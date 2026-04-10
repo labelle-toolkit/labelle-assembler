@@ -2,28 +2,56 @@
 
 Code generator and build assembler for the [labelle](https://github.com/labelle-toolkit) game toolkit.
 
-## Status
+Reads a game project's `project.labelle` configuration and materializes the
+`.labelle/<backend>_<platform>/` build directory with all generated build files
+(`build.zig`, `build.zig.zon`, `main.zig`, plugin manifests, copied source
+trees). Designed to be invoked as a subprocess by the `labelle` CLI launcher,
+so generator versions can evolve independently of the CLI binary.
 
-**Placeholder.** This repository is reserved for the eventual extraction
-of the assembler from [`labelle-cli`](https://github.com/labelle-toolkit/labelle-cli).
-Code lives at `labelle-cli/generator/` today.
-
-See [RFC: Split the assembler from the CLI](https://github.com/labelle-toolkit/labelle-cli/blob/rfc/split-assembler/RFC-split-assembler.md)
+See the [RFC: Split the assembler from the CLI](https://github.com/labelle-toolkit/labelle-cli/blob/rfc/split-assembler/RFC-split-assembler.md)
 ([tracking issue #122](https://github.com/labelle-toolkit/labelle-cli/issues/122))
 for the architectural plan and migration phases.
 
-## What this will be
+## Build
 
-A standalone, independently versioned binary that:
+Requires [Zig 0.15.2+](https://ziglang.org/download/).
 
-- Reads `project.labelle` from a game project root
-- Materializes `.labelle/<target>/` build artifacts (`build.zig`,
-  `build.zig.zon`, `main.zig`, copied source trees, plugin manifests)
-- Resolves and validates plugin dependencies
-- Exits with structured error codes; designed to be invoked as a
-  subprocess by the `labelle` CLI launcher
+```bash
+zig build
+```
 
-The split lets generator versions evolve independently of the CLI binary,
-so users no longer need to reinstall `labelle` every time the generator
-changes, and different game projects on the same machine can pin different
-generator versions via `project.labelle`.
+The binary is written to `zig-out/bin/labelle-assembler`.
+
+## Usage
+
+```bash
+./zig-out/bin/labelle-assembler --help
+./zig-out/bin/labelle-assembler --protocol-version
+./zig-out/bin/labelle-assembler generate --project-root /path/to/game
+```
+
+### Generate options
+
+| Flag | Description |
+|------|-------------|
+| `--project-root <path>` | Path to game project (containing `project.labelle`) |
+| `--scene <name>` | Override initial scene |
+| `--platform <name>` | Override target platform (`desktop`, `wasm`, `ios`, `android`) |
+| `--backend <name>` | Override graphics backend (`raylib`, `sokol`, `sdl`, `bgfx`, `wgpu`) |
+
+### Run tests
+
+```bash
+zig build test
+```
+
+## Release binaries
+
+Pre-built binaries are published on the
+[Releases](https://github.com/labelle-toolkit/labelle-assembler/releases) page
+when a version tag is pushed. Binary naming convention:
+
+- `labelle-assembler-macos-aarch64`
+- `labelle-assembler-macos-x86_64`
+- `labelle-assembler-linux-aarch64`
+- `labelle-assembler-linux-x86_64`
