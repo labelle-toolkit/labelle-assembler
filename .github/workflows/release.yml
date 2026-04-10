@@ -36,10 +36,18 @@ jobs:
           version: 0.15.2
 
       - name: Build
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          zig build \
+            -Dtarget=${{ matrix.target }} \
+            -Doptimize=ReleaseSafe \
+            -Dcli_version="$VERSION" \
+            -Dcore_version="$VERSION" \
+            -Dengine_version="$VERSION" \
+            -Dgfx_version="$VERSION"
 
       - name: Rename binary
-        run: mv zig-out/bin/labelle-assembler ${{ matrix.artifact }}
+        run: cp zig-out/bin/labelle-assembler ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
