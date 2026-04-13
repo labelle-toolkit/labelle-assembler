@@ -24,16 +24,22 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
     } else if (cfg.platform == .ios) {
         try tpl.writeSection(build_zig_tmpl, "header_ios", w);
+    } else if (cfg.platform == .android) {
+        try tpl.writeSection(build_zig_tmpl, "header_android", w);
     } else {
         try tpl.writeSection(build_zig_tmpl, "header", w);
     }
 
     if (cfg.platform == .ios) {
-        // Emit target alias for ECS adapters, plugins, and GUI that use `target` variable
         if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
             try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
         }
         try tpl.writeSection(build_zig_tmpl, "ios_deps", w);
+    } else if (cfg.platform == .android) {
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
+            try tpl.writeSection(build_zig_tmpl, "android_target_alias", w);
+        }
+        try tpl.writeSection(build_zig_tmpl, "android_deps", w);
     } else {
         try tpl.writeSection(build_zig_tmpl, "deps", w);
     }
@@ -57,6 +63,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
                 try tpl.writeSection(build_zig_tmpl, "backend_sokol_wasm", w);
             } else if (cfg.platform == .ios) {
                 try tpl.writeSection(build_zig_tmpl, "backend_sokol_ios", w);
+            } else if (cfg.platform == .android) {
+                try tpl.writeSection(build_zig_tmpl, "backend_sokol_android", w);
             } else {
                 try tpl.writeSection(build_zig_tmpl, "backend_sokol", w);
             }
@@ -174,6 +182,32 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         }
 
         try tpl.writeSection(build_zig_tmpl, "ios_footer", w);
+    } else if (cfg.platform == .android) {
+        // Android: build shared library for NativeActivity, link NDK libs
+        try tpl.writeSection(build_zig_tmpl, "android_exe_start", w);
+
+        for (cfg.plugins) |plugin| {
+            try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
+        }
+
+        if (cfg.ecs != .mock) {
+            try tpl.writeSection(build_zig_tmpl, "android_exe_ecs_import", w);
+        }
+        if (cfg.hasGui()) {
+            try tpl.writeSection(build_zig_tmpl, "android_exe_gui_import", w);
+        }
+
+        try tpl.writeSection(build_zig_tmpl, "android_exe_end", w);
+        try tpl.writeSection(build_zig_tmpl, "android_link", w);
+
+        if (cfg.resolved_gui) |gui| {
+            if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
+                try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
+                try tpl.writeSection(build_zig_tmpl, "android_link_gui_bridge", w);
+            }
+        }
+
+        try tpl.writeSection(build_zig_tmpl, "android_footer", w);
     } else {
         // Desktop: build as executable, link natively
         try tpl.writeSection(build_zig_tmpl, "exe_start", w);
