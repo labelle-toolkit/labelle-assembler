@@ -149,6 +149,9 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
 
         const initial = cfg.initial_scene orelse jsonc_scene_names[0];
         try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
+        if (cfg.states.len > 0) {
+            try w.print("    g.setState(\"{s}\");\n", .{cfg.states[0]});
+        }
     }
 
     try w.writeAll("    runner.setup(&g);\n");
