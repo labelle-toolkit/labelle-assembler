@@ -56,6 +56,9 @@ jobs:
         if: runner.os == 'Linux'
         run: cd backends/raylib && zig build test
 
+      - name: plugins/debug tests
+        run: cd plugins/debug && zig build test
+
       - name: bgfx backend tests + cross-compile compile-check
         run: |
           cd backends/bgfx
