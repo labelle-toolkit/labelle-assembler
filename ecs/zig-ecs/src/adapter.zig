@@ -119,6 +119,8 @@ pub fn removeComponent(self: *Self, entity: Entity, comptime T: type) void {
 /// struct — returning the iterator from `view()` would leave that
 /// pointer dangling after return-by-value.
 pub fn View(comptime _includes: anytype, comptime _excludes: anytype) type {
+    comptime validateComponentTuple(_includes);
+    comptime validateComponentTuple(_excludes);
     comptime std.debug.assert(_includes.len >= 1);
     return struct {
         backend: *Self,
@@ -180,6 +182,25 @@ pub fn View(comptime _includes: anytype, comptime _excludes: anytype) type {
 /// registry's storage for `includes[0]`. Iteration cost is paid in
 /// `next()`, walking the dense entity slice and (for multi-views)
 /// filtering by component membership via `self.inner.tryGet`.
+///
+/// ## Iteration stability
+///
+/// The returned `View` borrows a slice directly from the registry
+/// storage for the first include component. Adding or removing
+/// components of that type during iteration may grow/shrink the
+/// underlying storage and invalidate the slice — do not mutate the
+/// driving component type while a view over it is live. Mutating
+/// *other* component types is fine: the filter loop reads them
+/// fresh via `tryGet` on each candidate.
+///
+/// ## Performance tip: put the sparsest component first
+///
+/// `includes[0]` drives iteration — the view walks every entity
+/// with that component and filters the rest inline. Put the
+/// smallest-population component first for the tightest loop.
+/// `view(.{Projectile, Position}, .{})` is much faster than
+/// `view(.{Position, Projectile}, .{})` in a game with many
+/// positioned entities and few projectiles.
 pub fn view(self: *Self, comptime includes: anytype, comptime excludes: anytype) View(includes, excludes) {
     const basic = self.inner.basicView(includes[0]);
     const entities = basic.data();
