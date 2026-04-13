@@ -555,6 +555,55 @@ pub fn build(b: *std.Build) void {
 .android_link_gui_bridge
     lib.linkLibrary(gui_bridge_artifact);
 
+.android_package
+    // ── APK packaging step ──────────────────────────────────────────────
+    // Copies the freshly built libgame.so into apk-staging and re-signs the APK.
+    // Requires ANDROID_HOME and ~/.labelle/android-debug.keystore.
+    {
+        const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch "/tmp";
+        const android_home = std.process.getEnvVarOwned(b.allocator, "ANDROID_HOME") catch
+            @panic("ANDROID_HOME not set — cannot find apksigner");
+        defer b.allocator.free(android_home);
+        const keystore = b.pathJoin(&.{ home, ".labelle", "android-debug.keystore" });
+
+        // Find build-tools: prefer newest, then fall back
+        const build_tools_dir = blk: {
+            for (&[_][]const u8{ "36.0.0", "35.0.1", "35.0.0", "34.0.0" }) |ver| {
+                const p = b.pathJoin(&.{ android_home, "build-tools", ver });
+                if (std.fs.cwd().access(p, .{})) |_| break :blk p else |_| {}
+            }
+            break :blk b.pathJoin(&.{ android_home, "build-tools", "35.0.0" });
+        };
+        const apksigner = b.pathJoin(&.{ build_tools_dir, "apksigner" });
+
+        // Copy .so to staging
+        const stage_lib = b.addInstallFile(lib.getEmittedBin(), "../../apk-staging/lib/arm64-v8a/libgame.so");
+        stage_lib.step.dependOn(&lib.step);
+
+        // Repack APK from staging dir
+        const pack = b.addSystemCommand(&.{ "sh", "-c",
+            "cd \"$0\" && zip -r \"$1\" . -x '*.idsig'",
+            b.pathFromRoot("apk-staging"),
+            b.pathFromRoot("game_unsigned.apk"),
+        });
+        pack.step.dependOn(&stage_lib.step);
+
+        // Sign
+        const sign = b.addSystemCommand(&.{
+            apksigner,        "sign",
+            "--ks",           keystore,
+            "--ks-pass",      "pass:android",
+            "--key-pass",     "pass:android",
+            "--min-sdk-version", "26",
+            "--out",          b.pathFromRoot("game.apk"),
+            b.pathFromRoot("game_unsigned.apk"),
+        });
+        sign.step.dependOn(&pack.step);
+
+        const package_step = b.step("package", "Package and sign Android APK");
+        package_step.dependOn(&sign.step);
+    }
+
 .android_footer
     b.installArtifact(lib);
 
