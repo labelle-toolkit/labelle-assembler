@@ -598,11 +598,11 @@ pub fn generateMainZigFromTemplate(
             "        g.dispatchEvents();\n" ++
             "        // Update profiling pointers (debug only)\n" ++
             "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
-            "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
+            "            g.script_profile_ptr = @ptrCast(@alignCast(&runner.profile));\n" ++
             "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
             "        }\n" ++
             "        if (comptime PluginSystems.profiling_enabled) {\n" ++
-            "            g.plugin_profile_ptr = @ptrCast(&PluginSystems.plugin_profile);\n" ++
+            "            g.plugin_profile_ptr = @ptrCast(@alignCast(&PluginSystems.plugin_profile));\n" ++
             "            g.plugin_profile_count = PluginSystems.plugin_system_count;\n" ++
             "        }\n"
         else
@@ -612,7 +612,7 @@ pub fn generateMainZigFromTemplate(
             "        }\n" ++
             "        g.dispatchEvents();\n" ++
             "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
-            "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
+            "            g.script_profile_ptr = @ptrCast(@alignCast(&runner.profile));\n" ++
             "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
             "        }\n";
 

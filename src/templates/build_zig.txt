@@ -273,7 +273,7 @@ pub fn build(b: *std.Build) void {
     const sdk_path = getIosSdkPath(b, sdk_name) orelse
         @panic("Could not find iOS SDK. Is Xcode installed?");
 
-    const host_arch = b.host.result.cpu.arch;
+    const host_arch = b.graph.host.result.cpu.arch;
     const ios_target = if (device_mode)
         b.resolveTargetQuery(.{
             .cpu_arch = .aarch64,
