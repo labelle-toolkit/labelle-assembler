@@ -212,6 +212,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
             }
         }
 
+        try tpl.writeSection(build_zig_tmpl, "android_package", w);
         try tpl.writeSection(build_zig_tmpl, "android_footer", w);
     } else {
         // Desktop: build as executable, link natively
