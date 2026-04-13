@@ -27,6 +27,9 @@ jobs:
       - name: Test
         run: zig build test
 
+      - name: zig-ecs adapter tests
+        run: cd ecs/zig-ecs && zig build test
+
       - name: Verify binary
         run: |
           ./zig-out/bin/labelle-assembler --protocol-version
