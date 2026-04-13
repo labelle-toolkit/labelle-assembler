@@ -21,6 +21,13 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Install sokol system libs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libgl1-mesa-dev libx11-dev libxi-dev libxcursor-dev
+
       - name: Build
         run: zig build
 
@@ -32,6 +39,9 @@ jobs:
 
       - name: SDL backend build-helper tests
         run: cd backends/sdl && zig build test
+
+      - name: sokol backend unit tests + audio.zig compile-check
+        run: cd backends/sokol && zig build test
 
       - name: bgfx backend tests + cross-compile compile-check
         run: |

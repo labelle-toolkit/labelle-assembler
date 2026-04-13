@@ -12,32 +12,15 @@
 const std = @import("std");
 const sokol = @import("sokol");
 const saudio = sokol.audio;
+const slots = @import("audio_slots.zig");
 
-const MAX_SOUNDS = 256;
-const MAX_MUSIC = 32;
+const SoundSlot = slots.SoundSlot;
+const MusicSlot = slots.MusicSlot;
+const MAX_SOUNDS = slots.MAX_SOUNDS;
+const MAX_MUSIC = slots.MAX_MUSIC;
 const MAX_ACTIVE_VOICES = 64;
 
 // ── Sound slot storage ──────────────────────────────────────────
-
-const SoundSlot = struct {
-    samples: []const f32, // interleaved stereo PCM
-    sample_count: usize, // total number of f32 values
-    channels: u16,
-    sample_rate: u32,
-    volume: f32,
-};
-
-const MusicSlot = struct {
-    samples: []const f32,
-    sample_count: usize,
-    channels: u16,
-    sample_rate: u32,
-    volume: f32,
-    position: usize, // current playback position
-    playing: bool,
-    paused: bool,
-    looping: bool,
-};
 
 // Active voice for sound effect playback
 const Voice = struct {
@@ -46,13 +29,23 @@ const Voice = struct {
     active: bool,
 };
 
-var sounds: [MAX_SOUNDS]?SoundSlot = [_]?SoundSlot{null} ** MAX_SOUNDS;
-var music_slots: [MAX_MUSIC]?MusicSlot = [_]?MusicSlot{null} ** MAX_MUSIC;
+var sounds: slots.SoundSlots = slots.emptySoundSlots();
+var music_slots: slots.MusicSlots = slots.emptyMusicSlots();
 var voices: [MAX_ACTIVE_VOICES]Voice = [_]Voice{.{ .sound_id = 0, .position = 0, .active = false }} ** MAX_ACTIVE_VOICES;
 var next_sound_id: u32 = 1;
 var next_music_id: u32 = 1;
 var master_volume: f32 = 1.0;
 var audio_initialized: bool = false;
+
+/// Thin wrappers over the helpers in `audio_slots.zig` so each call
+/// site doesn't have to pass the module-level array explicitly.
+fn activeSound(id: u32) ?*SoundSlot {
+    return slots.activeSound(&sounds, id);
+}
+
+fn activeMusic(id: u32) ?*MusicSlot {
+    return slots.activeMusic(&music_slots, id);
+}
 
 // ── Audio system init ──────────────────────────────────────────
 
@@ -119,10 +112,11 @@ fn audioCallback(buffer: [*c]f32, num_frames: i32, num_channels: i32) callconv(.
     // Mix active sound voices
     for (&voices) |*voice| {
         if (!voice.active) continue;
-        const slot = sounds[voice.sound_id] orelse {
+        const slot_ptr = activeSound(voice.sound_id) orelse {
             voice.active = false;
             continue;
         };
+        const slot = slot_ptr.*;
 
         const vol = slot.volume * master_volume;
         var samples_written: usize = 0;
@@ -156,6 +150,7 @@ fn audioCallback(buffer: [*c]f32, num_frames: i32, num_channels: i32) callconv(.
     // Mix music tracks
     for (&music_slots) |*maybe_slot| {
         if (maybe_slot.*) |*slot| {
+            if (slot.unloaded) continue;
             if (!slot.playing or slot.paused) continue;
 
             // Guard: zero-length samples can't be played — stop to avoid infinite loop
@@ -342,26 +337,25 @@ pub fn loadSound(path: [:0]const u8) u32 {
 }
 
 pub fn unloadSound(id: u32) void {
-    if (id < MAX_SOUNDS) {
-        if (sounds[id] != null) {
-            // Stop any voices using this sound
-            for (&voices) |*voice| {
-                if (voice.active and voice.sound_id == id) {
-                    voice.active = false;
-                }
-            }
-            // Do NOT free slot.samples here — the audio callback thread may still
-            // be reading from it. Just mark the slot as unused. Proper reclamation
-            // of sample memory happens at shutdown.
-            sounds[id] = null;
+    if (activeSound(id) == null) return;
+    // Stop any voices using this sound before flipping the unloaded
+    // bit — the audio callback may still be iterating `voices` and
+    // about to follow `sound_id` into this slot.
+    for (&voices) |*voice| {
+        if (voice.active and voice.sound_id == id) {
+            voice.active = false;
         }
     }
+    // Do NOT free samples here — the audio callback thread may still
+    // be reading. `markSoundUnloaded` keeps the slot reachable via
+    // `sounds[id]` so `deinit` can free it at shutdown. See #10 — the
+    // pre-fix code nulled the whole optional and orphaned the buffer.
+    slots.markSoundUnloaded(&sounds, id);
 }
 
 pub fn playSound(id: u32) void {
     ensureInit();
-    if (id >= MAX_SOUNDS) return;
-    if (sounds[id] == null) return;
+    if (activeSound(id) == null) return;
 
     // Find a free voice slot
     for (&voices) |*voice| {
@@ -392,10 +386,8 @@ pub fn isSoundPlaying(id: u32) bool {
 }
 
 pub fn setSoundVolume(id: u32, volume: f32) void {
-    if (id < MAX_SOUNDS) {
-        if (sounds[id] != null) {
-            sounds[id].?.volume = std.math.clamp(volume, 0.0, 1.0);
-        }
+    if (activeSound(id)) |slot| {
+        slot.volume = std.math.clamp(volume, 0.0, 1.0);
     }
 }
 
@@ -425,67 +417,50 @@ pub fn loadMusic(path: [:0]const u8) u32 {
 }
 
 pub fn unloadMusic(id: u32) void {
-    if (id < MAX_MUSIC) {
-        if (music_slots[id] != null) {
-            // Do NOT free slot.samples here — the audio callback thread may still
-            // be reading from it. Just mark the slot as unused. Proper reclamation
-            // of sample memory happens at shutdown.
-            music_slots[id].?.playing = false;
-            music_slots[id] = null;
-        }
-    }
+    // `markMusicUnloaded` stops playback and sets the flag; the slot
+    // stays non-null so `deinit` can free the samples at shutdown.
+    // See #10 and unloadSound above for the full reasoning.
+    slots.markMusicUnloaded(&music_slots, id);
 }
 
 pub fn playMusic(id: u32) void {
     ensureInit();
-    if (id < MAX_MUSIC) {
-        if (music_slots[id] != null) {
-            music_slots[id].?.playing = true;
-            music_slots[id].?.paused = false;
-            music_slots[id].?.position = 0;
-        }
+    if (activeMusic(id)) |slot| {
+        slot.playing = true;
+        slot.paused = false;
+        slot.position = 0;
     }
 }
 
 pub fn stopMusic(id: u32) void {
-    if (id < MAX_MUSIC) {
-        if (music_slots[id] != null) {
-            music_slots[id].?.playing = false;
-            music_slots[id].?.position = 0;
-        }
+    if (activeMusic(id)) |slot| {
+        slot.playing = false;
+        slot.position = 0;
     }
 }
 
 pub fn pauseMusic(id: u32) void {
-    if (id < MAX_MUSIC) {
-        if (music_slots[id] != null) {
-            music_slots[id].?.paused = true;
-        }
+    if (activeMusic(id)) |slot| {
+        slot.paused = true;
     }
 }
 
 pub fn resumeMusic(id: u32) void {
-    if (id < MAX_MUSIC) {
-        if (music_slots[id] != null) {
-            music_slots[id].?.paused = false;
-        }
+    if (activeMusic(id)) |slot| {
+        slot.paused = false;
     }
 }
 
 pub fn isMusicPlaying(id: u32) bool {
-    if (id < MAX_MUSIC) {
-        if (music_slots[id]) |slot| {
-            return slot.playing and !slot.paused;
-        }
+    if (activeMusic(id)) |slot| {
+        return slot.playing and !slot.paused;
     }
     return false;
 }
 
 pub fn setMusicVolume(id: u32, volume: f32) void {
-    if (id < MAX_MUSIC) {
-        if (music_slots[id] != null) {
-            music_slots[id].?.volume = std.math.clamp(volume, 0.0, 1.0);
-        }
+    if (activeMusic(id)) |slot| {
+        slot.volume = std.math.clamp(volume, 0.0, 1.0);
     }
 }
 
