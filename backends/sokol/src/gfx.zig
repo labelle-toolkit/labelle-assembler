@@ -59,10 +59,24 @@ pub fn color(r: u8, g: u8, b: u8, a: u8) Color {
 
 var screen_w: i32 = 800;
 var screen_h: i32 = 600;
+var design_w: i32 = 800;
+var design_h: i32 = 600;
 
 pub fn setScreenSize(w: i32, h: i32) void {
     screen_w = w;
     screen_h = h;
+    // Keep design dims in sync with physical by default (backwards compat for
+    // desktop where design == physical). Call setDesignSize after to override.
+    design_w = w;
+    design_h = h;
+}
+
+/// Override design canvas dimensions for NDC mapping in screen-space mode.
+/// Call after setScreenSize when design resolution differs from physical
+/// (e.g. high_dpi=true on mobile where framebuffer is 2× the design size).
+pub fn setDesignSize(w: i32, h: i32) void {
+    design_w = w;
+    design_h = h;
 }
 
 // ── Camera state ────────────────────────────────────────────────────
@@ -76,7 +90,9 @@ var camera_active: bool = false;
 /// When a camera is active, applies forward transform: (world - target) * zoom + offset.
 fn toNdcX(px: f32) f32 {
     if (!camera_active) {
-        return (px / @as(f32, @floatFromInt(screen_w))) * 2.0 - 1.0;
+        // Screen-space: map design coords directly to NDC so a design-width
+        // quad fills exactly NDC -1..1 regardless of physical screen width.
+        return (px / @as(f32, @floatFromInt(design_w))) * 2.0 - 1.0;
     }
     const cam = active_camera;
     const screen_x = (px - cam.target.x) * cam.zoom + cam.offset.x;
@@ -84,16 +100,17 @@ fn toNdcX(px: f32) f32 {
 }
 
 fn toNdcY(py: f32) f32 {
-    const fh = @as(f32, @floatFromInt(screen_h));
     if (!camera_active) {
-        return 1.0 - (py / fh) * 2.0;
+        // Screen-space: map design coords directly to NDC so a design-height
+        // quad fills exactly NDC -1..1 regardless of physical screen height.
+        return 1.0 - (py / @as(f32, @floatFromInt(design_h))) * 2.0;
     }
     const cam = active_camera;
-    // Positions arrive in screen-space (Y-flipped by renderer.toScreenY).
-    // Undo the flip to get world Y-up, apply camera with inverted Y
-    // (screen Y-down vs world Y-up), then convert to NDC.
-    const world_y = fh - py;
-    const screen_y = -(world_y - cam.target.y) * cam.zoom + cam.offset.y;
+    const fh = @as(f32, @floatFromInt(screen_h));
+    // Positions arrive in screen-space Y-down (Y-flipped by renderer.toScreenY).
+    // Apply the camera in the same screen-Y-down convention as the raylib backend:
+    // screen_final = (py - target.y) * zoom + offset.y
+    const screen_y = (py - cam.target.y) * cam.zoom + cam.offset.y;
     return 1.0 - (screen_y / fh) * 2.0;
 }
 
@@ -191,10 +208,11 @@ pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
     const segments = 32;
     const cx = toNdcX(center_x);
     const cy = toNdcY(center_y);
-    // Convert radius to NDC scale
-    const fw: f32 = @floatFromInt(screen_w);
-    const rx = (radius / fw) * 2.0;
-    const ry = (radius / @as(f32, @floatFromInt(screen_h))) * 2.0;
+    // Convert radius to NDC scale — use design dims in screen-space to match toNdcX/Y.
+    const rw: f32 = @floatFromInt(if (!camera_active) design_w else screen_w);
+    const rh: f32 = @floatFromInt(if (!camera_active) design_h else screen_h);
+    const rx = (radius / rw) * 2.0;
+    const ry = (radius / rh) * 2.0;
 
     sgl.beginTriangleStrip();
     sgl.c4b(tint.r, tint.g, tint.b, tint.a);
