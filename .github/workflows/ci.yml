@@ -33,6 +33,15 @@ jobs:
       - name: SDL backend build-helper tests
         run: cd backends/sdl && zig build test
 
+      - name: bgfx backend tests + cross-compile compile-check
+        run: |
+          cd backends/bgfx
+          zig build test
+          zig build test -Dtarget=x86_64-linux-gnu
+          zig build test -Dtarget=x86_64-windows-gnu
+          zig build test -Dtarget=x86_64-macos
+          zig build test -Dtarget=aarch64-macos
+
       - name: Verify binary
         run: |
           ./zig-out/bin/labelle-assembler --protocol-version
