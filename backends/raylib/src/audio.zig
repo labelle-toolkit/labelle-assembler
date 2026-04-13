@@ -1,6 +1,7 @@
 /// Raylib audio backend — satisfies the engine AudioInterface(Impl) contract.
 /// Manages a registry of loaded sounds and music streams.
 const rl = @import("raylib");
+const slot_alloc = @import("slot_alloc.zig");
 
 const MAX_SOUNDS = 256;
 const MAX_MUSIC = 32;
@@ -15,10 +16,12 @@ var next_music_id: u32 = 1;
 pub fn loadSound(path: [:0]const u8) u32 {
     const snd = rl.loadSound(path);
     if (snd.stream.buffer == null) return 0;
-    const id = next_sound_id;
-    if (id >= MAX_SOUNDS) return 0;
+    const id = slot_alloc.findFreeSlot(rl.Sound, &sounds, next_sound_id, MAX_SOUNDS) orelse {
+        rl.unloadSound(snd);
+        return 0;
+    };
     sounds[id] = snd;
-    next_sound_id += 1;
+    if (id == next_sound_id) next_sound_id += 1;
     return id;
 }
 
@@ -69,10 +72,12 @@ pub fn setSoundVolume(id: u32, volume: f32) void {
 pub fn loadMusic(path: [:0]const u8) u32 {
     const mus = rl.loadMusicStream(path);
     if (mus.stream.buffer == null) return 0;
-    const id = next_music_id;
-    if (id >= MAX_MUSIC) return 0;
+    const id = slot_alloc.findFreeSlot(rl.Music, &music, next_music_id, MAX_MUSIC) orelse {
+        rl.unloadMusicStream(mus);
+        return 0;
+    };
     music[id] = mus;
-    next_music_id += 1;
+    if (id == next_music_id) next_music_id += 1;
     return id;
 }
 

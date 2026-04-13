@@ -46,6 +46,9 @@ jobs:
       - name: wgpu backend WAV parser tests
         run: cd backends/wgpu && zig build test
 
+      - name: raylib backend slot-allocator tests
+        run: cd backends/raylib && zig build test
+
       - name: bgfx backend tests + cross-compile compile-check
         run: |
           cd backends/bgfx
