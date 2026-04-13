@@ -116,6 +116,9 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     const gizmo_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "gizmos", ".zon");
     defer scanner.freeNames(allocator, gizmo_names);
 
+    const animation_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "animations", ".zon");
+    defer scanner.freeNames(allocator, animation_names);
+
     // Copy-only folders (no scanning needed)
     try scanner.copyDirRecursive(allocator, game_dir, target_dir, "assets");
 
@@ -226,7 +229,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     // Generate main.zig — load engine template from codegen/ directory
     const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
     defer allocator.free(engine_template);
-    const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, component_names, hook_names, event_names, enum_names, view_names, gizmo_names);
+    const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names);
     defer allocator.free(main_zig_content);
     try scanner.writeFile(target_dir, "main.zig", main_zig_content);
 }
