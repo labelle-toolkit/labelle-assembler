@@ -46,7 +46,14 @@ jobs:
       - name: wgpu backend WAV parser tests
         run: cd backends/wgpu && zig build test
 
+      # Linux-only: raylib-zig transitively pulls hexops/xcode-frameworks
+      # via `git+https://`, which Zig's git fetcher can't resolve on the
+      # macos-latest runner ("unable to discover remote git server
+      # capabilities: ProtocolError"). The slot_alloc tests are pure Zig
+      # with no platform-specific behaviour, so running them on the
+      # ubuntu runner alone is enough.
       - name: raylib backend slot-allocator tests
+        if: runner.os == 'Linux'
         run: cd backends/raylib && zig build test
 
       - name: bgfx backend tests + cross-compile compile-check
