@@ -85,7 +85,10 @@ pub fn makeDesc(desc: struct {
     // Android emulators typically support GLES 3.0 but not 3.1.
     // Sokol defaults to 3.1 on Android, which causes EGL_BAD_CONFIG on emulators.
     // Request 3.0 explicitly so the app works on both real devices and emulators.
-    const is_android = comptime builtin.target.isAndroid();
+    // std.Target.isAndroid() is not available in Zig 0.15.2; check ABI directly.
+    // .android covers arm64/x86_64; .androideabi covers arm/x86.
+    const is_android = comptime builtin.target.abi == .android or
+        builtin.target.abi == .androideabi;
     return .{
         .init_cb = desc.init_cb,
         .frame_cb = desc.frame_cb,
