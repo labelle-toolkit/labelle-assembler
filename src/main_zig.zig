@@ -233,6 +233,7 @@ pub fn generateMainZigFromTemplate(
     enum_names: []const []const u8,
     view_names: []const []const u8,
     gizmo_names: []const []const u8,
+    animation_names: []const []const u8,
 ) ![]const u8 {
     var data = tpl.TemplateData{
         .scalars = std.StringHashMap([]const u8).init(allocator),
@@ -562,6 +563,25 @@ pub fn generateMainZigFromTemplate(
         const block = try buf.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("gizmo_registry_block", block);
+    }
+
+    // Animation registry block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (animation_names.len > 0) {
+            var anim_ident_buf: [256]u8 = undefined;
+            var anim_pascal_buf: [128]u8 = undefined;
+            for (animation_names) |name| {
+                const ident = pathToIdent(name, &anim_ident_buf);
+                const pascal = snakeToPascal(ident, &anim_pascal_buf);
+                try bw.print("const {s}Anim = engine.AnimationDef(@import(\"animations/{s}.zon\"));\n", .{ pascal, name });
+            }
+            try bw.writeAll("\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(allocator, block);
+        try data.scalars.put("animation_registry_block", block);
     }
 
     // ── Lifecycle section (rendered from backend template, same as procedural path) ──
