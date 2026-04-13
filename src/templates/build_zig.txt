@@ -560,11 +560,13 @@ pub fn build(b: *std.Build) void {
     // Copies the freshly built libgame.so into apk-staging and re-signs the APK.
     // Requires ANDROID_HOME and ~/.labelle/android-debug.keystore.
     {
-        const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch "/tmp";
-        const android_home = std.process.getEnvVarOwned(b.allocator, "ANDROID_HOME") catch
-            @panic("ANDROID_HOME not set — cannot find apksigner");
-        defer b.allocator.free(android_home);
-        const keystore = b.pathJoin(&.{ home, ".labelle", "android-debug.keystore" });
+        // ANDROID_HOME is read lazily — a missing value only fails when `zig build package` runs.
+        const android_home = std.process.getEnvVarOwned(b.allocator, "ANDROID_HOME") catch "";
+        defer if (android_home.len > 0) b.allocator.free(android_home);
+        const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch
+            std.process.getEnvVarOwned(b.allocator, "USERPROFILE") catch "";
+        defer if (home.len > 0) b.allocator.free(home);
+        const keystore = b.pathJoin(&.{ if (home.len > 0) home else "/tmp", ".labelle", "android-debug.keystore" });
 
         // Find build-tools: prefer newest, then fall back
         const build_tools_dir = blk: {
@@ -576,8 +578,16 @@ pub fn build(b: *std.Build) void {
         };
         const apksigner = b.pathJoin(&.{ build_tools_dir, "apksigner" });
 
-        // Copy .so to staging
-        const stage_lib = b.addInstallFile(lib.getEmittedBin(), "../../apk-staging/lib/arm64-v8a/libgame.so");
+        // Derive ABI directory from the actual build target so emulator (x86_64) and device (arm64) both work.
+        const abi_dir: []const u8 = switch (android_target.result.cpu.arch) {
+            .aarch64 => "arm64-v8a",
+            .x86_64  => "x86_64",
+            .arm     => "armeabi-v7a",
+            .x86     => "x86",
+            else     => "arm64-v8a",
+        };
+        // "../apk-staging/..." installs relative to zig-out/, resolving to {project_root}/apk-staging/.
+        const stage_lib = b.addInstallFile(lib.getEmittedBin(), b.fmt("../apk-staging/lib/{s}/libgame.so", .{abi_dir}));
         stage_lib.step.dependOn(&lib.step);
 
         // Repack APK from staging dir
