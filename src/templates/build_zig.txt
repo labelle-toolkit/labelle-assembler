@@ -370,6 +370,8 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Override a module import without leaking memory.
+/// NOTE: Duplicated from .footer — each generated build.zig is standalone and
+/// needs its own copy of this helper.
 fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
     const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
     if (!gop.found_existing) {
@@ -388,7 +390,7 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
         defer b.allocator.free(ndk_home);
         const sysroot = b.pathJoin(&.{ ndk_home, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
         if (std.fs.cwd().access(sysroot, .{})) |_| {
-            return b.allocator.dupe(u8, sysroot) catch null;
+            return sysroot;
         } else |_| {}
     }
     // 2. ANDROID_HOME/ndk/<latest>/
@@ -401,15 +403,22 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
         var iter = dir.iterate();
         while (iter.next() catch null) |entry| {
             if (entry.kind == .directory) {
-                if (latest) |prev| b.allocator.free(prev);
-                latest = b.allocator.dupe(u8, entry.name) catch null;
+                // Pick the highest version by lexicographic comparison
+                if (latest) |prev| {
+                    if (std.mem.order(u8, entry.name, prev) == .gt) {
+                        b.allocator.free(prev);
+                        latest = b.allocator.dupe(u8, entry.name) catch null;
+                    }
+                } else {
+                    latest = b.allocator.dupe(u8, entry.name) catch null;
+                }
             }
         }
         if (latest) |version| {
             defer b.allocator.free(version);
             const sysroot = b.pathJoin(&.{ ndk_dir, version, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
             if (std.fs.cwd().access(sysroot, .{})) |_| {
-                return b.allocator.dupe(u8, sysroot) catch null;
+                return sysroot;
             } else |_| {}
         }
     }
@@ -446,6 +455,9 @@ pub fn build(b: *std.Build) void {
             .abi = .android,
         });
 
+    // Architecture-specific triple for NDK include/library paths
+    const ndk_arch_triple: []const u8 = if (emulator_mode) "x86_64-linux-android" else "aarch64-linux-android";
+
 .android_target_alias
     const target = android_target;
 
@@ -478,7 +490,7 @@ pub fn build(b: *std.Build) void {
 
     // Configure NDK sysroot paths on sokol_clib for C header compilation
     sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include" }) });
-    sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include/aarch64-linux-android" }) });
+    sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }) });
 
 .android_exe_start
     const lib = b.addSharedLibrary(.{
@@ -510,7 +522,7 @@ pub fn build(b: *std.Build) void {
 .android_link
     lib.linkLibrary(sokol_clib);
     lib.linkLibC();
-    lib.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/lib/aarch64-linux-android/34" }) });
+    lib.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }) });
     lib.root_module.linkSystemLibrary("android", .{});
     lib.root_module.linkSystemLibrary("log", .{});
     lib.root_module.linkSystemLibrary("GLESv3", .{});
@@ -527,6 +539,8 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Override a module import without leaking memory.
+/// NOTE: Duplicated from .footer — each generated build.zig is standalone and
+/// needs its own copy of this helper.
 fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
     const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
     if (!gop.found_existing) {

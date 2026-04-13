@@ -198,7 +198,12 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         }
 
         try tpl.writeSection(build_zig_tmpl, "android_exe_end", w);
-        try tpl.writeSection(build_zig_tmpl, "android_link", w);
+
+        // Pass target_sdk_version from AndroidConfig (default 34) for NDK library path
+        const android_cfg = cfg.android orelse config.AndroidConfig{};
+        var sdk_buf: [10]u8 = undefined;
+        const sdk_version_str = std.fmt.bufPrint(&sdk_buf, "{d}", .{android_cfg.target_sdk_version}) catch "34";
+        try tpl.renderSection(build_zig_tmpl, "android_link", .{ .target_sdk_version = sdk_version_str }, w);
 
         if (cfg.resolved_gui) |gui| {
             if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
