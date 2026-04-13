@@ -102,54 +102,112 @@ pub fn removeComponent(self: *Self, entity: Entity, comptime T: type) void {
 }
 
 /// View type — iterates matching entities, converting to external Entity.
-/// Materializes results into a buffer to avoid dangling pointers from
-/// stack-local zig-ecs views and to provide a consistent deinit() interface.
+///
+/// The underlying storage for the first include component is borrowed
+/// directly via `basicView(T).data()`, which hands back the dense entity
+/// slice owned by the zig-ecs registry. Iteration walks that slice
+/// backwards (matching the old `reverseIterator` order) without
+/// copying or allocating anything — the pre-refactor adapter
+/// materialised the whole result list into a fresh `ArrayList` on
+/// every `view()` call, which dominated per-frame allocator pressure
+/// for systems that loop via views (#13).
+///
+/// For multi-include / exclude views, the adapter reimplements the
+/// filter loop inline at `next()` time using `self.backend.tryGet`.
+/// This avoids zig-ecs's `MultiView.Iterator`, which stores a self
+/// pointer (`view: *Self`) back into its originating `MultiView`
+/// struct — returning the iterator from `view()` would leave that
+/// pointer dangling after return-by-value.
 pub fn View(comptime _includes: anytype, comptime _excludes: anytype) type {
+    comptime validateComponentTuple(_includes);
+    comptime validateComponentTuple(_excludes);
+    comptime std.debug.assert(_includes.len >= 1);
     return struct {
-        entities: []const Entity,
-        index: usize = 0,
-        allocator: std.mem.Allocator,
+        backend: *Self,
+        /// Dense entity slice from the first include type's storage.
+        /// Walked backwards via `index` to mirror `reverseIterator`.
+        /// Stable: owned by the registry, not by this struct.
+        entities: []const InternalEntity,
+        index: usize,
 
         const ViewSelf = @This();
-        const includes = _includes;
-        const excludes = _excludes;
+        const is_single = _includes.len == 1 and _excludes.len == 0;
 
         pub fn next(self: *ViewSelf) ?Entity {
-            if (self.index < self.entities.len) {
-                const entity = self.entities[self.index];
-                self.index += 1;
-                return entity;
+            while (self.index > 0) {
+                self.index -= 1;
+                const internal = self.entities[self.index];
+                const external = toExternal(internal);
+
+                if (comptime !is_single) {
+                    // Candidate must have every *other* include component.
+                    // First include is already satisfied — it's the one
+                    // whose storage we're iterating.
+                    var has_all = true;
+                    inline for (1.._includes.len) |i| {
+                        const T = _includes[i];
+                        if (self.backend.inner.tryGet(T, internal) == null) {
+                            has_all = false;
+                            break;
+                        }
+                    }
+                    if (!has_all) continue;
+
+                    // And must not have any excluded component.
+                    var any_excluded = false;
+                    inline for (0.._excludes.len) |i| {
+                        const T = _excludes[i];
+                        if (self.backend.inner.tryGet(T, internal) != null) {
+                            any_excluded = true;
+                            break;
+                        }
+                    }
+                    if (any_excluded) continue;
+                }
+
+                return external;
             }
             return null;
         }
 
-        pub fn deinit(self: *ViewSelf) void {
-            self.allocator.free(self.entities);
-        }
+        /// No-op retained for API compatibility — the old view
+        /// implementation owned a heap buffer that needed freeing.
+        pub fn deinit(_: *ViewSelf) void {}
     };
 }
 
 /// Create a view iterating entities with the given include/exclude filters.
+///
+/// `view()` does no work beyond a single pointer grab into the
+/// registry's storage for `includes[0]`. Iteration cost is paid in
+/// `next()`, walking the dense entity slice and (for multi-views)
+/// filtering by component membership via `self.inner.tryGet`.
+///
+/// ## Iteration stability
+///
+/// The returned `View` borrows a slice directly from the registry
+/// storage for the first include component. Adding or removing
+/// components of that type during iteration may grow/shrink the
+/// underlying storage and invalidate the slice — do not mutate the
+/// driving component type while a view over it is live. Mutating
+/// *other* component types is fine: the filter loop reads them
+/// fresh via `tryGet` on each candidate.
+///
+/// ## Performance tip: put the sparsest component first
+///
+/// `includes[0]` drives iteration — the view walks every entity
+/// with that component and filters the rest inline. Put the
+/// smallest-population component first for the tightest loop.
+/// `view(.{Projectile, Position}, .{})` is much faster than
+/// `view(.{Position, Projectile}, .{})` in a game with many
+/// positioned entities and few projectiles.
 pub fn view(self: *Self, comptime includes: anytype, comptime excludes: anytype) View(includes, excludes) {
-    var result: std.ArrayListUnmanaged(Entity) = .{};
-
-    if (includes.len == 1 and excludes.len == 0) {
-        const basic = self.inner.basicView(includes[0]);
-        var iter = basic.entityIterator();
-        while (iter.next()) |internal| {
-            result.append(self.inner.allocator, toExternal(internal)) catch @panic("OOM");
-        }
-    } else {
-        var multi = self.inner.view(includes, excludes);
-        var iter = multi.entityIterator();
-        while (iter.next()) |internal| {
-            result.append(self.inner.allocator, toExternal(internal)) catch @panic("OOM");
-        }
-    }
-
+    const basic = self.inner.basicView(includes[0]);
+    const entities = basic.data();
     return .{
-        .entities = result.toOwnedSlice(self.inner.allocator) catch @panic("OOM"),
-        .allocator = self.inner.allocator,
+        .backend = self,
+        .entities = entities,
+        .index = entities.len,
     };
 }
 
