@@ -570,10 +570,9 @@ pub fn generateMainZigFromTemplate(
         var buf = std.ArrayList(u8){};
         const bw = buf.writer(allocator);
         if (animation_names.len > 0) {
-            var anim_ident_buf: [256]u8 = undefined;
             var anim_pascal_buf: [128]u8 = undefined;
             for (animation_names) |name| {
-                const ident = pathToIdent(name, &anim_ident_buf);
+                const ident = pathToIdent(name, &ident_buf);
                 const pascal = snakeToPascal(ident, &anim_pascal_buf);
                 try bw.print("const {s}Anim = engine.AnimationDef(@import(\"animations/{s}.zon\"));\n", .{ pascal, name });
             }
