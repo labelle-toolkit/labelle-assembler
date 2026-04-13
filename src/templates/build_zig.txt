@@ -437,14 +437,21 @@ fn ndkHostTag() []const u8 {
 
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
-    const emulator_mode = b.option(bool, "emulator", "Build for Android x86_64 emulator") orelse false;
+    const emulator_mode = b.option(bool, "emulator", "Build for Android emulator (x86_64 on Intel Mac, arm64 on Apple Silicon)") orelse false;
 
     const ndk_sysroot = getAndroidNdkSysroot(b) orelse
         @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
 
+    // On Apple Silicon the Android emulator runs ARM64 images; on Intel Macs
+    // it runs x86_64. Use the host arch to select the right ABI automatically.
+    const emulator_arch: std.Target.Cpu.Arch = switch (b.graph.host.result.cpu.arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    };
+
     const android_target = if (emulator_mode)
         b.resolveTargetQuery(.{
-            .cpu_arch = .x86_64,
+            .cpu_arch = emulator_arch,
             .os_tag = .linux,
             .abi = .android,
         })
@@ -456,7 +463,10 @@ pub fn build(b: *std.Build) void {
         });
 
     // Architecture-specific triple for NDK include/library paths
-    const ndk_arch_triple: []const u8 = if (emulator_mode) "x86_64-linux-android" else "aarch64-linux-android";
+    const ndk_arch_triple: []const u8 = if (emulator_mode and emulator_arch == .x86_64)
+        "x86_64-linux-android"
+    else
+        "aarch64-linux-android";
 
 .android_target_alias
     const target = android_target;
@@ -493,8 +503,9 @@ pub fn build(b: *std.Build) void {
     sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }) });
 
 .android_exe_start
-    const lib = b.addSharedLibrary(.{
+    const lib = b.addLibrary(.{
         .name = "game",
+        .linkage = .dynamic,
         .root_module = b.createModule(.{
             .root_source_file = b.path("main.zig"),
             .target = android_target,
@@ -527,6 +538,19 @@ pub fn build(b: *std.Build) void {
     lib.root_module.linkSystemLibrary("log", .{});
     lib.root_module.linkSystemLibrary("GLESv3", .{});
     lib.root_module.linkSystemLibrary("EGL", .{});
+
+    // Zig does not bundle Android libc — provide a libc.txt that points the
+    // compiler at the NDK sysroot so Zig can resolve <stdio.h> and friends.
+    const libc_content = std.mem.concat(b.allocator, u8, &.{
+        "include_dir=",     b.pathJoin(&.{ ndk_sysroot, "usr/include" }),                               "\n",
+        "sys_include_dir=", b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }),              "\n",
+        "crt_dir=",         b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }), "\n",
+        "msvc_lib_dir=\n",
+        "kernel32_lib_dir=\n",
+        "gcc_dir=\n",
+    }) catch @panic("OOM");
+    const android_libc = b.addWriteFiles();
+    lib.setLibCFile(android_libc.add("android-libc.txt", libc_content));
 
 .android_link_gui_bridge
     lib.linkLibrary(gui_bridge_artifact);
