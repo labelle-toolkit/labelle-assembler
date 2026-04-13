@@ -16,7 +16,7 @@ var next_music_id: u32 = 1;
 pub fn loadSound(path: [:0]const u8) u32 {
     const snd = rl.loadSound(path);
     if (snd.stream.buffer == null) return 0;
-    const id = slot_alloc.findFreeSlot(rl.Sound, &sounds, next_sound_id, MAX_SOUNDS) orelse {
+    const id = slot_alloc.findFreeSlot(rl.Sound, &sounds, next_sound_id) orelse {
         rl.unloadSound(snd);
         return 0;
     };
@@ -72,7 +72,7 @@ pub fn setSoundVolume(id: u32, volume: f32) void {
 pub fn loadMusic(path: [:0]const u8) u32 {
     const mus = rl.loadMusicStream(path);
     if (mus.stream.buffer == null) return 0;
-    const id = slot_alloc.findFreeSlot(rl.Music, &music, next_music_id, MAX_MUSIC) orelse {
+    const id = slot_alloc.findFreeSlot(rl.Music, &music, next_music_id) orelse {
         rl.unloadMusicStream(mus);
         return 0;
     };
