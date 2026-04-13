@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const helpers = @import("build_helpers.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -11,12 +12,14 @@ pub fn build(b: *std.Build) void {
     // Homebrew under /opt/homebrew (Apple Silicon) or /usr/local
     // (Intel), and Zig doesn't search those by default.
     //
-    // Override via `-Dsdl-prefix=/custom/path` for non-standard installs.
+    // Override via `-Dsdl-prefix=/custom/path` for non-standard installs
+    // or cross-compilation (auto-detect skips cross-compile — see
+    // build_helpers.zig for the logic and test cases).
     const sdl_prefix: []const u8 = b.option(
         []const u8,
         "sdl-prefix",
         "SDL2 install prefix (auto-detected on macOS Homebrew, unused on Linux/Windows)",
-    ) orelse detectSdlPrefix(target.result.os.tag);
+    ) orelse helpers.detectSdlPrefix(target.result.os.tag, builtin.target.os.tag, dirExists);
 
     // Shared SDL2 C import module — ensures a single set of opaque types.
     // Only include/library *paths* are set here for @cImport resolution.
@@ -66,23 +69,17 @@ pub fn build(b: *std.Build) void {
     window_mod.addImport("gfx", gfx_mod);
     window_mod.addImport("input", input_mod);
     window_mod.addImport("audio", audio_mod);
-}
 
-/// Probe common macOS Homebrew prefixes for an SDL2 install. Returns
-/// an empty string on Linux/Windows (system search handles it), when
-/// cross-compiling (host filesystem is unrelated to the target), or
-/// when no SDL2 install is found.
-///
-/// Cross-compilation must supply `-Dsdl-prefix=<target-sdl2-root>`.
-fn detectSdlPrefix(target_os: std.Target.Os.Tag) []const u8 {
-    // Skip auto-detection when cross-compiling — the filesystem probes
-    // below run on the host, but the header/lib paths they discover
-    // only make sense if we're building for the host OS.
-    if (target_os != builtin.target.os.tag) return "";
-    if (target_os != .macos) return "";
-    if (dirExists("/opt/homebrew/include/SDL2")) return "/opt/homebrew";
-    if (dirExists("/usr/local/include/SDL2")) return "/usr/local";
-    return "";
+    // ── Unit tests for build_helpers.zig ────────────────────────────
+    const helper_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build_helpers.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const test_step = b.step("test", "Run SDL backend build-helper tests");
+    test_step.dependOn(&b.addRunArtifact(helper_tests).step);
 }
 
 fn addSdlPaths(b: *std.Build, mod: *std.Build.Module, prefix: []const u8) void {
