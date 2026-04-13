@@ -3,8 +3,12 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
+        // Pinned to silversquirl/zig-nuklear main (2024-07-11).
+        // Bumping requires `zig fetch <new-url>` to get the new hash;
+        // keep this in sync with bridges/raylib/build.zig.zon.
         .nuklear = .{
-            .path = "../../../zig-nuklear",
+            .url = "https://github.com/silversquirl/zig-nuklear/archive/6beb25d3e5dd8fa0401b7d1933f993bc48244765.tar.gz",
+            .hash = "nuklear-4.12.0-AAAAACGbEgD72uKM81LvjfikiBmlrX_-kl-TfIkRwZFM",
         },
     },
     .paths = .{

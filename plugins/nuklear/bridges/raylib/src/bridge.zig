@@ -133,10 +133,14 @@ export fn nk_bridge_end() void {
                 const text_ptr: [*]const u8 = @ptrCast(&t.string);
                 const text_len: usize = @intCast(t.length);
                 if (text_len > 0) {
-                    // Use raylib's default font for simplicity
+                    // raylib's DrawText takes a sentinel-terminated
+                    // string, so we need a local null-terminated
+                    // copy. 4 KiB is enough for typical UI labels
+                    // (the pre-fix 256-byte buffer silently
+                    // truncated long descriptions and log entries);
+                    // anything that exceeds this cap gets clamped.
                     const text_slice = text_ptr[0..text_len];
-                    // Null-terminate for raylib
-                    var buf: [256]u8 = undefined;
+                    var buf: [4096]u8 = undefined;
                     const len = @min(text_len, buf.len - 1);
                     @memcpy(buf[0..len], text_slice[0..len]);
                     buf[len] = 0;

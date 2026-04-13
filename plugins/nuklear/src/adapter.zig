@@ -18,6 +18,9 @@ pub fn shutdown() void {
 }
 
 pub fn begin() void {
+    // Reset the per-frame window counter so `beginWindow` staggers
+    // siblings correctly (see `windows_this_frame` below).
+    windows_this_frame = 0;
     nk_bridge_begin();
 }
 
@@ -34,28 +37,38 @@ pub fn wantsMouse() bool {
 }
 
 pub fn wantsKeyboard() bool {
-    return false;
+    // Nuklear captures the keyboard when any widget has focus —
+    // typically a text input or similar active editor. Reporting
+    // false unconditionally (the pre-fix behaviour) meant games
+    // happily consumed keypresses meant for an active text field.
+    return c.nk_item_is_any_active(nk_bridge_get_context()) != 0;
 }
 
 // ── Standard widget API ────────────────────────────────────
 
-// Window position offset — each new window gets a different position
-var window_count: f32 = 0;
+// Monotonic counter of windows opened this frame. Used to stagger
+// the initial position of each window so multiple `beginWindow`
+// calls on the same frame don't stack perfectly on top of each
+// other. Reset at the start of every frame in `begin()` — the
+// previous code decremented in `endWindow`, which made sequential
+// siblings see the same offset (0) and overlap perfectly.
+var windows_this_frame: u32 = 0;
 var in_table: bool = false;
 var table_columns: i32 = 1;
 var table_col_idx: i32 = 0;
 
 pub fn beginWindow(name: [*:0]const u8) bool {
     const ctx = nk_bridge_get_context();
-    // Offset each window so they don't overlap
-    const offset = window_count * 30;
-    window_count += 1;
+    const offset: f32 = @as(f32, @floatFromInt(windows_this_frame)) * 30;
+    windows_this_frame += 1;
     return c.nk_begin(ctx, name, .{ .x = 20 + offset, .y = 20 + offset, .w = 400, .h = 500 }, c.NK_WINDOW_BORDER | c.NK_WINDOW_MOVABLE | c.NK_WINDOW_SCALABLE | c.NK_WINDOW_TITLE | c.NK_WINDOW_MINIMIZABLE);
 }
 
 pub fn endWindow() void {
     c.nk_end(nk_bridge_get_context());
-    if (window_count > 0) window_count -= 1;
+    // Do NOT touch `windows_this_frame` here — decrementing would
+    // collapse sequential siblings onto the same offset. The
+    // counter is reset in `begin()` once per frame.
 }
 
 pub fn separator() void {

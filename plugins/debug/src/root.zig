@@ -18,7 +18,13 @@ pub var enabled: bool = true;
 /// Key to toggle the debug inspector. Default: F12.
 pub var toggle_key: engine.KeyboardKey = .f12;
 
-const MAX_COMPONENTS: usize = 32;
+/// Upper bound on the number of component types the inspector can
+/// filter on. Games with more component types than this will see
+/// their extra types appear in the browser but not in the filter
+/// list (the loop in `drawEntityBrowser` gates on `i < MAX_COMPONENTS`).
+/// Bumped from 32 → 128 based on PR #27 review; bump again if a game
+/// legitimately exceeds that.
+const MAX_COMPONENTS: usize = 128;
 var component_filters: [MAX_COMPONENTS]bool = [_]bool{false} ** MAX_COMPONENTS;
 
 // State persistence
@@ -105,10 +111,14 @@ pub const Systems = struct {
                 var perf_buf: [64]u8 = undefined;
                 Gui.label(std.fmt.bufPrintZ(&perf_buf, "Min: {d:.0} Avg: {d:.0} Max: {d:.0}", .{ fps_min, fps_avg, fps_max }) catch "?");
 
-                // Mini frame time graph via text bars
+                // Mini frame time graph via text bars. Keep the
+                // buffer one byte larger than the visible width so
+                // the null terminator doesn't clobber the last bar
+                // — the pre-fix version wrote 40 bar chars, then
+                // overwrote index 39 with 0 and only rendered 39.
                 var graph_buf: [64]u8 = undefined;
                 const bar_len: usize = 40;
-                var bar: [bar_len]u8 = undefined;
+                var bar: [bar_len + 1]u8 = undefined;
                 const max_ms: f32 = 33.3; // 30 FPS = one full bar
                 for (0..bar_len) |i| {
                     const idx = (frame_index + FPS_HISTORY - bar_len + i) % FPS_HISTORY;
@@ -116,8 +126,8 @@ pub const Systems = struct {
                     const ratio = @min(t / max_ms, 1.0);
                     bar[i] = if (ratio > 0.8) '!' else if (ratio > 0.5) '#' else if (ratio > 0.2) '=' else '.';
                 }
-                bar[bar_len - 1] = 0;
-                Gui.label(std.fmt.bufPrintZ(&graph_buf, "[{s}]", .{bar[0 .. bar_len - 1 :0]}) catch "?");
+                bar[bar_len] = 0;
+                Gui.label(std.fmt.bufPrintZ(&graph_buf, "[{s}]", .{bar[0..bar_len :0]}) catch "?");
             }
             // Script profiling (debug builds only)
             if (game.script_profile_ptr) |ptr| {
@@ -256,7 +266,14 @@ fn drawEntityBrowser(game: anytype, comptime Gui: type) void {
         inline for (comp_names, 0..) |name, i| {
             if (i < MAX_COMPONENTS) {
                 const prev = component_filters[i];
-                _ = Gui.checkbox(@ptrCast(name), &component_filters[i]);
+                // Copy the component name into a null-terminated
+                // buffer rather than relying on `@ptrCast` on a
+                // `[]const u8` — the registry's `names()` is free
+                // to return slices that aren't sentinel-terminated,
+                // and `[*:0]` reads past the end on those.
+                var name_buf: [128]u8 = undefined;
+                const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch "?";
+                _ = Gui.checkbox(name_z, &component_filters[i]);
                 if (component_filters[i] != prev) state_dirty = true;
                 if ((i + 1) % 4 != 0 and i + 1 < comp_names.len) Gui.sameLine();
             }
