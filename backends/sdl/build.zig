@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -68,10 +69,17 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Probe common macOS Homebrew prefixes for an SDL2 install. Returns
-/// an empty string on Linux/Windows (system search handles it) or if
-/// no SDL2 install is found.
-fn detectSdlPrefix(os_tag: std.Target.Os.Tag) []const u8 {
-    if (os_tag != .macos) return "";
+/// an empty string on Linux/Windows (system search handles it), when
+/// cross-compiling (host filesystem is unrelated to the target), or
+/// when no SDL2 install is found.
+///
+/// Cross-compilation must supply `-Dsdl-prefix=<target-sdl2-root>`.
+fn detectSdlPrefix(target_os: std.Target.Os.Tag) []const u8 {
+    // Skip auto-detection when cross-compiling — the filesystem probes
+    // below run on the host, but the header/lib paths they discover
+    // only make sense if we're building for the host OS.
+    if (target_os != builtin.target.os.tag) return "";
+    if (target_os != .macos) return "";
     if (dirExists("/opt/homebrew/include/SDL2")) return "/opt/homebrew";
     if (dirExists("/usr/local/include/SDL2")) return "/usr/local";
     return "";
