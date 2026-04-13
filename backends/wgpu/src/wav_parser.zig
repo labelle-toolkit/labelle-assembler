@@ -64,7 +64,7 @@ pub fn parseWav(allocator: std.mem.Allocator, buf: []const u8) ParseError![]f32 
     var bits_per_sample: u16 = 0;
     var fmt_found = false;
     var data_offset: usize = 0;
-    var data_size: u32 = 0;
+    var data_size_clamped: usize = 0;
     var data_found = false;
 
     var pos: usize = 12;
@@ -77,15 +77,18 @@ pub fn parseWav(allocator: std.mem.Allocator, buf: []const u8) ParseError![]f32 
         const chunk_size = std.mem.readInt(u32, buf[pos + 4 ..][0..4], .little);
         const chunk_data_start = pos + 8;
 
-        // The chunk's data region must fit inside `buf`. This is the
-        // #12 guard: a crafted huge chunk_size used to wrap `pos`
-        // silently on 32-bit and cause an infinite loop or OOB read.
+        // Checked computation of the chunk's declared end offset.
+        // This is the #12 regression guard — a crafted huge chunk_size
+        // used to wrap `pos` silently on 32-bit.
         const chunk_data_end = std.math.add(usize, chunk_data_start, chunk_size) catch
             return ParseError.ChunkSizeOverflow;
-        if (chunk_data_end > buf.len) return ParseError.ChunkExceedsBuffer;
 
         if (std.mem.eql(u8, chunk_id, "fmt ")) {
+            // fmt chunks must be fully present — we read fixed
+            // offsets inside. A truncated fmt chunk is genuinely
+            // malformed.
             if (chunk_size < 16) return ParseError.FmtChunkTooSmall;
+            if (chunk_data_end > buf.len) return ParseError.ChunkExceedsBuffer;
             const fmt = buf[chunk_data_start..];
             const audio_format = std.mem.readInt(u16, fmt[0..2], .little);
             if (audio_format != 1) return ParseError.UnsupportedAudioFormat;
@@ -93,9 +96,23 @@ pub fn parseWav(allocator: std.mem.Allocator, buf: []const u8) ParseError![]f32 
             bits_per_sample = std.mem.readInt(u16, fmt[14..16], .little);
             fmt_found = true;
         } else if (std.mem.eql(u8, chunk_id, "data")) {
+            // data chunks are allowed to be *truncated* — some
+            // streaming encoders write a placeholder size they never
+            // go back and patch, so the declared size overshoots the
+            // actual file. The pre-refactor audio.zig tolerated this
+            // via `@min(data_size, bytes_read - data_offset)` and
+            // loaded whatever bytes were actually present; preserve
+            // that behaviour instead of rejecting the file.
             data_offset = chunk_data_start;
-            data_size = chunk_size;
+            const available = buf.len - chunk_data_start;
+            data_size_clamped = @min(@as(usize, chunk_size), available);
             data_found = true;
+        } else {
+            // Unknown chunks that don't fit inside the buffer also
+            // signal corruption — we can't seek past the end to the
+            // next chunk. Break rather than error so parsing still
+            // succeeds if `fmt` and `data` have already been found.
+            if (chunk_data_end > buf.len) break;
         }
 
         if (fmt_found and data_found) break;
@@ -103,7 +120,11 @@ pub fn parseWav(allocator: std.mem.Allocator, buf: []const u8) ParseError![]f32 
         // Advance to the next chunk. Chunks are 2-byte aligned, so
         // insert a pad byte if the data ends on an odd offset. Use
         // checked arithmetic for the pad too — on any edge case
-        // `pos` must never wrap.
+        // `pos` must never wrap. If the declared end runs past the
+        // buffer (only possible for a truncated `data` chunk that
+        // we already consumed above, since `fmt`/unknown paths error
+        // or break), there's no next chunk to seek to — stop.
+        if (chunk_data_end > buf.len) break;
         var next_pos = chunk_data_end;
         if (next_pos % 2 != 0) {
             next_pos = std.math.add(usize, next_pos, 1) catch
@@ -117,15 +138,12 @@ pub fn parseWav(allocator: std.mem.Allocator, buf: []const u8) ParseError![]f32 
     if (bits_per_sample != 16) return ParseError.UnsupportedBitDepth;
     if (num_channels == 0 or num_channels > 2) return ParseError.UnsupportedChannelCount;
 
-    // Clamp declared data size to what's actually in the buffer. We
-    // already checked `data_offset + data_size <= buf.len` inside the
-    // loop, so the @min is belt-and-suspenders for defensive reasons.
-    const remaining = buf.len - data_offset;
-    const actual_data_size: usize = @min(@as(usize, data_size), remaining);
-    const raw_buf = buf[data_offset .. data_offset + actual_data_size];
+    // `data_size_clamped` was already clamped to the actual bytes
+    // available inside the loop; just use it directly.
+    const raw_buf = buf[data_offset .. data_offset + data_size_clamped];
 
     const bytes_per_sample: usize = 2; // 16-bit
-    const sample_count: usize = actual_data_size / bytes_per_sample;
+    const sample_count: usize = data_size_clamped / bytes_per_sample;
     const frame_count = sample_count / @as(usize, num_channels);
 
     // Output buffer is always interleaved stereo f32.
@@ -271,18 +289,53 @@ test "parseWav regression for #12: chunk_size that overflows usize returns error
         result == ParseError.ChunkSizeOverflow);
 }
 
-test "parseWav rejects chunk that runs past the end of the buffer" {
+test "parseWav rejects a truncated fmt chunk" {
     var buf = [_]u8{0} ** 20;
     @memcpy(buf[0..4], "RIFF");
     buf[4] = 0x10;
     @memcpy(buf[8..12], "WAVE");
     @memcpy(buf[12..16], "fmt ");
-    // size = 1000 — well past the 20-byte buffer.
+    // size = 1000 — well past the 20-byte buffer. fmt chunks must
+    // be fully present (we read fixed offsets inside), so this is
+    // rejected.
     buf[16] = 0xE8;
     buf[17] = 0x03;
     buf[18] = 0x00;
     buf[19] = 0x00;
     try testing.expectError(ParseError.ChunkExceedsBuffer, parseWav(testing.allocator, &buf));
+}
+
+test "parseWav tolerates a truncated data chunk (regression for Bugbot on PR #20)" {
+    // Some streaming WAV encoders write a placeholder data-chunk
+    // size they never patch, so the declared size overshoots the
+    // actual file. The pre-refactor loadWav handled this via a
+    // `@min(data_size, bytes_read - data_offset)` clamp; an earlier
+    // version of this file rejected it outright. This test locks
+    // in the tolerant behaviour so the regression can't come back.
+    //
+    // Craft a valid 16-bit mono WAV with 4 bytes of PCM (2 samples)
+    // but declare the data chunk as 1_000_000 bytes. parseWav should
+    // load the 4 bytes it can actually see and return a 2-frame
+    // stereo output.
+    const real_pcm: [4]u8 = .{ 0x00, 0x40, 0x00, 0xC0 }; // +0.5, -0.5
+    const wav_template = try buildWav(testing.allocator, 1, 16, 1, &real_pcm);
+    defer testing.allocator.free(wav_template);
+
+    // Patch the data chunk's size field to 1_000_000 without adding
+    // any actual bytes. buildWav's layout: 12 (header) + 8 + 16 (fmt) +
+    // 4 (data id "data") = offset 40 for the u32 data_size field.
+    const data_size_offset = 12 + 8 + 16 + 4;
+    std.mem.writeInt(u32, wav_template[data_size_offset..][0..4], 1_000_000, .little);
+
+    const out = try parseWav(testing.allocator, wav_template);
+    defer testing.allocator.free(out);
+
+    // 2 real samples available → 2 stereo frames → 4 interleaved f32.
+    try testing.expectEqual(@as(usize, 4), out.len);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), out[1], 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, -0.5), out[2], 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, -0.5), out[3], 0.0001);
 }
 
 test "parseWav rejects missing fmt chunk (only data present)" {
