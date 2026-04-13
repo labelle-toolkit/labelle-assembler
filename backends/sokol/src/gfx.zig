@@ -209,10 +209,12 @@ pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
     const cx = toNdcX(center_x);
     const cy = toNdcY(center_y);
     // Convert radius to NDC scale — use design dims in screen-space to match toNdcX/Y.
+    // In camera mode, scale by zoom so the circle grows/shrinks with the camera.
     const rw: f32 = @floatFromInt(if (!camera_active) design_w else screen_w);
     const rh: f32 = @floatFromInt(if (!camera_active) design_h else screen_h);
-    const rx = (radius / rw) * 2.0;
-    const ry = (radius / rh) * 2.0;
+    const zoom: f32 = if (camera_active) active_camera.zoom else 1.0;
+    const rx = (radius * zoom / rw) * 2.0;
+    const ry = (radius * zoom / rh) * 2.0;
 
     sgl.beginTriangleStrip();
     sgl.c4b(tint.r, tint.g, tint.b, tint.a);
@@ -371,16 +373,16 @@ pub fn getScreenHeight() i32 {
 pub fn screenToWorld(pos: Vector2, camera: Camera2D) Vector2 {
     return .{
         .x = (pos.x - camera.offset.x) / camera.zoom + camera.target.x,
-        // Y is inverted: screen Y-down, world Y-up
-        .y = camera.target.y - (pos.y - camera.offset.y) / camera.zoom,
+        // Screen Y-down convention, same as raylib backend
+        .y = (pos.y - camera.offset.y) / camera.zoom + camera.target.y,
     };
 }
 
 pub fn worldToScreen(pos: Vector2, camera: Camera2D) Vector2 {
     return .{
         .x = (pos.x - camera.target.x) * camera.zoom + camera.offset.x,
-        // Y is inverted: world Y-up, screen Y-down
-        .y = -(pos.y - camera.target.y) * camera.zoom + camera.offset.y,
+        // Screen Y-down convention, same as raylib backend
+        .y = (pos.y - camera.target.y) * camera.zoom + camera.offset.y,
     };
 }
 
