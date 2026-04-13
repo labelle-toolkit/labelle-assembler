@@ -1014,6 +1014,9 @@ pub fn getScreenHeight() i32 {
     return screen_h;
 }
 
+/// No-op: bgfx backend handles DPI scaling via its own screen size queries.
+pub fn setDesignSize(_: i32, _: i32) void {}
+
 pub fn screenToWorld(pos: Vector2, camera: Camera2D) Vector2 {
     return .{
         .x = (pos.x - camera.offset.x) / camera.zoom + camera.target.x,
