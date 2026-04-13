@@ -57,4 +57,31 @@ pub fn build(b: *std.Build) void {
 
     // ── Re-export the native artifact so consumers can link it ──────
     b.installArtifact(sokol_clib);
+
+    // ── Unit tests ──────────────────────────────────────────────────
+    const test_step = b.step("test", "Run sokol backend unit tests");
+
+    // Pure state-transition tests for audio_slots.zig. No sokol
+    // import, so this runs anywhere — no libasound/libGL/libX11
+    // system deps needed. This is the regression lock for the #10
+    // unloaded-slot leak fix.
+    const host_target = b.resolveTargetQuery(.{});
+    const slots_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/audio_slots.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(slots_tests).step);
+
+    // Compile-check audio.zig via a test binary off audio_mod. This
+    // pulls in the full sokol module graph so it only works when the
+    // host has sokol's system libs installed (libasound, libGL, libX11,
+    // libXi, libXcursor on Linux). The test binary has no test blocks,
+    // so the run step is a no-op — the point is to verify audio.zig
+    // actually compiles against sokol after the refactor. Depends on
+    // the compile step, not the run step, so cross-compile works too.
+    const audio_compile_check = b.addTest(.{ .root_module = audio_mod });
+    test_step.dependOn(&audio_compile_check.step);
 }
