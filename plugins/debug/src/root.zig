@@ -394,7 +394,9 @@ fn drawEntityDetail(game: anytype, comptime Gui: type) void {
         inline for (comp_names) |name| {
             const T = Reg.getType(name);
             if (game.active_world.ecs_backend.getComponent(entity, T)) |comp| {
-                if (Gui.treeNode(@ptrCast(name))) {
+                var name_buf: [128]u8 = undefined;
+                const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch "?";
+                if (Gui.treeNode(name_z)) {
                     showStructFields(Gui, comp, T);
                     Gui.treePop();
                 }
