@@ -25,13 +25,14 @@
 /// sets the flag and `mixOutput` performs the actual deallocation when it
 /// observes the flag, ensuring the buffer is not freed mid-read.
 const std = @import("std");
+const wav_parser = @import("wav_parser.zig");
 
 // ── Limits ────────────────────────────────────────────────────────────
 
 const MAX_SOUNDS = 256;
 const MAX_MUSIC = 32;
 const SAMPLE_RATE = 44100;
-const CHANNELS = 2;
+const CHANNELS = wav_parser.OUTPUT_CHANNELS;
 
 // ── Sound slot ────────────────────────────────────────────────────────
 
@@ -65,6 +66,11 @@ var next_music_id: u32 = 1;
 var master_volume: f32 = 1.0;
 
 // ── WAV loader (minimal, 16-bit PCM only) ─────────────────────────────
+//
+// Reads the file into memory and delegates to `wav_parser.parseWav`.
+// The parse step has its own unit tests in `wav_parser.zig`; this
+// wrapper is just I/O glue that propagates errors as a null result
+// to match the `?[]f32` contract the rest of the module uses.
 
 fn loadWav(path: [:0]const u8) ?[]f32 {
     const file = std.fs.cwd().openFile(std.mem.span(path), .{}) catch return null;
@@ -80,88 +86,7 @@ fn loadWav(path: [:0]const u8) ?[]f32 {
     const bytes_read = file.readAll(file_buf) catch return null;
     if (bytes_read != file_size) return null;
 
-    // Validate RIFF/WAVE header (first 12 bytes)
-    if (!std.mem.eql(u8, file_buf[0..4], "RIFF") or !std.mem.eql(u8, file_buf[8..12], "WAVE")) {
-        return null;
-    }
-
-    // Scan chunks starting at offset 12 to find "fmt " and "data".
-    var num_channels: u16 = 0;
-    var bits_per_sample: u16 = 0;
-    var fmt_found = false;
-    var data_offset: usize = 0;
-    var data_size: u32 = 0;
-    var data_found = false;
-
-    var pos: usize = 12;
-    while (pos + 8 <= bytes_read) {
-        const chunk_id = file_buf[pos..][0..4];
-        const chunk_size = std.mem.readInt(u32, file_buf[pos + 4 ..][0..4], .little);
-        const chunk_data_start = pos + 8;
-
-        if (std.mem.eql(u8, chunk_id, "fmt ")) {
-            if (chunk_size < 16 or chunk_data_start + 16 > bytes_read) return null;
-            const fmt = file_buf[chunk_data_start..];
-            const audio_format = std.mem.readInt(u16, fmt[0..2], .little);
-            if (audio_format != 1) return null; // Only PCM (format 1) supported
-            num_channels = std.mem.readInt(u16, fmt[2..4], .little);
-            bits_per_sample = std.mem.readInt(u16, fmt[14..16], .little);
-            fmt_found = true;
-        } else if (std.mem.eql(u8, chunk_id, "data")) {
-            data_offset = chunk_data_start;
-            data_size = chunk_size;
-            data_found = true;
-        }
-
-        if (fmt_found and data_found) break;
-
-        // Advance to next chunk (chunks are 2-byte aligned)
-        pos = chunk_data_start + chunk_size;
-        if (pos % 2 != 0) pos += 1; // Pad byte
-    }
-
-    if (!fmt_found or !data_found) return null;
-    if (bits_per_sample != 16) return null; // Only 16-bit PCM supported
-    if (num_channels == 0 or num_channels > 2) return null;
-
-    const actual_data_size: usize = @min(@as(usize, data_size), bytes_read - data_offset);
-    const raw_buf = file_buf[data_offset .. data_offset + actual_data_size];
-
-    const sample_count: usize = actual_data_size / (@as(usize, bits_per_sample) / 8);
-
-    // Convert to interleaved stereo f32
-    const frame_count = sample_count / @as(usize, num_channels);
-    const out_samples = frame_count * CHANNELS;
-    const pcm = std.heap.page_allocator.alloc(f32, out_samples) catch return null;
-
-    var i: usize = 0;
-    while (i < frame_count) : (i += 1) {
-        // Read source sample(s)
-        var left: f32 = 0;
-        var right: f32 = 0;
-        const src_idx = i * @as(usize, num_channels);
-        if (src_idx < sample_count) {
-            const byte_off = src_idx * 2;
-            if (byte_off + 1 < raw_buf.len) {
-                const s16 = std.mem.readInt(i16, raw_buf[byte_off..][0..2], .little);
-                left = @as(f32, @floatFromInt(s16)) / 32768.0;
-            }
-        }
-        if (num_channels >= 2 and (src_idx + 1) < sample_count) {
-            const byte_off = (src_idx + 1) * 2;
-            if (byte_off + 1 < raw_buf.len) {
-                const s16 = std.mem.readInt(i16, raw_buf[byte_off..][0..2], .little);
-                right = @as(f32, @floatFromInt(s16)) / 32768.0;
-            }
-        } else {
-            right = left; // Mono -> duplicate to both channels
-        }
-
-        pcm[i * CHANNELS + 0] = left;
-        pcm[i * CHANNELS + 1] = right;
-    }
-
-    return pcm;
+    return wav_parser.parseWav(std.heap.page_allocator, file_buf[0..bytes_read]) catch null;
 }
 
 // ── Sound effects ──────────────────────────────────────────────────────

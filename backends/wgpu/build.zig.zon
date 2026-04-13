@@ -1,5 +1,5 @@
 .{
-    .fingerprint = 0xa1b2c3d4e5f60003,
+    .fingerprint = 0x993952ebf33b101a,
     .name = .labelle_wgpu,
     .version = "0.1.0",
     .minimum_zig_version = "0.15.2",
