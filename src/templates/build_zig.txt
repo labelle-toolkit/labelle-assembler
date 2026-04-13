@@ -370,6 +370,177 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Override a module import without leaking memory.
+/// NOTE: Duplicated from .footer — each generated build.zig is standalone and
+/// needs its own copy of this helper.
+fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
+    const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
+    if (!gop.found_existing) {
+        gop.key_ptr.* = name;
+    }
+    gop.value_ptr.* = module;
+}
+
+.header_android
+const std = @import("std");
+
+/// Detect Android NDK sysroot path.
+fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
+    // 1. ANDROID_NDK_HOME env var
+    if (std.process.getEnvVarOwned(b.allocator, "ANDROID_NDK_HOME") catch null) |ndk_home| {
+        defer b.allocator.free(ndk_home);
+        const sysroot = b.pathJoin(&.{ ndk_home, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
+        if (std.fs.cwd().access(sysroot, .{})) |_| {
+            return sysroot;
+        } else |_| {}
+    }
+    // 2. ANDROID_HOME/ndk/<latest>/
+    if (std.process.getEnvVarOwned(b.allocator, "ANDROID_HOME") catch null) |home| {
+        defer b.allocator.free(home);
+        const ndk_dir = b.pathJoin(&.{ home, "ndk" });
+        var dir = std.fs.cwd().openDir(ndk_dir, .{ .iterate = true }) catch return null;
+        defer dir.close();
+        var latest: ?[]const u8 = null;
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind == .directory) {
+                // Pick the highest version by lexicographic comparison
+                if (latest) |prev| {
+                    if (std.mem.order(u8, entry.name, prev) == .gt) {
+                        b.allocator.free(prev);
+                        latest = b.allocator.dupe(u8, entry.name) catch null;
+                    }
+                } else {
+                    latest = b.allocator.dupe(u8, entry.name) catch null;
+                }
+            }
+        }
+        if (latest) |version| {
+            defer b.allocator.free(version);
+            const sysroot = b.pathJoin(&.{ ndk_dir, version, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
+            if (std.fs.cwd().access(sysroot, .{})) |_| {
+                return sysroot;
+            } else |_| {}
+        }
+    }
+    return null;
+}
+
+fn ndkHostTag() []const u8 {
+    const builtin = @import("builtin");
+    return switch (builtin.os.tag) {
+        .linux => "linux-x86_64",
+        .macos => "darwin-x86_64",
+        .windows => "windows-x86_64",
+        else => "linux-x86_64",
+    };
+}
+
+pub fn build(b: *std.Build) void {
+    const optimize = b.standardOptimizeOption(.{});
+    const emulator_mode = b.option(bool, "emulator", "Build for Android x86_64 emulator") orelse false;
+
+    const ndk_sysroot = getAndroidNdkSysroot(b) orelse
+        @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
+
+    const android_target = if (emulator_mode)
+        b.resolveTargetQuery(.{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .android,
+        })
+    else
+        b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .linux,
+            .abi = .android,
+        });
+
+    // Architecture-specific triple for NDK include/library paths
+    const ndk_arch_triple: []const u8 = if (emulator_mode) "x86_64-linux-android" else "aarch64-linux-android";
+
+.android_target_alias
+    const target = android_target;
+
+.android_deps
+    const core_dep = b.dependency("labelle_core", .{ .target = android_target, .optimize = optimize });
+    const core_mod = core_dep.module("labelle-core");
+
+    const gfx_dep = b.dependency("labelle_gfx", .{ .target = android_target, .optimize = optimize });
+    const gfx_mod = gfx_dep.module("labelle-gfx");
+
+    const engine_dep = b.dependency("engine", .{ .target = android_target, .optimize = optimize });
+    const engine_mod = engine_dep.module("engine");
+
+    overrideImport(gfx_mod, "labelle-core", core_mod);
+    overrideImport(engine_mod, "labelle-core", core_mod);
+    overrideImport(engine_mod, "labelle-gfx", gfx_mod);
+
+.backend_sokol_android
+    // sokol with dont_link_system_libs — we link Android libs manually
+    const backend_dep = b.dependency("labelle_sokol", .{
+        .target = android_target,
+        .optimize = optimize,
+        .dont_link_system_libs = true,
+    });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+    const sokol_clib = backend_dep.artifact("sokol_clib");
+
+    // Configure NDK sysroot paths on sokol_clib for C header compilation
+    sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include" }) });
+    sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }) });
+
+.android_exe_start
+    const lib = b.addSharedLibrary(.{
+        .name = "game",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = android_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "labelle-core", .module = core_mod },
+                .{ .name = "labelle-gfx", .module = gfx_mod },
+                .{ .name = "labelle-engine", .module = engine_mod },
+                .{ .name = "backend_gfx", .module = backend_gfx },
+                .{ .name = "backend_input", .module = backend_input },
+                .{ .name = "backend_audio", .module = backend_audio },
+                .{ .name = "backend_window", .module = backend_window },
+
+.android_exe_ecs_import
+                .{ .name = "ecs_backend", .module = ecs_mod },
+
+.android_exe_gui_import
+                .{ .name = "gui_backend", .module = gui_mod },
+
+.android_exe_end
+            },
+        }),
+    });
+
+.android_link
+    lib.linkLibrary(sokol_clib);
+    lib.linkLibC();
+    lib.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }) });
+    lib.root_module.linkSystemLibrary("android", .{});
+    lib.root_module.linkSystemLibrary("log", .{});
+    lib.root_module.linkSystemLibrary("GLESv3", .{});
+    lib.root_module.linkSystemLibrary("EGL", .{});
+
+.android_link_gui_bridge
+    lib.linkLibrary(gui_bridge_artifact);
+
+.android_footer
+    b.installArtifact(lib);
+
+    const run_step = b.step("run", "Build for Android");
+    run_step.dependOn(&lib.step);
+}
+
+/// Override a module import without leaking memory.
+/// NOTE: Duplicated from .footer — each generated build.zig is standalone and
+/// needs its own copy of this helper.
 fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
     const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
     if (!gop.found_existing) {
