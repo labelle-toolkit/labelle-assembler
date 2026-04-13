@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const glfw = @import("zglfw");
 const zbgfx = @import("zbgfx");
 const bgfx = zbgfx.bgfx;
+const platform = @import("platform.zig");
 
 pub const ConfigFlags = struct {
     window_hidden: bool = false,
@@ -47,8 +48,33 @@ pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
     init.resolution.width = @intCast(width);
     init.resolution.height = @intCast(height);
     init.resolution.reset = 0x00000080; // BGFX_RESET_VSYNC
-    init.platformData.ndt = null;
-    init.platformData.nwh = glfw.getCocoaWindow(win);
+
+    // Fill in bgfx's native display type (ndt) and native window handle
+    // (nwh) for the build target. See src/platform.zig for the source
+    // mapping and its unit tests.
+    switch (comptime platform.windowHandleSourceFor(builtin.target.os.tag)) {
+        .cocoa => {
+            init.platformData.ndt = null;
+            init.platformData.nwh = glfw.getCocoaWindow(win);
+        },
+        .win32 => {
+            init.platformData.ndt = null;
+            init.platformData.nwh = glfw.getWin32Window(win);
+        },
+        .x11 => {
+            init.platformData.ndt = glfw.getX11Display();
+            const xid: u32 = glfw.getX11Window(win);
+            init.platformData.nwh = @ptrFromInt(@as(usize, xid));
+        },
+        .wayland => {
+            // Not currently selected — Linux/BSD map to .x11 in
+            // platform.zig. Kept here so adding Wayland support in a
+            // follow-up is a platform.zig change, not a window.zig one.
+            init.platformData.ndt = glfw.getWaylandDisplay();
+            init.platformData.nwh = glfw.getWaylandWindow(win);
+        },
+        .unsupported => @compileError("bgfx backend: unsupported OS for window handle"),
+    }
     init.platformData.context = null;
     init.platformData.queue = null;
     init.platformData.backBuffer = null;
