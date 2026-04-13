@@ -43,6 +43,9 @@ jobs:
       - name: sokol backend unit tests + audio.zig compile-check
         run: cd backends/sokol && zig build test
 
+      - name: wgpu backend WAV parser tests
+        run: cd backends/wgpu && zig build test
+
       - name: bgfx backend tests + cross-compile compile-check
         run: |
           cd backends/bgfx
