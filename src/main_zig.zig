@@ -667,6 +667,21 @@ pub fn generateMainZigFromTemplate(
                 const allocator_expr: []const u8 = if (is_wasm) "std.heap.c_allocator" else "gpa.allocator()";
                 const allocator_cleanup: []const u8 = if (is_wasm) "" else "    _ = gpa.deinit();\n";
 
+                // Wire the GUI bridge into sokol's event callback so widgets
+                // see mouse / keyboard input. labelle-imgui's sokol bridge
+                // exports `imgui_bridge_handle_event` for exactly this — when
+                // a GUI plugin is configured we forward each event to it.
+                // Without this hook simgui's IO state stays empty and ImGui
+                // buttons/sliders never respond.
+                const gui_event_extern: []const u8 = if (cfg.hasGui())
+                    "extern fn imgui_bridge_handle_event(ev: [*c]const @import(\"backend_input\").Event) bool;\n\n"
+                else
+                    "";
+                const gui_event_forward: []const u8 = if (cfg.hasGui())
+                    "    _ = imgui_bridge_handle_event(ev);\n"
+                else
+                    "";
+
                 try tpl.render(lifecycle_tmpl, .{
                     .module_vars = module_vars,
                     .width = w_str,
@@ -676,6 +691,8 @@ pub fn generateMainZigFromTemplate(
                     .init_code = init_code,
                     .tick_code = tick_code,
                     .gui_draw_code = gui_draw_code,
+                    .gui_event_extern = gui_event_extern,
+                    .gui_event_forward = gui_event_forward,
                     .cleanup_code = cleanup_code,
                     .platform_comment = platform_comment,
                     .entry_comment = entry_comment,

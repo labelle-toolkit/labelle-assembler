@@ -23,9 +23,9 @@ export fn init() callconv(.c) void {
     };
 }
 
-fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
+{{gui_event_extern}}fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
     @import("backend_input").handleEvent(ev);
-}
+{{gui_event_forward}}}
 
 export fn frame() callconv(.c) void {
     if (!g.isRunning()) {
