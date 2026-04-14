@@ -72,3 +72,70 @@ jobs:
         run: |
           ./zig-out/bin/labelle-assembler --protocol-version
           ./zig-out/bin/labelle-assembler --help
+
+  # End-to-end usage test: check out every sibling repo the examples
+  # need (labelle-cli for the binary, labelle-core/engine/gfx for the
+  # runtime packages), then `labelle generate` and `zig build` the
+  # raylib example. Validates that the assembler + backends +
+  # zig-ecs + deps_linker pipeline produces a project that actually
+  # compiles, not just resolves paths.
+  #
+  # Linux only for now — raylib-zig's transitive hexops/xcode-frameworks
+  # dep doesn't fetch cleanly from the macos GitHub runner (see the
+  # slot-allocator gate above for context).
+  examples-integration:
+    name: Examples integration test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-cli
+          path: labelle-cli
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-core
+          path: labelle-core
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-engine
+          path: labelle-engine
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gfx
+          path: labelle-gfx
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install raylib + sokol system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libxext-dev libxfixes-dev \
+            libwayland-dev libxkbcommon-dev libasound2-dev
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Build labelle-cli
+        run: cd labelle-cli && zig build
+
+      - name: Generate + build the raylib example
+        env:
+          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
+        run: |
+          cd labelle-assembler/examples/raylib
+          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
+          cd .labelle/raylib_desktop
+          zig build
