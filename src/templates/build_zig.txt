@@ -470,8 +470,9 @@ pub fn build(b: *std.Build) void {
 
     // Architecture-specific triple for NDK include/library paths
     const ndk_arch_triple: []const u8 = switch (android_arch) {
+        .aarch64 => "aarch64-linux-android",
         .x86_64 => "x86_64-linux-android",
-        else => "aarch64-linux-android",
+        else => unreachable, // android_arch is pinned to one of the two above
     };
 
 .android_target_alias
