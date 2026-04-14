@@ -89,10 +89,13 @@ var camera_active: bool = false;
 /// Convert screen-space pixel coordinates to NDC (-1..1) for sokol_gl.
 /// When a camera is active, applies forward transform: (world - target) * zoom + offset.
 ///
-/// The camera offset is stored in design coordinates (e.g. design_w/2, design_h/2)
-/// so that the engine code is portable between backends.  When physical screen
-/// dimensions differ from design dimensions (HiDPI / mobile), scale the offset to
-/// physical pixels before dividing by the physical screen extent.
+/// The camera's offset is produced by labelle-gfx's camera.toBackend() as
+/// `{ getScreenWidth()/2, getScreenHeight()/2 }`, and our getScreenWidth/Height
+/// return `screen_w` / `screen_h` — the physical framebuffer dimensions set by
+/// setScreenSize(). So cam.offset is already in physical pixels, and dividing by
+/// the physical screen extent (fw/fh) gives the correct NDC. Screen-space
+/// rendering (no camera) is the special case that divides by design_w/design_h
+/// because positions there are still in design coordinates.
 fn toNdcX(px: f32) f32 {
     if (!camera_active) {
         // Screen-space: map design coords directly to NDC so a design-width
@@ -101,10 +104,7 @@ fn toNdcX(px: f32) f32 {
     }
     const cam = active_camera;
     const fw = @as(f32, @floatFromInt(screen_w));
-    const fdw = @as(f32, @floatFromInt(design_w));
-    // Scale offset from design-space to physical-space so the camera center
-    // lands at the correct NDC position even when design != physical (HiDPI).
-    const screen_x = (px - cam.target.x) * cam.zoom + cam.offset.x * (fw / fdw);
+    const screen_x = (px - cam.target.x) * cam.zoom + cam.offset.x;
     return (screen_x / fw) * 2.0 - 1.0;
 }
 
@@ -116,10 +116,8 @@ fn toNdcY(py: f32) f32 {
     }
     const cam = active_camera;
     const fh = @as(f32, @floatFromInt(screen_h));
-    const fdh = @as(f32, @floatFromInt(design_h));
     // Positions arrive in screen-space Y-down (Y-flipped by renderer.toScreenY).
-    // Scale offset from design-space to physical-space (same HiDPI correction as X).
-    const screen_y = (py - cam.target.y) * cam.zoom + cam.offset.y * (fh / fdh);
+    const screen_y = (py - cam.target.y) * cam.zoom + cam.offset.y;
     return 1.0 - (screen_y / fh) * 2.0;
 }
 
@@ -380,24 +378,18 @@ pub fn getScreenHeight() i32 {
 }
 
 pub fn screenToWorld(pos: Vector2, camera: Camera2D) Vector2 {
-    // Scale camera offset from design-space to physical-space (HiDPI correction).
-    const off_x = camera.offset.x * @as(f32, @floatFromInt(screen_w)) / @as(f32, @floatFromInt(design_w));
-    const off_y = camera.offset.y * @as(f32, @floatFromInt(screen_h)) / @as(f32, @floatFromInt(design_h));
     return .{
-        .x = (pos.x - off_x) / camera.zoom + camera.target.x,
+        .x = (pos.x - camera.offset.x) / camera.zoom + camera.target.x,
         // Screen Y-down convention, same as raylib backend
-        .y = (pos.y - off_y) / camera.zoom + camera.target.y,
+        .y = (pos.y - camera.offset.y) / camera.zoom + camera.target.y,
     };
 }
 
 pub fn worldToScreen(pos: Vector2, camera: Camera2D) Vector2 {
-    // Scale camera offset from design-space to physical-space (HiDPI correction).
-    const off_x = camera.offset.x * @as(f32, @floatFromInt(screen_w)) / @as(f32, @floatFromInt(design_w));
-    const off_y = camera.offset.y * @as(f32, @floatFromInt(screen_h)) / @as(f32, @floatFromInt(design_h));
     return .{
-        .x = (pos.x - camera.target.x) * camera.zoom + off_x,
+        .x = (pos.x - camera.target.x) * camera.zoom + camera.offset.x,
         // Screen Y-down convention, same as raylib backend
-        .y = (pos.y - camera.target.y) * camera.zoom + off_y,
+        .y = (pos.y - camera.target.y) * camera.zoom + camera.offset.y,
     };
 }
 
