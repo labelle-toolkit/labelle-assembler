@@ -438,6 +438,12 @@ fn ndkHostTag() []const u8 {
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const emulator_mode = b.option(bool, "emulator", "Build for Android emulator (x86_64 on Intel Mac, arm64 on Apple Silicon)") orelse false;
+    // `-Dandroid_arch=arm64|x86_64` is the explicit selector used by
+    // `labelle android --all-abis` to produce a fat APK from a single
+    // host machine. When unset, we fall back to the legacy behavior
+    // (emulator picks the host-matching arch, otherwise arm64) so
+    // existing `zig build -Demulator=true` invocations keep working.
+    const android_arch_opt = b.option([]const u8, "android_arch", "Android target arch (arm64|x86_64). Overrides -Demulator when set.");
 
     const ndk_sysroot = getAndroidNdkSysroot(b) orelse
         @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
@@ -449,24 +455,25 @@ pub fn build(b: *std.Build) void {
         else => .x86_64,
     };
 
-    const android_target = if (emulator_mode)
-        b.resolveTargetQuery(.{
-            .cpu_arch = emulator_arch,
-            .os_tag = .linux,
-            .abi = .android,
-        })
-    else
-        b.resolveTargetQuery(.{
-            .cpu_arch = .aarch64,
-            .os_tag = .linux,
-            .abi = .android,
-        });
+    const android_arch: std.Target.Cpu.Arch = if (android_arch_opt) |name| blk: {
+        if (std.mem.eql(u8, name, "arm64") or std.mem.eql(u8, name, "aarch64")) break :blk .aarch64;
+        if (std.mem.eql(u8, name, "x86_64") or std.mem.eql(u8, name, "x64")) break :blk .x86_64;
+        std.debug.print("build.zig: unknown -Dandroid_arch value '{s}' (expected arm64 or x86_64)\n", .{name});
+        @panic("invalid android_arch");
+    } else if (emulator_mode) emulator_arch else .aarch64;
+
+    const android_target = b.resolveTargetQuery(.{
+        .cpu_arch = android_arch,
+        .os_tag = .linux,
+        .abi = .android,
+    });
 
     // Architecture-specific triple for NDK include/library paths
-    const ndk_arch_triple: []const u8 = if (emulator_mode and emulator_arch == .x86_64)
-        "x86_64-linux-android"
-    else
-        "aarch64-linux-android";
+    const ndk_arch_triple: []const u8 = switch (android_arch) {
+        .aarch64 => "aarch64-linux-android",
+        .x86_64 => "x86_64-linux-android",
+        else => unreachable, // android_arch is pinned to one of the two above
+    };
 
 .android_target_alias
     const target = android_target;
