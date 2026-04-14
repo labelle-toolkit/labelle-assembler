@@ -17,6 +17,13 @@ pub const ConfigFlags = struct {
 /// on the sokol backend (sokol_app always shows the window).
 pub fn setConfigFlags(_: ConfigFlags) void {}
 
+/// sokol_gl pipeline with alpha blending enabled. The default sgl pipeline
+/// has blend disabled, which makes atlas sprites render their transparent
+/// pixels as opaque (the underlying layer doesn't show through). We create
+/// this once in initGfx and load it on every beginFrame so all sgl draws —
+/// textured sprites, rectangles, circles, text — get correct alpha blending.
+var alpha_pipeline: sgl.Pipeline = .{};
+
 pub fn initGfx() void {
     sg.setup(.{
         .environment = sglue.environment(),
@@ -25,9 +32,19 @@ pub fn initGfx() void {
     sgl.setup(.{
         .logger = .{ .func = slog.func },
     });
+    alpha_pipeline = sgl.makePipeline(.{
+        .colors = .{ .{ .blend = .{
+            .enabled = true,
+            .src_factor_rgb = .SRC_ALPHA,
+            .dst_factor_rgb = .ONE_MINUS_SRC_ALPHA,
+            .src_factor_alpha = .ONE,
+            .dst_factor_alpha = .ONE_MINUS_SRC_ALPHA,
+        } }, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+    });
 }
 
 pub fn shutdownGfx() void {
+    sgl.destroyPipeline(alpha_pipeline);
     sgl.shutdown();
     sg.shutdown();
 }
@@ -55,6 +72,9 @@ pub fn frameDuration() f64 {
 
 pub fn beginFrame() sg.PassAction {
     sgl.defaults();
+    // sgl.defaults() resets to the default non-blended pipeline; load our
+    // alpha-blended pipeline so sprites render transparency correctly.
+    sgl.loadPipeline(alpha_pipeline);
     var pass_action: sg.PassAction = .{};
     pass_action.colors[0] = .{
         .load_action = .CLEAR,

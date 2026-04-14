@@ -62,21 +62,54 @@ var screen_h: i32 = 600;
 var design_w: i32 = 800;
 var design_h: i32 = 600;
 
+// Aspect-preserving fit scale from design → physical, recomputed on any
+// dimension change instead of per-vertex. Used by toNdcX/toNdcY and
+// drawCircle to letterbox/pillarbox the design canvas inside the window.
+var fit_scale_x: f32 = 1.0;
+var fit_scale_y: f32 = 1.0;
+
+/// Recompute the cached fit scale from screen_w/h and design_w/h.
+/// Call after any change to those values.
+fn recomputeFitScale() void {
+    const dw: f32 = @floatFromInt(design_w);
+    const dh: f32 = @floatFromInt(design_h);
+    const sw: f32 = @floatFromInt(screen_w);
+    const sh: f32 = @floatFromInt(screen_h);
+    if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
+        fit_scale_x = 1;
+        fit_scale_y = 1;
+        return;
+    }
+    const design_aspect = dw / dh;
+    const physical_aspect = sw / sh;
+    if (physical_aspect > design_aspect) {
+        // Wider than design → pillarbox (shrink X).
+        fit_scale_x = design_aspect / physical_aspect;
+        fit_scale_y = 1;
+    } else {
+        // Taller than design → letterbox (shrink Y).
+        fit_scale_x = 1;
+        fit_scale_y = physical_aspect / design_aspect;
+    }
+}
+
 pub fn setScreenSize(w: i32, h: i32) void {
-    screen_w = w;
-    screen_h = h;
+    screen_w = if (w > 0) w else 1;
+    screen_h = if (h > 0) h else 1;
     // Keep design dims in sync with physical by default (backwards compat for
     // desktop where design == physical). Call setDesignSize after to override.
-    design_w = w;
-    design_h = h;
+    design_w = screen_w;
+    design_h = screen_h;
+    recomputeFitScale();
 }
 
 /// Override design canvas dimensions for NDC mapping in screen-space mode.
 /// Call after setScreenSize when design resolution differs from physical
 /// (e.g. high_dpi=true on mobile where framebuffer is 2× the design size).
 pub fn setDesignSize(w: i32, h: i32) void {
-    design_w = w;
-    design_h = h;
+    design_w = if (w > 0) w else 1;
+    design_h = if (h > 0) h else 1;
+    recomputeFitScale();
 }
 
 // ── Camera state ────────────────────────────────────────────────────
@@ -87,38 +120,41 @@ var camera_active: bool = false;
 // ── Coordinate helpers ──────────────────────────────────────────────
 
 /// Convert screen-space pixel coordinates to NDC (-1..1) for sokol_gl.
-/// When a camera is active, applies forward transform: (world - target) * zoom + offset.
+/// Always maps against the design canvas (design_w/design_h), then applies
+/// the cached aspect-preserving fit scale so the same game coordinates
+/// produce correct, non-stretched NDC regardless of the physical
+/// framebuffer size.
 ///
 /// The camera's offset is produced by labelle-gfx's camera.toBackend() as
-/// `{ getScreenWidth()/2, getScreenHeight()/2 }`, and our getScreenWidth/Height
-/// return `screen_w` / `screen_h` — the physical framebuffer dimensions set by
-/// setScreenSize(). So cam.offset is already in physical pixels, and dividing by
-/// the physical screen extent (fw/fh) gives the correct NDC. Screen-space
-/// rendering (no camera) is the special case that divides by design_w/design_h
-/// because positions there are still in design coordinates.
+/// `{ getScreenWidth()/2, getScreenHeight()/2 }`; since getScreenWidth/Height
+/// return the design dimensions, `cam.offset` is also in design pixels and
+/// the division cancels correctly.
+///
+/// design_w/h are clamped ≥ 1 by setScreenSize/setDesignSize, so the
+/// divisions below are guaranteed safe.
 fn toNdcX(px: f32) f32 {
-    if (!camera_active) {
-        // Screen-space: map design coords directly to NDC so a design-width
-        // quad fills exactly NDC -1..1 regardless of physical screen width.
-        return (px / @as(f32, @floatFromInt(design_w))) * 2.0 - 1.0;
-    }
-    const cam = active_camera;
-    const fw = @as(f32, @floatFromInt(screen_w));
-    const screen_x = (px - cam.target.x) * cam.zoom + cam.offset.x;
-    return (screen_x / fw) * 2.0 - 1.0;
+    const dw: f32 = @floatFromInt(design_w);
+    const raw = if (!camera_active)
+        (px / dw) * 2.0 - 1.0
+    else blk: {
+        const cam = active_camera;
+        const screen_x = (px - cam.target.x) * cam.zoom + cam.offset.x;
+        break :blk (screen_x / dw) * 2.0 - 1.0;
+    };
+    return raw * fit_scale_x;
 }
 
 fn toNdcY(py: f32) f32 {
-    if (!camera_active) {
-        // Screen-space: map design coords directly to NDC so a design-height
-        // quad fills exactly NDC -1..1 regardless of physical screen height.
-        return 1.0 - (py / @as(f32, @floatFromInt(design_h))) * 2.0;
-    }
-    const cam = active_camera;
-    const fh = @as(f32, @floatFromInt(screen_h));
-    // Positions arrive in screen-space Y-down (Y-flipped by renderer.toScreenY).
-    const screen_y = (py - cam.target.y) * cam.zoom + cam.offset.y;
-    return 1.0 - (screen_y / fh) * 2.0;
+    const dh: f32 = @floatFromInt(design_h);
+    const raw = if (!camera_active)
+        1.0 - (py / dh) * 2.0
+    else blk: {
+        const cam = active_camera;
+        // Positions arrive in screen-space Y-down (Y-flipped by renderer.toScreenY).
+        const screen_y = (py - cam.target.y) * cam.zoom + cam.offset.y;
+        break :blk 1.0 - (screen_y / dh) * 2.0;
+    };
+    return raw * fit_scale_y;
 }
 
 // ── Draw primitives (Backend contract) ─────────────────────────────────
@@ -236,13 +272,15 @@ pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
     const segments = 32;
     const cx = toNdcX(center_x);
     const cy = toNdcY(center_y);
-    // Convert radius to NDC scale — use design dims in screen-space to match toNdcX/Y.
+    // Convert radius to NDC scale using design dims so it matches toNdcX/Y.
     // In camera mode, scale by zoom so the circle grows/shrinks with the camera.
-    const rw: f32 = @floatFromInt(if (!camera_active) design_w else screen_w);
-    const rh: f32 = @floatFromInt(if (!camera_active) design_h else screen_h);
+    // Apply the same cached aspect-preserving fit as toNdcX/Y so the circle
+    // stays round under letterbox/pillarbox.
+    const rw: f32 = @floatFromInt(design_w);
+    const rh: f32 = @floatFromInt(design_h);
     const zoom: f32 = if (camera_active) active_camera.zoom else 1.0;
-    const rx = (radius * zoom / rw) * 2.0;
-    const ry = (radius * zoom / rh) * 2.0;
+    const rx = (radius * zoom / rw) * 2.0 * fit_scale_x;
+    const ry = (radius * zoom / rh) * 2.0 * fit_scale_y;
 
     sgl.beginTriangleStrip();
     sgl.c4b(tint.r, tint.g, tint.b, tint.a);
@@ -391,11 +429,14 @@ pub fn endMode2D() void {
 }
 
 pub fn getScreenWidth() i32 {
-    return screen_w;
+    // Return the design canvas width so camera offset / viewport math works
+    // in design pixels (resolution-independent). Physical framebuffer size is
+    // tracked separately in screen_w/screen_h but isn't exposed here.
+    return design_w;
 }
 
 pub fn getScreenHeight() i32 {
-    return screen_h;
+    return design_h;
 }
 
 pub fn screenToWorld(pos: Vector2, camera: Camera2D) Vector2 {

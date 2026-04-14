@@ -21,7 +21,15 @@ export fn init() callconv(.c) void {
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
 {{init_code}}}
 
+fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
+    @import("backend_input").handleEvent(ev);
+}
+
 export fn frame() callconv(.c) void {
+    if (!g.isRunning()) {
+        window.requestQuit();
+        return;
+    }
     frame_count +|= 1;
 
     const actual_w = window.width();
@@ -48,6 +56,9 @@ export fn frame() callconv(.c) void {
     g.render();
     g.renderGizmos();
     window.endFrame();
+    // Clear edge-triggered key/button/touch state AFTER scripts had a chance
+    // to read it. See the matching comment in desktop.txt — same invariant.
+    @import("backend_input").newFrame();
 }
 
 export fn cleanup() callconv(.c) void {
@@ -72,6 +83,7 @@ export fn sokol_main(argc: c_int, argv: [*][*:0]u8) window.Desc {
         .init_cb = &init,
         .frame_cb = &frame,
         .cleanup_cb = &cleanup,
+        .event_cb = &sokolEvent,
         .w = screen_w,
         .h = screen_h,
         .title = screen_title,
