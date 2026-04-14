@@ -163,14 +163,39 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
     // Guard against division by zero
     if (texture.width == 0 or texture.height == 0) return;
 
-    // Calculate UV coordinates from the source rectangle
+    // Calculate UV coordinates from the source rectangle.
+    //
+    // Negative source.width / source.height are the labelle-gfx convention
+    // for "flip horizontally / vertically" — the renderer negates the rect
+    // dimensions when sprite.flip_x or sprite.flip_y is set. The atlas
+    // region itself always lives at [source.x, source.x + |source.width|]
+    // and [source.y, source.y + |source.height|], so we compute the UV
+    // bounds from the absolute extents and then SWAP u0/u1 (or v0/v1) on
+    // the flip path.
+    //
+    // The previous implementation used `(source.x + source.width)` directly,
+    // which on a flip moved the sampling LEFT of source.x and read pixels
+    // from a neighboring atlas region. On a packed atlas with hundreds of
+    // sprites, that neighbor was usually some other character's frame —
+    // hence the "characters wearing each other's animations" symptom in
+    // flying-platform-labelle when workers turned around.
     const tex_width: f32 = @floatFromInt(texture.width);
     const tex_height: f32 = @floatFromInt(texture.height);
 
-    const uv0 =source.x / tex_width;
-    const tv0 =source.y / tex_height;
-    const uv1 =(source.x + source.width) / tex_width;
-    const tv1 =(source.y + source.height) / tex_height;
+    const sw_abs = @abs(source.width);
+    const sh_abs = @abs(source.height);
+    const flip_x = source.width < 0;
+    const flip_y = source.height < 0;
+
+    const u_left = source.x / tex_width;
+    const u_right = (source.x + sw_abs) / tex_width;
+    const v_top = source.y / tex_height;
+    const v_bottom = (source.y + sh_abs) / tex_height;
+
+    const uv0 = if (flip_x) u_right else u_left;
+    const uv1 = if (flip_x) u_left else u_right;
+    const tv0 = if (flip_y) v_bottom else v_top;
+    const tv1 = if (flip_y) v_top else v_bottom;
 
     // Tint as floats (0.0 - 1.0)
     const r: f32 = @as(f32, @floatFromInt(tint.r)) / 255.0;
