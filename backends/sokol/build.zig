@@ -12,13 +12,29 @@ pub fn build(b: *std.Build) void {
     // Forward dont_link_system_libs for iOS builds — we link frameworks manually.
     const dont_link_system_libs = b.option(bool, "dont_link_system_libs", "Don't link system libraries (for iOS cross-compilation)") orelse false;
 
+    // Enable sokol-imgui — builds sokol with simgui_* support compiled in.
+    // When true, the backend pulls cimgui (lazily) just to expose its
+    // header search path to sokol_clib so sokol_imgui.h's IMPL can resolve
+    // cimgui types. The cimgui artifact itself is provided by the GUI
+    // plugin (labelle-imgui) and linked at the final exe step.
+    const with_sokol_imgui = b.option(bool, "with_sokol_imgui", "Build sokol with simgui (sokol_imgui) support") orelse false;
+
     const sokol_dep = b.dependency("sokol", .{
         .target = target,
         .optimize = optimize,
         .dont_link_system_libs = dont_link_system_libs,
+        .with_sokol_imgui = with_sokol_imgui,
     });
     const sokol_mod = sokol_dep.module("sokol");
     const sokol_clib = sokol_dep.artifact("sokol_clib");
+
+    if (with_sokol_imgui) {
+        const cimgui_dep = b.lazyDependency("cimgui", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse return;
+        sokol_clib.root_module.addIncludePath(cimgui_dep.path("src"));
+    }
 
     // ── Gfx backend module ──────────────────────────────────────────
     const gfx_mod = b.addModule("gfx", .{

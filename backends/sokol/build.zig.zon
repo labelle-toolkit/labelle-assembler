@@ -10,6 +10,15 @@
             .url = "https://github.com/floooh/sokol-zig/archive/8e2d21bebd8428d82a1f320e999c058303c8323d.tar.gz",
             .hash = "sokol-0.1.0-pb1HKxTaNgA8rXBh41wxEucgmR4YPuoOXGeXbFyGPvTK",
         },
+        // Lazy: only fetched when -Dwith_sokol_imgui=true. Pin must match
+        // labelle-imgui/build.zig.zon so the same cimgui sources are used
+        // by both the sokol_imgui IMPL and the cimgui_clib artifact linked
+        // into the final exe.
+        .cimgui = .{
+            .url = "git+https://github.com/floooh/dcimgui.git#4557d7526fdd977f46ca10c2bbdd63532254f8d6",
+            .hash = "cimgui-0.1.0-44ClkXnYlwBKnil7TfCWL9z1Zo_2YJCJREzrpdFiGvA1",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

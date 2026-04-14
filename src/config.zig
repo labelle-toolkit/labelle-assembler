@@ -129,6 +129,11 @@ pub const ResolvedGui = struct {
     bridge_dir: ?[]const u8 = null,
     /// Bridge artifact name (e.g., "rlimgui_bridge", "nuklear_raylib_bridge").
     bridge_artifact: []const u8 = "",
+    /// True when the bridge requires the sokol backend to be built with
+    /// `-Dwith_sokol_imgui=true`. Sokol_imgui is compiled into sokol_clib
+    /// itself (not a separate library) so the build option must propagate
+    /// through the backend dep declaration in the generated build.zig.
+    needs_sokol_imgui: bool = false,
 };
 
 pub const ProjectConfig = struct {

@@ -33,7 +33,13 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *config.ProjectConfig
     // that reference this buffer. It must stay alive as long as resolved_gui.
     errdefer allocator.free(manifest_z);
 
-    const manifest = std.zon.parse.fromSlice(GuiLabelle, allocator, manifest_z, null, .{}) catch |err| {
+    // ignore_unknown_fields keeps older parsers compatible with future
+    // gui.labelle additions (e.g. backend hint flags introduced after a
+    // pinned labelle-cli release). Without this, every new field would
+    // require a CLI bump in lockstep.
+    const manifest = std.zon.parse.fromSlice(GuiLabelle, allocator, manifest_z, null, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
         std.debug.print("labelle: could not parse GUI manifest '{s}': {any}\n", .{ manifest_path, err });
         return error.GuiManifestParseError;
     };
@@ -74,6 +80,7 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *config.ProjectConfig
             .plugin_dir = plugin_dir,
             .bridge_dir = bridge_dir,
             .bridge_artifact = bridge_def.adapter,
+            .needs_sokol_imgui = bridge_def.needs_sokol_imgui,
         };
     } else {
         cfg.resolved_gui = .{
@@ -111,6 +118,9 @@ fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: co
 const BridgeDef = struct {
     adapter: []const u8 = "",
     path: ?[]const u8 = null,
+    /// Bridge requires the backend to be built with `-Dwith_sokol_imgui=true`.
+    /// Only meaningful for the sokol bridge — see ResolvedGui.needs_sokol_imgui.
+    needs_sokol_imgui: bool = false,
 };
 
 const Bridges = struct {
