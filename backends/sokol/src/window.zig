@@ -112,7 +112,10 @@ pub fn makeDesc(desc: struct {
     };
 }
 
-/// Run the sokol application loop with callbacks.
+/// Run the sokol application loop with callbacks. Forwards each field
+/// explicitly because Zig treats `run`'s anon-struct parameter and
+/// `makeDesc`'s anon-struct parameter as distinct types — passing one
+/// to the other directly would fail to compile.
 pub fn run(desc: struct {
     init_cb: *const fn () callconv(.c) void,
     frame_cb: *const fn () callconv(.c) void,
@@ -122,5 +125,13 @@ pub fn run(desc: struct {
     h: i32 = 600,
     title: [:0]const u8 = "LaBelle v2",
 }) void {
-    sapp.run(makeDesc(desc));
+    sapp.run(makeDesc(.{
+        .init_cb = desc.init_cb,
+        .frame_cb = desc.frame_cb,
+        .cleanup_cb = desc.cleanup_cb,
+        .event_cb = desc.event_cb,
+        .w = desc.w,
+        .h = desc.h,
+        .title = desc.title,
+    }));
 }
