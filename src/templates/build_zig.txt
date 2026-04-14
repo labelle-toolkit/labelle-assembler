@@ -57,6 +57,17 @@ pub fn build(b: *std.Build) !void {
     const backend_window = backend_dep.module("window");
     const sokol_clib = backend_dep.artifact("sokol_clib");
 
+.backend_sokol_wasm_imgui
+    const backend_dep = b.dependency("labelle_sokol", .{
+        .target = target,
+        .optimize = optimize,
+        .with_sokol_imgui = true,
+    });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+
 .backend_sokol_wasm
     const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize });
     const backend_gfx = backend_dep.module("gfx");
@@ -338,6 +349,23 @@ pub fn build(b: *std.Build) void {
     // Configure SDK paths on sokol_clib for C header compilation
     configureSdkPaths(b, sokol_clib, sdk_path);
 
+.backend_sokol_ios_imgui
+    // sokol with dont_link_system_libs + sokol_imgui — frameworks linked manually below
+    const backend_dep = b.dependency("labelle_sokol", .{
+        .target = ios_target,
+        .optimize = optimize,
+        .dont_link_system_libs = true,
+        .with_sokol_imgui = true,
+    });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+    const sokol_clib = backend_dep.artifact("sokol_clib");
+
+    // Configure SDK paths on sokol_clib for C header compilation
+    configureSdkPaths(b, sokol_clib, sdk_path);
+
 .ios_exe_start
     const exe = b.addExecutable(.{
         .name = "game",
@@ -503,6 +531,24 @@ pub fn build(b: *std.Build) void {
         .target = android_target,
         .optimize = optimize,
         .dont_link_system_libs = true,
+    });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+    const sokol_clib = backend_dep.artifact("sokol_clib");
+
+    // Configure NDK sysroot paths on sokol_clib for C header compilation
+    sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include" }) });
+    sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }) });
+
+.backend_sokol_android_imgui
+    // sokol with dont_link_system_libs + sokol_imgui — Android libs linked manually below
+    const backend_dep = b.dependency("labelle_sokol", .{
+        .target = android_target,
+        .optimize = optimize,
+        .dont_link_system_libs = true,
+        .with_sokol_imgui = true,
     });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");

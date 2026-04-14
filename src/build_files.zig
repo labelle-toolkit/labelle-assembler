@@ -60,17 +60,13 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         .raylib => try tpl.writeSection(build_zig_tmpl, "backend_raylib", w),
         .sokol => {
             const want_imgui = if (cfg.resolved_gui) |g| g.needs_sokol_imgui else false;
-            if (cfg.platform == .wasm) {
-                try tpl.writeSection(build_zig_tmpl, "backend_sokol_wasm", w);
-            } else if (cfg.platform == .ios) {
-                try tpl.writeSection(build_zig_tmpl, "backend_sokol_ios", w);
-            } else if (cfg.platform == .android) {
-                try tpl.writeSection(build_zig_tmpl, "backend_sokol_android", w);
-            } else if (want_imgui) {
-                try tpl.writeSection(build_zig_tmpl, "backend_sokol_imgui", w);
-            } else {
-                try tpl.writeSection(build_zig_tmpl, "backend_sokol", w);
-            }
+            const section: []const u8 = switch (cfg.platform) {
+                .wasm => if (want_imgui) "backend_sokol_wasm_imgui" else "backend_sokol_wasm",
+                .ios => if (want_imgui) "backend_sokol_ios_imgui" else "backend_sokol_ios",
+                .android => if (want_imgui) "backend_sokol_android_imgui" else "backend_sokol_android",
+                .desktop => if (want_imgui) "backend_sokol_imgui" else "backend_sokol",
+            };
+            try tpl.writeSection(build_zig_tmpl, section, w);
         },
         .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),
         .bgfx => try tpl.writeSection(build_zig_tmpl, "backend_bgfx", w),
