@@ -78,6 +78,37 @@ pub fn setApplyFit(active: bool) void {
     fit_active = active;
 }
 
+/// Convert a physical-pixel screen coordinate (e.g. a sokol_app touch
+/// or mouse event in framebuffer pixels) to a design-pixel coordinate
+/// inside the pillarboxed/letterboxed canvas.
+///
+/// Touch / mouse events arrive in raw framebuffer pixels, but
+/// game-level math (`cam.screenToWorld`, sprite positions, etc.) all
+/// works in design pixels. Without this conversion, a pinch midpoint
+/// computed from two touches would be off by the pillarbox bar width
+/// and a global zoom factor.
+pub fn screenToDesign(px: f32, py: f32) struct { x: f32, y: f32 } {
+    const sw: f32 = @floatFromInt(screen_w);
+    const sh: f32 = @floatFromInt(screen_h);
+    const dw: f32 = @floatFromInt(design_w);
+    const dh: f32 = @floatFromInt(design_h);
+    if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
+        return .{ .x = px, .y = py };
+    }
+    // The design canvas is centered inside the physical framebuffer,
+    // scaled by fit_scale_x/y in each axis. Inverse the mapping:
+    // 1) subtract the bar offset, 2) divide by the fitted size,
+    // 3) multiply by the design size.
+    const fitted_w = sw * fit_scale_x;
+    const fitted_h = sh * fit_scale_y;
+    const bar_x = (sw - fitted_w) * 0.5;
+    const bar_y = (sh - fitted_h) * 0.5;
+    return .{
+        .x = (px - bar_x) * dw / fitted_w,
+        .y = (py - bar_y) * dh / fitted_h,
+    };
+}
+
 /// Recompute the cached fit scale from screen_w/h and design_w/h.
 /// Call after any change to those values.
 fn recomputeFitScale() void {
