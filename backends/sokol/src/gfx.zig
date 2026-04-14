@@ -68,6 +68,16 @@ var design_h: i32 = 600;
 var fit_scale_x: f32 = 1.0;
 var fit_scale_y: f32 = 1.0;
 
+// When false, toNdcX/toNdcY skip the fit_scale multiplication and the
+// design canvas stretches to fill the entire physical framebuffer. The
+// renderer toggles this around `screen_fill` layers so backdrops can
+// cover the pillarbox bars while game content stays correctly fitted.
+var fit_active: bool = true;
+
+pub fn setApplyFit(active: bool) void {
+    fit_active = active;
+}
+
 /// Recompute the cached fit scale from screen_w/h and design_w/h.
 /// Call after any change to those values.
 fn recomputeFitScale() void {
@@ -141,7 +151,7 @@ fn toNdcX(px: f32) f32 {
         const screen_x = (px - cam.target.x) * cam.zoom + cam.offset.x;
         break :blk (screen_x / dw) * 2.0 - 1.0;
     };
-    return raw * fit_scale_x;
+    return if (fit_active) raw * fit_scale_x else raw;
 }
 
 fn toNdcY(py: f32) f32 {
@@ -154,7 +164,7 @@ fn toNdcY(py: f32) f32 {
         const screen_y = (py - cam.target.y) * cam.zoom + cam.offset.y;
         break :blk 1.0 - (screen_y / dh) * 2.0;
     };
-    return raw * fit_scale_y;
+    return if (fit_active) raw * fit_scale_y else raw;
 }
 
 // ── Draw primitives (Backend contract) ─────────────────────────────────
@@ -304,8 +314,10 @@ pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
     const rw: f32 = @floatFromInt(design_w);
     const rh: f32 = @floatFromInt(design_h);
     const zoom: f32 = if (camera_active) active_camera.zoom else 1.0;
-    const rx = (radius * zoom / rw) * 2.0 * fit_scale_x;
-    const ry = (radius * zoom / rh) * 2.0 * fit_scale_y;
+    const fx: f32 = if (fit_active) fit_scale_x else 1.0;
+    const fy: f32 = if (fit_active) fit_scale_y else 1.0;
+    const rx = (radius * zoom / rw) * 2.0 * fx;
+    const ry = (radius * zoom / rh) * 2.0 * fy;
 
     sgl.beginTriangleStrip();
     sgl.c4b(tint.r, tint.g, tint.b, tint.a);
