@@ -67,7 +67,7 @@ pub const AndroidConfig = struct {
     orientation: Orientation = .all,
 };
 
-pub const LayerSpace = enum { world, screen };
+pub const LayerSpace = enum { world, screen, screen_fill };
 
 pub const LayerDef = struct {
     name: []const u8,
