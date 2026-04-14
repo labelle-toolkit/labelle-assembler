@@ -55,7 +55,6 @@ pub fn wantsKeyboard() bool {
 var windows_this_frame: u32 = 0;
 var in_table: bool = false;
 var table_columns: i32 = 1;
-var table_col_idx: i32 = 0;
 
 pub fn beginWindow(name: [*:0]const u8) bool {
     const ctx = nk_bridge_get_context();
@@ -151,7 +150,6 @@ pub fn beginTable(_: [*:0]const u8, columns: i32) bool {
     const ctx = nk_bridge_get_context();
     in_table = true;
     table_columns = columns;
-    table_col_idx = 0;
     c.nk_layout_row_dynamic(ctx, 20, columns);
     return true;
 }
@@ -159,16 +157,13 @@ pub fn beginTable(_: [*:0]const u8, columns: i32) bool {
 pub fn endTable() void {
     in_table = false;
     table_columns = 1;
-    table_col_idx = 0;
 }
 
 pub fn tableNextRow() void {
     const ctx = nk_bridge_get_context();
-    table_col_idx = 0;
     c.nk_layout_row_dynamic(ctx, 20, table_columns);
 }
 
 pub fn tableNextColumn() bool {
-    table_col_idx += 1;
     return true;
 }
