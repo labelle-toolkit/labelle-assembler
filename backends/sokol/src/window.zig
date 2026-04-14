@@ -32,6 +32,13 @@ pub fn shutdownGfx() void {
     sg.shutdown();
 }
 
+/// Request that the sokol_app event loop terminate on the next iteration.
+/// Mirrors `rl.closeWindow` / `sdl.quit` — the generated frame callback
+/// polls `g.isRunning()` and calls this when a script called `game.quit()`.
+pub fn requestQuit() void {
+    sapp.requestQuit();
+}
+
 pub fn width() i32 {
     return sapp.width();
 }

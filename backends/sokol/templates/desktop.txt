@@ -28,7 +28,10 @@ fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
 }
 
 export fn frame() callconv(.c) void {
-    @import("backend_input").newFrame();
+    if (!g.isRunning()) {
+        window.requestQuit();
+        return;
+    }
     BackendGfxType.setScreenSize(window.width(), window.height());
     // Keep design coords fixed so screen-space NDC mapping uses the design resolution
     // rather than the physical framebuffer size (which differs on HiDPI displays).
@@ -40,6 +43,10 @@ export fn frame() callconv(.c) void {
     g.render();
     g.renderGizmos();
 {{gui_draw_code}}    window.endFrame();
+    // Clear one-shot pressed/released state AFTER scripts have consumed it.
+    // Calling newFrame at the top of frame() would race with sapp events
+    // dispatched between frame callbacks and drop isKeyPressed reports.
+    @import("backend_input").newFrame();
 }
 
 export fn cleanup() callconv(.c) void {
