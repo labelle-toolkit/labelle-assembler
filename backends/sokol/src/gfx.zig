@@ -213,6 +213,27 @@ pub fn drawRectangleRec(rec: Rectangle, tint: Color) void {
     sgl.end();
 }
 
+/// Draw a rectangle outline. `line_thick` is accepted for API compatibility
+/// with raylib's drawRectangleLinesEx but is ignored — sgl LINES always
+/// render 1 pixel thick. For thicker outlines, the caller can compose four
+/// drawRectangleRec bars instead.
+pub fn drawRectangleLinesEx(rec: Rectangle, line_thick: f32, tint: Color) void {
+    _ = line_thick;
+    const x0 = toNdcX(rec.x);
+    const y0 = toNdcY(rec.y);
+    const x1 = toNdcX(rec.x + rec.width);
+    const y1 = toNdcY(rec.y + rec.height);
+
+    sgl.beginLineStrip();
+    sgl.c4b(tint.r, tint.g, tint.b, tint.a);
+    sgl.v2f(x0, y0);
+    sgl.v2f(x1, y0);
+    sgl.v2f(x1, y1);
+    sgl.v2f(x0, y1);
+    sgl.v2f(x0, y0);
+    sgl.end();
+}
+
 pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
     const segments = 32;
     const cx = toNdcX(center_x);
