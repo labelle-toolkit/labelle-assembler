@@ -51,7 +51,9 @@ pub fn beginFrame() sg.PassAction {
     var pass_action: sg.PassAction = .{};
     pass_action.colors[0] = .{
         .load_action = .CLEAR,
-        .clear_value = .{ .r = 0.95, .g = 0.95, .b = 0.95, .a = 1.0 },
+        // Match the raylib backend's default clear color (30, 30, 35) so
+        // projects render the same backdrop regardless of backend.
+        .clear_value = .{ .r = 30.0 / 255.0, .g = 30.0 / 255.0, .b = 35.0 / 255.0, .a = 1.0 },
     };
     return pass_action;
 }
