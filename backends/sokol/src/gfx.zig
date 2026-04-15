@@ -78,6 +78,44 @@ pub fn setApplyFit(active: bool) void {
     fit_active = active;
 }
 
+/// Convert a physical-pixel screen coordinate (e.g. a sokol_app touch
+/// or mouse event in framebuffer pixels) to a design-pixel coordinate
+/// inside the pillarboxed/letterboxed canvas.
+///
+/// Touch / mouse events arrive in raw framebuffer pixels, but
+/// game-level math (`cam.screenToWorld`, sprite positions, etc.) all
+/// works in design pixels. Without this conversion, a pinch midpoint
+/// computed from two touches would be off by the pillarbox bar width
+/// and a global zoom factor.
+pub fn screenToDesign(px: f32, py: f32) Vector2 {
+    const sw: f32 = @floatFromInt(screen_w);
+    const sh: f32 = @floatFromInt(screen_h);
+    const dw: f32 = @floatFromInt(design_w);
+    const dh: f32 = @floatFromInt(design_h);
+    if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
+        return .{ .x = px, .y = py };
+    }
+    // Always apply the fitted-mode inverse mapping. `fit_active` is a
+    // transient render-state flag toggled per-layer inside the draw
+    // loop (fitted for world/UI layers, off for `screen_fill` layers)
+    // — input handlers fire async to rendering, so reading it here
+    // would pick up whatever value the last drawn layer happened to
+    // leave behind, which is neither well-defined nor useful.
+    //
+    // The fitted math is also correct for `screen_fill` callers: when
+    // there is no pillarbox, `fit_scale_x == fit_scale_y == 1`, so
+    // `bar_x/y` evaluate to 0 and the mapping degenerates to the
+    // straight `px * dw / sw` ratio.
+    const fitted_w = sw * fit_scale_x;
+    const fitted_h = sh * fit_scale_y;
+    const bar_x = (sw - fitted_w) * 0.5;
+    const bar_y = (sh - fitted_h) * 0.5;
+    return .{
+        .x = (px - bar_x) * dw / fitted_w,
+        .y = (py - bar_y) * dh / fitted_h,
+    };
+}
+
 /// Recompute the cached fit scale from screen_w/h and design_w/h.
 /// Call after any change to those values.
 fn recomputeFitScale() void {
