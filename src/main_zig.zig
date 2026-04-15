@@ -3,12 +3,14 @@ const std = @import("std");
 const tpl = @import("template.zig");
 const config = @import("config.zig");
 const script_scanner = @import("script_scanner.zig");
+const scene_manifest = @import("scene_manifest.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const PluginDep = config.PluginDep;
 const LayerDef = config.LayerDef;
 const ResourceDef = config.ResourceDef;
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
+const SceneManifest = scene_manifest.SceneManifest;
 
 
 /// Check if a script entry with the given name exists.
@@ -180,6 +182,70 @@ fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
     return buf.toOwnedSlice(allocator);
 }
 
+/// Emit the `SceneAssetManifests` comptime struct that exposes each scene's
+/// declared `assets:` array to labelle-engine. The format is the codegen
+/// contract for the SceneEntry.assets consumer (labelle-engine issue #445):
+///
+///     pub const SceneAssetManifests = struct {
+///         pub const menu: []const []const u8 = &.{ "background", "ship" };
+///         pub const world_intro: []const []const u8 = &.{};
+///
+///         pub const Entry = struct { name: []const u8, assets: []const []const u8 };
+///         pub const entries: []const Entry = &.{
+///             .{ .name = "menu",        .assets = menu },
+///             .{ .name = "world/intro", .assets = world_intro },
+///         };
+///     };
+///
+/// Per-scene decls give comptime access by ident; the `entries` array is the
+/// stable iteration order (matches the assembler's sorted scene-name order).
+fn writeSceneAssetManifests(
+    w: anytype,
+    jsonc_scene_names: []const []const u8,
+    scene_manifests: []const SceneManifest,
+    ident_buf: *[256]u8,
+) !void {
+    if (jsonc_scene_names.len == 0) return;
+    // In the production codegen path the two slices are produced together in
+    // root.zig and are always the same length. Existing main.zig generation
+    // tests, however, pass the legacy parameter set with an empty manifest
+    // slice — we treat that as "no asset metadata, all scenes empty" so old
+    // tests stay valid without a forced rewrite.
+    const have_manifests = scene_manifests.len == jsonc_scene_names.len;
+    std.debug.assert(have_manifests or scene_manifests.len == 0);
+
+    try w.writeAll("\n// --- Scene asset manifests (parsed from scenes/*.jsonc) ---\n");
+    try w.writeAll("pub const SceneAssetManifests = struct {\n");
+
+    // Per-scene named decls.
+    for (jsonc_scene_names, 0..) |name, idx| {
+        const ident = pathToIdent(name, ident_buf);
+        const assets: []const []const u8 = if (have_manifests) scene_manifests[idx].assets else &.{};
+        if (assets.len == 0) {
+            try w.print("    pub const {s}: []const []const u8 = &.{{}};\n", .{ident});
+        } else {
+            try w.print("    pub const {s}: []const []const u8 = &.{{ ", .{ident});
+            for (assets, 0..) |asset, i| {
+                if (i > 0) try w.writeAll(", ");
+                try w.print("\"{s}\"", .{asset});
+            }
+            try w.writeAll(" };\n");
+        }
+    }
+
+    // Stable iteration list. Engine code can do
+    //   for (SceneAssetManifests.entries) |e| { ... e.name, e.assets ... }
+    // without touching @typeInfo at all.
+    try w.writeAll("\n    pub const Entry = struct { name: []const u8, assets: []const []const u8 };\n");
+    try w.writeAll("    pub const entries: []const Entry = &.{\n");
+    for (jsonc_scene_names) |name| {
+        const ident = pathToIdent(name, ident_buf);
+        try w.print("        .{{ .name = \"{s}\", .assets = {s} }},\n", .{ name, ident });
+    }
+    try w.writeAll("    };\n");
+    try w.writeAll("};\n");
+}
+
 /// Convert a path-style name to a valid Zig identifier: "enemies/goblin" -> "enemies_goblin".
 /// Replaces `/` and `+` with `_`, strips `.zig` extension.
 fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
@@ -227,6 +293,7 @@ pub fn generateMainZigFromTemplate(
     script_entries: []const ScriptEntry,
     prefab_names: []const []const u8,
     jsonc_scene_names: []const []const u8,
+    scene_manifests: []const SceneManifest,
     component_names: []const []const u8,
     hook_names: []const []const u8,
     event_names: []const []const u8,
@@ -327,6 +394,16 @@ pub fn generateMainZigFromTemplate(
                     \\
                     , .{ ident, name });
             }
+
+            // ── Scene → assets map (Asset Streaming RFC, ticket #46) ────
+            // Emit a comptime-visible struct that maps each scene's
+            // assembler name to the `assets:` array declared at the top of
+            // its .jsonc file. Empty arrays are emitted explicitly so the
+            // labelle-engine consumer (issue #445) can iterate `entries`
+            // without checking for missing keys. See also the upcoming
+            // labelle-engine SceneEntry.assets field — this block is the
+            // codegen contract that ticket reads.
+            try writeSceneAssetManifests(bw, jsonc_scene_names, scene_manifests, &ident_buf);
         }
         const block = try buf.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
