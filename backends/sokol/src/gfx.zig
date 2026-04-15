@@ -95,17 +95,19 @@ pub fn screenToDesign(px: f32, py: f32) Vector2 {
     if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
         return .{ .x = px, .y = py };
     }
-    // Honor `fit_active` exactly like `toNdcX/Y` and `drawCircle` do —
-    // when the layer is `screen_fill`, the design canvas stretches to
-    // fill the full framebuffer and there's no pillarbox bar to
-    // subtract. When the layer is fitted (the default), the canvas is
-    // centered inside the framebuffer scaled by fit_scale_*, so we
-    // inverse the mapping: 1) subtract the bar offset, 2) divide by
-    // the fitted size, 3) multiply by the design size.
-    const fx: f32 = if (fit_active) fit_scale_x else 1.0;
-    const fy: f32 = if (fit_active) fit_scale_y else 1.0;
-    const fitted_w = sw * fx;
-    const fitted_h = sh * fy;
+    // Always apply the fitted-mode inverse mapping. `fit_active` is a
+    // transient render-state flag toggled per-layer inside the draw
+    // loop (fitted for world/UI layers, off for `screen_fill` layers)
+    // — input handlers fire async to rendering, so reading it here
+    // would pick up whatever value the last drawn layer happened to
+    // leave behind, which is neither well-defined nor useful.
+    //
+    // The fitted math is also correct for `screen_fill` callers: when
+    // there is no pillarbox, `fit_scale_x == fit_scale_y == 1`, so
+    // `bar_x/y` evaluate to 0 and the mapping degenerates to the
+    // straight `px * dw / sw` ratio.
+    const fitted_w = sw * fit_scale_x;
+    const fitted_h = sh * fit_scale_y;
     const bar_x = (sw - fitted_w) * 0.5;
     const bar_y = (sh - fitted_h) * 0.5;
     return .{
