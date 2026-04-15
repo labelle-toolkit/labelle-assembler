@@ -37,11 +37,16 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     try w.writeAll("    var runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
     try w.writeAll("    defer runner.deinit();\n\n");
 
-    // Load embedded atlas resources before scene (sprites must be available at entity creation)
+    // Load (or register) embedded atlas resources. Lazy resources
+    // call `registerAtlasFromMemory` (parses JSON eagerly, defers PNG
+    // decode) so a script can decode them on demand. See
+    // `buildCallbackInitCode` for the matching code path that the
+    // sokol/wasm callback backends use.
     if (cfg.resources.len > 0) {
         try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
         for (cfg.resources) |res| {
-            try w.print("    try g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ res.name, res.json, res.texture });
+            const fn_name = if (res.lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
+            try w.print("    try g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ fn_name, res.name, res.json, res.texture });
         }
         try w.writeByte('\n');
     }
@@ -120,11 +125,20 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
 
     try w.writeAll("    runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
 
-    // Load embedded atlas resources before scene (sprites must be available at entity creation)
+    // Load (or register) embedded atlas resources before scene.
+    // Eager resources call `loadAtlasFromMemory` which decodes the
+    // PNG immediately — sprites are available the moment the scene
+    // is instantiated. Lazy resources (project.labelle: `lazy = true`)
+    // call `registerAtlasFromMemory`, which parses the JSON eagerly
+    // so sprite-name lookups still resolve, but defers the PNG
+    // decode until a script calls `game.loadAtlasIfNeeded(name)`.
+    // A loading-scene controller typically does this one atlas per
+    // frame so the scene stays animated during the load.
     if (cfg.resources.len > 0) {
         try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
         for (cfg.resources) |res| {
-            try w.print("    g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas\");\n", .{ res.name, res.json, res.texture });
+            const fn_name = if (res.lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
+            try w.print("    g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas: {s}\");\n", .{ fn_name, res.name, res.json, res.texture, res.name });
         }
         try w.writeByte('\n');
     }
