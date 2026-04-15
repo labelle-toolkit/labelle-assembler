@@ -274,7 +274,7 @@ fn writeSceneAssetManifests(
         const ident = pathToIdent(name, ident_buf);
         try w.writeAll("        .{ .name = ");
         try writeZigString(w, name);
-        try w.print(", .assets = {s} }},\n", .{ident});
+        try w.print(", .assets = @This().{s} }},\n", .{ident});
     }
     try w.writeAll("    };\n");
     try w.writeAll("};\n");

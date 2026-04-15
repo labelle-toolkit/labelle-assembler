@@ -779,8 +779,8 @@ pub const SCENE_ASSET_MANIFESTS = struct {
 
         // Stable iteration entries — engine consumer (#445) reads this.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const Entry = struct { name: []const u8, assets: []const []const u8 };") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".{ .name = \"menu\", .assets = menu }") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".{ .name = \"gameplay\", .assets = gameplay }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".{ .name = \"menu\", .assets = @This().menu }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".{ .name = \"gameplay\", .assets = @This().gameplay }") != null);
     }
 
     test "scenes without assets get explicit empty slice decls" {
@@ -813,7 +813,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
         // Decl uses underscored ident...
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const world_intro: []const []const u8 = &.{ \"background\" };") != null);
         // ...but the entries[] preserves the original slash-style name.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".{ .name = \"world/intro\", .assets = world_intro }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".{ .name = \"world/intro\", .assets = @This().world_intro }") != null);
     }
 
     test "no scenes emits no SceneAssetManifests struct" {
