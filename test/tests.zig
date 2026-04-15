@@ -769,7 +769,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         // Comptime struct + per-scene named decls.
@@ -792,7 +792,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const menu: []const []const u8 = &.{};") != null);
@@ -807,7 +807,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         // Decl uses underscored ident...
@@ -821,7 +821,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "SceneAssetManifests") == null);
@@ -836,7 +836,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"path\\\\asset\"") != null);
