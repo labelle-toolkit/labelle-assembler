@@ -207,28 +207,30 @@ pub fn parseSceneSource(
             },
         };
 
-        var list = try allocator.alloc([]const u8, arr.items.len);
-        var n: usize = 0;
-        errdefer {
-            for (list[0..n]) |s| allocator.free(s);
-            allocator.free(list);
-        }
-        for (arr.items) |item| {
-            switch (item) {
-                .string => |s| {
-                    list[n] = try allocator.dupe(u8, s);
-                    n += 1;
-                },
-                else => {
-                    std.debug.print(
-                        "labelle-assembler: scene '{s}' has a non-string entry in 'assets'\n",
-                        .{display_path},
-                    );
-                    return error.InvalidAssetsField;
-                },
+        if (arr.items.len > 0) {
+            var list = try allocator.alloc([]const u8, arr.items.len);
+            var n: usize = 0;
+            errdefer {
+                for (list[0..n]) |s| allocator.free(s);
+                allocator.free(list);
             }
+            for (arr.items) |item| {
+                switch (item) {
+                    .string => |s| {
+                        list[n] = try allocator.dupe(u8, s);
+                        n += 1;
+                    },
+                    else => {
+                        std.debug.print(
+                            "labelle-assembler: scene '{s}' has a non-string entry in 'assets'\n",
+                            .{display_path},
+                        );
+                        return error.InvalidAssetsField;
+                    },
+                }
+            }
+            assets = list;
         }
-        assets = list;
     }
 
     return .{

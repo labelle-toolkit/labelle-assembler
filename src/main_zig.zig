@@ -182,6 +182,21 @@ fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
     return buf.toOwnedSlice(allocator);
 }
 
+/// Write a Zig double-quoted string literal for `s`, escaping `\` and `"` so
+/// that asset names or scene names containing those characters produce valid
+/// generated source rather than a compile error.
+fn writeZigString(w: anytype, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            else => try w.writeByte(c),
+        }
+    }
+    try w.writeByte('"');
+}
+
 /// Emit the `SceneAssetManifests` comptime struct that exposes each scene's
 /// declared `assets:` array to labelle-engine. The format is the codegen
 /// contract for the SceneEntry.assets consumer (labelle-engine issue #445):
@@ -227,7 +242,7 @@ fn writeSceneAssetManifests(
             try w.print("    pub const {s}: []const []const u8 = &.{{ ", .{ident});
             for (assets, 0..) |asset, i| {
                 if (i > 0) try w.writeAll(", ");
-                try w.print("\"{s}\"", .{asset});
+                try writeZigString(w, asset);
             }
             try w.writeAll(" };\n");
         }
@@ -240,7 +255,9 @@ fn writeSceneAssetManifests(
     try w.writeAll("    pub const entries: []const Entry = &.{\n");
     for (jsonc_scene_names) |name| {
         const ident = pathToIdent(name, ident_buf);
-        try w.print("        .{{ .name = \"{s}\", .assets = {s} }},\n", .{ name, ident });
+        try w.writeAll("        .{ .name = ");
+        try writeZigString(w, name);
+        try w.print(", .assets = {s} }},\n", .{ident});
     }
     try w.writeAll("    };\n");
     try w.writeAll("};\n");

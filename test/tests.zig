@@ -826,6 +826,22 @@ pub const SCENE_ASSET_MANIFESTS = struct {
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "SceneAssetManifests") == null);
     }
+
+    test "asset names with backslash or quote are escaped in generated source" {
+        const jsonc_scenes = &[_][]const u8{"menu"};
+        const manifests = [_]SceneManifest{
+            .{ .name = "menu", .assets = &[_][]const u8{ "path\\asset", "say\"hi" } },
+        };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"path\\\\asset\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"say\\\"hi\"") != null);
+    }
 };
 
 // ── Scripts ──────────────────────────────────────────────────────────
