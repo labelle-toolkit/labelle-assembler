@@ -39,11 +39,16 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     try w.writeAll("    var runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
     try w.writeAll("    defer runner.deinit();\n\n");
 
-    // Load embedded atlas resources before scene (sprites must be available at entity creation)
+    // Load (or register) embedded atlas resources. Lazy resources
+    // call `registerAtlasFromMemory` (parses JSON eagerly, defers PNG
+    // decode) so a script can decode them on demand. See
+    // `buildCallbackInitCode` for the matching code path that the
+    // sokol/wasm callback backends use.
     if (cfg.resources.len > 0) {
         try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
         for (cfg.resources) |res| {
-            try w.print("    try g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ res.name, res.json, res.texture });
+            const fn_name = if (res.lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
+            try w.print("    try g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ fn_name, res.name, res.json, res.texture });
         }
         try w.writeByte('\n');
     }
@@ -122,11 +127,20 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
 
     try w.writeAll("    runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
 
-    // Load embedded atlas resources before scene (sprites must be available at entity creation)
+    // Load (or register) embedded atlas resources before scene.
+    // Eager resources call `loadAtlasFromMemory` which decodes the
+    // PNG immediately — sprites are available the moment the scene
+    // is instantiated. Lazy resources (project.labelle: `lazy = true`)
+    // call `registerAtlasFromMemory`, which parses the JSON eagerly
+    // so sprite-name lookups still resolve, but defers the PNG
+    // decode until a script calls `game.loadAtlasIfNeeded(name)`.
+    // A loading-scene controller typically does this one atlas per
+    // frame so the scene stays animated during the load.
     if (cfg.resources.len > 0) {
         try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
         for (cfg.resources) |res| {
-            try w.print("    g.loadAtlasFromMemory(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas\");\n", .{ res.name, res.json, res.texture });
+            const fn_name = if (res.lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
+            try w.print("    g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas: {s}\");\n", .{ fn_name, res.name, res.json, res.texture, res.name });
         }
         try w.writeByte('\n');
     }
@@ -151,6 +165,9 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
 
         const initial = cfg.initial_scene orelse jsonc_scene_names[0];
         try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
+        if (cfg.states.len > 0) {
+            try w.print("    g.setState(\"{s}\");\n", .{cfg.states[0]});
+        }
     }
 
     try w.writeAll("    runner.setup(&g);\n");
@@ -317,6 +334,7 @@ pub fn generateMainZigFromTemplate(
     enum_names: []const []const u8,
     view_names: []const []const u8,
     gizmo_names: []const []const u8,
+    animation_names: []const []const u8,
 ) ![]const u8 {
     var data = tpl.TemplateData{
         .scalars = std.StringHashMap([]const u8).init(allocator),
@@ -658,6 +676,24 @@ pub fn generateMainZigFromTemplate(
         try data.scalars.put("gizmo_registry_block", block);
     }
 
+    // Animation registry block
+    {
+        var buf = std.ArrayList(u8){};
+        const bw = buf.writer(allocator);
+        if (animation_names.len > 0) {
+            var anim_pascal_buf: [128]u8 = undefined;
+            for (animation_names) |name| {
+                const ident = pathToIdent(name, &ident_buf);
+                const pascal = snakeToPascal(ident, &anim_pascal_buf);
+                try bw.print("const {s}Anim = engine.AnimationDef(@import(\"animations/{s}.zon\"));\n", .{ pascal, name });
+            }
+            try bw.writeAll("\n");
+        }
+        const block = try buf.toOwnedSlice(allocator);
+        try allocs.append(allocator, block);
+        try data.scalars.put("animation_registry_block", block);
+    }
+
     // ── Lifecycle section (rendered from backend template, same as procedural path) ──
     {
         var buf = std.ArrayList(u8){};
@@ -673,11 +709,11 @@ pub fn generateMainZigFromTemplate(
             "        g.dispatchEvents();\n" ++
             "        // Update profiling pointers (debug only)\n" ++
             "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
-            "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
+            "            g.script_profile_ptr = @ptrCast(@alignCast(&runner.profile));\n" ++
             "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
             "        }\n" ++
             "        if (comptime PluginSystems.profiling_enabled) {\n" ++
-            "            g.plugin_profile_ptr = @ptrCast(&PluginSystems.plugin_profile);\n" ++
+            "            g.plugin_profile_ptr = @ptrCast(@alignCast(&PluginSystems.plugin_profile));\n" ++
             "            g.plugin_profile_count = PluginSystems.plugin_system_count;\n" ++
             "        }\n"
         else
@@ -687,7 +723,7 @@ pub fn generateMainZigFromTemplate(
             "        }\n" ++
             "        g.dispatchEvents();\n" ++
             "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
-            "            g.script_profile_ptr = @ptrCast(&runner.profile);\n" ++
+            "            g.script_profile_ptr = @ptrCast(@alignCast(&runner.profile));\n" ++
             "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
             "        }\n";
 
@@ -739,6 +775,21 @@ pub fn generateMainZigFromTemplate(
                 const allocator_expr: []const u8 = if (is_wasm) "std.heap.c_allocator" else "gpa.allocator()";
                 const allocator_cleanup: []const u8 = if (is_wasm) "" else "    _ = gpa.deinit();\n";
 
+                // Wire the GUI bridge into sokol's event callback so widgets
+                // see mouse / keyboard input. labelle-imgui's sokol bridge
+                // exports `imgui_bridge_handle_event` for exactly this — when
+                // a GUI plugin is configured we forward each event to it.
+                // Without this hook simgui's IO state stays empty and ImGui
+                // buttons/sliders never respond.
+                const gui_event_extern: []const u8 = if (cfg.hasGui())
+                    "extern fn imgui_bridge_handle_event(ev: [*c]const @import(\"backend_input\").Event) bool;\n\n"
+                else
+                    "";
+                const gui_event_forward: []const u8 = if (cfg.hasGui())
+                    "    _ = imgui_bridge_handle_event(ev);\n"
+                else
+                    "";
+
                 try tpl.render(lifecycle_tmpl, .{
                     .module_vars = module_vars,
                     .width = w_str,
@@ -748,6 +799,8 @@ pub fn generateMainZigFromTemplate(
                     .init_code = init_code,
                     .tick_code = tick_code,
                     .gui_draw_code = gui_draw_code,
+                    .gui_event_extern = gui_event_extern,
+                    .gui_event_forward = gui_event_forward,
                     .cleanup_code = cleanup_code,
                     .platform_comment = platform_comment,
                     .entry_comment = entry_comment,

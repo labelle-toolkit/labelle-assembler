@@ -1,0 +1,67 @@
+const BackendGfxType = @import("backend_gfx");
+
+var g: AssembledGame = undefined;
+{{hooks_init_block}}
+{{allocator_decl}}
+{{module_vars}}
+const screen_w: u32 = {{width}};
+const screen_h: u32 = {{height}};
+const screen_title = "{{title}}";
+const target_fps: u32 = {{fps}};
+
+fn initInner() !void {
+    const allocator = {{allocator_expr}};
+{{init_code}}}
+
+export fn init() callconv(.c) void {
+{{hidden_setup}}    window.initGfx();
+    g = AssembledGame.init({{allocator_expr}});
+    g.setHooks(&hooks);
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    initInner() catch |err| {
+        std.debug.print("labelle: init failed: {any}\n", .{err});
+    };
+}
+
+{{gui_event_extern}}fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
+    @import("backend_input").handleEvent(ev);
+{{gui_event_forward}}}
+
+export fn frame() callconv(.c) void {
+    if (!g.isRunning()) {
+        window.requestQuit();
+        return;
+    }
+    BackendGfxType.setScreenSize(window.width(), window.height());
+    // Keep design coords fixed so screen-space NDC mapping uses the design resolution
+    // rather than the physical framebuffer size (which differs on HiDPI displays).
+    BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
+    const dt: f32 = 1.0 / @as(f32, @floatFromInt(target_fps));
+{{tick_code}}    g.tick(dt);
+    const pass_action = window.beginFrame();
+    window.beginPass(pass_action);
+    g.render();
+    g.renderGizmos();
+{{gui_draw_code}}    window.endFrame();
+    // Clear one-shot pressed/released state AFTER scripts have consumed it.
+    // Calling newFrame at the top of frame() would race with sapp events
+    // dispatched between frame callbacks and drop isKeyPressed reports.
+    @import("backend_input").newFrame();
+}
+
+export fn cleanup() callconv(.c) void {
+{{cleanup_code}}    g.deinit();
+    window.shutdownGfx();
+{{allocator_cleanup}}}
+
+pub fn main() void {
+    window.run(.{
+        .init_cb = &init,
+        .frame_cb = &frame,
+        .cleanup_cb = &cleanup,
+        .event_cb = &sokolEvent,
+        .w = screen_w,
+        .h = screen_h,
+        .title = screen_title,
+    });
+}

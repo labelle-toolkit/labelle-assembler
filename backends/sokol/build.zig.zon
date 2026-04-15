@@ -1,0 +1,19 @@
+.{
+    .fingerprint = 0x312df839bf864b91,
+    .name = .labelle_sokol,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .sokol = .{
+            // Pinned to a specific commit — see #146. Bumping this requires
+            // updating the hash via `zig fetch <new url>`.
+            .url = "https://github.com/floooh/sokol-zig/archive/8e2d21bebd8428d82a1f320e999c058303c8323d.tar.gz",
+            .hash = "sokol-0.1.0-pb1HKxTaNgA8rXBh41wxEucgmR4YPuoOXGeXbFyGPvTK",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

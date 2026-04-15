@@ -1,0 +1,25 @@
+.{
+    .name = .nuklear_raylib_bridge,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        // Keep in sync with ../../build.zig.zon.
+        .nuklear = .{
+            .url = "https://github.com/silversquirl/zig-nuklear/archive/6beb25d3e5dd8fa0401b7d1933f993bc48244765.tar.gz",
+            .hash = "nuklear-4.12.0-AAAAACGbEgD72uKM81LvjfikiBmlrX_-kl-TfIkRwZFM",
+        },
+        // Pinned to match backends/raylib/build.zig.zon so both halves
+        // resolve the same raylib-zig version. The pre-fix manifest
+        // used \`refs/heads/devel.tar.gz\` with a stale Zig 0.11 hash
+        // format (same class of fragility as #146).
+        .@"raylib-zig" = .{
+            .url = "https://github.com/raylib-zig/raylib-zig/archive/cd71c85d571027ac8033357f83b124ee051825b3.tar.gz",
+            .hash = "raylib_zig-5.6.0-dev-KE8REENOBQC-m5nK7M2b5aKSIubJPbPLUYcRhT7aT3RN",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

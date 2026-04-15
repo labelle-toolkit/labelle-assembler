@@ -24,16 +24,22 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
     } else if (cfg.platform == .ios) {
         try tpl.writeSection(build_zig_tmpl, "header_ios", w);
+    } else if (cfg.platform == .android) {
+        try tpl.writeSection(build_zig_tmpl, "header_android", w);
     } else {
         try tpl.writeSection(build_zig_tmpl, "header", w);
     }
 
     if (cfg.platform == .ios) {
-        // Emit target alias for ECS adapters, plugins, and GUI that use `target` variable
         if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
             try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
         }
         try tpl.writeSection(build_zig_tmpl, "ios_deps", w);
+    } else if (cfg.platform == .android) {
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
+            try tpl.writeSection(build_zig_tmpl, "android_target_alias", w);
+        }
+        try tpl.writeSection(build_zig_tmpl, "android_deps", w);
     } else {
         try tpl.writeSection(build_zig_tmpl, "deps", w);
     }
@@ -57,6 +63,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
                 try tpl.writeSection(build_zig_tmpl, "backend_sokol_wasm", w);
             } else if (cfg.platform == .ios) {
                 try tpl.writeSection(build_zig_tmpl, "backend_sokol_ios", w);
+            } else if (cfg.platform == .android) {
+                try tpl.writeSection(build_zig_tmpl, "backend_sokol_android", w);
             } else {
                 try tpl.writeSection(build_zig_tmpl, "backend_sokol", w);
             }
@@ -174,6 +182,38 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         }
 
         try tpl.writeSection(build_zig_tmpl, "ios_footer", w);
+    } else if (cfg.platform == .android) {
+        // Android: build shared library for NativeActivity, link NDK libs
+        try tpl.writeSection(build_zig_tmpl, "android_exe_start", w);
+
+        for (cfg.plugins) |plugin| {
+            try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
+        }
+
+        if (cfg.ecs != .mock) {
+            try tpl.writeSection(build_zig_tmpl, "android_exe_ecs_import", w);
+        }
+        if (cfg.hasGui()) {
+            try tpl.writeSection(build_zig_tmpl, "android_exe_gui_import", w);
+        }
+
+        try tpl.writeSection(build_zig_tmpl, "android_exe_end", w);
+
+        // Pass target_sdk_version from AndroidConfig (default 34) for NDK library path
+        const android_cfg = cfg.android orelse config.AndroidConfig{};
+        var sdk_buf: [10]u8 = undefined;
+        const sdk_version_str = std.fmt.bufPrint(&sdk_buf, "{d}", .{android_cfg.target_sdk_version}) catch "34";
+        try tpl.renderSection(build_zig_tmpl, "android_link", .{ .target_sdk_version = sdk_version_str }, w);
+
+        if (cfg.resolved_gui) |gui| {
+            if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
+                try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
+                try tpl.writeSection(build_zig_tmpl, "android_link_gui_bridge", w);
+            }
+        }
+
+        try tpl.writeSection(build_zig_tmpl, "android_package", w);
+        try tpl.writeSection(build_zig_tmpl, "android_footer", w);
     } else {
         // Desktop: build as executable, link natively
         try tpl.writeSection(build_zig_tmpl, "exe_start", w);
@@ -298,7 +338,7 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
         const section = std.fmt.bufPrint(&sb, "dep_{s}_path", .{bn}) catch unreachable;
         var spb: [128]u8 = undefined;
         const sp = std.fmt.bufPrint(&spb, "backends/{s}", .{bn}) catch unreachable;
-        const bp_abs = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, sp);
+        const bp_abs = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, sp);
         defer allocator.free(bp_abs);
         const bp = try relativePath(allocator, abs_target, bp_abs);
         defer allocator.free(bp);
@@ -312,7 +352,7 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
             const dd: []const u8 = switch (cfg.ecs) { .zig_ecs => "zig-ecs", .zflecs => "zflecs", .mr_ecs => "mr-ecs", .mock => unreachable };
             var spb: [128]u8 = undefined;
             const sp = std.fmt.bufPrint(&spb, "ecs/{s}", .{dd}) catch unreachable;
-            const ep_abs = try cache.resolveCliPackage(allocator, cfg.labelle_version, project_dir, sp);
+            const ep_abs = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, sp);
             defer allocator.free(ep_abs);
             const ep = try relativePath(allocator, abs_target, ep_abs);
             defer allocator.free(ep);

@@ -57,7 +57,17 @@ pub const IosConfig = struct {
     device_family: []const u8 = "1,2",
 };
 
-pub const LayerSpace = enum { world, screen };
+// ── Android Configuration ──────────────────────────────────────────
+
+pub const AndroidConfig = struct {
+    app_name: []const u8 = "",
+    package_name: []const u8 = "", // e.g. "com.labelle.mygame"
+    min_sdk_version: u32 = 28, // Android 9 (Pie) — NativeActivity + GLES3
+    target_sdk_version: u32 = 34, // Android 14
+    orientation: Orientation = .all,
+};
+
+pub const LayerSpace = enum { world, screen, screen_fill };
 
 pub const LayerDef = struct {
     name: []const u8,
@@ -69,6 +79,14 @@ pub const ResourceDef = struct {
     name: []const u8,
     json: []const u8 = "",
     texture: []const u8 = "",
+    /// When `true`, the generated `init()` registers this atlas with
+    /// `registerAtlasFromMemory` (parses the JSON, defers the PNG
+    /// decode). The user is then responsible for calling
+    /// `game.loadAtlasIfNeeded(name)` from a script — typically a
+    /// loading-scene controller — before any sprite from this atlas is
+    /// rendered. Defaults to `false`, which preserves the eager
+    /// `loadAtlasFromMemory` behavior every existing project relies on.
+    lazy: bool = false,
 };
 
 /// Returns true if a version string is a local path override.
@@ -166,6 +184,9 @@ pub const ProjectConfig = struct {
     /// iOS configuration — parsed from project.labelle `.ios` section.
     /// Defaults to null (derived from project name/title when absent).
     ios: ?IosConfig = null,
+
+    /// Android configuration — parsed from project.labelle `.android` section.
+    android: ?AndroidConfig = null,
 
     /// Pinned assembler version (Phase 3 of RFC #122).
     /// When set, the CLI resolves the assembler binary from the cache at

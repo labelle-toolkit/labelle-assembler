@@ -273,7 +273,7 @@ pub fn build(b: *std.Build) void {
     const sdk_path = getIosSdkPath(b, sdk_name) orelse
         @panic("Could not find iOS SDK. Is Xcode installed?");
 
-    const host_arch = b.host.result.cpu.arch;
+    const host_arch = b.graph.host.result.cpu.arch;
     const ios_target = if (device_mode)
         b.resolveTargetQuery(.{
             .cpu_arch = .aarch64,
@@ -370,6 +370,267 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Override a module import without leaking memory.
+/// NOTE: Duplicated from .footer — each generated build.zig is standalone and
+/// needs its own copy of this helper.
+fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
+    const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
+    if (!gop.found_existing) {
+        gop.key_ptr.* = name;
+    }
+    gop.value_ptr.* = module;
+}
+
+.header_android
+const std = @import("std");
+
+/// Detect Android NDK sysroot path.
+fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
+    // 1. ANDROID_NDK_HOME env var
+    if (std.process.getEnvVarOwned(b.allocator, "ANDROID_NDK_HOME") catch null) |ndk_home| {
+        defer b.allocator.free(ndk_home);
+        const sysroot = b.pathJoin(&.{ ndk_home, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
+        if (std.fs.cwd().access(sysroot, .{})) |_| {
+            return sysroot;
+        } else |_| {}
+    }
+    // 2. ANDROID_HOME/ndk/<latest>/
+    if (std.process.getEnvVarOwned(b.allocator, "ANDROID_HOME") catch null) |home| {
+        defer b.allocator.free(home);
+        const ndk_dir = b.pathJoin(&.{ home, "ndk" });
+        var dir = std.fs.cwd().openDir(ndk_dir, .{ .iterate = true }) catch return null;
+        defer dir.close();
+        var latest: ?[]const u8 = null;
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind == .directory) {
+                // Pick the highest version by lexicographic comparison
+                if (latest) |prev| {
+                    if (std.mem.order(u8, entry.name, prev) == .gt) {
+                        b.allocator.free(prev);
+                        latest = b.allocator.dupe(u8, entry.name) catch null;
+                    }
+                } else {
+                    latest = b.allocator.dupe(u8, entry.name) catch null;
+                }
+            }
+        }
+        if (latest) |version| {
+            defer b.allocator.free(version);
+            const sysroot = b.pathJoin(&.{ ndk_dir, version, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
+            if (std.fs.cwd().access(sysroot, .{})) |_| {
+                return sysroot;
+            } else |_| {}
+        }
+    }
+    return null;
+}
+
+fn ndkHostTag() []const u8 {
+    const builtin = @import("builtin");
+    return switch (builtin.os.tag) {
+        .linux => "linux-x86_64",
+        .macos => "darwin-x86_64",
+        .windows => "windows-x86_64",
+        else => "linux-x86_64",
+    };
+}
+
+pub fn build(b: *std.Build) void {
+    const optimize = b.standardOptimizeOption(.{});
+    const emulator_mode = b.option(bool, "emulator", "Build for Android emulator (x86_64 on Intel Mac, arm64 on Apple Silicon)") orelse false;
+    // `-Dandroid_arch=arm64|x86_64` is the explicit selector used by
+    // `labelle android --all-abis` to produce a fat APK from a single
+    // host machine. When unset, we fall back to the legacy behavior
+    // (emulator picks the host-matching arch, otherwise arm64) so
+    // existing `zig build -Demulator=true` invocations keep working.
+    const android_arch_opt = b.option([]const u8, "android_arch", "Android target arch (arm64|x86_64). Overrides -Demulator when set.");
+
+    const ndk_sysroot = getAndroidNdkSysroot(b) orelse
+        @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
+
+    // On Apple Silicon the Android emulator runs ARM64 images; on Intel Macs
+    // it runs x86_64. Use the host arch to select the right ABI automatically.
+    const emulator_arch: std.Target.Cpu.Arch = switch (b.graph.host.result.cpu.arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    };
+
+    const android_arch: std.Target.Cpu.Arch = if (android_arch_opt) |name| blk: {
+        if (std.mem.eql(u8, name, "arm64") or std.mem.eql(u8, name, "aarch64")) break :blk .aarch64;
+        if (std.mem.eql(u8, name, "x86_64") or std.mem.eql(u8, name, "x64")) break :blk .x86_64;
+        std.debug.print("build.zig: unknown -Dandroid_arch value '{s}' (expected arm64 or x86_64)\n", .{name});
+        @panic("invalid android_arch");
+    } else if (emulator_mode) emulator_arch else .aarch64;
+
+    const android_target = b.resolveTargetQuery(.{
+        .cpu_arch = android_arch,
+        .os_tag = .linux,
+        .abi = .android,
+    });
+
+    // Architecture-specific triple for NDK include/library paths
+    const ndk_arch_triple: []const u8 = switch (android_arch) {
+        .aarch64 => "aarch64-linux-android",
+        .x86_64 => "x86_64-linux-android",
+        else => unreachable, // android_arch is pinned to one of the two above
+    };
+
+.android_target_alias
+    const target = android_target;
+
+.android_deps
+    const core_dep = b.dependency("labelle_core", .{ .target = android_target, .optimize = optimize });
+    const core_mod = core_dep.module("labelle-core");
+
+    const gfx_dep = b.dependency("labelle_gfx", .{ .target = android_target, .optimize = optimize });
+    const gfx_mod = gfx_dep.module("labelle-gfx");
+
+    const engine_dep = b.dependency("engine", .{ .target = android_target, .optimize = optimize });
+    const engine_mod = engine_dep.module("engine");
+
+    overrideImport(gfx_mod, "labelle-core", core_mod);
+    overrideImport(engine_mod, "labelle-core", core_mod);
+    overrideImport(engine_mod, "labelle-gfx", gfx_mod);
+
+.backend_sokol_android
+    // sokol with dont_link_system_libs — we link Android libs manually
+    const backend_dep = b.dependency("labelle_sokol", .{
+        .target = android_target,
+        .optimize = optimize,
+        .dont_link_system_libs = true,
+    });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+    const sokol_clib = backend_dep.artifact("sokol_clib");
+
+    // Configure NDK sysroot paths on sokol_clib for C header compilation
+    sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include" }) });
+    sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }) });
+
+.android_exe_start
+    const lib = b.addLibrary(.{
+        .name = "game",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = android_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "labelle-core", .module = core_mod },
+                .{ .name = "labelle-gfx", .module = gfx_mod },
+                .{ .name = "labelle-engine", .module = engine_mod },
+                .{ .name = "backend_gfx", .module = backend_gfx },
+                .{ .name = "backend_input", .module = backend_input },
+                .{ .name = "backend_audio", .module = backend_audio },
+                .{ .name = "backend_window", .module = backend_window },
+
+.android_exe_ecs_import
+                .{ .name = "ecs_backend", .module = ecs_mod },
+
+.android_exe_gui_import
+                .{ .name = "gui_backend", .module = gui_mod },
+
+.android_exe_end
+            },
+        }),
+    });
+
+.android_link
+    lib.linkLibrary(sokol_clib);
+    lib.linkLibC();
+    lib.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }) });
+    lib.root_module.linkSystemLibrary("android", .{});
+    lib.root_module.linkSystemLibrary("log", .{});
+    lib.root_module.linkSystemLibrary("GLESv3", .{});
+    lib.root_module.linkSystemLibrary("EGL", .{});
+
+    // Zig does not bundle Android libc — provide a libc.txt that points the
+    // compiler at the NDK sysroot so Zig can resolve <stdio.h> and friends.
+    const libc_content = std.mem.concat(b.allocator, u8, &.{
+        "include_dir=",     b.pathJoin(&.{ ndk_sysroot, "usr/include" }),                               "\n",
+        "sys_include_dir=", b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }),              "\n",
+        "crt_dir=",         b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }), "\n",
+        "msvc_lib_dir=\n",
+        "kernel32_lib_dir=\n",
+        "gcc_dir=\n",
+    }) catch @panic("OOM");
+    const android_libc = b.addWriteFiles();
+    lib.setLibCFile(android_libc.add("android-libc.txt", libc_content));
+
+.android_link_gui_bridge
+    lib.linkLibrary(gui_bridge_artifact);
+
+.android_package
+    // ── APK packaging step ──────────────────────────────────────────────
+    // Copies the freshly built libgame.so into apk-staging and re-signs the APK.
+    // Requires ANDROID_HOME and ~/.labelle/android-debug.keystore.
+    {
+        // ANDROID_HOME is read lazily — a missing value only fails when `zig build package` runs.
+        const android_home = std.process.getEnvVarOwned(b.allocator, "ANDROID_HOME") catch "";
+        defer if (android_home.len > 0) b.allocator.free(android_home);
+        const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch
+            std.process.getEnvVarOwned(b.allocator, "USERPROFILE") catch "";
+        defer if (home.len > 0) b.allocator.free(home);
+        const keystore = b.pathJoin(&.{ if (home.len > 0) home else "/tmp", ".labelle", "android-debug.keystore" });
+
+        // Find build-tools: prefer newest, then fall back
+        const build_tools_dir = blk: {
+            for (&[_][]const u8{ "36.0.0", "35.0.1", "35.0.0", "34.0.0" }) |ver| {
+                const p = b.pathJoin(&.{ android_home, "build-tools", ver });
+                if (std.fs.cwd().access(p, .{})) |_| break :blk p else |_| {}
+            }
+            break :blk b.pathJoin(&.{ android_home, "build-tools", "35.0.0" });
+        };
+        const apksigner = b.pathJoin(&.{ build_tools_dir, "apksigner" });
+
+        // Derive ABI directory from the actual build target so emulator (x86_64) and device (arm64) both work.
+        const abi_dir: []const u8 = switch (android_target.result.cpu.arch) {
+            .aarch64 => "arm64-v8a",
+            .x86_64  => "x86_64",
+            .arm     => "armeabi-v7a",
+            .x86     => "x86",
+            else     => "arm64-v8a",
+        };
+        // "../apk-staging/..." installs relative to zig-out/, resolving to {project_root}/apk-staging/.
+        const stage_lib = b.addInstallFile(lib.getEmittedBin(), b.fmt("../apk-staging/lib/{s}/libgame.so", .{abi_dir}));
+        stage_lib.step.dependOn(&lib.step);
+
+        // Repack APK from staging dir
+        const pack = b.addSystemCommand(&.{ "sh", "-c",
+            "cd \"$0\" && zip -r \"$1\" . -x '*.idsig'",
+            b.pathFromRoot("apk-staging"),
+            b.pathFromRoot("game_unsigned.apk"),
+        });
+        pack.step.dependOn(&stage_lib.step);
+
+        // Sign
+        const sign = b.addSystemCommand(&.{
+            apksigner,        "sign",
+            "--ks",           keystore,
+            "--ks-pass",      "pass:android",
+            "--key-pass",     "pass:android",
+            "--min-sdk-version", "26",
+            "--out",          b.pathFromRoot("game.apk"),
+            b.pathFromRoot("game_unsigned.apk"),
+        });
+        sign.step.dependOn(&pack.step);
+
+        const package_step = b.step("package", "Package and sign Android APK");
+        package_step.dependOn(&sign.step);
+    }
+
+.android_footer
+    b.installArtifact(lib);
+
+    const run_step = b.step("run", "Build for Android");
+    run_step.dependOn(&lib.step);
+}
+
+/// Override a module import without leaking memory.
+/// NOTE: Duplicated from .footer — each generated build.zig is standalone and
+/// needs its own copy of this helper.
 fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
     const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
     if (!gop.found_existing) {

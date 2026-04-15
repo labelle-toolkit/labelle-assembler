@@ -1,0 +1,24 @@
+.{
+    .fingerprint = 0x9cd73c2cb5d6d1eb,
+    .name = .labelle_bgfx,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        // Pinned to specific commits — same class of fix as #146.
+        // Bumping either dep requires `zig fetch <new-url>` to get
+        // the new hash, then updating the url and hash together.
+        .zbgfx = .{
+            .url = "https://codeberg.org/cyberegoorg/zbgfx/archive/4f9e031d201ca4f7262558c5c224b635fa87ae7c.tar.gz",
+            .hash = "zbgfx-0.10.1-Sm4IxEWLywb5UqCYEImIBXJor_EhNg9GIpGPH8tfgtyh",
+        },
+        .zglfw = .{
+            .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
+            .hash = "zglfw-0.10.0-dev-zgVDNIG4IQBWN_sfMD-xfC9bJS2hbBN2W7jNlDLovcdC",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

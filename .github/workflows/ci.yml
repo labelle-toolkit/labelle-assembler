@@ -21,13 +21,121 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Install sokol system libs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libgl1-mesa-dev libx11-dev libxi-dev libxcursor-dev
+
       - name: Build
         run: zig build
 
       - name: Test
         run: zig build test
 
+      - name: zig-ecs adapter tests
+        run: cd ecs/zig-ecs && zig build test
+
+      - name: SDL backend build-helper tests
+        run: cd backends/sdl && zig build test
+
+      - name: sokol backend unit tests + audio.zig compile-check
+        run: cd backends/sokol && zig build test
+
+      - name: wgpu backend WAV parser tests
+        run: cd backends/wgpu && zig build test
+
+      # Linux-only: raylib-zig transitively pulls hexops/xcode-frameworks
+      # via `git+https://`, which Zig's git fetcher can't resolve on the
+      # macos-latest runner ("unable to discover remote git server
+      # capabilities: ProtocolError"). The slot_alloc tests are pure Zig
+      # with no platform-specific behaviour, so running them on the
+      # ubuntu runner alone is enough.
+      - name: raylib backend slot-allocator tests
+        if: runner.os == 'Linux'
+        run: cd backends/raylib && zig build test
+
+      - name: plugins/debug tests
+        run: cd plugins/debug && zig build test
+
+      - name: bgfx backend tests + cross-compile compile-check
+        run: |
+          cd backends/bgfx
+          zig build test
+          zig build test -Dtarget=x86_64-linux-gnu
+          zig build test -Dtarget=x86_64-windows-gnu
+          zig build test -Dtarget=x86_64-macos
+          zig build test -Dtarget=aarch64-macos
+
       - name: Verify binary
         run: |
           ./zig-out/bin/labelle-assembler --protocol-version
           ./zig-out/bin/labelle-assembler --help
+
+  # End-to-end usage test: check out every sibling repo the examples
+  # need (labelle-cli for the binary, labelle-core/engine/gfx for the
+  # runtime packages), then `labelle generate` and `zig build` the
+  # raylib example. Validates that the assembler + backends +
+  # zig-ecs + deps_linker pipeline produces a project that actually
+  # compiles, not just resolves paths.
+  #
+  # Linux only for now — raylib-zig's transitive hexops/xcode-frameworks
+  # dep doesn't fetch cleanly from the macos GitHub runner (see the
+  # slot-allocator gate above for context).
+  examples-integration:
+    name: Examples integration test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-cli
+          path: labelle-cli
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-core
+          path: labelle-core
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-engine
+          path: labelle-engine
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gfx
+          path: labelle-gfx
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install raylib + sokol system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libxext-dev libxfixes-dev \
+            libwayland-dev libxkbcommon-dev libasound2-dev
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Build labelle-cli
+        run: cd labelle-cli && zig build
+
+      - name: Generate + build the raylib example
+        env:
+          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
+        run: |
+          cd labelle-assembler/examples/raylib
+          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
+          cd .labelle/raylib_desktop
+          zig build
