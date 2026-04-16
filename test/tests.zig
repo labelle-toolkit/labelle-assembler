@@ -1045,10 +1045,21 @@ pub const IMAGE_BACKEND_WIRING = struct {
         // The exhaustion guard MUST appear before `uploadTexture` in
         // the emitted `upload` body: if the table is full and we
         // upload first, we leak a GPU resource (the handle is
-        // discarded with the error return).
-        const guard_idx = std.mem.indexOf(u8, main_zig, "if (next_id >= MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;") orelse return error.GuardMissing;
+        // discarded with the error return). Matches the new slot-scan
+        // form — the `handle == MAX_IMAGE_ASSETS` sentinel is how the
+        // rewrite signals "no free slot" after the scan.
+        const guard_idx = std.mem.indexOf(u8, main_zig, "if (handle == MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;") orelse return error.GuardMissing;
         const upload_call_idx = std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(backend_decoded)") orelse return error.UploadCallMissing;
         try std.testing.expect(guard_idx < upload_call_idx);
+
+        // Also lock in the slot-reuse behavior: the scan must run
+        // BEFORE the guard, and `unload` must clear `slots[texture]`
+        // so recycled indices come back into play. Monotonic
+        // `next_id`-style counters are gone — guard against
+        // regression.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "for (slots, 0..) |slot, i|") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "slots[texture] = null;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var next_id:") == null);
     }
 
     test "adapter decode marshals engine.DecodedImage from backend DecodedImage" {
