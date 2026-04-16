@@ -31,7 +31,11 @@
             }
         },
         // One sprite from the "jump" atlas — proves both atlases
-        // decoded and uploaded independently.
+        // decoded and uploaded independently. The JumpAnim marker
+        // opts this entity into scripts/playing/jump_animator.zig,
+        // which cycles sprite_name through jump_0001..jump_0009 to
+        // prove the streaming pipeline keeps re-resolving sprite
+        // names after the initial load.
         {
             "components": {
                 "Position": { "x": 650, "y": 450 },
@@ -42,7 +46,8 @@
                     "scale_x": 3.0,
                     "scale_y": 3.0
                 },
-                "SpriteMarker": {}
+                "SpriteMarker": {},
+                "JumpAnim": {}
             }
         }
     ]
