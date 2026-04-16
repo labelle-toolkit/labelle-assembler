@@ -34,24 +34,27 @@ pub fn tick(game: anytype, _: f32) void {
     // running the moment the swap completes.
     drawProgressBar(game, game.assets.progress(target_assets));
 
-    // Bump the state machine to "playing" the frame the manifest
-    // is ready, so the playing-state scripts (main_scene's camera
-    // setup, jump_animator, the screenshot trigger) start
-    // ticking on the very next frame after the swap.
-    if (game.assets.allReady(target_assets)) {
-        game.setState("playing");
-    }
-
     // Phase 2 manifest gate (labelle-engine #458): idempotent
     // acquire on the first call, silent return while decoding,
     // synchronous swap once `allReady`. The script is expected
-    // to call this every frame.
+    // to call this every frame. Bail early on error so we don't
+    // leave the state machine in `playing` while the swap failed.
     game.setScene("main") catch |err| {
         std.log.err(
             "loading_controller: setScene('main') failed: {s}",
             .{@errorName(err)},
         );
+        return;
     };
+
+    // Bump the state machine to "playing" only after a successful
+    // swap. Doing this BEFORE setScene risks orphaning the game in
+    // `playing` if setScene errors during the swap — this
+    // controller is bound to `loading` and would stop ticking, so
+    // any retry path would be unreachable.
+    if (game.assets.allReady(target_assets)) {
+        game.setState("playing");
+    }
 }
 
 /// Screen-space progress bar. Drawn entirely with gizmos so it
