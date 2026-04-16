@@ -139,3 +139,17 @@ jobs:
           $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
           cd .labelle/raylib_desktop
           zig build
+
+      # Smoke test for the Asset Streaming RFC (labelle-assembler#55,
+      # labelle-engine#437). Same recipe as the raylib example above —
+      # build-only, not a headless runtime check. Runtime exercise
+      # requires a display (raylib creates its GL context at init);
+      # local `labelle run --timeout=Ns` covers the render path.
+      - name: Generate + build the asset-streaming-smoke example
+        env:
+          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
+        run: |
+          cd labelle-assembler/examples/asset-streaming-smoke
+          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
+          cd .labelle/raylib_desktop
+          zig build

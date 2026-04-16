@@ -1,0 +1,13 @@
+{
+    // Loading scene — no entities, no sprite assets. The controller in
+    // scripts/loading/loading_controller.zig drives the atlas-decode
+    // progress bar via screen-space gizmos, which need no textures.
+    //
+    // The intentionally-empty `assets:` block demonstrates the "eager
+    // preloaded, swap-in instantly" side of the RFC pattern: scenes
+    // with no deferred assets become active immediately — here, at
+    // the first frame, without blocking on any PNG decode.
+    "name": "loading",
+    "assets": [],
+    "entities": []
+}
