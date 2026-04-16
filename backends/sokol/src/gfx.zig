@@ -334,8 +334,10 @@ pub fn drawRectangleRec(rec: Rectangle, tint: Color) void {
 }
 
 /// Draw a filled rectangle rotated around (cx, cy). `rotation` is in
-/// radians; positive values rotate counter-clockwise in screen space.
-/// The rectangle is centered on (cx, cy) — width/2 on each side.
+/// **radians** (matches `sgl.rotate` and the retained-engine Shape
+/// rotation convention) — intentionally distinct from `drawTexturePro`
+/// above, which takes **degrees** for raylib-parity reasons. The
+/// rectangle is centered on (cx, cy) — width/2 on each side.
 pub fn drawRectangleRotated(cx: f32, cy: f32, width: f32, height: f32, rotation: f32, tint: Color) void {
     const pivot_ndc_x = toNdcX(cx);
     const pivot_ndc_y = toNdcY(cy);
@@ -535,7 +537,10 @@ pub fn decodeImage(
         const w = std.mem.readInt(u32, data[lrgba_magic.len..][0..4], .little);
         const h = std.mem.readInt(u32, data[lrgba_magic.len + 4 ..][0..4], .little);
         if (w == 0 or h == 0) return error.LoadFailed;
-        const pixels_len: usize = @as(usize, w) * @as(usize, h) * 4;
+        // Checked multiplication — `w * h * 4` could overflow `usize`
+        // on 32-bit targets or with adversarial dimensions.
+        const wh = std.math.mul(usize, @as(usize, w), @as(usize, h)) catch return error.LoadFailed;
+        const pixels_len = std.math.mul(usize, wh, 4) catch return error.LoadFailed;
         if (data.len < lrgba_header_len + pixels_len) return error.LoadFailed;
         const owned = try allocator.alloc(u8, pixels_len);
         @memcpy(owned, data[lrgba_header_len .. lrgba_header_len + pixels_len]);

@@ -88,7 +88,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     // detects the LRGBA magic and skips stb_image entirely. Leaves
     // the path untouched when no sibling exists so `--no-bake` and
     // fresh checkouts still build from the source PNG.
-    var rgba_path_allocs = std.ArrayList([]const u8){};
+    var rgba_path_allocs: std.ArrayListUnmanaged([]const u8) = .{};
     defer {
         for (rgba_path_allocs.items) |s| allocator.free(s);
         rgba_path_allocs.deinit(allocator);
@@ -97,6 +97,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
         if (res.texture.len == 0) continue;
         if (!std.mem.endsWith(u8, res.texture, ".png")) continue;
         const rgba_rel = try std.mem.concat(allocator, u8, &.{ res.texture[0 .. res.texture.len - 4], ".rgba" });
+        errdefer allocator.free(rgba_rel);
         const abs = try std.fs.path.join(allocator, &.{ game_dir, rgba_rel });
         defer allocator.free(abs);
         std.fs.cwd().access(abs, .{}) catch {

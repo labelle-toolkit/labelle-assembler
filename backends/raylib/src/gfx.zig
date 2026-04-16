@@ -141,7 +141,10 @@ pub fn decodeImage(
         const w = std.mem.readInt(u32, data[lrgba_magic.len..][0..4], .little);
         const h = std.mem.readInt(u32, data[lrgba_magic.len + 4 ..][0..4], .little);
         if (w == 0 or h == 0) return error.LoadFailed;
-        const pixels_len: usize = @as(usize, w) * @as(usize, h) * 4;
+        // Checked multiplication — `w * h * 4` could overflow `usize`
+        // on 32-bit targets or with adversarial dimensions.
+        const wh = std.math.mul(usize, @as(usize, w), @as(usize, h)) catch return error.LoadFailed;
+        const pixels_len = std.math.mul(usize, wh, 4) catch return error.LoadFailed;
         if (data.len < lrgba_header_len + pixels_len) return error.LoadFailed;
         const owned = try allocator.alloc(u8, pixels_len);
         @memcpy(owned, data[lrgba_header_len .. lrgba_header_len + pixels_len]);
