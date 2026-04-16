@@ -262,10 +262,23 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
-    // Create deps/ hardlinks in .labelle/deps/ (shared across targets)
+    // Create deps/ hardlinks in .labelle/deps/ (shared across targets).
+    // On failure (e.g. a `local:` plugin pointing at a non-existent
+    // directory), log loudly and fall back to cache-relative paths.
+    // Silent failure used to mask the underlying issue and surface
+    // later as cryptic "package's path-relative dep doesn't resolve"
+    // errors during `zig build` — see labelle-toolkit/labelle-cli#174.
     const deps_parent = output_dir orelse target_dir;
     const resolved_deps: ?[]const deps_linker.DepEntry = if (deps_parent != null and project_dir != null)
-        deps_linker.createDepsLinks(allocator, cfg, deps_parent.?, project_dir.?) catch null
+        deps_linker.createDepsLinks(allocator, cfg, deps_parent.?, project_dir.?) catch |err| blk: {
+            std.debug.print(
+                "labelle-assembler: WARNING — createDepsLinks failed ({s}); falling back to cache-relative dep paths\n" ++
+                    "labelle-assembler:   this often masks the real cause: a `local:` plugin path that doesn't exist,\n" ++
+                    "labelle-assembler:   or a missing entry in ~/.labelle/packages/. Check your project.labelle plugins.\n",
+                .{@errorName(err)},
+            );
+            break :blk null;
+        }
     else
         null;
 
