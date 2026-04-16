@@ -56,6 +56,12 @@ fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}const ImageBackendAdapter = struct {{\n", .{indent});
     try w.print("{s}    const MAX_IMAGE_ASSETS = 1024;\n", .{indent});
     try w.print("{s}    var slots: [MAX_IMAGE_ASSETS]?BackendGfx.Texture = [_]?BackendGfx.Texture{{null}} ** MAX_IMAGE_ASSETS;\n", .{indent});
+    // Renderer pointer for `registerCatalogTexture` — set after
+    // `g` is initialized in main(). Without this the renderer's
+    // sprite draw path falls back to treating the slot handle as a
+    // GL texture id and produces white quads. See
+    // labelle-toolkit/labelle-gfx#248.
+    try w.print("{s}    var renderer_ref: ?*Renderer = null;\n", .{indent});
     try w.print("{s}\n", .{indent});
     try w.print("{s}    fn decode(\n", .{indent});
     try w.print("{s}        file_type: [:0]const u8,\n", .{indent});
@@ -89,6 +95,13 @@ fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}        }};\n", .{indent});
     try w.print("{s}        const tex = try BackendGfx.uploadTexture(backend_decoded);\n", .{indent});
     try w.print("{s}        slots[handle] = tex;\n", .{indent});
+    // Register the slot handle → real BackendTexture mapping with
+    // the renderer so the sprite draw path resolves correctly.
+    // The slot handle is NOT a GL texture id; without this
+    // registration `getTextureInfo(handle)` returns null and
+    // raylib renders white quads — see
+    // labelle-toolkit/labelle-gfx#248.
+    try w.print("{s}        if (renderer_ref) |r| r.registerCatalogTexture(handle, tex);\n", .{indent});
     try w.print("{s}        return handle;\n", .{indent});
     try w.print("{s}    }}\n", .{indent});
     try w.print("{s}\n", .{indent});
@@ -105,6 +118,11 @@ fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}    .upload = ImageBackendAdapter.upload,\n", .{indent});
     try w.print("{s}    .unload = ImageBackendAdapter.unload,\n", .{indent});
     try w.print("{s}}});\n", .{indent});
+    // Wire the renderer reference for the upload path's
+    // `registerCatalogTexture` call. `g` is initialized just above
+    // this snippet's caller (main_zig.zig template substitution
+    // point) so the assignment is safe.
+    try w.print("{s}ImageBackendAdapter.renderer_ref = g.renderer;\n", .{indent});
     try w.print("\n", .{});
 }
 
