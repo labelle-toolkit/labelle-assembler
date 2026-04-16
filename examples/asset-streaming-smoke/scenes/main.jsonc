@@ -1,0 +1,42 @@
+{
+    // Main scene — rendered only after the loading controller has
+    // decoded every atlas listed in `assets:` below. The assembler
+    // parses this block, validates each name against `project.labelle`,
+    // and emits it into `SceneAssetManifests.entries` so engine code
+    // (and the loading controller) can iterate it at runtime via
+    // `game.scenes.get("main").?.assets`.
+    "name": "main",
+    "assets": ["sprites", "jump"],
+    "entities": [
+        // One sprite from the "sprites" atlas — proves a late-loaded
+        // texture actually made it to the GPU.
+        {
+            "components": {
+                "Position": { "x": 300, "y": 300 },
+                "Sprite": {
+                    "sprite_name": "player.png",
+                    "pivot": "center",
+                    "layer": "world",
+                    "scale_x": 3.0,
+                    "scale_y": 3.0
+                },
+                "SpriteMarker": {}
+            }
+        },
+        // One sprite from the "jump" atlas — proves both atlases
+        // decoded and uploaded independently.
+        {
+            "components": {
+                "Position": { "x": 500, "y": 300 },
+                "Sprite": {
+                    "sprite_name": "jump_0001.png",
+                    "pivot": "center",
+                    "layer": "world",
+                    "scale_x": 3.0,
+                    "scale_y": 3.0
+                },
+                "SpriteMarker": {}
+            }
+        }
+    ]
+}

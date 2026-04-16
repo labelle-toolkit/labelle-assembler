@@ -1,0 +1,35 @@
+.{
+    .name = "asset_streaming_smoke",
+    .title = "LaBelle — Asset Streaming Smoke Test",
+    .width = 800,
+    .height = 600,
+    .target_fps = 60,
+    .backend = .raylib,
+    .ecs = .zig_ecs,
+    .initial_scene = "loading",
+    // Two states: the "loading" state drives the progress bar + atlas
+    // decode loop; "playing" runs once every main-scene asset is ready.
+    // First state in the list is the initial state (see buildSetupCode
+    // in src/main_zig.zig), so the game starts on the loading scene
+    // with its dedicated controller ticking.
+    .states = .{ "loading", "playing" },
+    .resources = .{
+        // Both atlases are referenced by scenes/main.jsonc's `assets:`
+        // block, so the lazy-inference pass (src/lazy_inference.zig)
+        // flips the default to `lazy = true`. That emits
+        // `registerAtlasFromMemory` (parses JSON, defers PNG decode)
+        // instead of `loadAtlasFromMemory` in the generated main.zig —
+        // exactly the codepath the loading controller exercises below.
+        .{ .name = "sprites", .json = "assets/sprites.json", .texture = "assets/sprites.png" },
+        .{ .name = "jump", .json = "assets/jump.json", .texture = "assets/jump.png" },
+    },
+    .layers = .{
+        .{ .name = "world", .order = 0, .space = .world },
+        .{ .name = "ui", .order = 1, .space = .screen },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}
