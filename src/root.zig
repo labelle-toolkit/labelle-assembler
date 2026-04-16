@@ -7,6 +7,7 @@ const config = @import("config.zig");
 const cache = @import("cache.zig");
 const scanner = @import("scanner.zig");
 pub const scene_manifest = @import("scene_manifest.zig");
+pub const asset_validator = @import("asset_validator.zig");
 const main_zig = @import("main_zig.zig");
 pub const script_scanner = @import("script_scanner.zig");
 const build_files = @import("build_files.zig");
@@ -19,6 +20,7 @@ const gui_resolve = @import("gui_resolve.zig");
 test {
     _ = @import("plugin_manifest.zig");
     _ = @import("scene_manifest.zig");
+    _ = @import("asset_validator.zig");
 }
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
@@ -99,6 +101,13 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     defer allocator.free(scenes_target);
     const scene_manifests = try scene_manifest.parseSceneDir(allocator, scenes_target, jsonc_scene_names);
     defer scene_manifest.freeManifests(allocator, scene_manifests);
+
+    // Reject scene `assets:` entries that don't match a resource
+    // declared in project.labelle. Runs before any codegen so typos
+    // like `backgroud` surface as a build error against the scene file
+    // rather than a confusing "atlas not found" panic at runtime.
+    // Ticket #47.
+    try asset_validator.validateSceneAssets(allocator, scene_manifests, cfg.resources);
 
     // Copy all script files (including subdirectories) into target dir.
     // Then use ScriptScanner to parse directory-based state binding.

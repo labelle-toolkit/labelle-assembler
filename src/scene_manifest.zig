@@ -10,7 +10,8 @@
 ///
 /// This module deliberately does not validate asset names against
 /// `project.labelle` resources, nor offer Levenshtein "did you mean"
-/// suggestions — those belong to a follow-up ticket.
+/// suggestions for unknown top-level scene keys — asset-name
+/// validation lives in `asset_validator.zig` (ticket #47).
 const std = @import("std");
 
 /// Parsed manifest for a single scene file.
