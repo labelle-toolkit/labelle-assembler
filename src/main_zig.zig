@@ -56,7 +56,6 @@ fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}const ImageBackendAdapter = struct {{\n", .{indent});
     try w.print("{s}    const MAX_IMAGE_ASSETS = 1024;\n", .{indent});
     try w.print("{s}    var slots: [MAX_IMAGE_ASSETS]?BackendGfx.Texture = [_]?BackendGfx.Texture{{null}} ** MAX_IMAGE_ASSETS;\n", .{indent});
-    try w.print("{s}    var next_id: u32 = 0;\n", .{indent});
     try w.print("{s}\n", .{indent});
     try w.print("{s}    fn decode(\n", .{indent});
     try w.print("{s}        file_type: [:0]const u8,\n", .{indent});
@@ -68,16 +67,28 @@ fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}    }}\n", .{indent});
     try w.print("{s}\n", .{indent});
     try w.print("{s}    fn upload(decoded: engine.DecodedImage) anyerror!engine.AssetTexture {{\n", .{indent});
-    try w.print("{s}        if (next_id >= MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;\n", .{indent});
+    // Find a free slot BEFORE uploading to the GPU — otherwise a
+    // full slot table would leak the backend texture. Reusing the
+    // lowest free index means `unload`'s recycled slots come back
+    // into play (critical: `next_id`-style monotonic counters
+    // exhaust after MAX_IMAGE_ASSETS total uploads regardless of
+    // intervening unloads). O(MAX_IMAGE_ASSETS) scan is fine for
+    // a 1024-slot array — this path runs once per asset upload.
+    try w.print("{s}        var handle: u32 = MAX_IMAGE_ASSETS;\n", .{indent});
+    try w.print("{s}        for (slots, 0..) |slot, i| {{\n", .{indent});
+    try w.print("{s}            if (slot == null) {{\n", .{indent});
+    try w.print("{s}                handle = @intCast(i);\n", .{indent});
+    try w.print("{s}                break;\n", .{indent});
+    try w.print("{s}            }}\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
+    try w.print("{s}        if (handle == MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;\n", .{indent});
     try w.print("{s}        const backend_decoded: BackendGfx.DecodedImage = .{{\n", .{indent});
     try w.print("{s}            .pixels = decoded.pixels,\n", .{indent});
     try w.print("{s}            .width = decoded.width,\n", .{indent});
     try w.print("{s}            .height = decoded.height,\n", .{indent});
     try w.print("{s}        }};\n", .{indent});
     try w.print("{s}        const tex = try BackendGfx.uploadTexture(backend_decoded);\n", .{indent});
-    try w.print("{s}        const handle = next_id;\n", .{indent});
     try w.print("{s}        slots[handle] = tex;\n", .{indent});
-    try w.print("{s}        next_id += 1;\n", .{indent});
     try w.print("{s}        return handle;\n", .{indent});
     try w.print("{s}    }}\n", .{indent});
     try w.print("{s}\n", .{indent});
