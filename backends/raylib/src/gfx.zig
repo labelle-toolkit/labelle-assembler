@@ -141,13 +141,16 @@ pub fn decodeImage(
         const w = std.mem.readInt(u32, data[lrgba_magic.len..][0..4], .little);
         const h = std.mem.readInt(u32, data[lrgba_magic.len + 4 ..][0..4], .little);
         if (w == 0 or h == 0) return error.LoadFailed;
-        // Checked multiplication — `w * h * 4` could overflow `usize`
-        // on 32-bit targets or with adversarial dimensions.
+        // Checked arithmetic — `w * h * 4` and `header + pixels_len`
+        // both could overflow `usize` on 32-bit targets or with
+        // adversarial dimensions; a silent wrap would let the
+        // `data.len <` check pass incorrectly.
         const wh = std.math.mul(usize, @as(usize, w), @as(usize, h)) catch return error.LoadFailed;
         const pixels_len = std.math.mul(usize, wh, 4) catch return error.LoadFailed;
-        if (data.len < lrgba_header_len + pixels_len) return error.LoadFailed;
+        const end = std.math.add(usize, lrgba_header_len, pixels_len) catch return error.LoadFailed;
+        if (data.len < end) return error.LoadFailed;
         const owned = try allocator.alloc(u8, pixels_len);
-        @memcpy(owned, data[lrgba_header_len .. lrgba_header_len + pixels_len]);
+        @memcpy(owned, data[lrgba_header_len..end]);
         return .{ .pixels = owned, .width = w, .height = h };
     }
 
