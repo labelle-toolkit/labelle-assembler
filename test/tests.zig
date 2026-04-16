@@ -1041,6 +1041,14 @@ pub const IMAGE_BACKEND_WIRING = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var slots: [MAX_IMAGE_ASSETS]?BackendGfx.Texture") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "slots[handle] = tex;") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (slots[texture]) |tex|") != null);
+
+        // The exhaustion guard MUST appear before `uploadTexture` in
+        // the emitted `upload` body: if the table is full and we
+        // upload first, we leak a GPU resource (the handle is
+        // discarded with the error return).
+        const guard_idx = std.mem.indexOf(u8, main_zig, "if (next_id >= MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;") orelse return error.GuardMissing;
+        const upload_call_idx = std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(backend_decoded)") orelse return error.UploadCallMissing;
+        try std.testing.expect(guard_idx < upload_call_idx);
     }
 
     test "adapter decode marshals engine.DecodedImage from backend DecodedImage" {

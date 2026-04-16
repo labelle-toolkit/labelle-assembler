@@ -68,13 +68,13 @@ fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}    }}\n", .{indent});
     try w.print("{s}\n", .{indent});
     try w.print("{s}    fn upload(decoded: engine.DecodedImage) anyerror!engine.AssetTexture {{\n", .{indent});
+    try w.print("{s}        if (next_id >= MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;\n", .{indent});
     try w.print("{s}        const backend_decoded: BackendGfx.DecodedImage = .{{\n", .{indent});
     try w.print("{s}            .pixels = decoded.pixels,\n", .{indent});
     try w.print("{s}            .width = decoded.width,\n", .{indent});
     try w.print("{s}            .height = decoded.height,\n", .{indent});
     try w.print("{s}        }};\n", .{indent});
     try w.print("{s}        const tex = try BackendGfx.uploadTexture(backend_decoded);\n", .{indent});
-    try w.print("{s}        if (next_id >= MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;\n", .{indent});
     try w.print("{s}        const handle = next_id;\n", .{indent});
     try w.print("{s}        slots[handle] = tex;\n", .{indent});
     try w.print("{s}        next_id += 1;\n", .{indent});
