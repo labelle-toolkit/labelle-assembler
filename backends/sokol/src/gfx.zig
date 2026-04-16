@@ -333,6 +333,32 @@ pub fn drawRectangleRec(rec: Rectangle, tint: Color) void {
     sgl.end();
 }
 
+/// Draw a filled rectangle rotated around (cx, cy). `rotation` is in
+/// **radians** (matches `sgl.rotate` and the retained-engine Shape
+/// rotation convention) — intentionally distinct from `drawTexturePro`
+/// above, which takes **degrees** for raylib-parity reasons. The
+/// rectangle is centered on (cx, cy) — width/2 on each side.
+pub fn drawRectangleRotated(cx: f32, cy: f32, width: f32, height: f32, rotation: f32, tint: Color) void {
+    const pivot_ndc_x = toNdcX(cx);
+    const pivot_ndc_y = toNdcY(cy);
+    const half_w_ndc = toNdcX(cx + width * 0.5) - pivot_ndc_x;
+    const half_h_ndc = pivot_ndc_y - toNdcY(cy + height * 0.5);
+
+    sgl.pushMatrix();
+    sgl.translate(pivot_ndc_x, pivot_ndc_y, 0);
+    sgl.rotate(rotation, 0, 0, 1);
+
+    sgl.beginQuads();
+    sgl.c4b(tint.r, tint.g, tint.b, tint.a);
+    sgl.v2f(-half_w_ndc, half_h_ndc);
+    sgl.v2f(half_w_ndc, half_h_ndc);
+    sgl.v2f(half_w_ndc, -half_h_ndc);
+    sgl.v2f(-half_w_ndc, -half_h_ndc);
+    sgl.end();
+
+    sgl.popMatrix();
+}
+
 /// Draw a rectangle outline. `line_thick` is accepted for API compatibility
 /// with raylib's drawRectangleLinesEx but is ignored — sgl LINES always
 /// render 1 pixel thick. For thicker outlines, the caller can compose four
@@ -493,11 +519,37 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
 /// `DecodedImage` whose `pixels` buffer is allocated from `allocator` —
 /// the caller owns it and MUST free it via the same allocator on both
 /// the success and the discard paths (see `uploadTexture`).
+/// "LRGBA" + 3 padding bytes (8-byte alignment). Followed by u32 LE
+/// width, u32 LE height, then width*height*4 bytes of RGBA pixels.
+/// Produced by `labelle build`'s pre-bake step to skip PNG decode on
+/// cold start. See labelle-cli/src/cli/bake.zig.
+const lrgba_magic = "LRGBA\x00\x00\x00";
+const lrgba_header_len = lrgba_magic.len + 8;
+
 pub fn decodeImage(
     _: [:0]const u8,
     data: []const u8,
     allocator: std.mem.Allocator,
 ) !DecodedImage {
+    // Fast path: pre-baked LRGBA container. No PNG decode needed — the
+    // bake step already ran stb_image at build time.
+    if (data.len >= lrgba_header_len and std.mem.eql(u8, data[0..lrgba_magic.len], lrgba_magic)) {
+        const w = std.mem.readInt(u32, data[lrgba_magic.len..][0..4], .little);
+        const h = std.mem.readInt(u32, data[lrgba_magic.len + 4 ..][0..4], .little);
+        if (w == 0 or h == 0) return error.LoadFailed;
+        // Checked arithmetic — `w * h * 4` and `header + pixels_len`
+        // both could overflow `usize` on 32-bit targets or with
+        // adversarial dimensions; a silent wrap would let the
+        // `data.len <` check pass incorrectly.
+        const wh = std.math.mul(usize, @as(usize, w), @as(usize, h)) catch return error.LoadFailed;
+        const pixels_len = std.math.mul(usize, wh, 4) catch return error.LoadFailed;
+        const end = std.math.add(usize, lrgba_header_len, pixels_len) catch return error.LoadFailed;
+        if (data.len < end) return error.LoadFailed;
+        const owned = try allocator.alloc(u8, pixels_len);
+        @memcpy(owned, data[lrgba_header_len..end]);
+        return .{ .pixels = owned, .width = w, .height = h };
+    }
+
     var width: c_int = 0;
     var height: c_int = 0;
     var channels: c_int = 0;

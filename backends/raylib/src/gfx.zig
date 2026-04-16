@@ -123,11 +123,37 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
 /// the result to RGBA8, copies the pixels into an allocator-owned buffer
 /// and frees the raylib-owned image. The caller owns the returned
 /// `pixels` slice and frees it on both the success and the discard path.
+/// "LRGBA" + 3 padding bytes (8-byte alignment). Followed by u32 LE
+/// width, u32 LE height, then width*height*4 bytes of RGBA pixels.
+/// Produced by `labelle build`'s pre-bake step to skip PNG decode on
+/// cold start. See labelle-cli/src/cli/bake.zig.
+const lrgba_magic = "LRGBA\x00\x00\x00";
+const lrgba_header_len = lrgba_magic.len + 8;
+
 pub fn decodeImage(
     file_type: [:0]const u8,
     data: []const u8,
     allocator: std.mem.Allocator,
 ) !DecodedImage {
+    // Fast path: pre-baked LRGBA container. No PNG decode needed — the
+    // bake step already ran stb_image at build time.
+    if (data.len >= lrgba_header_len and std.mem.eql(u8, data[0..lrgba_magic.len], lrgba_magic)) {
+        const w = std.mem.readInt(u32, data[lrgba_magic.len..][0..4], .little);
+        const h = std.mem.readInt(u32, data[lrgba_magic.len + 4 ..][0..4], .little);
+        if (w == 0 or h == 0) return error.LoadFailed;
+        // Checked arithmetic — `w * h * 4` and `header + pixels_len`
+        // both could overflow `usize` on 32-bit targets or with
+        // adversarial dimensions; a silent wrap would let the
+        // `data.len <` check pass incorrectly.
+        const wh = std.math.mul(usize, @as(usize, w), @as(usize, h)) catch return error.LoadFailed;
+        const pixels_len = std.math.mul(usize, wh, 4) catch return error.LoadFailed;
+        const end = std.math.add(usize, lrgba_header_len, pixels_len) catch return error.LoadFailed;
+        if (data.len < end) return error.LoadFailed;
+        const owned = try allocator.alloc(u8, pixels_len);
+        @memcpy(owned, data[lrgba_header_len..end]);
+        return .{ .pixels = owned, .width = w, .height = h };
+    }
+
     var image = rl.loadImageFromMemory(file_type, data) catch return error.LoadFailed;
     defer rl.unloadImage(image);
 

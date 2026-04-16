@@ -83,6 +83,31 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     defer allocator.free(mutable_resources);
     cfg.resources = mutable_resources;
 
+    // Swap `.texture = "...png"` to the pre-baked `.rgba` sibling
+    // when the CLI's bake step produced one. The runtime decoder
+    // detects the LRGBA magic and skips stb_image entirely. Leaves
+    // the path untouched when no sibling exists so `--no-bake` and
+    // fresh checkouts still build from the source PNG.
+    var rgba_path_allocs: std.ArrayListUnmanaged([]const u8) = .{};
+    defer {
+        for (rgba_path_allocs.items) |s| allocator.free(s);
+        rgba_path_allocs.deinit(allocator);
+    }
+    for (mutable_resources) |*res| {
+        if (res.texture.len == 0) continue;
+        if (!std.mem.endsWith(u8, res.texture, ".png")) continue;
+        const rgba_rel = try std.mem.concat(allocator, u8, &.{ res.texture[0 .. res.texture.len - 4], ".rgba" });
+        errdefer allocator.free(rgba_rel);
+        const abs = try std.fs.path.join(allocator, &.{ game_dir, rgba_rel });
+        defer allocator.free(abs);
+        std.fs.cwd().access(abs, .{}) catch {
+            allocator.free(rgba_rel);
+            continue;
+        };
+        try rgba_path_allocs.append(allocator, rgba_rel);
+        res.texture = rgba_rel;
+    }
+
     const cwd = std.fs.cwd();
 
     // Target subfolder: .labelle/raylib_desktop/, .labelle/sokol_ios/, etc.
