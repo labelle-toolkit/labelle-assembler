@@ -7,12 +7,19 @@
     // `game.scenes.get("main").?.assets`.
     "name": "main",
     "assets": ["sprites", "jump"],
+    // World coords are Y-up after the centerOnScreen call in
+    // scripts/playing/main_scene.zig — origin at the bottom-left of
+    // the 800×600 viewport. (550, 450) and (650, 450) place both
+    // sprites in the TOP-RIGHT quadrant, side by side, so the smoke
+    // test's "sprites visible" assertion is unambiguous: anything
+    // appearing in any other quadrant means the asset-streaming
+    // pipeline ate the position somewhere.
     "entities": [
         // One sprite from the "sprites" atlas — proves a late-loaded
         // texture actually made it to the GPU.
         {
             "components": {
-                "Position": { "x": 300, "y": 300 },
+                "Position": { "x": 550, "y": 450 },
                 "Sprite": {
                     "sprite_name": "player.png",
                     "pivot": "center",
@@ -27,7 +34,7 @@
         // decoded and uploaded independently.
         {
             "components": {
-                "Position": { "x": 500, "y": 300 },
+                "Position": { "x": 650, "y": 450 },
                 "Sprite": {
                     "sprite_name": "jump_0001.png",
                     "pivot": "center",
