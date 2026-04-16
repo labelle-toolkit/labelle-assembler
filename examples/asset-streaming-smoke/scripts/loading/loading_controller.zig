@@ -45,6 +45,14 @@
 
 const std = @import("std");
 
+// Bind the controller to the "loading" state explicitly. Without this
+// declaration the assembler's script runner imports the file at global
+// scope, so `tick` would fire in every state — including `playing`,
+// where `ready_count == target_assets.len` would still hold and
+// trigger `queueSceneChange("main")` every frame, infinitely
+// restarting the main scene.
+pub const game_states = .{"loading"};
+
 pub fn tick(game: anytype, _: f32) void {
     // Look up the main scene's asset manifest. This is the exact
     // slice emitted by the assembler into `SceneAssetManifests.main`
@@ -97,8 +105,12 @@ pub fn tick(game: anytype, _: f32) void {
     // Flip to the main scene + playing state when every atlas is
     // ready. Use `queueSceneChange` rather than a direct `setScene`
     // so the transition fires on a clean frame boundary — the game
-    // loop drains `pending_scene_change` right after tick.
-    if (target_assets.len > 0 and ready_count == target_assets.len) {
+    // loop drains `pending_scene_change` right after tick. The empty-
+    // manifest case (`target_assets.len == 0`) is valid per the
+    // README's "instant-load" behavior — `ready_count == 0 == len`
+    // trips the transition immediately, which is exactly what a
+    // manifestless main scene should do.
+    if (ready_count == target_assets.len) {
         game.setState("playing");
         game.queueSceneChange("main");
     }

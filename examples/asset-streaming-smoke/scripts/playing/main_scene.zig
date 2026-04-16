@@ -9,6 +9,13 @@
 // is gone, the streaming round-trip worked: lazy register -> per-
 // frame decode -> GPU upload -> atlas sprite lookup -> draw.
 
+// Bound to the "playing" state so the Escape handler doesn't fire
+// during loading. The key check is harmless in other states, but
+// adhering to the state-driven model keeps this script aligned with
+// `loading_controller` and the convention the engine enforces for
+// script binding.
+pub const game_states = .{"playing"};
+
 pub fn tick(game: anytype, _: f32) void {
     if (game.isKeyPressed(.escape)) {
         game.quit();
