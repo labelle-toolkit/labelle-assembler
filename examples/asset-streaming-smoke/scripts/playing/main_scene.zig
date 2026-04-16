@@ -29,20 +29,32 @@ pub fn State(comptime EcsBackend: type) type {
 
 pub fn tick(game: anytype, state: anytype, _: anytype, _: f32) void {
     // One-shot camera centering — see comment in scenes/main.jsonc.
+    // Use the explicit design dimensions (400, 300 = half of the
+    // 800×600 declared in project.labelle) instead of
+    // `centerOnScreen()`, which queries the backend's physical
+    // pixel dims. On Android the framebuffer is the tablet's native
+    // resolution (e.g. 2000×1200 landscape), so centerOnScreen
+    // would put the camera at (1000, 600) — way outside the design
+    // canvas — and every sprite would render off-screen.
     if (!state.centered) {
-        game.getCamera().centerOnScreen();
+        game.getCamera().setPosition(400, 300);
         state.centered = true;
     }
 
     state.frames += 1;
-    // Take a screenshot 30 frames into "playing" so atlases are
-    // decoded, sprites are uploaded, and at least one full render
-    // cycle has flushed. Saves to /tmp/smoke-test.png and quits so
-    // CI-style runs (and the human viewer) get a reproducible image.
-    if (!state.screenshotted and state.frames >= 30) {
-        window.takeScreenshot("smoke-test.png");
-        state.screenshotted = true;
-        game.quit();
+
+    // Backends that expose `takeScreenshot` (raylib desktop) save a
+    // reproducible PNG 30 frames into "playing" and quit, so CI runs
+    // and the human viewer get an artifact without needing a window
+    // manager. Sokol (Android, WASM) has no `takeScreenshot` hook —
+    // skip the artifact path and just loop forever so a user can
+    // visually verify the animation on-device.
+    if (@hasDecl(window, "takeScreenshot")) {
+        if (!state.screenshotted and state.frames >= 30) {
+            window.takeScreenshot("smoke-test.png");
+            state.screenshotted = true;
+            game.quit();
+        }
     }
 
     if (game.isKeyPressed(.escape)) {
