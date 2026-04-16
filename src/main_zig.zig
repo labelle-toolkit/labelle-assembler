@@ -78,6 +78,19 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
             try w.print("    g.registerSceneSimple(\"{s}\", jsonc_{s}_loader);\n", .{ name, ident });
         }
 
+        // Attach parsed asset manifests (Asset Streaming RFC #437 /
+        // labelle-engine#445). The comptime `SceneAssetManifests` struct is
+        // emitted into this file by `writeSceneAssetManifests` — each
+        // `entries[i]` pairs the original scene name with the slice declared
+        // in its .jsonc `"assets": [...]` block. Scenes without a manifest
+        // get an empty slice, which is the legacy default, so this is a
+        // no-op for back-compat scenes. `catch {}` is defensive — the
+        // setter only fails on SceneNotFound, which can't happen here
+        // because the preceding loop registered every name in the list.
+        try w.writeAll("    inline for (SceneAssetManifests.entries) |scene_asset_entry| {\n");
+        try w.writeAll("        g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets) catch {};\n");
+        try w.writeAll("    }\n");
+
         const initial = cfg.initial_scene orelse jsonc_scene_names[0];
         try w.print("    try g.setScene(\"{s}\");\n", .{initial});
         // Set initial game state (first declared state in project.labelle)
@@ -174,6 +187,13 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
             const ident = pathToIdent(name, &jsonc_ident_buf);
             try w.print("    g.registerSceneSimple(\"{s}\", jsonc_{s}_loader);\n", .{ name, ident });
         }
+
+        // Attach parsed asset manifests — mirrors the loop-based setup path.
+        // See `buildSetupCode` for the rationale; this block exists so
+        // callback-based backends (sokol, wasm) get the same wiring.
+        try w.writeAll("    inline for (SceneAssetManifests.entries) |scene_asset_entry| {\n");
+        try w.writeAll("        g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets) catch {};\n");
+        try w.writeAll("    }\n");
 
         const initial = cfg.initial_scene orelse jsonc_scene_names[0];
         try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
