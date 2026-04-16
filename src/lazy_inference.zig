@@ -38,27 +38,29 @@ const scene_manifest = @import("scene_manifest.zig");
 /// place. The caller (`generate` in root.zig) is expected to have
 /// duplicated the parsed slice before calling, since the parsed ZON
 /// memory may be `[]const ResourceDef` in some call paths.
+///
+/// Complexity: O(Resources + TotalSceneAssets). We build a single
+/// `StringHashMap` of every referenced asset name once, then look each
+/// resource up in constant time — a plain nested scan would be
+/// O(Resources × Scenes × Assets), which grows uncomfortably for larger
+/// projects and is unnecessary given how cheap the map is.
 pub fn resolveLazyDefaults(
+    allocator: std.mem.Allocator,
     resources: []config.ResourceDef,
     manifests: []const scene_manifest.SceneManifest,
-) void {
-    for (resources) |*res| {
-        if (res.lazy != null) continue; // Explicit — user wins.
-        res.lazy = isReferencedByAnyScene(res.name, manifests);
-    }
-}
-
-/// Returns true if any scene manifest's `assets:` list contains `name`.
-fn isReferencedByAnyScene(
-    name: []const u8,
-    manifests: []const scene_manifest.SceneManifest,
-) bool {
+) !void {
+    var referenced = std.StringHashMap(void).init(allocator);
+    defer referenced.deinit();
     for (manifests) |m| {
         for (m.assets) |asset| {
-            if (std.mem.eql(u8, asset, name)) return true;
+            try referenced.put(asset, {});
         }
     }
-    return false;
+
+    for (resources) |*res| {
+        if (res.lazy != null) continue; // Explicit — user wins.
+        res.lazy = referenced.contains(res.name);
+    }
 }
 
 // ───── Tests ──────────────────────────────────────────────────────────
@@ -71,7 +73,7 @@ test "explicit lazy=true is preserved even when unreferenced" {
         .{ .name = "ignored_by_scene", .lazy = true },
     };
     const manifests = [_]SceneManifest{};
-    resolveLazyDefaults(&resources, &manifests);
+    try resolveLazyDefaults(std.testing.allocator, &resources, &manifests);
     try std.testing.expectEqual(@as(?bool, true), resources[0].lazy);
 }
 
@@ -83,7 +85,7 @@ test "explicit lazy=false is preserved even when referenced" {
     const manifests = [_]SceneManifest{
         .{ .name = "menu", .assets = &assets },
     };
-    resolveLazyDefaults(&resources, &manifests);
+    try resolveLazyDefaults(std.testing.allocator, &resources, &manifests);
     try std.testing.expectEqual(@as(?bool, false), resources[0].lazy);
 }
 
@@ -95,7 +97,7 @@ test "default + referenced-by-scene → lazy" {
     const manifests = [_]SceneManifest{
         .{ .name = "menu", .assets = &assets },
     };
-    resolveLazyDefaults(&resources, &manifests);
+    try resolveLazyDefaults(std.testing.allocator, &resources, &manifests);
     try std.testing.expectEqual(@as(?bool, true), resources[0].lazy);
 }
 
@@ -104,7 +106,7 @@ test "default + not-referenced → eager (back-compat)" {
         .{ .name = "legacy_atlas" },
     };
     const manifests = [_]SceneManifest{};
-    resolveLazyDefaults(&resources, &manifests);
+    try resolveLazyDefaults(std.testing.allocator, &resources, &manifests);
     try std.testing.expectEqual(@as(?bool, false), resources[0].lazy);
 }
 
@@ -119,7 +121,7 @@ test "default + empty assets across scenes → eager (back-compat)" {
         .{ .name = "menu", .assets = empty },
         .{ .name = "gameplay", .assets = empty },
     };
-    resolveLazyDefaults(&resources, &manifests);
+    try resolveLazyDefaults(std.testing.allocator, &resources, &manifests);
     try std.testing.expectEqual(@as(?bool, false), resources[0].lazy);
 }
 
@@ -134,7 +136,7 @@ test "mixed: some referenced, some explicit, some unreferenced" {
     const manifests = [_]SceneManifest{
         .{ .name = "menu", .assets = &assets },
     };
-    resolveLazyDefaults(&resources, &manifests);
+    try resolveLazyDefaults(std.testing.allocator, &resources, &manifests);
     try std.testing.expectEqual(@as(?bool, true), resources[0].lazy); // defaulted → referenced → lazy
     try std.testing.expectEqual(@as(?bool, false), resources[1].lazy); // defaulted → unreferenced → eager
     try std.testing.expectEqual(@as(?bool, true), resources[2].lazy); // explicit kept
@@ -155,7 +157,7 @@ test "scene referencing an undeclared resource does not affect unrelated default
     const manifests = [_]SceneManifest{
         .{ .name = "menu", .assets = &assets },
     };
-    resolveLazyDefaults(&resources, &manifests);
+    try resolveLazyDefaults(std.testing.allocator, &resources, &manifests);
     try std.testing.expectEqual(@as(?bool, true), resources[0].lazy);
     try std.testing.expectEqual(@as(?bool, false), resources[1].lazy);
 }

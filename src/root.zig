@@ -126,7 +126,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     // list, or to `false` (eager) otherwise. The eager fallback keeps
     // unmigrated projects — the ones without `assets:` blocks — using
     // the old always-eager behavior. Ticket #48.
-    lazy_inference.resolveLazyDefaults(mutable_resources, scene_manifests);
+    try lazy_inference.resolveLazyDefaults(allocator, mutable_resources, scene_manifests);
 
     // Copy all script files (including subdirectories) into target dir.
     // Then use ScriptScanner to parse directory-based state binding.

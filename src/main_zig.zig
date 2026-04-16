@@ -47,11 +47,13 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     if (cfg.resources.len > 0) {
         try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
         for (cfg.resources) |res| {
-            // `null` means the default-inference pass hasn't run or couldn't
-            // decide — fall back to the new default (lazy) so the generated
-            // binary still links. The generate() pipeline always runs the
-            // inference pass, so this is defensive.
-            const is_lazy = res.lazy orelse true;
+            // `null` means the default-inference pass hasn't run (e.g. a
+            // direct test call into `generateMainZigFromTemplate`). Fall
+            // back to EAGER so an unmigrated-project code path matches
+            // the back-compat rule in `lazy_inference.resolveLazyDefaults`
+            // — a defaulted + unreferenced resource stays eager so legacy
+            // projects keep decoding their atlases at startup.
+            const is_lazy = res.lazy orelse false;
             const fn_name = if (is_lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
             try w.print("    try g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ fn_name, res.name, res.json, res.texture });
         }

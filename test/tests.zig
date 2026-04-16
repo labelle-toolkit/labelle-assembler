@@ -1090,13 +1090,14 @@ pub const RESOURCES = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"characters\"") == null);
     }
 
-    test "lazy=null falls back to lazy at codegen time (default flip)" {
-        // When `generate()` hasn't run its default-inference pass,
-        // `generateMainZigFromTemplate` still needs to pick a default.
-        // Ticket #48 makes that default `true` (lazy). This mirrors
-        // the behavior users get when they omit `lazy` entirely and
-        // the resource is referenced by a scene — the normal flow
-        // pre-resolves the null to true in generate().
+    test "lazy=null falls back to eager at codegen time (matches back-compat rule)" {
+        // When `generate()` hasn't run its default-inference pass (e.g.
+        // a direct test call into `generateMainZigFromTemplate`), the
+        // codegen fallback picks EAGER. This matches the back-compat
+        // rule in `lazy_inference.resolveLazyDefaults`: a resource with
+        // `lazy = null` that isn't referenced by any scene stays eager
+        // so legacy projects keep decoding their atlases at startup.
+        // Picking `lazy` here would silently break unmigrated projects.
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
             .backend = .raylib,
@@ -1107,7 +1108,8 @@ pub const RESOURCES = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerAtlasFromMemory(\"characters\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"characters\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerAtlasFromMemory(\"characters\"") == null);
     }
 };
 

@@ -28,17 +28,29 @@ pub const ValidationError = error{
     OutOfMemory,
 };
 
+/// Maximum name length we'll DP with a stack buffer. Resource names in
+/// `project.labelle` are identifiers like `"background"` / `"ship"` — in
+/// practice well under 64 chars. Anything longer falls back to the heap
+/// path so the algorithm stays correct for pathological inputs.
+const STACK_DP_CAP: usize = 64;
+
 /// Compute the Levenshtein edit distance between `a` and `b`, capped
 /// at `cap`. Returns `cap` if the true distance is ≥ `cap`, which is
 /// all we need for threshold checks — callers only care whether a
-/// match is "close enough". Allocator is used for the DP row buffers.
+/// match is "close enough".
+///
+/// The two DP rows live on the stack when `b.len + 1 <= STACK_DP_CAP`,
+/// which covers every realistic resource name and avoids per-call heap
+/// allocation in the common typo path (one call per declared resource,
+/// once per bad scene entry). `allocator` is only touched as the
+/// fallback for longer inputs.
 pub fn levenshteinCapped(
     allocator: std.mem.Allocator,
     a: []const u8,
     b: []const u8,
     cap: usize,
 ) !usize {
-    // Trivial cases avoid the DP allocation entirely.
+    // Trivial cases avoid the DP entirely.
     if (a.len == 0) return @min(b.len, cap);
     if (b.len == 0) return @min(a.len, cap);
     // If the length difference alone exceeds the cap, we can't do
@@ -47,17 +59,33 @@ pub fn levenshteinCapped(
     const len_diff = if (a.len > b.len) a.len - b.len else b.len - a.len;
     if (len_diff >= cap) return cap;
 
-    // Two-row DP. `prev` holds row i-1, `curr` holds row i.
-    var prev = try allocator.alloc(usize, b.len + 1);
-    defer allocator.free(prev);
-    var curr = try allocator.alloc(usize, b.len + 1);
-    defer allocator.free(curr);
+    const row_len = b.len + 1;
 
-    for (0..b.len + 1) |j| prev[j] = j;
+    // Fast path: both rows fit on the stack. `row_len * 2` slots total
+    // — one for `prev`, one for `curr` — so the inline buffer is sized
+    // for the worst case at `STACK_DP_CAP`.
+    var stack_buf: [STACK_DP_CAP * 2]usize = undefined;
+
+    var prev: []usize = undefined;
+    var curr: []usize = undefined;
+    var heap_slab: ?[]usize = null;
+    defer if (heap_slab) |slab| allocator.free(slab);
+
+    if (row_len <= STACK_DP_CAP) {
+        prev = stack_buf[0..row_len];
+        curr = stack_buf[row_len .. row_len * 2];
+    } else {
+        const slab = try allocator.alloc(usize, row_len * 2);
+        heap_slab = slab;
+        prev = slab[0..row_len];
+        curr = slab[row_len .. row_len * 2];
+    }
+
+    for (0..row_len) |j| prev[j] = j;
 
     for (1..a.len + 1) |i| {
         curr[0] = i;
-        for (1..b.len + 1) |j| {
+        for (1..row_len) |j| {
             const cost: usize = if (a[i - 1] == b[j - 1]) 0 else 1;
             const del = prev[j] + 1;
             const ins = curr[j - 1] + 1;
