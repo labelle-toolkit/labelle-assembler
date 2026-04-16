@@ -47,7 +47,12 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     if (cfg.resources.len > 0) {
         try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
         for (cfg.resources) |res| {
-            const fn_name = if (res.lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
+            // `null` means the default-inference pass hasn't run or couldn't
+            // decide — fall back to the new default (lazy) so the generated
+            // binary still links. The generate() pipeline always runs the
+            // inference pass, so this is defensive.
+            const is_lazy = res.lazy orelse true;
+            const fn_name = if (is_lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
             try w.print("    try g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ fn_name, res.name, res.json, res.texture });
         }
         try w.writeByte('\n');
@@ -139,7 +144,10 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
     if (cfg.resources.len > 0) {
         try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
         for (cfg.resources) |res| {
-            const fn_name = if (res.lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
+            // See buildSetupCode for the rationale — null means "fall back
+            // to the post-parse default", which is lazy.
+            const is_lazy = res.lazy orelse true;
+            const fn_name = if (is_lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
             try w.print("    g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas: {s}\");\n", .{ fn_name, res.name, res.json, res.texture, res.name });
         }
         try w.writeByte('\n');

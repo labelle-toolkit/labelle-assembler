@@ -1038,13 +1038,19 @@ pub const LAYERS = struct {
 
 pub const RESOURCES = struct {
     test "generates embedded atlas loading from resource config" {
+        // Resources here are passed with explicit `lazy = false` so the
+        // emitted code path uses `loadAtlasFromMemory` (eager). Without
+        // the explicit override, ticket #48's default-flip pass would
+        // resolve null → lazy and the emitted call site would be
+        // `registerAtlasFromMemory`. That separate default-flip
+        // behavior is covered by the LAZY_DEFAULTS test block below.
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
             .resources = &.{
-                .{ .name = "characters", .json = "assets/characters.json", .texture = "assets/characters.png" },
-                .{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png" },
+                .{ .name = "characters", .json = "assets/characters.json", .texture = "assets/characters.png", .lazy = false },
+                .{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png", .lazy = false },
             },
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
@@ -1067,6 +1073,41 @@ pub const RESOURCES = struct {
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory") == null);
+    }
+
+    test "explicit lazy=true emits registerAtlasFromMemory" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "characters", .json = "assets/characters.json", .texture = "assets/characters.png", .lazy = true },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerAtlasFromMemory(\"characters\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"characters\"") == null);
+    }
+
+    test "lazy=null falls back to lazy at codegen time (default flip)" {
+        // When `generate()` hasn't run its default-inference pass,
+        // `generateMainZigFromTemplate` still needs to pick a default.
+        // Ticket #48 makes that default `true` (lazy). This mirrors
+        // the behavior users get when they omit `lazy` entirely and
+        // the resource is referenced by a scene — the normal flow
+        // pre-resolves the null to true in generate().
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "characters", .json = "assets/characters.json", .texture = "assets/characters.png" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerAtlasFromMemory(\"characters\"") != null);
     }
 };
 
