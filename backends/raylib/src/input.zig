@@ -49,11 +49,13 @@ pub fn getTouchCount() u32 {
 }
 
 pub fn getTouchX(index: u32) f32 {
-    return @floatFromInt(rl.getTouchX(@intCast(index)));
+    // raylib's getTouchX/Y are no-arg shortcuts for touch 0; for
+    // multi-touch the index-aware call is getTouchPosition(index).
+    return rl.getTouchPosition(@intCast(index)).x;
 }
 
 pub fn getTouchY(index: u32) f32 {
-    return @floatFromInt(rl.getTouchY(@intCast(index)));
+    return rl.getTouchPosition(@intCast(index)).y;
 }
 
 pub fn getTouchId(index: u32) u64 {
