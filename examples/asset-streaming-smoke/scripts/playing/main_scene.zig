@@ -28,16 +28,14 @@ pub fn State(comptime EcsBackend: type) type {
 }
 
 pub fn tick(game: anytype, state: anytype, _: anytype, _: f32) void {
-    // One-shot camera centering — see comment in scenes/main.jsonc.
-    // Use the explicit design dimensions (400, 300 = half of the
-    // 800×600 declared in project.labelle) instead of
-    // `centerOnScreen()`, which queries the backend's physical
-    // pixel dims. On Android the framebuffer is the tablet's native
-    // resolution (e.g. 2000×1200 landscape), so centerOnScreen
-    // would put the camera at (1000, 600) — way outside the design
+    // One-shot camera centering on the DESIGN canvas (the size
+    // declared in project.labelle), not the physical framebuffer.
+    // On Android the framebuffer is the tablet's native resolution
+    // (e.g. 2000×1200 landscape), so `centerOnScreen` would put the
+    // camera at (1000, 600) — miles outside the 800×600 design
     // canvas — and every sprite would render off-screen.
     if (!state.centered) {
-        game.getCamera().setPosition(400, 300);
+        game.getCamera().centerOnDesign();
         state.centered = true;
     }
 

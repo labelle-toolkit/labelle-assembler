@@ -160,6 +160,19 @@ pub fn setDesignSize(w: i32, h: i32) void {
     recomputeFitScale();
 }
 
+/// Optional accessors used by `Camera.centerOnDesign()` (labelle-gfx
+/// camera module). Distinct from `getScreenWidth/Height`, which
+/// return the physical framebuffer — design dims are the project's
+/// declared canvas size, scaled to fit the framebuffer with
+/// pillarbox/letterbox.
+pub fn getDesignWidth() i32 {
+    return design_w;
+}
+
+pub fn getDesignHeight() i32 {
+    return design_h;
+}
+
 // ── Camera state ────────────────────────────────────────────────────
 
 var active_camera: Camera2D = .{};
