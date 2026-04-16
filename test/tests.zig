@@ -842,6 +842,42 @@ pub const SCENE_ASSET_MANIFESTS = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"path\\\\asset\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"say\\\"hi\"") != null);
     }
+
+    test "setup emits setSceneAssets loop driven by SceneAssetManifests.entries (raylib)" {
+        const jsonc_scenes = &[_][]const u8{ "menu", "gameplay" };
+        const manifests = [_]SceneManifest{
+            .{ .name = "menu", .assets = &[_][]const u8{"background"} },
+            .{ .name = "gameplay", .assets = &[_][]const u8{ "ship", "rooms" } },
+        };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // The setup block should thread SceneAssetManifests.entries into
+        // SceneEntry.assets via the engine's setSceneAssets helper. See
+        // labelle-engine#445 for the consumer.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "inline for (SceneAssetManifests.entries) |scene_asset_entry|") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets)") != null);
+    }
+
+    test "callback-init path also emits setSceneAssets loop (sokol)" {
+        const jsonc_scenes = &[_][]const u8{"menu"};
+        const manifests = [_]SceneManifest{
+            .{ .name = "menu", .assets = &[_][]const u8{"background"} },
+        };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "inline for (SceneAssetManifests.entries) |scene_asset_entry|") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets)") != null);
+    }
 };
 
 // ── Scripts ──────────────────────────────────────────────────────────
