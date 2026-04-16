@@ -880,6 +880,206 @@ pub const SCENE_ASSET_MANIFESTS = struct {
     }
 };
 
+// ── Image-backend wiring (Asset Streaming RFC, ticket #53) ───────────
+//
+// Companion to labelle-engine#452 (engine.ImageLoader.setBackend slot)
+// and labelle-assembler#51 (backends expose decodeImage /
+// uploadTexture / unloadTexture). These tests lock in the codegen
+// that threads the engine's image-asset loader into the assembled
+// backend at Game.init.
+
+pub const IMAGE_BACKEND_WIRING = struct {
+    // Assertions shared across every backend variant we generate for.
+    // Every assembler-generated `main.zig` MUST ship:
+    //   * the three `ImageBackendAdapter` member functions
+    //     (decode/upload/unload) so `setBackend`'s function-pointer
+    //     struct literal is well-typed;
+    //   * the `engine.ImageLoader.setBackend(...)` call itself; AND
+    //   * that call must appear BEFORE any `registerAtlasFromMemory`
+    //     / `loadAtlasFromMemory` / scene / script code that could
+    //     reach `AssetCatalog.acquire` on an image asset. If any of
+    //     those fire with the slot still null, the engine surfaces
+    //     `error.ImageBackendNotInitialized` at the entry's failed
+    //     state — clean but game-breaking.
+    fn expectImageBackendWiring(main_zig: []const u8) !void {
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const ImageBackendAdapter = struct {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn decode(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn upload(decoded: engine.DecodedImage) anyerror!engine.AssetTexture") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn unload(texture: engine.AssetTexture) void") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.decodeImage(file_type, data, alloc)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(backend_decoded)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.unloadTexture(tex)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.ImageLoader.setBackend(.{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".decode = ImageBackendAdapter.decode") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".upload = ImageBackendAdapter.upload") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".unload = ImageBackendAdapter.unload") != null);
+    }
+
+    test "buildSetupCode emits setBackend + adapters (raylib)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try expectImageBackendWiring(main_zig);
+    }
+
+    test "buildCallbackInitCode emits setBackend + adapters (sokol)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try expectImageBackendWiring(main_zig);
+    }
+
+    // The remaining three backends go through the same `buildSetupCode`
+    // path as raylib (see `use_callback_lifecycle` in
+    // `src/main_zig.zig` — only `.sokol` or `.wasm` flip to the
+    // callback path). We still assert each variant individually so a
+    // future split in the lifecycle selection can't silently drop one.
+    test "buildSetupCode emits setBackend + adapters (sdl)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sdl,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try expectImageBackendWiring(main_zig);
+    }
+
+    test "buildSetupCode emits setBackend + adapters (bgfx)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .bgfx,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try expectImageBackendWiring(main_zig);
+    }
+
+    test "buildSetupCode emits setBackend + adapters (wgpu)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .wgpu,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try expectImageBackendWiring(main_zig);
+    }
+
+    test "setBackend runs before any registerScene / atlas registration (raylib)" {
+        const jsonc_scenes = &[_][]const u8{"menu"};
+        const manifests = [_]SceneManifest{
+            .{ .name = "menu", .assets = &[_][]const u8{} },
+        };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "sprites", .json = "assets/sprites.json", .texture = "assets/sprites.png" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // The rule: `setBackend` populates the hook BEFORE any
+        // asset/scene code can reach `AssetCatalog.acquire`. For the
+        // loop-based backends that means before the atlas loader
+        // call and before `registerSceneSimple`. We assert the
+        // setBackend index is strictly less than both.
+        const set_backend_idx = std.mem.indexOf(u8, main_zig, "engine.ImageLoader.setBackend(.{") orelse return error.SetBackendMissing;
+        const atlas_idx = std.mem.indexOf(u8, main_zig, "g.loadAtlasFromMemory") orelse std.mem.indexOf(u8, main_zig, "g.registerAtlasFromMemory") orelse return error.AtlasLoadMissing;
+        const register_scene_idx = std.mem.indexOf(u8, main_zig, "g.registerSceneSimple(") orelse return error.RegisterSceneMissing;
+
+        try std.testing.expect(set_backend_idx < atlas_idx);
+        try std.testing.expect(set_backend_idx < register_scene_idx);
+    }
+
+    test "setBackend runs before any registerScene / atlas registration (sokol)" {
+        const jsonc_scenes = &[_][]const u8{"menu"};
+        const manifests = [_]SceneManifest{
+            .{ .name = "menu", .assets = &[_][]const u8{} },
+        };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "sprites", .json = "assets/sprites.json", .texture = "assets/sprites.png" },
+            },
+        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        const set_backend_idx = std.mem.indexOf(u8, main_zig, "engine.ImageLoader.setBackend(.{") orelse return error.SetBackendMissing;
+        const atlas_idx = std.mem.indexOf(u8, main_zig, "g.loadAtlasFromMemory") orelse std.mem.indexOf(u8, main_zig, "g.registerAtlasFromMemory") orelse return error.AtlasLoadMissing;
+        const register_scene_idx = std.mem.indexOf(u8, main_zig, "g.registerSceneSimple(") orelse return error.RegisterSceneMissing;
+
+        try std.testing.expect(set_backend_idx < atlas_idx);
+        try std.testing.expect(set_backend_idx < register_scene_idx);
+    }
+
+    test "adapters stash the full backend Texture in a slot table (raylib)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // The side-table is the load-bearing bit — without it we'd
+        // lose the sokol/bgfx/wgpu/sdl aux handles on every unload.
+        // Assert the storage shape (optional BackendGfx.Texture per
+        // slot) and that the upload/unload paths both go through it.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var slots: [MAX_IMAGE_ASSETS]?BackendGfx.Texture") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "slots[handle] = tex;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (slots[texture]) |tex|") != null);
+
+        // The exhaustion guard MUST appear before `uploadTexture` in
+        // the emitted `upload` body: if the table is full and we
+        // upload first, we leak a GPU resource (the handle is
+        // discarded with the error return). Matches the new slot-scan
+        // form — the `handle == MAX_IMAGE_ASSETS` sentinel is how the
+        // rewrite signals "no free slot" after the scan.
+        const guard_idx = std.mem.indexOf(u8, main_zig, "if (handle == MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;") orelse return error.GuardMissing;
+        const upload_call_idx = std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(backend_decoded)") orelse return error.UploadCallMissing;
+        try std.testing.expect(guard_idx < upload_call_idx);
+
+        // Also lock in the slot-reuse behavior: the scan must run
+        // BEFORE the guard, and `unload` must clear `slots[texture]`
+        // so recycled indices come back into play. Monotonic
+        // `next_id`-style counters are gone — guard against
+        // regression.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "for (slots, 0..) |slot, i|") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "slots[texture] = null;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var next_id:") == null);
+    }
+
+    test "adapter decode marshals engine.DecodedImage from backend DecodedImage" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Assert the field-for-field copy shape — a mismatch here
+        // would silently break the engine's DecodedImage layout.
+        // The emitted struct literal must reach every field of
+        // `engine.DecodedImage`: pixels, width, height.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".pixels = d.pixels") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".width = d.width") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".height = d.height") != null);
+    }
+};
+
 // ── Scripts ──────────────────────────────────────────────────────────
 
 pub const SCRIPTS = struct {

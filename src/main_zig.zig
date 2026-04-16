@@ -21,6 +21,93 @@ fn hasContextEntry(entries: []const ScriptEntry) bool {
     return false;
 }
 
+/// Emit the image-backend wiring: an adapter namespace bridging the
+/// backend's `decodeImage`/`uploadTexture`/`unloadTexture` to
+/// `engine.ImageBackend`, plus the `engine.ImageLoader.setBackend(...)`
+/// call that installs the adapter.
+///
+/// Why a side-table: `engine.AssetTexture` is a flat `u32`, but backend
+/// `Texture` values are per-backend structs. Most backends (raylib,
+/// sdl, bgfx, wgpu) also store width/height in the struct — those
+/// fields are unused by their `unloadTexture` paths so a `.id`
+/// round-trip would work. Sokol, however, stores `sg.Image`,
+/// `sg.View`, and `sg.Sampler` handles alongside the id; those extra
+/// handles MUST reach `sg.destroyView` / `sg.destroySampler` on
+/// unload or every uploaded texture leaks two GL resources. A uniform
+/// side-table keyed by a fresh u32 handle handles every backend the
+/// same way without touching either contract.
+///
+/// Called with `indent` matching the surrounding block (4 spaces in
+/// `buildSetupCode`, 4 spaces in `buildCallbackInitCode`). The
+/// emitted block ends with a blank line so the following code can
+/// stay its existing shape.
+///
+/// Ticket: labelle-toolkit/labelle-assembler#53
+/// Refs: labelle-toolkit/labelle-engine#437 (Asset Streaming RFC)
+fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
+    try w.print("{s}// ── Image asset backend wiring (Asset Streaming RFC, #53) ──\n", .{indent});
+    try w.print("{s}// `engine.ImageLoader.setBackend` installs function-pointer adapters\n", .{indent});
+    try w.print("{s}// that marshal between `BackendGfx`'s `DecodedImage`/`Texture` and\n", .{indent});
+    try w.print("{s}// the engine's `DecodedImage` + flat `AssetTexture` (u32) handle.\n", .{indent});
+    try w.print("{s}// A private slot table keyed by a fresh u32 preserves the full\n", .{indent});
+    try w.print("{s}// backend `Texture` so unload releases every auxiliary GPU handle\n", .{indent});
+    try w.print("{s}// (e.g. sokol's `sg.View` + `sg.Sampler`) — a plain `.id` passthrough\n", .{indent});
+    try w.print("{s}// would leak those aux handles.\n", .{indent});
+    try w.print("{s}const ImageBackendAdapter = struct {{\n", .{indent});
+    try w.print("{s}    const MAX_IMAGE_ASSETS = 1024;\n", .{indent});
+    try w.print("{s}    var slots: [MAX_IMAGE_ASSETS]?BackendGfx.Texture = [_]?BackendGfx.Texture{{null}} ** MAX_IMAGE_ASSETS;\n", .{indent});
+    try w.print("{s}\n", .{indent});
+    try w.print("{s}    fn decode(\n", .{indent});
+    try w.print("{s}        file_type: [:0]const u8,\n", .{indent});
+    try w.print("{s}        data: []const u8,\n", .{indent});
+    try w.print("{s}        alloc: std.mem.Allocator,\n", .{indent});
+    try w.print("{s}    ) anyerror!engine.DecodedImage {{\n", .{indent});
+    try w.print("{s}        const d = try BackendGfx.decodeImage(file_type, data, alloc);\n", .{indent});
+    try w.print("{s}        return .{{ .pixels = d.pixels, .width = d.width, .height = d.height }};\n", .{indent});
+    try w.print("{s}    }}\n", .{indent});
+    try w.print("{s}\n", .{indent});
+    try w.print("{s}    fn upload(decoded: engine.DecodedImage) anyerror!engine.AssetTexture {{\n", .{indent});
+    // Find a free slot BEFORE uploading to the GPU — otherwise a
+    // full slot table would leak the backend texture. Reusing the
+    // lowest free index means `unload`'s recycled slots come back
+    // into play (critical: `next_id`-style monotonic counters
+    // exhaust after MAX_IMAGE_ASSETS total uploads regardless of
+    // intervening unloads). O(MAX_IMAGE_ASSETS) scan is fine for
+    // a 1024-slot array — this path runs once per asset upload.
+    try w.print("{s}        var handle: u32 = MAX_IMAGE_ASSETS;\n", .{indent});
+    try w.print("{s}        for (slots, 0..) |slot, i| {{\n", .{indent});
+    try w.print("{s}            if (slot == null) {{\n", .{indent});
+    try w.print("{s}                handle = @intCast(i);\n", .{indent});
+    try w.print("{s}                break;\n", .{indent});
+    try w.print("{s}            }}\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
+    try w.print("{s}        if (handle == MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;\n", .{indent});
+    try w.print("{s}        const backend_decoded: BackendGfx.DecodedImage = .{{\n", .{indent});
+    try w.print("{s}            .pixels = decoded.pixels,\n", .{indent});
+    try w.print("{s}            .width = decoded.width,\n", .{indent});
+    try w.print("{s}            .height = decoded.height,\n", .{indent});
+    try w.print("{s}        }};\n", .{indent});
+    try w.print("{s}        const tex = try BackendGfx.uploadTexture(backend_decoded);\n", .{indent});
+    try w.print("{s}        slots[handle] = tex;\n", .{indent});
+    try w.print("{s}        return handle;\n", .{indent});
+    try w.print("{s}    }}\n", .{indent});
+    try w.print("{s}\n", .{indent});
+    try w.print("{s}    fn unload(texture: engine.AssetTexture) void {{\n", .{indent});
+    try w.print("{s}        if (texture >= MAX_IMAGE_ASSETS) return;\n", .{indent});
+    try w.print("{s}        if (slots[texture]) |tex| {{\n", .{indent});
+    try w.print("{s}            BackendGfx.unloadTexture(tex);\n", .{indent});
+    try w.print("{s}            slots[texture] = null;\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
+    try w.print("{s}    }}\n", .{indent});
+    try w.print("{s}}};\n", .{indent});
+    try w.print("{s}engine.ImageLoader.setBackend(.{{\n", .{indent});
+    try w.print("{s}    .decode = ImageBackendAdapter.decode,\n", .{indent});
+    try w.print("{s}    .upload = ImageBackendAdapter.upload,\n", .{indent});
+    try w.print("{s}    .unload = ImageBackendAdapter.unload,\n", .{indent});
+    try w.print("{s}}});\n", .{indent});
+    try w.print("\n", .{});
+}
+
 /// Build the setup code block for {{setup_code}} (loop-based backends).
 fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8, prefab_names: []const []const u8) ![]const u8 {
     var buf = std.ArrayList(u8){};
@@ -34,6 +121,17 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
             try w.writeAll("    defer GuiBackend.shutdown();\n\n");
         }
     }
+
+    // Install the engine's image-asset backend hook before any
+    // `registerAtlasFromMemory`, `setScene`, or script `setup` can
+    // fire — once a scene controller starts calling `catalog.acquire`
+    // on an image asset, the hook MUST already point at the backend.
+    // Safe to emit unconditionally: all five Backend variants ship
+    // the required `decodeImage`/`uploadTexture`/`unloadTexture`
+    // trio (see backends/*/src/gfx.zig), and the adapter itself has
+    // no runtime cost until the asset catalog actually decodes an
+    // image.
+    try writeImageBackendWiring(w, "    ");
 
     // ScriptRunner owns all per-script state + shared context
     try w.writeAll("    var runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
@@ -146,6 +244,13 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
             try w.writeAll("    GuiBackend.init();\n");
         }
     }
+
+    // Mirror the loop-path setup: install the image-asset backend hook
+    // first so any later atlas / scene / script code that eventually
+    // reaches `catalog.acquire` already sees a populated slot. See the
+    // `buildSetupCode` comment for why this is emit-unconditional
+    // across every backend variant.
+    try writeImageBackendWiring(w, "    ");
 
     try w.writeAll("    runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
 
