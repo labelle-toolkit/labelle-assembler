@@ -83,17 +83,65 @@ pub fn entityCount(self: *Self) usize {
     return self.entity_count;
 }
 
+/// Zero-sized marker components (`struct {}`) are a legitimate ECS
+/// pattern — a tag with no payload. zig-ecs's `component_storage`
+/// registers a typed instance array and emits a 16+-frame-deep
+/// `@compileError("This method is not available to zero-sized
+/// components")` the moment anything touches `tryGet`/`get`. But the
+/// underlying sparse-set side of the storage (add / contains / remove /
+/// data) is fine for empty structs — `addOrReplace` already special-
+/// cases them. This adapter bypasses the typed-payload path entirely
+/// for `@sizeOf(T) == 0` and uses only the sparse-set primitives, so
+/// `pub const Marker = struct {};` flows through the engine without
+/// any padding workaround (#57).
+///
+/// For `getComponent` on a zero-sized type there is no real instance
+/// to return — every value of `T` is identical. We return a pointer
+/// to a comptime-known empty singleton so the engine's query layer
+/// (which holds `*T` in its result tuples) stays happy.
+fn emptySingleton(comptime T: type) *T {
+    comptime std.debug.assert(@sizeOf(T) == 0);
+    const S = struct {
+        var value: T = .{};
+    };
+    return &S.value;
+}
+
+/// Presence check that works for both sized and zero-sized component
+/// types. zig-ecs's `tryGet` compile-errors for `@sizeOf(T) == 0`, so
+/// for zero-sized types we drop down to the sparse-set `contains`
+/// primitive which is safe (see #57). Tolerates destroyed entities by
+/// gating on `valid` — the existing `tryGet != null` shape the adapter
+/// exposes to callers never asserts on validity, so neither do we.
+fn storageContains(self: *Self, comptime T: type, ie: InternalEntity) bool {
+    if (comptime @sizeOf(T) == 0) {
+        if (!self.inner.valid(ie)) return false;
+        return self.inner.assure(T).contains(ie);
+    }
+    return self.inner.tryGet(T, ie) != null;
+}
+
 pub fn addComponent(self: *Self, entity: Entity, component: anytype) void {
     self.assertValid(entity, "addComponent(" ++ @typeName(@TypeOf(component)) ++ ")");
     self.inner.addOrReplace(toInternal(entity), component);
 }
 
 pub fn getComponent(self: *Self, entity: Entity, comptime T: type) ?*T {
+    if (comptime @sizeOf(T) == 0) {
+        const ie = toInternal(entity);
+        if (!self.inner.valid(ie)) return null;
+        return if (self.inner.assure(T).contains(ie)) emptySingleton(T) else null;
+    }
     return self.inner.tryGet(T, toInternal(entity));
 }
 
 pub fn hasComponent(self: *Self, entity: Entity, comptime T: type) bool {
-    return self.inner.tryGet(T, toInternal(entity)) != null;
+    const ie = toInternal(entity);
+    if (comptime @sizeOf(T) == 0) {
+        if (!self.inner.valid(ie)) return false;
+        return self.inner.assure(T).contains(ie);
+    }
+    return self.inner.tryGet(T, ie) != null;
 }
 
 pub fn removeComponent(self: *Self, entity: Entity, comptime T: type) void {
@@ -113,7 +161,9 @@ pub fn removeComponent(self: *Self, entity: Entity, comptime T: type) void {
 /// for systems that loop via views (#13).
 ///
 /// For multi-include / exclude views, the adapter reimplements the
-/// filter loop inline at `next()` time using `self.backend.tryGet`.
+/// filter loop inline at `next()` time via `storageContains`, which
+/// dispatches to `tryGet` for sized types and to the sparse-set
+/// `contains` primitive for zero-sized marker components (see #57).
 /// This avoids zig-ecs's `MultiView.Iterator`, which stores a self
 /// pointer (`view: *Self`) back into its originating `MultiView`
 /// struct — returning the iterator from `view()` would leave that
@@ -146,7 +196,7 @@ pub fn View(comptime _includes: anytype, comptime _excludes: anytype) type {
                     var has_all = true;
                     inline for (1.._includes.len) |i| {
                         const T = _includes[i];
-                        if (self.backend.inner.tryGet(T, internal) == null) {
+                        if (!storageContains(self.backend, T, internal)) {
                             has_all = false;
                             break;
                         }
@@ -157,7 +207,7 @@ pub fn View(comptime _includes: anytype, comptime _excludes: anytype) type {
                     var any_excluded = false;
                     inline for (0.._excludes.len) |i| {
                         const T = _excludes[i];
-                        if (self.backend.inner.tryGet(T, internal) != null) {
+                        if (storageContains(self.backend, T, internal)) {
                             any_excluded = true;
                             break;
                         }
@@ -191,7 +241,7 @@ pub fn View(comptime _includes: anytype, comptime _excludes: anytype) type {
 /// underlying storage and invalidate the slice — do not mutate the
 /// driving component type while a view over it is live. Mutating
 /// *other* component types is fine: the filter loop reads them
-/// fresh via `tryGet` on each candidate.
+/// fresh via `storageContains` on each candidate.
 ///
 /// ## Performance tip: put the sparsest component first
 ///

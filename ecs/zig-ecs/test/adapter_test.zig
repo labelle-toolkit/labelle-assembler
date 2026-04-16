@@ -7,6 +7,12 @@ const Position = struct { x: f32 = 0, y: f32 = 0 };
 const Health = struct { current: f32 = 100, max: f32 = 100 };
 const Tag = struct { label: u32 = 0 };
 
+// Zero-sized marker components — the `struct {}` spelling that used to
+// trip zig-ecs's deep-trace `@compileError` before #57. Two distinct
+// types to check they don't alias each other in the registry.
+const SpriteMarker = struct {};
+const PlayerMarker = struct {};
+
 test "createEntity and entityExists" {
     var ecs = Adapter.init(testing.allocator);
     defer ecs.deinit();
@@ -347,6 +353,209 @@ test "view: combined include + exclude respects both filters" {
     while (v.next()) |entity| {
         total += 1;
         try testing.expectEqual(e1, entity);
+    }
+    try testing.expectEqual(@as(usize, 1), total);
+}
+
+// ── Regression tests for #57 (zero-sized marker components) ─────────
+//
+// `pub const Marker = struct {};` used to fail with a 16+-frame-deep
+// `@compileError("This method is not available to zero-sized
+// components")` out of zig-ecs's `component_storage.zig` the moment
+// anything hit `tryGet`. The adapter now detects `@sizeOf(T) == 0` at
+// comptime and routes through the sparse-set presence primitives
+// instead of the typed-payload path.
+
+test "marker: zero-sized component compiles and is queryable" {
+    var ecs = Adapter.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e = ecs.createEntity();
+    // The whole point of this ticket: no padding byte required.
+    ecs.addComponent(e, SpriteMarker{});
+    try testing.expect(ecs.hasComponent(e, SpriteMarker));
+}
+
+test "marker: add → has → remove → has returns false" {
+    var ecs = Adapter.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e = ecs.createEntity();
+    ecs.addComponent(e, SpriteMarker{});
+    try testing.expect(ecs.hasComponent(e, SpriteMarker));
+
+    ecs.removeComponent(e, SpriteMarker);
+    try testing.expect(!ecs.hasComponent(e, SpriteMarker));
+}
+
+test "marker: getComponent returns non-null singleton when present" {
+    var ecs = Adapter.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e = ecs.createEntity();
+    try testing.expectEqual(@as(?*SpriteMarker, null), ecs.getComponent(e, SpriteMarker));
+
+    ecs.addComponent(e, SpriteMarker{});
+    const got = ecs.getComponent(e, SpriteMarker);
+    try testing.expect(got != null);
+}
+
+test "marker: getComponent returns null for destroyed entity" {
+    var ecs = Adapter.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e = ecs.createEntity();
+    ecs.addComponent(e, SpriteMarker{});
+    ecs.destroyEntity(e);
+
+    try testing.expect(!ecs.hasComponent(e, SpriteMarker));
+    try testing.expectEqual(@as(?*SpriteMarker, null), ecs.getComponent(e, SpriteMarker));
+}
+
+test "marker: view iterates exactly the tagged entities" {
+    var ecs = Adapter.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e1 = ecs.createEntity();
+    const e2 = ecs.createEntity();
+    const e3 = ecs.createEntity();
+    ecs.addComponent(e1, SpriteMarker{});
+    // e2 intentionally untagged.
+    ecs.addComponent(e3, SpriteMarker{});
+    _ = e2;
+
+    var seen_e1 = false;
+    var seen_e3 = false;
+    var total: usize = 0;
+    var v = ecs.view(.{SpriteMarker}, .{});
+    defer v.deinit();
+    while (v.next()) |entity| {
+        total += 1;
+        if (entity == e1) seen_e1 = true;
+        if (entity == e3) seen_e3 = true;
+    }
+    try testing.expectEqual(@as(usize, 2), total);
+    try testing.expect(seen_e1);
+    try testing.expect(seen_e3);
+}
+
+test "marker: distinct marker types do not alias" {
+    var ecs = Adapter.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e = ecs.createEntity();
+    ecs.addComponent(e, SpriteMarker{});
+
+    try testing.expect(ecs.hasComponent(e, SpriteMarker));
+    try testing.expect(!ecs.hasComponent(e, PlayerMarker));
+
+    ecs.addComponent(e, PlayerMarker{});
+    try testing.expect(ecs.hasComponent(e, SpriteMarker));
+    try testing.expect(ecs.hasComponent(e, PlayerMarker));
+
+    ecs.removeComponent(e, SpriteMarker);
+    try testing.expect(!ecs.hasComponent(e, SpriteMarker));
+    try testing.expect(ecs.hasComponent(e, PlayerMarker));
+}
+
+test "marker: mixes with sized components — multi-include view" {
+    var ecs = Adapter.init(testing.allocator);
+    defer ecs.deinit();
+
+    // e1: Position + SpriteMarker — matches
+    const e1 = ecs.createEntity();
+    ecs.addComponent(e1, Position{ .x = 1, .y = 1 });
+    ecs.addComponent(e1, SpriteMarker{});
+    // e2: Position only — no marker, should be filtered out
+    const e2 = ecs.createEntity();
+    ecs.addComponent(e2, Position{ .x = 2, .y = 2 });
+    // e3: SpriteMarker only — no Position, should be filtered out
+    const e3 = ecs.createEntity();
+    ecs.addComponent(e3, SpriteMarker{});
+
+    var total: usize = 0;
+    var v = ecs.view(.{ Position, SpriteMarker }, .{});
+    defer v.deinit();
+    while (v.next()) |entity| {
+        total += 1;
+        try testing.expectEqual(e1, entity);
+        try testing.expect(entity != e2 and entity != e3);
+        // Sized-component access still works on entities that also
+        // carry a marker — the sized path isn't disturbed.
+        try testing.expectEqual(@as(f32, 1), ecs.getComponent(entity, Position).?.x);
+    }
+    try testing.expectEqual(@as(usize, 1), total);
+}
+
+test "marker: drives multi-include view when listed first" {
+    // `includes[0]` is the storage walked by `view()`; putting a
+    // zero-sized type there exercises `basicView(Marker).data()`
+    // (sparse-set slice) as the iteration driver.
+    var ecs = Adapter.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e1 = ecs.createEntity();
+    ecs.addComponent(e1, SpriteMarker{});
+    ecs.addComponent(e1, Position{ .x = 7, .y = 7 });
+
+    const e2 = ecs.createEntity();
+    ecs.addComponent(e2, SpriteMarker{});
+    // e2 missing Position — filtered out.
+
+    var total: usize = 0;
+    var v = ecs.view(.{ SpriteMarker, Position }, .{});
+    defer v.deinit();
+    while (v.next()) |entity| {
+        total += 1;
+        try testing.expectEqual(e1, entity);
+    }
+    try testing.expectEqual(@as(usize, 1), total);
+}
+
+test "marker: excluded marker is respected in view" {
+    var ecs = Adapter.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e1 = ecs.createEntity();
+    ecs.addComponent(e1, Position{ .x = 1, .y = 1 });
+    // e1 has no marker — should be included.
+
+    const e2 = ecs.createEntity();
+    ecs.addComponent(e2, Position{ .x = 2, .y = 2 });
+    ecs.addComponent(e2, SpriteMarker{});
+    // e2 has marker — should be excluded.
+
+    var total: usize = 0;
+    var v = ecs.view(.{Position}, .{SpriteMarker});
+    defer v.deinit();
+    while (v.next()) |entity| {
+        total += 1;
+        try testing.expectEqual(e1, entity);
+    }
+    try testing.expectEqual(@as(usize, 1), total);
+}
+
+test "marker: query returns result tuples with marker pointer" {
+    var ecs = Adapter.init(testing.allocator);
+    defer ecs.deinit();
+
+    const e1 = ecs.createEntity();
+    ecs.addComponent(e1, SpriteMarker{});
+    ecs.addComponent(e1, Position{ .x = 42, .y = 0 });
+
+    var q = ecs.query(.{ SpriteMarker, Position });
+    defer q.deinit(testing.allocator);
+    var total: usize = 0;
+    while (q.next()) |result| {
+        total += 1;
+        try testing.expectEqual(e1, result.entity);
+        // The sized-component pointer still dereferences to the
+        // real value — the marker path doesn't corrupt neighbours.
+        try testing.expectEqual(@as(f32, 42), result.comp_1.x);
+        // `comp_0` is a `*SpriteMarker`. We just care that it's
+        // non-null at the type level (pointers to zero-sized
+        // types are valid in Zig regardless of address).
+        _ = result.comp_0;
     }
     try testing.expectEqual(@as(usize, 1), total);
 }
