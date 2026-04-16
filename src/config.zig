@@ -79,14 +79,26 @@ pub const ResourceDef = struct {
     name: []const u8,
     json: []const u8 = "",
     texture: []const u8 = "",
-    /// When `true`, the generated `init()` registers this atlas with
-    /// `registerAtlasFromMemory` (parses the JSON, defers the PNG
-    /// decode). The user is then responsible for calling
-    /// `game.loadAtlasIfNeeded(name)` from a script — typically a
-    /// loading-scene controller — before any sprite from this atlas is
-    /// rendered. Defaults to `false`, which preserves the eager
-    /// `loadAtlasFromMemory` behavior every existing project relies on.
-    lazy: bool = false,
+    /// Controls whether this atlas is decoded eagerly at `init()` time
+    /// or deferred until a script calls `game.loadAtlasIfNeeded(name)`.
+    ///
+    /// - `null` (field omitted): the assembler picks a default. As of
+    ///   ticket #48, the default is `true` (lazy) when the resource
+    ///   appears in any scene's `assets:` list, and `false` (eager)
+    ///   otherwise. The eager fallback preserves back-compat for every
+    ///   existing project that hasn't migrated its scenes to declare
+    ///   `assets:`.
+    /// - `true`: always lazy — the generated init calls
+    ///   `registerAtlasFromMemory` (parses the JSON, defers the PNG
+    ///   decode). A script must call `game.loadAtlasIfNeeded(name)`
+    ///   before any sprite from this atlas is rendered.
+    /// - `false`: always eager — the generated init calls
+    ///   `loadAtlasFromMemory`, decoding everything at startup.
+    ///
+    /// Explicit values (true/false) always win over the default
+    /// inference pass, so a project can opt in or out of laziness
+    /// regardless of scene references.
+    lazy: ?bool = null,
 };
 
 /// Returns true if a version string is a local path override.

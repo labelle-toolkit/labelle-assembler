@@ -7,6 +7,8 @@ const config = @import("config.zig");
 const cache = @import("cache.zig");
 const scanner = @import("scanner.zig");
 pub const scene_manifest = @import("scene_manifest.zig");
+pub const asset_validator = @import("asset_validator.zig");
+pub const lazy_inference = @import("lazy_inference.zig");
 const main_zig = @import("main_zig.zig");
 pub const script_scanner = @import("script_scanner.zig");
 const build_files = @import("build_files.zig");
@@ -19,6 +21,8 @@ const gui_resolve = @import("gui_resolve.zig");
 test {
     _ = @import("plugin_manifest.zig");
     _ = @import("scene_manifest.zig");
+    _ = @import("asset_validator.zig");
+    _ = @import("lazy_inference.zig");
 }
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
@@ -69,7 +73,16 @@ pub const resolveAssemblerPackage = cache.resolveAssemblerPackage;
 pub const resolveBundledPackage = cache.resolveBundledPackage;
 
 /// Generate all assembler files into output_dir/.labelle/{backend}_{platform}/.
-pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []const u8, game_dir: []const u8) !void {
+pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir: []const u8, game_dir: []const u8) !void {
+    // Shadow the caller's cfg with a mutable copy. Ticket #48's lazy
+    // default-inference pass needs to rewrite `cfg.resources[i].lazy`
+    // in place, and we don't want to surprise callers by touching
+    // their parsed slice.
+    var cfg = cfg_in;
+    const mutable_resources = try allocator.dupe(ResourceDef, cfg.resources);
+    defer allocator.free(mutable_resources);
+    cfg.resources = mutable_resources;
+
     const cwd = std.fs.cwd();
 
     // Target subfolder: .labelle/raylib_desktop/, .labelle/sokol_ios/, etc.
@@ -99,6 +112,21 @@ pub fn generate(allocator: std.mem.Allocator, cfg: ProjectConfig, output_dir: []
     defer allocator.free(scenes_target);
     const scene_manifests = try scene_manifest.parseSceneDir(allocator, scenes_target, jsonc_scene_names);
     defer scene_manifest.freeManifests(allocator, scene_manifests);
+
+    // Reject scene `assets:` entries that don't match a resource
+    // declared in project.labelle. Runs before any codegen so typos
+    // like `backgroud` surface as a build error against the scene file
+    // rather than a confusing "atlas not found" panic at runtime.
+    // Ticket #47.
+    try asset_validator.validateSceneAssets(allocator, scene_manifests, cfg.resources);
+
+    // Resolve the implicit `lazy` default on each resource entry.
+    // Explicit `lazy = true/false` wins; null falls back to `true`
+    // (lazy) when the resource is referenced by any scene's `assets:`
+    // list, or to `false` (eager) otherwise. The eager fallback keeps
+    // unmigrated projects — the ones without `assets:` blocks — using
+    // the old always-eager behavior. Ticket #48.
+    try lazy_inference.resolveLazyDefaults(allocator, mutable_resources, scene_manifests);
 
     // Copy all script files (including subdirectories) into target dir.
     // Then use ScriptScanner to parse directory-based state binding.
