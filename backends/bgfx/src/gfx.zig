@@ -485,9 +485,6 @@ fn findFreeTextureSlot() ?u32 {
 }
 
 pub fn loadTexture(path: [:0]const u8) !Texture {
-    // Check for a free texture slot before doing any work
-    const id = findFreeTextureSlot() orelse return error.LoadFailed;
-
     // Read file from disk
     const file = std.fs.cwd().openFile(path, .{}) catch return error.LoadFailed;
     defer file.close();
@@ -503,53 +500,59 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     const bytes_read = file.readAll(data) catch return error.LoadFailed;
     if (bytes_read < 18) return error.LoadFailed;
 
-    const file_buf = data[0..bytes_read];
+    const decoded = try decodeImage("", data[0..bytes_read], allocator);
+    defer allocator.free(decoded.pixels);
+    return uploadTexture(decoded);
+}
 
-    // Try BMP first, then TGA
+/// Pure CPU decode, safe from a worker thread. The bgfx backend ships
+/// hand-rolled BMP and TGA decoders (no stb_image link) — we try BMP
+/// first, then fall back to TGA. The caller's allocator owns the
+/// returned `pixels` buffer and frees it on both the success and the
+/// discard paths.
+pub fn decodeImage(
+    _: [:0]const u8,
+    data: []const u8,
+    allocator: std.mem.Allocator,
+) !DecodedImage {
     // TODO: Add PNG decoding (requires inflate/zlib decompression) or integrate stb_image
-    if (tryDecodeBmp(file_buf)) |img| {
-        const mem = bgfx.copy(img.pixels.ptr, @intCast(img.pixels.len));
-        const handle = bgfx.createTexture2D(
-            img.width,
-            img.height,
-            false,
-            1,
-            .RGBA8,
-            bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp,
-            mem,
-            0,
-        );
-        if (handle.idx == std.math.maxInt(u16)) {
-            allocator.free(img.pixels);
-            return error.LoadFailed;
-        }
-        texture_handles[id] = handle;
-        texture_pixel_data[id] = img.pixels;
-        return .{ .id = id, .width = @intCast(img.width), .height = @intCast(img.height) };
-    }
-
-    if (tryDecodeTga(file_buf)) |img| {
-        const mem = bgfx.copy(img.pixels.ptr, @intCast(img.pixels.len));
-        const handle = bgfx.createTexture2D(
-            img.width,
-            img.height,
-            false,
-            1,
-            .RGBA8,
-            bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp,
-            mem,
-            0,
-        );
-        if (handle.idx == std.math.maxInt(u16)) {
-            allocator.free(img.pixels);
-            return error.LoadFailed;
-        }
-        texture_handles[id] = handle;
-        texture_pixel_data[id] = img.pixels;
-        return .{ .id = id, .width = @intCast(img.width), .height = @intCast(img.height) };
-    }
-
+    if (tryDecodeBmp(data, allocator)) |img| return img;
+    if (tryDecodeTga(data, allocator)) |img| return img;
     return error.LoadFailed;
+}
+
+/// Main/GL-thread GPU upload. bgfx copies the pixel buffer into its own
+/// command queue via `bgfx.copy`, so we do NOT free `decoded.pixels` —
+/// the caller owns it and frees it on both the success and the discard
+/// paths. The backend retains its own copy via bgfx.copy's memcpy.
+pub fn uploadTexture(decoded: DecodedImage) !Texture {
+    if (decoded.width == 0 or decoded.height == 0) return error.LoadFailed;
+    const id = findFreeTextureSlot() orelse return error.LoadFailed;
+
+    const w: u16 = std.math.cast(u16, decoded.width) orelse return error.LoadFailed;
+    const h: u16 = std.math.cast(u16, decoded.height) orelse return error.LoadFailed;
+
+    const mem = bgfx.copy(decoded.pixels.ptr, @intCast(decoded.pixels.len));
+    const handle = bgfx.createTexture2D(
+        w,
+        h,
+        false,
+        1,
+        .RGBA8,
+        bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp,
+        mem,
+        0,
+    );
+    if (handle.idx == std.math.maxInt(u16)) return error.LoadFailed;
+
+    texture_handles[id] = handle;
+    // The old loadTexture path cached the decoded bytes in
+    // texture_pixel_data[id] so it could free them on unload; with the
+    // new split contract the caller owns the bytes and bgfx.copy has
+    // already taken its own copy, so we leave the slot null here.
+    texture_pixel_data[id] = null;
+
+    return .{ .id = id, .width = @intCast(decoded.width), .height = @intCast(decoded.height) };
 }
 
 pub fn unloadTexture(texture: Texture) void {
@@ -643,15 +646,18 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
 
 // ── Image decoding helpers ─────────────────────────────────────────────
 
-const DecodedImage = struct {
-    pixels: []u8, // RGBA8, owned by page_allocator
-    width: u16,
-    height: u16,
+/// CPU-decoded image owned by the caller's allocator. See sokol's
+/// `DecodedImage` doc-comment for why this is defined per-backend
+/// instead of imported from labelle-gfx — same reasoning applies.
+pub const DecodedImage = struct {
+    pixels: []u8,
+    width: u32,
+    height: u32,
 };
 
 /// Decode an uncompressed 24-bit or 32-bit BMP to RGBA8.
 /// Handles BGR-to-RGB conversion, row padding, and top-down/bottom-up orientation.
-fn tryDecodeBmp(data: []const u8) ?DecodedImage {
+fn tryDecodeBmp(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
     if (data.len < 54) return null;
     if (data[0] != 'B' or data[1] != 'M') return null;
 
@@ -672,7 +678,7 @@ fn tryDecodeBmp(data: []const u8) ?DecodedImage {
     const row_size = ((width * bytes_per_pixel + 3) / 4) * 4; // BMP rows are 4-byte aligned
 
     const out_size = @as(usize, width) * @as(usize, height) * 4;
-    const pixels = std.heap.page_allocator.alloc(u8, out_size) catch return null;
+    const pixels = allocator.alloc(u8, out_size) catch return null;
 
     var y: u32 = 0;
     while (y < height) : (y += 1) {
@@ -683,7 +689,7 @@ fn tryDecodeBmp(data: []const u8) ?DecodedImage {
             const src = row_off + @as(usize, x) * @as(usize, bytes_per_pixel);
             const dst = (@as(usize, y) * @as(usize, width) + @as(usize, x)) * 4;
             if (src + bytes_per_pixel > data.len or dst + 4 > pixels.len) {
-                std.heap.page_allocator.free(pixels);
+                allocator.free(pixels);
                 return null;
             }
             // BMP stores BGR(A)
@@ -694,12 +700,12 @@ fn tryDecodeBmp(data: []const u8) ?DecodedImage {
         }
     }
 
-    return DecodedImage{ .pixels = pixels, .width = @intCast(width), .height = @intCast(height) };
+    return DecodedImage{ .pixels = pixels, .width = width, .height = height };
 }
 
 /// Decode an uncompressed TGA (type 2) to RGBA8.
 /// Handles 24/32-bit pixels, BGR-to-RGB conversion, and orientation via descriptor bit 5.
-fn tryDecodeTga(data: []const u8) ?DecodedImage {
+fn tryDecodeTga(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
     if (data.len < 18) return null;
 
     const image_type = data[2];
@@ -720,7 +726,7 @@ fn tryDecodeTga(data: []const u8) ?DecodedImage {
     const top_down = (descriptor & 0x20) != 0;
 
     const out_size = @as(usize, width) * @as(usize, height) * 4;
-    const pixels = std.heap.page_allocator.alloc(u8, out_size) catch return null;
+    const pixels = allocator.alloc(u8, out_size) catch return null;
 
     var y: u32 = 0;
     while (y < height) : (y += 1) {
@@ -730,7 +736,7 @@ fn tryDecodeTga(data: []const u8) ?DecodedImage {
             const src = pixel_offset + (@as(usize, src_y) * @as(usize, width) + @as(usize, x)) * bytes_per_pixel;
             const dst = (@as(usize, y) * @as(usize, width) + @as(usize, x)) * 4;
             if (src + bytes_per_pixel > data.len or dst + 4 > pixels.len) {
-                std.heap.page_allocator.free(pixels);
+                allocator.free(pixels);
                 return null;
             }
             // TGA stores BGR(A)
@@ -741,7 +747,7 @@ fn tryDecodeTga(data: []const u8) ?DecodedImage {
         }
     }
 
-    return DecodedImage{ .pixels = pixels, .width = @intCast(width), .height = @intCast(height) };
+    return DecodedImage{ .pixels = pixels, .width = width, .height = height };
 }
 
 // TODO: Add PNG decoding (requires inflate/zlib decompression) or integrate stb_image

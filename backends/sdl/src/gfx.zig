@@ -13,6 +13,15 @@ pub const Texture = struct {
     height: i32,
 };
 
+/// CPU-decoded image owned by the caller's allocator. See sokol's
+/// `DecodedImage` doc-comment for why this is defined per-backend
+/// instead of imported from labelle-gfx — same reasoning applies.
+pub const DecodedImage = struct {
+    pixels: []u8,
+    width: u32,
+    height: u32,
+};
+
 /// Internal texture storage — maps id -> SDL_Texture pointer.
 var texture_slots: [MAX_TEXTURES]?*c.SDL_Texture = [_]?*c.SDL_Texture{null} ** MAX_TEXTURES;
 
@@ -545,6 +554,110 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     }
 
     // Store in first available slot (reuse freed IDs)
+    const id = findFreeTextureSlot() orelse {
+        c.SDL_DestroyTexture(tex_ptr);
+        return error.LoadFailed;
+    };
+    texture_slots[id] = tex_ptr;
+
+    return .{ .id = id, .width = @intCast(w), .height = @intCast(h) };
+}
+
+/// Pure CPU decode, safe from a worker thread. Base SDL2 only ships a
+/// BMP decoder (SDL_LoadBMP_RW) — PNG/JPG would need SDL_image, which the
+/// backend does not link. This matches the existing `loadTexture` path
+/// which is also BMP-only. The decoded pixels are converted to RGBA32
+/// and copied into an allocator-owned buffer; the caller owns the buffer
+/// and frees it on both the success and the discard paths.
+pub fn decodeImage(
+    _: [:0]const u8,
+    data: []const u8,
+    allocator: std.mem.Allocator,
+) !DecodedImage {
+    if (data.len == 0) return error.LoadFailed;
+
+    // SDL_RWFromConstMem takes a (const void*, int) — wrap the slice and
+    // let SDL_LoadBMP_RW consume it. The free=1 arg to SDL_LoadBMP_RW
+    // frees the RWops on return; we own `data` either way.
+    const rw = c.SDL_RWFromConstMem(@ptrCast(data.ptr), @intCast(data.len)) orelse {
+        return error.LoadFailed;
+    };
+    const surface: *c.SDL_Surface = c.SDL_LoadBMP_RW(rw, 1) orelse {
+        return error.LoadFailed;
+    };
+    defer c.SDL_FreeSurface(surface);
+
+    // Normalise to RGBA32 so the caller always gets 4 bytes per pixel
+    // regardless of the source BMP's channel layout.
+    const rgba_surface: *c.SDL_Surface = c.SDL_ConvertSurfaceFormat(
+        surface,
+        c.SDL_PIXELFORMAT_RGBA32,
+        0,
+    ) orelse return error.LoadFailed;
+    defer c.SDL_FreeSurface(rgba_surface);
+
+    const w_raw = rgba_surface.w;
+    const h_raw = rgba_surface.h;
+    if (w_raw <= 0 or h_raw <= 0) return error.LoadFailed;
+    const width: u32 = @intCast(w_raw);
+    const height: u32 = @intCast(h_raw);
+    const len: usize = @as(usize, width) * @as(usize, height) * 4;
+
+    const owned = try allocator.alloc(u8, len);
+    errdefer allocator.free(owned);
+
+    // SDL may have row padding (`pitch`) — copy row by row to produce a
+    // tightly packed RGBA8 buffer.
+    const src_base: [*]const u8 = @ptrCast(rgba_surface.pixels);
+    const src_pitch: usize = @intCast(rgba_surface.pitch);
+    const row_bytes: usize = @as(usize, width) * 4;
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        const src_row = src_base + y * src_pitch;
+        const dst_row = owned.ptr + y * row_bytes;
+        @memcpy(dst_row[0..row_bytes], src_row[0..row_bytes]);
+    }
+
+    return .{
+        .pixels = owned,
+        .width = width,
+        .height = height,
+    };
+}
+
+/// Main/GL-thread GPU upload. Creates an SDL_Texture with
+/// SDL_PIXELFORMAT_RGBA32 and streams the decoded pixels in via
+/// SDL_UpdateTexture. Does NOT free `decoded.pixels` — the caller owns
+/// the buffer on both the success and the discard paths.
+pub fn uploadTexture(decoded: DecodedImage) !Texture {
+    const ren = sdl_renderer orelse return error.LoadFailed;
+    if (decoded.width == 0 or decoded.height == 0) return error.LoadFailed;
+
+    const w: c_int = @intCast(decoded.width);
+    const h: c_int = @intCast(decoded.height);
+
+    const tex_ptr: *c.SDL_Texture = c.SDL_CreateTexture(
+        ren,
+        c.SDL_PIXELFORMAT_RGBA32,
+        c.SDL_TEXTUREACCESS_STATIC,
+        w,
+        h,
+    ) orelse {
+        std.log.err("SDL_CreateTexture failed: {s}", .{c.SDL_GetError()});
+        return error.LoadFailed;
+    };
+
+    const pitch: c_int = @intCast(@as(usize, decoded.width) * 4);
+    if (c.SDL_UpdateTexture(tex_ptr, null, decoded.pixels.ptr, pitch) != 0) {
+        std.log.err("SDL_UpdateTexture failed: {s}", .{c.SDL_GetError()});
+        c.SDL_DestroyTexture(tex_ptr);
+        return error.LoadFailed;
+    }
+
+    if (c.SDL_SetTextureBlendMode(tex_ptr, c.SDL_BLENDMODE_BLEND) != 0) {
+        // Non-fatal: blend mode defaults work for opaque content.
+    }
+
     const id = findFreeTextureSlot() orelse {
         c.SDL_DestroyTexture(tex_ptr);
         return error.LoadFailed;
