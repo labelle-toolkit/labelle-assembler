@@ -536,9 +536,6 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
 }
 
 pub fn loadTexture(path: [:0]const u8) !Texture {
-    const id = next_texture_id;
-    if (id >= MAX_TEXTURES) return error.LoadFailed;
-
     const file = std.fs.cwd().openFile(std.mem.span(path), .{}) catch return error.LoadFailed;
     defer file.close();
 
@@ -546,26 +543,54 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     const file_size = stat.size;
     if (file_size < 18) return error.LoadFailed; // Too small for any image header
 
-    const file_buf = std.heap.page_allocator.alloc(u8, file_size) catch return error.LoadFailed;
-    defer std.heap.page_allocator.free(file_buf);
+    const allocator = std.heap.page_allocator;
+    const file_buf = allocator.alloc(u8, file_size) catch return error.LoadFailed;
+    defer allocator.free(file_buf);
 
     const bytes_read = file.readAll(file_buf) catch return error.LoadFailed;
     if (bytes_read != file_size) return error.LoadFailed;
 
-    // Try BMP first, then TGA
-    if (decodeBmp(file_buf[0..bytes_read])) |img| {
-        textures[id] = .{ .pixels = img.pixels, .width = img.width, .height = img.height, .active = true };
-        next_texture_id += 1;
-        return Texture{ .id = id, .width = img.width, .height = img.height };
-    }
+    const decoded = try decodeImage("", file_buf[0..bytes_read], allocator);
+    defer allocator.free(decoded.pixels);
+    return uploadTexture(decoded);
+}
 
-    if (decodeTga(file_buf[0..bytes_read])) |img| {
-        textures[id] = .{ .pixels = img.pixels, .width = img.width, .height = img.height, .active = true };
-        next_texture_id += 1;
-        return Texture{ .id = id, .width = img.width, .height = img.height };
-    }
-
+/// Pure CPU decode, safe from a worker thread. wgpu's backend ships
+/// hand-rolled BMP and TGA decoders (no stb_image link) — we try BMP
+/// first, then fall back to TGA. The caller's allocator owns the
+/// returned `pixels` buffer and frees it on both the success and the
+/// discard paths.
+pub fn decodeImage(
+    _: [:0]const u8,
+    data: []const u8,
+    allocator: std.mem.Allocator,
+) !DecodedImage {
+    // TODO: Add PNG decoding (requires inflate/zlib decompression) or integrate stb_image
+    if (decodeBmp(data, allocator)) |img| return img;
+    if (decodeTga(data, allocator)) |img| return img;
     return error.LoadFailed;
+}
+
+/// Main/GL-thread GPU upload. This wgpu backend currently retains its
+/// decoded pixels in the texture slot (drawTexturePro uploads them
+/// lazily via `wgpuQueueWriteTexture` — or a stub path, depending on
+/// renderer state), so we COPY `decoded.pixels` into a fresh
+/// page_allocator buffer that the slot owns. We do NOT free
+/// `decoded.pixels` — the caller owns that buffer on both the success
+/// and the discard paths.
+pub fn uploadTexture(decoded: DecodedImage) !Texture {
+    const id = next_texture_id;
+    if (id >= MAX_TEXTURES) return error.LoadFailed;
+    if (decoded.width == 0 or decoded.height == 0) return error.LoadFailed;
+
+    const owned = std.heap.page_allocator.alloc(u8, decoded.pixels.len) catch return error.LoadFailed;
+    @memcpy(owned, decoded.pixels);
+
+    const w: i32 = @intCast(decoded.width);
+    const h: i32 = @intCast(decoded.height);
+    textures[id] = .{ .pixels = owned, .width = w, .height = h, .active = true };
+    next_texture_id += 1;
+    return Texture{ .id = id, .width = w, .height = h };
 }
 
 pub fn unloadTexture(texture: Texture) void {
@@ -579,14 +604,17 @@ pub fn unloadTexture(texture: Texture) void {
 
 // ── Image decoding helpers ─────────────────────────────────────────────
 
-const DecodedImage = struct {
-    pixels: []u8, // RGBA8, owned
-    width: i32,
-    height: i32,
+/// CPU-decoded image owned by the caller's allocator. See sokol's
+/// `DecodedImage` doc-comment for why this is defined per-backend
+/// instead of imported from labelle-gfx — same reasoning applies.
+pub const DecodedImage = struct {
+    pixels: []u8,
+    width: u32,
+    height: u32,
 };
 
 /// Decode an uncompressed 24-bit or 32-bit BMP to RGBA8.
-fn decodeBmp(data: []const u8) ?DecodedImage {
+fn decodeBmp(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
     if (data.len < 54) return null;
     if (data[0] != 'B' or data[1] != 'M') return null;
 
@@ -607,7 +635,7 @@ fn decodeBmp(data: []const u8) ?DecodedImage {
     const row_size = ((width * bytes_per_pixel + 3) / 4) * 4; // BMP rows are 4-byte aligned
 
     const out_size = @as(usize, width) * @as(usize, height) * 4;
-    const pixels = std.heap.page_allocator.alloc(u8, out_size) catch return null;
+    const pixels = allocator.alloc(u8, out_size) catch return null;
 
     var y: u32 = 0;
     while (y < height) : (y += 1) {
@@ -618,7 +646,7 @@ fn decodeBmp(data: []const u8) ?DecodedImage {
             const src = row_off + @as(usize, x) * @as(usize, bytes_per_pixel);
             const dst = (@as(usize, y) * @as(usize, width) + @as(usize, x)) * 4;
             if (src + bytes_per_pixel > data.len or dst + 4 > pixels.len) {
-                std.heap.page_allocator.free(pixels);
+                allocator.free(pixels);
                 return null;
             }
             // BMP stores BGR(A)
@@ -629,11 +657,11 @@ fn decodeBmp(data: []const u8) ?DecodedImage {
         }
     }
 
-    return DecodedImage{ .pixels = pixels, .width = @intCast(width), .height = @intCast(height) };
+    return DecodedImage{ .pixels = pixels, .width = width, .height = height };
 }
 
 /// Decode an uncompressed TGA (type 2) to RGBA8.
-fn decodeTga(data: []const u8) ?DecodedImage {
+fn decodeTga(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
     if (data.len < 18) return null;
 
     const image_type = data[2];
@@ -654,7 +682,7 @@ fn decodeTga(data: []const u8) ?DecodedImage {
     const top_down = (descriptor & 0x20) != 0;
 
     const out_size = @as(usize, width) * @as(usize, height) * 4;
-    const pixels = std.heap.page_allocator.alloc(u8, out_size) catch return null;
+    const pixels = allocator.alloc(u8, out_size) catch return null;
 
     var y: u32 = 0;
     while (y < height) : (y += 1) {
@@ -664,7 +692,7 @@ fn decodeTga(data: []const u8) ?DecodedImage {
             const src = pixel_offset + (@as(usize, src_y) * @as(usize, width) + @as(usize, x)) * bytes_per_pixel;
             const dst = (@as(usize, y) * @as(usize, width) + @as(usize, x)) * 4;
             if (src + bytes_per_pixel > data.len or dst + 4 > pixels.len) {
-                std.heap.page_allocator.free(pixels);
+                allocator.free(pixels);
                 return null;
             }
             // TGA stores BGR(A)
@@ -675,7 +703,7 @@ fn decodeTga(data: []const u8) ?DecodedImage {
         }
     }
 
-    return DecodedImage{ .pixels = pixels, .width = @intCast(width), .height = @intCast(height) };
+    return DecodedImage{ .pixels = pixels, .width = width, .height = height };
 }
 
 // TODO: Add PNG decoding (requires inflate/zlib decompression) or integrate stb_image
