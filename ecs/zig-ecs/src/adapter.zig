@@ -110,15 +110,13 @@ fn emptySingleton(comptime T: type) *T {
 /// Presence check that works for both sized and zero-sized component
 /// types. zig-ecs's `tryGet` compile-errors for `@sizeOf(T) == 0`, so
 /// for zero-sized types we drop down to the sparse-set `contains`
-/// primitive which is safe (see #57). Tolerates destroyed entities by
-/// gating on `valid` — the existing `tryGet != null` shape the adapter
-/// exposes to callers never asserts on validity, so neither do we.
-fn storageContains(self: *Self, comptime T: type, ie: InternalEntity) bool {
-    if (comptime @sizeOf(T) == 0) {
-        if (!self.inner.valid(ie)) return false;
-        return self.inner.assure(T).contains(ie);
-    }
-    return self.inner.tryGet(T, ie) != null;
+/// primitive which is safe (see #57). `contains` already does its own
+/// version check internally (equivalent to `valid(ie)`), so there's no
+/// need for an explicit gate here — and for sized types `contains` is
+/// cheaper than `tryGet != null` because it skips the instance-pointer
+/// calculation. `inline` keeps the call site tight inside View.next().
+inline fn storageContains(self: *Self, comptime T: type, ie: InternalEntity) bool {
+    return self.inner.assure(T).contains(ie);
 }
 
 pub fn addComponent(self: *Self, entity: Entity, component: anytype) void {
@@ -128,20 +126,13 @@ pub fn addComponent(self: *Self, entity: Entity, component: anytype) void {
 
 pub fn getComponent(self: *Self, entity: Entity, comptime T: type) ?*T {
     if (comptime @sizeOf(T) == 0) {
-        const ie = toInternal(entity);
-        if (!self.inner.valid(ie)) return null;
-        return if (self.inner.assure(T).contains(ie)) emptySingleton(T) else null;
+        return if (self.storageContains(T, toInternal(entity))) emptySingleton(T) else null;
     }
     return self.inner.tryGet(T, toInternal(entity));
 }
 
 pub fn hasComponent(self: *Self, entity: Entity, comptime T: type) bool {
-    const ie = toInternal(entity);
-    if (comptime @sizeOf(T) == 0) {
-        if (!self.inner.valid(ie)) return false;
-        return self.inner.assure(T).contains(ie);
-    }
-    return self.inner.tryGet(T, ie) != null;
+    return self.storageContains(T, toInternal(entity));
 }
 
 pub fn removeComponent(self: *Self, entity: Entity, comptime T: type) void {
