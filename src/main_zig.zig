@@ -84,11 +84,13 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
         // `entries[i]` pairs the original scene name with the slice declared
         // in its .jsonc `"assets": [...]` block. Scenes without a manifest
         // get an empty slice, which is the legacy default, so this is a
-        // no-op for back-compat scenes. `catch {}` is defensive — the
-        // setter only fails on SceneNotFound, which can't happen here
-        // because the preceding loop registered every name in the list.
+        // no-op for back-compat scenes. The setter only fails on
+        // SceneNotFound, which shouldn't happen here because the preceding
+        // loop registered every name in the list — propagate via `try` so
+        // any mismatch (e.g. an assembler/engine version skew) surfaces
+        // loudly instead of being silently swallowed.
         try w.writeAll("    inline for (SceneAssetManifests.entries) |scene_asset_entry| {\n");
-        try w.writeAll("        g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets) catch {};\n");
+        try w.writeAll("        try g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets);\n");
         try w.writeAll("    }\n");
 
         const initial = cfg.initial_scene orelse jsonc_scene_names[0];
@@ -189,10 +191,12 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
         }
 
         // Attach parsed asset manifests — mirrors the loop-based setup path.
-        // See `buildSetupCode` for the rationale; this block exists so
-        // callback-based backends (sokol, wasm) get the same wiring.
+        // See `buildSetupCode` for the rationale. `init` is void here (C
+        // compatibility for sokol/wasm callback backends), so we can't
+        // propagate with `try`; panic on the impossible SceneNotFound
+        // instead of swallowing, matching the `setScene` pattern below.
         try w.writeAll("    inline for (SceneAssetManifests.entries) |scene_asset_entry| {\n");
-        try w.writeAll("        g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets) catch {};\n");
+        try w.writeAll("        g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets) catch @panic(\"failed to set scene assets\");\n");
         try w.writeAll("    }\n");
 
         const initial = cfg.initial_scene orelse jsonc_scene_names[0];
