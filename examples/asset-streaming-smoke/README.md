@@ -76,9 +76,17 @@ Expected behaviour:
 
 - Window opens showing an empty 800×600 frame.
 - A green progress bar fills across two ticks (one per atlas).
-- The progress bar disappears; two sprites (a player and a jumper
-  pose) render in the middle of the screen.
-- Escape quits.
+- The progress bar disappears; two sprites (a blue player face and
+  a small jumper figure) render in the **top-right quadrant** of the
+  window — at world (550, 450) and (650, 450). That position is
+  intentional: it's the simplest unambiguous "the JSON-declared
+  coordinates ended up where the JSON said they would" check;
+  anything in any other quadrant means the streaming pipeline
+  mangled the position somewhere.
+- After 30 frames the playing-state script saves
+  `smoke-test.png` to the run directory and quits, so a CI runner
+  gets a reproducible image without needing a window manager.
+- Escape quits early.
 
 ## CI integration
 

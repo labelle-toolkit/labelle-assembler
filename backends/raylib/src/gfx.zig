@@ -199,8 +199,27 @@ pub fn getScreenHeight() i32 {
     return rl.getScreenHeight();
 }
 
-/// No-op: raylib handles DPI scaling internally via SetWindowSize/GetScreenWidth.
-pub fn setDesignSize(_: i32, _: i32) void {}
+/// raylib handles DPI scaling internally — `getScreenWidth/Height`
+/// already return logical (design) pixels in the common case. We
+/// still record the design dims here so `getDesignWidth/Height`
+/// has a stable answer regardless of the OS's window-size quirks
+/// (multi-monitor moves, fullscreen toggles, etc.). When unset,
+/// the getters fall back to the live screen size.
+var design_w: i32 = 0;
+var design_h: i32 = 0;
+
+pub fn setDesignSize(w: i32, h: i32) void {
+    design_w = if (w > 0) w else 0;
+    design_h = if (h > 0) h else 0;
+}
+
+pub fn getDesignWidth() i32 {
+    return if (design_w > 0) design_w else rl.getScreenWidth();
+}
+
+pub fn getDesignHeight() i32 {
+    return if (design_h > 0) design_h else rl.getScreenHeight();
+}
 
 pub fn screenToWorld(pos: Vector2, camera: Camera2D) Vector2 {
     const result = rl.getScreenToWorld2D(pos.toRl(), camera.toRl());
