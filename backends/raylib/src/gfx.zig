@@ -1,9 +1,19 @@
 /// Raylib gfx backend — satisfies the labelle-gfx Backend(Impl) contract.
+const std = @import("std");
 const rl = @import("raylib");
 
 // ── Backend types ──────────────────────────────────────────────────────
 
 pub const Texture = struct { id: u32, width: i32, height: i32 };
+
+/// CPU-decoded image owned by the caller's allocator. See sokol's
+/// `DecodedImage` doc-comment for why this is defined per-backend
+/// instead of imported from labelle-gfx — same reasoning applies.
+pub const DecodedImage = struct {
+    pixels: []u8,
+    width: u32,
+    height: u32,
+};
 
 pub const Color = struct {
     r: u8,
@@ -108,9 +118,56 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     return .{ .id = @intCast(tex.id), .width = tex.width, .height = tex.height };
 }
 
-pub fn loadTextureFromMemory(file_type: [:0]const u8, data: []const u8) !Texture {
-    const image = rl.loadImageFromMemory(file_type, data) catch return error.LoadFailed;
+/// Pure CPU decode, safe from a worker thread. Uses raylib's built-in
+/// `loadImageFromMemory` (which calls stb_image internally), normalises
+/// the result to RGBA8, copies the pixels into an allocator-owned buffer
+/// and frees the raylib-owned image. The caller owns the returned
+/// `pixels` slice and frees it on both the success and the discard path.
+pub fn decodeImage(
+    file_type: [:0]const u8,
+    data: []const u8,
+    allocator: std.mem.Allocator,
+) !DecodedImage {
+    var image = rl.loadImageFromMemory(file_type, data) catch return error.LoadFailed;
     defer rl.unloadImage(image);
+
+    // Force RGBA8 so the caller can treat `pixels` as 4 bytes per pixel
+    // without having to branch on raylib's PixelFormat enum.
+    if (image.format != .uncompressed_r8g8b8a8) {
+        rl.imageFormat(&image, .uncompressed_r8g8b8a8);
+        if (image.format != .uncompressed_r8g8b8a8) return error.LoadFailed;
+    }
+
+    if (image.width <= 0 or image.height <= 0) return error.LoadFailed;
+
+    const width: u32 = @intCast(image.width);
+    const height: u32 = @intCast(image.height);
+    const len: usize = @as(usize, width) * @as(usize, height) * 4;
+
+    const owned = try allocator.alloc(u8, len);
+    const src: [*]const u8 = @ptrCast(image.data);
+    @memcpy(owned, src[0..len]);
+
+    return .{
+        .pixels = owned,
+        .width = width,
+        .height = height,
+    };
+}
+
+/// Main/GL-thread GPU upload. Synthesises a raylib `Image` that points
+/// into the caller's pixel buffer (raylib's `loadTextureFromImage` copies
+/// the pixels to the GPU and does not retain ownership), then returns
+/// the resulting texture. Does NOT free `decoded.pixels` — the caller
+/// frees that buffer on both the success and the discard path.
+pub fn uploadTexture(decoded: DecodedImage) !Texture {
+    const image: rl.Image = .{
+        .data = @ptrCast(@constCast(decoded.pixels.ptr)),
+        .width = @intCast(decoded.width),
+        .height = @intCast(decoded.height),
+        .mipmaps = 1,
+        .format = .uncompressed_r8g8b8a8,
+    };
     const tex = rl.loadTextureFromImage(image) catch return error.LoadFailed;
     if (tex.id == 0) return error.LoadFailed;
     return .{ .id = @intCast(tex.id), .width = tex.width, .height = tex.height };

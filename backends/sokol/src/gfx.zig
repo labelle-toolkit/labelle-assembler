@@ -443,6 +443,22 @@ const stbi = @cImport({
     @cInclude("stb_image.h");
 });
 
+/// CPU-decoded image owned by the caller's allocator. Field layout
+/// (`pixels: []u8`, `width: u32`, `height: u32`) mirrors labelle-gfx's
+/// `DecodedImage` exactly — Zig's lazy comptime evaluation of the
+/// generic `Backend(Impl)` wrapper means the `decodeImage`/`uploadTexture`
+/// forwarders in the wrapper are never instantiated by the retained
+/// engine (it only calls the synthesized `loadTextureFromMemory`
+/// convenience wrapper, which stays in Impl-land and never crosses the
+/// nominal-type boundary), so a structurally identical per-backend type
+/// is sufficient to satisfy the `@hasDecl` contract without adding
+/// labelle-gfx as a dependency of the backend package.
+pub const DecodedImage = struct {
+    pixels: []u8,
+    width: u32,
+    height: u32,
+};
+
 pub fn loadTexture(path: [:0]const u8) !Texture {
     // Read the file from disk, then decode from memory
     const file = std.fs.cwd().openFileZ(path, .{}) catch return error.LoadFailed;
@@ -455,18 +471,24 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     const data = file.readToEndAlloc(std.heap.page_allocator, @intCast(file_size)) catch return error.LoadFailed;
     defer std.heap.page_allocator.free(data);
 
-    return loadTextureFromMemoryData(data);
+    const decoded = try decodeImage("", data, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(decoded.pixels);
+    return uploadTexture(decoded);
 }
 
-pub fn loadTextureFromMemory(_: [:0]const u8, data: []const u8) !Texture {
-    return loadTextureFromMemoryData(data);
-}
-
-fn loadTextureFromMemoryData(data: []const u8) !Texture {
+/// Pure CPU decode: safe to call from a worker thread. Returns a
+/// `DecodedImage` whose `pixels` buffer is allocated from `allocator` —
+/// the caller owns it and MUST free it via the same allocator on both
+/// the success and the discard paths (see `uploadTexture`).
+pub fn decodeImage(
+    _: [:0]const u8,
+    data: []const u8,
+    allocator: std.mem.Allocator,
+) !DecodedImage {
     var width: c_int = 0;
     var height: c_int = 0;
     var channels: c_int = 0;
-    const pixels = stbi.stbi_load_from_memory(
+    const raw = stbi.stbi_load_from_memory(
         @ptrCast(data.ptr),
         @intCast(data.len),
         &width,
@@ -474,12 +496,30 @@ fn loadTextureFromMemoryData(data: []const u8) !Texture {
         &channels,
         4, // force RGBA
     );
-    if (pixels == null) return error.LoadFailed;
-    defer stbi.stbi_image_free(pixels);
+    if (raw == null) return error.LoadFailed;
+    defer stbi.stbi_image_free(raw);
 
-    const size: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
-    const pixel_data: []const u8 = @as([*]const u8, @ptrCast(pixels))[0..size];
-    return createTextureFromRgba(pixel_data, width, height);
+    if (width <= 0 or height <= 0) return error.LoadFailed;
+
+    const len: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+    const owned = try allocator.alloc(u8, len);
+    @memcpy(owned, @as([*]const u8, @ptrCast(raw))[0..len]);
+
+    return .{
+        .pixels = owned,
+        .width = @intCast(width),
+        .height = @intCast(height),
+    };
+}
+
+/// Main/GL-thread GPU upload. Does NOT free `decoded.pixels` — the
+/// caller (the asset catalog, or the `loadTexture`/`loadTextureFromMemory`
+/// helper) owns that buffer and frees it on both the success and the
+/// discard paths.
+pub fn uploadTexture(decoded: DecodedImage) !Texture {
+    const w: i32 = @intCast(decoded.width);
+    const h: i32 = @intCast(decoded.height);
+    return createTextureFromRgba(decoded.pixels, w, h);
 }
 
 pub fn unloadTexture(texture: Texture) void {
