@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
         "test/script_scanner_tests.zig",
         "test/deps_linker_tests.zig",
         "test/template_dynamic_test.zig",
+        "test/scanner_symlink_tests.zig",
     };
 
     for (test_files) |test_file| {
