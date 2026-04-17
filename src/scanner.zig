@@ -163,27 +163,30 @@ pub fn linkDir(
     // Skip silently if source doesn't exist — matches copyDirRecursive.
     cwd.access(src_path, .{}) catch return;
 
-    try cwd.makePath(dst_base);
+    // Ensure the symlink's immediate parent exists. Using dst_parent
+    // (not dst_base) handles plugin-declared nested `folder` values
+    // like "foo/bar" correctly — makePath(dst_base) alone would fail
+    // on symLink() because `dst_base/foo` wouldn't exist.
+    const dst_parent = std.fs.path.dirname(dst_path) orelse ".";
+    try cwd.makePath(dst_parent);
 
     // Compute the relative target from the parent of the link to the
     // source. Using a relative link lets the project directory be moved
     // without breaking (absolute paths would snap on relocation).
-    const dst_parent = std.fs.path.dirname(dst_path) orelse ".";
     const relative_target = try std.fs.path.relative(allocator, dst_parent, src_path);
     defer allocator.free(relative_target);
 
-    // Inspect whatever is at dst_path.
+    // Inspect whatever is at dst_path. `deleteTree` handles every
+    // case uniformly — it removes file symlinks, directory symlinks
+    // (on Windows where deleteFile can't), and real directories left
+    // over from older copy-based generates. Safe because `dst_base`
+    // is the CLI's managed target directory (`.labelle/<target>/`).
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     if (cwd.readLink(dst_path, &link_buf)) |existing| {
         if (std.mem.eql(u8, existing, relative_target)) return;
-        // Stale link — replace it.
-        try cwd.deleteFile(dst_path);
+        try cwd.deleteTree(dst_path);
     } else |err| switch (err) {
         error.FileNotFound => {},
-        // `NotLink` = regular dir left over from an older copy-based
-        // generate. Remove the whole tree so the symlink can take its
-        // place. Safe because `dst_base` is the CLI's managed target
-        // directory (`.labelle/<target>/`).
         error.NotLink => try cwd.deleteTree(dst_path),
         else => return err,
     }
@@ -256,6 +259,11 @@ fn scanRecursive(
                         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, base_stem })
                     else
                         try allocator.dupe(u8, base_stem);
+                    // If `append` fails between the stem allocation
+                    // and the list taking ownership, free it here
+                    // so the outer errdefer (which only walks the
+                    // list) doesn't miss it.
+                    errdefer allocator.free(stem);
                     try names.append(allocator, stem);
                 }
             },

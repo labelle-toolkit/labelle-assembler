@@ -112,6 +112,34 @@ pub const LinkDir = struct {
         f.close();
     }
 
+    test "creates intermediate directories when folder is nested" {
+        // Plugin-declared convention dirs can be nested (e.g.
+        // `foo/bar`). `linkDir` must make the immediate parent of
+        // the symlink exist before calling symLink, otherwise
+        // FileNotFound on the parent fails the create.
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.makePath("project/nested/deep");
+        try writeSample(tmp.dir, "project/nested/deep/thing.zig", "");
+        try tmp.dir.makePath("project/.labelle/target");
+
+        const src_base = try tmp.dir.realpathAlloc(std.testing.allocator, "project");
+        defer std.testing.allocator.free(src_base);
+        const dst_base = try tmp.dir.realpathAlloc(std.testing.allocator, "project/.labelle/target");
+        defer std.testing.allocator.free(dst_base);
+
+        try scanner.linkDir(std.testing.allocator, src_base, dst_base, "nested/deep");
+
+        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const target = try tmp.dir.readLink("project/.labelle/target/nested/deep", &link_buf);
+        try std.testing.expect(!std.fs.path.isAbsolute(target));
+
+        // And the file through the link is reachable.
+        const f = try tmp.dir.openFile("project/.labelle/target/nested/deep/thing.zig", .{});
+        f.close();
+    }
+
     test "missing source is silently skipped" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();

@@ -128,10 +128,12 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     // the old always-eager behavior. Ticket #48.
     try lazy_inference.resolveLazyDefaults(allocator, mutable_resources, scene_manifests);
 
-    // Copy all script files (including subdirectories) into target dir.
-    // Then use ScriptScanner to parse directory-based state binding.
-    const script_names_unused = try scanner.linkAndScan(allocator, game_dir, target_dir, "scripts", ".zig");
-    scanner.freeNames(allocator, script_names_unused);
+    // Symlink the scripts directory; names from a shallow scan are
+    // thrown away here because `script_scanner.ScriptScanner` below
+    // does its own richer walk (state-directory binding, numeric
+    // prefix ordering, etc.). `linkDir` gives the same layout as
+    // `linkAndScan` without the redundant name collection.
+    try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 
     const scripts_target = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
     defer allocator.free(scripts_target);
