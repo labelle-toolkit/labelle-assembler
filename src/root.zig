@@ -5,7 +5,7 @@ const std = @import("std");
 // ── Submodules ─────────────────────────────────────────────────────────
 const config = @import("config.zig");
 const cache = @import("cache.zig");
-const scanner = @import("scanner.zig");
+pub const scanner = @import("scanner.zig");
 pub const scene_manifest = @import("scene_manifest.zig");
 pub const asset_validator = @import("asset_validator.zig");
 pub const lazy_inference = @import("lazy_inference.zig");
@@ -98,10 +98,10 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
 
     // Copy game folders into target dir and scan file stems in one pass.
     // Folders that need scanning use copyAndScan; assets is copy-only.
-    const prefab_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "prefabs", ".jsonc");
+    const prefab_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "prefabs", ".jsonc");
     defer scanner.freeNames(allocator, prefab_names);
 
-    const jsonc_scene_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "scenes", ".jsonc");
+    const jsonc_scene_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "scenes", ".jsonc");
     defer scanner.freeNames(allocator, jsonc_scene_names);
 
     // Parse each scene file's top-level manifest (assets: array + unknown-key
@@ -130,7 +130,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
 
     // Copy all script files (including subdirectories) into target dir.
     // Then use ScriptScanner to parse directory-based state binding.
-    const script_names_unused = try scanner.copyAndScan(allocator, game_dir, target_dir, "scripts", ".zig");
+    const script_names_unused = try scanner.linkAndScan(allocator, game_dir, target_dir, "scripts", ".zig");
     scanner.freeNames(allocator, script_names_unused);
 
     const scripts_target = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
@@ -140,29 +140,29 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     try script_scan.scanDir(scripts_target);
     const script_entries = script_scan.getEntries();
 
-    const component_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "components", ".zig");
+    const component_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "components", ".zig");
     defer scanner.freeNames(allocator, component_names);
 
-    const hook_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "hooks", ".zig");
+    const hook_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "hooks", ".zig");
     defer scanner.freeNames(allocator, hook_names);
 
-    const event_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "events", ".zig");
+    const event_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "events", ".zig");
     defer scanner.freeNames(allocator, event_names);
 
-    const enum_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "enums", ".zig");
+    const enum_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "enums", ".zig");
     defer scanner.freeNames(allocator, enum_names);
 
-    const view_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "views", ".zon");
+    const view_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "views", ".zon");
     defer scanner.freeNames(allocator, view_names);
 
-    const gizmo_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "gizmos", ".zon");
+    const gizmo_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "gizmos", ".zon");
     defer scanner.freeNames(allocator, gizmo_names);
 
-    const animation_names = try scanner.copyAndScan(allocator, game_dir, target_dir, "animations", ".zon");
+    const animation_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "animations", ".zon");
     defer scanner.freeNames(allocator, animation_names);
 
     // Copy-only folders (no scanning needed)
-    try scanner.copyDirRecursive(allocator, game_dir, target_dir, "assets");
+    try scanner.linkDir(allocator, game_dir, target_dir, "assets");
 
     // ── Plugin-declared convention directories ────────────────────────
     // Each plugin in cfg.plugins may ship a `plugin.labelle` manifest at
@@ -234,7 +234,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
                     // validated by plugin_manifest.loadFromDir at load
                     // time, so .? here is safe.
                     const ext = dir.extension.?;
-                    const names = try scanner.copyAndScan(
+                    const names = try scanner.linkAndScan(
                         allocator,
                         game_dir,
                         target_dir,
@@ -247,7 +247,7 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
                     scanner.freeNames(allocator, names);
                 },
                 .copy_only => {
-                    try scanner.copyDirRecursive(
+                    try scanner.linkDir(
                         allocator,
                         game_dir,
                         target_dir,
