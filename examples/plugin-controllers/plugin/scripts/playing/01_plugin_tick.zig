@@ -18,6 +18,13 @@
 
 pub const game_states = .{"playing"};
 
+// Must stay in sync with `FRAMES_BEFORE_QUIT` in the game's
+// `scripts/playing/01_game_tick.zig`. Both scripts cap their log output
+// at the same frame count so the CI grep pattern for `frame=1..N` is
+// deterministic — raylib's main loop keeps ticking past the quit
+// signal until the CI timeout fires.
+const FRAMES_BEFORE_QUIT: u32 = 5;
+
 pub fn State(comptime EcsBackend: type) type {
     _ = EcsBackend;
     return struct {
@@ -26,6 +33,7 @@ pub fn State(comptime EcsBackend: type) type {
 }
 
 pub fn tick(game: anytype, state: anytype, _: anytype, _: f32) void {
+    if (state.frame >= FRAMES_BEFORE_QUIT) return;
     state.frame += 1;
     game.log.info("[demo-plugin] plugin-tick frame={d}", .{state.frame});
 }

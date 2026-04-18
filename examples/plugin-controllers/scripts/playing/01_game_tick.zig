@@ -47,6 +47,15 @@ pub fn State(comptime EcsBackend: type) type {
 }
 
 pub fn tick(game: anytype, state: anytype, _: anytype, _: f32) void {
+    // Under raylib, `game.quit()` doesn't break the main loop —
+    // `windowShouldClose()` stays false for a hidden window — so ticks
+    // keep firing past frame `FRAMES_BEFORE_QUIT` until the CI timeout
+    // kills the process. Cap our log output so the captured stderr
+    // stays deterministic: after FRAMES_BEFORE_QUIT ticks we stop
+    // logging new frames. The CI grep keys on frames 1..FRAMES_BEFORE_QUIT
+    // so the extra silent iterations don't change the asserted pattern.
+    if (state.frame >= FRAMES_BEFORE_QUIT) return;
+
     state.frame += 1;
     game.log.info("[game] game-tick frame={d}", .{state.frame});
 
