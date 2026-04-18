@@ -140,7 +140,10 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     var script_scan = script_scanner.ScriptScanner.init(allocator, cfg.states);
     defer script_scan.deinit();
     try script_scan.scanDir(scripts_target);
-    const script_entries = script_scan.getEntries();
+    // NOTE: `script_scan.getEntries()` is deliberately called AFTER the
+    // plugin-shipped-scripts loop below (`scanPluginDir` appends more
+    // entries and can reallocate the backing buffer). The final capture
+    // happens just before `generateMainZigFromTemplate`.
 
     const component_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "components", ".zig");
     defer scanner.freeNames(allocator, component_names);
@@ -256,8 +259,96 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
                         dir.name,
                     );
                 },
+                .ship_from_plugin => {
+                    // Plugin-shipped content: source dir lives in the
+                    // plugin's cached package rather than the consuming
+                    // game. Resolves the plugin's path up-front because
+                    // copyAndScan takes a base and a folder-under-base.
+                    // Silently skips if the plugin doesn't actually ship
+                    // the declared directory — matches copy_and_scan's
+                    // missing-source tolerance so a plugin author can
+                    // declare the convention eagerly and ship content
+                    // incrementally.
+                    const ext = dir.extension.?;
+                    const plugin_src_dir = try cache.resolvePlugin(allocator, plugin, game_dir);
+                    defer allocator.free(plugin_src_dir);
+                    const names = try scanner.copyAndScan(
+                        allocator,
+                        plugin_src_dir,
+                        target_dir,
+                        dir.name,
+                        ext,
+                    );
+                    scanner.freeNames(allocator, names);
+                },
             }
         }
+    }
+
+    // ── Plugin-shipped scripts (RFC-plugin-controllers §2, step-1 half 3) ─
+    //
+    // A plugin can ship its own `scripts/` directory that the assembler
+    // copies into the generated build alongside the game's own `scripts/`.
+    // These are discovered via a convention — any plugin that has a
+    // top-level `scripts/` dir in its cached package contributes scripts —
+    // rather than via an explicit `plugin.labelle` entry, because `scripts`
+    // is a reserved convention name (see RESERVED_DIR_NAMES) that the
+    // plugin manifest already forbids plugins from claiming.
+    //
+    // Layout in the generated target:
+    //   <target>/scripts/                         ← game's own scripts (unchanged)
+    //   <target>/scripts/.plugin_<name>/<rel>     ← each plugin's scripts,
+    //                                               isolated per plugin so
+    //                                               they form their own
+    //                                               numeric-prefix scope
+    //
+    // Scanning is driven by the `ScriptScanner` via `scanPluginDir`
+    // below — each plugin's scripts form their own numeric-prefix
+    // namespace, so the duplicate-prefix validator treats each plugin
+    // block as independent. Cross-plugin prefix collisions are
+    // impossible by construction. Game-vs-plugin collisions are also
+    // impossible — the game scripts live under `scripts/` while plugin
+    // scripts live under `scripts/.plugin_<name>/`, which the scanner
+    // treats as a different namespace.
+    //
+    // Plugins without a `scripts/` dir contribute nothing — backward-compat
+    // with every existing plugin (labelle-fsm, labelle-pathfinding today).
+    // Both `copyAndScanAbs` and `scanPluginDir` silently no-op on a
+    // missing source dir, so no explicit probe is needed here.
+    for (cfg.plugins) |plugin| {
+        // Plugin was already resolved during the manifest-loading loop
+        // above; re-resolving here is infallible in practice. Use `try`
+        // to match the manifest-load contract — a failure here is a
+        // cache corruption, not a plugin configuration error, and
+        // should fail the generate rather than silently skip.
+        const plugin_src_dir = try cache.resolvePlugin(allocator, plugin, game_dir);
+        defer allocator.free(plugin_src_dir);
+
+        const plugin_scripts_src = try std.fs.path.join(allocator, &.{ plugin_src_dir, "scripts" });
+        defer allocator.free(plugin_scripts_src);
+
+        // Destination: `<target>/scripts/.plugin_<name>/`. The leading `.`
+        // prevents accidental collision with a game state directory (states
+        // must be lowercase alphanumeric + `_`, per `isValidStateName`, so
+        // `.plugin_foo` can never be mistaken for a state dir by the
+        // scanner).
+        const plugin_dst_subdir = try std.fmt.allocPrint(allocator, ".plugin_{s}", .{plugin.name});
+        defer allocator.free(plugin_dst_subdir);
+        const plugin_scripts_dst = try std.fs.path.join(allocator, &.{ target_dir, "scripts", plugin_dst_subdir });
+        defer allocator.free(plugin_scripts_dst);
+
+        const names = try scanner.copyAndScanAbs(
+            allocator,
+            plugin_scripts_src,
+            plugin_scripts_dst,
+            ".zig",
+        );
+        scanner.freeNames(allocator, names);
+
+        // Feed the plugin's scripts into the scanner as a new block,
+        // isolated under the plugin's namespace so the duplicate-prefix
+        // validator treats it independently of the game block.
+        try script_scan.scanPluginDir(plugin_scripts_dst, plugin.name);
     }
 
     // Generate build.zig.zon
@@ -270,7 +361,12 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
 
-    // Generate main.zig — load engine template from codegen/ directory
+    // Generate main.zig — load engine template from codegen/ directory.
+    // Capture script entries NOW, after all game + plugin scripts have
+    // been fed to the scanner (see root.zig §script discovery). Capturing
+    // earlier would produce a stale slice that misses every
+    // plugin-shipped script.
+    const script_entries = script_scan.getEntries();
     const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
     defer allocator.free(engine_template);
     const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names);

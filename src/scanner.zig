@@ -106,6 +106,35 @@ pub fn writeFile(dir_path: []const u8, filename: []const u8, content: []const u8
     try file.writeAll(content);
 }
 
+/// Copy files from `src_dir` to `dst_dir` (recursively) and return sorted
+/// file stems matching the given extension. Mirrors `copyAndScan` but takes
+/// two fully-resolved absolute paths instead of a base+folder pair, so the
+/// source and destination don't have to share a relative folder name.
+///
+/// Motivating use: plugin-shipped scripts at `<plugin>/scripts/**` need to
+/// land at `<target>/scripts/.plugin_<name>/**`. Those two paths don't share
+/// a last segment, so `copyAndScan(src_base, dst_base, "scripts", ".zig")`
+/// can't express the shape. This helper splits the concerns cleanly.
+pub fn copyAndScanAbs(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8, ext: []const u8) ![][]const u8 {
+    const cwd = std.fs.cwd();
+
+    var names: std.ArrayList([]const u8) = .{};
+    errdefer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+
+    try copyAndScanRecursive(allocator, cwd, src_dir, dst_dir, "", ext, &names);
+
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    return names.toOwnedSlice(allocator);
+}
+
 /// Copy a subdirectory from src_base/folder to dst_base/folder.
 /// Copies all files (non-recursive, skips directories and .bridge.zig).
 pub fn copyDir(allocator: std.mem.Allocator, src_base: []const u8, dst_base: []const u8, folder: []const u8) !void {

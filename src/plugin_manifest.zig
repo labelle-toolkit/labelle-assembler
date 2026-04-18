@@ -39,6 +39,18 @@ pub const ConventionDirMode = enum {
     /// recursively, no scanning. Mirrors `scanner.copyDirRecursive`
     /// used for assets/.
     copy_only,
+    /// Like `copy_and_scan`, but the source directory is inside the
+    /// **plugin's** cached package, not the consuming game's tree.
+    /// Copies <plugin>/<name>/** into <target>/<name>/ and scans the
+    /// file stems with `extension`. Enables a plugin to ship its own
+    /// scripts, hooks, or other scanned assets that become part of the
+    /// generated build alongside the game's own.
+    ///
+    /// See RFC-plugin-controllers §migration step 1 — pathfinder will
+    /// use this mode to ship `libs/pathfinder/scripts/playing/01_advance.zig`
+    /// as a 5-line per-frame bridge that every consuming game
+    /// automatically picks up.
+    ship_from_plugin,
 };
 
 pub const ConventionDir = struct {
@@ -231,15 +243,17 @@ pub fn loadFromDir(
             return error.PluginManifestUnsafeDirName;
         }
 
-        // copy_and_scan mode requires an explicit extension. root.zig
-        // used to silently default to ".zig", which hid typos and
-        // surprised plugin authors scanning .jsonc or .zon files. The
-        // RFC marks extension as required for this mode — enforce it
-        // here at load time with a clear diagnostic.
-        if (dir.mode == .copy_and_scan and dir.extension == null) {
+        // Scan modes require an explicit extension. root.zig used to
+        // silently default to ".zig", which hid typos and surprised
+        // plugin authors scanning .jsonc or .zon files. The RFC marks
+        // extension as required for these modes — enforce it here at
+        // load time with a clear diagnostic. `copy_only` skips scanning
+        // entirely so extension is irrelevant and must stay null-or-anything.
+        const needs_extension = dir.mode == .copy_and_scan or dir.mode == .ship_from_plugin;
+        if (needs_extension and dir.extension == null) {
             std.debug.print(
-                "labelle: plugin '{s}' declared convention_dir '{s}' with mode .copy_and_scan\n  but 'extension' is missing. copy_and_scan mode requires a file extension to scan (e.g. \".zig\").\n  use mode .copy_only if you want to copy every file regardless of extension.\n",
-                .{ expected_name, dir.name },
+                "labelle: plugin '{s}' declared convention_dir '{s}' with mode .{s}\n  but 'extension' is missing. scan modes require a file extension (e.g. \".zig\").\n  use mode .copy_only if you want to copy every file regardless of extension.\n",
+                .{ expected_name, dir.name, @tagName(dir.mode) },
             );
             return error.PluginManifestMissingExtension;
         }
@@ -377,6 +391,89 @@ test "ZonManifest: parses manifest with no convention_dirs" {
 
     try testing.expectEqualStrings("marker_only", parsed.name);
     try testing.expectEqual(@as(usize, 0), parsed.convention_dirs.len);
+}
+
+test "ZonManifest: parses ship_from_plugin mode with extension" {
+    const src =
+        \\.{
+        \\    .name = "pathfinder",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .{
+        \\        .{
+        \\            .name = "scripts",
+        \\            .extension = ".zig",
+        \\            .mode = .ship_from_plugin,
+        \\        },
+        \\    },
+        \\}
+    ;
+    const src_z = try testing.allocator.dupeZ(u8, src);
+    defer testing.allocator.free(src_z);
+
+    // Note: "scripts" *is* reserved for the hardcoded engine convention,
+    // so at the load level this entry would hit the reserved-name guard.
+    // The raw ZON parser only cares about the shape of the enum, though.
+    const parsed = try std.zon.parse.fromSlice(ZonManifest, testing.allocator, src_z, null, .{});
+    defer std.zon.parse.free(testing.allocator, parsed);
+
+    try testing.expectEqual(ConventionDirMode.ship_from_plugin, parsed.convention_dirs[0].mode);
+    try testing.expectEqualStrings(".zig", parsed.convention_dirs[0].extension.?);
+}
+
+test "loadFromDir: rejects ship_from_plugin without extension" {
+    // Scan modes need an explicit extension so the plugin author can't
+    // accidentally ship a mixed-extension directory that the scanner
+    // silently treats as .zig-only. Same rule as copy_and_scan.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "pathfinder",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .{
+        \\        .{
+        \\            .name = "pathfinder_scripts",
+        \\            .mode = .ship_from_plugin,
+        \\        },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadFromDir(testing.allocator, tmp_path, "pathfinder");
+    try testing.expectError(error.PluginManifestMissingExtension, result);
+}
+
+test "loadFromDir: parses ship_from_plugin mode end-to-end" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "pathfinder",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .{
+        \\        .{
+        \\            .name = "pathfinder_bridges",
+        \\            .extension = ".zig",
+        \\            .mode = .ship_from_plugin,
+        \\        },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "pathfinder")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqual(ConventionDirMode.ship_from_plugin, manifest.convention_dirs[0].mode);
+    try testing.expectEqualStrings("pathfinder_bridges", manifest.convention_dirs[0].name);
+    try testing.expectEqualStrings(".zig", manifest.convention_dirs[0].extension.?);
 }
 
 test "ZonManifest: parses manifest with multiple convention dirs (different extensions on same name)" {

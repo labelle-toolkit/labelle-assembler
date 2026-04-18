@@ -126,6 +126,50 @@ fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("\n", .{});
 }
 
+/// Emit the `PluginControllers` comptime dispatcher that scans each plugin's
+/// root module for `pub const Controller = struct { ... }` and forwards
+/// `setup` / `deinit` lifecycle calls.
+///
+/// Backward-compatible: the `@hasDecl` guard means plugins that don't opt in
+/// contribute nothing at comptime and generate no code.
+///
+/// RFC: flying-platform-labelle#208 §1 (manifest contract) and §2 (lifecycle
+/// wiring). This is the step-1 discovery: only `setup` and `deinit` are
+/// auto-wired; per-frame plugin work ships as plugin scripts (step 3).
+fn writePluginControllersBlock(bw: anytype, cfg: ProjectConfig) !void {
+    try bw.writeAll("// --- Plugin controllers (RFC-plugin-controllers §1–§2) ---\n");
+    try bw.writeAll("// Discovers `pub const Controller` in each plugin root module at comptime\n");
+    try bw.writeAll("// and dispatches `setup` / `deinit` on scene load / unload. Plugins without\n");
+    try bw.writeAll("// a Controller export are silently skipped by the `@hasDecl` guard.\n");
+    try bw.writeAll("const PluginControllers = struct {\n");
+    try bw.writeAll("    const _plugin_mods = .{\n");
+    for (cfg.plugins) |plugin| {
+        try bw.print("        @import(\"{s}\"),\n", .{plugin.name});
+    }
+    try bw.writeAll("    };\n\n");
+    try bw.writeAll("    /// Call Controller.setup(game) on every plugin that declares one.\n");
+    try bw.writeAll("    /// Plugins whose root module does not export a `Controller` are silently skipped.\n");
+    try bw.writeAll("    pub fn setup(game: anytype) !void {\n");
+    try bw.writeAll("        inline for (_plugin_mods) |mod| {\n");
+    try bw.writeAll("            if (@hasDecl(mod, \"Controller\")) {\n");
+    try bw.writeAll("                const C = @field(mod, \"Controller\");\n");
+    try bw.writeAll("                if (@hasDecl(C, \"setup\")) try C.setup(game);\n");
+    try bw.writeAll("            }\n");
+    try bw.writeAll("        }\n");
+    try bw.writeAll("    }\n\n");
+    try bw.writeAll("    /// Call Controller.deinit(game) on every plugin that declares one.\n");
+    try bw.writeAll("    /// Mirrors setup(). Skips plugins without a Controller export or without a deinit.\n");
+    try bw.writeAll("    pub fn deinit(game: anytype) void {\n");
+    try bw.writeAll("        inline for (_plugin_mods) |mod| {\n");
+    try bw.writeAll("            if (@hasDecl(mod, \"Controller\")) {\n");
+    try bw.writeAll("                const C = @field(mod, \"Controller\");\n");
+    try bw.writeAll("                if (@hasDecl(C, \"deinit\")) C.deinit(game);\n");
+    try bw.writeAll("            }\n");
+    try bw.writeAll("        }\n");
+    try bw.writeAll("    }\n");
+    try bw.writeAll("};\n\n");
+}
+
 /// Build the setup code block for {{setup_code}} (loop-based backends).
 fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8, prefab_names: []const []const u8) ![]const u8 {
     var buf = std.ArrayList(u8){};
@@ -223,6 +267,13 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     if (cfg.plugins.len > 0) {
         try w.writeAll("    PluginSystems.setup(&g);\n");
         try w.writeAll("    defer PluginSystems.deinit();\n");
+        // Plugin controllers: setup on scene load, deinit on scene unload.
+        // RFC-plugin-controllers §2 — auto-wired for plugins exporting
+        // `pub const Controller = struct { setup, deinit, ... }`.
+        // Runs after PluginSystems.setup so controllers can depend on
+        // registered systems. `defer` mirrors PluginSystems.deinit ordering.
+        try w.writeAll("    try PluginControllers.setup(&g);\n");
+        try w.writeAll("    defer PluginControllers.deinit(&g);\n");
     }
 
     return buf.toOwnedSlice(allocator);
@@ -333,6 +384,10 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
 
     if (cfg.plugins.len > 0) {
         try w.writeAll("    PluginSystems.setup(&g);\n");
+        // Plugin controllers: setup on scene load. Deinit is emitted by
+        // `buildCallbackCleanupCode` since callback backends don't share
+        // the `defer` scope of init. RFC-plugin-controllers §2.
+        try w.writeAll("    PluginControllers.setup(&g) catch @panic(\"plugin controller setup failed\");\n");
     }
 
     return buf.toOwnedSlice(allocator);
@@ -350,6 +405,10 @@ fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
     }
 
     if (cfg.plugins.len > 0) {
+        // Mirror-order of buildCallbackInitCode: deinit in reverse of setup
+        // so controllers tear down before the systems they depend on.
+        // RFC-plugin-controllers §2.
+        try w.writeAll("    PluginControllers.deinit(&g);\n");
         try w.writeAll("    PluginSystems.deinit();\n");
     }
 
@@ -440,7 +499,13 @@ fn writeSceneAssetManifests(
 }
 
 /// Convert a path-style name to a valid Zig identifier: "enemies/goblin" -> "enemies_goblin".
-/// Replaces `/` and `+` with `_`, strips `.zig` extension.
+/// Replaces `/`, `+`, and `.` with `_`, strips the `.zig` extension first.
+///
+/// The `.` → `_` rewrite covers plugin-shipped scripts that land under
+/// `.plugin_<name>/…` — the leading dot would otherwise produce an identifier
+/// that Zig rejects. The rewrite is safe for ordinary scene / scripts paths
+/// because the only dot in valid convention names is the `.zig` suffix, which
+/// is stripped before the char walk.
 fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
     if (name.len > buf.len) {
         std.debug.print("labelle: path too long for identifier (max {d} chars): '{s}'\n", .{ buf.len, name });
@@ -450,7 +515,7 @@ fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
     const end = if (std.mem.endsWith(u8, name, ".zig")) name.len - 4 else name.len;
     var i: usize = 0;
     for (name[0..end]) |c| {
-        buf[i] = if (c == '/' or c == '+') '_' else c;
+        buf[i] = if (c == '/' or c == '+' or c == '.') '_' else c;
         i += 1;
     }
     return buf[0..i];
@@ -747,7 +812,18 @@ pub fn generateMainZigFromTemplate(
         try data.scalars.put("component_registry_block", block);
     }
 
-    // System registry block
+    // System registry block + Plugin controllers block (appended into the
+    // same scalar so it slots into existing `{{system_registry_block}}`
+    // placeholder in main.zig.template without needing a template update).
+    //
+    // The Plugin controllers scaffolding discovers `pub const Controller` in
+    // each plugin root module at comptime and emits a `setup` / `deinit`
+    // dispatcher the generated main calls on scene load / unload.
+    // Backward-compatible: plugins without a Controller export are silently
+    // skipped by the `@hasDecl` guard, so no runtime cost and no
+    // generate-time opt-in needed.
+    //
+    // See flying-platform-labelle#208 (RFC: Plugin-Exported Controllers) §1–§2.
     {
         var buf = std.ArrayList(u8){};
         const bw = buf.writer(allocator);
@@ -759,6 +835,8 @@ pub fn generateMainZigFromTemplate(
             }
             try bw.writeAll("});\n\n");
             try bw.writeAll("const DiscoveredGizmoCategories = PluginSystems.gizmoCategories();\n\n");
+
+            try writePluginControllersBlock(bw, cfg);
         } else {
             try bw.writeAll("const GizmoCatEntry = struct { name: []const u8, id: u8 };\n");
             try bw.writeAll("const DiscoveredGizmoCategories: []const GizmoCatEntry = &.{};\n\n");

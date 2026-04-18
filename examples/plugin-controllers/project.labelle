@@ -1,0 +1,38 @@
+// Minimal end-to-end example for PR #73's plugin-Controller machinery.
+//
+// Declares a single local fixture plugin (`plugin/`) and nothing else —
+// no atlases, no ECS backend, no GUI, no custom layers beyond the
+// built-in defaults. The generated binary runs the raylib desktop
+// backend with a hidden window (`.hidden = true`), drives the scene
+// into the single `playing` state, emits a few `[game] game-tick …`
+// and `[demo-plugin] plugin-tick …` log lines, then calls
+// `game.quit()` to exit.
+//
+// The CI log-order assertion lives in `.github/workflows/ci.yml` under
+// the `examples-integration` job — see the `Runtime log-order check`
+// step for the grep pattern.
+.{
+    .name = "plugin_controllers_demo",
+    .title = "LaBelle — Plugin Controllers E2E",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    // Hidden window keeps raylib's init path happy (it still needs an
+    // OpenGL context on Linux CI under xvfb) while suppressing any
+    // actual pixels being drawn. The CI job wraps the run in xvfb-run
+    // so the context is available; a display server would work equally
+    // well for local dev.
+    .hidden = true,
+    .backend = .raylib,
+    .ecs = .mock,
+    .initial_scene = "main",
+    .states = .{"playing"},
+    .plugins = .{
+        .{ .name = "demo_plugin", .repo = "local:./plugin" },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}

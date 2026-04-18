@@ -1,0 +1,8 @@
+{
+    // Minimal scene manifest — no entities, no assets, no room. Exists
+    // purely so `g.setScene("main")` has a name to bind against during
+    // the setup path. The plugin-Controller discovery fires on scene
+    // load; the scene itself contributes zero runtime behaviour.
+    "name": "main",
+    "entities": []
+}

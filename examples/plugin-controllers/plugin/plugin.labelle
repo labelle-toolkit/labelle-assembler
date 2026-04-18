@@ -1,0 +1,23 @@
+// Minimal fixture plugin manifest for the plugin-controllers E2E example.
+//
+// Exercises three pieces of the PR #73 machinery:
+//   1. `manifest_version = 1` — the parser accepts the current schema.
+//   2. `ship_from_plugin` mode on a non-reserved directory — validates
+//      that plugin-authored assets living inside the plugin's cached
+//      package are copied into the generated build target. `scripts/`
+//      itself is reserved, so the plugin ships its per-frame scripts
+//      via the auto-discovered `scripts/` convention (handled without
+//      a manifest entry — see RFC-plugin-controllers §2).
+//   3. A Controller export — see `src/root.zig` for the lifecycle hooks
+//      the assembler auto-wires into `PluginControllers.setup/.deinit`.
+.{
+    .name = "demo_plugin",
+    .manifest_version = 1,
+    .convention_dirs = .{
+        .{
+            .name = "demo_playbooks",
+            .extension = ".zig",
+            .mode = .ship_from_plugin,
+        },
+    },
+}

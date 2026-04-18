@@ -28,6 +28,19 @@ pub const ScriptScanner = struct {
     // Track shared allocations for proper cleanup (one per state dir)
     shared_subdirs: std.ArrayList([]const u8) = .{},
     shared_states: std.ArrayList([]const []const u8) = .{},
+    /// Plugin name strings owned by the scanner. One entry per unique
+    /// plugin that contributed a `scanPluginDir` call. Lifetime matches
+    /// the scanner's; deinit frees them.
+    shared_plugin_names: std.ArrayList([]const u8) = .{},
+    /// Running counter: how many plugin blocks we've scanned so far.
+    /// Used to seed `plugin_index` on each entry so sort order matches
+    /// `project.labelle`'s `.plugins` array order.
+    next_plugin_index: u32 = 0,
+    /// Scratch slot used while scanning a single plugin. Set by
+    /// `scanPluginDir` before the recursive walk, cleared afterward so
+    /// subsequent game scans remain plugin-free.
+    current_plugin_name: ?[]const u8 = null,
+    current_plugin_index: u32 = 0,
 
     pub const ScriptEntry = struct {
         /// Script name (prefix stripped, .zig stripped).
@@ -43,6 +56,17 @@ pub const ScriptScanner = struct {
         /// Relative path from the scripts/ root (e.g., "playing/navigation/02_movement.zig").
         /// For root-level scripts, same as filename.
         rel_path: []const u8,
+        /// Origin plugin name if this script was shipped by a plugin
+        /// (RFC-plugin-controllers §2). `null` means a game-owned script,
+        /// which runs in block 1. Plugin scripts run in block 2, ordered
+        /// by `plugin_index` (their position in project.labelle's .plugins
+        /// list), then by numeric prefix within their own plugin namespace.
+        plugin_name: ?[]const u8 = null,
+        /// Position in `project.labelle`'s `.plugins` array. Used as the
+        /// inter-plugin sort key; stable across builds since it's driven
+        /// by declaration order. Zero for game scripts (they sort first
+        /// via the `plugin_name == null` check regardless).
+        plugin_index: u32 = 0,
     };
 
     pub const ScanError = error{
@@ -79,6 +103,10 @@ pub const ScriptScanner = struct {
             self.allocator.free(states);
         }
         self.shared_states.deinit(self.allocator);
+
+        // Free plugin names owned by scanPluginDir.
+        for (self.shared_plugin_names.items) |s| self.allocator.free(s);
+        self.shared_plugin_names.deinit(self.allocator);
     }
 
     /// Scan a scripts directory on disk.
@@ -96,6 +124,11 @@ pub const ScriptScanner = struct {
                 const name_copy = try self.allocator.dupe(u8, entry.name);
                 try self.addEntryWithPath(name_copy, null, &.{}, name_copy);
             } else if (entry.kind == .directory) {
+                // Skip plugin sub-trees (`.plugin_<name>/`) — `scanPluginDir`
+                // handles those separately and they must not leak into the
+                // game block.
+                if (std.mem.startsWith(u8, entry.name, ".plugin_")) continue;
+
                 // First-level directory — parse for state binding
                 const dir_states = try self.parseDirStates(entry.name);
                 if (dir_states.len == 0) continue;
@@ -118,6 +151,80 @@ pub const ScriptScanner = struct {
         try self.validateNoDuplicateOrders();
     }
 
+    /// Scan a plugin-shipped scripts directory. Assigns every entry the
+    /// current plugin's namespace so the generator can emit them as a
+    /// separate block (RFC-plugin-controllers §2) and the duplicate-prefix
+    /// validator can scope collisions per-plugin.
+    ///
+    /// Call once per plugin, in `project.labelle` `.plugins` declaration
+    /// order — `next_plugin_index` seeds `plugin_index` on each entry so
+    /// the final sort reproduces that order. Calling on a directory that
+    /// doesn't exist is a no-op (same tolerance as `scanDir`).
+    ///
+    /// The caller is expected to `scanDir` the game's own scripts first,
+    /// then loop over plugins calling `scanPluginDir`. Each `scanPluginDir`
+    /// call internally re-sorts + re-validates so the final entries order
+    /// always reflects every script fed so far — callers don't need a
+    /// separate finalize step.
+    pub fn scanPluginDir(self: *ScriptScanner, plugin_scripts_dir: []const u8, plugin_name: []const u8) ScanError!void {
+        // Don't error if the plugin doesn't ship a scripts/ dir — that's
+        // the common case (labelle-fsm, labelle-pathfinding today).
+        var dir = std.fs.cwd().openDir(plugin_scripts_dir, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        const name_dup = try self.allocator.dupe(u8, plugin_name);
+        try self.shared_plugin_names.append(self.allocator, name_dup);
+
+        // Assign this plugin its position in the declaration order.
+        // Increment first so plugin indices start at 1 — leaves 0 free as
+        // a sentinel for "not a plugin script".
+        self.next_plugin_index += 1;
+        self.current_plugin_name = name_dup;
+        self.current_plugin_index = self.next_plugin_index;
+        defer {
+            self.current_plugin_name = null;
+            self.current_plugin_index = 0;
+        }
+
+        // Generated code imports scripts via `@import("scripts/<rel_path>")`,
+        // so plugin entries need a rel_path prefixed with `.plugin_<name>/`
+        // — matching the on-disk layout root.zig laid down.
+        const rel_prefix = try std.fmt.allocPrint(self.allocator, ".plugin_{s}", .{plugin_name});
+        // rel_prefix is borrowed into per-entry rel_paths via allocPrint
+        // below, not referenced directly — so free it at the end of the scan.
+        defer self.allocator.free(rel_prefix);
+
+        var iter = dir.iterate();
+        while (iter.next() catch return) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
+                const name_copy = try self.allocator.dupe(u8, entry.name);
+                const rel_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
+                try self.addEntryWithPath(name_copy, null, &.{}, rel_path);
+            } else if (entry.kind == .directory) {
+                // Plugin state-scoped dirs follow the same convention as
+                // the game's scripts/: first-level dirs are state bindings.
+                const dir_states = try self.parseDirStates(entry.name);
+                if (dir_states.len == 0) continue;
+
+                const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ plugin_scripts_dir, entry.name });
+                defer self.allocator.free(subdir_path);
+                const subdir_name = try self.allocator.dupe(u8, entry.name);
+                try self.shared_subdirs.append(self.allocator, subdir_name);
+                try self.shared_states.append(self.allocator, dir_states);
+                // The relative-path prefix threads through recursion so
+                // nested plugin dirs end up with `.plugin_<name>/<state>/...`.
+                const rel_prefix_with_state = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
+                defer self.allocator.free(rel_prefix_with_state);
+                try self.scanZigFilesRecursive(subdir_path, subdir_name, dir_states, rel_prefix_with_state);
+            }
+        }
+
+        // Sort + revalidate so every plugin's block stays consistent with
+        // the game block. Re-sorting is O(n log n) per plugin; n is small.
+        self.sortEntries();
+        try self.validateNoDuplicateOrders();
+    }
+
     /// Add an entry manually (for testing without filesystem).
     pub fn addEntry(self: *ScriptScanner, filename: []const u8, subdir: ?[]const u8, states: []const []const u8) !void {
         const name = stripPrefixAndExtension(filename);
@@ -130,6 +237,8 @@ pub const ScriptScanner = struct {
             .sort_order = sort_order,
             .subdir = subdir,
             .rel_path = filename,
+            .plugin_name = self.current_plugin_name,
+            .plugin_index = self.current_plugin_index,
         });
     }
 
@@ -145,6 +254,8 @@ pub const ScriptScanner = struct {
             .sort_order = sort_order,
             .subdir = subdir,
             .rel_path = rel_path,
+            .plugin_name = self.current_plugin_name,
+            .plugin_index = self.current_plugin_index,
         });
     }
 
@@ -216,7 +327,14 @@ pub const ScriptScanner = struct {
     }
 
     /// Validate that no two scripts in the same scope share a numeric prefix.
-    /// Scope = same subdir (null → global).
+    /// Scope = same subdir (null → global) AND same plugin namespace.
+    ///
+    /// Plugin namespaces are separate: two different plugins can both ship
+    /// `05_foo.zig` in `playing/` without conflict (RFC-plugin-controllers
+    /// §2). Game scripts and plugin scripts also live in different scopes,
+    /// so a game `05_foo.zig` and a plugin `05_foo.zig` don't collide —
+    /// which matches the RFC's "cross-plugin and plugin-vs-game collisions
+    /// are impossible by construction" claim.
     fn validateNoDuplicateOrders(self: *ScriptScanner) ScanError!void {
         const entries = self.entries.items;
 
@@ -226,25 +344,43 @@ pub const ScriptScanner = struct {
                 const b_order = b.sort_order orelse continue;
                 if (a_order != b_order) continue;
 
-                // Same order — check if same scope
-                const same_scope = blk: {
-                    if (a.subdir == null and b.subdir == null) break :blk true;
-                    if (a.subdir) |a_sub| {
-                        if (b.subdir) |b_sub| {
-                            break :blk std.mem.eql(u8, a_sub, b_sub);
-                        }
+                // Same order — check if same scope. Three axes of scope:
+                //  1. Same plugin namespace (both game, OR same plugin).
+                //  2. Same subdir (both global OR same state dir).
+                // Plugin namespace check first — it's the cheapest
+                // early-out and also the most frequent "different scope"
+                // case across two plugins.
+                const same_plugin = blk: {
+                    if (a.plugin_name == null and b.plugin_name == null) break :blk true;
+                    if (a.plugin_name) |a_p| {
+                        if (b.plugin_name) |b_p| break :blk std.mem.eql(u8, a_p, b_p);
                     }
                     break :blk false;
                 };
+                if (!same_plugin) continue;
 
-                if (same_scope) {
-                    const scope_name = a.subdir orelse "(global)";
+                const same_subdir = blk: {
+                    if (a.subdir == null and b.subdir == null) break :blk true;
+                    if (a.subdir) |a_sub| {
+                        if (b.subdir) |b_sub| break :blk std.mem.eql(u8, a_sub, b_sub);
+                    }
+                    break :blk false;
+                };
+                if (!same_subdir) continue;
+
+                const scope_name = a.subdir orelse "(global)";
+                if (a.plugin_name) |plugin_name| {
+                    std.debug.print(
+                        "error: duplicate script order {d:0>2} in plugin '{s}' scripts/{s}/:\n  - {s}\n  - {s}\n",
+                        .{ a_order, plugin_name, scope_name, a.filename, b.filename },
+                    );
+                } else {
                     std.debug.print(
                         "error: duplicate script order {d:0>2} in scripts/{s}/:\n  - {s}\n  - {s}\n",
                         .{ a_order, scope_name, a.filename, b.filename },
                     );
-                    return error.DuplicateSortOrder;
                 }
+                return error.DuplicateSortOrder;
             }
         }
     }
@@ -252,24 +388,40 @@ pub const ScriptScanner = struct {
     pub fn sortEntries(self: *ScriptScanner) void {
         std.mem.sortUnstable(ScriptEntry, self.entries.items, {}, struct {
             fn lessThan(_: void, a: ScriptEntry, b: ScriptEntry) bool {
-                // 1. Global scripts (no subdir) before state-scoped scripts
+                // 1. Game scripts (no plugin_name) always before plugin
+                //    scripts. This enforces the RFC-plugin-controllers §2
+                //    two-block ordering: the game's `scripts/` runs first,
+                //    then plugin scripts.
+                const a_is_plugin = a.plugin_name != null;
+                const b_is_plugin = b.plugin_name != null;
+                if (a_is_plugin != b_is_plugin) return !a_is_plugin;
+
+                // 2. Among plugin scripts: plugin_index (== position in
+                //    `project.labelle`'s `.plugins` list) decides the
+                //    inter-plugin order. Stable across builds.
+                if (a_is_plugin and b_is_plugin) {
+                    if (a.plugin_index != b.plugin_index) return a.plugin_index < b.plugin_index;
+                }
+
+                // 3. Within the same block (game OR same plugin): global
+                //    scripts (no subdir) before state-scoped scripts.
                 const a_global = a.subdir == null;
                 const b_global = b.subdir == null;
                 if (a_global != b_global) return a_global;
 
-                // 2. Within same scope: numbered before unnumbered
+                // 4. Within same scope: numbered before unnumbered
                 const a_has_order = a.sort_order != null;
                 const b_has_order = b.sort_order != null;
                 if (a_has_order != b_has_order) return a_has_order;
 
-                // 3. Both numbered: sort by number
+                // 5. Both numbered: sort by number
                 if (a.sort_order) |a_order| {
                     if (b.sort_order) |b_order| {
                         if (a_order != b_order) return a_order < b_order;
                     }
                 }
 
-                // 4. Alphabetical by name
+                // 6. Alphabetical by name
                 return std.mem.order(u8, a.name, b.name) == .lt;
             }
         }.lessThan);
