@@ -18,11 +18,10 @@
 
 pub const game_states = .{"playing"};
 
-// Must stay in sync with `FRAMES_BEFORE_QUIT` in the game's
-// `scripts/playing/01_game_tick.zig`. Both scripts cap their log output
-// at the same frame count so the CI grep pattern for `frame=1..N` is
-// deterministic — raylib's main loop keeps ticking past the quit
-// signal until the CI timeout fires.
+/// Mirrors the cap in the game's `scripts/playing/01_game_tick.zig`. The
+/// null backend caps frames at `LABELLE_NULL_FRAMES` (default 5) — both
+/// scripts use the same constant so the captured log stays deterministic
+/// even if a CI job sets `LABELLE_NULL_FRAMES` higher than the default.
 const FRAMES_BEFORE_QUIT: u32 = 5;
 
 pub fn State(comptime EcsBackend: type) type {

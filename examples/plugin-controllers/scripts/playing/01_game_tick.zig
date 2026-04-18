@@ -7,36 +7,36 @@
 //! in `test/script_scanner_tests.zig`), so there's no duplicate-prefix
 //! collision between the two files.
 //!
-//! Exit strategy: raylib's main-loop guard is `window.windowShouldClose()`,
-//! which only flips on ESC / user-initiated close. A hidden-window CI run
-//! can't reach either, and `rl.closeWindow()` from inside tick() crashes
-//! the same iteration's subsequent draw calls. The CI job wraps execution
-//! in `timeout 3s` so the process is killed once we've emitted enough
-//! interleaved log lines.
+//! Exit strategy: the example runs on the *null* backend, whose generated
+//! `main()` caps execution at `LABELLE_NULL_FRAMES` frames (default 5)
+//! and then falls through to the `defer`-bound teardown. So the loop
+//! exits cleanly without needing `game.quit()` or a SIGTERM from
+//! `timeout`, and `[demo-plugin] deinit` is observed at the tail of the
+//! captured log.
 //!
-//! Consequence: `[demo-plugin] deinit` is NOT expected in the runtime log
-//! for this raylib example. The generated `defer PluginControllers.deinit(&g)`
-//! IS still asserted — by the snapshot tests in `test/tests.zig`
-//! (`PLUGIN_CONTROLLERS → plugins present wires controllers into setup_code`).
-//! The runtime check covers the parts snapshots can't: that the generated
-//! code compiles and that setup + tick order behave the same way a
-//! consumer game would see them.
-//!
-//! Matching CI grep expects this canonical sequence in stderr:
+//! The matching CI log assertion (now a `diff -u` against a fixed
+//! expected file) expects this canonical sequence in stderr:
 //!   [demo-plugin] setup
 //!   [game] game-tick frame=1
 //!   [demo-plugin] plugin-tick frame=1
 //!   [game] game-tick frame=2
 //!   [demo-plugin] plugin-tick frame=2
 //!   … (FRAMES_BEFORE_QUIT total interleaved game/plugin lines) …
+//!   [demo-plugin] deinit
 //!
 //! Interleaving comes from the engine's script execution order: within
 //! the `playing` state, block-1 (game) scripts run before block-2 (plugin)
 //! scripts each tick. `PluginControllers.setup` is called once during
-//! setup_code before the tick loop starts.
+//! setup_code before the tick loop starts; `deinit` runs once on shutdown
+//! via the `defer` chain in the generated main.
 
 pub const game_states = .{"playing"};
 
+/// Cap the number of frames this script logs. Must stay in sync with
+/// the default `LABELLE_NULL_FRAMES` value the null backend uses
+/// (`backends/null/templates/desktop.txt` → `DEFAULT_NULL_FRAMES`).
+/// If a CI run sets `LABELLE_NULL_FRAMES` higher, the extra ticks
+/// silently no-op here so the canonical log sequence stays bounded.
 const FRAMES_BEFORE_QUIT: u32 = 5;
 
 pub fn State(comptime EcsBackend: type) type {
@@ -47,23 +47,8 @@ pub fn State(comptime EcsBackend: type) type {
 }
 
 pub fn tick(game: anytype, state: anytype, _: anytype, _: f32) void {
-    // Under raylib, `game.quit()` doesn't break the main loop —
-    // `windowShouldClose()` stays false for a hidden window — so ticks
-    // keep firing past frame `FRAMES_BEFORE_QUIT` until the CI timeout
-    // kills the process. Cap our log output so the captured stderr
-    // stays deterministic: after FRAMES_BEFORE_QUIT ticks we stop
-    // logging new frames. The CI grep keys on frames 1..FRAMES_BEFORE_QUIT
-    // so the extra silent iterations don't change the asserted pattern.
     if (state.frame >= FRAMES_BEFORE_QUIT) return;
 
     state.frame += 1;
     game.log.info("[game] game-tick frame={d}", .{state.frame});
-
-    if (state.frame >= FRAMES_BEFORE_QUIT) {
-        // Flip the engine's `running` flag so sokol-style backends
-        // (which do poll `g.isRunning()`) can exit cleanly if this
-        // example is ever ported over. Raylib keeps looping until
-        // timeout.
-        game.quit();
-    }
 }
