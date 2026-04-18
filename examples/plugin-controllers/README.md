@@ -83,7 +83,7 @@ cd examples/plugin-controllers
 labelle generate
 cd .labelle/raylib_desktop
 zig build
-timeout 3 ./zig-out/bin/plugin_controllers_demo 2>&1 | head -40
+timeout 3 ./zig-out/bin/game 2>&1 | head -40
 ```
 
 The project declares `.hidden = true`, so raylib creates its OpenGL
