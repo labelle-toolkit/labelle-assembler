@@ -1,0 +1,43 @@
+// @generated — labelle-assembler null backend
+// No window, no input, no audio, no renderer interaction. The main loop
+// runs for a fixed number of frames (LABELLE_NULL_FRAMES env var, default
+// 5) at a constant 1/60s timestep, then exits cleanly so `defer`-bound
+// teardown (PluginControllers.deinit, GPA leak check) actually runs.
+const screen_w: u32 = {{width}};
+const screen_h: u32 = {{height}};
+const screen_title = "{{title}}";
+const target_fps: u32 = {{fps}};
+
+const DEFAULT_NULL_FRAMES: u32 = 5;
+
+/// Read LABELLE_NULL_FRAMES from the environment, falling back to
+/// DEFAULT_NULL_FRAMES when unset or unparseable. Bounded so a typo
+/// (`LABELLE_NULL_FRAMES=infinity`) never deadlocks CI.
+fn getMaxFrames(allocator: std.mem.Allocator) u32 {
+    const raw = std.process.getEnvVarOwned(allocator, "LABELLE_NULL_FRAMES") catch return DEFAULT_NULL_FRAMES;
+    defer allocator.free(raw);
+    return std.fmt.parseInt(u32, raw, 10) catch DEFAULT_NULL_FRAMES;
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+{{hooks_init_block}}
+    var g = AssembledGame.init(allocator);
+    defer g.deinit();
+
+    g.setHooks(&hooks);
+
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    g.getCamera().setPosition(0, @as(f32, @floatFromInt(screen_h)));
+
+{{setup_code}}
+    const max_frames = getMaxFrames(allocator);
+    const dt: f32 = 1.0 / 60.0;
+    var frame: u32 = 0;
+    while (frame < max_frames) : (frame += 1) {
+{{tick_code}}        g.tick(dt);
+{{gui_draw_code}}    }
+}

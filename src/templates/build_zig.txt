@@ -76,6 +76,15 @@ pub fn build(b: *std.Build) !void {
     const backend_window = backend_dep.module("window");
     const glfw_artifact = backend_dep.artifact("glfw");
 
+.backend_null
+    // Null backend — pure Zig, no native artifact. Every backend module is
+    // a no-op stub; the generated main() drives a fixed-frame tick loop.
+    const backend_dep = b.dependency("labelle_null", .{ .target = target, .optimize = optimize });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+
 .ecs_adapter
     const ecs_dep = b.dependency("{{ecs_dep_name}}", .{ .target = target, .optimize = optimize });
     const ecs_mod = ecs_dep.module("ecs");

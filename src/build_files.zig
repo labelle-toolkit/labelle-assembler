@@ -72,6 +72,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),
         .bgfx => try tpl.writeSection(build_zig_tmpl, "backend_bgfx", w),
         .wgpu => try tpl.writeSection(build_zig_tmpl, "backend_wgpu", w),
+        .null => try tpl.writeSection(build_zig_tmpl, "backend_null", w),
     }
 
     switch (cfg.ecs) {
@@ -238,6 +239,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
             .sdl => try tpl.writeSection(build_zig_tmpl, "link_sdl", w),
             .bgfx => try tpl.writeSection(build_zig_tmpl, "link_bgfx", w),
             .wgpu => try tpl.writeSection(build_zig_tmpl, "link_wgpu", w),
+            // Null backend has no native artifact — every backend module is
+            // pure Zig, no library to link.
+            .null => {},
         }
 
         // Bridge artifact (raw_backend GUIs) — declare + link

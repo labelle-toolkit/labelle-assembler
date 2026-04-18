@@ -2,7 +2,12 @@
 /// Pure types — no template or I/O dependencies.
 const std = @import("std");
 
-pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu };
+/// Graphics / windowing backend selection. `null` is a headless backend
+/// (no graphics context, no input, no audio, no window) that drives the
+/// generated `main()` through a fixed-frame tick loop — used for
+/// lifecycle / determinism / integration tests that don't exercise
+/// rendering. See `backends/null/` for the no-op implementations.
+pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 pub const Platform = enum { desktop, ios, android, wasm };
 pub const EcsChoice = enum { mock, zig_ecs, zflecs, mr_ecs };
 

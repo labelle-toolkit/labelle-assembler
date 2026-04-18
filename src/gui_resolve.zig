@@ -140,6 +140,10 @@ fn getBridgeForBackend(bridges: Bridges, backend: config.Backend) ?BridgeDef {
         .sdl => bridges.sdl,
         .bgfx => bridges.bgfx,
         .wgpu => bridges.wgpu,
+        // Null backend has no GUI surface to bridge to — every GUI plugin
+        // is incompatible by definition. Caller's null-bridge branch already
+        // emits the right "no bridge for backend X" diagnostic.
+        .null => null,
     };
 }
 
