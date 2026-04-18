@@ -667,6 +667,116 @@ pub const MAIN_ZIG = struct {
     }
 };
 
+// ── Plugin controllers (RFC-plugin-controllers §1–§2) ─────────────────
+//
+// Snapshot-style assertions on the generated main.zig for a fixture project
+// with plugins. Verifies:
+//   - Plugins present → `PluginControllers` scaffold is emitted with a
+//     comptime `@hasDecl(mod, "Controller")` discovery loop for every plugin.
+//   - Plugins present → the generated setup/cleanup path invokes
+//     `PluginControllers.setup(&g)` / `PluginControllers.deinit(&g)`.
+//   - Plugins absent → no controller scaffolding leaks into the output
+//     (backward-compat with games that declare no plugins).
+//   - Both controller-exporting and non-exporting plugins coexist: the
+//     discovery is structural (name-based), so nothing plugin-shape-specific
+//     is emitted — the same code handles a fsm-style "components only"
+//     plugin and a pathfinder-style "Controller + components" plugin.
+pub const PLUGIN_CONTROLLERS = struct {
+    const plugins_two = &[_]generate.PluginDep{
+        .{ .name = "pathfinder", .repo = "github.com/labelle-toolkit/labelle-pathfinding", .version = "0.1.0" },
+        .{ .name = "fsm", .repo = "github.com/labelle-toolkit/labelle-fsm", .version = "0.1.0" },
+    };
+
+    test "plugins present emits PluginControllers scaffold with @hasDecl discovery" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = plugins_two,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Scaffold struct is emitted
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const PluginControllers = struct") != null);
+
+        // Both plugin imports end up in the _plugin_mods tuple
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"pathfinder\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"fsm\")") != null);
+
+        // Discovery is `@hasDecl`-guarded (plugins without Controller are skipped)
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (@hasDecl(mod, \"Controller\"))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (@hasDecl(C, \"setup\"))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (@hasDecl(C, \"deinit\"))") != null);
+
+        // setup is `!void` (controllers can fail), deinit is `void` (must not)
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn setup(game: anytype) !void") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn deinit(game: anytype) void") != null);
+    }
+
+    test "plugins present wires controllers into setup_code (loop backend)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = plugins_two,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "try PluginControllers.setup(&g);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "defer PluginControllers.deinit(&g);") != null);
+    }
+
+    test "plugins present wires controllers into init/cleanup (sokol callback backend)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = plugins_two,
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Callback backends can't `try` in `void` init, so setup uses `catch @panic`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "PluginControllers.setup(&g) catch") != null);
+        // Cleanup emits the deinit call directly (no defer scope across callbacks).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "PluginControllers.deinit(&g);") != null);
+    }
+
+    test "no plugins omits all controller scaffolding (backward-compat)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{},
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "PluginControllers") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "PluginSystems") == null);
+    }
+
+    test "plugin block preserves .plugins declaration order in _plugin_mods tuple" {
+        // Declaration order in `project.labelle` drives both the gate for
+        // controller setup/deinit AND (later, step 3) the plugin-script block
+        // order. This test pins the first invariant so a refactor can't silently
+        // swap plugins around.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = plugins_two,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        const pathfinder_idx = std.mem.indexOf(u8, main_zig, "@import(\"pathfinder\")") orelse return error.NotFound;
+        const fsm_idx = std.mem.indexOf(u8, main_zig, "@import(\"fsm\")") orelse return error.NotFound;
+        // pathfinder is declared first in `plugins_two`, so it must appear
+        // first in _plugin_mods too. (Both plugins appear twice — once in
+        // PluginSystems, once in PluginControllers — but relative order is
+        // the same, so comparing the first occurrences is unambiguous.)
+        try std.testing.expect(pathfinder_idx < fsm_idx);
+    }
+};
+
 // ── Sokol backend ────────────────────────────────────────────────────
 
 pub const SOKOL = struct {
