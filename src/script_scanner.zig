@@ -162,11 +162,10 @@ pub const ScriptScanner = struct {
     /// doesn't exist is a no-op (same tolerance as `scanDir`).
     ///
     /// The caller is expected to `scanDir` the game's own scripts first,
-    /// then loop over plugins calling `scanPluginDir`. After all calls,
-    /// either call `finalize()` or rely on `scanDir`'s end-of-call
-    /// sort+validate — but note that the final sort must see every entry,
-    /// so plugins added *after* `scanDir` returned will need `finalize()`
-    /// (or a re-sort and re-validate).
+    /// then loop over plugins calling `scanPluginDir`. Each `scanPluginDir`
+    /// call internally re-sorts + re-validates so the final entries order
+    /// always reflects every script fed so far — callers don't need a
+    /// separate finalize step.
     pub fn scanPluginDir(self: *ScriptScanner, plugin_scripts_dir: []const u8, plugin_name: []const u8) ScanError!void {
         // Don't error if the plugin doesn't ship a scripts/ dir — that's
         // the common case (labelle-fsm, labelle-pathfinding today).
