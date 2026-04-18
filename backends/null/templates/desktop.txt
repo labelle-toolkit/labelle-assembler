@@ -11,8 +11,15 @@ const target_fps: u32 = {{fps}};
 const DEFAULT_NULL_FRAMES: u32 = 5;
 
 /// Read LABELLE_NULL_FRAMES from the environment, falling back to
-/// DEFAULT_NULL_FRAMES when unset or unparseable. Bounded so a typo
-/// (`LABELLE_NULL_FRAMES=infinity`) never deadlocks CI.
+/// DEFAULT_NULL_FRAMES when unset, unparseable, or on any allocation
+/// failure. Bounded so a typo (`LABELLE_NULL_FRAMES=infinity`) never
+/// deadlocks CI.
+///
+/// Memory: `getEnvVarOwned` only allocates on success — if it returns
+/// `error.EnvironmentVariableNotFound`, `error.OutOfMemory`, or
+/// `error.InvalidWtf8`, no buffer was allocated, so the `catch` has
+/// nothing to free. The `defer` below is only reached on the success
+/// path where `raw` is a valid heap allocation.
 fn getMaxFrames(allocator: std.mem.Allocator) u32 {
     const raw = std.process.getEnvVarOwned(allocator, "LABELLE_NULL_FRAMES") catch return DEFAULT_NULL_FRAMES;
     defer allocator.free(raw);
