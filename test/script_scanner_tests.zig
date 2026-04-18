@@ -436,6 +436,277 @@ pub const DuplicateValidation = struct {
     }
 };
 
+/// Plugin-shipped scripts (RFC-plugin-controllers §2).
+///
+/// A plugin can ship its own `scripts/` directory that the assembler copies
+/// into the generated build alongside the game's own. Game scripts run in
+/// block 1 (numeric-prefix ordered), plugin scripts run in block 2 (per
+/// plugin, in `project.labelle` `.plugins` declaration order, then
+/// numeric-prefix-ordered within each plugin's namespace).
+pub const PluginBlockOrdering = struct {
+    test "plugin scripts sort after game scripts" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        // Game block: one global script + one playing script.
+        try tmp_dir.dir.makeDir("scripts");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/global.zig", .data = "" });
+        try tmp_dir.dir.makeDir("scripts/playing");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/01_pathfinder.zig", .data = "" });
+
+        // Plugin block: one plugin ships its own scripts.
+        try tmp_dir.dir.makeDir("pathfinder_scripts");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "pathfinder_scripts/01_startup.zig", .data = "" });
+        try tmp_dir.dir.makeDir("pathfinder_scripts/playing");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "pathfinder_scripts/playing/01_advance.zig", .data = "" });
+
+        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const plugin_scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "pathfinder_scripts");
+
+        const states_list = [_][]const u8{"playing"};
+        var scanner = ScriptScanner.init(alloc, &states_list);
+        try scanner.scanDir(scripts_path);
+        try scanner.scanPluginDir(plugin_scripts_path, "pathfinder");
+
+        const entries = scanner.getEntries();
+        try expect.equal(entries.len, @as(usize, 4));
+
+        // Block 1: game scripts first (global then numbered state script).
+        try expect.toBeTrue(entries[0].plugin_name == null);
+        try expect.toBeTrue(entries[1].plugin_name == null);
+
+        // Block 2: pathfinder plugin scripts after the game block.
+        try expect.toBeTrue(entries[2].plugin_name != null);
+        try std.testing.expectEqualStrings("pathfinder", entries[2].plugin_name.?);
+        try expect.toBeTrue(entries[3].plugin_name != null);
+        try std.testing.expectEqualStrings("pathfinder", entries[3].plugin_name.?);
+    }
+
+    test "two plugins sort in scanPluginDir call order (project.labelle .plugins order)" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        try tmp_dir.dir.makeDir("scripts");
+
+        try tmp_dir.dir.makeDir("pathfinder_s");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "pathfinder_s/01_a.zig", .data = "" });
+
+        try tmp_dir.dir.makeDir("scheduler_s");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scheduler_s/01_a.zig", .data = "" });
+
+        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const pf_path = try tmp_dir.dir.realpathAlloc(alloc, "pathfinder_s");
+        const sched_path = try tmp_dir.dir.realpathAlloc(alloc, "scheduler_s");
+
+        const states_list = [_][]const u8{};
+        var scanner = ScriptScanner.init(alloc, &states_list);
+        try scanner.scanDir(scripts_path);
+        // Scheduler declared before pathfinder in project.labelle.
+        try scanner.scanPluginDir(sched_path, "scheduler");
+        try scanner.scanPluginDir(pf_path, "pathfinder");
+
+        const entries = scanner.getEntries();
+        try expect.equal(entries.len, @as(usize, 2));
+        try std.testing.expectEqualStrings("scheduler", entries[0].plugin_name.?);
+        try std.testing.expectEqualStrings("pathfinder", entries[1].plugin_name.?);
+    }
+
+    test "same numeric prefix across two plugins is ok (separate namespaces)" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        try tmp_dir.dir.makeDir("scripts");
+
+        try tmp_dir.dir.makeDir("a_scripts");
+        try tmp_dir.dir.makeDir("a_scripts/playing");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "a_scripts/playing/05_foo.zig", .data = "" });
+
+        try tmp_dir.dir.makeDir("b_scripts");
+        try tmp_dir.dir.makeDir("b_scripts/playing");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "b_scripts/playing/05_foo.zig", .data = "" });
+
+        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const a_path = try tmp_dir.dir.realpathAlloc(alloc, "a_scripts");
+        const b_path = try tmp_dir.dir.realpathAlloc(alloc, "b_scripts");
+
+        const states_list = [_][]const u8{"playing"};
+        var scanner = ScriptScanner.init(alloc, &states_list);
+        try scanner.scanDir(scripts_path);
+        // Duplicate 05_ prefix across two plugins — must not be an error.
+        try scanner.scanPluginDir(a_path, "a");
+        try scanner.scanPluginDir(b_path, "b");
+
+        try expect.equal(scanner.getEntries().len, @as(usize, 2));
+    }
+
+    test "same numeric prefix within a single plugin is a build error" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        try tmp_dir.dir.makeDir("scripts");
+
+        try tmp_dir.dir.makeDir("a_scripts");
+        try tmp_dir.dir.makeDir("a_scripts/playing");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "a_scripts/playing/05_foo.zig", .data = "" });
+        try tmp_dir.dir.writeFile(.{ .sub_path = "a_scripts/playing/05_bar.zig", .data = "" });
+
+        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const a_path = try tmp_dir.dir.realpathAlloc(alloc, "a_scripts");
+
+        const states_list = [_][]const u8{"playing"};
+        var scanner = ScriptScanner.init(alloc, &states_list);
+        try scanner.scanDir(scripts_path);
+        try std.testing.expectError(error.DuplicateSortOrder, scanner.scanPluginDir(a_path, "a"));
+    }
+
+    test "same numeric prefix in game vs plugin is ok (different blocks)" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        try tmp_dir.dir.makeDir("scripts");
+        try tmp_dir.dir.makeDir("scripts/playing");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/01_game.zig", .data = "" });
+
+        try tmp_dir.dir.makeDir("plug_scripts");
+        try tmp_dir.dir.makeDir("plug_scripts/playing");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "plug_scripts/playing/01_plug.zig", .data = "" });
+
+        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const plug_path = try tmp_dir.dir.realpathAlloc(alloc, "plug_scripts");
+
+        const states_list = [_][]const u8{"playing"};
+        var scanner = ScriptScanner.init(alloc, &states_list);
+        try scanner.scanDir(scripts_path);
+        // Game has 01_game.zig at playing/ and plugin has 01_plug.zig at
+        // playing/. Different namespaces — must NOT collide.
+        try scanner.scanPluginDir(plug_path, "plug");
+
+        try expect.equal(scanner.getEntries().len, @as(usize, 2));
+    }
+
+    test "scanDir ignores .plugin_<name> subdirs in the game scripts tree" {
+        // The assembler copies plugin scripts into
+        // `<target>/scripts/.plugin_<name>/…`. When `scanDir` walks the
+        // game tree after the copy pass, it must skip those so they don't
+        // double-register as both game and plugin scripts.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        try tmp_dir.dir.makeDir("scripts");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/game_global.zig", .data = "" });
+        try tmp_dir.dir.makeDir("scripts/.plugin_pathfinder");
+        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/.plugin_pathfinder/01_advance.zig", .data = "" });
+
+        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+
+        const states_list = [_][]const u8{};
+        var scanner = ScriptScanner.init(alloc, &states_list);
+        try scanner.scanDir(scripts_path);
+
+        // Only the game script should be picked up by scanDir.
+        try expect.equal(scanner.getEntries().len, @as(usize, 1));
+        try std.testing.expectEqualStrings("game_global", scanner.getEntries()[0].name);
+    }
+};
+
+/// `ship_from_plugin` ConventionDirMode copies files from a plugin's cached
+/// package into the generated build tree (RFC-plugin-controllers §2, step 1).
+///
+/// The assembler's top-level `generate` orchestrates this, but the actual
+/// copy step goes through `scanner.copyAndScanAbs`, which takes two
+/// fully-resolved absolute paths. The test fixture simulates a plugin
+/// shipping a directory by writing files to a temp dir, then calling
+/// `copyAndScanAbs` directly.
+pub const ShipFromPlugin = struct {
+    const scanner = generator.scanner;
+
+    test "copyAndScanAbs copies and scans files end-to-end" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.makeDir("plugin_src");
+        try tmp.dir.writeFile(.{ .sub_path = "plugin_src/01_startup.zig", .data = "pub fn setup() void {}" });
+        try tmp.dir.writeFile(.{ .sub_path = "plugin_src/02_advance.zig", .data = "pub fn tick() void {}" });
+
+        try tmp.dir.makeDir("target");
+
+        const src_path = try tmp.dir.realpathAlloc(alloc, "plugin_src");
+        const dst_path = try tmp.dir.realpathAlloc(alloc, "target");
+
+        const names = try scanner.copyAndScanAbs(alloc, src_path, dst_path, ".zig");
+
+        // Returned names are sorted stems (no extension).
+        try expect.equal(names.len, @as(usize, 2));
+        try std.testing.expectEqualStrings("01_startup", names[0]);
+        try std.testing.expectEqualStrings("02_advance", names[1]);
+
+        // Files are present at the destination.
+        var dst_dir = try tmp.dir.openDir("target", .{});
+        defer dst_dir.close();
+
+        const startup_content = try dst_dir.readFileAlloc(alloc, "01_startup.zig", 1024);
+        try std.testing.expectEqualStrings("pub fn setup() void {}", startup_content);
+
+        const advance_content = try dst_dir.readFileAlloc(alloc, "02_advance.zig", 1024);
+        try std.testing.expectEqualStrings("pub fn tick() void {}", advance_content);
+    }
+
+    test "copyAndScanAbs preserves subdirectory structure" {
+        // Plugin scripts often ship state-scoped dirs (e.g. `playing/`); the
+        // copy must preserve that nesting so the state-scoping semantics
+        // carry through to the generated build.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.makeDir("plugin_src");
+        try tmp.dir.makeDir("plugin_src/playing");
+        try tmp.dir.writeFile(.{ .sub_path = "plugin_src/playing/01_advance.zig", .data = "" });
+
+        try tmp.dir.makeDir("target");
+
+        const src_path = try tmp.dir.realpathAlloc(alloc, "plugin_src");
+        const dst_path = try tmp.dir.realpathAlloc(alloc, "target");
+
+        _ = try scanner.copyAndScanAbs(alloc, src_path, dst_path, ".zig");
+
+        // Subdirectory preserved.
+        var target_playing = try tmp.dir.openDir("target/playing", .{});
+        target_playing.close();
+    }
+};
+
 // Regression tests for memory leaks (issue #78).
 // These use std.testing.allocator directly (not arena) so the GPA
 // detects any leaked allocations and fails the test.

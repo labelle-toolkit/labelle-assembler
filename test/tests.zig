@@ -754,6 +754,42 @@ pub const PLUGIN_CONTROLLERS = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "PluginSystems") == null);
     }
 
+    test "plugin-shipped scripts: AllScripts imports from .plugin_<name>/ subtree" {
+        // The assembler copies plugin scripts into
+        // `<target>/scripts/.plugin_<name>/…` so `@import("scripts/<rel>")`
+        // works. Sanity-check: given a script entry with plugin_name set and
+        // a `rel_path = ".plugin_pathfinder/01_advance.zig"`, the generator
+        // emits an import that references the plugin subtree and gives it a
+        // legal Zig identifier (the leading `.` must be rewritten).
+        const plugin_script_entry: generate.script_scanner.ScriptScanner.ScriptEntry = .{
+            .name = "advance",
+            .filename = "01_advance.zig",
+            .states = &.{},
+            .sort_order = 1,
+            .subdir = null,
+            .rel_path = ".plugin_pathfinder/01_advance.zig",
+            .plugin_name = "pathfinder",
+            .plugin_index = 1,
+        };
+        const entries: []const generate.script_scanner.ScriptScanner.ScriptEntry = &.{plugin_script_entry};
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = plugins_two,
+        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Plugin script lives under `<target>/scripts/.plugin_pathfinder/…`
+        // on disk, and the generated code must reference it by that path.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"scripts/.plugin_pathfinder/01_advance.zig\")") != null);
+
+        // The Zig identifier used for the const decl has `.` rewritten so
+        // the generated source compiles.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_plugin_pathfinder_01_advance") != null);
+    }
+
     test "plugin block preserves .plugins declaration order in _plugin_mods tuple" {
         // Declaration order in `project.labelle` drives both the gate for
         // controller setup/deinit AND (later, step 3) the plugin-script block

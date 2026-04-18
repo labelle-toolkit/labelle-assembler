@@ -499,7 +499,13 @@ fn writeSceneAssetManifests(
 }
 
 /// Convert a path-style name to a valid Zig identifier: "enemies/goblin" -> "enemies_goblin".
-/// Replaces `/` and `+` with `_`, strips `.zig` extension.
+/// Replaces `/`, `+`, and `.` with `_`, strips the `.zig` extension first.
+///
+/// The `.` → `_` rewrite covers plugin-shipped scripts that land under
+/// `.plugin_<name>/…` — the leading dot would otherwise produce an identifier
+/// that Zig rejects. The rewrite is safe for ordinary scene / scripts paths
+/// because the only dot in valid convention names is the `.zig` suffix, which
+/// is stripped before the char walk.
 fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
     if (name.len > buf.len) {
         std.debug.print("labelle: path too long for identifier (max {d} chars): '{s}'\n", .{ buf.len, name });
@@ -509,7 +515,7 @@ fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
     const end = if (std.mem.endsWith(u8, name, ".zig")) name.len - 4 else name.len;
     var i: usize = 0;
     for (name[0..end]) |c| {
-        buf[i] = if (c == '/' or c == '+') '_' else c;
+        buf[i] = if (c == '/' or c == '+' or c == '.') '_' else c;
         i += 1;
     }
     return buf[0..i];
