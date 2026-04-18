@@ -37,7 +37,16 @@ The binary is written to `zig-out/bin/labelle-assembler`.
 | `--project-root <path>` | Path to game project (containing `project.labelle`) |
 | `--scene <name>` | Override initial scene |
 | `--platform <name>` | Override target platform (`desktop`, `wasm`, `ios`, `android`) |
-| `--backend <name>` | Override graphics backend (`raylib`, `sokol`, `sdl`, `bgfx`, `wgpu`) |
+| `--backend <name>` | Override graphics backend (`raylib`, `sokol`, `sdl`, `bgfx`, `wgpu`, `null`) |
+
+The `null` backend is a headless test/CI backend with no graphics, audio,
+input, or window subsystem — every backend module is a no-op stub. The
+generated `main()` runs the engine's tick loop for `LABELLE_NULL_FRAMES`
+frames (default 5) and exits cleanly so `defer`-bound teardown actually
+runs. Use `.backend = .null` in `project.labelle` for lifecycle /
+integration / determinism tests that don't exercise rendering — see
+`examples/plugin-controllers/` for a worked example and
+`backends/null/` for the implementation.
 
 ### Run tests
 

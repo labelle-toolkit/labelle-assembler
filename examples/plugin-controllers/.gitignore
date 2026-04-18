@@ -1,1 +1,7 @@
 .labelle/
+
+# Plugin-shipped scripts copied here by the assembler when it symlinks
+# the game's scripts/ dir into the generated target — see PR #71's
+# symlink-game-dirs change. Each plugin's scripts/ subtree lands under
+# scripts/.plugin_<name>/ at generate time.
+scripts/.plugin_*/

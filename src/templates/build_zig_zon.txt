@@ -48,6 +48,11 @@
             .path = "{{backend_path}}",
         },
 
+.dep_null_path
+        .labelle_null = .{
+            .path = "{{backend_path}}",
+        },
+
 .dep_ecs_path
         .{{ecs_dep_name}} = .{
             .path = "{{ecs_path}}",

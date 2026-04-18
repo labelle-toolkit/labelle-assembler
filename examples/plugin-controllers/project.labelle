@@ -2,28 +2,27 @@
 //
 // Declares a single local fixture plugin (`plugin/`) and nothing else —
 // no atlases, no ECS backend, no GUI, no custom layers beyond the
-// built-in defaults. The generated binary runs the raylib desktop
-// backend with a hidden window (`.hidden = true`), drives the scene
-// into the single `playing` state, emits a few `[game] game-tick …`
-// and `[demo-plugin] plugin-tick …` log lines, then calls
-// `game.quit()` to exit.
+// built-in defaults. The generated binary runs the *null* backend's
+// fixed-frame tick loop, drives the scene into the single `playing`
+// state, emits the `[game] game-tick …` and `[demo-plugin] plugin-tick …`
+// log lines, then exits cleanly so `defer PluginControllers.deinit(&g)`
+// runs and the canonical `[demo-plugin] deinit` line is observed.
 //
-// The CI log-order assertion lives in `.github/workflows/ci.yml` under
-// the `examples-integration` job — see the `Runtime log-order check`
-// step for the grep pattern.
+// Frame count is controlled at runtime by `LABELLE_NULL_FRAMES`
+// (default 5). The CI log-order assertion lives in
+// `.github/workflows/ci.yml` under the `examples-integration` job —
+// see the `Runtime log-order check` step for the diff target.
 .{
     .name = "plugin_controllers_demo",
     .title = "LaBelle — Plugin Controllers E2E",
     .width = 320,
     .height = 240,
     .target_fps = 60,
-    // Hidden window keeps raylib's init path happy (it still needs an
-    // OpenGL context on Linux CI under xvfb) while suppressing any
-    // actual pixels being drawn. The CI job wraps the run in xvfb-run
-    // so the context is available; a display server would work equally
-    // well for local dev.
-    .hidden = true,
-    .backend = .raylib,
+    // Headless null backend: no graphics context, no window, no input.
+    // Removes the xvfb-on-Linux dance the raylib backend required and
+    // lets the loop exit cleanly after N frames so the deinit defer
+    // actually runs (closing the runtime coverage gap PR #73 flagged).
+    .backend = .null,
     .ecs = .mock,
     .initial_scene = "main",
     .states = .{"playing"},

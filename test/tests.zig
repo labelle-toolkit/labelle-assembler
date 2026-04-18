@@ -317,6 +317,28 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "glfw_artifact") != null);
     }
 
+    test "null backend wires modules without artifact link" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .null,
+            .ecs = .mock,
+        });
+        defer std.testing.allocator.free(build_zig);
+
+        // Module wiring still happens — the engine's import surface is the
+        // same regardless of backend.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_null") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "backend_gfx") != null);
+
+        // No native artifact to link — the null backend is pure Zig. The
+        // raylib/sokol/sdl/bgfx/wgpu paths each emit a `linkLibrary(...)`
+        // for their backend artifact; null must not.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "raylib_artifact") == null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "sokol_clib") == null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "bgfx_artifact") == null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "glfw_artifact") == null);
+    }
+
     test "deduplicates labelle-core across gfx and engine" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",

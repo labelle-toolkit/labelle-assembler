@@ -158,61 +158,71 @@ jobs:
       # (RFC-plugin-controllers §1–§2). Unlike the build-only examples
       # above, this step also RUNS the binary and asserts the log output
       # matches a canonical `setup` → interleaved `game-tick` /
-      # `plugin-tick` sequence. Catches "generated code compiles but
-      # doesn't behave" regressions that snapshot tests in tests.zig
-      # can't — e.g. PluginControllers.setup silently skipped, or
-      # plugin-shipped scripts copied but never dispatched.
+      # `plugin-tick` → `deinit` sequence. Catches "generated code
+      # compiles but doesn't behave" regressions that snapshot tests in
+      # tests.zig can't — e.g. PluginControllers.setup silently skipped,
+      # plugin-shipped scripts copied but never dispatched, or
+      # PluginControllers.deinit not actually wired into the defer chain.
       #
-      # Why xvfb: raylib creates an OpenGL context at init even with
-      # `.hidden = true`, and on headless Linux runners the context
-      # requires a display server. xvfb-run provides the minimal X
-      # server the GL context needs. macOS CI would work without xvfb
-      # but raylib-zig's transitive deps don't fetch cleanly there (see
-      # the slot-allocator gate earlier in this file).
-      #
-      # Why `timeout 3`: raylib's main loop polls
-      # `window.windowShouldClose()`, which can't flip on a hidden
-      # window. The example caps its log output at FRAMES_BEFORE_QUIT
-      # ticks (silent past that point); `timeout` is what actually
-      # kills the process.
+      # Backend: `.null` (see project.labelle). The null backend has no
+      # graphics context, no window, no input — runs the engine's tick
+      # loop for `LABELLE_NULL_FRAMES` (default 5) frames and exits.
+      # That removes the xvfb-on-Linux dance the raylib backend
+      # required and lets the loop exit cleanly so `defer
+      # PluginControllers.deinit(&g)` actually runs (which is the whole
+      # point of asserting `[demo-plugin] deinit` in the canonical log).
       - name: Generate + build the plugin-controllers example
-        env:
-          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
         run: |
           cd labelle-assembler/examples/plugin-controllers
-          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
-          cd .labelle/raylib_desktop
-          zig build
 
-      - name: Install xvfb for the plugin-controllers runtime check
-        run: sudo apt-get install -y xvfb
+          # Invoke the assembler binary directly — labelle-cli's bundled
+          # generator module is pinned to an older release that doesn't
+          # know about the `.null` Backend variant added in this PR, so
+          # `labelle generate` would fail at the project.labelle parse
+          # step before forwarding to LABELLE_ASSEMBLER. Once labelle-cli
+          # bumps its pinned assembler dep past this PR we can route this
+          # back through `labelle generate` like the other examples.
+          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+
+          cd .labelle/null_desktop
+
+          # The assembler intentionally leaves build.zig.zon's fingerprint
+          # at a placeholder; labelle-cli normally patches it via a
+          # post-generate `runner.fixFingerprint` pass. Replicate that
+          # here: capture Zig's "invalid fingerprint: 0xBAD; ... use this
+          # value: 0xGOOD" diagnostic from a first build attempt, rewrite
+          # the field, then build for real.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
 
       - name: Runtime log-order check for plugin-controllers
         run: |
-          cd labelle-assembler/examples/plugin-controllers/.labelle/raylib_desktop
+          cd labelle-assembler/examples/plugin-controllers/.labelle/null_desktop
 
-          # Run headlessly. `timeout` exits 124 when it sends SIGTERM,
-          # which is the expected path (see the preceding step's comment
-          # on raylib's loop guard). Tolerate both 0 (clean `game.quit()`
-          # on sokol-style ports) and 124 (timeout kill).
-          set +e
-          xvfb-run -a -s "-screen 0 320x240x24" \
-            timeout 3 ./zig-out/bin/game > run.log 2>&1
-          RC=$?
-          set -e
-          if [ $RC -ne 0 ] && [ $RC -ne 124 ]; then
-            echo "E: binary exited with unexpected code $RC"
-            echo "--- captured output ---"
-            cat run.log
-            exit 1
-          fi
+          # Null backend exits cleanly after LABELLE_NULL_FRAMES frames
+          # (default 5). No window, no GL context, no display server —
+          # the binary either runs to completion (rc=0) or crashes
+          # (anything else). No `timeout` wrapper needed.
+          ./zig-out/bin/game > run.log 2>&1
 
           # Extract only the tagged lifecycle events we care about.
-          # Drops raylib banner, log timestamps, and log level prefix.
+          # Drops log timestamps and log level prefix.
           grep -oE '\[(demo-plugin|game)\] [a-z-]+( frame=[0-9]+)?' run.log > actual.txt || true
 
           # Canonical sequence — see `examples/plugin-controllers/README.md`
           # and the `FRAMES_BEFORE_QUIT = 5` in the two tick scripts.
+          # The trailing `[demo-plugin] deinit` is reachable now that the
+          # null backend exits cleanly (raylib's hidden-window loop
+          # couldn't, which is why PR #73's matching assertion was a
+          # snapshot-only check on the generated `defer ... deinit`).
           cat > expected.txt <<'END'
           [demo-plugin] setup
           [game] game-tick frame=1
@@ -225,6 +235,7 @@ jobs:
           [demo-plugin] plugin-tick frame=4
           [game] game-tick frame=5
           [demo-plugin] plugin-tick frame=5
+          [demo-plugin] deinit
           END
           # Strip the YAML-block leading indent from the heredoc body.
           sed -i 's/^          //' expected.txt
