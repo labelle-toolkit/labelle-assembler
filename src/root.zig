@@ -300,16 +300,19 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     //                                               they form their own
     //                                               numeric-prefix scope
     //
-    // Scanning is driven by the `ScriptScanner` (see addPluginBlock below),
-    // so the duplicate-prefix validator treats each plugin block as
-    // independent. Cross-plugin prefix collisions are impossible by
-    // construction. Game-vs-plugin collisions are also impossible — the
-    // game scripts live under `scripts/` while plugin scripts live under
-    // `scripts/.plugin_<name>/`, which the scanner treats as a different
-    // namespace.
+    // Scanning is driven by the `ScriptScanner` via `scanPluginDir`
+    // below — each plugin's scripts form their own numeric-prefix
+    // namespace, so the duplicate-prefix validator treats each plugin
+    // block as independent. Cross-plugin prefix collisions are
+    // impossible by construction. Game-vs-plugin collisions are also
+    // impossible — the game scripts live under `scripts/` while plugin
+    // scripts live under `scripts/.plugin_<name>/`, which the scanner
+    // treats as a different namespace.
     //
     // Plugins without a `scripts/` dir contribute nothing — backward-compat
     // with every existing plugin (labelle-fsm, labelle-pathfinding today).
+    // Both `copyAndScanAbs` and `scanPluginDir` silently no-op on a
+    // missing source dir, so no explicit probe is needed here.
     for (cfg.plugins) |plugin| {
         // Plugin was already resolved during the manifest-loading loop
         // above; re-resolving here is infallible in practice. Use `try`
@@ -321,12 +324,6 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
 
         const plugin_scripts_src = try std.fs.path.join(allocator, &.{ plugin_src_dir, "scripts" });
         defer allocator.free(plugin_scripts_src);
-
-        // Probe for existence — plugins without a `scripts/` dir are the
-        // norm and must not error. Store + defer close the handle so we
-        // don't leak one file descriptor per plugin with a scripts dir.
-        var plugin_scripts_dir = cwd.openDir(plugin_scripts_src, .{}) catch continue;
-        plugin_scripts_dir.close();
 
         // Destination: `<target>/scripts/.plugin_<name>/`. The leading `.`
         // prevents accidental collision with a game state directory (states
