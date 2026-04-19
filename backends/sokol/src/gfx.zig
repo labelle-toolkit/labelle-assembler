@@ -333,6 +333,42 @@ pub fn drawRectangleRec(rec: Rectangle, tint: Color) void {
     sgl.end();
 }
 
+/// Draw a filled rectangle rotated `rotation` radians around its
+/// centre `(center_x, center_y)`. Width and height are in world
+/// pixels (same as `drawRectangleRec`). Screen space is Y-down and
+/// the rotation matrix is `[cos -sin; sin cos]`, so positive
+/// rotation rotates **clockwise** in visible screen space — the
+/// same direction as raylib's `DrawRectanglePro(..., rotation,
+/// color)` with positive values.
+///
+/// Required by labelle-gfx's `drawRectanglePro` shim once a game
+/// sets `Shape.rotation` on a rectangle entity. Backends that don't
+/// implement this primitive fall back to the axis-aligned
+/// `drawRectangleRec` via the shim — no behavioural regression for
+/// games that never rotate rectangles.
+pub fn drawRectanglePro(center_x: f32, center_y: f32, width: f32, height: f32, rotation: f32, tint: Color) void {
+    const hw = width * 0.5;
+    const hh = height * 0.5;
+    const cos_r = @cos(rotation);
+    const sin_r = @sin(rotation);
+
+    const local = [4][2]f32{
+        .{ -hw, -hh },
+        .{ hw, -hh },
+        .{ hw, hh },
+        .{ -hw, hh },
+    };
+
+    sgl.beginQuads();
+    sgl.c4b(tint.r, tint.g, tint.b, tint.a);
+    for (local) |p| {
+        const wx = center_x + p[0] * cos_r - p[1] * sin_r;
+        const wy = center_y + p[0] * sin_r + p[1] * cos_r;
+        sgl.v2f(toNdcX(wx), toNdcY(wy));
+    }
+    sgl.end();
+}
+
 /// Draw a rectangle outline. `line_thick` is accepted for API compatibility
 /// with raylib's drawRectangleLinesEx but is ignored — sgl LINES always
 /// render 1 pixel thick. For thicker outlines, the caller can compose four
