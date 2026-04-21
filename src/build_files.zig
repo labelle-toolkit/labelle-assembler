@@ -114,6 +114,16 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
             if (cfg.hasGui()) {
                 try w.print("    overrideImport(plugin_{s}_mod, \"gui_backend\", gui_mod);\n", .{plugin.name});
             }
+
+            // Sibling plugins — every plugin can `@import("<other-plugin>")`
+            // and reach its root module. Closes flying-platform-labelle#262.
+            // `overrideImport` is a no-op for plugins that don't actually
+            // import the sibling, so wiring all-to-all is safe and keeps
+            // the assembler's manifest schema unchanged.
+            for (cfg.plugins) |sibling| {
+                if (std.mem.eql(u8, plugin.name, sibling.name)) continue;
+                try w.print("    overrideImport(plugin_{s}_mod, \"{s}\", plugin_{s}_mod);\n", .{ plugin.name, sibling.name, sibling.name });
+            }
         }
     }
 
