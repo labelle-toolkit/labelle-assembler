@@ -118,6 +118,13 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     return .{ .id = @intCast(tex.id), .width = tex.width, .height = tex.height };
 }
 
+/// "LRGBA" + 3 padding bytes (8-byte alignment). Followed by u32 LE
+/// width, u32 LE height, then width*height*4 bytes of RGBA pixels.
+/// Produced by `labelle build --bake` (labelle-cli) to skip PNG decode
+/// on cold start. See labelle-cli/src/cli/bake.zig.
+const lrgba_magic = "LRGBA\x00\x00\x00";
+const lrgba_header_len = lrgba_magic.len + 8;
+
 /// Pure CPU decode, safe from a worker thread. Uses raylib's built-in
 /// `loadImageFromMemory` (which calls stb_image internally), normalises
 /// the result to RGBA8, copies the pixels into an allocator-owned buffer
@@ -128,6 +135,22 @@ pub fn decodeImage(
     data: []const u8,
     allocator: std.mem.Allocator,
 ) !DecodedImage {
+    // Fast path: pre-baked LRGBA container. No PNG decode needed —
+    // the bake step already ran stb_image at build time.
+    if (data.len >= lrgba_header_len and std.mem.eql(u8, data[0..lrgba_magic.len], lrgba_magic)) {
+        const w = std.mem.readInt(u32, data[lrgba_magic.len..][0..4], .little);
+        const h = std.mem.readInt(u32, data[lrgba_magic.len + 4 ..][0..4], .little);
+        if (w == 0 or h == 0) return error.LoadFailed;
+        // Checked arithmetic — see sokol gfx decodeImage for rationale.
+        const wh = std.math.mul(usize, @as(usize, w), @as(usize, h)) catch return error.LoadFailed;
+        const pixels_len = std.math.mul(usize, wh, 4) catch return error.LoadFailed;
+        const end = std.math.add(usize, lrgba_header_len, pixels_len) catch return error.LoadFailed;
+        if (data.len < end) return error.LoadFailed;
+        const owned = try allocator.alloc(u8, pixels_len);
+        @memcpy(owned, data[lrgba_header_len..end]);
+        return .{ .pixels = owned, .width = w, .height = h };
+    }
+
     var image = rl.loadImageFromMemory(file_type, data) catch return error.LoadFailed;
     defer rl.unloadImage(image);
 
