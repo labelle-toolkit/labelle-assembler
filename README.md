@@ -12,6 +12,13 @@ See the [RFC: Split the assembler from the CLI](https://github.com/labelle-toolk
 ([tracking issue #122](https://github.com/labelle-toolkit/labelle-cli/issues/122))
 for the architectural plan and migration phases.
 
+**Writing a plugin?** See the
+[plugin authoring guide](https://github.com/labelle-toolkit/labelle-cli/blob/main/docs/plugin-authoring.md)
+for the end-to-end `Controller` + `plugin.labelle` walk-through, and
+[`examples/plugin-controllers/`](./examples/plugin-controllers/) for a
+minimal working example that exercises every layer the assembler wires
+up.
+
 ## Build
 
 Requires [Zig 0.15.2+](https://ziglang.org/download/).
