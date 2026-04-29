@@ -357,6 +357,11 @@ fn frame() callconv(.c) void {
 
     drawHud();
 
+    // Flush queued sokol-gl primitives before `endFrame`; the new
+    // window API splits this out of `endFrame` so the desktop frame
+    // loop can put a GUI block between the flush and pass-end. See
+    // labelle-imgui#4 / PR #80.
+    window.flushScene();
     window.endFrame();
 
     // Clear per-frame edge-triggered input state (pressed/released) AFTER
