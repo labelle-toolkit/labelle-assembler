@@ -21,9 +21,9 @@ export fn init() callconv(.c) void {
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
 {{init_code}}}
 
-fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
+{{gui_event_extern}}fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
     @import("backend_input").handleEvent(ev);
-}
+{{gui_event_forward}}}
 
 export fn frame() callconv(.c) void {
     if (!g.isRunning()) {
@@ -55,7 +55,12 @@ export fn frame() callconv(.c) void {
     window.beginPass(pass_action);
     g.render();
     g.renderGizmos();
-    window.endFrame();
+    // Flush queued sokol-gl primitives BEFORE the GUI renders so imgui
+    // draws are submitted on top of sprites in the same pass. Same shape
+    // as the desktop template — see labelle-imgui#4 / PR #80 for the
+    // overdraw bug this ordering fixes.
+    window.flushScene();
+{{gui_draw_code}}    window.endFrame();
     // Clear edge-triggered key/button/touch state AFTER scripts had a chance
     // to read it. See the matching comment in desktop.txt — same invariant.
     @import("backend_input").newFrame();

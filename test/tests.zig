@@ -1639,3 +1639,132 @@ pub const SUBFOLDERS = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".hud = @import(\"views/hud.zon\")") != null);
     }
 };
+
+// ── sokol pass-ordering regression (labelle-imgui#4 / PR #80) ────────
+//
+// These tests guard the fix that splits `sgl.draw` out of `endFrame`
+// into a dedicated `flushScene` called *between* scene rendering and
+// GUI rendering. Earlier the `sgl.draw` in `endFrame` ran AFTER
+// `simgui.render` had already submitted the GUI's draw calls, and
+// since draws are layered in submission order inside one sokol-gfx
+// pass, the sprite flush re-painted everything on top of the GUI and
+// hid it. The two file-content checks below pin the structural fix
+// — they're the cheapest signal we can get without spinning up a
+// full sokol app.
+
+pub const SOKOL_PASS_ORDER = struct {
+    fn readRepoFile(allocator: std.mem.Allocator, rel_path: []const u8) ![]const u8 {
+        // Tests run with the package root (assembler repo root) as cwd,
+        // per the repo's `zig build test` convention.
+        return std.fs.cwd().readFileAlloc(allocator, rel_path, 1 * 1024 * 1024);
+    }
+
+    test "desktop template calls flushScene between renderGizmos and gui_draw_code" {
+        const tmpl = try readRepoFile(std.testing.allocator, "backends/sokol/templates/desktop.txt");
+        defer std.testing.allocator.free(tmpl);
+
+        const flush_idx = std.mem.indexOf(u8, tmpl, "window.flushScene()") orelse {
+            return error.MissingFlushScene;
+        };
+        const gizmos_idx = std.mem.indexOf(u8, tmpl, "g.renderGizmos()") orelse {
+            return error.MissingRenderGizmos;
+        };
+        const gui_idx = std.mem.indexOf(u8, tmpl, "{{gui_draw_code}}") orelse {
+            return error.MissingGuiDrawCode;
+        };
+
+        // Ordering: renderGizmos < flushScene < gui_draw_code.
+        try std.testing.expect(gizmos_idx < flush_idx);
+        try std.testing.expect(flush_idx < gui_idx);
+    }
+
+    test "endFrame in sokol window backend has no sgl.draw call" {
+        // The defensive `sgl.draw` was removed because sokol-gl rewinds
+        // its vertex / command buffers on `sg_commit` — not on
+        // `sgl_draw` — so a second `sgl.draw` re-submits the same
+        // vertex buffer and re-paints the sprites on top of the GUI.
+        const window_zig = try readRepoFile(std.testing.allocator, "backends/sokol/src/window.zig");
+        defer std.testing.allocator.free(window_zig);
+
+        // Locate `pub fn endFrame` and the matching closing brace, then
+        // assert the body has no actual `sgl.draw()` call. The doc
+        // comment intentionally references the call name in prose, so
+        // we walk the body line-by-line and skip `//`-prefixed lines.
+        const end_frame_signature = "pub fn endFrame() void {";
+        const start = std.mem.indexOf(u8, window_zig, end_frame_signature) orelse {
+            return error.MissingEndFrame;
+        };
+        const body_start = start + end_frame_signature.len;
+        const body_end_rel = std.mem.indexOfScalar(u8, window_zig[body_start..], '}') orelse {
+            return error.UnterminatedEndFrame;
+        };
+        const body = window_zig[body_start .. body_start + body_end_rel];
+
+        var saw_end_pass = false;
+        var saw_commit = false;
+        var iter = std.mem.splitScalar(u8, body, '\n');
+        while (iter.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t");
+            if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
+            // Real code line — must not contain `sgl.draw`.
+            try std.testing.expect(std.mem.indexOf(u8, line, "sgl.draw") == null);
+            if (std.mem.indexOf(u8, line, "sg.endPass") != null) saw_end_pass = true;
+            if (std.mem.indexOf(u8, line, "sg.commit") != null) saw_commit = true;
+        }
+        try std.testing.expect(saw_end_pass);
+        try std.testing.expect(saw_commit);
+    }
+
+    test "mobile template calls flushScene before endFrame" {
+        // Mobile has no GUI block today — but `endFrame` no longer
+        // flushes sgl on its own (split out by the desktop fix), so
+        // mobile must call `flushScene` itself or sprites never reach
+        // the framebuffer (black-screen regression first hit on the
+        // tablet during PR #80 testing).
+        const tmpl = try readRepoFile(std.testing.allocator, "backends/sokol/templates/mobile.txt");
+        defer std.testing.allocator.free(tmpl);
+
+        const flush_idx = std.mem.indexOf(u8, tmpl, "window.flushScene()") orelse {
+            return error.MissingFlushScene;
+        };
+        const end_idx = std.mem.indexOf(u8, tmpl, "window.endFrame()") orelse {
+            return error.MissingEndFrame;
+        };
+        try std.testing.expect(flush_idx < end_idx);
+    }
+
+    test "flushScene exists and calls sgl.draw" {
+        const window_zig = try readRepoFile(std.testing.allocator, "backends/sokol/src/window.zig");
+        defer std.testing.allocator.free(window_zig);
+
+        const flush_signature = "pub fn flushScene() void {";
+        const start = std.mem.indexOf(u8, window_zig, flush_signature) orelse {
+            return error.MissingFlushScene;
+        };
+        const body_start = start + flush_signature.len;
+        const body_end_rel = std.mem.indexOfScalar(u8, window_zig[body_start..], '}') orelse {
+            return error.UnterminatedFlushScene;
+        };
+        const body = window_zig[body_start .. body_start + body_end_rel];
+
+        try std.testing.expect(std.mem.indexOf(u8, body, "sgl.draw") != null);
+    }
+};
+
+// ── plugins/imgui module name (PR #80 part 2) ────────────────────────
+//
+// `build_files.zig:87` constructs the gui-dep module name as
+// `labelle_<gui.name>`. The bundled plugin's build.zig has to register
+// the module under that exact name or `gui_dep.module(...)` panics with
+// "unable to find module" at game-build time. Pinning the expected name
+// keeps the two halves in sync.
+
+pub const PLUGINS_IMGUI = struct {
+    test "imgui plugin build.zig adds module as labelle_imgui" {
+        const plugin_build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "plugins/imgui/build.zig", 1 * 1024 * 1024);
+        defer std.testing.allocator.free(plugin_build);
+        try std.testing.expect(std.mem.indexOf(u8, plugin_build, "addModule(\"labelle_imgui\"") != null);
+        // Old name guarded against — would silently break game builds.
+        try std.testing.expect(std.mem.indexOf(u8, plugin_build, "addModule(\"gui\"") == null);
+    }
+};

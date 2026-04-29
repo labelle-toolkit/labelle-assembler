@@ -42,6 +42,11 @@ export fn frame() callconv(.c) void {
     window.beginPass(pass_action);
     g.render();
     g.renderGizmos();
+    // Flush queued sokol-gl primitives (sprites, gizmos) into the
+    // active sg pass BEFORE the GUI renders, so imgui's draws are
+    // submitted on top instead of being hidden underneath the sgl
+    // flush that used to happen at endFrame. See labelle-imgui#4.
+    window.flushScene();
 {{gui_draw_code}}    window.endFrame();
     // Clear one-shot pressed/released state AFTER scripts have consumed it.
     // Calling newFrame at the top of frame() would race with sapp events

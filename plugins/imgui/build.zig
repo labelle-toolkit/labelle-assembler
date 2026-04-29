@@ -11,8 +11,12 @@ pub fn build(b: *std.Build) void {
     const cimgui_mod = dep_cimgui.module(cimgui_conf.module_name);
 
     // GUI adapter module — satisfies GuiInterface contract.
-    // Does NOT depend on any backend. The bridge wires the backend connection.
-    const gui_mod = b.addModule("gui", .{
+    // Module name must be `labelle_imgui` to match the assembler's
+    // `gui_mod_name = "labelle_<gui.name>"` template (build_files.zig:87).
+    // Mismatch was the historical cause of `gui_dep.module("labelle_imgui")`
+    // panicking with "unable to find module" when the assembler-bundled
+    // imgui plugin tried to be used as a `.gui = .{ .path = ... }` source.
+    const gui_mod = b.addModule("labelle_imgui", .{
         .root_source_file = b.path("src/adapter.zig"),
         .target = target,
         .optimize = optimize,
