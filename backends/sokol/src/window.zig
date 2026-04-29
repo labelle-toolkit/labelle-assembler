@@ -89,8 +89,27 @@ pub fn beginPass(pass_action: sg.PassAction) void {
     sg.beginPass(.{ .action = pass_action, .swapchain = sglue.swapchain() });
 }
 
-pub fn endFrame() void {
+/// Flush queued sokol-gl primitives (sprites, gizmos, sgl-rendered text)
+/// to the active sokol-gfx pass. The frame-loop template calls this
+/// **between** scene rendering (`g.render()` / `g.renderGizmos()`) and
+/// GUI rendering (`g.guiBegin()` / drawGui / `g.guiEnd()`), so sgl
+/// primitives land in the framebuffer before any imgui draws are
+/// emitted. The original `endFrame` flushed sgl AFTER `simgui.render()`
+/// had already submitted the GUI's draw calls in the same pass — and
+/// since draws are layered in submission order, the sprites painted on
+/// top of the GUI and hid it entirely. See labelle-toolkit/labelle-imgui#4.
+pub fn flushScene() void {
     sgl.draw();
+}
+
+pub fn endFrame() void {
+    // No `sgl.draw()` here on purpose — `flushScene()` already drained
+    // the queue between scene rendering and GUI rendering. Calling
+    // `sgl.draw()` a second time would *re-submit* the same vertex /
+    // command buffers (sokol-gl rewinds them on `sg_commit`, not on
+    // `sgl_draw`), painting the sprites a second time on top of any
+    // GUI submitted between the two flushes — which is exactly the
+    // labelle-imgui#4 symptom this split fixes.
     sg.endPass();
     sg.commit();
 }
