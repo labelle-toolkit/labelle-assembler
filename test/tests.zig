@@ -1715,6 +1715,24 @@ pub const SOKOL_PASS_ORDER = struct {
         try std.testing.expect(saw_commit);
     }
 
+    test "mobile template calls flushScene before endFrame" {
+        // Mobile has no GUI block today — but `endFrame` no longer
+        // flushes sgl on its own (split out by the desktop fix), so
+        // mobile must call `flushScene` itself or sprites never reach
+        // the framebuffer (black-screen regression first hit on the
+        // tablet during PR #80 testing).
+        const tmpl = try readRepoFile(std.testing.allocator, "backends/sokol/templates/mobile.txt");
+        defer std.testing.allocator.free(tmpl);
+
+        const flush_idx = std.mem.indexOf(u8, tmpl, "window.flushScene()") orelse {
+            return error.MissingFlushScene;
+        };
+        const end_idx = std.mem.indexOf(u8, tmpl, "window.endFrame()") orelse {
+            return error.MissingEndFrame;
+        };
+        try std.testing.expect(flush_idx < end_idx);
+    }
+
     test "flushScene exists and calls sgl.draw" {
         const window_zig = try readRepoFile(std.testing.allocator, "backends/sokol/src/window.zig");
         defer std.testing.allocator.free(window_zig);

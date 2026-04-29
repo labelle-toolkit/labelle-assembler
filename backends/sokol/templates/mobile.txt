@@ -55,6 +55,14 @@ export fn frame() callconv(.c) void {
     window.beginPass(pass_action);
     g.render();
     g.renderGizmos();
+    // Flush queued sokol-gl primitives before `endFrame`. The desktop
+    // template puts a GUI block between `flushScene` and `endFrame` to
+    // keep imgui draws on top; on mobile there's no GUI block, but the
+    // flush is still required because `endFrame` no longer calls
+    // `sgl.draw()` itself (split out so the desktop pass-ordering fix
+    // could land — see labelle-imgui#4). Without this, sprites get
+    // queued and never reach the framebuffer → black screen.
+    window.flushScene();
     window.endFrame();
     // Clear edge-triggered key/button/touch state AFTER scripts had a chance
     // to read it. See the matching comment in desktop.txt — same invariant.
