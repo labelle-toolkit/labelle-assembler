@@ -61,7 +61,7 @@ pub fn main() !void {
     _ = args.skip(); // program name
 
     const first = args.next() orelse {
-        std.debug.print("{s}", .{usage});
+        writeStderr(usage);
         std.process.exit(2);
     };
 
@@ -76,7 +76,7 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h") or std.mem.eql(u8, first, "help")) {
-        std.debug.print("{s}", .{usage});
+        writeStderr(usage);
         return;
     }
 
@@ -86,8 +86,15 @@ pub fn main() !void {
     }
 
     std.log.err("labelle-assembler: unknown subcommand '{s}'", .{first});
-    std.debug.print("\n{s}", .{usage});
+    writeStderr("\n" ++ usage);
     std.process.exit(2);
+}
+
+/// Write directly to stderr without a level prefix. Used for the usage
+/// banner — `std.log.*` would prepend `info:`/`error:`, and `std.debug.print`
+/// is intended for development-time printf debugging, not production output.
+fn writeStderr(msg: []const u8) void {
+    std.fs.File.stderr().writeAll(msg) catch {};
 }
 
 fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
@@ -190,17 +197,24 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     // against the generated tree. Tracked for follow-up.
 }
 
+/// Comptime-built " name1 name2 ..." string for an enum's fields. Folds
+/// to a single string literal in the binary; the `comptime blk:` form
+/// (rather than a comptime-only function body) is what lets a runtime
+/// caller obtain the value as if it were a string literal.
+fn enumFieldList(comptime E: type) []const u8 {
+    return comptime blk: {
+        var out: []const u8 = "";
+        for (@typeInfo(E).@"enum".fields) |f| out = out ++ " " ++ f.name;
+        break :blk out;
+    };
+}
+
 /// Parse a --platform value into the Platform enum, or log an error
 /// listing accepted values and return null. Caller is expected to exit
 /// with code 2 on null.
 fn parsePlatform(val: []const u8) ?gen.Platform {
     if (std.meta.stringToEnum(gen.Platform, val)) |p| return p;
-    const accepted = comptime blk: {
-        var out: []const u8 = "";
-        for (@typeInfo(gen.Platform).@"enum".fields) |f| out = out ++ " " ++ f.name;
-        break :blk out;
-    };
-    std.log.err("labelle-assembler: unknown platform '{s}'\n  expected one of:{s}", .{ val, accepted });
+    std.log.err("labelle-assembler: unknown platform '{s}'\n  expected one of:{s}", .{ val, enumFieldList(gen.Platform) });
     return null;
 }
 
@@ -209,12 +223,7 @@ fn parsePlatform(val: []const u8) ?gen.Platform {
 /// with code 2 on null.
 fn parseBackend(val: []const u8) ?gen.Backend {
     if (std.meta.stringToEnum(gen.Backend, val)) |b| return b;
-    const accepted = comptime blk: {
-        var out: []const u8 = "";
-        for (@typeInfo(gen.Backend).@"enum".fields) |f| out = out ++ " " ++ f.name;
-        break :blk out;
-    };
-    std.log.err("labelle-assembler: unknown backend '{s}'\n  expected one of:{s}", .{ val, accepted });
+    std.log.err("labelle-assembler: unknown backend '{s}'\n  expected one of:{s}", .{ val, enumFieldList(gen.Backend) });
     return null;
 }
 
