@@ -262,6 +262,22 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
             }
         }
 
+        // ── Test step (desktop only) ───────────────────────────────
+        // Emits the same plugin/ecs/gui import shape as the exe so test
+        // files have access to the full game module graph. Cross-compile
+        // targets (wasm/ios/android) skip this — tests run on the host.
+        try tpl.writeSection(build_zig_tmpl, "tests_start", w);
+        for (cfg.plugins) |plugin| {
+            try w.print("                        .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
+        }
+        if (cfg.ecs != .mock) {
+            try tpl.writeSection(build_zig_tmpl, "tests_ecs_import", w);
+        }
+        if (cfg.hasGui()) {
+            try tpl.writeSection(build_zig_tmpl, "tests_gui_import", w);
+        }
+        try tpl.writeSection(build_zig_tmpl, "tests_end", w);
+
         try tpl.writeSection(build_zig_tmpl, "footer", w);
     }
 
