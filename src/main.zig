@@ -61,7 +61,7 @@ pub fn main() !void {
     _ = args.skip(); // program name
 
     const first = args.next() orelse {
-        std.debug.print("{s}", .{usage});
+        writeStderr(usage);
         std.process.exit(2);
     };
 
@@ -76,7 +76,7 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h") or std.mem.eql(u8, first, "help")) {
-        std.debug.print("{s}", .{usage});
+        writeStderr(usage);
         return;
     }
 
@@ -85,8 +85,16 @@ pub fn main() !void {
         return;
     }
 
-    std.debug.print("labelle-assembler: unknown subcommand '{s}'\n\n{s}", .{ first, usage });
+    std.log.err("labelle-assembler: unknown subcommand '{s}'", .{first});
+    writeStderr("\n" ++ usage);
     std.process.exit(2);
+}
+
+/// Write directly to stderr without a level prefix. Used for the usage
+/// banner — `std.log.*` would prepend `info:`/`error:`, and `std.debug.print`
+/// is intended for development-time printf debugging, not production output.
+fn writeStderr(msg: []const u8) void {
+    std.fs.File.stderr().writeAll(msg) catch {};
 }
 
 fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
@@ -98,21 +106,21 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--project-root")) {
             project_root = args.next() orelse {
-                std.debug.print("labelle-assembler: --project-root requires a value\n", .{});
+                std.log.err("labelle-assembler: --project-root requires a value", .{});
                 std.process.exit(2);
             };
         } else if (std.mem.startsWith(u8, arg, "--project-root=")) {
             project_root = arg["--project-root=".len..];
         } else if (std.mem.eql(u8, arg, "--scene")) {
             scene_override = args.next() orelse {
-                std.debug.print("labelle-assembler: --scene requires a value\n", .{});
+                std.log.err("labelle-assembler: --scene requires a value", .{});
                 std.process.exit(2);
             };
         } else if (std.mem.startsWith(u8, arg, "--scene=")) {
             scene_override = arg["--scene=".len..];
         } else if (std.mem.eql(u8, arg, "--platform")) {
             const val = args.next() orelse {
-                std.debug.print("labelle-assembler: --platform requires a value\n", .{});
+                std.log.err("labelle-assembler: --platform requires a value", .{});
                 std.process.exit(2);
             };
             platform_override = parsePlatform(val) orelse std.process.exit(2);
@@ -120,20 +128,20 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
             platform_override = parsePlatform(arg["--platform=".len..]) orelse std.process.exit(2);
         } else if (std.mem.eql(u8, arg, "--backend")) {
             const val = args.next() orelse {
-                std.debug.print("labelle-assembler: --backend requires a value\n", .{});
+                std.log.err("labelle-assembler: --backend requires a value", .{});
                 std.process.exit(2);
             };
             backend_override = parseBackend(val) orelse std.process.exit(2);
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
             backend_override = parseBackend(arg["--backend=".len..]) orelse std.process.exit(2);
         } else {
-            std.debug.print("labelle-assembler generate: unknown flag '{s}'\n", .{arg});
+            std.log.err("labelle-assembler generate: unknown flag '{s}'", .{arg});
             std.process.exit(2);
         }
     }
 
     const root = project_root orelse {
-        std.debug.print("labelle-assembler generate: --project-root is required\n", .{});
+        std.log.err("labelle-assembler generate: --project-root is required", .{});
         std.process.exit(2);
     };
 
@@ -142,7 +150,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     const arena_alloc = arena.allocator();
 
     var cfg = readProjectConfig(arena_alloc, root) catch |err| {
-        std.debug.print("labelle-assembler: failed to read project.labelle in '{s}': {s}\n", .{ root, @errorName(err) });
+        std.log.err("labelle-assembler: failed to read project.labelle in '{s}': {s}", .{ root, @errorName(err) });
         std.process.exit(1);
     };
 
@@ -154,7 +162,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     // and populates cfg.resolved_gui. Must run before gen.generate so the
     // generated build.zig/zon and main.zig include the GUI module wiring.
     gen.resolveGuiPlugin(arena_alloc, &cfg, root) catch |err| {
-        std.debug.print("labelle-assembler: failed to resolve GUI plugin: {s}\n", .{@errorName(err)});
+        std.log.err("labelle-assembler: failed to resolve GUI plugin: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
 
@@ -162,13 +170,13 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     defer allocator.free(output_dir);
 
     gen.generate(allocator, cfg, output_dir, root, .{}) catch |err| {
-        std.debug.print("labelle-assembler: generate failed: {s}\n", .{@errorName(err)});
+        std.log.err("labelle-assembler: generate failed: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
 
     const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
     defer allocator.free(target_name);
-    std.debug.print("labelle-assembler: generated .labelle/{s}/\n", .{target_name});
+    std.log.info("labelle-assembler: generated .labelle/{s}/", .{target_name});
 
     // Issue #83: also emit a backend-agnostic test target at .labelle/tests/.
     // Uses the null backend so `zig build test` works on any host without
@@ -189,31 +197,33 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     // against the generated tree. Tracked for follow-up.
 }
 
-/// Parse a --platform value into the Platform enum, or print an error
+/// Comptime-built " name1 name2 ..." string for an enum's fields. Folds
+/// to a single string literal in the binary; the `comptime blk:` form
+/// (rather than a comptime-only function body) is what lets a runtime
+/// caller obtain the value as if it were a string literal.
+fn enumFieldList(comptime E: type) []const u8 {
+    return comptime blk: {
+        var out: []const u8 = "";
+        for (@typeInfo(E).@"enum".fields) |f| out = out ++ " " ++ f.name;
+        break :blk out;
+    };
+}
+
+/// Parse a --platform value into the Platform enum, or log an error
 /// listing accepted values and return null. Caller is expected to exit
 /// with code 2 on null.
 fn parsePlatform(val: []const u8) ?gen.Platform {
     if (std.meta.stringToEnum(gen.Platform, val)) |p| return p;
-    std.debug.print("labelle-assembler: unknown platform '{s}'\n", .{val});
-    std.debug.print("  expected one of:", .{});
-    inline for (@typeInfo(gen.Platform).@"enum".fields) |f| {
-        std.debug.print(" {s}", .{f.name});
-    }
-    std.debug.print("\n", .{});
+    std.log.err("labelle-assembler: unknown platform '{s}'\n  expected one of:{s}", .{ val, enumFieldList(gen.Platform) });
     return null;
 }
 
-/// Parse a --backend value into the Backend enum, or print an error
+/// Parse a --backend value into the Backend enum, or log an error
 /// listing accepted values and return null. Caller is expected to exit
 /// with code 2 on null.
 fn parseBackend(val: []const u8) ?gen.Backend {
     if (std.meta.stringToEnum(gen.Backend, val)) |b| return b;
-    std.debug.print("labelle-assembler: unknown backend '{s}'\n", .{val});
-    std.debug.print("  expected one of:", .{});
-    inline for (@typeInfo(gen.Backend).@"enum".fields) |f| {
-        std.debug.print(" {s}", .{f.name});
-    }
-    std.debug.print("\n", .{});
+    std.log.err("labelle-assembler: unknown backend '{s}'\n  expected one of:{s}", .{ val, enumFieldList(gen.Backend) });
     return null;
 }
 
