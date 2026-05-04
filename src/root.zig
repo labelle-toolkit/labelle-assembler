@@ -467,6 +467,13 @@ pub fn generateTestsTarget(
 ) !void {
     var cfg = cfg_in;
     cfg.backend = .null;
+    // Force the host platform too. For wasm/ios/android projects, leaving
+    // cfg.platform as-is would route the tests target through the
+    // cross-compile build template (which omits the test step entirely),
+    // producing a build.zig that builds cleanly but never runs tests. The
+    // tests target is meant to run on the developer's host regardless of
+    // what the exe target ships as.
+    cfg.platform = .desktop;
     try generate(allocator, cfg, output_dir, game_dir, .{
         .target_name_override = "tests",
         .is_tests_target = true,
