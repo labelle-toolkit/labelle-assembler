@@ -72,8 +72,26 @@ pub const resolvePlugin = cache.resolvePlugin;
 pub const resolveAssemblerPackage = cache.resolveAssemblerPackage;
 pub const resolveBundledPackage = cache.resolveBundledPackage;
 
-/// Generate all assembler files into output_dir/.labelle/{backend}_{platform}/.
-pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir: []const u8, game_dir: []const u8) !void {
+/// Generate all assembler files into output_dir/<target_name>/.
+/// `opts.target_name_override` lets the caller pin the subdirectory name
+/// (used by `generateTestsTarget` to emit `.labelle/tests/`); null falls
+/// back to `<backend>_<platform>`. `opts.is_tests_target` selects the
+/// test-only build.zig shape — no exe step, no main.zig — and is paired
+/// with the override by `generateTestsTarget`. Issue #83.
+pub const GenerateOptions = struct {
+    target_name_override: ?[]const u8 = null,
+    is_tests_target: bool = false,
+};
+
+pub fn generate(
+    allocator: std.mem.Allocator,
+    cfg_in: ProjectConfig,
+    output_dir: []const u8,
+    game_dir: []const u8,
+    opts: GenerateOptions,
+) !void {
+    const target_name_override = opts.target_name_override;
+    const is_tests_target = opts.is_tests_target;
     // Shadow the caller's cfg with a mutable copy. Ticket #48's lazy
     // default-inference pass needs to rewrite `cfg.resources[i].lazy`
     // in place, and we don't want to surprise callers by touching
@@ -111,15 +129,16 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     const cwd = std.fs.cwd();
 
     // Target subfolder: .labelle/raylib_desktop/, .labelle/sokol_ios/, etc.
-    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
+    // Override is used for the `.labelle/tests/` target where the name
+    // shouldn't reflect the backend (issue #83).
+    const target_name = if (target_name_override) |name|
+        try allocator.dupe(u8, name)
+    else
+        try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
     defer allocator.free(target_name);
     const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
     defer allocator.free(target_dir);
     try cwd.makePath(target_dir);
-
-    // Load backend lifecycle template
-    const backend_tmpl = try loadBackendTemplate(allocator, game_dir, cfg);
-    defer allocator.free(backend_tmpl);
 
     // Copy game folders into target dir and scan file stems in one pass.
     // Folders that need scanning use copyAndScan; assets is copy-only.
@@ -385,12 +404,16 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     }
 
     // Generate build.zig.zon
-    const zon = try build_files.generateBuildZigZon(allocator, cfg, target_dir, output_dir, game_dir);
+    const zon = try build_files.generateBuildZigZon(allocator, cfg, target_dir, output_dir, game_dir, .{
+        // The tests target runs second — additive merge so the exe
+        // target's deps (chosen-backend, plugins) survive. Issue #83.
+        .recreate_deps = !is_tests_target,
+    });
     defer allocator.free(zon);
     try scanner.writeFile(target_dir, "build.zig.zon", zon);
 
     // Generate build.zig
-    const build_zig = try build_files.generateBuildZig(allocator, cfg);
+    const build_zig = try build_files.generateBuildZig(allocator, cfg, .{ .is_tests_target = is_tests_target });
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
 
@@ -399,12 +422,24 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     // been fed to the scanner (see root.zig §script discovery). Capturing
     // earlier would produce a stale slice that misses every
     // plugin-shipped script.
-    const script_entries = script_scan.getEntries();
-    const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
-    defer allocator.free(engine_template);
-    const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names);
-    defer allocator.free(main_zig_content);
-    try scanner.writeFile(target_dir, "main.zig", main_zig_content);
+    //
+    // The tests target has no exe and therefore no main.zig — its build.zig
+    // only emits a `test` step rooted at `__tests_root.zig`.
+    if (!is_tests_target) {
+        const script_entries = script_scan.getEntries();
+        // Backend lifecycle template — only the exe target needs it.
+        // Loading it for the tests target would fail unnecessarily if the
+        // null backend's `desktop.txt` is missing from the cache, since
+        // the tests target never emits main.zig and therefore never uses
+        // the template anyway.
+        const backend_tmpl = try loadBackendTemplate(allocator, game_dir, cfg);
+        defer allocator.free(backend_tmpl);
+        const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
+        defer allocator.free(engine_template);
+        const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names);
+        defer allocator.free(main_zig_content);
+        try scanner.writeFile(target_dir, "main.zig", main_zig_content);
+    }
 
     // Emit `__tests_root.zig` — a `test { _ = @import("tests/<stem>.zig"); }`
     // wrapper that pulls every test file's blocks into the test compile unit.
@@ -414,6 +449,38 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     const tests_root = try generateTestsRoot(allocator, test_names);
     defer allocator.free(tests_root);
     try scanner.writeFile(target_dir, "__tests_root.zig", tests_root);
+}
+
+/// Generate the backend-agnostic test target at `output_dir/tests/`. Issue #83.
+///
+/// Reuses `generate` with `cfg.backend = .null` so test compile units link
+/// against the pure-Zig null backend (no native artifact, no system libs)
+/// regardless of which backend the user picked for their exe build. This
+/// lets `zig build test` run on any host without backend-specific apt-get
+/// installs or cross-compile toolchains, and means tests are reproducible
+/// across machines independent of the active exe target.
+///
+/// `is_tests_target = true` trims the emitted build.zig to a single test
+/// step (no exe, no run step) and skips main.zig generation entirely.
+pub fn generateTestsTarget(
+    allocator: std.mem.Allocator,
+    cfg_in: ProjectConfig,
+    output_dir: []const u8,
+    game_dir: []const u8,
+) !void {
+    var cfg = cfg_in;
+    cfg.backend = .null;
+    // Force the host platform too. For wasm/ios/android projects, leaving
+    // cfg.platform as-is would route the tests target through the
+    // cross-compile build template (which omits the test step entirely),
+    // producing a build.zig that builds cleanly but never runs tests. The
+    // tests target is meant to run on the developer's host regardless of
+    // what the exe target ships as.
+    cfg.platform = .desktop;
+    try generate(allocator, cfg, output_dir, game_dir, .{
+        .target_name_override = "tests",
+        .is_tests_target = true,
+    });
 }
 
 /// Build the body of `__tests_root.zig`. One `_ = @import("tests/<stem>.zig");`

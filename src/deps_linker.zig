@@ -16,11 +16,21 @@ pub const DepEntry = struct {
     abs_path: []const u8,
 };
 
+pub const DepsLinkOptions = struct {
+    /// True (default) wipes `deps_dir` before re-creating it. The tests
+    /// target (issue #83) sets this to false because the exe target's
+    /// generate already populated `deps_dir` with the chosen-backend
+    /// links — wiping it would orphan the exe's deps. The tests pass
+    /// only adds the null backend's link to the existing dir.
+    recreate: bool = true,
+};
+
 pub fn createDepsLinks(
     allocator: std.mem.Allocator,
     cfg: ProjectConfig,
     target_dir: []const u8,
     project_dir: []const u8,
+    opts: DepsLinkOptions,
 ) ![]const DepEntry {
     var deps = std.ArrayList(DepEntry){};
 
@@ -90,12 +100,19 @@ pub fn createDepsLinks(
     const deps_dir = try std.fs.path.join(allocator, &.{ target_dir, "deps" });
     defer allocator.free(deps_dir);
 
-    cwd.deleteTree(deps_dir) catch {};
+    if (opts.recreate) cwd.deleteTree(deps_dir) catch {};
     try cwd.makePath(deps_dir);
 
     for (deps.items) |dep| {
         const dest = try std.fs.path.join(allocator, &.{ deps_dir, dep.link_name });
         defer allocator.free(dest);
+
+        // In additive mode (recreate=false), skip links that already
+        // exist — created by a previous target's pass. Hardlinking on
+        // top of an existing tree would error.
+        if (!opts.recreate) {
+            if (cwd.access(dest, .{})) |_| continue else |_| {}
+        }
 
         const abs = cwd.realpathAlloc(allocator, dep.abs_path) catch dep.abs_path;
         defer if (abs.ptr != dep.abs_path.ptr) allocator.free(abs);
@@ -107,34 +124,46 @@ pub fn createDepsLinks(
     // After hardlinking, the paths still point relative to the original location
     // which is wrong from .labelle/deps/. Resolve each path against the original
     // abs location and recompute the relative path from the new dest location.
-    for (cfg.plugins) |plugin| {
-        if (!plugin.isLocal()) continue;
+    //
+    // Only run in `recreate=true` (first-pass) mode. In additive mode the
+    // first pass already rewrote every dest zon to be relative to its
+    // .labelle/deps/<plugin>/ location; running rewriteZonPaths again on
+    // those already-rewritten files would re-resolve the new paths against
+    // the original `abs_src` (the plugin's source-tree location) and
+    // produce a corrupted target (one extra `../` in practice). The set of
+    // local plugins is identical between passes — only the bundled
+    // backend/ECS deps differ — and bundled deps don't have local `.path`
+    // entries to rewrite, so skipping is safe.
+    if (opts.recreate) {
+        for (cfg.plugins) |plugin| {
+            if (!plugin.isLocal()) continue;
 
-        const link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{plugin.name});
-        defer allocator.free(link_name);
+            const link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{plugin.name});
+            defer allocator.free(link_name);
 
-        const dest = try std.fs.path.join(allocator, &.{ deps_dir, link_name });
-        defer allocator.free(dest);
+            const dest = try std.fs.path.join(allocator, &.{ deps_dir, link_name });
+            defer allocator.free(dest);
 
-        const plugin_path = try cache.resolvePlugin(allocator, plugin, project_dir);
-        defer allocator.free(plugin_path);
+            const plugin_path = try cache.resolvePlugin(allocator, plugin, project_dir);
+            defer allocator.free(plugin_path);
 
-        const abs_src = cwd.realpathAlloc(allocator, plugin_path) catch continue;
-        defer allocator.free(abs_src);
+            const abs_src = cwd.realpathAlloc(allocator, plugin_path) catch continue;
+            defer allocator.free(abs_src);
 
-        const abs_dest = cwd.realpathAlloc(allocator, dest) catch continue;
-        defer allocator.free(abs_dest);
+            const abs_dest = cwd.realpathAlloc(allocator, dest) catch continue;
+            defer allocator.free(abs_dest);
 
-        try rewriteZonPaths(allocator, abs_src, abs_dest);
-    }
+            try rewriteZonPaths(allocator, abs_src, abs_dest);
+        }
 
-    // Also rewrite GUI plugin/bridge paths — the GUI is resolved separately
-    // from cfg.plugins but may also have local .path deps.
-    // rewriteZonPaths is a no-op if no .path entries exist, so always safe to call.
-    if (cfg.resolved_gui) |gui| {
-        try rewriteLocalDep(allocator, cwd, gui.plugin_dir, deps_dir, "labelle-gui");
-        if (gui.bridge_dir) |bd|
-            try rewriteLocalDep(allocator, cwd, bd, deps_dir, "gui-bridge");
+        // Also rewrite GUI plugin/bridge paths — the GUI is resolved separately
+        // from cfg.plugins but may also have local .path deps.
+        // rewriteZonPaths is a no-op if no .path entries exist, so always safe to call.
+        if (cfg.resolved_gui) |gui| {
+            try rewriteLocalDep(allocator, cwd, gui.plugin_dir, deps_dir, "labelle-gui");
+            if (gui.bridge_dir) |bd|
+                try rewriteLocalDep(allocator, cwd, bd, deps_dir, "gui-bridge");
+        }
     }
 
     return deps.toOwnedSlice(allocator);

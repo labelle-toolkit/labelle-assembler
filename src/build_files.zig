@@ -15,7 +15,14 @@ const build_zig_zon_tmpl = @embedFile("templates/build_zig_zon.txt");
 // build.zig generator
 // ============================================================
 
-pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]const u8 {
+pub const BuildZigOptions = struct {
+    /// Emit a test-only build.zig: skip the exe step, the run step,
+    /// and the backend artifact link. Used by `generateTestsTarget`
+    /// in root.zig for `.labelle/tests/build.zig` (issue #83).
+    is_tests_target: bool = false,
+};
+
+pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: BuildZigOptions) ![]const u8 {
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
@@ -226,39 +233,45 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         try tpl.writeSection(build_zig_tmpl, "android_package", w);
         try tpl.writeSection(build_zig_tmpl, "android_footer", w);
     } else {
-        // Desktop: build as executable, link natively
-        try tpl.writeSection(build_zig_tmpl, "exe_start", w);
+        // Desktop: build as executable, link natively. Test-only targets
+        // (issue #83) skip the exe assembly + backend artifact link + bridge
+        // entirely — they go straight from the deps/plugin/gui wiring above
+        // to the test step below, then to a stripped footer that closes the
+        // build function without referencing `exe`.
+        if (!opts.is_tests_target) {
+            try tpl.writeSection(build_zig_tmpl, "exe_start", w);
 
-        for (cfg.plugins) |plugin| {
-            try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
-        }
+            for (cfg.plugins) |plugin| {
+                try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
+            }
 
-        if (cfg.ecs != .mock) {
-            try tpl.writeSection(build_zig_tmpl, "exe_ecs_import", w);
-        }
-        if (cfg.hasGui()) {
-            try tpl.writeSection(build_zig_tmpl, "exe_gui_import", w);
-        }
+            if (cfg.ecs != .mock) {
+                try tpl.writeSection(build_zig_tmpl, "exe_ecs_import", w);
+            }
+            if (cfg.hasGui()) {
+                try tpl.writeSection(build_zig_tmpl, "exe_gui_import", w);
+            }
 
-        try tpl.writeSection(build_zig_tmpl, "exe_end", w);
+            try tpl.writeSection(build_zig_tmpl, "exe_end", w);
 
-        // Link backend artifact
-        switch (cfg.backend) {
-            .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib", w),
-            .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol", w),
-            .sdl => try tpl.writeSection(build_zig_tmpl, "link_sdl", w),
-            .bgfx => try tpl.writeSection(build_zig_tmpl, "link_bgfx", w),
-            .wgpu => try tpl.writeSection(build_zig_tmpl, "link_wgpu", w),
-            // Null backend has no native artifact — every backend module is
-            // pure Zig, no library to link.
-            .null => {},
-        }
+            // Link backend artifact
+            switch (cfg.backend) {
+                .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib", w),
+                .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol", w),
+                .sdl => try tpl.writeSection(build_zig_tmpl, "link_sdl", w),
+                .bgfx => try tpl.writeSection(build_zig_tmpl, "link_bgfx", w),
+                .wgpu => try tpl.writeSection(build_zig_tmpl, "link_wgpu", w),
+                // Null backend has no native artifact — every backend module is
+                // pure Zig, no library to link.
+                .null => {},
+            }
 
-        // Bridge artifact (raw_backend GUIs) — declare + link
-        if (cfg.resolved_gui) |gui| {
-            if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
-                try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
-                try tpl.writeSection(build_zig_tmpl, "link_gui_bridge", w);
+            // Bridge artifact (raw_backend GUIs) — declare + link
+            if (cfg.resolved_gui) |gui| {
+                if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
+                    try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
+                    try tpl.writeSection(build_zig_tmpl, "link_gui_bridge", w);
+                }
             }
         }
 
@@ -278,7 +291,14 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
         }
         try tpl.writeSection(build_zig_tmpl, "tests_end", w);
 
-        try tpl.writeSection(build_zig_tmpl, "footer", w);
+        // Test-only target (issue #83): close the build function without
+        // installing/running the exe. Otherwise emit the regular footer
+        // that wires `b.installArtifact(exe)` and the `run` step.
+        if (opts.is_tests_target) {
+            try tpl.writeSection(build_zig_tmpl, "tests_only_footer", w);
+        } else {
+            try tpl.writeSection(build_zig_tmpl, "footer", w);
+        }
     }
 
     return buf.toOwnedSlice(allocator);
@@ -288,7 +308,15 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]con
 // build.zig.zon generator
 // ============================================================
 
-pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, output_dir: ?[]const u8, project_dir: ?[]const u8) ![]const u8 {
+pub const BuildZigZonOptions = struct {
+    /// True (default) wipes the shared `.labelle/deps/` directory before
+    /// recreating it. The tests target (issue #83) sets this to false so
+    /// the second-pass generation merges its null-backend dep into the
+    /// existing dir without orphaning the exe target's chosen-backend dep.
+    recreate_deps: bool = true,
+};
+
+pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, output_dir: ?[]const u8, project_dir: ?[]const u8, opts: BuildZigZonOptions) ![]const u8 {
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
@@ -300,7 +328,7 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     // errors during `zig build` — see labelle-toolkit/labelle-cli#174.
     const deps_parent = output_dir orelse target_dir;
     const resolved_deps: ?[]const deps_linker.DepEntry = if (deps_parent != null and project_dir != null)
-        deps_linker.createDepsLinks(allocator, cfg, deps_parent.?, project_dir.?) catch |err| blk: {
+        deps_linker.createDepsLinks(allocator, cfg, deps_parent.?, project_dir.?, .{ .recreate = opts.recreate_deps }) catch |err| blk: {
             // OOM is not recoverable by retrying with cache-relative
             // paths — those need allocation too. Propagate so the caller
             // can fail cleanly instead of papering over the failure.
