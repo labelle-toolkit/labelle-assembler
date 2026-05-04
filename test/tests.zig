@@ -261,7 +261,7 @@ pub const BUILD_ZIG = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkLibrary") != null);
@@ -273,7 +273,7 @@ pub const BUILD_ZIG = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkLibrary") != null);
@@ -285,7 +285,7 @@ pub const BUILD_ZIG = struct {
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_sdl") != null);
@@ -297,7 +297,7 @@ pub const BUILD_ZIG = struct {
             .name = "test-game",
             .backend = .bgfx,
             .ecs = .mock,
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_bgfx") != null);
@@ -310,7 +310,7 @@ pub const BUILD_ZIG = struct {
             .name = "test-game",
             .backend = .wgpu,
             .ecs = .mock,
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_wgpu") != null);
@@ -322,7 +322,7 @@ pub const BUILD_ZIG = struct {
             .name = "test-game",
             .backend = .null,
             .ecs = .mock,
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         // Module wiring still happens — the engine's import surface is the
@@ -344,7 +344,7 @@ pub const BUILD_ZIG = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         // gfx and engine must use the project-level core, not their own resolved version
@@ -359,7 +359,7 @@ pub const BUILD_ZIG = struct {
             .backend = .raylib,
             .ecs = .mock,
             .resolved_gui = testGuiRenderInterface("clay"),
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "gui_mod") != null);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_gui") != null);
@@ -371,7 +371,7 @@ pub const BUILD_ZIG = struct {
             .backend = .raylib,
             .ecs = .mock,
             .resolved_gui = testGuiRawBackend("imgui"),
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "gui_bridge") != null);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "gui_bridge_artifact") != null);
@@ -382,7 +382,7 @@ pub const BUILD_ZIG = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "gui_mod") == null);
     }
@@ -392,7 +392,7 @@ pub const BUILD_ZIG = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         // The test step is the entry point users invoke via `zig build test`.
@@ -409,7 +409,7 @@ pub const BUILD_ZIG = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .zig_ecs,
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         // The exe and the test step both bind `ecs_backend` from `ecs_mod`,
@@ -417,6 +417,30 @@ pub const BUILD_ZIG = struct {
         // exe imports list and once in the per-test addTest module.
         const exe_count = std.mem.count(u8, build_zig, "ecs_backend");
         try std.testing.expect(exe_count >= 2);
+    }
+
+    test "is_tests_target trims exe assembly + run step (issue #83)" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .null,
+            .ecs = .mock,
+        }, .{ .is_tests_target = true });
+        defer std.testing.allocator.free(build_zig);
+
+        // Test step is the only entry point — keep it.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.step(\"test\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "addTest") != null);
+
+        // No exe assembly: `addExecutable`, `installArtifact(exe)`, the
+        // run step, or `b.addRunArtifact(exe)` would all reference an
+        // undefined `exe` symbol since we never declared one.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "addExecutable") == null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "installArtifact(exe)") == null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.step(\"run\"") == null);
+
+        // overrideImport helper still emitted — the plugin/gfx/engine
+        // module-graph wiring above the test step calls it.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "fn overrideImport(") != null);
     }
 };
 
@@ -446,7 +470,7 @@ pub const PLUGINS = struct {
             .backend = .raylib,
             .ecs = .mock,
             .plugins = &.{},
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_pathfinding") == null);
@@ -481,7 +505,7 @@ pub const PLUGINS = struct {
                 .{ .name = "pathfinding", .repo = "github.com/labelle-toolkit/labelle-pathfinding", .version = "0.1.0" },
                 .{ .name = "physics", .repo = "github.com/labelle-toolkit/labelle-physics", .version = "0.1.0" },
             },
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_pathfinding") != null);
@@ -498,7 +522,7 @@ pub const PLUGINS = struct {
             .plugins = &.{
                 .{ .name = "physics", .repo = "github.com/labelle-toolkit/labelle-physics", .version = "0.1.0" },
             },
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         // Core + gfx + engine (always injected)
@@ -524,7 +548,7 @@ pub const PLUGINS = struct {
             .plugins = &.{
                 .{ .name = "physics", .repo = "github.com/labelle-toolkit/labelle-physics", .version = "0.1.0" },
             },
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         // Should NOT have ecs_backend when using mock
@@ -543,7 +567,7 @@ pub const PLUGINS = struct {
             .plugins = &.{
                 .{ .name = "physics", .repo = "github.com/labelle-toolkit/labelle-physics", .version = "0.1.0" },
             },
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(plugin_physics_mod, \"gui_backend\", gui_mod)") != null);
@@ -557,7 +581,7 @@ pub const PLUGINS = struct {
             .plugins = &.{
                 .{ .name = "physics", .repo = "github.com/labelle-toolkit/labelle-physics", .version = "0.1.0" },
             },
-        });
+        }, .{});
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(\"gui_backend\"") == null);

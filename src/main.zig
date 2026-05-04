@@ -161,7 +161,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     const output_dir = try std.fs.path.join(allocator, &.{ root, ".labelle" });
     defer allocator.free(output_dir);
 
-    gen.generate(allocator, cfg, output_dir, root, null) catch |err| {
+    gen.generate(allocator, cfg, output_dir, root, .{}) catch |err| {
         std.debug.print("labelle-assembler: generate failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };

@@ -688,6 +688,23 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
     const test_step = b.step("test", "Run game-side tests");
     test_step.dependOn(&b.addRunArtifact(test_root).step);
 
+.tests_only_footer
+}
+
+/// Override a module import without leaking memory.
+/// Zig's addImport always calls b.dupe(name), leaking the old key on replacement
+/// and creating unnecessary allocations for new keys. This function accesses the
+/// import_table directly: reuses existing keys and avoids b.dupe entirely.
+fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
+    const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
+    if (!gop.found_existing) {
+        // New import — store our key (string literal from generated code, lives forever)
+        gop.key_ptr.* = name;
+    }
+    // Replace value (existing or new)
+    gop.value_ptr.* = module;
+}
+
 .footer
     b.installArtifact(exe);
 

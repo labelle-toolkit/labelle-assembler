@@ -73,16 +73,25 @@ pub const resolveAssemblerPackage = cache.resolveAssemblerPackage;
 pub const resolveBundledPackage = cache.resolveBundledPackage;
 
 /// Generate all assembler files into output_dir/<target_name>/.
-/// When `target_name_override` is null, uses `<backend>_<platform>` (the
-/// default for exe targets). The override is used by `generateTestsTarget`
-/// to emit `.labelle/tests/` from the same code path. Issue #83.
+/// `opts.target_name_override` lets the caller pin the subdirectory name
+/// (used by `generateTestsTarget` to emit `.labelle/tests/`); null falls
+/// back to `<backend>_<platform>`. `opts.is_tests_target` selects the
+/// test-only build.zig shape — no exe step, no main.zig — and is paired
+/// with the override by `generateTestsTarget`. Issue #83.
+pub const GenerateOptions = struct {
+    target_name_override: ?[]const u8 = null,
+    is_tests_target: bool = false,
+};
+
 pub fn generate(
     allocator: std.mem.Allocator,
     cfg_in: ProjectConfig,
     output_dir: []const u8,
     game_dir: []const u8,
-    target_name_override: ?[]const u8,
+    opts: GenerateOptions,
 ) !void {
+    const target_name_override = opts.target_name_override;
+    const is_tests_target = opts.is_tests_target;
     // Shadow the caller's cfg with a mutable copy. Ticket #48's lazy
     // default-inference pass needs to rewrite `cfg.resources[i].lazy`
     // in place, and we don't want to surprise callers by touching
@@ -404,7 +413,7 @@ pub fn generate(
     try scanner.writeFile(target_dir, "build.zig.zon", zon);
 
     // Generate build.zig
-    const build_zig = try build_files.generateBuildZig(allocator, cfg);
+    const build_zig = try build_files.generateBuildZig(allocator, cfg, .{ .is_tests_target = is_tests_target });
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
 
@@ -413,12 +422,17 @@ pub fn generate(
     // been fed to the scanner (see root.zig §script discovery). Capturing
     // earlier would produce a stale slice that misses every
     // plugin-shipped script.
-    const script_entries = script_scan.getEntries();
-    const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
-    defer allocator.free(engine_template);
-    const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names);
-    defer allocator.free(main_zig_content);
-    try scanner.writeFile(target_dir, "main.zig", main_zig_content);
+    //
+    // The tests target has no exe and therefore no main.zig — its build.zig
+    // only emits a `test` step rooted at `__tests_root.zig`.
+    if (!is_tests_target) {
+        const script_entries = script_scan.getEntries();
+        const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
+        defer allocator.free(engine_template);
+        const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names);
+        defer allocator.free(main_zig_content);
+        try scanner.writeFile(target_dir, "main.zig", main_zig_content);
+    }
 
     // Emit `__tests_root.zig` — a `test { _ = @import("tests/<stem>.zig"); }`
     // wrapper that pulls every test file's blocks into the test compile unit.
@@ -439,11 +453,8 @@ pub fn generate(
 /// installs or cross-compile toolchains, and means tests are reproducible
 /// across machines independent of the active exe target.
 ///
-/// The cost: the second-pass generation also writes a vestigial null-backend
-/// exe (`main.zig`, exe step in build.zig) inside `.labelle/tests/`. Nothing
-/// invokes that exe — it's just along for the ride because `generate` always
-/// emits one. A follow-up commit will trim the build.zig template down to
-/// test-only when the override is set.
+/// `is_tests_target = true` trims the emitted build.zig to a single test
+/// step (no exe, no run step) and skips main.zig generation entirely.
 pub fn generateTestsTarget(
     allocator: std.mem.Allocator,
     cfg_in: ProjectConfig,
@@ -452,7 +463,10 @@ pub fn generateTestsTarget(
 ) !void {
     var cfg = cfg_in;
     cfg.backend = .null;
-    try generate(allocator, cfg, output_dir, game_dir, "tests");
+    try generate(allocator, cfg, output_dir, game_dir, .{
+        .target_name_override = "tests",
+        .is_tests_target = true,
+    });
 }
 
 /// Build the body of `__tests_root.zig`. One `_ = @import("tests/<stem>.zig");`
