@@ -174,10 +174,10 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     // Uses the null backend so `zig build test` works on any host without
     // pulling in the chosen backend's native libs (X11/GL/Cocoa/etc.).
     gen.generateTestsTarget(allocator, cfg, output_dir, root) catch |err| {
-        std.debug.print("labelle-assembler: tests target generate failed: {s}\n", .{@errorName(err)});
+        std.log.err("labelle-assembler: tests target generate failed: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
-    std.debug.print("labelle-assembler: generated .labelle/tests/\n", .{});
+    std.log.info("labelle-assembler: generated .labelle/tests/", .{});
 
     // NOTE: build.zig.zon's `.fingerprint` field is left at the placeholder
     // value emitted by the generator template. The CLI patches it via a
