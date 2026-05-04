@@ -16,11 +16,21 @@ pub const DepEntry = struct {
     abs_path: []const u8,
 };
 
+pub const DepsLinkOptions = struct {
+    /// True (default) wipes `deps_dir` before re-creating it. The tests
+    /// target (issue #83) sets this to false because the exe target's
+    /// generate already populated `deps_dir` with the chosen-backend
+    /// links — wiping it would orphan the exe's deps. The tests pass
+    /// only adds the null backend's link to the existing dir.
+    recreate: bool = true,
+};
+
 pub fn createDepsLinks(
     allocator: std.mem.Allocator,
     cfg: ProjectConfig,
     target_dir: []const u8,
     project_dir: []const u8,
+    opts: DepsLinkOptions,
 ) ![]const DepEntry {
     var deps = std.ArrayList(DepEntry){};
 
@@ -90,12 +100,19 @@ pub fn createDepsLinks(
     const deps_dir = try std.fs.path.join(allocator, &.{ target_dir, "deps" });
     defer allocator.free(deps_dir);
 
-    cwd.deleteTree(deps_dir) catch {};
+    if (opts.recreate) cwd.deleteTree(deps_dir) catch {};
     try cwd.makePath(deps_dir);
 
     for (deps.items) |dep| {
         const dest = try std.fs.path.join(allocator, &.{ deps_dir, dep.link_name });
         defer allocator.free(dest);
+
+        // In additive mode (recreate=false), skip links that already
+        // exist — created by a previous target's pass. Hardlinking on
+        // top of an existing tree would error.
+        if (!opts.recreate) {
+            if (cwd.access(dest, .{})) |_| continue else |_| {}
+        }
 
         const abs = cwd.realpathAlloc(allocator, dep.abs_path) catch dep.abs_path;
         defer if (abs.ptr != dep.abs_path.ptr) allocator.free(abs);

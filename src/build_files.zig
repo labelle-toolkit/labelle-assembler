@@ -308,7 +308,15 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 // build.zig.zon generator
 // ============================================================
 
-pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, output_dir: ?[]const u8, project_dir: ?[]const u8) ![]const u8 {
+pub const BuildZigZonOptions = struct {
+    /// True (default) wipes the shared `.labelle/deps/` directory before
+    /// recreating it. The tests target (issue #83) sets this to false so
+    /// the second-pass generation merges its null-backend dep into the
+    /// existing dir without orphaning the exe target's chosen-backend dep.
+    recreate_deps: bool = true,
+};
+
+pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, output_dir: ?[]const u8, project_dir: ?[]const u8, opts: BuildZigZonOptions) ![]const u8 {
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
 
@@ -320,7 +328,7 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     // errors during `zig build` — see labelle-toolkit/labelle-cli#174.
     const deps_parent = output_dir orelse target_dir;
     const resolved_deps: ?[]const deps_linker.DepEntry = if (deps_parent != null and project_dir != null)
-        deps_linker.createDepsLinks(allocator, cfg, deps_parent.?, project_dir.?) catch |err| blk: {
+        deps_linker.createDepsLinks(allocator, cfg, deps_parent.?, project_dir.?, .{ .recreate = opts.recreate_deps }) catch |err| blk: {
             // OOM is not recoverable by retrying with cache-relative
             // paths — those need allocation too. Propagate so the caller
             // can fail cleanly instead of papering over the failure.

@@ -408,7 +408,11 @@ pub fn generate(
     }
 
     // Generate build.zig.zon
-    const zon = try build_files.generateBuildZigZon(allocator, cfg, target_dir, output_dir, game_dir);
+    const zon = try build_files.generateBuildZigZon(allocator, cfg, target_dir, output_dir, game_dir, .{
+        // The tests target runs second — additive merge so the exe
+        // target's deps (chosen-backend, plugins) survive. Issue #83.
+        .recreate_deps = !is_tests_target,
+    });
     defer allocator.free(zon);
     try scanner.writeFile(target_dir, "build.zig.zon", zon);
 
