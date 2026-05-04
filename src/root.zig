@@ -72,8 +72,17 @@ pub const resolvePlugin = cache.resolvePlugin;
 pub const resolveAssemblerPackage = cache.resolveAssemblerPackage;
 pub const resolveBundledPackage = cache.resolveBundledPackage;
 
-/// Generate all assembler files into output_dir/.labelle/{backend}_{platform}/.
-pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir: []const u8, game_dir: []const u8) !void {
+/// Generate all assembler files into output_dir/<target_name>/.
+/// When `target_name_override` is null, uses `<backend>_<platform>` (the
+/// default for exe targets). The override is used by `generateTestsTarget`
+/// to emit `.labelle/tests/` from the same code path. Issue #83.
+pub fn generate(
+    allocator: std.mem.Allocator,
+    cfg_in: ProjectConfig,
+    output_dir: []const u8,
+    game_dir: []const u8,
+    target_name_override: ?[]const u8,
+) !void {
     // Shadow the caller's cfg with a mutable copy. Ticket #48's lazy
     // default-inference pass needs to rewrite `cfg.resources[i].lazy`
     // in place, and we don't want to surprise callers by touching
@@ -111,7 +120,12 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     const cwd = std.fs.cwd();
 
     // Target subfolder: .labelle/raylib_desktop/, .labelle/sokol_ios/, etc.
-    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
+    // Override is used for the `.labelle/tests/` target where the name
+    // shouldn't reflect the backend (issue #83).
+    const target_name = if (target_name_override) |name|
+        try allocator.dupe(u8, name)
+    else
+        try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
     defer allocator.free(target_name);
     const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
     defer allocator.free(target_dir);
@@ -414,6 +428,31 @@ pub fn generate(allocator: std.mem.Allocator, cfg_in: ProjectConfig, output_dir:
     const tests_root = try generateTestsRoot(allocator, test_names);
     defer allocator.free(tests_root);
     try scanner.writeFile(target_dir, "__tests_root.zig", tests_root);
+}
+
+/// Generate the backend-agnostic test target at `output_dir/tests/`. Issue #83.
+///
+/// Reuses `generate` with `cfg.backend = .null` so test compile units link
+/// against the pure-Zig null backend (no native artifact, no system libs)
+/// regardless of which backend the user picked for their exe build. This
+/// lets `zig build test` run on any host without backend-specific apt-get
+/// installs or cross-compile toolchains, and means tests are reproducible
+/// across machines independent of the active exe target.
+///
+/// The cost: the second-pass generation also writes a vestigial null-backend
+/// exe (`main.zig`, exe step in build.zig) inside `.labelle/tests/`. Nothing
+/// invokes that exe — it's just along for the ride because `generate` always
+/// emits one. A follow-up commit will trim the build.zig template down to
+/// test-only when the override is set.
+pub fn generateTestsTarget(
+    allocator: std.mem.Allocator,
+    cfg_in: ProjectConfig,
+    output_dir: []const u8,
+    game_dir: []const u8,
+) !void {
+    var cfg = cfg_in;
+    cfg.backend = .null;
+    try generate(allocator, cfg, output_dir, game_dir, "tests");
 }
 
 /// Build the body of `__tests_root.zig`. One `_ = @import("tests/<stem>.zig");`
