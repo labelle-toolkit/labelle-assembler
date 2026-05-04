@@ -386,6 +386,38 @@ pub const BUILD_ZIG = struct {
         defer std.testing.allocator.free(build_zig);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "gui_mod") == null);
     }
+
+    test "emits test step rooted at __tests_root.zig wrapper" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        });
+        defer std.testing.allocator.free(build_zig);
+
+        // The test step is the entry point users invoke via `zig build test`.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.step(\"test\"") != null);
+        // Single addTest rooted at the assembler-generated wrapper. The
+        // wrapper at the build root is what lets test files reach
+        // `components/`, `scripts/`, etc. via relative `@import`.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "addTest") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "__tests_root.zig") != null);
+    }
+
+    test "test step reuses exe module imports" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .zig_ecs,
+        });
+        defer std.testing.allocator.free(build_zig);
+
+        // The exe and the test step both bind `ecs_backend` from `ecs_mod`,
+        // so each appears twice in the rendered build.zig — once in the
+        // exe imports list and once in the per-test addTest module.
+        const exe_count = std.mem.count(u8, build_zig, "ecs_backend");
+        try std.testing.expect(exe_count >= 2);
+    }
 };
 
 // ── Plugin wiring ────────────────────────────────────────────────────

@@ -648,6 +648,46 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
     gop.value_ptr.* = module;
 }
 
+.tests_start
+    // ── Test step ──────────────────────────────────────────────────
+    // Single test compile unit rooted at `__tests_root.zig` (generated
+    // by labelle-assembler alongside main.zig). The wrapper imports
+    // every `.zig` file under the project's `tests/` folder so their
+    // `test "..." { }` blocks are pulled into this binary.
+    //
+    // Why a wrapper at the build root rather than per-file `addTest`:
+    // Zig's "module path" is the directory of the module's root source
+    // file. With this root at the build root, files under `tests/`,
+    // `components/`, `scripts/`, etc. are all reachable via relative
+    // `@import`, mirroring how the exe sees them — so test code can
+    // `@import("../../components/worker.zig")` from `tests/components/`.
+    const test_root = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("__tests_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "labelle-core", .module = core_mod },
+                .{ .name = "labelle-gfx", .module = gfx_mod },
+                .{ .name = "labelle-engine", .module = engine_mod },
+                .{ .name = "backend_gfx", .module = backend_gfx },
+                .{ .name = "backend_input", .module = backend_input },
+                .{ .name = "backend_audio", .module = backend_audio },
+                .{ .name = "backend_window", .module = backend_window },
+
+.tests_ecs_import
+                .{ .name = "ecs_backend", .module = ecs_mod },
+
+.tests_gui_import
+                .{ .name = "gui_backend", .module = gui_mod },
+
+.tests_end
+            },
+        }),
+    });
+    const test_step = b.step("test", "Run game-side tests");
+    test_step.dependOn(&b.addRunArtifact(test_root).step);
+
 .footer
     b.installArtifact(exe);
 
