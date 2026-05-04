@@ -140,10 +140,6 @@ pub fn generate(
     defer allocator.free(target_dir);
     try cwd.makePath(target_dir);
 
-    // Load backend lifecycle template
-    const backend_tmpl = try loadBackendTemplate(allocator, game_dir, cfg);
-    defer allocator.free(backend_tmpl);
-
     // Copy game folders into target dir and scan file stems in one pass.
     // Folders that need scanning use copyAndScan; assets is copy-only.
     const prefab_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "prefabs", ".jsonc");
@@ -431,6 +427,13 @@ pub fn generate(
     // only emits a `test` step rooted at `__tests_root.zig`.
     if (!is_tests_target) {
         const script_entries = script_scan.getEntries();
+        // Backend lifecycle template — only the exe target needs it.
+        // Loading it for the tests target would fail unnecessarily if the
+        // null backend's `desktop.txt` is missing from the cache, since
+        // the tests target never emits main.zig and therefore never uses
+        // the template anyway.
+        const backend_tmpl = try loadBackendTemplate(allocator, game_dir, cfg);
+        defer allocator.free(backend_tmpl);
         const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
         defer allocator.free(engine_template);
         const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names);
