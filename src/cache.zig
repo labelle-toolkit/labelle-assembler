@@ -101,12 +101,25 @@ pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, pro
 /// Resolve a local path override relative to a project directory.
 /// If project_dir is provided, joins it with the local path before resolving.
 /// Falls back to CWD if project_dir is null.
+///
+/// Worktree handling: paths that escape the project tree (first component
+/// is `..`) are anchored at the main checkout instead of the worktree —
+/// `local:../sibling-repo` style entries describe siblings of the main
+/// project, which sit next to the main checkout, not next to the worktree.
+/// Project-internal paths (`@libs/foo` → `libs/foo`, or any path without
+/// a leading `..`) keep the worktree's path so worker-edited code is
+/// picked up correctly during parallel-agent workflows. See
+/// resolveProjectRoot and pathEscapesProject.
 fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, project_dir: ?[]const u8) ![]const u8 {
     const resolve_path = if (std.fs.path.isAbsolute(local_path))
         try allocator.dupe(u8, local_path)
     else if (project_dir) |pd| blk: {
-        const joined = try std.fs.path.join(allocator, &.{ pd, local_path });
-        break :blk joined;
+        const base = if (pathEscapesProject(local_path))
+            try resolveProjectRoot(allocator, pd)
+        else
+            try allocator.dupe(u8, pd);
+        defer allocator.free(base);
+        break :blk try std.fs.path.join(allocator, &.{ base, local_path });
     } else try allocator.dupe(u8, local_path);
     defer allocator.free(resolve_path);
 
@@ -114,6 +127,114 @@ fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, projec
         std.debug.print("labelle: warning: local path '{s}' does not exist\n", .{resolve_path});
         return try allocator.dupe(u8, resolve_path);
     };
+}
+
+/// Whether `path`'s first component is `..` — i.e. the path walks out of
+/// the project tree it's joined against. Used to distinguish sibling-style
+/// `local:../foo` entries from project-internal `@libs/foo` entries so the
+/// worktree redirect only applies to the former.
+fn pathEscapesProject(path: []const u8) bool {
+    var iter = std.mem.tokenizeAny(u8, path, "/\\");
+    const first = iter.next() orelse return false;
+    return std.mem.eql(u8, first, "..");
+}
+
+/// In a worktree, return the main-checkout-equivalent of `abs_path` (a
+/// path inside the worktree filesystem). Used by callers that need to
+/// anchor path-resolution math at the main checkout while still reading
+/// file contents from the worktree — most notably rewriteZonPaths in
+/// deps_linker, where local plugin zons contain `.path = "../sibling"`
+/// references that describe siblings of the main project.
+///
+/// Returns a copy of `abs_path` unchanged when:
+///   - `project_dir` is not a worktree, or
+///   - `abs_path` doesn't sit inside the (canonical) project_dir
+///     (e.g. it already points at an external sibling).
+pub fn toMainCheckoutPath(allocator: std.mem.Allocator, abs_path: []const u8, project_dir: []const u8) ![]const u8 {
+    const root = try resolveProjectRoot(allocator, project_dir);
+    defer allocator.free(root);
+
+    if (std.mem.eql(u8, root, project_dir)) return allocator.dupe(u8, abs_path);
+
+    const project_canon = std.fs.cwd().realpathAlloc(allocator, project_dir) catch
+        return allocator.dupe(u8, abs_path);
+    defer allocator.free(project_canon);
+
+    if (std.mem.eql(u8, root, project_canon)) return allocator.dupe(u8, abs_path);
+    if (!std.mem.startsWith(u8, abs_path, project_canon)) return allocator.dupe(u8, abs_path);
+    if (abs_path.len == project_canon.len) return allocator.dupe(u8, root);
+    if (abs_path[project_canon.len] != '/' and abs_path[project_canon.len] != '\\')
+        return allocator.dupe(u8, abs_path);
+
+    return std.fs.path.join(allocator, &.{ root, abs_path[project_canon.len + 1 ..] });
+}
+
+/// If `project_dir` is a git worktree, return the path of the main checkout.
+/// Otherwise return a copy of `project_dir` unchanged.
+///
+/// Worktree detection: `<project_dir>/.git` exists as a regular file (not a
+/// directory). The file is a linkfile starting with `gitdir: <path>` where
+/// `<path>` matches `<main>/.git/worktrees/<name>`. We validate this exact
+/// shape — git uses `.git` linkfiles for other layouts (submodules end in
+/// `/.git/modules/<name>`, `--separate-git-dir` can land anywhere) and
+/// stripping three dirname levels would return the wrong directory.
+///
+/// `gitdir:` values can be either absolute or relative — git itself supports
+/// both. Relative values are resolved against the directory containing the
+/// `.git` file (i.e. project_dir).
+///
+/// Linkfiles are typically a single line but can carry additional keys like
+/// `commondir:` — only the first line is parsed.
+///
+/// On any error (no .git, parse failure, non-worktree layout, etc.) returns
+/// project_dir unchanged so non-git callers and the main checkout keep
+/// their existing behavior.
+fn resolveProjectRoot(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 {
+    const git_path = try std.fs.path.join(allocator, &.{ project_dir, ".git" });
+    defer allocator.free(git_path);
+
+    const stat = std.fs.cwd().statFile(git_path) catch return allocator.dupe(u8, project_dir);
+    if (stat.kind != .file) return allocator.dupe(u8, project_dir);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, git_path, 4096) catch
+        return allocator.dupe(u8, project_dir);
+    defer allocator.free(content);
+
+    // Parse only the first line — `commondir:` and other keys may follow.
+    const eol = std.mem.indexOfAny(u8, content, "\r\n") orelse content.len;
+    const first_line = std.mem.trim(u8, content[0..eol], " \t");
+
+    const prefix = "gitdir:";
+    if (!std.mem.startsWith(u8, first_line, prefix)) return allocator.dupe(u8, project_dir);
+
+    const gitdir_raw = std.mem.trim(u8, first_line[prefix.len..], " \t");
+    if (gitdir_raw.len == 0) return allocator.dupe(u8, project_dir);
+
+    // Resolve a relative `gitdir:` against project_dir (git defines
+    // relative gitdir entries as relative to the `.git` file itself).
+    var gitdir_owned: ?[]u8 = null;
+    defer if (gitdir_owned) |b| allocator.free(b);
+    const gitdir = if (std.fs.path.isAbsolute(gitdir_raw)) gitdir_raw else blk: {
+        const joined = try std.fs.path.join(allocator, &.{ project_dir, gitdir_raw });
+        gitdir_owned = joined;
+        break :blk joined;
+    };
+
+    // Validate worktree layout: gitdir must match `<main>/.git/worktrees/<name>`.
+    // Submodules (`<parent>/.git/modules/<name>`) and `--separate-git-dir`
+    // layouts also use `.git` linkfiles — silently anchoring those at a
+    // wrong path would corrupt `local:` resolution.
+    const wt_dir = std.fs.path.dirname(gitdir) orelse return allocator.dupe(u8, project_dir);
+    if (!std.mem.eql(u8, std.fs.path.basename(wt_dir), "worktrees"))
+        return allocator.dupe(u8, project_dir);
+
+    const dot_git = std.fs.path.dirname(wt_dir) orelse return allocator.dupe(u8, project_dir);
+    if (!std.mem.eql(u8, std.fs.path.basename(dot_git), ".git"))
+        return allocator.dupe(u8, project_dir);
+
+    const main_checkout = std.fs.path.dirname(dot_git) orelse return allocator.dupe(u8, project_dir);
+    // Resolve the main checkout in case the gitdir contained `..`/symlinks.
+    return std.fs.cwd().realpathAlloc(allocator, main_checkout) catch allocator.dupe(u8, main_checkout);
 }
 
 /// Check if a framework package version is cached.
@@ -568,4 +689,341 @@ pub fn copyDirRecursive(allocator: std.mem.Allocator, src: []const u8, dst: []co
             else => {},
         }
     }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+test "resolveProjectRoot: main checkout (.git is a directory) returns project_dir unchanged" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("project/.git");
+    const project_abs = try tmp.dir.realpathAlloc(alloc, "project");
+    defer alloc.free(project_abs);
+
+    const root = try resolveProjectRoot(alloc, project_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(project_abs, root);
+}
+
+test "resolveProjectRoot: worktree linkfile resolves to main checkout" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Layout:
+    //   tmp/main/.git/worktrees/wt
+    //   tmp/wt/.git  (linkfile pointing back into main/.git/worktrees/wt)
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("wt");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+
+    const linkfile_contents = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile_contents);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile_contents);
+
+    const root = try resolveProjectRoot(alloc, wt_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(main_abs, root);
+}
+
+test "resolveProjectRoot: not a git repo returns project_dir unchanged" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("plain");
+    const plain_abs = try tmp.dir.realpathAlloc(alloc, "plain");
+    defer alloc.free(plain_abs);
+
+    const root = try resolveProjectRoot(alloc, plain_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(plain_abs, root);
+}
+
+test "resolveLocalPath: worktree-internal path (no `..` prefix) stays in the worktree" {
+    // Regression test for Copilot review on PR #88: `@libs/foo` plugins
+    // (which become bare `libs/foo` after PluginDep.localPath strips the
+    // prefix) describe paths INSIDE the project tree. They must resolve
+    // against the worktree itself, not the main checkout — otherwise
+    // worker edits to libs/<plugin>/ in a worktree would be ignored and
+    // the build would silently use the main checkout's version.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Layout: main checkout has libs/foo/file with old content; worktree
+    // has libs/foo/file with new content. resolveLocalPath called from
+    // the worktree must return the worktree's libs/foo, not main's.
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("main/libs/foo");
+    try tmp.dir.makePath("wt/libs/foo");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+
+    const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile);
+
+    const resolved = try resolveLocalPath(alloc, "libs/foo", wt_abs);
+    defer alloc.free(resolved);
+
+    const expected = try std.fs.path.join(alloc, &.{ wt_abs, "libs/foo" });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
+}
+
+test "resolveLocalPath: escaping path (starts with `..`) anchors at main checkout" {
+    // The other half of the worktree split: `local:../sibling-repo` style
+    // paths describe siblings of the main project, which sit next to the
+    // main checkout. These MUST anchor at the main checkout, otherwise
+    // they climb out of the worktree into a non-existent location.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("sibling");
+    try tmp.dir.makePath("wt");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+    const sibling_abs = try tmp.dir.realpathAlloc(alloc, "sibling");
+    defer alloc.free(sibling_abs);
+
+    const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile);
+
+    const resolved = try resolveLocalPath(alloc, "../sibling", wt_abs);
+    defer alloc.free(resolved);
+
+    try std.testing.expectEqualStrings(sibling_abs, resolved);
+}
+
+test "toMainCheckoutPath: worktree path inside project_dir maps to main checkout" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("main/libs/foo");
+    try tmp.dir.makePath("wt/libs/foo");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+    const wt_libs_foo = try tmp.dir.realpathAlloc(alloc, "wt/libs/foo");
+    defer alloc.free(wt_libs_foo);
+
+    const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile);
+
+    const mapped = try toMainCheckoutPath(alloc, wt_libs_foo, wt_abs);
+    defer alloc.free(mapped);
+
+    const expected = try std.fs.path.join(alloc, &.{ main_abs, "libs/foo" });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, mapped);
+}
+
+test "toMainCheckoutPath: path outside project_dir is returned unchanged" {
+    // Sibling-style local plugins resolve to paths OUTSIDE the worktree
+    // (e.g. `local:../labelle-assembler/...` already lands at a path
+    // next to the main checkout). toMainCheckoutPath must leave these
+    // alone so the prefix substitution doesn't corrupt them.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("sibling");
+    try tmp.dir.makePath("wt");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+    const sibling_abs = try tmp.dir.realpathAlloc(alloc, "sibling");
+    defer alloc.free(sibling_abs);
+
+    const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile);
+
+    const mapped = try toMainCheckoutPath(alloc, sibling_abs, wt_abs);
+    defer alloc.free(mapped);
+
+    try std.testing.expectEqualStrings(sibling_abs, mapped);
+}
+
+test "toMainCheckoutPath: not in a worktree returns path unchanged" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("main/.git");
+    try tmp.dir.makePath("main/libs/foo");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const libs_foo = try tmp.dir.realpathAlloc(alloc, "main/libs/foo");
+    defer alloc.free(libs_foo);
+
+    const mapped = try toMainCheckoutPath(alloc, libs_foo, main_abs);
+    defer alloc.free(mapped);
+
+    try std.testing.expectEqualStrings(libs_foo, mapped);
+}
+
+test "pathEscapesProject: classifies paths correctly" {
+    try std.testing.expect(pathEscapesProject(".."));
+    try std.testing.expect(pathEscapesProject("../foo"));
+    try std.testing.expect(pathEscapesProject("../foo/bar"));
+    try std.testing.expect(!pathEscapesProject("foo"));
+    try std.testing.expect(!pathEscapesProject("./foo"));
+    try std.testing.expect(!pathEscapesProject("libs/foo"));
+    try std.testing.expect(!pathEscapesProject(""));
+}
+
+test "resolveProjectRoot: submodule .git linkfile returns project_dir unchanged" {
+    // Git also uses `.git` files for submodules: `gitdir: <parent>/.git/modules/<name>`.
+    // resolveProjectRoot must NOT treat these as worktrees — stripping
+    // three dirname levels would land at `<parent>/.git`, anchoring `local:`
+    // resolution at the superproject's git internals.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("super/.git/modules/sub");
+    try tmp.dir.makePath("super/sub");
+
+    const super_abs = try tmp.dir.realpathAlloc(alloc, "super");
+    defer alloc.free(super_abs);
+    const sub_abs = try tmp.dir.realpathAlloc(alloc, "super/sub");
+    defer alloc.free(sub_abs);
+
+    const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/modules/sub\n", .{super_abs});
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile("super/sub/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile);
+
+    const root = try resolveProjectRoot(alloc, sub_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(sub_abs, root);
+}
+
+test "resolveProjectRoot: relative gitdir is resolved against project_dir" {
+    // git can write relative `gitdir:` values (especially with
+    // `git config worktree.useRelativePaths`). resolveProjectRoot must
+    // anchor them at project_dir, not treat them as already absolute.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("main/wt");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "main/wt");
+    defer alloc.free(wt_abs);
+
+    const f = try tmp.dir.createFile("main/wt/.git", .{});
+    defer f.close();
+    try f.writeAll("gitdir: ../.git/worktrees/wt\n");
+
+    const root = try resolveProjectRoot(alloc, wt_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(main_abs, root);
+}
+
+test "resolveProjectRoot: linkfile with extra keys (commondir) parses first line only" {
+    // git linkfiles may carry additional trailing keys like `commondir:`.
+    // Only the first line is the gitdir.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("wt");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+
+    const linkfile = try std.fmt.allocPrint(
+        alloc,
+        "gitdir: {s}/.git/worktrees/wt\ncommondir: {s}/.git\n",
+        .{ main_abs, main_abs },
+    );
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile);
+
+    const root = try resolveProjectRoot(alloc, wt_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(main_abs, root);
+}
+
+test "resolveProjectRoot: malformed linkfile returns project_dir unchanged" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("wt");
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll("not a gitdir line\n");
+
+    const root = try resolveProjectRoot(alloc, wt_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(wt_abs, root);
 }

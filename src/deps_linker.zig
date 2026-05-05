@@ -117,6 +117,27 @@ pub fn createDepsLinks(
         const abs = cwd.realpathAlloc(allocator, dep.abs_path) catch dep.abs_path;
         defer if (abs.ptr != dep.abs_path.ptr) allocator.free(abs);
 
+        // Skip-and-warn ONLY when the source is missing. The original
+        // cascade bug (#87) was triggered when a `local:` plugin path
+        // didn't exist and the propagated error tripped build_files.zig's
+        // fallback codepath, which emitted depth-overshoot paths to the
+        // global cache. Pre-checking source existence here neutralises
+        // that path. The dep entry stays in the result list — the bad
+        // path is still emitted in the zon, so zig surfaces a clear
+        // "missing package" error at build time.
+        //
+        // Operational errors at hardlinkTree time (PermissionDenied,
+        // NoSpaceLeft, cross-device hardlink, etc.) propagate as fatal
+        // — better to fail noisily than silently produce an incomplete
+        // deps/ tree that confuses the user with a misleading error
+        // much later.
+        cwd.access(abs, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.log.warn("could not link dep '{s}': source '{s}' does not exist — skipping", .{ dep.link_name, abs });
+                continue;
+            },
+            else => return err,
+        };
         try hardlinkTree(allocator, abs, dest);
     }
 
@@ -153,16 +174,25 @@ pub fn createDepsLinks(
             const abs_dest = cwd.realpathAlloc(allocator, dest) catch continue;
             defer allocator.free(abs_dest);
 
-            try rewriteZonPaths(allocator, abs_src, abs_dest);
+            // In a worktree, anchor path-resolution math at the main
+            // checkout. The plugin's hardlinked file content stays
+            // worktree-sourced (so worker edits are visible), but its
+            // `.path = "../sibling"` references describe siblings of the
+            // main project — not siblings of the worktree, which sit at
+            // a different filesystem depth. See cache.toMainCheckoutPath.
+            const resolution_src = try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
+            defer allocator.free(resolution_src);
+
+            try rewriteZonPaths(allocator, resolution_src, abs_dest);
         }
 
         // Also rewrite GUI plugin/bridge paths — the GUI is resolved separately
         // from cfg.plugins but may also have local .path deps.
         // rewriteZonPaths is a no-op if no .path entries exist, so always safe to call.
         if (cfg.resolved_gui) |gui| {
-            try rewriteLocalDep(allocator, cwd, gui.plugin_dir, deps_dir, "labelle-gui");
+            try rewriteLocalDep(allocator, cwd, gui.plugin_dir, deps_dir, "labelle-gui", project_dir);
             if (gui.bridge_dir) |bd|
-                try rewriteLocalDep(allocator, cwd, bd, deps_dir, "gui-bridge");
+                try rewriteLocalDep(allocator, cwd, bd, deps_dir, "gui-bridge", project_dir);
         }
     }
 
@@ -261,14 +291,18 @@ extern "kernel32" fn CreateHardLinkW(
 ) callconv(.winapi) c_int;
 
 /// Resolve src/dest to absolute paths and call rewriteZonPaths.
-fn rewriteLocalDep(allocator: std.mem.Allocator, cwd: std.fs.Dir, src_path: []const u8, deps_dir: []const u8, link_name: []const u8) !void {
+/// `project_dir` is used to remap abs_src to its main-checkout equivalent
+/// when in a worktree (see cache.toMainCheckoutPath).
+fn rewriteLocalDep(allocator: std.mem.Allocator, cwd: std.fs.Dir, src_path: []const u8, deps_dir: []const u8, link_name: []const u8, project_dir: []const u8) !void {
     const dest = try std.fs.path.join(allocator, &.{ deps_dir, link_name });
     defer allocator.free(dest);
     const abs_src = cwd.realpathAlloc(allocator, src_path) catch return;
     defer allocator.free(abs_src);
     const abs_dest = cwd.realpathAlloc(allocator, dest) catch return;
     defer allocator.free(abs_dest);
-    try rewriteZonPaths(allocator, abs_src, abs_dest);
+    const resolution_src = try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
+    defer allocator.free(resolution_src);
+    try rewriteZonPaths(allocator, resolution_src, abs_dest);
 }
 
 /// Rewrite relative `.path` dependencies in a hardlinked build.zig.zon.
@@ -501,4 +535,28 @@ test "rewriteZonPaths: skips files without .path deps" {
     const result = try tmp.dir.readFileAlloc(alloc, "dest/build.zig.zon", 64 * 1024);
     defer alloc.free(result);
     try std.testing.expectEqualStrings(zon_content, result);
+}
+
+test "hardlinkTree: errors on missing source" {
+    // Pins the precondition that createDepsLinks's source-pre-check relies
+    // on — if hardlinkTree were ever changed to silently succeed on a
+    // missing source, the source-FileNotFound branch in createDepsLinks
+    // would never trigger and the worktree cascade bug (#87) could
+    // re-emerge through a different path.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("dest_parent");
+    const dest_parent = try tmp.dir.realpathAlloc(alloc, "dest_parent");
+    defer alloc.free(dest_parent);
+
+    const missing_src = try std.fs.path.join(alloc, &.{ dest_parent, "does_not_exist" });
+    defer alloc.free(missing_src);
+    const dest = try std.fs.path.join(alloc, &.{ dest_parent, "linked" });
+    defer alloc.free(dest);
+
+    const result = hardlinkTree(alloc, missing_src, dest);
+    try std.testing.expectError(error.FileNotFound, result);
 }
