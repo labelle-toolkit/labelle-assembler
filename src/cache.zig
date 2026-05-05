@@ -102,17 +102,24 @@ pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, pro
 /// If project_dir is provided, joins it with the local path before resolving.
 /// Falls back to CWD if project_dir is null.
 ///
-/// When project_dir is a git worktree, the local path is anchored at the
-/// main checkout instead — `local:` paths in `project.labelle` describe
-/// sibling repos, which sit next to the main checkout, not next to the
-/// worktree. See resolveProjectRoot.
+/// Worktree handling: paths that escape the project tree (first component
+/// is `..`) are anchored at the main checkout instead of the worktree —
+/// `local:../sibling-repo` style entries describe siblings of the main
+/// project, which sit next to the main checkout, not next to the worktree.
+/// Project-internal paths (`@libs/foo` → `libs/foo`, or any path without
+/// a leading `..`) keep the worktree's path so worker-edited code is
+/// picked up correctly during parallel-agent workflows. See
+/// resolveProjectRoot and pathEscapesProject.
 fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, project_dir: ?[]const u8) ![]const u8 {
     const resolve_path = if (std.fs.path.isAbsolute(local_path))
         try allocator.dupe(u8, local_path)
     else if (project_dir) |pd| blk: {
-        const root = try resolveProjectRoot(allocator, pd);
-        defer allocator.free(root);
-        break :blk try std.fs.path.join(allocator, &.{ root, local_path });
+        const base = if (pathEscapesProject(local_path))
+            try resolveProjectRoot(allocator, pd)
+        else
+            try allocator.dupe(u8, pd);
+        defer allocator.free(base);
+        break :blk try std.fs.path.join(allocator, &.{ base, local_path });
     } else try allocator.dupe(u8, local_path);
     defer allocator.free(resolve_path);
 
@@ -120,6 +127,46 @@ fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, projec
         std.debug.print("labelle: warning: local path '{s}' does not exist\n", .{resolve_path});
         return try allocator.dupe(u8, resolve_path);
     };
+}
+
+/// Whether `path`'s first component is `..` — i.e. the path walks out of
+/// the project tree it's joined against. Used to distinguish sibling-style
+/// `local:../foo` entries from project-internal `@libs/foo` entries so the
+/// worktree redirect only applies to the former.
+fn pathEscapesProject(path: []const u8) bool {
+    var iter = std.mem.tokenizeAny(u8, path, "/\\");
+    const first = iter.next() orelse return false;
+    return std.mem.eql(u8, first, "..");
+}
+
+/// In a worktree, return the main-checkout-equivalent of `abs_path` (a
+/// path inside the worktree filesystem). Used by callers that need to
+/// anchor path-resolution math at the main checkout while still reading
+/// file contents from the worktree — most notably rewriteZonPaths in
+/// deps_linker, where local plugin zons contain `.path = "../sibling"`
+/// references that describe siblings of the main project.
+///
+/// Returns a copy of `abs_path` unchanged when:
+///   - `project_dir` is not a worktree, or
+///   - `abs_path` doesn't sit inside the (canonical) project_dir
+///     (e.g. it already points at an external sibling).
+pub fn toMainCheckoutPath(allocator: std.mem.Allocator, abs_path: []const u8, project_dir: []const u8) ![]const u8 {
+    const root = try resolveProjectRoot(allocator, project_dir);
+    defer allocator.free(root);
+
+    if (std.mem.eql(u8, root, project_dir)) return allocator.dupe(u8, abs_path);
+
+    const project_canon = std.fs.cwd().realpathAlloc(allocator, project_dir) catch
+        return allocator.dupe(u8, abs_path);
+    defer allocator.free(project_canon);
+
+    if (std.mem.eql(u8, root, project_canon)) return allocator.dupe(u8, abs_path);
+    if (!std.mem.startsWith(u8, abs_path, project_canon)) return allocator.dupe(u8, abs_path);
+    if (abs_path.len == project_canon.len) return allocator.dupe(u8, root);
+    if (abs_path[project_canon.len] != '/' and abs_path[project_canon.len] != '\\')
+        return allocator.dupe(u8, abs_path);
+
+    return std.fs.path.join(allocator, &.{ root, abs_path[project_canon.len + 1 ..] });
 }
 
 /// If `project_dir` is a git worktree, return the path of the main checkout.
@@ -673,6 +720,171 @@ test "resolveProjectRoot: not a git repo returns project_dir unchanged" {
     defer alloc.free(root);
 
     try std.testing.expectEqualStrings(plain_abs, root);
+}
+
+test "resolveLocalPath: worktree-internal path (no `..` prefix) stays in the worktree" {
+    // Regression test for Copilot review on PR #88: `@libs/foo` plugins
+    // (which become bare `libs/foo` after PluginDep.localPath strips the
+    // prefix) describe paths INSIDE the project tree. They must resolve
+    // against the worktree itself, not the main checkout — otherwise
+    // worker edits to libs/<plugin>/ in a worktree would be ignored and
+    // the build would silently use the main checkout's version.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Layout: main checkout has libs/foo/file with old content; worktree
+    // has libs/foo/file with new content. resolveLocalPath called from
+    // the worktree must return the worktree's libs/foo, not main's.
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("main/libs/foo");
+    try tmp.dir.makePath("wt/libs/foo");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+
+    const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile);
+
+    const resolved = try resolveLocalPath(alloc, "libs/foo", wt_abs);
+    defer alloc.free(resolved);
+
+    const expected = try std.fs.path.join(alloc, &.{ wt_abs, "libs/foo" });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
+}
+
+test "resolveLocalPath: escaping path (starts with `..`) anchors at main checkout" {
+    // The other half of the worktree split: `local:../sibling-repo` style
+    // paths describe siblings of the main project, which sit next to the
+    // main checkout. These MUST anchor at the main checkout, otherwise
+    // they climb out of the worktree into a non-existent location.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("sibling");
+    try tmp.dir.makePath("wt");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+    const sibling_abs = try tmp.dir.realpathAlloc(alloc, "sibling");
+    defer alloc.free(sibling_abs);
+
+    const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile);
+
+    const resolved = try resolveLocalPath(alloc, "../sibling", wt_abs);
+    defer alloc.free(resolved);
+
+    try std.testing.expectEqualStrings(sibling_abs, resolved);
+}
+
+test "toMainCheckoutPath: worktree path inside project_dir maps to main checkout" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("main/libs/foo");
+    try tmp.dir.makePath("wt/libs/foo");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+    const wt_libs_foo = try tmp.dir.realpathAlloc(alloc, "wt/libs/foo");
+    defer alloc.free(wt_libs_foo);
+
+    const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile);
+
+    const mapped = try toMainCheckoutPath(alloc, wt_libs_foo, wt_abs);
+    defer alloc.free(mapped);
+
+    const expected = try std.fs.path.join(alloc, &.{ main_abs, "libs/foo" });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, mapped);
+}
+
+test "toMainCheckoutPath: path outside project_dir is returned unchanged" {
+    // Sibling-style local plugins resolve to paths OUTSIDE the worktree
+    // (e.g. `local:../labelle-assembler/...` already lands at a path
+    // next to the main checkout). toMainCheckoutPath must leave these
+    // alone so the prefix substitution doesn't corrupt them.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("sibling");
+    try tmp.dir.makePath("wt");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+    const sibling_abs = try tmp.dir.realpathAlloc(alloc, "sibling");
+    defer alloc.free(sibling_abs);
+
+    const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile);
+
+    const mapped = try toMainCheckoutPath(alloc, sibling_abs, wt_abs);
+    defer alloc.free(mapped);
+
+    try std.testing.expectEqualStrings(sibling_abs, mapped);
+}
+
+test "toMainCheckoutPath: not in a worktree returns path unchanged" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("main/.git");
+    try tmp.dir.makePath("main/libs/foo");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const libs_foo = try tmp.dir.realpathAlloc(alloc, "main/libs/foo");
+    defer alloc.free(libs_foo);
+
+    const mapped = try toMainCheckoutPath(alloc, libs_foo, main_abs);
+    defer alloc.free(mapped);
+
+    try std.testing.expectEqualStrings(libs_foo, mapped);
+}
+
+test "pathEscapesProject: classifies paths correctly" {
+    try std.testing.expect(pathEscapesProject(".."));
+    try std.testing.expect(pathEscapesProject("../foo"));
+    try std.testing.expect(pathEscapesProject("../foo/bar"));
+    try std.testing.expect(!pathEscapesProject("foo"));
+    try std.testing.expect(!pathEscapesProject("./foo"));
+    try std.testing.expect(!pathEscapesProject("libs/foo"));
+    try std.testing.expect(!pathEscapesProject(""));
 }
 
 test "resolveProjectRoot: malformed linkfile returns project_dir unchanged" {
