@@ -253,12 +253,27 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
         try w.writeAll("        try g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets);\n");
         try w.writeAll("    }\n");
 
-        const initial = cfg.initial_scene orelse jsonc_scene_names[0];
-        try w.print("    try g.setScene(\"{s}\");\n", .{initial});
-        // Set initial game state (first declared state in project.labelle)
+        // Attach declared `initial_state` from each scene's .jsonc
+        // (labelle-engine#500). Same setter pattern as setSceneAssets;
+        // the engine's setScene calls setState(initial_state) after the
+        // scene loads, so a scene can opt into running in a specific
+        // game state without external coordination. Scenes that didn't
+        // declare one are absent from this manifest, so this is a
+        // no-op for back-compat scenes.
+        try w.writeAll("    inline for (SceneInitialStateManifests.entries) |scene_state_entry| {\n");
+        try w.writeAll("        try g.setSceneInitialState(scene_state_entry.name, scene_state_entry.initial_state);\n");
+        try w.writeAll("    }\n");
+
+        // Set the project's default initial state BEFORE setScene so
+        // setScene (which may override via the scene's initial_state)
+        // sees a stable baseline. Order matters: scene preference wins
+        // over the project default, which is the whole point of #500.
         if (cfg.states.len > 0) {
             try w.print("    g.setState(\"{s}\");\n", .{cfg.states[0]});
         }
+
+        const initial = cfg.initial_scene orelse jsonc_scene_names[0];
+        try w.print("    try g.setScene(\"{s}\");\n", .{initial});
         try w.writeByte('\n');
     }
 
@@ -373,11 +388,20 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
         try w.writeAll("        g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets) catch @panic(\"failed to set scene assets\");\n");
         try w.writeAll("    }\n");
 
-        const initial = cfg.initial_scene orelse jsonc_scene_names[0];
-        try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
+        // Attach declared `initial_state` (labelle-engine#500). See
+        // `buildSetupCode` for the full rationale. Same panic-on-impossible-
+        // SceneNotFound pattern as setSceneAssets above.
+        try w.writeAll("    inline for (SceneInitialStateManifests.entries) |scene_state_entry| {\n");
+        try w.writeAll("        g.setSceneInitialState(scene_state_entry.name, scene_state_entry.initial_state) catch @panic(\"failed to set scene initial state\");\n");
+        try w.writeAll("    }\n");
+
+        // Default initial state BEFORE setScene — see `buildSetupCode`.
         if (cfg.states.len > 0) {
             try w.print("    g.setState(\"{s}\");\n", .{cfg.states[0]});
         }
+
+        const initial = cfg.initial_scene orelse jsonc_scene_names[0];
+        try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
     }
 
     try w.writeAll("    runner.setup(&g);\n");
@@ -493,6 +517,53 @@ fn writeSceneAssetManifests(
         try w.writeAll("        .{ .name = ");
         try writeZigString(w, name);
         try w.print(", .assets = @This().{s} }},\n", .{ident});
+    }
+    try w.writeAll("    };\n");
+    try w.writeAll("};\n");
+}
+
+/// Emit the `SceneInitialStateManifests` comptime struct that exposes each
+/// scene's declared `initial_state:` to labelle-engine's setSceneInitialState
+/// API. Mirrors the SceneAssetManifests pattern (see above).
+///
+///     pub const SceneInitialStateManifests = struct {
+///         pub const Entry = struct { name: []const u8, initial_state: []const u8 };
+///         pub const entries: []const Entry = &.{
+///             .{ .name = "combat_arena", .initial_state = "playing" },
+///         };
+///     };
+///
+/// Unlike SceneAssetManifests, this struct ONLY lists scenes that actually
+/// declared an `initial_state` — scenes without one don't appear, so the
+/// generated `inline for (entries)` loop is a no-op for back-compat scenes.
+fn writeSceneInitialStateManifests(
+    w: anytype,
+    jsonc_scene_names: []const []const u8,
+    scene_manifests: []const SceneManifest,
+) !void {
+    if (jsonc_scene_names.len == 0) return;
+    if (scene_manifests.len != jsonc_scene_names.len) {
+        // Legacy parameter set (manifest slice empty) — emit a stub
+        // with no entries so the generated inline-for is a no-op.
+        try w.writeAll("\n// --- Scene initial-state manifests (parsed from scenes/*.jsonc) ---\n");
+        try w.writeAll("pub const SceneInitialStateManifests = struct {\n");
+        try w.writeAll("    pub const Entry = struct { name: []const u8, initial_state: []const u8 };\n");
+        try w.writeAll("    pub const entries: []const Entry = &.{};\n");
+        try w.writeAll("};\n");
+        return;
+    }
+
+    try w.writeAll("\n// --- Scene initial-state manifests (parsed from scenes/*.jsonc) ---\n");
+    try w.writeAll("pub const SceneInitialStateManifests = struct {\n");
+    try w.writeAll("    pub const Entry = struct { name: []const u8, initial_state: []const u8 };\n");
+    try w.writeAll("    pub const entries: []const Entry = &.{\n");
+    for (scene_manifests) |m| {
+        const state = m.initial_state orelse continue;
+        try w.writeAll("        .{ .name = ");
+        try writeZigString(w, m.name);
+        try w.writeAll(", .initial_state = ");
+        try writeZigString(w, state);
+        try w.writeAll(" },\n");
     }
     try w.writeAll("    };\n");
     try w.writeAll("};\n");
@@ -663,6 +734,11 @@ pub fn generateMainZigFromTemplate(
             // labelle-engine SceneEntry.assets field — this block is the
             // codegen contract that ticket reads.
             try writeSceneAssetManifests(bw, jsonc_scene_names, scene_manifests, &ident_buf);
+
+            // Same pattern for scene-declared `initial_state`
+            // (labelle-engine#500) — emit only the scenes that opted in,
+            // so the generated inline-for is a no-op for back-compat.
+            try writeSceneInitialStateManifests(bw, jsonc_scene_names, scene_manifests);
         }
         const block = try buf.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
