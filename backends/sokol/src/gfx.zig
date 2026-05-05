@@ -139,9 +139,14 @@ pub fn designToPhysical(pos: Vector2) Vector2 {
     }
     // Forward of the `screenToDesign` math: a design-pixel `pos` lands
     // inside the fitted region `[bar_x, bar_x + fitted_w]`, scaled by
-    // `fitted_w / dw` from its design-space position. Same shape for
-    // y. Degenerate `screen_fill` callers (when `fit_scale_*` == 1)
-    // collapse `bar_*` to 0 and reduce to `pos.x * sw / dw`.
+    // `fitted_w / dw` from its design-space position. Same shape for y.
+    // When there is no pillarbox/letterbox (`fit_scale_x == fit_scale_y == 1`),
+    // `bar_*` evaluate to 0 and the mapping reduces to `pos.x * sw / dw`.
+    //
+    // Like `screenToDesign`, `fit_active` is intentionally ignored: it is a
+    // transient render-state flag toggled per-layer inside the draw loop, and
+    // callers of this function (e.g. `Camera.worldToFramebuffer`) run outside
+    // the render loop. The always-on fitted mapping is the correct one.
     const fitted_w = sw * fit_scale_x;
     const fitted_h = sh * fit_scale_y;
     const bar_x = (sw - fitted_w) * 0.5;
