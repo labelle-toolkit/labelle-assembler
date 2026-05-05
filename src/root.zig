@@ -23,6 +23,8 @@ test {
     _ = @import("scene_manifest.zig");
     _ = @import("asset_validator.zig");
     _ = @import("lazy_inference.zig");
+    _ = @import("cache.zig");
+    _ = @import("deps_linker.zig");
 }
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────

@@ -117,7 +117,17 @@ pub fn createDepsLinks(
         const abs = cwd.realpathAlloc(allocator, dep.abs_path) catch dep.abs_path;
         defer if (abs.ptr != dep.abs_path.ptr) allocator.free(abs);
 
-        try hardlinkTree(allocator, abs, dest);
+        // Skip-and-warn on per-dep failure instead of poisoning the whole
+        // operation. A bad `local:` plugin path would otherwise propagate
+        // out, trip build_files.zig's fallback codepath, and trigger the
+        // depth-overshoot cascade that makes worktree builds emit garbage
+        // paths into ~/.labelle/packages/. The dep entry stays in the
+        // result list — the bad path is still emitted in the zon, so zig
+        // surfaces a clear "missing package" error at build time instead.
+        hardlinkTree(allocator, abs, dest) catch |err| {
+            std.log.warn("could not link dep '{s}' from '{s}': {s} — skipping", .{ dep.link_name, abs, @errorName(err) });
+            continue;
+        };
     }
 
     // Rewrite relative .path deps in local plugins' build.zig.zon files.
@@ -501,4 +511,28 @@ test "rewriteZonPaths: skips files without .path deps" {
     const result = try tmp.dir.readFileAlloc(alloc, "dest/build.zig.zon", 64 * 1024);
     defer alloc.free(result);
     try std.testing.expectEqualStrings(zon_content, result);
+}
+
+test "hardlinkTree: errors on missing source (precondition for createDepsLinks skip-and-warn)" {
+    // The createDepsLinks loop wraps hardlinkTree in a catch that warns
+    // and skips on failure rather than poisoning the whole operation.
+    // This test pins the underlying error path so that defensive contract
+    // can't silently regress (e.g. someone making hardlinkTree return
+    // success on a missing source would re-open the cascade bug).
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("dest_parent");
+    const dest_parent = try tmp.dir.realpathAlloc(alloc, "dest_parent");
+    defer alloc.free(dest_parent);
+
+    const missing_src = try std.fs.path.join(alloc, &.{ dest_parent, "does_not_exist" });
+    defer alloc.free(missing_src);
+    const dest = try std.fs.path.join(alloc, &.{ dest_parent, "linked" });
+    defer alloc.free(dest);
+
+    const result = hardlinkTree(alloc, missing_src, dest);
+    try std.testing.expectError(error.FileNotFound, result);
 }

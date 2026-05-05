@@ -101,12 +101,18 @@ pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, pro
 /// Resolve a local path override relative to a project directory.
 /// If project_dir is provided, joins it with the local path before resolving.
 /// Falls back to CWD if project_dir is null.
+///
+/// When project_dir is a git worktree, the local path is anchored at the
+/// main checkout instead — `local:` paths in `project.labelle` describe
+/// sibling repos, which sit next to the main checkout, not next to the
+/// worktree. See resolveProjectRoot.
 fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, project_dir: ?[]const u8) ![]const u8 {
     const resolve_path = if (std.fs.path.isAbsolute(local_path))
         try allocator.dupe(u8, local_path)
     else if (project_dir) |pd| blk: {
-        const joined = try std.fs.path.join(allocator, &.{ pd, local_path });
-        break :blk joined;
+        const root = try resolveProjectRoot(allocator, pd);
+        defer allocator.free(root);
+        break :blk try std.fs.path.join(allocator, &.{ root, local_path });
     } else try allocator.dupe(u8, local_path);
     defer allocator.free(resolve_path);
 
@@ -114,6 +120,42 @@ fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, projec
         std.debug.print("labelle: warning: local path '{s}' does not exist\n", .{resolve_path});
         return try allocator.dupe(u8, resolve_path);
     };
+}
+
+/// If `project_dir` is a git worktree, return the path of the main checkout.
+/// Otherwise return a copy of `project_dir` unchanged.
+///
+/// Worktree detection: `<project_dir>/.git` exists as a regular file (not a
+/// directory). The file is a single-line linkfile: `gitdir: <abs>/.git/worktrees/<name>`.
+/// The main checkout is three `dirname` steps above that gitdir value
+/// (strip `<name>`, then `worktrees`, then `.git`).
+///
+/// On any error (no .git, parse failure, etc.) returns project_dir unchanged
+/// so non-git callers and the main checkout keep their existing behavior.
+fn resolveProjectRoot(allocator: std.mem.Allocator, project_dir: []const u8) ![]u8 {
+    const git_path = try std.fs.path.join(allocator, &.{ project_dir, ".git" });
+    defer allocator.free(git_path);
+
+    const stat = std.fs.cwd().statFile(git_path) catch return allocator.dupe(u8, project_dir);
+    if (stat.kind != .file) return allocator.dupe(u8, project_dir);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, git_path, 4096) catch
+        return allocator.dupe(u8, project_dir);
+    defer allocator.free(content);
+
+    const line = std.mem.trim(u8, content, " \t\r\n");
+    const prefix = "gitdir:";
+    if (!std.mem.startsWith(u8, line, prefix)) return allocator.dupe(u8, project_dir);
+
+    const gitdir = std.mem.trim(u8, line[prefix.len..], " \t");
+    if (gitdir.len == 0) return allocator.dupe(u8, project_dir);
+
+    var path = gitdir;
+    var i: u8 = 0;
+    while (i < 3) : (i += 1) {
+        path = std.fs.path.dirname(path) orelse return allocator.dupe(u8, project_dir);
+    }
+    return allocator.dupe(u8, path);
 }
 
 /// Check if a framework package version is cached.
@@ -568,4 +610,87 @@ pub fn copyDirRecursive(allocator: std.mem.Allocator, src: []const u8, dst: []co
             else => {},
         }
     }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+test "resolveProjectRoot: main checkout (.git is a directory) returns project_dir unchanged" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("project/.git");
+    const project_abs = try tmp.dir.realpathAlloc(alloc, "project");
+    defer alloc.free(project_abs);
+
+    const root = try resolveProjectRoot(alloc, project_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(project_abs, root);
+}
+
+test "resolveProjectRoot: worktree linkfile resolves to main checkout" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Layout:
+    //   tmp/main/.git/worktrees/wt
+    //   tmp/wt/.git  (linkfile pointing back into main/.git/worktrees/wt)
+    try tmp.dir.makePath("main/.git/worktrees/wt");
+    try tmp.dir.makePath("wt");
+
+    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    defer alloc.free(main_abs);
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+
+    const linkfile_contents = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
+    defer alloc.free(linkfile_contents);
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll(linkfile_contents);
+
+    const root = try resolveProjectRoot(alloc, wt_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(main_abs, root);
+}
+
+test "resolveProjectRoot: not a git repo returns project_dir unchanged" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("plain");
+    const plain_abs = try tmp.dir.realpathAlloc(alloc, "plain");
+    defer alloc.free(plain_abs);
+
+    const root = try resolveProjectRoot(alloc, plain_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(plain_abs, root);
+}
+
+test "resolveProjectRoot: malformed linkfile returns project_dir unchanged" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("wt");
+    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    defer alloc.free(wt_abs);
+
+    const f = try tmp.dir.createFile("wt/.git", .{});
+    defer f.close();
+    try f.writeAll("not a gitdir line\n");
+
+    const root = try resolveProjectRoot(alloc, wt_abs);
+    defer alloc.free(root);
+
+    try std.testing.expectEqualStrings(wt_abs, root);
 }
