@@ -22,6 +22,13 @@ pub const SceneManifest = struct {
     /// Assets requested by the scene's top-level `assets:` array. May be empty.
     /// Each string is owned by this manifest's allocator.
     assets: []const []const u8,
+    /// Game state the scene wants `setScene` to transition into after load.
+    /// `null` means the scene didn't declare one; `setScene` leaves the
+    /// game state untouched (current behavior). When non-null, codegen
+    /// emits a `setSceneInitialState(name, state)` call so the engine
+    /// honors it at runtime. See labelle-engine#500.
+    /// String is owned by this manifest's allocator.
+    initial_state: ?[]const u8 = null,
 };
 
 /// Whitelisted top-level keys allowed in a scene .jsonc file. Anything outside
@@ -38,6 +45,7 @@ const ALLOWED_TOP_LEVEL_KEYS: []const []const u8 = &.{
     "include",
     "entities",
     "scripts",
+    "initial_state",
 };
 
 fn isAllowedTopLevelKey(key: []const u8) bool {
@@ -47,12 +55,14 @@ fn isAllowedTopLevelKey(key: []const u8) bool {
     return false;
 }
 
-/// Errors surfaced from manifest parsing. `UnknownSceneKey` and
-/// `InvalidAssetsField` are hard build errors — the assembler must abort and
-/// print a clear message naming the offending file.
+/// Errors surfaced from manifest parsing. `UnknownSceneKey`,
+/// `InvalidAssetsField`, and `InvalidInitialStateField` are hard build
+/// errors — the assembler must abort and print a clear message naming
+/// the offending file.
 pub const ParseError = error{
     UnknownSceneKey,
     InvalidAssetsField,
+    InvalidInitialStateField,
     InvalidSceneJson,
     OutOfMemory,
 };
@@ -186,7 +196,7 @@ pub fn parseSceneSource(
         if (!isAllowedTopLevelKey(entry.key_ptr.*)) {
             std.debug.print(
                 "labelle-assembler: unknown top-level key '{s}' in scene '{s}'.\n" ++
-                    "  Allowed keys: name, assets, include, entities, scripts\n" ++
+                    "  Allowed keys: name, assets, include, entities, scripts, initial_state\n" ++
                     "  (Did-you-mean suggestions land in labelle-assembler#47.)\n",
                 .{ entry.key_ptr.*, display_path },
             );
@@ -234,9 +244,37 @@ pub fn parseSceneSource(
         }
     }
 
+    // Read initial_state — optional, default null. Must be a plain
+    // string ("playing", "menu", etc.). Invalid types are a hard build
+    // error so a typo like a numeric or array value can't silently fall
+    // back to "no initial state declared".
+    var initial_state: ?[]const u8 = null;
+    if (root.get("initial_state")) |state_val| {
+        switch (state_val) {
+            .string => |s| {
+                if (s.len == 0) {
+                    std.debug.print(
+                        "labelle-assembler: scene '{s}' has empty 'initial_state' string\n",
+                        .{display_path},
+                    );
+                    return error.InvalidInitialStateField;
+                }
+                initial_state = try allocator.dupe(u8, s);
+            },
+            else => {
+                std.debug.print(
+                    "labelle-assembler: scene '{s}' has 'initial_state' but it is not a string\n",
+                    .{display_path},
+                );
+                return error.InvalidInitialStateField;
+            },
+        }
+    }
+
     return .{
         .name = scene_name,
         .assets = assets,
+        .initial_state = initial_state,
     };
 }
 
@@ -246,6 +284,7 @@ pub fn freeManifest(allocator: std.mem.Allocator, manifest: SceneManifest) void 
     if (manifest.assets.len > 0) {
         allocator.free(manifest.assets);
     }
+    if (manifest.initial_state) |s| allocator.free(s);
 }
 
 /// Free a slice of manifests in one shot.
@@ -354,6 +393,52 @@ test "singular 'asset' typo is a hard error" {
     ;
     const result = parseSceneSource(std.testing.allocator, "menu", "scenes/menu.jsonc", src);
     try std.testing.expectError(error.UnknownSceneKey, result);
+}
+
+test "parses initial_state string" {
+    const src =
+        \\{
+        \\    "name": "combat_arena",
+        \\    "initial_state": "playing",
+        \\    "entities": []
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "combat_arena", "combat.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+    try std.testing.expect(m.initial_state != null);
+    try std.testing.expectEqualStrings("playing", m.initial_state.?);
+}
+
+test "scene without initial_state yields null (back-compat default)" {
+    const src =
+        \\{
+        \\    "name": "menu",
+        \\    "entities": []
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "menu", "menu.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+    try std.testing.expect(m.initial_state == null);
+}
+
+test "non-string initial_state is a hard error" {
+    const src =
+        \\{
+        \\    "initial_state": ["playing"]
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "menu", "menu.jsonc", src);
+    try std.testing.expectError(error.InvalidInitialStateField, result);
+}
+
+test "empty initial_state string is a hard error" {
+    const src =
+        \\{
+        \\    "initial_state": ""
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "menu", "menu.jsonc", src);
+    try std.testing.expectError(error.InvalidInitialStateField, result);
 }
 
 test "assets and entities coexist (back-compat)" {
