@@ -116,6 +116,47 @@ pub fn screenToDesign(px: f32, py: f32) Vector2 {
     };
 }
 
+/// Inverse of `screenToDesign`: convert a design-pixel coordinate
+/// (e.g. the output of `cam.worldToScreen` for an in-world entity)
+/// to its physical-framebuffer pixel position inside the
+/// pillarboxed/letterboxed canvas.
+///
+/// Pinning an imgui window to a world-space entity needs this:
+/// `igSetNextWindowPos` interprets coords in physical-framebuffer
+/// pixels (`igGetIO().DisplaySize`), but `cam.worldToScreen` returns
+/// design pixels. Without this conversion, the imgui window lands
+/// at the wrong place whenever physical ≠ design (Android,
+/// resized desktop window). See [labelle-gfx#253][1].
+///
+/// [1]: https://github.com/labelle-toolkit/labelle-gfx/issues/253
+pub fn designToPhysical(pos: Vector2) Vector2 {
+    const sw: f32 = @floatFromInt(screen_w);
+    const sh: f32 = @floatFromInt(screen_h);
+    const dw: f32 = @floatFromInt(design_w);
+    const dh: f32 = @floatFromInt(design_h);
+    if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
+        return pos;
+    }
+    // Forward of the `screenToDesign` math: a design-pixel `pos` lands
+    // inside the fitted region `[bar_x, bar_x + fitted_w]`, scaled by
+    // `fitted_w / dw` from its design-space position. Same shape for y.
+    // When there is no pillarbox/letterbox (`fit_scale_x == fit_scale_y == 1`),
+    // `bar_*` evaluate to 0 and the mapping reduces to `pos.x * sw / dw`.
+    //
+    // Like `screenToDesign`, `fit_active` is intentionally ignored: it is a
+    // transient render-state flag toggled per-layer inside the draw loop, and
+    // callers of this function (e.g. `Camera.worldToFramebuffer`) run outside
+    // the render loop. The always-on fitted mapping is the correct one.
+    const fitted_w = sw * fit_scale_x;
+    const fitted_h = sh * fit_scale_y;
+    const bar_x = (sw - fitted_w) * 0.5;
+    const bar_y = (sh - fitted_h) * 0.5;
+    return .{
+        .x = bar_x + pos.x * fitted_w / dw,
+        .y = bar_y + pos.y * fitted_h / dh,
+    };
+}
+
 /// Recompute the cached fit scale from screen_w/h and design_w/h.
 /// Call after any change to those values.
 fn recomputeFitScale() void {
