@@ -124,8 +124,19 @@ pub fn createDepsLinks(
         // paths into ~/.labelle/packages/. The dep entry stays in the
         // result list — the bad path is still emitted in the zon, so zig
         // surfaces a clear "missing package" error at build time instead.
+        //
+        // OutOfMemory is a global failure — propagate it so callers don't
+        // silently continue with a half-allocated state.
+        //
+        // hardlinkTree creates `dest` via makePath BEFORE reading the source,
+        // so a failed call leaves a stale empty directory behind. Clean it
+        // up so additive-mode (recreate=false) re-passes don't see the
+        // empty dir at line 113-115's access() check and silently treat it
+        // as already-linked.
         hardlinkTree(allocator, abs, dest) catch |err| {
+            if (err == error.OutOfMemory) return err;
             std.log.warn("could not link dep '{s}' from '{s}': {s} — skipping", .{ dep.link_name, abs, @errorName(err) });
+            cwd.deleteTree(dest) catch {};
             continue;
         };
     }
@@ -513,12 +524,17 @@ test "rewriteZonPaths: skips files without .path deps" {
     try std.testing.expectEqualStrings(zon_content, result);
 }
 
-test "hardlinkTree: errors on missing source (precondition for createDepsLinks skip-and-warn)" {
+test "hardlinkTree: errors on missing source and leaves a stale dest dir" {
     // The createDepsLinks loop wraps hardlinkTree in a catch that warns
     // and skips on failure rather than poisoning the whole operation.
-    // This test pins the underlying error path so that defensive contract
-    // can't silently regress (e.g. someone making hardlinkTree return
-    // success on a missing source would re-open the cascade bug).
+    // This test pins two preconditions so that contract can't regress:
+    //   1. hardlinkTree errors when the source is missing (someone making
+    //      it return success would re-open the original cascade bug).
+    //   2. hardlinkTree creates `dest` via makePath BEFORE reading the
+    //      source — so on failure, a stale empty dir is left behind.
+    //      The catch in createDepsLinks must clean it up; if hardlinkTree
+    //      were ever changed to *not* leave the stale dir, the cleanup
+    //      becomes a harmless no-op and this test pins the assumption.
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -535,4 +551,10 @@ test "hardlinkTree: errors on missing source (precondition for createDepsLinks s
 
     const result = hardlinkTree(alloc, missing_src, dest);
     try std.testing.expectError(error.FileNotFound, result);
+
+    // Stale-dest precondition: if this `access` errors with FileNotFound,
+    // hardlinkTree was changed to not pre-create the dest dir. The
+    // deleteTree cleanup in createDepsLinks would then be a harmless
+    // no-op — but the surrounding comment there should be updated.
+    try std.fs.cwd().access(dest, .{});
 }
