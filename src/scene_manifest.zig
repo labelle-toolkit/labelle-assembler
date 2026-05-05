@@ -253,6 +253,11 @@ pub fn parseSceneSource(
         switch (state_val) {
             .string => |s| {
                 if (s.len == 0) {
+                    // Use std.debug.print, not std.log.err — the negative-
+                    // path tests in this file rely on these prints not
+                    // counting as logged errors (which would fail the
+                    // expectError tests). Same pattern as the assets
+                    // validation errors above.
                     std.debug.print(
                         "labelle-assembler: scene '{s}' has empty 'initial_state' string\n",
                         .{display_path},
