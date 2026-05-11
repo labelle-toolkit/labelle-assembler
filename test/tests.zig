@@ -1631,6 +1631,58 @@ pub const SUBFOLDERS = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"prefabs/player.jsonc\")") != null);
     }
 
+    test "prefab_naming = .path keeps subfolder prefix in the registered name (default)" {
+        const prefabs = &[_][]const u8{ "items/poop", "player" };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            // `prefab_naming` left default; explicit for the test.
+            .prefab_naming = .path,
+        }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "addEmbeddedPrefab(&g, \"items/poop\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "addEmbeddedPrefab(&g, \"player\"") != null);
+    }
+
+    test "prefab_naming = .basename drops the subfolder prefix from the registered name" {
+        const prefabs = &[_][]const u8{ "items/poop", "characters/worker", "player" };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .prefab_naming = .basename,
+        }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Registered name is the basename only — every `spawnPrefab` /
+        // scene reference can use the flat name regardless of where on
+        // disk the prefab lives.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "addEmbeddedPrefab(&g, \"poop\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "addEmbeddedPrefab(&g, \"worker\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "addEmbeddedPrefab(&g, \"player\"") != null);
+        // The embedFile still uses the full path so the bytes resolve.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"prefabs/items/poop.jsonc\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"prefabs/characters/worker.jsonc\")") != null);
+    }
+
+    test "prefab_naming = .basename errors on duplicate basenames" {
+        // Two prefabs with the same basename in different subfolders —
+        // under `.basename` they would both try to register as
+        // `"goblin"`, silently overwriting one with the other. The
+        // generator must surface this at generate time so the
+        // developer renames before shipping.
+        const prefabs = &[_][]const u8{ "enemies/goblin", "allies/goblin" };
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .prefab_naming = .basename,
+        }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        try std.testing.expectError(error.PrefabBasenameCollision, result);
+    }
+
     test "scripts in organizational subdirs use path-based identifiers" {
         const playing_states: []const []const u8 = &.{"playing"};
         const entries: []const ScriptEntry = &.{

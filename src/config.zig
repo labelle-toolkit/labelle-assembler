@@ -10,6 +10,7 @@ const std = @import("std");
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 pub const Platform = enum { desktop, ios, android, wasm };
 pub const EcsChoice = enum { mock, zig_ecs, zflecs, mr_ecs };
+pub const PrefabNaming = enum { path, basename };
 
 /// CLI version — injected from root build.zig via build options.
 pub const CLI_VERSION = @import("build_options").cli_version;
@@ -204,6 +205,18 @@ pub const ProjectConfig = struct {
 
     /// Android configuration — parsed from project.labelle `.android` section.
     android: ?AndroidConfig = null,
+
+    /// How prefab names are registered in the generated setup code.
+    ///
+    /// * `.path` (default, backward compatible) — registered name is
+    ///   the relative path under `prefabs/` without the extension.
+    ///   E.g. `prefabs/items/poop.jsonc` registers as `"items/poop"`.
+    /// * `.basename` — registered name is the file's basename only.
+    ///   E.g. `prefabs/items/poop.jsonc` registers as `"poop"`. Lets
+    ///   a project organize prefabs into folders without rewriting
+    ///   every `spawnPrefab` / scene reference. Duplicate basenames
+    ///   across folders are a generate-time error.
+    prefab_naming: PrefabNaming = .path,
 
     /// Pinned assembler version (Phase 3 of RFC #122).
     /// When set, the CLI resolves the assembler binary from the cache at
