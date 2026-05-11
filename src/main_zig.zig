@@ -606,8 +606,14 @@ pub fn generateMainZigFromTemplate(
     if (cfg.prefab_naming == .basename) {
         if (try checkBasenameCollisions(allocator, prefab_names)) |msg| {
             defer allocator.free(msg);
-            var w = std.fs.File.stderr().writer(&.{});
-            w.interface.print("labelle-assembler: {s}\n", .{msg}) catch {};
+            // Match the diagnostic style in `main.zig` (line 97):
+            // `stderr().writeAll(...)`. Avoids `std.log.err` so the
+            // Zig test runner doesn't classify the expected
+            // diagnostic as a logged-error test failure.
+            const prefix = "labelle-assembler: ";
+            std.fs.File.stderr().writeAll(prefix) catch {};
+            std.fs.File.stderr().writeAll(msg) catch {};
+            std.fs.File.stderr().writeAll("\n") catch {};
             return error.PrefabBasenameCollision;
         }
     }
