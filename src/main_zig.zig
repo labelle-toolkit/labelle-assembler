@@ -13,6 +13,24 @@ const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
 const SceneManifest = scene_manifest.SceneManifest;
 
 
+/// Validate that no two prefab paths collapse to the same basename.
+/// Returns a heap-allocated error message on collision (caller
+/// owns); returns `null` when the set is unambiguous. Quadratic
+/// over the prefab list — fine for the expected ~10²-scale prefab
+/// counts, no need for a HashSet.
+fn checkBasenameCollisions(allocator: std.mem.Allocator, prefab_names: []const []const u8) !?[]const u8 {
+    for (prefab_names, 0..) |a, i| {
+        const a_base = std.fs.path.basename(a);
+        for (prefab_names[i + 1 ..]) |b| {
+            const b_base = std.fs.path.basename(b);
+            if (std.mem.eql(u8, a_base, b_base)) {
+                return try std.fmt.allocPrint(allocator, "duplicate prefab basename '{s}' (paths: '{s}', '{s}') — every prefab must have a unique filename across subfolders", .{ a_base, a, b });
+            }
+        }
+    }
+    return null;
+}
+
 /// Check if a script entry with the given name exists.
 fn hasContextEntry(entries: []const ScriptEntry) bool {
     for (entries) |entry| {
@@ -224,7 +242,8 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     if (prefab_names.len > 0) {
         try w.writeAll("    // Embedded prefabs (via @embedFile)\n");
         for (prefab_names) |name| {
-            try w.print("    try JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"prefabs/{s}.jsonc\"), \"prefabs\");\n", .{ name, name });
+            const display = std.fs.path.basename(name);
+            try w.print("    try JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"prefabs/{s}.jsonc\"), \"prefabs\");\n", .{ display, name });
         }
         try w.writeByte('\n');
     }
@@ -365,7 +384,8 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
     if (prefab_names.len > 0) {
         try w.writeAll("    // Embedded prefabs (via @embedFile)\n");
         for (prefab_names) |name| {
-            try w.print("    JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"prefabs/{s}.jsonc\"), \"prefabs\") catch @panic(\"failed to load prefab\");\n", .{ name, name });
+            const display = std.fs.path.basename(name);
+            try w.print("    JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"prefabs/{s}.jsonc\"), \"prefabs\") catch @panic(\"failed to load prefab\");\n", .{ display, name });
         }
         try w.writeByte('\n');
     }
@@ -631,6 +651,22 @@ pub fn generateMainZigFromTemplate(
     gizmo_names: []const []const u8,
     animation_names: []const []const u8,
 ) ![]const u8 {
+    // Surface basename collisions at generate time, before any
+    // code emission — otherwise two prefabs with the same filename
+    // in different subfolders would both try to register the same
+    // name and silently overwrite. Match the diagnostic style in
+    // `main.zig:97` (`stderr().writeAll(...)`) instead of
+    // `std.log.err` so the Zig test runner doesn't classify the
+    // expected diagnostic as a logged-error test failure.
+    if (try checkBasenameCollisions(allocator, prefab_names)) |msg| {
+        defer allocator.free(msg);
+        const prefix = "labelle-assembler: ";
+        std.fs.File.stderr().writeAll(prefix) catch {};
+        std.fs.File.stderr().writeAll(msg) catch {};
+        std.fs.File.stderr().writeAll("\n") catch {};
+        return error.PrefabBasenameCollision;
+    }
+
     var data = tpl.TemplateData{
         .scalars = std.StringHashMap([]const u8).init(allocator),
         .lists = std.StringHashMap([]const tpl.ListItem).init(allocator),
