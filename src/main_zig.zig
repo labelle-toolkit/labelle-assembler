@@ -1257,6 +1257,13 @@ pub fn generateMainZigFromTemplate(
                     "var gpa = std.heap.GeneralPurposeAllocator(.{}){};";
                 const allocator_expr: []const u8 = if (is_wasm) "std.heap.c_allocator" else "gpa.allocator()";
                 const allocator_cleanup: []const u8 = if (is_wasm) "" else "    _ = gpa.deinit();\n";
+                // For wasm, `allocator` is already declared at module scope
+                // by `{{allocator_decl}}` above, so re-declaring it inside
+                // `initInner` would trigger Zig's "local constant shadows
+                // declaration" error (labelle-cli#198). For desktop, the
+                // module scope only has `var gpa = ...`, so we still need
+                // the inner alias.
+                const allocator_local_decl: []const u8 = if (is_wasm) "" else "    const allocator = gpa.allocator();\n";
 
                 // Wire the GUI bridge into sokol's event callback so widgets
                 // see mouse / keyboard input. labelle-imgui's sokol bridge
@@ -1291,6 +1298,7 @@ pub fn generateMainZigFromTemplate(
                     .hooks_init_block = hooks_init,
                     .allocator_decl = allocator_decl,
                     .allocator_expr = allocator_expr,
+                    .allocator_local_decl = allocator_local_decl,
                     .allocator_cleanup = allocator_cleanup,
                     // Preview-mode wiring (labelle-assembler#94,
                     // labelle-engine#520). `g.preview` is the canonical

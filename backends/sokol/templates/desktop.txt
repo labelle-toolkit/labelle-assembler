@@ -10,8 +10,7 @@ const screen_title = "{{title}}";
 const target_fps: u32 = {{fps}};
 
 fn initInner() !void {
-    const allocator = {{allocator_expr}};
-{{preview_setup}}{{init_code}}}
+{{allocator_local_decl}}{{preview_setup}}{{init_code}}}
 
 export fn init() callconv(.c) void {
 {{hidden_setup}}    window.initGfx();

@@ -31,6 +31,19 @@ pub fn build(b: *std.Build) void {
     gfx_mod.addIncludePath(b.path("src"));
     gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
 
+    // When cross-compiling to wasm32-emscripten the C compile of
+    // `stb_image_impl.c` cannot find `<stdlib.h>` because Zig does not
+    // ship libc headers for `wasm32-emscripten` — they live in emsdk's
+    // sysroot. Mirror what `sokol-zig` does for `sokol_clib` (see
+    // sokol/build.zig:204) and plumb the emsdk sysroot include path
+    // into the gfx module. Gated on `.emscripten` so the desktop /
+    // mobile builds remain untouched (labelle-cli#197).
+    if (target.result.os.tag == .emscripten) {
+        if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
+            gfx_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
+        }
+    }
+
     // ── Input backend module ────────────────────────────────────────
     const input_mod = b.addModule("input", .{
         .root_source_file = b.path("src/input.zig"),

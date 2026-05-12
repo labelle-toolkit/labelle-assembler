@@ -101,6 +101,30 @@ const sokol_lifecycle =
     \\
 ;
 
+// Mirror of `backends/sokol/templates/desktop.txt` — the actual sokol+wasm
+// template — but trimmed to just the bits that matter for verifying the
+// allocator-shadow fix (labelle-cli#198). Module-scope emits
+// `{{allocator_decl}}` and `initInner` emits `{{allocator_local_decl}}`
+// (empty on wasm, `const allocator = gpa.allocator();` on desktop). The
+// regression we're guarding against is *two* `const allocator =` lines
+// in the same generated file for sokol+wasm.
+const sokol_alloc_lifecycle =
+    \\var g: AssembledGame = undefined;
+    \\{{hooks_init_block}}
+    \\{{allocator_decl}}
+    \\{{module_vars}}
+    \\fn initInner() !void {
+    \\{{allocator_local_decl}}{{init_code}}}
+    \\export fn init() callconv(.c) void {
+    \\    g = AssembledGame.init({{allocator_expr}});
+    \\    initInner() catch unreachable;
+    \\}
+    \\export fn cleanup() callconv(.c) void {
+    \\{{cleanup_code}}    g.deinit();
+    \\{{allocator_cleanup}}}
+    \\
+;
+
 const empty_names: []const []const u8 = &.{};
 const ScriptEntry = generate.script_scanner.ScriptScanner.ScriptEntry;
 const empty_entries: []const ScriptEntry = &.{};
@@ -957,6 +981,50 @@ pub const SOKOL = struct {
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.init()") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.shutdown()") != null);
+    }
+
+    // Regression: labelle-cli#198. The generator used to emit
+    // `const allocator = std.heap.c_allocator;` at module scope AND
+    // `const allocator = std.heap.c_allocator;` inside `initInner`, so
+    // Zig rejected the sokol+wasm build with a "local constant shadows
+    // declaration" error before any of the game code could compile.
+    // For wasm, the inner declaration must be omitted (allocator is
+    // already in scope from the module-level `{{allocator_decl}}`).
+    test "wasm: no duplicate const allocator declaration in main.zig" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .wasm,
+            .ecs = .mock,
+        }, sokol_alloc_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // The module-scope decl must still be emitted — that's where
+        // `allocator` lives for the whole generated file on wasm.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const allocator = std.heap.c_allocator;") != null);
+
+        // But there must be only one such declaration anywhere in the
+        // file — the inner one inside `initInner` would shadow it.
+        const needle = "const allocator = std.heap.c_allocator;";
+        const first = std.mem.indexOf(u8, main_zig, needle) orelse return error.NotFound;
+        const after = main_zig[first + needle.len ..];
+        try std.testing.expect(std.mem.indexOf(u8, after, needle) == null);
+    }
+
+    // Counter-test: desktop sokol must still emit the inner alias so
+    // `initInner` can refer to `allocator` (the module scope only has
+    // `var gpa = ...`, not `const allocator = ...`).
+    test "desktop: initInner declares allocator from gpa" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .desktop,
+            .ecs = .mock,
+        }, sokol_alloc_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var gpa = std.heap.GeneralPurposeAllocator") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const allocator = gpa.allocator();") != null);
     }
 };
 
