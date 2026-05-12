@@ -1957,6 +1957,18 @@ pub const PREVIEW_MODE = struct {
         // tickHeartbeat itself, so a per-tick call is safe.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
 
+        // Drain editor `subscribe` / `unsubscribe` frames every tick.
+        // Without this call the `subscribed_components` set stays
+        // empty and `component_changed` frames are silently dropped
+        // by `isComponentSubscribed` (labelle-engine preview_mode.zig).
+        // Must run BEFORE the heartbeat write so a malformed
+        // subscription frame doesn't poison the same flush.
+        const poll_idx = std.mem.indexOf(u8, main_zig, "_p.pollSubscription()");
+        const tick_idx = std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(");
+        try std.testing.expect(poll_idx != null);
+        try std.testing.expect(tick_idx != null);
+        try std.testing.expect(poll_idx.? < tick_idx.?);
+
         // Generated source must still be parseable.
         const dup = try std.testing.allocator.dupeZ(u8, main_zig);
         defer std.testing.allocator.free(dup);
@@ -1996,6 +2008,15 @@ pub const PREVIEW_MODE = struct {
 
         // frame tick fires the heartbeat (rate-limit inside tickHeartbeat).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
+
+        // Same subscribe-frame drain as the loop backend. Poll runs
+        // before heartbeat so a malformed subscribe can't poison the
+        // outbound flush. See loop-backend test for full rationale.
+        const poll_idx = std.mem.indexOf(u8, main_zig, "_p.pollSubscription()");
+        const tick_idx = std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(");
+        try std.testing.expect(poll_idx != null);
+        try std.testing.expect(tick_idx != null);
+        try std.testing.expect(poll_idx.? < tick_idx.?);
 
         // cleanup callback only emits the graceful `bye`. The actual
         // socket + arena teardown lives in `g.deinit()` (called by
