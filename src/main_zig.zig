@@ -335,6 +335,14 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
 // project.labelle opt-in flag and matches the umbrella's "every
 // generated binary speaks preview" intent (labelle-gui#59).
 
+// PID source note: `std.posix.system.getpid()` (pre-fix snippet) is
+// fine on Linux/macOS but breaks portability — `std.posix.system`
+// maps to `std.c` on Windows/WASM and neither exports a usable
+// `getpid` (Windows uses `_getpid`, WASM libc support is incomplete).
+// Both snippets below use a comptime branch: Windows hits the
+// kernel32 API, WASM falls back to 0, POSIX uses the public
+// `std.posix.getpid()` wrapper.
+
 /// In-function preview setup for loop-style main()s. Parses argv,
 /// dials the editor, sends `hello`, defers `bye` + `deinit`. Pasted
 /// after `const allocator = ...` and before the main game loop.
@@ -351,7 +359,13 @@ const PREVIEW_LOOP_SETUP =
     \\            break :blk null;
     \\        };
     \\        if (_preview) |*_p| {
-    \\            _p.sendHello("labelle-engine", @intCast(std.posix.system.getpid())) catch {};
+    \\            const _pid = if (comptime @import("builtin").target.os.tag == .windows)
+    \\                std.os.windows.kernel32.GetCurrentProcessId()
+    \\            else if (comptime @import("builtin").target.cpu.arch.isWasm())
+    \\                @as(u32, 0)
+    \\            else
+    \\                std.posix.getpid();
+    \\            _p.sendHello("labelle-engine", @intCast(_pid)) catch {};
     \\        }
     \\    }
     \\    defer if (_preview) |*_p| {
@@ -379,19 +393,31 @@ const PREVIEW_MODULE_VARS =
 /// already been routed through the platform's entry, so we go via
 /// `std.process.argsAlloc` here too. Same shape as the loop variant
 /// minus the `defer` (cleanup lives in the cleanup callback).
+///
+/// Note: the original `catch &[_][:0]u8{}` form gave `_argv` a
+/// `[]const [:0]u8` type, which doesn't satisfy `argsFree`'s
+/// `[][:0]u8` parameter. The `if/else |_|` shape pulls the alloc
+/// success path into its own scope where `_argv`'s type matches.
 const PREVIEW_INIT_CALLBACK =
     \\    // ── Preview mode (labelle-assembler#94) ──
-    \\    const _argv = std.process.argsAlloc(allocator) catch &[_][:0]u8{};
-    \\    defer if (_argv.len > 0) std.process.argsFree(allocator, _argv);
-    \\    if (engine.parsePreviewArgs(_argv)) |_ep| {
-    \\        _preview = engine.Preview.connect(allocator, _ep) catch |err| blk: {
-    \\            std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _ep, @errorName(err) });
-    \\            break :blk null;
-    \\        };
-    \\        if (_preview) |*_p| {
-    \\            _p.sendHello("labelle-engine", @intCast(std.posix.system.getpid())) catch {};
+    \\    if (std.process.argsAlloc(allocator)) |_argv| {
+    \\        defer std.process.argsFree(allocator, _argv);
+    \\        if (engine.parsePreviewArgs(_argv)) |_ep| {
+    \\            _preview = engine.Preview.connect(allocator, _ep) catch |err| blk: {
+    \\                std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _ep, @errorName(err) });
+    \\                break :blk null;
+    \\            };
+    \\            if (_preview) |*_p| {
+    \\                const _pid = if (comptime @import("builtin").target.os.tag == .windows)
+    \\                    std.os.windows.kernel32.GetCurrentProcessId()
+    \\                else if (comptime @import("builtin").target.cpu.arch.isWasm())
+    \\                    @as(u32, 0)
+    \\                else
+    \\                    std.posix.getpid();
+    \\                _p.sendHello("labelle-engine", @intCast(_pid)) catch {};
+    \\            }
     \\        }
-    \\    }
+    \\    } else |_| {}
     \\
 ;
 

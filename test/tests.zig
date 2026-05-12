@@ -1937,6 +1937,14 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.deinit()") != null);
 
+        // PID is resolved via a comptime branch on builtin.target so the
+        // generated source compiles for Windows/WASM as well as POSIX —
+        // not `std.posix.system.getpid()` which doesn't link on
+        // Windows/WASM (PR #95 review).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.system.getpid()") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.os.windows.kernel32.GetCurrentProcessId()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.getpid()") != null);
+
         // Heartbeat inside the frame loop — rate-limited inside
         // tickHeartbeat itself, so a per-tick call is safe.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
@@ -1961,10 +1969,22 @@ pub const PREVIEW_MODE = struct {
         // init/frame/cleanup invocations).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview: ?engine.Preview = null;") != null);
 
-        // initInner handles connect + hello.
+        // initInner handles connect + hello. The argv allocation runs
+        // through an `if/else |_|` rather than a `catch &[_][:0]u8{}`
+        // sentinel — the sentinel form produces a `[]const [:0]u8`
+        // which mismatches `argsFree`'s `[][:0]u8` parameter (PR #95
+        // review). Asserting `if (std.process.argsAlloc...` and the
+        // absence of the empty-sentinel form locks the shape in.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (std.process.argsAlloc(allocator)) |_argv|") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "&[_][:0]u8{}") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.parsePreviewArgs(_argv)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.Preview.connect(allocator, _ep)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(") != null);
+
+        // Same cross-platform PID expression as the loop backend.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.system.getpid()") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.os.windows.kernel32.GetCurrentProcessId()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.getpid()") != null);
 
         // frame tick fires the heartbeat (rate-limit inside tickHeartbeat).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
