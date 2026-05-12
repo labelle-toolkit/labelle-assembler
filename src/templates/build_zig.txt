@@ -195,6 +195,16 @@ pub fn build(b: *std.Build) !void {
         .shell_file_path = null,
         .use_webgl2 = true,
         .release_use_closure = false,
+        // Emscripten defaults to a 64 KB C stack, which the engine's
+        // scene-load + atlas-decode path overflows into the WASM
+        // `.data` segment under sokol. Concrete symptom: the
+        // module-level `var backend: ?ImageBackend` in the engine's
+        // image loader gets clobbered to zero between the first
+        // atlas's `upload` and the second atlas's `decode`, surfacing
+        // as `error.ImageBackendNotInitialized`. sokol-zig's own
+        // example bumps the stack to 512 KB; we follow that here.
+        // See labelle-toolkit/labelle-cli#201.
+        .extra_args = &.{"-sSTACK_SIZE=512KB"},
     });
     const emcc_step = &link_step.step;
 
