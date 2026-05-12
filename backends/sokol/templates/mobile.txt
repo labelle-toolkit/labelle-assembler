@@ -1,6 +1,6 @@
 const BackendGfxType = @import("backend_gfx");
 
-{{module_vars}}var g: AssembledGame = undefined;
+{{module_vars}}{{preview_module_vars}}var g: AssembledGame = undefined;
 {{hooks_init_block}}
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 
@@ -19,7 +19,7 @@ export fn init() callconv(.c) void {
 
     g.setHooks(&hooks);
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
-{{init_code}}}
+{{preview_setup}}{{init_code}}}
 
 {{gui_event_extern}}fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
     @import("backend_input").handleEvent(ev);
@@ -50,7 +50,7 @@ export fn frame() callconv(.c) void {
     }
     // Cap dt at 4 frames to prevent physics explosions after backgrounding.
     const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(target_fps)));
-{{tick_code}}    g.tick(dt);
+{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
     const pass_action = window.beginFrame();
     window.beginPass(pass_action);
     g.render();
@@ -67,7 +67,7 @@ export fn frame() callconv(.c) void {
 }
 
 export fn cleanup() callconv(.c) void {
-    g.deinit();
+{{preview_cleanup}}    g.deinit();
     // On iOS, don't shutdown sokol_gfx — sokol_app owns the Metal device and
     // UIWindow lifecycle. On Android, shutdown is safe.
     if (comptime @import("builtin").target.os.tag != .ios) {

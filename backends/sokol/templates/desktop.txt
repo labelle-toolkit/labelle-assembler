@@ -3,7 +3,7 @@ const BackendGfxType = @import("backend_gfx");
 var g: AssembledGame = undefined;
 {{hooks_init_block}}
 {{allocator_decl}}
-{{module_vars}}
+{{module_vars}}{{preview_module_vars}}
 const screen_w: u32 = {{width}};
 const screen_h: u32 = {{height}};
 const screen_title = "{{title}}";
@@ -11,7 +11,7 @@ const target_fps: u32 = {{fps}};
 
 fn initInner() !void {
     const allocator = {{allocator_expr}};
-{{init_code}}}
+{{preview_setup}}{{init_code}}}
 
 export fn init() callconv(.c) void {
 {{hidden_setup}}    window.initGfx();
@@ -37,7 +37,7 @@ export fn frame() callconv(.c) void {
     // rather than the physical framebuffer size (which differs on HiDPI displays).
     BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
     const dt: f32 = 1.0 / @as(f32, @floatFromInt(target_fps));
-{{tick_code}}    g.tick(dt);
+{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
     const pass_action = window.beginFrame();
     window.beginPass(pass_action);
     g.render();
@@ -55,7 +55,7 @@ export fn frame() callconv(.c) void {
 }
 
 export fn cleanup() callconv(.c) void {
-{{cleanup_code}}    g.deinit();
+{{preview_cleanup}}{{cleanup_code}}    g.deinit();
     window.shutdownGfx();
 {{allocator_cleanup}}}
 
