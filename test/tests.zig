@@ -1937,13 +1937,13 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.deinit()") != null);
 
-        // PID is resolved via a comptime branch on builtin.target so the
-        // generated source compiles for Windows/WASM as well as POSIX —
-        // not `std.posix.system.getpid()` which doesn't link on
-        // Windows/WASM (PR #95 review).
+        // PID sent in `hello` is currently a placeholder 0 — the
+        // per-OS branch via `std.posix.getpid()` broke on Linux because
+        // that function isn't on `std.posix` in Zig 0.15.2's stdlib.
+        // Diagnostic value only; editor doesn't depend on the real PID.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.system.getpid()") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.os.windows.kernel32.GetCurrentProcessId()") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.getpid()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.getpid()") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(\"labelle-engine\", 0)") != null);
 
         // Heartbeat inside the frame loop — rate-limited inside
         // tickHeartbeat itself, so a per-tick call is safe.
@@ -1981,10 +1981,10 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.Preview.connect(allocator, _ep)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(") != null);
 
-        // Same cross-platform PID expression as the loop backend.
+        // PID placeholder 0 (see loop-backend test for rationale).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.system.getpid()") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.os.windows.kernel32.GetCurrentProcessId()") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.getpid()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.getpid()") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(\"labelle-engine\", 0)") != null);
 
         // frame tick fires the heartbeat (rate-limit inside tickHeartbeat).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);

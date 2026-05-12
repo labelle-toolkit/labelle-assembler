@@ -335,13 +335,15 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
 // project.labelle opt-in flag and matches the umbrella's "every
 // generated binary speaks preview" intent (labelle-gui#59).
 
-// PID source note: `std.posix.system.getpid()` (pre-fix snippet) is
-// fine on Linux/macOS but breaks portability — `std.posix.system`
-// maps to `std.c` on Windows/WASM and neither exports a usable
-// `getpid` (Windows uses `_getpid`, WASM libc support is incomplete).
-// Both snippets below use a comptime branch: Windows hits the
-// kernel32 API, WASM falls back to 0, POSIX uses the public
-// `std.posix.getpid()` wrapper.
+// PID is purely informational in the `hello` message — the editor
+// uses it for UI display, not for any process management. Earlier
+// snippets tried a per-OS comptime branch (`std.posix.getpid()` on
+// POSIX, kernel32 on Windows) but `std.posix.getpid` isn't exposed
+// in Zig 0.15.2's stdlib (only `std.os.linux.getpid` and
+// `std.c.getpid` exist, and the latter requires linking libc which
+// not every backend does). Simplest portable fix: send 0. A
+// follow-up can wire the real PID once we settle on a stdlib import
+// that's universal across our backends.
 
 /// In-function preview setup for loop-style main()s. Parses argv,
 /// dials the editor, sends `hello`, defers `bye` + `deinit`. Pasted
@@ -359,13 +361,8 @@ const PREVIEW_LOOP_SETUP =
     \\            break :blk null;
     \\        };
     \\        if (_preview) |*_p| {
-    \\            const _pid = if (comptime @import("builtin").target.os.tag == .windows)
-    \\                std.os.windows.kernel32.GetCurrentProcessId()
-    \\            else if (comptime @import("builtin").target.cpu.arch.isWasm())
-    \\                @as(u32, 0)
-    \\            else
-    \\                std.posix.getpid();
-    \\            _p.sendHello("labelle-engine", @intCast(_pid)) catch {};
+    \\            // PID 0 is a placeholder — see preview note in main_zig.zig.
+    \\            _p.sendHello("labelle-engine", 0) catch {};
     \\        }
     \\    }
     \\    defer if (_preview) |*_p| {
@@ -408,13 +405,8 @@ const PREVIEW_INIT_CALLBACK =
     \\                break :blk null;
     \\            };
     \\            if (_preview) |*_p| {
-    \\                const _pid = if (comptime @import("builtin").target.os.tag == .windows)
-    \\                    std.os.windows.kernel32.GetCurrentProcessId()
-    \\                else if (comptime @import("builtin").target.cpu.arch.isWasm())
-    \\                    @as(u32, 0)
-    \\                else
-    \\                    std.posix.getpid();
-    \\                _p.sendHello("labelle-engine", @intCast(_pid)) catch {};
+    \\                // PID 0 is a placeholder — see preview note in main_zig.zig.
+    \\                _p.sendHello("labelle-engine", 0) catch {};
     \\            }
     \\        }
     \\    } else |_| {}
