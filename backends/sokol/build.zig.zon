@@ -10,6 +10,18 @@
             .url = "https://github.com/floooh/sokol-zig/archive/8e2d21bebd8428d82a1f320e999c058303c8323d.tar.gz",
             .hash = "sokol-0.1.0-pb1HKxTaNgA8rXBh41wxEucgmR4YPuoOXGeXbFyGPvTK",
         },
+        // emsdk is needed at WASM build time so we can plumb the
+        // sysroot include path through to `stb_image_impl.c`. The
+        // assembler-generated `build.zig.zon` already declares an
+        // `emsdk` dep at the same version for the link step
+        // (`wasm_emsdk_sokol` template section); we mirror it here so
+        // the gfx module's C compile can resolve `<stdlib.h>` and the
+        // other emsdk system headers (labelle-cli#197).
+        .emsdk = .{
+            .url = "git+https://github.com/emscripten-core/emsdk#4.0.9",
+            .hash = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
