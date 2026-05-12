@@ -11,7 +11,7 @@ var g: AssembledGame = undefined;
 var hooks: GameHooks = undefined;
 var g_allocator: std.mem.Allocator = undefined;
 var runner: Runner = undefined;
-{{preview_module_vars}}
+
 fn gameFrame() callconv(.c) void {
     const dt: f32 = window.getFrameTime();
 {{preview_heartbeat}}{{tick_code}}    g.tick(dt);
@@ -33,7 +33,6 @@ pub fn main() !void {
     const allocator = std.heap.c_allocator;
     g_allocator = allocator;
 
-{{preview_setup}}
 {{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
     // Note: no defer closeWindow — Emscripten keeps running after main returns.
 
@@ -45,5 +44,5 @@ pub fn main() !void {
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
     g.getCamera().setPosition(0, @as(f32, @floatFromInt(screen_h)));
 
-{{setup_code}}    emscripten.emscripten_set_main_loop(gameFrame, @intCast(target_fps), true);
+{{preview_setup}}{{setup_code}}    emscripten.emscripten_set_main_loop(gameFrame, @intCast(target_fps), true);
 }

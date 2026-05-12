@@ -1,6 +1,6 @@
 const BackendGfxType = @import("backend_gfx");
 
-{{module_vars}}{{preview_module_vars}}var g: AssembledGame = undefined;
+{{module_vars}}var g: AssembledGame = undefined;
 {{hooks_init_block}}
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 

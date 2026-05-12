@@ -1866,18 +1866,20 @@ pub const PLUGINS_IMGUI = struct {
 pub const PREVIEW_MODE = struct {
     // Loop-style lifecycle (raylib / sdl / bgfx / wgpu desktop). Matches
     // the placement in `backends/raylib/templates/desktop.txt` — preview
-    // setup after the allocator decl, heartbeat at the top of the loop.
+    // setup runs AFTER `var g = AssembledGame.init(...)` so it can
+    // assign directly into `g.preview` (labelle-engine#520); heartbeat
+    // sits at the top of the loop.
     const preview_loop_lifecycle =
         \\const screen_w: u32 = {{width}};
         \\const screen_h: u32 = {{height}};
         \\pub fn main() !void {
         \\    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
         \\    const allocator = gpa.allocator();
-        \\{{preview_setup}}
         \\{{hidden_setup}}    var hooks = GameHooks{};
         \\    var g = AssembledGame.init(allocator);
+        \\    defer g.deinit();
         \\    g.setHooks(&hooks);
-        \\{{setup_code}}
+        \\{{preview_setup}}{{setup_code}}
         \\    while (true) {
         \\        const dt: f32 = 0.016;
         \\{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
@@ -1887,14 +1889,15 @@ pub const PREVIEW_MODE = struct {
     ;
 
     // Sokol-style callback lifecycle. Mirrors
-    // `backends/sokol/templates/desktop.txt` placement: module-level
-    // `_preview` decl, preview setup inside `initInner`, heartbeat in
-    // `frame`, sendBye + deinit in `cleanup`.
+    // `backends/sokol/templates/desktop.txt` placement: preview setup
+    // inside `initInner` (after `g = AssembledGame.init(...)`), heartbeat
+    // in `frame`, graceful `bye` in `cleanup`. Game.deinit owns the
+    // socket+arena teardown.
     const preview_sokol_lifecycle =
         \\var g: AssembledGame = undefined;
         \\{{hooks_init_block}}
         \\{{allocator_decl}}
-        \\{{module_vars}}{{preview_module_vars}}
+        \\{{module_vars}}
         \\fn initInner() !void {
         \\    const allocator = {{allocator_expr}};
         \\{{preview_setup}}{{init_code}}}
@@ -1928,14 +1931,19 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.process.argsAlloc(allocator)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.parsePreviewArgs(_argv)") != null);
 
-        // Connect + hello on the happy path.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.Preview.connect(allocator, _ep)") != null);
+        // Connect assigns directly into `g.preview` so Phase 2 ECS
+        // telemetry (labelle-engine#520) can fire from the first scene
+        // load. No local `_preview` holding slot.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.preview = engine.Preview.connect(allocator, _ep)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview:") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(") != null);
 
-        // Clean shutdown via defer (loop backend has a single function scope).
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "defer if (_preview)") != null);
+        // Clean shutdown via defer: only emits the graceful `bye`. The
+        // socket close + arena teardown live inside `Game.deinit`
+        // (registered earlier, so LIFO runs `sendBye` first then deinit).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "defer if (g.preview)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.deinit()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.deinit()") == null);
 
         // PID sent in `hello` is currently a placeholder 0 — the
         // per-OS branch via `std.posix.getpid()` broke on Linux because
@@ -1965,20 +1973,20 @@ pub const PREVIEW_MODE = struct {
         }, preview_sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // Module-level state (callbacks need to share `_preview` across
-        // init/frame/cleanup invocations).
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview: ?engine.Preview = null;") != null);
+        // No module-level `_preview` decl — `g.preview` is the
+        // canonical storage (labelle-engine#520).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview:") == null);
 
-        // initInner handles connect + hello. The argv allocation runs
-        // through an `if/else |_|` rather than a `catch &[_][:0]u8{}`
-        // sentinel — the sentinel form produces a `[]const [:0]u8`
-        // which mismatches `argsFree`'s `[][:0]u8` parameter (PR #95
-        // review). Asserting `if (std.process.argsAlloc...` and the
-        // absence of the empty-sentinel form locks the shape in.
+        // initInner handles connect + hello against `g.preview`. The
+        // argv allocation runs through an `if/else |_|` rather than a
+        // `catch &[_][:0]u8{}` sentinel — the sentinel form produces a
+        // `[]const [:0]u8` which mismatches `argsFree`'s `[][:0]u8`
+        // parameter (PR #95 review). Asserting `if (std.process.argsAlloc...`
+        // and the absence of the empty-sentinel form locks the shape in.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (std.process.argsAlloc(allocator)) |_argv|") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "&[_][:0]u8{}") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.parsePreviewArgs(_argv)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.Preview.connect(allocator, _ep)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.preview = engine.Preview.connect(allocator, _ep)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(") != null);
 
         // PID placeholder 0 (see loop-backend test for rationale).
@@ -1989,10 +1997,11 @@ pub const PREVIEW_MODE = struct {
         // frame tick fires the heartbeat (rate-limit inside tickHeartbeat).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
 
-        // cleanup callback sends bye + deinit (no `defer` in callback
-        // backends — the function scope ends before sokol exits).
+        // cleanup callback only emits the graceful `bye`. The actual
+        // socket + arena teardown lives in `g.deinit()` (called by
+        // `{{cleanup_code}}` immediately after) per labelle-engine#520.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.deinit();") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.deinit()") == null);
 
         // AST parses cleanly.
         const dup = try std.testing.allocator.dupeZ(u8, main_zig);
