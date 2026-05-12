@@ -257,6 +257,17 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
             try w.print("    g.registerSceneSimple(\"{s}\", jsonc_{s}_loader);\n", .{ name, ident });
         }
 
+        // Embed every scene's JSONC source under its include-relative
+        // path so `"include": [...]` directives resolve against memory
+        // instead of `std.fs.cwd().openFile(...)`. Desktop works either
+        // way (cwd is the project root), but WASM and Android have no
+        // project directory in the working dir, so a scene that
+        // includes another fragment would FileNotFound at runtime
+        // without this — see labelle-toolkit/labelle-cli#200.
+        for (jsonc_scene_names) |name| {
+            try w.print("    try g.addEmbeddedSceneSource(\"scenes/{s}.jsonc\", @embedFile(\"scenes/{s}.jsonc\"));\n", .{ name, name });
+        }
+
         // Attach parsed asset manifests (Asset Streaming RFC #437 /
         // labelle-engine#445). The comptime `SceneAssetManifests` struct is
         // emitted into this file by `writeSceneAssetManifests` — each
@@ -531,6 +542,14 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
         for (jsonc_scene_names) |name| {
             const ident = pathToIdent(name, &jsonc_ident_buf);
             try w.print("    g.registerSceneSimple(\"{s}\", jsonc_{s}_loader);\n", .{ name, ident });
+        }
+
+        // Embed every scene's JSONC source so `"include"` directives
+        // resolve against memory on WASM (no filesystem access for
+        // project files). See `buildSetupCode` for full rationale and
+        // labelle-toolkit/labelle-cli#200 for the failure this fixes.
+        for (jsonc_scene_names) |name| {
+            try w.print("    g.addEmbeddedSceneSource(\"scenes/{s}.jsonc\", @embedFile(\"scenes/{s}.jsonc\")) catch @panic(\"failed to register embedded scene source\");\n", .{ name, name });
         }
 
         // Attach parsed asset manifests — mirrors the loop-based setup path.
