@@ -346,65 +346,63 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
 // that's universal across our backends.
 
 /// In-function preview setup for loop-style main()s. Parses argv,
-/// dials the editor, sends `hello`, defers `bye` + `deinit`. Pasted
-/// after `const allocator = ...` and before the main game loop.
+/// dials the editor, assigns directly into `g.preview`, sends `hello`.
+/// Pasted AFTER `var g = AssembledGame.init(...)` so the engine's
+/// ECS lifecycle (createEntity / destroyEntity / addComponent) can
+/// emit Phase 2 telemetry from the very first scene load
+/// (labelle-engine#520).
+///
+/// Ownership note: `Game.deinit` owns the `Preview` teardown. The
+/// `defer` here only emits the graceful `bye` frame; the socket
+/// close + arena deinit run inside `g.deinit()` (registered earlier
+/// in the same scope, so LIFO runs `sendBye` first, then `g.deinit`).
 const PREVIEW_LOOP_SETUP =
-    \\    // ── Preview mode (labelle-assembler#94) ──
+    \\    // ── Preview mode (labelle-assembler#94, labelle-engine#520) ──
     \\    // Connect to the editor's TCP listener when launched with
     \\    // `--preview-mode <host:port>`. Absent → no-op.
-    \\    const _argv = try std.process.argsAlloc(allocator);
-    \\    defer std.process.argsFree(allocator, _argv);
-    \\    var _preview: ?engine.Preview = null;
-    \\    if (engine.parsePreviewArgs(_argv)) |_ep| {
-    \\        _preview = engine.Preview.connect(allocator, _ep) catch |err| blk: {
-    \\            std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _ep, @errorName(err) });
-    \\            break :blk null;
-    \\        };
-    \\        if (_preview) |*_p| {
-    \\            // PID 0 is a placeholder — see preview note in main_zig.zig.
-    \\            _p.sendHello("labelle-engine", 0) catch {};
+    \\    {
+    \\        const _argv = try std.process.argsAlloc(allocator);
+    \\        defer std.process.argsFree(allocator, _argv);
+    \\        if (engine.parsePreviewArgs(_argv)) |_ep| {
+    \\            g.preview = engine.Preview.connect(allocator, _ep) catch |err| blk: {
+    \\                std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _ep, @errorName(err) });
+    \\                break :blk null;
+    \\            };
+    \\            if (g.preview) |*_p| {
+    \\                // PID 0 is a placeholder — see preview note in main_zig.zig.
+    \\                _p.sendHello("labelle-engine", 0) catch {};
+    \\            }
     \\        }
     \\    }
-    \\    defer if (_preview) |*_p| {
-    \\        _p.sendBye(.normal) catch {};
-    \\        _p.deinit();
-    \\    };
+    \\    defer if (g.preview) |*_p| _p.sendBye(.normal) catch {};
     \\
 ;
 
 /// Heartbeat tick — rate-limited inside `tickHeartbeat`. Safe to
 /// call every frame; ~4 Hz on the wire regardless of FPS.
 const PREVIEW_HEARTBEAT_LOOP =
-    \\        if (_preview) |*_p| _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
+    \\        if (g.preview) |*_p| _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
     \\
 ;
 
-/// Module-level decl for callback backends. `_preview` outlives any
-/// one callback so init/frame/cleanup can share it.
-const PREVIEW_MODULE_VARS =
-    \\var _preview: ?engine.Preview = null;
-    \\
-;
-
-/// Init-callback preview block. Runs once at startup; argv has
-/// already been routed through the platform's entry, so we go via
-/// `std.process.argsAlloc` here too. Same shape as the loop variant
-/// minus the `defer` (cleanup lives in the cleanup callback).
+/// Init-callback preview block. Runs once at startup, AFTER
+/// `g = AssembledGame.init(...)` — `g.preview` is the canonical
+/// storage; no module-level `_preview` needed.
 ///
 /// Note: the original `catch &[_][:0]u8{}` form gave `_argv` a
 /// `[]const [:0]u8` type, which doesn't satisfy `argsFree`'s
 /// `[][:0]u8` parameter. The `if/else |_|` shape pulls the alloc
 /// success path into its own scope where `_argv`'s type matches.
 const PREVIEW_INIT_CALLBACK =
-    \\    // ── Preview mode (labelle-assembler#94) ──
+    \\    // ── Preview mode (labelle-assembler#94, labelle-engine#520) ──
     \\    if (std.process.argsAlloc(allocator)) |_argv| {
     \\        defer std.process.argsFree(allocator, _argv);
     \\        if (engine.parsePreviewArgs(_argv)) |_ep| {
-    \\            _preview = engine.Preview.connect(allocator, _ep) catch |err| blk: {
+    \\            g.preview = engine.Preview.connect(allocator, _ep) catch |err| blk: {
     \\                std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _ep, @errorName(err) });
     \\                break :blk null;
     \\            };
-    \\            if (_preview) |*_p| {
+    \\            if (g.preview) |*_p| {
     \\                // PID 0 is a placeholder — see preview note in main_zig.zig.
     \\                _p.sendHello("labelle-engine", 0) catch {};
     \\            }
@@ -413,15 +411,12 @@ const PREVIEW_INIT_CALLBACK =
     \\
 ;
 
-/// Cleanup-callback preview teardown. Mirrors the `defer` in the loop
-/// setup. Best-effort `sendBye` — failure to write is fine, the editor
-/// reads EOF either way (see preview_mode.zig docs).
+/// Cleanup-callback preview teardown. Only emits the graceful `bye`
+/// frame — `Game.deinit` (called by `{{cleanup_code}}` immediately
+/// after) owns the actual socket + arena teardown
+/// (labelle-engine#520).
 const PREVIEW_CLEANUP_CALLBACK =
-    \\    if (_preview) |*_p| {
-    \\        _p.sendBye(.normal) catch {};
-    \\        _p.deinit();
-    \\        _preview = null;
-    \\    }
+    \\    if (g.preview) |*_p| _p.sendBye(.normal) catch {};
     \\
 ;
 
@@ -429,7 +424,7 @@ const PREVIEW_CLEANUP_CALLBACK =
 /// the loop variant, since sokol's `frame` body sits at function scope
 /// not inside a `while`).
 const PREVIEW_HEARTBEAT_CALLBACK =
-    \\    if (_preview) |*_p| _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
+    \\    if (g.preview) |*_p| _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
     \\
 ;
 
@@ -1278,10 +1273,11 @@ pub fn generateMainZigFromTemplate(
                     .allocator_decl = allocator_decl,
                     .allocator_expr = allocator_expr,
                     .allocator_cleanup = allocator_cleanup,
-                    // Preview-mode wiring (labelle-assembler#94). Sokol
-                    // hoists `_preview` to module scope so init/frame/
-                    // cleanup can share it across callback invocations.
-                    .preview_module_vars = PREVIEW_MODULE_VARS,
+                    // Preview-mode wiring (labelle-assembler#94,
+                    // labelle-engine#520). `g.preview` is the canonical
+                    // storage; init dials + assigns, frame heartbeats,
+                    // cleanup emits the graceful `bye`, and `g.deinit`
+                    // owns the socket + arena teardown.
                     .preview_setup = PREVIEW_INIT_CALLBACK,
                     .preview_heartbeat = PREVIEW_HEARTBEAT_CALLBACK,
                     .preview_cleanup = PREVIEW_CLEANUP_CALLBACK,
@@ -1302,7 +1298,6 @@ pub fn generateMainZigFromTemplate(
                     .gui_draw_code = gui_draw_code,
                     .hidden_setup = hidden_setup,
                     .hooks_init_block = hooks_init,
-                    .preview_module_vars = PREVIEW_MODULE_VARS,
                     .preview_setup = PREVIEW_INIT_CALLBACK,
                     .preview_heartbeat = PREVIEW_HEARTBEAT_CALLBACK,
                 }, bw);

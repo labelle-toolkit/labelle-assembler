@@ -3,7 +3,7 @@ const BackendGfxType = @import("backend_gfx");
 var g: AssembledGame = undefined;
 {{hooks_init_block}}
 {{allocator_decl}}
-{{module_vars}}{{preview_module_vars}}
+{{module_vars}}
 const screen_w: u32 = {{width}};
 const screen_h: u32 = {{height}};
 const screen_title = "{{title}}";
