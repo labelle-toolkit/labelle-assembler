@@ -177,6 +177,15 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     emcc_settings.put("ALLOW_MEMORY_GROWTH", "1") catch unreachable;
+    // Match the sokol-wasm 512 KB stack (default is 64 KB and the
+    // engine's scene-load + atlas-decode path is documented to
+    // overflow it into the WASM `.data` segment — concrete cause and
+    // fix in labelle-toolkit/labelle-cli#201 / labelle-toolkit/
+    // labelle-assembler#100). Apply to raylib_wasm too: raylib's
+    // current example happens to fit under 64 KB only because it
+    // ships a single small atlas; a deeper scene would hit the
+    // same corruption.
+    emcc_settings.put("STACK_SIZE", "524288") catch unreachable;
     const install_dir: std.Build.InstallDir = .{ .custom = "web" };
     const emcc_step = emsdk.emccStep(b, raylib_artifact, wasm, .{
         .optimize = optimize,
