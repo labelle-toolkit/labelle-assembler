@@ -8,6 +8,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+{{preview_setup}}
 {{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
     defer window.closeWindow();
     window.setTargetFPS(target_fps);
@@ -23,7 +24,7 @@ pub fn main() !void {
 {{setup_code}}
     while (!window.windowShouldClose()) {
         const dt: f32 = 0.016;
-{{tick_code}}        g.tick(dt);
+{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
 
         window.beginDrawing();
         window.clearBackground(245, 245, 245, 255);

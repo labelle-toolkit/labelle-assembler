@@ -1849,3 +1849,156 @@ pub const PLUGINS_IMGUI = struct {
         try std.testing.expect(std.mem.indexOf(u8, plugin_build, "addModule(\"gui\"") == null);
     }
 };
+
+// ── Preview mode (PIE Phase 1, labelle-assembler#94) ──────────────────
+//
+// Every generated main.zig must wire `--preview-mode <host:port>` argv
+// parsing + the `engine.Preview` lifecycle so the labelle-gui editor can
+// connect to a running game without per-backend opt-in. Engine primitives
+// land in labelle-engine#517 — this is the assembler-side codegen that
+// actually calls them. Acceptance is in the ticket body of #94.
+//
+// The real backend templates carry the `{{preview_setup}}` /
+// `{{preview_heartbeat}}` / `{{preview_module_vars}}` /
+// `{{preview_cleanup}}` placeholders. The test uses a mini inline
+// lifecycle that mirrors the placement so the assertions check codegen
+// without dragging the full raylib/sokol template surface into the test.
+pub const PREVIEW_MODE = struct {
+    // Loop-style lifecycle (raylib / sdl / bgfx / wgpu desktop). Matches
+    // the placement in `backends/raylib/templates/desktop.txt` — preview
+    // setup after the allocator decl, heartbeat at the top of the loop.
+    const preview_loop_lifecycle =
+        \\const screen_w: u32 = {{width}};
+        \\const screen_h: u32 = {{height}};
+        \\pub fn main() !void {
+        \\    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        \\    const allocator = gpa.allocator();
+        \\{{preview_setup}}
+        \\{{hidden_setup}}    var hooks = GameHooks{};
+        \\    var g = AssembledGame.init(allocator);
+        \\    g.setHooks(&hooks);
+        \\{{setup_code}}
+        \\    while (true) {
+        \\        const dt: f32 = 0.016;
+        \\{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
+        \\{{gui_draw_code}}    }
+        \\}
+        \\
+    ;
+
+    // Sokol-style callback lifecycle. Mirrors
+    // `backends/sokol/templates/desktop.txt` placement: module-level
+    // `_preview` decl, preview setup inside `initInner`, heartbeat in
+    // `frame`, sendBye + deinit in `cleanup`.
+    const preview_sokol_lifecycle =
+        \\var g: AssembledGame = undefined;
+        \\{{hooks_init_block}}
+        \\{{allocator_decl}}
+        \\{{module_vars}}{{preview_module_vars}}
+        \\fn initInner() !void {
+        \\    const allocator = {{allocator_expr}};
+        \\{{preview_setup}}{{init_code}}}
+        \\
+        \\export fn init() callconv(.c) void {
+        \\    g = AssembledGame.init({{allocator_expr}});
+        \\    g.setHooks(&hooks);
+        \\    initInner() catch unreachable;
+        \\}
+        \\
+        \\export fn frame() callconv(.c) void {
+        \\    const dt: f32 = 0.016;
+        \\{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
+        \\{{gui_draw_code}}}
+        \\
+        \\export fn cleanup() callconv(.c) void {
+        \\{{preview_cleanup}}{{cleanup_code}}    g.deinit();
+        \\{{allocator_cleanup}}}
+        \\
+    ;
+
+    test "loop backend emits argv parse + Preview lifecycle + heartbeat" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, preview_loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Argv parser is wired through the engine's re-export.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.process.argsAlloc(allocator)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.parsePreviewArgs(_argv)") != null);
+
+        // Connect + hello on the happy path.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.Preview.connect(allocator, _ep)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(") != null);
+
+        // Clean shutdown via defer (loop backend has a single function scope).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "defer if (_preview)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.deinit()") != null);
+
+        // PID sent in `hello` is currently a placeholder 0 — the
+        // per-OS branch via `std.posix.getpid()` broke on Linux because
+        // that function isn't on `std.posix` in Zig 0.15.2's stdlib.
+        // Diagnostic value only; editor doesn't depend on the real PID.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.system.getpid()") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.getpid()") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(\"labelle-engine\", 0)") != null);
+
+        // Heartbeat inside the frame loop — rate-limited inside
+        // tickHeartbeat itself, so a per-tick call is safe.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
+
+        // Generated source must still be parseable.
+        const dup = try std.testing.allocator.dupeZ(u8, main_zig);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "sokol callback backend emits module-level Preview + init/frame/cleanup wiring" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, preview_sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Module-level state (callbacks need to share `_preview` across
+        // init/frame/cleanup invocations).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview: ?engine.Preview = null;") != null);
+
+        // initInner handles connect + hello. The argv allocation runs
+        // through an `if/else |_|` rather than a `catch &[_][:0]u8{}`
+        // sentinel — the sentinel form produces a `[]const [:0]u8`
+        // which mismatches `argsFree`'s `[][:0]u8` parameter (PR #95
+        // review). Asserting `if (std.process.argsAlloc...` and the
+        // absence of the empty-sentinel form locks the shape in.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (std.process.argsAlloc(allocator)) |_argv|") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "&[_][:0]u8{}") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.parsePreviewArgs(_argv)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.Preview.connect(allocator, _ep)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(") != null);
+
+        // PID placeholder 0 (see loop-backend test for rationale).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.system.getpid()") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.posix.getpid()") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(\"labelle-engine\", 0)") != null);
+
+        // frame tick fires the heartbeat (rate-limit inside tickHeartbeat).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
+
+        // cleanup callback sends bye + deinit (no `defer` in callback
+        // backends — the function scope ends before sokol exits).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.deinit();") != null);
+
+        // AST parses cleanly.
+        const dup = try std.testing.allocator.dupeZ(u8, main_zig);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+};

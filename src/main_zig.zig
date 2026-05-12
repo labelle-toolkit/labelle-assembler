@@ -313,6 +313,126 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     return buf.toOwnedSlice(allocator);
 }
 
+// ============================================================
+// Preview-mode codegen (PIE Phase 1, labelle-assembler#94)
+// ============================================================
+//
+// Emit the `--preview-mode <host:port>` argv parser + `engine.Preview`
+// lifecycle into every generated `main.zig`. The engine ships the
+// primitives in `labelle-engine/src/preview_mode.zig` (re-exported via
+// `engine.parsePreviewArgs` / `engine.Preview`) — this is the
+// assembler's job of actually calling them at the right places.
+//
+// Loop backends (raylib desktop, sdl, bgfx, wgpu) get a single
+// in-function block before the main loop plus a heartbeat call inside
+// the loop body. Callback backends (sokol, raylib wasm) hoist
+// `_preview` to module scope so `init` can connect, `frame` can
+// heartbeat, and `cleanup` can sendBye + deinit cleanly.
+//
+// All snippets are emit-always: when `--preview-mode` is absent the
+// runtime parse returns null and the rest of the block compiles down
+// to a no-op `if (null) ...`. Keeping it unconditional avoids a
+// project.labelle opt-in flag and matches the umbrella's "every
+// generated binary speaks preview" intent (labelle-gui#59).
+
+// PID is purely informational in the `hello` message — the editor
+// uses it for UI display, not for any process management. Earlier
+// snippets tried a per-OS comptime branch (`std.posix.getpid()` on
+// POSIX, kernel32 on Windows) but `std.posix.getpid` isn't exposed
+// in Zig 0.15.2's stdlib (only `std.os.linux.getpid` and
+// `std.c.getpid` exist, and the latter requires linking libc which
+// not every backend does). Simplest portable fix: send 0. A
+// follow-up can wire the real PID once we settle on a stdlib import
+// that's universal across our backends.
+
+/// In-function preview setup for loop-style main()s. Parses argv,
+/// dials the editor, sends `hello`, defers `bye` + `deinit`. Pasted
+/// after `const allocator = ...` and before the main game loop.
+const PREVIEW_LOOP_SETUP =
+    \\    // ── Preview mode (labelle-assembler#94) ──
+    \\    // Connect to the editor's TCP listener when launched with
+    \\    // `--preview-mode <host:port>`. Absent → no-op.
+    \\    const _argv = try std.process.argsAlloc(allocator);
+    \\    defer std.process.argsFree(allocator, _argv);
+    \\    var _preview: ?engine.Preview = null;
+    \\    if (engine.parsePreviewArgs(_argv)) |_ep| {
+    \\        _preview = engine.Preview.connect(allocator, _ep) catch |err| blk: {
+    \\            std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _ep, @errorName(err) });
+    \\            break :blk null;
+    \\        };
+    \\        if (_preview) |*_p| {
+    \\            // PID 0 is a placeholder — see preview note in main_zig.zig.
+    \\            _p.sendHello("labelle-engine", 0) catch {};
+    \\        }
+    \\    }
+    \\    defer if (_preview) |*_p| {
+    \\        _p.sendBye(.normal) catch {};
+    \\        _p.deinit();
+    \\    };
+    \\
+;
+
+/// Heartbeat tick — rate-limited inside `tickHeartbeat`. Safe to
+/// call every frame; ~4 Hz on the wire regardless of FPS.
+const PREVIEW_HEARTBEAT_LOOP =
+    \\        if (_preview) |*_p| _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
+    \\
+;
+
+/// Module-level decl for callback backends. `_preview` outlives any
+/// one callback so init/frame/cleanup can share it.
+const PREVIEW_MODULE_VARS =
+    \\var _preview: ?engine.Preview = null;
+    \\
+;
+
+/// Init-callback preview block. Runs once at startup; argv has
+/// already been routed through the platform's entry, so we go via
+/// `std.process.argsAlloc` here too. Same shape as the loop variant
+/// minus the `defer` (cleanup lives in the cleanup callback).
+///
+/// Note: the original `catch &[_][:0]u8{}` form gave `_argv` a
+/// `[]const [:0]u8` type, which doesn't satisfy `argsFree`'s
+/// `[][:0]u8` parameter. The `if/else |_|` shape pulls the alloc
+/// success path into its own scope where `_argv`'s type matches.
+const PREVIEW_INIT_CALLBACK =
+    \\    // ── Preview mode (labelle-assembler#94) ──
+    \\    if (std.process.argsAlloc(allocator)) |_argv| {
+    \\        defer std.process.argsFree(allocator, _argv);
+    \\        if (engine.parsePreviewArgs(_argv)) |_ep| {
+    \\            _preview = engine.Preview.connect(allocator, _ep) catch |err| blk: {
+    \\                std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _ep, @errorName(err) });
+    \\                break :blk null;
+    \\            };
+    \\            if (_preview) |*_p| {
+    \\                // PID 0 is a placeholder — see preview note in main_zig.zig.
+    \\                _p.sendHello("labelle-engine", 0) catch {};
+    \\            }
+    \\        }
+    \\    } else |_| {}
+    \\
+;
+
+/// Cleanup-callback preview teardown. Mirrors the `defer` in the loop
+/// setup. Best-effort `sendBye` — failure to write is fine, the editor
+/// reads EOF either way (see preview_mode.zig docs).
+const PREVIEW_CLEANUP_CALLBACK =
+    \\    if (_preview) |*_p| {
+    \\        _p.sendBye(.normal) catch {};
+    \\        _p.deinit();
+    \\        _preview = null;
+    \\    }
+    \\
+;
+
+/// Heartbeat for sokol's frame callback (one extra indent level vs.
+/// the loop variant, since sokol's `frame` body sits at function scope
+/// not inside a `while`).
+const PREVIEW_HEARTBEAT_CALLBACK =
+    \\    if (_preview) |*_p| _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
+    \\
+;
+
 /// Build the GUI draw code for {{gui_draw_code}}.
 fn buildGuiDrawCode(allocator: std.mem.Allocator, cfg: ProjectConfig, view_names: []const []const u8) ![]const u8 {
     var buf = std.ArrayList(u8){};
@@ -1158,8 +1278,20 @@ pub fn generateMainZigFromTemplate(
                     .allocator_decl = allocator_decl,
                     .allocator_expr = allocator_expr,
                     .allocator_cleanup = allocator_cleanup,
+                    // Preview-mode wiring (labelle-assembler#94). Sokol
+                    // hoists `_preview` to module scope so init/frame/
+                    // cleanup can share it across callback invocations.
+                    .preview_module_vars = PREVIEW_MODULE_VARS,
+                    .preview_setup = PREVIEW_INIT_CALLBACK,
+                    .preview_heartbeat = PREVIEW_HEARTBEAT_CALLBACK,
+                    .preview_cleanup = PREVIEW_CLEANUP_CALLBACK,
                 }, bw);
             } else {
+                // Raylib wasm: emscripten-driven callback loop. Preview
+                // setup runs once in main() before the loop is handed
+                // to emscripten; heartbeats fire inside `gameFrame`.
+                // No cleanup callback — emscripten keeps running after
+                // main returns, and the editor reads EOF on tab close.
                 try tpl.render(lifecycle_tmpl, .{
                     .width = w_str,
                     .height = h_str,
@@ -1170,6 +1302,9 @@ pub fn generateMainZigFromTemplate(
                     .gui_draw_code = gui_draw_code,
                     .hidden_setup = hidden_setup,
                     .hooks_init_block = hooks_init,
+                    .preview_module_vars = PREVIEW_MODULE_VARS,
+                    .preview_setup = PREVIEW_INIT_CALLBACK,
+                    .preview_heartbeat = PREVIEW_HEARTBEAT_CALLBACK,
                 }, bw);
             }
         } else {
@@ -1186,6 +1321,11 @@ pub fn generateMainZigFromTemplate(
                 .gui_draw_code = gui_draw_code,
                 .hidden_setup = hidden_setup,
                 .hooks_init_block = hooks_init,
+                // Preview-mode wiring (labelle-assembler#94). Always
+                // emitted; runtime parse returns null when the flag is
+                // absent so the block is a no-op for non-preview runs.
+                .preview_setup = PREVIEW_LOOP_SETUP,
+                .preview_heartbeat = PREVIEW_HEARTBEAT_LOOP,
             }, bw);
         }
 
