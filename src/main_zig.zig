@@ -380,8 +380,19 @@ const PREVIEW_LOOP_SETUP =
 
 /// Heartbeat tick — rate-limited inside `tickHeartbeat`. Safe to
 /// call every frame; ~4 Hz on the wire regardless of FPS.
+///
+/// `pollSubscription` runs first so a malformed subscribe frame
+/// doesn't poison the same flush as the heartbeat write. It's
+/// non-blocking (peeks the socket via `EAGAIN`) and drains any
+/// `subscribe` / `unsubscribe` JSON lines the editor sent since
+/// the last tick — without it the engine never reads the
+/// `subscribed_components` set that gates `component_changed`
+/// frames (labelle-engine#520 paired with labelle-assembler#96).
 const PREVIEW_HEARTBEAT_LOOP =
-    \\        if (g.preview) |*_p| _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
+    \\        if (g.preview) |*_p| {
+    \\            _p.pollSubscription() catch {};
+    \\            _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
+    \\        }
     \\
 ;
 
@@ -423,8 +434,16 @@ const PREVIEW_CLEANUP_CALLBACK =
 /// Heartbeat for sokol's frame callback (one extra indent level vs.
 /// the loop variant, since sokol's `frame` body sits at function scope
 /// not inside a `while`).
+///
+/// Same poll-before-write ordering as the loop variant: drain any
+/// `subscribe` / `unsubscribe` frames the editor sent BEFORE the
+/// heartbeat write so a malformed subscription can't poison the
+/// outbound flush. See the loop variant for the full rationale.
 const PREVIEW_HEARTBEAT_CALLBACK =
-    \\    if (g.preview) |*_p| _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
+    \\    if (g.preview) |*_p| {
+    \\        _p.pollSubscription() catch {};
+    \\        _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
+    \\    }
     \\
 ;
 
