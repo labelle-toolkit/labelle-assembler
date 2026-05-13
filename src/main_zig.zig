@@ -336,11 +336,9 @@ pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}        const engine_params: *const engine.FontBakeParams = @ptrCast(@alignCast(params orelse return error.FontBakeParamsMissing));\n", .{indent});
     try w.print("{s}        const backend_params: BackendGfx.FontBakeParams = .{{\n", .{indent});
     try w.print("{s}            .pixel_height = engine_params.pixel_height,\n", .{indent});
+    try w.print("{s}            .ranges = engine_params.ranges,\n", .{indent});
     try w.print("{s}            .atlas_width = engine_params.atlas_width,\n", .{indent});
     try w.print("{s}            .atlas_height = engine_params.atlas_height,\n", .{indent});
-    try w.print("{s}            .codepoint_ranges = engine_params.codepoint_ranges,\n", .{indent});
-    try w.print("{s}            .oversample_h = engine_params.oversample_h,\n", .{indent});
-    try w.print("{s}            .oversample_v = engine_params.oversample_v,\n", .{indent});
     try w.print("{s}        }};\n", .{indent});
     try w.print("{s}        const d = try BackendGfx.decodeFont(file_type, data, &backend_params, alloc);\n", .{indent});
     try w.print("{s}        return .{{\n", .{indent});
@@ -455,6 +453,198 @@ fn writePluginControllersBlock(bw: anytype, cfg: ProjectConfig) !void {
 }
 
 /// Build the setup code block for {{setup_code}} (loop-based backends).
+/// Wrapper style for `emitResourceLoad`. The two callers differ only
+/// in how they propagate load failures:
+///
+/// - `try_style` — used by `buildSetupCode`, whose enclosing function
+///   returns `!void`. Emits `try g.loadXxxFromMemory(...);`.
+/// - `catch_panic_style` — used by `buildCallbackInitCode`, whose
+///   sokol-callback host has no error channel to unwind into. Emits
+///   `g.loadXxxFromMemory(...) catch @panic("failed to load ...");`.
+const LoadStyle = enum { try_style, catch_panic_style };
+
+/// Strip the leading dot from a path extension. `".wav"` → `"wav"`,
+/// `""` / `"."` → `""`. Matches the contract of
+/// `Game.registerSoundFromMemory` / `registerFontFromMemory`'s
+/// `file_type` parameter (lower-case extension without the dot).
+fn extWithoutDot(path: []const u8) []const u8 {
+    const ext = std.fs.path.extension(path);
+    if (ext.len <= 1) return "";
+    return ext[1..];
+}
+
+/// Returns true iff `name` is a valid bare Zig identifier — first
+/// character `[A-Za-z_]`, rest `[A-Za-z0-9_]`. Doesn't reject Zig
+/// keywords; in practice resource names like `fn` are vanishingly
+/// rare and the resulting compile error names the line clearly.
+///
+/// Font resources need this guard because `emitResourceLoad` for
+/// `.font` interpolates the resource name into Zig identifier
+/// positions (`{name}_ranges`, `{name}_params`) — a hyphenated name
+/// like `"ui-font"` would generate `const ui-font_ranges = ...`, which
+/// is uncompilable. Atlas + sound emissions only place names inside
+/// string literals so they're unaffected. Bugbot caught the gap on
+/// #105.
+fn isValidZigIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const first = name[0];
+    const first_ok = (first >= 'A' and first <= 'Z') or (first >= 'a' and first <= 'z') or first == '_';
+    if (!first_ok) return false;
+    for (name[1..]) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Emit the loader call for one `ResourceDef`, dispatching on
+/// `res.kind()`:
+///
+/// - `.atlas` → `g.{load,register}AtlasFromMemory(name, json, png, ".png")`
+/// - `.sound` → `g.{load,register}SoundFromMemory(name, ext, bytes)`
+/// - `.font`  → emits `{name}_ranges` const array + `{name}_params`
+///   const struct, then `g.{load,register}FontFromMemory(name, ext,
+///   bytes, &{name}_params)`. Materialising the params as a local
+///   `engine.FontBakeParams` lets the catalog's `WorkRequest.params`
+///   slot point at it without a runtime allocation; the const lives
+///   on the stack frame for `main()`'s lifetime.
+///
+/// Caller has already validated `res.kind() != .invalid` via
+/// `validateResources` — this function returns `error.InvalidResourceDef`
+/// if reached anyway to guard against future call-site additions.
+fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
+    const is_lazy = res.lazy orelse false;
+    switch (res.kind()) {
+        .atlas => {
+            const fn_name = if (is_lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
+            switch (style) {
+                .try_style => try w.print(
+                    "    try g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n",
+                    .{ fn_name, res.name, res.json, res.texture },
+                ),
+                .catch_panic_style => try w.print(
+                    "    g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas: {s}\");\n",
+                    .{ fn_name, res.name, res.json, res.texture, res.name },
+                ),
+            }
+        },
+        .sound => {
+            const fn_name = if (is_lazy) "registerSoundFromMemory" else "loadSoundFromMemory";
+            const ext = extWithoutDot(res.sound);
+            switch (style) {
+                .try_style => try w.print(
+                    "    try g.{s}(\"{s}\", \"{s}\", @embedFile(\"{s}\"));\n",
+                    .{ fn_name, res.name, ext, res.sound },
+                ),
+                .catch_panic_style => try w.print(
+                    "    g.{s}(\"{s}\", \"{s}\", @embedFile(\"{s}\")) catch @panic(\"failed to load sound: {s}\");\n",
+                    .{ fn_name, res.name, ext, res.sound, res.name },
+                ),
+            }
+        },
+        .font => {
+            const fn_name = if (is_lazy) "registerFontFromMemory" else "loadFontFromMemory";
+            const ext = extWithoutDot(res.font);
+            const params = res.font_params orelse @import("config.zig").FontBakeParams{};
+            // Materialise FontBakeParams locally so the slice field has
+            // a real address to point at. The trailing const sits in
+            // main()'s frame until process exit — same lifetime as
+            // `@embedFile` bytes on the catalog side.
+            try w.print("    const {s}_ranges = [_]engine.CodepointRange{{\n", .{res.name});
+            for (params.ranges) |r| {
+                try w.print("        .{{ .first = 0x{X}, .last = 0x{X} }},\n", .{ r.first, r.last });
+            }
+            try w.print("    }};\n", .{});
+            try w.print(
+                "    const {s}_params: engine.FontBakeParams = .{{ .pixel_height = {d}, .ranges = &{s}_ranges, .atlas_width = {d}, .atlas_height = {d} }};\n",
+                .{ res.name, params.pixel_height, res.name, params.atlas_width, params.atlas_height },
+            );
+            switch (style) {
+                .try_style => try w.print(
+                    "    try g.{s}(\"{s}\", \"{s}\", @embedFile(\"{s}\"), &{s}_params);\n",
+                    .{ fn_name, res.name, ext, res.font, res.name },
+                ),
+                .catch_panic_style => try w.print(
+                    "    g.{s}(\"{s}\", \"{s}\", @embedFile(\"{s}\"), &{s}_params) catch @panic(\"failed to load font: {s}\");\n",
+                    .{ fn_name, res.name, ext, res.font, res.name, res.name },
+                ),
+            }
+        },
+        .invalid => return error.InvalidResourceDef,
+    }
+}
+
+/// Pre-emission validation pass over `cfg.resources`. Surfaces every
+/// malformed entry as a stderr diagnostic and returns `error.InvalidResource`
+/// after the first one — the user sees the offending resource name and
+/// what's wrong before any codegen happens. The CLI maps the structured
+/// errors from `ResourceDef.validate()` to actionable hints.
+fn validateResources(cfg: ProjectConfig) !void {
+    for (cfg.resources) |res| {
+        switch (res.validate()) {
+            .ok => {},
+            .no_path => {
+                std.fs.File.stderr().writeAll("labelle-assembler: resource '") catch {};
+                std.fs.File.stderr().writeAll(res.name) catch {};
+                std.fs.File.stderr().writeAll("' declares no asset path. Set one of `.json`+`.texture` (atlas), `.sound` (.wav/.ogg), or `.font` (.ttf/.otf).\n") catch {};
+                return error.InvalidResource;
+            },
+            .multiple_paths => {
+                std.fs.File.stderr().writeAll("labelle-assembler: resource '") catch {};
+                std.fs.File.stderr().writeAll(res.name) catch {};
+                std.fs.File.stderr().writeAll("' sets more than one asset path. A resource is exactly one of atlas / sound / font.\n") catch {};
+                return error.InvalidResource;
+            },
+            .atlas_incomplete => {
+                std.fs.File.stderr().writeAll("labelle-assembler: atlas resource '") catch {};
+                std.fs.File.stderr().writeAll(res.name) catch {};
+                std.fs.File.stderr().writeAll("' is missing either `.json` or `.texture`. Both are required.\n") catch {};
+                return error.InvalidResource;
+            },
+            .font_params_misplaced => {
+                std.fs.File.stderr().writeAll("labelle-assembler: resource '") catch {};
+                std.fs.File.stderr().writeAll(res.name) catch {};
+                std.fs.File.stderr().writeAll("' sets `.font_params` but is not a font resource. Remove `.font_params` or change to `.font = \"...\"`.\n") catch {};
+                return error.InvalidResource;
+            },
+        }
+        // Extension sanity for sound/font — surfaces obviously-wrong
+        // extensions (e.g. `.font = "x.png"`) at codegen time instead
+        // of letting the generated `@embedFile` swallow it silently
+        // alongside an empty file_type string.
+        if (res.kind() == .sound) {
+            const ext = extWithoutDot(res.sound);
+            if (!std.mem.eql(u8, ext, "wav") and !std.mem.eql(u8, ext, "ogg")) {
+                std.fs.File.stderr().writeAll("labelle-assembler: sound resource '") catch {};
+                std.fs.File.stderr().writeAll(res.name) catch {};
+                std.fs.File.stderr().writeAll("' has unsupported extension. Expected `.wav` or `.ogg`.\n") catch {};
+                return error.UnsupportedResourceExtension;
+            }
+        }
+        if (res.kind() == .font) {
+            const ext = extWithoutDot(res.font);
+            if (!std.mem.eql(u8, ext, "ttf") and !std.mem.eql(u8, ext, "otf")) {
+                std.fs.File.stderr().writeAll("labelle-assembler: font resource '") catch {};
+                std.fs.File.stderr().writeAll(res.name) catch {};
+                std.fs.File.stderr().writeAll("' has unsupported extension. Expected `.ttf` or `.otf`.\n") catch {};
+                return error.UnsupportedResourceExtension;
+            }
+            // Font emission interpolates `res.name` into Zig
+            // identifier positions (`{name}_ranges`, `{name}_params`).
+            // A hyphenated name like "ui-font" would otherwise produce
+            // uncompilable `const ui-font_ranges = ...`. Atlas + sound
+            // emissions don't have this constraint — those names only
+            // appear in string literals.
+            if (!isValidZigIdentifier(res.name)) {
+                std.fs.File.stderr().writeAll("labelle-assembler: font resource '") catch {};
+                std.fs.File.stderr().writeAll(res.name) catch {};
+                std.fs.File.stderr().writeAll("' has a name that is not a valid Zig identifier. Font resource names must start with [A-Za-z_] and contain only [A-Za-z0-9_] thereafter (the codegen uses the name as a local const identifier for the bake params).\n") catch {};
+                return error.InvalidFontResourceName;
+            }
+        }
+    }
+}
+
 fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8, prefab_names: []const []const u8) ![]const u8 {
     var buf = std.ArrayList(u8){};
     const w = buf.writer(allocator);
@@ -489,17 +679,16 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     // `buildCallbackInitCode` for the matching code path that the
     // sokol/wasm callback backends use.
     if (cfg.resources.len > 0) {
-        try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
+        try w.writeAll("    // Load embedded assets (atlases, sounds, fonts via @embedFile)\n");
         for (cfg.resources) |res| {
-            // `null` means the default-inference pass hasn't run (e.g. a
-            // direct test call into `generateMainZigFromTemplate`). Fall
-            // back to EAGER so an unmigrated-project code path matches
-            // the back-compat rule in `lazy_inference.resolveLazyDefaults`
-            // — a defaulted + unreferenced resource stays eager so legacy
-            // projects keep decoding their atlases at startup.
-            const is_lazy = res.lazy orelse false;
-            const fn_name = if (is_lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
-            try w.print("    try g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n", .{ fn_name, res.name, res.json, res.texture });
+            // `lazy = null` means the default-inference pass hasn't run
+            // (e.g. a direct test call into `generateMainZigFromTemplate`).
+            // `emitResourceLoad` treats null as EAGER so unmigrated-project
+            // code paths match the back-compat rule in
+            // `lazy_inference.resolveLazyDefaults` — a defaulted +
+            // unreferenced resource stays eager so legacy projects keep
+            // decoding their atlases at startup.
+            try emitResourceLoad(w, res, .try_style);
         }
         try w.writeByte('\n');
     }
@@ -778,15 +967,15 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
     // A loading-scene controller typically does this one atlas per
     // frame so the scene stays animated during the load.
     if (cfg.resources.len > 0) {
-        try w.writeAll("    // Load sprite atlases (embedded via @embedFile)\n");
+        try w.writeAll("    // Load embedded assets (atlases, sounds, fonts via @embedFile)\n");
         for (cfg.resources) |res| {
             // See buildSetupCode for the rationale — null means "inference
             // pass didn't run", which we treat as eager (back-compat) so
             // unmigrated sokol/wasm projects keep decoding their atlases
             // at startup. Must match the fallback in buildSetupCode.
-            const is_lazy = res.lazy orelse false;
-            const fn_name = if (is_lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
-            try w.print("    g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas: {s}\");\n", .{ fn_name, res.name, res.json, res.texture, res.name });
+            // The sokol-callback host has no error channel to unwind
+            // into, so we use `.catch_panic_style` instead of `try`.
+            try emitResourceLoad(w, res, .catch_panic_style);
         }
         try w.writeByte('\n');
     }
@@ -1085,6 +1274,14 @@ pub fn generateMainZigFromTemplate(
         std.fs.File.stderr().writeAll("\n") catch {};
         return error.PrefabBasenameCollision;
     }
+
+    // Validate every resource entry before any codegen. Catches
+    // half-declared atlases (only `.json` or only `.texture`),
+    // multi-kind tangles (`.sound` + `.font` on the same entry),
+    // unrecognised file extensions, and misplaced `.font_params`.
+    // The diagnostic is written to stderr inside the helper so
+    // each malformed entry surfaces its name and reason before bailout.
+    try validateResources(cfg);
 
     var data = tpl.TemplateData{
         .scalars = std.StringHashMap([]const u8).init(allocator),
