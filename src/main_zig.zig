@@ -669,6 +669,41 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
     // image.
     try writeImageBackendWiring(w, "    ");
 
+    // Audio + font adapter wiring is GATED on whether the project
+    // actually declares matching resources. Two reasons:
+    //
+    //   1. The audio adapter references `BackendAudio.decodeAudio` /
+    //      `uploadSound` / `unloadSound`. Concrete audio backends
+    //      (raylib-audio, sokol-audio, …) only implement those once
+    //      they opt in. Emitting the adapter unconditionally would
+    //      break compilation against backends that haven't.
+    //
+    //   2. The font adapter references `BackendGfx.FontAtlas` /
+    //      `decodeFont` / `uploadFontAtlas` / `unloadFontAtlas` at
+    //      *comptime* — the slot-table type is resolved at struct
+    //      declaration, outside any `@hasDecl`-guarded function body
+    //      (Bugbot + Gemini caught this on #103/#105). A project that
+    //      doesn't declare font resources must never see those
+    //      references in generated code.
+    //
+    // Gating on `ResourceDef.kind()` makes the adapter conditional on
+    // the project actually needing it — which is the correct
+    // semantics anyway. A project with audio resources targeting a
+    // backend without audio support gets a clean compile error
+    // pointing at `BackendAudio.decodeAudio`; same for fonts. Closes
+    // labelle-assembler#104.
+    var has_audio = false;
+    var has_font = false;
+    for (cfg.resources) |res| {
+        switch (res.kind()) {
+            .sound => has_audio = true,
+            .font => has_font = true,
+            else => {},
+        }
+    }
+    if (has_audio) try writeAudioBackendWiring(w, "    ");
+    if (has_font) try writeFontBackendWiring(w, "    ");
+
     // ScriptRunner owns all per-script state + shared context
     try w.writeAll("    var runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
     try w.writeAll("    defer runner.deinit();\n\n");
@@ -954,6 +989,21 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
     // `buildSetupCode` comment for why this is emit-unconditional
     // across every backend variant.
     try writeImageBackendWiring(w, "    ");
+
+    // Audio + font adapters gated on resource presence — same
+    // rationale as `buildSetupCode`. See the comment block there
+    // for the full reasoning; closes labelle-assembler#104.
+    var has_audio = false;
+    var has_font = false;
+    for (cfg.resources) |res| {
+        switch (res.kind()) {
+            .sound => has_audio = true,
+            .font => has_font = true,
+            else => {},
+        }
+    }
+    if (has_audio) try writeAudioBackendWiring(w, "    ");
+    if (has_font) try writeFontBackendWiring(w, "    ");
 
     try w.writeAll("    runner = Runner.init(allocator, &g.active_world.ecs_backend);\n");
 
