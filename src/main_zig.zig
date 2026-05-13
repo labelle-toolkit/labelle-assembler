@@ -345,13 +345,21 @@ pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}            .bitmap = d.bitmap,\n", .{indent});
     try w.print("{s}            .width = d.width,\n", .{indent});
     try w.print("{s}            .height = d.height,\n", .{indent});
-    try w.print("{s}            .glyphs = d.glyphs,\n", .{indent});
-    try w.print("{s}            .codepoint_index = d.codepoint_index,\n", .{indent});
+    // `.glyphs` / `.codepoint_index` / `.kerning` are slices of
+    // structurally-identical-but-nominally-distinct extern structs
+    // (BackendGfx.Glyph vs engine.Glyph, etc.). Plain assignment
+    // fails to typecheck across the nominal boundary; `@ptrCast`
+    // on the slice is a zero-cost reinterpret that respects the
+    // `extern struct` layout guarantee on both sides. See
+    // labelle-engine#533 + labelle-gfx#259 for the matching
+    // `extern struct` declarations this relies on.
+    try w.print("{s}            .glyphs = @ptrCast(d.glyphs),\n", .{indent});
+    try w.print("{s}            .codepoint_index = @ptrCast(d.codepoint_index),\n", .{indent});
     try w.print("{s}            .ascent = d.ascent,\n", .{indent});
     try w.print("{s}            .descent = d.descent,\n", .{indent});
     try w.print("{s}            .line_gap = d.line_gap,\n", .{indent});
     try w.print("{s}            .line_height = d.line_height,\n", .{indent});
-    try w.print("{s}            .kerning = d.kerning,\n", .{indent});
+    try w.print("{s}            .kerning = @ptrCast(d.kerning),\n", .{indent});
     try w.print("{s}        }};\n", .{indent});
     try w.print("{s}    }}\n", .{indent});
     try w.print("{s}\n", .{indent});
@@ -373,13 +381,15 @@ pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}            .bitmap = decoded.bitmap,\n", .{indent});
     try w.print("{s}            .width = decoded.width,\n", .{indent});
     try w.print("{s}            .height = decoded.height,\n", .{indent});
-    try w.print("{s}            .glyphs = decoded.glyphs,\n", .{indent});
-    try w.print("{s}            .codepoint_index = decoded.codepoint_index,\n", .{indent});
+    // Reverse-direction slice marshal (engine → BackendGfx). Same
+    // ptrcast trick as the decode path above.
+    try w.print("{s}            .glyphs = @ptrCast(decoded.glyphs),\n", .{indent});
+    try w.print("{s}            .codepoint_index = @ptrCast(decoded.codepoint_index),\n", .{indent});
     try w.print("{s}            .ascent = decoded.ascent,\n", .{indent});
     try w.print("{s}            .descent = decoded.descent,\n", .{indent});
     try w.print("{s}            .line_gap = decoded.line_gap,\n", .{indent});
     try w.print("{s}            .line_height = decoded.line_height,\n", .{indent});
-    try w.print("{s}            .kerning = decoded.kerning,\n", .{indent});
+    try w.print("{s}            .kerning = @ptrCast(decoded.kerning),\n", .{indent});
     try w.print("{s}        }};\n", .{indent});
     try w.print("{s}        const atlas = try BackendGfx.uploadFontAtlas(backend_decoded);\n", .{indent});
     try w.print("{s}        slots[idx] = atlas;\n", .{indent});
