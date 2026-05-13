@@ -2094,6 +2094,132 @@ pub const RESOURCE_EMISSION = struct {
     }
 };
 
+// ── Gated adapter-wiring call sites (Phase 4 closeout, #104) ─────────
+//
+// `writeAudioBackendWiring` + `writeFontBackendWiring` only fire when
+// the project actually declares matching resources. Two reasons:
+//   - audio adapter references BackendAudio.decodeAudio etc., which
+//     a backend may not implement yet
+//   - font adapter references BackendGfx.FontAtlas at comptime
+//     (Bugbot/Gemini caught this on #103/#105) — emitting it for a
+//     font-less project on a font-less backend would break compilation
+//
+// These tests pin down the gating across both setup paths
+// (buildSetupCode + buildCallbackInitCode).
+
+pub const GATED_ADAPTER_WIRING = struct {
+    test "no audio/font resources → only image adapter wiring emitted (raylib setup path)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "world", .json = "atlases/world.json", .texture = "atlases/world.png" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "ImageBackendAdapter") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "AudioBackendAdapter") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "FontBackendAdapter") == null);
+    }
+
+    test "sound resource → audio adapter wiring emitted (raylib setup path)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "boss_theme", .sound = "audio/boss.ogg" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "AudioBackendAdapter") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.AudioLoader.setBackend(") != null);
+        // Font adapter must NOT appear when only sound resources are declared.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "FontBackendAdapter") == null);
+    }
+
+    test "font resource → font adapter wiring emitted (raylib setup path)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "ui_font", .font = "fonts/ui.ttf" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "FontBackendAdapter") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.FontLoader.setBackend(") != null);
+        // Audio adapter must NOT appear when only font resources are declared.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "AudioBackendAdapter") == null);
+    }
+
+    test "mixed resources → both audio and font adapters emitted" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "world", .json = "atlases/world.json", .texture = "atlases/world.png" },
+                .{ .name = "boss_theme", .sound = "audio/boss.ogg" },
+                .{ .name = "ui_font", .font = "fonts/ui.ttf" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "ImageBackendAdapter") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "AudioBackendAdapter") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "FontBackendAdapter") != null);
+
+        // Ordering: image adapter first, then audio, then font, then
+        // resource loads. Deterministic emit order keeps codegen
+        // reproducible across runs.
+        const img_pos = std.mem.indexOf(u8, main_zig, "ImageBackendAdapter") orelse return error.ImageMissing;
+        const audio_pos = std.mem.indexOf(u8, main_zig, "AudioBackendAdapter") orelse return error.AudioMissing;
+        const font_pos = std.mem.indexOf(u8, main_zig, "FontBackendAdapter") orelse return error.FontMissing;
+        const load_pos = std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"world\"") orelse return error.LoadMissing;
+        try std.testing.expect(img_pos < audio_pos);
+        try std.testing.expect(audio_pos < font_pos);
+        try std.testing.expect(font_pos < load_pos);
+    }
+
+    test "sokol callback path also gates audio/font adapters" {
+        // Sokol/wasm uses buildCallbackInitCode rather than
+        // buildSetupCode — the gating must hold there too.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "boss_theme", .sound = "audio/boss.ogg" },
+            },
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "AudioBackendAdapter") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "FontBackendAdapter") == null);
+    }
+
+    test "sokol callback path: font-only project gets font adapter, not audio" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "ui_font", .font = "fonts/ui.ttf" },
+            },
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "FontBackendAdapter") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "AudioBackendAdapter") == null);
+    }
+};
+
 // ── ResourceDef kind + validation (Phase 4 schema, #447/#448) ────────
 //
 // Schema-only tests. Emission dispatch (audio/font → `loadSoundFromMemory` /
