@@ -1513,6 +1513,14 @@ pub const FONT_BACKEND_WIRING = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, ".line_height = d.line_height") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, ".kerning = @ptrCast(d.kerning)") != null);
 
+        // Mirror asserts for the upload direction (engine → BackendGfx
+        // slice marshal). Decode + upload both cross the nominal
+        // boundary, so both need the ptrcast — Bugbot caught this gap
+        // on initial review.
+        try std.testing.expect(std.mem.indexOf(u8, out, ".glyphs = @ptrCast(decoded.glyphs)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".codepoint_index = @ptrCast(decoded.codepoint_index)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".kerning = @ptrCast(decoded.kerning)") != null);
+
         // FontBakeParams also threads through decode (RFC §7) —
         // the `params: ?*const anyopaque` is cast back to the
         // engine type then copied field-by-field into the
