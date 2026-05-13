@@ -244,6 +244,171 @@ pub fn writeAudioBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}}});\n", .{indent});
     try w.print("\n", .{});
 }
+/// Emit the font-backend wiring: an adapter namespace bridging the
+/// graphics backend's `decodeFont`/`uploadFontAtlas`/`unloadFontAtlas`
+/// to `engine.FontBackend`, plus the `engine.FontLoader.setBackend(...)`
+/// call that installs the adapter.
+///
+/// Structural mirror of `writeImageBackendWiring`. Fonts live alongside
+/// images in `BackendGfx` (labelle-gfx#258 adds the three font traits
+/// next to the existing image trio), NOT in a separate `BackendFont`
+/// module. The slot table marshals between the backend's per-backend
+/// `FontAtlas` struct and the engine's flat `FontId`
+/// ({ index: u16, generation: u16 }) handle — same shape as
+/// `writeAudioBackendWiring`'s slot/SoundId pairing.
+///
+/// `FontBakeParams` threads through decode (RFC §7): the engine passes
+/// `WorkRequest.params` as `?*const anyopaque`, the generated adapter
+/// casts it back to `*const engine.FontBakeParams` and copies field-by-
+/// field into the backend's structurally-identical-but-nominally-
+/// distinct `BackendGfx.FontBakeParams` before calling `decodeFont`.
+///
+/// `@hasDecl` guard: labelle-gfx#258 gates the font decls behind the
+/// concrete backend opting in (raylib gets them first, sokol/sdl/bgfx/
+/// wgpu follow as glyph rasterisers are ported). The generated adapter
+/// mirrors that guard — every method's body is wrapped in
+/// `if (@hasDecl(BackendGfx, "decodeFont"))`-style checks so games
+/// that don't use fonts still compile on backends that haven't
+/// implemented the traits yet. When the decls are missing the adapter
+/// returns `error.FontBackendNotImplemented` from `decode`/`upload`
+/// and silently no-ops on `unload`.
+///
+/// SCAFFOLDING (Phase 4, #448): this helper is currently defined but
+/// NOT yet called from `buildSetupCode` / `buildCallbackInitCode`. The
+/// missing pieces before it can be wired in:
+///   1. `engine.FontLoader` must be re-exported from
+///      `labelle-engine/src/root.zig` (sibling PR in flight — mirrors
+///      the `ImageLoader` / `AudioLoader` re-exports).
+///   2. `ProjectConfig.resources` (in `src/config.zig`) must grow a
+///      font-shaped resource entry (`.ttf` / `.otf` + a
+///      `FontBakeParams` payload: pixel sizes, atlas dimensions,
+///      codepoint ranges) and the assembler must dispatch on extension
+///      to choose between `registerAtlasFromMemory`,
+///      `registerSoundFromMemory`, and `registerFontFromMemory`.
+///   3. At least one graphics backend (`labelle-raylib` first, per
+///      labelle-gfx#258) must implement `decodeFont` /
+///      `uploadFontAtlas` / `unloadFontAtlas` on its `gfx.zig`. Until
+///      then, calling this helper unconditionally would generate code
+///      that fails to compile on the non-opted-in backends — hence the
+///      `@hasDecl` guard.
+///
+/// This PR lands the codegen skeleton + unit tests so the function is
+/// reviewed in isolation; follow-up PRs add the three pieces above and
+/// the call sites.
+///
+/// Ticket: labelle-engine#448 (font loader tracking)
+/// Sibling: `writeAudioBackendWiring` (audio scaffolding, #447)
+/// Refs: labelle-gfx#258 (font traits on `Backend(Impl)`)
+pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
+    try w.print("{s}// ── Font asset backend wiring (Asset Streaming RFC, #448) ──\n", .{indent});
+    try w.print("{s}// `engine.FontLoader.setBackend` installs function-pointer adapters\n", .{indent});
+    try w.print("{s}// that marshal between `BackendGfx`'s `DecodedFont`/`FontAtlas` and\n", .{indent});
+    try w.print("{s}// the engine's `DecodedFont` + `FontId` ({{ index, generation }}) handle.\n", .{indent});
+    try w.print("{s}// A private slot table keyed by the FontId index preserves the full\n", .{indent});
+    try w.print("{s}// backend `FontAtlas` struct so unload releases the GPU atlas texture\n", .{indent});
+    try w.print("{s}// (and any auxiliary handles the backend allocates per font).\n", .{indent});
+    try w.print("{s}// `FontBakeParams` threads through decode (RFC §7).\n", .{indent});
+    try w.print("{s}// `@hasDecl` guards each method body: backends that haven't opted into\n", .{indent});
+    try w.print("{s}// gfx#258's font traits return `error.FontBackendNotImplemented` from\n", .{indent});
+    try w.print("{s}// decode/upload and no-op on unload, so games without font usage still\n", .{indent});
+    try w.print("{s}// compile against every backend.\n", .{indent});
+    try w.print("{s}const FontBackendAdapter = struct {{\n", .{indent});
+    try w.print("{s}    const MAX_FONT_ASSETS = 1024;\n", .{indent});
+    try w.print("{s}    var slots: [MAX_FONT_ASSETS]?BackendGfx.FontAtlas = [_]?BackendGfx.FontAtlas{{null}} ** MAX_FONT_ASSETS;\n", .{indent});
+    try w.print("{s}\n", .{indent});
+    try w.print("{s}    fn decode(\n", .{indent});
+    try w.print("{s}        file_type: [:0]const u8,\n", .{indent});
+    try w.print("{s}        data: []const u8,\n", .{indent});
+    try w.print("{s}        params: ?*const anyopaque,\n", .{indent});
+    try w.print("{s}        alloc: std.mem.Allocator,\n", .{indent});
+    try w.print("{s}    ) anyerror!engine.DecodedFont {{\n", .{indent});
+    // `@hasDecl` guard: without it, games that don't actually
+    // reach the font loader still fail to compile on backends
+    // that haven't implemented the gfx#258 font traits yet. The
+    // guard short-circuits to a runtime error instead.
+    try w.print("{s}        if (!@hasDecl(BackendGfx, \"decodeFont\")) return error.FontBackendNotImplemented;\n", .{indent});
+    // `params` is a `?*const anyopaque` per the engine's
+    // `WorkRequest` contract; the loader casts back to the
+    // engine's `FontBakeParams` then copies field-by-field
+    // into the backend's structurally-identical-but-nominally-
+    // distinct `BackendGfx.FontBakeParams`. Same trap as the
+    // image/audio adapters' DecodedX copy.
+    try w.print("{s}        const engine_params: *const engine.FontBakeParams = @ptrCast(@alignCast(params orelse return error.FontBakeParamsMissing));\n", .{indent});
+    try w.print("{s}        const backend_params: BackendGfx.FontBakeParams = .{{\n", .{indent});
+    try w.print("{s}            .pixel_height = engine_params.pixel_height,\n", .{indent});
+    try w.print("{s}            .atlas_width = engine_params.atlas_width,\n", .{indent});
+    try w.print("{s}            .atlas_height = engine_params.atlas_height,\n", .{indent});
+    try w.print("{s}            .codepoint_ranges = engine_params.codepoint_ranges,\n", .{indent});
+    try w.print("{s}            .oversample_h = engine_params.oversample_h,\n", .{indent});
+    try w.print("{s}            .oversample_v = engine_params.oversample_v,\n", .{indent});
+    try w.print("{s}        }};\n", .{indent});
+    try w.print("{s}        const d = try BackendGfx.decodeFont(file_type, data, &backend_params, alloc);\n", .{indent});
+    try w.print("{s}        return .{{\n", .{indent});
+    try w.print("{s}            .bitmap = d.bitmap,\n", .{indent});
+    try w.print("{s}            .width = d.width,\n", .{indent});
+    try w.print("{s}            .height = d.height,\n", .{indent});
+    try w.print("{s}            .glyphs = d.glyphs,\n", .{indent});
+    try w.print("{s}            .codepoint_index = d.codepoint_index,\n", .{indent});
+    try w.print("{s}            .ascent = d.ascent,\n", .{indent});
+    try w.print("{s}            .descent = d.descent,\n", .{indent});
+    try w.print("{s}            .line_gap = d.line_gap,\n", .{indent});
+    try w.print("{s}            .line_height = d.line_height,\n", .{indent});
+    try w.print("{s}            .kerning = d.kerning,\n", .{indent});
+    try w.print("{s}        }};\n", .{indent});
+    try w.print("{s}    }}\n", .{indent});
+    try w.print("{s}\n", .{indent});
+    try w.print("{s}    fn upload(decoded: engine.DecodedFont) anyerror!engine.FontId {{\n", .{indent});
+    try w.print("{s}        if (!@hasDecl(BackendGfx, \"uploadFontAtlas\")) return error.FontBackendNotImplemented;\n", .{indent});
+    // Find a free slot BEFORE uploading to the GPU — same
+    // reasoning as the image/audio adapters: a full slot table
+    // with an upload-first ordering would leak the backend
+    // atlas texture.
+    try w.print("{s}        var idx: u16 = MAX_FONT_ASSETS;\n", .{indent});
+    try w.print("{s}        for (slots, 0..) |slot, i| {{\n", .{indent});
+    try w.print("{s}            if (slot == null) {{\n", .{indent});
+    try w.print("{s}                idx = @intCast(i);\n", .{indent});
+    try w.print("{s}                break;\n", .{indent});
+    try w.print("{s}            }}\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
+    try w.print("{s}        if (idx == MAX_FONT_ASSETS) return error.FontSlotsExhausted;\n", .{indent});
+    try w.print("{s}        const backend_decoded: BackendGfx.DecodedFont = .{{\n", .{indent});
+    try w.print("{s}            .bitmap = decoded.bitmap,\n", .{indent});
+    try w.print("{s}            .width = decoded.width,\n", .{indent});
+    try w.print("{s}            .height = decoded.height,\n", .{indent});
+    try w.print("{s}            .glyphs = decoded.glyphs,\n", .{indent});
+    try w.print("{s}            .codepoint_index = decoded.codepoint_index,\n", .{indent});
+    try w.print("{s}            .ascent = decoded.ascent,\n", .{indent});
+    try w.print("{s}            .descent = decoded.descent,\n", .{indent});
+    try w.print("{s}            .line_gap = decoded.line_gap,\n", .{indent});
+    try w.print("{s}            .line_height = decoded.line_height,\n", .{indent});
+    try w.print("{s}            .kerning = decoded.kerning,\n", .{indent});
+    try w.print("{s}        }};\n", .{indent});
+    try w.print("{s}        const atlas = try BackendGfx.uploadFontAtlas(backend_decoded);\n", .{indent});
+    try w.print("{s}        slots[idx] = atlas;\n", .{indent});
+    // Generation is fixed at 1 for v1 — concrete backends that
+    // need stale-handle detection can bump this in a follow-up
+    // by tracking a per-slot generation counter incremented on
+    // unload. Matches the audio adapter's v1 posture.
+    try w.print("{s}        return .{{ .index = idx, .generation = 1 }};\n", .{indent});
+    try w.print("{s}    }}\n", .{indent});
+    try w.print("{s}\n", .{indent});
+    try w.print("{s}    fn unload(font: engine.FontId) void {{\n", .{indent});
+    try w.print("{s}        if (!@hasDecl(BackendGfx, \"unloadFontAtlas\")) return;\n", .{indent});
+    try w.print("{s}        if (font.index >= MAX_FONT_ASSETS) return;\n", .{indent});
+    try w.print("{s}        if (slots[font.index]) |a| {{\n", .{indent});
+    try w.print("{s}            BackendGfx.unloadFontAtlas(a);\n", .{indent});
+    try w.print("{s}            slots[font.index] = null;\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
+    try w.print("{s}    }}\n", .{indent});
+    try w.print("{s}}};\n", .{indent});
+    try w.print("{s}engine.FontLoader.setBackend(.{{\n", .{indent});
+    try w.print("{s}    .decode = FontBackendAdapter.decode,\n", .{indent});
+    try w.print("{s}    .upload = FontBackendAdapter.upload,\n", .{indent});
+    try w.print("{s}    .unload = FontBackendAdapter.unload,\n", .{indent});
+    try w.print("{s}}});\n", .{indent});
+    try w.print("\n", .{});
+}
+
 
 /// Emit the `PluginControllers` comptime dispatcher that scans each plugin's
 /// root module for `pub const Controller = struct { ... }` and forwards

@@ -1441,6 +1441,120 @@ pub const AUDIO_BACKEND_WIRING = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "slots[sound.index] = null") != null);
     }
 };
+// ── Font Backend Wiring ──────────────────────────────────────────────
+//
+// Phase 4 of the Asset Streaming RFC (labelle-engine#448). Scaffolding
+// only — `writeFontBackendWiring` is defined and shape-tested but not
+// yet called from buildSetupCode / buildCallbackInitCode. The function
+// emits an adapter + `engine.FontLoader.setBackend(...)` call that
+// will be reached once (a) `engine.FontLoader` is re-exported,
+// (b) font resources (.ttf / .otf + FontBakeParams) land in
+// `ProjectConfig`, and (c) at least one graphics backend implements
+// labelle-gfx#258's `decodeFont` / `uploadFontAtlas` / `unloadFontAtlas`
+// traits on its `Backend(Impl)`. Until then these tests guard the
+// codegen output by direct invocation against an in-memory buffer.
+
+pub const FONT_BACKEND_WIRING = struct {
+    fn renderFont() ![]const u8 {
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(std.testing.allocator);
+        const w = buf.writer(std.testing.allocator);
+        try generate.writeFontBackendWiring(w, "    ");
+        return buf.toOwnedSlice(std.testing.allocator);
+    }
+
+    test "writeFontBackendWiring emits adapter + setBackend" {
+        const out = try renderFont();
+        defer std.testing.allocator.free(out);
+
+        // Adapter shape.
+        try std.testing.expect(std.mem.indexOf(u8, out, "const FontBackendAdapter = struct {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn decode(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn upload(decoded: engine.DecodedFont) anyerror!engine.FontId") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unload(font: engine.FontId) void") != null);
+
+        // Marshalling to the graphics backend (gfx#258 puts font traits
+        // alongside the existing image trio on `Backend(Impl)`, NOT in
+        // a separate `BackendFont` module).
+        try std.testing.expect(std.mem.indexOf(u8, out, "BackendGfx.decodeFont(file_type, data, &backend_params, alloc)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "BackendGfx.uploadFontAtlas(backend_decoded)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "BackendGfx.unloadFontAtlas(a)") != null);
+
+        // setBackend installation.
+        try std.testing.expect(std.mem.indexOf(u8, out, "engine.FontLoader.setBackend(.{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".decode = FontBackendAdapter.decode") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".upload = FontBackendAdapter.upload") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".unload = FontBackendAdapter.unload") != null);
+    }
+
+    test "writeFontBackendWiring marshals DecodedFont fields" {
+        // `BackendGfx.DecodedFont` is structurally identical to
+        // `engine.DecodedFont` but nominally distinct (same trap as
+        // images / audio). Verify the field-by-field copy reaches
+        // every field the engine ships in its DecodedFont contract:
+        // bitmap + dims, glyph table + codepoint index, vertical
+        // metrics, line height, kerning.
+        const out = try renderFont();
+        defer std.testing.allocator.free(out);
+
+        try std.testing.expect(std.mem.indexOf(u8, out, ".bitmap = d.bitmap") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".width = d.width") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".height = d.height") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".glyphs = d.glyphs") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".codepoint_index = d.codepoint_index") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".ascent = d.ascent") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".descent = d.descent") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".line_gap = d.line_gap") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".line_height = d.line_height") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".kerning = d.kerning") != null);
+
+        // FontBakeParams also threads through decode (RFC §7) —
+        // the `params: ?*const anyopaque` is cast back to the
+        // engine type then copied field-by-field into the
+        // backend's mirror struct before being forwarded to
+        // `BackendGfx.decodeFont`.
+        try std.testing.expect(std.mem.indexOf(u8, out, "params: ?*const anyopaque") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "*const engine.FontBakeParams") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "const backend_params: BackendGfx.FontBakeParams = .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "return error.FontBakeParamsMissing") != null);
+    }
+
+    test "writeFontBackendWiring marshals FontAtlas via slot table → FontId" {
+        // Slot table mirrors the audio side: backend's `FontAtlas`
+        // struct stays alongside a u16 slot index that becomes
+        // `FontId.index`. Generation pinned to 1 in v1 (documented).
+        // `@hasDecl` guard wraps every method body so backends that
+        // haven't opted into gfx#258's font traits still compile,
+        // erroring at runtime with `FontBackendNotImplemented`
+        // instead of failing at compile time.
+        const out = try renderFont();
+        defer std.testing.allocator.free(out);
+
+        try std.testing.expect(std.mem.indexOf(u8, out, "var slots: [MAX_FONT_ASSETS]?BackendGfx.FontAtlas") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "if (idx == MAX_FONT_ASSETS) return error.FontSlotsExhausted") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".index = idx, .generation = 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "if (font.index >= MAX_FONT_ASSETS) return") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "slots[font.index] = null") != null);
+
+        // The `@hasDecl` guards are the load-bearing bit that lets
+        // this scaffold land before every backend implements the
+        // gfx#258 traits. Without them, `zig build` against a
+        // backend missing `decodeFont` would fail at compile time
+        // even for games that don't actually use fonts.
+        try std.testing.expect(std.mem.indexOf(u8, out, "if (!@hasDecl(BackendGfx, \"decodeFont\")) return error.FontBackendNotImplemented") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "if (!@hasDecl(BackendGfx, \"uploadFontAtlas\")) return error.FontBackendNotImplemented") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "if (!@hasDecl(BackendGfx, \"unloadFontAtlas\")) return") != null);
+
+        // Exhaustion guard MUST appear before `uploadFontAtlas`
+        // in the emitted `upload` body — otherwise a full table
+        // leaks the backend atlas (handle is discarded with the
+        // error return).
+        const guard_idx = std.mem.indexOf(u8, out, "if (idx == MAX_FONT_ASSETS) return error.FontSlotsExhausted") orelse return error.GuardMissing;
+        const upload_call_idx = std.mem.indexOf(u8, out, "BackendGfx.uploadFontAtlas(backend_decoded)") orelse return error.UploadCallMissing;
+        try std.testing.expect(guard_idx < upload_call_idx);
+    }
+};
+
 
 // ── Scripts ──────────────────────────────────────────────────────────
 
