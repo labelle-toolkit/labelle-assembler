@@ -1128,7 +1128,11 @@ pub fn decodeFont(
     // both the success and discard paths (mirroring `decodeImage`).
     const atlas_w: usize = params.atlas_width;
     const atlas_h: usize = params.atlas_height;
-    const bitmap = try allocator.alloc(u8, atlas_w * atlas_h);
+    // Guard against 32-bit (incl. wasm32) `usize` wraparound on the
+    // bitmap size multiply — a wrap would alloc an undersized buffer
+    // that the C packer happily writes past.
+    const bitmap_len = std.math.mul(usize, atlas_w, atlas_h) catch return error.FontAtlasTooLarge;
+    const bitmap = try allocator.alloc(u8, bitmap_len);
     errdefer allocator.free(bitmap);
     @memset(bitmap, 0);
 
@@ -1198,9 +1202,10 @@ pub fn decodeFont(
         if (ok == 0) {
             // Partial-pack failures usually mean "atlas too small";
             // bubble it up as a decode error so the catalog reports
-            // a clean error to the game.
-            allocator.free(glyphs);
-            allocator.free(codepoint_index);
+            // a clean error to the game. `glyphs` and `codepoint_index`
+            // have `errdefer allocator.free(...)` at their alloc sites
+            // (above) so we let those fire — manually freeing here
+            // would double-free.
             return error.FontAtlasTooSmall;
         }
         write_idx += @intCast(count);
@@ -1251,26 +1256,70 @@ pub fn decodeFont(
     const line_gap: f32 = @as(f32, @floatFromInt(line_gap_i)) * scale;
     const line_height: f32 = ascent - descent + line_gap;
 
-    // Kerning — sparse. We walk the (small) packed-codepoint set
-    // pairwise and emit only non-zero kern advances. For ASCII-only
-    // bakes this is O(95² ≈ 9025) calls, each cheap; for larger
-    // bakes the kern table dominates so this is a known cost. A
-    // future PR can swap to `stbtt_GetKerningTable` for one-shot
-    // extraction.
+    // Kerning — extract the whole table in one pass via
+    // `stbtt_GetKerningTable`. The previous double-loop over
+    // `codepoint_index` called `stbtt_GetCodepointKernAdvance` N²
+    // times (~9K calls for ASCII; quadratic for larger ranges).
+    // The new path is O(N + K) where N is the baked codepoint set
+    // and K is the font's stored kerning pair count.
+    //
+    // The kerning table stores GLYPH INDICES, not codepoints, so we
+    // build a `glyph_index → codepoint` map by walking the baked
+    // codepoints once and resolving each via `stbtt_FindGlyphIndex`.
+    // Pairs that reference glyphs outside the baked set are dropped.
     var kern_list = std.array_list.Aligned(KernPair, null).empty;
     errdefer kern_list.deinit(allocator);
-    for (codepoint_index) |a| {
-        for (codepoint_index) |b| {
-            const adv_units = stbtt.stbtt_GetCodepointKernAdvance(
-                &font_info,
-                @intCast(a.codepoint),
-                @intCast(b.codepoint),
-            );
-            if (adv_units == 0) continue;
+
+    const pair_count_i = stbtt.stbtt_GetKerningTableLength(&font_info);
+    if (pair_count_i > 0) {
+        const pair_count: usize = @intCast(pair_count_i);
+
+        // glyph-index → codepoint map for the baked set. Two parallel
+        // slices sorted by glyph_index, queried with `std.sort.binarySearch`
+        // so per-pair lookup is O(log N) rather than O(N).
+        const GlyphMapEntry = struct { glyph: i32, codepoint: u32 };
+        const map = try allocator.alloc(GlyphMapEntry, codepoint_index.len);
+        defer allocator.free(map);
+        for (codepoint_index, 0..) |entry, mi| {
+            const gi = stbtt.stbtt_FindGlyphIndex(&font_info, @intCast(entry.codepoint));
+            map[mi] = .{ .glyph = gi, .codepoint = entry.codepoint };
+        }
+        std.mem.sort(GlyphMapEntry, map, {}, struct {
+            fn lessThan(_: void, a: GlyphMapEntry, b: GlyphMapEntry) bool {
+                return a.glyph < b.glyph;
+            }
+        }.lessThan);
+
+        const lookup = struct {
+            fn find(slice: []const GlyphMapEntry, glyph: i32) ?u32 {
+                var lo: usize = 0;
+                var hi: usize = slice.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (slice[mid].glyph < glyph) {
+                        lo = mid + 1;
+                    } else if (slice[mid].glyph > glyph) {
+                        hi = mid;
+                    } else {
+                        return slice[mid].codepoint;
+                    }
+                }
+                return null;
+            }
+        }.find;
+
+        const table = try allocator.alloc(stbtt.stbtt_kerningentry, pair_count);
+        defer allocator.free(table);
+        const written = stbtt.stbtt_GetKerningTable(&font_info, table.ptr, @intCast(pair_count));
+        const written_n: usize = if (written < 0) 0 else @intCast(written);
+        for (table[0..written_n]) |entry| {
+            if (entry.advance == 0) continue;
+            const first_cp = lookup(map, entry.glyph1) orelse continue;
+            const second_cp = lookup(map, entry.glyph2) orelse continue;
             try kern_list.append(allocator, .{
-                .first = a.codepoint,
-                .second = b.codepoint,
-                .advance = @as(f32, @floatFromInt(adv_units)) * scale,
+                .first = first_cp,
+                .second = second_cp,
+                .advance = @as(f32, @floatFromInt(entry.advance)) * scale,
             });
         }
     }

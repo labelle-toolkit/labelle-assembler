@@ -591,12 +591,18 @@ fn decodeWav(data: []const u8, allocator: std.mem.Allocator) !DecodedAudio {
     const channels: u8 = @intCast(wav.channels);
     if (total_frames == 0 or channels == 0) return error.AudioDecodeFailed;
 
-    const total_samples = total_frames * channels;
+    // Guard against 32-bit (incl. wasm32) `usize` wraparound on the
+    // frame × channel multiply — a wrap would alloc an undersized
+    // buffer that drwav happily writes past.
+    const total_samples = std.math.mul(usize, total_frames, channels) catch return error.AudioTooLarge;
     const samples = try allocator.alloc(i16, total_samples);
     errdefer allocator.free(samples);
 
     const got = drwav.drwav_read_pcm_frames_s16(&wav, total_frames, samples.ptr);
-    if (got == 0) return error.AudioDecodeFailed;
+    // Treat short reads as failures: the trailing samples are
+    // uninitialised, so emitting the buffer would mix garbage into
+    // the output. `errdefer` above frees the partial buffer.
+    if (got < total_frames) return error.AudioDecodeFailed;
 
     return .{
         .samples = samples,
@@ -625,19 +631,25 @@ fn decodeOgg(data: []const u8, allocator: std.mem.Allocator) !DecodedAudio {
     const total_frames: usize = @intCast(total_samples_c);
     if (total_frames == 0) return error.AudioDecodeFailed;
 
-    const total_samples = total_frames * channels;
+    // Guard against 32-bit (incl. wasm32) `usize` wraparound on the
+    // frame × channel multiply — a wrap would alloc an undersized
+    // buffer that stb_vorbis happily writes past.
+    const total_samples = std.math.mul(usize, total_frames, channels) catch return error.AudioTooLarge;
     const samples = try allocator.alloc(i16, total_samples);
     errdefer allocator.free(samples);
 
     // `get_samples_short_interleaved` takes (channels, dest, dest_len_in_shorts)
-    // and returns the number of FRAMES decoded.
+    // and returns the number of FRAMES decoded (or 0/negative on error).
     const got = stbv.stb_vorbis_get_samples_short_interleaved(
         vorbis,
         info.channels,
         samples.ptr,
         @intCast(total_samples),
     );
+    // Reject short and error reads — trailing samples would be
+    // uninitialised garbage and we'd play it through the device.
     if (got <= 0) return error.AudioDecodeFailed;
+    if (@as(usize, @intCast(got)) < total_frames) return error.AudioDecodeFailed;
 
     return .{
         .samples = samples,
@@ -693,25 +705,28 @@ pub fn unloadSound(sound: Sound) void {
 
     // Stop any voices playing this slot so the audio callback won't
     // chase a freed pointer between the markUnloaded below and the
-    // deinit-side free. Same ordering as the legacy unload(id) path.
+    // shutdown-time free. Same ordering as the legacy
+    // `unloadSoundById` path (see this file, ~line 350).
     for (&voices) |*voice| {
         if (voice.active and voice.sound_id == sound.slot_index) {
             voice.active = false;
         }
     }
+    // Do NOT free `s.samples` here. The audio callback runs on a
+    // separate thread; even after we flip `active = false` on every
+    // voice, a callback iteration that already captured the slot
+    // pointer above can still be reading `slot.samples[position]`.
+    // The previous eager free (`std.heap.page_allocator.free(s.samples)`
+    // + `sounds[...] = null`) raced that read and was a use-after-free.
+    //
+    // We mirror the legacy `unloadSoundById` pattern: mark the slot
+    // unloaded so `activeSound` returns null on subsequent passes,
+    // and let `deinit` walk every non-null slot and free its samples
+    // at shutdown. The buffer stays reachable via `sounds[slot]` so
+    // it is not leaked. Slot reuse for fresh `uploadSound` calls is
+    // gated on `sounds[i] == null`, matching the legacy behaviour —
+    // unloaded slots are NOT reclaimed at runtime by design.
     slots.markSoundUnloaded(&sounds, sound.slot_index);
-
-    // Eager free: unlike the legacy `unloadSound(id)` path — which
-    // keeps the buffer reachable for `deinit` to free at shutdown —
-    // Phase 4 callers churn loads/unloads at runtime (level
-    // transitions, dynamic audio asset streaming). Holding every
-    // ever-unloaded buffer until shutdown would balloon the slot
-    // pool's residual memory. Voices for this slot are deactivated
-    // above, so no audio-callback read can race the free here.
-    if (sounds[sound.slot_index]) |s| {
-        std.heap.page_allocator.free(s.samples);
-        sounds[sound.slot_index] = null;
-    }
 }
 
 // ── Phase 4 surface tests ─────────────────────────────────────────────
