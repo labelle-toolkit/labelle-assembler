@@ -30,6 +30,11 @@ pub fn build(b: *std.Build) void {
     gfx_mod.addImport("sokol", sokol_mod);
     gfx_mod.addIncludePath(b.path("src"));
     gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
+    // Phase 4 font baker (labelle-engine#448). stb_truetype lives next
+    // to stb_image and is compiled in the same way — single-header C
+    // lib, separate `_impl.c` translation unit defining the
+    // implementation macro.
+    gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
 
     // When cross-compiling to wasm32-emscripten the C compile of
     // `stb_image_impl.c` cannot find `<stdlib.h>` because Zig does not
@@ -37,7 +42,8 @@ pub fn build(b: *std.Build) void {
     // sysroot. Mirror what `sokol-zig` does for `sokol_clib` (see
     // sokol/build.zig:204) and plumb the emsdk sysroot include path
     // into the gfx module. Gated on `.emscripten` so the desktop /
-    // mobile builds remain untouched (labelle-cli#197).
+    // mobile builds remain untouched (labelle-cli#197). stb_truetype
+    // also pulls in `<stdlib.h>`, so the same sysroot include applies.
     if (target.result.os.tag == .emscripten) {
         if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
             gfx_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
@@ -57,8 +63,29 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/audio.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     audio_mod.addImport("sokol", sokol_mod);
+    audio_mod.addIncludePath(b.path("src"));
+    // Phase 4 audio decoders (labelle-engine#447):
+    //   - stb_vorbis.c is both the API *and* the implementation — it is
+    //     a single .c file you compile directly, not a header + impl
+    //     translation-unit pair.
+    //   - dr_wav matches stb_image's split: header + an _impl.c TU
+    //     that defines the implementation macro before including the
+    //     header.
+    audio_mod.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
+    audio_mod.addCSourceFile(.{ .file = b.path("src/dr_wav_impl.c"), .flags = &.{} });
+
+    // Mirror the emsdk sysroot include from gfx_mod: stb_vorbis and
+    // dr_wav both pull in <stdlib.h> / <string.h> / <math.h> which
+    // require emscripten's sysroot when cross-compiling to
+    // wasm32-emscripten (labelle-cli#197).
+    if (target.result.os.tag == .emscripten) {
+        if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
+            audio_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
+        }
+    }
 
     // ── Window backend module ───────────────────────────────────────
     const window_mod = b.addModule("window", .{
@@ -91,10 +118,33 @@ pub fn build(b: *std.Build) void {
     // Compile-check audio.zig via a test binary off audio_mod. This
     // pulls in the full sokol module graph so it only works when the
     // host has sokol's system libs installed (libasound, libGL, libX11,
-    // libXi, libXcursor on Linux). The test binary has no test blocks,
-    // so the run step is a no-op — the point is to verify audio.zig
-    // actually compiles against sokol after the refactor. Depends on
-    // the compile step, not the run step, so cross-compile works too.
+    // libXi, libXcursor on Linux). Depending on the compile step keeps
+    // this useful for cross-compile (the binary doesn't need to run);
+    // the host_audio_tests step below adds the run side for native.
     const audio_compile_check = b.addTest(.{ .root_module = audio_mod });
     test_step.dependOn(&audio_compile_check.step);
+
+    // Compile-check gfx.zig — same trick as `audio_compile_check`.
+    // Verifies the Phase 4 font surface (`FontAtlas`, `decodeFont`,
+    // `uploadFontAtlas`, `unloadFontAtlas`) keeps compiling against
+    // sokol_gfx + stb_truetype.
+    const gfx_compile_check = b.addTest(.{ .root_module = gfx_mod });
+    test_step.dependOn(&gfx_compile_check.step);
+
+    // ── Phase 4 host-native test runs ────────────────────────────────
+    //
+    // The compile-checks above only ensure the bytecode builds. The
+    // Phase 4 decoder unit tests (decodeFont rejecting empty/garbage
+    // input, decodeAudio dispatching on file_type, Sound layout
+    // invariants) are pure-CPU and exercise no sokol API — they're
+    // safe to run on the host target when the user explicitly asks
+    // for it. Wired off a separate `test-host` step rather than
+    // `test` so the default cross-compile flow stays linker-free.
+    const test_host_step = b.step(
+        "test-host",
+        "Run Phase 4 decoder unit tests natively (needs sokol's system libs).",
+    );
+    test_host_step.dependOn(&b.addRunArtifact(audio_compile_check).step);
+    test_host_step.dependOn(&b.addRunArtifact(gfx_compile_check).step);
+    test_host_step.dependOn(&b.addRunArtifact(slots_tests).step);
 }
