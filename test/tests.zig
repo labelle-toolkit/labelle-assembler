@@ -1825,6 +1825,130 @@ pub const RESOURCES = struct {
     }
 };
 
+// ── ResourceDef kind + validation (Phase 4 schema, #447/#448) ────────
+//
+// Schema-only tests. Emission dispatch (audio/font → `loadSoundFromMemory` /
+// `loadFontFromMemory`) is a separate PR — the codegen helpers it'll
+// call were added in labelle-engine#532, and the codegen skeletons it'll
+// emit live behind `writeAudioBackendWiring` (#102) /
+// `writeFontBackendWiring` (#103). This block locks down the parsing +
+// classification + structural-validation half so call-site work can
+// land independently.
+
+pub const RESOURCE_KINDS = struct {
+    test "kind: atlas requires both json and texture" {
+        const atlas: generate.ResourceDef = .{
+            .name = "ok",
+            .json = "atlas.json",
+            .texture = "atlas.png",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.atlas, atlas.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.ok, atlas.validate());
+    }
+
+    test "kind: sound resource classifies as sound" {
+        const sfx: generate.ResourceDef = .{
+            .name = "boss_roar",
+            .sound = "audio/boss.ogg",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.sound, sfx.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.ok, sfx.validate());
+    }
+
+    test "kind: font resource classifies as font" {
+        const font: generate.ResourceDef = .{
+            .name = "ui_font",
+            .font = "fonts/m5x7.ttf",
+            .font_params = .{ .pixel_height = 16 },
+        };
+        try std.testing.expectEqual(generate.ResourceKind.font, font.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.ok, font.validate());
+    }
+
+    test "kind: font with omitted font_params still classifies (defaults kick in at emit)" {
+        const font: generate.ResourceDef = .{
+            .name = "title_font",
+            .font = "fonts/title.ttf",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.font, font.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.ok, font.validate());
+    }
+
+    test "validate: empty resource reports no_path" {
+        const empty: generate.ResourceDef = .{ .name = "ghost" };
+        try std.testing.expectEqual(generate.ResourceKind.invalid, empty.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.no_path, empty.validate());
+    }
+
+    test "validate: atlas with only texture reports atlas_incomplete" {
+        const half: generate.ResourceDef = .{
+            .name = "broken",
+            .texture = "atlas.png",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.invalid, half.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.atlas_incomplete, half.validate());
+    }
+
+    test "validate: atlas with only json reports atlas_incomplete" {
+        const half: generate.ResourceDef = .{
+            .name = "broken",
+            .json = "atlas.json",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.invalid, half.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.atlas_incomplete, half.validate());
+    }
+
+    test "validate: atlas + sound on same entry reports multiple_paths" {
+        const tangle: generate.ResourceDef = .{
+            .name = "confused",
+            .json = "atlas.json",
+            .texture = "atlas.png",
+            .sound = "audio.wav",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.invalid, tangle.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.multiple_paths, tangle.validate());
+    }
+
+    test "validate: sound + font on same entry reports multiple_paths" {
+        const tangle: generate.ResourceDef = .{
+            .name = "confused",
+            .sound = "audio.wav",
+            .font = "font.ttf",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.invalid, tangle.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.multiple_paths, tangle.validate());
+    }
+
+    test "validate: font_params on a sound resource reports font_params_misplaced" {
+        // Catches the typo where the user wrote `.sound = "..."` but
+        // also pasted `.font_params = .{ ... }` (forgetting that
+        // params only belong on font resources). Without this guard
+        // the bake params would silently no-op.
+        const misplaced: generate.ResourceDef = .{
+            .name = "typo",
+            .sound = "audio.wav",
+            .font_params = .{ .pixel_height = 24 },
+        };
+        try std.testing.expectEqual(generate.ResourceKind.sound, misplaced.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.font_params_misplaced, misplaced.validate());
+    }
+
+    test "FontBakeParams defaults match engine/gfx" {
+        // Lock the shape: default 16 px pixel height, ASCII printable
+        // range 0x20..0x7F, 512×512 atlas. Drift here would cause the
+        // generated adapter to round-trip different defaults than the
+        // engine + labelle-gfx ship, which silently changes the
+        // baked atlas on projects that omit `font_params`.
+        const params: generate.FontBakeParams = .{};
+        try std.testing.expectEqual(@as(f32, 16), params.pixel_height);
+        try std.testing.expectEqual(@as(u32, 512), params.atlas_width);
+        try std.testing.expectEqual(@as(u32, 512), params.atlas_height);
+        try std.testing.expectEqual(@as(usize, 1), params.ranges.len);
+        try std.testing.expectEqual(@as(u32, 0x20), params.ranges[0].first);
+        try std.testing.expectEqual(@as(u32, 0x7F), params.ranges[0].last);
+    }
+};
+
 // ── Hidden window flag ───────────────────────────────────────────────
 
 pub const HIDDEN_WINDOW = struct {

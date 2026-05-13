@@ -80,30 +80,142 @@ pub const LayerDef = struct {
     space: LayerSpace = .world,
 };
 
+/// Half-open codepoint range `[first, last)` baked into a font atlas.
+/// Structurally identical to `labelle-gfx`'s `CodepointRange` and
+/// `labelle-engine`'s `font_types.CodepointEntry` source range — the
+/// assembler copies field-by-field at codegen time to bridge nominal
+/// type differences across the three repos.
+pub const CodepointRange = struct {
+    first: u32,
+    last: u32,
+};
+
+/// Bake-time parameters for a font resource. Carried alongside the
+/// `.ttf` / `.otf` bytes into the font loader's `decode` via the
+/// catalog's `WorkRequest.params` slot (`?*const anyopaque`). The
+/// loader casts back to `*const engine.FontBakeParams`, then the
+/// assembler-generated `FontBackendAdapter.decode` copies into the
+/// graphics backend's mirror struct (labelle-gfx#258's
+/// `FontBakeParams`) before calling `decodeFont`.
+///
+/// Defaults match the engine + gfx contracts: 16 px pixel height,
+/// ASCII printable range (0x20..0x7F), 512×512 atlas.
+pub const FontBakeParams = struct {
+    pixel_height: f32 = 16,
+    ranges: []const CodepointRange = &.{ .{ .first = 0x20, .last = 0x7F } },
+    atlas_width: u32 = 512,
+    atlas_height: u32 = 512,
+};
+
+/// Discriminator for `ResourceDef`. Picked by inspecting which of the
+/// resource's path fields are populated; validation rejects entries
+/// that set more than one or none. Drives the assembler's emission
+/// dispatch: atlas → `loadAtlasFromMemory`, sound →
+/// `loadSoundFromMemory`, font → `loadFontFromMemory`.
+pub const ResourceKind = enum {
+    atlas,
+    sound,
+    font,
+    invalid,
+};
+
+/// Sentinel returned by `ResourceDef.validate` to surface what went
+/// wrong with a malformed entry. The CLI maps these to actionable
+/// stderr diagnostics before bailing.
+pub const ResourceValidationError = enum {
+    ok,
+    /// No asset-path field set — caller forgot to declare what this
+    /// resource points at. Tell the user to add `.json`/`.texture`
+    /// (atlas), `.sound`, or `.font`.
+    no_path,
+    /// More than one of `.json`+`.texture` / `.sound` / `.font` set
+    /// on the same entry. A resource is exactly one asset kind.
+    multiple_paths,
+    /// Atlas is half-declared: one of `.json` / `.texture` is set
+    /// but not the other. Both are required for an atlas resource.
+    atlas_incomplete,
+    /// `.font_params` set on a non-font resource. Indicates a typo
+    /// — e.g. user meant `.font = "..."` but wrote `.font_params`
+    /// on an atlas or sound entry.
+    font_params_misplaced,
+};
+
 pub const ResourceDef = struct {
     name: []const u8,
+
+    // ── Atlas (legacy image resource — JSON sprite map + PNG/RGBA texture)
     json: []const u8 = "",
     texture: []const u8 = "",
-    /// Controls whether this atlas is decoded eagerly at `init()` time
-    /// or deferred until a script calls `game.loadAtlasIfNeeded(name)`.
+
+    // ── Sound (Phase 4, #447). `.wav` / `.ogg` path relative to the
+    // project root. Mutually exclusive with the atlas / font paths.
+    sound: []const u8 = "",
+
+    // ── Font (Phase 4, #448). `.ttf` / `.otf` path. Pairs with
+    // `font_params` to control the bake (pixel size + glyph ranges +
+    // atlas dimensions). Mutually exclusive with atlas / sound paths.
+    font: []const u8 = "",
+
+    /// Bake parameters for font resources. Ignored on atlas/sound
+    /// entries — `validate()` reports `font_params_misplaced` if set
+    /// alongside `.json` / `.texture` / `.sound`. Default applies
+    /// when the user omits `font_params` on a font resource: 16 px,
+    /// ASCII printable, 512×512 atlas — matches the engine + gfx
+    /// `FontBakeParams` defaults.
+    font_params: ?FontBakeParams = null,
+
+    /// Controls whether this resource is decoded eagerly at `init()`
+    /// time or deferred until a script calls
+    /// `game.loadAtlasIfNeeded(name)` / `loadSoundIfNeeded(name)` /
+    /// `loadFontIfNeeded(name)`.
     ///
-    /// - `null` (field omitted): the assembler picks a default. As of
-    ///   ticket #48, the default is `true` (lazy) when the resource
-    ///   appears in any scene's `assets:` list, and `false` (eager)
-    ///   otherwise. The eager fallback preserves back-compat for every
-    ///   existing project that hasn't migrated its scenes to declare
-    ///   `assets:`.
-    /// - `true`: always lazy — the generated init calls
-    ///   `registerAtlasFromMemory` (parses the JSON, defers the PNG
-    ///   decode). A script must call `game.loadAtlasIfNeeded(name)`
-    ///   before any sprite from this atlas is rendered.
-    /// - `false`: always eager — the generated init calls
-    ///   `loadAtlasFromMemory`, decoding everything at startup.
+    /// Applies to all three resource kinds. The `lazy_inference` pass
+    /// (ticket #48) fills in `null` based on whether any scene's
+    /// `assets:` block references the name; explicit values always
+    /// win.
     ///
-    /// Explicit values (true/false) always win over the default
-    /// inference pass, so a project can opt in or out of laziness
-    /// regardless of scene references.
+    /// - `null` (field omitted): the assembler picks a default.
+    ///   Lazy when the resource appears in any scene's `assets:`
+    ///   list, eager otherwise.
+    /// - `true`: always lazy — generated init calls `register*FromMemory`.
+    /// - `false`: always eager — generated init calls `load*FromMemory`.
     lazy: ?bool = null,
+
+    /// Classify which kind of asset this resource declares, based on
+    /// which path fields are populated. Returns `.invalid` for empty
+    /// or multi-kind entries — call `validate()` for the structured
+    /// reason.
+    pub fn kind(self: ResourceDef) ResourceKind {
+        const has_atlas = self.json.len > 0 or self.texture.len > 0;
+        const has_sound = self.sound.len > 0;
+        const has_font = self.font.len > 0;
+        const count: u8 = @as(u8, @intFromBool(has_atlas)) + @intFromBool(has_sound) + @intFromBool(has_font);
+        if (count != 1) return .invalid;
+        if (has_atlas) {
+            // Both halves of the atlas pair must be set; one-without-
+            // the-other is .invalid so the caller surfaces a clear
+            // diagnostic instead of generating broken codegen.
+            if (self.json.len == 0 or self.texture.len == 0) return .invalid;
+            return .atlas;
+        }
+        if (has_sound) return .sound;
+        return .font;
+    }
+
+    /// Structured validation result. The CLI translates the enum
+    /// variants into actionable stderr diagnostics that point at the
+    /// offending `name` and tell the user what to add or remove.
+    pub fn validate(self: ResourceDef) ResourceValidationError {
+        const has_atlas = self.json.len > 0 or self.texture.len > 0;
+        const has_sound = self.sound.len > 0;
+        const has_font = self.font.len > 0;
+        const count: u8 = @as(u8, @intFromBool(has_atlas)) + @intFromBool(has_sound) + @intFromBool(has_font);
+        if (count == 0) return .no_path;
+        if (count > 1) return .multiple_paths;
+        if (has_atlas and (self.json.len == 0 or self.texture.len == 0)) return .atlas_incomplete;
+        if (self.font_params != null and !has_font) return .font_params_misplaced;
+        return .ok;
+    }
 };
 
 /// Returns true if a version string is a local path override.
