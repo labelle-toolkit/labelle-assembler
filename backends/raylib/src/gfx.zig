@@ -329,7 +329,11 @@ pub const DecodedFont = struct {
 /// pipeline already configures. `width`/`height` are stored alongside
 /// the texture so the renderer can compute normalised UVs from the
 /// glyph's pixel-space rect without poking raylib for image metadata.
-pub const FontAtlas = struct {
+///
+/// `extern struct` so the assembler's `writeFontBackendWiring`
+/// field-by-field copy lands on the same stable C-ABI layout as
+/// `CodepointRange`, `Glyph`, `CodepointEntry`, and `KernPair`.
+pub const FontAtlas = extern struct {
     texture_id: u32,
     width: u32,
     height: u32,

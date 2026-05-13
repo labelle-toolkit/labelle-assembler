@@ -441,6 +441,13 @@ test "decodeAudio surfaces AudioDecodeFailed on garbage wav input" {
     try testing.expectError(error.AudioDecodeFailed, decodeAudio("wav", &fake, testing.allocator));
 }
 
+test "decodeAudio surfaces AudioDecodeFailed on garbage ogg input" {
+    // Not an Ogg capture pattern — stb_vorbis_open_memory should return null.
+    var fake: [1024]u8 = undefined;
+    for (&fake, 0..) |*b, i| b.* = @truncate(i);
+    try testing.expectError(error.AudioDecodeFailed, decodeAudio("ogg", &fake, testing.allocator));
+}
+
 test "Sound has stable extern layout" {
     // Locks the Phase 4 wire shape: the assembler's codegen does a
     // field-by-field copy through this struct, so size + alignment

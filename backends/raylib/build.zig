@@ -116,8 +116,34 @@ pub fn build(b: *std.Build) void {
     // cross-compile flow linker-free, matching sokol's split
     // (sokol's `test` works without a linker because sokol's C lib
     // has no host-framework dep; raylib's does, so we segregate).
-    const audio_compile_check = b.addTest(.{ .root_module = audio_mod });
-    const gfx_compile_check = b.addTest(.{ .root_module = gfx_mod });
+    //
+    // Both test modules are forced to `host_target` so that
+    // `zig build -Dtarget=wasm32-emscripten test-host` still builds
+    // and runs natively rather than trying to execute a wasm binary.
+    // Mirror the same explicit host_target already used by slot_alloc_tests.
+    const audio_host_mod = b.createModule(.{
+        .root_source_file = b.path("src/audio.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    audio_host_mod.addImport("raylib", raylib_mod);
+    audio_host_mod.addIncludePath(b.path("src"));
+    audio_host_mod.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
+    audio_host_mod.addCSourceFile(.{ .file = b.path("src/dr_wav_impl.c"), .flags = &.{} });
+
+    const gfx_host_mod = b.createModule(.{
+        .root_source_file = b.path("src/gfx.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gfx_host_mod.addImport("raylib", raylib_mod);
+    gfx_host_mod.addIncludePath(b.path("src"));
+    gfx_host_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
+
+    const audio_compile_check = b.addTest(.{ .root_module = audio_host_mod });
+    const gfx_compile_check = b.addTest(.{ .root_module = gfx_host_mod });
 
     const test_host_step = b.step(
         "test-host",
