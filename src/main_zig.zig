@@ -144,6 +144,107 @@ fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("\n", .{});
 }
 
+/// Emit the audio-backend wiring: an adapter namespace bridging the
+/// backend's `decodeAudio`/`uploadSound`/`unloadSound` to
+/// `engine.AudioBackend`, plus the `engine.AudioLoader.setBackend(...)`
+/// call that installs the adapter.
+///
+/// Structural mirror of `writeImageBackendWiring`. The slot table
+/// marshals between the backend's per-backend `Sound` struct and the
+/// engine's flat `SoundId` ({ index: u16, generation: u16 }) handle.
+/// Concrete audio backends (raylib-audio, sokol-audio, …) publish
+/// `decodeAudio`/`uploadSound`/`unloadSound` next to their existing
+/// runtime playback functions in the backend's audio module
+/// (imported here as `BackendAudio` — see
+/// `labelle-engine/codegen/main.zig.template`).
+///
+/// SCAFFOLDING (Phase 4, #447): this helper is currently defined but
+/// NOT yet called from `buildSetupCode` / `buildCallbackInitCode`. The
+/// missing pieces before it can be wired in:
+///   1. `engine.AudioLoader` must be re-exported from
+///      `labelle-engine/src/root.zig` (mirror of `ImageLoader` at the
+///      bottom of that file).
+///   2. `ProjectConfig.resources` (in `src/config.zig`) must grow a
+///      resource shape for audio (`.wav`/`.ogg` instead of the
+///      atlas-shaped `.json` + `.texture`), and the assembler must
+///      dispatch on extension to choose between `registerAtlasFromMemory`
+///      and `registerSoundFromMemory` (or equivalent).
+///   3. At least one concrete backend (`labelle-raylib-audio` or
+///      `labelle-sokol-audio`) must implement `decodeAudio` etc. on its
+///      audio module. Until then, calling this helper would generate
+///      code that fails to compile.
+///
+/// This PR lands the codegen skeleton + unit tests so the function is
+/// reviewed in isolation; follow-up PRs add the three pieces above and
+/// the call sites.
+///
+/// Ticket: labelle-engine#447 (audio loader tracking)
+/// Sibling: `writeImageBackendWiring` (already wired)
+pub fn writeAudioBackendWiring(w: anytype, indent: []const u8) !void {
+    try w.print("{s}// ── Audio asset backend wiring (Asset Streaming RFC, #447) ──\n", .{indent});
+    try w.print("{s}// `engine.AudioLoader.setBackend` installs function-pointer adapters\n", .{indent});
+    try w.print("{s}// that marshal between `BackendAudio`'s `DecodedAudio`/`Sound` and\n", .{indent});
+    try w.print("{s}// the engine's `DecodedAudio` + `SoundId` ({{ index, generation }}) handle.\n", .{indent});
+    try w.print("{s}// A private slot table keyed by the SoundId index preserves the full\n", .{indent});
+    try w.print("{s}// backend `Sound` struct so unload releases the device-side buffer\n", .{indent});
+    try w.print("{s}// (and any auxiliary handles the backend allocates per sound).\n", .{indent});
+    try w.print("{s}const AudioBackendAdapter = struct {{\n", .{indent});
+    try w.print("{s}    const MAX_AUDIO_ASSETS = 1024;\n", .{indent});
+    try w.print("{s}    var slots: [MAX_AUDIO_ASSETS]?BackendAudio.Sound = [_]?BackendAudio.Sound{{null}} ** MAX_AUDIO_ASSETS;\n", .{indent});
+    try w.print("{s}\n", .{indent});
+    try w.print("{s}    fn decode(\n", .{indent});
+    try w.print("{s}        file_type: [:0]const u8,\n", .{indent});
+    try w.print("{s}        data: []const u8,\n", .{indent});
+    try w.print("{s}        alloc: std.mem.Allocator,\n", .{indent});
+    try w.print("{s}    ) anyerror!engine.DecodedAudio {{\n", .{indent});
+    try w.print("{s}        const d = try BackendAudio.decodeAudio(file_type, data, alloc);\n", .{indent});
+    try w.print("{s}        return .{{ .samples = d.samples, .sample_rate = d.sample_rate, .channels = d.channels }};\n", .{indent});
+    try w.print("{s}    }}\n", .{indent});
+    try w.print("{s}\n", .{indent});
+    try w.print("{s}    fn upload(decoded: engine.DecodedAudio) anyerror!engine.SoundId {{\n", .{indent});
+    // Find a free slot BEFORE uploading to the audio device —
+    // otherwise a full slot table would leak the backend sound.
+    // Reusing the lowest free index means `unload`'s recycled slots
+    // come back into play; a monotonic counter would exhaust after
+    // MAX_AUDIO_ASSETS total uploads regardless of intervening
+    // unloads.
+    try w.print("{s}        var idx: u16 = MAX_AUDIO_ASSETS;\n", .{indent});
+    try w.print("{s}        for (slots, 0..) |slot, i| {{\n", .{indent});
+    try w.print("{s}            if (slot == null) {{\n", .{indent});
+    try w.print("{s}                idx = @intCast(i);\n", .{indent});
+    try w.print("{s}                break;\n", .{indent});
+    try w.print("{s}            }}\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
+    try w.print("{s}        if (idx == MAX_AUDIO_ASSETS) return error.AudioSlotsExhausted;\n", .{indent});
+    try w.print("{s}        const backend_decoded: BackendAudio.DecodedAudio = .{{\n", .{indent});
+    try w.print("{s}            .samples = decoded.samples,\n", .{indent});
+    try w.print("{s}            .sample_rate = decoded.sample_rate,\n", .{indent});
+    try w.print("{s}            .channels = decoded.channels,\n", .{indent});
+    try w.print("{s}        }};\n", .{indent});
+    try w.print("{s}        const sound = try BackendAudio.uploadSound(backend_decoded);\n", .{indent});
+    try w.print("{s}        slots[idx] = sound;\n", .{indent});
+    // Generation is fixed at 1 for v1 — concrete backends that need
+    // stale-handle detection can bump this in a follow-up by tracking
+    // a per-slot generation counter incremented on unload.
+    try w.print("{s}        return .{{ .index = idx, .generation = 1 }};\n", .{indent});
+    try w.print("{s}    }}\n", .{indent});
+    try w.print("{s}\n", .{indent});
+    try w.print("{s}    fn unload(sound: engine.SoundId) void {{\n", .{indent});
+    try w.print("{s}        if (sound.index >= MAX_AUDIO_ASSETS) return;\n", .{indent});
+    try w.print("{s}        if (slots[sound.index]) |s| {{\n", .{indent});
+    try w.print("{s}            BackendAudio.unloadSound(s);\n", .{indent});
+    try w.print("{s}            slots[sound.index] = null;\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
+    try w.print("{s}    }}\n", .{indent});
+    try w.print("{s}}};\n", .{indent});
+    try w.print("{s}engine.AudioLoader.setBackend(.{{\n", .{indent});
+    try w.print("{s}    .decode = AudioBackendAdapter.decode,\n", .{indent});
+    try w.print("{s}    .upload = AudioBackendAdapter.upload,\n", .{indent});
+    try w.print("{s}    .unload = AudioBackendAdapter.unload,\n", .{indent});
+    try w.print("{s}}});\n", .{indent});
+    try w.print("\n", .{});
+}
+
 /// Emit the `PluginControllers` comptime dispatcher that scans each plugin's
 /// root module for `pub const Controller = struct { ... }` and forwards
 /// `setup` / `deinit` lifecycle calls.

@@ -1372,6 +1372,76 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 };
 
+// ── Audio Backend Wiring ─────────────────────────────────────────────
+//
+// Phase 4 of the Asset Streaming RFC (labelle-engine#447). Scaffolding
+// only — `writeAudioBackendWiring` is defined and shape-tested but not
+// yet called from buildSetupCode / buildCallbackInitCode. The function
+// emits an adapter + `engine.AudioLoader.setBackend(...)` call that
+// will be reached once (a) `engine.AudioLoader` is re-exported,
+// (b) audio resources land in `ProjectConfig`, and (c) a concrete
+// audio backend implements `decodeAudio` / `uploadSound` /
+// `unloadSound` on its audio module. Until then these tests guard the
+// codegen output by direct invocation against an in-memory buffer.
+
+pub const AUDIO_BACKEND_WIRING = struct {
+    fn renderAudio() ![]const u8 {
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(std.testing.allocator);
+        const w = buf.writer(std.testing.allocator);
+        try generate.writeAudioBackendWiring(w, "    ");
+        return buf.toOwnedSlice(std.testing.allocator);
+    }
+
+    test "writeAudioBackendWiring emits adapter + setBackend" {
+        const out = try renderAudio();
+        defer std.testing.allocator.free(out);
+
+        // Adapter shape.
+        try std.testing.expect(std.mem.indexOf(u8, out, "const AudioBackendAdapter = struct {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn decode(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn upload(decoded: engine.DecodedAudio) anyerror!engine.SoundId") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unload(sound: engine.SoundId) void") != null);
+
+        // Marshalling to the backend's audio module.
+        try std.testing.expect(std.mem.indexOf(u8, out, "BackendAudio.decodeAudio(file_type, data, alloc)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "BackendAudio.uploadSound(backend_decoded)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "BackendAudio.unloadSound(s)") != null);
+
+        // setBackend installation.
+        try std.testing.expect(std.mem.indexOf(u8, out, "engine.AudioLoader.setBackend(.{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".decode = AudioBackendAdapter.decode") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".upload = AudioBackendAdapter.upload") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".unload = AudioBackendAdapter.unload") != null);
+    }
+
+    test "writeAudioBackendWiring marshals DecodedAudio fields" {
+        // `BackendAudio.DecodedAudio` is structurally identical to
+        // `engine.DecodedAudio` but nominally distinct (same trap as
+        // images). Verify the field-by-field copy.
+        const out = try renderAudio();
+        defer std.testing.allocator.free(out);
+
+        try std.testing.expect(std.mem.indexOf(u8, out, ".samples = decoded.samples") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".sample_rate = decoded.sample_rate") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".channels = decoded.channels") != null);
+    }
+
+    test "writeAudioBackendWiring marshals Sound via slot table → SoundId" {
+        // Slot table mirrors the image side: backend's `Sound` struct
+        // stays alongside a u16 slot index that becomes
+        // `SoundId.index`. Generation pinned to 1 in v1 (documented).
+        const out = try renderAudio();
+        defer std.testing.allocator.free(out);
+
+        try std.testing.expect(std.mem.indexOf(u8, out, "var slots: [MAX_AUDIO_ASSETS]?BackendAudio.Sound") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "if (idx == MAX_AUDIO_ASSETS) return error.AudioSlotsExhausted") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".index = idx, .generation = 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "if (sound.index >= MAX_AUDIO_ASSETS) return") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "slots[sound.index] = null") != null);
+    }
+};
+
 // ── Scripts ──────────────────────────────────────────────────────────
 
 pub const SCRIPTS = struct {

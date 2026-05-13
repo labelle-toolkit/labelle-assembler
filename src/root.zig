@@ -52,6 +52,7 @@ pub const isLocalVersion = config.isLocalVersion;
 pub const resolveGuiPlugin = gui_resolve.resolveGuiPlugin;
 
 pub const generateMainZigFromTemplate = main_zig.generateMainZigFromTemplate;
+pub const writeAudioBackendWiring = main_zig.writeAudioBackendWiring;
 pub const generateBuildZig = build_files.generateBuildZig;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
 pub const deps_linker = build_files.deps_linker;
