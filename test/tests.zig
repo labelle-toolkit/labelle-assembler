@@ -1500,13 +1500,18 @@ pub const FONT_BACKEND_WIRING = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, ".bitmap = d.bitmap") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, ".width = d.width") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, ".height = d.height") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, ".glyphs = d.glyphs") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, ".codepoint_index = d.codepoint_index") != null);
+        // Slice fields are `@ptrCast` across the nominally-distinct
+        // extern-struct boundary between BackendGfx.Glyph and
+        // engine.Glyph (and equivalent for the other two slice
+        // element types). Locks the codegen so a regression to
+        // plain `.glyphs = d.glyphs` would be caught here.
+        try std.testing.expect(std.mem.indexOf(u8, out, ".glyphs = @ptrCast(d.glyphs)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".codepoint_index = @ptrCast(d.codepoint_index)") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, ".ascent = d.ascent") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, ".descent = d.descent") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, ".line_gap = d.line_gap") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, ".line_height = d.line_height") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, ".kerning = d.kerning") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".kerning = @ptrCast(d.kerning)") != null);
 
         // FontBakeParams also threads through decode (RFC §7) —
         // the `params: ?*const anyopaque` is cast back to the
