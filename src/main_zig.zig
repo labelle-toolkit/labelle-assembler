@@ -473,6 +473,30 @@ fn extWithoutDot(path: []const u8) []const u8 {
     return ext[1..];
 }
 
+/// Returns true iff `name` is a valid bare Zig identifier — first
+/// character `[A-Za-z_]`, rest `[A-Za-z0-9_]`. Doesn't reject Zig
+/// keywords; in practice resource names like `fn` are vanishingly
+/// rare and the resulting compile error names the line clearly.
+///
+/// Font resources need this guard because `emitResourceLoad` for
+/// `.font` interpolates the resource name into Zig identifier
+/// positions (`{name}_ranges`, `{name}_params`) — a hyphenated name
+/// like `"ui-font"` would generate `const ui-font_ranges = ...`, which
+/// is uncompilable. Atlas + sound emissions only place names inside
+/// string literals so they're unaffected. Bugbot caught the gap on
+/// #105.
+fn isValidZigIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const first = name[0];
+    const first_ok = (first >= 'A' and first <= 'Z') or (first >= 'a' and first <= 'z') or first == '_';
+    if (!first_ok) return false;
+    for (name[1..]) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 /// Emit the loader call for one `ResourceDef`, dispatching on
 /// `res.kind()`:
 ///
@@ -604,6 +628,18 @@ fn validateResources(cfg: ProjectConfig) !void {
                 std.fs.File.stderr().writeAll(res.name) catch {};
                 std.fs.File.stderr().writeAll("' has unsupported extension. Expected `.ttf` or `.otf`.\n") catch {};
                 return error.UnsupportedResourceExtension;
+            }
+            // Font emission interpolates `res.name` into Zig
+            // identifier positions (`{name}_ranges`, `{name}_params`).
+            // A hyphenated name like "ui-font" would otherwise produce
+            // uncompilable `const ui-font_ranges = ...`. Atlas + sound
+            // emissions don't have this constraint — those names only
+            // appear in string literals.
+            if (!isValidZigIdentifier(res.name)) {
+                std.fs.File.stderr().writeAll("labelle-assembler: font resource '") catch {};
+                std.fs.File.stderr().writeAll(res.name) catch {};
+                std.fs.File.stderr().writeAll("' has a name that is not a valid Zig identifier. Font resource names must start with [A-Za-z_] and contain only [A-Za-z0-9_] thereafter (the codegen uses the name as a local const identifier for the bake params).\n") catch {};
+                return error.InvalidFontResourceName;
             }
         }
     }

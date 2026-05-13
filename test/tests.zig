@@ -2030,6 +2030,68 @@ pub const RESOURCE_EMISSION = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         try std.testing.expectError(error.InvalidResource, result);
     }
+
+    test "validation rejects font resource name with hyphen (Bugbot finding on #105)" {
+        // Cursor Bugbot flagged that `emitResourceLoad` for fonts
+        // interpolates the resource name into Zig identifier positions
+        // (`{name}_ranges`, `{name}_params`). Without this guard a
+        // name like "ui-font" would generate `const ui-font_ranges = ...`
+        // which is uncompilable. Validation rejects up front with a
+        // clean diagnostic naming the bad resource.
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "ui-font", .font = "fonts/ui.ttf" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        try std.testing.expectError(error.InvalidFontResourceName, result);
+    }
+
+    test "validation rejects font resource name starting with digit" {
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "8bit_font", .font = "fonts/8bit.ttf" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        try std.testing.expectError(error.InvalidFontResourceName, result);
+    }
+
+    test "validation rejects font resource name with dot" {
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "display.regular", .font = "fonts/display.ttf" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        try std.testing.expectError(error.InvalidFontResourceName, result);
+    }
+
+    test "atlas + sound resources accept hyphenated names (only fonts need identifier safety)" {
+        // Verify the identifier-safety check is scoped to fonts —
+        // atlas and sound names only appear inside string literals
+        // in the emitted code, so they accept any name. This guard
+        // ensures we don't over-restrict.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "boss-theme", .sound = "audio/boss.ogg" },
+                .{ .name = "ui-atlas", .json = "atlases/ui.json", .texture = "atlases/ui.png" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSoundFromMemory(\"boss-theme\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"ui-atlas\"") != null);
+    }
 };
 
 // ── ResourceDef kind + validation (Phase 4 schema, #447/#448) ────────
