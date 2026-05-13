@@ -367,6 +367,14 @@ fn decodeOgg(data: []const u8, allocator: std.mem.Allocator) !DecodedAudio {
 /// copies the samples, so the caller's buffer can be freed
 /// immediately after this call returns.
 pub fn uploadSound(decoded: DecodedAudio) !Sound {
+    // Reject zero-channel inputs up-front. `decodeAudio` already
+    // rejects them, but `uploadSound` is a public API that can be
+    // called with a hand-constructed `DecodedAudio` (e.g. games that
+    // synthesize PCM in-engine). Without this guard the
+    // `@divTrunc(samples.len, channels)` below would panic in debug
+    // and be UB in release.
+    if (decoded.channels == 0) return error.AudioInvalidChannels;
+
     // Find a free slot. Walk from index 1 — id 0 is reserved as
     // "no sound" for the legacy `loadSound` path, which we preserve
     // to keep the two surfaces' semantics aligned.
@@ -455,3 +463,18 @@ test "Sound has stable extern layout" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(Sound));
     try testing.expectEqual(@as(usize, 4), @alignOf(Sound));
 }
+
+// NOTE on `uploadSound` zero-channel coverage:
+//
+// The channel-zero guard in `uploadSound` (returning
+// `error.AudioInvalidChannels` before `@divTrunc(.., channels)`) is
+// the user-facing fix for the div-by-zero Cursor Bugbot flagged.
+// We deliberately do NOT add a test that calls `uploadSound` from
+// the host test target here: doing so forces the linker to resolve
+// `rl.loadSoundFromWave` against `libraylib.a`, which embeds its
+// own private copies of `dr_wav` and `stb_vorbis`. The audio module
+// compiles `dr_wav_impl.c` + `stb_vorbis.c` separately, so the link
+// step would fail with 100+ duplicate-symbol errors (`_drwav_*`,
+// `_stb_vorbis_*`). The parallel sokol test
+// (`backends/sokol/src/audio.zig`) exercises an equivalent guard at
+// the unit level without that linker constraint.
