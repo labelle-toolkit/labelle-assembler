@@ -80,6 +80,40 @@ pub fn markSoundUnloaded(slots: *SoundSlots, id: u32) void {
     if (activeSound(slots, id)) |slot| slot.unloaded = true;
 }
 
+/// Single source of truth for sound-slot allocation. Scans `slots`
+/// from index 1 (slot 0 reserved for the legacy "not loaded" sentinel)
+/// and returns the first slot index that is either:
+///   - empty (`slots[i] == null`), or
+///   - previously marked unloaded (`slots[i].?.unloaded == true`) — a
+///     recyclable slot whose old samples buffer the caller must defer
+///     to its own `pending_frees` list before overwriting.
+///
+/// Returns `null` if every slot is occupied by a live sound. Both the
+/// legacy `loadSound` and the Phase 4 `uploadSound` go through this
+/// helper so the two APIs cannot collide on the same slot index (the
+/// pre-fix code had `loadSound` blindly writing to `next_sound_id`,
+/// which `uploadSound` had no way to observe — issue #110).
+pub fn allocateSoundSlot(slots: *SoundSlots) ?u32 {
+    var i: u32 = 1;
+    while (i < MAX_SOUNDS) : (i += 1) {
+        if (slots[i] == null) return i;
+        if (slots[i].?.unloaded) return i;
+    }
+    return null;
+}
+
+/// Music counterpart of `allocateSoundSlot`. Same scan policy; the
+/// legacy `loadMusic` path also routes through this so a future
+/// Phase 4 music upload won't repeat the slot-collision class of bug.
+pub fn allocateMusicSlot(slots: *MusicSlots) ?u32 {
+    var i: u32 = 1;
+    while (i < MAX_MUSIC) : (i += 1) {
+        if (slots[i] == null) return i;
+        if (slots[i].?.unloaded) return i;
+    }
+    return null;
+}
+
 /// Mark a music slot unloaded. Also stops playback so the audio
 /// callback will skip it on its next pass before the `unloaded` flag
 /// is even observed.
@@ -215,4 +249,58 @@ test "activeMusic returns null for out-of-range id" {
     var slots = emptyMusicSlots();
     try testing.expect(activeMusic(&slots, MAX_MUSIC) == null);
     try testing.expect(activeMusic(&slots, MAX_MUSIC + 10) == null);
+}
+
+test "allocateSoundSlot returns first null slot starting at index 1" {
+    var slots = emptySoundSlots();
+    // Slot 0 must never be picked — it's the legacy "not loaded" sentinel.
+    try testing.expectEqual(@as(?u32, 1), allocateSoundSlot(&slots));
+
+    const buf = try testing.allocator.alloc(f32, 1);
+    defer testing.allocator.free(buf);
+    slots[1] = makeTestSound(buf);
+    try testing.expectEqual(@as(?u32, 2), allocateSoundSlot(&slots));
+}
+
+test "allocateSoundSlot recycles unloaded slots before exhausting the pool" {
+    var slots = emptySoundSlots();
+    const buf = try testing.allocator.alloc(f32, 1);
+    defer testing.allocator.free(buf);
+
+    // Fill every slot from 1 onward with a live sound.
+    var i: u32 = 1;
+    while (i < MAX_SOUNDS) : (i += 1) slots[i] = makeTestSound(buf);
+
+    // No free slot — pool is exhausted.
+    try testing.expect(allocateSoundSlot(&slots) == null);
+
+    // Unload the middle slot — `allocateSoundSlot` must now return it
+    // even though it's non-null. This is the recycling fix for #110.
+    slots[42].?.unloaded = true;
+    try testing.expectEqual(@as(?u32, 42), allocateSoundSlot(&slots));
+}
+
+test "allocateSoundSlot returns null when every slot is live" {
+    var slots = emptySoundSlots();
+    const buf = try testing.allocator.alloc(f32, 1);
+    defer testing.allocator.free(buf);
+
+    var i: u32 = 1;
+    while (i < MAX_SOUNDS) : (i += 1) slots[i] = makeTestSound(buf);
+
+    try testing.expect(allocateSoundSlot(&slots) == null);
+}
+
+test "allocateMusicSlot recycles unloaded slots" {
+    var slots = emptyMusicSlots();
+    const buf = try testing.allocator.alloc(f32, 1);
+    defer testing.allocator.free(buf);
+
+    try testing.expectEqual(@as(?u32, 1), allocateMusicSlot(&slots));
+
+    slots[1] = makeTestMusic(buf);
+    try testing.expectEqual(@as(?u32, 2), allocateMusicSlot(&slots));
+
+    slots[1].?.unloaded = true;
+    try testing.expectEqual(@as(?u32, 1), allocateMusicSlot(&slots));
 }

@@ -32,10 +32,23 @@ const Voice = struct {
 var sounds: slots.SoundSlots = slots.emptySoundSlots();
 var music_slots: slots.MusicSlots = slots.emptyMusicSlots();
 var voices: [MAX_ACTIVE_VOICES]Voice = [_]Voice{.{ .sound_id = 0, .position = 0, .active = false }} ** MAX_ACTIVE_VOICES;
-var next_sound_id: u32 = 1;
-var next_music_id: u32 = 1;
 var master_volume: f32 = 1.0;
 var audio_initialized: bool = false;
+
+// Deferred-free list for sample buffers whose slot has been recycled
+// by a subsequent `loadSound` / `uploadSound`. We don't free these at
+// the recycle site because the audio thread may still hold a stale
+// pointer captured before `voice.active` was flipped to false; by the
+// time the slot is reused, sokol_audio's buffer-period (10–20ms) has
+// elapsed and a fresh `uploadSound` is fine to overwrite the slot
+// fields — but the old `[]f32` allocation has to outlive the audio
+// thread for the safety story to hold, so we park it here and free
+// everything at `deinit` after `saudio.shutdown()` blocks the callback.
+//
+// This is the same trade-off `markSoundUnloaded` already encodes for
+// non-recycled slots; we simply extend it across the recycle boundary.
+var pending_sound_frees: std.ArrayList([]const f32) = .{};
+var pending_music_frees: std.ArrayList([]const f32) = .{};
 
 /// Thin wrappers over the helpers in `audio_slots.zig` so each call
 /// site doesn't have to pass the module-level array explicitly.
@@ -68,7 +81,10 @@ pub fn deinit() void {
     if (!audio_initialized) return;
 
     // Stop the audio callback first so it no longer reads shared state.
-    saudio.shutdown();
+    // `isvalid()` guards against the test-host path where we flip
+    // `audio_initialized` manually without ever calling `saudio.setup`
+    // — `saudio.shutdown` asserts `setup_called` and would abort.
+    if (saudio.isvalid()) saudio.shutdown();
 
     // Free all sound sample buffers.
     for (&sounds) |*slot| {
@@ -86,13 +102,29 @@ pub fn deinit() void {
         }
     }
 
+    // Free every sample buffer whose slot was recycled during the run
+    // (issue #110): these allocations were intentionally kept alive
+    // past their `unloadSound` because the audio callback thread may
+    // have still held a pointer to them. `saudio.shutdown()` above
+    // joined that thread, so we can drop them now.
+    for (pending_sound_frees.items) |buf| std.heap.page_allocator.free(buf);
+    pending_sound_frees.deinit(std.heap.page_allocator);
+    pending_sound_frees = .{};
+    for (pending_music_frees.items) |buf| std.heap.page_allocator.free(buf);
+    pending_music_frees.deinit(std.heap.page_allocator);
+    pending_music_frees = .{};
+
     // Reset all voices.
     for (&voices) |*voice| {
         voice.* = .{ .sound_id = 0, .position = 0, .active = false };
     }
 
-    next_sound_id = 1;
-    next_music_id = 1;
+    // Reset per-slot generation counters too — otherwise stale
+    // generations would survive across a deinit/init cycle and a
+    // fresh `Sound` handle could collide with a stale held one.
+    sound_generations = [_]u32{0} ** slots.MAX_SOUNDS;
+    music_generations = [_]u32{0} ** slots.MAX_MUSIC;
+
     master_volume = 1.0;
     audio_initialized = false;
 }
@@ -317,13 +349,67 @@ fn convertToF32(pcm_data: []const u8, channels: u16, sample_rate: u32, bits: u16
 
 // ── Sound effects ──────────────────────────────────────────
 
+// Legacy `u32` audio id encoding (#110 follow-up).
+//
+// Pre-fix, the legacy `loadSound`/`loadMusic` paths returned the slot
+// index verbatim as `u32`. That worked when slots were never recycled
+// — a stale id couldn't collide with a new occupant because the id
+// allocator was monotonic. The slot-recycling fix changed that: a
+// freed slot can be reused by the next `loadSound`, so a stale id
+// stored by game code can now alias the new sound.
+//
+// `unloadSoundById(stale_id)` would tear down the live recycled
+// occupant. To prevent that without changing the public `u32` type,
+// we pack the slot's generation into the upper 16 bits of the
+// returned id: `(generation & 0xFFFF) << 16 | (slot_idx & 0xFFFF)`.
+//
+// MAX_SOUNDS = 256 and MAX_MUSIC = 32, so the bottom 16 bits hold the
+// index with room to spare. The Phase 4 `Sound` struct already does
+// the same trick with explicit `slot_index`/`generation` fields; this
+// is the legacy `u32`-shaped counterpart.
+//
+// Read consumers (`playSound`, `stopSound`, etc.) only decode the
+// slot index — passing a stale id at those entry points would
+// silently address the recycled slot (annoying but not destructive),
+// mirroring v1 behaviour. The generation check is enforced where it
+// matters: `unloadSoundById` / `unloadMusic`, which destroy state.
+const SLOT_INDEX_MASK: u32 = 0xFFFF;
+const GEN_SHIFT: u5 = 16;
+
+fn encodeLegacyId(slot_idx: u32, generation: u32) u32 {
+    return ((generation & 0xFFFF) << GEN_SHIFT) | (slot_idx & SLOT_INDEX_MASK);
+}
+
+fn decodeLegacySlot(id: u32) u32 {
+    return id & SLOT_INDEX_MASK;
+}
+
+fn decodeLegacyGeneration(id: u32) u32 {
+    return (id >> GEN_SHIFT) & 0xFFFF;
+}
+
 pub fn loadSound(path: [:0]const u8) u32 {
     ensureInit();
     const wav = loadWavFile(path) orelse return 0;
-    const id = next_sound_id;
-    if (id >= MAX_SOUNDS) {
+    // Route through the shared allocator so this legacy path can't
+    // collide with the Phase 4 `uploadSound` (issue #110). The pre-fix
+    // code blindly wrote to `sounds[next_sound_id]` which `uploadSound`
+    // had no way to observe, silently leaking the Phase 4 slot's
+    // converted-f32 buffer and stranding a stale `Sound` handle.
+    const id = slots.allocateSoundSlot(&sounds) orelse {
         std.heap.page_allocator.free(wav.samples);
         return 0;
+    };
+    // If we're reusing an unloaded slot, park the old samples buffer
+    // on the deferred-free list so deinit (which runs after the audio
+    // thread has been joined) can release it. We can't free in place
+    // because the audio callback may still hold a stale pointer.
+    if (sounds[id]) |old| {
+        pending_sound_frees.append(std.heap.page_allocator, old.samples) catch {
+            // Append failed (OOM on the list growth): leak the buffer
+            // rather than free-mid-runtime — same reasoning as above.
+            // The slot itself still gets overwritten below.
+        };
     }
     sounds[id] = .{
         .samples = wav.samples,
@@ -332,8 +418,13 @@ pub fn loadSound(path: [:0]const u8) u32 {
         .sample_rate = wav.sample_rate,
         .volume = 1.0,
     };
-    next_sound_id += 1;
-    return id;
+    // Bump the generation so any Phase 4 `Sound` handle held against
+    // this slot index from a prior occupant becomes stale (its
+    // generation check in `unloadSound` will now fail-soft), and so
+    // the encoded legacy `u32` below stays unique across recycle
+    // cycles.
+    sound_generations[id] += 1;
+    return encodeLegacyId(id, sound_generations[id]);
 }
 
 /// Legacy path-based unload, paired with `loadSound(path)`. Renamed
@@ -342,49 +433,64 @@ pub fn loadSound(path: [:0]const u8) u32 {
 /// take the bare name. Game code that was calling `audio.unloadSound(id)`
 /// against the legacy API moves to this name; the catalog path uses
 /// `unloadSound(sound)` further down.
+///
+/// Validates the generation packed into the returned `u32` against
+/// `sound_generations[slot]` so a stale id (held across an
+/// upload/unload + recycle cycle) is a no-op rather than tearing down
+/// the live recycled occupant. See `encodeLegacyId`.
 pub fn unloadSoundById(id: u32) void {
-    if (activeSound(id) == null) return;
+    const slot_idx = decodeLegacySlot(id);
+    const gen = decodeLegacyGeneration(id);
+    if (slot_idx == 0 or slot_idx >= MAX_SOUNDS) return;
+    // Generation mismatch ⇒ stale id from a previous occupant of this
+    // slot. Refuse to tear down the live sound. We compare against
+    // the low 16 bits since that's what the encoded id carries.
+    if ((sound_generations[slot_idx] & 0xFFFF) != gen) return;
+    if (activeSound(slot_idx) == null) return;
     // Stop any voices using this sound before flipping the unloaded
     // bit — the audio callback may still be iterating `voices` and
     // about to follow `sound_id` into this slot.
     for (&voices) |*voice| {
-        if (voice.active and voice.sound_id == id) {
+        if (voice.active and voice.sound_id == slot_idx) {
             voice.active = false;
         }
     }
     // Do NOT free samples here — the audio callback thread may still
     // be reading. `markSoundUnloaded` keeps the slot reachable via
-    // `sounds[id]` so `deinit` can free it at shutdown. See #10 — the
+    // `sounds[slot]` so `deinit` can free it at shutdown. See #10 — the
     // pre-fix code nulled the whole optional and orphaned the buffer.
-    slots.markSoundUnloaded(&sounds, id);
+    slots.markSoundUnloaded(&sounds, slot_idx);
 }
 
 pub fn playSound(id: u32) void {
     ensureInit();
-    if (activeSound(id) == null) return;
+    const slot_idx = decodeLegacySlot(id);
+    if (activeSound(slot_idx) == null) return;
 
     // Find a free voice slot
     for (&voices) |*voice| {
         if (!voice.active) {
-            voice.* = .{ .sound_id = id, .position = 0, .active = true };
+            voice.* = .{ .sound_id = slot_idx, .position = 0, .active = true };
             return;
         }
     }
     // All voices busy: steal the oldest (first) voice
-    voices[0] = .{ .sound_id = id, .position = 0, .active = true };
+    voices[0] = .{ .sound_id = slot_idx, .position = 0, .active = true };
 }
 
 pub fn stopSound(id: u32) void {
+    const slot_idx = decodeLegacySlot(id);
     for (&voices) |*voice| {
-        if (voice.active and voice.sound_id == id) {
+        if (voice.active and voice.sound_id == slot_idx) {
             voice.active = false;
         }
     }
 }
 
 pub fn isSoundPlaying(id: u32) bool {
+    const slot_idx = decodeLegacySlot(id);
     for (&voices) |*voice| {
-        if (voice.active and voice.sound_id == id) {
+        if (voice.active and voice.sound_id == slot_idx) {
             return true;
         }
     }
@@ -392,20 +498,30 @@ pub fn isSoundPlaying(id: u32) bool {
 }
 
 pub fn setSoundVolume(id: u32, volume: f32) void {
-    if (activeSound(id)) |slot| {
+    if (activeSound(decodeLegacySlot(id))) |slot| {
         slot.volume = std.math.clamp(volume, 0.0, 1.0);
     }
 }
 
 // ── Music (streaming) ──────────────────────────────────────
 
+/// Per-slot generation counter for the legacy music path. Same
+/// rationale as `sound_generations` (see #110 follow-up): the
+/// encoded `u32` returned by `loadMusic` packs this so a stale id
+/// across a recycle boundary is a no-op in `unloadMusic`.
+var music_generations: [slots.MAX_MUSIC]u32 = [_]u32{0} ** slots.MAX_MUSIC;
+
 pub fn loadMusic(path: [:0]const u8) u32 {
     ensureInit();
     const wav = loadWavFile(path) orelse return 0;
-    const id = next_music_id;
-    if (id >= MAX_MUSIC) {
+    // Same pattern as `loadSound`: shared allocator + deferred free
+    // for any recycled slot's old samples. See #110.
+    const id = slots.allocateMusicSlot(&music_slots) orelse {
         std.heap.page_allocator.free(wav.samples);
         return 0;
+    };
+    if (music_slots[id]) |old| {
+        pending_music_frees.append(std.heap.page_allocator, old.samples) catch {};
     }
     music_slots[id] = .{
         .samples = wav.samples,
@@ -418,20 +534,28 @@ pub fn loadMusic(path: [:0]const u8) u32 {
         .paused = false,
         .looping = true,
     };
-    next_music_id += 1;
-    return id;
+    music_generations[id] += 1;
+    return encodeLegacyId(id, music_generations[id]);
 }
 
+/// Validates the generation packed into the returned `u32` against
+/// `music_generations[slot]` so a stale id (held across an
+/// upload/unload + recycle cycle) is a no-op. See `encodeLegacyId`
+/// and `unloadSoundById` for the full reasoning.
 pub fn unloadMusic(id: u32) void {
+    const slot_idx = decodeLegacySlot(id);
+    const gen = decodeLegacyGeneration(id);
+    if (slot_idx == 0 or slot_idx >= MAX_MUSIC) return;
+    if ((music_generations[slot_idx] & 0xFFFF) != gen) return;
     // `markMusicUnloaded` stops playback and sets the flag; the slot
     // stays non-null so `deinit` can free the samples at shutdown.
     // See #10 and unloadSound above for the full reasoning.
-    slots.markMusicUnloaded(&music_slots, id);
+    slots.markMusicUnloaded(&music_slots, slot_idx);
 }
 
 pub fn playMusic(id: u32) void {
     ensureInit();
-    if (activeMusic(id)) |slot| {
+    if (activeMusic(decodeLegacySlot(id))) |slot| {
         slot.playing = true;
         slot.paused = false;
         slot.position = 0;
@@ -439,33 +563,33 @@ pub fn playMusic(id: u32) void {
 }
 
 pub fn stopMusic(id: u32) void {
-    if (activeMusic(id)) |slot| {
+    if (activeMusic(decodeLegacySlot(id))) |slot| {
         slot.playing = false;
         slot.position = 0;
     }
 }
 
 pub fn pauseMusic(id: u32) void {
-    if (activeMusic(id)) |slot| {
+    if (activeMusic(decodeLegacySlot(id))) |slot| {
         slot.paused = true;
     }
 }
 
 pub fn resumeMusic(id: u32) void {
-    if (activeMusic(id)) |slot| {
+    if (activeMusic(decodeLegacySlot(id))) |slot| {
         slot.paused = false;
     }
 }
 
 pub fn isMusicPlaying(id: u32) bool {
-    if (activeMusic(id)) |slot| {
+    if (activeMusic(decodeLegacySlot(id))) |slot| {
         return slot.playing and !slot.paused;
     }
     return false;
 }
 
 pub fn setMusicVolume(id: u32, volume: f32) void {
-    if (activeMusic(id)) |slot| {
+    if (activeMusic(decodeLegacySlot(id))) |slot| {
         slot.volume = std.math.clamp(volume, 0.0, 1.0);
     }
 }
@@ -668,21 +792,36 @@ fn decodeOgg(data: []const u8, allocator: std.mem.Allocator) !DecodedAudio {
 pub fn uploadSound(decoded: DecodedAudio) !Sound {
     ensureInit();
 
-    // Find a free slot. Walk from index 1 — the legacy path reserves
-    // id 0 for "not loaded", which we preserve to keep the two
-    // surfaces' semantics aligned.
-    var slot_idx: u32 = 0;
-    var i: u32 = 1;
-    while (i < slots.MAX_SOUNDS) : (i += 1) {
-        if (sounds[i] == null) {
-            slot_idx = i;
-            break;
-        }
-    }
-    if (slot_idx == 0) return error.AudioSlotsExhausted;
+    // Reject zero-channel inputs up-front. `decodeAudio` already
+    // rejects them, but `uploadSound` is a public API that can be
+    // called with a hand-constructed `DecodedAudio` (e.g. games that
+    // synthesize PCM in-engine). A zero `channels` would propagate
+    // into `sample_count`/mixer-step arithmetic and the audio
+    // callback's stride math; rejecting here keeps the slot pool's
+    // invariants honest.
+    if (decoded.channels == 0) return error.AudioInvalidChannels;
+
+    // Shared slot allocator — accepts null OR unloaded slots, so this
+    // path now recycles slots whose `unloadSound` already ran (issue
+    // #110: pre-fix the scan looked only for `null`, and `markSoundUnloaded`
+    // keeps the slot non-null, so the pool exhausted after MAX_SOUNDS
+    // upload+unload cycles). Going through the shared helper also
+    // means the legacy `loadSound` path can never collide on the same
+    // index (the two used to disagree about what "free" meant).
+    const slot_idx = slots.allocateSoundSlot(&sounds) orelse return error.AudioSlotsExhausted;
 
     const f32_samples = convertS16ToF32(decoded.samples) catch return error.OutOfMemory;
     errdefer std.heap.page_allocator.free(f32_samples);
+
+    // If we're reusing a previously-unloaded slot, its old samples
+    // buffer is still pinned by the deferred-free contract — we can't
+    // free it here because the audio thread may have captured the
+    // pointer before its containing voice went `active = false`. Park
+    // it on `pending_sound_frees` and let `deinit` (which calls
+    // `saudio.shutdown` first) release everything safely.
+    if (sounds[slot_idx]) |old| {
+        try pending_sound_frees.append(std.heap.page_allocator, old.samples);
+    }
 
     sounds[slot_idx] = .{
         .samples = f32_samples,
@@ -757,4 +896,295 @@ test "Sound has stable extern layout" {
     // need to stay invariant.
     try testing.expectEqual(@as(usize, 8), @sizeOf(Sound));
     try testing.expectEqual(@as(usize, 4), @alignOf(Sound));
+}
+
+// ── Slot-management regression tests for #110 ─────────────────────────
+//
+// These exercise the upload + unload paths' interaction with the
+// shared slot allocator without spinning up sokol's audio device. We
+// flip `audio_initialized` to true so `ensureInit` is a no-op (it
+// won't call `saudio.setup` and the OS audio thread never starts).
+// All sample buffers are heap-allocated through `page_allocator` to
+// match the runtime paths' allocator choice.
+
+/// Reset the module's static state so each test starts from a clean
+/// slate (deinit needs `audio_initialized = true` to actually run its
+/// cleanup walk; the tests below assume that path).
+fn resetForTest() void {
+    audio_initialized = true; // skip saudio.setup
+    // Drain everything via the real deinit, then re-prime for the
+    // next test segment.
+    deinit();
+    audio_initialized = true;
+}
+
+fn makeDecodedFor(allocator: std.mem.Allocator, frames: usize) !DecodedAudio {
+    const samples = try allocator.alloc(i16, frames);
+    for (samples, 0..) |*s, i| s.* = @intCast(@as(i32, @intCast(i)) & 0x7FFF);
+    return .{ .samples = samples, .sample_rate = 44100, .channels = 1 };
+}
+
+test "uploadSound recycles slots through upload+unload cycles past MAX_SOUNDS (#110)" {
+    resetForTest();
+    defer {
+        audio_initialized = true;
+        deinit();
+    }
+
+    const allocator = std.testing.allocator;
+
+    // Run more cycles than slots exist. Pre-fix, `uploadSound` only
+    // scanned for `null` slots and `unloadSound`/`markSoundUnloaded`
+    // never nulled the slot — so the 256th cycle returned
+    // `error.AudioSlotsExhausted`. With the recycle fix it must run
+    // for arbitrarily many cycles.
+    const cycles: usize = @as(usize, slots.MAX_SOUNDS) * 3;
+    var i: usize = 0;
+    while (i < cycles) : (i += 1) {
+        const decoded = try makeDecodedFor(allocator, 4);
+        defer allocator.free(decoded.samples);
+
+        const sound = try uploadSound(decoded);
+        try testing.expect(sound.slot_index != 0);
+        unloadSound(sound);
+    }
+
+    // After all that churn the slot pool is still serviceable.
+    const decoded = try makeDecodedFor(allocator, 4);
+    defer allocator.free(decoded.samples);
+    const final = try uploadSound(decoded);
+    try testing.expect(final.slot_index != 0);
+    unloadSound(final);
+}
+
+test "loadSound and uploadSound do not collide on the same slot (#110)" {
+    resetForTest();
+    defer {
+        audio_initialized = true;
+        deinit();
+    }
+
+    const allocator = std.testing.allocator;
+
+    // Simulate the legacy path with a hand-crafted slot insertion —
+    // `loadSound` itself parses a WAV from disk which we don't want
+    // to pull into the test. The collision case the issue documents
+    // is purely about the slot index chosen, so we exercise the
+    // shared allocator directly: claim a slot the way `loadSound`
+    // now does, then upload a Phase 4 sound and assert the indices
+    // differ.
+    const legacy_id = slots.allocateSoundSlot(&sounds) orelse return error.NoSlot;
+    const legacy_buf = try std.heap.page_allocator.alloc(f32, 2);
+    sounds[legacy_id] = .{
+        .samples = legacy_buf,
+        .sample_count = legacy_buf.len,
+        .channels = 1,
+        .sample_rate = 44100,
+        .volume = 1.0,
+    };
+    sound_generations[legacy_id] += 1;
+
+    const decoded = try makeDecodedFor(allocator, 4);
+    defer allocator.free(decoded.samples);
+    const phase4 = try uploadSound(decoded);
+
+    try testing.expect(phase4.slot_index != legacy_id);
+    try testing.expect(phase4.slot_index != 0);
+
+    // The legacy slot is still intact — the Phase 4 upload did not
+    // clobber it (the pre-fix bug was the *opposite* direction, but
+    // the symmetric check is the right invariant for the shared
+    // allocator).
+    try testing.expect(sounds[legacy_id] != null);
+    try testing.expect(!sounds[legacy_id].?.unloaded);
+    try testing.expectEqual(legacy_buf.len, sounds[legacy_id].?.sample_count);
+
+    unloadSound(phase4);
+}
+
+test "uploadSound after unloadSound bumps generation so stale Sound handles fail-soft (#110)" {
+    resetForTest();
+    defer {
+        audio_initialized = true;
+        deinit();
+    }
+
+    const allocator = std.testing.allocator;
+
+    const decoded_a = try makeDecodedFor(allocator, 4);
+    defer allocator.free(decoded_a.samples);
+    const first = try uploadSound(decoded_a);
+
+    unloadSound(first);
+
+    // With slot 1 unloaded and every other slot empty, the shared
+    // allocator's "first null or unloaded" scan returns slot 1 again
+    // — exactly the recycle case we care about.
+    const decoded_b = try makeDecodedFor(allocator, 4);
+    defer allocator.free(decoded_b.samples);
+    const second = try uploadSound(decoded_b);
+
+    try testing.expectEqual(first.slot_index, second.slot_index);
+    try testing.expect(second.generation != first.generation);
+
+    // Calling `unloadSound(first)` now must be a no-op: the slot
+    // belongs to `second`. Otherwise we'd tear down the live sound.
+    unloadSound(first);
+    try testing.expect(sounds[second.slot_index] != null);
+    try testing.expect(!sounds[second.slot_index].?.unloaded);
+
+    // Real teardown via the fresh handle.
+    unloadSound(second);
+}
+
+test "uploadSound rejects zero-channel DecodedAudio (#111 follow-up)" {
+    resetForTest();
+    defer {
+        audio_initialized = true;
+        deinit();
+    }
+
+    const allocator = std.testing.allocator;
+    const samples = try allocator.alloc(i16, 4);
+    defer allocator.free(samples);
+    const decoded: DecodedAudio = .{
+        .samples = samples,
+        .sample_rate = 44100,
+        .channels = 0,
+    };
+    try testing.expectError(error.AudioInvalidChannels, uploadSound(decoded));
+}
+
+test "unloadSoundById ignores stale legacy id after slot recycle (#111)" {
+    // The legacy `u32` returned by `loadSound` now packs the slot
+    // generation in its high 16 bits. After a load + unload, a
+    // subsequent load that recycles the same slot produces a fresh
+    // generation; the OLD id is stale and must NOT tear down the
+    // recycled occupant. Pre-fix, `unloadSoundById` took the bare
+    // `u32` as a raw slot index and would have flipped the new
+    // slot's `unloaded` bit.
+    resetForTest();
+    defer {
+        audio_initialized = true;
+        deinit();
+    }
+
+    // We can't drive `loadSound` from a test without a WAV on disk,
+    // so we simulate the load+unload+load sequence using the same
+    // primitives `loadSound`/`unloadSoundById` go through: shared
+    // allocator → encoded id → generation bump.
+    const first_slot = slots.allocateSoundSlot(&sounds) orelse return error.NoSlot;
+    const first_buf = try std.heap.page_allocator.alloc(f32, 2);
+    sounds[first_slot] = .{
+        .samples = first_buf,
+        .sample_count = first_buf.len,
+        .channels = 1,
+        .sample_rate = 44100,
+        .volume = 1.0,
+    };
+    sound_generations[first_slot] += 1;
+    const stale_id = encodeLegacyId(first_slot, sound_generations[first_slot]);
+
+    // Unload puts the slot on the recycle list (markSoundUnloaded
+    // sets the unloaded flag but keeps the optional non-null).
+    unloadSoundById(stale_id);
+    try testing.expect(sounds[first_slot].?.unloaded);
+
+    // Simulate a fresh `loadSound` that recycles the same index. We
+    // park the old buffer on the deferred-free list, the same way
+    // the real `loadSound` does.
+    const recycled_slot = slots.allocateSoundSlot(&sounds) orelse return error.NoSlot;
+    try testing.expectEqual(first_slot, recycled_slot);
+    if (sounds[recycled_slot]) |old| {
+        try pending_sound_frees.append(std.heap.page_allocator, old.samples);
+    }
+    const new_buf = try std.heap.page_allocator.alloc(f32, 4);
+    sounds[recycled_slot] = .{
+        .samples = new_buf,
+        .sample_count = new_buf.len,
+        .channels = 1,
+        .sample_rate = 44100,
+        .volume = 1.0,
+    };
+    sound_generations[recycled_slot] += 1;
+    const fresh_id = encodeLegacyId(recycled_slot, sound_generations[recycled_slot]);
+    try testing.expect(stale_id != fresh_id);
+
+    // The critical assertion: calling unloadSoundById with the stale
+    // id must NOT mark the recycled occupant as unloaded.
+    unloadSoundById(stale_id);
+    try testing.expect(sounds[recycled_slot] != null);
+    try testing.expect(!sounds[recycled_slot].?.unloaded);
+
+    // The fresh id still works.
+    unloadSoundById(fresh_id);
+    try testing.expect(sounds[recycled_slot].?.unloaded);
+}
+
+test "unloadMusic ignores stale legacy id after slot recycle (#111)" {
+    resetForTest();
+    defer {
+        audio_initialized = true;
+        deinit();
+    }
+
+    const first_slot = slots.allocateMusicSlot(&music_slots) orelse return error.NoSlot;
+    const first_buf = try std.heap.page_allocator.alloc(f32, 2);
+    music_slots[first_slot] = .{
+        .samples = first_buf,
+        .sample_count = first_buf.len,
+        .channels = 1,
+        .sample_rate = 44100,
+        .volume = 1.0,
+        .position = 0,
+        .playing = false,
+        .paused = false,
+        .looping = false,
+    };
+    music_generations[first_slot] += 1;
+    const stale_id = encodeLegacyId(first_slot, music_generations[first_slot]);
+
+    unloadMusic(stale_id);
+    try testing.expect(music_slots[first_slot].?.unloaded);
+
+    const recycled_slot = slots.allocateMusicSlot(&music_slots) orelse return error.NoSlot;
+    try testing.expectEqual(first_slot, recycled_slot);
+    if (music_slots[recycled_slot]) |old| {
+        try pending_music_frees.append(std.heap.page_allocator, old.samples);
+    }
+    const new_buf = try std.heap.page_allocator.alloc(f32, 4);
+    music_slots[recycled_slot] = .{
+        .samples = new_buf,
+        .sample_count = new_buf.len,
+        .channels = 1,
+        .sample_rate = 44100,
+        .volume = 1.0,
+        .position = 0,
+        .playing = false,
+        .paused = false,
+        .looping = false,
+    };
+    music_generations[recycled_slot] += 1;
+    const fresh_id = encodeLegacyId(recycled_slot, music_generations[recycled_slot]);
+    try testing.expect(stale_id != fresh_id);
+
+    unloadMusic(stale_id);
+    try testing.expect(music_slots[recycled_slot] != null);
+    try testing.expect(!music_slots[recycled_slot].?.unloaded);
+
+    unloadMusic(fresh_id);
+    try testing.expect(music_slots[recycled_slot].?.unloaded);
+}
+
+test "legacy id encode/decode roundtrip" {
+    // Slot index in low 16 bits, generation in high 16 bits.
+    try testing.expectEqual(@as(u32, 0x0001_002A), encodeLegacyId(42, 1));
+    try testing.expectEqual(@as(u32, 42), decodeLegacySlot(0x0001_002A));
+    try testing.expectEqual(@as(u32, 1), decodeLegacyGeneration(0x0001_002A));
+
+    // Generation truncation past 16 bits — the decode reads only
+    // the low 16, and the encode masks both halves.
+    const id = encodeLegacyId(7, 0x1_FFFF);
+    try testing.expectEqual(@as(u32, 7), decodeLegacySlot(id));
+    try testing.expectEqual(@as(u32, 0xFFFF), decodeLegacyGeneration(id));
 }
