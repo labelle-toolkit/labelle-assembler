@@ -15,7 +15,13 @@ var next_music_id: u32 = 1;
 
 pub fn loadSound(path: [:0]const u8) u32 {
     const snd = rl.loadSound(path);
-    if (snd.stream.buffer == null) return 0;
+    // `snd.stream.buffer` is `*rAudioBuffer` (non-optional) in
+    // raylib-zig 5.6.0-dev, so a `== null` check fails to typecheck.
+    // The canonical raylib API for "did the load succeed?" is
+    // `IsSoundValid` (returns false when stream + sample data are
+    // uninitialised, which is what raylib's C code does on failure).
+    // Surfaced during labelle-assembler#112 review.
+    if (!rl.isSoundValid(snd)) return 0;
     const id = slot_alloc.findFreeSlot(rl.Sound, &sounds, next_sound_id) orelse {
         rl.unloadSound(snd);
         return 0;
@@ -71,7 +77,9 @@ pub fn setSoundVolume(id: u32, volume: f32) void {
 
 pub fn loadMusic(path: [:0]const u8) u32 {
     const mus = rl.loadMusicStream(path);
-    if (mus.stream.buffer == null) return 0;
+    // See `loadSound` above: `mus.stream.buffer` is now non-optional
+    // in raylib-zig 5.6.0-dev. Use the canonical `IsMusicValid`.
+    if (!rl.isMusicValid(mus)) return 0;
     const id = slot_alloc.findFreeSlot(rl.Music, &music, next_music_id) orelse {
         rl.unloadMusicStream(mus);
         return 0;
