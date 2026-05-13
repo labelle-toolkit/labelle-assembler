@@ -1517,6 +1517,21 @@ pub const FONT_BACKEND_WIRING = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "*const engine.FontBakeParams") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "const backend_params: BackendGfx.FontBakeParams = .{") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "return error.FontBakeParamsMissing") != null);
+
+        // Field names MUST match engine.FontBakeParams / gfx FontBakeParams
+        // verbatim (pixel_height / ranges / atlas_width / atlas_height).
+        // Initial scaffold (#103) drifted to `codepoint_ranges` +
+        // `oversample_h` / `oversample_v` which don't exist on either
+        // engine or gfx — caught by Gemini reviewing #105.
+        try std.testing.expect(std.mem.indexOf(u8, out, ".pixel_height = engine_params.pixel_height") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".ranges = engine_params.ranges") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".atlas_width = engine_params.atlas_width") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".atlas_height = engine_params.atlas_height") != null);
+        // Drift guards: these are the names #103 wrongly emitted —
+        // none should appear in the generated code.
+        try std.testing.expect(std.mem.indexOf(u8, out, "codepoint_ranges") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "oversample_h") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "oversample_v") == null);
     }
 
     test "writeFontBackendWiring marshals FontAtlas via slot table → FontId" {
@@ -1822,6 +1837,198 @@ pub const RESOURCES = struct {
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"characters\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerAtlasFromMemory(\"characters\"") == null);
+    }
+};
+
+// ── Resource emission dispatch (Phase 4, #447/#448) ──────────────────
+//
+// Verifies the resource-loading emission in buildSetupCode (and the
+// mirrored buildCallbackInitCode for sokol/wasm) dispatches by
+// `ResourceDef.kind()`. Each kind has its own register/load helper
+// pair on Game (added in labelle-engine#532) plus, for fonts, a
+// generated `FontBakeParams` const that the loader points at through
+// `WorkRequest.params`.
+
+pub const RESOURCE_EMISSION = struct {
+    test "atlas emission stays on the legacy loadAtlasFromMemory path" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "world", .json = "atlases/world.json", .texture = "atlases/world.png", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"world\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"atlases/world.json\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"atlases/world.png\")") != null);
+    }
+
+    test "sound resource emits loadSoundFromMemory with extension-derived file_type" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "boss_theme", .sound = "audio/boss.ogg", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSoundFromMemory(\"boss_theme\", \"ogg\", @embedFile(\"audio/boss.ogg\"))") != null);
+        // Must NOT generate an atlas call for a sound resource.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"boss_theme\"") == null);
+    }
+
+    test "lazy sound resource emits registerSoundFromMemory" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "sfx_click", .sound = "audio/click.wav", .lazy = true },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerSoundFromMemory(\"sfx_click\", \"wav\", @embedFile(\"audio/click.wav\"))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSoundFromMemory(\"sfx_click\"") == null);
+    }
+
+    test "font resource emits FontBakeParams const + loadFontFromMemory" {
+        const ranges = [_]generate.CodepointRange{
+            .{ .first = 0x20, .last = 0x7F },
+        };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{
+                    .name = "ui_font",
+                    .font = "fonts/m5x7.ttf",
+                    .font_params = .{ .pixel_height = 16, .ranges = &ranges, .atlas_width = 512, .atlas_height = 512 },
+                    .lazy = false,
+                },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Locally-materialised ranges array.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const ui_font_ranges = [_]engine.CodepointRange{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".first = 0x20, .last = 0x7F") != null);
+        // Locally-materialised params struct.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const ui_font_params: engine.FontBakeParams = .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".pixel_height = 16") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".ranges = &ui_font_ranges") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".atlas_width = 512") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".atlas_height = 512") != null);
+        // The load call passes the params pointer.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadFontFromMemory(\"ui_font\", \"ttf\", @embedFile(\"fonts/m5x7.ttf\"), &ui_font_params)") != null);
+    }
+
+    test "font resource without explicit font_params uses defaults" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                // No font_params — defaults pulled from FontBakeParams{}.
+                .{ .name = "default_font", .font = "fonts/default.otf", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Default pixel_height = 16, atlas 512×512, ASCII printable range.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".pixel_height = 16") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".atlas_width = 512") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".first = 0x20, .last = 0x7F") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadFontFromMemory(\"default_font\", \"otf\"") != null);
+    }
+
+    test "mixed resources emit one call per kind, in declared order" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "world", .json = "atlases/world.json", .texture = "atlases/world.png", .lazy = false },
+                .{ .name = "boss", .sound = "audio/boss.ogg", .lazy = false },
+                .{ .name = "ui_font", .font = "fonts/m5x7.ttf", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        const world_pos = std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"world\"") orelse return error.AtlasMissing;
+        const boss_pos = std.mem.indexOf(u8, main_zig, "loadSoundFromMemory(\"boss\"") orelse return error.SoundMissing;
+        const font_pos = std.mem.indexOf(u8, main_zig, "loadFontFromMemory(\"ui_font\"") orelse return error.FontMissing;
+        // Declared order preserved in emission — keeps the codegen
+        // deterministic across runs and the per-resource constants
+        // (e.g. `ui_font_ranges`) declared before their consumer.
+        try std.testing.expect(world_pos < boss_pos);
+        try std.testing.expect(boss_pos < font_pos);
+    }
+
+    test "validation rejects sound resource with unsupported extension" {
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "bad", .sound = "audio/song.mp3", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        try std.testing.expectError(error.UnsupportedResourceExtension, result);
+    }
+
+    test "validation rejects font resource with unsupported extension" {
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "bad", .font = "fonts/wrong.png", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        try std.testing.expectError(error.UnsupportedResourceExtension, result);
+    }
+
+    test "validation rejects no-path resource" {
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "empty" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        try std.testing.expectError(error.InvalidResource, result);
+    }
+
+    test "validation rejects atlas-incomplete resource" {
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "half", .texture = "atlas.png" }, // missing .json
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        try std.testing.expectError(error.InvalidResource, result);
+    }
+
+    test "validation rejects multiple-path resource" {
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "tangle", .sound = "x.wav", .font = "y.ttf" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        try std.testing.expectError(error.InvalidResource, result);
     }
 };
 
