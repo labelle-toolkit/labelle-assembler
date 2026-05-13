@@ -1075,7 +1075,7 @@ pub const DecodedFont = struct {
 /// are stored alongside the image so the renderer can compute
 /// normalised UVs from the glyph's pixel-space rect without poking
 /// sokol_gfx for image metadata.
-pub const FontAtlas = struct {
+pub const FontAtlas = extern struct {
     image: sg.Image,
     width: u32,
     height: u32,
