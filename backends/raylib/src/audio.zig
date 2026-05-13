@@ -375,6 +375,14 @@ pub fn uploadSound(decoded: DecodedAudio) !Sound {
     // and be UB in release.
     if (decoded.channels == 0) return error.AudioInvalidChannels;
 
+    // Reject sample counts that aren't an integer multiple of
+    // channels — `@divTrunc` below would silently drop the
+    // remainder, producing a partial-frame upload with garbage at
+    // the end. Caller bug surfaces here as a clean error instead of
+    // a wave with mismatched frameCount vs underlying buffer length.
+    // Bugbot finding on labelle-assembler#112 post-fix-agent review.
+    if (decoded.samples.len % @as(usize, decoded.channels) != 0) return error.AudioMalformedFrameCount;
+
     // Find a free slot. Walk from index 1 — id 0 is reserved as
     // "no sound" for the legacy `loadSound` path, which we preserve
     // to keep the two surfaces' semantics aligned.
