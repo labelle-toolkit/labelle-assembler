@@ -336,7 +336,13 @@ pub fn loadSound(path: [:0]const u8) u32 {
     return id;
 }
 
-pub fn unloadSound(id: u32) void {
+/// Legacy path-based unload, paired with `loadSound(path)`. Renamed
+/// from `unloadSound` so the Phase 4 catalog-shaped surface (which
+/// requires `unloadSound(sound: Sound)` per the engine contract) can
+/// take the bare name. Game code that was calling `audio.unloadSound(id)`
+/// against the legacy API moves to this name; the catalog path uses
+/// `unloadSound(sound)` further down.
+pub fn unloadSoundById(id: u32) void {
     if (activeSound(id) == null) return;
     // Stop any voices using this sound before flipping the unloaded
     // bit — the audio callback may still be iterating `voices` and
@@ -474,4 +480,266 @@ pub fn updateMusic(_: u32) void {
 
 pub fn setVolume(volume: f32) void {
     master_volume = std.math.clamp(volume, 0.0, 1.0);
+}
+
+// ── Phase 4 audio loader surface (labelle-engine#447) ─────────────────
+//
+// Decode/upload split mirrors the gfx image + font paths: pure CPU
+// decode in `decodeAudio` (worker-thread safe — stb_vorbis / dr_wav
+// only touch the input bytes + the allocator-owned PCM buffer),
+// audio-device-side registration in `uploadSound` on the main thread
+// (slot-pool insert).
+//
+// ADDITIVE: the path-based `loadSound`/`playSound`/`stopSound` above
+// keeps working unchanged for games that use the runtime loader
+// instead of the Phase 4 asset catalog. The two surfaces share the
+// underlying `audio_slots` storage so an `unloadSound(Sound)` from
+// the catalog path correctly tears down the same slot a `playSound(id)`
+// from the legacy path would see.
+
+const drwav = @cImport({
+    @cInclude("dr_wav.h");
+});
+
+// stb_vorbis is single-file (the .c IS the API + implementation). We
+// pull just the prototypes for the handful of decode functions we
+// call here through a hand-rolled header — `@cInclude("stb_vorbis.c")`
+// would compile the implementation a second time and collide with the
+// C-source-side translation unit on every `stb_vorbis_*` symbol.
+const stbv = @cImport({
+    @cInclude("stb_vorbis_decl.h");
+});
+
+/// CPU-decoded interleaved-PCM audio. Field layout matches
+/// `labelle-engine/audio_backend/src/backend.zig`'s `DecodedAudio`
+/// so the assembler's `writeAudioBackendWiring` field-by-field copy
+/// lands on a stable shape.
+pub const DecodedAudio = struct {
+    /// Interleaved PCM samples. Length == `frame_count * channels`.
+    /// Owned by the allocator passed to `decodeAudio`; the caller
+    /// frees via that same allocator on both the success and
+    /// discard paths.
+    samples: []i16,
+    sample_rate: u32,
+    channels: u8,
+};
+
+/// Opaque sound handle for the Phase 4 loader. Generation-tagged so
+/// `unloadSound` can detect stale handles (the slot may have been
+/// recycled by a subsequent upload between the catalog's read of
+/// the handle and the unload call).
+pub const Sound = extern struct {
+    slot_index: u32,
+    generation: u32,
+};
+
+/// Per-slot generation counter for the Phase 4 path. Distinct from
+/// `next_sound_id` (legacy-path monotonic id) — we tag a generation
+/// onto each `Sound` handle so `unloadSound` can fail-soft on stale
+/// references (same trick the engine's `SoundId` uses on the public
+/// side, hoisted here so callers that hold a `Sound` value across
+/// an unload + re-upload don't accidentally tear down the new sound).
+var sound_generations: [slots.MAX_SOUNDS]u32 = [_]u32{0} ** slots.MAX_SOUNDS;
+
+/// PCM samples staged for the audio callback. The legacy `SoundSlot`
+/// in `audio_slots.zig` keeps samples as `[]const f32` because the
+/// callback mixes in f32. We allocate the converted f32 buffer here
+/// so the slot pool's existing shutdown walk frees it via
+/// `page_allocator` (matching the legacy `loadSound` path's choice).
+fn convertS16ToF32(samples: []const i16) ![]f32 {
+    const out = try std.heap.page_allocator.alloc(f32, samples.len);
+    for (samples, 0..) |s, i| {
+        out[i] = @as(f32, @floatFromInt(s)) / 32768.0;
+    }
+    return out;
+}
+
+/// Pure CPU decode — worker-thread safe.
+///
+/// Dispatches on `file_type`:
+///   - "wav" → `dr_wav` (drwav_init_memory + drwav_read_pcm_frames_s16).
+///     Handles every PCM bit-depth + IEEE float internally — strictly
+///     more capable than the home-grown `parseWav` above, which we
+///     keep for the legacy `loadSound` path so its behaviour stays
+///     byte-for-byte equivalent.
+///   - "ogg" → `stb_vorbis` (open_memory + get_samples_short_interleaved).
+///     Single-allocation streaming decode into a caller-owned i16
+///     buffer.
+///
+/// The returned `samples` slice is from `allocator` — caller frees
+/// on BOTH success and discard paths.
+pub fn decodeAudio(
+    file_type: [:0]const u8,
+    data: []const u8,
+    allocator: std.mem.Allocator,
+) !DecodedAudio {
+    if (data.len == 0) return error.AudioDecodeFailed;
+
+    if (std.mem.eql(u8, file_type, "wav")) return decodeWav(data, allocator);
+    if (std.mem.eql(u8, file_type, "ogg")) return decodeOgg(data, allocator);
+    return error.UnsupportedAudioFormat;
+}
+
+fn decodeWav(data: []const u8, allocator: std.mem.Allocator) !DecodedAudio {
+    var wav: drwav.drwav = undefined;
+    if (drwav.drwav_init_memory(&wav, data.ptr, data.len, null) == 0) {
+        return error.AudioDecodeFailed;
+    }
+    defer _ = drwav.drwav_uninit(&wav);
+
+    const total_frames: usize = @intCast(wav.totalPCMFrameCount);
+    const channels: u8 = @intCast(wav.channels);
+    if (total_frames == 0 or channels == 0) return error.AudioDecodeFailed;
+
+    const total_samples = total_frames * channels;
+    const samples = try allocator.alloc(i16, total_samples);
+    errdefer allocator.free(samples);
+
+    const got = drwav.drwav_read_pcm_frames_s16(&wav, total_frames, samples.ptr);
+    if (got == 0) return error.AudioDecodeFailed;
+
+    return .{
+        .samples = samples,
+        .sample_rate = @intCast(wav.sampleRate),
+        .channels = channels,
+    };
+}
+
+fn decodeOgg(data: []const u8, allocator: std.mem.Allocator) !DecodedAudio {
+    var err: c_int = 0;
+    const vorbis = stbv.stb_vorbis_open_memory(
+        data.ptr,
+        @intCast(data.len),
+        &err,
+        null,
+    );
+    if (vorbis == null) return error.AudioDecodeFailed;
+    defer stbv.stb_vorbis_close(vorbis);
+
+    const info = stbv.stb_vorbis_get_info(vorbis);
+    const channels: u8 = @intCast(info.channels);
+    const sample_rate: u32 = @intCast(info.sample_rate);
+    if (channels == 0) return error.AudioDecodeFailed;
+
+    const total_samples_c = stbv.stb_vorbis_stream_length_in_samples(vorbis);
+    const total_frames: usize = @intCast(total_samples_c);
+    if (total_frames == 0) return error.AudioDecodeFailed;
+
+    const total_samples = total_frames * channels;
+    const samples = try allocator.alloc(i16, total_samples);
+    errdefer allocator.free(samples);
+
+    // `get_samples_short_interleaved` takes (channels, dest, dest_len_in_shorts)
+    // and returns the number of FRAMES decoded.
+    const got = stbv.stb_vorbis_get_samples_short_interleaved(
+        vorbis,
+        info.channels,
+        samples.ptr,
+        @intCast(total_samples),
+    );
+    if (got <= 0) return error.AudioDecodeFailed;
+
+    return .{
+        .samples = samples,
+        .sample_rate = sample_rate,
+        .channels = channels,
+    };
+}
+
+/// Main-thread audio-device registration. Allocates a converted f32
+/// PCM buffer (sokol_audio mixes in f32) into the slot pool and
+/// returns a generation-tagged `Sound` handle.
+///
+/// Does NOT take ownership of `decoded.samples` — caller frees on
+/// both the success and discard paths, same contract as
+/// `uploadTexture` for `DecodedImage.pixels`.
+pub fn uploadSound(decoded: DecodedAudio) !Sound {
+    ensureInit();
+
+    // Find a free slot. Walk from index 1 — the legacy path reserves
+    // id 0 for "not loaded", which we preserve to keep the two
+    // surfaces' semantics aligned.
+    var slot_idx: u32 = 0;
+    var i: u32 = 1;
+    while (i < slots.MAX_SOUNDS) : (i += 1) {
+        if (sounds[i] == null) {
+            slot_idx = i;
+            break;
+        }
+    }
+    if (slot_idx == 0) return error.AudioSlotsExhausted;
+
+    const f32_samples = convertS16ToF32(decoded.samples) catch return error.OutOfMemory;
+    errdefer std.heap.page_allocator.free(f32_samples);
+
+    sounds[slot_idx] = .{
+        .samples = f32_samples,
+        .sample_count = f32_samples.len,
+        .channels = decoded.channels,
+        .sample_rate = decoded.sample_rate,
+        .volume = 1.0,
+    };
+    sound_generations[slot_idx] += 1;
+
+    return .{ .slot_index = slot_idx, .generation = sound_generations[slot_idx] };
+}
+
+/// Counterpart to `uploadSound`. Validates the generation tag so a
+/// stale handle (one whose slot has been recycled) is a no-op
+/// rather than tearing down the live sound that now lives there.
+pub fn unloadSound(sound: Sound) void {
+    if (sound.slot_index == 0 or sound.slot_index >= slots.MAX_SOUNDS) return;
+    if (sound_generations[sound.slot_index] != sound.generation) return;
+
+    // Stop any voices playing this slot so the audio callback won't
+    // chase a freed pointer between the markUnloaded below and the
+    // deinit-side free. Same ordering as the legacy unload(id) path.
+    for (&voices) |*voice| {
+        if (voice.active and voice.sound_id == sound.slot_index) {
+            voice.active = false;
+        }
+    }
+    slots.markSoundUnloaded(&sounds, sound.slot_index);
+
+    // Eager free: unlike the legacy `unloadSound(id)` path — which
+    // keeps the buffer reachable for `deinit` to free at shutdown —
+    // Phase 4 callers churn loads/unloads at runtime (level
+    // transitions, dynamic audio asset streaming). Holding every
+    // ever-unloaded buffer until shutdown would balloon the slot
+    // pool's residual memory. Voices for this slot are deactivated
+    // above, so no audio-callback read can race the free here.
+    if (sounds[sound.slot_index]) |s| {
+        std.heap.page_allocator.free(s.samples);
+        sounds[sound.slot_index] = null;
+    }
+}
+
+// ── Phase 4 surface tests ─────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "decodeAudio rejects empty data" {
+    try testing.expectError(error.AudioDecodeFailed, decodeAudio("wav", &.{}, testing.allocator));
+    try testing.expectError(error.AudioDecodeFailed, decodeAudio("ogg", &.{}, testing.allocator));
+}
+
+test "decodeAudio rejects unknown file_type" {
+    const fake = "anything";
+    try testing.expectError(error.UnsupportedAudioFormat, decodeAudio("flac", fake, testing.allocator));
+    try testing.expectError(error.UnsupportedAudioFormat, decodeAudio("mp3", fake, testing.allocator));
+}
+
+test "decodeAudio surfaces AudioDecodeFailed on garbage wav input" {
+    // Not a RIFF header — dr_wav's init_memory should fail.
+    var fake: [1024]u8 = undefined;
+    for (&fake, 0..) |*b, i| b.* = @truncate(i);
+    try testing.expectError(error.AudioDecodeFailed, decodeAudio("wav", &fake, testing.allocator));
+}
+
+test "Sound has stable extern layout" {
+    // Locks the Phase 4 wire shape: the assembler's codegen does a
+    // field-by-field copy through this struct, so size + alignment
+    // need to stay invariant.
+    try testing.expectEqual(@as(usize, 8), @sizeOf(Sound));
+    try testing.expectEqual(@as(usize, 4), @alignOf(Sound));
 }

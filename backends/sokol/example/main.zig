@@ -374,7 +374,7 @@ fn frame() callconv(.c) void {
 
 fn cleanup() callconv(.c) void {
     if (atlas_texture) |tex| gfx.unloadTexture(tex);
-    if (sound_id != 0) audio.unloadSound(sound_id);
+    if (sound_id != 0) audio.unloadSoundById(sound_id);
     if (music_id != 0) audio.unloadMusic(music_id);
     audio.deinit();
     window.shutdownGfx();
