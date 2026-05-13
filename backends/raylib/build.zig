@@ -18,8 +18,26 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/gfx.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     gfx_mod.addImport("raylib", raylib_mod);
+    gfx_mod.addIncludePath(b.path("src"));
+    // Phase 4 font baker (labelle-engine#448). stb_truetype is a
+    // single-header C lib — separate `_impl.c` translation unit
+    // defines the implementation macro before including the header.
+    gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
+
+    // When cross-compiling to wasm32-emscripten the C compile of
+    // `stb_truetype_impl.c` cannot find `<stdlib.h>` because Zig does
+    // not ship libc headers for `wasm32-emscripten` — they live in
+    // emsdk's sysroot. Mirror what sokol-zig does for its `_clib` and
+    // plumb the emsdk sysroot include path. Gated on `.emscripten`
+    // so the desktop / mobile / iOS builds remain untouched.
+    if (target.result.os.tag == .emscripten) {
+        if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
+            gfx_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
+        }
+    }
 
     // ── Input backend module ────────────────────────────────────────
     const input_mod = b.addModule("input", .{
@@ -34,8 +52,29 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/audio.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     audio_mod.addImport("raylib", raylib_mod);
+    audio_mod.addIncludePath(b.path("src"));
+    // Phase 4 audio decoders (labelle-engine#447):
+    //   - stb_vorbis.c is both the API *and* the implementation — it
+    //     is a single .c file you compile directly, not a header +
+    //     impl translation-unit pair.
+    //   - dr_wav matches stb_image's split: header + an _impl.c TU
+    //     that defines the implementation macro before including the
+    //     header.
+    audio_mod.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
+    audio_mod.addCSourceFile(.{ .file = b.path("src/dr_wav_impl.c"), .flags = &.{} });
+
+    // Mirror the emsdk sysroot include from gfx_mod: stb_vorbis and
+    // dr_wav both pull in <stdlib.h> / <string.h> / <math.h> which
+    // require emscripten's sysroot when cross-compiling to
+    // wasm32-emscripten.
+    if (target.result.os.tag == .emscripten) {
+        if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
+            audio_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
+        }
+    }
 
     // ── Window backend module ───────────────────────────────────────
     const window_mod = b.addModule("window", .{
@@ -48,7 +87,8 @@ pub fn build(b: *std.Build) void {
     // ── Re-export the native artifact so consumers can link it ──────
     b.installArtifact(raylib_artifact);
 
-    // ── Unit tests for the pure slot allocator ────────────────────
+    // ── Unit tests ──────────────────────────────────────────────────
+    //
     // `slot_alloc.zig` has no raylib import, so its test binary
     // builds without pulling in the native raylib library. This is
     // the regression lock for #11 (slot-reuse after unload).
@@ -62,4 +102,28 @@ pub fn build(b: *std.Build) void {
     });
     const test_step = b.step("test", "Run raylib backend unit tests");
     test_step.dependOn(&b.addRunArtifact(slot_alloc_tests).step);
+
+    // ── Phase 4 host-native test runs ────────────────────────────────
+    //
+    // The Phase 4 decoder unit tests (decodeFont rejecting empty /
+    // garbage input, decodeAudio dispatching on file_type, Sound
+    // layout invariants) are pure-CPU and exercise no raylib API,
+    // but the test binary itself imports `gfx.zig`/`audio.zig`,
+    // which transitively pulls in raylib-zig + its C artifact. That
+    // C link depends on host-side frameworks (Foundation, IOKit,
+    // …) that the default `test` step shouldn't require — wiring
+    // these off a separate `test-host` step keeps the default
+    // cross-compile flow linker-free, matching sokol's split
+    // (sokol's `test` works without a linker because sokol's C lib
+    // has no host-framework dep; raylib's does, so we segregate).
+    const audio_compile_check = b.addTest(.{ .root_module = audio_mod });
+    const gfx_compile_check = b.addTest(.{ .root_module = gfx_mod });
+
+    const test_host_step = b.step(
+        "test-host",
+        "Run Phase 4 decoder unit tests natively (needs raylib's system libs).",
+    );
+    test_host_step.dependOn(&b.addRunArtifact(audio_compile_check).step);
+    test_host_step.dependOn(&b.addRunArtifact(gfx_compile_check).step);
+    test_host_step.dependOn(&b.addRunArtifact(slot_alloc_tests).step);
 }
