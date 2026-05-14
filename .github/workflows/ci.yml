@@ -32,11 +32,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gui
-          # labelle-gui#95: flow-codegen sub-package extraction (Part A of #94).
-          # Bumped to 29c1f29 (feat/zig-0.16-migration) which migrates
-          # flow-codegen to Zig 0.16 (ArrayList.empty, Allocating Writer,
-          # std.Io.Dir, zspec 0.9.1).
-          ref: 29c1f2911b3114896687a116c8d7b543ce48ec30
+          # Track gui's `main`. The path-dep on `../labelle-gui/flow-codegen`
+          # in build.zig.zon resolves against this sibling checkout. The
+          # 0.16 migration of flow-codegen is now on main, so no commit
+          # pin is needed.
+          ref: main
           path: labelle-gui
 
       - uses: mlugg/setup-zig@v2
@@ -130,11 +130,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gui
-          # labelle-gui#95: flow-codegen sub-package extraction (Part A of #94).
-          # Bumped to 29c1f29 (feat/zig-0.16-migration) which migrates
-          # flow-codegen to Zig 0.16 (ArrayList.empty, Allocating Writer,
-          # std.Io.Dir, zspec 0.9.1).
-          ref: 29c1f2911b3114896687a116c8d7b543ce48ec30
+          # Track gui's `main`. The path-dep on `../labelle-gui/flow-codegen`
+          # in build.zig.zon resolves against this sibling checkout. The
+          # 0.16 migration of flow-codegen is now on main, so no commit
+          # pin is needed.
+          ref: main
           path: labelle-gui
 
       - uses: actions/checkout@v4
