@@ -31,6 +31,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          # labelle-gui#95: flow-codegen sub-package extraction (Part A of #94).
+          ref: b8a5c77eed2bce4a7e17908437c761b2397402d8
+          path: ../labelle-gui
+
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0

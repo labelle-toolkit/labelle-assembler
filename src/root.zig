@@ -11,6 +11,7 @@ pub const asset_validator = @import("asset_validator.zig");
 pub const lazy_inference = @import("lazy_inference.zig");
 const main_zig = @import("main_zig.zig");
 pub const script_scanner = @import("script_scanner.zig");
+pub const flow_scanner = @import("flow_scanner.zig");
 const build_files = @import("build_files.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
@@ -413,6 +414,21 @@ pub fn generate(
         try script_scan.scanPluginDir(plugin_scripts_dst, plugin.name);
     }
 
+    // ── Flow codegen (#94, Part B) ─────────────────────────────────────
+    //
+    // Walk `<game>/scripts/flows/*.flow.zon`, emit a sibling `.zig`
+    // per file via the `flow_codegen` sub-package (shipped from
+    // labelle-gui), and append a synthetic `ScriptEntry` for each so
+    // the existing AllScripts block picks them up naturally on the
+    // next emit pass. The tests target shares this codepath — flows
+    // are global (state-less) scripts and contribute to both exe and
+    // tests builds. Empty `scripts/flows/` is a silent no-op.
+    // flow_scanner already wrote a per-file `flows/<name>: <err>`
+    // diagnostic to stderr; propagate the typed error so `generate`
+    // exits non-zero.
+    var flow_result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir);
+    defer flow_result.deinit();
+
     // Generate build.zig.zon
     const zon = try build_files.generateBuildZigZon(allocator, cfg, target_dir, output_dir, game_dir, .{
         // The tests target runs second — additive merge so the exe
@@ -436,7 +452,19 @@ pub fn generate(
     // The tests target has no exe and therefore no main.zig — its build.zig
     // only emits a `test` step rooted at `__tests_root.zig`.
     if (!is_tests_target) {
-        const script_entries = script_scan.getEntries();
+        const scanned_entries = script_scan.getEntries();
+        // Merge in the synthetic flow entries so AllScripts sees both
+        // hand-authored scripts and `.flow.zon`-derived ones. Flows
+        // sort after every real script in the game block today (no
+        // numeric prefix, alphabetical fallback), matching the file
+        // layout on disk where `scripts/flows/*.zig` sits below
+        // `scripts/*.zig` lexicographically. A future RFC can revisit
+        // ordering — none of v1's flows depend on it.
+        const merged_entries = try allocator.alloc(script_scanner.ScriptScanner.ScriptEntry, scanned_entries.len + flow_result.entries.len);
+        defer allocator.free(merged_entries);
+        @memcpy(merged_entries[0..scanned_entries.len], scanned_entries);
+        @memcpy(merged_entries[scanned_entries.len..], flow_result.entries);
+
         // Backend lifecycle template — only the exe target needs it.
         // Loading it for the tests target would fail unnecessarily if the
         // null backend's `desktop.txt` is missing from the cache, since
@@ -446,7 +474,7 @@ pub fn generate(
         defer allocator.free(backend_tmpl);
         const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
         defer allocator.free(engine_template);
-        const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, script_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names);
+        const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, merged_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names);
         defer allocator.free(main_zig_content);
         try scanner.writeFile(target_dir, "main.zig", main_zig_content);
     }
