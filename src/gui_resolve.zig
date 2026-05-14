@@ -21,7 +21,7 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *config.ProjectConfig
     const manifest_path = try std.fs.path.join(allocator, &.{ plugin_dir, "gui.labelle" });
     defer allocator.free(manifest_path);
 
-    const manifest_raw = std.fs.cwd().readFileAlloc(allocator, manifest_path, 64 * 1024) catch |err| {
+    const manifest_raw = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), manifest_path, allocator, .limited(64 * 1024)) catch |err| {
         std.debug.print("labelle: could not read GUI manifest '{s}': {any}\n", .{ manifest_path, err });
         std.debug.print("  hint: GUI plugins must contain a gui.labelle manifest file\n", .{});
         return error.GuiManifestNotFound;
@@ -33,7 +33,7 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *config.ProjectConfig
     // that reference this buffer. It must stay alive as long as resolved_gui.
     errdefer allocator.free(manifest_z);
 
-    const manifest = std.zon.parse.fromSlice(GuiLabelle, allocator, manifest_z, null, .{}) catch |err| {
+    const manifest = std.zon.parse.fromSliceAlloc(GuiLabelle, allocator, manifest_z, null, .{}) catch |err| {
         std.debug.print("labelle: could not parse GUI manifest '{s}': {any}\n", .{ manifest_path, err });
         return error.GuiManifestParseError;
     };

@@ -656,8 +656,9 @@ fn validateResources(cfg: ProjectConfig) !void {
 }
 
 fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8, prefab_names: []const []const u8) ![]const u8 {
-    var buf = std.ArrayList(u8){};
-    const w = buf.writer(allocator);
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer alloc_writer.deinit();
+    const w = &alloc_writer.writer;
 
     if (cfg.resolved_gui) |gui| {
         if (gui.lifecycle.init) {
@@ -821,7 +822,8 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
         try w.writeAll("    defer PluginControllers.deinit(&g);\n");
     }
 
-    return buf.toOwnedSlice(allocator);
+    var arr_list = alloc_writer.toArrayList();
+    return arr_list.toOwnedSlice(allocator);
 }
 
 // ============================================================
@@ -960,8 +962,9 @@ const PREVIEW_HEARTBEAT_CALLBACK =
 
 /// Build the GUI draw code for {{gui_draw_code}}.
 fn buildGuiDrawCode(allocator: std.mem.Allocator, cfg: ProjectConfig, view_names: []const []const u8) ![]const u8 {
-    var buf = std.ArrayList(u8){};
-    const w = buf.writer(allocator);
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer alloc_writer.deinit();
+    const w = &alloc_writer.writer;
 
     if (cfg.hasGui()) {
         try w.writeAll("        g.guiBegin();\n");
@@ -975,7 +978,8 @@ fn buildGuiDrawCode(allocator: std.mem.Allocator, cfg: ProjectConfig, view_names
         try w.writeAll("        g.guiEnd();\n");
     }
 
-    return buf.toOwnedSlice(allocator);
+    var arr_list = alloc_writer.toArrayList();
+    return arr_list.toOwnedSlice(allocator);
 }
 
 // ============================================================
@@ -984,8 +988,9 @@ fn buildGuiDrawCode(allocator: std.mem.Allocator, cfg: ProjectConfig, view_names
 
 /// Init code for callback-based backends (inside a `!void` helper, can use try).
 fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8, prefab_names: []const []const u8) ![]const u8 {
-    var buf = std.ArrayList(u8){};
-    const w = buf.writer(allocator);
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer alloc_writer.deinit();
+    const w = &alloc_writer.writer;
 
     if (cfg.resolved_gui) |gui| {
         if (gui.lifecycle.init) {
@@ -1102,13 +1107,15 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
         try w.writeAll("    PluginControllers.setup(&g) catch @panic(\"plugin controller setup failed\");\n");
     }
 
-    return buf.toOwnedSlice(allocator);
+    var arr_list = alloc_writer.toArrayList();
+    return arr_list.toOwnedSlice(allocator);
 }
 
 /// Cleanup code for callback-based backends (in cleanup() C callback).
 fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]const u8 {
-    var buf = std.ArrayList(u8){};
-    const w = buf.writer(allocator);
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer alloc_writer.deinit();
+    const w = &alloc_writer.writer;
 
     if (cfg.resolved_gui) |gui| {
         if (gui.lifecycle.shutdown) {
@@ -1126,7 +1133,8 @@ fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
 
     try w.writeAll("    runner.deinit();\n");
 
-    return buf.toOwnedSlice(allocator);
+    var arr_list = alloc_writer.toArrayList();
+    return arr_list.toOwnedSlice(allocator);
 }
 
 /// Write a Zig double-quoted string literal for `s`, escaping `\` and `"` so
@@ -1329,9 +1337,10 @@ pub fn generateMainZigFromTemplate(
     if (try checkBasenameCollisions(allocator, prefab_names)) |msg| {
         defer allocator.free(msg);
         const prefix = "labelle-assembler: ";
-        std.fs.File.stderr().writeAll(prefix) catch {};
-        std.fs.File.stderr().writeAll(msg) catch {};
-        std.fs.File.stderr().writeAll("\n") catch {};
+        const io = config.globalIo();
+        std.Io.File.stderr().writeStreamingAll(io, prefix) catch {};
+        std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+        std.Io.File.stderr().writeStreamingAll(io, "\n") catch {};
         return error.PrefabBasenameCollision;
     }
 
@@ -1351,7 +1360,7 @@ pub fn generateMainZigFromTemplate(
     defer data.lists.deinit();
 
     // Track allocations for cleanup
-    var allocs = std.ArrayList([]const u8){};
+    var allocs: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocs.items) |s| allocator.free(s);
         allocs.deinit(allocator);
@@ -1367,8 +1376,9 @@ pub fn generateMainZigFromTemplate(
 
     // Hook imports block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (hook_names.len > 0) {
             try bw.writeAll("\n// --- Hook imports ---\n");
             for (hook_names) |name| {
@@ -1376,15 +1386,17 @@ pub fn generateMainZigFromTemplate(
                 try bw.print("const {s} = @import(\"hooks/{s}.zig\");\n", .{ ident, name });
             }
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("hook_imports_block", block);
     }
 
     // Event imports block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (event_names.len > 0) {
             try bw.writeAll("\n// --- Event imports ---\n");
             for (event_names) |name| {
@@ -1392,15 +1404,17 @@ pub fn generateMainZigFromTemplate(
                 try bw.print("const {s} = @import(\"events/{s}.zig\");\n", .{ ident, name });
             }
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("event_imports_block", block);
     }
 
     // Enum imports block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (enum_names.len > 0) {
             try bw.writeAll("\n// --- Enum imports ---\n");
             for (enum_names) |name| {
@@ -1408,15 +1422,17 @@ pub fn generateMainZigFromTemplate(
                 try bw.print("const {s} = @import(\"enums/{s}.zig\");\n", .{ ident, name });
             }
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("enum_imports_block", block);
     }
 
     // JSONC scene block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (jsonc_scene_names.len > 0 or prefab_names.len > 0) {
             try bw.writeAll("\n// --- JSONC scene loaders (embedded) ---\n");
             if (gizmo_names.len > 0) {
@@ -1452,17 +1468,20 @@ pub fn generateMainZigFromTemplate(
             // so the generated inline-for is a no-op for back-compat.
             try writeSceneInitialStateManifests(bw, jsonc_scene_names, scene_manifests);
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("jsonc_scene_block", block);
     }
 
     // Game layers block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         try generateGameLayers(cfg.layers, bw);
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("game_layers_block", block);
     }
@@ -1479,22 +1498,25 @@ pub fn generateMainZigFromTemplate(
 
     // AllHookPayloads block — merge engine payloads with game events if present
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (event_names.len == 0) {
             try bw.writeAll("const AllHookPayloads = engine.HookPayload(EcsBackend.Entity);\n\n");
         } else {
             try bw.writeAll("const AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), GameEvents });\n\n");
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("all_hook_payloads_block", block);
     }
 
     // Game hooks block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (hook_names.len == 0) {
             try bw.writeAll("const GameHooks = struct {};\n\n");
         } else {
@@ -1507,15 +1529,17 @@ pub fn generateMainZigFromTemplate(
             }
             try bw.writeAll(" });\n\n");
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("game_hooks_block", block);
     }
 
     // Hooks init block — instantiate individual hooks and wire into GameHooks
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (hook_names.len == 0) {
             try bw.writeAll("    var hooks = GameHooks{};\n");
         } else {
@@ -1532,15 +1556,17 @@ pub fn generateMainZigFromTemplate(
             }
             try bw.writeAll(" } };\n");
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("hooks_init_block", block);
     }
 
     // Game events block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (event_names.len == 0) {
             try bw.writeAll("const GameEvents = void;\n\n");
         } else {
@@ -1553,7 +1579,8 @@ pub fn generateMainZigFromTemplate(
             }
             try bw.writeAll("};\n\n");
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("game_events_block", block);
     }
@@ -1561,18 +1588,21 @@ pub fn generateMainZigFromTemplate(
     // Prefab registry block — JSONC prefabs are loaded at runtime via
     // addEmbeddedPrefab, so the comptime registry is always empty.
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         try bw.writeAll("const Prefabs = engine.PrefabRegistry(.{});\n\n");
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("prefab_registry_block", block);
     }
 
     // Component registry block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         const has_plugins = cfg.plugins.len > 0;
         if (has_plugins) {
             try bw.writeAll("const Components = engine.ComponentRegistryWithPlugins(.{\n");
@@ -1595,7 +1625,8 @@ pub fn generateMainZigFromTemplate(
         } else {
             try bw.writeAll("});\n\n");
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("component_registry_block", block);
     }
@@ -1613,8 +1644,9 @@ pub fn generateMainZigFromTemplate(
     //
     // See flying-platform-labelle#208 (RFC: Plugin-Exported Controllers) §1–§2.
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (cfg.plugins.len > 0) {
             try bw.writeAll("const PluginSystems = engine.SystemRegistry(.{\n");
             try bw.writeAll("    @import(\"labelle-gfx\"),\n");
@@ -1629,15 +1661,17 @@ pub fn generateMainZigFromTemplate(
             try bw.writeAll("const GizmoCatEntry = struct { name: []const u8, id: u8 };\n");
             try bw.writeAll("const DiscoveredGizmoCategories: []const GizmoCatEntry = &.{};\n\n");
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("system_registry_block", block);
     }
 
     // All scripts block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         try bw.writeAll("const AllScripts = struct {\n");
         for (script_entries) |entry| {
             if (std.mem.eql(u8, entry.name, "context")) continue;
@@ -1660,15 +1694,17 @@ pub fn generateMainZigFromTemplate(
             }
         }
         try bw.writeAll("};\n\n");
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("all_scripts_block", block);
     }
 
     // View registry block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (view_names.len > 0) {
             try bw.writeAll("const Views = engine.ViewRegistry(.{\n");
             for (view_names) |name| {
@@ -1679,15 +1715,17 @@ pub fn generateMainZigFromTemplate(
         } else {
             try bw.writeAll("const Views = engine.EmptyViewRegistry;\n\n");
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("view_registry_block", block);
     }
 
     // Gizmo registry block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (gizmo_names.len > 0) {
             try bw.writeAll("const Gizmos = engine.GizmoRegistry(.{\n");
             for (gizmo_names) |name| {
@@ -1696,15 +1734,17 @@ pub fn generateMainZigFromTemplate(
             }
             try bw.writeAll("});\n\n");
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("gizmo_registry_block", block);
     }
 
     // Animation registry block
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
         if (animation_names.len > 0) {
             var anim_pascal_buf: [128]u8 = undefined;
             for (animation_names) |name| {
@@ -1714,15 +1754,17 @@ pub fn generateMainZigFromTemplate(
             }
             try bw.writeAll("\n");
         }
-        const block = try buf.toOwnedSlice(allocator);
+        var arr_list_b = alloc_writer_b.toArrayList();
+        const block = try arr_list_b.toOwnedSlice(allocator);
         try allocs.append(allocator, block);
         try data.scalars.put("animation_registry_block", block);
     }
 
     // ── Lifecycle section (rendered from backend template, same as procedural path) ──
     {
-        var buf = std.ArrayList(u8){};
-        const bw = buf.writer(allocator);
+        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
+        errdefer alloc_writer_b.deinit();
+        const bw = &alloc_writer_b.writer;
 
         const tick_code = if (cfg.plugins.len > 0)
             "        const scaled_dt = dt * g.time_scale;\n" ++
@@ -1893,16 +1935,18 @@ pub fn generateMainZigFromTemplate(
             }, bw);
         }
 
-        const lifecycle = try buf.toOwnedSlice(allocator);
+        var arr_list_l = alloc_writer_b.toArrayList();
+        const lifecycle = try arr_list_l.toOwnedSlice(allocator);
         try allocs.append(allocator, lifecycle);
         try data.scalars.put("lifecycle", lifecycle);
     }
 
     // ── Render the engine template ──
-    var output = std.ArrayList(u8){};
-    errdefer output.deinit(allocator);
-    try tpl.renderDynamic(engine_template, data, output.writer(allocator));
-    return output.toOwnedSlice(allocator);
+    var output_alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output_alloc_writer.deinit();
+    try tpl.renderDynamic(engine_template, data, &output_alloc_writer.writer);
+    var output_arr_list = output_alloc_writer.toArrayList();
+    return output_arr_list.toOwnedSlice(allocator);
 }
 
 /// Generate the GameLayers enum from project.labelle layer definitions.

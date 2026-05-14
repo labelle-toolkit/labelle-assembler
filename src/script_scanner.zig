@@ -19,6 +19,7 @@
 ///   - Same prefix numbers in different state scopes are allowed.
 ///   - Directories not matching declared states are silently ignored.
 const std = @import("std");
+const config = @import("config.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ScriptScanner = struct {
@@ -26,12 +27,12 @@ pub const ScriptScanner = struct {
     entries: std.ArrayList(ScriptEntry),
     valid_states: []const []const u8,
     // Track shared allocations for proper cleanup (one per state dir)
-    shared_subdirs: std.ArrayList([]const u8) = .{},
-    shared_states: std.ArrayList([]const []const u8) = .{},
+    shared_subdirs: std.ArrayList([]const u8) = .empty,
+    shared_states: std.ArrayList([]const []const u8) = .empty,
     /// Plugin name strings owned by the scanner. One entry per unique
     /// plugin that contributed a `scanPluginDir` call. Lifetime matches
     /// the scanner's; deinit frees them.
-    shared_plugin_names: std.ArrayList([]const u8) = .{},
+    shared_plugin_names: std.ArrayList([]const u8) = .empty,
     /// Running counter: how many plugin blocks we've scanned so far.
     /// Used to seed `plugin_index` on each entry so sort order matches
     /// `project.labelle`'s `.plugins` array order.
@@ -77,7 +78,7 @@ pub const ScriptScanner = struct {
     pub fn init(allocator: Allocator, valid_states: []const []const u8) ScriptScanner {
         return .{
             .allocator = allocator,
-            .entries = .{},
+            .entries = .empty,
             .valid_states = valid_states,
         };
     }
@@ -114,11 +115,12 @@ pub const ScriptScanner = struct {
     /// First-level subdirectories define state binding.
     /// Deeper subdirectories are purely organizational.
     pub fn scanDir(self: *ScriptScanner, scripts_dir: []const u8) ScanError!void {
-        var dir = std.fs.cwd().openDir(scripts_dir, .{ .iterate = true }) catch return;
-        defer dir.close();
+        const io = config.globalIo();
+        var dir = std.Io.Dir.cwd().openDir(io, scripts_dir, .{ .iterate = true }) catch return;
+        defer dir.close(io);
 
         var iter = dir.iterate();
-        while (iter.next() catch return) |entry| {
+        while (iter.next(io) catch return) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
                 // Root-level script — runs in all states
                 const name_copy = try self.allocator.dupe(u8, entry.name);
@@ -169,8 +171,9 @@ pub const ScriptScanner = struct {
     pub fn scanPluginDir(self: *ScriptScanner, plugin_scripts_dir: []const u8, plugin_name: []const u8) ScanError!void {
         // Don't error if the plugin doesn't ship a scripts/ dir — that's
         // the common case (labelle-fsm, labelle-pathfinding today).
-        var dir = std.fs.cwd().openDir(plugin_scripts_dir, .{ .iterate = true }) catch return;
-        defer dir.close();
+        const io = config.globalIo();
+        var dir = std.Io.Dir.cwd().openDir(io, plugin_scripts_dir, .{ .iterate = true }) catch return;
+        defer dir.close(io);
 
         const name_dup = try self.allocator.dupe(u8, plugin_name);
         try self.shared_plugin_names.append(self.allocator, name_dup);
@@ -195,7 +198,7 @@ pub const ScriptScanner = struct {
         defer self.allocator.free(rel_prefix);
 
         var iter = dir.iterate();
-        while (iter.next() catch return) |entry| {
+        while (iter.next(io) catch return) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
                 const name_copy = try self.allocator.dupe(u8, entry.name);
                 const rel_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
@@ -266,7 +269,7 @@ pub const ScriptScanner = struct {
 
     /// Get entries filtered by state (includes global scripts).
     pub fn getEntriesForState(self: *const ScriptScanner, state: []const u8) ![]const ScriptEntry {
-        var result: std.ArrayList(ScriptEntry) = .{};
+        var result: std.ArrayList(ScriptEntry) = .empty;
         for (self.entries.items) |entry| {
             if (entry.states.len == 0) {
                 // Global script — runs in all states
@@ -286,11 +289,12 @@ pub const ScriptScanner = struct {
     /// Recursively scan a directory for .zig files. Subdirectories within
     /// a state folder are purely organizational — they don't affect state binding.
     fn scanZigFilesRecursive(self: *ScriptScanner, dir_path: []const u8, state_dir_name: ?[]const u8, states: []const []const u8, rel_prefix: []const u8) ScanError!void {
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        const io = config.globalIo();
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
 
         var iter = dir.iterate();
-        while (iter.next() catch return) |entry| {
+        while (iter.next(io) catch return) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
                 const name_copy = try self.allocator.dupe(u8, entry.name);
                 const rel_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
@@ -306,7 +310,7 @@ pub const ScriptScanner = struct {
     }
 
     fn parseDirStates(self: *ScriptScanner, dir_name: []const u8) ![]const []const u8 {
-        var states: std.ArrayList([]const u8) = .{};
+        var states: std.ArrayList([]const u8) = .empty;
         var iter = std.mem.splitScalar(u8, dir_name, '+');
 
         while (iter.next()) |state_name| {

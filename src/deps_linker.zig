@@ -32,7 +32,7 @@ pub fn createDepsLinks(
     project_dir: []const u8,
     opts: DepsLinkOptions,
 ) ![]const DepEntry {
-    var deps = std.ArrayList(DepEntry){};
+    var deps: std.ArrayList(DepEntry) = .empty;
 
     const core_path = try cache.resolveFrameworkPackage(allocator, "core", cfg.core_version, project_dir);
     try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "labelle_core"), .link_name = try allocator.dupe(u8, "labelle-core"), .abs_path = core_path });
@@ -96,12 +96,13 @@ pub fn createDepsLinks(
     }
 
     // Create deps/ directory with hardlinked copies
-    const cwd = std.fs.cwd();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
     const deps_dir = try std.fs.path.join(allocator, &.{ target_dir, "deps" });
     defer allocator.free(deps_dir);
 
-    if (opts.recreate) cwd.deleteTree(deps_dir) catch {};
-    try cwd.makePath(deps_dir);
+    if (opts.recreate) cwd.deleteTree(io, deps_dir) catch {};
+    try cwd.createDirPath(io, deps_dir);
 
     for (deps.items) |dep| {
         const dest = try std.fs.path.join(allocator, &.{ deps_dir, dep.link_name });
@@ -111,10 +112,10 @@ pub fn createDepsLinks(
         // exist — created by a previous target's pass. Hardlinking on
         // top of an existing tree would error.
         if (!opts.recreate) {
-            if (cwd.access(dest, .{})) |_| continue else |_| {}
+            if (cwd.access(io, dest, .{})) |_| continue else |_| {}
         }
 
-        const abs = cwd.realpathAlloc(allocator, dep.abs_path) catch dep.abs_path;
+        const abs = cwd.realPathFileAlloc(io, dep.abs_path, allocator) catch dep.abs_path;
         defer if (abs.ptr != dep.abs_path.ptr) allocator.free(abs);
 
         // Skip-and-warn ONLY when the source is missing. The original
@@ -131,7 +132,7 @@ pub fn createDepsLinks(
         // — better to fail noisily than silently produce an incomplete
         // deps/ tree that confuses the user with a misleading error
         // much later.
-        cwd.access(abs, .{}) catch |err| switch (err) {
+        cwd.access(io, abs, .{}) catch |err| switch (err) {
             error.FileNotFound => {
                 std.log.warn("could not link dep '{s}': source '{s}' does not exist — skipping", .{ dep.link_name, abs });
                 continue;
@@ -168,10 +169,10 @@ pub fn createDepsLinks(
             const plugin_path = try cache.resolvePlugin(allocator, plugin, project_dir);
             defer allocator.free(plugin_path);
 
-            const abs_src = cwd.realpathAlloc(allocator, plugin_path) catch continue;
+            const abs_src = cwd.realPathFileAlloc(io, plugin_path, allocator) catch continue;
             defer allocator.free(abs_src);
 
-            const abs_dest = cwd.realpathAlloc(allocator, dest) catch continue;
+            const abs_dest = cwd.realPathFileAlloc(io, dest, allocator) catch continue;
             defer allocator.free(abs_dest);
 
             // In a worktree, anchor path-resolution math at the main
@@ -212,14 +213,15 @@ pub fn freeDepEntries(allocator: std.mem.Allocator, deps: []const DepEntry) void
 /// Recursively hardlink a directory tree. Creates directories, hardlinks files.
 /// Falls back to copy for files that can't be hardlinked (cross-device).
 fn hardlinkTree(allocator: std.mem.Allocator, src_path: []const u8, dest_path: []const u8) !void {
-    const cwd = std.fs.cwd();
-    try cwd.makePath(dest_path);
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, dest_path);
 
-    var src_dir = try cwd.openDir(src_path, .{ .iterate = true });
-    defer src_dir.close();
+    var src_dir = try cwd.openDir(io, src_path, .{ .iterate = true });
+    defer src_dir.close(io);
 
     var iter = src_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         const src_sub = try std.fs.path.join(allocator, &.{ src_path, entry.name });
         defer allocator.free(src_sub);
         const dest_sub = try std.fs.path.join(allocator, &.{ dest_path, entry.name });
@@ -240,9 +242,10 @@ fn hardlinkTree(allocator: std.mem.Allocator, src_path: []const u8, dest_path: [
             },
             .sym_link => {
                 // Read symlink target and recreate it
-                var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const target = src_dir.readLink(entry.name, &target_buf) catch continue;
-                cwd.symLink(target, dest_sub, .{}) catch {};
+                var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const target_len = src_dir.readLink(io, entry.name, &target_buf) catch continue;
+                const target = target_buf[0..target_len];
+                cwd.symLink(io, target, dest_sub, .{}) catch {};
             },
             else => {},
         }
@@ -254,18 +257,19 @@ fn hardlinkTree(allocator: std.mem.Allocator, src_path: []const u8, dest_path: [
 /// Create a hardlink, falling back to copy. Works on macOS, Linux, and Windows.
 /// Hardlinks share disk space (zero cost) and work without admin privileges.
 fn hardlinkOrCopy(src: []const u8, dest: []const u8) !void {
-    const cwd = std.fs.cwd();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
     const builtin = @import("builtin");
 
     if (comptime builtin.os.tag == .windows) {
         // Windows: use CreateHardLinkW from kernel32
         windowsHardLink(src, dest) catch {
-            try cwd.copyFile(src, cwd, dest, .{});
+            try cwd.copyFile(src, cwd, dest, io, .{});
         };
     } else {
-        // POSIX: link() syscall
-        std.posix.link(src, dest) catch {
-            try cwd.copyFile(src, cwd, dest, .{});
+        // POSIX: hardLink (formerly posix.link)
+        cwd.hardLink(src, cwd, dest, io, .{}) catch {
+            try cwd.copyFile(src, cwd, dest, io, .{});
         };
     }
 }
@@ -293,12 +297,13 @@ extern "kernel32" fn CreateHardLinkW(
 /// Resolve src/dest to absolute paths and call rewriteZonPaths.
 /// `project_dir` is used to remap abs_src to its main-checkout equivalent
 /// when in a worktree (see cache.toMainCheckoutPath).
-fn rewriteLocalDep(allocator: std.mem.Allocator, cwd: std.fs.Dir, src_path: []const u8, deps_dir: []const u8, link_name: []const u8, project_dir: []const u8) !void {
+fn rewriteLocalDep(allocator: std.mem.Allocator, cwd: std.Io.Dir, src_path: []const u8, deps_dir: []const u8, link_name: []const u8, project_dir: []const u8) !void {
+    const io = config.globalIo();
     const dest = try std.fs.path.join(allocator, &.{ deps_dir, link_name });
     defer allocator.free(dest);
-    const abs_src = cwd.realpathAlloc(allocator, src_path) catch return;
+    const abs_src = cwd.realPathFileAlloc(io, src_path, allocator) catch return;
     defer allocator.free(abs_src);
-    const abs_dest = cwd.realpathAlloc(allocator, dest) catch return;
+    const abs_dest = cwd.realPathFileAlloc(io, dest, allocator) catch return;
     defer allocator.free(abs_dest);
     const resolution_src = try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
     defer allocator.free(resolution_src);
@@ -316,7 +321,8 @@ fn rewriteZonPaths(allocator: std.mem.Allocator, src_dir: []const u8, dest_dir: 
     const zon_path = try std.fs.path.join(allocator, &.{ dest_dir, "build.zig.zon" });
     defer allocator.free(zon_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, zon_path, 256 * 1024) catch |err| {
+    const io = config.globalIo();
+    const content = std.Io.Dir.cwd().readFileAlloc(io, zon_path, allocator, .limited(256 * 1024)) catch |err| {
         std.debug.print("labelle: warning: could not read {s}: {any}\n", .{ zon_path, err });
         return;
     };
@@ -325,7 +331,7 @@ fn rewriteZonPaths(allocator: std.mem.Allocator, src_dir: []const u8, dest_dir: 
     // Quick check: skip files without relative .path deps
     if (std.mem.indexOf(u8, content, ".path") == null) return;
 
-    var result = std.ArrayList(u8){};
+    var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
 
     var i: usize = 0;
@@ -381,10 +387,10 @@ fn rewriteZonPaths(allocator: std.mem.Allocator, src_dir: []const u8, dest_dir: 
 
     // Only write if changed
     if (!std.mem.eql(u8, content, result.items)) {
-        const cwd = std.fs.cwd();
+        const cwd = std.Io.Dir.cwd();
 
         // Delete the hardlink first so we never rewrite the original package file.
-        cwd.deleteFile(zon_path) catch |err| switch (err) {
+        cwd.deleteFile(io, zon_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
@@ -393,16 +399,16 @@ fn rewriteZonPaths(allocator: std.mem.Allocator, src_dir: []const u8, dest_dir: 
         const tmp_path = try std.fs.path.join(allocator, &.{ dest_dir, "build.zig.zon.tmp" });
         defer allocator.free(tmp_path);
 
-        cwd.deleteFile(tmp_path) catch |err| switch (err) {
+        cwd.deleteFile(io, tmp_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
 
-        const file = try cwd.createFile(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(result.items);
+        const file = try cwd.createFile(io, tmp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, result.items);
 
-        try cwd.rename(tmp_path, zon_path);
+        try cwd.rename(tmp_path, cwd, zon_path, io);
     }
 }
 
@@ -414,7 +420,7 @@ fn computeRelativePath(allocator: std.mem.Allocator, from_dir: []const u8, to_pa
     const resolved_to = try std.fs.path.resolve(allocator, &.{to_path});
     defer allocator.free(resolved_to);
 
-    const rel = try std.fs.path.relative(allocator, from_dir, resolved_to);
+    const rel = try std.fs.path.relative(allocator, "", null, from_dir, resolved_to);
 
     // ZON files should always use forward slashes.
     if (comptime @import("builtin").os.tag == .windows) {
@@ -461,9 +467,9 @@ test "rewriteZonPaths: rewrites relative path deps" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("project/libs/needs_machine");
-    try tmp.dir.makePath("project/.labelle/deps/labelle-needs_machine");
-    try tmp.dir.makePath("labelle-fsm");
+    try tmp.dir.createDirPath(std.testing.io,"project/libs/needs_machine");
+    try tmp.dir.createDirPath(std.testing.io,"project/.labelle/deps/labelle-needs_machine");
+    try tmp.dir.createDirPath(std.testing.io,"labelle-fsm");
 
     const zon_content =
         \\.{
@@ -480,18 +486,18 @@ test "rewriteZonPaths: rewrites relative path deps" {
         \\}
     ;
 
-    const dest_zon = try tmp.dir.createFile("project/.labelle/deps/labelle-needs_machine/build.zig.zon", .{});
-    defer dest_zon.close();
-    try dest_zon.writeAll(zon_content);
+    const dest_zon = try tmp.dir.createFile(std.testing.io, "project/.labelle/deps/labelle-needs_machine/build.zig.zon", .{});
+    defer dest_zon.close(std.testing.io);
+    try dest_zon.writeStreamingAll(std.testing.io, zon_content);
 
-    const src_abs = try tmp.dir.realpathAlloc(alloc, "project/libs/needs_machine");
+    const src_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project/libs/needs_machine", alloc);
     defer alloc.free(src_abs);
-    const dest_abs = try tmp.dir.realpathAlloc(alloc, "project/.labelle/deps/labelle-needs_machine");
+    const dest_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project/.labelle/deps/labelle-needs_machine", alloc);
     defer alloc.free(dest_abs);
 
     try rewriteZonPaths(alloc, src_abs, dest_abs);
 
-    const result = try tmp.dir.readFileAlloc(alloc, "project/.labelle/deps/labelle-needs_machine/build.zig.zon", 64 * 1024);
+    const result = try tmp.dir.readFileAlloc(std.testing.io, "project/.labelle/deps/labelle-needs_machine/build.zig.zon", alloc, .limited(64 * 1024));
     defer alloc.free(result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, ".url = \"https://example.com/core.tar.gz\"") != null);
@@ -506,8 +512,8 @@ test "rewriteZonPaths: skips files without .path deps" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("src");
-    try tmp.dir.makePath("dest");
+    try tmp.dir.createDirPath(std.testing.io,"src");
+    try tmp.dir.createDirPath(std.testing.io,"dest");
 
     const zon_content =
         \\.{
@@ -521,18 +527,18 @@ test "rewriteZonPaths: skips files without .path deps" {
         \\}
     ;
 
-    const dest_zon = try tmp.dir.createFile("dest/build.zig.zon", .{});
-    defer dest_zon.close();
-    try dest_zon.writeAll(zon_content);
+    const dest_zon = try tmp.dir.createFile(std.testing.io, "dest/build.zig.zon", .{});
+    defer dest_zon.close(std.testing.io);
+    try dest_zon.writeStreamingAll(std.testing.io, zon_content);
 
-    const src_abs = try tmp.dir.realpathAlloc(alloc, "src");
+    const src_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "src", alloc);
     defer alloc.free(src_abs);
-    const dest_abs = try tmp.dir.realpathAlloc(alloc, "dest");
+    const dest_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "dest", alloc);
     defer alloc.free(dest_abs);
 
     try rewriteZonPaths(alloc, src_abs, dest_abs);
 
-    const result = try tmp.dir.readFileAlloc(alloc, "dest/build.zig.zon", 64 * 1024);
+    const result = try tmp.dir.readFileAlloc(std.testing.io, "dest/build.zig.zon", alloc, .limited(64 * 1024));
     defer alloc.free(result);
     try std.testing.expectEqualStrings(zon_content, result);
 }
@@ -548,8 +554,8 @@ test "hardlinkTree: errors on missing source" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("dest_parent");
-    const dest_parent = try tmp.dir.realpathAlloc(alloc, "dest_parent");
+    try tmp.dir.createDirPath(std.testing.io,"dest_parent");
+    const dest_parent = try tmp.dir.realPathFileAlloc(std.testing.io, "dest_parent", alloc);
     defer alloc.free(dest_parent);
 
     const missing_src = try std.fs.path.join(alloc, &.{ dest_parent, "does_not_exist" });

@@ -22,14 +22,15 @@ const PACKAGES_SUBDIR = "packages";
 /// Resolve the cache root directory.
 /// Priority: LABELLE_HOME env var > ~/.labelle/
 pub fn getCacheRoot(allocator: std.mem.Allocator) ![]const u8 {
+    const env = config.globalEnviron();
     // Check LABELLE_HOME env var first
-    if (std.process.getEnvVarOwned(allocator, "LABELLE_HOME")) |home| {
+    if (env.getAlloc(allocator, "LABELLE_HOME")) |home| {
         return home;
     } else |_| {}
 
     // Fall back to platform-appropriate home directory
     const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-    const home_dir = std.process.getEnvVarOwned(allocator, home_env) catch |err| {
+    const home_dir = env.getAlloc(allocator, home_env) catch |err| {
         std.debug.print("labelle: could not determine home directory ({s}): {any}\n", .{ home_env, err });
         return error.NoHomeDirectory;
     };
@@ -123,7 +124,7 @@ fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, projec
     } else try allocator.dupe(u8, local_path);
     defer allocator.free(resolve_path);
 
-    return std.fs.cwd().realpathAlloc(allocator, resolve_path) catch {
+    return std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), resolve_path, allocator) catch {
         std.debug.print("labelle: warning: local path '{s}' does not exist\n", .{resolve_path});
         return try allocator.dupe(u8, resolve_path);
     };
@@ -156,7 +157,7 @@ pub fn toMainCheckoutPath(allocator: std.mem.Allocator, abs_path: []const u8, pr
 
     if (std.mem.eql(u8, root, project_dir)) return allocator.dupe(u8, abs_path);
 
-    const project_canon = std.fs.cwd().realpathAlloc(allocator, project_dir) catch
+    const project_canon = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, allocator) catch
         return allocator.dupe(u8, abs_path);
     defer allocator.free(project_canon);
 
@@ -193,10 +194,11 @@ fn resolveProjectRoot(allocator: std.mem.Allocator, project_dir: []const u8) ![]
     const git_path = try std.fs.path.join(allocator, &.{ project_dir, ".git" });
     defer allocator.free(git_path);
 
-    const stat = std.fs.cwd().statFile(git_path) catch return allocator.dupe(u8, project_dir);
+    const io = config.globalIo();
+    const stat = std.Io.Dir.cwd().statFile(io, git_path, .{}) catch return allocator.dupe(u8, project_dir);
     if (stat.kind != .file) return allocator.dupe(u8, project_dir);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, git_path, 4096) catch
+    const content = std.Io.Dir.cwd().readFileAlloc(io, git_path, allocator, .limited(4096)) catch
         return allocator.dupe(u8, project_dir);
     defer allocator.free(content);
 
@@ -234,7 +236,7 @@ fn resolveProjectRoot(allocator: std.mem.Allocator, project_dir: []const u8) ![]
 
     const main_checkout = std.fs.path.dirname(dot_git) orelse return allocator.dupe(u8, project_dir);
     // Resolve the main checkout in case the gitdir contained `..`/symlinks.
-    return std.fs.cwd().realpathAlloc(allocator, main_checkout) catch allocator.dupe(u8, main_checkout);
+    return std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), main_checkout, allocator) catch allocator.dupe(u8, main_checkout);
 }
 
 /// Check if a framework package version is cached.
@@ -280,9 +282,10 @@ pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: [
     const target = try std.fs.path.join(allocator, &.{ packages_dir, "assembler", assembler_version });
     defer allocator.free(target);
 
-    const cwd = std.fs.cwd();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
 
-    cwd.makePath(target) catch |err| {
+    cwd.createDirPath(io, target) catch |err| {
         std.debug.print("labelle: could not create cache directory '{s}': {any}\n", .{ target, err });
         return error.CachePopulationFailed;
     };
@@ -307,7 +310,7 @@ pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: [
 /// Validate that all dependencies in a project config are cached.
 /// Returns a list of missing packages, or empty if all are cached.
 pub fn validateCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) ![]const []const u8 {
-    var missing: std.ArrayList([]const u8) = .{};
+    var missing: std.ArrayList([]const u8) = .empty;
 
     // Framework packages
     const framework = [_]struct { name: []const u8, version: []const u8 }{
@@ -430,7 +433,8 @@ pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: [
     const tmp_dir = try getTempPath(allocator, "labelle-assembler-fetch", assembler_version);
     defer allocator.free(tmp_dir);
 
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    const io = config.globalIo();
+    std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
 
     gitCloneShallow(allocator, git_url, tag, tmp_dir) catch {
         std.debug.print("labelle: could not fetch assembler packages at v{s}\n", .{assembler_version});
@@ -438,8 +442,8 @@ pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: [
         return error.FetchFailed;
     };
 
-    const cwd = std.fs.cwd();
-    cwd.makePath(target) catch {};
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, target) catch {};
 
     const subdirs = [_][]const u8{ "backends", "ecs", "gui" };
     for (subdirs) |subdir| {
@@ -456,14 +460,15 @@ pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: [
         };
     }
 
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
 }
 
 /// Shallow clone a git repo at a specific tag into the target directory.
 fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, tag: []const u8, target: []const u8) !void {
+    const io = config.globalIo();
     // Ensure parent directory exists
     if (std.fs.path.dirname(target)) |parent| {
-        std.fs.cwd().makePath(parent) catch {};
+        std.Io.Dir.cwd().createDirPath(io, parent) catch {};
     }
 
     const result = std.process.Child.run(.{
@@ -492,7 +497,7 @@ fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, tag: []co
     // Remove .git directory to save space
     const git_dir = try std.fs.path.join(allocator, &.{ target, ".git" });
     defer allocator.free(git_dir);
-    std.fs.cwd().deleteTree(git_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(io, git_dir) catch {};
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
@@ -501,10 +506,11 @@ fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, tag: []co
 /// The source_dir must be an absolute path (resolved via realpath).
 /// Creates parent directories as needed.
 fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, target: []const u8) !void {
-    const cwd = std.fs.cwd();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
 
     // Resolve source to absolute path
-    const abs_source = cwd.realpathAlloc(allocator, source_dir) catch |err| {
+    const abs_source = cwd.realPathFileAlloc(io, source_dir, allocator) catch |err| {
         std.debug.print("labelle: source directory not found '{s}': {any}\n", .{ source_dir, err });
         return error.CachePopulationFailed;
     };
@@ -512,7 +518,7 @@ fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, target: 
 
     // Ensure parent directory exists
     if (std.fs.path.dirname(target)) |parent| {
-        cwd.makePath(parent) catch |err| {
+        cwd.createDirPath(io, parent) catch |err| {
             std.debug.print("labelle: could not create cache directory '{s}': {any}\n", .{ parent, err });
             return error.CachePopulationFailed;
         };
@@ -520,16 +526,17 @@ fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, target: 
 
     // Create symlink (absolute target → source), fall back to copy on failure
     // (Windows requires admin/Developer Mode for symlinks)
-    cwd.symLink(abs_source, target, .{ .is_directory = true }) catch |err| {
+    cwd.symLink(io, abs_source, target, .{ .is_directory = true }) catch |err| {
         if (err == error.PathAlreadyExists) {
             // Verify the existing entry points to the expected source
-            var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const existing = std.fs.readLinkAbsolute(target, &link_buf) catch return; // not a symlink, assume OK
+            var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const existing_len = std.Io.Dir.readLinkAbsolute(io, target, &link_buf) catch return; // not a symlink, assume OK
+            const existing = link_buf[0..existing_len];
             if (!std.mem.eql(u8, existing, abs_source)) {
                 std.debug.print("labelle: warning: cache entry '{s}' points to '{s}', expected '{s}'\n", .{ target, existing, abs_source });
                 // Remove stale link and recreate
-                cwd.deleteFile(target) catch return;
-                cwd.symLink(abs_source, target, .{ .is_directory = true }) catch return;
+                cwd.deleteFile(io, target) catch return;
+                cwd.symLink(io, abs_source, target, .{ .is_directory = true }) catch return;
             }
             return;
         }
@@ -544,9 +551,10 @@ fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, target: 
 /// Get a platform-aware temporary directory path.
 /// Uses TEMP/TMP on Windows, /tmp on Unix.
 fn getTempPath(allocator: std.mem.Allocator, prefix: []const u8, suffix: []const u8) ![]const u8 {
+    const env = config.globalEnviron();
     const tmp_base = if (builtin.os.tag == .windows)
-        std.process.getEnvVarOwned(allocator, "TEMP") catch
-            std.process.getEnvVarOwned(allocator, "TMP") catch
+        env.getAlloc(allocator, "TEMP") catch
+            env.getAlloc(allocator, "TMP") catch
             try allocator.dupe(u8, "C:\\Windows\\Temp")
     else
         try allocator.dupe(u8, "/tmp");
@@ -556,7 +564,7 @@ fn getTempPath(allocator: std.mem.Allocator, prefix: []const u8, suffix: []const
 }
 
 fn dirExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(config.globalIo(), path, .{}) catch return false;
     return true;
 }
 
@@ -586,15 +594,16 @@ pub fn patchCachedDeps(allocator: std.mem.Allocator, cfg: config.ProjectConfig) 
 
         // Patch subpackage build.zig.zon files (scene/, camera/, etc.)
         // Subpackages are one level deeper → "../../labelle-core"
-        var dir = std.fs.cwd().openDir(pkg_dir, .{ .iterate = true }) catch continue;
-        defer dir.close();
+        const io = config.globalIo();
+        var dir = std.Io.Dir.cwd().openDir(io, pkg_dir, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(io)) |entry| {
             if (entry.kind != .directory) continue;
             const sub_zon = try std.fs.path.join(allocator, &.{ pkg_dir, entry.name, "build.zig.zon" });
             defer allocator.free(sub_zon);
-            if (std.fs.cwd().access(sub_zon, .{})) |_| {
+            if (std.Io.Dir.cwd().access(io, sub_zon, .{})) |_| {
                 const sub_dir = try std.fs.path.join(allocator, &.{ pkg_dir, entry.name });
                 defer allocator.free(sub_dir);
                 try patchZonFile(allocator, sub_dir, "build.zig.zon", true);
@@ -612,7 +621,8 @@ fn patchZonFile(allocator: std.mem.Allocator, dir_path: []const u8, filename: []
     const file_path = try std.fs.path.join(allocator, &.{ dir_path, filename });
     defer allocator.free(file_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, file_path, 256 * 1024) catch return;
+    const io = config.globalIo();
+    const content = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(256 * 1024)) catch return;
     defer allocator.free(content);
 
     // After deps_linker, all packages are siblings under .labelle/deps/.
@@ -633,16 +643,16 @@ fn patchZonFile(allocator: std.mem.Allocator, dir_path: []const u8, filename: []
 
     // Only write if changed
     if (!std.mem.eql(u8, content, result)) {
-        const file = try std.fs.cwd().createFile(file_path, .{});
-        defer file.close();
-        try file.writeAll(result);
+        const file = try std.Io.Dir.cwd().createFile(io, file_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, result);
     }
     allocator.free(result);
 }
 
 /// Simple string replace-all helper.
 fn replaceAll(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
-    var list = std.ArrayList(u8){};
+    var list: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < haystack.len) {
         if (i + needle.len <= haystack.len and std.mem.eql(u8, haystack[i..][0..needle.len], needle)) {
@@ -658,21 +668,22 @@ fn replaceAll(allocator: std.mem.Allocator, haystack: []const u8, needle: []cons
 
 /// Check if a path is a symlink.
 fn isSymlink(path: []const u8) bool {
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    _ = std.fs.readLinkAbsolute(path, &link_buf) catch return false;
+    var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    _ = std.Io.Dir.readLinkAbsolute(config.globalIo(), path, &link_buf) catch return false;
     return true;
 }
 
 /// Recursively copy a directory tree.
 pub fn copyDirRecursive(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
-    const cwd = std.fs.cwd();
-    cwd.makePath(dst) catch {};
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, dst) catch {};
 
-    var src_dir = try cwd.openDir(src, .{ .iterate = true });
-    defer src_dir.close();
+    var src_dir = try cwd.openDir(io, src, .{ .iterate = true });
+    defer src_dir.close(io);
 
     var iter = src_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         const src_sub = try std.fs.path.join(allocator, &.{ src, entry.name });
         defer allocator.free(src_sub);
         const dst_sub = try std.fs.path.join(allocator, &.{ dst, entry.name });
@@ -681,7 +692,7 @@ pub fn copyDirRecursive(allocator: std.mem.Allocator, src: []const u8, dst: []co
         switch (entry.kind) {
             .directory => try copyDirRecursive(allocator, src_sub, dst_sub),
             .file => {
-                cwd.copyFile(src_sub, cwd, dst_sub, .{}) catch |err| {
+                cwd.copyFile(src_sub, cwd, dst_sub, io, .{}) catch |err| {
                     std.debug.print("labelle: could not copy '{s}': {any}\n", .{ src_sub, err });
                     return err;
                 };
@@ -699,8 +710,8 @@ test "resolveProjectRoot: main checkout (.git is a directory) returns project_di
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("project/.git");
-    const project_abs = try tmp.dir.realpathAlloc(alloc, "project");
+    try tmp.dir.createDirPath(std.testing.io,"project/.git");
+    const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
     defer alloc.free(project_abs);
 
     const root = try resolveProjectRoot(alloc, project_abs);
@@ -718,19 +729,19 @@ test "resolveProjectRoot: worktree linkfile resolves to main checkout" {
     // Layout:
     //   tmp/main/.git/worktrees/wt
     //   tmp/wt/.git  (linkfile pointing back into main/.git/worktrees/wt)
-    try tmp.dir.makePath("main/.git/worktrees/wt");
-    try tmp.dir.makePath("wt");
+    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io,"wt");
 
-    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
-    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    const wt_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "wt", alloc);
     defer alloc.free(wt_abs);
 
     const linkfile_contents = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
     defer alloc.free(linkfile_contents);
-    const f = try tmp.dir.createFile("wt/.git", .{});
-    defer f.close();
-    try f.writeAll(linkfile_contents);
+    const f = try tmp.dir.createFile(std.testing.io, "wt/.git", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, linkfile_contents);
 
     const root = try resolveProjectRoot(alloc, wt_abs);
     defer alloc.free(root);
@@ -744,8 +755,8 @@ test "resolveProjectRoot: not a git repo returns project_dir unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("plain");
-    const plain_abs = try tmp.dir.realpathAlloc(alloc, "plain");
+    try tmp.dir.createDirPath(std.testing.io,"plain");
+    const plain_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "plain", alloc);
     defer alloc.free(plain_abs);
 
     const root = try resolveProjectRoot(alloc, plain_abs);
@@ -769,20 +780,20 @@ test "resolveLocalPath: worktree-internal path (no `..` prefix) stays in the wor
     // Layout: main checkout has libs/foo/file with old content; worktree
     // has libs/foo/file with new content. resolveLocalPath called from
     // the worktree must return the worktree's libs/foo, not main's.
-    try tmp.dir.makePath("main/.git/worktrees/wt");
-    try tmp.dir.makePath("main/libs/foo");
-    try tmp.dir.makePath("wt/libs/foo");
+    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io,"main/libs/foo");
+    try tmp.dir.createDirPath(std.testing.io,"wt/libs/foo");
 
-    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
-    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    const wt_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "wt", alloc);
     defer alloc.free(wt_abs);
 
     const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
     defer alloc.free(linkfile);
-    const f = try tmp.dir.createFile("wt/.git", .{});
-    defer f.close();
-    try f.writeAll(linkfile);
+    const f = try tmp.dir.createFile(std.testing.io, "wt/.git", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, linkfile);
 
     const resolved = try resolveLocalPath(alloc, "libs/foo", wt_abs);
     defer alloc.free(resolved);
@@ -802,22 +813,22 @@ test "resolveLocalPath: escaping path (starts with `..`) anchors at main checkou
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("main/.git/worktrees/wt");
-    try tmp.dir.makePath("sibling");
-    try tmp.dir.makePath("wt");
+    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io,"sibling");
+    try tmp.dir.createDirPath(std.testing.io,"wt");
 
-    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
-    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    const wt_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "wt", alloc);
     defer alloc.free(wt_abs);
-    const sibling_abs = try tmp.dir.realpathAlloc(alloc, "sibling");
+    const sibling_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sibling", alloc);
     defer alloc.free(sibling_abs);
 
     const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
     defer alloc.free(linkfile);
-    const f = try tmp.dir.createFile("wt/.git", .{});
-    defer f.close();
-    try f.writeAll(linkfile);
+    const f = try tmp.dir.createFile(std.testing.io, "wt/.git", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, linkfile);
 
     const resolved = try resolveLocalPath(alloc, "../sibling", wt_abs);
     defer alloc.free(resolved);
@@ -831,22 +842,22 @@ test "toMainCheckoutPath: worktree path inside project_dir maps to main checkout
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("main/.git/worktrees/wt");
-    try tmp.dir.makePath("main/libs/foo");
-    try tmp.dir.makePath("wt/libs/foo");
+    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io,"main/libs/foo");
+    try tmp.dir.createDirPath(std.testing.io,"wt/libs/foo");
 
-    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
-    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    const wt_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "wt", alloc);
     defer alloc.free(wt_abs);
-    const wt_libs_foo = try tmp.dir.realpathAlloc(alloc, "wt/libs/foo");
+    const wt_libs_foo = try tmp.dir.realPathFileAlloc(std.testing.io, "wt/libs/foo", alloc);
     defer alloc.free(wt_libs_foo);
 
     const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
     defer alloc.free(linkfile);
-    const f = try tmp.dir.createFile("wt/.git", .{});
-    defer f.close();
-    try f.writeAll(linkfile);
+    const f = try tmp.dir.createFile(std.testing.io, "wt/.git", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, linkfile);
 
     const mapped = try toMainCheckoutPath(alloc, wt_libs_foo, wt_abs);
     defer alloc.free(mapped);
@@ -866,22 +877,22 @@ test "toMainCheckoutPath: path outside project_dir is returned unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("main/.git/worktrees/wt");
-    try tmp.dir.makePath("sibling");
-    try tmp.dir.makePath("wt");
+    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io,"sibling");
+    try tmp.dir.createDirPath(std.testing.io,"wt");
 
-    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
-    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    const wt_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "wt", alloc);
     defer alloc.free(wt_abs);
-    const sibling_abs = try tmp.dir.realpathAlloc(alloc, "sibling");
+    const sibling_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sibling", alloc);
     defer alloc.free(sibling_abs);
 
     const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/worktrees/wt\n", .{main_abs});
     defer alloc.free(linkfile);
-    const f = try tmp.dir.createFile("wt/.git", .{});
-    defer f.close();
-    try f.writeAll(linkfile);
+    const f = try tmp.dir.createFile(std.testing.io, "wt/.git", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, linkfile);
 
     const mapped = try toMainCheckoutPath(alloc, sibling_abs, wt_abs);
     defer alloc.free(mapped);
@@ -895,12 +906,12 @@ test "toMainCheckoutPath: not in a worktree returns path unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("main/.git");
-    try tmp.dir.makePath("main/libs/foo");
+    try tmp.dir.createDirPath(std.testing.io,"main/.git");
+    try tmp.dir.createDirPath(std.testing.io,"main/libs/foo");
 
-    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
-    const libs_foo = try tmp.dir.realpathAlloc(alloc, "main/libs/foo");
+    const libs_foo = try tmp.dir.realPathFileAlloc(std.testing.io, "main/libs/foo", alloc);
     defer alloc.free(libs_foo);
 
     const mapped = try toMainCheckoutPath(alloc, libs_foo, main_abs);
@@ -929,19 +940,19 @@ test "resolveProjectRoot: submodule .git linkfile returns project_dir unchanged"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("super/.git/modules/sub");
-    try tmp.dir.makePath("super/sub");
+    try tmp.dir.createDirPath(std.testing.io,"super/.git/modules/sub");
+    try tmp.dir.createDirPath(std.testing.io,"super/sub");
 
-    const super_abs = try tmp.dir.realpathAlloc(alloc, "super");
+    const super_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "super", alloc);
     defer alloc.free(super_abs);
-    const sub_abs = try tmp.dir.realpathAlloc(alloc, "super/sub");
+    const sub_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "super/sub", alloc);
     defer alloc.free(sub_abs);
 
     const linkfile = try std.fmt.allocPrint(alloc, "gitdir: {s}/.git/modules/sub\n", .{super_abs});
     defer alloc.free(linkfile);
-    const f = try tmp.dir.createFile("super/sub/.git", .{});
-    defer f.close();
-    try f.writeAll(linkfile);
+    const f = try tmp.dir.createFile(std.testing.io, "super/sub/.git", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, linkfile);
 
     const root = try resolveProjectRoot(alloc, sub_abs);
     defer alloc.free(root);
@@ -958,17 +969,17 @@ test "resolveProjectRoot: relative gitdir is resolved against project_dir" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("main/.git/worktrees/wt");
-    try tmp.dir.makePath("main/wt");
+    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io,"main/wt");
 
-    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
-    const wt_abs = try tmp.dir.realpathAlloc(alloc, "main/wt");
+    const wt_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main/wt", alloc);
     defer alloc.free(wt_abs);
 
-    const f = try tmp.dir.createFile("main/wt/.git", .{});
-    defer f.close();
-    try f.writeAll("gitdir: ../.git/worktrees/wt\n");
+    const f = try tmp.dir.createFile(std.testing.io, "main/wt/.git", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, "gitdir: ../.git/worktrees/wt\n");
 
     const root = try resolveProjectRoot(alloc, wt_abs);
     defer alloc.free(root);
@@ -984,12 +995,12 @@ test "resolveProjectRoot: linkfile with extra keys (commondir) parses first line
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("main/.git/worktrees/wt");
-    try tmp.dir.makePath("wt");
+    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io,"wt");
 
-    const main_abs = try tmp.dir.realpathAlloc(alloc, "main");
+    const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
-    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    const wt_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "wt", alloc);
     defer alloc.free(wt_abs);
 
     const linkfile = try std.fmt.allocPrint(
@@ -998,9 +1009,9 @@ test "resolveProjectRoot: linkfile with extra keys (commondir) parses first line
         .{ main_abs, main_abs },
     );
     defer alloc.free(linkfile);
-    const f = try tmp.dir.createFile("wt/.git", .{});
-    defer f.close();
-    try f.writeAll(linkfile);
+    const f = try tmp.dir.createFile(std.testing.io, "wt/.git", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, linkfile);
 
     const root = try resolveProjectRoot(alloc, wt_abs);
     defer alloc.free(root);
@@ -1014,13 +1025,13 @@ test "resolveProjectRoot: malformed linkfile returns project_dir unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("wt");
-    const wt_abs = try tmp.dir.realpathAlloc(alloc, "wt");
+    try tmp.dir.createDirPath(std.testing.io,"wt");
+    const wt_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "wt", alloc);
     defer alloc.free(wt_abs);
 
-    const f = try tmp.dir.createFile("wt/.git", .{});
-    defer f.close();
-    try f.writeAll("not a gitdir line\n");
+    const f = try tmp.dir.createFile(std.testing.io, "wt/.git", .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, "not a gitdir line\n");
 
     const root = try resolveProjectRoot(alloc, wt_abs);
     defer alloc.free(root);

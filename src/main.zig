@@ -51,53 +51,53 @@ const usage =
     \\
 ;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    gen.initGlobalIo(init.minimal);
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args.deinit();
     _ = args.skip(); // program name
 
     const first = args.next() orelse {
-        writeStderr(usage);
+        writeStderr(io, usage);
         std.process.exit(2);
     };
 
     if (std.mem.eql(u8, first, "--protocol-version")) {
         // Protocol version goes to stdout so callers can capture it via
         // a normal pipe. Everything else goes to stderr.
-        const stdout = std.fs.File.stdout();
+        const stdout = std.Io.File.stdout();
         var buf: [16]u8 = undefined;
         const msg = try std.fmt.bufPrint(&buf, "{d}\n", .{PROTOCOL_VERSION});
-        try stdout.writeAll(msg);
+        try stdout.writeStreamingAll(io, msg);
         return;
     }
 
     if (std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h") or std.mem.eql(u8, first, "help")) {
-        writeStderr(usage);
+        writeStderr(io, usage);
         return;
     }
 
     if (std.mem.eql(u8, first, "generate")) {
-        try cmdGenerate(allocator, &args);
+        try cmdGenerate(allocator, io, &args);
         return;
     }
 
     std.log.err("labelle-assembler: unknown subcommand '{s}'", .{first});
-    writeStderr("\n" ++ usage);
+    writeStderr(io, "\n" ++ usage);
     std.process.exit(2);
 }
 
 /// Write directly to stderr without a level prefix. Used for the usage
 /// banner — `std.log.*` would prepend `info:`/`error:`, and `std.debug.print`
 /// is intended for development-time printf debugging, not production output.
-fn writeStderr(msg: []const u8) void {
-    std.fs.File.stderr().writeAll(msg) catch {};
+fn writeStderr(io: std.Io, msg: []const u8) void {
+    std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
 }
 
-fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
+fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     var project_root: ?[]const u8 = null;
     var scene_override: ?[]const u8 = null;
     var platform_override: ?gen.Platform = null;
@@ -149,7 +149,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var cfg = readProjectConfig(arena_alloc, root) catch |err| {
+    var cfg = readProjectConfig(arena_alloc, io, root) catch |err| {
         std.log.err("labelle-assembler: failed to read project.labelle in '{s}': {s}", .{ root, @errorName(err) });
         std.process.exit(1);
     };
@@ -231,14 +231,14 @@ fn parseBackend(val: []const u8) ?gen.Backend {
 /// assembler binary doesn't pull in CLI-side modules. The CLI's version
 /// will route through this binary in Phase 2; this duplication is
 /// intentional and temporary.
-fn readProjectConfig(allocator: std.mem.Allocator, project_dir: []const u8) !gen.ProjectConfig {
+fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []const u8) !gen.ProjectConfig {
     @setEvalBranchQuota(10000);
     const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
     defer allocator.free(labelle_path);
 
-    const source_raw = try std.fs.cwd().readFileAlloc(allocator, labelle_path, 1024 * 1024);
+    const source_raw = try std.Io.Dir.cwd().readFileAlloc(io, labelle_path, allocator, .limited(1024 * 1024));
     defer allocator.free(source_raw);
 
     const source = try allocator.dupeZ(u8, source_raw);
-    return try std.zon.parse.fromSlice(gen.ProjectConfig, allocator, source, null, .{});
+    return try std.zon.parse.fromSliceAlloc(gen.ProjectConfig, allocator, source, null, .{});
 }
