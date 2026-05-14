@@ -152,11 +152,16 @@ pub fn handleEvent(ev: [*c]const sapp.Event) void {
         },
         .TOUCHES_BEGAN, .TOUCHES_MOVED, .TOUCHES_ENDED, .TOUCHES_CANCELLED => {
             touch_count = @intCast(ev.*.num_touches);
-            for (0..@intCast(ev.*.num_touches)) |i| {
+            const n: usize = @intCast(ev.*.num_touches);
+            // Zig 0.16: chained access like `ev.*.touches[i].field`
+            // through a `[*c]` C pointer fails to resolve the field.
+            // Copy the touches array to a local first, then index it.
+            const touches: [8]sapp.Touchpoint = ev[0].touches;
+            for (0..n) |i| {
                 if (i >= MAX_TOUCHES) break;
-                touch_xs[i] = ev.*.touches[i].pos_x;
-                touch_ys[i] = ev.*.touches[i].pos_y;
-                touch_ids[i] = @intCast(ev.*.touches[i].identifier);
+                touch_xs[i] = touches[i].pos_x;
+                touch_ys[i] = touches[i].pos_y;
+                touch_ids[i] = @intCast(touches[i].identifier);
             }
             if (ev.*.type == .TOUCHES_ENDED or ev.*.type == .TOUCHES_CANCELLED) {
                 touch_count = 0;

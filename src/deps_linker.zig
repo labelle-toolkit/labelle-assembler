@@ -183,13 +183,16 @@ pub fn createDepsLinks(
             const abs_dest = cwd.realPathFileAlloc(io, dest, allocator) catch continue;
             defer allocator.free(abs_dest);
 
-            // In a worktree, anchor path-resolution math at the main
-            // checkout. The plugin's hardlinked file content stays
-            // worktree-sourced (so worker edits are visible), but its
-            // `.path = "../sibling"` references describe siblings of the
-            // main project — not siblings of the worktree, which sit at
-            // a different filesystem depth. See cache.toMainCheckoutPath.
-            const resolution_src = try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
+            // Resolution-anchor selection: prefer worktree-relative if
+            // the dep's first `.path = "..."` target exists in the
+            // worktree's filesystem layout. Falls back to PR #88's
+            // main-checkout anchor for the single-worktree case (only
+            // the game is worktreed; toolkit deps sit beside the main
+            // checkout).
+            const resolution_src = if (try firstPathDepResolvesInWorktree(allocator, abs_src))
+                try allocator.dupe(u8, abs_src)
+            else
+                try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
             defer allocator.free(resolution_src);
 
             try rewriteZonPaths(allocator, resolution_src, abs_dest);
@@ -313,7 +316,10 @@ fn rewriteLocalDep(allocator: std.mem.Allocator, cwd: std.Io.Dir, src_path: []co
     defer allocator.free(abs_src);
     const abs_dest = cwd.realPathFileAlloc(io, dest, allocator) catch return;
     defer allocator.free(abs_dest);
-    const resolution_src = try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
+    const resolution_src = if (try firstPathDepResolvesInWorktree(allocator, abs_src))
+        try allocator.dupe(u8, abs_src)
+    else
+        try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
     defer allocator.free(resolution_src);
     try rewriteZonPaths(allocator, resolution_src, abs_dest);
 }
@@ -423,6 +429,40 @@ fn rewriteZonPaths(allocator: std.mem.Allocator, src_dir: []const u8, dest_dir: 
 /// Compute a relative path from `from_dir` to `to_path`.
 /// Uses std.fs.path.relative for cross-platform correctness, then
 /// normalizes to forward slashes for ZON portability.
+/// Heuristic: does the dep's *first* `.path = "..."` reference resolve to an
+/// existing directory under `abs_src`'s worktree-native layout?
+///
+/// Used to pick the resolution anchor for `rewriteZonPaths`. PR #88 anchored
+/// all `local:` paths at the main checkout (assuming toolkit deps sit beside
+/// it), but that breaks parallel-worktree setups where everything is worktreed
+/// under the same parent. When the worktree-relative target exists, prefer it;
+/// otherwise fall through to `cache.toMainCheckoutPath` so the original
+/// single-worktree pattern still works.
+///
+/// Reads at most 64 KiB of the source `build.zig.zon`. No-op (returns false)
+/// for packages without `.path` deps or with unreadable manifests.
+fn firstPathDepResolvesInWorktree(allocator: std.mem.Allocator, abs_src: []const u8) !bool {
+    const io = config.globalIo();
+    const zon_path = try std.fs.path.join(allocator, &.{ abs_src, "build.zig.zon" });
+    defer allocator.free(zon_path);
+
+    const content = std.Io.Dir.cwd().readFileAlloc(io, zon_path, allocator, .limited(64 * 1024)) catch return false;
+    defer allocator.free(content);
+
+    const path_marker = ".path = \"";
+    const start = std.mem.indexOf(u8, content, path_marker) orelse return false;
+    const after = start + path_marker.len;
+    const end_rel = std.mem.indexOfScalar(u8, content[after..], '"') orelse return false;
+    const rel = content[after .. after + end_rel];
+    if (rel.len == 0 or rel[0] != '.') return false;
+
+    const target = try std.fs.path.join(allocator, &.{ abs_src, rel });
+    defer allocator.free(target);
+    var dir = std.Io.Dir.cwd().openDir(io, target, .{}) catch return false;
+    dir.close(io);
+    return true;
+}
+
 fn computeRelativePath(allocator: std.mem.Allocator, from_dir: []const u8, to_path: []const u8) ![]u8 {
     // Resolve `..` components in to_path before computing relative path.
     const resolved_to = try std.fs.path.resolve(allocator, &.{to_path});
