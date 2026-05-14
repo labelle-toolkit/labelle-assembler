@@ -15,14 +15,12 @@ const DEFAULT_NULL_FRAMES: u32 = 5;
 /// failure. Bounded so a typo (`LABELLE_NULL_FRAMES=infinity`) never
 /// deadlocks CI.
 ///
-/// Memory: `getEnvVarOwned` only allocates on success — if it returns
-/// `error.EnvironmentVariableNotFound`, `error.OutOfMemory`, or
-/// `error.InvalidWtf8`, no buffer was allocated, so the `catch` has
-/// nothing to free. The `defer` below is only reached on the success
-/// path where `raw` is a valid heap allocation.
-fn getMaxFrames(allocator: std.mem.Allocator) u32 {
-    const raw = std.process.getEnvVarOwned(allocator, "LABELLE_NULL_FRAMES") catch return DEFAULT_NULL_FRAMES;
-    defer allocator.free(raw);
+/// std.process.getEnvVarOwned was removed in Zig 0.16; env flows
+/// through std.process.Environ which would require Init plumbing.
+/// Fall back to libc getenv — engine links libc, so std.c is available.
+fn getMaxFrames(_: std.mem.Allocator) u32 {
+    const raw_c = std.c.getenv("LABELLE_NULL_FRAMES") orelse return DEFAULT_NULL_FRAMES;
+    const raw = std.mem.span(raw_c);
     return std.fmt.parseInt(u32, raw, 10) catch DEFAULT_NULL_FRAMES;
 }
 
