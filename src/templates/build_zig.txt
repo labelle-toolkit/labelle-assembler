@@ -29,6 +29,19 @@ pub fn build(b: *std.Build) !void {
     overrideImport(engine_mod, "labelle-core", core_mod);
     overrideImport(engine_mod, "labelle-gfx", gfx_mod);
 
+.game_mod_decl
+    // `game` module — local shim (game.zig) re-exporting engine's `Game`
+    // and `EntityId` so generated flow files at `scripts/flows/*.zig`
+    // can `@import("game")`. See labelle-assembler#116.
+    const game_mod = b.createModule(.{
+        .root_source_file = b.path("game.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "labelle-engine", .module = engine_mod },
+        },
+    });
+
 .backend_raylib
     const backend_dep = b.dependency("labelle_raylib", .{ .target = target, .optimize = optimize });
     const backend_gfx = backend_dep.module("gfx");
@@ -126,6 +139,9 @@ pub fn build(b: *std.Build) !void {
 .exe_gui_import
                 .{ .name = "gui_backend", .module = gui_mod },
 
+.exe_game_import
+                .{ .name = "game", .module = game_mod },
+
 .exe_end
             },
         }),
@@ -162,6 +178,9 @@ pub fn build(b: *std.Build) !void {
 
 .wasm_exe_gui_import
                 .{ .name = "gui_backend", .module = gui_mod },
+
+.wasm_exe_game_import
+                .{ .name = "game", .module = game_mod },
 
 .wasm_exe_end
             },
@@ -338,6 +357,17 @@ pub fn build(b: *std.Build) void {
     overrideImport(engine_mod, "labelle-core", core_mod);
     overrideImport(engine_mod, "labelle-gfx", gfx_mod);
 
+.game_mod_decl_ios
+    // `game` module — see labelle-assembler#116. iOS-targeted variant.
+    const game_mod = b.createModule(.{
+        .root_source_file = b.path("game.zig"),
+        .target = ios_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "labelle-engine", .module = engine_mod },
+        },
+    });
+
 .backend_sokol_ios
     // sokol with dont_link_system_libs — we link iOS frameworks manually
     const backend_dep = b.dependency("labelle_sokol", .{
@@ -375,6 +405,9 @@ pub fn build(b: *std.Build) void {
 
 .ios_exe_gui_import
                 .{ .name = "gui_backend", .module = gui_mod },
+
+.ios_exe_game_import
+                .{ .name = "game", .module = game_mod },
 
 .ios_exe_end
             },
@@ -520,6 +553,17 @@ pub fn build(b: *std.Build) void {
     overrideImport(engine_mod, "labelle-core", core_mod);
     overrideImport(engine_mod, "labelle-gfx", gfx_mod);
 
+.game_mod_decl_android
+    // `game` module — see labelle-assembler#116. Android-targeted variant.
+    const game_mod = b.createModule(.{
+        .root_source_file = b.path("game.zig"),
+        .target = android_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "labelle-engine", .module = engine_mod },
+        },
+    });
+
 .backend_sokol_android
     // sokol with dont_link_system_libs — we link Android libs manually
     const backend_dep = b.dependency("labelle_sokol", .{
@@ -559,6 +603,9 @@ pub fn build(b: *std.Build) void {
 
 .android_exe_gui_import
                 .{ .name = "gui_backend", .module = gui_mod },
+
+.android_exe_game_import
+                .{ .name = "game", .module = game_mod },
 
 .android_exe_end
             },
@@ -699,6 +746,9 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
 
 .tests_gui_import
                 .{ .name = "gui_backend", .module = gui_mod },
+
+.tests_game_import
+                .{ .name = "game", .module = game_mod },
 
 .tests_end
             },
