@@ -42,13 +42,19 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
         }
         try tpl.writeSection(build_zig_tmpl, "ios_deps", w);
+        try tpl.writeSection(build_zig_tmpl, "game_mod_decl_ios", w);
     } else if (cfg.platform == .android) {
         if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
             try tpl.writeSection(build_zig_tmpl, "android_target_alias", w);
         }
         try tpl.writeSection(build_zig_tmpl, "android_deps", w);
+        try tpl.writeSection(build_zig_tmpl, "game_mod_decl_android", w);
     } else {
         try tpl.writeSection(build_zig_tmpl, "deps", w);
+        // Bind the `game` module right after deps so the exe/tests
+        // module imports below can reference `game_mod`. See
+        // labelle-assembler#116.
+        try tpl.writeSection(build_zig_tmpl, "game_mod_decl", w);
     }
 
     // Plugin dep/module declarations (for all declared plugins)
@@ -155,6 +161,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         if (cfg.hasGui()) {
             try tpl.writeSection(build_zig_tmpl, "wasm_exe_gui_import", w);
         }
+        try tpl.writeSection(build_zig_tmpl, "wasm_exe_game_import", w);
 
         try tpl.writeSection(build_zig_tmpl, "wasm_exe_end", w);
 
@@ -187,6 +194,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         if (cfg.hasGui()) {
             try tpl.writeSection(build_zig_tmpl, "ios_exe_gui_import", w);
         }
+        try tpl.writeSection(build_zig_tmpl, "ios_exe_game_import", w);
 
         try tpl.writeSection(build_zig_tmpl, "ios_exe_end", w);
         try tpl.writeSection(build_zig_tmpl, "ios_link", w);
@@ -214,6 +222,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         if (cfg.hasGui()) {
             try tpl.writeSection(build_zig_tmpl, "android_exe_gui_import", w);
         }
+        try tpl.writeSection(build_zig_tmpl, "android_exe_game_import", w);
 
         try tpl.writeSection(build_zig_tmpl, "android_exe_end", w);
 
@@ -251,6 +260,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             if (cfg.hasGui()) {
                 try tpl.writeSection(build_zig_tmpl, "exe_gui_import", w);
             }
+            try tpl.writeSection(build_zig_tmpl, "exe_game_import", w);
 
             try tpl.writeSection(build_zig_tmpl, "exe_end", w);
 
@@ -289,6 +299,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         if (cfg.hasGui()) {
             try tpl.writeSection(build_zig_tmpl, "tests_gui_import", w);
         }
+        try tpl.writeSection(build_zig_tmpl, "tests_game_import", w);
         try tpl.writeSection(build_zig_tmpl, "tests_end", w);
 
         // Test-only target (issue #83): close the build function without

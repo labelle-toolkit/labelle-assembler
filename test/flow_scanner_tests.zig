@@ -251,3 +251,60 @@ pub const AllScriptsIntegration = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const flows_move =") != null);
     }
 };
+
+// ── `game` module binding (labelle-assembler#116) ──────────────────────
+//
+// Flow files emitted by labelle-gui's `flow-codegen` start with
+// `const game_mod = @import("game");`, so the generated `build.zig` must
+// expose a `"game"` module. These tests pin the shape we ship: a
+// project-local `game.zig` shim re-exporting `Game` / `EntityId` from
+// labelle-engine, wired via `b.createModule` and added to every exe /
+// test root_module that includes flow-derived script files. See the
+// PR body for the alias-vs-shim rationale.
+
+pub const GameModuleBinding = struct {
+    test "generateBuildZig declares a game_mod from a local game.zig and wires it into the exe imports" {
+        const allocator = std.testing.allocator;
+
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        };
+
+        const build_zig = try generator.generateBuildZig(allocator, cfg, .{});
+        defer allocator.free(build_zig);
+
+        // Module declaration: rooted at `game.zig`, with `labelle-engine`
+        // in its import table so `@import("labelle-engine")` resolves
+        // inside the shim.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "const game_mod = b.createModule(.{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, ".root_source_file = b.path(\"game.zig\")") != null);
+
+        // Imports on the exe root_module: `"game"` keyed at `game_mod`.
+        // String-matching on the literal pair is the contract the
+        // codegen relies on — `@import("game")` won't resolve without
+        // this exact wiring.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, ".{ .name = \"game\", .module = game_mod }") != null);
+
+        // Test step must also import `"game"` so test files (and
+        // flow-derived `.zig` files reached via the AllScripts wrapper)
+        // see the same module.
+        const test_step_idx = std.mem.indexOf(u8, build_zig, "addTest(").?;
+        const game_in_tests = std.mem.indexOfPos(u8, build_zig, test_step_idx, ".{ .name = \"game\", .module = game_mod }");
+        try std.testing.expect(game_in_tests != null);
+    }
+
+    test "game.zig shim re-exports Game and EntityId from labelle-engine" {
+        const src = generator.game_shim_source;
+
+        // `@import("game")` users expect both decls at the root.
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const Game") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const EntityId") != null);
+
+        // The shim must source those decls from labelle-engine — the
+        // codegen-emitted flow files assume `Game` / `EntityId` have
+        // the engine's hook semantics.
+        try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"labelle-engine\")") != null);
+    }
+};
