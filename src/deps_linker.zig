@@ -115,7 +115,15 @@ pub fn createDepsLinks(
             if (cwd.access(io, dest, .{})) |_| continue else |_| {}
         }
 
-        const abs = cwd.realPathFileAlloc(io, dep.abs_path, allocator) catch dep.abs_path;
+        // realPathFileAlloc returns [:0]u8 (sentinel-terminated) but we
+        // unify the type with dep.abs_path []const u8. Dupe to a plain
+        // []u8 to avoid the DebugAllocator size-mismatch panic on free
+        // (the sentinel byte differs between allocated size and slice length).
+        const abs: []const u8 = blk: {
+            const resolved = cwd.realPathFileAlloc(io, dep.abs_path, allocator) catch break :blk dep.abs_path;
+            defer allocator.free(resolved);
+            break :blk allocator.dupe(u8, resolved) catch dep.abs_path;
+        };
         defer if (abs.ptr != dep.abs_path.ptr) allocator.free(abs);
 
         // Skip-and-warn ONLY when the source is missing. The original
