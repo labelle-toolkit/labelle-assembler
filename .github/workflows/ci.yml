@@ -96,21 +96,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
+          ref: feat/zig-0.16-migration
           path: labelle-cli
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-core
+          ref: feat/zig-0.16-migration
           path: labelle-core
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-engine
+          ref: feat/zig-0.16-migration
           path: labelle-engine
 
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gfx
+          ref: feat/zig-0.16-migration
           path: labelle-gfx
 
       - uses: mlugg/setup-zig@v2
