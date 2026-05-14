@@ -590,31 +590,32 @@ fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
 /// what's wrong before any codegen happens. The CLI maps the structured
 /// errors from `ResourceDef.validate()` to actionable hints.
 fn validateResources(cfg: ProjectConfig) !void {
+    const io = config.globalIo();
     for (cfg.resources) |res| {
         switch (res.validate()) {
             .ok => {},
             .no_path => {
-                std.fs.File.stderr().writeAll("labelle-assembler: resource '") catch {};
-                std.fs.File.stderr().writeAll(res.name) catch {};
-                std.fs.File.stderr().writeAll("' declares no asset path. Set one of `.json`+`.texture` (atlas), `.sound` (.wav/.ogg), or `.font` (.ttf/.otf).\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' declares no asset path. Set one of `.json`+`.texture` (atlas), `.sound` (.wav/.ogg), or `.font` (.ttf/.otf).\n") catch {};
                 return error.InvalidResource;
             },
             .multiple_paths => {
-                std.fs.File.stderr().writeAll("labelle-assembler: resource '") catch {};
-                std.fs.File.stderr().writeAll(res.name) catch {};
-                std.fs.File.stderr().writeAll("' sets more than one asset path. A resource is exactly one of atlas / sound / font.\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' sets more than one asset path. A resource is exactly one of atlas / sound / font.\n") catch {};
                 return error.InvalidResource;
             },
             .atlas_incomplete => {
-                std.fs.File.stderr().writeAll("labelle-assembler: atlas resource '") catch {};
-                std.fs.File.stderr().writeAll(res.name) catch {};
-                std.fs.File.stderr().writeAll("' is missing either `.json` or `.texture`. Both are required.\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: atlas resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' is missing either `.json` or `.texture`. Both are required.\n") catch {};
                 return error.InvalidResource;
             },
             .font_params_misplaced => {
-                std.fs.File.stderr().writeAll("labelle-assembler: resource '") catch {};
-                std.fs.File.stderr().writeAll(res.name) catch {};
-                std.fs.File.stderr().writeAll("' sets `.font_params` but is not a font resource. Remove `.font_params` or change to `.font = \"...\"`.\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' sets `.font_params` but is not a font resource. Remove `.font_params` or change to `.font = \"...\"`.\n") catch {};
                 return error.InvalidResource;
             },
         }
@@ -625,18 +626,18 @@ fn validateResources(cfg: ProjectConfig) !void {
         if (res.kind() == .sound) {
             const ext = extWithoutDot(res.sound);
             if (!std.mem.eql(u8, ext, "wav") and !std.mem.eql(u8, ext, "ogg")) {
-                std.fs.File.stderr().writeAll("labelle-assembler: sound resource '") catch {};
-                std.fs.File.stderr().writeAll(res.name) catch {};
-                std.fs.File.stderr().writeAll("' has unsupported extension. Expected `.wav` or `.ogg`.\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: sound resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' has unsupported extension. Expected `.wav` or `.ogg`.\n") catch {};
                 return error.UnsupportedResourceExtension;
             }
         }
         if (res.kind() == .font) {
             const ext = extWithoutDot(res.font);
             if (!std.mem.eql(u8, ext, "ttf") and !std.mem.eql(u8, ext, "otf")) {
-                std.fs.File.stderr().writeAll("labelle-assembler: font resource '") catch {};
-                std.fs.File.stderr().writeAll(res.name) catch {};
-                std.fs.File.stderr().writeAll("' has unsupported extension. Expected `.ttf` or `.otf`.\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: font resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' has unsupported extension. Expected `.ttf` or `.otf`.\n") catch {};
                 return error.UnsupportedResourceExtension;
             }
             // Font emission interpolates `res.name` into Zig
@@ -646,9 +647,9 @@ fn validateResources(cfg: ProjectConfig) !void {
             // emissions don't have this constraint — those names only
             // appear in string literals.
             if (!isValidZigIdentifier(res.name)) {
-                std.fs.File.stderr().writeAll("labelle-assembler: font resource '") catch {};
-                std.fs.File.stderr().writeAll(res.name) catch {};
-                std.fs.File.stderr().writeAll("' has a name that is not a valid Zig identifier. Font resource names must start with [A-Za-z_] and contain only [A-Za-z0-9_] thereafter (the codegen uses the name as a local const identifier for the bake params).\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: font resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' has a name that is not a valid Zig identifier. Font resource names must start with [A-Za-z_] and contain only [A-Za-z0-9_] thereafter (the codegen uses the name as a local const identifier for the bake params).\n") catch {};
                 return error.InvalidFontResourceName;
             }
         }
