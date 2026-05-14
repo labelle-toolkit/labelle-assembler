@@ -1,6 +1,7 @@
 /// Type definitions for the labelle-cli generator.
 /// Pure types — no template or I/O dependencies.
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Process-wide Io handle used by helpers in cache.zig / scanner.zig / etc.
 /// that historically used `std.fs.cwd()` (which no longer exists on 0.16).
@@ -37,6 +38,7 @@ pub fn globalIo() std.Io {
 }
 
 pub fn globalEnviron() std.process.Environ {
+    if (builtin.is_test) return std.testing.environ;
     return _global_environ;
 }
 
