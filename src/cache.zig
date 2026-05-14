@@ -19,19 +19,32 @@ const config = @import("config.zig");
 const DEFAULT_CACHE_DIR = ".labelle";
 const PACKAGES_SUBDIR = "packages";
 
+/// Look up an env var via the process Environ (populated from main's
+/// `Init.Minimal.environ` in production) or libc `getenv` as a fallback
+/// for tests that never call `main`.
+fn envLookup(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
+    const env = config.globalEnviron();
+    if (env.getAlloc(allocator, name)) |v| return v else |_| {}
+    // Fall back to libc getenv (works in tests without Init.Minimal).
+    if (builtin.os.tag != .windows) {
+        const z_name = allocator.dupeZ(u8, name) catch return null;
+        defer allocator.free(z_name);
+        const raw = std.c.getenv(z_name.ptr) orelse return null;
+        return allocator.dupe(u8, std.mem.span(raw)) catch null;
+    }
+    // Windows: skip for now; production code rarely hits this path under tests.
+    return null;
+}
+
 /// Resolve the cache root directory.
 /// Priority: LABELLE_HOME env var > ~/.labelle/
 pub fn getCacheRoot(allocator: std.mem.Allocator) ![]const u8 {
-    const env = config.globalEnviron();
-    // Check LABELLE_HOME env var first
-    if (env.getAlloc(allocator, "LABELLE_HOME")) |home| {
-        return home;
-    } else |_| {}
+    if (envLookup(allocator, "LABELLE_HOME")) |home| return home;
 
     // Fall back to platform-appropriate home directory
     const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-    const home_dir = env.getAlloc(allocator, home_env) catch |err| {
-        std.debug.print("labelle: could not determine home directory ({s}): {any}\n", .{ home_env, err });
+    const home_dir = envLookup(allocator, home_env) orelse {
+        std.debug.print("labelle: could not determine home directory ({s})\n", .{home_env});
         return error.NoHomeDirectory;
     };
     defer allocator.free(home_dir);
