@@ -261,6 +261,47 @@ jobs:
           fi
           echo "PASS: null headless example ran 5 frames and exited cleanly"
 
+      # Smoke test for the Flows end-to-end compile loop
+      # (labelle-gui#96). Exercises the full pipeline shipped by
+      # labelle-gui#94/#101/#102 + labelle-engine#541 + labelle-assembler
+      # #115/#117:
+      #
+      #   .flow.zon (4-node graph) → flow_scanner → flow_codegen.renderFlowZig
+      #     → emitted scripts/flows/tick.zig → "game" module re-export
+      #     → Game.getComponent / Game.setField / game.preview.emitNodeEntered
+      #     → linked into the generated game binary
+      #
+      # Invokes the assembler binary directly (same recipe as the null
+      # step above) — labelle-cli's bundled generator module is pinned
+      # to an older release and routing through `labelle generate` is
+      # unnecessary friction here. Build-only: same depth as the other
+      # examples, raylib still needs a display to run.
+      - name: Generate + build the flows-smoke example
+        run: |
+          cd labelle-assembler/examples/flows-smoke
+          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+
+          # Asserted output of the flow_scanner pass — fails loudly here
+          # if a regression silently disables the scanner.
+          test -f scripts/flows/tick.zig
+          test -f .labelle/raylib_desktop/scripts/flows/tick.zig
+
+          cd .labelle/raylib_desktop
+
+          # Same labelle-cli-equivalent fixFingerprint dance as the
+          # null step above — the assembler emits a placeholder
+          # fingerprint that the CLI normally rewrites post-generate.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
       # End-to-end test for PR #73's plugin-Controller machinery
       # (RFC-plugin-controllers §1–§2). Unlike the build-only examples
       # above, this step also RUNS the binary and asserts the log output

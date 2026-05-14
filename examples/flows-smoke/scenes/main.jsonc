@@ -1,0 +1,18 @@
+{
+    // Smoke fixture for labelle-gui#96 — exercises the .flow.zon
+    // codegen end-to-end. The single entity carries a Position
+    // component, which scripts/flows/tick.flow.zon reads via
+    // `GetComponent`, adds a literal `1.0` to its `.x`, and writes
+    // back via `SetField` on OnCreate. The flow's generated function
+    // wires into the engine's onCreate dispatch and runs once on
+    // scene load — the only assertion this CI cares about is that
+    // the whole pipeline compiles.
+    "name": "main",
+    "entities": [
+        {
+            "components": {
+                "Position": { "x": 100, "y": 200 }
+            }
+        }
+    ]
+}

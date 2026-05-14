@@ -1,0 +1,6 @@
+.labelle/
+# flow_scanner writes generated `.zig` next to the `.flow.zon` source
+# (the target's `scripts/` is a symlink back to this tree), so the
+# emitted file appears here on every `zig build generate` and is
+# regenerated every time — don't track it.
+scripts/flows/*.zig

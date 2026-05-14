@@ -1,0 +1,14 @@
+.{
+    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
+    .nodes = .{
+        .{ .id = 1, .pos = .{ 0, 0 }, .kind = .{ .GetComponent = .{ .type = "Position" } } },
+        .{ .id = 2, .pos = .{ 0, 0 }, .kind = .{ .Literal = .{ .value = "1.0" } } },
+        .{ .id = 3, .pos = .{ 0, 0 }, .kind = .{ .BinOp = .{ .op = .add } } },
+        .{ .id = 4, .pos = .{ 0, 0 }, .kind = .{ .SetField = .{ .target = "Position.x" } } },
+    },
+    .links = .{
+        .{ .from = .{ .node = 1, .pin = "x" }, .to = .{ .node = 3, .pin = "a" } },
+        .{ .from = .{ .node = 2, .pin = "value" }, .to = .{ .node = 3, .pin = "b" } },
+        .{ .from = .{ .node = 3, .pin = "result" }, .to = .{ .node = 4, .pin = "value" } },
+    },
+}
