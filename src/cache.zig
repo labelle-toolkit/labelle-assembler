@@ -471,8 +471,7 @@ fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, tag: []co
         std.Io.Dir.cwd().createDirPath(io, parent) catch {};
     }
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, io, .{
         .argv = &.{
             "git", "clone", "--depth", "1", "--branch", tag, repo_url, target,
         },
@@ -484,7 +483,7 @@ fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, tag: []co
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             std.debug.print("labelle: git clone failed:\n{s}\n", .{result.stderr});
             return error.FetchFailed;
         },
