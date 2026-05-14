@@ -1023,7 +1023,7 @@ pub const SOKOL = struct {
         }, sokol_alloc_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var gpa = std.heap.GeneralPurposeAllocator") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var gpa = std.heap.DebugAllocator") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "const allocator = gpa.allocator();") != null);
     }
 };
