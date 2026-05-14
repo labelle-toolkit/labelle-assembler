@@ -8,6 +8,10 @@
             .url = "git+https://github.com/raylib-zig/raylib-zig#f25c5173b4c40ef53c7ccf6d8d51ead0892f9f22",
             .hash = "raylib_zig-6.0.0-KE8REDJ4BQBu7lKwYNt6R4j5ywPeS37zqW6zrtjCcRwH",
         },
+        .emsdk = .{
+            .url = "git+https://github.com/emscripten-core/emsdk?ref=4.0.9#3bcf1dcd01f040f370e10fe673a092d9ed79ebb5",
+            .hash = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ",
+        },
     },
     .paths = .{
         "build.zig",

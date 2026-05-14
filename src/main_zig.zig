@@ -891,10 +891,10 @@ const PREVIEW_LOOP_SETUP =
 /// `subscribed_components` set that gates `component_changed`
 /// frames (labelle-engine#520 paired with labelle-assembler#96).
 const PREVIEW_HEARTBEAT_LOOP =
-    \\        if (g.preview) |*_p| {
-    \\            _p.pollSubscription() catch {};
-    \\            _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
-    \\        }
+    \\        // Preview-mode heartbeat stubbed during Zig 0.16 migration
+    \\        // — std.time.milliTimestamp was removed and Preview itself
+    \\        // returns error.PreviewDisabled. Restore once preview_mode
+    \\        // is rewritten on std.Io.net.
     \\
 ;
 
@@ -932,10 +932,7 @@ const PREVIEW_CLEANUP_CALLBACK =
 /// heartbeat write so a malformed subscription can't poison the
 /// outbound flush. See the loop variant for the full rationale.
 const PREVIEW_HEARTBEAT_CALLBACK =
-    \\    if (g.preview) |*_p| {
-    \\        _p.pollSubscription() catch {};
-    \\        _p.tickHeartbeat(@intCast(std.time.milliTimestamp())) catch {};
-    \\    }
+    \\    // Preview-mode heartbeat stubbed during Zig 0.16 migration.
     \\
 ;
 
