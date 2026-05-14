@@ -28,16 +28,26 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # build.zig.zon has a `.path = "../labelle-gui/flow-codegen"` dep, so the
+    # gui sibling has to live next to the assembler checkout. actions/checkout
+    # forbids `path:` values that escape the workspace, so both checkouts go
+    # into named subdirs and the build runs from inside the assembler one.
+    defaults:
+      run:
+        working-directory: labelle-assembler
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
 
       - name: Checkout labelle-gui (flow_codegen)
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gui
-          # labelle-gui#95: flow-codegen sub-package extraction (Part A of #94).
-          ref: b8a5c77eed2bce4a7e17908437c761b2397402d8
-          path: ../labelle-gui
+          # Track gui's main; the 0.16-migrated flow-codegen lives there.
+          ref: main
+          path: labelle-gui
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -61,7 +71,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          # `working-directory: labelle-assembler` only affects `run:` steps,
+          # so the `uses:` action needs the explicit relative path.
+          path: labelle-assembler/${{ matrix.artifact }}
 
   release:
     needs: build
