@@ -6,9 +6,13 @@ const std = @import("std");
 /// that historically used `std.fs.cwd()` (which no longer exists on 0.16).
 /// Must be initialized from `main()` by calling `initGlobalIo()` with the
 /// process Init block, so the underlying Threaded impl sees the real env.
+///
+/// Tests don't call `main`, so `globalIo()` lazy-initializes a default
+/// Threaded instance with empty argv0 / environ on first access.
 var _global_threaded: std.Io.Threaded = undefined;
 var _global_io: std.Io = undefined;
 var _global_environ: std.process.Environ = .empty;
+var _global_io_initialized: bool = false;
 
 /// Initialize the process-wide Io. Call once from main() before any helpers
 /// access globalIo(). The provided minimal block is forwarded into a
@@ -20,9 +24,15 @@ pub fn initGlobalIo(minimal: std.process.Init.Minimal) void {
     });
     _global_io = _global_threaded.io();
     _global_environ = minimal.environ;
+    _global_io_initialized = true;
 }
 
 pub fn globalIo() std.Io {
+    if (!_global_io_initialized) {
+        _global_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        _global_io = _global_threaded.io();
+        _global_io_initialized = true;
+    }
     return _global_io;
 }
 
