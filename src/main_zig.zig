@@ -872,23 +872,11 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
 /// in the same scope, so LIFO runs `sendBye` first, then `g.deinit`).
 const PREVIEW_LOOP_SETUP =
     \\    // ── Preview mode (labelle-assembler#94, labelle-engine#520) ──
-    \\    // Connect to the editor's TCP listener when launched with
-    \\    // `--preview-mode <host:port>`. Absent → no-op.
-    \\    {
-    \\        const _argv = try std.process.argsAlloc(allocator);
-    \\        defer std.process.argsFree(allocator, _argv);
-    \\        if (engine.parsePreviewArgs(_argv)) |_ep| {
-    \\            g.preview = engine.Preview.connect(allocator, _ep) catch |err| blk: {
-    \\                std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _ep, @errorName(err) });
-    \\                break :blk null;
-    \\            };
-    \\            if (g.preview) |*_p| {
-    \\                // PID 0 is a placeholder — see preview note in main_zig.zig.
-    \\                _p.sendHello("labelle-engine", 0) catch {};
-    \\            }
-    \\        }
-    \\    }
-    \\    defer if (g.preview) |*_p| _p.sendBye(.normal) catch {};
+    \\    // Preview mode: stubbed during the Zig 0.16 migration —
+    \\    // std.net was reshaped into std.Io.net, std.process.argsAlloc
+    \\    // was removed. Engine.Preview.connect now returns
+    \\    // error.PreviewDisabled regardless. Restore the args-parsing
+    \\    // call once preview_mode is rewritten on std.Io.net.
     \\
 ;
 
@@ -919,20 +907,10 @@ const PREVIEW_HEARTBEAT_LOOP =
 /// `[][:0]u8` parameter. The `if/else |_|` shape pulls the alloc
 /// success path into its own scope where `_argv`'s type matches.
 const PREVIEW_INIT_CALLBACK =
-    \\    // ── Preview mode (labelle-assembler#94, labelle-engine#520) ──
-    \\    if (std.process.argsAlloc(allocator)) |_argv| {
-    \\        defer std.process.argsFree(allocator, _argv);
-    \\        if (engine.parsePreviewArgs(_argv)) |_ep| {
-    \\            g.preview = engine.Preview.connect(allocator, _ep) catch |err| blk: {
-    \\                std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _ep, @errorName(err) });
-    \\                break :blk null;
-    \\            };
-    \\            if (g.preview) |*_p| {
-    \\                // PID 0 is a placeholder — see preview note in main_zig.zig.
-    \\                _p.sendHello("labelle-engine", 0) catch {};
-    \\            }
-    \\        }
-    \\    } else |_| {}
+    \\    // ── Preview mode — stubbed (Zig 0.16 migration) ──
+    \\    // std.process.argsAlloc was removed and engine.Preview.connect
+    \\    // now returns error.PreviewDisabled regardless. Restore once
+    \\    // preview_mode is rewritten on std.Io.net.
     \\
 ;
 
