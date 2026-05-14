@@ -59,7 +59,7 @@ const raylib_lifecycle =
     \\const screen_title = "{{title}}";
     \\const target_fps: u32 = {{fps}};
     \\pub fn main() !void {
-    \\    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    \\    var gpa = std.heap.DebugAllocator(.{}).init;
     \\    const allocator = gpa.allocator();
     \\{{hidden_setup}}    var hooks = GameHooks{};
     \\    var g = AssembledGame.init(allocator);
@@ -78,7 +78,7 @@ const raylib_lifecycle =
 const sokol_lifecycle =
     \\var g: AssembledGame = undefined;
     \\var hooks: GameHooks = .{};
-    \\var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    \\var gpa = std.heap.DebugAllocator(.{}).init;
     \\{{module_vars}}const screen_w: u32 = {{width}};
     \\const screen_h: u32 = {{height}};
     \\const screen_title = "{{title}}";
@@ -2655,7 +2655,7 @@ pub const PREVIEW_MODE = struct {
         \\const screen_w: u32 = {{width}};
         \\const screen_h: u32 = {{height}};
         \\pub fn main() !void {
-        \\    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        \\    var gpa = std.heap.DebugAllocator(.{}).init;
         \\    const allocator = gpa.allocator();
         \\{{hidden_setup}}    var hooks = GameHooks{};
         \\    var g = AssembledGame.init(allocator);
