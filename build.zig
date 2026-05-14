@@ -10,6 +10,8 @@ pub fn build(b: *std.Build) void {
     const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse cli_version;
 
     const zspec_dep = b.dependency("zspec", .{ .target = target, .optimize = optimize });
+    const flow_codegen_dep = b.dependency("flow_codegen", .{ .target = target, .optimize = optimize });
+    const flow_codegen_module = flow_codegen_dep.module("flow_codegen");
 
     const options = b.addOptions();
     options.addOption([]const u8, "cli_version", cli_version);
@@ -23,6 +25,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     generator_module.addOptions("build_options", options);
+    generator_module.addImport("flow_codegen", flow_codegen_module);
 
     // ── Assembler binary ───────────────────────────────────────────────
     const assembler_exe = b.addExecutable(.{
@@ -34,6 +37,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     assembler_exe.root_module.addOptions("build_options", options);
+    assembler_exe.root_module.addImport("flow_codegen", flow_codegen_module);
     b.installArtifact(assembler_exe);
 
     const assembler_run = b.addRunArtifact(assembler_exe);
@@ -53,15 +57,21 @@ pub fn build(b: *std.Build) void {
         }),
     });
     src_tests.root_module.addOptions("build_options", options);
+    src_tests.root_module.addImport("flow_codegen", flow_codegen_module);
     test_step.dependOn(&b.addRunArtifact(src_tests).step);
 
-    // BDD-style tests from test/
+    // BDD-style tests from test/. Each test target gets `generator`,
+    // `zspec`, and `flow_codegen` so any future test file can reach
+    // them without further build.zig churn. flow_codegen is cheap to
+    // attach (pure-Zig sub-package, no native deps) so the blanket
+    // import isn't an unwanted runtime cost.
     const test_files = [_][]const u8{
         "test/tests.zig",
         "test/script_scanner_tests.zig",
         "test/deps_linker_tests.zig",
         "test/template_dynamic_test.zig",
         "test/scanner_symlink_tests.zig",
+        "test/flow_scanner_tests.zig",
     };
 
     for (test_files) |test_file| {
@@ -73,6 +83,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "generator", .module = generator_module },
                     .{ .name = "zspec", .module = zspec_dep.module("zspec") },
+                    .{ .name = "flow_codegen", .module = flow_codegen_module },
                 },
             }),
         });
