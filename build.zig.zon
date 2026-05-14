@@ -8,6 +8,15 @@
             .url = "https://github.com/apotema/zspec/archive/v0.8.0.tar.gz",
             .hash = "zspec-0.8.0-jaKLbSK-AwD6myJjkg3OfGAKJyj5iaFzFfVu-pcUsUn1",
         },
+        // In-tree sibling sub-package shipped from labelle-gui (#94).
+        // The pure-Zig `.flow.zon` parser + Zig-source codegen lives
+        // there so `zig build generate` can emit script files without
+        // pulling in the editor's imgui/zgui stack. Path is relative to
+        // this package and assumes the canonical sibling-clones toolkit
+        // layout (`../labelle-gui/`).
+        .flow_codegen = .{
+            .path = "../labelle-gui/flow-codegen",
+        },
     },
     .paths = .{
         "build.zig",
