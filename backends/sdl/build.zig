@@ -91,10 +91,16 @@ fn addSdlPaths(b: *std.Build, mod: *std.Build.Module, prefix: []const u8) void {
 }
 
 fn dirExists(path: []const u8) bool {
-    // std.fs.cwd() removed in 0.16. Use libc access (POSIX/macOS).
-    if (path.len >= 4095) return false;
-    var z: [4096:0]u8 = undefined;
-    @memcpy(z[0..path.len], path);
-    z[path.len] = 0;
-    return std.c.access(@ptrCast(&z), 0) == 0;
+    // std.fs.cwd() removed in 0.16. The build runner doesn't link libc,
+    // so we can't use std.c.access either — spin up an ad-hoc Io.Threaded
+    // and go through std.Io.Dir.access{Absolute,}.
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    } else {
+        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    }
+    return true;
 }

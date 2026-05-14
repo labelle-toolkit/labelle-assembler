@@ -1839,7 +1839,7 @@ pub fn generateMainZigFromTemplate(
                 const allocator_decl: []const u8 = if (is_wasm)
                     "// Use c_allocator for Emscripten — delegates to emscripten's malloc/free\n// which respects ALLOW_MEMORY_GROWTH. GPA is incompatible with wasm32-emscripten.\nconst allocator = std.heap.c_allocator;"
                 else
-                    "var gpa = std.heap.GeneralPurposeAllocator(.{}){};";
+                    "var gpa = std.heap.DebugAllocator(.{}).init;";
                 const allocator_expr: []const u8 = if (is_wasm) "std.heap.c_allocator" else "gpa.allocator()";
                 const allocator_cleanup: []const u8 = if (is_wasm) "" else "    _ = gpa.deinit();\n";
                 // For wasm, `allocator` is already declared at module scope
