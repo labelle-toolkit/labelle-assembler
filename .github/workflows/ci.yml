@@ -14,8 +14,19 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # All steps run from inside the labelle-assembler checkout so the
+    # `../labelle-gui/flow-codegen` path-dep in build.zig.zon resolves
+    # to the sibling checkout below. actions/checkout@v4 forbids
+    # `path:` values that escape the workspace, so we put both repos
+    # inside it as siblings.
+    defaults:
+      run:
+        working-directory: labelle-assembler
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
 
       - name: Checkout labelle-gui (flow_codegen)
         uses: actions/checkout@v4
@@ -23,7 +34,7 @@ jobs:
           repository: labelle-toolkit/labelle-gui
           # labelle-gui#95: flow-codegen sub-package extraction (Part A of #94).
           ref: b8a5c77eed2bce4a7e17908437c761b2397402d8
-          path: ../labelle-gui
+          path: labelle-gui
 
       - uses: mlugg/setup-zig@v2
         with:
