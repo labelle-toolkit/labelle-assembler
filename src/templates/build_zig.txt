@@ -132,7 +132,7 @@ pub fn build(b: *std.Build) !void {
     });
 
 .link_raylib
-    exe.linkLibrary(raylib_artifact);
+    exe.root_module.linkLibrary(raylib_artifact);
 
 .wasm_emsdk_raylib
     const emsdk = @import("labelle_raylib").emsdk;
@@ -195,7 +195,7 @@ pub fn build(b: *std.Build) !void {
     });
 
 .link_sokol_wasm
-    wasm.linkLibrary(backend_dep.artifact("sokol_clib"));
+    wasm.root_module.linkLibrary(backend_dep.artifact("sokol_clib"));
     const link_step = try sokol_em.emLinkStep(b, .{
         .target = target,
         .optimize = optimize,
@@ -233,22 +233,22 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
 }
 
 .link_sokol
-    exe.linkLibrary(sokol_clib);
+    exe.root_module.linkLibrary(sokol_clib);
 
 .link_sdl
 
 .link_bgfx
-    exe.linkLibrary(bgfx_artifact);
-    exe.linkLibrary(glfw_artifact);
+    exe.root_module.linkLibrary(bgfx_artifact);
+    exe.root_module.linkLibrary(glfw_artifact);
 
 .link_wgpu
-    exe.linkLibrary(glfw_artifact);
+    exe.root_module.linkLibrary(glfw_artifact);
 
 .link_gui_bridge
-    exe.linkLibrary(gui_bridge_artifact);
+    exe.root_module.linkLibrary(gui_bridge_artifact);
 
 .link_gui_bridge_wasm
-    wasm.linkLibrary(gui_bridge_artifact);
+    wasm.root_module.linkLibrary(gui_bridge_artifact);
 
 .header_ios
 const std = @import("std");
@@ -382,13 +382,13 @@ pub fn build(b: *std.Build) void {
     });
 
 .ios_link
-    exe.linkLibrary(sokol_clib);
-    exe.linkLibC();
+    exe.root_module.linkLibrary(sokol_clib);
+    exe.root_module.link_libc = true;
     addExeSdkPaths(b, exe, sdk_path);
     linkIosFrameworks(exe);
 
 .ios_link_gui_bridge
-    exe.linkLibrary(gui_bridge_artifact);
+    exe.root_module.linkLibrary(gui_bridge_artifact);
 
 .ios_footer
     b.installArtifact(exe);
