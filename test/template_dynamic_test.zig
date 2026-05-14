@@ -13,9 +13,10 @@ test {
 // ── Helpers ───────────────────────────────────────────────────────────
 
 fn render(template: []const u8, data: tpl.TemplateData) ![]const u8 {
-    var buf = std.ArrayList(u8){};
-    try tpl.renderDynamic(template, data, buf.writer(a));
-    return buf.toOwnedSlice(a);
+    var alloc_writer: std.Io.Writer.Allocating = .init(a);
+    errdefer alloc_writer.deinit();
+    try tpl.renderDynamic(template, data, &alloc_writer.writer);
+    return alloc_writer.toOwnedSlice();
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
