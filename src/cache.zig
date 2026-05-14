@@ -124,10 +124,14 @@ fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, projec
     } else try allocator.dupe(u8, local_path);
     defer allocator.free(resolve_path);
 
-    return std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), resolve_path, allocator) catch {
+    // realPathFileAlloc returns [:0]u8 — dupe to plain []u8 so callers
+    // can `allocator.free` without the sentinel-byte size mismatch.
+    const resolved = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), resolve_path, allocator) catch {
         std.debug.print("labelle: warning: local path '{s}' does not exist\n", .{resolve_path});
         return try allocator.dupe(u8, resolve_path);
     };
+    defer allocator.free(resolved);
+    return try allocator.dupe(u8, resolved);
 }
 
 /// Whether `path`'s first component is `..` — i.e. the path walks out of
@@ -157,8 +161,11 @@ pub fn toMainCheckoutPath(allocator: std.mem.Allocator, abs_path: []const u8, pr
 
     if (std.mem.eql(u8, root, project_dir)) return allocator.dupe(u8, abs_path);
 
-    const project_canon = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, allocator) catch
+    // Dupe to []u8 to free cleanly (realPathFileAlloc returns [:0]u8).
+    const project_canon_z = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), project_dir, allocator) catch
         return allocator.dupe(u8, abs_path);
+    defer allocator.free(project_canon_z);
+    const project_canon = try allocator.dupe(u8, project_canon_z);
     defer allocator.free(project_canon);
 
     if (std.mem.eql(u8, root, project_canon)) return allocator.dupe(u8, abs_path);
@@ -236,7 +243,11 @@ fn resolveProjectRoot(allocator: std.mem.Allocator, project_dir: []const u8) ![]
 
     const main_checkout = std.fs.path.dirname(dot_git) orelse return allocator.dupe(u8, project_dir);
     // Resolve the main checkout in case the gitdir contained `..`/symlinks.
-    return std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), main_checkout, allocator) catch allocator.dupe(u8, main_checkout);
+    // realPathFileAlloc returns [:0]u8 — dupe to plain []u8 for clean free.
+    const resolved = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), main_checkout, allocator) catch
+        return allocator.dupe(u8, main_checkout);
+    defer allocator.free(resolved);
+    return try allocator.dupe(u8, resolved);
 }
 
 /// Check if a framework package version is cached.
@@ -508,11 +519,14 @@ fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, target: 
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
-    // Resolve source to absolute path
-    const abs_source = cwd.realPathFileAlloc(io, source_dir, allocator) catch |err| {
+    // Resolve source to absolute path. Dupe to plain []u8 so the free
+    // doesn't trip on realPathFileAlloc's sentinel byte.
+    const abs_source_z = cwd.realPathFileAlloc(io, source_dir, allocator) catch |err| {
         std.debug.print("labelle: source directory not found '{s}': {any}\n", .{ source_dir, err });
         return error.CachePopulationFailed;
     };
+    defer allocator.free(abs_source_z);
+    const abs_source = try allocator.dupe(u8, abs_source_z);
     defer allocator.free(abs_source);
 
     // Ensure parent directory exists
