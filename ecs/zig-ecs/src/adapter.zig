@@ -43,7 +43,7 @@ pub fn init(allocator: std.mem.Allocator) Self {
     return .{
         .inner = zig_ecs.Registry.init(allocator),
         .entity_count = 0,
-        .alive_entities = .{},
+        .alive_entities = .empty,
         .alloc = allocator,
     };
 }
@@ -266,31 +266,20 @@ fn validateComponentTuple(comptime components: anytype) void {
 fn QueryResultType(comptime components: anytype) type {
     comptime validateComponentTuple(components);
     const fields_info = @typeInfo(@TypeOf(components)).@"struct".fields;
-    var fields: [fields_info.len + 1]std.builtin.Type.StructField = undefined;
-    fields[0] = .{
-        .name = "entity",
-        .type = Entity,
-        .default_value_ptr = null,
-        .is_comptime = false,
-        .alignment = @alignOf(Entity),
-    };
+    var field_names: [fields_info.len + 1][]const u8 = undefined;
+    var field_types: [fields_info.len + 1]type = undefined;
+    var field_attrs: [fields_info.len + 1]std.builtin.Type.StructField.Attributes = undefined;
+    field_names[0] = "entity";
+    field_types[0] = Entity;
+    field_attrs[0] = .{};
     for (fields_info, 0..) |_, i| {
         const T = components[i];
         const name = std.fmt.comptimePrint("comp_{d}", .{i});
-        fields[i + 1] = .{
-            .name = name,
-            .type = *T,
-            .default_value_ptr = null,
-            .is_comptime = false,
-            .alignment = @alignOf(*T),
-        };
+        field_names[i + 1] = name;
+        field_types[i + 1] = *T;
+        field_attrs[i + 1] = .{};
     }
-    return @Type(.{ .@"struct" = .{
-        .layout = .auto,
-        .fields = &fields,
-        .decls = &.{},
-        .is_tuple = false,
-    } });
+    return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
 }
 
 /// QueryIterator type for this backend.
@@ -338,7 +327,7 @@ pub fn QueryIterator(comptime components: anytype) type {
 
 /// Query entities with direct component access.
 pub fn query(self: *Self, comptime components: anytype) QueryIterator(components) {
-    var entities = std.ArrayListUnmanaged(Entity){};
+    var entities: std.ArrayListUnmanaged(Entity) = .empty;
     entities.appendSlice(self.alloc, self.alive_entities.items) catch @panic("OOM");
     return .{
         .backend = self,

@@ -23,6 +23,7 @@
 const std = @import("std");
 const flow_codegen = @import("flow_codegen");
 const script_scanner = @import("script_scanner.zig");
+const config = @import("config.zig");
 
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
 
@@ -52,16 +53,18 @@ pub fn scanAndEmit(
     game_dir: []const u8,
     target_dir: []const u8,
 ) !FlowScanResult {
+    const io = config.globalIo();
+
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var entries = std.ArrayList(ScriptEntry){};
+    var entries: std.ArrayList(ScriptEntry) = .empty;
 
     const src_flows = try std.fs.path.join(allocator, &.{ game_dir, "scripts", "flows" });
     defer allocator.free(src_flows);
 
-    var src_dir = std.fs.cwd().openDir(src_flows, .{ .iterate = true }) catch |err| switch (err) {
+    var src_dir = std.Io.Dir.cwd().openDir(io, src_flows, .{ .iterate = true }) catch |err| switch (err) {
         // Empty flows/ dir is the common case for projects that don't
         // use the editor — silently no-op rather than forcing every
         // project to materialise the directory.
@@ -71,25 +74,25 @@ pub fn scanAndEmit(
         },
         else => return err,
     };
-    defer src_dir.close();
+    defer src_dir.close(io);
 
     // Output dir — same path through the scripts/ symlink. `makePath`
     // is idempotent and creates the `flows/` directory next to the
     // game's `.flow.zon` sources when missing.
     const dst_flows = try std.fs.path.join(allocator, &.{ target_dir, "scripts", "flows" });
     defer allocator.free(dst_flows);
-    try std.fs.cwd().makePath(dst_flows);
+    try std.Io.Dir.cwd().createDirPath(io, dst_flows);
 
     // Stable iteration order — collect filenames first, sort, then
     // process. Matters because the codegen step is allowed to fail
     // and we want the error message to be reproducible across runs.
-    var filenames = std.ArrayList([]const u8){};
+    var filenames: std.ArrayList([]const u8) = .empty;
     defer {
         for (filenames.items) |n| allocator.free(n);
         filenames.deinit(allocator);
     }
     var iter = src_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".flow.zon")) continue;
         try filenames.append(allocator, try allocator.dupe(u8, entry.name));
@@ -106,7 +109,7 @@ pub fn scanAndEmit(
         const src_path = try std.fs.path.join(allocator, &.{ src_flows, name });
         defer allocator.free(src_path);
 
-        var loaded = flow_codegen.flow_io.loadFromFile(allocator, src_path) catch |err| {
+        var loaded = flow_codegen.flow_io.loadFromFile(io, allocator, src_path) catch |err| {
             reportFlowError(name, err);
             return err;
         };
@@ -134,9 +137,7 @@ pub fn scanAndEmit(
         const dst_path = try std.fs.path.join(allocator, &.{ dst_flows, out_filename });
         defer allocator.free(dst_path);
 
-        var out_file = try std.fs.cwd().createFile(dst_path, .{ .truncate = true });
-        defer out_file.close();
-        try out_file.writeAll(generated);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst_path, .data = generated });
 
         // Flows aren't state-gated in v1 — they always run. Match the
         // global-script shape (`states = &.{}`, `subdir = null`) so
@@ -165,8 +166,8 @@ pub fn scanAndEmit(
 /// swallowed because there's nothing actionable a caller could do
 /// about them, and the typed error is what actually fails the build.
 fn reportFlowError(filename: []const u8, err: anyerror) void {
-    const stderr = std.fs.File.stderr();
+    const io = config.globalIo();
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "flows/{s}: {s}\n", .{ filename, @errorName(err) }) catch return;
-    stderr.writeAll(msg) catch {};
+    std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
 }

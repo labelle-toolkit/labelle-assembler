@@ -42,7 +42,11 @@ var fps_max: f32 = 0;
 var frame_ms: f32 = 0;
 
 fn updateFpsTracking() void {
-    const now = std.time.milliTimestamp();
+    // std.time.milliTimestamp removed in 0.16. FPS tracking is debug-only;
+    // stub to a monotonically increasing counter so the histogram still updates.
+    const S = struct { var counter: i64 = 0; };
+    S.counter += 16;
+    const now: i64 = S.counter;
     if (last_time) |prev| {
         const delta_ms: f32 = @floatFromInt(now - prev);
         frame_times[frame_index] = delta_ms;
@@ -445,20 +449,10 @@ fn logWarn(game: anytype, comptime fmt: []const u8, args: anytype) void {
 // ── Gizmo state persistence ──────────────────────────────────────────
 
 fn loadDebugState(game: anytype) void {
-    const file = std.fs.cwd().openFile(STATE_FILE, .{}) catch |err| {
-        if (err != error.FileNotFound) {
-            logWarn(game, "could not open state file: {any}", .{err});
-        }
-        return;
-    };
-    defer file.close();
-
-    var buf: [4096]u8 = undefined;
-    const len = file.readAll(&buf) catch |err| {
-        logWarn(game, "could not read state file: {any}", .{err});
-        return;
-    };
-    applyDebugState(game, buf[0..len]);
+    // Stubbed during 0.16 migration: std.fs.cwd() removed, file IO now
+    // takes an io param the plugin doesn't have. Restoring via a thin
+    // libc fopen() helper is a follow-up.
+    _ = game;
 }
 
 /// Parse a debug_state.ini string and apply values to game + module state.
@@ -495,17 +489,8 @@ fn applyDebugState(game: anytype, content: []const u8) void {
 }
 
 fn saveDebugState(game: anytype) void {
-    var buf: [4096]u8 = undefined;
-    const len = serializeDebugState(game, &buf);
-
-    const file = std.fs.cwd().createFile(STATE_FILE, .{}) catch |err| {
-        logWarn(game, "could not create state file: {any}", .{err});
-        return;
-    };
-    defer file.close();
-    file.writeAll(buf[0..len]) catch |err| {
-        logWarn(game, "could not write state file: {any}", .{err});
-    };
+    // Stubbed during 0.16 migration — see loadDebugState above.
+    _ = game;
 }
 
 /// Serialize debug state into a buffer. Returns bytes written.

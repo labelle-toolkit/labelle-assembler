@@ -1,5 +1,6 @@
 /// File scanning and directory copy utilities for the labelle-cli generator.
 const std = @import("std");
+const config = @import("config.zig");
 
 pub fn freeNames(allocator: std.mem.Allocator, names: []const []const u8) void {
     for (names) |n| allocator.free(n);
@@ -10,16 +11,17 @@ pub fn freeNames(allocator: std.mem.Allocator, names: []const []const u8) void {
 /// sorted file stems matching the given extension. Subfolder paths are preserved
 /// in the returned names (e.g., "enemies/goblin" for prefabs/enemies/goblin.zon).
 pub fn copyAndScan(allocator: std.mem.Allocator, src_base: []const u8, dst_base: []const u8, folder: []const u8, ext: []const u8) ![][]const u8 {
-    const cwd = std.fs.cwd();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
 
     const src_path = try std.fs.path.join(allocator, &.{ src_base, folder });
     defer allocator.free(src_path);
     const dst_path = try std.fs.path.join(allocator, &.{ dst_base, folder });
     defer allocator.free(dst_path);
 
-    try cwd.makePath(dst_path);
+    try cwd.createDirPath(io, dst_path);
 
-    var names: std.ArrayList([]const u8) = .{};
+    var names: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (names.items) |n| allocator.free(n);
         names.deinit(allocator);
@@ -40,35 +42,36 @@ pub fn copyAndScan(allocator: std.mem.Allocator, src_base: []const u8, dst_base:
 /// folder root (empty string for the top level, "enemies" for a subfolder, etc.).
 fn copyAndScanRecursive(
     allocator: std.mem.Allocator,
-    cwd: std.fs.Dir,
+    cwd: std.Io.Dir,
     src_path: []const u8,
     dst_path: []const u8,
     prefix: []const u8,
     ext: []const u8,
     names: *std.ArrayList([]const u8),
 ) !void {
-    var src_dir = cwd.openDir(src_path, .{ .iterate = true }) catch |err| switch (err) {
+    const io = config.globalIo();
+    var src_dir = cwd.openDir(io, src_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer src_dir.close();
+    defer src_dir.close(io);
 
-    try cwd.makePath(dst_path);
-    var dst_dir = try cwd.openDir(dst_path, .{});
-    defer dst_dir.close();
+    try cwd.createDirPath(io, dst_path);
+    var dst_dir = try cwd.openDir(io, dst_path, .{});
+    defer dst_dir.close(io);
 
     var iter = src_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (std.mem.eql(u8, entry.name, ".bridge.zig")) continue;
 
         switch (entry.kind) {
             .file => {
                 // Copy file
-                const content = try src_dir.readFileAlloc(allocator, entry.name, 1024 * 1024);
+                const content = try src_dir.readFileAlloc(io, entry.name, allocator, .limited(1024 * 1024));
                 defer allocator.free(content);
-                const out_file = try dst_dir.createFile(entry.name, .{});
-                defer out_file.close();
-                try out_file.writeAll(content);
+                const out_file = try dst_dir.createFile(io, entry.name, .{});
+                defer out_file.close(io);
+                try out_file.writeStreamingAll(io, content);
 
                 // Collect stem if extension matches
                 if (std.mem.endsWith(u8, entry.name, ext)) {
@@ -98,12 +101,13 @@ fn copyAndScanRecursive(
 }
 
 pub fn writeFile(dir_path: []const u8, filename: []const u8, content: []const u8) !void {
-    const cwd = std.fs.cwd();
-    var dir = try cwd.openDir(dir_path, .{});
-    defer dir.close();
-    const file = try dir.createFile(filename, .{});
-    defer file.close();
-    try file.writeAll(content);
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    var dir = try cwd.openDir(io, dir_path, .{});
+    defer dir.close(io);
+    const file = try dir.createFile(io, filename, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, content);
 }
 
 /// Copy files from `src_dir` to `dst_dir` (recursively) and return sorted
@@ -116,9 +120,9 @@ pub fn writeFile(dir_path: []const u8, filename: []const u8, content: []const u8
 /// a last segment, so `copyAndScan(src_base, dst_base, "scripts", ".zig")`
 /// can't express the shape. This helper splits the concerns cleanly.
 pub fn copyAndScanAbs(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8, ext: []const u8) ![][]const u8 {
-    const cwd = std.fs.cwd();
+    const cwd = std.Io.Dir.cwd();
 
-    var names: std.ArrayList([]const u8) = .{};
+    var names: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (names.items) |n| allocator.free(n);
         names.deinit(allocator);
@@ -138,31 +142,32 @@ pub fn copyAndScanAbs(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir
 /// Copy a subdirectory from src_base/folder to dst_base/folder.
 /// Copies all files (non-recursive, skips directories and .bridge.zig).
 pub fn copyDir(allocator: std.mem.Allocator, src_base: []const u8, dst_base: []const u8, folder: []const u8) !void {
-    const cwd = std.fs.cwd();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
 
     const src_path = try std.fs.path.join(allocator, &.{ src_base, folder });
     defer allocator.free(src_path);
     const dst_path = try std.fs.path.join(allocator, &.{ dst_base, folder });
     defer allocator.free(dst_path);
 
-    try cwd.makePath(dst_path);
+    try cwd.createDirPath(io, dst_path);
 
-    var src_dir = cwd.openDir(src_path, .{ .iterate = true }) catch return; // skip if doesn't exist
-    defer src_dir.close();
-    var dst_dir = try cwd.openDir(dst_path, .{});
-    defer dst_dir.close();
+    var src_dir = cwd.openDir(io, src_path, .{ .iterate = true }) catch return; // skip if doesn't exist
+    defer src_dir.close(io);
+    var dst_dir = try cwd.openDir(io, dst_path, .{});
+    defer dst_dir.close(io);
 
     var iter = src_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (std.mem.eql(u8, entry.name, ".bridge.zig")) continue; // skip old bridge files
 
-        const content = try src_dir.readFileAlloc(allocator, entry.name, 1024 * 1024);
+        const content = try src_dir.readFileAlloc(io, entry.name, allocator, .limited(1024 * 1024));
         defer allocator.free(content);
 
-        const out_file = try dst_dir.createFile(entry.name, .{});
-        defer out_file.close();
-        try out_file.writeAll(content);
+        const out_file = try dst_dir.createFile(io, entry.name, .{});
+        defer out_file.close(io);
+        try out_file.writeStreamingAll(io, content);
     }
 }
 
@@ -182,7 +187,8 @@ pub fn linkDir(
     dst_base: []const u8,
     folder: []const u8,
 ) !void {
-    const cwd = std.fs.cwd();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
 
     const src_path = try std.fs.path.join(allocator, &.{ src_base, folder });
     defer allocator.free(src_path);
@@ -190,19 +196,19 @@ pub fn linkDir(
     defer allocator.free(dst_path);
 
     // Skip silently if source doesn't exist — matches copyDirRecursive.
-    cwd.access(src_path, .{}) catch return;
+    cwd.access(io, src_path, .{}) catch return;
 
     // Ensure the symlink's immediate parent exists. Using dst_parent
     // (not dst_base) handles plugin-declared nested `folder` values
     // like "foo/bar" correctly — makePath(dst_base) alone would fail
     // on symLink() because `dst_base/foo` wouldn't exist.
     const dst_parent = std.fs.path.dirname(dst_path) orelse ".";
-    try cwd.makePath(dst_parent);
+    try cwd.createDirPath(io, dst_parent);
 
     // Compute the relative target from the parent of the link to the
     // source. Using a relative link lets the project directory be moved
     // without breaking (absolute paths would snap on relocation).
-    const relative_target = try std.fs.path.relative(allocator, dst_parent, src_path);
+    const relative_target = try std.fs.path.relative(allocator, "", null, dst_parent, src_path);
     defer allocator.free(relative_target);
 
     // Inspect whatever is at dst_path. `deleteTree` handles every
@@ -210,17 +216,18 @@ pub fn linkDir(
     // (on Windows where deleteFile can't), and real directories left
     // over from older copy-based generates. Safe because `dst_base`
     // is the CLI's managed target directory (`.labelle/<target>/`).
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (cwd.readLink(dst_path, &link_buf)) |existing| {
+    var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (cwd.readLink(io, dst_path, &link_buf)) |existing_len| {
+        const existing = link_buf[0..existing_len];
         if (std.mem.eql(u8, existing, relative_target)) return;
-        try cwd.deleteTree(dst_path);
+        try cwd.deleteTree(io, dst_path);
     } else |err| switch (err) {
         error.FileNotFound => {},
-        error.NotLink => try cwd.deleteTree(dst_path),
+        error.NotLink => try cwd.deleteTree(io, dst_path),
         else => return err,
     }
 
-    try cwd.symLink(relative_target, dst_path, .{ .is_directory = true });
+    try cwd.symLink(io, relative_target, dst_path, .{ .is_directory = true });
 }
 
 /// Scan `src_base/folder` recursively for file stems matching `ext` and
@@ -241,11 +248,11 @@ pub fn linkAndScan(
 ) ![][]const u8 {
     try linkDir(allocator, src_base, dst_base, folder);
 
-    const cwd = std.fs.cwd();
+    const cwd = std.Io.Dir.cwd();
     const src_path = try std.fs.path.join(allocator, &.{ src_base, folder });
     defer allocator.free(src_path);
 
-    var names: std.ArrayList([]const u8) = .{};
+    var names: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (names.items) |n| allocator.free(n);
         names.deinit(allocator);
@@ -264,20 +271,21 @@ pub fn linkAndScan(
 
 fn scanRecursive(
     allocator: std.mem.Allocator,
-    cwd: std.fs.Dir,
+    cwd: std.Io.Dir,
     src_path: []const u8,
     prefix: []const u8,
     ext: []const u8,
     names: *std.ArrayList([]const u8),
 ) !void {
-    var src_dir = cwd.openDir(src_path, .{ .iterate = true }) catch |err| switch (err) {
+    const io = config.globalIo();
+    var src_dir = cwd.openDir(io, src_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer src_dir.close();
+    defer src_dir.close(io);
 
     var iter = src_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (std.mem.eql(u8, entry.name, ".bridge.zig")) continue;
 
         switch (entry.kind) {
@@ -314,30 +322,31 @@ fn scanRecursive(
 /// Recursively copy a directory tree from src_base/folder to dst_base/folder.
 /// Copies all files and subdirectories. Used for assets which have nested folders.
 pub fn copyDirRecursive(allocator: std.mem.Allocator, src_base: []const u8, dst_base: []const u8, folder: []const u8) !void {
-    const cwd = std.fs.cwd();
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
 
     const src_path = try std.fs.path.join(allocator, &.{ src_base, folder });
     defer allocator.free(src_path);
     const dst_path = try std.fs.path.join(allocator, &.{ dst_base, folder });
     defer allocator.free(dst_path);
 
-    try cwd.makePath(dst_path);
+    try cwd.createDirPath(io, dst_path);
 
-    var src_dir = cwd.openDir(src_path, .{ .iterate = true }) catch return;
-    defer src_dir.close();
+    var src_dir = cwd.openDir(io, src_path, .{ .iterate = true }) catch return;
+    defer src_dir.close(io);
 
     var iter = src_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         switch (entry.kind) {
             .file => {
-                const content = try src_dir.readFileAlloc(allocator, entry.name, 10 * 1024 * 1024);
+                const content = try src_dir.readFileAlloc(io, entry.name, allocator, .limited(10 * 1024 * 1024));
                 defer allocator.free(content);
 
-                var dst_dir = try cwd.openDir(dst_path, .{});
-                defer dst_dir.close();
-                const out_file = try dst_dir.createFile(entry.name, .{});
-                defer out_file.close();
-                try out_file.writeAll(content);
+                var dst_dir = try cwd.openDir(io, dst_path, .{});
+                defer dst_dir.close(io);
+                const out_file = try dst_dir.createFile(io, entry.name, .{});
+                defer out_file.close(io);
+                try out_file.writeStreamingAll(io, content);
             },
             .directory => {
                 const sub_folder = try std.fs.path.join(allocator, &.{ folder, entry.name });

@@ -52,11 +52,10 @@ const move_flow_zon =
     \\
 ;
 
-fn writeSample(dir: std.fs.Dir, rel: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(rel)) |parent| try dir.makePath(parent);
-    const f = try dir.createFile(rel, .{});
-    defer f.close();
-    try f.writeAll(content);
+fn writeSample(dir: std.Io.Dir, rel: []const u8, content: []const u8) !void {
+    const io = std.testing.io;
+    if (std.fs.path.dirname(rel)) |parent| try dir.createDirPath(io, parent);
+    try dir.writeFile(io, .{ .sub_path = rel, .data = content });
 }
 
 /// Build the canonical `<game>/.labelle/target/` shape: a real
@@ -64,11 +63,19 @@ fn writeSample(dir: std.fs.Dir, rel: []const u8, content: []const u8) !void {
 /// target side. Mirrors what `generate()` lays down by the time
 /// `flow_scanner.scanAndEmit` is called.
 fn setupFixture(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !struct { game_dir: []const u8, target_dir: []const u8 } {
-    try tmp.dir.makePath("game/scripts/flows");
-    try tmp.dir.makePath("game/.labelle/target");
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "game/scripts/flows");
+    try tmp.dir.createDirPath(io, "game/.labelle/target");
 
-    const game_dir = try tmp.dir.realpathAlloc(allocator, "game");
-    const target_dir = try tmp.dir.realpathAlloc(allocator, "game/.labelle/target");
+    // realPathFileAlloc returns [:0]u8 — dupe to plain []u8 so the
+    // caller can free with the matching size hint (DebugAllocator
+    // panics on `[:0]u8`-as-`[]u8` size mismatches).
+    const game_dir_z = try tmp.dir.realPathFileAlloc(io, "game", allocator);
+    defer allocator.free(game_dir_z);
+    const game_dir = try allocator.dupe(u8, game_dir_z);
+    const target_dir_z = try tmp.dir.realPathFileAlloc(io, "game/.labelle/target", allocator);
+    defer allocator.free(target_dir_z);
+    const target_dir = try allocator.dupe(u8, target_dir_z);
 
     // Plant the .flow.zon fixture.
     try writeSample(tmp.dir, "game/scripts/flows/move.flow.zon", move_flow_zon);
@@ -105,7 +112,7 @@ pub const FlowScanner = struct {
         const out_path = try std.fs.path.join(allocator, &.{ fx.target_dir, "scripts", "flows", "move.zig" });
         defer allocator.free(out_path);
 
-        const source = try std.fs.cwd().readFileAlloc(allocator, out_path, 64 * 1024);
+        const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, out_path, allocator, .limited(64 * 1024));
         defer allocator.free(source);
 
         // Smoke-check the prelude — confirms codegen used the
@@ -130,11 +137,16 @@ pub const FlowScanner = struct {
 
         // Build the target shell but leave `scripts/flows/` absent —
         // the common case for any project that doesn't use the editor.
-        try tmp.dir.makePath("game/scripts");
-        try tmp.dir.makePath("game/.labelle/target");
-        const game_dir = try tmp.dir.realpathAlloc(allocator, "game");
+        const io = std.testing.io;
+        try tmp.dir.createDirPath(io, "game/scripts");
+        try tmp.dir.createDirPath(io, "game/.labelle/target");
+        const game_dir_z = try tmp.dir.realPathFileAlloc(io, "game", allocator);
+        defer allocator.free(game_dir_z);
+        const game_dir = try allocator.dupe(u8, game_dir_z);
         defer allocator.free(game_dir);
-        const target_dir = try tmp.dir.realpathAlloc(allocator, "game/.labelle/target");
+        const target_dir_z = try tmp.dir.realPathFileAlloc(io, "game/.labelle/target", allocator);
+        defer allocator.free(target_dir_z);
+        const target_dir = try allocator.dupe(u8, target_dir_z);
         defer allocator.free(target_dir);
         try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 
@@ -149,11 +161,16 @@ pub const FlowScanner = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        try tmp.dir.makePath("game/scripts/flows");
-        try tmp.dir.makePath("game/.labelle/target");
-        const game_dir = try tmp.dir.realpathAlloc(allocator, "game");
+        const io = std.testing.io;
+        try tmp.dir.createDirPath(io, "game/scripts/flows");
+        try tmp.dir.createDirPath(io, "game/.labelle/target");
+        const game_dir_z = try tmp.dir.realPathFileAlloc(io, "game", allocator);
+        defer allocator.free(game_dir_z);
+        const game_dir = try allocator.dupe(u8, game_dir_z);
         defer allocator.free(game_dir);
-        const target_dir = try tmp.dir.realpathAlloc(allocator, "game/.labelle/target");
+        const target_dir_z = try tmp.dir.realPathFileAlloc(io, "game/.labelle/target", allocator);
+        defer allocator.free(target_dir_z);
+        const target_dir = try allocator.dupe(u8, target_dir_z);
         defer allocator.free(target_dir);
         try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 

@@ -202,22 +202,22 @@ pub const RealDirectoryScan = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/save_load.zig", .data = "// global" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/debug.zig", .data = "// global" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/save_load.zig", .data = "// global" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/debug.zig", .data = "// global" });
 
-        try tmp_dir.dir.makeDir("scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/01_pathfinder.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/02_movement.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/03_production.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/01_pathfinder.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/02_movement.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/03_production.zig", .data = "" });
 
-        try tmp_dir.dir.makeDir("scripts/menu");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/menu/menu_ui.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/menu");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/menu/menu_ui.zig", .data = "" });
 
-        try tmp_dir.dir.makeDir("scripts/playing+paused");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing+paused/camera.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing+paused");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing+paused/camera.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
 
         const states_list = [_][]const u8{ "menu", "playing", "paused" };
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -248,15 +248,15 @@ pub const RealDirectoryScan = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.makeDir("scripts/playing");
-        try tmp_dir.dir.makeDir("scripts/NotAState");
-        try tmp_dir.dir.makeDir("scripts/some-state");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/foo.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/NotAState/bar.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/some-state/baz.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/NotAState");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/some-state");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/foo.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/NotAState/bar.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/some-state/baz.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
 
         const states_list = [_][]const u8{"playing"};
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -274,25 +274,25 @@ pub const RealDirectoryScan = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/save_load.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/save_load.zig", .data = "" });
 
-        try tmp_dir.dir.makeDir("scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/01_pathfinder_bridge.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/01_pathfinder_bridge.zig", .data = "" });
 
-        try tmp_dir.dir.makeDir("scripts/playing/navigation");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/navigation/02_navigation_orchestrator.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/navigation/03_worker_movement.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing/navigation");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/navigation/02_navigation_orchestrator.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/navigation/03_worker_movement.zig", .data = "" });
 
-        try tmp_dir.dir.makeDir("scripts/playing/production");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/production/04_workstation_readiness.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/production/05_production_system.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing/production");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/production/04_workstation_readiness.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/production/05_production_system.zig", .data = "" });
 
-        try tmp_dir.dir.makeDir("scripts/playing/gizmos");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/gizmos/tendable_gizmos.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/gizmos/item_gizmos.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing/gizmos");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/gizmos/tendable_gizmos.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/gizmos/item_gizmos.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
 
         const states_list = [_][]const u8{ "playing", "paused" };
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -352,13 +352,13 @@ pub const RealDirectoryScan = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.makeDir("scripts/playing");
-        try tmp_dir.dir.makeDir("scripts/loading");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/foo.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/loading/bar.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/loading");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/foo.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/loading/bar.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
 
         const states_list = [_][]const u8{"playing"};
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -378,12 +378,12 @@ pub const DuplicateValidation = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.makeDir("scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/02_foo.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/02_bar.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/02_foo.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/02_bar.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
 
         const states_list = [_][]const u8{"playing"};
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -398,13 +398,13 @@ pub const DuplicateValidation = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.makeDir("scripts/playing");
-        try tmp_dir.dir.makeDir("scripts/menu");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/01_movement.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/menu/01_menu_ui.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/menu");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/01_movement.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/menu/01_menu_ui.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
 
         const states_list = [_][]const u8{ "playing", "menu" };
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -421,14 +421,14 @@ pub const DuplicateValidation = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.makeDir("scripts/playing");
-        try tmp_dir.dir.makeDir("scripts/playing/navigation");
-        try tmp_dir.dir.makeDir("scripts/playing/production");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/navigation/02_movement.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/production/02_production.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing/navigation");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing/production");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/navigation/02_movement.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/production/02_production.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
 
         const states_list = [_][]const u8{"playing"};
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -453,19 +453,19 @@ pub const PluginBlockOrdering = struct {
         defer tmp_dir.cleanup();
 
         // Game block: one global script + one playing script.
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/global.zig", .data = "" });
-        try tmp_dir.dir.makeDir("scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/01_pathfinder.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/global.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/01_pathfinder.zig", .data = "" });
 
         // Plugin block: one plugin ships its own scripts.
-        try tmp_dir.dir.makeDir("pathfinder_scripts");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "pathfinder_scripts/01_startup.zig", .data = "" });
-        try tmp_dir.dir.makeDir("pathfinder_scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "pathfinder_scripts/playing/01_advance.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"pathfinder_scripts");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "pathfinder_scripts/01_startup.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"pathfinder_scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "pathfinder_scripts/playing/01_advance.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
-        const plugin_scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "pathfinder_scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
+        const plugin_scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "pathfinder_scripts", alloc);
 
         const states_list = [_][]const u8{"playing"};
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -494,17 +494,17 @@ pub const PluginBlockOrdering = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
 
-        try tmp_dir.dir.makeDir("pathfinder_s");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "pathfinder_s/01_a.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"pathfinder_s");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "pathfinder_s/01_a.zig", .data = "" });
 
-        try tmp_dir.dir.makeDir("scheduler_s");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scheduler_s/01_a.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scheduler_s");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scheduler_s/01_a.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
-        const pf_path = try tmp_dir.dir.realpathAlloc(alloc, "pathfinder_s");
-        const sched_path = try tmp_dir.dir.realpathAlloc(alloc, "scheduler_s");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
+        const pf_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "pathfinder_s", alloc);
+        const sched_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scheduler_s", alloc);
 
         const states_list = [_][]const u8{};
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -527,19 +527,19 @@ pub const PluginBlockOrdering = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
 
-        try tmp_dir.dir.makeDir("a_scripts");
-        try tmp_dir.dir.makeDir("a_scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "a_scripts/playing/05_foo.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"a_scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"a_scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "a_scripts/playing/05_foo.zig", .data = "" });
 
-        try tmp_dir.dir.makeDir("b_scripts");
-        try tmp_dir.dir.makeDir("b_scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "b_scripts/playing/05_foo.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"b_scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"b_scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "b_scripts/playing/05_foo.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
-        const a_path = try tmp_dir.dir.realpathAlloc(alloc, "a_scripts");
-        const b_path = try tmp_dir.dir.realpathAlloc(alloc, "b_scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
+        const a_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "a_scripts", alloc);
+        const b_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "b_scripts", alloc);
 
         const states_list = [_][]const u8{"playing"};
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -559,15 +559,15 @@ pub const PluginBlockOrdering = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
 
-        try tmp_dir.dir.makeDir("a_scripts");
-        try tmp_dir.dir.makeDir("a_scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "a_scripts/playing/05_foo.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "a_scripts/playing/05_bar.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"a_scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"a_scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "a_scripts/playing/05_foo.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "a_scripts/playing/05_bar.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
-        const a_path = try tmp_dir.dir.realpathAlloc(alloc, "a_scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
+        const a_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "a_scripts", alloc);
 
         const states_list = [_][]const u8{"playing"};
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -583,16 +583,16 @@ pub const PluginBlockOrdering = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.makeDir("scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/01_game.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/01_game.zig", .data = "" });
 
-        try tmp_dir.dir.makeDir("plug_scripts");
-        try tmp_dir.dir.makeDir("plug_scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "plug_scripts/playing/01_plug.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"plug_scripts");
+        try tmp_dir.dir.createDirPath(std.testing.io,"plug_scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "plug_scripts/playing/01_plug.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
-        const plug_path = try tmp_dir.dir.realpathAlloc(alloc, "plug_scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
+        const plug_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "plug_scripts", alloc);
 
         const states_list = [_][]const u8{"playing"};
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -616,12 +616,12 @@ pub const PluginBlockOrdering = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/game_global.zig", .data = "" });
-        try tmp_dir.dir.makeDir("scripts/.plugin_pathfinder");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/.plugin_pathfinder/01_advance.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/game_global.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/.plugin_pathfinder");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/.plugin_pathfinder/01_advance.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
 
         const states_list = [_][]const u8{};
         var scanner = ScriptScanner.init(alloc, &states_list);
@@ -652,14 +652,14 @@ pub const ShipFromPlugin = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        try tmp.dir.makeDir("plugin_src");
-        try tmp.dir.writeFile(.{ .sub_path = "plugin_src/01_startup.zig", .data = "pub fn setup() void {}" });
-        try tmp.dir.writeFile(.{ .sub_path = "plugin_src/02_advance.zig", .data = "pub fn tick() void {}" });
+        try tmp.dir.createDirPath(std.testing.io,"plugin_src");
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plugin_src/01_startup.zig", .data = "pub fn setup() void {}" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plugin_src/02_advance.zig", .data = "pub fn tick() void {}" });
 
-        try tmp.dir.makeDir("target");
+        try tmp.dir.createDirPath(std.testing.io,"target");
 
-        const src_path = try tmp.dir.realpathAlloc(alloc, "plugin_src");
-        const dst_path = try tmp.dir.realpathAlloc(alloc, "target");
+        const src_path = try tmp.dir.realPathFileAlloc(std.testing.io, "plugin_src", alloc);
+        const dst_path = try tmp.dir.realPathFileAlloc(std.testing.io, "target", alloc);
 
         const names = try scanner.copyAndScanAbs(alloc, src_path, dst_path, ".zig");
 
@@ -669,13 +669,13 @@ pub const ShipFromPlugin = struct {
         try std.testing.expectEqualStrings("02_advance", names[1]);
 
         // Files are present at the destination.
-        var dst_dir = try tmp.dir.openDir("target", .{});
-        defer dst_dir.close();
+        var dst_dir = try tmp.dir.openDir(std.testing.io, "target", .{});
+        defer dst_dir.close(std.testing.io);
 
-        const startup_content = try dst_dir.readFileAlloc(alloc, "01_startup.zig", 1024);
+        const startup_content = try dst_dir.readFileAlloc(std.testing.io, "01_startup.zig", alloc, .limited(1024));
         try std.testing.expectEqualStrings("pub fn setup() void {}", startup_content);
 
-        const advance_content = try dst_dir.readFileAlloc(alloc, "02_advance.zig", 1024);
+        const advance_content = try dst_dir.readFileAlloc(std.testing.io, "02_advance.zig", alloc, .limited(1024));
         try std.testing.expectEqualStrings("pub fn tick() void {}", advance_content);
     }
 
@@ -690,20 +690,20 @@ pub const ShipFromPlugin = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        try tmp.dir.makeDir("plugin_src");
-        try tmp.dir.makeDir("plugin_src/playing");
-        try tmp.dir.writeFile(.{ .sub_path = "plugin_src/playing/01_advance.zig", .data = "" });
+        try tmp.dir.createDirPath(std.testing.io,"plugin_src");
+        try tmp.dir.createDirPath(std.testing.io,"plugin_src/playing");
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plugin_src/playing/01_advance.zig", .data = "" });
 
-        try tmp.dir.makeDir("target");
+        try tmp.dir.createDirPath(std.testing.io,"target");
 
-        const src_path = try tmp.dir.realpathAlloc(alloc, "plugin_src");
-        const dst_path = try tmp.dir.realpathAlloc(alloc, "target");
+        const src_path = try tmp.dir.realPathFileAlloc(std.testing.io, "plugin_src", alloc);
+        const dst_path = try tmp.dir.realPathFileAlloc(std.testing.io, "target", alloc);
 
         _ = try scanner.copyAndScanAbs(alloc, src_path, dst_path, ".zig");
 
         // Subdirectory preserved.
-        var target_playing = try tmp.dir.openDir("target/playing", .{});
-        target_playing.close();
+        var target_playing = try tmp.dir.openDir(std.testing.io, "target/playing", .{});
+        target_playing.close(std.testing.io);
     }
 };
 
@@ -717,18 +717,18 @@ pub const MemoryLeaks = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/global.zig", .data = "" });
-        try tmp_dir.dir.makeDir("scripts/playing");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/01_movement.zig", .data = "" });
-        try tmp_dir.dir.makeDir("scripts/playing/sub");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing/sub/02_ai.zig", .data = "" });
-        try tmp_dir.dir.makeDir("scripts/menu");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/menu/ui.zig", .data = "" });
-        try tmp_dir.dir.makeDir("scripts/playing+menu");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/playing+menu/camera.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/global.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/01_movement.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing/sub");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/sub/02_ai.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/menu");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/menu/ui.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts/playing+menu");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing+menu/camera.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
         defer alloc.free(scripts_path);
 
         const states_list = [_][]const u8{ "playing", "menu" };
@@ -747,11 +747,11 @@ pub const MemoryLeaks = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
 
-        try tmp_dir.dir.makeDir("scripts");
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/foo.zig", .data = "" });
-        try tmp_dir.dir.writeFile(.{ .sub_path = "scripts/bar.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io,"scripts");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/foo.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/bar.zig", .data = "" });
 
-        const scripts_path = try tmp_dir.dir.realpathAlloc(alloc, "scripts");
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
         defer alloc.free(scripts_path);
 
         const states_list = [_][]const u8{"playing"};

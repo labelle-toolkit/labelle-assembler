@@ -13,6 +13,7 @@
 /// suggestions for unknown top-level scene keys — asset-name
 /// validation lives in `asset_validator.zig` (ticket #47).
 const std = @import("std");
+const config = @import("config.zig");
 
 /// Parsed manifest for a single scene file.
 pub const SceneManifest = struct {
@@ -320,7 +321,7 @@ pub fn parseSceneDir(
         const rel = try std.fmt.allocPrint(allocator, "{s}/{s}.jsonc", .{ scenes_dir, name });
         defer allocator.free(rel);
 
-        const source = std.fs.cwd().readFileAlloc(allocator, rel, 1024 * 1024) catch |err| {
+        const source = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), rel, allocator, .limited(1024 * 1024)) catch |err| {
             std.debug.print(
                 "labelle-assembler: could not read scene '{s}': {s}\n",
                 .{ rel, @errorName(err) },

@@ -47,8 +47,8 @@ var audio_initialized: bool = false;
 //
 // This is the same trade-off `markSoundUnloaded` already encodes for
 // non-recycled slots; we simply extend it across the recycle boundary.
-var pending_sound_frees: std.ArrayList([]const f32) = .{};
-var pending_music_frees: std.ArrayList([]const f32) = .{};
+var pending_sound_frees: std.ArrayList([]const f32) = .empty;
+var pending_music_frees: std.ArrayList([]const f32) = .empty;
 
 /// Thin wrappers over the helpers in `audio_slots.zig` so each call
 /// site doesn't have to pass the module-level array explicitly.
@@ -109,10 +109,10 @@ pub fn deinit() void {
     // joined that thread, so we can drop them now.
     for (pending_sound_frees.items) |buf| std.heap.page_allocator.free(buf);
     pending_sound_frees.deinit(std.heap.page_allocator);
-    pending_sound_frees = .{};
+    pending_sound_frees = .empty;
     for (pending_music_frees.items) |buf| std.heap.page_allocator.free(buf);
     pending_music_frees.deinit(std.heap.page_allocator);
-    pending_music_frees = .{};
+    pending_music_frees = .empty;
 
     // Reset all voices.
     for (&voices) |*voice| {

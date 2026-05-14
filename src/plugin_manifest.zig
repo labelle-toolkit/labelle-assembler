@@ -156,8 +156,8 @@ pub fn loadFromDir(
 
     // Read the file. If the file does not exist, return null — this is
     // a legal "no manifest" plugin (e.g. labelle-pathfinder).
-    const cwd = std.fs.cwd();
-    const raw_bytes = cwd.readFileAlloc(allocator, manifest_path, 64 * 1024) catch |err| {
+    const cwd = std.Io.Dir.cwd();
+    const raw_bytes = cwd.readFileAlloc(config.globalIo(), manifest_path, allocator, .limited(64 * 1024)) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
@@ -176,7 +176,7 @@ pub fn loadFromDir(
     // manifest from a future plugin that adds a new optional field
     // should still load in an older CLI. Hard-incompat changes bump
     // manifest_version (checked below) rather than adding fields.
-    const parsed = std.zon.parse.fromSlice(ZonManifest, allocator, raw_z, null, .{
+    const parsed = std.zon.parse.fromSliceAlloc(ZonManifest, allocator, raw_z, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
         std.debug.print(
@@ -342,7 +342,7 @@ test "ZonManifest: parses minimal manifest with one convention dir" {
     const src_z = try testing.allocator.dupeZ(u8, src);
     defer testing.allocator.free(src_z);
 
-    const parsed = try std.zon.parse.fromSlice(ZonManifest, testing.allocator, src_z, null, .{});
+    const parsed = try std.zon.parse.fromSliceAlloc(ZonManifest, testing.allocator, src_z, null, .{});
     defer std.zon.parse.free(testing.allocator, parsed);
 
     try testing.expectEqualStrings("fsm", parsed.name);
@@ -369,7 +369,7 @@ test "ZonManifest: parses copy_only mode without extension" {
     const src_z = try testing.allocator.dupeZ(u8, src);
     defer testing.allocator.free(src_z);
 
-    const parsed = try std.zon.parse.fromSlice(ZonManifest, testing.allocator, src_z, null, .{});
+    const parsed = try std.zon.parse.fromSliceAlloc(ZonManifest, testing.allocator, src_z, null, .{});
     defer std.zon.parse.free(testing.allocator, parsed);
 
     try testing.expectEqual(ConventionDirMode.copy_only, parsed.convention_dirs[0].mode);
@@ -386,7 +386,7 @@ test "ZonManifest: parses manifest with no convention_dirs" {
     const src_z = try testing.allocator.dupeZ(u8, src);
     defer testing.allocator.free(src_z);
 
-    const parsed = try std.zon.parse.fromSlice(ZonManifest, testing.allocator, src_z, null, .{});
+    const parsed = try std.zon.parse.fromSliceAlloc(ZonManifest, testing.allocator, src_z, null, .{});
     defer std.zon.parse.free(testing.allocator, parsed);
 
     try testing.expectEqualStrings("marker_only", parsed.name);
@@ -413,7 +413,7 @@ test "ZonManifest: parses ship_from_plugin mode with extension" {
     // Note: "scripts" *is* reserved for the hardcoded engine convention,
     // so at the load level this entry would hit the reserved-name guard.
     // The raw ZON parser only cares about the shape of the enum, though.
-    const parsed = try std.zon.parse.fromSlice(ZonManifest, testing.allocator, src_z, null, .{});
+    const parsed = try std.zon.parse.fromSliceAlloc(ZonManifest, testing.allocator, src_z, null, .{});
     defer std.zon.parse.free(testing.allocator, parsed);
 
     try testing.expectEqual(ConventionDirMode.ship_from_plugin, parsed.convention_dirs[0].mode);
@@ -440,7 +440,7 @@ test "loadFromDir: rejects ship_from_plugin without extension" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     const result = loadFromDir(testing.allocator, tmp_path, "pathfinder");
@@ -465,7 +465,7 @@ test "loadFromDir: parses ship_from_plugin mode end-to-end" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     var manifest = (try loadFromDir(testing.allocator, tmp_path, "pathfinder")).?;
@@ -490,7 +490,7 @@ test "ZonManifest: parses manifest with multiple convention dirs (different exte
     const src_z = try testing.allocator.dupeZ(u8, src);
     defer testing.allocator.free(src_z);
 
-    const parsed = try std.zon.parse.fromSlice(ZonManifest, testing.allocator, src_z, null, .{});
+    const parsed = try std.zon.parse.fromSliceAlloc(ZonManifest, testing.allocator, src_z, null, .{});
     defer std.zon.parse.free(testing.allocator, parsed);
 
     try testing.expectEqual(@as(usize, 2), parsed.convention_dirs.len);
@@ -500,17 +500,17 @@ test "ZonManifest: parses manifest with multiple convention dirs (different exte
 
 // ── loadFromDir integration tests against a real (tmp) plugin dir ──
 
-fn writeManifestFile(tmp_dir: std.fs.Dir, body: []const u8) !void {
-    var f = try tmp_dir.createFile("plugin.labelle", .{});
-    defer f.close();
-    try f.writeAll(body);
+fn writeManifestFile(tmp_dir: std.Io.Dir, body: []const u8) !void {
+    var f = try tmp_dir.createFile(testing.io, "plugin.labelle", .{});
+    defer f.close(testing.io);
+    try f.writeStreamingAll(testing.io, body);
 }
 
 test "loadFromDir: returns null when plugin.labelle is missing" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     const result = try loadFromDir(testing.allocator, tmp_path, "fsm");
@@ -535,7 +535,7 @@ test "loadFromDir: parses a valid manifest" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     var manifest = (try loadFromDir(testing.allocator, tmp_path, "fsm")).?;
@@ -560,7 +560,7 @@ test "loadFromDir: errors on name mismatch" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     const result = loadFromDir(testing.allocator, tmp_path, "different_name");
@@ -578,7 +578,7 @@ test "loadFromDir: errors on manifest_version higher than supported" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     const result = loadFromDir(testing.allocator, tmp_path, "fsm");
@@ -599,7 +599,7 @@ test "loadFromDir: errors on manifest_version zero" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     const result = loadFromDir(testing.allocator, tmp_path, "fsm");
@@ -624,7 +624,7 @@ test "loadFromDir: errors when plugin tries to declare a reserved name" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     const result = loadFromDir(testing.allocator, tmp_path, "fsm");
@@ -642,7 +642,7 @@ test "loadFromDir: errors on malformed ZON" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     const result = loadFromDir(testing.allocator, tmp_path, "fsm");
@@ -666,7 +666,7 @@ test "loadFromDir: parses copy_only mode end-to-end" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     var manifest = (try loadFromDir(testing.allocator, tmp_path, "fsm")).?;
@@ -710,7 +710,7 @@ test "loadFromDir: rejects path traversal in convention_dir name" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     const result = loadFromDir(testing.allocator, tmp_path, "evil");
@@ -735,7 +735,7 @@ test "loadFromDir: rejects absolute path in convention_dir name" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     const result = loadFromDir(testing.allocator, tmp_path, "evil");
@@ -759,7 +759,7 @@ test "loadFromDir: rejects copy_and_scan without extension" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     const result = loadFromDir(testing.allocator, tmp_path, "fsm");
@@ -788,7 +788,7 @@ test "loadFromDir: ignore_unknown_fields allows forward-compat manifests" {
         \\}
     );
 
-    const tmp_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(tmp_path);
 
     var manifest = (try loadFromDir(testing.allocator, tmp_path, "fsm")).?;

@@ -75,7 +75,7 @@ pub fn getSection(template: []const u8, section: []const u8) ?[]const u8 {
 
         const name_start = pos + 1;
         const line_end = std.mem.indexOfScalarPos(u8, template, name_start, '\n') orelse template.len;
-        const name = std.mem.trimRight(u8, template[name_start..line_end], " \t\r");
+        const name = std.mem.trimEnd(u8, template[name_start..line_end], " \t\r");
 
         if (std.mem.eql(u8, name, section)) {
             const content_start = if (line_end < template.len) line_end + 1 else template.len;

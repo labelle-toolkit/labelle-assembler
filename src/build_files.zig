@@ -23,8 +23,9 @@ pub const BuildZigOptions = struct {
 };
 
 pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: BuildZigOptions) ![]const u8 {
-    var buf = std.ArrayList(u8){};
-    const w = buf.writer(allocator);
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer alloc_writer.deinit();
+    const w = &alloc_writer.writer;
 
     if (cfg.platform == .wasm) {
         try tpl.writeSection(build_zig_tmpl, "header_wasm", w);
@@ -312,7 +313,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         }
     }
 
-    return buf.toOwnedSlice(allocator);
+    var arr_list = alloc_writer.toArrayList();
+    return arr_list.toOwnedSlice(allocator);
 }
 
 // ============================================================
@@ -328,8 +330,9 @@ pub const BuildZigZonOptions = struct {
 };
 
 pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, output_dir: ?[]const u8, project_dir: ?[]const u8, opts: BuildZigZonOptions) ![]const u8 {
-    var buf = std.ArrayList(u8){};
-    const w = buf.writer(allocator);
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer alloc_writer.deinit();
+    const w = &alloc_writer.writer;
 
     // Create deps/ hardlinks in .labelle/deps/ (shared across targets).
     // On failure (e.g. a `local:` plugin pointing at a non-existent
@@ -389,13 +392,14 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
 
     try tpl.writeSection(build_zig_zon_tmpl, "footer", w);
 
-    return buf.toOwnedSlice(allocator);
+    var arr_list = alloc_writer.toArrayList();
+    return arr_list.toOwnedSlice(allocator);
 }
 
 /// Fallback: compute relative paths when deps/ symlinks aren't available.
 fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, project_dir: ?[]const u8, w: anytype) !void {
     const abs_target: ?[]const u8 = if (target_dir) |td|
-        std.fs.cwd().realpathAlloc(allocator, td) catch null
+        std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), td, allocator) catch null
     else
         null;
     defer if (abs_target) |at| allocator.free(at);
@@ -468,5 +472,5 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
 /// Both must be absolute paths when from_dir is provided. Returns an allocator-owned string.
 fn relativePath(allocator: std.mem.Allocator, from_dir: ?[]const u8, to_path: []const u8) ![]const u8 {
     if (from_dir == null) return try allocator.dupe(u8, to_path);
-    return std.fs.path.relative(allocator, from_dir.?, to_path);
+    return std.fs.path.relative(allocator, "", null, from_dir.?, to_path);
 }

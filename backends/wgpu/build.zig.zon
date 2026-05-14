@@ -6,11 +6,12 @@
     .dependencies = .{
         .wgpu_native_zig = .{
             .url = "git+https://github.com/apotema/wgpu_native_zig#fb54d9c8cbefa0b8d0e8224aa8323b7974ae454f",
-            .hash = "1220ec8a938a2b278c3e5f8dc624b98342f610dfd42099f0d8fe85f3aaf3fe8dd1a3",
+            .hash = "wgpu_native_zig-6.5.0-B9jeDFtzAwDsipOKKyeMPl-NxiS5g0L2EN_UIJnw2P6F",
+            .lazy = true,
         },
         .zglfw = .{
-            .url = "git+https://github.com/zig-gamedev/zglfw#15bf6ec59a4e1399d0c753455f69b28f09e41791",
-            .hash = "zglfw-0.10.0-dev-zgVDNHO2IQDy_fSdwY5U4z42rHUuKgt7T9f-qmQ3FnuL",
+            .url = "git+https://github.com/zig-gamedev/zglfw#51003c105d23db378bb59ce415a387b22f1b0892",
+            .hash = "zglfw-0.10.0-dev-zgVDNIy4IQDJNRy4jrP1As-SZxfJpuWhU1iJ-wBab_VD",
         },
     },
     .paths = .{

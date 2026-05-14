@@ -16,7 +16,7 @@ pub const FreeDepEntries = struct {
     test "frees all string fields and the slice (regression #78)" {
         const alloc = std.testing.allocator;
 
-        var deps_list = std.ArrayList(DepEntry){};
+        var deps_list: std.ArrayList(DepEntry) = .empty;
         try deps_list.append(alloc, .{
             .zon_name = try alloc.dupe(u8, "labelle_core"),
             .link_name = try alloc.dupe(u8, "labelle-core"),

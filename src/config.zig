@@ -1,6 +1,46 @@
 /// Type definitions for the labelle-cli generator.
 /// Pure types — no template or I/O dependencies.
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Process-wide Io handle used by helpers in cache.zig / scanner.zig / etc.
+/// that historically used `std.fs.cwd()` (which no longer exists on 0.16).
+/// Must be initialized from `main()` by calling `initGlobalIo()` with the
+/// process Init block, so the underlying Threaded impl sees the real env.
+///
+/// Tests don't call `main`, so `globalIo()` lazy-initializes a default
+/// Threaded instance with empty argv0 / environ on first access.
+var _global_threaded: std.Io.Threaded = undefined;
+var _global_io: std.Io = undefined;
+var _global_environ: std.process.Environ = .empty;
+var _global_io_initialized: bool = false;
+
+/// Initialize the process-wide Io. Call once from main() before any helpers
+/// access globalIo(). The provided minimal block is forwarded into a
+/// Threaded instance whose lifetime is the rest of the process.
+pub fn initGlobalIo(minimal: std.process.Init.Minimal) void {
+    _global_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .argv0 = .init(minimal.args),
+        .environ = minimal.environ,
+    });
+    _global_io = _global_threaded.io();
+    _global_environ = minimal.environ;
+    _global_io_initialized = true;
+}
+
+pub fn globalIo() std.Io {
+    if (!_global_io_initialized) {
+        _global_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        _global_io = _global_threaded.io();
+        _global_io_initialized = true;
+    }
+    return _global_io;
+}
+
+pub fn globalEnviron() std.process.Environ {
+    if (builtin.is_test) return std.testing.environ;
+    return _global_environ;
+}
 
 /// Graphics / windowing backend selection. `null` is a headless backend
 /// (no graphics context, no input, no audio, no window) that drives the
