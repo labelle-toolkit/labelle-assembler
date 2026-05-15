@@ -859,6 +859,31 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
 // follow-up can wire the real PID once we settle on a stdlib import
 // that's universal across our backends.
 
+/// Module-scope helpers the preview blocks rely on. `getenv` and
+/// `clock_gettime` are at module scope because `extern "c" fn`
+/// must be; both names are unique within the generated main.zig.
+/// `_preview_now_ms` is a tiny libc clock_gettime wrapper that
+/// stands in for the now-removed `std.time.milliTimestamp`.
+const PREVIEW_HELPERS =
+    \\
+    \\const _PreviewTimespec = extern struct { sec: isize, nsec: isize };
+    \\const _preview_getenv = @extern(
+    \\    *const fn (name: [*:0]const u8) callconv(.c) ?[*:0]const u8,
+    \\    .{ .name = "getenv" },
+    \\);
+    \\const _preview_clock_gettime = @extern(
+    \\    *const fn (clk_id: c_int, tp: *_PreviewTimespec) callconv(.c) c_int,
+    \\    .{ .name = "clock_gettime" },
+    \\);
+    \\fn _preview_now_ms() u64 {
+    \\    const CLOCK_MONOTONIC: c_int = if (@import("builtin").os.tag == .macos) 6 else 1;
+    \\    var ts: _PreviewTimespec = undefined;
+    \\    _ = _preview_clock_gettime(CLOCK_MONOTONIC, &ts);
+    \\    return @intCast(@as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000));
+    \\}
+    \\
+;
+
 /// In-function preview setup for loop-style main()s. Parses argv,
 /// dials the editor, assigns directly into `g.preview`, sends `hello`.
 /// Pasted AFTER `var g = AssembledGame.init(...)` so the engine's
@@ -872,11 +897,25 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
 /// in the same scope, so LIFO runs `sendBye` first, then `g.deinit`).
 const PREVIEW_LOOP_SETUP =
     \\    // ── Preview mode (labelle-assembler#94, labelle-engine#520) ──
-    \\    // Preview mode: stubbed during the Zig 0.16 migration —
-    \\    // std.net was reshaped into std.Io.net, std.process.argsAlloc
-    \\    // was removed. Engine.Preview.connect now returns
-    \\    // error.PreviewDisabled regardless. Restore the args-parsing
-    \\    // call once preview_mode is rewritten on std.Io.net.
+    \\    // Connect to the editor's TCP listener when `LABELLE_PREVIEW=host:port`
+    \\    // is set in the environment. (Zig 0.16 removed `std.process.argsAlloc`
+    \\    // and the easy path to argv without changing `pub fn main()`'s
+    \\    // signature, so the env-var hand-off is the smallest restoration.)
+    \\    if (_preview_getenv("LABELLE_PREVIEW")) |_env_z| {
+    \\        const _host_port = std.mem.span(_env_z);
+    \\        if (_host_port.len > 0) {
+    \\            var _preview_threaded = std.Io.Threaded.init(allocator, .{});
+    \\            defer _preview_threaded.deinit();
+    \\            g.preview = engine.Preview.connect(_preview_threaded.io(), allocator, _host_port) catch |err| blk: {
+    \\                std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _host_port, @errorName(err) });
+    \\                break :blk null;
+    \\            };
+    \\            if (g.preview) |*_p| _p.sendHello("labelle-engine", 0) catch {};
+    \\        }
+    \\    }
+    \\    defer if (g.preview) |*_p| {
+    \\        _p.sendBye(.normal) catch {};
+    \\    };
     \\
 ;
 
@@ -891,10 +930,10 @@ const PREVIEW_LOOP_SETUP =
 /// `subscribed_components` set that gates `component_changed`
 /// frames (labelle-engine#520 paired with labelle-assembler#96).
 const PREVIEW_HEARTBEAT_LOOP =
-    \\        // Preview-mode heartbeat stubbed during Zig 0.16 migration
-    \\        // — std.time.milliTimestamp was removed and Preview itself
-    \\        // returns error.PreviewDisabled. Restore once preview_mode
-    \\        // is rewritten on std.Io.net.
+    \\        if (g.preview) |*_p| {
+    \\            _p.pollSubscription() catch {};
+    \\            _p.tickHeartbeat(_preview_now_ms()) catch {};
+    \\        }
     \\
 ;
 
@@ -907,10 +946,23 @@ const PREVIEW_HEARTBEAT_LOOP =
 /// `[][:0]u8` parameter. The `if/else |_|` shape pulls the alloc
 /// success path into its own scope where `_argv`'s type matches.
 const PREVIEW_INIT_CALLBACK =
-    \\    // ── Preview mode — stubbed (Zig 0.16 migration) ──
-    \\    // std.process.argsAlloc was removed and engine.Preview.connect
-    \\    // now returns error.PreviewDisabled regardless. Restore once
-    \\    // preview_mode is rewritten on std.Io.net.
+    \\    // ── Preview mode (labelle-assembler#94, labelle-engine#520) ──
+    \\    // Sokol callback path: connect once in `init`, frame-callback
+    \\    // pulses the heartbeat, cleanup-callback sends bye. Storage is
+    \\    // `g.preview` (Game owns the lifecycle); see PREVIEW_LOOP_SETUP
+    \\    // above for the env-var rationale.
+    \\    if (_preview_getenv("LABELLE_PREVIEW")) |_env_z| {
+    \\        const _host_port = std.mem.span(_env_z);
+    \\        if (_host_port.len > 0) {
+    \\            var _preview_threaded = std.Io.Threaded.init(allocator, .{});
+    \\            defer _preview_threaded.deinit();
+    \\            g.preview = engine.Preview.connect(_preview_threaded.io(), allocator, _host_port) catch |err| blk: {
+    \\                std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _host_port, @errorName(err) });
+    \\                break :blk null;
+    \\            };
+    \\            if (g.preview) |*_p| _p.sendHello("labelle-engine", 0) catch {};
+    \\        }
+    \\    }
     \\
 ;
 
@@ -932,7 +984,10 @@ const PREVIEW_CLEANUP_CALLBACK =
 /// heartbeat write so a malformed subscription can't poison the
 /// outbound flush. See the loop variant for the full rationale.
 const PREVIEW_HEARTBEAT_CALLBACK =
-    \\    // Preview-mode heartbeat stubbed during Zig 0.16 migration.
+    \\    if (g.preview) |*_p| {
+    \\        _p.pollSubscription() catch {};
+    \\        _p.tickHeartbeat(_preview_now_ms()) catch {};
+    \\    }
     \\
 ;
 
@@ -1790,7 +1845,9 @@ pub fn generateMainZigFromTemplate(
         const use_callback_lifecycle = cfg.backend == .sokol or cfg.platform == .wasm;
 
         if (use_callback_lifecycle) {
-            const module_vars = if (cfg.backend == .sokol) "var runner: Runner = undefined;\n" else "";
+            const sokol_runner: []const u8 = if (cfg.backend == .sokol) "var runner: Runner = undefined;\n" else "";
+            const module_vars = try std.mem.concat(allocator, u8, &.{ sokol_runner, PREVIEW_HELPERS });
+            defer allocator.free(module_vars);
             const init_code = try buildCallbackInitCode(allocator, cfg, jsonc_scene_names, prefab_names);
             defer allocator.free(init_code);
 
@@ -1903,6 +1960,7 @@ pub fn generateMainZigFromTemplate(
                 .gui_draw_code = gui_draw_code,
                 .hidden_setup = hidden_setup,
                 .hooks_init_block = hooks_init,
+                .module_vars = PREVIEW_HELPERS,
                 // Preview-mode wiring (labelle-assembler#94). Always
                 // emitted; runtime parse returns null when the flag is
                 // absent so the block is a no-op for non-preview runs.
