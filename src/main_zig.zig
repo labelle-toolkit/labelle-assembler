@@ -1731,6 +1731,15 @@ const PREVIEW_READBACK_HELPERS_METAL_SOKOL =
     \\// rebuilding the descriptor every frame.
     \\var _preview_mtl_views: [_PreviewMtlRingMax]window.gfx_types.View = [_]window.gfx_types.View{.{}} ** _PreviewMtlRingMax;
     \\var _preview_mtl_attachments: [_PreviewMtlRingMax]window.gfx_types.Attachments = [_]window.gfx_types.Attachments{.{}} ** _PreviewMtlRingMax;
+    \\// Shared depth-stencil image + view for the offscreen ring.
+    \\// Game render pipelines were built against the swapchain's
+    \\// depth-stencil context; sokol-gfx's validation layer aborts
+    \\// (VALIDATE_APIP_DEPTHSTENCILATTACHMENT_FORMAT) the first
+    \\// time `applyPipeline` runs inside an attachments pass that
+    \\// has no matching depth-stencil. One shared image is enough —
+    \\// only one slot renders per frame. #136.
+    \\var _preview_mtl_depth_img: window.gfx_types.Image = .{};
+    \\var _preview_mtl_depth_view: window.gfx_types.View = .{};
     \\// `_preview_mtl_target_active` mirrors whether `window.setEditorRenderTarget`
     \\// is currently armed for this frame — set by the pre-render block
     \\// when the editor has accepted a frame, cleared by the post-render
@@ -2150,6 +2159,33 @@ const PREVIEW_PRE_RENDER_METAL_SOKOL =
     \\                        _preview_mtl_initialized = false;
     \\                    }
     \\                    _p.beginFrameStreamIOSurface(_sw, _sh) catch break :_mtl_pre_render;
+    \\                    // Allocate the shared depth-stencil image
+    \\                    // sized to match the offscreen color ring (#136).
+    \\                    // The game's render pipelines were built against
+    \\                    // the swapchain's depth-stencil context;
+    \\                    // sokol-gfx's validation aborts the first
+    \\                    // applyPipeline inside attachments without
+    \\                    // matching depth-stencil. DEPTH_STENCIL is the
+    \\                    // sokol default; matches the pipelines.
+    \\                    if (_preview_mtl_depth_view.id != 0) {
+    \\                        window.gfx_types.destroyView(_preview_mtl_depth_view);
+    \\                        _preview_mtl_depth_view = .{};
+    \\                    }
+    \\                    if (_preview_mtl_depth_img.id != 0) {
+    \\                        window.gfx_types.destroyImage(_preview_mtl_depth_img);
+    \\                        _preview_mtl_depth_img = .{};
+    \\                    }
+    \\                    _preview_mtl_depth_img = window.gfx_types.makeImage(.{
+    \\                        .width = @intCast(_sw),
+    \\                        .height = @intCast(_sh),
+    \\                        .pixel_format = .DEPTH_STENCIL,
+    \\                        .usage = .{ .depth_stencil_attachment = true, .immutable = true },
+    \\                    });
+    \\                    if (_preview_mtl_depth_img.id == 0) break :_mtl_pre_render;
+    \\                    _preview_mtl_depth_view = window.gfx_types.makeView(.{
+    \\                        .depth_stencil_attachment = .{ .image = _preview_mtl_depth_img },
+    \\                    });
+    \\                    if (_preview_mtl_depth_view.id == 0) break :_mtl_pre_render;
     \\                    // The engine producer's default ring size is 3
     \\                    // (preview_iosurface.Options.ring_size). Loop
     \\                    // until we hit the first null surface to handle
@@ -2198,6 +2234,7 @@ const PREVIEW_PRE_RENDER_METAL_SOKOL =
     \\                        _preview_mtl_views[_slot] = _view;
     \\                        var _att: _sg.Attachments = .{};
     \\                        _att.colors[0] = _view;
+    \\                        _att.depth_stencil = _preview_mtl_depth_view;
     \\                        _preview_mtl_attachments[_slot] = _att;
     \\                    }
     \\                    if (!_alloc_ok) {
