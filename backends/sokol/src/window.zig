@@ -115,38 +115,22 @@ pub fn endFrame() void {
 }
 
 /// Metal device pointer (MTLDevice*) for the Play-in-Editor preview's
-/// macOS/iOS readback path (labelle-assembler#125). Returns the same
+/// macOS/iOS Path-A producer (labelle-assembler#131). Returns the same
 /// device sokol acquires for the swapchain — safe to call any number
 /// of times per frame. `null` on non-Metal builds and pre-init
 /// (sapp not valid yet).
+///
+/// Path A wraps each IOSurface as an `MTLTexture` via
+/// `[device newTextureWithDescriptor:iosurface:plane:]` — the device
+/// pointer is the *only* sokol-side resource we still need. The
+/// drawable accessor that the Path-B blit chain needed
+/// (`sapp_metal_get_current_drawable`, lived on the
+/// `feat/expose-cached-metal-drawable` sokol-zig fork) is gone from
+/// the generated source. The fork itself is now vestigial — its
+/// removal is a separate cleanup step.
 pub fn metalDevice() ?*const anyopaque {
     if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .ios) return null;
     return sapp.getEnvironment().metal.device;
-}
-
-/// Metal drawable pointer (CAMetalDrawable*) for the current frame.
-///
-/// Returns the drawable that sokol-app cached the last time
-/// `sapp_get_swapchain()` ran this frame (i.e. the one sokol-gfx
-/// just rendered into via `sglue_swapchain()` inside
-/// `window.beginPass()`). This is **not** a fresh
-/// `[CAMetalLayer nextDrawable]` — calling that again post-render
-/// would hand us an empty drawable and defeat the readback entirely.
-///
-/// Wired through our sokol-zig fork's `sapp_metal_get_current_drawable`
-/// accessor (`labelle-toolkit/sokol-zig` branch
-/// `feat/expose-cached-metal-drawable`; upstream tracking:
-/// floooh/sokol-zig#154). The fork caches the drawable inside
-/// `_sapp.macos.mtl.cur_drawable` (and the iOS equivalent) as the
-/// swapchain-next call hands it to sokol-gfx, then re-exposes it via
-/// a public C accessor with `__bridge` cast semantics so we can
-/// tunnel the Objective-C id through plain C code.
-///
-/// Returns `null` on non-Metal builds, pre-init (sapp not yet valid),
-/// or if no swapchain acquisition has happened this frame.
-pub fn metalCurrentDrawable() ?*const anyopaque {
-    if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .ios) return null;
-    return sapp.metalGetCurrentDrawable();
 }
 
 /// The sokol app descriptor type — re-exported so callers don't need to
