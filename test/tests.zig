@@ -2979,6 +2979,129 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_RGBA") != null);
 
         // Generated source must still parse as valid Zig.
+        const dup_iosurface = try std.testing.allocator.dupeZ(u8, main_zig);
+        defer std.testing.allocator.free(dup_iosurface);
+        var ast_iosurface = try std.zig.Ast.parse(std.testing.allocator, dup_iosurface, .zig);
+        defer ast_iosurface.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast_iosurface.errors.len);
+    }
+
+    // ── Sokol PBO readback codegen (labelle-assembler#122 slice 1) ──
+    // Mirrors `backends/sokol/templates/desktop.txt`:
+    //   - module scope gets `{{module_vars}}` (GL externs + PBO state)
+    //   - `init` callback runs `{{preview_setup}}` (Preview.connect +
+    //     allocator stash)
+    //   - `frame` callback runs `{{preview_heartbeat}}` then renders
+    //     then `{{preview_readback}}` right before `window.endFrame()`
+    //   - `cleanup` callback runs `{{preview_cleanup}}` (endFrameStream
+    //     + glDeleteBuffers + free) then sends the graceful `bye`
+    // This trimmed lifecycle mirrors that shape so the placement +
+    // gating assertions below correspond to real generated source.
+    const preview_sokol_readback_lifecycle =
+        \\var g: AssembledGame = undefined;
+        \\{{hooks_init_block}}
+        \\{{allocator_decl}}
+        \\{{module_vars}}
+        \\fn initInner() !void {
+        \\    const allocator = {{allocator_expr}};
+        \\{{preview_setup}}{{init_code}}}
+        \\
+        \\export fn init() callconv(.c) void {
+        \\    g = AssembledGame.init({{allocator_expr}});
+        \\    g.setHooks(&hooks);
+        \\    initInner() catch unreachable;
+        \\}
+        \\
+        \\export fn frame() callconv(.c) void {
+        \\    const dt: f32 = 0.016;
+        \\{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
+        \\    g.render();
+        \\    window.flushScene();
+        \\{{gui_draw_code}}{{preview_readback}}    window.endFrame();
+        \\}
+        \\
+        \\export fn cleanup() callconv(.c) void {
+        \\{{preview_cleanup}}{{cleanup_code}}    g.deinit();
+        \\{{allocator_cleanup}}}
+        \\
+    ;
+
+    test "sokol desktop emits PBO readback + publishFrame between flushScene and endFrame" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Comptime gating — the entire GL path hides behind
+        // `_sokol_preview_gl_enabled`, a `builtin.os.tag` switch that
+        // returns true on Linux (default sokol GLCORE / Android GLES3)
+        // and false on Darwin (Metal) / Windows (D3D11) / iOS (Metal).
+        // Slice 1 only handles the GL paths; Metal + D3D11 are deferred
+        // to slices 2 and 3 (#122 follow-ups).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_gl_enabled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"builtin\").os.tag") != null);
+
+        // GL extern decls live inside a struct-namespace gated on the
+        // flag — the `else struct {}` branch has no symbols, so a
+        // Metal / D3D11 sokol build never references unresolved GL
+        // symbols at link time.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _SokolPreviewGl = if (_sokol_preview_gl_enabled)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "else struct {}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glReadPixels") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glGenBuffers") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glMapBuffer") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "PIXEL_PACK_BUFFER") != null);
+
+        // PBO state at module scope (sokol's callbacks don't share a
+        // local stack frame, so the locals raylib's main() uses for
+        // the same purpose live at file scope here).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_pbos: [3]c_uint") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_pbo_initialized: bool") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_frame_idx: u64") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_pixel_buf: []u8") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_allocator: std.mem.Allocator") != null);
+
+        // Per-frame readback wiring — same shape as raylib's loop body
+        // (beginFrameStream + glReadPixels + 2-frame priming gap +
+        // glMapBuffer + publishFrame).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrame(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.isFrameAccepted()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_frame_idx >= 2") != null);
+
+        // Source-order: beginFrameStream must precede publishFrame
+        // (otherwise the first publish would hit an un-offered ring).
+        const begin_idx = std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(").?;
+        const publish_idx = std.mem.indexOf(u8, main_zig, "_p.publishFrame(").?;
+        try std.testing.expect(begin_idx < publish_idx);
+
+        // The readback snippet must land BEFORE `window.endFrame()`
+        // — endFrame calls `sg.endPass()` + `sg.commit()`, and
+        // glReadPixels needs GL_BACK still bound (i.e. before the
+        // swap). The test template places `{{preview_readback}}` right
+        // before `window.endFrame()`, so confirm the order in the
+        // output.
+        const readback_marker = std.mem.indexOf(u8, main_zig, "_SokolPreviewGl.readPixels(0, 0, _sw_i, _sh_i").?;
+        const end_frame_idx = std.mem.indexOf(u8, main_zig, "window.endFrame()").?;
+        try std.testing.expect(readback_marker < end_frame_idx);
+
+        // Cleanup teardown: endFrameStream + glDeleteBuffers + free.
+        // Must run BEFORE the graceful `bye` (LIFO with engine-owned
+        // socket close — same shape as raylib's `defer` ordering).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStream()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewGl.deleteBuffers(3, &_preview_pbos)") != null);
+        const cleanup_endstream = std.mem.indexOf(u8, main_zig, "_p.endFrameStream()").?;
+        const cleanup_bye = std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)").?;
+        try std.testing.expect(cleanup_endstream < cleanup_bye);
+
+        // Init callback stashes the allocator into the module-scope
+        // slot so frame + cleanup can grow / free the CPU staging
+        // buffer without reaching back through `g`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_allocator = allocator;") != null);
+
+        // Generated source must still parse as valid Zig.
         const dup = try std.testing.allocator.dupeZ(u8, main_zig);
         defer std.testing.allocator.free(dup);
         var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
@@ -2988,14 +3111,17 @@ pub const PREVIEW_MODE = struct {
 
     test "non-raylib loop backends still do not pull in IOSurface lifecycle" {
         // Regression-lock: the macOS gating is raylib-desktop-only.
-        // sdl/sokol share the loop-style lifecycle branch but neither
-        // links to OpenGL nor runs the readback path, so neither the
-        // SHM nor the IOSurface preview API should leak into their
-        // generated main. (sokol uses the init-callback path, but
-        // this test runs it through the loop-style template the same
-        // way the existing non-raylib readback test does — what matters
-        // is that the assembler doesn't widen scope.)
-        for ([_]generate.Backend{ .sdl, .sokol }) |backend| {
+        // Pure loop-style sdl currently shares no pixel publish path
+        // with raylib's readback, so neither the SHM nor the IOSurface
+        // preview API should leak in.
+        //
+        // sokol used to be in this list, but slice 1 of #122 added a
+        // sokol-callback pixel publish that legitimately emits
+        // `_p.beginFrameStream(` etc. regardless of which template
+        // is used (the emit is keyed on `cfg.backend == .sokol`).
+        // The sokol path is covered separately by the dedicated sokol
+        // tests above.
+        for ([_]generate.Backend{.sdl}) |backend| {
             const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
                 .name = "test-game",
                 .backend = backend,
@@ -3010,5 +3136,53 @@ pub const PREVIEW_MODE = struct {
             try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStream(") == null);
             try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStreamIOSurface(") == null);
         }
+    }
+
+    test "raylib desktop still emits its own PBO readback after the sokol slice lands" {
+        // Regression lock — the sokol slice extended the emit gating
+        // on the callback branch but the raylib desktop loop branch
+        // is untouched. Re-runs the key raylib assertions to make
+        // sure the slice 1 work didn't accidentally drift the raylib
+        // codepath.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // raylib's externs are at module scope (no struct-namespace
+        // gate), with `_gl_*` underscore-prefix names — sokol uses
+        // its own `_SokolPreviewGl.*` namespace. Asserting both
+        // makes sure neither branch silently rewires through the
+        // other's identifiers.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_read_pixels") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_PIXEL_PACK_BUFFER") != null);
+        // sokol-specific names must NOT leak into raylib output.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_gl_enabled") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewGl") == null);
+    }
+
+    test "non-loop, non-sokol backends do not pull in any preview pixel publish path" {
+        // The slice 1 emit extends the sokol-callback branch — sdl /
+        // bgfx / wgpu run through the loop branch and still get no
+        // pixel publish (their tickets are separate slices). And
+        // wasm-raylib (callback branch but `cfg.backend != .sokol`)
+        // also must stay unchanged. This guards both.
+        const main_zig_sdl = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sdl,
+            .ecs = .mock,
+        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig_sdl);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_sokol_preview_gl_enabled") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_SokolPreviewGl") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "glReadPixels") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.publishFrame(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.beginFrameStream(") == null);
+        // Control-plane wiring stays intact.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.sendHello(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.tickHeartbeat(") != null);
     }
 };
