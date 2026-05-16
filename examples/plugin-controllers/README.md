@@ -85,7 +85,7 @@ only assert at the codegen layer.
 
 The `.null` backend (`backends/null/`) ships pure-Zig no-op stubs for
 every gfx / input / audio / window symbol the engine expects, plus a
-`templates/desktop.txt` that emits a `main()` shaped like:
+`templates/headless.txt` that emits a `main()` shaped like:
 
 ```zig
 pub fn main() !void {

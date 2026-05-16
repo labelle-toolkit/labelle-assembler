@@ -1,0 +1,8 @@
+{
+    // Minimal scene — no entities, no assets. The headless example doesn't
+    // need any world state; the per-frame tick script is what drives the
+    // smoke check. Exists so `g.setScene("main")` has a name to bind to
+    // during the generated setup path.
+    "name": "main",
+    "entities": []
+}

@@ -1,8 +1,15 @@
-// @generated — labelle-assembler null backend
-// No window, no input, no audio, no renderer interaction. The main loop
-// runs for a fixed number of frames (LABELLE_NULL_FRAMES env var, default
-// 5) at a constant 1/60s timestep, then exits cleanly so `defer`-bound
-// teardown (PluginControllers.deinit, GPA leak check) actually runs.
+// @generated — labelle-assembler null backend (headless game runner)
+// No window, no GPU, no input, no audio, no renderer interaction. The
+// main loop runs for a fixed number of frames (LABELLE_NULL_FRAMES env
+// var, default 5) at a constant 1/60s timestep, then exits cleanly so
+// `defer`-bound teardown (PluginControllers.deinit, GPA leak check,
+// preview `bye`) actually runs.
+//
+// Why a frame counter instead of `window.windowShouldClose()`: there is
+// no window. Why no `g.render()`: no draw surface. Why no sleep: tests
+// want determinism; CI wants a bounded wall-clock. The preview control
+// plane (LABELLE_PREVIEW=host:port → hello/heartbeat/bye) still wires
+// up because the engine's editor protocol is GPU-independent.
 const screen_w: u32 = {{width}};
 const screen_h: u32 = {{height}};
 const screen_title = "{{title}}";
@@ -10,6 +17,7 @@ const target_fps: u32 = {{fps}};
 
 const DEFAULT_NULL_FRAMES: u32 = 5;
 
+{{module_vars}}
 /// Read LABELLE_NULL_FRAMES from the environment, falling back to
 /// DEFAULT_NULL_FRAMES when unset, unparseable, or on any allocation
 /// failure. Bounded so a typo (`LABELLE_NULL_FRAMES=infinity`) never
@@ -38,11 +46,11 @@ pub fn main() !void {
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
     g.getCamera().setPosition(0, @as(f32, @floatFromInt(screen_h)));
 
-{{setup_code}}
+{{preview_setup}}{{setup_code}}
     const max_frames = getMaxFrames(allocator);
     const dt: f32 = 1.0 / 60.0;
     var frame: u32 = 0;
     while (frame < max_frames) : (frame += 1) {
-{{tick_code}}        g.tick(dt);
+{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
 {{gui_draw_code}}    }
 }

@@ -101,6 +101,45 @@ const sokol_lifecycle =
     \\
 ;
 
+// Mirror of `backends/null/templates/headless.txt` — the actual null
+// backend's lifecycle template — trimmed to the placeholders the loop
+// path emits. Used by the headless-runner tests below so the assertion
+// surface matches the shape of the generated `main.zig` exactly without
+// pulling in the file from disk.
+const null_lifecycle =
+    \\const screen_w: u32 = {{width}};
+    \\const screen_h: u32 = {{height}};
+    \\const screen_title = "{{title}}";
+    \\const target_fps: u32 = {{fps}};
+    \\
+    \\{{module_vars}}
+    \\fn getMaxFrames(_: std.mem.Allocator) u32 {
+    \\    const raw_c = std.c.getenv("LABELLE_NULL_FRAMES") orelse return 5;
+    \\    const raw = std.mem.span(raw_c);
+    \\    return std.fmt.parseInt(u32, raw, 10) catch 5;
+    \\}
+    \\
+    \\pub fn main() !void {
+    \\    var gpa = std.heap.DebugAllocator(.{}).init;
+    \\    defer _ = gpa.deinit();
+    \\    const allocator = gpa.allocator();
+    \\{{hooks_init_block}}
+    \\    var g = AssembledGame.init(allocator);
+    \\    defer g.deinit();
+    \\    g.setHooks(&hooks);
+    \\    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    \\    g.getCamera().setPosition(0, @as(f32, @floatFromInt(screen_h)));
+    \\{{preview_setup}}{{setup_code}}
+    \\    const max_frames = getMaxFrames(allocator);
+    \\    const dt: f32 = 1.0 / 60.0;
+    \\    var frame: u32 = 0;
+    \\    while (frame < max_frames) : (frame += 1) {
+    \\{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
+    \\{{gui_draw_code}}    }
+    \\}
+    \\
+;
+
 // Mirror of `backends/sokol/templates/desktop.txt` — the actual sokol+wasm
 // template — but trimmed to just the bits that matter for verifying the
 // allocator-shadow fix (labelle-cli#198). Module-scope emits
@@ -766,6 +805,106 @@ pub const MAIN_ZIG = struct {
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn main()") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "MockEcsBackend") != null);
+    }
+};
+
+// ── Null backend (headless game runner, labelle-assembler#129) ───────
+//
+// The .null backend produces a binary that runs the engine's tick loop
+// for a bounded number of frames with no window, no GPU, no input. It
+// shares the loop-based lifecycle path with raylib/sdl/bgfx/wgpu (the
+// `else` branch in `generateMainZigFromTemplate`'s lifecycle block), but
+// uses a frame-counter `while` instead of `windowShouldClose()` and
+// emits no `g.render()` / GPU readback. These tests pin the shape of
+// the generated `main.zig` for the null path so a future
+// refactor that accidentally routes null through the sokol-callback
+// branch (or that strips the LABELLE_PREVIEW control-plane wiring)
+// surfaces here instead of at CI runtime.
+pub const NULL_BACKEND = struct {
+    test "null backend generates headless main with no sokol_app.run" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .null,
+            .ecs = .mock,
+        }, null_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Real `pub fn main()` orchestrates the lifecycle — not a sokol
+        // export-fn triple driven by `sapp_run`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn main()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn init() callconv(.c) void") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "sapp_run") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.run(.{") == null);
+        // Frame-counter loop, not a windowShouldClose loop.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "while (frame < max_frames)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "windowShouldClose") == null);
+    }
+
+    test "null backend wires LABELLE_PREVIEW env-var (control plane works)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .null,
+            .ecs = .mock,
+        }, null_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // LABELLE_PREVIEW handshake: parse env, dial editor, send hello,
+        // tick heartbeats, send bye. The wire is GPU-independent — only
+        // the readback path is GPU-bound — so headless preview is real.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_getenv(\"LABELLE_PREVIEW\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.Preview.connect") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "sendHello") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "tickHeartbeat") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "sendBye") != null);
+    }
+
+    test "null backend does NOT emit PREVIEW_READBACK_* blocks" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .null,
+            .ecs = .mock,
+        }, null_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // No GPU → no GL/D3D11/Metal readback helpers, no publishFrame
+        // path. The raylib desktop branch (and the three sokol slices)
+        // own those; null must stay clear of every one of them.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_pbos") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_read_pixels") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "publishFrame") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "publishFrameIOSurface") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "beginFrameStream") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "endFrameStream") == null);
+    }
+
+    test "raylib + sokol unchanged — null doesn't leak into other backends" {
+        // Regression-lock: the headless main pattern must NOT appear in
+        // raylib's or sokol's generated output, and each backend's
+        // existing rendering wiring stays intact.
+        const raylib_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(raylib_main);
+
+        // Frame-counter loop is null-only; raylib uses windowShouldClose.
+        try std.testing.expect(std.mem.indexOf(u8, raylib_main, "while (frame < max_frames)") == null);
+        try std.testing.expect(std.mem.indexOf(u8, raylib_main, "windowShouldClose") != null);
+        // Rendering path intact.
+        try std.testing.expect(std.mem.indexOf(u8, raylib_main, "g.render()") != null);
+
+        const sokol_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(sokol_main);
+
+        // Sokol uses callback exports, not a frame counter.
+        try std.testing.expect(std.mem.indexOf(u8, sokol_main, "while (frame < max_frames)") == null);
+        try std.testing.expect(std.mem.indexOf(u8, sokol_main, "export fn frame()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sokol_main, "g.render()") != null);
     }
 };
 

@@ -202,6 +202,65 @@ jobs:
           cd .labelle/raylib_desktop
           zig build
 
+      # Null-backend headless example (labelle-assembler#129). Smoke-tests
+      # the .null path end-to-end: generate → build → RUN. The example has
+      # no plugins / GUI / assets — just a single per-frame script logging
+      # `[null] frame=N`. Asserts the binary exits cleanly after the
+      # default `LABELLE_NULL_FRAMES=5` cap (rc=0) and emits exactly the 5
+      # canonical lines. Catches "headless main compiles but doesn't
+      # behave" regressions that the codegen-snapshot tests in tests.zig
+      # can't surface — e.g. a future refactor accidentally routing null
+      # through the sokol-callback branch, or the frame counter going
+      # unbounded.
+      - name: Generate + build + run the null headless example
+        run: |
+          cd labelle-assembler/examples/null
+
+          # Bypass labelle-cli (pinned to an older release that doesn't
+          # know about the `.null` Backend variant added in this PR);
+          # invoke the assembler binary directly, then patch the
+          # placeholder fingerprint the same way labelle-cli's runner
+          # does. Mirrors the plugin-controllers recipe below.
+          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+
+          cd .labelle/null_desktop
+
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # Null backend has no window / display server / GL context,
+          # so the binary either runs to completion (rc=0) or crashes.
+          ./zig-out/bin/game > run.log 2>&1
+
+          # Pin the canonical 5-frame sequence — surfaces a runaway
+          # loop or a missed counter bump immediately. Drop log
+          # timestamps + level prefix; only the tagged frame events
+          # matter.
+          grep -oE '\[null\] frame=[0-9]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          [null] frame=1
+          [null] frame=2
+          [null] frame=3
+          [null] frame=4
+          [null] frame=5
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: null headless example frame sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: null headless example ran 5 frames and exited cleanly"
+
       # End-to-end test for PR #73's plugin-Controller machinery
       # (RFC-plugin-controllers §1–§2). Unlike the build-only examples
       # above, this step also RUNS the binary and asserts the log output
