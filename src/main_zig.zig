@@ -2179,10 +2179,22 @@ const PREVIEW_PRE_RENDER_METAL_SOKOL =
     \\                        _desc.mtl_textures[0] = @ptrCast(_mtl_tex);
     \\                        _desc.mtl_textures[1] = @ptrCast(_mtl_tex);
     \\                        const _img = _sg.makeImage(_desc);
+    \\                        if (_img.id == 0) {
+    \\                            // Pool exhausted — sokol returns a
+    \\                            // zero-id handle. Bail; the rollback
+    \\                            // block below tears down whatever
+    \\                            // we'd already created.
+    \\                            _alloc_ok = false;
+    \\                            break;
+    \\                        }
     \\                        _preview_mtl_sg_images[_slot] = _img;
     \\                        const _view = _sg.makeView(.{
     \\                            .color_attachment = .{ .image = _img },
     \\                        });
+    \\                        if (_view.id == 0) {
+    \\                            _alloc_ok = false;
+    \\                            break;
+    \\                        }
     \\                        _preview_mtl_views[_slot] = _view;
     \\                        var _att: _sg.Attachments = .{};
     \\                        _att.colors[0] = _view;
@@ -2191,8 +2203,14 @@ const PREVIEW_PRE_RENDER_METAL_SOKOL =
     \\                    if (!_alloc_ok) {
     \\                        // Rollback any partially-allocated ring so
     \\                        // the next resize attempt starts clean.
+    \\                        // Includes the just-failed slot — when
+    \\                        // makeImage / makeView returned a zero-id
+    \\                        // handle mid-init, `_preview_mtl_textures
+    \\                        // [_slot]` (and possibly _sg_images[_slot])
+    \\                        // had already been assigned. Loop through
+    \\                        // _slot inclusive to release them too.
     \\                        var _i: u32 = 0;
-    \\                        while (_i < _slot) : (_i += 1) {
+    \\                        while (_i <= _slot and _i < _PreviewMtlRingMax) : (_i += 1) {
     \\                            if (_preview_mtl_views[_i].id != 0) {
     \\                                window.gfx_types.destroyView(_preview_mtl_views[_i]);
     \\                                _preview_mtl_views[_i] = .{};
