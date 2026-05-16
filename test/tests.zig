@@ -2826,4 +2826,120 @@ pub const PREVIEW_MODE = struct {
         defer ast.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
     }
+
+    // PBO async-readback codegen for the raylib desktop loop
+    // (labelle-engine#544). Mirrors `backends/raylib/templates/desktop.txt`
+    // placement: the `{{preview_readback}}` block sits between
+    // `g.renderGizmos()` / GUI draw and `window.endDrawing()`, so the
+    // glReadPixels DMA hits the still-bound back buffer before raylib
+    // swaps. The test uses a stripped-down lifecycle that mirrors the
+    // real shape — full template assertions live in the smoke run
+    // documented in the PR body.
+    const preview_readback_lifecycle =
+        \\const screen_w: u32 = {{width}};
+        \\const screen_h: u32 = {{height}};
+        \\
+        \\{{module_vars}}pub fn main() !void {
+        \\    var gpa = std.heap.DebugAllocator(.{}).init;
+        \\    defer _ = gpa.deinit();
+        \\    const allocator = gpa.allocator();
+        \\    window.initWindow(screen_w, screen_h, "t");
+        \\    defer window.closeWindow();
+        \\    var hooks = GameHooks{};
+        \\    var g = AssembledGame.init(allocator);
+        \\    defer g.deinit();
+        \\    g.setHooks(&hooks);
+        \\{{preview_setup}}{{setup_code}}
+        \\    while (!window.windowShouldClose()) {
+        \\        const dt: f32 = 0.016;
+        \\{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
+        \\        window.beginDrawing();
+        \\        g.render();
+        \\        g.renderGizmos();
+        \\{{gui_draw_code}}{{preview_readback}}        window.endDrawing();
+        \\    }
+        \\}
+        \\
+    ;
+
+    test "raylib desktop emits PBO readback + publishFrame between render and endDrawing" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Module-scope GL externs (raylib's libGL / CGL / WGL link gives
+        // us these for free — `@extern` resolves them at link time).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glReadPixels") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glGenBuffers") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glMapBuffer") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_PIXEL_PACK_BUFFER") != null);
+
+        // Per-frame readback wiring: beginFrameStream on first frame /
+        // resize, glReadPixels into the bound PBO, publishFrame from
+        // the 2-frames-ago PBO via glMapBuffer.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrame(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.isFrameAccepted()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_frame_idx >= 2") != null);
+
+        // beginFrameStream must be gated on dim-change (resize handling)
+        // and must run BEFORE publishFrame in source order — otherwise
+        // the first frame would be published into an unallocated ring.
+        const begin_idx = std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(").?;
+        const publish_idx = std.mem.indexOf(u8, main_zig, "_p.publishFrame(").?;
+        try std.testing.expect(begin_idx < publish_idx);
+
+        // The readback snippet must land in the frame body between the
+        // GUI draw and `window.endDrawing()` — emitting it after the
+        // swap reads from an undefined back buffer (glReadPixels on
+        // GL_BACK is only well-defined before SwapBuffers). The test
+        // template places `{{preview_readback}}` right before
+        // `window.endDrawing()`, so confirm the order in the output.
+        const readback_marker = std.mem.indexOf(u8, main_zig, "_gl_read_pixels(0, 0, _sw_i, _sh_i").?;
+        const end_drawing_idx = std.mem.indexOf(u8, main_zig, "window.endDrawing()").?;
+        try std.testing.expect(readback_marker < end_drawing_idx);
+
+        // endFrameStream runs in a deferred cleanup so SHM teardown
+        // happens before `Game.deinit` (LIFO order — the engine owns
+        // the socket but the ring is the producer's to close).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStream()") != null);
+
+        // Generated source must still parse as valid Zig.
+        const dup = try std.testing.allocator.dupeZ(u8, main_zig);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "non-raylib loop backends do not pull in GL externs or PBO readback" {
+        // sdl is the regression lock: it shares the loop-style lifecycle
+        // branch with raylib but doesn't link OpenGL directly, so
+        // emitting `_gl_read_pixels` etc. there would either fail to
+        // link or compile against the wrong driver. The conditional on
+        // `cfg.backend == .raylib` in `main_zig.zig` is what keeps the
+        // readback block out of sdl/bgfx/wgpu — this asserts that.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sdl,
+            .ecs = .mock,
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_read_pixels") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_gen_buffers") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_PIXEL_PACK_BUFFER") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrame(") == null);
+
+        // Control-plane wiring stays intact for the non-raylib backends
+        // — they still speak the heartbeat / hello / bye protocol over
+        // TCP, just without the SHM pixel stream.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
+    }
 };
