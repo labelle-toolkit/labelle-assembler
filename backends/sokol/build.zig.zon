@@ -5,13 +5,18 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .sokol = .{
-            // Pinned to the labelle-toolkit fork of sokol-zig (branch
-            // `feat/expose-cached-metal-drawable`) which restores the
-            // `sapp_metal_get_current_drawable` accessor needed by the
-            // Metal/IOSurface readback path below. Upstream tracking:
-            // floooh/sokol-zig#154. Bumping requires `zig fetch <url>`.
-            .url = "https://github.com/labelle-toolkit/sokol-zig/archive/refs/heads/feat/expose-cached-metal-drawable.tar.gz",
-            .hash = "sokol-0.1.0-pb1HK0lpNwDe6o44qZwZ9THFraqfm68MKix7xr00z7-U",
+            // Pinned to upstream floooh/sokol-zig. Historically this
+            // pointed at the labelle-toolkit fork of sokol-zig (branch
+            // `feat/expose-cached-metal-drawable`) which restored a
+            // `sapp_metal_get_current_drawable` accessor for an early
+            // Path B Metal/IOSurface readback experiment. We've since
+            // switched to Path A — an offscreen IOSurface-backed render
+            // target — which never reads the post-frame drawable, so
+            // the fork patch is no longer needed. See floooh/sokol#1510
+            // (closed) for the upstream rationale. Bumping requires
+            // `zig fetch --save=sokol <url>`.
+            .url = "https://github.com/floooh/sokol-zig/archive/8b1a651e6b8e76af3063a4094a5935432eb8afe2.tar.gz",
+            .hash = "sokol-0.1.0-pb1HK1lhNwCdIF2-WujvJqi1YoK7Qvgm14Ywmup5C6_q",
         },
         // emsdk is needed at WASM build time so we can plumb the
         // sysroot include path through to `stb_image_impl.c`. The
