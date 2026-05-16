@@ -3688,4 +3688,82 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.sendHello(") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.tickHeartbeat(") != null);
     }
+
+    // ── window.hideWindow on preview connect (labelle-assembler#137) ──
+    //
+    // When LABELLE_PREVIEW is set AND the engine successfully dials the
+    // editor, the standalone sokol-app window is redundant — the
+    // editor's Game View tab samples our IOSurface ring directly and
+    // is the user-facing surface. Closing the standalone window kills
+    // the preview subprocess (sokol-app exits the event loop on
+    // close), so we hide it instead. The hide call must:
+    //   1. Live INSIDE the `if (g.preview) |*_p|` arm — only fire on
+    //      a successful connect, not blind env-var presence, so a
+    //      misconfigured `LABELLE_PREVIEW` (typo, dead listener)
+    //      doesn't leave the user with no visible window AND no
+    //      editor view.
+    //   2. Run AFTER `sendHello` so the editor sees the hello before
+    //      we vanish from the desktop (purely cosmetic ordering, but
+    //      keeps the wire trace readable).
+    //   3. Stay sokol-only — the raylib desktop loop doesn't open a
+    //      separate window-in-window surface; its `LABELLE_PREVIEW`
+    //      block must not reference `window.hideWindow`.
+    test "sokol callback emits window.hideWindow inside preview-connect arm (#137)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, preview_sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // hideWindow is referenced in the generated source.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.hideWindow()") != null);
+
+        // Ordering: sendHello must precede hideWindow (keeps the wire
+        // trace readable — editor sees the hello before we vanish from
+        // the desktop).
+        const hello_idx = std.mem.indexOf(u8, main_zig, "_p.sendHello(\"labelle-engine\", 0)").?;
+        const hide_idx = std.mem.indexOf(u8, main_zig, "window.hideWindow()").?;
+        try std.testing.expect(hello_idx < hide_idx);
+
+        // Ordering: hideWindow must sit INSIDE the `if (g.preview) |*_p|`
+        // arm, so a failed `Preview.connect` (which returns null via
+        // `catch ... break :blk null`) skips the hide. The arm is
+        // opened immediately after the `Preview.connect` call site —
+        // confirm hideWindow lives between that opener and the next
+        // top-level `_preview_getenv` reference (which only appears
+        // again much later, if at all, in unrelated codegen). The
+        // proximity bound is generous (1024 chars) to absorb the
+        // explanatory comment block without coupling the test to the
+        // exact wording.
+        try std.testing.expect(hide_idx - hello_idx < 1024);
+
+        // Generated source must still parse.
+        const dup = try std.testing.allocator.dupeZ(u8, main_zig);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "raylib loop backend does NOT reference window.hideWindow (#137)" {
+        // The hide-window fix is sokol-specific — raylib desktop has
+        // no separate window-in-window surface, and `window.hideWindow`
+        // doesn't exist on the raylib backend's window module. Any
+        // leak of the symbol into a non-sokol template would be a
+        // hard link error.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.hideWindow") == null);
+
+        // Sanity: the LABELLE_PREVIEW control-plane wiring IS present
+        // on the raylib path — only the hide call is sokol-only.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_getenv(\"LABELLE_PREVIEW\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(") != null);
+    }
 };

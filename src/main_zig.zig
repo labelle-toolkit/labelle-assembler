@@ -1198,7 +1198,19 @@ const PREVIEW_INIT_CALLBACK =
     \\                std.debug.print("labelle: preview-mode connect to '{s}' failed: {s}\n", .{ _host_port, @errorName(err) });
     \\                break :blk null;
     \\            };
-    \\            if (g.preview) |*_p| _p.sendHello("labelle-engine", 0) catch {};
+    \\            if (g.preview) |*_p| {
+    \\                _p.sendHello("labelle-engine", 0) catch {};
+    \\                // labelle-assembler#137: now that the editor is on
+    \\                // the wire and will sample our IOSurface ring, hide
+    \\                // the standalone sokol-app window — its Game View
+    \\                // tab is the user-facing surface. Gated on a
+    \\                // successful `connect` (not just env-var presence)
+    \\                // so a misconfigured `LABELLE_PREVIEW` doesn't leave
+    \\                // the user with no visible window AND no editor view.
+    \\                // macOS-only inside `window.hideWindow`; a no-op on
+    \\                // every other platform until follow-up slices land.
+    \\                window.hideWindow();
+    \\            }
     \\        }
     \\    }
     \\
