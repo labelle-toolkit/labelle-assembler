@@ -1643,6 +1643,268 @@ const PREVIEW_READBACK_HELPERS_SOKOL_D3D11 =
     \\
 ;
 
+/// Sokol Metal/IOSurface readback (labelle-assembler#125 slice 2).
+/// Companion to the GL block above — on macOS/iOS the default sokol
+/// backend is Metal, where there is no `glReadPixels` to lean on. We
+/// pull pixels off the swapchain through the Objective-C runtime
+/// (`objc_msgSend`) using the sokol window backend's
+/// `metalDevice` / `metalCurrentDrawable` helpers, blit the
+/// drawable's texture into a managed-storage staging texture, sync +
+/// read the bytes back into a CPU buffer, swizzle BGRA8 → RGBA8 and
+/// hand the result to `Preview.publishFrameIOSurface` (labelle-
+/// engine#547), which swizzles back to BGRA into the IOSurface ring.
+/// The double-swizzle is the price of staying inside the engine's
+/// existing `publishFrameIOSurface(rgba)` contract; a
+/// `publishFrameIOSurfaceBgra` follow-up that takes BGRA directly is
+/// filed in labelle-engine#548 and would eliminate the pre-swizzle.
+///
+/// IMPORTANT: `window.metalCurrentDrawable` is currently a stub that
+/// returns `null` — see the function comment in
+/// `backends/sokol/src/window.zig`. The current sokol-zig replaced
+/// the legacy `sapp_metal_get_current_drawable` accessor (cached
+/// frame drawable) with a struct-returning `sapp_get_swapchain()`
+/// that calls `[CAMetalLayer nextDrawable]` on every call. Calling
+/// it from our readback would acquire a fresh empty drawable
+/// instead of the one sokol just rendered into. The entire blit
+/// chain is gated on this returning non-null, so today the readback
+/// no-ops cleanly on macOS — flipping the stub once the upstream
+/// API gap is resolved (sokol upstream issue: expose
+/// "currently-acquired drawable" cache, or equivalent) is a single-
+/// line change.
+///
+/// All state is module-scope (parallels the GL block) because sokol's
+/// init/frame/cleanup callbacks don't share a stack frame. The
+/// `_preview_allocator` slot is the SAME one the GL block stashes —
+/// the two gates are mutually exclusive (GL = .linux, Metal =
+/// .macos/.ios) so they never race for it.
+///
+/// `objc_msgSend` is variadic in libobjc, but each typed call shape
+/// is wrapped in its own `@extern` with the concrete callconv so we
+/// don't have to wrestle with variadic ABI quirks (arm64 in
+/// particular is fussy). The extern points at the same libobjc
+/// symbol (`objc_msgSend`); the link-time symbol is unique.
+const PREVIEW_READBACK_HELPERS_METAL_SOKOL =
+    \\
+    \\// ── Sokol Metal/IOSurface gating (labelle-assembler#125 slice 2) ──
+    \\// Metal is sokol's default backend on Darwin (macOS + iOS). The
+    \\// readback path runs through libobjc directly — no Metal Zig
+    \\// bindings exist in sokol-zig beyond the device / drawable
+    \\// accessors. Comptime-gating on builtin.os.tag keeps the objc
+    \\// externs out of non-Darwin link lines (libobjc only exists on
+    \\// Apple platforms). The complementary `_sokol_preview_gl_enabled`
+    \\// flag above is mutually exclusive — GL is .linux only on the
+    \\// default sokol build, Metal is .macos/.ios only — so exactly
+    \\// one of the two pixel-publish paths fires at runtime.
+    \\const _sokol_preview_metal_enabled: bool = switch (@import("builtin").os.tag) {
+    \\    .macos, .ios => true,
+    \\    else => false,
+    \\};
+    \\
+    \\// Metal readback state at module scope (sokol's callback model
+    \\// has no shared local scope between init/frame/cleanup). The
+    \\// `_preview_allocator` declared in the GL block above is reused
+    \\// here — the GL / Metal gates are mutually exclusive on every
+    \\// supported target, so the slot is never contested.
+    \\var _preview_mtl_initialized: bool = false;
+    \\var _preview_mtl_command_queue: ?*anyopaque = null;
+    \\var _preview_mtl_staging_texture: ?*anyopaque = null;
+    \\var _preview_mtl_pixel_buf: []u8 = &[_]u8{};
+    \\var _preview_mtl_last_w: u32 = 0;
+    \\var _preview_mtl_last_h: u32 = 0;
+    \\
+    \\// Objective-C runtime bridging. Selectors + msgSend casts live
+    \\// inside a struct-namespace gated on `_sokol_preview_metal_enabled`
+    \\// — the `else struct {}` branch carries no symbols, so a non-
+    \\// Darwin sokol build never references libobjc at link time.
+    \\//
+    \\// MTLPixelFormatBGRA8Unorm = 80 — the default sokol Metal swapchain
+    \\// pixel format. We match it for the staging texture so the blit
+    \\// is a straight per-pixel copy with no format conversion.
+    \\const _SokolPreviewMetal = if (_sokol_preview_metal_enabled) struct {
+    \\    pub const MTLPixelFormatBGRA8Unorm: u64 = 80;
+    \\    pub const MTLStorageModeShared: u64 = 0;
+    \\    pub const MTLStorageModeManaged: u64 = 1;
+    \\    pub const MTLTextureUsageShaderRead: u64 = 0x01;
+    \\    pub const MTLTextureType2D: u64 = 2;
+    \\
+    \\    // Sokol device + drawable accessors live in the sokol window
+    \\    // backend (`window.metalDevice` / `window.metalCurrentDrawable`).
+    \\    // The current sokol-zig (pinned via labelle-sokol) no longer
+    \\    // exports the legacy `sapp_metal_get_device` /
+    \\    // `sapp_metal_get_current_drawable` C symbols — they were
+    \\    // replaced by struct-returning `sapp_get_environment` /
+    \\    // `sapp_get_swapchain` calls whose by-value Apple-ARM64 ABI
+    \\    // is too fussy to extern directly from `@extern` here. The
+    \\    // window-backend wrappers handle the struct return and hand
+    \\    // back the `?*anyopaque` pointer the readback needs.
+    \\
+
+    \\    // libobjc primitives. Each typed `objc_msgSend` variant is a
+    \\    // separate @extern with a concrete signature — the libobjc
+    \\    // symbol is variadic, but every call site has a fixed shape.
+    \\    pub const sel_registerName = @extern(
+    \\        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
+    \\        .{ .name = "sel_registerName" },
+    \\    );
+    \\    pub const objc_getClass = @extern(
+    \\        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
+    \\        .{ .name = "objc_getClass" },
+    \\    );
+    \\
+    \\    // msgSend(obj, sel) -> id
+    \\    pub const msgSend_id = @extern(
+    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) ?*anyopaque,
+    \\        .{ .name = "objc_msgSend" },
+    \\    );
+    \\    // msgSend(obj, sel) -> void
+    \\    pub const msgSend_void = @extern(
+    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) void,
+    \\        .{ .name = "objc_msgSend" },
+    \\    );
+    \\    // msgSend(obj, sel) -> usize (for width/height NSUInteger getters)
+    \\    pub const msgSend_usize = @extern(
+    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) usize,
+    \\        .{ .name = "objc_msgSend" },
+    \\    );
+    \\    // msgSend(obj, sel, ptr) -> id
+    \\    pub const msgSend_id_ptr = @extern(
+    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque, arg: ?*anyopaque) callconv(.c) ?*anyopaque,
+    \\        .{ .name = "objc_msgSend" },
+    \\    );
+    \\
+    \\    // [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:width:height:mipmapped:]
+    \\    pub const msgSend_texdesc = @extern(
+    \\        *const fn (cls: ?*anyopaque, sel: ?*anyopaque, fmt: u64, w: usize, h: usize, mip: u8) callconv(.c) ?*anyopaque,
+    \\        .{ .name = "objc_msgSend" },
+    \\    );
+    \\    // [texdesc setStorageMode:] / [texdesc setUsage:] — single-arg setters
+    \\    pub const msgSend_set_u64 = @extern(
+    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque, v: u64) callconv(.c) void,
+    \\        .{ .name = "objc_msgSend" },
+    \\    );
+    \\
+    \\    // [encoder copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:
+    \\    //                toTexture:destinationSlice:destinationLevel:destinationOrigin:]
+    \\    // MTLOrigin / MTLSize are 3 x NSUInteger structs (24 bytes on 64-bit).
+    \\    // Pass them by value — the Apple ABI documents struct-by-value
+    \\    // for objc_msgSend at this size.
+    \\    pub const MTLOrigin = extern struct { x: usize, y: usize, z: usize };
+    \\    pub const MTLSize = extern struct { width: usize, height: usize, depth: usize };
+    \\    pub const MTLRegion = extern struct { origin: MTLOrigin, size: MTLSize };
+    \\    pub const msgSend_copy_tex = @extern(
+    \\        *const fn (
+    \\            obj: ?*anyopaque,
+    \\            sel: ?*anyopaque,
+    \\            src: ?*anyopaque,
+    \\            src_slice: usize,
+    \\            src_level: usize,
+    \\            src_origin: MTLOrigin,
+    \\            src_size: MTLSize,
+    \\            dst: ?*anyopaque,
+    \\            dst_slice: usize,
+    \\            dst_level: usize,
+    \\            dst_origin: MTLOrigin,
+    \\        ) callconv(.c) void,
+    \\        .{ .name = "objc_msgSend" },
+    \\    );
+    \\    // [encoder synchronizeResource:] — managed-storage host sync
+    \\    pub const msgSend_sync = @extern(
+    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque, res: ?*anyopaque) callconv(.c) void,
+    \\        .{ .name = "objc_msgSend" },
+    \\    );
+    \\    // [texture getBytes:bytesPerRow:fromRegion:mipmapLevel:]
+    \\    pub const msgSend_get_bytes = @extern(
+    \\        *const fn (
+    \\            obj: ?*anyopaque,
+    \\            sel: ?*anyopaque,
+    \\            bytes: [*]u8,
+    \\            bytes_per_row: usize,
+    \\            region: MTLRegion,
+    \\            level: usize,
+    \\        ) callconv(.c) void,
+    \\        .{ .name = "objc_msgSend" },
+    \\    );
+    \\
+    \\    // Selector cache — looked up lazily on first frame so the
+    \\    // selector pointers stay valid for the lifetime of the
+    \\    // process. NSSelector lookups are fast but not free; caching
+    \\    // them keeps the per-frame overhead in the per-pixel copy
+    \\    // loop rather than the selector machinery.
+    \\    pub var sel_newCommandQueue: ?*anyopaque = null;
+    \\    pub var sel_commandBuffer: ?*anyopaque = null;
+    \\    pub var sel_blitCommandEncoder: ?*anyopaque = null;
+    \\    pub var sel_endEncoding: ?*anyopaque = null;
+    \\    pub var sel_commit: ?*anyopaque = null;
+    \\    pub var sel_waitUntilCompleted: ?*anyopaque = null;
+    \\    pub var sel_texture: ?*anyopaque = null;
+    \\    pub var sel_width: ?*anyopaque = null;
+    \\    pub var sel_height: ?*anyopaque = null;
+    \\    pub var sel_copyFromTexture: ?*anyopaque = null;
+    \\    pub var sel_synchronizeResource: ?*anyopaque = null;
+    \\    pub var sel_getBytes: ?*anyopaque = null;
+    \\    pub var sel_newTexture: ?*anyopaque = null;
+    \\    pub var sel_setStorageMode: ?*anyopaque = null;
+    \\    pub var sel_setUsage: ?*anyopaque = null;
+    \\    pub var sel_release: ?*anyopaque = null;
+    \\    pub var sel_texDesc: ?*anyopaque = null;
+    \\    pub var cls_MTLTextureDescriptor: ?*anyopaque = null;
+    \\
+    \\    pub fn loadSelectors() void {
+    \\        if (sel_commit != null) return;
+    \\        sel_newCommandQueue = sel_registerName("newCommandQueue");
+    \\        sel_commandBuffer = sel_registerName("commandBuffer");
+    \\        sel_blitCommandEncoder = sel_registerName("blitCommandEncoder");
+    \\        sel_endEncoding = sel_registerName("endEncoding");
+    \\        sel_commit = sel_registerName("commit");
+    \\        sel_waitUntilCompleted = sel_registerName("waitUntilCompleted");
+    \\        sel_texture = sel_registerName("texture");
+    \\        sel_width = sel_registerName("width");
+    \\        sel_height = sel_registerName("height");
+    \\        sel_copyFromTexture = sel_registerName(
+    \\            "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+    \\        );
+    \\        sel_synchronizeResource = sel_registerName("synchronizeResource:");
+    \\        sel_getBytes = sel_registerName("getBytes:bytesPerRow:fromRegion:mipmapLevel:");
+    \\        sel_newTexture = sel_registerName("newTextureWithDescriptor:");
+    \\        sel_setStorageMode = sel_registerName("setStorageMode:");
+    \\        sel_setUsage = sel_registerName("setUsage:");
+    \\        sel_release = sel_registerName("release");
+    \\        sel_texDesc = sel_registerName(
+    \\            "texture2DDescriptorWithPixelFormat:width:height:mipmapped:",
+    \\        );
+    \\        cls_MTLTextureDescriptor = objc_getClass("MTLTextureDescriptor");
+    \\    }
+    \\
+    \\    pub fn createStagingTexture(device: ?*anyopaque, w: u32, h: u32) ?*anyopaque {
+    \\        const cls = cls_MTLTextureDescriptor orelse return null;
+    \\        const desc = msgSend_texdesc(
+    \\            cls,
+    \\            sel_texDesc,
+    \\            MTLPixelFormatBGRA8Unorm,
+    \\            @intCast(w),
+    \\            @intCast(h),
+    \\            0,
+    \\        ) orelse return null;
+    \\        // Managed storage on macOS so we can `synchronizeResource:` +
+    \\        // `getBytes:` back to CPU. iOS uses shared storage (no
+    \\        // managed mode on iOS GPUs); both surface as
+    \\        // CPU-readable.
+    \\        const storage_mode: u64 = if (@import("builtin").os.tag == .ios)
+    \\            MTLStorageModeShared
+    \\        else
+    \\            MTLStorageModeManaged;
+    \\        msgSend_set_u64(desc, sel_setStorageMode, storage_mode);
+    \\        msgSend_set_u64(desc, sel_setUsage, MTLTextureUsageShaderRead);
+    \\        return msgSend_id_ptr(device, sel_newTexture, desc);
+    \\    }
+    \\
+    \\    pub fn release(obj: ?*anyopaque) void {
+    \\        if (obj) |o| msgSend_void(o, sel_release);
+    \\    }
+    \\} else struct {};
+    \\
+;
+
 /// Init-callback addendum for the D3D11 staging-texture ring. Stashes
 /// the allocator into the shared module-scope slot (`_preview_allocator`)
 /// so the frame + cleanup callbacks can grow / free the CPU staging
@@ -1651,6 +1913,20 @@ const PREVIEW_READBACK_HELPERS_SOKOL_D3D11 =
 /// one ever runs.
 const PREVIEW_READBACK_INIT_SOKOL_D3D11 =
     \\    if (comptime _sokol_preview_d3d11_enabled) {
+    \\        _preview_allocator = allocator;
+    \\    }
+    \\
+;
+
+/// Init-callback addendum for the Metal readback. Mirrors the GL
+/// variant — the `_preview_allocator` slot is declared by the GL
+/// block above and shared between paths (mutually exclusive at
+/// runtime, so no contention). Selector cache is lazy-loaded on
+/// first frame instead of here to keep the init callback's failure
+/// surface narrow (sokol's init runs before the Metal device exists
+/// in some sokol-app configs).
+const PREVIEW_READBACK_INIT_METAL_SOKOL =
+    \\    if (comptime _sokol_preview_metal_enabled) {
     \\        _preview_allocator = allocator;
     \\    }
     \\
@@ -1821,6 +2097,147 @@ const PREVIEW_READBACK_FRAME_SOKOL_D3D11 =
     \\
 ;
 
+/// Per-frame Metal readback for sokol's `frame` callback. Comptime-
+/// gated on `_sokol_preview_metal_enabled` — the entire block
+/// evaporates on Linux (GLCORE/GLES3) and Windows (D3D11) builds.
+///
+/// Placement: this block emits AFTER `window.endFrame()` (which
+/// calls `sg.endPass(); sg.commit()`). The GL block can read BEFORE
+/// `endFrame` because `glReadPixels` triggers a synchronous flush;
+/// Metal has no such side effect — our blit lives in its own
+/// command buffer, and Metal's automatic hazard tracking only
+/// guarantees ordering once sokol's command buffer has been
+/// committed. Reading before `sg.commit()` would deadlock our
+/// `waitUntilCompleted:` against an uncommitted dependency.
+///
+/// Algorithm:
+///   1. Lazy-init: load selectors, create a command queue, allocate
+///      the BGRA8 staging MTLTexture + RGBA8 CPU buffer sized for
+///      the current framebuffer dimensions.
+///   2. Get `drawable.texture` (the swapchain backbuffer).
+///   3. Encode a blit `copyFromTexture:...:toTexture:...` into the
+///      staging texture, `synchronizeResource:` (macOS only —
+///      no-op on iOS shared storage), `endEncoding`, `commit`,
+///      `waitUntilCompleted`.
+///   4. `getBytes:bytesPerRow:fromRegion:mipmapLevel:` into a
+///      contiguous BGRA8 CPU buffer.
+///   5. Swizzle BGRA8 → RGBA8 into `_preview_mtl_pixel_buf`.
+///   6. `Preview.publishFrameIOSurface(_preview_mtl_pixel_buf)` —
+///      engine swizzles back to BGRA into the IOSurface ring.
+///
+/// The double-swizzle (BGRA→RGBA producer, RGBA→BGRA engine) is the
+/// price of staying inside the engine's existing
+/// `publishFrameIOSurface(rgba)` API contract. A
+/// `publishFrameIOSurfaceBgra` follow-up is filed in labelle-
+/// engine#548; eliminating the producer-side swizzle would shave
+/// ~4 ns/pixel from the readback hot path.
+const PREVIEW_READBACK_FRAME_METAL_SOKOL =
+    \\        if (comptime _sokol_preview_metal_enabled) {
+    \\            if (g.preview) |*_p| _mtl_readback: {
+    \\                const _sw_i = window.width();
+    \\                const _sh_i = window.height();
+    \\                if (_sw_i <= 0 or _sh_i <= 0) break :_mtl_readback;
+    \\                const _sw: u32 = @intCast(_sw_i);
+    \\                const _sh: u32 = @intCast(_sh_i);
+    \\                const _needed_bytes: usize = @as(usize, _sw) * @as(usize, _sh) * 4;
+    \\
+    \\                _SokolPreviewMetal.loadSelectors();
+    \\                const _device = @as(?*anyopaque, @constCast(window.metalDevice())) orelse break :_mtl_readback;
+    \\
+    \\                // (Re)negotiate IOSurface ring + staging resources on
+    \\                // first frame OR a window resize. Idempotent on the
+    \\                // engine side — `beginFrameStreamIOSurface` tears
+    \\                // down the old ring before re-offering.
+    \\                if (_sw != _preview_mtl_last_w or _sh != _preview_mtl_last_h) {
+    \\                    _p.beginFrameStreamIOSurface(_sw, _sh) catch break :_mtl_readback;
+    \\                    if (_preview_mtl_command_queue == null) {
+    \\                        _preview_mtl_command_queue = _SokolPreviewMetal.msgSend_id(_device, _SokolPreviewMetal.sel_newCommandQueue);
+    \\                    }
+    \\                    if (_preview_mtl_staging_texture) |old| {
+    \\                        _SokolPreviewMetal.release(old);
+    \\                        _preview_mtl_staging_texture = null;
+    \\                    }
+    \\                    _preview_mtl_staging_texture = _SokolPreviewMetal.createStagingTexture(_device, _sw, _sh);
+    \\                    if (_preview_mtl_pixel_buf.len != _needed_bytes) {
+    \\                        if (_preview_mtl_pixel_buf.len != 0) _preview_allocator.free(_preview_mtl_pixel_buf);
+    \\                        _preview_mtl_pixel_buf = _preview_allocator.alloc(u8, _needed_bytes) catch &[_]u8{};
+    \\                    }
+    \\                    // Only commit the new dims once every resource
+    \\                    // landed — a transient alloc / texture-creation
+    \\                    // failure must NOT poison the resize gate, else
+    \\                    // we'd loop forever in the "skip readback" arm
+    \\                    // below with last_w/h matching the screen.
+    \\                    if (_preview_mtl_command_queue != null and
+    \\                        _preview_mtl_staging_texture != null and
+    \\                        _preview_mtl_pixel_buf.len == _needed_bytes)
+    \\                    {
+    \\                        _preview_mtl_last_w = _sw;
+    \\                        _preview_mtl_last_h = _sh;
+    \\                        _preview_mtl_initialized = true;
+    \\                    }
+    \\                }
+    \\
+    \\                if (!_preview_mtl_initialized) break :_mtl_readback;
+    \\                if (!_p.isFrameAccepted() or _preview_mtl_pixel_buf.len != _needed_bytes) break :_mtl_readback;
+    \\
+    \\                const _drawable = @as(?*anyopaque, @constCast(window.metalCurrentDrawable())) orelse break :_mtl_readback;
+    \\                const _src_tex = _SokolPreviewMetal.msgSend_id(_drawable, _SokolPreviewMetal.sel_texture) orelse break :_mtl_readback;
+    \\                const _dst_tex = _preview_mtl_staging_texture orelse break :_mtl_readback;
+    \\                const _queue = _preview_mtl_command_queue orelse break :_mtl_readback;
+    \\
+    \\                const _cb = _SokolPreviewMetal.msgSend_id(_queue, _SokolPreviewMetal.sel_commandBuffer) orelse break :_mtl_readback;
+    \\                const _encoder = _SokolPreviewMetal.msgSend_id(_cb, _SokolPreviewMetal.sel_blitCommandEncoder) orelse break :_mtl_readback;
+    \\
+    \\                const _origin: _SokolPreviewMetal.MTLOrigin = .{ .x = 0, .y = 0, .z = 0 };
+    \\                const _size: _SokolPreviewMetal.MTLSize = .{ .width = _sw, .height = _sh, .depth = 1 };
+    \\                _SokolPreviewMetal.msgSend_copy_tex(
+    \\                    _encoder,
+    \\                    _SokolPreviewMetal.sel_copyFromTexture,
+    \\                    _src_tex, 0, 0, _origin, _size,
+    \\                    _dst_tex, 0, 0, _origin,
+    \\                );
+    \\                if (comptime @import("builtin").os.tag == .macos) {
+    \\                    _SokolPreviewMetal.msgSend_sync(_encoder, _SokolPreviewMetal.sel_synchronizeResource, _dst_tex);
+    \\                }
+    \\                _SokolPreviewMetal.msgSend_void(_encoder, _SokolPreviewMetal.sel_endEncoding);
+    \\                _SokolPreviewMetal.msgSend_void(_cb, _SokolPreviewMetal.sel_commit);
+    \\                _SokolPreviewMetal.msgSend_void(_cb, _SokolPreviewMetal.sel_waitUntilCompleted);
+    \\
+    \\                // getBytes into the BGRA8 CPU buffer (reusing the
+    \\                // RGBA destination slot — we overwrite in-place
+    \\                // during the swizzle). bytes_per_row is exactly
+    \\                // width*4 here because we own the staging texture
+    \\                // dims and Metal stages a contiguous BGRA8 layout
+    \\                // for getBytes regardless of any internal tiling.
+    \\                const _region: _SokolPreviewMetal.MTLRegion = .{ .origin = _origin, .size = _size };
+    \\                const _row_bytes: usize = @as(usize, _sw) * 4;
+    \\                _SokolPreviewMetal.msgSend_get_bytes(
+    \\                    _dst_tex,
+    \\                    _SokolPreviewMetal.sel_getBytes,
+    \\                    _preview_mtl_pixel_buf.ptr,
+    \\                    _row_bytes,
+    \\                    _region,
+    \\                    0,
+    \\                );
+    \\
+    \\                // BGRA8 → RGBA8 in-place swizzle. The engine's
+    \\                // `publishFrameIOSurface` expects RGBA8 and will
+    \\                // swizzle back to BGRA8 during the IOSurface copy.
+    \\                // See the header comment for the open question on
+    \\                // a BGRA-direct publish API.
+    \\                var _i: usize = 0;
+    \\                while (_i + 3 < _preview_mtl_pixel_buf.len) : (_i += 4) {
+    \\                    const _b = _preview_mtl_pixel_buf[_i];
+    \\                    _preview_mtl_pixel_buf[_i] = _preview_mtl_pixel_buf[_i + 2];
+    \\                    _preview_mtl_pixel_buf[_i + 2] = _b;
+    \\                }
+    \\
+    \\                _p.publishFrameIOSurface(_preview_mtl_pixel_buf) catch {};
+    \\            }
+    \\        }
+    \\
+;
+
 /// Cleanup-callback teardown for the sokol D3D11 staging-texture ring.
 /// Runs BEFORE `PREVIEW_CLEANUP_CALLBACK` (which sends the graceful
 /// `bye`), matching the GL block's LIFO ordering. Gated on
@@ -1843,6 +2260,29 @@ const PREVIEW_READBACK_CLEANUP_SOKOL_D3D11 =
     \\            _preview_d3d11_initialized = false;
     \\        }
     \\        if (_preview_pixel_buf.len != 0) _preview_allocator.free(_preview_pixel_buf);
+    \\    }
+    \\
+;
+
+/// Cleanup-callback teardown for the Metal readback ring. Runs
+/// BEFORE `PREVIEW_CLEANUP_CALLBACK` (the graceful `bye`) so the
+/// engine still has its socket open when the IOSurface producer
+/// tears down — matches the GL + raylib LIFO ordering.
+const PREVIEW_READBACK_CLEANUP_METAL_SOKOL =
+    \\    if (comptime _sokol_preview_metal_enabled) {
+    \\        if (g.preview) |*_p| _p.endFrameStreamIOSurface();
+    \\        if (_preview_mtl_staging_texture) |t| {
+    \\            _SokolPreviewMetal.release(t);
+    \\            _preview_mtl_staging_texture = null;
+    \\        }
+    \\        if (_preview_mtl_command_queue) |q| {
+    \\            _SokolPreviewMetal.release(q);
+    \\            _preview_mtl_command_queue = null;
+    \\        }
+    \\        if (_preview_mtl_pixel_buf.len != 0) {
+    \\            _preview_allocator.free(_preview_mtl_pixel_buf);
+    \\            _preview_mtl_pixel_buf = &[_]u8{};
+    \\        }
     \\    }
     \\
 ;
@@ -2702,21 +3142,31 @@ pub fn generateMainZigFromTemplate(
 
         if (use_callback_lifecycle) {
             const sokol_runner: []const u8 = if (cfg.backend == .sokol) "var runner: Runner = undefined;\n" else "";
-            // Sokol-backend builds get BOTH readback helper blocks emitted:
-            //   - GL PBO ring (labelle-assembler#122 slice 1, #124) — fires on
-            //     Linux/Android via `_sokol_preview_gl_enabled`.
-            //   - D3D11 staging-texture ring (labelle-assembler#126, slice 2 of
-            //     #122) — fires on Windows via `_sokol_preview_d3d11_enabled`.
-            // The two gates are mutually exclusive (`.linux` vs `.windows`),
-            // so only one block's runtime code path is reachable per target.
-            // The `else struct {}` branches in each helper namespace keep
-            // unresolved-symbol references off the link line on the inactive
-            // target. Emit-unconditional for `cfg.backend == .sokol` keeps the
-            // generated source uniform across desktop / mobile templates;
-            // wasm routes through the raylib branch below and stays out of
-            // both readback paths for now.
+            // Sokol-backend builds get ALL THREE readback helper blocks
+            // emitted side-by-side:
+            //   - GL PBO ring (labelle-assembler#122 slice 1, #124) —
+            //     fires on Linux/Android via `_sokol_preview_gl_enabled`.
+            //   - D3D11 staging-texture ring (labelle-assembler#126,
+            //     slice 2 of #122) — fires on Windows via
+            //     `_sokol_preview_d3d11_enabled`.
+            //   - Metal/IOSurface ring (labelle-assembler#125, slice 3
+            //     of #122) — fires on macOS/iOS via
+            //     `_sokol_preview_metal_enabled`.
+            // The three gates are mutually exclusive (Linux vs Windows
+            // vs Darwin), so only one block's runtime code path is
+            // reachable per target. The `else struct {}` branches in
+            // each helper namespace keep unresolved-symbol references
+            // off the link line on the inactive targets.
+            // Emit-unconditional for `cfg.backend == .sokol` keeps the
+            // generated source uniform across desktop / mobile
+            // templates; wasm routes through the raylib branch below
+            // and stays out of all three readback paths for now.
             const sokol_readback_helpers: []const u8 = if (cfg.backend == .sokol)
-                try std.mem.concat(allocator, u8, &.{ PREVIEW_READBACK_HELPERS_SOKOL, PREVIEW_READBACK_HELPERS_SOKOL_D3D11 })
+                try std.mem.concat(allocator, u8, &.{
+                    PREVIEW_READBACK_HELPERS_SOKOL,
+                    PREVIEW_READBACK_HELPERS_SOKOL_D3D11,
+                    PREVIEW_READBACK_HELPERS_METAL_SOKOL,
+                })
             else
                 "";
             defer if (cfg.backend == .sokol) allocator.free(sokol_readback_helpers);
@@ -2771,25 +3221,44 @@ pub fn generateMainZigFromTemplate(
                 else
                     "";
 
-                // Readback hookups (labelle-assembler#122). Each lifecycle
-                // slot gets BOTH the GL block (slice 1, #124) and the D3D11
-                // block (slice 2, #126) concatenated:
-                //   - init   : stash the allocator into the module-scope slot
-                //              (idempotent across the two gates — one branch
-                //              fires per target)
-                //   - frame  : both readback bodies, each comptime-gated; the
-                //              inactive one elides entirely so the active
-                //              backend's code path runs straight through.
-                //   - cleanup: endFrameStream + ring teardown for both, then
-                //              the graceful `bye`. Buffer free guarded so the
-                //              inactive block is a no-op.
-                // The Metal slot (#125) will plug into the same concat shape
-                // when slice 3 lands.
-                const preview_setup_sokol = try std.mem.concat(allocator, u8, &.{ PREVIEW_INIT_CALLBACK, PREVIEW_READBACK_INIT_SOKOL, PREVIEW_READBACK_INIT_SOKOL_D3D11 });
+                // Readback hookups (labelle-assembler#122). Each
+                // lifecycle slot gets ALL THREE backend variants
+                // concatenated (GL slice 1 #124, D3D11 slice 2 #126,
+                // Metal slice 3 #125):
+                //   - init   : stash the allocator into the module-scope
+                //              slot (idempotent across the three gates —
+                //              exactly one branch fires per target)
+                //   - frame  : pre-endFrame slot carries GL + D3D11
+                //              (both rely on a flush-on-read primitive
+                //              that's safe before `sg.commit()`); the
+                //              Metal block runs in the post-endFrame
+                //              slot because Metal needs `sg.commit()`
+                //              to land the swapchain texture before our
+                //              own command buffer can read it.
+                //   - cleanup: endFrameStream + ring teardown for each,
+                //              then the graceful `bye`. Buffer free
+                //              guarded so the inactive blocks are
+                //              no-ops.
+                // The three paths evaporate on the non-matching OS via
+                // their `_sokol_preview_{gl,d3d11,metal}_enabled` flags.
+                const preview_setup_sokol = try std.mem.concat(allocator, u8, &.{
+                    PREVIEW_INIT_CALLBACK,
+                    PREVIEW_READBACK_INIT_SOKOL,
+                    PREVIEW_READBACK_INIT_SOKOL_D3D11,
+                    PREVIEW_READBACK_INIT_METAL_SOKOL,
+                });
                 defer allocator.free(preview_setup_sokol);
-                const preview_readback_sokol = try std.mem.concat(allocator, u8, &.{ PREVIEW_READBACK_FRAME_SOKOL, PREVIEW_READBACK_FRAME_SOKOL_D3D11 });
+                const preview_readback_sokol = try std.mem.concat(allocator, u8, &.{
+                    PREVIEW_READBACK_FRAME_SOKOL,
+                    PREVIEW_READBACK_FRAME_SOKOL_D3D11,
+                });
                 defer allocator.free(preview_readback_sokol);
-                const preview_cleanup_sokol = try std.mem.concat(allocator, u8, &.{ PREVIEW_READBACK_CLEANUP_SOKOL, PREVIEW_READBACK_CLEANUP_SOKOL_D3D11, PREVIEW_CLEANUP_CALLBACK });
+                const preview_cleanup_sokol = try std.mem.concat(allocator, u8, &.{
+                    PREVIEW_READBACK_CLEANUP_SOKOL,
+                    PREVIEW_READBACK_CLEANUP_SOKOL_D3D11,
+                    PREVIEW_READBACK_CLEANUP_METAL_SOKOL,
+                    PREVIEW_CLEANUP_CALLBACK,
+                });
                 defer allocator.free(preview_cleanup_sokol);
 
                 try tpl.render(lifecycle_tmpl, .{
@@ -2822,6 +3291,10 @@ pub fn generateMainZigFromTemplate(
                     .preview_setup = preview_setup_sokol,
                     .preview_heartbeat = PREVIEW_HEARTBEAT_CALLBACK,
                     .preview_readback = preview_readback_sokol,
+                    // Metal readback fires AFTER `window.endFrame()`
+                    // — see PREVIEW_READBACK_FRAME_METAL_SOKOL header
+                    // for the post-commit timing rationale.
+                    .preview_readback_post = PREVIEW_READBACK_FRAME_METAL_SOKOL,
                     .preview_cleanup = preview_cleanup_sokol,
                 }, bw);
             } else {

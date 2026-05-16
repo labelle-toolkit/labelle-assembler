@@ -61,7 +61,7 @@ export fn frame() callconv(.c) void {
     // overdraw bug this ordering fixes.
     window.flushScene();
 {{gui_draw_code}}{{preview_readback}}    window.endFrame();
-    // Clear edge-triggered key/button/touch state AFTER scripts had a chance
+{{preview_readback_post}}    // Clear edge-triggered key/button/touch state AFTER scripts had a chance
     // to read it. See the matching comment in desktop.txt — same invariant.
     @import("backend_input").newFrame();
 }
