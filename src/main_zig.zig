@@ -1288,7 +1288,11 @@ const PREVIEW_READBACK_HELPERS_SOKOL =
     \\const _SokolPreviewGl = if (_sokol_preview_gl_enabled) struct {
     \\    pub const PIXEL_PACK_BUFFER: c_uint = 0x88EB;
     \\    pub const STREAM_READ: c_uint = 0x88E1;
-    \\    pub const READ_ONLY: c_uint = 0x88B8;
+    \\    // GL_MAP_READ_BIT — bit-flag for glMapBufferRange's access.
+    \\    // Core in GL 3.0+ AND GLES 3.0+; glMapBuffer is desktop-only
+    \\    // and ships on GLES only as `GL_OES_mapbuffer`, so the range
+    \\    // variant is the portable choice for Android GLES3 builds.
+    \\    pub const MAP_READ_BIT: c_uint = 0x0001;
     \\    pub const PACK_ALIGNMENT: c_uint = 0x0D05;
     \\    pub const RGBA: c_uint = 0x1908;
     \\    pub const UNSIGNED_BYTE: c_uint = 0x1401;
@@ -1316,9 +1320,9 @@ const PREVIEW_READBACK_HELPERS_SOKOL =
     \\        *const fn (x: c_int, y: c_int, w: c_int, h: c_int, fmt: c_uint, ty: c_uint, data: ?*anyopaque) callconv(.c) void,
     \\        .{ .name = "glReadPixels" },
     \\    );
-    \\    pub const mapBuffer = @extern(
-    \\        *const fn (target: c_uint, access: c_uint) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "glMapBuffer" },
+    \\    pub const mapBufferRange = @extern(
+    \\        *const fn (target: c_uint, offset: isize, length: isize, access: c_uint) callconv(.c) ?*anyopaque,
+    \\        .{ .name = "glMapBufferRange" },
     \\    );
     \\    pub const unmapBuffer = @extern(
     \\        *const fn (target: c_uint) callconv(.c) u8,
@@ -1387,9 +1391,17 @@ const PREVIEW_READBACK_FRAME_SOKOL =
     \\                        if (_preview_pixel_buf.len != 0) _preview_allocator.free(_preview_pixel_buf);
     \\                        _preview_pixel_buf = _preview_allocator.alloc(u8, _needed_bytes) catch &[_]u8{};
     \\                    }
-    \\                    _preview_last_w = _sw;
-    \\                    _preview_last_h = _sh;
-    \\                    _preview_frame_idx = 0;
+    \\                    // Only commit the new dims once the CPU buffer
+    \\                    // is the right size — otherwise a transient
+    \\                    // alloc failure would leave us with `last_w/h`
+    \\                    // matching the screen, skipping the resize block
+    \\                    // on every subsequent frame and stranding the
+    \\                    // readback in a permanent break state.
+    \\                    if (_preview_pixel_buf.len == _needed_bytes) {
+    \\                        _preview_last_w = _sw;
+    \\                        _preview_last_h = _sh;
+    \\                        _preview_frame_idx = 0;
+    \\                    }
     \\                }
     \\
     \\                if (!_p.isFrameAccepted() or _preview_pixel_buf.len != _needed_bytes) break :_readback;
@@ -1401,7 +1413,12 @@ const PREVIEW_READBACK_FRAME_SOKOL =
     \\                if (_preview_frame_idx >= 2) {
     \\                    const _read_idx: usize = @intCast((_preview_frame_idx - 2) % 3);
     \\                    _SokolPreviewGl.bindBuffer(_SokolPreviewGl.PIXEL_PACK_BUFFER, _preview_pbos[_read_idx]);
-    \\                    const _mapped = _SokolPreviewGl.mapBuffer(_SokolPreviewGl.PIXEL_PACK_BUFFER, _SokolPreviewGl.READ_ONLY);
+    \\                    const _mapped = _SokolPreviewGl.mapBufferRange(
+    \\                        _SokolPreviewGl.PIXEL_PACK_BUFFER,
+    \\                        0,
+    \\                        @intCast(_preview_pbo_bytes),
+    \\                        _SokolPreviewGl.MAP_READ_BIT,
+    \\                    );
     \\                    if (_mapped) |_src| {
     \\                        const _src_ptr: [*]const u8 = @ptrCast(_src);
     \\                        const _row_bytes: usize = @as(usize, _sw) * 4;
@@ -1411,8 +1428,16 @@ const PREVIEW_READBACK_FRAME_SOKOL =
     \\                            const _dst_row = _preview_pixel_buf.ptr + (@as(usize, _y) * _row_bytes);
     \\                            @memcpy(_dst_row[0.._row_bytes], _src_row[0.._row_bytes]);
     \\                        }
-    \\                        _ = _SokolPreviewGl.unmapBuffer(_SokolPreviewGl.PIXEL_PACK_BUFFER);
-    \\                        _p.publishFrame(_preview_pixel_buf) catch {};
+    \\                        // glUnmapBuffer returns GL_FALSE (0) if the
+    \\                        // buffer contents became corrupt during the
+    \\                        // map (e.g. context loss, screen-resolution
+    \\                        // change racing with the readback). In that
+    \\                        // case our memcpy above read garbage —
+    \\                        // skip publishFrame so the editor doesn't
+    \\                        // display a torn frame.
+    \\                        if (_SokolPreviewGl.unmapBuffer(_SokolPreviewGl.PIXEL_PACK_BUFFER) != 0) {
+    \\                            _p.publishFrame(_preview_pixel_buf) catch {};
+    \\                        }
     \\                    }
     \\                }
     \\                _SokolPreviewGl.bindBuffer(_SokolPreviewGl.PIXEL_PACK_BUFFER, 0);
