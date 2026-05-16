@@ -988,6 +988,13 @@ const PREVIEW_LOOP_SETUP =
 /// `endFrameStream` would be a no-op but the symbol `_gl_delete_buffers`
 /// in the same defer block isn't available to them — splitting keeps
 /// the non-raylib loop backends compiling unchanged.
+///
+/// macOS path (labelle-assembler#121, labelle-engine#547): when the
+/// generated game is built for macOS, the engine exposes a zero-copy
+/// IOSurface variant of the same lifecycle triple
+/// (`beginFrameStreamIOSurface` / `publishFrameIOSurface` /
+/// `endFrameStreamIOSurface`). The teardown defer here picks the
+/// matching `end*` at comptime so the right side is closed.
 const PREVIEW_READBACK_SETUP =
     \\    // PBO ring + CPU-side pixel buffer for the per-frame async readback
     \\    // (labelle-engine#544). `_preview_pbos` ids are lazily generated
@@ -995,6 +1002,10 @@ const PREVIEW_READBACK_SETUP =
     \\    // per-PBO allocation size so a resize can re-issue `glBufferData`
     \\    // without reallocating the IDs. The CPU buffer is the staging
     \\    // copy fed into `Preview.publishFrame` (RGBA8, exact dims).
+    \\    // On macOS the same RGBA8 buffer is handed to
+    \\    // `publishFrameIOSurface`, which swizzles to BGRA during the
+    \\    // IOSurface lock/copy — producer-side format stays RGBA8 either
+    \\    // way (labelle-assembler#121).
     \\    var _preview_pbos: [3]c_uint = .{ 0, 0, 0 };
     \\    var _preview_pbo_bytes: usize = 0;
     \\    var _preview_pbo_initialized: bool = false;
@@ -1005,7 +1016,13 @@ const PREVIEW_READBACK_SETUP =
     \\    _ = &_preview_pbo_bytes;
     \\    defer if (_preview_pixel_buf.len != 0) allocator.free(_preview_pixel_buf);
     \\    defer if (_preview_pbo_initialized) _gl_delete_buffers(3, &_preview_pbos);
-    \\    defer if (g.preview) |*_p| _p.endFrameStream();
+    \\    defer if (g.preview) |*_p| {
+    \\        if (comptime @import("builtin").os.tag == .macos) {
+    \\            _p.endFrameStreamIOSurface();
+    \\        } else {
+    \\            _p.endFrameStream();
+    \\        }
+    \\    };
     \\
 ;
 
@@ -1052,6 +1069,14 @@ const PREVIEW_HEARTBEAT_LOOP =
 ///
 /// All allocator failures + GL errors are swallowed; preview is a
 /// best-effort sidecar, never a reason to crash the game.
+///
+/// macOS path (labelle-assembler#121, labelle-engine#547): the per-frame
+/// glReadPixels + PBO ring is identical, but the engine API surface
+/// switches at comptime to the zero-copy IOSurface triple
+/// (`beginFrameStreamIOSurface` / `publishFrameIOSurface`). The
+/// producer-side pixel buffer stays RGBA8 — `publishFrameIOSurface`
+/// does the RGBA→BGRA swizzle internally during the IOSurface
+/// lock/copy, so no producer-side format change is needed.
 const PREVIEW_READBACK_LOOP =
     \\        if (g.preview) |*_p| _readback: {
     \\            const _sw_i = window.getScreenWidth();
@@ -1068,8 +1093,16 @@ const PREVIEW_READBACK_LOOP =
     \\            // hood. After this, `isFrameAccepted` flips back to false
     \\            // until the editor sends a fresh `frame_accept`; the
     \\            // readback below will skip until then.
+    \\            //
+    \\            // On macOS the IOSurface variant is used instead — same
+    \\            // lifecycle contract, zero-copy frame transport via
+    \\            // mach ports (labelle-assembler#121).
     \\            if (_sw != _preview_last_w or _sh != _preview_last_h) {
-    \\                _p.beginFrameStream(_sw, _sh) catch break :_readback;
+    \\                if (comptime @import("builtin").os.tag == .macos) {
+    \\                    _p.beginFrameStreamIOSurface(_sw, _sh) catch break :_readback;
+    \\                } else {
+    \\                    _p.beginFrameStream(_sw, _sh) catch break :_readback;
+    \\                }
     \\                if (!_preview_pbo_initialized) {
     \\                    _gl_gen_buffers(3, &_preview_pbos);
     \\                    _preview_pbo_initialized = true;
@@ -1123,7 +1156,14 @@ const PREVIEW_READBACK_LOOP =
     \\                        @memcpy(_dst_row[0.._row_bytes], _src_row[0.._row_bytes]);
     \\                    }
     \\                    _ = _gl_unmap_buffer(_GL_PIXEL_PACK_BUFFER);
-    \\                    _p.publishFrame(_preview_pixel_buf) catch {};
+    \\                    // macOS path: hand the RGBA8 buffer to the
+    \\                    // IOSurface publisher — engine swizzles to BGRA
+    \\                    // during the IOSurface lock (labelle-assembler#121).
+    \\                    if (comptime @import("builtin").os.tag == .macos) {
+    \\                        _p.publishFrameIOSurface(_preview_pixel_buf) catch {};
+    \\                    } else {
+    \\                        _p.publishFrame(_preview_pixel_buf) catch {};
+    \\                    }
     \\                } else {
     \\                    // Map failed (driver bug / context loss). Skip
     \\                    // this frame and let the next one try again.
