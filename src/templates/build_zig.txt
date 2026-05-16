@@ -267,6 +267,23 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
 .link_sokol
     exe.root_module.linkLibrary(sokol_clib);
 
+    // IOSurface + CoreFoundation are needed for the macOS preview-mode
+    // IOSurface producer (labelle-assembler#121 + #125, labelle-
+    // engine#547). The engine references `IOSurfaceCreate`,
+    // `IOSurfaceLock`, `CFNumberCreate`, etc. via `@extern "c"` —
+    // these symbols live in IOSurface.framework + CoreFoundation
+    // .framework, and sokol's upstream linker line does not propagate
+    // them. Same on iOS (the framework path is identical). Linux /
+    // Windows / web have no macOS-specific symbols to resolve here,
+    // so the framework links are gated on the Darwin target tags.
+    switch (target.result.os.tag) {
+        .macos, .ios => {
+            exe.root_module.linkFramework("IOSurface", .{});
+            exe.root_module.linkFramework("CoreFoundation", .{});
+        },
+        else => {},
+    }
+
 .link_sdl
 
 .link_bgfx

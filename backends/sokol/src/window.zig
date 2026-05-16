@@ -114,6 +114,38 @@ pub fn endFrame() void {
     sg.commit();
 }
 
+/// Metal device pointer (MTLDevice*) for the Play-in-Editor preview's
+/// macOS/iOS readback path (labelle-assembler#125). Returns the same
+/// device sokol acquires for the swapchain — safe to call any number
+/// of times per frame. `null` on non-Metal builds and pre-init
+/// (sapp not valid yet).
+pub fn metalDevice() ?*const anyopaque {
+    if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .ios) return null;
+    return sapp.getEnvironment().metal.device;
+}
+
+/// Metal drawable pointer (CAMetalDrawable*) for the current frame.
+/// Currently a STUB returning `null`: sokol's `sapp_get_swapchain()`
+/// calls `[CAMetalLayer nextDrawable]` internally, which acquires a
+/// brand-new drawable each call. Sokol-gfx's `sglue_swapchain()`
+/// already called it during `window.beginPass()`, so calling it again
+/// here would hand us a fresh empty drawable rather than the one
+/// sokol just rendered into — defeating the readback entirely.
+///
+/// The right fix lives in sokol-gfx / sokol-app: expose the
+/// "currently-acquired drawable" from the per-frame cache (the
+/// equivalent of the legacy `sapp_metal_get_current_drawable`
+/// accessor that older sokol versions shipped). Filed upstream as
+/// the engine-side gap labelle-assembler#125 documents in its PR body
+/// — without it the generated readback gracefully no-ops on macOS
+/// (the `?*anyopaque` orelse break gates the entire blit chain on
+/// this returning non-null). All the wiring is in place; flipping
+/// the stub to return the real drawable is a single-line change once
+/// the upstream API lands.
+pub fn metalCurrentDrawable() ?*const anyopaque {
+    return null;
+}
+
 /// The sokol app descriptor type — re-exported so callers don't need to
 /// import sokol directly (used by mobile sokol_main return type).
 pub const Desc = sapp.Desc;

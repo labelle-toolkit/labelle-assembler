@@ -47,7 +47,7 @@ export fn frame() callconv(.c) void {
     // flush that used to happen at endFrame. See labelle-imgui#4.
     window.flushScene();
 {{gui_draw_code}}{{preview_readback}}    window.endFrame();
-    // Clear one-shot pressed/released state AFTER scripts have consumed it.
+{{preview_readback_post}}    // Clear one-shot pressed/released state AFTER scripts have consumed it.
     // Calling newFrame at the top of frame() would race with sapp events
     // dispatched between frame callbacks and drop isKeyPressed reports.
     @import("backend_input").newFrame();

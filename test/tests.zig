@@ -3018,7 +3018,7 @@ pub const PREVIEW_MODE = struct {
         \\    g.render();
         \\    window.flushScene();
         \\{{gui_draw_code}}{{preview_readback}}    window.endFrame();
-        \\}
+        \\{{preview_readback_post}}}
         \\
         \\export fn cleanup() callconv(.c) void {
         \\{{preview_cleanup}}{{cleanup_code}}    g.deinit();
@@ -3109,6 +3109,105 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
     }
 
+    test "sokol emits Metal/IOSurface readback block alongside GL block (slice 2 / #125)" {
+        // Slice 2 wires the macOS Metal path into the same sokol emit
+        // branch. Both the GL block (#124) and the Metal block (#125)
+        // must coexist in the generated source — they're guarded by
+        // mutually exclusive `_sokol_preview_{gl,metal}_enabled`
+        // comptime flags so exactly one fires at runtime on every
+        // supported target (GL on .linux desktop / Android, Metal on
+        // .macos / .ios).
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Metal flag + namespace gate.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_metal_enabled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".macos, .ios => true,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _SokolPreviewMetal = if (_sokol_preview_metal_enabled)") != null);
+
+        // Objective-C runtime bridging — selectors + msgSend cluster.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "objc_msgSend") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "sel_registerName") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "objc_getClass") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "newCommandQueue") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "blitCommandEncoder") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "copyFromTexture:sourceSlice:sourceLevel:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "getBytes:bytesPerRow:fromRegion:mipmapLevel:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "MTLPixelFormatBGRA8Unorm") != null);
+
+        // Sokol device + drawable accessors are wrapped in the sokol
+        // window backend (`window.metalDevice` /
+        // `window.metalCurrentDrawable`) — the legacy C symbols were
+        // dropped from sokol-zig in favor of struct-returning
+        // `sapp_get_environment` / `sapp_get_swapchain`, whose
+        // by-value Apple-ARM64 ABI doesn't play nicely with `@extern`.
+        // The wrappers handle the struct return and expose the raw
+        // pointers the readback needs.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.metalDevice()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.metalCurrentDrawable()") != null);
+
+        // Metal module-scope state (parallels the GL block — separate
+        // names so they don't collide when both blocks emit).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_initialized: bool") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_command_queue: ?*anyopaque") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_staging_texture: ?*anyopaque") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_pixel_buf: []u8") != null);
+
+        // IOSurface publish lifecycle on the Metal path. The triple
+        // matches `Preview.beginFrameStreamIOSurface` /
+        // `publishFrameIOSurface` / `endFrameStreamIOSurface`
+        // (labelle-engine#547). The single CPU buffer is RGBA8 so the
+        // engine's existing `publishFrameIOSurface(rgba)` contract
+        // applies — the producer-side does BGRA→RGBA swizzle so the
+        // engine's RGBA→BGRA swizzle lands the right bytes in the
+        // IOSurface ring. Double swizzle is the known wart; tracked
+        // by labelle-engine#548.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStreamIOSurface(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrameIOSurface(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStreamIOSurface()") != null);
+
+        // Source-order: beginFrameStreamIOSurface must precede the
+        // first publishFrameIOSurface (otherwise the first publish
+        // would hit an un-offered ring).
+        const begin_iosurf_idx = std.mem.indexOf(u8, main_zig, "_p.beginFrameStreamIOSurface(").?;
+        const publish_iosurf_idx = std.mem.indexOf(u8, main_zig, "_p.publishFrameIOSurface(").?;
+        try std.testing.expect(begin_iosurf_idx < publish_iosurf_idx);
+
+        // The Metal readback snippet must land AFTER `window.endFrame()`
+        // — see the PREVIEW_READBACK_FRAME_METAL_SOKOL header for the
+        // post-commit timing rationale. The test template places
+        // `{{preview_readback_post}}` right after `window.endFrame()`.
+        const metal_marker = std.mem.indexOf(u8, main_zig, "_SokolPreviewMetal.msgSend_copy_tex").?;
+        const end_frame_idx = std.mem.indexOf(u8, main_zig, "window.endFrame()").?;
+        try std.testing.expect(end_frame_idx < metal_marker);
+
+        // GL block from slice 1 must still emit unchanged — both
+        // blocks coexist in the same generated source.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_gl_enabled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewGl") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glReadPixels") != null);
+
+        // Cleanup teardown for the Metal path: endFrameStreamIOSurface
+        // + release MTL objects + free CPU buffer. Must run BEFORE
+        // the graceful `bye` (LIFO with engine-owned socket close —
+        // same shape as the GL cleanup ordering).
+        const cleanup_end_iosurf = std.mem.indexOf(u8, main_zig, "_p.endFrameStreamIOSurface()").?;
+        const cleanup_bye = std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)").?;
+        try std.testing.expect(cleanup_end_iosurf < cleanup_bye);
+
+        // Generated source must still parse as valid Zig — guards
+        // against typos in the new `@extern` declarations.
+        const dup = try std.testing.allocator.dupeZ(u8, main_zig);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
     test "non-raylib loop backends still do not pull in IOSurface lifecycle" {
         // Regression-lock: the macOS gating is raylib-desktop-only.
         // Pure loop-style sdl currently shares no pixel publish path
@@ -3159,11 +3258,15 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_read_pixels") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_PIXEL_PACK_BUFFER") != null);
         // sokol-specific names must NOT leak into raylib output —
-        // covers both the GL slice (#124) and the D3D11 slice (#126).
+        // covers the GL slice (#124), the D3D11 slice (#126), and the
+        // Metal slice (#125).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_gl_enabled") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_d3d11_enabled") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewGl") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewD3d11") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_metal_enabled") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewMetal") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.metalDevice()") == null);
     }
 
     test "sokol desktop emits D3D11 staging-texture readback alongside the GL block" {
@@ -3311,6 +3414,13 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "sg_d3d11_device") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.publishFrame(") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.beginFrameStream(") == null);
+        // Slice 2 Metal additions (#125) must also stay out of
+        // non-sokol templates — the helpers + extern namespace +
+        // IOSurface publish all key on `cfg.backend == .sokol`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_sokol_preview_metal_enabled") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_SokolPreviewMetal") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.publishFrameIOSurface(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "window.metalDevice()") == null);
         // Control-plane wiring stays intact.
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.sendHello(") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.tickHeartbeat(") != null);
