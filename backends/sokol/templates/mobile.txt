@@ -60,7 +60,7 @@ export fn frame() callconv(.c) void {
     // as the desktop template — see labelle-imgui#4 / PR #80 for the
     // overdraw bug this ordering fixes.
     window.flushScene();
-{{gui_draw_code}}    window.endFrame();
+{{gui_draw_code}}{{preview_readback}}    window.endFrame();
     // Clear edge-triggered key/button/touch state AFTER scripts had a chance
     // to read it. See the matching comment in desktop.txt — same invariant.
     @import("backend_input").newFrame();
