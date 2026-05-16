@@ -3158,9 +3158,136 @@ pub const PREVIEW_MODE = struct {
         // other's identifiers.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_read_pixels") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_PIXEL_PACK_BUFFER") != null);
-        // sokol-specific names must NOT leak into raylib output.
+        // sokol-specific names must NOT leak into raylib output —
+        // covers both the GL slice (#124) and the D3D11 slice (#126).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_gl_enabled") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_d3d11_enabled") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewGl") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewD3d11") == null);
+    }
+
+    test "sokol desktop emits D3D11 staging-texture readback alongside the GL block" {
+        // labelle-assembler#126 (slice 2 of #122): Windows sokol-on-D3D11
+        // can't share the GL PBO path (no `glReadPixels`), so the
+        // generated source emits a parallel block keyed on
+        // `_sokol_preview_d3d11_enabled` (`builtin.os.tag == .windows`).
+        // Both blocks ship side by side; their gates are mutually
+        // exclusive so only one runs per target.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Comptime gate.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_d3d11_enabled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"builtin\").os.tag == .windows") != null);
+
+        // Struct-namespace pattern matching the GL block — the
+        // `else struct {}` branch keeps D3D11 entry points off the
+        // link line on Linux/Darwin so `sg_d3d11_device` etc. don't
+        // become unresolved-symbol errors there.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _SokolPreviewD3d11 = if (_sokol_preview_d3d11_enabled)") != null);
+
+        // Public sokol-zig D3D11 / DXGI handles — the producer reaches
+        // through these to find the back-buffer Texture2D.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "sg_d3d11_device") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "sg_d3d11_device_context") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "sapp_d3d11_get_swap_chain") != null);
+
+        // COM dispatch path — `IDXGISwapChain::GetBuffer` →
+        // `ID3D11DeviceContext::CopyResource` → `Map`/`Unmap`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "swapChainGetBuffer") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "deviceCreateTexture2D") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "contextCopyResource") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "contextMap") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "contextUnmap") != null);
+        // IID_ID3D11Texture2D — passed to GetBuffer to get the back
+        // buffer as a Texture2D.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "IID_ID3D11Texture2D") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "0x6F15AAF2") != null);
+
+        // 3-deep staging-texture ring + initialization flag at module
+        // scope — same shape as the GL `_preview_pbos` ring.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_d3d11_staging: [3]?*anyopaque") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_d3d11_initialized: bool") != null);
+
+        // SHM lifecycle — same producer-side calls as the GL block
+        // because both share the SHM consumer protocol.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrame(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStream()") != null);
+
+        // Source-order: beginFrameStream must precede publishFrame
+        // within the D3D11 block too — otherwise the first publish
+        // would hit an un-offered ring.
+        const d3d11_gate = std.mem.indexOf(u8, main_zig, "_sokol_preview_d3d11_enabled").?;
+        // The first reference is at the gate declaration; the next
+        // few references inside the if-comptime blocks come right
+        // after. We pick the GATED frame block by finding the second
+        // occurrence (inside `if (comptime _sokol_preview_d3d11_enabled)`).
+        const after_decl = main_zig[d3d11_gate + "_sokol_preview_d3d11_enabled".len ..];
+        const frame_gate_rel = std.mem.indexOf(u8, after_decl, "if (comptime _sokol_preview_d3d11_enabled)").?;
+        const frame_gate_abs = d3d11_gate + "_sokol_preview_d3d11_enabled".len + frame_gate_rel;
+        const after_frame_gate = main_zig[frame_gate_abs..];
+        const begin_rel = std.mem.indexOf(u8, after_frame_gate, "_p.beginFrameStream(").?;
+        const publish_rel = std.mem.indexOf(u8, after_frame_gate, "_p.publishFrame(").?;
+        try std.testing.expect(begin_rel < publish_rel);
+
+        // BGRA→RGBA swizzle. The D3D11 swapchain default format is
+        // `DXGI_FORMAT_B8G8R8A8_UNORM`; the SHM consumer expects
+        // RGBA. We swap channels 0 and 2 during the memcpy. Pinning
+        // the format constant + the swizzle direction here so a
+        // future protocol-format-tagged variant has a concrete site
+        // to update.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "FORMAT_B8G8R8A8_UNORM") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_src_row[_off + 2]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_src_row[_off + 0]") != null);
+
+        // Staging-texture descriptor — must be USAGE_STAGING + CPU_ACCESS_READ
+        // or the Map call returns E_INVALIDARG.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "USAGE_STAGING") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "CPU_ACCESS_READ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "MAP_READ") != null);
+
+        // 2-frame priming gap — same as GL path. Frame N's
+        // CopyResource is Mapped on frame N+2 to keep the GPU's
+        // copy queue clear of the CPU's read.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_frame_idx >= 2") != null);
+
+        // Init callback stashes the allocator into the shared module
+        // slot — both the GL and the D3D11 init helpers write to
+        // `_preview_allocator`, but the comptime gates make them
+        // mutually exclusive.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_allocator = allocator;") != null);
+
+        // Cleanup teardown — release every staging texture, then
+        // free the CPU buffer, BEFORE `bye`.
+        const cleanup_release = std.mem.indexOf(u8, main_zig, "_SokolPreviewD3d11.release(").?;
+        const cleanup_bye = std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)").?;
+        try std.testing.expect(cleanup_release < cleanup_bye);
+
+        // The D3D11 readback snippet must land BEFORE `window.endFrame()`
+        // — endFrame calls `sg.endPass()` + `sg.commit()`, which is
+        // the latest the staging copy can land before the swap.
+        const readback_marker = std.mem.indexOf(u8, main_zig, "_SokolPreviewD3d11.contextCopyResource(").?;
+        const end_frame_idx = std.mem.indexOf(u8, main_zig, "window.endFrame()").?;
+        try std.testing.expect(readback_marker < end_frame_idx);
+
+        // GL block must still be present unchanged (slice 1, #124).
+        // The two blocks ship side by side; this guards against an
+        // accidental displacement of the GL emit by the D3D11 work.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_gl_enabled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _SokolPreviewGl = if (_sokol_preview_gl_enabled)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glReadPixels") != null);
+
+        // Generated source must still parse as valid Zig.
+        const dup = try std.testing.allocator.dupeZ(u8, main_zig);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
     }
 
     test "non-loop, non-sokol backends do not pull in any preview pixel publish path" {
@@ -3177,8 +3304,11 @@ pub const PREVIEW_MODE = struct {
         defer std.testing.allocator.free(main_zig_sdl);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_sokol_preview_gl_enabled") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_sokol_preview_d3d11_enabled") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_SokolPreviewGl") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_SokolPreviewD3d11") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "glReadPixels") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "sg_d3d11_device") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.publishFrame(") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_p.beginFrameStream(") == null);
         // Control-plane wiring stays intact.
