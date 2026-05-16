@@ -1,0 +1,28 @@
+// Minimal example for labelle-assembler#129 — the .null (headless)
+// backend. No window, no GPU, no input. The generated `main()` runs a
+// fixed-dt tick loop bounded by `LABELLE_NULL_FRAMES` (default 5) and
+// exits cleanly so `defer g.deinit()` runs.
+//
+// CI builds this example, runs it, and asserts the exit is clean
+// (see `.github/workflows/ci.yml` → `examples-integration`). The
+// `01_quit_after_n_frames.zig` script logs one line per frame so the
+// CI step can also pin the tick count.
+.{
+    .name = "null_headless_demo",
+    .title = "LaBelle — Null Backend Headless Demo",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    // Headless: no window, no GPU, no input. Built bin runs to a fixed
+    // frame count and exits cleanly. Cross-platform — null has no
+    // platform-specific deps.
+    .backend = .null,
+    .ecs = .mock,
+    .initial_scene = "main",
+    .states = .{"playing"},
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}

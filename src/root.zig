@@ -607,7 +607,15 @@ fn loadEngineTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: P
 /// Load the backend+platform lifecycle template from the CLI cache.
 fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: ProjectConfig) ![]const u8 {
     const backend_name = @tagName(cfg.backend);
-    const platform_name = if (cfg.backend == .sokol and (cfg.platform == .ios or cfg.platform == .android))
+    // Null backend has a single platform-independent template — `headless.txt`.
+    // No window toolkit means there's nothing platform-specific to vary by:
+    // the same `pub fn main() ... while (frame < max_frames) ...` loop runs
+    // identically on Linux / macOS / Windows. Keeping the file name
+    // descriptive (instead of reusing `desktop.txt`) signals at a glance
+    // that this template intentionally omits windowing / rendering.
+    const platform_name = if (cfg.backend == .null)
+        "headless"
+    else if (cfg.backend == .sokol and (cfg.platform == .ios or cfg.platform == .android))
         "mobile"
     else if (cfg.backend == .sokol and cfg.platform == .wasm)
         "desktop" // sokol uses a single template for desktop and wasm

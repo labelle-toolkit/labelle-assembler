@@ -34,7 +34,7 @@ pub const game_states = .{"playing"};
 
 /// Cap the number of frames this script logs. Must stay in sync with
 /// the default `LABELLE_NULL_FRAMES` value the null backend uses
-/// (`backends/null/templates/desktop.txt` → `DEFAULT_NULL_FRAMES`).
+/// (`backends/null/templates/headless.txt` → `DEFAULT_NULL_FRAMES`).
 /// If a CI run sets `LABELLE_NULL_FRAMES` higher, the extra ticks
 /// silently no-op here so the canonical log sequence stays bounded.
 const FRAMES_BEFORE_QUIT: u32 = 5;
