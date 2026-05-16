@@ -32,6 +32,14 @@ pub fn getFrameTime() f32 {
     return rl.getFrameTime();
 }
 
+pub fn getScreenWidth() i32 {
+    return rl.getScreenWidth();
+}
+
+pub fn getScreenHeight() i32 {
+    return rl.getScreenHeight();
+}
+
 pub fn beginDrawing() void {
     rl.beginDrawing();
 }

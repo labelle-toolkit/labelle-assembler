@@ -884,6 +884,63 @@ const PREVIEW_HELPERS =
     \\
 ;
 
+/// Raw GL externs + constants needed for the raylib desktop PBO-based
+/// async readback path. Raylib links the platform's OpenGL loader on
+/// desktop (CGL / GLX / WGL), so PBO entry points are present as
+/// regular `extern "c"` symbols — `@extern` here resolves them at link
+/// time without any extra dependency.
+///
+/// Concatenated into `module_vars` for raylib-desktop only. Other
+/// loop backends (sdl/bgfx/wgpu) don't use these and don't ship them
+/// (their readback story is a separate ticket). The constants are GL
+/// 2.1 / 3.3 core values — stable across drivers and platforms.
+const PREVIEW_READBACK_HELPERS =
+    \\
+    \\// ── GL constants for PBO readback (labelle-engine#544) ──
+    \\const _GL_PIXEL_PACK_BUFFER: c_uint = 0x88EB;
+    \\const _GL_STREAM_READ: c_uint = 0x88E1;
+    \\const _GL_READ_ONLY: c_uint = 0x88B8;
+    \\const _GL_PACK_ALIGNMENT: c_uint = 0x0D05;
+    \\const _GL_RGBA: c_uint = 0x1908;
+    \\const _GL_UNSIGNED_BYTE: c_uint = 0x1401;
+    \\
+    \\// PBO entry points. raylib's libGL/CGL/WGL link gives us these
+    \\// for free. Names are the standard GL 2.1+ C symbols.
+    \\const _gl_pixel_storei = @extern(
+    \\    *const fn (pname: c_uint, param: c_int) callconv(.c) void,
+    \\    .{ .name = "glPixelStorei" },
+    \\);
+    \\const _gl_gen_buffers = @extern(
+    \\    *const fn (n: c_int, buffers: [*]c_uint) callconv(.c) void,
+    \\    .{ .name = "glGenBuffers" },
+    \\);
+    \\const _gl_delete_buffers = @extern(
+    \\    *const fn (n: c_int, buffers: [*]const c_uint) callconv(.c) void,
+    \\    .{ .name = "glDeleteBuffers" },
+    \\);
+    \\const _gl_bind_buffer = @extern(
+    \\    *const fn (target: c_uint, buffer: c_uint) callconv(.c) void,
+    \\    .{ .name = "glBindBuffer" },
+    \\);
+    \\const _gl_buffer_data = @extern(
+    \\    *const fn (target: c_uint, size: isize, data: ?*const anyopaque, usage: c_uint) callconv(.c) void,
+    \\    .{ .name = "glBufferData" },
+    \\);
+    \\const _gl_read_pixels = @extern(
+    \\    *const fn (x: c_int, y: c_int, w: c_int, h: c_int, fmt: c_uint, ty: c_uint, data: ?*anyopaque) callconv(.c) void,
+    \\    .{ .name = "glReadPixels" },
+    \\);
+    \\const _gl_map_buffer = @extern(
+    \\    *const fn (target: c_uint, access: c_uint) callconv(.c) ?*anyopaque,
+    \\    .{ .name = "glMapBuffer" },
+    \\);
+    \\const _gl_unmap_buffer = @extern(
+    \\    *const fn (target: c_uint) callconv(.c) u8,
+    \\    .{ .name = "glUnmapBuffer" },
+    \\);
+    \\
+;
+
 /// In-function preview setup for loop-style main()s. Parses argv,
 /// dials the editor, assigns directly into `g.preview`, sends `hello`.
 /// Pasted AFTER `var g = AssembledGame.init(...)` so the engine's
@@ -919,6 +976,39 @@ const PREVIEW_LOOP_SETUP =
     \\
 ;
 
+/// Raylib-desktop-only addendum to `PREVIEW_LOOP_SETUP`. Declares the
+/// PBO ring + CPU staging buffer locals that `PREVIEW_READBACK_LOOP`
+/// uses, and registers the deferred GL/SHM teardown. Pasted right
+/// after `PREVIEW_LOOP_SETUP` so both run inside `main()`'s scope and
+/// `g` is already bound.
+///
+/// The `endFrameStream` defer lives here (not in `PREVIEW_LOOP_SETUP`)
+/// because only the readback path actually opens the SHM ring. Other
+/// loop backends never call `beginFrameStream`, so calling
+/// `endFrameStream` would be a no-op but the symbol `_gl_delete_buffers`
+/// in the same defer block isn't available to them — splitting keeps
+/// the non-raylib loop backends compiling unchanged.
+const PREVIEW_READBACK_SETUP =
+    \\    // PBO ring + CPU-side pixel buffer for the per-frame async readback
+    \\    // (labelle-engine#544). `_preview_pbos` ids are lazily generated
+    \\    // on the first accepted frame; `_preview_pbo_bytes` tracks the
+    \\    // per-PBO allocation size so a resize can re-issue `glBufferData`
+    \\    // without reallocating the IDs. The CPU buffer is the staging
+    \\    // copy fed into `Preview.publishFrame` (RGBA8, exact dims).
+    \\    var _preview_pbos: [3]c_uint = .{ 0, 0, 0 };
+    \\    var _preview_pbo_bytes: usize = 0;
+    \\    var _preview_pbo_initialized: bool = false;
+    \\    var _preview_frame_idx: u64 = 0;
+    \\    var _preview_last_w: u32 = 0;
+    \\    var _preview_last_h: u32 = 0;
+    \\    var _preview_pixel_buf: []u8 = &[_]u8{};
+    \\    _ = &_preview_pbo_bytes;
+    \\    defer if (_preview_pixel_buf.len != 0) allocator.free(_preview_pixel_buf);
+    \\    defer if (_preview_pbo_initialized) _gl_delete_buffers(3, &_preview_pbos);
+    \\    defer if (g.preview) |*_p| _p.endFrameStream();
+    \\
+;
+
 /// Heartbeat tick — rate-limited inside `tickHeartbeat`. Safe to
 /// call every frame; ~4 Hz on the wire regardless of FPS.
 ///
@@ -933,6 +1023,114 @@ const PREVIEW_HEARTBEAT_LOOP =
     \\        if (g.preview) |*_p| {
     \\            _p.pollSubscription() catch {};
     \\            _p.tickHeartbeat(_preview_now_ms()) catch {};
+    \\        }
+    \\
+;
+
+/// PBO-based async GPU→CPU readback that runs inside the raylib desktop
+/// frame loop, between `g.render*` and `window.endDrawing()`
+/// (labelle-engine#544).
+///
+/// Translates the imgui-preview PoC's 3-deep PBO ring into the
+/// generated main:
+///
+///   frame N   : bind pbo[N % 3] → glReadPixels (async DMA into PBO)
+///   frame N+2 : bind pbo[(N-2) % 3] → glMapBuffer → memcpy to CPU
+///               → Preview.publishFrame → unmap
+///
+/// The 2-frame priming gap is what hides the GPU→CPU stall; the first
+/// two frames only kick off readback and publish nothing. From frame
+/// 2 onwards we always have a mature PBO to map.
+///
+/// Resize handling: the screen dims are read every frame from
+/// `window.getScreenWidth/Height`. When they differ from the last
+/// published dims we tear the PBO ring + CPU buffer down, re-issue
+/// `Preview.beginFrameStream(w,h)` (idempotent — internally re-offers
+/// + frees the prior SHM ring), and reset the priming counter. The
+/// editor responds with a fresh `frame_accept` and publishes resume
+/// on the next pass through the priming gap.
+///
+/// All allocator failures + GL errors are swallowed; preview is a
+/// best-effort sidecar, never a reason to crash the game.
+const PREVIEW_READBACK_LOOP =
+    \\        if (g.preview) |*_p| _readback: {
+    \\            const _sw_i = window.getScreenWidth();
+    \\            const _sh_i = window.getScreenHeight();
+    \\            if (_sw_i <= 0 or _sh_i <= 0) break :_readback;
+    \\            const _sw: u32 = @intCast(_sw_i);
+    \\            const _sh: u32 = @intCast(_sh_i);
+    \\            const _needed_bytes: usize = @as(usize, _sw) * @as(usize, _sh) * 4;
+    \\
+    \\            // Resize / first-frame: (re)negotiate the SHM ring with
+    \\            // the editor and (re)size the PBOs + CPU staging buffer.
+    \\            // beginFrameStream is idempotent across resizes — the
+    \\            // engine tears down the old ring and re-offers under the
+    \\            // hood. After this, `isFrameAccepted` flips back to false
+    \\            // until the editor sends a fresh `frame_accept`; the
+    \\            // readback below will skip until then.
+    \\            if (_sw != _preview_last_w or _sh != _preview_last_h) {
+    \\                _p.beginFrameStream(_sw, _sh) catch break :_readback;
+    \\                if (!_preview_pbo_initialized) {
+    \\                    _gl_gen_buffers(3, &_preview_pbos);
+    \\                    _preview_pbo_initialized = true;
+    \\                }
+    \\                _gl_pixel_storei(_GL_PACK_ALIGNMENT, 4);
+    \\                for (_preview_pbos) |_pbo_id| {
+    \\                    _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, _pbo_id);
+    \\                    _gl_buffer_data(_GL_PIXEL_PACK_BUFFER, @intCast(_needed_bytes), null, _GL_STREAM_READ);
+    \\                }
+    \\                _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, 0);
+    \\                _preview_pbo_bytes = _needed_bytes;
+    \\                if (_preview_pixel_buf.len != _needed_bytes) {
+    \\                    if (_preview_pixel_buf.len != 0) allocator.free(_preview_pixel_buf);
+    \\                    _preview_pixel_buf = allocator.alloc(u8, _needed_bytes) catch &[_]u8{};
+    \\                }
+    \\                _preview_last_w = _sw;
+    \\                _preview_last_h = _sh;
+    \\                _preview_frame_idx = 0;
+    \\            }
+    \\
+    \\            // Editor not yet attached (or not yet acknowledged the
+    \\            // current offer)? Skip the readback entirely — saves the
+    \\            // glReadPixels + glMapBuffer cost when nobody is watching.
+    \\            if (!_p.isFrameAccepted() or _preview_pixel_buf.len != _needed_bytes) break :_readback;
+    \\
+    \\            // Issue the async DMA into the write PBO. With a PIXEL_PACK_BUFFER
+    \\            // bound, the last arg to glReadPixels is an offset, not a pointer.
+    \\            const _write_idx: usize = @intCast(_preview_frame_idx % 3);
+    \\            _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, _preview_pbos[_write_idx]);
+    \\            _gl_read_pixels(0, 0, _sw_i, _sh_i, _GL_RGBA, _GL_UNSIGNED_BYTE, null);
+    \\
+    \\            // Once the ring is primed (≥ 2 frames in flight), map the
+    \\            // oldest PBO and publish it. glMapBuffer blocks here only
+    \\            // if the DMA hasn't finished — which is precisely the
+    \\            // stall the 2-frame gap is designed to hide.
+    \\            if (_preview_frame_idx >= 2) {
+    \\                const _read_idx: usize = @intCast((_preview_frame_idx - 2) % 3);
+    \\                _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, _preview_pbos[_read_idx]);
+    \\                const _mapped = _gl_map_buffer(_GL_PIXEL_PACK_BUFFER, _GL_READ_ONLY);
+    \\                if (_mapped) |_src| {
+    \\                    const _src_ptr: [*]const u8 = @ptrCast(_src);
+    \\                    // GL returns rows bottom-up; the editor's SHM
+    \\                    // consumer treats the ring as top-down RGBA8.
+    \\                    // Flip-on-copy keeps the producer side cheap
+    \\                    // (one extra strided memcpy vs. a CPU rotate).
+    \\                    const _row_bytes: usize = @as(usize, _sw) * 4;
+    \\                    var _y: u32 = 0;
+    \\                    while (_y < _sh) : (_y += 1) {
+    \\                        const _src_row = _src_ptr + (@as(usize, _sh - 1 - _y) * _row_bytes);
+    \\                        const _dst_row = _preview_pixel_buf.ptr + (@as(usize, _y) * _row_bytes);
+    \\                        @memcpy(_dst_row[0.._row_bytes], _src_row[0.._row_bytes]);
+    \\                    }
+    \\                    _ = _gl_unmap_buffer(_GL_PIXEL_PACK_BUFFER);
+    \\                    _p.publishFrame(_preview_pixel_buf) catch {};
+    \\                } else {
+    \\                    // Map failed (driver bug / context loss). Skip
+    \\                    // this frame and let the next one try again.
+    \\                }
+    \\            }
+    \\            _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, 0);
+    \\            _preview_frame_idx +%= 1;
     \\        }
     \\
 ;
@@ -1950,6 +2148,27 @@ pub fn generateMainZigFromTemplate(
             const setup_code = try buildSetupCode(allocator, cfg, jsonc_scene_names, prefab_names);
             defer allocator.free(setup_code);
 
+            // Raylib desktop gets the PBO async-readback block + the GL
+            // externs that drive it (labelle-engine#544). The PoC at
+            // imgui-preview-poc/src/game.zig is the reference shape.
+            // Other loop backends (sdl/bgfx/wgpu) keep an empty readback
+            // slot until their per-backend tickets land — sokol's readback
+            // already runs through its own callback path. raylib WASM
+            // takes the callback branch above, so this only fires for
+            // raylib desktop.
+            const is_raylib_desktop = cfg.backend == .raylib;
+            const module_vars_loop = if (is_raylib_desktop)
+                try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, PREVIEW_READBACK_HELPERS })
+            else
+                PREVIEW_HELPERS;
+            defer if (is_raylib_desktop) allocator.free(module_vars_loop);
+            const preview_setup_loop = if (is_raylib_desktop)
+                try std.mem.concat(allocator, u8, &.{ PREVIEW_LOOP_SETUP, PREVIEW_READBACK_SETUP })
+            else
+                PREVIEW_LOOP_SETUP;
+            defer if (is_raylib_desktop) allocator.free(preview_setup_loop);
+            const readback_block = if (is_raylib_desktop) PREVIEW_READBACK_LOOP else "";
+
             try tpl.render(lifecycle_tmpl, .{
                 .width = w_str,
                 .height = h_str,
@@ -1960,12 +2179,13 @@ pub fn generateMainZigFromTemplate(
                 .gui_draw_code = gui_draw_code,
                 .hidden_setup = hidden_setup,
                 .hooks_init_block = hooks_init,
-                .module_vars = PREVIEW_HELPERS,
+                .module_vars = module_vars_loop,
                 // Preview-mode wiring (labelle-assembler#94). Always
                 // emitted; runtime parse returns null when the flag is
                 // absent so the block is a no-op for non-preview runs.
-                .preview_setup = PREVIEW_LOOP_SETUP,
+                .preview_setup = preview_setup_loop,
                 .preview_heartbeat = PREVIEW_HEARTBEAT_LOOP,
+                .preview_readback = readback_block,
             }, bw);
         }
 

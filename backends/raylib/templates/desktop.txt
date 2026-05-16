@@ -31,6 +31,6 @@ const target_fps: u32 = {{fps}};
         g.render();
         g.renderGizmos();
 {{gui_draw_code}}        window.drawText(screen_title, 10, 10, 20, 180, 180, 180, 255);
-        window.endDrawing();
+{{preview_readback}}        window.endDrawing();
     }
 }
