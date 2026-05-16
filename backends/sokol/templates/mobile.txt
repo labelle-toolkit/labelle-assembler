@@ -51,7 +51,7 @@ export fn frame() callconv(.c) void {
     // Cap dt at 4 frames to prevent physics explosions after backgrounding.
     const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(target_fps)));
 {{preview_heartbeat}}{{tick_code}}    g.tick(dt);
-    const pass_action = window.beginFrame();
+{{preview_pre_render}}    const pass_action = window.beginFrame();
     window.beginPass(pass_action);
     g.render();
     g.renderGizmos();

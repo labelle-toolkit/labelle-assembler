@@ -3154,7 +3154,7 @@ pub const PREVIEW_MODE = struct {
         \\export fn frame() callconv(.c) void {
         \\    const dt: f32 = 0.016;
         \\{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
-        \\    g.render();
+        \\{{preview_pre_render}}    g.render();
         \\    window.flushScene();
         \\{{gui_draw_code}}{{preview_readback}}    window.endFrame();
         \\{{preview_readback_post}}}
@@ -3376,6 +3376,94 @@ pub const PREVIEW_MODE = struct {
 
         // Generated source must still parse as valid Zig — guards
         // against typos in the new `@extern` declarations.
+        const dup = try std.testing.allocator.dupeZ(u8, main_zig);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "sokol Metal Path-A routes game render into the offscreen IOSurface target (#133)" {
+        // The producer infrastructure from #131/#132 allocates IOSurfaces,
+        // wraps them as MTLTextures + sg.Images, and signals slot-ready
+        // each frame — but until #133 the game's `sg.beginPass` still
+        // targets the swapchain, so the IOSurfaces stay zero-filled and
+        // the editor's Game View renders black. The fix adds a small
+        // `window.setEditorRenderTarget` shim that swaps `beginPass`
+        // attachments for one frame; this test asserts the codegen
+        // emits the shim wiring in the right order around `g.render()`.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // Per-slot color-attachment View + Attachments arrays at module
+        // scope so the per-frame block can flip the gfx layer with a
+        // single struct copy instead of rebuilding each frame.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_views: [_PreviewMtlRingMax]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_attachments: [_PreviewMtlRingMax]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_target_active: bool") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_write_slot: u32") != null);
+
+        // Each ring slot must build a color-attachment View off its
+        // `sg.Image` and stash it in the per-slot Attachments. The
+        // `Attachments.colors[0]` assignment is the load-bearing line
+        // the gfx shim reads from.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".color_attachment = .{ .image = _img }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_att.colors[0] = _view;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_mtl_attachments[_slot] = _att;") != null);
+
+        // Pre-render block arms the shim BEFORE `g.render()`, post-
+        // render block tears it down. Both APIs come from the window
+        // backend (`backends/sokol/src/window.zig`).
+        const set_target_idx = std.mem.indexOf(u8, main_zig, "window.setEditorRenderTarget(_preview_mtl_attachments[_write_slot])").?;
+        const clear_target_idx = std.mem.indexOf(u8, main_zig, "window.clearEditorRenderTarget()").?;
+        const render_idx = std.mem.indexOf(u8, main_zig, "g.render();").?;
+        const signal_idx = std.mem.indexOf(u8, main_zig, "_p.signalSlotReady(_preview_mtl_write_slot)").?;
+
+        // setEditorRenderTarget MUST fire before `g.render()` so the
+        // `window.beginPass` inside the frame body sees the override
+        // and routes sokol-gfx into the IOSurface attachments.
+        try std.testing.expect(set_target_idx < render_idx);
+        // signalSlotReady MUST fire after `g.render()` (the just-
+        // rendered slot is what we're publishing).
+        try std.testing.expect(render_idx < signal_idx);
+        // clearEditorRenderTarget MUST fire after the signal so the
+        // override stays armed across the whole render-then-publish
+        // window — and so the next frame's `beginPass` defaults back
+        // to the swapchain even if the pre-render block bails (editor
+        // disconnect, transient ring rebuild). The post-render block
+        // emits at least one clearEditorRenderTarget call in the
+        // frame body; we match the earliest occurrence (the cleanup
+        // callback has its own — guarded below by ordering against
+        // the engine teardown).
+        try std.testing.expect(signal_idx < clear_target_idx);
+
+        // The pre-render block computes `_write_slot` from the frame
+        // index BEFORE the post-render block reads it via the shared
+        // module-scope `_preview_mtl_write_slot`.
+        const compute_slot_idx = std.mem.indexOf(u8, main_zig, "_preview_mtl_write_slot = _write_slot;").?;
+        try std.testing.expect(compute_slot_idx < signal_idx);
+
+        // Frame index advances inside the post-render block, not the
+        // pre-render block — otherwise a bail between the two would
+        // skip publishing a slot but still bump the index, drifting
+        // the ring out of sync.
+        const post_render_advance_idx = std.mem.lastIndexOf(u8, main_zig, "_preview_frame_idx +%= 1;").?;
+        try std.testing.expect(post_render_advance_idx > render_idx);
+
+        // Cleanup must also clear the editor render target before
+        // destroying the views/images it points at (use-after-free
+        // defense). The frame-body clear is the FIRST occurrence; the
+        // cleanup-block clear is the SECOND. Compare the second one
+        // against the engine teardown call to lock that ordering.
+        const cleanup_clear_idx = std.mem.indexOfPos(u8, main_zig, clear_target_idx + 1, "window.clearEditorRenderTarget()").?;
+        const cleanup_end_iosurf = std.mem.indexOf(u8, main_zig, "_p.endFrameStreamIOSurface()").?;
+        try std.testing.expect(cleanup_clear_idx < cleanup_end_iosurf);
+
+        // Generated source must still parse as valid Zig.
         const dup = try std.testing.allocator.dupeZ(u8, main_zig);
         defer std.testing.allocator.free(dup);
         var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);

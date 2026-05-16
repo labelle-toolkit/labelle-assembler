@@ -7,6 +7,16 @@ const sgl = sokol.gl;
 const sglue = sokol.glue;
 const slog = sokol.log;
 
+/// Re-export `sokol.gfx` so the generated `main.zig` (which only depends
+/// on `backend_window`, not directly on `sokol`) can reach sg.Image,
+/// sg.View, sg.Attachments, sg.makeImage, sg.makeView, sg.destroyImage,
+/// sg.destroyView, sg.ImageDesc, etc. Used by the Path-A IOSurface ring
+/// the Play-in-Editor preview producer builds at module scope — every
+/// member of the ring is an sg-flavoured handle, so without this re-
+/// export the codegen would either need a parallel `sokol` dep on the
+/// root module (cross-cutting concern) or duplicate the type defs.
+pub const gfx_types = sokol.gfx;
+
 pub const ConfigFlags = struct {
     window_hidden: bool = false,
 };
@@ -85,7 +95,40 @@ pub fn beginFrame() sg.PassAction {
     return pass_action;
 }
 
+/// Editor-mode override for the next `beginPass`. When non-null, `beginPass`
+/// routes the game's render into these attachments (Path-A offscreen
+/// IOSurface render target — labelle-assembler#133) instead of the
+/// sokol_app swapchain. The override stays set across frames; the host
+/// flips it on/off around each frame's render via `setEditorRenderTarget`
+/// / `clearEditorRenderTarget`. Defaults to null so the standalone /
+/// non-editor path renders to the swapchain as before.
+var current_editor_render_target: ?sg.Attachments = null;
+
+/// Route the next `beginPass` into these attachments instead of the
+/// swapchain. The Path-A producer (Metal/IOSurface ring) populates one
+/// `sg.Attachments` per ring slot during ring (re)negotiation, then on
+/// each frame the host picks `_write_slot` and passes the corresponding
+/// attachments through this shim before `g.render()`. The pass clears
+/// to the same color the swapchain path uses.
+pub fn setEditorRenderTarget(attachments: sg.Attachments) void {
+    current_editor_render_target = attachments;
+}
+
+/// Clear the editor render-target override so the next `beginPass`
+/// returns to the swapchain. Called after the host's frame body emits
+/// `signalSlotReady` for the just-rendered slot — keeps the override
+/// strictly one-frame scoped even if a later frame skips the
+/// `setEditorRenderTarget` call (e.g. transient ring re-negotiation
+/// or editor disconnect).
+pub fn clearEditorRenderTarget() void {
+    current_editor_render_target = null;
+}
+
 pub fn beginPass(pass_action: sg.PassAction) void {
+    if (current_editor_render_target) |attachments| {
+        sg.beginPass(.{ .action = pass_action, .attachments = attachments });
+        return;
+    }
     sg.beginPass(.{ .action = pass_action, .swapchain = sglue.swapchain() });
 }
 
