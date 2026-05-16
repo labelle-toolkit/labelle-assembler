@@ -2942,4 +2942,73 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
     }
+
+    // macOS IOSurface gating (labelle-assembler#121, labelle-engine#547).
+    // The raylib desktop template emits BOTH the SHM and the IOSurface
+    // lifecycle calls; the actual selection happens at comptime via
+    // `@import("builtin").os.tag == .macos`. This test only asserts
+    // both strings are present in the emitted source — the comptime
+    // branch is exercised when the generated game is compiled for a
+    // specific OS, not here.
+    test "raylib desktop emits both SHM and IOSurface preview lifecycle calls" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        defer std.testing.allocator.free(main_zig);
+
+        // SHM (non-macOS) branch.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrame(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStream()") != null);
+
+        // IOSurface (macOS) branch — zero-copy variant.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStreamIOSurface(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrameIOSurface(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStreamIOSurface()") != null);
+
+        // Comptime switch sentinel — proves the gating is platform-based
+        // and not unconditional. If somebody later flips this to runtime
+        // dispatch (vtable, function pointer) this assertion fires.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"builtin\").os.tag == .macos") != null);
+
+        // Producer-side buffer stays RGBA8 — `glReadPixels` produces
+        // RGBA8 and `publishFrameIOSurface` swizzles internally during
+        // the IOSurface lock/copy, so no producer-side format change.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_RGBA") != null);
+
+        // Generated source must still parse as valid Zig.
+        const dup = try std.testing.allocator.dupeZ(u8, main_zig);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "non-raylib loop backends still do not pull in IOSurface lifecycle" {
+        // Regression-lock: the macOS gating is raylib-desktop-only.
+        // sdl/sokol share the loop-style lifecycle branch but neither
+        // links to OpenGL nor runs the readback path, so neither the
+        // SHM nor the IOSurface preview API should leak into their
+        // generated main. (sokol uses the init-callback path, but
+        // this test runs it through the loop-style template the same
+        // way the existing non-raylib readback test does — what matters
+        // is that the assembler doesn't widen scope.)
+        for ([_]generate.Backend{ .sdl, .sokol }) |backend| {
+            const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+                .name = "test-game",
+                .backend = backend,
+                .ecs = .mock,
+            }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+            defer std.testing.allocator.free(main_zig);
+
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(") == null);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStreamIOSurface(") == null);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrame(") == null);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrameIOSurface(") == null);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStream(") == null);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStreamIOSurface(") == null);
+        }
+    }
 };
