@@ -1209,7 +1209,14 @@ const PREVIEW_INIT_CALLBACK =
     \\                // the user with no visible window AND no editor view.
     \\                // macOS-only inside `window.hideWindow`; a no-op on
     \\                // every other platform until follow-up slices land.
-    \\                window.hideWindow();
+    \\                // `@hasDecl` guard: this `PREVIEW_INIT_CALLBACK`
+    \\                // template is shared with the raylib-WASM callback
+    \\                // path (see emitter `else` branch below the sokol
+    \\                // arm). The raylib `window` module has no
+    \\                // `hideWindow` decl, so an unguarded call would
+    \\                // compile-fail any raylib-WASM project with
+    \\                // LABELLE_PREVIEW set.
+    \\                if (comptime @hasDecl(window, "hideWindow")) window.hideWindow();
     \\            }
     \\        }
     \\    }

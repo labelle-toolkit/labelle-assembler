@@ -3719,6 +3719,18 @@ pub const PREVIEW_MODE = struct {
         // hideWindow is referenced in the generated source.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.hideWindow()") != null);
 
+        // The call site MUST be `@hasDecl`-guarded so this same
+        // `PREVIEW_INIT_CALLBACK` template (shared with the raylib-
+        // WASM callback path) doesn't break the raylib build —
+        // raylib's `window` module has no `hideWindow` decl. Verify
+        // the guard sits in front of the call and references the
+        // sokol-side `hideWindow` symbol.
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            main_zig,
+            "if (comptime @hasDecl(window, \"hideWindow\")) window.hideWindow();",
+        ) != null);
+
         // Ordering: sendHello must precede hideWindow (keeps the wire
         // trace readable — editor sees the hello before we vanish from
         // the desktop).
@@ -3736,7 +3748,7 @@ pub const PREVIEW_MODE = struct {
         // proximity bound is generous (1024 chars) to absorb the
         // explanatory comment block without coupling the test to the
         // exact wording.
-        try std.testing.expect(hide_idx - hello_idx < 1024);
+        try std.testing.expect(hide_idx - hello_idx < 2048);
 
         // Generated source must still parse.
         const dup = try std.testing.allocator.dupeZ(u8, main_zig);
