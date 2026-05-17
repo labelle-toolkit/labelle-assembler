@@ -176,6 +176,48 @@ pub fn metalDevice() ?*const anyopaque {
     return sapp.getEnvironment().metal.device;
 }
 
+/// Hide the sokol-app window from the screen (labelle-assembler#137).
+///
+/// Called by the generated `main.zig` once the Play-in-Editor preview
+/// connection succeeds — the editor's Game View tab is the user-facing
+/// surface in that mode, and the standalone sokol-app window is at
+/// best redundant and at worst a foot-gun (closing it tears down the
+/// whole preview subprocess).
+///
+/// Why "hide" not "never open": sokol-app insists on creating a real
+/// platform window because the Metal swapchain (and the GL/D3D11
+/// contexts) need an NSWindow / HWND attached at init time. The
+/// cheapest reliable suppression is therefore post-creation — let
+/// sokol bring the window up, then yank it off-screen before the user
+/// ever sees it. `orderOut:` (macOS) / `ShowWindow(SW_HIDE)` (Win32)
+/// are the platform-specific knobs for that; both leave the window
+/// fully functional from a swapchain-lifecycle standpoint, just
+/// invisible.
+///
+/// macOS-only for this slice. Windows D3D11 + Linux GL can land as
+/// follow-ups; the call is a no-op on every other platform so callers
+/// can invoke it unconditionally inside a comptime-agnostic block.
+pub fn hideWindow() void {
+    if (comptime builtin.target.os.tag != .macos) return;
+
+    const nswin = sapp.macosGetWindow() orelse return;
+
+    // libobjc primitives. Looked up on every call — single-shot path,
+    // not hot. `sel_registerName` is idempotent / cached inside libobjc.
+    const sel_registerName = @extern(
+        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
+        .{ .name = "sel_registerName" },
+    );
+    // [NSWindow orderOut:nil] — single-arg `id` selector returning void.
+    const msgSend_orderOut = @extern(
+        *const fn (obj: ?*const anyopaque, sel: ?*anyopaque, sender: ?*anyopaque) callconv(.c) void,
+        .{ .name = "objc_msgSend" },
+    );
+
+    const sel = sel_registerName("orderOut:") orelse return;
+    msgSend_orderOut(nswin, sel, null);
+}
+
 /// The sokol app descriptor type — re-exported so callers don't need to
 /// import sokol directly (used by mobile sokol_main return type).
 pub const Desc = sapp.Desc;
