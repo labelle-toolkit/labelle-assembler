@@ -240,48 +240,34 @@ pub fn hideWindow() void {
         *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
         .{ .name = "sel_registerName" },
     );
-    const objc_getClass = @extern(
-        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
-        .{ .name = "objc_getClass" },
-    );
-
-    // Three nested objc_msgSend variants (Zig requires distinct types per
-    // argument shape because objc_msgSend is variadic in C).
-    // 1. `id (*)(id, SEL)` — getter / no-arg.
-    const msgSend_id = @extern(
-        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) ?*anyopaque,
-        .{ .name = "objc_msgSend" },
-    );
-    // 2. `void (*)(id, SEL, id)` — single-id arg.
-    const msgSend_orderOut = @extern(
+    // `void (*)(id, SEL, id)` — single-id-arg variant.
+    const msgSend_id_arg = @extern(
         *const fn (obj: ?*const anyopaque, sel: ?*anyopaque, sender: ?*anyopaque) callconv(.c) void,
         .{ .name = "objc_msgSend" },
     );
-    // 3. `void (*)(id, SEL, NSInteger)` — single-integer arg.
-    const msgSend_setActivationPolicy = @extern(
-        *const fn (obj: ?*anyopaque, sel: ?*anyopaque, policy: isize) callconv(.c) bool,
+    // `void (*)(id, SEL, double)` — single-double-arg variant for
+    // setAlphaValue:. Double on ARM64 + x86_64 is passed in vector regs;
+    // separate typed binding keeps the ABI clean.
+    const msgSend_double_arg = @extern(
+        *const fn (obj: ?*const anyopaque, sel: ?*anyopaque, alpha: f64) callconv(.c) void,
         .{ .name = "objc_msgSend" },
     );
 
-    // 1. Demote the process to an accessory app (no dock icon, no menu
-    //    bar, no Cmd-Tab entry). The preview subprocess shouldn't appear
-    //    as a peer application — it's a child of the editor.
-    //    NSApplicationActivationPolicyAccessory = 1.
-    if (objc_getClass("NSApplication")) |NSApplication| {
-        if (sel_registerName("sharedApplication")) |sel_shared| {
-            if (msgSend_id(NSApplication, sel_shared)) |NSApp| {
-                if (sel_registerName("setActivationPolicy:")) |sel_setpolicy| {
-                    _ = msgSend_setActivationPolicy(NSApp, sel_setpolicy, 1);
-                }
-            }
-        }
+    // 1. [window setAlphaValue:0.0] — the window stays in the window
+    //    list (so Metal's swapchain + display link stay attached) but is
+    //    fully transparent. Doesn't touch the activation policy, so
+    //    NSApp.activationPolicy stays Regular and Metal keeps receiving
+    //    frame callbacks (Accessory policy was breaking that).
+    if (sel_registerName("setAlphaValue:")) |sel_alpha| {
+        msgSend_double_arg(nswin, sel_alpha, 0.0);
     }
 
-    // 2. [NSWindow orderOut:nil] — yank the standalone game window off
-    //    the screen. Combined with the activation-policy demotion above,
-    //    nothing visible remains of the subprocess.
+    // 2. [window orderOut:nil] — also order off-screen so it doesn't
+    //    appear in window switchers / mission control even at alpha 0.
+    //    Combined, the window is functionally invisible without any
+    //    Metal-pipeline side effects.
     if (sel_registerName("orderOut:")) |sel_orderOut| {
-        msgSend_orderOut(nswin, sel_orderOut, null);
+        msgSend_id_arg(nswin, sel_orderOut, null);
     }
 }
 
