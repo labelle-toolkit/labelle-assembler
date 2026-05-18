@@ -1216,22 +1216,7 @@ const PREVIEW_INIT_CALLBACK =
     \\                // `hideWindow` decl, so an unguarded call would
     \\                // compile-fail any raylib-WASM project with
     \\                // LABELLE_PREVIEW set.
-    \\                //
-    \\                // labelle-assembler#140: Path-A is disabled on
-    \\                // macOS/iOS (no IOSurface producer publishes frames),
-    \\                // so hiding the standalone window leaves the user
-    \\                // with nothing to look at — the gui's Game View tab
-    \\                // is empty. Skip the hide on Darwin so the
-    \\                // standalone sokol-app window stays visible and the
-    \\                // user can iterate the game there until a real
-    \\                // Path-A fix lands. On Linux GL and Windows D3D11
-    \\                // (where a producer IS publishing) the hide still
-    \\                // fires as before.
-    \\                const _preview_can_hide_window = comptime switch (@import("builtin").os.tag) {
-    \\                    .macos, .ios => false,
-    \\                    else => true,
-    \\                };
-    \\                if (comptime @hasDecl(window, "hideWindow") and _preview_can_hide_window) window.hideWindow();
+    \\                if (comptime @hasDecl(window, "hideWindow")) window.hideWindow();
     \\            }
     \\        }
     \\    }
