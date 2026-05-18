@@ -240,34 +240,21 @@ pub fn hideWindow() void {
         *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
         .{ .name = "sel_registerName" },
     );
-    // `void (*)(id, SEL, id)` — single-id-arg variant.
-    const msgSend_id_arg = @extern(
+    const msgSend_orderOut = @extern(
         *const fn (obj: ?*const anyopaque, sel: ?*anyopaque, sender: ?*anyopaque) callconv(.c) void,
         .{ .name = "objc_msgSend" },
     );
-    // `void (*)(id, SEL, double)` — single-double-arg variant for
-    // setAlphaValue:. Double on ARM64 + x86_64 is passed in vector regs;
-    // separate typed binding keeps the ABI clean.
-    const msgSend_double_arg = @extern(
-        *const fn (obj: ?*const anyopaque, sel: ?*anyopaque, alpha: f64) callconv(.c) void,
-        .{ .name = "objc_msgSend" },
-    );
 
-    // 1. [window setAlphaValue:0.0] — the window stays in the window
-    //    list (so Metal's swapchain + display link stay attached) but is
-    //    fully transparent. Doesn't touch the activation policy, so
-    //    NSApp.activationPolicy stays Regular and Metal keeps receiving
-    //    frame callbacks (Accessory policy was breaking that).
-    if (sel_registerName("setAlphaValue:")) |sel_alpha| {
-        msgSend_double_arg(nswin, sel_alpha, 0.0);
-    }
-
-    // 2. [window orderOut:nil] — also order off-screen so it doesn't
-    //    appear in window switchers / mission control even at alpha 0.
-    //    Combined, the window is functionally invisible without any
-    //    Metal-pipeline side effects.
+    // [NSWindow orderOut:nil] — yank the window off-screen.
+    //
+    // Tried more aggressive variants (setActivationPolicy:Accessory,
+    // setAlphaValue:0) and both broke Metal's frame-callback dispatch
+    // so Game View went black. orderOut is the only knob that keeps the
+    // Metal display link alive. Trade-off: the window may briefly flash
+    // on launch before init_cb fires, and a dock icon stays — both are
+    // visible-but-non-blocking annoyances rather than broken preview.
     if (sel_registerName("orderOut:")) |sel_orderOut| {
-        msgSend_id_arg(nswin, sel_orderOut, null);
+        msgSend_orderOut(nswin, sel_orderOut, null);
     }
 }
 
