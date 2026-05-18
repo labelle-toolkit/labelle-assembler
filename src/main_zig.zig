@@ -896,48 +896,40 @@ const PREVIEW_HELPERS =
 /// 2.1 / 3.3 core values — stable across drivers and platforms.
 const PREVIEW_READBACK_HELPERS =
     \\
-    \\// ── GL constants for PBO readback (labelle-engine#544) ──
-    \\const _GL_PIXEL_PACK_BUFFER: c_uint = 0x88EB;
-    \\const _GL_STREAM_READ: c_uint = 0x88E1;
-    \\const _GL_READ_ONLY: c_uint = 0x88B8;
-    \\const _GL_PACK_ALIGNMENT: c_uint = 0x0D05;
-    \\const _GL_RGBA: c_uint = 0x1908;
-    \\const _GL_UNSIGNED_BYTE: c_uint = 0x1401;
-    \\
-    \\// PBO entry points. raylib's libGL/CGL/WGL link gives us these
-    \\// for free. Names are the standard GL 2.1+ C symbols.
-    \\const _gl_pixel_storei = @extern(
-    \\    *const fn (pname: c_uint, param: c_int) callconv(.c) void,
-    \\    .{ .name = "glPixelStorei" },
-    \\);
-    \\const _gl_gen_buffers = @extern(
-    \\    *const fn (n: c_int, buffers: [*]c_uint) callconv(.c) void,
-    \\    .{ .name = "glGenBuffers" },
-    \\);
-    \\const _gl_delete_buffers = @extern(
-    \\    *const fn (n: c_int, buffers: [*]const c_uint) callconv(.c) void,
-    \\    .{ .name = "glDeleteBuffers" },
-    \\);
-    \\const _gl_bind_buffer = @extern(
-    \\    *const fn (target: c_uint, buffer: c_uint) callconv(.c) void,
-    \\    .{ .name = "glBindBuffer" },
-    \\);
-    \\const _gl_buffer_data = @extern(
-    \\    *const fn (target: c_uint, size: isize, data: ?*const anyopaque, usage: c_uint) callconv(.c) void,
-    \\    .{ .name = "glBufferData" },
-    \\);
-    \\const _gl_read_pixels = @extern(
-    \\    *const fn (x: c_int, y: c_int, w: c_int, h: c_int, fmt: c_uint, ty: c_uint, data: ?*anyopaque) callconv(.c) void,
-    \\    .{ .name = "glReadPixels" },
-    \\);
-    \\const _gl_map_buffer = @extern(
-    \\    *const fn (target: c_uint, access: c_uint) callconv(.c) ?*anyopaque,
-    \\    .{ .name = "glMapBuffer" },
-    \\);
-    \\const _gl_unmap_buffer = @extern(
-    \\    *const fn (target: c_uint) callconv(.c) u8,
-    \\    .{ .name = "glUnmapBuffer" },
-    \\);
+    \\// ── Preview readback bridges (labelle-assembler#140) ──
+    \\// All GL state + PBO ring + per-frame readback machinery now
+    \\// lives in `backends/raylib/src/window.zig:preview_pbo`. The
+    \\// codegen owns only these tiny bridge fns that wrap
+    \\// `engine.Preview` methods behind an `*anyopaque` boundary so
+    \\// the backend module doesn't need an engine type-import.
+    \\fn _preview_pbo_begin_bridge(ctx: *anyopaque, w: u32, h: u32) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.beginFrameStream(w, h);
+    \\}
+    \\fn _preview_pbo_publish_bridge(ctx: *anyopaque, pixels: []const u8) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.publishFrame(pixels);
+    \\}
+    \\fn _preview_pbo_end_bridge(ctx: *anyopaque) void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    p.endFrameStream();
+    \\}
+    \\fn _preview_pbo_begin_ios_bridge(ctx: *anyopaque, w: u32, h: u32) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.beginFrameStreamIOSurface(w, h);
+    \\}
+    \\fn _preview_pbo_publish_ios_bridge(ctx: *anyopaque, pixels: []const u8) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.publishFrameIOSurface(pixels);
+    \\}
+    \\fn _preview_pbo_end_ios_bridge(ctx: *anyopaque) void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    p.endFrameStreamIOSurface();
+    \\}
+    \\fn _preview_pbo_accepted_bridge(ctx: *anyopaque) bool {
+    \\    const p: *const engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.isFrameAccepted();
+    \\}
     \\
 ;
 
@@ -996,33 +988,23 @@ const PREVIEW_LOOP_SETUP =
 /// `endFrameStreamIOSurface`). The teardown defer here picks the
 /// matching `end*` at comptime so the right side is closed.
 const PREVIEW_READBACK_SETUP =
-    \\    // PBO ring + CPU-side pixel buffer for the per-frame async readback
-    \\    // (labelle-engine#544). `_preview_pbos` ids are lazily generated
-    \\    // on the first accepted frame; `_preview_pbo_bytes` tracks the
-    \\    // per-PBO allocation size so a resize can re-issue `glBufferData`
-    \\    // without reallocating the IDs. The CPU buffer is the staging
-    \\    // copy fed into `Preview.publishFrame` (RGBA8, exact dims).
-    \\    // On macOS the same RGBA8 buffer is handed to
-    \\    // `publishFrameIOSurface`, which swizzles to BGRA during the
-    \\    // IOSurface lock/copy — producer-side format stays RGBA8 either
-    \\    // way (labelle-assembler#121).
-    \\    var _preview_pbos: [3]c_uint = .{ 0, 0, 0 };
-    \\    var _preview_pbo_bytes: usize = 0;
-    \\    var _preview_pbo_initialized: bool = false;
-    \\    var _preview_frame_idx: u64 = 0;
-    \\    var _preview_last_w: u32 = 0;
-    \\    var _preview_last_h: u32 = 0;
-    \\    var _preview_pixel_buf: []u8 = &[_]u8{};
-    \\    _ = &_preview_pbo_bytes;
-    \\    defer if (_preview_pixel_buf.len != 0) allocator.free(_preview_pixel_buf);
-    \\    defer if (_preview_pbo_initialized) _gl_delete_buffers(3, &_preview_pbos);
-    \\    defer if (g.preview) |*_p| {
-    \\        if (comptime @import("builtin").os.tag == .macos) {
-    \\            _p.endFrameStreamIOSurface();
-    \\        } else {
-    \\            _p.endFrameStream();
-    \\        }
-    \\    };
+    \\    // labelle-assembler#140 — preview readback is now
+    \\    // backend-internal. Wire engine.Preview methods into the
+    \\    // backend vtable + register cleanup. The bridges below
+    \\    // are emitted at module scope by PREVIEW_READBACK_HELPERS.
+    \\    if (g.preview) |*_p| {
+    \\        window.preview_pbo.attach(.{
+    \\            .ctx = @ptrCast(_p),
+    \\            .beginFrameStream = _preview_pbo_begin_bridge,
+    \\            .publishFrame = _preview_pbo_publish_bridge,
+    \\            .endFrameStream = _preview_pbo_end_bridge,
+    \\            .beginFrameStreamIOSurface = _preview_pbo_begin_ios_bridge,
+    \\            .publishFrameIOSurface = _preview_pbo_publish_ios_bridge,
+    \\            .endFrameStreamIOSurface = _preview_pbo_end_ios_bridge,
+    \\            .isFrameAccepted = _preview_pbo_accepted_bridge,
+    \\        }, allocator);
+    \\    }
+    \\    defer window.preview_pbo.deinit();
     \\
 ;
 
@@ -1078,99 +1060,9 @@ const PREVIEW_HEARTBEAT_LOOP =
 /// does the RGBA→BGRA swizzle internally during the IOSurface
 /// lock/copy, so no producer-side format change is needed.
 const PREVIEW_READBACK_LOOP =
-    \\        if (g.preview) |*_p| _readback: {
-    \\            const _sw_i = window.getScreenWidth();
-    \\            const _sh_i = window.getScreenHeight();
-    \\            if (_sw_i <= 0 or _sh_i <= 0) break :_readback;
-    \\            const _sw: u32 = @intCast(_sw_i);
-    \\            const _sh: u32 = @intCast(_sh_i);
-    \\            const _needed_bytes: usize = @as(usize, _sw) * @as(usize, _sh) * 4;
-    \\
-    \\            // Resize / first-frame: (re)negotiate the SHM ring with
-    \\            // the editor and (re)size the PBOs + CPU staging buffer.
-    \\            // beginFrameStream is idempotent across resizes — the
-    \\            // engine tears down the old ring and re-offers under the
-    \\            // hood. After this, `isFrameAccepted` flips back to false
-    \\            // until the editor sends a fresh `frame_accept`; the
-    \\            // readback below will skip until then.
-    \\            //
-    \\            // On macOS the IOSurface variant is used instead — same
-    \\            // lifecycle contract, zero-copy frame transport via
-    \\            // mach ports (labelle-assembler#121).
-    \\            if (_sw != _preview_last_w or _sh != _preview_last_h) {
-    \\                if (comptime @import("builtin").os.tag == .macos) {
-    \\                    _p.beginFrameStreamIOSurface(_sw, _sh) catch break :_readback;
-    \\                } else {
-    \\                    _p.beginFrameStream(_sw, _sh) catch break :_readback;
-    \\                }
-    \\                if (!_preview_pbo_initialized) {
-    \\                    _gl_gen_buffers(3, &_preview_pbos);
-    \\                    _preview_pbo_initialized = true;
-    \\                }
-    \\                _gl_pixel_storei(_GL_PACK_ALIGNMENT, 4);
-    \\                for (_preview_pbos) |_pbo_id| {
-    \\                    _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, _pbo_id);
-    \\                    _gl_buffer_data(_GL_PIXEL_PACK_BUFFER, @intCast(_needed_bytes), null, _GL_STREAM_READ);
-    \\                }
-    \\                _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, 0);
-    \\                _preview_pbo_bytes = _needed_bytes;
-    \\                if (_preview_pixel_buf.len != _needed_bytes) {
-    \\                    if (_preview_pixel_buf.len != 0) allocator.free(_preview_pixel_buf);
-    \\                    _preview_pixel_buf = allocator.alloc(u8, _needed_bytes) catch &[_]u8{};
-    \\                }
-    \\                _preview_last_w = _sw;
-    \\                _preview_last_h = _sh;
-    \\                _preview_frame_idx = 0;
-    \\            }
-    \\
-    \\            // Editor not yet attached (or not yet acknowledged the
-    \\            // current offer)? Skip the readback entirely — saves the
-    \\            // glReadPixels + glMapBuffer cost when nobody is watching.
-    \\            if (!_p.isFrameAccepted() or _preview_pixel_buf.len != _needed_bytes) break :_readback;
-    \\
-    \\            // Issue the async DMA into the write PBO. With a PIXEL_PACK_BUFFER
-    \\            // bound, the last arg to glReadPixels is an offset, not a pointer.
-    \\            const _write_idx: usize = @intCast(_preview_frame_idx % 3);
-    \\            _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, _preview_pbos[_write_idx]);
-    \\            _gl_read_pixels(0, 0, _sw_i, _sh_i, _GL_RGBA, _GL_UNSIGNED_BYTE, null);
-    \\
-    \\            // Once the ring is primed (≥ 2 frames in flight), map the
-    \\            // oldest PBO and publish it. glMapBuffer blocks here only
-    \\            // if the DMA hasn't finished — which is precisely the
-    \\            // stall the 2-frame gap is designed to hide.
-    \\            if (_preview_frame_idx >= 2) {
-    \\                const _read_idx: usize = @intCast((_preview_frame_idx - 2) % 3);
-    \\                _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, _preview_pbos[_read_idx]);
-    \\                const _mapped = _gl_map_buffer(_GL_PIXEL_PACK_BUFFER, _GL_READ_ONLY);
-    \\                if (_mapped) |_src| {
-    \\                    const _src_ptr: [*]const u8 = @ptrCast(_src);
-    \\                    // GL returns rows bottom-up; the editor's SHM
-    \\                    // consumer treats the ring as top-down RGBA8.
-    \\                    // Flip-on-copy keeps the producer side cheap
-    \\                    // (one extra strided memcpy vs. a CPU rotate).
-    \\                    const _row_bytes: usize = @as(usize, _sw) * 4;
-    \\                    var _y: u32 = 0;
-    \\                    while (_y < _sh) : (_y += 1) {
-    \\                        const _src_row = _src_ptr + (@as(usize, _sh - 1 - _y) * _row_bytes);
-    \\                        const _dst_row = _preview_pixel_buf.ptr + (@as(usize, _y) * _row_bytes);
-    \\                        @memcpy(_dst_row[0.._row_bytes], _src_row[0.._row_bytes]);
-    \\                    }
-    \\                    _ = _gl_unmap_buffer(_GL_PIXEL_PACK_BUFFER);
-    \\                    // macOS path: hand the RGBA8 buffer to the
-    \\                    // IOSurface publisher — engine swizzles to BGRA
-    \\                    // during the IOSurface lock (labelle-assembler#121).
-    \\                    if (comptime @import("builtin").os.tag == .macos) {
-    \\                        _p.publishFrameIOSurface(_preview_pixel_buf) catch {};
-    \\                    } else {
-    \\                        _p.publishFrame(_preview_pixel_buf) catch {};
-    \\                    }
-    \\                } else {
-    \\                    // Map failed (driver bug / context loss). Skip
-    \\                    // this frame and let the next one try again.
-    \\                }
-    \\            }
-    \\            _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, 0);
-    \\            _preview_frame_idx +%= 1;
+    \\        if (g.preview) |*_p| {
+    \\            _ = _p;
+    \\            window.preview_pbo.frame();
     \\        }
     \\
 ;
