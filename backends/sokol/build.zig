@@ -12,9 +12,19 @@ pub fn build(b: *std.Build) void {
     // Forward dont_link_system_libs for iOS builds — we link frameworks manually.
     const dont_link_system_libs = b.option(bool, "dont_link_system_libs", "Don't link system libraries (for iOS cross-compilation)") orelse false;
 
+    // IMPORTANT: keep these options in lockstep with
+    // `labelle-imgui/bridges/sokol/build.zig`. Zig keys each
+    // `b.dependency("sokol", .{...})` resolution by the option set, so
+    // mismatched options produce *two* separately compiled `sokol_clib`
+    // artifacts in the same binary — and therefore two copies of the
+    // `_sg` static state. Symptom: sgl draws land in the IOSurface
+    // pass but simgui draws don't (different state machines). Symmetric
+    // option list = one artifact = one `_sg` (labelle-assembler#140).
     const sokol_dep = b.dependency("sokol", .{
         .target = target,
         .optimize = optimize,
+        .with_sokol_imgui = true,
+        .with_sokol_imgui_no_app = true,
         .dont_link_system_libs = dont_link_system_libs,
     });
     const sokol_mod = sokol_dep.module("sokol");
