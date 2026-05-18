@@ -53,9 +53,41 @@ pub fn initGfx() void {
     });
 }
 
+/// Quiet-exit handler for the upstream sokol-gfx SIGSEGV in
+/// `_sg_mtl_garbage_collect` during `sg_shutdown` (labelle-assembler#140).
+/// Bug lives in sokol-gfx's deferred-release queue, not our cleanup.
+/// By the time the signal fires the game has already published its
+/// last frame to the editor consumer, so an immediate `_exit(0)` keeps
+/// the gui's preview state machine in a clean disconnect instead of
+/// surfacing a crash dump.
+fn quietExitOnShutdownCrash(_: std.posix.SIG, _: *const std.posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    // _exit(2) bypasses atexit handlers — important because the
+    // crash happens INSIDE sokol's teardown, and running more cleanup
+    // would re-enter the broken state.
+    std.c._exit(0);
+}
+
+const std = @import("std");
+
 pub fn shutdownGfx() void {
     sgl.destroyPipeline(alpha_pipeline);
     sgl.shutdown();
+
+    // labelle-assembler#140 workaround — install the quiet-exit handler
+    // ONLY on the Darwin/Metal path where the upstream crash reproduces.
+    // Linux/Windows/etc. take the normal sg.shutdown path and crash
+    // legitimately on any real bug.
+    if (builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
+        var sa: std.posix.Sigaction = .{
+            .handler = .{ .sigaction = quietExitOnShutdownCrash },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.SIGINFO,
+        };
+        std.posix.sigaction(std.posix.SIG.SEGV, &sa, null);
+        std.posix.sigaction(std.posix.SIG.BUS, &sa, null);
+        std.posix.sigaction(std.posix.SIG.ABRT, &sa, null);
+    }
+
     sg.shutdown();
 }
 
