@@ -1721,8 +1721,16 @@ const PREVIEW_READBACK_HELPERS_METAL_SOKOL =
     \\// with `_sokol_preview_gl_enabled` (GL = .linux only on default
     \\// sokol, Metal = .macos/.ios only) — exactly one of the two
     \\// publish paths fires per target.
+    \\// Path-A disabled on macOS pending a fix for labelle-assembler#140
+    \\// — SIGSEGV in `_sg_mtl_garbage_collect` during `sg_shutdown` after
+    \\// preview-mode runs. Cleanup itself is clean (verified via
+    \\// instrumentation on `debug/path-a-shutdown-instrumentation`); the
+    \\// bug is inside sokol-gfx's deferred-release queue, not the preview
+    \\// teardown. Keeping the gate at `false` makes the Path-A producer
+    \\// a no-op on macOS — game runs without crashing, Game View shows
+    \\// an empty tab until a real fix lands.
     \\const _sokol_preview_metal_enabled: bool = switch (@import("builtin").os.tag) {
-    \\    .macos, .ios => true,
+    \\    .macos, .ios => false, // see labelle-assembler#140
     \\    else => false,
     \\};
     \\
