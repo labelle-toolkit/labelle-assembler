@@ -2379,6 +2379,14 @@ const PREVIEW_READBACK_CLEANUP_SOKOL_D3D11 =
 /// freed IOSurface backing storage during the release window.
 const PREVIEW_READBACK_CLEANUP_METAL_SOKOL =
     \\    if (comptime _sokol_preview_metal_enabled) {
+    \\        // [DEBUG instrumentation for labelle-assembler#140 — shutdown
+    \\        // SIGSEGV in _sg_mtl_garbage_collect. Logs every cleanup step
+    \\        // with handle/pointer identity so we can pinpoint which call
+    \\        // is enqueueing the bad slot. Remove once the root cause is
+    \\        // identified and the real fix lands.]
+    \\        std.debug.print("[mtl-cleanup] enter ring_size={d} initialized={} target_active={}\n", .{
+    \\            _preview_mtl_ring_size, _preview_mtl_initialized, _preview_mtl_target_active,
+    \\        });
     \\        // Make sure the gfx layer isn't still pointing at one of
     \\        // the attachments we're about to free — otherwise the next
     \\        // frame after shutdown (there shouldn't be one, but defend
@@ -2386,26 +2394,59 @@ const PREVIEW_READBACK_CLEANUP_METAL_SOKOL =
     \\        window.clearEditorRenderTarget();
     \\        var _i: u32 = 0;
     \\        while (_i < _preview_mtl_ring_size) : (_i += 1) {
+    \\            std.debug.print("[mtl-cleanup] slot {d}: view.id={d} img.id={d} tex={?*}\n", .{
+    \\                _i,
+    \\                _preview_mtl_views[_i].id,
+    \\                _preview_mtl_sg_images[_i].id,
+    \\                _preview_mtl_textures[_i],
+    \\            });
     \\            // Views first — sokol-gfx asserts on destroying an
     \\            // image that still has a view bound to it.
     \\            if (_preview_mtl_views[_i].id != 0) {
+    \\                std.debug.print("[mtl-cleanup] slot {d}: destroyView id={d}\n", .{ _i, _preview_mtl_views[_i].id });
     \\                window.gfx_types.destroyView(_preview_mtl_views[_i]);
     \\                _preview_mtl_views[_i] = .{};
     \\            }
     \\            _preview_mtl_attachments[_i] = .{};
-    \\            if (_preview_mtl_sg_images[_i].id != 0) {
-    \\                window.gfx_types.destroyImage(_preview_mtl_sg_images[_i]);
-    \\                _preview_mtl_sg_images[_i] = .{};
-    \\            }
+    \\            // CHANGE: release the manual MTLTexture retain BEFORE
+    \\            // sokol's destroyImage queues the pool slot. This
+    \\            // mirrors the ring-resize order at lines 2168-2185 and
+    \\            // narrows the window in which sokol's deferred-release
+    \\            // queue can hold a slot pointing at a doomed texture.
+    \\            // If reorder alone fixes the crash, the manual release
+    \\            // and the sokol GC were colliding via the pool wrap.
     \\            if (_preview_mtl_textures[_i]) |t| {
+    \\                std.debug.print("[mtl-cleanup] slot {d}: release MTLTexture ptr={*}\n", .{ _i, t });
     \\                _SokolPreviewMetal.release(t);
     \\                _preview_mtl_textures[_i] = null;
     \\            }
+    \\            if (_preview_mtl_sg_images[_i].id != 0) {
+    \\                std.debug.print("[mtl-cleanup] slot {d}: destroyImage id={d}\n", .{ _i, _preview_mtl_sg_images[_i].id });
+    \\                window.gfx_types.destroyImage(_preview_mtl_sg_images[_i]);
+    \\                _preview_mtl_sg_images[_i] = .{};
+    \\            }
+    \\        }
+    \\        // ADDED: tear down the shared depth-stencil image + view
+    \\        // that resize creates (lines 2195-2210). The original
+    \\        // cleanup template only walked the color ring, leaving
+    \\        // these two sokol resources live at sg_shutdown time —
+    \\        // a candidate contributor to the GC-walk corruption.
+    \\        if (_preview_mtl_depth_view.id != 0) {
+    \\            std.debug.print("[mtl-cleanup] destroyView depth.id={d}\n", .{_preview_mtl_depth_view.id});
+    \\            window.gfx_types.destroyView(_preview_mtl_depth_view);
+    \\            _preview_mtl_depth_view = .{};
+    \\        }
+    \\        if (_preview_mtl_depth_img.id != 0) {
+    \\            std.debug.print("[mtl-cleanup] destroyImage depth.id={d}\n", .{_preview_mtl_depth_img.id});
+    \\            window.gfx_types.destroyImage(_preview_mtl_depth_img);
+    \\            _preview_mtl_depth_img = .{};
     \\        }
     \\        _preview_mtl_ring_size = 0;
     \\        _preview_mtl_initialized = false;
     \\        _preview_mtl_target_active = false;
+    \\        std.debug.print("[mtl-cleanup] endFrameStreamIOSurface\n", .{});
     \\        if (g.preview) |*_p| _p.endFrameStreamIOSurface();
+    \\        std.debug.print("[mtl-cleanup] done — sg.shutdown next\n", .{});
     \\    }
     \\
 ;
