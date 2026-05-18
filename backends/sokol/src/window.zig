@@ -256,6 +256,145 @@ pub fn hideWindow() void {
 /// import sokol directly (used by mobile sokol_main return type).
 pub const Desc = sapp.Desc;
 
+// ──────────────────────────────────────────────────────────────────
+// Preview-mode bridges (labelle-assembler#140 architecture rethink)
+// ──────────────────────────────────────────────────────────────────
+// These were previously emitted inline by the assembler codegen as
+// `\\`-escaped Zig source in `PREVIEW_READBACK_HELPERS_METAL_SOKOL`.
+// They're pure backend-specific Metal/objc runtime bindings — the
+// generated `main.zig` shouldn't have known about libobjc, Metal
+// pixel formats, MTLTextureDescriptor, or IOSurface texture
+// wrapping. Moving them here is step one of the preview-decoupling:
+// the codegen template now just aliases `window.PreviewMtlBridge`,
+// and a future migration moves the per-frame state + frame logic
+// across the same seam.
+
+/// Comptime gate equivalent to the codegen's old `_sokol_preview_metal_enabled`.
+/// The codegen `PREVIEW_READBACK_HELPERS_METAL_SOKOL` template now reads:
+///   const _sokol_preview_metal_enabled = window.preview_metal_enabled;
+/// so the truth-value lives in the backend module.
+pub const preview_metal_enabled: bool = switch (builtin.target.os.tag) {
+    .macos, .ios => true,
+    else => false,
+};
+
+/// libobjc + Metal runtime bindings used by the macOS Path-A preview
+/// producer (#131). Wraps an IOSurface as an `MTLTexture` so sokol-gfx
+/// can render directly into shared editor-visible memory.
+///
+/// MTLPixelFormatBGRA8Unorm = 80 — matches the IOSurface's BGRA8 pixel
+/// format the engine producer negotiates (preview_iosurface.kPixelFormat_BGRA8).
+///
+/// On non-Darwin this resolves to an empty struct so no libobjc / Metal
+/// symbols leak into the link line.
+pub const PreviewMtlBridge = if (preview_metal_enabled) struct {
+    pub const MTLPixelFormatBGRA8Unorm: u64 = 80;
+    pub const MTLStorageModeShared: u64 = 0;
+    pub const MTLStorageModeManaged: u64 = 1;
+    pub const MTLTextureUsageShaderRead: u64 = 0x01;
+    pub const MTLTextureUsageRenderTarget: u64 = 0x04;
+    pub const MTLTextureType2D: u64 = 2;
+
+    // libobjc primitives. Each typed `objc_msgSend` variant is a separate
+    // @extern with a concrete signature — the libobjc symbol is variadic
+    // but every call site has a fixed shape.
+    pub const sel_registerName = @extern(
+        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
+        .{ .name = "sel_registerName" },
+    );
+    pub const objc_getClass = @extern(
+        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
+        .{ .name = "objc_getClass" },
+    );
+
+    // msgSend(obj, sel) -> void  (for `release`)
+    pub const msgSend_void = @extern(
+        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) void,
+        .{ .name = "objc_msgSend" },
+    );
+    // msgSend(cls, sel) -> id  (for `[MTLTextureDescriptor alloc]` style)
+    pub const msgSend_id = @extern(
+        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) ?*anyopaque,
+        .{ .name = "objc_msgSend" },
+    );
+    // [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:width:height:mipmapped:]
+    pub const msgSend_texdesc = @extern(
+        *const fn (cls: ?*anyopaque, sel: ?*anyopaque, fmt: u64, w: usize, h: usize, mip: u8) callconv(.c) ?*anyopaque,
+        .{ .name = "objc_msgSend" },
+    );
+    // single-arg u64 setters
+    pub const msgSend_set_u64 = @extern(
+        *const fn (obj: ?*anyopaque, sel: ?*anyopaque, v: u64) callconv(.c) void,
+        .{ .name = "objc_msgSend" },
+    );
+    // [device newTextureWithDescriptor:iosurface:plane:]
+    pub const msgSend_newtex_iosurf = @extern(
+        *const fn (
+            obj: ?*anyopaque,
+            sel: ?*anyopaque,
+            desc: ?*anyopaque,
+            iosurface: ?*anyopaque,
+            plane: usize,
+        ) callconv(.c) ?*anyopaque,
+        .{ .name = "objc_msgSend" },
+    );
+
+    // Selector cache — looked up lazily on first frame.
+    pub var sel_release: ?*anyopaque = null;
+    pub var sel_setStorageMode: ?*anyopaque = null;
+    pub var sel_setUsage: ?*anyopaque = null;
+    pub var sel_texDesc: ?*anyopaque = null;
+    pub var sel_newTextureWithDescriptorIOSurfacePlane: ?*anyopaque = null;
+    pub var cls_MTLTextureDescriptor: ?*anyopaque = null;
+
+    pub fn loadSelectors() void {
+        if (sel_release != null) return;
+        sel_release = sel_registerName("release");
+        sel_setStorageMode = sel_registerName("setStorageMode:");
+        sel_setUsage = sel_registerName("setUsage:");
+        sel_texDesc = sel_registerName(
+            "texture2DDescriptorWithPixelFormat:width:height:mipmapped:",
+        );
+        sel_newTextureWithDescriptorIOSurfacePlane = sel_registerName(
+            "newTextureWithDescriptor:iosurface:plane:",
+        );
+        cls_MTLTextureDescriptor = objc_getClass("MTLTextureDescriptor");
+    }
+
+    /// Wrap `iosurface` as an `MTLTexture` whose backing store is the
+    /// surface bytes. Width/height/format must match the IOSurface.
+    /// Usage: ShaderRead | RenderTarget. Returns null on alloc failure.
+    pub fn createIOSurfaceTexture(
+        device: ?*anyopaque,
+        iosurface: ?*anyopaque,
+        w: u32,
+        h: u32,
+    ) ?*anyopaque {
+        const cls = cls_MTLTextureDescriptor orelse return null;
+        const desc = msgSend_texdesc(
+            cls,
+            sel_texDesc,
+            MTLPixelFormatBGRA8Unorm,
+            @intCast(w),
+            @intCast(h),
+            0,
+        ) orelse return null;
+        msgSend_set_u64(desc, sel_setStorageMode, MTLStorageModeShared);
+        msgSend_set_u64(desc, sel_setUsage, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
+        return msgSend_newtex_iosurf(
+            device,
+            sel_newTextureWithDescriptorIOSurfacePlane,
+            desc,
+            iosurface,
+            0,
+        );
+    }
+
+    pub fn release(obj: ?*anyopaque) void {
+        if (obj) |o| msgSend_void(o, sel_release);
+    }
+} else struct {};
+
 /// Build a sokol app descriptor without starting the event loop.
 /// Used on mobile targets where sokol calls sokol_main() and reads its
 /// return value as sapp_desc — the host must NOT call sapp_run() itself.

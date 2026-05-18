@@ -1728,10 +1728,13 @@ const PREVIEW_READBACK_HELPERS_METAL_SOKOL =
     \\// crash happens *after* the last frame has been published, so by
     \\// the time SIGSEGV fires Game View already has its frames; the
     \\// process just exits 0 silently instead of dumping a .ips file.
-    \\const _sokol_preview_metal_enabled: bool = switch (@import("builtin").os.tag) {
-    \\    .macos, .ios => true,
-    \\    else => false,
-    \\};
+    \\// labelle-assembler#140: the Path-A enablement gate now lives in
+    \\// the backend module (`backends/sokol/src/window.zig`). The
+    \\// codegen aliases it so the existing `_sokol_preview_metal_enabled`
+    \\// name keeps working unchanged across the Path-A code paths
+    \\// below. This is step one of moving backend-specific preview
+    \\// knowledge out of the codegen.
+    \\const _sokol_preview_metal_enabled = window.preview_metal_enabled;
     \\
     \\// Path-A Metal state at module scope (sokol's callback model has
     \\// no shared local scope between init/frame/cleanup). The
@@ -1791,125 +1794,12 @@ const PREVIEW_READBACK_HELPERS_METAL_SOKOL =
     \\// MTLPixelFormatBGRA8Unorm = 80 — matches the IOSurface's BGRA8
     \\// pixel format the engine producer sets up
     \\// (`preview_iosurface.kPixelFormat_BGRA8`).
-    \\const _SokolPreviewMetal = if (_sokol_preview_metal_enabled) struct {
-    \\    pub const MTLPixelFormatBGRA8Unorm: u64 = 80;
-    \\    pub const MTLStorageModeShared: u64 = 0;
-    \\    pub const MTLStorageModeManaged: u64 = 1;
-    \\    pub const MTLTextureUsageShaderRead: u64 = 0x01;
-    \\    pub const MTLTextureUsageRenderTarget: u64 = 0x04;
-    \\    pub const MTLTextureType2D: u64 = 2;
-    \\
-    \\    // libobjc primitives. Each typed `objc_msgSend` variant is a
-    \\    // separate @extern with a concrete signature — the libobjc
-    \\    // symbol is variadic, but every call site has a fixed shape.
-    \\    pub const sel_registerName = @extern(
-    \\        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "sel_registerName" },
-    \\    );
-    \\    pub const objc_getClass = @extern(
-    \\        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "objc_getClass" },
-    \\    );
-    \\
-    \\    // msgSend(obj, sel) -> void  (for `release`)
-    \\    pub const msgSend_void = @extern(
-    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) void,
-    \\        .{ .name = "objc_msgSend" },
-    \\    );
-    \\    // msgSend(cls, sel) -> id  (for `[MTLTextureDescriptor alloc]` style)
-    \\    pub const msgSend_id = @extern(
-    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "objc_msgSend" },
-    \\    );
-    \\
-    \\    // [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:width:height:mipmapped:]
-    \\    pub const msgSend_texdesc = @extern(
-    \\        *const fn (cls: ?*anyopaque, sel: ?*anyopaque, fmt: u64, w: usize, h: usize, mip: u8) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "objc_msgSend" },
-    \\    );
-    \\    // [texdesc setStorageMode:] / [texdesc setUsage:] — single-arg setters
-    \\    pub const msgSend_set_u64 = @extern(
-    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque, v: u64) callconv(.c) void,
-    \\        .{ .name = "objc_msgSend" },
-    \\    );
-    \\
-    \\    // [device newTextureWithDescriptor:descriptor iosurface:surface plane:plane]
-    \\    // — the producer-side wrap that gives us an `MTLTexture` whose
-    \\    // backing store is the IOSurface bytes. The texture is the one
-    \\    // we'd later hand to sokol-gfx via `sg.ImageDesc.mtl_textures`.
-    \\    pub const msgSend_newtex_iosurf = @extern(
-    \\        *const fn (
-    \\            obj: ?*anyopaque,
-    \\            sel: ?*anyopaque,
-    \\            desc: ?*anyopaque,
-    \\            iosurface: ?*anyopaque,
-    \\            plane: usize,
-    \\        ) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "objc_msgSend" },
-    \\    );
-    \\
-    \\    // Selector cache — looked up lazily on first frame.
-    \\    pub var sel_release: ?*anyopaque = null;
-    \\    pub var sel_setStorageMode: ?*anyopaque = null;
-    \\    pub var sel_setUsage: ?*anyopaque = null;
-    \\    pub var sel_texDesc: ?*anyopaque = null;
-    \\    pub var sel_newTextureWithDescriptorIOSurfacePlane: ?*anyopaque = null;
-    \\    pub var cls_MTLTextureDescriptor: ?*anyopaque = null;
-    \\
-    \\    pub fn loadSelectors() void {
-    \\        if (sel_release != null) return;
-    \\        sel_release = sel_registerName("release");
-    \\        sel_setStorageMode = sel_registerName("setStorageMode:");
-    \\        sel_setUsage = sel_registerName("setUsage:");
-    \\        sel_texDesc = sel_registerName(
-    \\            "texture2DDescriptorWithPixelFormat:width:height:mipmapped:",
-    \\        );
-    \\        sel_newTextureWithDescriptorIOSurfacePlane = sel_registerName(
-    \\            "newTextureWithDescriptor:iosurface:plane:",
-    \\        );
-    \\        cls_MTLTextureDescriptor = objc_getClass("MTLTextureDescriptor");
-    \\    }
-    \\
-    \\    /// Wrap `iosurface` as an `MTLTexture` whose backing store is
-    \\    /// the surface bytes. Width/height/format must match the
-    \\    /// IOSurface (we negotiated BGRA8 with the engine producer).
-    \\    /// Usage flags: `ShaderRead | RenderTarget` so sokol-gfx can
-    \\    /// later use this as a color-attachment image *and* sample it
-    \\    /// for the fullscreen-quad swapchain blit when the gfx
-    \\    /// redirect lands. Returns null on Metal allocation failure.
-    \\    pub fn createIOSurfaceTexture(
-    \\        device: ?*anyopaque,
-    \\        iosurface: ?*anyopaque,
-    \\        w: u32,
-    \\        h: u32,
-    \\    ) ?*anyopaque {
-    \\        const cls = cls_MTLTextureDescriptor orelse return null;
-    \\        const desc = msgSend_texdesc(
-    \\            cls,
-    \\            sel_texDesc,
-    \\            MTLPixelFormatBGRA8Unorm,
-    \\            @intCast(w),
-    \\            @intCast(h),
-    \\            0,
-    \\        ) orelse return null;
-    \\        // Storage mode: macOS uses shared with IOSurfaces (the
-    \\        // kernel mediates GPU/CPU coherence via the surface
-    \\        // itself); iOS GPUs only support shared anyway.
-    \\        msgSend_set_u64(desc, sel_setStorageMode, MTLStorageModeShared);
-    \\        msgSend_set_u64(desc, sel_setUsage, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
-    \\        return msgSend_newtex_iosurf(
-    \\            device,
-    \\            sel_newTextureWithDescriptorIOSurfacePlane,
-    \\            desc,
-    \\            iosurface,
-    \\            0,
-    \\        );
-    \\    }
-    \\
-    \\    pub fn release(obj: ?*anyopaque) void {
-    \\        if (obj) |o| msgSend_void(o, sel_release);
-    \\    }
-    \\} else struct {};
+    \\// labelle-assembler#140: the libobjc + Metal bridge struct
+    \\// previously defined inline here now lives in the sokol
+    \\// backend module (`backends/sokol/src/window.zig:PreviewMtlBridge`).
+    \\// On non-Darwin builds it resolves to an empty struct, same as
+    \\// before — no libobjc / Metal symbols leak into the link line.
+    \\const _SokolPreviewMetal = window.PreviewMtlBridge;
     \\
 ;
 
