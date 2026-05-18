@@ -1022,7 +1022,41 @@ const PREVIEW_HEARTBEAT_LOOP =
     \\        if (g.preview) |*_p| {
     \\            _p.pollSubscription() catch {};
     \\            _p.tickHeartbeat(_preview_now_ms()) catch {};
+    \\            // Drain editor → game input events (labelle-assembler#143).
+    \\            // The imgui plugin's sokol bridge exposes thin shims over
+    \\            // `simgui_add_*_event`; we link weakly so projects without
+    \\            // the plugin still build.
+    \\            while (_p.popInputEvent()) |_ev| {
+    \\                switch (_ev) {
+    \\                    .mouse_pos => |_m| _preview_input_mouse_pos(_m.x, _m.y),
+    \\                    .mouse_button => |_m| _preview_input_mouse_button(_m.button, _m.down),
+    \\                }
+    \\            }
     \\        }
+    \\
+;
+
+/// Wrappers around the imgui sokol bridge's mouse-event exports.
+/// Emitted only when the project's gui plugin is set (cfg.resolved_gui).
+/// Projects without a gui plugin get `PREVIEW_INPUT_DISPATCH_STUB` so
+/// the `_preview_input_*` symbols still resolve in PREVIEW_HEARTBEAT_LOOP
+/// (the drain just discards events).
+const PREVIEW_INPUT_DISPATCH =
+    \\extern fn imgui_bridge_mouse_pos(x: f32, y: f32) void;
+    \\extern fn imgui_bridge_mouse_button(button: i32, down: bool) void;
+    \\
+    \\fn _preview_input_mouse_pos(x: f32, y: f32) void {
+    \\    imgui_bridge_mouse_pos(x, y);
+    \\}
+    \\fn _preview_input_mouse_button(button: i32, down: bool) void {
+    \\    imgui_bridge_mouse_button(button, down);
+    \\}
+    \\
+;
+
+const PREVIEW_INPUT_DISPATCH_STUB =
+    \\fn _preview_input_mouse_pos(_: f32, _: f32) void {}
+    \\fn _preview_input_mouse_button(_: i32, _: bool) void {}
     \\
 ;
 
@@ -1135,6 +1169,12 @@ const PREVIEW_HEARTBEAT_CALLBACK =
     \\    if (g.preview) |*_p| {
     \\        _p.pollSubscription() catch {};
     \\        _p.tickHeartbeat(_preview_now_ms()) catch {};
+    \\        while (_p.popInputEvent()) |_ev| {
+    \\            switch (_ev) {
+    \\                .mouse_pos => |_m| _preview_input_mouse_pos(_m.x, _m.y),
+    \\                .mouse_button => |_m| _preview_input_mouse_button(_m.button, _m.down),
+    \\            }
+    \\        }
     \\    }
     \\
 ;
@@ -2823,7 +2863,11 @@ pub fn generateMainZigFromTemplate(
             else
                 "";
             defer if (cfg.backend == .sokol) allocator.free(sokol_readback_helpers);
-            const module_vars = try std.mem.concat(allocator, u8, &.{ sokol_runner, PREVIEW_HELPERS, sokol_readback_helpers });
+            const input_dispatch_cb: []const u8 = if (cfg.resolved_gui != null)
+                PREVIEW_INPUT_DISPATCH
+            else
+                PREVIEW_INPUT_DISPATCH_STUB;
+            const module_vars = try std.mem.concat(allocator, u8, &.{ sokol_runner, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch_cb });
             defer allocator.free(module_vars);
             const init_code = try buildCallbackInitCode(allocator, cfg, jsonc_scene_names, prefab_names);
             defer allocator.free(init_code);
@@ -3002,11 +3046,15 @@ pub fn generateMainZigFromTemplate(
             // takes the callback branch above, so this only fires for
             // raylib desktop.
             const is_raylib_desktop = cfg.backend == .raylib;
-            const module_vars_loop = if (is_raylib_desktop)
-                try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, PREVIEW_READBACK_HELPERS })
+            const input_dispatch: []const u8 = if (cfg.resolved_gui != null)
+                PREVIEW_INPUT_DISPATCH
             else
-                PREVIEW_HELPERS;
-            defer if (is_raylib_desktop) allocator.free(module_vars_loop);
+                PREVIEW_INPUT_DISPATCH_STUB;
+            const module_vars_loop = if (is_raylib_desktop)
+                try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, PREVIEW_READBACK_HELPERS, input_dispatch })
+            else
+                try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, input_dispatch });
+            defer allocator.free(module_vars_loop);
             const preview_setup_loop = if (is_raylib_desktop)
                 try std.mem.concat(allocator, u8, &.{ PREVIEW_LOOP_SETUP, PREVIEW_READBACK_SETUP })
             else
