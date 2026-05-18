@@ -240,14 +240,49 @@ pub fn hideWindow() void {
         *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
         .{ .name = "sel_registerName" },
     );
-    // [NSWindow orderOut:nil] — single-arg `id` selector returning void.
+    const objc_getClass = @extern(
+        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
+        .{ .name = "objc_getClass" },
+    );
+
+    // Three nested objc_msgSend variants (Zig requires distinct types per
+    // argument shape because objc_msgSend is variadic in C).
+    // 1. `id (*)(id, SEL)` — getter / no-arg.
+    const msgSend_id = @extern(
+        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) ?*anyopaque,
+        .{ .name = "objc_msgSend" },
+    );
+    // 2. `void (*)(id, SEL, id)` — single-id arg.
     const msgSend_orderOut = @extern(
         *const fn (obj: ?*const anyopaque, sel: ?*anyopaque, sender: ?*anyopaque) callconv(.c) void,
         .{ .name = "objc_msgSend" },
     );
+    // 3. `void (*)(id, SEL, NSInteger)` — single-integer arg.
+    const msgSend_setActivationPolicy = @extern(
+        *const fn (obj: ?*anyopaque, sel: ?*anyopaque, policy: isize) callconv(.c) bool,
+        .{ .name = "objc_msgSend" },
+    );
 
-    const sel = sel_registerName("orderOut:") orelse return;
-    msgSend_orderOut(nswin, sel, null);
+    // 1. Demote the process to an accessory app (no dock icon, no menu
+    //    bar, no Cmd-Tab entry). The preview subprocess shouldn't appear
+    //    as a peer application — it's a child of the editor.
+    //    NSApplicationActivationPolicyAccessory = 1.
+    if (objc_getClass("NSApplication")) |NSApplication| {
+        if (sel_registerName("sharedApplication")) |sel_shared| {
+            if (msgSend_id(NSApplication, sel_shared)) |NSApp| {
+                if (sel_registerName("setActivationPolicy:")) |sel_setpolicy| {
+                    _ = msgSend_setActivationPolicy(NSApp, sel_setpolicy, 1);
+                }
+            }
+        }
+    }
+
+    // 2. [NSWindow orderOut:nil] — yank the standalone game window off
+    //    the screen. Combined with the activation-policy demotion above,
+    //    nothing visible remains of the subprocess.
+    if (sel_registerName("orderOut:")) |sel_orderOut| {
+        msgSend_orderOut(nswin, sel_orderOut, null);
+    }
 }
 
 /// The sokol app descriptor type — re-exported so callers don't need to
