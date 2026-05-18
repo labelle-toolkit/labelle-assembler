@@ -240,21 +240,30 @@ pub fn hideWindow() void {
         *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
         .{ .name = "sel_registerName" },
     );
-    const msgSend_orderOut = @extern(
-        *const fn (obj: ?*const anyopaque, sel: ?*anyopaque, sender: ?*anyopaque) callconv(.c) void,
+    // `void (*)(id, SEL, NSPoint)` for setFrameOrigin: — moves the
+    // window without resizing. NSPoint on ARM64 = {x:f64, y:f64} = 16B.
+    const NSPoint = extern struct { x: f64, y: f64 };
+    const msgSend_setFrameOrigin = @extern(
+        *const fn (obj: ?*const anyopaque, sel: ?*anyopaque, origin: NSPoint) callconv(.c) void,
         .{ .name = "objc_msgSend" },
     );
 
-    // [NSWindow orderOut:nil] — yank the window off-screen.
+    // Move the window far off-screen, preserving its size. We must NOT
+    // touch the size — sokol uses `sapp.width()/height()` (which tracks
+    // the NSWindow's content rect) as the Path-A IOSurface dimensions.
+    // Shrinking the window would shrink the offscreen render target.
     //
-    // Tried more aggressive variants (setActivationPolicy:Accessory,
-    // setAlphaValue:0) and both broke Metal's frame-callback dispatch
-    // so Game View went black. orderOut is the only knob that keeps the
-    // Metal display link alive. Trade-off: the window may briefly flash
-    // on launch before init_cb fires, and a dock icon stays — both are
-    // visible-but-non-blocking annoyances rather than broken preview.
-    if (sel_registerName("orderOut:")) |sel_orderOut| {
-        msgSend_orderOut(nswin, sel_orderOut, null);
+    // orderOut: would also work for invisibility but it suspends sokol's
+    // frame callbacks (Metal display link treats off-screen windows as
+    // not-needing-redraws), killing Path-A's frame publishing → Game
+    // View goes black. setFrameOrigin to a far-negative coordinate keeps
+    // the window "visible" from sokol's POV so frame callbacks keep
+    // firing, but the user can't see it.
+    //
+    // Trade-off: dock icon still appears (Regular activation policy).
+    // Demoting to Accessory also breaks Metal — separately tracked.
+    if (sel_registerName("setFrameOrigin:")) |sel| {
+        msgSend_setFrameOrigin(nswin, sel, .{ .x = -99999.0, .y = -99999.0 });
     }
 }
 
