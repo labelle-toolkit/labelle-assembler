@@ -1,4 +1,5 @@
 /// Sokol window backend — windowing lifecycle via sokol_app.
+const std = @import("std");
 const builtin = @import("builtin");
 const sokol = @import("sokol");
 const sapp = sokol.app;
@@ -6,6 +7,28 @@ const sg = sokol.gfx;
 const sgl = sokol.gl;
 const sglue = sokol.glue;
 const slog = sokol.log;
+
+// ──────────────────────────────────────────────────────────────────
+// Headless preview mode (labelle-assembler#140 — no-window preview)
+// ──────────────────────────────────────────────────────────────────
+// When `LABELLE_PREVIEW` is set, the game runs without sokol-app: no
+// NSWindow, no dock icon. We create an MTLDevice directly, hand it to
+// sokol-gfx via a custom sg_environment, and drive the frame loop at
+// ~60Hz. The Path-A IOSurface ring publishes frames to the gui's
+// Game View consumer — that's the only visible surface.
+//
+// Public API below (initGfx, width, height, metalDevice, requestQuit,
+// beginPass) branches internally on `headless_mode`, so the codegen
+// needs zero changes.
+var headless_mode: bool = false;
+var headless_w: i32 = 0;
+var headless_h: i32 = 0;
+var headless_mtl_device: ?*anyopaque = null;
+var headless_quit_requested: bool = false;
+
+extern "c" fn MTLCreateSystemDefaultDevice() ?*anyopaque;
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+extern "c" fn nanosleep(rqtp: *const std.c.timespec, rmtp: ?*std.c.timespec) c_int;
 
 /// Re-export `sokol.gfx` so the generated `main.zig` (which only depends
 /// on `backend_window`, not directly on `sokol`) can reach sg.Image,
@@ -35,8 +58,19 @@ pub fn setConfigFlags(_: ConfigFlags) void {}
 var alpha_pipeline: sgl.Pipeline = .{};
 
 pub fn initGfx() void {
+    // Headless preview mode supplies its own MTLDevice; sglue.environment()
+    // reads from sapp which isn't valid (sokol-app never ran).
+    const env: sg.Environment = if (headless_mode) .{
+        .defaults = .{
+            .color_format = .BGRA8,
+            .depth_format = .DEPTH_STENCIL,
+            .sample_count = 1,
+        },
+        .metal = .{ .device = headless_mtl_device },
+    } else sglue.environment();
+
     sg.setup(.{
-        .environment = sglue.environment(),
+        .environment = env,
         .logger = .{ .func = slog.func },
     });
     sgl.setup(.{
@@ -67,8 +101,6 @@ fn quietExitOnShutdownCrash(_: std.posix.SIG, _: *const std.posix.siginfo_t, _: 
     std.c._exit(0);
 }
 
-const std = @import("std");
-
 pub fn shutdownGfx() void {
     sgl.destroyPipeline(alpha_pipeline);
     sgl.shutdown();
@@ -95,15 +127,19 @@ pub fn shutdownGfx() void {
 /// Mirrors `rl.closeWindow` / `sdl.quit` — the generated frame callback
 /// polls `g.isRunning()` and calls this when a script called `game.quit()`.
 pub fn requestQuit() void {
+    if (headless_mode) {
+        headless_quit_requested = true;
+        return;
+    }
     sapp.requestQuit();
 }
 
 pub fn width() i32 {
-    return sapp.width();
+    return if (headless_mode) headless_w else sapp.width();
 }
 
 pub fn height() i32 {
-    return sapp.height();
+    return if (headless_mode) headless_h else sapp.height();
 }
 
 /// Duration of the last frame in seconds.
@@ -161,7 +197,51 @@ pub fn beginPass(pass_action: sg.PassAction) void {
         sg.beginPass(.{ .action = pass_action, .attachments = attachments });
         return;
     }
+    if (headless_mode) {
+        // No swapchain in headless preview mode. Route the pass into a
+        // small fallback offscreen attachments so the game's draws
+        // complete (this happens for the very first frames before
+        // preview_mtl arms its IOSurface ring + the editor accepts).
+        sg.beginPass(.{ .action = pass_action, .attachments = headlessFallbackAttachments() });
+        return;
+    }
     sg.beginPass(.{ .action = pass_action, .swapchain = sglue.swapchain() });
+}
+
+// ── Headless fallback render target ──────────────────────────────
+var headless_fallback_attachments: sg.Attachments = .{};
+var headless_fallback_color_img: sg.Image = .{};
+var headless_fallback_color_view: sg.View = .{};
+var headless_fallback_depth_img: sg.Image = .{};
+var headless_fallback_depth_view: sg.View = .{};
+
+fn headlessFallbackAttachments() sg.Attachments {
+    // sg.Attachments isn't a handle (no .id) so use the color-view's
+    // id as the lazy-init sentinel.
+    if (headless_fallback_color_view.id != 0) return headless_fallback_attachments;
+    headless_fallback_color_img = sg.makeImage(.{
+        .width = 16,
+        .height = 16,
+        .pixel_format = .BGRA8,
+        .usage = .{ .color_attachment = true, .immutable = true },
+    });
+    headless_fallback_color_view = sg.makeView(.{
+        .color_attachment = .{ .image = headless_fallback_color_img },
+    });
+    headless_fallback_depth_img = sg.makeImage(.{
+        .width = 16,
+        .height = 16,
+        .pixel_format = .DEPTH_STENCIL,
+        .usage = .{ .depth_stencil_attachment = true, .immutable = true },
+    });
+    headless_fallback_depth_view = sg.makeView(.{
+        .depth_stencil_attachment = .{ .image = headless_fallback_depth_img },
+    });
+    var att: sg.Attachments = .{};
+    att.colors[0] = headless_fallback_color_view;
+    att.depth_stencil = headless_fallback_depth_view;
+    headless_fallback_attachments = att;
+    return att;
 }
 
 /// Flush queued sokol-gl primitives (sprites, gizmos, sgl-rendered text)
@@ -205,6 +285,7 @@ pub fn endFrame() void {
 /// removal is a separate cleanup step.
 pub fn metalDevice() ?*const anyopaque {
     if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .ios) return null;
+    if (headless_mode) return headless_mtl_device;
     return sapp.getEnvironment().metal.device;
 }
 
@@ -451,8 +532,10 @@ pub const preview_mtl = if (preview_metal_enabled) struct {
     pub fn beginFrame() void {
         const vtable = vt orelse return;
 
-        const sw_i = sapp.width();
-        const sh_i = sapp.height();
+        // Use width()/height() wrappers so headless mode returns the
+        // configured dims (sapp isn't running in headless).
+        const sw_i = width();
+        const sh_i = height();
         if (sw_i <= 0 or sh_i <= 0) return;
         const sw: u32 = @intCast(sw_i);
         const sh: u32 = @intCast(sh_i);
@@ -680,6 +763,27 @@ pub fn run(desc: struct {
     h: i32 = 600,
     title: [:0]const u8 = "LaBelle v2",
 }) void {
+    // Headless preview branch — when LABELLE_PREVIEW is set on Darwin,
+    // skip sokol-app entirely (no NSWindow, no dock icon) and drive
+    // sokol-gfx ourselves against a manually-acquired MTLDevice. The
+    // Path-A IOSurface ring (preview_mtl) is the only visible surface.
+    const is_darwin = builtin.target.os.tag == .macos or builtin.target.os.tag == .ios;
+    if (is_darwin) {
+        if (getenv("LABELLE_PREVIEW")) |raw| {
+            const env_val = std.mem.span(raw);
+            if (env_val.len > 0) {
+                runHeadless(.{
+                    .init_cb = desc.init_cb,
+                    .frame_cb = desc.frame_cb,
+                    .cleanup_cb = desc.cleanup_cb,
+                    .w = desc.w,
+                    .h = desc.h,
+                });
+                return;
+            }
+        }
+    }
+
     sapp.run(makeDesc(.{
         .init_cb = desc.init_cb,
         .frame_cb = desc.frame_cb,
@@ -689,4 +793,43 @@ pub fn run(desc: struct {
         .h = desc.h,
         .title = desc.title,
     }));
+}
+
+/// Run the game without sokol-app. Creates an MTLDevice, lets the game
+/// init sokol-gfx against it (via `initGfx`'s headless branch), drives
+/// a ~60 Hz frame loop. Darwin-only — `MTLCreateSystemDefaultDevice` is
+/// the entry point. Headless preview only path.
+fn runHeadless(desc: struct {
+    init_cb: *const fn () callconv(.c) void,
+    frame_cb: *const fn () callconv(.c) void,
+    cleanup_cb: *const fn () callconv(.c) void,
+    w: i32 = 800,
+    h: i32 = 600,
+}) void {
+    const device = MTLCreateSystemDefaultDevice() orelse {
+        std.debug.print("labelle: runHeadless: MTLCreateSystemDefaultDevice returned null; aborting preview.\n", .{});
+        return;
+    };
+
+    headless_mode = true;
+    headless_mtl_device = device;
+    headless_w = desc.w;
+    headless_h = desc.h;
+    headless_quit_requested = false;
+    defer {
+        headless_mode = false;
+        headless_mtl_device = null;
+    }
+
+    desc.init_cb();
+    defer desc.cleanup_cb();
+
+    // ~60 Hz frame loop via libc nanosleep (Zig 0.16 moved std.Thread.sleep
+    // to an Io-context API we don't have here).
+    const frame_ns: c_long = @intCast(std.time.ns_per_s / 60);
+    while (!headless_quit_requested) {
+        desc.frame_cb();
+        const ts = std.c.timespec{ .sec = 0, .nsec = frame_ns };
+        _ = nanosleep(&ts, null);
+    }
 }
