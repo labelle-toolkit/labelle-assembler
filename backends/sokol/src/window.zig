@@ -230,41 +230,26 @@ pub fn metalDevice() ?*const anyopaque {
 /// follow-ups; the call is a no-op on every other platform so callers
 /// can invoke it unconditionally inside a comptime-agnostic block.
 pub fn hideWindow() void {
-    if (comptime builtin.target.os.tag != .macos) return;
-
-    const nswin = sapp.macosGetWindow() orelse return;
-
-    // libobjc primitives. Looked up on every call — single-shot path,
-    // not hot. `sel_registerName` is idempotent / cached inside libobjc.
-    const sel_registerName = @extern(
-        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
-        .{ .name = "sel_registerName" },
-    );
-    // `void (*)(id, SEL, NSPoint)` for setFrameOrigin: — moves the
-    // window without resizing. NSPoint on ARM64 = {x:f64, y:f64} = 16B.
-    const NSPoint = extern struct { x: f64, y: f64 };
-    const msgSend_setFrameOrigin = @extern(
-        *const fn (obj: ?*const anyopaque, sel: ?*anyopaque, origin: NSPoint) callconv(.c) void,
-        .{ .name = "objc_msgSend" },
-    );
-
-    // Move the window far off-screen, preserving its size. We must NOT
-    // touch the size — sokol uses `sapp.width()/height()` (which tracks
-    // the NSWindow's content rect) as the Path-A IOSurface dimensions.
-    // Shrinking the window would shrink the offscreen render target.
+    // Currently a no-op on macOS pending a way to suppress the standalone
+    // sokol-app window without breaking Path-A's IOSurface pipeline.
+    // Every approach tried in this session regressed something:
     //
-    // orderOut: would also work for invisibility but it suspends sokol's
-    // frame callbacks (Metal display link treats off-screen windows as
-    // not-needing-redraws), killing Path-A's frame publishing → Game
-    // View goes black. setFrameOrigin to a far-negative coordinate keeps
-    // the window "visible" from sokol's POV so frame callbacks keep
-    // firing, but the user can't see it.
+    // - [NSWindow orderOut:]               → suspended sokol's frame
+    //   callbacks (Metal display link), Game View went black.
+    // - [NSApp setActivationPolicy:Accessory] → also stopped frame
+    //   callbacks, Game View black.
+    // - [NSWindow setAlphaValue:0.0]       → display link treated the
+    //   alpha-0 window as occluded, frame callbacks stopped.
+    // - [NSWindow setFrameOrigin: far off-screen] → window landed on a
+    //   phantom screen with mismatched backing scale, the IOSurface
+    //   dimensions stopped matching the MTLTexture descriptor and
+    //   `_mtlValidateStrideTextureParameters` aborted in-frame.
     //
-    // Trade-off: dock icon still appears (Regular activation policy).
-    // Demoting to Accessory also breaks Metal — separately tracked.
-    if (sel_registerName("setFrameOrigin:")) |sel| {
-        msgSend_setFrameOrigin(nswin, sel, .{ .x = -99999.0, .y = -99999.0 });
-    }
+    // For now the standalone game window stays visible during
+    // LABELLE_PREVIEW runs on macOS. Game View renders normally;
+    // the user just has an extra window they can ignore or move
+    // behind the editor. Real fix is tracked separately.
+    _ = sapp;
 }
 
 /// The sokol app descriptor type — re-exported so callers don't need to
