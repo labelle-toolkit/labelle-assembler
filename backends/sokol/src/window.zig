@@ -395,6 +395,245 @@ pub const PreviewMtlBridge = if (preview_metal_enabled) struct {
     }
 } else struct {};
 
+// ──────────────────────────────────────────────────────────────────
+// Preview-mode Path-A state + lifecycle (labelle-assembler#140 Phase B)
+// ──────────────────────────────────────────────────────────────────
+// Phase A moved the libobjc/Metal bindings (PreviewMtlBridge) into
+// this module. Phase B moves the per-frame ring management, the
+// associated module-scope state, and the cleanup teardown.
+//
+// To avoid an engine dependency on this backend module (and the
+// resulting type-instance ambiguity in the build graph), the
+// codegen passes engine.Preview's relevant methods through this
+// vtable. The backend module never sees an `engine.Preview` type.
+
+pub const PreviewIOSurfaceVtable = struct {
+    /// Opaque pointer to the host's `engine.Preview` instance. The
+    /// backend never dereferences it; passes it back verbatim.
+    ctx: *anyopaque,
+    beginStream: *const fn (ctx: *anyopaque, w: u32, h: u32) anyerror!void,
+    getSurfaceAt: *const fn (ctx: *anyopaque, slot: u32) ?*anyopaque,
+    signalSlotReady: *const fn (ctx: *anyopaque, slot: u32) anyerror!void,
+    endStream: *const fn (ctx: *anyopaque) void,
+    isFrameAccepted: *const fn (ctx: *anyopaque) bool,
+};
+
+/// Path-A state + frame/cleanup hooks. The codegen calls these from
+/// init/frame/cleanup callbacks. All state lives here; the generated
+/// main.zig no longer carries `_preview_mtl_*` vars or the
+/// ring-management block.
+pub const preview_mtl = if (preview_metal_enabled) struct {
+    pub const RING_MAX: u32 = 8;
+    var initialized: bool = false;
+    var ring_size: u32 = 0;
+    var textures: [RING_MAX]?*anyopaque = [_]?*anyopaque{null} ** RING_MAX;
+    var sg_images: [RING_MAX]sg.Image = [_]sg.Image{.{}} ** RING_MAX;
+    var views: [RING_MAX]sg.View = [_]sg.View{.{}} ** RING_MAX;
+    var attachments: [RING_MAX]sg.Attachments = [_]sg.Attachments{.{}} ** RING_MAX;
+    var depth_img: sg.Image = .{};
+    var depth_view: sg.View = .{};
+    var target_active: bool = false;
+    var write_slot: u32 = 0;
+    var last_w: u32 = 0;
+    var last_h: u32 = 0;
+    var vt: ?PreviewIOSurfaceVtable = null;
+
+    /// Wire the engine.Preview vtable. Called once after the gui's
+    /// preview handshake succeeds, before the first frame.
+    pub fn attach(vtable: PreviewIOSurfaceVtable) void {
+        vt = vtable;
+    }
+
+    /// Pre-render hook. Negotiates the ring with the editor on resize,
+    /// picks the next write slot, redirects the next `beginPass` into
+    /// the offscreen IOSurface render target via `setEditorRenderTarget`.
+    /// No-op if the editor hasn't accepted the frame stream yet.
+    pub fn beginFrame() void {
+        const vtable = vt orelse return;
+
+        const sw_i = sapp.width();
+        const sh_i = sapp.height();
+        if (sw_i <= 0 or sh_i <= 0) return;
+        const sw: u32 = @intCast(sw_i);
+        const sh: u32 = @intCast(sh_i);
+
+        const device = @as(?*anyopaque, @constCast(metalDevice())) orelse return;
+        PreviewMtlBridge.loadSelectors();
+
+        if (!initialized or sw != last_w or sh != last_h) {
+            // Tear down any prior ring before reallocating.
+            if (initialized) {
+                var i: u32 = 0;
+                while (i < ring_size) : (i += 1) {
+                    if (views[i].id != 0) {
+                        sg.destroyView(views[i]);
+                        views[i] = .{};
+                    }
+                    attachments[i] = .{};
+                    if (textures[i]) |t| {
+                        PreviewMtlBridge.release(t);
+                        textures[i] = null;
+                    }
+                    if (sg_images[i].id != 0) {
+                        sg.destroyImage(sg_images[i]);
+                        sg_images[i] = .{};
+                    }
+                }
+                initialized = false;
+            }
+
+            vtable.beginStream(vtable.ctx, sw, sh) catch return;
+
+            // (Re)alloc shared depth-stencil image.
+            if (depth_view.id != 0) {
+                sg.destroyView(depth_view);
+                depth_view = .{};
+            }
+            if (depth_img.id != 0) {
+                sg.destroyImage(depth_img);
+                depth_img = .{};
+            }
+            depth_img = sg.makeImage(.{
+                .width = @intCast(sw),
+                .height = @intCast(sh),
+                .pixel_format = .DEPTH_STENCIL,
+                .usage = .{ .depth_stencil_attachment = true, .immutable = true },
+            });
+            if (depth_img.id == 0) return;
+            depth_view = sg.makeView(.{
+                .depth_stencil_attachment = .{ .image = depth_img },
+            });
+            if (depth_view.id == 0) return;
+
+            // Allocate ring slots (up to RING_MAX) until we hit the first
+            // null IOSurface — the engine's producer maintains its own
+            // ring size (default 3) and exposes slots via `getSurfaceAt`.
+            var alloc_ok = true;
+            var slot: u32 = 0;
+            while (slot < RING_MAX) : (slot += 1) {
+                const iosurf = vtable.getSurfaceAt(vtable.ctx, slot) orelse break;
+                const mtl_tex = PreviewMtlBridge.createIOSurfaceTexture(device, iosurf, sw, sh) orelse {
+                    alloc_ok = false;
+                    break;
+                };
+                textures[slot] = mtl_tex;
+                var desc: sg.ImageDesc = .{
+                    .width = @intCast(sw),
+                    .height = @intCast(sh),
+                    .pixel_format = .BGRA8,
+                    .usage = .{ .color_attachment = true, .immutable = true },
+                };
+                desc.mtl_textures[0] = @ptrCast(mtl_tex);
+                desc.mtl_textures[1] = @ptrCast(mtl_tex);
+                const img = sg.makeImage(desc);
+                if (img.id == 0) {
+                    alloc_ok = false;
+                    break;
+                }
+                sg_images[slot] = img;
+                const view = sg.makeView(.{
+                    .color_attachment = .{ .image = img },
+                });
+                if (view.id == 0) {
+                    alloc_ok = false;
+                    break;
+                }
+                views[slot] = view;
+                var att: sg.Attachments = .{};
+                att.colors[0] = view;
+                att.depth_stencil = depth_view;
+                attachments[slot] = att;
+            }
+
+            if (!alloc_ok) {
+                // Roll back partial ring; reset state so next attempt is clean.
+                var i: u32 = 0;
+                while (i <= slot and i < RING_MAX) : (i += 1) {
+                    if (views[i].id != 0) {
+                        sg.destroyView(views[i]);
+                        views[i] = .{};
+                    }
+                    attachments[i] = .{};
+                    if (textures[i]) |t| {
+                        PreviewMtlBridge.release(t);
+                        textures[i] = null;
+                    }
+                    if (sg_images[i].id != 0) {
+                        sg.destroyImage(sg_images[i]);
+                        sg_images[i] = .{};
+                    }
+                }
+                return;
+            }
+
+            ring_size = slot;
+            initialized = true;
+            last_w = sw;
+            last_h = sh;
+            write_slot = 0;
+        }
+
+        if (!vtable.isFrameAccepted(vtable.ctx)) return;
+        if (ring_size == 0) return;
+
+        setEditorRenderTarget(attachments[write_slot]);
+        target_active = true;
+    }
+
+    /// Post-render hook. Signals the just-written slot to the editor
+    /// and clears the render-target redirect. No-op if `beginFrame`
+    /// didn't activate a target this frame.
+    pub fn endFrame() void {
+        const vtable = vt orelse return;
+        if (!target_active) return;
+        vtable.signalSlotReady(vtable.ctx, write_slot) catch {};
+        clearEditorRenderTarget();
+        target_active = false;
+        write_slot = (write_slot + 1) % ring_size;
+    }
+
+    /// Cleanup hook. Destroys all sokol resources + MTLTextures + the
+    /// shared depth attachments, then asks the engine to tear down
+    /// the IOSurface ring.
+    pub fn deinit() void {
+        const vtable_opt = vt;
+        clearEditorRenderTarget();
+        var i: u32 = 0;
+        while (i < ring_size) : (i += 1) {
+            if (views[i].id != 0) {
+                sg.destroyView(views[i]);
+                views[i] = .{};
+            }
+            attachments[i] = .{};
+            if (textures[i]) |t| {
+                PreviewMtlBridge.release(t);
+                textures[i] = null;
+            }
+            if (sg_images[i].id != 0) {
+                sg.destroyImage(sg_images[i]);
+                sg_images[i] = .{};
+            }
+        }
+        if (depth_view.id != 0) {
+            sg.destroyView(depth_view);
+            depth_view = .{};
+        }
+        if (depth_img.id != 0) {
+            sg.destroyImage(depth_img);
+            depth_img = .{};
+        }
+        ring_size = 0;
+        initialized = false;
+        target_active = false;
+        if (vtable_opt) |vtable| vtable.endStream(vtable.ctx);
+    }
+} else struct {
+    pub fn attach(_: PreviewIOSurfaceVtable) void {}
+    pub fn beginFrame() void {}
+    pub fn endFrame() void {}
+    pub fn deinit() void {}
+};
+
 /// Build a sokol app descriptor without starting the event loop.
 /// Used on mobile targets where sokol calls sokol_main() and reads its
 /// return value as sapp_desc — the host must NOT call sapp_run() itself.

@@ -1200,22 +1200,21 @@ const PREVIEW_INIT_CALLBACK =
     \\            };
     \\            if (g.preview) |*_p| {
     \\                _p.sendHello("labelle-engine", 0) catch {};
-    \\                // labelle-assembler#137: now that the editor is on
-    \\                // the wire and will sample our IOSurface ring, hide
-    \\                // the standalone sokol-app window — its Game View
-    \\                // tab is the user-facing surface. Gated on a
-    \\                // successful `connect` (not just env-var presence)
-    \\                // so a misconfigured `LABELLE_PREVIEW` doesn't leave
-    \\                // the user with no visible window AND no editor view.
-    \\                // macOS-only inside `window.hideWindow`; a no-op on
-    \\                // every other platform until follow-up slices land.
-    \\                // `@hasDecl` guard: this `PREVIEW_INIT_CALLBACK`
-    \\                // template is shared with the raylib-WASM callback
-    \\                // path (see emitter `else` branch below the sokol
-    \\                // arm). The raylib `window` module has no
-    \\                // `hideWindow` decl, so an unguarded call would
-    \\                // compile-fail any raylib-WASM project with
-    \\                // LABELLE_PREVIEW set.
+    \\                // labelle-assembler#140 Phase B: wire the engine.Preview
+    \\                // methods into the backend's preview_mtl vtable so the
+    \\                // backend can drive IOSurface stream lifecycle without
+    \\                // needing an engine type-import. Bridges declared at
+    \\                // module scope (see PREVIEW_READBACK_HELPERS_METAL_SOKOL).
+    \\                if (comptime @hasDecl(window, "preview_mtl")) {
+    \\                    window.preview_mtl.attach(.{
+    \\                        .ctx = @ptrCast(_p),
+    \\                        .beginStream = _preview_mtl_begin_stream_bridge,
+    \\                        .getSurfaceAt = _preview_mtl_get_surface_bridge,
+    \\                        .signalSlotReady = _preview_mtl_signal_bridge,
+    \\                        .endStream = _preview_mtl_end_stream_bridge,
+    \\                        .isFrameAccepted = _preview_mtl_accepted_bridge,
+    \\                    });
+    \\                }
     \\                if (comptime @hasDecl(window, "hideWindow")) window.hideWindow();
     \\            }
     \\        }
@@ -1712,94 +1711,47 @@ const PREVIEW_READBACK_HELPERS_SOKOL_D3D11 =
 /// so they never race for it.
 const PREVIEW_READBACK_HELPERS_METAL_SOKOL =
     \\
-    \\// ── Sokol Metal/IOSurface gating (Path A — labelle-assembler#131) ─
-    \\// Metal is sokol's default backend on Darwin (macOS + iOS). The
-    \\// Path-A producer wraps each IOSurface as an MTLTexture via
-    \\// `newTextureWithDescriptor:iosurface:plane:`. We need libobjc on
-    \\// Darwin only; comptime-gating on builtin.os.tag keeps the
-    \\// `@extern` decls out of non-Darwin link lines. Mutually exclusive
-    \\// with `_sokol_preview_gl_enabled` (GL = .linux only on default
-    \\// sokol, Metal = .macos/.ios only) — exactly one of the two
-    \\// publish paths fires per target.
-    \\// Path-A is re-enabled on macOS — the upstream sokol-gfx SIGSEGV
-    \\// in `_sg_mtl_garbage_collect` during `sg_shutdown` (#140) is now
-    \\// absorbed by a quiet-exit signal handler installed in
-    \\// `window.shutdownGfx` immediately before `sg.shutdown`. The
-    \\// crash happens *after* the last frame has been published, so by
-    \\// the time SIGSEGV fires Game View already has its frames; the
-    \\// process just exits 0 silently instead of dumping a .ips file.
-    \\// labelle-assembler#140: the Path-A enablement gate now lives in
-    \\// the backend module (`backends/sokol/src/window.zig`). The
-    \\// codegen aliases it so the existing `_sokol_preview_metal_enabled`
-    \\// name keeps working unchanged across the Path-A code paths
-    \\// below. This is step one of moving backend-specific preview
-    \\// knowledge out of the codegen.
+    \\// ── Sokol Metal/IOSurface preview seam (labelle-assembler#140) ─
+    \\// All Path-A state + ring management + cleanup now lives in the
+    \\// backend module (`backends/sokol/src/window.zig:preview_mtl`).
+    \\// The codegen owns only:
+    \\//   1. The comptime enable gate (aliased from the backend).
+    \\//   2. Five tiny bridge fns that wrap `engine.Preview` methods
+    \\//      behind an `*anyopaque` boundary so the backend never needs
+    \\//      an engine type-import (the engine module would otherwise
+    \\//      have to be wired through the backend's build graph too).
+    \\//   3. The vtable-attach call inside the init callback (see
+    \\//      PREVIEW_INIT_CALLBACK below).
     \\const _sokol_preview_metal_enabled = window.preview_metal_enabled;
     \\
-    \\// Path-A Metal state at module scope (sokol's callback model has
-    \\// no shared local scope between init/frame/cleanup). The
-    \\// `_preview_allocator` declared in the GL block above is reused
-    \\// here — mutually exclusive gates, never contested.
-    \\//
-    \\// We own one `MTLTexture` per IOSurface in the ring. sokol-gfx
-    \\// gets a parallel `Image` ring whose `mtl_textures[]` slots point
-    \\// to our owned textures — sokol does NOT retain the underlying
-    \\// MTLTexture, so we must keep the `_preview_mtl_textures` array
-    \\// alive for the lifetime of the sg_images. `_preview_mtl_ring_size`
-    \\// caches the negotiated ring size (matches the engine producer's
-    \\// `ring_size`, default 3).
-    \\const _PreviewMtlRingMax: u32 = 8; // matches preview_iosurface.MAX_RING
-    \\var _preview_mtl_initialized: bool = false;
-    \\var _preview_mtl_ring_size: u32 = 0;
-    \\var _preview_mtl_textures: [_PreviewMtlRingMax]?*anyopaque = [_]?*anyopaque{null} ** _PreviewMtlRingMax;
-    \\var _preview_mtl_sg_images: [_PreviewMtlRingMax]window.gfx_types.Image = [_]window.gfx_types.Image{.{}} ** _PreviewMtlRingMax;
-    \\// Path-A render-target wiring (labelle-assembler#133): each ring
-    \\// slot also gets a color-attachment `sg.View` + a pre-built
-    \\// `sg.Attachments` so the per-frame body can flip the gfx layer's
-    \\// `setEditorRenderTarget` with a single struct copy instead of
-    \\// rebuilding the descriptor every frame.
-    \\var _preview_mtl_views: [_PreviewMtlRingMax]window.gfx_types.View = [_]window.gfx_types.View{.{}} ** _PreviewMtlRingMax;
-    \\var _preview_mtl_attachments: [_PreviewMtlRingMax]window.gfx_types.Attachments = [_]window.gfx_types.Attachments{.{}} ** _PreviewMtlRingMax;
-    \\// Shared depth-stencil image + view for the offscreen ring.
-    \\// Game render pipelines were built against the swapchain's
-    \\// depth-stencil context; sokol-gfx's validation layer aborts
-    \\// (VALIDATE_APIP_DEPTHSTENCILATTACHMENT_FORMAT) the first
-    \\// time `applyPipeline` runs inside an attachments pass that
-    \\// has no matching depth-stencil. One shared image is enough —
-    \\// only one slot renders per frame. #136.
-    \\var _preview_mtl_depth_img: window.gfx_types.Image = .{};
-    \\var _preview_mtl_depth_view: window.gfx_types.View = .{};
-    \\// `_preview_mtl_target_active` mirrors whether `window.setEditorRenderTarget`
-    \\// is currently armed for this frame — set by the pre-render block
-    \\// when the editor has accepted a frame, cleared by the post-render
-    \\// block right after `signalSlotReady`. Decouples the two blocks so
-    \\// the post-render path doesn't need to recompute the gate
-    \\// (`isFrameAccepted` can flip between the two emit points if the
-    \\// editor disconnects mid-frame).
-    \\var _preview_mtl_target_active: bool = false;
-    \\// Slot currently bound as the editor render target. Shared between
-    \\// the pre-render block (writes) and the post-render block (reads
-    \\// for `signalSlotReady`). Decoupled from `_preview_frame_idx` so
-    \\// the post-render path doesn't double-advance the ring if the
-    \\// pre-render path bailed.
-    \\var _preview_mtl_write_slot: u32 = 0;
-    \\var _preview_mtl_last_w: u32 = 0;
-    \\var _preview_mtl_last_h: u32 = 0;
-    \\
-    \\// Objective-C runtime bridging. Selectors + msgSend casts live
-    \\// inside a struct-namespace gated on `_sokol_preview_metal_enabled`
-    \\// — the `else struct {}` branch carries no symbols, so a non-
-    \\// Darwin sokol build never references libobjc at link time.
-    \\//
-    \\// MTLPixelFormatBGRA8Unorm = 80 — matches the IOSurface's BGRA8
-    \\// pixel format the engine producer sets up
-    \\// (`preview_iosurface.kPixelFormat_BGRA8`).
-    \\// labelle-assembler#140: the libobjc + Metal bridge struct
-    \\// previously defined inline here now lives in the sokol
-    \\// backend module (`backends/sokol/src/window.zig:PreviewMtlBridge`).
-    \\// On non-Darwin builds it resolves to an empty struct, same as
-    \\// before — no libobjc / Metal symbols leak into the link line.
-    \\const _SokolPreviewMetal = window.PreviewMtlBridge;
+    \\// Bridge fns — pure wrappers over the engine.Preview methods the
+    \\// backend's preview_mtl namespace drives via its vtable. These
+    \\// live in module scope because the vtable is wired up once during
+    \\// init and persists for the program's lifetime.
+    \\fn _preview_mtl_begin_stream_bridge(ctx: *anyopaque, w: u32, h: u32) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.beginFrameStreamIOSurface(w, h);
+    \\}
+    \\fn _preview_mtl_get_surface_bridge(ctx: *anyopaque, slot: u32) ?*anyopaque {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    // getIOSurfaceAt returns `??*opaque` — outer optional means
+    \\    // "slot in range", inner means "IOSurfaceRef itself nullable".
+    \\    const maybe_ref = p.getIOSurfaceAt(slot) orelse return null;
+    \\    const ref = maybe_ref orelse return null;
+    \\    return @ptrCast(ref);
+    \\}
+    \\fn _preview_mtl_signal_bridge(ctx: *anyopaque, slot: u32) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.signalSlotReady(slot);
+    \\}
+    \\fn _preview_mtl_end_stream_bridge(ctx: *anyopaque) void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    p.endFrameStreamIOSurface();
+    \\}
+    \\fn _preview_mtl_accepted_bridge(ctx: *anyopaque) bool {
+    \\    const p: *const engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.isFrameAccepted();
+    \\}
     \\
 ;
 
@@ -2027,181 +1979,7 @@ const PREVIEW_READBACK_FRAME_SOKOL_D3D11 =
 /// in the swapchain or our IOSurface — no shader / pipeline
 /// reconfiguration needed.
 const PREVIEW_PRE_RENDER_METAL_SOKOL =
-    \\        if (comptime _sokol_preview_metal_enabled) {
-    \\            _preview_mtl_target_active = false;
-    \\            if (g.preview) |*_p| _mtl_pre_render: {
-    \\                const _sw_i = window.width();
-    \\                const _sh_i = window.height();
-    \\                if (_sw_i <= 0 or _sh_i <= 0) break :_mtl_pre_render;
-    \\                const _sw: u32 = @intCast(_sw_i);
-    \\                const _sh: u32 = @intCast(_sh_i);
-    \\
-    \\                _SokolPreviewMetal.loadSelectors();
-    \\                const _device = @as(?*anyopaque, @constCast(window.metalDevice())) orelse break :_mtl_pre_render;
-    \\
-    \\                // (Re)negotiate IOSurface ring + MTLTexture wrappers
-    \\                // + sokol-gfx Image handles on first frame OR a
-    \\                // window resize. Idempotent on the engine side —
-    \\                // `beginFrameStreamIOSurface` tears down the old
-    \\                // ring before re-offering. The default ring size
-    \\                // is 3 (matches preview_iosurface.Options default);
-    \\                // the engine producer asserts ring_size <= MAX_RING
-    \\                // (8) so the comptime bound here is safe.
-    \\                if (_sw != _preview_mtl_last_w or _sh != _preview_mtl_last_h) {
-    \\                    // Tear down any prior MTLTextures + sg_images +
-    \\                    // views before allocating the new ring — dims
-    \\                    // change means the old sokol attachments are
-    \\                    // now unusable, and the MTLTextures held a
-    \\                    // strong ref on the previous IOSurfaces. Order
-    \\                    // matters: views must die before images
-    \\                    // (sokol-gfx asserts on dangling parents).
-    \\                    if (_preview_mtl_initialized) {
-    \\                        var _i: u32 = 0;
-    \\                        while (_i < _preview_mtl_ring_size) : (_i += 1) {
-    \\                            if (_preview_mtl_views[_i].id != 0) {
-    \\                                window.gfx_types.destroyView(_preview_mtl_views[_i]);
-    \\                                _preview_mtl_views[_i] = .{};
-    \\                            }
-    \\                            _preview_mtl_attachments[_i] = .{};
-    \\                            if (_preview_mtl_textures[_i]) |t| {
-    \\                                _SokolPreviewMetal.release(t);
-    \\                                _preview_mtl_textures[_i] = null;
-    \\                            }
-    \\                            if (_preview_mtl_sg_images[_i].id != 0) {
-    \\                                window.gfx_types.destroyImage(_preview_mtl_sg_images[_i]);
-    \\                                _preview_mtl_sg_images[_i] = .{};
-    \\                            }
-    \\                        }
-    \\                        _preview_mtl_initialized = false;
-    \\                    }
-    \\                    _p.beginFrameStreamIOSurface(_sw, _sh) catch break :_mtl_pre_render;
-    \\                    // Allocate the shared depth-stencil image
-    \\                    // sized to match the offscreen color ring (#136).
-    \\                    // The game's render pipelines were built against
-    \\                    // the swapchain's depth-stencil context;
-    \\                    // sokol-gfx's validation aborts the first
-    \\                    // applyPipeline inside attachments without
-    \\                    // matching depth-stencil. DEPTH_STENCIL is the
-    \\                    // sokol default; matches the pipelines.
-    \\                    if (_preview_mtl_depth_view.id != 0) {
-    \\                        window.gfx_types.destroyView(_preview_mtl_depth_view);
-    \\                        _preview_mtl_depth_view = .{};
-    \\                    }
-    \\                    if (_preview_mtl_depth_img.id != 0) {
-    \\                        window.gfx_types.destroyImage(_preview_mtl_depth_img);
-    \\                        _preview_mtl_depth_img = .{};
-    \\                    }
-    \\                    _preview_mtl_depth_img = window.gfx_types.makeImage(.{
-    \\                        .width = @intCast(_sw),
-    \\                        .height = @intCast(_sh),
-    \\                        .pixel_format = .DEPTH_STENCIL,
-    \\                        .usage = .{ .depth_stencil_attachment = true, .immutable = true },
-    \\                    });
-    \\                    if (_preview_mtl_depth_img.id == 0) break :_mtl_pre_render;
-    \\                    _preview_mtl_depth_view = window.gfx_types.makeView(.{
-    \\                        .depth_stencil_attachment = .{ .image = _preview_mtl_depth_img },
-    \\                    });
-    \\                    if (_preview_mtl_depth_view.id == 0) break :_mtl_pre_render;
-    \\                    // The engine producer's default ring size is 3
-    \\                    // (preview_iosurface.Options.ring_size). Loop
-    \\                    // until we hit the first null surface to handle
-    \\                    // bounded variation cleanly without baking the
-    \\                    // value into the codegen.
-    \\                    var _alloc_ok = true;
-    \\                    var _slot: u32 = 0;
-    \\                    while (_slot < _PreviewMtlRingMax) : (_slot += 1) {
-    \\                        const _iosurf = _p.getIOSurfaceAt(_slot) orelse break;
-    \\                        const _mtl_tex = _SokolPreviewMetal.createIOSurfaceTexture(_device, _iosurf, _sw, _sh) orelse {
-    \\                            _alloc_ok = false;
-    \\                            break;
-    \\                        };
-    \\                        _preview_mtl_textures[_slot] = _mtl_tex;
-    \\                        // Inject the MTLTexture into sokol-gfx as an
-    \\                        // external image with `color_attachment = true`
-    \\                        // so we can make a color-attachment View off
-    \\                        // it and bind that into a Pass attachments
-    \\                        // struct (#133).
-    \\                        const _sg = window.gfx_types;
-    \\                        var _desc: _sg.ImageDesc = .{
-    \\                            .width = @intCast(_sw),
-    \\                            .height = @intCast(_sh),
-    \\                            .pixel_format = .BGRA8,
-    \\                            .usage = .{ .color_attachment = true, .immutable = true },
-    \\                        };
-    \\                        _desc.mtl_textures[0] = @ptrCast(_mtl_tex);
-    \\                        _desc.mtl_textures[1] = @ptrCast(_mtl_tex);
-    \\                        const _img = _sg.makeImage(_desc);
-    \\                        if (_img.id == 0) {
-    \\                            // Pool exhausted — sokol returns a
-    \\                            // zero-id handle. Bail; the rollback
-    \\                            // block below tears down whatever
-    \\                            // we'd already created.
-    \\                            _alloc_ok = false;
-    \\                            break;
-    \\                        }
-    \\                        _preview_mtl_sg_images[_slot] = _img;
-    \\                        const _view = _sg.makeView(.{
-    \\                            .color_attachment = .{ .image = _img },
-    \\                        });
-    \\                        if (_view.id == 0) {
-    \\                            _alloc_ok = false;
-    \\                            break;
-    \\                        }
-    \\                        _preview_mtl_views[_slot] = _view;
-    \\                        var _att: _sg.Attachments = .{};
-    \\                        _att.colors[0] = _view;
-    \\                        _att.depth_stencil = _preview_mtl_depth_view;
-    \\                        _preview_mtl_attachments[_slot] = _att;
-    \\                    }
-    \\                    if (!_alloc_ok) {
-    \\                        // Rollback any partially-allocated ring so
-    \\                        // the next resize attempt starts clean.
-    \\                        // Includes the just-failed slot — when
-    \\                        // makeImage / makeView returned a zero-id
-    \\                        // handle mid-init, `_preview_mtl_textures
-    \\                        // [_slot]` (and possibly _sg_images[_slot])
-    \\                        // had already been assigned. Loop through
-    \\                        // _slot inclusive to release them too.
-    \\                        var _i: u32 = 0;
-    \\                        while (_i <= _slot and _i < _PreviewMtlRingMax) : (_i += 1) {
-    \\                            if (_preview_mtl_views[_i].id != 0) {
-    \\                                window.gfx_types.destroyView(_preview_mtl_views[_i]);
-    \\                                _preview_mtl_views[_i] = .{};
-    \\                            }
-    \\                            _preview_mtl_attachments[_i] = .{};
-    \\                            if (_preview_mtl_textures[_i]) |t| {
-    \\                                _SokolPreviewMetal.release(t);
-    \\                                _preview_mtl_textures[_i] = null;
-    \\                            }
-    \\                            if (_preview_mtl_sg_images[_i].id != 0) {
-    \\                                window.gfx_types.destroyImage(_preview_mtl_sg_images[_i]);
-    \\                                _preview_mtl_sg_images[_i] = .{};
-    \\                            }
-    \\                        }
-    \\                        break :_mtl_pre_render;
-    \\                    }
-    \\                    _preview_mtl_ring_size = _slot;
-    \\                    _preview_mtl_last_w = _sw;
-    \\                    _preview_mtl_last_h = _sh;
-    \\                    _preview_mtl_initialized = true;
-    \\                }
-    \\
-    \\                if (!_preview_mtl_initialized) break :_mtl_pre_render;
-    \\                if (_preview_mtl_ring_size == 0) break :_mtl_pre_render;
-    \\                if (!_p.isFrameAccepted()) break :_mtl_pre_render;
-    \\
-    \\                // Pick the next ring slot and arm the gfx layer.
-    \\                // `window.beginPass` reads `current_editor_render_target`
-    \\                // on the next call and routes `sg.beginPass` into
-    \\                // these attachments instead of the swapchain — so
-    \\                // `g.render()` lands directly in the IOSurface bytes
-    \\                // the editor will sample.
-    \\                const _write_slot: u32 = @intCast(_preview_frame_idx % _preview_mtl_ring_size);
-    \\                _preview_mtl_write_slot = _write_slot;
-    \\                window.setEditorRenderTarget(_preview_mtl_attachments[_write_slot]);
-    \\                _preview_mtl_target_active = true;
-    \\            }
-    \\        }
+    \\        if (comptime _sokol_preview_metal_enabled) window.preview_mtl.beginFrame();
     \\
 ;
 
@@ -2222,16 +2000,7 @@ const PREVIEW_PRE_RENDER_METAL_SOKOL =
 ///     transient ring rebuild, etc.). One-frame-scoped override
 ///     contract — see the shim in `backends/sokol/src/window.zig`.
 const PREVIEW_READBACK_FRAME_METAL_SOKOL =
-    \\        if (comptime _sokol_preview_metal_enabled) {
-    \\            if (_preview_mtl_target_active) {
-    \\                if (g.preview) |*_p| {
-    \\                    _p.signalSlotReady(_preview_mtl_write_slot) catch {};
-    \\                    _preview_frame_idx +%= 1;
-    \\                }
-    \\                _preview_mtl_target_active = false;
-    \\            }
-    \\            window.clearEditorRenderTarget();
-    \\        }
+    \\        if (comptime _sokol_preview_metal_enabled) window.preview_mtl.endFrame();
     \\
 ;
 
@@ -2275,35 +2044,7 @@ const PREVIEW_READBACK_CLEANUP_SOKOL_D3D11 =
 /// first would leave the MTLTextures pointing at potentially
 /// freed IOSurface backing storage during the release window.
 const PREVIEW_READBACK_CLEANUP_METAL_SOKOL =
-    \\    if (comptime _sokol_preview_metal_enabled) {
-    \\        // Make sure the gfx layer isn't still pointing at one of
-    \\        // the attachments we're about to free — otherwise the next
-    \\        // frame after shutdown (there shouldn't be one, but defend
-    \\        // anyway) would hit a use-after-free in `beginPass`.
-    \\        window.clearEditorRenderTarget();
-    \\        var _i: u32 = 0;
-    \\        while (_i < _preview_mtl_ring_size) : (_i += 1) {
-    \\            // Views first — sokol-gfx asserts on destroying an
-    \\            // image that still has a view bound to it.
-    \\            if (_preview_mtl_views[_i].id != 0) {
-    \\                window.gfx_types.destroyView(_preview_mtl_views[_i]);
-    \\                _preview_mtl_views[_i] = .{};
-    \\            }
-    \\            _preview_mtl_attachments[_i] = .{};
-    \\            if (_preview_mtl_sg_images[_i].id != 0) {
-    \\                window.gfx_types.destroyImage(_preview_mtl_sg_images[_i]);
-    \\                _preview_mtl_sg_images[_i] = .{};
-    \\            }
-    \\            if (_preview_mtl_textures[_i]) |t| {
-    \\                _SokolPreviewMetal.release(t);
-    \\                _preview_mtl_textures[_i] = null;
-    \\            }
-    \\        }
-    \\        _preview_mtl_ring_size = 0;
-    \\        _preview_mtl_initialized = false;
-    \\        _preview_mtl_target_active = false;
-    \\        if (g.preview) |*_p| _p.endFrameStreamIOSurface();
-    \\    }
+    \\    if (comptime _sokol_preview_metal_enabled) window.preview_mtl.deinit();
     \\
 ;
 
