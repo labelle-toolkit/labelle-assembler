@@ -529,13 +529,17 @@ pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void
     sgl.disableTexture();
 }
 
+// Both stb headers go through a tiny shim that empties out clang's
+// nullability qualifiers before include. Zig 0.16's translate-c
+// rejects `_Nonnull` on array parameters in Bionic's stdlib.h on the
+// Android NDK 27 sysroot — see Flying-Platform/flying-platform-labelle#450.
+// Macro-replacing `_Nonnull` / `_Nullable` to nothing makes the
+// preprocessor strip them before translate-c sees the declarations.
 const stbi = @cImport({
-    @cInclude("stb_image.h");
+    @cInclude("stb_shim.h");
 });
 
-const stbtt = @cImport({
-    @cInclude("stb_truetype.h");
-});
+const stbtt = stbi;
 
 /// CPU-decoded image owned by the caller's allocator. Field layout
 /// (`pixels: []u8`, `width: u32`, `height: u32`) mirrors labelle-gfx's
