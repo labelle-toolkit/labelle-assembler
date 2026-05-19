@@ -391,12 +391,25 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     // regenerating yields a stable value per project (no gratuitous
     // cache invalidation). The previous FNV-1a-based hash produced
     // fingerprints rejected by Zig 0.16's validator.
+    //
+    // The id half can't be 0 (reserved by Zig 0.16 for "unhashed") or
+    // 0xffffffff (reserved for "explicitly opted out of dedup"). Both
+    // reservations are checked in `std.zon.Manifest`; a project name
+    // whose Wyhash happens to land on either would generate a zon
+    // file that fails validation despite the correct CRC half. Clamp
+    // to a safe non-reserved value.
     const zon_package_name = "generated_game";
     const name_crc: u32 = std.hash.Crc32.hash(zon_package_name);
     const fork_id: u32 = blk: {
         var h = std.hash.Wyhash.init(0xa11e11e);
         h.update(cfg.name);
-        break :blk @truncate(h.final());
+        const raw: u32 = @truncate(h.final());
+        // Coerce away the two reserved sentinels.
+        break :blk switch (raw) {
+            0 => 1,
+            0xffffffff => 0xfffffffe,
+            else => raw,
+        };
     };
     const hash: u64 = (@as(u64, name_crc) << 32) | @as(u64, fork_id);
     var hash_buf: [16]u8 = undefined;

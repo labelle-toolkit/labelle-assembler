@@ -503,6 +503,12 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
         defer dir.close(io);
         var latest: ?[]const u8 = null;
         var iter = dir.iterate();
+        // `iter.next(io)` returns `!?Entry`. We deliberately swallow
+        // I/O errors per-entry (treat as end-of-iteration) so a single
+        // unreadable subdir doesn't abort NDK detection — the next
+        // pass through `getAndroidNdkSysroot` still has `ANDROID_NDK_HOME`
+        // as a fallback, and any genuine misconfiguration surfaces via
+        // the explicit `@panic` at the call site below.
         while (iter.next(io) catch null) |entry| {
             if (entry.kind == .directory) {
                 // Pick the highest version by lexicographic comparison
