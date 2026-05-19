@@ -589,13 +589,16 @@ pub const preview_mtl = if (preview_metal_enabled) struct {
                         views[i] = .{};
                     }
                     attachments[i] = .{};
-                    if (textures[i]) |t| {
-                        PreviewMtlBridge.release(t);
-                        textures[i] = null;
-                    }
+                    // Order matters: destroy the sokol image first (it
+                    // holds an internal reference to the MTLTexture but
+                    // does NOT retain it), then release the MTLTexture.
                     if (sg_images[i].id != 0) {
                         sg.destroyImage(sg_images[i]);
                         sg_images[i] = .{};
+                    }
+                    if (textures[i]) |t| {
+                        PreviewMtlBridge.release(t);
+                        textures[i] = null;
                     }
                 }
                 initialized = false;
@@ -666,6 +669,9 @@ pub const preview_mtl = if (preview_metal_enabled) struct {
 
             if (!alloc_ok) {
                 // Roll back partial ring; reset state so next attempt is clean.
+                // Order matters: destroy the sokol image first (it holds an
+                // internal reference to the MTLTexture but does NOT retain
+                // it), then release the MTLTexture.
                 var i: u32 = 0;
                 while (i <= slot and i < RING_MAX) : (i += 1) {
                     if (views[i].id != 0) {
@@ -673,13 +679,13 @@ pub const preview_mtl = if (preview_metal_enabled) struct {
                         views[i] = .{};
                     }
                     attachments[i] = .{};
-                    if (textures[i]) |t| {
-                        PreviewMtlBridge.release(t);
-                        textures[i] = null;
-                    }
                     if (sg_images[i].id != 0) {
                         sg.destroyImage(sg_images[i]);
                         sg_images[i] = .{};
+                    }
+                    if (textures[i]) |t| {
+                        PreviewMtlBridge.release(t);
+                        textures[i] = null;
                     }
                 }
                 return;
@@ -724,13 +730,17 @@ pub const preview_mtl = if (preview_metal_enabled) struct {
                 views[i] = .{};
             }
             attachments[i] = .{};
-            if (textures[i]) |t| {
-                PreviewMtlBridge.release(t);
-                textures[i] = null;
-            }
+            // Order matters: destroy the sokol image first (it holds an
+            // internal reference to the MTLTexture but does NOT retain it),
+            // then release the MTLTexture. Reversing the order leaves
+            // sg_image pointing at freed Metal memory.
             if (sg_images[i].id != 0) {
                 sg.destroyImage(sg_images[i]);
                 sg_images[i] = .{};
+            }
+            if (textures[i]) |t| {
+                PreviewMtlBridge.release(t);
+                textures[i] = null;
             }
         }
         if (depth_view.id != 0) {
