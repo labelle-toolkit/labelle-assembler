@@ -144,7 +144,13 @@ pub fn height() i32 {
 
 /// Duration of the last frame in seconds.
 /// Use this for dt in the frame callback instead of a hardcoded value.
+///
+/// In headless preview mode sokol-app never ran, so `sapp.frameDuration()`
+/// returns ~0 — which causes divide-by-zero or stalled physics in game
+/// code that derives delta-time from this. `runHeadless` paces at ~60 Hz
+/// via `nanosleep`, so 1/60 is the truthful answer there.
 pub fn frameDuration() f64 {
+    if (headless_mode) return 1.0 / 60.0;
     return sapp.frameDuration();
 }
 
