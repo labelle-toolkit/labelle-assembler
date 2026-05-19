@@ -225,27 +225,57 @@ fn headlessFallbackAttachments() sg.Attachments {
     // sg.Attachments isn't a handle (no .id) so use the color-view's
     // id as the lazy-init sentinel.
     if (headless_fallback_color_view.id != 0) return headless_fallback_attachments;
-    headless_fallback_color_img = sg.makeImage(.{
+
+    // Build everything in locals first; only commit to module-scope
+    // statics when all four handles validate. If any creation fails
+    // (pool exhaustion / driver error), return an empty
+    // `sg.Attachments` and leave `headless_fallback_color_view.id == 0`
+    // so the next call retries the lazy-init cleanly instead of
+    // caching broken attachments forever.
+    const color_img = sg.makeImage(.{
         .width = 16,
         .height = 16,
         .pixel_format = .BGRA8,
         .usage = .{ .color_attachment = true, .immutable = true },
     });
-    headless_fallback_color_view = sg.makeView(.{
-        .color_attachment = .{ .image = headless_fallback_color_img },
+    if (color_img.id == 0) return .{};
+    const color_view = sg.makeView(.{
+        .color_attachment = .{ .image = color_img },
     });
-    headless_fallback_depth_img = sg.makeImage(.{
+    if (color_view.id == 0) {
+        sg.destroyImage(color_img);
+        return .{};
+    }
+    const depth_img = sg.makeImage(.{
         .width = 16,
         .height = 16,
         .pixel_format = .DEPTH_STENCIL,
         .usage = .{ .depth_stencil_attachment = true, .immutable = true },
     });
-    headless_fallback_depth_view = sg.makeView(.{
-        .depth_stencil_attachment = .{ .image = headless_fallback_depth_img },
+    if (depth_img.id == 0) {
+        sg.destroyView(color_view);
+        sg.destroyImage(color_img);
+        return .{};
+    }
+    const depth_view = sg.makeView(.{
+        .depth_stencil_attachment = .{ .image = depth_img },
     });
+    if (depth_view.id == 0) {
+        sg.destroyImage(depth_img);
+        sg.destroyView(color_view);
+        sg.destroyImage(color_img);
+        return .{};
+    }
+
     var att: sg.Attachments = .{};
-    att.colors[0] = headless_fallback_color_view;
-    att.depth_stencil = headless_fallback_depth_view;
+    att.colors[0] = color_view;
+    att.depth_stencil = depth_view;
+
+    // All four handles valid — commit to module scope.
+    headless_fallback_color_img = color_img;
+    headless_fallback_color_view = color_view;
+    headless_fallback_depth_img = depth_img;
+    headless_fallback_depth_view = depth_view;
     headless_fallback_attachments = att;
     return att;
 }
