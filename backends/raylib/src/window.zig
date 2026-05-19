@@ -200,9 +200,16 @@ pub const preview_pbo = struct {
                 if (pixel_buf.len != 0) allocator.free(pixel_buf);
                 pixel_buf = allocator.alloc(u8, needed_bytes) catch &[_]u8{};
             }
-            last_w = sw;
-            last_h = sh;
-            frame_idx = 0;
+            // Only commit the resize state when the CPU staging buffer
+            // matches `needed_bytes` — otherwise the next frame would
+            // see `sw == last_w and sh == last_h`, skip realloc, and
+            // stall the preview indefinitely. Leaving these unchanged
+            // means the next frame retries the (re)negotiation path.
+            if (pixel_buf.len == needed_bytes) {
+                last_w = sw;
+                last_h = sh;
+                frame_idx = 0;
+            }
         }
 
         if (!vtable.isFrameAccepted(vtable.ctx) or pixel_buf.len != needed_bytes) return;
