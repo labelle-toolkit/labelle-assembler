@@ -1077,9 +1077,11 @@ const PREVIEW_HEARTBEAT_LOOP =
 ;
 
 /// Wrappers around the imgui sokol bridge's mouse-event exports.
-/// Emitted only when the project's gui plugin is set (cfg.resolved_gui).
-/// Projects without a gui plugin get `PREVIEW_INPUT_DISPATCH_STUB` so
-/// the `_preview_input_*` symbols still resolve in PREVIEW_HEARTBEAT_LOOP
+/// Emitted only when the project's gui plugin is *imgui* specifically —
+/// the `imgui_bridge_mouse_*` externs only resolve against the imgui
+/// bridge. Projects with a different gui plugin (clay, simple-raylib,
+/// simple-sokol, …) or no gui at all get `PREVIEW_INPUT_DISPATCH_STUB`,
+/// so the `_preview_input_*` symbols still resolve in PREVIEW_HEARTBEAT_LOOP
 /// (the drain just discards events).
 const PREVIEW_INPUT_DISPATCH =
     \\extern fn imgui_bridge_mouse_pos(x: f32, y: f32) void;
@@ -2913,8 +2915,13 @@ pub fn generateMainZigFromTemplate(
             else
                 "";
             defer if (cfg.backend == .sokol) allocator.free(sokol_readback_helpers);
-            const input_dispatch_cb: []const u8 = if (cfg.resolved_gui != null)
-                PREVIEW_INPUT_DISPATCH
+            // PREVIEW_INPUT_DISPATCH emits `extern fn imgui_bridge_mouse_*`
+            // symbols, which only exist when the gui plugin is imgui. Gate
+            // narrowly on plugin name — other gui plugins (clay, simple-raylib,
+            // simple-sokol, …) would link-fail on these externs. The stub
+            // variant provides safe no-ops for those projects.
+            const input_dispatch_cb: []const u8 = if (cfg.resolved_gui) |gui|
+                (if (std.mem.eql(u8, gui.name, "imgui")) PREVIEW_INPUT_DISPATCH else PREVIEW_INPUT_DISPATCH_STUB)
             else
                 PREVIEW_INPUT_DISPATCH_STUB;
             const module_vars = try std.mem.concat(allocator, u8, &.{ sokol_runner, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch_cb });
@@ -3135,8 +3142,11 @@ pub fn generateMainZigFromTemplate(
             // takes the callback branch above, so this only fires for
             // raylib desktop.
             const is_raylib_desktop = cfg.backend == .raylib;
-            const input_dispatch: []const u8 = if (cfg.resolved_gui != null)
-                PREVIEW_INPUT_DISPATCH
+            // See gate rationale on the sokol-callback site above: dispatch
+            // body declares imgui-specific externs, so non-imgui gui plugins
+            // must take the stub branch.
+            const input_dispatch: []const u8 = if (cfg.resolved_gui) |gui|
+                (if (std.mem.eql(u8, gui.name, "imgui")) PREVIEW_INPUT_DISPATCH else PREVIEW_INPUT_DISPATCH_STUB)
             else
                 PREVIEW_INPUT_DISPATCH_STUB;
             const module_vars_loop = if (is_raylib_desktop)
