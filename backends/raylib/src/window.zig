@@ -147,7 +147,6 @@ pub const preview_pbo = struct {
     var allocator_set: bool = false;
     var vt: ?PreviewPboVtable = null;
     var pbos: [3]c_uint = .{ 0, 0, 0 };
-    var pbo_bytes: usize = 0;
     var pbo_initialized: bool = false;
     var frame_idx: u64 = 0;
     var last_w: u32 = 0;
@@ -195,7 +194,6 @@ pub const preview_pbo = struct {
                 glBufferData(GL_PIXEL_PACK_BUFFER, @intCast(needed_bytes), null, GL_STREAM_READ);
             }
             glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-            pbo_bytes = needed_bytes;
             if (pixel_buf.len != needed_bytes) {
                 if (pixel_buf.len != 0) allocator.free(pixel_buf);
                 pixel_buf = allocator.alloc(u8, needed_bytes) catch &[_]u8{};
