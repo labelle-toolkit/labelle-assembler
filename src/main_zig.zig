@@ -859,6 +859,46 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
 // follow-up can wire the real PID once we settle on a stdlib import
 // that's universal across our backends.
 
+/// Workaround for Zig 0.16.0 wasm32-emscripten compile failure
+/// (labelle-assembler#141). The default panic handler in 0.16.0
+/// transitively imports `std.Io.Threaded`, whose posix wrappers fail
+/// to type-check against emscripten's signal-enum shape
+/// (`std/Io/Threaded.zig:15315` / `std/os/emscripten.zig:215`).
+/// Overriding both `std_options_debug_io` and `panic` at the root
+/// source keeps the default panic-handler chain from instantiating
+/// `std.Io.Threaded`. This is the workaround recommended on the
+/// Ziggit forum thread linked below and lands the documented fix
+/// inside the generated `main.zig`.
+///
+/// Fixed upstream on Zig master by PR #31850 (lands in 0.17.0-dev);
+/// drop this once labelle-toolkit moves off 0.16.x.
+///
+/// NOTE: this only neutralises the *implicit* path from the panic
+/// handler. The generated preview-mode block (PREVIEW_INIT_CALLBACK)
+/// still calls `std.Io.Threaded.init(...).io()` directly, which
+/// re-instantiates the offending type. Skipping that on wasm is a
+/// separate follow-up (the preview env-var is never set in a browser
+/// context anyway).
+///
+/// References:
+///   https://ziggit.dev/t/0-16-0-wasm32-emscripten-fails-to-build-because-of-default-panic-handler-recommended-workaround/15052
+///   PR #31850 (Zig upstream)
+///
+/// Emitted only when `cfg.platform == .wasm`; lands near the top of
+/// the generated `main.zig` so the two `pub const` decls are at
+/// module root (Zig looks up these override names there).
+const WASM_PANIC_WORKAROUND =
+    \\
+    \\// Zig 0.16.0 wasm32-emscripten: override the default panic handler to
+    \\// avoid std.Io.Threaded import (which has broken posix wrappers on
+    \\// emscripten). Fixed upstream in 0.17.0-dev (PR #31850); remove this
+    \\// once labelle-toolkit moves off 0.16.
+    \\// https://ziggit.dev/t/0-16-0-wasm32-emscripten-fails-to-build-because-of-default-panic-handler-recommended-workaround/15052
+    \\pub const std_options_debug_io = std.Io.failing;
+    \\pub const panic = std.debug.no_panic;
+    \\
+;
+
 /// Module-scope helpers the preview blocks rely on. `getenv` and
 /// `clock_gettime` are at module scope because `extern "c" fn`
 /// must be; both names are unique within the generated main.zig.
@@ -2395,10 +2435,20 @@ pub fn generateMainZigFromTemplate(
     var ident_buf: [256]u8 = undefined;
 
     // Hook imports block
+    //
+    // The wasm32-emscripten panic-handler override (labelle-assembler#141)
+    // is emitted at the top of this block so the two `pub const` root
+    // declarations land near `const std = @import("std")` in the
+    // generated `main.zig`. They MUST appear at module root for Zig to
+    // honor them, and this block is rendered right after the stdlib
+    // imports in `labelle-engine/codegen/main.zig.template`.
     {
         var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
         errdefer alloc_writer_b.deinit();
         const bw = &alloc_writer_b.writer;
+        if (cfg.platform == .wasm) {
+            try bw.writeAll(WASM_PANIC_WORKAROUND);
+        }
         if (hook_names.len > 0) {
             try bw.writeAll("\n// --- Hook imports ---\n");
             for (hook_names) |name| {
