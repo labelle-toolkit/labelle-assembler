@@ -623,6 +623,12 @@ pub fn build(b: *std.Build) void {
     // Configure NDK sysroot paths on sokol_clib for C header compilation
     sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include" }) });
     sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }) });
+    // Android shared libs (libgame.so) must be position-independent.
+    // Static archives like libsokol_clib.a are consumed into the .so,
+    // so every .o inside them needs `-fPIC` too — otherwise ld.lld
+    // refuses the AArch64 R_AARCH64_ABS64 / R_AARCH64_ADR_PREL_PG_HI21
+    // relocations. See labelle-assembler#147.
+    sokol_clib.root_module.pic = true;
 
 .android_exe_start
     const lib = b.addLibrary(.{
@@ -632,6 +638,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = android_target,
             .optimize = optimize,
+            .pic = true,
             .imports = &.{
                 .{ .name = "labelle-core", .module = core_mod },
                 .{ .name = "labelle-gfx", .module = gfx_mod },
@@ -678,6 +685,8 @@ pub fn build(b: *std.Build) void {
     lib.setLibCFile(android_libc.add("android-libc.txt", libc_content));
 
 .android_link_gui_bridge
+    // Same -fPIC requirement as sokol_clib — see labelle-assembler#147.
+    gui_bridge_artifact.root_module.pic = true;
     lib.root_module.linkLibrary(gui_bridge_artifact);
 
 .android_package
