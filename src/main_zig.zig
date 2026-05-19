@@ -2988,33 +2988,62 @@ pub fn generateMainZigFromTemplate(
                 //              no-ops.
                 // The three paths evaporate on the non-matching OS via
                 // their `_sokol_preview_{gl,d3d11,metal}_enabled` flags.
-                const preview_setup_sokol = try std.mem.concat(allocator, u8, &.{
-                    PREVIEW_INIT_CALLBACK,
-                    PREVIEW_READBACK_INIT_SOKOL,
-                    PREVIEW_READBACK_INIT_SOKOL_D3D11,
-                    PREVIEW_READBACK_INIT_METAL_SOKOL,
-                });
+                //
+                // Wasm-emscripten gate (labelle-assembler#141): preview
+                // mode is useless in a browser tab (no `LABELLE_PREVIEW`
+                // env, no TCP socket out), and `std.Io.Threaded.init` +
+                // `.io()` instantiates the vtable that references
+                // `childWaitPosix` → triggers the Zig 0.16
+                // `Threaded.zig:15315` / `emscripten.zig:215` enum
+                // mismatches. Emit empty strings for the preview slots
+                // on wasm so the generated `main.zig` never references
+                // `std.Io.Threaded`. See ziglang/zig#31849 + PR #31850
+                // for the upstream fix; this is the workaround for now.
+                const preview_setup_sokol = if (is_wasm)
+                    try allocator.dupe(u8, "")
+                else
+                    try std.mem.concat(allocator, u8, &.{
+                        PREVIEW_INIT_CALLBACK,
+                        PREVIEW_READBACK_INIT_SOKOL,
+                        PREVIEW_READBACK_INIT_SOKOL_D3D11,
+                        PREVIEW_READBACK_INIT_METAL_SOKOL,
+                    });
                 defer allocator.free(preview_setup_sokol);
-                const preview_readback_sokol = try std.mem.concat(allocator, u8, &.{
-                    PREVIEW_READBACK_FRAME_SOKOL,
-                    PREVIEW_READBACK_FRAME_SOKOL_D3D11,
-                    // Path A (#131): the Metal block no longer depends
-                    // on a swapchain drawable, so it can run in the
-                    // pre-endFrame slot alongside GL / D3D11. The
-                    // `{{preview_readback_post}}` template hole gets
-                    // an empty string below — kept in the template so
-                    // existing test scaffolding still expands cleanly,
-                    // but no longer carries any Metal payload.
-                    PREVIEW_READBACK_FRAME_METAL_SOKOL,
-                });
+                // Wasm-emscripten gate (labelle-assembler#141, same
+                // rationale as `preview_setup_sokol` above). Heartbeat
+                // + readback + cleanup all touch `g.preview`'s public
+                // methods, and Zig's lazy compilation may still pull
+                // the `popInputEvent` / `tickHeartbeat` codepaths into
+                // the wasm exe even when `g.preview` is statically
+                // null. Emit empty strings so the generated `main.zig`
+                // never references Preview's IO surface on wasm.
+                const preview_readback_sokol = if (is_wasm)
+                    try allocator.dupe(u8, "")
+                else
+                    try std.mem.concat(allocator, u8, &.{
+                        PREVIEW_READBACK_FRAME_SOKOL,
+                        PREVIEW_READBACK_FRAME_SOKOL_D3D11,
+                        // Path A (#131): the Metal block no longer depends
+                        // on a swapchain drawable, so it can run in the
+                        // pre-endFrame slot alongside GL / D3D11. The
+                        // `{{preview_readback_post}}` template hole gets
+                        // an empty string below — kept in the template so
+                        // existing test scaffolding still expands cleanly,
+                        // but no longer carries any Metal payload.
+                        PREVIEW_READBACK_FRAME_METAL_SOKOL,
+                    });
                 defer allocator.free(preview_readback_sokol);
-                const preview_cleanup_sokol = try std.mem.concat(allocator, u8, &.{
-                    PREVIEW_READBACK_CLEANUP_SOKOL,
-                    PREVIEW_READBACK_CLEANUP_SOKOL_D3D11,
-                    PREVIEW_READBACK_CLEANUP_METAL_SOKOL,
-                    PREVIEW_CLEANUP_CALLBACK,
-                });
+                const preview_cleanup_sokol = if (is_wasm)
+                    try allocator.dupe(u8, "")
+                else
+                    try std.mem.concat(allocator, u8, &.{
+                        PREVIEW_READBACK_CLEANUP_SOKOL,
+                        PREVIEW_READBACK_CLEANUP_SOKOL_D3D11,
+                        PREVIEW_READBACK_CLEANUP_METAL_SOKOL,
+                        PREVIEW_CLEANUP_CALLBACK,
+                    });
                 defer allocator.free(preview_cleanup_sokol);
+                const preview_heartbeat_sokol: []const u8 = if (is_wasm) "" else PREVIEW_HEARTBEAT_CALLBACK;
 
                 try tpl.render(lifecycle_tmpl, .{
                     .module_vars = module_vars,
@@ -3044,7 +3073,7 @@ pub fn generateMainZigFromTemplate(
                     // graceful `bye`, and `g.deinit` owns the socket +
                     // arena teardown.
                     .preview_setup = preview_setup_sokol,
-                    .preview_heartbeat = PREVIEW_HEARTBEAT_CALLBACK,
+                    .preview_heartbeat = preview_heartbeat_sokol,
                     // Path A render-target wiring (#133) — fires BEFORE
                     // `window.beginFrame()` so the swapchain-vs-offscreen
                     // decision is made before sokol-gfx commits to either.
@@ -3069,6 +3098,16 @@ pub fn generateMainZigFromTemplate(
                 // to emscripten; heartbeats fire inside `gameFrame`.
                 // No cleanup callback — emscripten keeps running after
                 // main returns, and the editor reads EOF on tab close.
+                //
+                // Wasm-emscripten gate (labelle-assembler#141): preview
+                // mode is useless in a browser tab, and the explicit
+                // `std.Io.Threaded.init` in PREVIEW_INIT_CALLBACK pulls
+                // the broken Zig 0.16 posix wrappers into the wasm exe
+                // (Threaded.zig:15315 / emscripten.zig:215). Emit empty
+                // strings on wasm. Both branches of this `if/else` land
+                // on wasm in practice, but keep the gate explicit so
+                // the intent is local.
+                const is_wasm_raylib = cfg.platform == .wasm;
                 try tpl.render(lifecycle_tmpl, .{
                     .width = w_str,
                     .height = h_str,
@@ -3079,8 +3118,8 @@ pub fn generateMainZigFromTemplate(
                     .gui_draw_code = gui_draw_code,
                     .hidden_setup = hidden_setup,
                     .hooks_init_block = hooks_init,
-                    .preview_setup = PREVIEW_INIT_CALLBACK,
-                    .preview_heartbeat = PREVIEW_HEARTBEAT_CALLBACK,
+                    .preview_setup = if (is_wasm_raylib) "" else PREVIEW_INIT_CALLBACK,
+                    .preview_heartbeat = if (is_wasm_raylib) "" else PREVIEW_HEARTBEAT_CALLBACK,
                 }, bw);
             }
         } else {

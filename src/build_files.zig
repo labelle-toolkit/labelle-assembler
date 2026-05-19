@@ -177,18 +177,26 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         try tpl.writeSection(build_zig_tmpl, "wasm_exe_end", w);
 
-        switch (cfg.backend) {
-            .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib_wasm", w),
-            .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol_wasm", w),
-            else => {},
-        }
-
-        // Link bridge artifact for WASM (raw_backend GUIs)
+        // Link bridge artifact for WASM (raw_backend GUIs) BEFORE the
+        // backend-specific link step. sokol-zig's `emLinkStep` snapshots
+        // `lib_main.getCompileDependencies(false)` to assemble the emcc
+        // command line — libraries linked AFTER `emLinkStep` returned
+        // don't always end up on the emcc cmdline reliably (observed
+        // missing `libsokol_imgui_bridge.a` despite `linkLibrary`
+        // running before `make()`, labelle-assembler#141). Moving the
+        // bridge link to BEFORE the backend's emLinkStep call ensures
+        // the dep list is complete when emcc args are gathered.
         if (cfg.resolved_gui) |gui| {
             if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
                 try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
                 try tpl.writeSection(build_zig_tmpl, "link_gui_bridge_wasm", w);
             }
+        }
+
+        switch (cfg.backend) {
+            .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib_wasm", w),
+            .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol_wasm", w),
+            else => {},
         }
 
         try tpl.writeSection(build_zig_tmpl, "wasm_footer", w);
