@@ -32,18 +32,34 @@ pub fn build(b: *std.Build) void {
     // generated build.zig flips `with_imgui` on only when the project
     // has the imgui plugin in its gui config.
     //
-    // `with_sokol_imgui_no_app` stays unconditional because sokol-zig
-    // gates its cflag on the outer `with_sokol_imgui` already — it's a
-    // harmless no-op when imgui is off, and keeps the option set
-    // identical to the bridge's when imgui is on.
+    // `with_sokol_imgui_no_app` stays unconditional on every target
+    // EXCEPT Android because sokol-zig gates its cflag on the outer
+    // `with_sokol_imgui` already — it's a harmless no-op when imgui is
+    // off, and keeps the option set identical to the bridge's when
+    // imgui is on. Android is the exception: the device runs sokol_app
+    // natively (no headless preview), and the freshly-fetched sokol-zig
+    // hasn't been patched with the option, so passing it trips
+    // `error: invalid option: -Dwith_sokol_imgui_no_app`. The matching
+    // skip in `labelle-imgui/bridges/sokol/build.zig` keeps the option
+    // sets symmetric on Android too (still one `sokol_clib` artifact,
+    // one `_sg`). See labelle-assembler#146.
     const with_imgui = b.option(bool, "with_imgui", "Build sokol with sokol_imgui (must match imgui bridge if used)") orelse false;
-    const sokol_dep = b.dependency("sokol", .{
-        .target = target,
-        .optimize = optimize,
-        .with_sokol_imgui = with_imgui,
-        .with_sokol_imgui_no_app = true,
-        .dont_link_system_libs = dont_link_system_libs,
-    });
+    const is_android = target.result.abi == .android or target.result.abi == .androideabi;
+    const sokol_dep = if (is_android)
+        b.dependency("sokol", .{
+            .target = target,
+            .optimize = optimize,
+            .with_sokol_imgui = with_imgui,
+            .dont_link_system_libs = dont_link_system_libs,
+        })
+    else
+        b.dependency("sokol", .{
+            .target = target,
+            .optimize = optimize,
+            .with_sokol_imgui = with_imgui,
+            .with_sokol_imgui_no_app = true,
+            .dont_link_system_libs = dont_link_system_libs,
+        });
     const sokol_mod = sokol_dep.module("sokol");
     const sokol_clib = sokol_dep.artifact("sokol_clib");
 
