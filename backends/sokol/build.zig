@@ -12,9 +12,36 @@ pub fn build(b: *std.Build) void {
     // Forward dont_link_system_libs for iOS builds — we link frameworks manually.
     const dont_link_system_libs = b.option(bool, "dont_link_system_libs", "Don't link system libraries (for iOS cross-compilation)") orelse false;
 
+    // Opt-in `with_sokol_imgui` switch — only the imgui-plugin path
+    // needs sokol_imgui.c compiled. Forcing it on for every project
+    // breaks no-gui builds because sokol_imgui.c `#include`s
+    // `cimgui.h`, which only the imgui bridge provides on the include
+    // path. WASM-without-imgui was the canonical regression
+    // (`sokol_imgui.c:8:10: error: 'cimgui.h' file not found`); session
+    // smoke testing surfaced it.
+    //
+    // IMPORTANT: when `with_imgui=true`, the option set passed here
+    // MUST match `labelle-imgui/bridges/sokol/build.zig` exactly. Zig
+    // keys each `b.dependency("sokol", .{...})` resolution by the
+    // option set, so mismatched options produce *two* separately
+    // compiled `sokol_clib` artifacts in the same binary — and
+    // therefore two copies of the `_sg` static state. Symptom: sgl
+    // draws land in the IOSurface pass but simgui draws don't
+    // (different state machines). Symmetric option list = one
+    // artifact = one `_sg` (labelle-assembler#140). The assembler's
+    // generated build.zig flips `with_imgui` on only when the project
+    // has the imgui plugin in its gui config.
+    //
+    // `with_sokol_imgui_no_app` stays unconditional because sokol-zig
+    // gates its cflag on the outer `with_sokol_imgui` already — it's a
+    // harmless no-op when imgui is off, and keeps the option set
+    // identical to the bridge's when imgui is on.
+    const with_imgui = b.option(bool, "with_imgui", "Build sokol with sokol_imgui (must match imgui bridge if used)") orelse false;
     const sokol_dep = b.dependency("sokol", .{
         .target = target,
         .optimize = optimize,
+        .with_sokol_imgui = with_imgui,
+        .with_sokol_imgui_no_app = true,
         .dont_link_system_libs = dont_link_system_libs,
     });
     const sokol_mod = sokol_dep.module("sokol");
@@ -29,26 +56,33 @@ pub fn build(b: *std.Build) void {
     });
     gfx_mod.addImport("sokol", sokol_mod);
     gfx_mod.addIncludePath(b.path("src"));
+
+    // When cross-compiling to wasm32-emscripten the C compile of
+    // `stb_image_impl.c` cannot find `<stdlib.h>` / `<stdio.h>`
+    // because Zig does not ship libc headers for `wasm32-emscripten`
+    // — they live in emsdk's sysroot. Plumb the emsdk sysroot include
+    // path into the gfx module BEFORE adding the C sources so the
+    // build graph has it attached when the consuming Compile step
+    // collects translation units. Gated on `.emscripten` so the
+    // desktop / mobile builds remain untouched (labelle-cli#197,
+    // labelle-assembler#141).
+    //
+    // Note: this MUST run before `addCSourceFile` below. In testing,
+    // setting it after the addCSourceFile calls caused emcc to bail
+    // with `'stdio.h' file not found`. Mirrors sokol-zig's pattern
+    // in `mod_sokol_clib`'s setup.
+    if (target.result.os.tag == .emscripten) {
+        if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
+            gfx_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
+        }
+    }
+
     gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
     // Phase 4 font baker (labelle-engine#448). stb_truetype lives next
     // to stb_image and is compiled in the same way — single-header C
     // lib, separate `_impl.c` translation unit defining the
     // implementation macro.
     gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
-
-    // When cross-compiling to wasm32-emscripten the C compile of
-    // `stb_image_impl.c` cannot find `<stdlib.h>` because Zig does not
-    // ship libc headers for `wasm32-emscripten` — they live in emsdk's
-    // sysroot. Mirror what `sokol-zig` does for `sokol_clib` (see
-    // sokol/build.zig:204) and plumb the emsdk sysroot include path
-    // into the gfx module. Gated on `.emscripten` so the desktop /
-    // mobile builds remain untouched (labelle-cli#197). stb_truetype
-    // also pulls in `<stdlib.h>`, so the same sysroot include applies.
-    if (target.result.os.tag == .emscripten) {
-        if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
-            gfx_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
-        }
-    }
 
     // ── Input backend module ────────────────────────────────────────
     const input_mod = b.addModule("input", .{
@@ -67,6 +101,19 @@ pub fn build(b: *std.Build) void {
     });
     audio_mod.addImport("sokol", sokol_mod);
     audio_mod.addIncludePath(b.path("src"));
+
+    // Mirror the emsdk sysroot include from gfx_mod: stb_vorbis and
+    // dr_wav both pull in <stdlib.h> / <string.h> / <math.h> which
+    // require emscripten's sysroot when cross-compiling to
+    // wasm32-emscripten (labelle-cli#197, labelle-assembler#141). MUST
+    // be set BEFORE the `addCSourceFile` calls below — see gfx_mod's
+    // comment.
+    if (target.result.os.tag == .emscripten) {
+        if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
+            audio_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
+        }
+    }
+
     // Phase 4 audio decoders (labelle-engine#447):
     //   - stb_vorbis.c is both the API *and* the implementation — it is
     //     a single .c file you compile directly, not a header + impl
@@ -76,16 +123,6 @@ pub fn build(b: *std.Build) void {
     //     header.
     audio_mod.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
     audio_mod.addCSourceFile(.{ .file = b.path("src/dr_wav_impl.c"), .flags = &.{} });
-
-    // Mirror the emsdk sysroot include from gfx_mod: stb_vorbis and
-    // dr_wav both pull in <stdlib.h> / <string.h> / <math.h> which
-    // require emscripten's sysroot when cross-compiling to
-    // wasm32-emscripten (labelle-cli#197).
-    if (target.result.os.tag == .emscripten) {
-        if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
-            audio_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
-        }
-    }
 
     // ── Window backend module ───────────────────────────────────────
     const window_mod = b.addModule("window", .{

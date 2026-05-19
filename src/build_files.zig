@@ -73,14 +73,25 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     switch (cfg.backend) {
         .raylib => try tpl.writeSection(build_zig_tmpl, "backend_raylib", w),
         .sokol => {
+            // `with_imgui` must be true ONLY when the project's gui plugin
+            // is imgui — sokol_imgui.c needs cimgui.h on its include path,
+            // which only the imgui bridge provides. When imgui IS in the
+            // dep graph, the option set here MUST match
+            // `labelle-imgui/bridges/sokol/build.zig` exactly so Zig
+            // resolves a single `sokol_clib` artifact (and a single `_sg`
+            // static state) — see labelle-assembler#140.
+            const with_imgui: []const u8 = if (cfg.resolved_gui) |gui|
+                if (std.mem.eql(u8, gui.name, "imgui")) "true" else "false"
+            else
+                "false";
             if (cfg.platform == .wasm) {
-                try tpl.writeSection(build_zig_tmpl, "backend_sokol_wasm", w);
+                try tpl.renderSection(build_zig_tmpl, "backend_sokol_wasm", .{ .with_imgui = with_imgui }, w);
             } else if (cfg.platform == .ios) {
-                try tpl.writeSection(build_zig_tmpl, "backend_sokol_ios", w);
+                try tpl.renderSection(build_zig_tmpl, "backend_sokol_ios", .{ .with_imgui = with_imgui }, w);
             } else if (cfg.platform == .android) {
-                try tpl.writeSection(build_zig_tmpl, "backend_sokol_android", w);
+                try tpl.renderSection(build_zig_tmpl, "backend_sokol_android", .{ .with_imgui = with_imgui }, w);
             } else {
-                try tpl.writeSection(build_zig_tmpl, "backend_sokol", w);
+                try tpl.renderSection(build_zig_tmpl, "backend_sokol", .{ .with_imgui = with_imgui }, w);
             }
         },
         .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),
@@ -166,18 +177,26 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         try tpl.writeSection(build_zig_tmpl, "wasm_exe_end", w);
 
-        switch (cfg.backend) {
-            .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib_wasm", w),
-            .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol_wasm", w),
-            else => {},
-        }
-
-        // Link bridge artifact for WASM (raw_backend GUIs)
+        // Link bridge artifact for WASM (raw_backend GUIs) BEFORE the
+        // backend-specific link step. sokol-zig's `emLinkStep` snapshots
+        // `lib_main.getCompileDependencies(false)` to assemble the emcc
+        // command line — libraries linked AFTER `emLinkStep` returned
+        // don't always end up on the emcc cmdline reliably (observed
+        // missing `libsokol_imgui_bridge.a` despite `linkLibrary`
+        // running before `make()`, labelle-assembler#141). Moving the
+        // bridge link to BEFORE the backend's emLinkStep call ensures
+        // the dep list is complete when emcc args are gathered.
         if (cfg.resolved_gui) |gui| {
             if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
                 try tpl.renderSection(build_zig_tmpl, "gui_bridge", .{ .bridge_artifact_name = gui.bridge_artifact }, w);
                 try tpl.writeSection(build_zig_tmpl, "link_gui_bridge_wasm", w);
             }
+        }
+
+        switch (cfg.backend) {
+            .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib_wasm", w),
+            .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol_wasm", w),
+            else => {},
         }
 
         try tpl.writeSection(build_zig_tmpl, "wasm_footer", w);

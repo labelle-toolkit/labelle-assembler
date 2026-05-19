@@ -859,6 +859,46 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
 // follow-up can wire the real PID once we settle on a stdlib import
 // that's universal across our backends.
 
+/// Workaround for Zig 0.16.0 wasm32-emscripten compile failure
+/// (labelle-assembler#141). The default panic handler in 0.16.0
+/// transitively imports `std.Io.Threaded`, whose posix wrappers fail
+/// to type-check against emscripten's signal-enum shape
+/// (`std/Io/Threaded.zig:15315` / `std/os/emscripten.zig:215`).
+/// Overriding both `std_options_debug_io` and `panic` at the root
+/// source keeps the default panic-handler chain from instantiating
+/// `std.Io.Threaded`. This is the workaround recommended on the
+/// Ziggit forum thread linked below and lands the documented fix
+/// inside the generated `main.zig`.
+///
+/// Fixed upstream on Zig master by PR #31850 (lands in 0.17.0-dev);
+/// drop this once labelle-toolkit moves off 0.16.x.
+///
+/// NOTE: this only neutralises the *implicit* path from the panic
+/// handler. The generated preview-mode block (PREVIEW_INIT_CALLBACK)
+/// still calls `std.Io.Threaded.init(...).io()` directly, which
+/// re-instantiates the offending type. Skipping that on wasm is a
+/// separate follow-up (the preview env-var is never set in a browser
+/// context anyway).
+///
+/// References:
+///   https://ziggit.dev/t/0-16-0-wasm32-emscripten-fails-to-build-because-of-default-panic-handler-recommended-workaround/15052
+///   PR #31850 (Zig upstream)
+///
+/// Emitted only when `cfg.platform == .wasm`; lands near the top of
+/// the generated `main.zig` so the two `pub const` decls are at
+/// module root (Zig looks up these override names there).
+const WASM_PANIC_WORKAROUND =
+    \\
+    \\// Zig 0.16.0 wasm32-emscripten: override the default panic handler to
+    \\// avoid std.Io.Threaded import (which has broken posix wrappers on
+    \\// emscripten). Fixed upstream in 0.17.0-dev (PR #31850); remove this
+    \\// once labelle-toolkit moves off 0.16.
+    \\// https://ziggit.dev/t/0-16-0-wasm32-emscripten-fails-to-build-because-of-default-panic-handler-recommended-workaround/15052
+    \\pub const std_options_debug_io = std.Io.failing;
+    \\pub const panic = std.debug.no_panic;
+    \\
+;
+
 /// Module-scope helpers the preview blocks rely on. `getenv` and
 /// `clock_gettime` are at module scope because `extern "c" fn`
 /// must be; both names are unique within the generated main.zig.
@@ -896,48 +936,40 @@ const PREVIEW_HELPERS =
 /// 2.1 / 3.3 core values — stable across drivers and platforms.
 const PREVIEW_READBACK_HELPERS =
     \\
-    \\// ── GL constants for PBO readback (labelle-engine#544) ──
-    \\const _GL_PIXEL_PACK_BUFFER: c_uint = 0x88EB;
-    \\const _GL_STREAM_READ: c_uint = 0x88E1;
-    \\const _GL_READ_ONLY: c_uint = 0x88B8;
-    \\const _GL_PACK_ALIGNMENT: c_uint = 0x0D05;
-    \\const _GL_RGBA: c_uint = 0x1908;
-    \\const _GL_UNSIGNED_BYTE: c_uint = 0x1401;
-    \\
-    \\// PBO entry points. raylib's libGL/CGL/WGL link gives us these
-    \\// for free. Names are the standard GL 2.1+ C symbols.
-    \\const _gl_pixel_storei = @extern(
-    \\    *const fn (pname: c_uint, param: c_int) callconv(.c) void,
-    \\    .{ .name = "glPixelStorei" },
-    \\);
-    \\const _gl_gen_buffers = @extern(
-    \\    *const fn (n: c_int, buffers: [*]c_uint) callconv(.c) void,
-    \\    .{ .name = "glGenBuffers" },
-    \\);
-    \\const _gl_delete_buffers = @extern(
-    \\    *const fn (n: c_int, buffers: [*]const c_uint) callconv(.c) void,
-    \\    .{ .name = "glDeleteBuffers" },
-    \\);
-    \\const _gl_bind_buffer = @extern(
-    \\    *const fn (target: c_uint, buffer: c_uint) callconv(.c) void,
-    \\    .{ .name = "glBindBuffer" },
-    \\);
-    \\const _gl_buffer_data = @extern(
-    \\    *const fn (target: c_uint, size: isize, data: ?*const anyopaque, usage: c_uint) callconv(.c) void,
-    \\    .{ .name = "glBufferData" },
-    \\);
-    \\const _gl_read_pixels = @extern(
-    \\    *const fn (x: c_int, y: c_int, w: c_int, h: c_int, fmt: c_uint, ty: c_uint, data: ?*anyopaque) callconv(.c) void,
-    \\    .{ .name = "glReadPixels" },
-    \\);
-    \\const _gl_map_buffer = @extern(
-    \\    *const fn (target: c_uint, access: c_uint) callconv(.c) ?*anyopaque,
-    \\    .{ .name = "glMapBuffer" },
-    \\);
-    \\const _gl_unmap_buffer = @extern(
-    \\    *const fn (target: c_uint) callconv(.c) u8,
-    \\    .{ .name = "glUnmapBuffer" },
-    \\);
+    \\// ── Preview readback bridges (labelle-assembler#140) ──
+    \\// All GL state + PBO ring + per-frame readback machinery now
+    \\// lives in `backends/raylib/src/window.zig:preview_pbo`. The
+    \\// codegen owns only these tiny bridge fns that wrap
+    \\// `engine.Preview` methods behind an `*anyopaque` boundary so
+    \\// the backend module doesn't need an engine type-import.
+    \\fn _preview_pbo_begin_bridge(ctx: *anyopaque, w: u32, h: u32) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.beginFrameStream(w, h);
+    \\}
+    \\fn _preview_pbo_publish_bridge(ctx: *anyopaque, pixels: []const u8) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.publishFrame(pixels);
+    \\}
+    \\fn _preview_pbo_end_bridge(ctx: *anyopaque) void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    p.endFrameStream();
+    \\}
+    \\fn _preview_pbo_begin_ios_bridge(ctx: *anyopaque, w: u32, h: u32) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.beginFrameStreamIOSurface(w, h);
+    \\}
+    \\fn _preview_pbo_publish_ios_bridge(ctx: *anyopaque, pixels: []const u8) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.publishFrameIOSurface(pixels);
+    \\}
+    \\fn _preview_pbo_end_ios_bridge(ctx: *anyopaque) void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    p.endFrameStreamIOSurface();
+    \\}
+    \\fn _preview_pbo_accepted_bridge(ctx: *anyopaque) bool {
+    \\    const p: *const engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.isFrameAccepted();
+    \\}
     \\
 ;
 
@@ -996,33 +1028,23 @@ const PREVIEW_LOOP_SETUP =
 /// `endFrameStreamIOSurface`). The teardown defer here picks the
 /// matching `end*` at comptime so the right side is closed.
 const PREVIEW_READBACK_SETUP =
-    \\    // PBO ring + CPU-side pixel buffer for the per-frame async readback
-    \\    // (labelle-engine#544). `_preview_pbos` ids are lazily generated
-    \\    // on the first accepted frame; `_preview_pbo_bytes` tracks the
-    \\    // per-PBO allocation size so a resize can re-issue `glBufferData`
-    \\    // without reallocating the IDs. The CPU buffer is the staging
-    \\    // copy fed into `Preview.publishFrame` (RGBA8, exact dims).
-    \\    // On macOS the same RGBA8 buffer is handed to
-    \\    // `publishFrameIOSurface`, which swizzles to BGRA during the
-    \\    // IOSurface lock/copy — producer-side format stays RGBA8 either
-    \\    // way (labelle-assembler#121).
-    \\    var _preview_pbos: [3]c_uint = .{ 0, 0, 0 };
-    \\    var _preview_pbo_bytes: usize = 0;
-    \\    var _preview_pbo_initialized: bool = false;
-    \\    var _preview_frame_idx: u64 = 0;
-    \\    var _preview_last_w: u32 = 0;
-    \\    var _preview_last_h: u32 = 0;
-    \\    var _preview_pixel_buf: []u8 = &[_]u8{};
-    \\    _ = &_preview_pbo_bytes;
-    \\    defer if (_preview_pixel_buf.len != 0) allocator.free(_preview_pixel_buf);
-    \\    defer if (_preview_pbo_initialized) _gl_delete_buffers(3, &_preview_pbos);
-    \\    defer if (g.preview) |*_p| {
-    \\        if (comptime @import("builtin").os.tag == .macos) {
-    \\            _p.endFrameStreamIOSurface();
-    \\        } else {
-    \\            _p.endFrameStream();
-    \\        }
-    \\    };
+    \\    // labelle-assembler#140 — preview readback is now
+    \\    // backend-internal. Wire engine.Preview methods into the
+    \\    // backend vtable + register cleanup. The bridges below
+    \\    // are emitted at module scope by PREVIEW_READBACK_HELPERS.
+    \\    if (g.preview) |*_p| {
+    \\        window.preview_pbo.attach(.{
+    \\            .ctx = @ptrCast(_p),
+    \\            .beginFrameStream = _preview_pbo_begin_bridge,
+    \\            .publishFrame = _preview_pbo_publish_bridge,
+    \\            .endFrameStream = _preview_pbo_end_bridge,
+    \\            .beginFrameStreamIOSurface = _preview_pbo_begin_ios_bridge,
+    \\            .publishFrameIOSurface = _preview_pbo_publish_ios_bridge,
+    \\            .endFrameStreamIOSurface = _preview_pbo_end_ios_bridge,
+    \\            .isFrameAccepted = _preview_pbo_accepted_bridge,
+    \\        }, allocator);
+    \\    }
+    \\    defer window.preview_pbo.deinit();
     \\
 ;
 
@@ -1040,7 +1062,43 @@ const PREVIEW_HEARTBEAT_LOOP =
     \\        if (g.preview) |*_p| {
     \\            _p.pollSubscription() catch {};
     \\            _p.tickHeartbeat(_preview_now_ms()) catch {};
+    \\            // Drain editor → game input events (labelle-assembler#143).
+    \\            // The imgui plugin's sokol bridge exposes thin shims over
+    \\            // `simgui_add_*_event`; we link weakly so projects without
+    \\            // the plugin still build.
+    \\            while (_p.popInputEvent()) |_ev| {
+    \\                switch (_ev) {
+    \\                    .mouse_pos => |_m| _preview_input_mouse_pos(_m.x, _m.y),
+    \\                    .mouse_button => |_m| _preview_input_mouse_button(_m.button, _m.down),
+    \\                }
+    \\            }
     \\        }
+    \\
+;
+
+/// Wrappers around the imgui sokol bridge's mouse-event exports.
+/// Emitted only when the project's gui plugin is *imgui* specifically —
+/// the `imgui_bridge_mouse_*` externs only resolve against the imgui
+/// bridge. Projects with a different gui plugin (clay, simple-raylib,
+/// simple-sokol, …) or no gui at all get `PREVIEW_INPUT_DISPATCH_STUB`,
+/// so the `_preview_input_*` symbols still resolve in PREVIEW_HEARTBEAT_LOOP
+/// (the drain just discards events).
+const PREVIEW_INPUT_DISPATCH =
+    \\extern fn imgui_bridge_mouse_pos(x: f32, y: f32) void;
+    \\extern fn imgui_bridge_mouse_button(button: i32, down: bool) void;
+    \\
+    \\fn _preview_input_mouse_pos(x: f32, y: f32) void {
+    \\    imgui_bridge_mouse_pos(x, y);
+    \\}
+    \\fn _preview_input_mouse_button(button: i32, down: bool) void {
+    \\    imgui_bridge_mouse_button(button, down);
+    \\}
+    \\
+;
+
+const PREVIEW_INPUT_DISPATCH_STUB =
+    \\fn _preview_input_mouse_pos(_: f32, _: f32) void {}
+    \\fn _preview_input_mouse_button(_: i32, _: bool) void {}
     \\
 ;
 
@@ -1078,99 +1136,9 @@ const PREVIEW_HEARTBEAT_LOOP =
 /// does the RGBA→BGRA swizzle internally during the IOSurface
 /// lock/copy, so no producer-side format change is needed.
 const PREVIEW_READBACK_LOOP =
-    \\        if (g.preview) |*_p| _readback: {
-    \\            const _sw_i = window.getScreenWidth();
-    \\            const _sh_i = window.getScreenHeight();
-    \\            if (_sw_i <= 0 or _sh_i <= 0) break :_readback;
-    \\            const _sw: u32 = @intCast(_sw_i);
-    \\            const _sh: u32 = @intCast(_sh_i);
-    \\            const _needed_bytes: usize = @as(usize, _sw) * @as(usize, _sh) * 4;
-    \\
-    \\            // Resize / first-frame: (re)negotiate the SHM ring with
-    \\            // the editor and (re)size the PBOs + CPU staging buffer.
-    \\            // beginFrameStream is idempotent across resizes — the
-    \\            // engine tears down the old ring and re-offers under the
-    \\            // hood. After this, `isFrameAccepted` flips back to false
-    \\            // until the editor sends a fresh `frame_accept`; the
-    \\            // readback below will skip until then.
-    \\            //
-    \\            // On macOS the IOSurface variant is used instead — same
-    \\            // lifecycle contract, zero-copy frame transport via
-    \\            // mach ports (labelle-assembler#121).
-    \\            if (_sw != _preview_last_w or _sh != _preview_last_h) {
-    \\                if (comptime @import("builtin").os.tag == .macos) {
-    \\                    _p.beginFrameStreamIOSurface(_sw, _sh) catch break :_readback;
-    \\                } else {
-    \\                    _p.beginFrameStream(_sw, _sh) catch break :_readback;
-    \\                }
-    \\                if (!_preview_pbo_initialized) {
-    \\                    _gl_gen_buffers(3, &_preview_pbos);
-    \\                    _preview_pbo_initialized = true;
-    \\                }
-    \\                _gl_pixel_storei(_GL_PACK_ALIGNMENT, 4);
-    \\                for (_preview_pbos) |_pbo_id| {
-    \\                    _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, _pbo_id);
-    \\                    _gl_buffer_data(_GL_PIXEL_PACK_BUFFER, @intCast(_needed_bytes), null, _GL_STREAM_READ);
-    \\                }
-    \\                _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, 0);
-    \\                _preview_pbo_bytes = _needed_bytes;
-    \\                if (_preview_pixel_buf.len != _needed_bytes) {
-    \\                    if (_preview_pixel_buf.len != 0) allocator.free(_preview_pixel_buf);
-    \\                    _preview_pixel_buf = allocator.alloc(u8, _needed_bytes) catch &[_]u8{};
-    \\                }
-    \\                _preview_last_w = _sw;
-    \\                _preview_last_h = _sh;
-    \\                _preview_frame_idx = 0;
-    \\            }
-    \\
-    \\            // Editor not yet attached (or not yet acknowledged the
-    \\            // current offer)? Skip the readback entirely — saves the
-    \\            // glReadPixels + glMapBuffer cost when nobody is watching.
-    \\            if (!_p.isFrameAccepted() or _preview_pixel_buf.len != _needed_bytes) break :_readback;
-    \\
-    \\            // Issue the async DMA into the write PBO. With a PIXEL_PACK_BUFFER
-    \\            // bound, the last arg to glReadPixels is an offset, not a pointer.
-    \\            const _write_idx: usize = @intCast(_preview_frame_idx % 3);
-    \\            _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, _preview_pbos[_write_idx]);
-    \\            _gl_read_pixels(0, 0, _sw_i, _sh_i, _GL_RGBA, _GL_UNSIGNED_BYTE, null);
-    \\
-    \\            // Once the ring is primed (≥ 2 frames in flight), map the
-    \\            // oldest PBO and publish it. glMapBuffer blocks here only
-    \\            // if the DMA hasn't finished — which is precisely the
-    \\            // stall the 2-frame gap is designed to hide.
-    \\            if (_preview_frame_idx >= 2) {
-    \\                const _read_idx: usize = @intCast((_preview_frame_idx - 2) % 3);
-    \\                _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, _preview_pbos[_read_idx]);
-    \\                const _mapped = _gl_map_buffer(_GL_PIXEL_PACK_BUFFER, _GL_READ_ONLY);
-    \\                if (_mapped) |_src| {
-    \\                    const _src_ptr: [*]const u8 = @ptrCast(_src);
-    \\                    // GL returns rows bottom-up; the editor's SHM
-    \\                    // consumer treats the ring as top-down RGBA8.
-    \\                    // Flip-on-copy keeps the producer side cheap
-    \\                    // (one extra strided memcpy vs. a CPU rotate).
-    \\                    const _row_bytes: usize = @as(usize, _sw) * 4;
-    \\                    var _y: u32 = 0;
-    \\                    while (_y < _sh) : (_y += 1) {
-    \\                        const _src_row = _src_ptr + (@as(usize, _sh - 1 - _y) * _row_bytes);
-    \\                        const _dst_row = _preview_pixel_buf.ptr + (@as(usize, _y) * _row_bytes);
-    \\                        @memcpy(_dst_row[0.._row_bytes], _src_row[0.._row_bytes]);
-    \\                    }
-    \\                    _ = _gl_unmap_buffer(_GL_PIXEL_PACK_BUFFER);
-    \\                    // macOS path: hand the RGBA8 buffer to the
-    \\                    // IOSurface publisher — engine swizzles to BGRA
-    \\                    // during the IOSurface lock (labelle-assembler#121).
-    \\                    if (comptime @import("builtin").os.tag == .macos) {
-    \\                        _p.publishFrameIOSurface(_preview_pixel_buf) catch {};
-    \\                    } else {
-    \\                        _p.publishFrame(_preview_pixel_buf) catch {};
-    \\                    }
-    \\                } else {
-    \\                    // Map failed (driver bug / context loss). Skip
-    \\                    // this frame and let the next one try again.
-    \\                }
-    \\            }
-    \\            _gl_bind_buffer(_GL_PIXEL_PACK_BUFFER, 0);
-    \\            _preview_frame_idx +%= 1;
+    \\        if (g.preview) |*_p| {
+    \\            _ = _p;
+    \\            window.preview_pbo.frame();
     \\        }
     \\
 ;
@@ -1200,22 +1168,21 @@ const PREVIEW_INIT_CALLBACK =
     \\            };
     \\            if (g.preview) |*_p| {
     \\                _p.sendHello("labelle-engine", 0) catch {};
-    \\                // labelle-assembler#137: now that the editor is on
-    \\                // the wire and will sample our IOSurface ring, hide
-    \\                // the standalone sokol-app window — its Game View
-    \\                // tab is the user-facing surface. Gated on a
-    \\                // successful `connect` (not just env-var presence)
-    \\                // so a misconfigured `LABELLE_PREVIEW` doesn't leave
-    \\                // the user with no visible window AND no editor view.
-    \\                // macOS-only inside `window.hideWindow`; a no-op on
-    \\                // every other platform until follow-up slices land.
-    \\                // `@hasDecl` guard: this `PREVIEW_INIT_CALLBACK`
-    \\                // template is shared with the raylib-WASM callback
-    \\                // path (see emitter `else` branch below the sokol
-    \\                // arm). The raylib `window` module has no
-    \\                // `hideWindow` decl, so an unguarded call would
-    \\                // compile-fail any raylib-WASM project with
-    \\                // LABELLE_PREVIEW set.
+    \\                // labelle-assembler#140 Phase B: wire the engine.Preview
+    \\                // methods into the backend's preview_mtl vtable so the
+    \\                // backend can drive IOSurface stream lifecycle without
+    \\                // needing an engine type-import. Bridges declared at
+    \\                // module scope (see PREVIEW_READBACK_HELPERS_METAL_SOKOL).
+    \\                if (comptime @hasDecl(window, "preview_mtl")) {
+    \\                    window.preview_mtl.attach(.{
+    \\                        .ctx = @ptrCast(_p),
+    \\                        .beginStream = _preview_mtl_begin_stream_bridge,
+    \\                        .getSurfaceAt = _preview_mtl_get_surface_bridge,
+    \\                        .signalSlotReady = _preview_mtl_signal_bridge,
+    \\                        .endStream = _preview_mtl_end_stream_bridge,
+    \\                        .isFrameAccepted = _preview_mtl_accepted_bridge,
+    \\                    });
+    \\                }
     \\                if (comptime @hasDecl(window, "hideWindow")) window.hideWindow();
     \\            }
     \\        }
@@ -1244,6 +1211,12 @@ const PREVIEW_HEARTBEAT_CALLBACK =
     \\    if (g.preview) |*_p| {
     \\        _p.pollSubscription() catch {};
     \\        _p.tickHeartbeat(_preview_now_ms()) catch {};
+    \\        while (_p.popInputEvent()) |_ev| {
+    \\            switch (_ev) {
+    \\                .mouse_pos => |_m| _preview_input_mouse_pos(_m.x, _m.y),
+    \\                .mouse_button => |_m| _preview_input_mouse_button(_m.button, _m.down),
+    \\            }
+    \\        }
     \\    }
     \\
 ;
@@ -1712,197 +1685,47 @@ const PREVIEW_READBACK_HELPERS_SOKOL_D3D11 =
 /// so they never race for it.
 const PREVIEW_READBACK_HELPERS_METAL_SOKOL =
     \\
-    \\// ── Sokol Metal/IOSurface gating (Path A — labelle-assembler#131) ─
-    \\// Metal is sokol's default backend on Darwin (macOS + iOS). The
-    \\// Path-A producer wraps each IOSurface as an MTLTexture via
-    \\// `newTextureWithDescriptor:iosurface:plane:`. We need libobjc on
-    \\// Darwin only; comptime-gating on builtin.os.tag keeps the
-    \\// `@extern` decls out of non-Darwin link lines. Mutually exclusive
-    \\// with `_sokol_preview_gl_enabled` (GL = .linux only on default
-    \\// sokol, Metal = .macos/.ios only) — exactly one of the two
-    \\// publish paths fires per target.
-    \\const _sokol_preview_metal_enabled: bool = switch (@import("builtin").os.tag) {
-    \\    .macos, .ios => true,
-    \\    else => false,
-    \\};
+    \\// ── Sokol Metal/IOSurface preview seam (labelle-assembler#140) ─
+    \\// All Path-A state + ring management + cleanup now lives in the
+    \\// backend module (`backends/sokol/src/window.zig:preview_mtl`).
+    \\// The codegen owns only:
+    \\//   1. The comptime enable gate (aliased from the backend).
+    \\//   2. Five tiny bridge fns that wrap `engine.Preview` methods
+    \\//      behind an `*anyopaque` boundary so the backend never needs
+    \\//      an engine type-import (the engine module would otherwise
+    \\//      have to be wired through the backend's build graph too).
+    \\//   3. The vtable-attach call inside the init callback (see
+    \\//      PREVIEW_INIT_CALLBACK below).
+    \\const _sokol_preview_metal_enabled = window.preview_metal_enabled;
     \\
-    \\// Path-A Metal state at module scope (sokol's callback model has
-    \\// no shared local scope between init/frame/cleanup). The
-    \\// `_preview_allocator` declared in the GL block above is reused
-    \\// here — mutually exclusive gates, never contested.
-    \\//
-    \\// We own one `MTLTexture` per IOSurface in the ring. sokol-gfx
-    \\// gets a parallel `Image` ring whose `mtl_textures[]` slots point
-    \\// to our owned textures — sokol does NOT retain the underlying
-    \\// MTLTexture, so we must keep the `_preview_mtl_textures` array
-    \\// alive for the lifetime of the sg_images. `_preview_mtl_ring_size`
-    \\// caches the negotiated ring size (matches the engine producer's
-    \\// `ring_size`, default 3).
-    \\const _PreviewMtlRingMax: u32 = 8; // matches preview_iosurface.MAX_RING
-    \\var _preview_mtl_initialized: bool = false;
-    \\var _preview_mtl_ring_size: u32 = 0;
-    \\var _preview_mtl_textures: [_PreviewMtlRingMax]?*anyopaque = [_]?*anyopaque{null} ** _PreviewMtlRingMax;
-    \\var _preview_mtl_sg_images: [_PreviewMtlRingMax]window.gfx_types.Image = [_]window.gfx_types.Image{.{}} ** _PreviewMtlRingMax;
-    \\// Path-A render-target wiring (labelle-assembler#133): each ring
-    \\// slot also gets a color-attachment `sg.View` + a pre-built
-    \\// `sg.Attachments` so the per-frame body can flip the gfx layer's
-    \\// `setEditorRenderTarget` with a single struct copy instead of
-    \\// rebuilding the descriptor every frame.
-    \\var _preview_mtl_views: [_PreviewMtlRingMax]window.gfx_types.View = [_]window.gfx_types.View{.{}} ** _PreviewMtlRingMax;
-    \\var _preview_mtl_attachments: [_PreviewMtlRingMax]window.gfx_types.Attachments = [_]window.gfx_types.Attachments{.{}} ** _PreviewMtlRingMax;
-    \\// Shared depth-stencil image + view for the offscreen ring.
-    \\// Game render pipelines were built against the swapchain's
-    \\// depth-stencil context; sokol-gfx's validation layer aborts
-    \\// (VALIDATE_APIP_DEPTHSTENCILATTACHMENT_FORMAT) the first
-    \\// time `applyPipeline` runs inside an attachments pass that
-    \\// has no matching depth-stencil. One shared image is enough —
-    \\// only one slot renders per frame. #136.
-    \\var _preview_mtl_depth_img: window.gfx_types.Image = .{};
-    \\var _preview_mtl_depth_view: window.gfx_types.View = .{};
-    \\// `_preview_mtl_target_active` mirrors whether `window.setEditorRenderTarget`
-    \\// is currently armed for this frame — set by the pre-render block
-    \\// when the editor has accepted a frame, cleared by the post-render
-    \\// block right after `signalSlotReady`. Decouples the two blocks so
-    \\// the post-render path doesn't need to recompute the gate
-    \\// (`isFrameAccepted` can flip between the two emit points if the
-    \\// editor disconnects mid-frame).
-    \\var _preview_mtl_target_active: bool = false;
-    \\// Slot currently bound as the editor render target. Shared between
-    \\// the pre-render block (writes) and the post-render block (reads
-    \\// for `signalSlotReady`). Decoupled from `_preview_frame_idx` so
-    \\// the post-render path doesn't double-advance the ring if the
-    \\// pre-render path bailed.
-    \\var _preview_mtl_write_slot: u32 = 0;
-    \\var _preview_mtl_last_w: u32 = 0;
-    \\var _preview_mtl_last_h: u32 = 0;
-    \\
-    \\// Objective-C runtime bridging. Selectors + msgSend casts live
-    \\// inside a struct-namespace gated on `_sokol_preview_metal_enabled`
-    \\// — the `else struct {}` branch carries no symbols, so a non-
-    \\// Darwin sokol build never references libobjc at link time.
-    \\//
-    \\// MTLPixelFormatBGRA8Unorm = 80 — matches the IOSurface's BGRA8
-    \\// pixel format the engine producer sets up
-    \\// (`preview_iosurface.kPixelFormat_BGRA8`).
-    \\const _SokolPreviewMetal = if (_sokol_preview_metal_enabled) struct {
-    \\    pub const MTLPixelFormatBGRA8Unorm: u64 = 80;
-    \\    pub const MTLStorageModeShared: u64 = 0;
-    \\    pub const MTLStorageModeManaged: u64 = 1;
-    \\    pub const MTLTextureUsageShaderRead: u64 = 0x01;
-    \\    pub const MTLTextureUsageRenderTarget: u64 = 0x04;
-    \\    pub const MTLTextureType2D: u64 = 2;
-    \\
-    \\    // libobjc primitives. Each typed `objc_msgSend` variant is a
-    \\    // separate @extern with a concrete signature — the libobjc
-    \\    // symbol is variadic, but every call site has a fixed shape.
-    \\    pub const sel_registerName = @extern(
-    \\        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "sel_registerName" },
-    \\    );
-    \\    pub const objc_getClass = @extern(
-    \\        *const fn (name: [*:0]const u8) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "objc_getClass" },
-    \\    );
-    \\
-    \\    // msgSend(obj, sel) -> void  (for `release`)
-    \\    pub const msgSend_void = @extern(
-    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) void,
-    \\        .{ .name = "objc_msgSend" },
-    \\    );
-    \\    // msgSend(cls, sel) -> id  (for `[MTLTextureDescriptor alloc]` style)
-    \\    pub const msgSend_id = @extern(
-    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "objc_msgSend" },
-    \\    );
-    \\
-    \\    // [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:width:height:mipmapped:]
-    \\    pub const msgSend_texdesc = @extern(
-    \\        *const fn (cls: ?*anyopaque, sel: ?*anyopaque, fmt: u64, w: usize, h: usize, mip: u8) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "objc_msgSend" },
-    \\    );
-    \\    // [texdesc setStorageMode:] / [texdesc setUsage:] — single-arg setters
-    \\    pub const msgSend_set_u64 = @extern(
-    \\        *const fn (obj: ?*anyopaque, sel: ?*anyopaque, v: u64) callconv(.c) void,
-    \\        .{ .name = "objc_msgSend" },
-    \\    );
-    \\
-    \\    // [device newTextureWithDescriptor:descriptor iosurface:surface plane:plane]
-    \\    // — the producer-side wrap that gives us an `MTLTexture` whose
-    \\    // backing store is the IOSurface bytes. The texture is the one
-    \\    // we'd later hand to sokol-gfx via `sg.ImageDesc.mtl_textures`.
-    \\    pub const msgSend_newtex_iosurf = @extern(
-    \\        *const fn (
-    \\            obj: ?*anyopaque,
-    \\            sel: ?*anyopaque,
-    \\            desc: ?*anyopaque,
-    \\            iosurface: ?*anyopaque,
-    \\            plane: usize,
-    \\        ) callconv(.c) ?*anyopaque,
-    \\        .{ .name = "objc_msgSend" },
-    \\    );
-    \\
-    \\    // Selector cache — looked up lazily on first frame.
-    \\    pub var sel_release: ?*anyopaque = null;
-    \\    pub var sel_setStorageMode: ?*anyopaque = null;
-    \\    pub var sel_setUsage: ?*anyopaque = null;
-    \\    pub var sel_texDesc: ?*anyopaque = null;
-    \\    pub var sel_newTextureWithDescriptorIOSurfacePlane: ?*anyopaque = null;
-    \\    pub var cls_MTLTextureDescriptor: ?*anyopaque = null;
-    \\
-    \\    pub fn loadSelectors() void {
-    \\        if (sel_release != null) return;
-    \\        sel_release = sel_registerName("release");
-    \\        sel_setStorageMode = sel_registerName("setStorageMode:");
-    \\        sel_setUsage = sel_registerName("setUsage:");
-    \\        sel_texDesc = sel_registerName(
-    \\            "texture2DDescriptorWithPixelFormat:width:height:mipmapped:",
-    \\        );
-    \\        sel_newTextureWithDescriptorIOSurfacePlane = sel_registerName(
-    \\            "newTextureWithDescriptor:iosurface:plane:",
-    \\        );
-    \\        cls_MTLTextureDescriptor = objc_getClass("MTLTextureDescriptor");
-    \\    }
-    \\
-    \\    /// Wrap `iosurface` as an `MTLTexture` whose backing store is
-    \\    /// the surface bytes. Width/height/format must match the
-    \\    /// IOSurface (we negotiated BGRA8 with the engine producer).
-    \\    /// Usage flags: `ShaderRead | RenderTarget` so sokol-gfx can
-    \\    /// later use this as a color-attachment image *and* sample it
-    \\    /// for the fullscreen-quad swapchain blit when the gfx
-    \\    /// redirect lands. Returns null on Metal allocation failure.
-    \\    pub fn createIOSurfaceTexture(
-    \\        device: ?*anyopaque,
-    \\        iosurface: ?*anyopaque,
-    \\        w: u32,
-    \\        h: u32,
-    \\    ) ?*anyopaque {
-    \\        const cls = cls_MTLTextureDescriptor orelse return null;
-    \\        const desc = msgSend_texdesc(
-    \\            cls,
-    \\            sel_texDesc,
-    \\            MTLPixelFormatBGRA8Unorm,
-    \\            @intCast(w),
-    \\            @intCast(h),
-    \\            0,
-    \\        ) orelse return null;
-    \\        // Storage mode: macOS uses shared with IOSurfaces (the
-    \\        // kernel mediates GPU/CPU coherence via the surface
-    \\        // itself); iOS GPUs only support shared anyway.
-    \\        msgSend_set_u64(desc, sel_setStorageMode, MTLStorageModeShared);
-    \\        msgSend_set_u64(desc, sel_setUsage, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
-    \\        return msgSend_newtex_iosurf(
-    \\            device,
-    \\            sel_newTextureWithDescriptorIOSurfacePlane,
-    \\            desc,
-    \\            iosurface,
-    \\            0,
-    \\        );
-    \\    }
-    \\
-    \\    pub fn release(obj: ?*anyopaque) void {
-    \\        if (obj) |o| msgSend_void(o, sel_release);
-    \\    }
-    \\} else struct {};
+    \\// Bridge fns — pure wrappers over the engine.Preview methods the
+    \\// backend's preview_mtl namespace drives via its vtable. These
+    \\// live in module scope because the vtable is wired up once during
+    \\// init and persists for the program's lifetime.
+    \\fn _preview_mtl_begin_stream_bridge(ctx: *anyopaque, w: u32, h: u32) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.beginFrameStreamIOSurface(w, h);
+    \\}
+    \\fn _preview_mtl_get_surface_bridge(ctx: *anyopaque, slot: u32) ?*anyopaque {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    // getIOSurfaceAt returns `??*opaque` — outer optional means
+    \\    // "slot in range", inner means "IOSurfaceRef itself nullable".
+    \\    const maybe_ref = p.getIOSurfaceAt(slot) orelse return null;
+    \\    const ref = maybe_ref orelse return null;
+    \\    return @ptrCast(ref);
+    \\}
+    \\fn _preview_mtl_signal_bridge(ctx: *anyopaque, slot: u32) anyerror!void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.signalSlotReady(slot);
+    \\}
+    \\fn _preview_mtl_end_stream_bridge(ctx: *anyopaque) void {
+    \\    const p: *engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    p.endFrameStreamIOSurface();
+    \\}
+    \\fn _preview_mtl_accepted_bridge(ctx: *anyopaque) bool {
+    \\    const p: *const engine.Preview = @ptrCast(@alignCast(ctx));
+    \\    return p.isFrameAccepted();
+    \\}
     \\
 ;
 
@@ -2130,181 +1953,7 @@ const PREVIEW_READBACK_FRAME_SOKOL_D3D11 =
 /// in the swapchain or our IOSurface — no shader / pipeline
 /// reconfiguration needed.
 const PREVIEW_PRE_RENDER_METAL_SOKOL =
-    \\        if (comptime _sokol_preview_metal_enabled) {
-    \\            _preview_mtl_target_active = false;
-    \\            if (g.preview) |*_p| _mtl_pre_render: {
-    \\                const _sw_i = window.width();
-    \\                const _sh_i = window.height();
-    \\                if (_sw_i <= 0 or _sh_i <= 0) break :_mtl_pre_render;
-    \\                const _sw: u32 = @intCast(_sw_i);
-    \\                const _sh: u32 = @intCast(_sh_i);
-    \\
-    \\                _SokolPreviewMetal.loadSelectors();
-    \\                const _device = @as(?*anyopaque, @constCast(window.metalDevice())) orelse break :_mtl_pre_render;
-    \\
-    \\                // (Re)negotiate IOSurface ring + MTLTexture wrappers
-    \\                // + sokol-gfx Image handles on first frame OR a
-    \\                // window resize. Idempotent on the engine side —
-    \\                // `beginFrameStreamIOSurface` tears down the old
-    \\                // ring before re-offering. The default ring size
-    \\                // is 3 (matches preview_iosurface.Options default);
-    \\                // the engine producer asserts ring_size <= MAX_RING
-    \\                // (8) so the comptime bound here is safe.
-    \\                if (_sw != _preview_mtl_last_w or _sh != _preview_mtl_last_h) {
-    \\                    // Tear down any prior MTLTextures + sg_images +
-    \\                    // views before allocating the new ring — dims
-    \\                    // change means the old sokol attachments are
-    \\                    // now unusable, and the MTLTextures held a
-    \\                    // strong ref on the previous IOSurfaces. Order
-    \\                    // matters: views must die before images
-    \\                    // (sokol-gfx asserts on dangling parents).
-    \\                    if (_preview_mtl_initialized) {
-    \\                        var _i: u32 = 0;
-    \\                        while (_i < _preview_mtl_ring_size) : (_i += 1) {
-    \\                            if (_preview_mtl_views[_i].id != 0) {
-    \\                                window.gfx_types.destroyView(_preview_mtl_views[_i]);
-    \\                                _preview_mtl_views[_i] = .{};
-    \\                            }
-    \\                            _preview_mtl_attachments[_i] = .{};
-    \\                            if (_preview_mtl_textures[_i]) |t| {
-    \\                                _SokolPreviewMetal.release(t);
-    \\                                _preview_mtl_textures[_i] = null;
-    \\                            }
-    \\                            if (_preview_mtl_sg_images[_i].id != 0) {
-    \\                                window.gfx_types.destroyImage(_preview_mtl_sg_images[_i]);
-    \\                                _preview_mtl_sg_images[_i] = .{};
-    \\                            }
-    \\                        }
-    \\                        _preview_mtl_initialized = false;
-    \\                    }
-    \\                    _p.beginFrameStreamIOSurface(_sw, _sh) catch break :_mtl_pre_render;
-    \\                    // Allocate the shared depth-stencil image
-    \\                    // sized to match the offscreen color ring (#136).
-    \\                    // The game's render pipelines were built against
-    \\                    // the swapchain's depth-stencil context;
-    \\                    // sokol-gfx's validation aborts the first
-    \\                    // applyPipeline inside attachments without
-    \\                    // matching depth-stencil. DEPTH_STENCIL is the
-    \\                    // sokol default; matches the pipelines.
-    \\                    if (_preview_mtl_depth_view.id != 0) {
-    \\                        window.gfx_types.destroyView(_preview_mtl_depth_view);
-    \\                        _preview_mtl_depth_view = .{};
-    \\                    }
-    \\                    if (_preview_mtl_depth_img.id != 0) {
-    \\                        window.gfx_types.destroyImage(_preview_mtl_depth_img);
-    \\                        _preview_mtl_depth_img = .{};
-    \\                    }
-    \\                    _preview_mtl_depth_img = window.gfx_types.makeImage(.{
-    \\                        .width = @intCast(_sw),
-    \\                        .height = @intCast(_sh),
-    \\                        .pixel_format = .DEPTH_STENCIL,
-    \\                        .usage = .{ .depth_stencil_attachment = true, .immutable = true },
-    \\                    });
-    \\                    if (_preview_mtl_depth_img.id == 0) break :_mtl_pre_render;
-    \\                    _preview_mtl_depth_view = window.gfx_types.makeView(.{
-    \\                        .depth_stencil_attachment = .{ .image = _preview_mtl_depth_img },
-    \\                    });
-    \\                    if (_preview_mtl_depth_view.id == 0) break :_mtl_pre_render;
-    \\                    // The engine producer's default ring size is 3
-    \\                    // (preview_iosurface.Options.ring_size). Loop
-    \\                    // until we hit the first null surface to handle
-    \\                    // bounded variation cleanly without baking the
-    \\                    // value into the codegen.
-    \\                    var _alloc_ok = true;
-    \\                    var _slot: u32 = 0;
-    \\                    while (_slot < _PreviewMtlRingMax) : (_slot += 1) {
-    \\                        const _iosurf = _p.getIOSurfaceAt(_slot) orelse break;
-    \\                        const _mtl_tex = _SokolPreviewMetal.createIOSurfaceTexture(_device, _iosurf, _sw, _sh) orelse {
-    \\                            _alloc_ok = false;
-    \\                            break;
-    \\                        };
-    \\                        _preview_mtl_textures[_slot] = _mtl_tex;
-    \\                        // Inject the MTLTexture into sokol-gfx as an
-    \\                        // external image with `color_attachment = true`
-    \\                        // so we can make a color-attachment View off
-    \\                        // it and bind that into a Pass attachments
-    \\                        // struct (#133).
-    \\                        const _sg = window.gfx_types;
-    \\                        var _desc: _sg.ImageDesc = .{
-    \\                            .width = @intCast(_sw),
-    \\                            .height = @intCast(_sh),
-    \\                            .pixel_format = .BGRA8,
-    \\                            .usage = .{ .color_attachment = true, .immutable = true },
-    \\                        };
-    \\                        _desc.mtl_textures[0] = @ptrCast(_mtl_tex);
-    \\                        _desc.mtl_textures[1] = @ptrCast(_mtl_tex);
-    \\                        const _img = _sg.makeImage(_desc);
-    \\                        if (_img.id == 0) {
-    \\                            // Pool exhausted — sokol returns a
-    \\                            // zero-id handle. Bail; the rollback
-    \\                            // block below tears down whatever
-    \\                            // we'd already created.
-    \\                            _alloc_ok = false;
-    \\                            break;
-    \\                        }
-    \\                        _preview_mtl_sg_images[_slot] = _img;
-    \\                        const _view = _sg.makeView(.{
-    \\                            .color_attachment = .{ .image = _img },
-    \\                        });
-    \\                        if (_view.id == 0) {
-    \\                            _alloc_ok = false;
-    \\                            break;
-    \\                        }
-    \\                        _preview_mtl_views[_slot] = _view;
-    \\                        var _att: _sg.Attachments = .{};
-    \\                        _att.colors[0] = _view;
-    \\                        _att.depth_stencil = _preview_mtl_depth_view;
-    \\                        _preview_mtl_attachments[_slot] = _att;
-    \\                    }
-    \\                    if (!_alloc_ok) {
-    \\                        // Rollback any partially-allocated ring so
-    \\                        // the next resize attempt starts clean.
-    \\                        // Includes the just-failed slot — when
-    \\                        // makeImage / makeView returned a zero-id
-    \\                        // handle mid-init, `_preview_mtl_textures
-    \\                        // [_slot]` (and possibly _sg_images[_slot])
-    \\                        // had already been assigned. Loop through
-    \\                        // _slot inclusive to release them too.
-    \\                        var _i: u32 = 0;
-    \\                        while (_i <= _slot and _i < _PreviewMtlRingMax) : (_i += 1) {
-    \\                            if (_preview_mtl_views[_i].id != 0) {
-    \\                                window.gfx_types.destroyView(_preview_mtl_views[_i]);
-    \\                                _preview_mtl_views[_i] = .{};
-    \\                            }
-    \\                            _preview_mtl_attachments[_i] = .{};
-    \\                            if (_preview_mtl_textures[_i]) |t| {
-    \\                                _SokolPreviewMetal.release(t);
-    \\                                _preview_mtl_textures[_i] = null;
-    \\                            }
-    \\                            if (_preview_mtl_sg_images[_i].id != 0) {
-    \\                                window.gfx_types.destroyImage(_preview_mtl_sg_images[_i]);
-    \\                                _preview_mtl_sg_images[_i] = .{};
-    \\                            }
-    \\                        }
-    \\                        break :_mtl_pre_render;
-    \\                    }
-    \\                    _preview_mtl_ring_size = _slot;
-    \\                    _preview_mtl_last_w = _sw;
-    \\                    _preview_mtl_last_h = _sh;
-    \\                    _preview_mtl_initialized = true;
-    \\                }
-    \\
-    \\                if (!_preview_mtl_initialized) break :_mtl_pre_render;
-    \\                if (_preview_mtl_ring_size == 0) break :_mtl_pre_render;
-    \\                if (!_p.isFrameAccepted()) break :_mtl_pre_render;
-    \\
-    \\                // Pick the next ring slot and arm the gfx layer.
-    \\                // `window.beginPass` reads `current_editor_render_target`
-    \\                // on the next call and routes `sg.beginPass` into
-    \\                // these attachments instead of the swapchain — so
-    \\                // `g.render()` lands directly in the IOSurface bytes
-    \\                // the editor will sample.
-    \\                const _write_slot: u32 = @intCast(_preview_frame_idx % _preview_mtl_ring_size);
-    \\                _preview_mtl_write_slot = _write_slot;
-    \\                window.setEditorRenderTarget(_preview_mtl_attachments[_write_slot]);
-    \\                _preview_mtl_target_active = true;
-    \\            }
-    \\        }
+    \\        if (comptime _sokol_preview_metal_enabled) window.preview_mtl.beginFrame();
     \\
 ;
 
@@ -2325,16 +1974,7 @@ const PREVIEW_PRE_RENDER_METAL_SOKOL =
 ///     transient ring rebuild, etc.). One-frame-scoped override
 ///     contract — see the shim in `backends/sokol/src/window.zig`.
 const PREVIEW_READBACK_FRAME_METAL_SOKOL =
-    \\        if (comptime _sokol_preview_metal_enabled) {
-    \\            if (_preview_mtl_target_active) {
-    \\                if (g.preview) |*_p| {
-    \\                    _p.signalSlotReady(_preview_mtl_write_slot) catch {};
-    \\                    _preview_frame_idx +%= 1;
-    \\                }
-    \\                _preview_mtl_target_active = false;
-    \\            }
-    \\            window.clearEditorRenderTarget();
-    \\        }
+    \\        if (comptime _sokol_preview_metal_enabled) window.preview_mtl.endFrame();
     \\
 ;
 
@@ -2378,35 +2018,7 @@ const PREVIEW_READBACK_CLEANUP_SOKOL_D3D11 =
 /// first would leave the MTLTextures pointing at potentially
 /// freed IOSurface backing storage during the release window.
 const PREVIEW_READBACK_CLEANUP_METAL_SOKOL =
-    \\    if (comptime _sokol_preview_metal_enabled) {
-    \\        // Make sure the gfx layer isn't still pointing at one of
-    \\        // the attachments we're about to free — otherwise the next
-    \\        // frame after shutdown (there shouldn't be one, but defend
-    \\        // anyway) would hit a use-after-free in `beginPass`.
-    \\        window.clearEditorRenderTarget();
-    \\        var _i: u32 = 0;
-    \\        while (_i < _preview_mtl_ring_size) : (_i += 1) {
-    \\            // Views first — sokol-gfx asserts on destroying an
-    \\            // image that still has a view bound to it.
-    \\            if (_preview_mtl_views[_i].id != 0) {
-    \\                window.gfx_types.destroyView(_preview_mtl_views[_i]);
-    \\                _preview_mtl_views[_i] = .{};
-    \\            }
-    \\            _preview_mtl_attachments[_i] = .{};
-    \\            if (_preview_mtl_sg_images[_i].id != 0) {
-    \\                window.gfx_types.destroyImage(_preview_mtl_sg_images[_i]);
-    \\                _preview_mtl_sg_images[_i] = .{};
-    \\            }
-    \\            if (_preview_mtl_textures[_i]) |t| {
-    \\                _SokolPreviewMetal.release(t);
-    \\                _preview_mtl_textures[_i] = null;
-    \\            }
-    \\        }
-    \\        _preview_mtl_ring_size = 0;
-    \\        _preview_mtl_initialized = false;
-    \\        _preview_mtl_target_active = false;
-    \\        if (g.preview) |*_p| _p.endFrameStreamIOSurface();
-    \\    }
+    \\    if (comptime _sokol_preview_metal_enabled) window.preview_mtl.deinit();
     \\
 ;
 
@@ -2825,10 +2437,20 @@ pub fn generateMainZigFromTemplate(
     var ident_buf: [256]u8 = undefined;
 
     // Hook imports block
+    //
+    // The wasm32-emscripten panic-handler override (labelle-assembler#141)
+    // is emitted at the top of this block so the two `pub const` root
+    // declarations land near `const std = @import("std")` in the
+    // generated `main.zig`. They MUST appear at module root for Zig to
+    // honor them, and this block is rendered right after the stdlib
+    // imports in `labelle-engine/codegen/main.zig.template`.
     {
         var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
         errdefer alloc_writer_b.deinit();
         const bw = &alloc_writer_b.writer;
+        if (cfg.platform == .wasm) {
+            try bw.writeAll(WASM_PANIC_WORKAROUND);
+        }
         if (hook_names.len > 0) {
             try bw.writeAll("\n// --- Hook imports ---\n");
             for (hook_names) |name| {
@@ -3293,7 +2915,16 @@ pub fn generateMainZigFromTemplate(
             else
                 "";
             defer if (cfg.backend == .sokol) allocator.free(sokol_readback_helpers);
-            const module_vars = try std.mem.concat(allocator, u8, &.{ sokol_runner, PREVIEW_HELPERS, sokol_readback_helpers });
+            // PREVIEW_INPUT_DISPATCH emits `extern fn imgui_bridge_mouse_*`
+            // symbols, which only exist when the gui plugin is imgui. Gate
+            // narrowly on plugin name — other gui plugins (clay, simple-raylib,
+            // simple-sokol, …) would link-fail on these externs. The stub
+            // variant provides safe no-ops for those projects.
+            const input_dispatch_cb: []const u8 = if (cfg.resolved_gui) |gui|
+                (if (std.mem.eql(u8, gui.name, "imgui")) PREVIEW_INPUT_DISPATCH else PREVIEW_INPUT_DISPATCH_STUB)
+            else
+                PREVIEW_INPUT_DISPATCH_STUB;
+            const module_vars = try std.mem.concat(allocator, u8, &.{ sokol_runner, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch_cb });
             defer allocator.free(module_vars);
             const init_code = try buildCallbackInitCode(allocator, cfg, jsonc_scene_names, prefab_names);
             defer allocator.free(init_code);
@@ -3364,33 +2995,62 @@ pub fn generateMainZigFromTemplate(
                 //              no-ops.
                 // The three paths evaporate on the non-matching OS via
                 // their `_sokol_preview_{gl,d3d11,metal}_enabled` flags.
-                const preview_setup_sokol = try std.mem.concat(allocator, u8, &.{
-                    PREVIEW_INIT_CALLBACK,
-                    PREVIEW_READBACK_INIT_SOKOL,
-                    PREVIEW_READBACK_INIT_SOKOL_D3D11,
-                    PREVIEW_READBACK_INIT_METAL_SOKOL,
-                });
+                //
+                // Wasm-emscripten gate (labelle-assembler#141): preview
+                // mode is useless in a browser tab (no `LABELLE_PREVIEW`
+                // env, no TCP socket out), and `std.Io.Threaded.init` +
+                // `.io()` instantiates the vtable that references
+                // `childWaitPosix` → triggers the Zig 0.16
+                // `Threaded.zig:15315` / `emscripten.zig:215` enum
+                // mismatches. Emit empty strings for the preview slots
+                // on wasm so the generated `main.zig` never references
+                // `std.Io.Threaded`. See ziglang/zig#31849 + PR #31850
+                // for the upstream fix; this is the workaround for now.
+                const preview_setup_sokol = if (is_wasm)
+                    try allocator.dupe(u8, "")
+                else
+                    try std.mem.concat(allocator, u8, &.{
+                        PREVIEW_INIT_CALLBACK,
+                        PREVIEW_READBACK_INIT_SOKOL,
+                        PREVIEW_READBACK_INIT_SOKOL_D3D11,
+                        PREVIEW_READBACK_INIT_METAL_SOKOL,
+                    });
                 defer allocator.free(preview_setup_sokol);
-                const preview_readback_sokol = try std.mem.concat(allocator, u8, &.{
-                    PREVIEW_READBACK_FRAME_SOKOL,
-                    PREVIEW_READBACK_FRAME_SOKOL_D3D11,
-                    // Path A (#131): the Metal block no longer depends
-                    // on a swapchain drawable, so it can run in the
-                    // pre-endFrame slot alongside GL / D3D11. The
-                    // `{{preview_readback_post}}` template hole gets
-                    // an empty string below — kept in the template so
-                    // existing test scaffolding still expands cleanly,
-                    // but no longer carries any Metal payload.
-                    PREVIEW_READBACK_FRAME_METAL_SOKOL,
-                });
+                // Wasm-emscripten gate (labelle-assembler#141, same
+                // rationale as `preview_setup_sokol` above). Heartbeat
+                // + readback + cleanup all touch `g.preview`'s public
+                // methods, and Zig's lazy compilation may still pull
+                // the `popInputEvent` / `tickHeartbeat` codepaths into
+                // the wasm exe even when `g.preview` is statically
+                // null. Emit empty strings so the generated `main.zig`
+                // never references Preview's IO surface on wasm.
+                const preview_readback_sokol = if (is_wasm)
+                    try allocator.dupe(u8, "")
+                else
+                    try std.mem.concat(allocator, u8, &.{
+                        PREVIEW_READBACK_FRAME_SOKOL,
+                        PREVIEW_READBACK_FRAME_SOKOL_D3D11,
+                        // Path A (#131): the Metal block no longer depends
+                        // on a swapchain drawable, so it can run in the
+                        // pre-endFrame slot alongside GL / D3D11. The
+                        // `{{preview_readback_post}}` template hole gets
+                        // an empty string below — kept in the template so
+                        // existing test scaffolding still expands cleanly,
+                        // but no longer carries any Metal payload.
+                        PREVIEW_READBACK_FRAME_METAL_SOKOL,
+                    });
                 defer allocator.free(preview_readback_sokol);
-                const preview_cleanup_sokol = try std.mem.concat(allocator, u8, &.{
-                    PREVIEW_READBACK_CLEANUP_SOKOL,
-                    PREVIEW_READBACK_CLEANUP_SOKOL_D3D11,
-                    PREVIEW_READBACK_CLEANUP_METAL_SOKOL,
-                    PREVIEW_CLEANUP_CALLBACK,
-                });
+                const preview_cleanup_sokol = if (is_wasm)
+                    try allocator.dupe(u8, "")
+                else
+                    try std.mem.concat(allocator, u8, &.{
+                        PREVIEW_READBACK_CLEANUP_SOKOL,
+                        PREVIEW_READBACK_CLEANUP_SOKOL_D3D11,
+                        PREVIEW_READBACK_CLEANUP_METAL_SOKOL,
+                        PREVIEW_CLEANUP_CALLBACK,
+                    });
                 defer allocator.free(preview_cleanup_sokol);
+                const preview_heartbeat_sokol: []const u8 = if (is_wasm) "" else PREVIEW_HEARTBEAT_CALLBACK;
 
                 try tpl.render(lifecycle_tmpl, .{
                     .module_vars = module_vars,
@@ -3420,7 +3080,7 @@ pub fn generateMainZigFromTemplate(
                     // graceful `bye`, and `g.deinit` owns the socket +
                     // arena teardown.
                     .preview_setup = preview_setup_sokol,
-                    .preview_heartbeat = PREVIEW_HEARTBEAT_CALLBACK,
+                    .preview_heartbeat = preview_heartbeat_sokol,
                     // Path A render-target wiring (#133) — fires BEFORE
                     // `window.beginFrame()` so the swapchain-vs-offscreen
                     // decision is made before sokol-gfx commits to either.
@@ -3445,6 +3105,16 @@ pub fn generateMainZigFromTemplate(
                 // to emscripten; heartbeats fire inside `gameFrame`.
                 // No cleanup callback — emscripten keeps running after
                 // main returns, and the editor reads EOF on tab close.
+                //
+                // Wasm-emscripten gate (labelle-assembler#141): preview
+                // mode is useless in a browser tab, and the explicit
+                // `std.Io.Threaded.init` in PREVIEW_INIT_CALLBACK pulls
+                // the broken Zig 0.16 posix wrappers into the wasm exe
+                // (Threaded.zig:15315 / emscripten.zig:215). Emit empty
+                // strings on wasm. Both branches of this `if/else` land
+                // on wasm in practice, but keep the gate explicit so
+                // the intent is local.
+                const is_wasm_raylib = cfg.platform == .wasm;
                 try tpl.render(lifecycle_tmpl, .{
                     .width = w_str,
                     .height = h_str,
@@ -3455,8 +3125,8 @@ pub fn generateMainZigFromTemplate(
                     .gui_draw_code = gui_draw_code,
                     .hidden_setup = hidden_setup,
                     .hooks_init_block = hooks_init,
-                    .preview_setup = PREVIEW_INIT_CALLBACK,
-                    .preview_heartbeat = PREVIEW_HEARTBEAT_CALLBACK,
+                    .preview_setup = if (is_wasm_raylib) "" else PREVIEW_INIT_CALLBACK,
+                    .preview_heartbeat = if (is_wasm_raylib) "" else PREVIEW_HEARTBEAT_CALLBACK,
                 }, bw);
             }
         } else {
@@ -3472,11 +3142,18 @@ pub fn generateMainZigFromTemplate(
             // takes the callback branch above, so this only fires for
             // raylib desktop.
             const is_raylib_desktop = cfg.backend == .raylib;
-            const module_vars_loop = if (is_raylib_desktop)
-                try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, PREVIEW_READBACK_HELPERS })
+            // See gate rationale on the sokol-callback site above: dispatch
+            // body declares imgui-specific externs, so non-imgui gui plugins
+            // must take the stub branch.
+            const input_dispatch: []const u8 = if (cfg.resolved_gui) |gui|
+                (if (std.mem.eql(u8, gui.name, "imgui")) PREVIEW_INPUT_DISPATCH else PREVIEW_INPUT_DISPATCH_STUB)
             else
-                PREVIEW_HELPERS;
-            defer if (is_raylib_desktop) allocator.free(module_vars_loop);
+                PREVIEW_INPUT_DISPATCH_STUB;
+            const module_vars_loop = if (is_raylib_desktop)
+                try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, PREVIEW_READBACK_HELPERS, input_dispatch })
+            else
+                try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, input_dispatch });
+            defer allocator.free(module_vars_loop);
             const preview_setup_loop = if (is_raylib_desktop)
                 try std.mem.concat(allocator, u8, &.{ PREVIEW_LOOP_SETUP, PREVIEW_READBACK_SETUP })
             else

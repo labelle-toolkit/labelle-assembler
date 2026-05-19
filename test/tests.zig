@@ -3009,42 +3009,48 @@ pub const PREVIEW_MODE = struct {
         }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // Module-scope GL externs (raylib's libGL / CGL / WGL link gives
-        // us these for free — `@extern` resolves them at link time).
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glReadPixels") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glGenBuffers") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "glMapBuffer") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_PIXEL_PACK_BUFFER") != null);
+        // labelle-assembler#140 — Phase B raylib migration. The PBO ring,
+        // GL externs, and per-frame readback all live in the backend
+        // module (`backends/raylib/src/window.zig:preview_pbo`). The
+        // codegen template emits only:
+        //   - the engine.Preview vtable bridge fns at module scope
+        //   - `window.preview_pbo.attach(...)` after the gui handshake
+        //   - `window.preview_pbo.frame()` in the per-frame block
+        //   - `defer window.preview_pbo.deinit()` in main()
 
-        // Per-frame readback wiring: beginFrameStream on first frame /
-        // resize, glReadPixels into the bound PBO, publishFrame from
-        // the 2-frames-ago PBO via glMapBuffer.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrame(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.isFrameAccepted()") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_frame_idx >= 2") != null);
+        // Vtable bridges declared at module scope.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_begin_bridge(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_publish_bridge(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_end_bridge(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_accepted_bridge(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_begin_ios_bridge(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_publish_ios_bridge(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_end_ios_bridge(") != null);
 
-        // beginFrameStream must be gated on dim-change (resize handling)
-        // and must run BEFORE publishFrame in source order — otherwise
-        // the first frame would be published into an unallocated ring.
-        const begin_idx = std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(").?;
-        const publish_idx = std.mem.indexOf(u8, main_zig, "_p.publishFrame(").?;
-        try std.testing.expect(begin_idx < publish_idx);
+        // Bridge bodies still reference engine.Preview methods so the
+        // type/name-correctness of the seam is observable from main_zig.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.beginFrameStream(w, h)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.publishFrame(pixels)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.endFrameStream()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.isFrameAccepted()") != null);
 
-        // The readback snippet must land in the frame body between the
-        // GUI draw and `window.endDrawing()` — emitting it after the
-        // swap reads from an undefined back buffer (glReadPixels on
-        // GL_BACK is only well-defined before SwapBuffers). The test
-        // template places `{{preview_readback}}` right before
-        // `window.endDrawing()`, so confirm the order in the output.
-        const readback_marker = std.mem.indexOf(u8, main_zig, "_gl_read_pixels(0, 0, _sw_i, _sh_i").?;
-        const end_drawing_idx = std.mem.indexOf(u8, main_zig, "window.endDrawing()").?;
-        try std.testing.expect(readback_marker < end_drawing_idx);
+        // Three backend lifecycle hooks: attach (init), frame (per frame),
+        // deinit (cleanup). Source-order caveat: the `defer deinit()` is
+        // declared at the top of main() right next to `attach`, so the
+        // deinit *string* appears in source order BEFORE the per-frame
+        // loop, even though it RUNS at scope-exit. What we can usefully
+        // assert is that all three are emitted and attach precedes the
+        // per-frame call.
+        const attach_idx = std.mem.indexOf(u8, main_zig, "window.preview_pbo.attach(.{").?;
+        const frame_idx = std.mem.indexOf(u8, main_zig, "window.preview_pbo.frame()").?;
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.deinit()") != null);
+        try std.testing.expect(attach_idx < frame_idx);
 
-        // endFrameStream runs in a deferred cleanup so SHM teardown
-        // happens before `Game.deinit` (LIFO order — the engine owns
-        // the socket but the ring is the producer's to close).
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStream()") != null);
+        // Old inline-code MUST be absent — these moved to the backend.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_PIXEL_PACK_BUFFER") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_read_pixels") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_pbos: [3]c_uint") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_frame_idx") == null);
 
         // Generated source must still parse as valid Zig.
         const dup = try std.testing.allocator.dupeZ(u8, main_zig);
@@ -3097,25 +3103,20 @@ pub const PREVIEW_MODE = struct {
         }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // SHM (non-macOS) branch.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrame(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStream()") != null);
+        // Post-#140 migration: the SHM-vs-IOSurface comptime branch lives
+        // INSIDE the backend's `preview_pbo.frame()`. The codegen emits
+        // both lifecycle's bridge fns at module scope; the backend
+        // dispatches at comptime via `builtin.target.os.tag == .macos`.
 
-        // IOSurface (macOS) branch — zero-copy variant.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStreamIOSurface(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrameIOSurface(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStreamIOSurface()") != null);
+        // SHM bridges (Linux/Windows).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.beginFrameStream(w, h)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.publishFrame(pixels)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.endFrameStream()") != null);
 
-        // Comptime switch sentinel — proves the gating is platform-based
-        // and not unconditional. If somebody later flips this to runtime
-        // dispatch (vtable, function pointer) this assertion fires.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"builtin\").os.tag == .macos") != null);
-
-        // Producer-side buffer stays RGBA8 — `glReadPixels` produces
-        // RGBA8 and `publishFrameIOSurface` swizzles internally during
-        // the IOSurface lock/copy, so no producer-side format change.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_RGBA") != null);
+        // IOSurface bridges (macOS).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.beginFrameStreamIOSurface(w, h)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.publishFrameIOSurface(pixels)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.endFrameStreamIOSurface()") != null);
 
         // Generated source must still parse as valid Zig.
         const dup_iosurface = try std.testing.allocator.dupeZ(u8, main_zig);
@@ -3250,14 +3251,17 @@ pub const PREVIEW_MODE = struct {
 
     test "sokol emits Metal Path-A IOSurface render-target block alongside GL block (#131)" {
         // Path A (floooh/sokol#1510): the Metal slice wraps engine-
-        // owned IOSurfaces as MTLTextures, injects them into sokol-gfx
-        // as external sg_images with `color_attachment = true`, and
-        // signals each frame via `signalSlotReady`. The GL block (#124)
-        // and Metal block (#131) coexist in the generated source —
-        // guarded by mutually exclusive
-        // `_sokol_preview_{gl,metal}_enabled` comptime flags so exactly
-        // one fires at runtime on every supported target (GL on .linux
-        // desktop / Android, Metal on .macos / .ios).
+        // owned IOSurfaces as MTLTextures. Post-#140 migration, all
+        // Path-A machinery (state, ring management, MTL bridge) lives
+        // in `backends/sokol/src/window.zig:preview_mtl`. The codegen
+        // emits only:
+        //   - `_sokol_preview_metal_enabled` aliased from the backend
+        //   - 5 vtable bridge fns wrapping engine.Preview methods
+        //   - `window.preview_mtl.attach(...)` post-handshake
+        //   - `window.preview_mtl.beginFrame/endFrame/deinit()` at the
+        //     three lifecycle hooks
+        // The GL slice (#124) is unchanged — sokol-Linux still has its
+        // inline PBO template emitted here.
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
             .backend = .sokol,
@@ -3265,97 +3269,37 @@ pub const PREVIEW_MODE = struct {
         }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // Metal flag + namespace gate.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_metal_enabled") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".macos, .ios => true,") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _SokolPreviewMetal = if (_sokol_preview_metal_enabled)") != null);
+        // Metal enable gate — aliased from the backend module.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_metal_enabled = window.preview_metal_enabled") != null);
 
-        // Objective-C runtime bridging — Path A keeps only the selectors
-        // it actually needs (texture-from-IOSurface wrap + release).
-        // The Path-B blit chain (newCommandQueue / blitCommandEncoder /
-        // copyFromTexture / getBytes) is GONE.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "objc_msgSend") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "sel_registerName") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "objc_getClass") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "newTextureWithDescriptor:iosurface:plane:") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "texture2DDescriptorWithPixelFormat:width:height:mipmapped:") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "MTLPixelFormatBGRA8Unorm") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "MTLTextureUsageRenderTarget") != null);
+        // Vtable bridges at module scope (5 fns).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_mtl_begin_stream_bridge(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_mtl_get_surface_bridge(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_mtl_signal_bridge(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_mtl_end_stream_bridge(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_mtl_accepted_bridge(") != null);
 
-        // Path-B blit chain MUST be absent — those selectors only make
-        // sense for the swapchain-readback shape Path B used.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "newCommandQueue") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "blitCommandEncoder") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "copyFromTexture:sourceSlice:sourceLevel:") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "getBytes:bytesPerRow:fromRegion:mipmapLevel:") == null);
-        // The drawable accessor stub was removed alongside Path B.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.metalCurrentDrawable") == null);
+        // Bridge bodies wrap engine.Preview Path-A methods.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.beginFrameStreamIOSurface(w, h)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.getIOSurfaceAt(slot)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.signalSlotReady(slot)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.endFrameStreamIOSurface()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.isFrameAccepted()") != null);
 
-        // Sokol device accessor is still needed — Path A asks the
-        // MTLDevice for `newTextureWithDescriptor:iosurface:plane:`.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.metalDevice()") != null);
+        // Backend lifecycle hooks emitted.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_mtl.attach(.{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_mtl.beginFrame()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_mtl.endFrame()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_mtl.deinit()") != null);
 
-        // Metal module-scope state (parallels the GL block — separate
-        // names so they don't collide when both blocks emit). Path A
-        // tracks an MTLTexture ring + parallel sg.Image handles.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_initialized: bool") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_ring_size: u32") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_textures: [_PreviewMtlRingMax]?*anyopaque") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_sg_images: [_PreviewMtlRingMax]") != null);
-        // Path-B-only state (command queue + staging texture +
-        // CPU buffer) MUST be absent.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_command_queue") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_staging_texture") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_pixel_buf") == null);
-
-        // Path-A protocol calls. `beginFrameStreamIOSurface` allocates
-        // the ring; `getIOSurfaceAt` borrows each surface for the
-        // MTLTexture wrap; `signalSlotReady` is the per-frame publish
-        // (no pixel copy); `endFrameStreamIOSurface` tears down the
-        // ring on cleanup. `publishFrameIOSurface` (the Path-B
-        // RGBA-publish entry point) MUST be absent — Path A's
-        // signal-only flow is the whole point of the rework.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStreamIOSurface(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.getIOSurfaceAt(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.signalSlotReady(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.endFrameStreamIOSurface()") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.publishFrameIOSurface(") == null);
-
-        // Sokol-gfx external-texture injection. Path A creates an
-        // sg.Image per IOSurface with the MTLTexture bound through
-        // `mtl_textures[]` and `color_attachment = true` so the gfx
-        // redirect (follow-up ticket — see header comment in
-        // PREVIEW_READBACK_FRAME_METAL_SOKOL) can route the game's
-        // render pass into these attachments later.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "createIOSurfaceTexture(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".color_attachment = true") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".pixel_format = .BGRA8") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "mtl_textures[0]") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".makeImage(") != null);
-
-        // Source-order: beginFrameStreamIOSurface must precede the
-        // first signalSlotReady (otherwise the first signal would
-        // hit an un-offered ring).
-        const begin_iosurf_idx = std.mem.indexOf(u8, main_zig, "_p.beginFrameStreamIOSurface(").?;
-        const signal_idx = std.mem.indexOf(u8, main_zig, "_p.signalSlotReady(").?;
-        try std.testing.expect(begin_iosurf_idx < signal_idx);
-
-        // Source-order: getIOSurfaceAt must precede the call to
-        // createIOSurfaceTexture (borrow the IOSurface before
-        // wrapping it as an MTLTexture). Match the call site —
-        // `_SokolPreviewMetal.createIOSurfaceTexture(_device,` — not
-        // the `pub fn createIOSurfaceTexture` definition that lives
-        // earlier in the helpers block.
-        const getio_idx = std.mem.indexOf(u8, main_zig, "_p.getIOSurfaceAt(").?;
-        const create_tex_call_idx = std.mem.indexOf(u8, main_zig, "_SokolPreviewMetal.createIOSurfaceTexture(_device,").?;
-        try std.testing.expect(getio_idx < create_tex_call_idx);
-
-        // Path A runs in the pre-endFrame slot (no drawable dep, no
-        // post-commit ordering constraint). The signalSlotReady call
-        // sits BEFORE `window.endFrame()` — the generated test
-        // template puts `{{preview_readback}}` there.
-        const end_frame_idx = std.mem.indexOf(u8, main_zig, "window.endFrame()").?;
-        try std.testing.expect(signal_idx < end_frame_idx);
+        // Old inline Path-A state + objc bindings MUST be absent —
+        // proves they moved to the backend, not just duplicated.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_textures: ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_sg_images: ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_attachments: ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_initialized:") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "MTLPixelFormatBGRA8Unorm") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "newTextureWithDescriptor:iosurface:plane:") == null);
 
         // GL block from slice 1 must still emit unchanged — both
         // blocks coexist in the same generated source.
@@ -3363,19 +3307,7 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewGl") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "glReadPixels") != null);
 
-        // Cleanup teardown for the Metal path: destroy sg_images,
-        // release MTLTextures, then ask the engine to tear down the
-        // IOSurface ring. Must run BEFORE the graceful `bye` (LIFO
-        // with engine-owned socket close — same shape as the GL
-        // cleanup ordering).
-        const cleanup_destroy_img = std.mem.indexOf(u8, main_zig, "destroyImage(_preview_mtl_sg_images").?;
-        const cleanup_end_iosurf = std.mem.indexOf(u8, main_zig, "_p.endFrameStreamIOSurface()").?;
-        const cleanup_bye = std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)").?;
-        try std.testing.expect(cleanup_destroy_img < cleanup_end_iosurf);
-        try std.testing.expect(cleanup_end_iosurf < cleanup_bye);
-
-        // Generated source must still parse as valid Zig — guards
-        // against typos in the new `@extern` declarations.
+        // Generated source must still parse as valid Zig.
         const dup = try std.testing.allocator.dupeZ(u8, main_zig);
         defer std.testing.allocator.free(dup);
         var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
@@ -3384,14 +3316,10 @@ pub const PREVIEW_MODE = struct {
     }
 
     test "sokol Metal Path-A routes game render into the offscreen IOSurface target (#133)" {
-        // The producer infrastructure from #131/#132 allocates IOSurfaces,
-        // wraps them as MTLTextures + sg.Images, and signals slot-ready
-        // each frame — but until #133 the game's `sg.beginPass` still
-        // targets the swapchain, so the IOSurfaces stay zero-filled and
-        // the editor's Game View renders black. The fix adds a small
-        // `window.setEditorRenderTarget` shim that swaps `beginPass`
-        // attachments for one frame; this test asserts the codegen
-        // emits the shim wiring in the right order around `g.render()`.
+        // Post-#140 migration: the setEditorRenderTarget redirect is
+        // driven from inside `window.preview_mtl.beginFrame()` and
+        // cleared by `window.preview_mtl.endFrame()`. The codegen
+        // template just calls these around `g.render()`.
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
             .backend = .sokol,
@@ -3399,69 +3327,26 @@ pub const PREVIEW_MODE = struct {
         }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // Per-slot color-attachment View + Attachments arrays at module
-        // scope so the per-frame block can flip the gfx layer with a
-        // single struct copy instead of rebuilding each frame.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_views: [_PreviewMtlRingMax]") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_attachments: [_PreviewMtlRingMax]") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_target_active: bool") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_mtl_write_slot: u32") != null);
-
-        // Each ring slot must build a color-attachment View off its
-        // `sg.Image` and stash it in the per-slot Attachments. The
-        // `Attachments.colors[0]` assignment is the load-bearing line
-        // the gfx shim reads from.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".color_attachment = .{ .image = _img }") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_att.colors[0] = _view;") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_mtl_attachments[_slot] = _att;") != null);
-
-        // Pre-render block arms the shim BEFORE `g.render()`, post-
-        // render block tears it down. Both APIs come from the window
-        // backend (`backends/sokol/src/window.zig`).
-        const set_target_idx = std.mem.indexOf(u8, main_zig, "window.setEditorRenderTarget(_preview_mtl_attachments[_write_slot])").?;
-        const clear_target_idx = std.mem.indexOf(u8, main_zig, "window.clearEditorRenderTarget()").?;
+        // Source-order: backend pre-frame hook fires BEFORE g.render()
+        // so the IOSurface render-target redirect is armed for the
+        // upcoming sg.beginPass; backend post-frame hook fires AFTER
+        // g.render() so the just-rendered slot is published.
+        const begin_idx = std.mem.indexOf(u8, main_zig, "window.preview_mtl.beginFrame()").?;
         const render_idx = std.mem.indexOf(u8, main_zig, "g.render();").?;
-        const signal_idx = std.mem.indexOf(u8, main_zig, "_p.signalSlotReady(_preview_mtl_write_slot)").?;
+        const end_idx = std.mem.indexOf(u8, main_zig, "window.preview_mtl.endFrame()").?;
+        try std.testing.expect(begin_idx < render_idx);
+        try std.testing.expect(render_idx < end_idx);
 
-        // setEditorRenderTarget MUST fire before `g.render()` so the
-        // `window.beginPass` inside the frame body sees the override
-        // and routes sokol-gfx into the IOSurface attachments.
-        try std.testing.expect(set_target_idx < render_idx);
-        // signalSlotReady MUST fire after `g.render()` (the just-
-        // rendered slot is what we're publishing).
-        try std.testing.expect(render_idx < signal_idx);
-        // clearEditorRenderTarget MUST fire after the signal so the
-        // override stays armed across the whole render-then-publish
-        // window — and so the next frame's `beginPass` defaults back
-        // to the swapchain even if the pre-render block bails (editor
-        // disconnect, transient ring rebuild). The post-render block
-        // emits at least one clearEditorRenderTarget call in the
-        // frame body; we match the earliest occurrence (the cleanup
-        // callback has its own — guarded below by ordering against
-        // the engine teardown).
-        try std.testing.expect(signal_idx < clear_target_idx);
+        // Cleanup hook fires after the frame loop ends. We can't easily
+        // assert the relative order against `sg.shutdown` from inside
+        // this test template, but it must at least exist.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_mtl.deinit()") != null);
 
-        // The pre-render block computes `_write_slot` from the frame
-        // index BEFORE the post-render block reads it via the shared
-        // module-scope `_preview_mtl_write_slot`.
-        const compute_slot_idx = std.mem.indexOf(u8, main_zig, "_preview_mtl_write_slot = _write_slot;").?;
-        try std.testing.expect(compute_slot_idx < signal_idx);
-
-        // Frame index advances inside the post-render block, not the
-        // pre-render block — otherwise a bail between the two would
-        // skip publishing a slot but still bump the index, drifting
-        // the ring out of sync.
-        const post_render_advance_idx = std.mem.lastIndexOf(u8, main_zig, "_preview_frame_idx +%= 1;").?;
-        try std.testing.expect(post_render_advance_idx > render_idx);
-
-        // Cleanup must also clear the editor render target before
-        // destroying the views/images it points at (use-after-free
-        // defense). The frame-body clear is the FIRST occurrence; the
-        // cleanup-block clear is the SECOND. Compare the second one
-        // against the engine teardown call to lock that ordering.
-        const cleanup_clear_idx = std.mem.indexOfPos(u8, main_zig, clear_target_idx + 1, "window.clearEditorRenderTarget()").?;
-        const cleanup_end_iosurf = std.mem.indexOf(u8, main_zig, "_p.endFrameStreamIOSurface()").?;
-        try std.testing.expect(cleanup_clear_idx < cleanup_end_iosurf);
+        // The OLD inline Path-A render-target code MUST be absent
+        // (moved to backend's preview_mtl.beginFrame/endFrame).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.setEditorRenderTarget(_preview_mtl_attachments") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_att.colors[0] = _view") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_mtl_write_slot = _write_slot") == null);
 
         // Generated source must still parse as valid Zig.
         const dup = try std.testing.allocator.dupeZ(u8, main_zig);
@@ -3503,9 +3388,9 @@ pub const PREVIEW_MODE = struct {
     test "raylib desktop still emits its own PBO readback after the sokol slice lands" {
         // Regression lock — the sokol slice extended the emit gating
         // on the callback branch but the raylib desktop loop branch
-        // is untouched. Re-runs the key raylib assertions to make
-        // sure the slice 1 work didn't accidentally drift the raylib
-        // codepath.
+        // is untouched. After #140 migration, both backends use the
+        // backend-module seam; raylib's bridges + lifecycle hooks
+        // appear in main_zig, sokol-specific names must NOT leak.
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
             .backend = .raylib,
@@ -3513,22 +3398,21 @@ pub const PREVIEW_MODE = struct {
         }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // raylib's externs are at module scope (no struct-namespace
-        // gate), with `_gl_*` underscore-prefix names — sokol uses
-        // its own `_SokolPreviewGl.*` namespace. Asserting both
-        // makes sure neither branch silently rewires through the
-        // other's identifiers.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_read_pixels") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_PIXEL_PACK_BUFFER") != null);
+        // Raylib backend hooks present.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.attach(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.frame()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.deinit()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_begin_bridge(") != null);
+
         // sokol-specific names must NOT leak into raylib output —
         // covers the GL slice (#124), the D3D11 slice (#126), and the
-        // Metal slice (#125).
+        // Metal slice (#125 / #140).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_gl_enabled") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_d3d11_enabled") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewGl") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewD3d11") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_metal_enabled") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewMetal") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_mtl") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.metalDevice()") == null);
     }
 
