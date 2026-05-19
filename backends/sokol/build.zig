@@ -12,18 +12,35 @@ pub fn build(b: *std.Build) void {
     // Forward dont_link_system_libs for iOS builds — we link frameworks manually.
     const dont_link_system_libs = b.option(bool, "dont_link_system_libs", "Don't link system libraries (for iOS cross-compilation)") orelse false;
 
-    // IMPORTANT: keep these options in lockstep with
-    // `labelle-imgui/bridges/sokol/build.zig`. Zig keys each
-    // `b.dependency("sokol", .{...})` resolution by the option set, so
-    // mismatched options produce *two* separately compiled `sokol_clib`
-    // artifacts in the same binary — and therefore two copies of the
-    // `_sg` static state. Symptom: sgl draws land in the IOSurface
-    // pass but simgui draws don't (different state machines). Symmetric
-    // option list = one artifact = one `_sg` (labelle-assembler#140).
+    // Opt-in `with_sokol_imgui` switch — only the imgui-plugin path
+    // needs sokol_imgui.c compiled. Forcing it on for every project
+    // breaks no-gui builds because sokol_imgui.c `#include`s
+    // `cimgui.h`, which only the imgui bridge provides on the include
+    // path. WASM-without-imgui was the canonical regression
+    // (`sokol_imgui.c:8:10: error: 'cimgui.h' file not found`); session
+    // smoke testing surfaced it.
+    //
+    // IMPORTANT: when `with_imgui=true`, the option set passed here
+    // MUST match `labelle-imgui/bridges/sokol/build.zig` exactly. Zig
+    // keys each `b.dependency("sokol", .{...})` resolution by the
+    // option set, so mismatched options produce *two* separately
+    // compiled `sokol_clib` artifacts in the same binary — and
+    // therefore two copies of the `_sg` static state. Symptom: sgl
+    // draws land in the IOSurface pass but simgui draws don't
+    // (different state machines). Symmetric option list = one
+    // artifact = one `_sg` (labelle-assembler#140). The assembler's
+    // generated build.zig flips `with_imgui` on only when the project
+    // has the imgui plugin in its gui config.
+    //
+    // `with_sokol_imgui_no_app` stays unconditional because sokol-zig
+    // gates its cflag on the outer `with_sokol_imgui` already — it's a
+    // harmless no-op when imgui is off, and keeps the option set
+    // identical to the bridge's when imgui is on.
+    const with_imgui = b.option(bool, "with_imgui", "Build sokol with sokol_imgui (must match imgui bridge if used)") orelse false;
     const sokol_dep = b.dependency("sokol", .{
         .target = target,
         .optimize = optimize,
-        .with_sokol_imgui = true,
+        .with_sokol_imgui = with_imgui,
         .with_sokol_imgui_no_app = true,
         .dont_link_system_libs = dont_link_system_libs,
     });

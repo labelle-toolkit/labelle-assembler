@@ -51,7 +51,11 @@ pub fn build(b: *std.Build) !void {
     const raylib_artifact = backend_dep.artifact("raylib");
 
 .backend_sokol
-    const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize });
+    // `with_imgui` flips sokol_imgui.c compilation on. MUST match the
+    // imgui bridge's option set when the project includes imgui, or
+    // Zig caches two `sokol_clib` artifacts (and two `_sg` states) —
+    // see comment in `backends/sokol/build.zig` (labelle-assembler#140).
+    const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize, .with_imgui = {{with_imgui}} });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");
     const backend_audio = backend_dep.module("audio");
@@ -59,7 +63,8 @@ pub fn build(b: *std.Build) !void {
     const sokol_clib = backend_dep.artifact("sokol_clib");
 
 .backend_sokol_wasm
-    const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize });
+    // See `.backend_sokol` for why `with_imgui` must match the bridge.
+    const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize, .with_imgui = {{with_imgui}} });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");
     const backend_audio = backend_dep.module("audio");
@@ -399,11 +404,13 @@ pub fn build(b: *std.Build) void {
     });
 
 .backend_sokol_ios
-    // sokol with dont_link_system_libs — we link iOS frameworks manually
+    // sokol with dont_link_system_libs — we link iOS frameworks manually.
+    // See `.backend_sokol` for why `with_imgui` must match the bridge.
     const backend_dep = b.dependency("labelle_sokol", .{
         .target = ios_target,
         .optimize = optimize,
         .dont_link_system_libs = true,
+        .with_imgui = {{with_imgui}},
     });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");
@@ -595,11 +602,13 @@ pub fn build(b: *std.Build) void {
     });
 
 .backend_sokol_android
-    // sokol with dont_link_system_libs — we link Android libs manually
+    // sokol with dont_link_system_libs — we link Android libs manually.
+    // See `.backend_sokol` for why `with_imgui` must match the bridge.
     const backend_dep = b.dependency("labelle_sokol", .{
         .target = android_target,
         .optimize = optimize,
         .dont_link_system_libs = true,
+        .with_imgui = {{with_imgui}},
     });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");
