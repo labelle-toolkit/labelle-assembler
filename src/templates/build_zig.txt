@@ -482,24 +482,34 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
 const std = @import("std");
 
 /// Detect Android NDK sysroot path.
+///
+/// Env lookups go through `b.graph.environ_map.get` and filesystem
+/// checks go through `std.Io.Dir.cwd().access(io, ...)` — Zig 0.16
+/// removed `std.process.getEnvVarOwned`, `std.posix.getenv`, and
+/// `std.fs.cwd()`. See labelle-assembler#144.
 fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
+    const io = b.graph.io;
     // 1. ANDROID_NDK_HOME env var
-    if (std.process.getEnvVarOwned(b.allocator, "ANDROID_NDK_HOME") catch null) |ndk_home| {
-        defer b.allocator.free(ndk_home);
+    if (b.graph.environ_map.get("ANDROID_NDK_HOME")) |ndk_home| {
         const sysroot = b.pathJoin(&.{ ndk_home, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
-        if (std.fs.cwd().access(sysroot, .{})) |_| {
+        if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| {
             return sysroot;
         } else |_| {}
     }
     // 2. ANDROID_HOME/ndk/<latest>/
-    if (std.process.getEnvVarOwned(b.allocator, "ANDROID_HOME") catch null) |home| {
-        defer b.allocator.free(home);
+    if (b.graph.environ_map.get("ANDROID_HOME")) |home| {
         const ndk_dir = b.pathJoin(&.{ home, "ndk" });
-        var dir = std.fs.cwd().openDir(ndk_dir, .{ .iterate = true }) catch return null;
-        defer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(io, ndk_dir, .{ .iterate = true }) catch return null;
+        defer dir.close(io);
         var latest: ?[]const u8 = null;
         var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
+        // `iter.next(io)` returns `!?Entry`. We deliberately swallow
+        // I/O errors per-entry (treat as end-of-iteration) so a single
+        // unreadable subdir doesn't abort NDK detection — the next
+        // pass through `getAndroidNdkSysroot` still has `ANDROID_NDK_HOME`
+        // as a fallback, and any genuine misconfiguration surfaces via
+        // the explicit `@panic` at the call site below.
+        while (iter.next(io) catch null) |entry| {
             if (entry.kind == .directory) {
                 // Pick the highest version by lexicographic comparison
                 if (latest) |prev| {
@@ -515,7 +525,7 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
         if (latest) |version| {
             defer b.allocator.free(version);
             const sysroot = b.pathJoin(&.{ ndk_dir, version, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
-            if (std.fs.cwd().access(sysroot, .{})) |_| {
+            if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| {
                 return sysroot;
             } else |_| {}
         }
@@ -652,8 +662,8 @@ pub fn build(b: *std.Build) void {
     });
 
 .android_link
-    lib.linkLibrary(sokol_clib);
-    lib.linkLibC();
+    lib.root_module.linkLibrary(sokol_clib);
+    lib.root_module.link_libc = true;
     lib.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }) });
     lib.root_module.linkSystemLibrary("android", .{});
     lib.root_module.linkSystemLibrary("log", .{});
@@ -674,26 +684,25 @@ pub fn build(b: *std.Build) void {
     lib.setLibCFile(android_libc.add("android-libc.txt", libc_content));
 
 .android_link_gui_bridge
-    lib.linkLibrary(gui_bridge_artifact);
+    lib.root_module.linkLibrary(gui_bridge_artifact);
 
 .android_package
     // ── APK packaging step ──────────────────────────────────────────────
     // Copies the freshly built libgame.so into apk-staging and re-signs the APK.
     // Requires ANDROID_HOME and ~/.labelle/android-debug.keystore.
     {
+        const io = b.graph.io;
         // ANDROID_HOME is read lazily — a missing value only fails when `zig build package` runs.
-        const android_home = std.process.getEnvVarOwned(b.allocator, "ANDROID_HOME") catch "";
-        defer if (android_home.len > 0) b.allocator.free(android_home);
-        const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch
-            std.process.getEnvVarOwned(b.allocator, "USERPROFILE") catch "";
-        defer if (home.len > 0) b.allocator.free(home);
+        const android_home = b.graph.environ_map.get("ANDROID_HOME") orelse "";
+        const home = b.graph.environ_map.get("HOME") orelse
+            b.graph.environ_map.get("USERPROFILE") orelse "";
         const keystore = b.pathJoin(&.{ if (home.len > 0) home else "/tmp", ".labelle", "android-debug.keystore" });
 
         // Find build-tools: prefer newest, then fall back
         const build_tools_dir = blk: {
             for (&[_][]const u8{ "36.0.0", "35.0.1", "35.0.0", "34.0.0" }) |ver| {
                 const p = b.pathJoin(&.{ android_home, "build-tools", ver });
-                if (std.fs.cwd().access(p, .{})) |_| break :blk p else |_| {}
+                if (std.Io.Dir.cwd().access(io, p, .{})) |_| break :blk p else |_| {}
             }
             break :blk b.pathJoin(&.{ android_home, "build-tools", "35.0.0" });
         };

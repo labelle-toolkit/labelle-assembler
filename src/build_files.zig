@@ -382,10 +382,36 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     else
         null;
 
-    var hash: u64 = 0x517cc1b727220a95;
-    for (cfg.name) |c| {
-        hash = hash *% 0x100000001b3 +% c;
-    }
+    // Zig 0.16 validates `build.zig.zon` fingerprints with the formula
+    // `(fingerprint >> 32) == std.hash.Crc32.hash(name)` where `name`
+    // is the literal `.name` field in the zon file — *not* the project
+    // name from project.labelle. The template hardcodes
+    // `.name = .generated_game,` so the CRC seed is fixed too. The
+    // lower 32 bits are a free-form "fork ID" derived from cfg.name so
+    // regenerating yields a stable value per project (no gratuitous
+    // cache invalidation). The previous FNV-1a-based hash produced
+    // fingerprints rejected by Zig 0.16's validator.
+    //
+    // The id half can't be 0 (reserved by Zig 0.16 for "unhashed") or
+    // 0xffffffff (reserved for "explicitly opted out of dedup"). Both
+    // reservations are checked in `std.zon.Manifest`; a project name
+    // whose Wyhash happens to land on either would generate a zon
+    // file that fails validation despite the correct CRC half. Clamp
+    // to a safe non-reserved value.
+    const zon_package_name = "generated_game";
+    const name_crc: u32 = std.hash.Crc32.hash(zon_package_name);
+    const fork_id: u32 = blk: {
+        var h = std.hash.Wyhash.init(0xa11e11e);
+        h.update(cfg.name);
+        const raw: u32 = @truncate(h.final());
+        // Coerce away the two reserved sentinels.
+        break :blk switch (raw) {
+            0 => 1,
+            0xffffffff => 0xfffffffe,
+            else => raw,
+        };
+    };
+    const hash: u64 = (@as(u64, name_crc) << 32) | @as(u64, fork_id);
     var hash_buf: [16]u8 = undefined;
     const hash_str = std.fmt.bufPrint(&hash_buf, "{x}", .{hash}) catch unreachable;
 
