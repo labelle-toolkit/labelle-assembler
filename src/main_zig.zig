@@ -823,6 +823,22 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
         try w.writeAll("    defer PluginControllers.deinit(&g);\n");
     }
 
+    // ── No Android immersive-mode call here (intentional) ────────────
+    //
+    // `buildCallbackInitCode` emits `engine.android.enableImmersiveMode()`
+    // for Android projects, but `buildSetupCode` does NOT — and that is
+    // correct, not an omission. `buildSetupCode` only ever runs for the
+    // loop-based backends (raylib, sdl, bgfx, wgpu), and NONE of those
+    // can target Android: Android is sokol-only. The only Android
+    // backend template that exists is `backends/sokol/templates/
+    // mobile.txt`; the loop-based backends ship `desktop.txt` (and
+    // raylib also `wasm.txt`) and have no `android.txt`, so
+    // `loadBackendTemplate` (see `root.zig`, which maps a non-sokol
+    // Android config to a missing `android.txt`) fails with
+    // `error.TemplateNotFound` before codegen ever reaches this
+    // function. Emitting the immersive call here would therefore be
+    // dead code that can never run on an Android target.
+
     var arr_list = alloc_writer.toArrayList();
     return arr_list.toOwnedSlice(allocator);
 }
