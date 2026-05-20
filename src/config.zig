@@ -110,6 +110,16 @@ pub const AndroidConfig = struct {
     min_sdk_version: u32 = 28, // Android 9 (Pie) — NativeActivity + GLES3
     target_sdk_version: u32 = 34, // Android 14
     orientation: Orientation = .all,
+    /// Launch the game fullscreen with the status bar and title bar
+    /// hidden, via the built-in `Theme.NoTitleBar.Fullscreen` Android
+    /// framework theme (no custom APK resources required).
+    ///
+    /// Scope: this covers the **status bar** and title bar only. It does
+    /// NOT hide the Android **navigation bar** (the on-screen
+    /// back/home/recents buttons) — true immersive-sticky nav-bar hiding
+    /// requires runtime native code (JNI `WindowInsetsController` calls)
+    /// and is a planned follow-up.
+    immersive_mode: bool = false,
 };
 
 pub const LayerSpace = enum { world, screen, screen_fill };
