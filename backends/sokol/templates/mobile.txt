@@ -84,7 +84,7 @@ export fn cleanup() callconv(.c) void {
 export fn sokol_main(argc: c_int, argv: [*][*:0]u8) window.Desc {
     _ = argc;
     _ = argv;
-    return window.makeDesc(.{
+{{immersive_entry}}    return window.makeDesc(.{
         .init_cb = &init,
         .frame_cb = &frame,
         .cleanup_cb = &cleanup,
