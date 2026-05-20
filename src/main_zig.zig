@@ -2187,37 +2187,56 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
 
     // ── Android immersive mode ──────────────────────────────────────
     //
-    // When the project sets `.android = .{ .immersive_mode = true }`,
-    // emit a call to the engine's runtime immersive helper. The legacy
-    // `Theme.NoTitleBar.Fullscreen` manifest theme `labelle-cli` writes
-    // does NOT hide the system bars on modern Android (verified broken
-    // on Android 14 / API 34) — Google moved system-bar control to a
-    // runtime API. `engine.android.enableImmersiveMode()` installs a
-    // JNI-based `View.setSystemUiVisibility` immersive-sticky call;
-    // see `labelle-engine/src/android.zig` for the UI-thread handling.
-    //
-    // Gated on `cfg.platform == .android` so non-Android targets never
-    // emit the call. The engine function is itself a comptime no-op off
-    // Android, but keeping the emission Android-only avoids a stray
-    // symbol reference in the desktop/wasm `main.zig`.
-    if (cfg.platform == .android) {
-        const immersive = if (cfg.android) |a| a.immersive_mode else false;
-        if (immersive) {
-            try w.writeAll(
-                \\    // Android immersive mode (project.labelle `.android.immersive_mode`):
-                \\    // hide the status + navigation bars (immersive-sticky). Safe to
-                \\    // call from sokol's render-thread `init` — the helper only
-                \\    // installs a UI-thread focus-callback hook; the actual JNI
-                \\    // decor-view call runs on the UI thread. See labelle-engine
-                \\    // src/android.zig for the rationale.
-                \\    engine.android.enableImmersiveMode();
-                \\
-            );
-        }
-    }
+    // The `engine.android.enableImmersiveMode()` call is NOT emitted
+    // here. It must run on the Android UI thread, which the render-
+    // thread `init` callback is not — so it is emitted into
+    // `sokol_main()` instead (see `buildImmersiveEntryCode`). The
+    // `init` callback runs too late to catch the window's first
+    // `onWindowFocusChanged`, which is why the bars used to stay
+    // visible until the first background+foreground cycle.
 
     var arr_list = alloc_writer.toArrayList();
     return arr_list.toOwnedSlice(allocator);
+}
+
+/// Body for the `{{immersive_entry}}` hole in the sokol `mobile.txt`
+/// template — the `engine.android.enableImmersiveMode()` call, emitted
+/// inside `sokol_main()`.
+///
+/// **Why `sokol_main()` and not `init()`:** the legacy
+/// `Theme.NoTitleBar.Fullscreen` manifest theme `labelle-cli` writes
+/// does NOT hide the system bars on modern Android (verified broken on
+/// Android 14 / API 34) — Google moved system-bar control to a runtime
+/// API. `enableImmersiveMode()` installs a UI-thread callback hook that
+/// performs that runtime JNI call.
+///
+/// sokol's `ANativeActivity_onCreate` invokes `sokol_main()` on the
+/// **UI thread**, before it registers its own `ANativeActivityCallbacks`
+/// — early enough that the hook fires at launch. The `init()` callback,
+/// by contrast, runs on sokol's render thread *after* the window's
+/// first `onWindowFocusChanged`; a hook installed there misses that
+/// first focus event, leaving the bars visible until the player
+/// background+foregrounds the app. See `labelle-engine/src/android.zig`.
+///
+/// Returns an empty string unless the target is Android with
+/// `.android = .{ .immersive_mode = true }`; the placeholder then
+/// expands to nothing (and is harmless in the shared sokol desktop /
+/// wasm `desktop.txt`, which has no `{{immersive_entry}}` hole at all).
+fn buildImmersiveEntryCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![]const u8 {
+    if (cfg.platform != .android) return allocator.dupe(u8, "");
+    const immersive = if (cfg.android) |a| a.immersive_mode else false;
+    if (!immersive) return allocator.dupe(u8, "");
+    return allocator.dupe(u8,
+        \\    // Android immersive mode (project.labelle `.android.immersive_mode`):
+        \\    // hide the status + navigation bars (immersive-sticky). Called from
+        \\    // `sokol_main()` — the UI thread, before sokol registers its own
+        \\    // ANativeActivity callbacks — so the hook catches the window's
+        \\    // first focus and the bars are hidden at launch. The helper only
+        \\    // installs a UI-thread callback hook; the JNI decor-view call runs
+        \\    // on the UI thread. See labelle-engine src/android.zig.
+        \\    engine.android.enableImmersiveMode();
+        \\
+    );
 }
 
 /// Cleanup code for callback-based backends (in cleanup() C callback).
@@ -3099,6 +3118,15 @@ pub fn generateMainZigFromTemplate(
                 defer allocator.free(preview_cleanup_sokol);
                 const preview_heartbeat_sokol: []const u8 = if (is_wasm) "" else PREVIEW_HEARTBEAT_CALLBACK;
 
+                // `{{immersive_entry}}` — Android immersive-mode call,
+                // emitted into `sokol_main()` (UI thread, pre-callback
+                // registration) so the bars are hidden at launch. Empty
+                // for non-Android / non-immersive projects; the shared
+                // sokol `desktop.txt` has no such hole, so an empty
+                // value there is a harmless no-op.
+                const immersive_entry = try buildImmersiveEntryCode(allocator, cfg);
+                defer allocator.free(immersive_entry);
+
                 try tpl.render(lifecycle_tmpl, .{
                     .module_vars = module_vars,
                     .width = w_str,
@@ -3145,6 +3173,7 @@ pub fn generateMainZigFromTemplate(
                     // entirely is a separate cleanup step.
                     .preview_readback_post = "",
                     .preview_cleanup = preview_cleanup_sokol,
+                    .immersive_entry = immersive_entry,
                 }, bw);
             } else {
                 // Raylib wasm: emscripten-driven callback loop. Preview
