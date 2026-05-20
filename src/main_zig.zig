@@ -823,6 +823,22 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
         try w.writeAll("    defer PluginControllers.deinit(&g);\n");
     }
 
+    // ── No Android immersive-mode call here (intentional) ────────────
+    //
+    // `buildCallbackInitCode` emits `engine.android.enableImmersiveMode()`
+    // for Android projects, but `buildSetupCode` does NOT — and that is
+    // correct, not an omission. `buildSetupCode` only ever runs for the
+    // loop-based backends (raylib, sdl, bgfx, wgpu), and NONE of those
+    // can target Android: Android is sokol-only. The only Android
+    // backend template that exists is `backends/sokol/templates/
+    // mobile.txt`; the loop-based backends ship `desktop.txt` (and
+    // raylib also `wasm.txt`) and have no `android.txt`, so
+    // `loadBackendTemplate` (see `root.zig`, which maps a non-sokol
+    // Android config to a missing `android.txt`) fails with
+    // `error.TemplateNotFound` before codegen ever reaches this
+    // function. Emitting the immersive call here would therefore be
+    // dead code that can never run on an Android target.
+
     var arr_list = alloc_writer.toArrayList();
     return arr_list.toOwnedSlice(allocator);
 }
@@ -2167,6 +2183,37 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
         // `buildCallbackCleanupCode` since callback backends don't share
         // the `defer` scope of init. RFC-plugin-controllers §2.
         try w.writeAll("    PluginControllers.setup(&g) catch @panic(\"plugin controller setup failed\");\n");
+    }
+
+    // ── Android immersive mode ──────────────────────────────────────
+    //
+    // When the project sets `.android = .{ .immersive_mode = true }`,
+    // emit a call to the engine's runtime immersive helper. The legacy
+    // `Theme.NoTitleBar.Fullscreen` manifest theme `labelle-cli` writes
+    // does NOT hide the system bars on modern Android (verified broken
+    // on Android 14 / API 34) — Google moved system-bar control to a
+    // runtime API. `engine.android.enableImmersiveMode()` installs a
+    // JNI-based `View.setSystemUiVisibility` immersive-sticky call;
+    // see `labelle-engine/src/android.zig` for the UI-thread handling.
+    //
+    // Gated on `cfg.platform == .android` so non-Android targets never
+    // emit the call. The engine function is itself a comptime no-op off
+    // Android, but keeping the emission Android-only avoids a stray
+    // symbol reference in the desktop/wasm `main.zig`.
+    if (cfg.platform == .android) {
+        const immersive = if (cfg.android) |a| a.immersive_mode else false;
+        if (immersive) {
+            try w.writeAll(
+                \\    // Android immersive mode (project.labelle `.android.immersive_mode`):
+                \\    // hide the status + navigation bars (immersive-sticky). Safe to
+                \\    // call from sokol's render-thread `init` — the helper only
+                \\    // installs a UI-thread focus-callback hook; the actual JNI
+                \\    // decor-view call runs on the UI thread. See labelle-engine
+                \\    // src/android.zig for the rationale.
+                \\    engine.android.enableImmersiveMode();
+                \\
+            );
+        }
     }
 
     var arr_list = alloc_writer.toArrayList();
