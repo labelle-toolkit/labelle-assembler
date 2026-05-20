@@ -1,0 +1,23 @@
+# flows-smoke
+
+End-to-end smoke fixture for the `.flow.zon` codegen pipeline
+(labelle-gui#96). `zig build generate` parses `scripts/flows/tick.flow.zon`,
+emits `scripts/flows/tick.zig`, and `zig build` proves the whole stack —
+flow parser, codegen, component imports, `Game.getComponent` /
+`Game.setField`, and the OnCreate alias path — compiles into a real game
+binary.
+
+CI builds this fixture but does not run the resulting binary (raylib
+needs a display); the build-only depth matches `examples/raylib` and
+`examples/asset-streaming-smoke`.
+
+## Workaround note
+
+`scripts/flows/components/Position.zig` is a temporary symlink back at
+the project-level `components/Position.zig`. The flow codegen (labelle-gui
+#102) emits `@import("components/<Name>.zig")` resolved relative to the
+generated flow file's directory (`scripts/flows/`), so without the
+symlink the import looks for `scripts/flows/components/<Name>.zig` and
+fails. Once the codegen emits a depth-aware path (`../../components/`)
+or the assembler exposes `components` as a named module, this directory
+can be deleted. See `scripts/flows/components/.keep` for context.

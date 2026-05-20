@@ -1,0 +1,20 @@
+.{
+    .name = "flows_smoke",
+    .title = "LaBelle — Flows End-to-End Smoke Test",
+    .width = 800,
+    .height = 600,
+    .target_fps = 60,
+    .backend = .raylib,
+    .ecs = .zig_ecs,
+    .initial_scene = "main",
+    .states = .{"playing"},
+    .resources = .{},
+    .layers = .{
+        .{ .name = "world", .order = 0, .space = .world },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}
