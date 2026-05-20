@@ -143,6 +143,19 @@ jobs:
           ref: main
           path: labelle-cli
 
+      # `cd labelle-cli && zig build` below pulls labelle-cli's pinned
+      # labelle_assembler package, which transitively declares
+      # `flow_codegen` as a relative path-dep (`../labelle-gui/flow-codegen`,
+      # an in-tree sub-package of labelle-gui). Zig unpacks the package
+      # into `labelle-cli/zig-pkg/`, so labelle-gui must be checked out
+      # there too. Mirrors the same fix in labelle-cli's own ci.yml.
+      - name: Checkout labelle-gui for the labelle-cli build
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-cli/zig-pkg/labelle-gui
+
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-core
