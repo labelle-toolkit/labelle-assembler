@@ -434,6 +434,119 @@ pub fn fetchPlugin(allocator: std.mem.Allocator, plugin: config.PluginDep) !void
     try gitCloneShallow(allocator, git_url, git_ref, target);
 }
 
+// ── GUI plugin (`.package` / `.url`) resolution ──────────────────────
+//
+// A GUI plugin declared as `.gui = .{ .package = "..." }` or
+// `.gui = .{ .url = "..." }` (see config.GuiPlugin) lands in the same
+// `~/.labelle/packages/...` cache tree the rest of the assembler uses:
+//
+//   .package  → ~/.labelle/packages/plugins/{package}/{version}
+//               (identical layout to a regular declared plugin — see
+//                resolvePlugin — so cache_cmd / lockfile tooling can
+//                mirror the path)
+//   .url      → ~/.labelle/packages/gui-url/{url-hash}/{ref}
+//               (a deterministic per-URL slot; the URL is hashed because
+//                it isn't a filesystem-safe key)
+//
+// `.package` is treated exactly like a regular plugin's `repo` field: a
+// host/path string such as `github.com/labelle-toolkit/labelle-imgui`.
+
+/// Resolve a GUI `.package` reference to its cached path.
+/// `package` is a repo-style host/path string (e.g.
+/// `github.com/labelle-toolkit/labelle-imgui`); `version` is a release
+/// version or a `local:` path override.
+/// Returns an absolute path like:
+///   ~/.labelle/packages/plugins/github.com/labelle-toolkit/labelle-imgui/0.3.0
+pub fn resolveGuiPackage(allocator: std.mem.Allocator, package: []const u8, version: []const u8, project_dir: ?[]const u8) ![]const u8 {
+    if (config.isLocalVersion(version)) {
+        return resolveLocalPath(allocator, config.localVersionPath(version), project_dir);
+    }
+
+    const packages_dir = try getPackagesDir(allocator);
+    defer allocator.free(packages_dir);
+    return try std.fs.path.join(allocator, &.{ packages_dir, "plugins", package, version });
+}
+
+/// Fetch a GUI `.package` from its git repo at a given version into the
+/// cache. Mirrors fetchPlugin: shallow-clones `https://{package}.git` at
+/// the version's git ref.
+pub fn fetchGuiPackage(allocator: std.mem.Allocator, package: []const u8, version: []const u8) !void {
+    const target = try resolveGuiPackage(allocator, package, version, null);
+    defer allocator.free(target);
+
+    const git_url = try std.fmt.allocPrint(allocator, "https://{s}.git", .{package});
+    defer allocator.free(git_url);
+
+    const git_ref = try config.versionToGitRef(allocator, version);
+    defer allocator.free(git_ref);
+
+    try gitCloneShallow(allocator, git_url, git_ref, target);
+}
+
+/// Resolve a GUI `.url` reference to its deterministic cache path.
+/// The URL is hashed (it's not a filesystem-safe key); `ref` is the git
+/// ref to check out (`.version` from the GuiPlugin, or "default").
+/// Returns an absolute path like:
+///   ~/.labelle/packages/gui-url/a1b2c3d4e5f6a7b8/default
+pub fn resolveGuiUrl(allocator: std.mem.Allocator, url: []const u8, ref: []const u8) ![]const u8 {
+    const packages_dir = try getPackagesDir(allocator);
+    defer allocator.free(packages_dir);
+
+    const url_hash = std.hash.Wyhash.hash(0xfa11e11e, url);
+    const hash_str = try std.fmt.allocPrint(allocator, "{x:0>16}", .{url_hash});
+    defer allocator.free(hash_str);
+
+    return try std.fs.path.join(allocator, &.{ packages_dir, "gui-url", hash_str, ref });
+}
+
+/// Fetch a GUI `.url` repo into its deterministic cache slot.
+/// Shallow-clones `url` into the path returned by `resolveGuiUrl(url, slot)`.
+/// `git_ref` is the branch/tag to check out, or null for the repo's
+/// default branch; `slot` is the cache-path component (the resolved ref
+/// name, or "default" for the implicit-default-branch case).
+pub fn fetchGuiUrl(allocator: std.mem.Allocator, url: []const u8, slot: []const u8, git_ref: ?[]const u8) !void {
+    const target = try resolveGuiUrl(allocator, url, slot);
+    defer allocator.free(target);
+
+    if (git_ref) |r| {
+        try gitCloneShallow(allocator, url, r, target);
+    } else {
+        try gitCloneShallowDefaultBranch(allocator, url, target);
+    }
+}
+
+/// Shallow-clone a git repo's default branch (no `--branch`) into `target`.
+fn gitCloneShallowDefaultBranch(allocator: std.mem.Allocator, repo_url: []const u8, target: []const u8) !void {
+    const io = config.globalIo();
+    if (std.fs.path.dirname(target)) |parent| {
+        std.Io.Dir.cwd().createDirPath(io, parent) catch {};
+    }
+
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "git", "clone", "--depth", "1", repo_url, target },
+    }) catch |err| {
+        std.log.err("labelle: git clone failed (is git installed?): {any}", .{err});
+        return error.FetchFailed;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            std.log.err("labelle: git clone failed:\n{s}", .{result.stderr});
+            return error.FetchFailed;
+        },
+        else => {
+            std.log.err("labelle: git clone terminated abnormally", .{});
+            return error.FetchFailed;
+        },
+    }
+
+    const git_dir = try std.fs.path.join(allocator, &.{ target, ".git" });
+    defer allocator.free(git_dir);
+    std.Io.Dir.cwd().deleteTree(io, git_dir) catch {};
+}
+
 /// Fetch assembler-bundled packages (backends, ecs, gui) into the cache.
 /// Clones from the labelle-assembler repo at the matching git ref.
 /// These packages ship with the assembler and are normally populated from the
