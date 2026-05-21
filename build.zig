@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     // fall back to `cli_version` ("dev" in a non-release build), which the
     // fetcher then mapped to a bogus `vdev` git ref (issue #159). A release
     // build of the CLI overrides each with `-D<pkg>_version=`.
-    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.11.0";
+    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.13.0";
     const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "1.42.0";
     const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.10.0";
     // Version this assembler binary stamps into a freshly scaffolded
