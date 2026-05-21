@@ -95,7 +95,11 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *config.ProjectConfig
 ///              fetched on demand if absent. Same layout cache.zig uses
 ///              for regular declared plugins.
 ///   .url     — a git URL, fetched into a deterministic per-URL cache
-///              slot (`~/.labelle/packages/gui-url/{hash}/{ref}`).
+///              slot (`~/.labelle/packages/gui-url/{url-hash}/{ref}`).
+///              `.version` is mapped to a git ref via `versionToGitRef`
+///              (semver → `v`-tag) like every other fetch path, and
+///              `.hash` — when set — is the expected commit SHA the
+///              checkout is verified against (see cache.fetchGuiUrl).
 fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: config.ProjectConfig, project_dir: []const u8) ![]const u8 {
     if (ref.path) |rel_path| {
         // Local path — resolve relative to project directory
@@ -136,19 +140,35 @@ fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: co
     }
     if (ref.url) |url| {
         // URL reference — fetch the repo into a deterministic per-URL
-        // cache slot. `.version`, when set, is the git ref to check out;
-        // otherwise the repo's default branch is used.
-        const git_ref = ref.version orelse "default";
+        // cache slot. `.version`, when set, names the git ref to check
+        // out; otherwise the repo's default branch is used.
+        //
+        // `.version` is routed through `config.versionToGitRef` exactly
+        // like every other fetch path (framework/plugin fetchers and the
+        // `.package` branch above): a semver `.version` (`0.3.0`) maps to
+        // the published release tag `v0.3.0`, while a branch name is used
+        // verbatim. Using `.version` raw here would have skipped the
+        // `v`-prefix and failed to find a semver release tag.
+        const clone_ref: ?[]u8 = if (ref.version) |v|
+            try config.versionToGitRef(allocator, v)
+        else
+            null;
+        defer if (clone_ref) |r| allocator.free(r);
 
-        const dir = try cache.resolveGuiUrl(allocator, url, git_ref);
+        // Cache slot keyed by the resolved git ref ("default" when the
+        // repo's default branch is used implicitly).
+        const slot = clone_ref orelse "default";
+
+        const dir = try cache.resolveGuiUrl(allocator, url, slot);
         errdefer allocator.free(dir);
 
         if (!cache.dirExists(dir)) {
-            std.log.info("labelle: fetching GUI plugin from {s} ({s})", .{ url, git_ref });
-            // For the implicit "default branch" case there is no ref to
-            // pass to `git clone --branch`; fetch the default head.
-            const clone_ref: ?[]const u8 = if (ref.version != null) ref.version else null;
-            cache.fetchGuiUrl(allocator, url, git_ref, clone_ref) catch |err| {
+            std.log.info("labelle: fetching GUI plugin from {s} ({s})", .{ url, slot });
+            // `.hash`, when set, is the expected commit SHA the checkout
+            // must resolve to — fetchGuiUrl verifies it (see its doc
+            // comment for the `.url`+`hash` contract). When null the
+            // plugin is fetched unpinned and fetchGuiUrl warns.
+            cache.fetchGuiUrl(allocator, url, slot, clone_ref, ref.hash) catch |err| {
                 std.log.err("labelle: could not fetch GUI plugin from '{s}': {s}", .{ url, @errorName(err) });
                 return error.GuiPluginFetchFailed;
             };
@@ -304,6 +324,38 @@ test "resolveGuiPackage: local: version bypasses the cache and resolves on disk"
     defer alloc.free(dir);
 
     try std.testing.expectEqualStrings(src_abs, dir);
+}
+
+test "resolvePluginDir: .url with a semver .version uses the v-prefixed tag as the cache slot" {
+    // Regression for the opencode MAJOR: the `.url` path must route
+    // `.version` through config.versionToGitRef just like every other
+    // fetch path — a semver `.version` resolves to the `v`-prefixed
+    // release tag. The cache slot is keyed by the resolved git ref, so
+    // a semver `.version` lands under a `v`-prefixed leaf.
+    const alloc = std.testing.allocator;
+
+    const git_ref = try config.versionToGitRef(alloc, "0.3.0");
+    defer alloc.free(git_ref);
+    try std.testing.expectEqualStrings("v0.3.0", git_ref);
+
+    const dir = try cache.resolveGuiUrl(alloc, "https://example.com/gui.git", git_ref);
+    defer alloc.free(dir);
+    // The slot leaf is the resolved git ref, not the raw version.
+    try std.testing.expectEqualStrings("v0.3.0", std.fs.path.basename(dir));
+}
+
+test "resolvePluginDir: .url with a branch .version uses the ref verbatim as the cache slot" {
+    // The other half of versionToGitRef: a non-semver `.version` (a
+    // branch name) is used verbatim — no `v` prefix.
+    const alloc = std.testing.allocator;
+
+    const git_ref = try config.versionToGitRef(alloc, "main");
+    defer alloc.free(git_ref);
+    try std.testing.expectEqualStrings("main", git_ref);
+
+    const dir = try cache.resolveGuiUrl(alloc, "https://example.com/gui.git", git_ref);
+    defer alloc.free(dir);
+    try std.testing.expectEqualStrings("main", std.fs.path.basename(dir));
 }
 
 test "resolveGuiPackage: a release version maps to the packages/plugins cache slot" {

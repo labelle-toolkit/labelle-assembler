@@ -504,19 +504,128 @@ pub fn resolveGuiUrl(allocator: std.mem.Allocator, url: []const u8, ref: []const
 /// `git_ref` is the branch/tag to check out, or null for the repo's
 /// default branch; `slot` is the cache-path component (the resolved ref
 /// name, or "default" for the implicit-default-branch case).
-pub fn fetchGuiUrl(allocator: std.mem.Allocator, url: []const u8, slot: []const u8, git_ref: ?[]const u8) !void {
+///
+/// `.url`+`hash` contract: a `.url` GUI plugin is git-cloned, so `hash`
+/// (when set) is the **expected commit SHA** the checked-out ref must
+/// resolve to. After cloning, the actual `HEAD` commit is verified against
+/// `expected_sha`; a mismatch aborts the fetch with `error.GuiUrlHashMismatch`
+/// so the build never proceeds against an unexpected revision. A full or
+/// abbreviated (>=7 char) SHA prefix is accepted. This differs from the
+/// Zig-package-manager `.url`+`hash` used in build.zig.zon, where `hash`
+/// is a tarball *content* hash — git URLs aren't fetched through the Zig
+/// package manager, so the closest pinning primitive available is the
+/// commit SHA. When `hash` is null the plugin is fetched unpinned (the
+/// pre-existing behavior) and a warning is emitted.
+pub fn fetchGuiUrl(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    slot: []const u8,
+    git_ref: ?[]const u8,
+    expected_sha: ?[]const u8,
+) !void {
     const target = try resolveGuiUrl(allocator, url, slot);
     defer allocator.free(target);
 
+    // Keep `.git` around when we still need to read HEAD for verification.
+    const keep_git_dir = expected_sha != null;
+
     if (git_ref) |r| {
-        try gitCloneShallow(allocator, url, r, target);
+        try gitCloneShallow2(allocator, url, r, target, keep_git_dir);
     } else {
-        try gitCloneShallowDefaultBranch(allocator, url, target);
+        try gitCloneShallowDefaultBranch2(allocator, url, target, keep_git_dir);
+    }
+
+    if (expected_sha) |sha| {
+        verifyGitHead(allocator, target, sha) catch |err| {
+            // The checkout is wrong / unverifiable — don't leave a poisoned
+            // cache slot that a later run would treat as already-fetched.
+            std.Io.Dir.cwd().deleteTree(config.globalIo(), target) catch {};
+            return err;
+        };
+        // Verification done — strip `.git` to match the unpinned path.
+        const git_dir = try std.fs.path.join(allocator, &.{ target, ".git" });
+        defer allocator.free(git_dir);
+        std.Io.Dir.cwd().deleteTree(config.globalIo(), git_dir) catch {};
+    } else {
+        std.log.warn(
+            "labelle: GUI plugin url '{s}' fetched without a '.hash' — " ++
+                "the checkout is unpinned and unverified; add '.hash = \"<commit-sha>\"' to pin it",
+            .{url},
+        );
+    }
+}
+
+/// Verify the `HEAD` commit of the git checkout at `repo_dir` matches
+/// `expected_sha`. Accepts a full 40-char SHA or an abbreviated prefix
+/// (>=7 chars). Returns `error.GuiUrlHashMismatch` on mismatch.
+fn verifyGitHead(allocator: std.mem.Allocator, repo_dir: []const u8, expected_sha: []const u8) !void {
+    if (expected_sha.len < 7 or expected_sha.len > 40) {
+        std.log.err(
+            "labelle: GUI plugin '.hash' must be a git commit SHA (7-40 hex chars), got '{s}'",
+            .{expected_sha},
+        );
+        return error.GuiUrlHashInvalid;
+    }
+    for (expected_sha) |c| {
+        if (!std.ascii.isHex(c)) {
+            std.log.err(
+                "labelle: GUI plugin '.hash' must be a git commit SHA (hex), got '{s}'",
+                .{expected_sha},
+            );
+            return error.GuiUrlHashInvalid;
+        }
+    }
+
+    const io = config.globalIo();
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "git", "-C", repo_dir, "rev-parse", "HEAD" },
+    }) catch |err| {
+        std.log.err("labelle: could not run git rev-parse to verify '.hash': {any}", .{err});
+        return error.GuiUrlHashUnverifiable;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            std.log.err("labelle: git rev-parse HEAD failed:\n{s}", .{result.stderr});
+            return error.GuiUrlHashUnverifiable;
+        },
+        else => {
+            std.log.err("labelle: git rev-parse HEAD terminated abnormally", .{});
+            return error.GuiUrlHashUnverifiable;
+        },
+    }
+
+    const head = std.mem.trim(u8, result.stdout, " \t\r\n");
+    // Case-insensitive prefix match: a full SHA matches exactly, an
+    // abbreviated `.hash` matches the leading hex of the resolved HEAD.
+    const matches = head.len >= expected_sha.len and
+        std.ascii.eqlIgnoreCase(head[0..expected_sha.len], expected_sha);
+    if (!matches) {
+        std.log.err(
+            "labelle: GUI plugin url checkout commit '{s}' does not match expected '.hash' '{s}'",
+            .{ head, expected_sha },
+        );
+        return error.GuiUrlHashMismatch;
     }
 }
 
 /// Shallow-clone a git repo's default branch (no `--branch`) into `target`.
 fn gitCloneShallowDefaultBranch(allocator: std.mem.Allocator, repo_url: []const u8, target: []const u8) !void {
+    return gitCloneShallowDefaultBranch2(allocator, repo_url, target, false);
+}
+
+/// Like gitCloneShallowDefaultBranch, but `keep_git_dir` controls whether the
+/// `.git` directory is stripped afterwards. Callers that need to verify the
+/// checked-out commit (`.url`+`hash`) pass `true` and strip `.git` themselves
+/// once verification has run.
+fn gitCloneShallowDefaultBranch2(
+    allocator: std.mem.Allocator,
+    repo_url: []const u8,
+    target: []const u8,
+    keep_git_dir: bool,
+) !void {
     const io = config.globalIo();
     if (std.fs.path.dirname(target)) |parent| {
         std.Io.Dir.cwd().createDirPath(io, parent) catch {};
@@ -542,6 +651,7 @@ fn gitCloneShallowDefaultBranch(allocator: std.mem.Allocator, repo_url: []const 
         },
     }
 
+    if (keep_git_dir) return;
     const git_dir = try std.fs.path.join(allocator, &.{ target, ".git" });
     defer allocator.free(git_dir);
     std.Io.Dir.cwd().deleteTree(io, git_dir) catch {};
@@ -598,6 +708,20 @@ pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: [
 /// Shallow clone a git repo at a specific git ref (tag or branch) into the
 /// target directory.
 fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, git_ref: []const u8, target: []const u8) !void {
+    return gitCloneShallow2(allocator, repo_url, git_ref, target, false);
+}
+
+/// Like gitCloneShallow, but `keep_git_dir` controls whether the `.git`
+/// directory is stripped afterwards. Callers that need to verify the
+/// checked-out commit (`.url`+`hash`) pass `true` and strip `.git`
+/// themselves once verification has run.
+fn gitCloneShallow2(
+    allocator: std.mem.Allocator,
+    repo_url: []const u8,
+    git_ref: []const u8,
+    target: []const u8,
+    keep_git_dir: bool,
+) !void {
     const io = config.globalIo();
     // Ensure parent directory exists
     if (std.fs.path.dirname(target)) |parent| {
@@ -626,6 +750,7 @@ fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, git_ref: 
         },
     }
 
+    if (keep_git_dir) return;
     // Remove .git directory to save space
     const git_dir = try std.fs.path.join(allocator, &.{ target, ".git" });
     defer allocator.free(git_dir);
@@ -1175,4 +1300,73 @@ test "resolveProjectRoot: malformed linkfile returns project_dir unchanged" {
     defer alloc.free(root);
 
     try std.testing.expectEqualStrings(wt_abs, root);
+}
+
+test "verifyGitHead: rejects a non-hex / wrong-length `.hash`" {
+    const alloc = std.testing.allocator;
+    // Too short.
+    try std.testing.expectError(
+        error.GuiUrlHashInvalid,
+        verifyGitHead(alloc, "/tmp/does-not-matter", "abc"),
+    );
+    // Non-hex characters.
+    try std.testing.expectError(
+        error.GuiUrlHashInvalid,
+        verifyGitHead(alloc, "/tmp/does-not-matter", "zzzzzzzz"),
+    );
+}
+
+test "verifyGitHead: matches the HEAD commit of a real git repo" {
+    const alloc = std.testing.allocator;
+    const io = config.globalIo();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "repo");
+    const repo_abs = try tmp.dir.realPathFileAlloc(io, "repo", alloc);
+    defer alloc.free(repo_abs);
+
+    // Build a one-commit git repo. Skip the test gracefully if git is
+    // unavailable in the environment.
+    const gitRun = struct {
+        fn run(a: std.mem.Allocator, argv: []const []const u8) !bool {
+            const r = std.process.run(a, config.globalIo(), .{ .argv = argv }) catch return false;
+            defer a.free(r.stdout);
+            defer a.free(r.stderr);
+            return switch (r.term) {
+                .exited => |code| code == 0,
+                else => false,
+            };
+        }
+    }.run;
+
+    if (!try gitRun(alloc, &.{ "git", "-C", repo_abs, "init", "-q" })) return error.SkipZigTest;
+    _ = try gitRun(alloc, &.{ "git", "-C", repo_abs, "config", "user.email", "t@t.t" });
+    _ = try gitRun(alloc, &.{ "git", "-C", repo_abs, "config", "user.name", "t" });
+    {
+        const f = try tmp.dir.createFile(io, "repo/file.txt", .{});
+        f.close(io);
+    }
+    _ = try gitRun(alloc, &.{ "git", "-C", repo_abs, "add", "." });
+    if (!try gitRun(alloc, &.{ "git", "-C", repo_abs, "commit", "-q", "-m", "init" }))
+        return error.SkipZigTest;
+
+    // Read the actual HEAD SHA.
+    const rev = std.process.run(alloc, io, .{
+        .argv = &.{ "git", "-C", repo_abs, "rev-parse", "HEAD" },
+    }) catch return error.SkipZigTest;
+    defer alloc.free(rev.stdout);
+    defer alloc.free(rev.stderr);
+    const head = std.mem.trim(u8, rev.stdout, " \t\r\n");
+
+    // Full SHA verifies.
+    try verifyGitHead(alloc, repo_abs, head);
+    // Abbreviated (10-char) prefix verifies.
+    try verifyGitHead(alloc, repo_abs, head[0..10]);
+    // A wrong SHA is rejected.
+    try std.testing.expectError(
+        error.GuiUrlHashMismatch,
+        verifyGitHead(alloc, repo_abs, "0123456789abcdef0123456789abcdef01234567"),
+    );
 }
