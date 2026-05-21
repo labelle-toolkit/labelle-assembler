@@ -375,9 +375,12 @@ test "scaffold pins real fetchable framework versions — #159 regression" {
     );
     defer alloc.free(labelle);
 
-    // Parse it back and confirm each fetched framework version is
-    // semver-shaped (starts with a digit) — i.e. it maps to a real `v<x>`
-    // release tag rather than a bogus ref like `vdev`.
+    // Parse it back and confirm each scaffolded framework version satisfies
+    // the proper semver shape via config.isSemverVersion (digits-and-dots
+    // with at least one dot) — i.e. it maps to a real `v<x.y.z>` release tag
+    // rather than a bogus ref like `vdev`. Asserting the full semver shape
+    // (not merely "starts with a digit") stops a stale non-semver default
+    // from slipping through.
     const src = try alloc.dupeZ(u8, labelle);
     defer alloc.free(src);
     var arena = std.heap.ArenaAllocator.init(alloc);
