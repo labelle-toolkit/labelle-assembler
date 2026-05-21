@@ -288,7 +288,20 @@ pub fn localVersionPath(version: []const u8) []const u8 {
 /// to a git ref: semver-shaped versions are published as `v`-prefixed tags
 /// (`v1.2.3`), while anything else is treated as a branch / ref name.
 pub fn isSemverVersion(version: []const u8) bool {
-    return version.len > 0 and std.ascii.isDigit(version[0]);
+    // A package release version is digits and dots only, with at least
+    // one dot (`1.13.0`, `0.31.0`). "Starts with a digit" was too loose
+    // — a digit-leading branch ref like `159-fix` or `2026/dev` would be
+    // mis-classified and clone-mangled into `v159-fix` (#159 review).
+    if (version.len == 0 or !std.ascii.isDigit(version[0])) return false;
+    var has_dot = false;
+    for (version) |c| {
+        if (c == '.') {
+            has_dot = true;
+        } else if (!std.ascii.isDigit(c)) {
+            return false;
+        }
+    }
+    return has_dot;
 }
 
 /// Map a package `version` string to the git ref to clone.
@@ -312,7 +325,7 @@ test "versionToGitRef: semver versions get a `v` prefix" {
     inline for (.{
         .{ "1.2.3", "v1.2.3" },
         .{ "0.31.0", "v0.31.0" },
-        .{ "2", "v2" },
+        .{ "1.13.0", "v1.13.0" },
     }) |case| {
         const ref = try versionToGitRef(alloc, case[0]);
         defer alloc.free(ref);
@@ -322,8 +335,10 @@ test "versionToGitRef: semver versions get a `v` prefix" {
 
 test "versionToGitRef: non-numeric versions are used verbatim as a ref" {
     const alloc = std.testing.allocator;
-    // The #159 regression: `dev` must not become `vdev`.
-    inline for (.{ "dev", "main", "feature/foo" }) |branch| {
+    // The #159 regression: `dev` must not become `vdev`. Digit-leading
+    // branch refs (`159-fix`, `2026/dev`) must also pass through verbatim
+    // — they are not semver despite the leading digit.
+    inline for (.{ "dev", "main", "feature/foo", "159-fix", "2026/dev" }) |branch| {
         const ref = try versionToGitRef(alloc, branch);
         defer alloc.free(ref);
         try std.testing.expectEqualStrings(branch, ref);
@@ -336,6 +351,10 @@ test "isSemverVersion: classifies version strings" {
     try std.testing.expect(!isSemverVersion("dev"));
     try std.testing.expect(!isSemverVersion("main"));
     try std.testing.expect(!isSemverVersion(""));
+    // Digit-leading branch refs are not semver.
+    try std.testing.expect(!isSemverVersion("159-fix"));
+    try std.testing.expect(!isSemverVersion("2026/dev"));
+    try std.testing.expect(!isSemverVersion("159")); // no dot — treated as a ref
 }
 
 // ── GUI Plugin System ────────────────────────────────────────────────
