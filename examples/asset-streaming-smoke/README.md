@@ -16,7 +16,7 @@ Tracks [labelle-assembler#55](https://github.com/labelle-toolkit/labelle-assembl
    `setSceneAssets` loop so every scene's manifest is attached to its
    `SceneEntry.assets` at init time.
 3. `scenes/loading.jsonc` has an empty `"assets": []` block — it
-   loads instantly on `initial_scene = "loading"`.
+   loads instantly on `initial_prefab = "loading"`.
 4. `scripts/loading/loading_controller.zig` reads
    `game.scenes.get("main").?.assets`, calls `loadAtlasIfNeeded` for
    one pending atlas per frame, draws a screen-space progress bar

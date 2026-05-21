@@ -6,7 +6,7 @@
     .target_fps = 60,
     .backend = .raylib,
     .ecs = .zig_ecs,
-    .initial_scene = "loading",
+    .initial_prefab = "loading",
     // Two states: the "loading" state drives the progress bar + atlas
     // decode loop; "playing" runs once every main-scene asset is ready.
     // First state in the list is the initial state (see buildSetupCode

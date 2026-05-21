@@ -6,7 +6,7 @@
     .target_fps = 60,
     .backend = .raylib,
     .ecs = .zig_ecs,
-    .initial_scene = "main",
+    .initial_prefab = "main",
     .states = .{"playing"},
     .resources = .{},
     .layers = .{

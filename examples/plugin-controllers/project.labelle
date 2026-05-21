@@ -24,7 +24,7 @@
     // actually runs (closing the runtime coverage gap PR #73 flagged).
     .backend = .null,
     .ecs = .mock,
-    .initial_scene = "main",
+    .initial_prefab = "main",
     .states = .{"playing"},
     .plugins = .{
         .{ .name = "demo_plugin", .repo = "local:./plugin" },
