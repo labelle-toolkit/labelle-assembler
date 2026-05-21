@@ -42,7 +42,7 @@ The binary is written to `zig-out/bin/labelle-assembler`.
 | Flag | Description |
 |------|-------------|
 | `--project-root <path>` | Path to game project (containing `project.labelle`) |
-| `--scene <name>` | Override initial scene |
+| `--scene <name>` | Override the initial prefab |
 | `--platform <name>` | Override target platform (`desktop`, `wasm`, `ios`, `android`) |
 | `--backend <name>` | Override graphics backend (`raylib`, `sokol`, `sdl`, `bgfx`, `wgpu`, `null`) |
 

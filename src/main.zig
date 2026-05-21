@@ -57,7 +57,7 @@ const usage =
     \\
     \\Generate options:
     \\  --project-root <path>   Path to game project (containing project.labelle)
-    \\  --scene <name>          Override initial scene from project.labelle
+    \\  --scene <name>          Override the initial prefab from project.labelle
     \\  --platform <name>       Override target platform (desktop, wasm, ios, android)
     \\  --backend <name>        Override graphics backend (raylib, sokol, sdl, bgfx, wgpu)
     \\
