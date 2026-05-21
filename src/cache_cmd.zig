@@ -114,7 +114,13 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         return;
     }
 
-    // Form 2: install <pkg> <version>.
+    // Form 2: install <pkg> <version>. Reject any trailing positionals —
+    // silently ignoring them hides typos like `install gfx 1.0 1.1`.
+    if (positionals.items.len > 2) {
+        std.log.err("labelle-assembler install: too many arguments — expected 'install <pkg> <version>'", .{});
+        writeStderr(io, "\n" ++ install_usage);
+        std.process.exit(2);
+    }
     const pkg_name = positionals.items[0];
     const version = positionals.items[1];
     if (std.mem.eql(u8, pkg_name, "core") or
@@ -143,7 +149,7 @@ const clean_usage =
     \\
     \\Keeps the versions referenced by project.labelle (if found) plus the
     \\assembler's built-in default versions; removes everything else under
-    \\~/.labelle/packages/.
+    \\~/.labelle/packages/ (core, engine, gfx, cli, and assembler namespaces).
     \\
 ;
 
@@ -187,9 +193,12 @@ pub fn cmdClean(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
 
     var kept = std.StringHashMap(std.StringHashMap(void)).init(arena_alloc);
 
-    const pkg_names = [_][]const u8{ "core", "engine", "gfx", "cli" };
+    // The `assembler` namespace (~/.labelle/packages/assembler/<version>/)
+    // is pruned alongside the framework packages. Its built-in default is
+    // this binary's own version.
+    const pkg_names = [_][]const u8{ "core", "engine", "gfx", "cli", "assembler" };
     const default_versions = [_][]const u8{
-        gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION,
+        gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION, gen.ASSEMBLER_VERSION,
     };
     for (pkg_names, 0..) |name, i| {
         var version_set = std.StringHashMap(void).init(arena_alloc);
@@ -203,6 +212,9 @@ pub fn cmdClean(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
             .{ .name = "engine", .version = cfg.engine_version },
             .{ .name = "gfx", .version = cfg.gfx_version },
             .{ .name = "cli", .version = cfg.labelle_version },
+            // assembler_version is optional in project.labelle; it falls
+            // back to labelle_version, matching ensureCache's resolution.
+            .{ .name = "assembler", .version = cfg.assembler_version orelse cfg.labelle_version },
         };
         for (project_refs) |ref| {
             if (config.isLocalVersion(ref.version)) continue;
@@ -312,7 +324,10 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const cfg = readProjectConfig(arena_alloc, io, root) catch {
+    // Parse project.labelle up front to fail fast on a malformed file —
+    // the parsed config itself is no longer needed (replaceVersionField
+    // edits the raw text and inserts omitted fields directly).
+    _ = readProjectConfig(arena_alloc, io, root) catch {
         std.log.err("labelle-assembler upgrade: failed to read project.labelle in '{s}'", .{root});
         std.process.exit(1);
     };
@@ -327,12 +342,22 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         std.log.info("labelle-assembler: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})", .{
             gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION,
         });
-        content = try replaceVersionField(arena_alloc, content, "core_version", cfg.core_version, gen.CORE_VERSION);
-        content = try replaceVersionField(arena_alloc, content, "engine_version", cfg.engine_version, gen.ENGINE_VERSION);
-        content = try replaceVersionField(arena_alloc, content, "gfx_version", cfg.gfx_version, gen.GFX_VERSION);
-        content = try replaceVersionField(arena_alloc, content, "labelle_version", cfg.labelle_version, gen.CLI_VERSION);
+        content = try replaceVersionField(arena_alloc, content, "core_version", gen.CORE_VERSION);
+        content = try replaceVersionField(arena_alloc, content, "engine_version", gen.ENGINE_VERSION);
+        content = try replaceVersionField(arena_alloc, content, "gfx_version", gen.GFX_VERSION);
+        content = try replaceVersionField(arena_alloc, content, "labelle_version", gen.CLI_VERSION);
     } else {
         const pkg = positionals.items[0];
+
+        // `upgrade all` is defined as "snap every package to the
+        // assembler's built-in compatible set". A version argument is
+        // meaningless there — one version can't apply to four distinct
+        // packages — so reject it instead of logging a version we ignore.
+        if (std.mem.eql(u8, pkg, "all") and positionals.items.len > 1) {
+            std.log.err("labelle-assembler upgrade: 'all' upgrades every package to the assembler's compatible set — it does not take a version argument", .{});
+            std.process.exit(2);
+        }
+
         const default_version: []const u8 = if (std.mem.eql(u8, pkg, "core"))
             gen.CORE_VERSION
         else if (std.mem.eql(u8, pkg, "engine"))
@@ -344,23 +369,29 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         const version = if (positionals.items.len > 1) positionals.items[1] else default_version;
 
         if (std.mem.eql(u8, pkg, "core")) {
-            content = try replaceVersionField(arena_alloc, content, "core_version", cfg.core_version, version);
+            content = try replaceVersionField(arena_alloc, content, "core_version", version);
         } else if (std.mem.eql(u8, pkg, "engine")) {
-            content = try replaceVersionField(arena_alloc, content, "engine_version", cfg.engine_version, version);
+            content = try replaceVersionField(arena_alloc, content, "engine_version", version);
         } else if (std.mem.eql(u8, pkg, "gfx")) {
-            content = try replaceVersionField(arena_alloc, content, "gfx_version", cfg.gfx_version, version);
+            content = try replaceVersionField(arena_alloc, content, "gfx_version", version);
         } else if (std.mem.eql(u8, pkg, "labelle") or std.mem.eql(u8, pkg, "cli")) {
-            content = try replaceVersionField(arena_alloc, content, "labelle_version", cfg.labelle_version, version);
+            content = try replaceVersionField(arena_alloc, content, "labelle_version", version);
         } else if (std.mem.eql(u8, pkg, "all")) {
-            content = try replaceVersionField(arena_alloc, content, "core_version", cfg.core_version, gen.CORE_VERSION);
-            content = try replaceVersionField(arena_alloc, content, "engine_version", cfg.engine_version, gen.ENGINE_VERSION);
-            content = try replaceVersionField(arena_alloc, content, "gfx_version", cfg.gfx_version, gen.GFX_VERSION);
-            content = try replaceVersionField(arena_alloc, content, "labelle_version", cfg.labelle_version, gen.CLI_VERSION);
+            content = try replaceVersionField(arena_alloc, content, "core_version", gen.CORE_VERSION);
+            content = try replaceVersionField(arena_alloc, content, "engine_version", gen.ENGINE_VERSION);
+            content = try replaceVersionField(arena_alloc, content, "gfx_version", gen.GFX_VERSION);
+            content = try replaceVersionField(arena_alloc, content, "labelle_version", gen.CLI_VERSION);
         } else {
             std.log.err("labelle-assembler upgrade: unknown package '{s}' (packages: core, engine, gfx, cli, all)", .{pkg});
             std.process.exit(2);
         }
-        std.log.info("labelle-assembler: upgrading {s} to {s}", .{ pkg, version });
+        if (std.mem.eql(u8, pkg, "all")) {
+            std.log.info("labelle-assembler: upgrading all packages to the assembler's compatible set (core={s}, engine={s}, gfx={s}, cli={s})", .{
+                gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION,
+            });
+        } else {
+            std.log.info("labelle-assembler: upgrading {s} to {s}", .{ pkg, version });
+        }
     }
 
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = labelle_path, .data = content }) catch {
@@ -372,26 +403,95 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
     std.log.info("  run 'labelle generate' to regenerate build files", .{});
 }
 
-/// Rewrite `.<field> = "<old>"` to `.<field> = "<new>"` in ZON content.
-/// Returns the input unchanged when the field is absent. Arena-allocated;
-/// the caller's arena owns the result.
+/// Rewrite a ZON version field to `new_value`.
+///
+/// Two cases:
+///   1. The field is written explicitly (`.<field> = "<anything>"`) — its
+///      value is replaced in place, preserving the original quoting/spacing
+///      around the `=`.
+///   2. The field is absent — it defaulted from the config schema, so it
+///      was never in the file. The field is *inserted* before the final
+///      closing `}` of the top-level struct so the upgrade actually takes
+///      effect (the previous behavior was a silent no-op).
+///
+/// `old_value` is no longer used to locate the field — matching only an
+/// exact prior value meant a defaulted/omitted field was never touched.
+/// Only the returned slice is allocated; all intermediates are freed, so
+/// the function is safe under a leak-checking allocator (it's normally
+/// called with an arena, but the tests use the testing allocator).
 fn replaceVersionField(
     allocator: std.mem.Allocator,
     content: []const u8,
     field_name: []const u8,
-    old_value: []const u8,
     new_value: []const u8,
 ) ![]u8 {
-    const search = try std.fmt.allocPrint(allocator, ".{s} = \"{s}\"", .{ field_name, old_value });
-    const replace = try std.fmt.allocPrint(allocator, ".{s} = \"{s}\"", .{ field_name, new_value });
-    if (std.mem.indexOf(u8, content, search)) |idx| {
+    // Locate an existing `.<field>` token (start of a struct field).
+    const field_token = try std.fmt.allocPrint(allocator, ".{s}", .{field_name});
+    defer allocator.free(field_token);
+
+    if (findFieldAssignment(content, field_token)) |span| {
         var result: std.ArrayList(u8) = .empty;
-        try result.appendSlice(allocator, content[0..idx]);
-        try result.appendSlice(allocator, replace);
-        try result.appendSlice(allocator, content[idx + search.len ..]);
+        errdefer result.deinit(allocator);
+        try result.appendSlice(allocator, content[0..span.start]);
+        try result.print(allocator, ".{s} = \"{s}\"", .{ field_name, new_value });
+        try result.appendSlice(allocator, content[span.end..]);
         return result.toOwnedSlice(allocator);
     }
-    return try allocator.dupe(u8, content);
+
+    // Field absent — insert it before the final closing brace.
+    const close = std.mem.lastIndexOfScalar(u8, content, '}') orelse {
+        // Not a recognizable ZON struct — leave it untouched rather than
+        // corrupt the file.
+        return try allocator.dupe(u8, content);
+    };
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    try result.appendSlice(allocator, content[0..close]);
+    try result.print(allocator, "    .{s} = \"{s}\",\n", .{ field_name, new_value });
+    try result.appendSlice(allocator, content[close..]);
+    return result.toOwnedSlice(allocator);
+}
+
+/// Byte span `[start, end)` of a `.<field> = "<value>"` assignment.
+const FieldSpan = struct { start: usize, end: usize };
+
+/// Find a `.<field> = "..."` assignment in ZON `content`. `field_token` is
+/// the `.<field>` prefix. Returns the span covering the dot through the
+/// closing quote of the string value, or null when the field is absent or
+/// not assigned a string literal.
+fn findFieldAssignment(content: []const u8, field_token: []const u8) ?FieldSpan {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, content, search_from, field_token)) |idx| {
+        search_from = idx + field_token.len;
+        // Must be a real field token: preceded by whitespace/brace/start and
+        // followed by whitespace or `=` (so `.gfx_version` doesn't match a
+        // hypothetical `.gfx_versions`).
+        if (idx > 0) {
+            const prev = content[idx - 1];
+            if (prev != ' ' and prev != '\t' and prev != '\n' and prev != '{' and prev != ',') continue;
+        }
+        var j = idx + field_token.len;
+        if (j >= content.len) return null;
+        const after = content[j];
+        if (after != ' ' and after != '\t' and after != '=') continue;
+        // Skip whitespace, require `=`.
+        while (j < content.len and (content[j] == ' ' or content[j] == '\t')) j += 1;
+        if (j >= content.len or content[j] != '=') continue;
+        j += 1;
+        while (j < content.len and (content[j] == ' ' or content[j] == '\t')) j += 1;
+        if (j >= content.len or content[j] != '"') continue;
+        // Find the matching closing quote (honoring backslash escapes).
+        var k = j + 1;
+        while (k < content.len) : (k += 1) {
+            if (content[k] == '\\') {
+                k += 1;
+                continue;
+            }
+            if (content[k] == '"') return .{ .start = idx, .end = k + 1 };
+        }
+        return null;
+    }
+    return null;
 }
 
 // ── cache population (ported from labelle-cli/src/cli/cache.zig) ──────
@@ -539,4 +639,126 @@ fn readProjectConfigQuiet(allocator: std.mem.Allocator, io: std.Io, project_dir:
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+// ── tests: upgrade version-field rewriting ───────────────────────────
+//
+// Regression guard for the #158 review findings: `upgrade` was a no-op
+// for any version field not written verbatim in project.labelle (a
+// defaulted/omitted field), because `replaceVersionField` only matched
+// an exact `.field = "<old>"` string.
+
+test "replaceVersionField rewrites an explicitly written field" {
+    const alloc = std.testing.allocator;
+    const content =
+        \\.{
+        \\    .name = "g",
+        \\    .core_version = "0.1.0",
+        \\}
+        \\
+    ;
+    const out = try replaceVersionField(alloc, content, "core_version", "0.9.9");
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".core_version = \"0.9.9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "0.1.0") == null);
+}
+
+test "replaceVersionField rewrites regardless of the prior value" {
+    // The old implementation needed the caller to pass the exact current
+    // value. The new one locates the field by name, so any prior value
+    // (including one that doesn't match the config default) is replaced.
+    const alloc = std.testing.allocator;
+    const content =
+        \\.{
+        \\    .gfx_version = "1.2.3-custom",
+        \\}
+        \\
+    ;
+    const out = try replaceVersionField(alloc, content, "gfx_version", "2.0.0");
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".gfx_version = \"2.0.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1.2.3-custom") == null);
+}
+
+test "replaceVersionField inserts an omitted field instead of no-op" {
+    const alloc = std.testing.allocator;
+    const content =
+        \\.{
+        \\    .name = "g",
+        \\    .engine_version = "0.1.0",
+        \\}
+        \\
+    ;
+    // core_version is absent (it defaulted from the schema). Upgrading it
+    // must insert the field, not silently do nothing.
+    const out = try replaceVersionField(alloc, content, "core_version", "0.5.0");
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".core_version = \"0.5.0\"") != null);
+    // The pre-existing field must be untouched.
+    try std.testing.expect(std.mem.indexOf(u8, out, ".engine_version = \"0.1.0\"") != null);
+    // Result must still be a closed struct.
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, out, "\n"), "}"));
+}
+
+test "replaceVersionField inserted field round-trips through the ZON parser" {
+    const alloc = std.testing.allocator;
+    const content =
+        \\.{
+        \\    .name = "g",
+        \\    .title = "g",
+        \\    .backend = .raylib,
+        \\    .ecs = .zig_ecs,
+        \\}
+        \\
+    ;
+    var c = try alloc.dupe(u8, content);
+    inline for (.{
+        .{ "core_version", "1.0.0" },
+        .{ "engine_version", "1.0.1" },
+        .{ "gfx_version", "1.0.2" },
+        .{ "labelle_version", "1.0.3" },
+    }) |pair| {
+        const next = try replaceVersionField(alloc, c, pair[0], pair[1]);
+        alloc.free(c);
+        c = next;
+    }
+    defer alloc.free(c);
+
+    const src = try alloc.dupeZ(u8, c);
+    defer alloc.free(src);
+    // Parse into an arena: ProjectConfig carries comptime-default slice
+    // fields (e.g. `.layers`) that std.zon.parse.free would choke on.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
+    try std.testing.expectEqualStrings("1.0.0", cfg.core_version);
+    try std.testing.expectEqualStrings("1.0.1", cfg.engine_version);
+    try std.testing.expectEqualStrings("1.0.2", cfg.gfx_version);
+    try std.testing.expectEqualStrings("1.0.3", cfg.labelle_version);
+}
+
+test "replaceVersionField does not match a longer field name" {
+    // `.gfx_version` must not be found inside a `.gfx_versions` token.
+    const alloc = std.testing.allocator;
+    const content =
+        \\.{
+        \\    .gfx_versions = "should-not-touch",
+        \\}
+        \\
+    ;
+    const out = try replaceVersionField(alloc, content, "gfx_version", "9.9.9");
+    defer alloc.free(out);
+    // The bogus field is left alone and a real `.gfx_version` is inserted.
+    try std.testing.expect(std.mem.indexOf(u8, out, "should-not-touch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".gfx_version = \"9.9.9\"") != null);
+}
+
+test "findFieldAssignment tolerates extra whitespace around =" {
+    const content =
+        \\.{
+        \\    .core_version   =   "0.1.0",
+        \\}
+    ;
+    const span = findFieldAssignment(content, ".core_version") orelse return error.NotFound;
+    try std.testing.expectEqualStrings(".core_version   =   \"0.1.0\"", content[span.start..span.end]);
 }

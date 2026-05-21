@@ -25,6 +25,21 @@ fn writeStderr(io: std.Io, msg: []const u8) void {
     std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
 }
 
+/// Escape `value` for embedding inside a ZON double-quoted string literal.
+/// Backslashes and double quotes are the only characters that would break
+/// the literal — a project name or version containing either would
+/// otherwise produce a `project.labelle` that fails to parse. Returns an
+/// allocator-owned slice; the caller frees it.
+fn escapeZonString(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (value) |c| {
+        if (c == '\\' or c == '"') try out.append(allocator, '\\');
+        try out.append(allocator, c);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 const init_usage =
     \\labelle-assembler init — scaffold a new project directory
     \\
@@ -136,6 +151,24 @@ pub fn scaffold(allocator: std.mem.Allocator, io: std.Io, opts: InitOptions) !vo
         defer aw.deinit();
         const w = &aw.writer;
 
+        // Escape every value that lands inside a `"..."` ZON literal — a
+        // name/path/version containing a quote or backslash would
+        // otherwise produce an unparseable project.labelle. `backend` and
+        // `ecs` are enum tags (`.{s}`, no quotes); they're validated
+        // against fixed enums downstream, so they're left unescaped.
+        const name_z = try escapeZonString(allocator, opts.name);
+        defer allocator.free(name_z);
+        const core_z = try escapeZonString(allocator, opts.core_version);
+        defer allocator.free(core_z);
+        const engine_z = try escapeZonString(allocator, opts.engine_version);
+        defer allocator.free(engine_z);
+        const gfx_z = try escapeZonString(allocator, opts.gfx_version);
+        defer allocator.free(gfx_z);
+        const labelle_z = try escapeZonString(allocator, opts.labelle_version);
+        defer allocator.free(labelle_z);
+        const assembler_z = try escapeZonString(allocator, opts.assembler_version);
+        defer allocator.free(assembler_z);
+
         try w.print(
             \\.{{
             \\    .name = "{s}",
@@ -146,14 +179,16 @@ pub fn scaffold(allocator: std.mem.Allocator, io: std.Io, opts: InitOptions) !vo
             \\    .backend = .{s},
             \\    .ecs = .{s},
             \\
-        , .{ opts.name, opts.name, opts.backend, opts.ecs });
+        , .{ name_z, name_z, opts.backend, opts.ecs });
 
         // GUI plugin reference (null = no GUI, or a plugin ref)
         if (opts.gui) |gui_path| {
+            const gui_z = try escapeZonString(allocator, gui_path);
+            defer allocator.free(gui_z);
             try w.print(
                 \\    .gui = .{{ .path = "{s}" }},
                 \\
-            , .{gui_path});
+            , .{gui_z});
         }
 
         try w.print(
@@ -170,7 +205,7 @@ pub fn scaffold(allocator: std.mem.Allocator, io: std.Io, opts: InitOptions) !vo
             \\    .assembler_version = "{s}",
             \\}}
             \\
-        , .{ opts.core_version, opts.engine_version, opts.gfx_version, opts.labelle_version, opts.assembler_version });
+        , .{ core_z, engine_z, gfx_z, labelle_z, assembler_z });
 
         const path = try std.fs.path.join(allocator, &.{ dir, "project.labelle" });
         defer allocator.free(path);
@@ -312,4 +347,64 @@ test "scaffold writes a project.labelle with the requested fields" {
     try std.testing.expect(std.mem.indexOf(u8, labelle, ".backend = .sokol") != null);
     try std.testing.expect(std.mem.indexOf(u8, labelle, ".ecs = .zflecs") != null);
     try std.testing.expect(std.mem.indexOf(u8, labelle, ".assembler_version = ") != null);
+}
+
+test "escapeZonString escapes quotes and backslashes" {
+    const alloc = std.testing.allocator;
+
+    const a = try escapeZonString(alloc, "say\"hi");
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("say\\\"hi", a);
+
+    const b = try escapeZonString(alloc, "path\\to");
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("path\\\\to", b);
+
+    const c = try escapeZonString(alloc, "plain");
+    defer alloc.free(c);
+    try std.testing.expectEqualStrings("plain", c);
+}
+
+test "scaffold writes a parseable project.labelle for a name with a quote" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = config.globalIo();
+
+    try tmp.dir.createDirPath(io, "init-escape");
+    const project_dir = try tmp.dir.realPathFileAlloc(io, "init-escape", alloc);
+    defer alloc.free(project_dir);
+
+    // A name containing both a double quote and a backslash — verbatim
+    // interpolation would produce an unparseable project.labelle.
+    try scaffold(alloc, io, .{
+        .name = "ev\"il\\game",
+        .dir = project_dir,
+        .core_version = "1.0\"0",
+    });
+
+    const labelle = try tmp.dir.readFileAlloc(
+        io,
+        "init-escape/project.labelle",
+        alloc,
+        .limited(4096),
+    );
+    defer alloc.free(labelle);
+
+    // The escaped form must be present...
+    try std.testing.expect(std.mem.indexOf(u8, labelle, "ev\\\"il\\\\game") != null);
+    try std.testing.expect(std.mem.indexOf(u8, labelle, "1.0\\\"0") != null);
+
+    // ...and the file must still parse as ZON.
+    const src = try alloc.dupeZ(u8, labelle);
+    defer alloc.free(src);
+    // Parse into an arena: ProjectConfig carries comptime-default slice
+    // fields (e.g. `.layers`) that std.zon.parse.free would choke on.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
+    try std.testing.expectEqualStrings("ev\"il\\game", cfg.name);
+    try std.testing.expectEqualStrings("1.0\"0", cfg.core_version);
 }

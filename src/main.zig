@@ -9,10 +9,11 @@
 //! in Phase 2 (opt-in via `LABELLE_ASSEMBLER` env var) and Phase 3
 //! (project-pinned `assembler_version` in `project.labelle`).
 //!
-//! Cache prerequisite: this binary assumes the package cache is already
-//! populated (engine/core/gfx packages available where the generator
-//! expects them). The CLI handles cache management before invoking the
-//! assembler. Running the binary directly is intended for testing the
+//! Cache: `generate` reads the local package cache (engine/core/gfx
+//! packages where the generator expects them). The binary now owns cache
+//! management itself via the `install`/`clean`/`upgrade` subcommands —
+//! run `install` before `generate`, or let the `labelle` CLI orchestrate
+//! it. Running the binary directly is intended for testing the
 //! CLI ↔ assembler boundary and for power users who manage their own
 //! cache.
 
@@ -61,9 +62,9 @@ const usage =
     \\  --backend <name>        Override graphics backend (raylib, sokol, sdl, bgfx, wgpu)
     \\
     \\Notes:
-    \\  This binary assumes the package cache is already populated. The
-    \\  `labelle` CLI handles cache management before invoking the
-    \\  assembler.
+    \\  `generate` reads the local package cache; run `install` first (or
+    \\  let the `labelle` CLI do it) to populate it. The `install`, `clean`,
+    \\  and `upgrade` subcommands manage that cache directly.
     \\
     \\See: https://github.com/labelle-toolkit/labelle-assembler
     \\
