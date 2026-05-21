@@ -18,12 +18,17 @@
 
 const std = @import("std");
 const gen = @import("root.zig");
+const cache_cmd = @import("cache_cmd.zig");
 
 /// Wire protocol version for CLI ↔ assembler subprocess communication.
 /// Bump when the command surface or output format changes in a way the
 /// CLI launcher needs to detect. The launcher reads this via
 /// `labelle-assembler --protocol-version` before invoking any subcommand.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 (#217 phase 1): added the `install`, `clean`, `upgrade` cache
+/// subcommands. The CLI delegates cache management to the binary instead
+/// of running the in-process generator's cache helpers.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 const usage =
     \\labelle-assembler — code generator for the labelle game toolkit
@@ -32,9 +37,15 @@ const usage =
     \\  labelle-assembler --protocol-version
     \\  labelle-assembler --help
     \\  labelle-assembler generate --project-root <path> [options]
+    \\  labelle-assembler install [--project-root <path>] [pkg [version]]
+    \\  labelle-assembler clean [--dry-run] [--project-root <path>]
+    \\  labelle-assembler upgrade --project-root <path> [pkg [version]]
     \\
     \\Subcommands:
     \\  generate    Materialize .labelle/<target>/ from project.labelle
+    \\  install     Fetch packages into the local cache
+    \\  clean       Prune unused cached package versions
+    \\  upgrade     Bump version fields in project.labelle
     \\
     \\Generate options:
     \\  --project-root <path>   Path to game project (containing project.labelle)
@@ -82,6 +93,21 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, first, "generate")) {
         try cmdGenerate(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "install")) {
+        try cache_cmd.cmdInstall(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "clean")) {
+        try cache_cmd.cmdClean(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "upgrade")) {
+        try cache_cmd.cmdUpgrade(allocator, io, &args);
         return;
     }
 
