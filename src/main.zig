@@ -19,6 +19,7 @@
 const std = @import("std");
 const gen = @import("root.zig");
 const cache_cmd = @import("cache_cmd.zig");
+const init_cmd = @import("init_cmd.zig");
 
 /// Wire protocol version for CLI ↔ assembler subprocess communication.
 /// Bump when the command surface or output format changes in a way the
@@ -28,7 +29,11 @@ const cache_cmd = @import("cache_cmd.zig");
 /// v2 (#217 phase 1): added the `install`, `clean`, `upgrade` cache
 /// subcommands. The CLI delegates cache management to the binary instead
 /// of running the in-process generator's cache helpers.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3 (#217 phase 3): added the `init` subcommand. The CLI delegates
+/// new-project scaffolding to the binary instead of its in-process
+/// `cmdInit`.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 const usage =
     \\labelle-assembler — code generator for the labelle game toolkit
@@ -40,12 +45,14 @@ const usage =
     \\  labelle-assembler install [--project-root <path>] [pkg [version]]
     \\  labelle-assembler clean [--dry-run] [--project-root <path>]
     \\  labelle-assembler upgrade --project-root <path> [pkg [version]]
+    \\  labelle-assembler init <name> [dir] [options]
     \\
     \\Subcommands:
     \\  generate    Materialize .labelle/<target>/ from project.labelle
     \\  install     Fetch packages into the local cache
     \\  clean       Prune unused cached package versions
     \\  upgrade     Bump version fields in project.labelle
+    \\  init        Scaffold a new project directory
     \\
     \\Generate options:
     \\  --project-root <path>   Path to game project (containing project.labelle)
@@ -108,6 +115,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, first, "upgrade")) {
         try cache_cmd.cmdUpgrade(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "init")) {
+        try init_cmd.cmdInit(allocator, io, &args);
         return;
     }
 
@@ -267,4 +279,10 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
 
     const source = try allocator.dupeZ(u8, source_raw);
     return try std.zon.parse.fromSliceAlloc(gen.ProjectConfig, allocator, source, null, .{});
+}
+
+// Pull in the subcommand modules' tests when this file is the test root.
+test {
+    std.testing.refAllDecls(@import("init_cmd.zig"));
+    std.testing.refAllDecls(@import("cache_cmd.zig"));
 }

@@ -52,6 +52,7 @@ pub const CLI_VERSION = config.CLI_VERSION;
 pub const CORE_VERSION = config.CORE_VERSION;
 pub const ENGINE_VERSION = config.ENGINE_VERSION;
 pub const GFX_VERSION = config.GFX_VERSION;
+pub const ASSEMBLER_VERSION = config.ASSEMBLER_VERSION;
 pub const isLocalVersion = config.isLocalVersion;
 pub const initGlobalIo = config.initGlobalIo;
 

@@ -8,6 +8,13 @@ pub fn build(b: *std.Build) void {
     const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse cli_version;
     const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse cli_version;
     const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse cli_version;
+    // Version this assembler binary stamps into a freshly scaffolded
+    // project.labelle's `assembler_version` field. Defaults to the
+    // package version from build.zig.zon so a release binary pins itself.
+    const assembler_version: []const u8 = b.option([]const u8, "assembler_version", "Default assembler version for `init`") orelse blk: {
+        const v = @import("build.zig.zon").version;
+        break :blk v;
+    };
 
     const zspec_dep = b.dependency("zspec", .{ .target = target, .optimize = optimize });
     const flow_codegen_dep = b.dependency("flow_codegen", .{ .target = target, .optimize = optimize });
@@ -18,6 +25,7 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "core_version", core_version);
     options.addOption([]const u8, "engine_version", engine_version);
     options.addOption([]const u8, "gfx_version", gfx_version);
+    options.addOption([]const u8, "assembler_version", assembler_version);
 
     const generator_module = b.addModule("generator", .{
         .root_source_file = b.path("src/root.zig"),
@@ -59,6 +67,20 @@ pub fn build(b: *std.Build) void {
     src_tests.root_module.addOptions("build_options", options);
     src_tests.root_module.addImport("flow_codegen", flow_codegen_module);
     test_step.dependOn(&b.addRunArtifact(src_tests).step);
+
+    // Subcommand tests — `src/main.zig` is the binary's root and reaches
+    // the subcommand modules (`init_cmd`, `cache_cmd`) that `src/root.zig`
+    // (the `generator` library) intentionally does not import.
+    const bin_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    bin_tests.root_module.addOptions("build_options", options);
+    bin_tests.root_module.addImport("flow_codegen", flow_codegen_module);
+    test_step.dependOn(&b.addRunArtifact(bin_tests).step);
 
     // BDD-style tests from test/. Each test target gets `generator`,
     // `zspec`, and `flow_codegen` so any future test file can reach
