@@ -25,6 +25,9 @@ jobs:
           - target: x86_64-linux
             artifact: labelle-assembler-linux-x86_64
             os: ubuntu-latest
+          - target: x86_64-windows
+            artifact: labelle-assembler-windows-x86_64
+            os: ubuntu-latest
 
     runs-on: ${{ matrix.os }}
 
@@ -65,7 +68,16 @@ jobs:
             -Dgfx_version="$VERSION"
 
       - name: Rename binary
-        run: cp zig-out/bin/labelle-assembler ${{ matrix.artifact }}
+        # Windows targets produce `labelle-assembler.exe`; every other target
+        # produces `labelle-assembler`. The published asset name omits the
+        # `.exe` suffix on all platforms so the CLI's download-URL builder
+        # (`labelle-assembler-<os>-<arch>`, no extension) matches exactly.
+        run: |
+          if [ -f zig-out/bin/labelle-assembler.exe ]; then
+            cp zig-out/bin/labelle-assembler.exe ${{ matrix.artifact }}
+          else
+            cp zig-out/bin/labelle-assembler ${{ matrix.artifact }}
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
