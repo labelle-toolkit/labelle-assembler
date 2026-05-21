@@ -82,6 +82,10 @@ pub const patchCachedDeps = cache.patchCachedDeps;
 pub const resolvePlugin = cache.resolvePlugin;
 pub const resolveAssemblerPackage = cache.resolveAssemblerPackage;
 pub const resolveBundledPackage = cache.resolveBundledPackage;
+pub const resolveGuiPackage = cache.resolveGuiPackage;
+pub const resolveGuiUrl = cache.resolveGuiUrl;
+pub const fetchGuiPackage = cache.fetchGuiPackage;
+pub const fetchGuiUrl = cache.fetchGuiUrl;
 
 /// Source for the per-project `game.zig` shim. Re-exports the engine's
 /// default `Game` type and its associated `EntityId` so generated flow

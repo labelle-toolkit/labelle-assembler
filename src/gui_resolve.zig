@@ -86,6 +86,20 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *config.ProjectConfig
 }
 
 /// Resolve the plugin directory from a GuiPlugin reference.
+///
+/// Supports four declaration shapes (see config.GuiPlugin):
+///   .path    — a local directory, relative to the project.
+///   .plugin  — a named entry in `.plugins`, resolved from the plugin cache.
+///   .package — a repo-style package, resolved from the package cache
+///              (`~/.labelle/packages/plugins/{package}/{version}`),
+///              fetched on demand if absent. Same layout cache.zig uses
+///              for regular declared plugins.
+///   .url     — a git URL, fetched into a deterministic per-URL cache
+///              slot (`~/.labelle/packages/gui-url/{url-hash}/{ref}`).
+///              `.version` is mapped to a git ref via `versionToGitRef`
+///              (semver → `v`-tag) like every other fetch path, and
+///              `.hash` — when set — is the expected commit SHA the
+///              checkout is verified against (see cache.fetchGuiUrl).
 fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: config.ProjectConfig, project_dir: []const u8) ![]const u8 {
     if (ref.path) |rel_path| {
         // Local path — resolve relative to project directory
@@ -98,11 +112,83 @@ fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: co
                 return cache.resolvePlugin(allocator, plugin, project_dir);
             }
         }
-        std.debug.print("labelle: GUI references plugin '{s}', but no plugin with that name is declared in .plugins\n", .{name});
+        std.log.err("labelle: GUI references plugin '{s}', but no plugin with that name is declared in .plugins", .{name});
         return error.GuiPluginNotFound;
     }
-    // TODO: support .package + .version (cache lookup) and .url + .hash (fetch)
-    std.debug.print("labelle: GUI plugin reference must include .path or .plugin\n", .{});
+    if (ref.package) |package| {
+        // Package reference — resolve from the package cache, fetching
+        // into ~/.labelle/packages/plugins/{package}/{version} if absent.
+        const version = ref.version orelse {
+            std.log.err("labelle: GUI plugin '.package = \"{s}\"' requires a '.version'", .{package});
+            return error.GuiPluginMissingVersion;
+        };
+
+        const dir = try cache.resolveGuiPackage(allocator, package, version, project_dir);
+        errdefer allocator.free(dir);
+
+        // `local:` versions resolve to an existing on-disk path; never fetched.
+        if (config.isLocalVersion(version)) return dir;
+
+        if (!cache.dirExists(dir)) {
+            std.log.info("labelle: fetching GUI plugin package {s} {s}", .{ package, version });
+            cache.fetchGuiPackage(allocator, package, version) catch |err| {
+                std.log.err("labelle: could not fetch GUI plugin package '{s}' {s}: {s}", .{ package, version, @errorName(err) });
+                return error.GuiPluginFetchFailed;
+            };
+        }
+        return dir;
+    }
+    if (ref.url) |url| {
+        // URL reference — fetch the repo into a deterministic per-URL
+        // cache slot. `.version`, when set, names the git ref to check
+        // out; otherwise the repo's default branch is used.
+        //
+        // `.version` is routed through `config.versionToGitRef` exactly
+        // like every other fetch path (framework/plugin fetchers and the
+        // `.package` branch above): a semver `.version` (`0.3.0`) maps to
+        // the published release tag `v0.3.0`, while a branch name is used
+        // verbatim. Using `.version` raw here would have skipped the
+        // `v`-prefix and failed to find a semver release tag.
+        const clone_ref: ?[]u8 = if (ref.version) |v|
+            try config.versionToGitRef(allocator, v)
+        else
+            null;
+        defer if (clone_ref) |r| allocator.free(r);
+
+        // Cache slot keyed by the resolved git ref ("default" when the
+        // repo's default branch is used implicitly).
+        const slot = clone_ref orelse "default";
+
+        const dir = try cache.resolveGuiUrl(allocator, url, slot);
+        errdefer allocator.free(dir);
+
+        if (!cache.dirExists(dir)) {
+            std.log.info("labelle: fetching GUI plugin from {s} ({s})", .{ url, slot });
+            // `.hash`, when set, is the expected commit SHA the checkout
+            // must resolve to — fetchGuiUrl verifies it (see its doc
+            // comment for the `.url`+`hash` contract). When null the
+            // plugin is fetched unpinned and fetchGuiUrl warns.
+            cache.fetchGuiUrl(allocator, url, slot, clone_ref, ref.hash) catch |err| {
+                std.log.err("labelle: could not fetch GUI plugin from '{s}': {s}", .{ url, @errorName(err) });
+                return error.GuiPluginFetchFailed;
+            };
+        } else if (ref.hash) |sha| {
+            // Cache HIT against a pinned `.hash`: the cached checkout may
+            // come from an earlier unpinned (or differently-pinned) fetch,
+            // so the cache slot's existence alone proves nothing. Re-verify
+            // the checked-out commit against `.hash` on *every* resolution.
+            // `.url` checkouts retain their `.git` directory precisely so
+            // this re-verification can run (see cache.fetchGuiUrl). A
+            // mismatched or unverifiable checkout is a hard error — the
+            // build must never proceed against an unexpected revision.
+            cache.verifyGuiUrlHash(allocator, dir, sha) catch {
+                return error.GuiUrlHashMismatch;
+            };
+        }
+        return dir;
+    }
+    // Malformed GuiPlugin — none of the four reference fields is set.
+    std.log.err("labelle: GUI plugin reference must set one of .path, .plugin, .package, or .url", .{});
     return error.GuiPluginResolutionNotSupported;
 }
 
@@ -156,4 +242,146 @@ fn printAvailableBridges(bridges: Bridges) void {
             first = false;
         }
     }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+test "resolvePluginDir: malformed GuiPlugin (no field set) is rejected" {
+    const alloc = std.testing.allocator;
+    const cfg: config.ProjectConfig = .{ .name = "t" };
+    const ref: config.GuiPlugin = .{};
+    try std.testing.expectError(
+        error.GuiPluginResolutionNotSupported,
+        resolvePluginDir(alloc, ref, cfg, "/tmp/project"),
+    );
+}
+
+test "resolvePluginDir: .package without .version is rejected" {
+    const alloc = std.testing.allocator;
+    const cfg: config.ProjectConfig = .{ .name = "t" };
+    const ref: config.GuiPlugin = .{ .package = "github.com/labelle-toolkit/labelle-imgui" };
+    try std.testing.expectError(
+        error.GuiPluginMissingVersion,
+        resolvePluginDir(alloc, ref, cfg, "/tmp/project"),
+    );
+}
+
+test "resolvePluginDir: .package with a local: version resolves the local dir" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Project dir with a sibling local GUI plugin checkout.
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.createDirPath(std.testing.io, "gui-plugin");
+
+    const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
+    defer alloc.free(project_abs);
+    const plugin_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "gui-plugin", alloc);
+    defer alloc.free(plugin_abs);
+
+    const cfg: config.ProjectConfig = .{ .name = "t" };
+    const ref: config.GuiPlugin = .{
+        .package = "github.com/labelle-toolkit/labelle-imgui",
+        .version = "local:../gui-plugin",
+    };
+
+    const dir = try resolvePluginDir(alloc, ref, cfg, project_abs);
+    defer alloc.free(dir);
+
+    try std.testing.expectEqualStrings(plugin_abs, dir);
+}
+
+test "resolveGuiUrl: deterministic, distinct per-URL, ref is the leaf component" {
+    const alloc = std.testing.allocator;
+
+    const a1 = try cache.resolveGuiUrl(alloc, "https://example.com/gui.git", "v1.0.0");
+    defer alloc.free(a1);
+    const a2 = try cache.resolveGuiUrl(alloc, "https://example.com/gui.git", "v1.0.0");
+    defer alloc.free(a2);
+    const b = try cache.resolveGuiUrl(alloc, "https://example.com/other.git", "v1.0.0");
+    defer alloc.free(b);
+
+    // Same URL + ref → identical path.
+    try std.testing.expectEqualStrings(a1, a2);
+    // Different URL → different path.
+    try std.testing.expect(!std.mem.eql(u8, a1, b));
+    // The ref is the final path component.
+    try std.testing.expectEqualStrings("v1.0.0", std.fs.path.basename(a1));
+    // The slot lives under the packages/gui-url tree.
+    try std.testing.expect(std.mem.indexOf(u8, a1, "gui-url") != null);
+}
+
+test "resolveGuiPackage: local: version bypasses the cache and resolves on disk" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.createDirPath(std.testing.io, "imgui-src");
+
+    const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
+    defer alloc.free(project_abs);
+    const src_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "imgui-src", alloc);
+    defer alloc.free(src_abs);
+
+    const dir = try cache.resolveGuiPackage(
+        alloc,
+        "github.com/labelle-toolkit/labelle-imgui",
+        "local:../imgui-src",
+        project_abs,
+    );
+    defer alloc.free(dir);
+
+    try std.testing.expectEqualStrings(src_abs, dir);
+}
+
+test "resolvePluginDir: .url with a semver .version uses the v-prefixed tag as the cache slot" {
+    // Regression for the opencode MAJOR: the `.url` path must route
+    // `.version` through config.versionToGitRef just like every other
+    // fetch path — a semver `.version` resolves to the `v`-prefixed
+    // release tag. The cache slot is keyed by the resolved git ref, so
+    // a semver `.version` lands under a `v`-prefixed leaf.
+    const alloc = std.testing.allocator;
+
+    const git_ref = try config.versionToGitRef(alloc, "0.3.0");
+    defer alloc.free(git_ref);
+    try std.testing.expectEqualStrings("v0.3.0", git_ref);
+
+    const dir = try cache.resolveGuiUrl(alloc, "https://example.com/gui.git", git_ref);
+    defer alloc.free(dir);
+    // The slot leaf is the resolved git ref, not the raw version.
+    try std.testing.expectEqualStrings("v0.3.0", std.fs.path.basename(dir));
+}
+
+test "resolvePluginDir: .url with a branch .version uses the ref verbatim as the cache slot" {
+    // The other half of versionToGitRef: a non-semver `.version` (a
+    // branch name) is used verbatim — no `v` prefix.
+    const alloc = std.testing.allocator;
+
+    const git_ref = try config.versionToGitRef(alloc, "main");
+    defer alloc.free(git_ref);
+    try std.testing.expectEqualStrings("main", git_ref);
+
+    const dir = try cache.resolveGuiUrl(alloc, "https://example.com/gui.git", git_ref);
+    defer alloc.free(dir);
+    try std.testing.expectEqualStrings("main", std.fs.path.basename(dir));
+}
+
+test "resolveGuiPackage: a release version maps to the packages/plugins cache slot" {
+    const alloc = std.testing.allocator;
+
+    const dir = try cache.resolveGuiPackage(
+        alloc,
+        "github.com/labelle-toolkit/labelle-imgui",
+        "0.3.0",
+        null,
+    );
+    defer alloc.free(dir);
+
+    // Same layout regular declared plugins use: plugins/{repo}/{version}.
+    try std.testing.expect(std.mem.indexOf(u8, dir, "plugins") != null);
+    try std.testing.expect(std.mem.endsWith(u8, dir, "github.com/labelle-toolkit/labelle-imgui/0.3.0"));
 }
