@@ -5,9 +5,15 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const cli_version: []const u8 = b.option([]const u8, "cli_version", "CLI version string") orelse "dev";
-    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse cli_version;
-    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse cli_version;
-    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse cli_version;
+    // Framework version defaults stamped into a freshly scaffolded
+    // project.labelle by `init`. These MUST be real, fetchable release
+    // versions — a fresh project has to build out of the box. They used to
+    // fall back to `cli_version` ("dev" in a non-release build), which the
+    // fetcher then mapped to a bogus `vdev` git ref (issue #159). A release
+    // build of the CLI overrides each with `-D<pkg>_version=`.
+    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.13.0";
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "1.42.0";
+    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.10.0";
     // Version this assembler binary stamps into a freshly scaffolded
     // project.labelle's `assembler_version` field. Defaults to the
     // package version from build.zig.zon so a release binary pins itself.

@@ -36,7 +36,7 @@ pub fn getCacheRoot(allocator: std.mem.Allocator) ![]const u8 {
     // Fall back to platform-appropriate home directory
     const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
     const home_dir = envLookup(allocator, home_env) orelse {
-        std.debug.print("labelle: could not determine home directory ({s})\n", .{home_env});
+        std.log.err("labelle: could not determine home directory ({s})", .{home_env});
         return error.NoHomeDirectory;
     };
     defer allocator.free(home_dir);
@@ -132,7 +132,7 @@ fn resolveLocalPath(allocator: std.mem.Allocator, local_path: []const u8, projec
     // realPathFileAlloc returns [:0]u8 — dupe to plain []u8 so callers
     // can `allocator.free` without the sentinel-byte size mismatch.
     const resolved = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), resolve_path, allocator) catch {
-        std.debug.print("labelle: warning: local path '{s}' does not exist\n", .{resolve_path});
+        std.log.warn("labelle: local path '{s}' does not exist", .{resolve_path});
         return try allocator.dupe(u8, resolve_path);
     };
     defer allocator.free(resolved);
@@ -302,7 +302,7 @@ pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: [
     const cwd = std.Io.Dir.cwd();
 
     cwd.createDirPath(io, target) catch |err| {
-        std.debug.print("labelle: could not create cache directory '{s}': {any}\n", .{ target, err });
+        std.log.err("labelle: could not create cache directory '{s}': {any}", .{ target, err });
         return error.CachePopulationFailed;
     };
 
@@ -317,7 +317,7 @@ pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: [
         defer allocator.free(dst_path);
 
         symlinkToCache(allocator, src_path, dst_path) catch |err| {
-            std.debug.print("labelle: could not link '{s}' to cache: {any}\n", .{ src_path, err });
+            std.log.err("labelle: could not link '{s}' to cache: {any}", .{ src_path, err });
             return error.CachePopulationFailed;
         };
     }
@@ -388,7 +388,7 @@ const FRAMEWORK_REPOS = [_]struct { name: []const u8, repo: []const u8 }{
 /// R2 base URL for CLI releases (binary + bundled packages).
 pub const R2_BASE_URL = "https://releases.labelle.games/cli";
 
-/// Fetch a framework package from its git repo at a given version tag.
+/// Fetch a framework package from its git repo at a given version.
 /// Clones into the cache directory.
 pub fn fetchFrameworkPackage(allocator: std.mem.Allocator, package: []const u8, version: []const u8) !void {
     // Find the repo URL
@@ -401,7 +401,7 @@ pub fn fetchFrameworkPackage(allocator: std.mem.Allocator, package: []const u8, 
     }
 
     if (repo_url == null) {
-        std.debug.print("labelle: unknown framework package '{s}'\n", .{package});
+        std.log.err("labelle: unknown framework package '{s}'", .{package});
         return error.UnknownPackage;
     }
 
@@ -411,13 +411,16 @@ pub fn fetchFrameworkPackage(allocator: std.mem.Allocator, package: []const u8, 
     const git_url = try std.fmt.allocPrint(allocator, "https://{s}.git", .{repo_url.?});
     defer allocator.free(git_url);
 
-    const tag = try std.fmt.allocPrint(allocator, "v{s}", .{version});
-    defer allocator.free(tag);
+    // Map version → git ref: a semver version (`1.2.3`) becomes a `v`-prefixed
+    // release tag; anything else (`dev`, `main`, a branch) is a ref name
+    // used verbatim. See config.versionToGitRef / issue #159.
+    const git_ref = try config.versionToGitRef(allocator, version);
+    defer allocator.free(git_ref);
 
-    try gitCloneShallow(allocator, git_url, tag, target);
+    try gitCloneShallow(allocator, git_url, git_ref, target);
 }
 
-/// Fetch a plugin from its git repo at a given version tag.
+/// Fetch a plugin from its git repo at a given version.
 pub fn fetchPlugin(allocator: std.mem.Allocator, plugin: config.PluginDep) !void {
     const target = try resolvePlugin(allocator, plugin, null);
     defer allocator.free(target);
@@ -425,14 +428,14 @@ pub fn fetchPlugin(allocator: std.mem.Allocator, plugin: config.PluginDep) !void
     const git_url = try std.fmt.allocPrint(allocator, "https://{s}.git", .{plugin.repo});
     defer allocator.free(git_url);
 
-    const tag = try std.fmt.allocPrint(allocator, "v{s}", .{plugin.version});
-    defer allocator.free(tag);
+    const git_ref = try config.versionToGitRef(allocator, plugin.version);
+    defer allocator.free(git_ref);
 
-    try gitCloneShallow(allocator, git_url, tag, target);
+    try gitCloneShallow(allocator, git_url, git_ref, target);
 }
 
 /// Fetch assembler-bundled packages (backends, ecs, gui) into the cache.
-/// Clones from the labelle-assembler repo at the matching tag.
+/// Clones from the labelle-assembler repo at the matching git ref.
 /// These packages ship with the assembler and are normally populated from the
 /// companion directory in dev; this is the remote fallback.
 pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: []const u8) !void {
@@ -443,8 +446,8 @@ pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: [
     defer allocator.free(target);
 
     const git_url = "https://github.com/labelle-toolkit/labelle-assembler.git";
-    const tag = try std.fmt.allocPrint(allocator, "v{s}", .{assembler_version});
-    defer allocator.free(tag);
+    const git_ref = try config.versionToGitRef(allocator, assembler_version);
+    defer allocator.free(git_ref);
 
     const tmp_dir = try getTempPath(allocator, "labelle-assembler-fetch", assembler_version);
     defer allocator.free(tmp_dir);
@@ -452,9 +455,9 @@ pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: [
     const io = config.globalIo();
     std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
 
-    gitCloneShallow(allocator, git_url, tag, tmp_dir) catch {
-        std.debug.print("labelle: could not fetch assembler packages at v{s}\n", .{assembler_version});
-        std.debug.print("  assembler-bundled packages (backends, ecs, gui) ship with the assembler binary.\n", .{});
+    gitCloneShallow(allocator, git_url, git_ref, tmp_dir) catch {
+        std.log.err("labelle: could not fetch assembler packages at {s}\n" ++
+            "  assembler-bundled packages (backends, ecs, gui) ship with the assembler binary.", .{git_ref});
         return error.FetchFailed;
     };
 
@@ -472,15 +475,16 @@ pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: [
         defer allocator.free(dst);
 
         copyDirRecursive(allocator, src, dst) catch |err| {
-            std.debug.print("labelle: warning: could not copy {s}: {any}\n", .{ subdir, err });
+            std.log.warn("labelle: could not copy {s}: {any}", .{ subdir, err });
         };
     }
 
     std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
 }
 
-/// Shallow clone a git repo at a specific tag into the target directory.
-fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, tag: []const u8, target: []const u8) !void {
+/// Shallow clone a git repo at a specific git ref (tag or branch) into the
+/// target directory.
+fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, git_ref: []const u8, target: []const u8) !void {
     const io = config.globalIo();
     // Ensure parent directory exists
     if (std.fs.path.dirname(target)) |parent| {
@@ -489,10 +493,10 @@ fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, tag: []co
 
     const result = std.process.run(allocator, io, .{
         .argv = &.{
-            "git", "clone", "--depth", "1", "--branch", tag, repo_url, target,
+            "git", "clone", "--depth", "1", "--branch", git_ref, repo_url, target,
         },
     }) catch |err| {
-        std.debug.print("labelle: git clone failed (is git installed?): {any}\n", .{err});
+        std.log.err("labelle: git clone failed (is git installed?): {any}", .{err});
         return error.FetchFailed;
     };
     defer allocator.free(result.stdout);
@@ -500,11 +504,11 @@ fn gitCloneShallow(allocator: std.mem.Allocator, repo_url: []const u8, tag: []co
 
     switch (result.term) {
         .exited => |code| if (code != 0) {
-            std.debug.print("labelle: git clone failed:\n{s}\n", .{result.stderr});
+            std.log.err("labelle: git clone failed:\n{s}", .{result.stderr});
             return error.FetchFailed;
         },
         else => {
-            std.debug.print("labelle: git clone terminated abnormally\n", .{});
+            std.log.err("labelle: git clone terminated abnormally", .{});
             return error.FetchFailed;
         },
     }
@@ -527,7 +531,7 @@ fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, target: 
     // Resolve source to absolute path. Dupe to plain []u8 so the free
     // doesn't trip on realPathFileAlloc's sentinel byte.
     const abs_source_z = cwd.realPathFileAlloc(io, source_dir, allocator) catch |err| {
-        std.debug.print("labelle: source directory not found '{s}': {any}\n", .{ source_dir, err });
+        std.log.err("labelle: source directory not found '{s}': {any}", .{ source_dir, err });
         return error.CachePopulationFailed;
     };
     defer allocator.free(abs_source_z);
@@ -537,7 +541,7 @@ fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, target: 
     // Ensure parent directory exists
     if (std.fs.path.dirname(target)) |parent| {
         cwd.createDirPath(io, parent) catch |err| {
-            std.debug.print("labelle: could not create cache directory '{s}': {any}\n", .{ parent, err });
+            std.log.err("labelle: could not create cache directory '{s}': {any}", .{ parent, err });
             return error.CachePopulationFailed;
         };
     }
@@ -551,7 +555,7 @@ fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, target: 
             const existing_len = std.Io.Dir.readLinkAbsolute(io, target, &link_buf) catch return; // not a symlink, assume OK
             const existing = link_buf[0..existing_len];
             if (!std.mem.eql(u8, existing, abs_source)) {
-                std.debug.print("labelle: warning: cache entry '{s}' points to '{s}', expected '{s}'\n", .{ target, existing, abs_source });
+                std.log.warn("labelle: cache entry '{s}' points to '{s}', expected '{s}'", .{ target, existing, abs_source });
                 // Remove stale link and recreate
                 cwd.deleteFile(io, target) catch return;
                 cwd.symLink(io, abs_source, target, .{ .is_directory = true }) catch return;
@@ -560,7 +564,7 @@ fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, target: 
         }
         // Fall back to copying the directory
         copyDirRecursive(allocator, abs_source, target) catch |copy_err| {
-            std.debug.print("labelle: could not link or copy '{s}' to '{s}': {any}\n", .{ abs_source, target, copy_err });
+            std.log.err("labelle: could not link or copy '{s}' to '{s}': {any}", .{ abs_source, target, copy_err });
             return error.CachePopulationFailed;
         };
     };
@@ -714,7 +718,7 @@ pub fn copyDirRecursive(allocator: std.mem.Allocator, src: []const u8, dst: []co
             .directory => try copyDirRecursive(allocator, src_sub, dst_sub),
             .file => {
                 cwd.copyFile(src_sub, cwd, dst_sub, io, .{}) catch |err| {
-                    std.debug.print("labelle: could not copy '{s}': {any}\n", .{ src_sub, err });
+                    std.log.warn("labelle: could not copy '{s}': {any}", .{ src_sub, err });
                     return err;
                 };
             },

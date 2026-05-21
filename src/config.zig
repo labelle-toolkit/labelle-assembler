@@ -283,6 +283,80 @@ pub fn localVersionPath(version: []const u8) []const u8 {
     return version["local:".len..];
 }
 
+/// Whether `version` looks like a semantic version number — i.e. it starts
+/// with a digit (`1.2.3`, `0.31.0`, `2`). Used to decide how a version maps
+/// to a git ref: semver-shaped versions are published as `v`-prefixed tags
+/// (`v1.2.3`), while anything else is treated as a branch / ref name.
+pub fn isSemverVersion(version: []const u8) bool {
+    // A package release version is digits and dots only, with at least
+    // one dot (`1.13.0`, `0.31.0`). "Starts with a digit" was too loose
+    // — a digit-leading branch ref like `159-fix` or `2026/dev` would be
+    // mis-classified and clone-mangled into `v159-fix` (#159 review).
+    if (version.len == 0 or !std.ascii.isDigit(version[0])) return false;
+    var has_dot = false;
+    for (version) |c| {
+        if (c == '.') {
+            has_dot = true;
+        } else if (!std.ascii.isDigit(c)) {
+            return false;
+        }
+    }
+    return has_dot;
+}
+
+/// Map a package `version` string to the git ref to clone.
+///
+/// A semver-shaped version (`1.2.3`) maps to the published release tag
+/// `v1.2.3`. Anything else — `dev`, `main`, a feature-branch name — is a
+/// ref in its own right and is used verbatim. Blindly prepending `v` to a
+/// non-numeric version produced bogus refs like `vdev` that failed deep
+/// inside `git clone` (issue #159).
+///
+/// Returns an allocator-owned slice; the caller frees it.
+pub fn versionToGitRef(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
+    if (isSemverVersion(version)) {
+        return std.fmt.allocPrint(allocator, "v{s}", .{version});
+    }
+    return allocator.dupe(u8, version);
+}
+
+test "versionToGitRef: semver versions get a `v` prefix" {
+    const alloc = std.testing.allocator;
+    inline for (.{
+        .{ "1.2.3", "v1.2.3" },
+        .{ "0.31.0", "v0.31.0" },
+        .{ "1.13.0", "v1.13.0" },
+    }) |case| {
+        const ref = try versionToGitRef(alloc, case[0]);
+        defer alloc.free(ref);
+        try std.testing.expectEqualStrings(case[1], ref);
+    }
+}
+
+test "versionToGitRef: non-numeric versions are used verbatim as a ref" {
+    const alloc = std.testing.allocator;
+    // The #159 regression: `dev` must not become `vdev`. Digit-leading
+    // branch refs (`159-fix`, `2026/dev`) must also pass through verbatim
+    // — they are not semver despite the leading digit.
+    inline for (.{ "dev", "main", "feature/foo", "159-fix", "2026/dev" }) |branch| {
+        const ref = try versionToGitRef(alloc, branch);
+        defer alloc.free(ref);
+        try std.testing.expectEqualStrings(branch, ref);
+    }
+}
+
+test "isSemverVersion: classifies version strings" {
+    try std.testing.expect(isSemverVersion("1.0.0"));
+    try std.testing.expect(isSemverVersion("0.31.0"));
+    try std.testing.expect(!isSemverVersion("dev"));
+    try std.testing.expect(!isSemverVersion("main"));
+    try std.testing.expect(!isSemverVersion(""));
+    // Digit-leading branch refs are not semver.
+    try std.testing.expect(!isSemverVersion("159-fix"));
+    try std.testing.expect(!isSemverVersion("2026/dev"));
+    try std.testing.expect(!isSemverVersion("159")); // no dot — treated as a ref
+}
+
 // ── GUI Plugin System ────────────────────────────────────────────────
 
 /// GUI plugin reference as declared in project.labelle.
