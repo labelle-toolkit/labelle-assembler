@@ -411,7 +411,10 @@ pub fn fetchFrameworkPackage(allocator: std.mem.Allocator, package: []const u8, 
     const git_url = try std.fmt.allocPrint(allocator, "https://{s}.git", .{repo_url.?});
     defer allocator.free(git_url);
 
-    const tag = try std.fmt.allocPrint(allocator, "v{s}", .{version});
+    // Map version → git ref: a semver version (`1.2.3`) is a `v`-prefixed
+    // release tag; anything else (`dev`, `main`, a branch) is a ref name
+    // used verbatim. See config.versionToGitRef / issue #159.
+    const tag = try config.versionToGitRef(allocator, version);
     defer allocator.free(tag);
 
     try gitCloneShallow(allocator, git_url, tag, target);
@@ -425,7 +428,7 @@ pub fn fetchPlugin(allocator: std.mem.Allocator, plugin: config.PluginDep) !void
     const git_url = try std.fmt.allocPrint(allocator, "https://{s}.git", .{plugin.repo});
     defer allocator.free(git_url);
 
-    const tag = try std.fmt.allocPrint(allocator, "v{s}", .{plugin.version});
+    const tag = try config.versionToGitRef(allocator, plugin.version);
     defer allocator.free(tag);
 
     try gitCloneShallow(allocator, git_url, tag, target);
@@ -443,7 +446,7 @@ pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: [
     defer allocator.free(target);
 
     const git_url = "https://github.com/labelle-toolkit/labelle-assembler.git";
-    const tag = try std.fmt.allocPrint(allocator, "v{s}", .{assembler_version});
+    const tag = try config.versionToGitRef(allocator, assembler_version);
     defer allocator.free(tag);
 
     const tmp_dir = try getTempPath(allocator, "labelle-assembler-fetch", assembler_version);
@@ -453,7 +456,7 @@ pub fn fetchAssemblerPackages(allocator: std.mem.Allocator, assembler_version: [
     std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
 
     gitCloneShallow(allocator, git_url, tag, tmp_dir) catch {
-        std.debug.print("labelle: could not fetch assembler packages at v{s}\n", .{assembler_version});
+        std.debug.print("labelle: could not fetch assembler packages at {s}\n", .{tag});
         std.debug.print("  assembler-bundled packages (backends, ecs, gui) ship with the assembler binary.\n", .{});
         return error.FetchFailed;
     };

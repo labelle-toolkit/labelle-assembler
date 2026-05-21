@@ -349,6 +349,45 @@ test "scaffold writes a project.labelle with the requested fields" {
     try std.testing.expect(std.mem.indexOf(u8, labelle, ".assembler_version = ") != null);
 }
 
+test "scaffold pins real fetchable framework versions — #159 regression" {
+    // A freshly scaffolded project.labelle must pin semver-shaped, fetchable
+    // versions. Scaffolding "dev" (or any non-numeric string) made the fetch
+    // synthesize a bogus `vdev` git ref and fail. Guard against a regression
+    // back to "dev" defaults.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = config.globalIo();
+
+    try tmp.dir.createDirPath(io, "init-159");
+    const project_dir = try tmp.dir.realPathFileAlloc(io, "init-159", alloc);
+    defer alloc.free(project_dir);
+
+    try scaffold(alloc, io, .{ .name = "init-159", .dir = project_dir });
+
+    const labelle = try tmp.dir.readFileAlloc(
+        io,
+        "init-159/project.labelle",
+        alloc,
+        .limited(4096),
+    );
+    defer alloc.free(labelle);
+
+    // Parse it back and confirm each fetched framework version is
+    // semver-shaped (starts with a digit) — i.e. it maps to a real `v<x>`
+    // release tag rather than a bogus ref like `vdev`.
+    const src = try alloc.dupeZ(u8, labelle);
+    defer alloc.free(src);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
+    try std.testing.expect(config.isSemverVersion(cfg.core_version));
+    try std.testing.expect(config.isSemverVersion(cfg.engine_version));
+    try std.testing.expect(config.isSemverVersion(cfg.gfx_version));
+}
+
 test "escapeZonString escapes quotes and backslashes" {
     const alloc = std.testing.allocator;
 
