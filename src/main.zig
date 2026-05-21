@@ -9,21 +9,32 @@
 //! in Phase 2 (opt-in via `LABELLE_ASSEMBLER` env var) and Phase 3
 //! (project-pinned `assembler_version` in `project.labelle`).
 //!
-//! Cache prerequisite: this binary assumes the package cache is already
-//! populated (engine/core/gfx packages available where the generator
-//! expects them). The CLI handles cache management before invoking the
-//! assembler. Running the binary directly is intended for testing the
+//! Cache: `generate` reads the local package cache (engine/core/gfx
+//! packages where the generator expects them). The binary now owns cache
+//! management itself via the `install`/`clean`/`upgrade` subcommands —
+//! run `install` before `generate`, or let the `labelle` CLI orchestrate
+//! it. Running the binary directly is intended for testing the
 //! CLI ↔ assembler boundary and for power users who manage their own
 //! cache.
 
 const std = @import("std");
 const gen = @import("root.zig");
+const cache_cmd = @import("cache_cmd.zig");
+const init_cmd = @import("init_cmd.zig");
 
 /// Wire protocol version for CLI ↔ assembler subprocess communication.
 /// Bump when the command surface or output format changes in a way the
 /// CLI launcher needs to detect. The launcher reads this via
 /// `labelle-assembler --protocol-version` before invoking any subcommand.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 (#217 phase 1): added the `install`, `clean`, `upgrade` cache
+/// subcommands. The CLI delegates cache management to the binary instead
+/// of running the in-process generator's cache helpers.
+///
+/// v3 (#217 phase 3): added the `init` subcommand. The CLI delegates
+/// new-project scaffolding to the binary instead of its in-process
+/// `cmdInit`.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 const usage =
     \\labelle-assembler — code generator for the labelle game toolkit
@@ -32,9 +43,17 @@ const usage =
     \\  labelle-assembler --protocol-version
     \\  labelle-assembler --help
     \\  labelle-assembler generate --project-root <path> [options]
+    \\  labelle-assembler install [--project-root <path>] [pkg [version]]
+    \\  labelle-assembler clean [--dry-run] [--project-root <path>]
+    \\  labelle-assembler upgrade --project-root <path> [pkg [version]]
+    \\  labelle-assembler init <name> [dir] [options]
     \\
     \\Subcommands:
     \\  generate    Materialize .labelle/<target>/ from project.labelle
+    \\  install     Fetch packages into the local cache
+    \\  clean       Prune unused cached package versions
+    \\  upgrade     Bump version fields in project.labelle
+    \\  init        Scaffold a new project directory
     \\
     \\Generate options:
     \\  --project-root <path>   Path to game project (containing project.labelle)
@@ -43,9 +62,9 @@ const usage =
     \\  --backend <name>        Override graphics backend (raylib, sokol, sdl, bgfx, wgpu)
     \\
     \\Notes:
-    \\  This binary assumes the package cache is already populated. The
-    \\  `labelle` CLI handles cache management before invoking the
-    \\  assembler.
+    \\  `generate` reads the local package cache; run `install` first (or
+    \\  let the `labelle` CLI do it) to populate it. The `install`, `clean`,
+    \\  and `upgrade` subcommands manage that cache directly.
     \\
     \\See: https://github.com/labelle-toolkit/labelle-assembler
     \\
@@ -82,6 +101,26 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, first, "generate")) {
         try cmdGenerate(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "install")) {
+        try cache_cmd.cmdInstall(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "clean")) {
+        try cache_cmd.cmdClean(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "upgrade")) {
+        try cache_cmd.cmdUpgrade(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "init")) {
+        try init_cmd.cmdInit(allocator, io, &args);
         return;
     }
 
@@ -241,4 +280,10 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
 
     const source = try allocator.dupeZ(u8, source_raw);
     return try std.zon.parse.fromSliceAlloc(gen.ProjectConfig, allocator, source, null, .{});
+}
+
+// Pull in the subcommand modules' tests when this file is the test root.
+test {
+    std.testing.refAllDecls(@import("init_cmd.zig"));
+    std.testing.refAllDecls(@import("cache_cmd.zig"));
 }

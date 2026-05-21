@@ -249,7 +249,7 @@ fn hardlinkTree(allocator: std.mem.Allocator, src_path: []const u8, dest_path: [
                 try hardlinkTree(allocator, src_sub, dest_sub);
             },
             .file => {
-                try hardlinkOrCopy(src_sub, dest_sub);
+                try hardlinkOrCopy(allocator, src_sub, dest_sub);
             },
             .sym_link => {
                 // Read symlink target and recreate it
@@ -267,14 +267,14 @@ fn hardlinkTree(allocator: std.mem.Allocator, src_path: []const u8, dest_path: [
 /// (cross-device, Windows without NTFS, etc).
 /// Create a hardlink, falling back to copy. Works on macOS, Linux, and Windows.
 /// Hardlinks share disk space (zero cost) and work without admin privileges.
-fn hardlinkOrCopy(src: []const u8, dest: []const u8) !void {
+fn hardlinkOrCopy(allocator: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
     const builtin = @import("builtin");
 
     if (comptime builtin.os.tag == .windows) {
         // Windows: use CreateHardLinkW from kernel32
-        windowsHardLink(src, dest) catch {
+        windowsHardLink(allocator, src, dest) catch {
             try cwd.copyFile(src, cwd, dest, io, .{});
         };
     } else {
@@ -287,15 +287,20 @@ fn hardlinkOrCopy(src: []const u8, dest: []const u8) !void {
 
 /// Windows hardlink via kernel32.CreateHardLinkW.
 /// Works on NTFS without admin privileges.
-fn windowsHardLink(src: []const u8, dest: []const u8) !void {
+fn windowsHardLink(allocator: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
     const builtin = @import("builtin");
     if (comptime builtin.os.tag != .windows) unreachable;
 
-    const windows = std.os.windows;
-    const src_w = try windows.sliceToPrefixedFileW(null, src);
-    const dest_w = try windows.sliceToPrefixedFileW(null, dest);
+    // Zig 0.16 removed `std.os.windows.sliceToPrefixedFileW`; convert the
+    // UTF-8 paths to NUL-terminated UTF-16LE ourselves. CreateHardLinkW is
+    // a Win32 (not NT) call, so a plain wide path — no `\??\` prefix — is
+    // what it expects.
+    const src_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, src);
+    defer allocator.free(src_w);
+    const dest_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, dest);
+    defer allocator.free(dest_w);
 
-    const result = CreateHardLinkW(dest_w.span().ptr, src_w.span().ptr, null);
+    const result = CreateHardLinkW(dest_w.ptr, src_w.ptr, null);
     if (result == 0) return error.PermissionDenied;
 }
 

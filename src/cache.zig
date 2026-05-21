@@ -581,7 +581,10 @@ fn getTempPath(allocator: std.mem.Allocator, prefix: []const u8, suffix: []const
     return try std.fmt.allocPrint(allocator, "{s}" ++ std.fs.path.sep_str ++ "{s}-{s}", .{ tmp_base, prefix, suffix });
 }
 
-fn dirExists(path: []const u8) bool {
+/// Whether `path` exists and is accessible. Public so the cache
+/// subcommand handlers (cache_cmd.zig) can probe monorepo source dirs
+/// before deciding between a local symlink and a remote clone.
+pub fn dirExists(path: []const u8) bool {
     std.Io.Dir.cwd().access(config.globalIo(), path, .{}) catch return false;
     return true;
 }

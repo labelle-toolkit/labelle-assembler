@@ -60,6 +60,11 @@ pub const CORE_VERSION = @import("build_options").core_version;
 pub const ENGINE_VERSION = @import("build_options").engine_version;
 pub const GFX_VERSION = @import("build_options").gfx_version;
 
+/// This assembler binary's own version — stamped into `assembler_version`
+/// of a freshly scaffolded project.labelle by the `init` subcommand.
+/// Defaults to the package version (build.zig.zon) via build options.
+pub const ASSEMBLER_VERSION = @import("build_options").assembler_version;
+
 /// A plugin dependency declared in project.labelle.
 /// Plugins are external packages with a repo URL and version tag.
 /// Use `repo = "local:../../path"` for local development overrides.
