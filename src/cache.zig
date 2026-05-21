@@ -516,6 +516,13 @@ pub fn resolveGuiUrl(allocator: std.mem.Allocator, url: []const u8, ref: []const
 /// package manager, so the closest pinning primitive available is the
 /// commit SHA. When `hash` is null the plugin is fetched unpinned (the
 /// pre-existing behavior) and a warning is emitted.
+///
+/// The `.git` directory of a `.url` checkout is **always retained** (it is
+/// not stripped after a fresh fetch). Keeping it lets `resolvePluginDir`
+/// re-run `verifyGuiUrlHash` on every later resolution — a cache *hit*
+/// against a pinned `.hash` must be re-verified, otherwise a previously
+/// unpinned (or differently-pinned) checkout could silently satisfy a
+/// pinned config.
 pub fn fetchGuiUrl(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -526,26 +533,22 @@ pub fn fetchGuiUrl(
     const target = try resolveGuiUrl(allocator, url, slot);
     defer allocator.free(target);
 
-    // Keep `.git` around when we still need to read HEAD for verification.
-    const keep_git_dir = expected_sha != null;
-
+    // Always keep `.git`: a pinned `.url` checkout is re-verified against
+    // `.hash` on every resolution, including cache hits, which needs
+    // `git rev-parse HEAD` to keep working.
     if (git_ref) |r| {
-        try gitCloneShallow2(allocator, url, r, target, keep_git_dir);
+        try gitCloneShallow2(allocator, url, r, target, true);
     } else {
-        try gitCloneShallowDefaultBranch2(allocator, url, target, keep_git_dir);
+        try gitCloneShallowDefaultBranch2(allocator, url, target, true);
     }
 
     if (expected_sha) |sha| {
-        verifyGitHead(allocator, target, sha) catch |err| {
+        verifyGuiUrlHash(allocator, target, sha) catch |err| {
             // The checkout is wrong / unverifiable — don't leave a poisoned
             // cache slot that a later run would treat as already-fetched.
             std.Io.Dir.cwd().deleteTree(config.globalIo(), target) catch {};
             return err;
         };
-        // Verification done — strip `.git` to match the unpinned path.
-        const git_dir = try std.fs.path.join(allocator, &.{ target, ".git" });
-        defer allocator.free(git_dir);
-        std.Io.Dir.cwd().deleteTree(config.globalIo(), git_dir) catch {};
     } else {
         std.log.warn(
             "labelle: GUI plugin url '{s}' fetched without a '.hash' — " ++
@@ -557,21 +560,25 @@ pub fn fetchGuiUrl(
 
 /// Verify the `HEAD` commit of the git checkout at `repo_dir` matches
 /// `expected_sha`. Accepts a full 40-char SHA or an abbreviated prefix
-/// (>=7 chars). Returns `error.GuiUrlHashMismatch` on mismatch.
+/// (>=7 chars).
+///
+/// This helper is intentionally **silent**: it returns a typed error and
+/// never calls `std.log.err` itself. Logging is the caller's job — Zig's
+/// test runner fails any test that emits a `std.log.err`, so a negative
+/// test must be able to exercise the reject paths cleanly with
+/// `expectError`. Callers (`fetchGuiUrl`, `verifyGuiUrlHash`) own the
+/// diagnostics.
+///
+/// Errors:
+///   error.GuiUrlHashInvalid       — `.hash` is not a 7-40 char hex string.
+///   error.GuiUrlHashUnverifiable  — `git rev-parse HEAD` could not be run.
+///   error.GuiUrlHashMismatch      — HEAD does not match `expected_sha`.
 fn verifyGitHead(allocator: std.mem.Allocator, repo_dir: []const u8, expected_sha: []const u8) !void {
     if (expected_sha.len < 7 or expected_sha.len > 40) {
-        std.log.err(
-            "labelle: GUI plugin '.hash' must be a git commit SHA (7-40 hex chars), got '{s}'",
-            .{expected_sha},
-        );
         return error.GuiUrlHashInvalid;
     }
     for (expected_sha) |c| {
         if (!std.ascii.isHex(c)) {
-            std.log.err(
-                "labelle: GUI plugin '.hash' must be a git commit SHA (hex), got '{s}'",
-                .{expected_sha},
-            );
             return error.GuiUrlHashInvalid;
         }
     }
@@ -579,8 +586,7 @@ fn verifyGitHead(allocator: std.mem.Allocator, repo_dir: []const u8, expected_sh
     const io = config.globalIo();
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "git", "-C", repo_dir, "rev-parse", "HEAD" },
-    }) catch |err| {
-        std.log.err("labelle: could not run git rev-parse to verify '.hash': {any}", .{err});
+    }) catch {
         return error.GuiUrlHashUnverifiable;
     };
     defer allocator.free(result.stdout);
@@ -588,11 +594,9 @@ fn verifyGitHead(allocator: std.mem.Allocator, repo_dir: []const u8, expected_sh
 
     switch (result.term) {
         .exited => |code| if (code != 0) {
-            std.log.err("labelle: git rev-parse HEAD failed:\n{s}", .{result.stderr});
             return error.GuiUrlHashUnverifiable;
         },
         else => {
-            std.log.err("labelle: git rev-parse HEAD terminated abnormally", .{});
             return error.GuiUrlHashUnverifiable;
         },
     }
@@ -603,12 +607,40 @@ fn verifyGitHead(allocator: std.mem.Allocator, repo_dir: []const u8, expected_sh
     const matches = head.len >= expected_sha.len and
         std.ascii.eqlIgnoreCase(head[0..expected_sha.len], expected_sha);
     if (!matches) {
-        std.log.err(
-            "labelle: GUI plugin url checkout commit '{s}' does not match expected '.hash' '{s}'",
-            .{ head, expected_sha },
-        );
         return error.GuiUrlHashMismatch;
     }
+}
+
+/// Caller-facing `.hash` verification for a `.url` GUI checkout.
+///
+/// Runs `verifyGitHead` against the checkout at `repo_dir` and, on any
+/// failure, emits the appropriate human-readable diagnostic before
+/// re-raising the typed error. This is the single place `.hash`
+/// verification is logged — `verifyGitHead` itself stays silent so tests
+/// can exercise its reject paths without tripping the test runner.
+///
+/// Used both right after a fresh fetch and on every cache-hit resolution
+/// (see `resolvePluginDir`'s `.url` branch), so a pinned config can never
+/// silently run against a stale or unverified checkout.
+pub fn verifyGuiUrlHash(allocator: std.mem.Allocator, repo_dir: []const u8, expected_sha: []const u8) !void {
+    verifyGitHead(allocator, repo_dir, expected_sha) catch |err| {
+        switch (err) {
+            error.GuiUrlHashInvalid => std.log.err(
+                "labelle: GUI plugin '.hash' must be a git commit SHA (7-40 hex chars), got '{s}'",
+                .{expected_sha},
+            ),
+            error.GuiUrlHashUnverifiable => std.log.err(
+                "labelle: could not verify GUI plugin '.hash' — 'git rev-parse HEAD' " ++
+                    "failed in '{s}' (is it a git checkout, and is git installed?)",
+                .{repo_dir},
+            ),
+            error.GuiUrlHashMismatch => std.log.err(
+                "labelle: GUI plugin url checkout in '{s}' does not match expected '.hash' '{s}'",
+                .{ repo_dir, expected_sha },
+            ),
+        }
+        return err;
+    };
 }
 
 /// Shallow-clone a git repo's default branch (no `--branch`) into `target`.
@@ -1342,14 +1374,23 @@ test "verifyGitHead: matches the HEAD commit of a real git repo" {
     }.run;
 
     if (!try gitRun(alloc, &.{ "git", "-C", repo_abs, "init", "-q" })) return error.SkipZigTest;
-    _ = try gitRun(alloc, &.{ "git", "-C", repo_abs, "config", "user.email", "t@t.t" });
-    _ = try gitRun(alloc, &.{ "git", "-C", repo_abs, "config", "user.name", "t" });
     {
         const f = try tmp.dir.createFile(io, "repo/file.txt", .{});
         f.close(io);
     }
     _ = try gitRun(alloc, &.{ "git", "-C", repo_abs, "add", "." });
-    if (!try gitRun(alloc, &.{ "git", "-C", repo_abs, "commit", "-q", "-m", "init" }))
+    // CI runners have no global git identity, so `git commit` would fail
+    // with "Committer identity unknown" and leave the repo with no HEAD.
+    // Pass the identity inline via `-c` so the test never depends on the
+    // environment's git config.
+    if (!try gitRun(alloc, &.{
+        "git",                   "-C",
+        repo_abs,                "-c",
+        "user.email=ci@example.com", "-c",
+        "user.name=ci",          "commit",
+        "-q",                    "-m",
+        "init",
+    }))
         return error.SkipZigTest;
 
     // Read the actual HEAD SHA.

@@ -172,6 +172,18 @@ fn resolvePluginDir(allocator: std.mem.Allocator, ref: config.GuiPlugin, cfg: co
                 std.log.err("labelle: could not fetch GUI plugin from '{s}': {s}", .{ url, @errorName(err) });
                 return error.GuiPluginFetchFailed;
             };
+        } else if (ref.hash) |sha| {
+            // Cache HIT against a pinned `.hash`: the cached checkout may
+            // come from an earlier unpinned (or differently-pinned) fetch,
+            // so the cache slot's existence alone proves nothing. Re-verify
+            // the checked-out commit against `.hash` on *every* resolution.
+            // `.url` checkouts retain their `.git` directory precisely so
+            // this re-verification can run (see cache.fetchGuiUrl). A
+            // mismatched or unverifiable checkout is a hard error — the
+            // build must never proceed against an unexpected revision.
+            cache.verifyGuiUrlHash(allocator, dir, sha) catch {
+                return error.GuiUrlHashMismatch;
+            };
         }
         return dir;
     }
