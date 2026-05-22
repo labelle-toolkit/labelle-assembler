@@ -814,6 +814,24 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
     const test_step = b.step("test", "Run game-side tests");
     test_step.dependOn(&b.addRunArtifact(test_root).step);
 
+.lib_test_step
+    // ── In-project library tests ───────────────────────────────────
+    // Each `@libs/<lib>` plugin lives at `libs/<lib>/` under the
+    // project root and ships its own `build.zig` with its own `test`
+    // step. Fan those out from the master `test` step by shelling out
+    // to `zig build test` per lib, so a single `zig build test` in
+    // this backend dir covers both the game-side `tests/` files and
+    // every in-project library. Obsoletes labelle-cli's `--no-libs`
+    // workaround (#184). See labelle-assembler#82.
+    {
+        const lib_test = b.addSystemCommand(&.{ "zig", "build", "test" });
+        // build.zig sits at `.labelle/<backend>_<platform>/`, so the
+        // project root is two levels up.
+        lib_test.setCwd(b.path("{{lib_cwd}}"));
+        lib_test.setName("zig build test ({{lib_name}})");
+        test_step.dependOn(&lib_test.step);
+    }
+
 .tests_only_footer
 }
 
