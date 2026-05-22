@@ -430,13 +430,15 @@ pub const ProjectConfig = struct {
     resources: []const ResourceDef = &.{},
 
     /// Project app icon / launch image, as a path relative to the project
-    /// root (e.g. `"assets/icon.png"`). Drives the platform launcher icon
-    /// (Android `ic_launcher` mipmaps, desktop window icon, …).
+    /// root (e.g. `"assets/icon.png"`).
     ///
-    /// When `null`, the assembler injects a bundled default "Labelle"
+    /// Today this field only governs default-icon injection: when it is
+    /// null or empty the assembler injects a bundled default "Labelle"
     /// branded icon so a freshly scaffolded game doesn't surface a blank
-    /// OS window icon / stock Android launcher icon (issue #66). A project
-    /// that sets this field suppresses the default entirely.
+    /// OS window icon / stock Android launcher icon (issue #66); setting
+    /// a non-empty path suppresses the default. Wiring the icon through
+    /// to the platform launcher (Android `ic_launcher` mipmaps, desktop
+    /// window icon) is a follow-up.
     app_icon: ?[]const u8 = null,
     /// When true, the window is created hidden (no visible window). Useful for headless testing in CI.
     hidden: bool = false,

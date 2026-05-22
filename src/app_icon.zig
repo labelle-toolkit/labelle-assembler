@@ -33,20 +33,30 @@ pub const default_icon_bytes = @embedFile("assets/default_icon.png");
 /// project. The target-dir root is assembler-owned and safe to write.
 pub const default_icon_rel_path = "default_icon.png";
 
-/// Resolve the effective app-icon path for a project.
-///
-/// Returns the project's declared `app_icon` verbatim when set, otherwise
-/// the bundled default's target-relative path. Never returns null — every
-/// generated build has an icon, the question is only whose.
-pub fn effectiveIconPath(cfg: ProjectConfig) []const u8 {
-    return cfg.app_icon orelse default_icon_rel_path;
+/// True when the project declares a usable icon of its own — a
+/// non-null, non-empty `app_icon`. A stray `.app_icon = ""` is
+/// treated as "no icon" so the project still receives the default
+/// rather than an empty, unusable path.
+fn hasOwnIcon(cfg: ProjectConfig) bool {
+    const icon = cfg.app_icon orelse return false;
+    return icon.len != 0;
 }
 
-/// Returns true when the assembler must inject the bundled default icon
-/// into the generated build tree — i.e. the project declared no
-/// `app_icon` of its own.
+/// Resolve the effective app-icon path for a project.
+///
+/// Returns the project's declared `app_icon` when it sets a non-empty
+/// one, otherwise the bundled default's target-relative path. Never
+/// returns null — every generated build has an icon, the question is
+/// only whose.
+pub fn effectiveIconPath(cfg: ProjectConfig) []const u8 {
+    return if (hasOwnIcon(cfg)) cfg.app_icon.? else default_icon_rel_path;
+}
+
+/// Returns true when the assembler must inject the bundled default
+/// icon into the generated build tree — i.e. the project declares no
+/// `app_icon` of its own (null or empty).
 pub fn usesDefaultIcon(cfg: ProjectConfig) bool {
-    return cfg.app_icon == null;
+    return !hasOwnIcon(cfg);
 }
 
 /// Inject the bundled default icon into the generated target dir when
@@ -59,13 +69,22 @@ pub fn usesDefaultIcon(cfg: ProjectConfig) bool {
 /// before this runs and is a real, writable directory, whereas
 /// `target_dir/assets` is a symlink to the source project.
 pub fn injectDefaultIcon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: []const u8) !void {
-    if (!usesDefaultIcon(cfg)) return;
-
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
     const icon_path = try std.fs.path.join(allocator, &.{ target_dir, default_icon_rel_path });
     defer allocator.free(icon_path);
+
+    if (!usesDefaultIcon(cfg)) {
+        // The project ships its own icon — drop a default left behind
+        // by an earlier generate so a stale copy doesn't linger in
+        // the target after the project adopts a custom `app_icon`.
+        cwd.deleteFile(io, icon_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        return;
+    }
 
     // Plain (non-exclusive) write: regenerating an existing target must
     // refresh the default icon rather than fail on a stale copy.
@@ -132,4 +151,33 @@ test "injectDefaultIcon: is a no-op when the project declares its own app_icon" 
     const icon_path = try std.fs.path.join(allocator, &.{ target_dir, default_icon_rel_path });
     defer allocator.free(icon_path);
     try std.testing.expectError(error.FileNotFound, cwd.access(io, icon_path, .{}));
+}
+
+test "injectDefaultIcon: removes a stale default after the project adopts an app_icon" {
+    const allocator = std.testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(target_dir);
+
+    const icon_path = try std.fs.path.join(allocator, &.{ target_dir, default_icon_rel_path });
+    defer allocator.free(icon_path);
+
+    // First generate: no app_icon -> the default lands in the target.
+    try injectDefaultIcon(allocator, ProjectConfig{ .name = "game" }, target_dir);
+    try cwd.access(io, icon_path, .{});
+
+    // Project later adopts its own icon -> the stale default is dropped.
+    const cfg = ProjectConfig{ .name = "game", .app_icon = "assets/custom.png" };
+    try injectDefaultIcon(allocator, cfg, target_dir);
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, icon_path, .{}));
+}
+
+test "usesDefaultIcon: an empty app_icon string still gets the default" {
+    // A stray `.app_icon = ""` is not a usable icon — treat it as unset.
+    try std.testing.expect(usesDefaultIcon(.{ .name = "game", .app_icon = "" }));
+    try std.testing.expectEqualStrings(default_icon_rel_path, effectiveIconPath(.{ .name = "game", .app_icon = "" }));
 }
