@@ -428,6 +428,16 @@ pub const ProjectConfig = struct {
     initial_scene: ?[]const u8 = null,
     /// Sprite atlas resources — each entry declares a named atlas with frame data and texture.
     resources: []const ResourceDef = &.{},
+
+    /// Project app icon / launch image, as a path relative to the project
+    /// root (e.g. `"assets/icon.png"`). Drives the platform launcher icon
+    /// (Android `ic_launcher` mipmaps, desktop window icon, …).
+    ///
+    /// When `null`, the assembler injects a bundled default "Labelle"
+    /// branded icon so a freshly scaffolded game doesn't surface a blank
+    /// OS window icon / stock Android launcher icon (issue #66). A project
+    /// that sets this field suppresses the default entirely.
+    app_icon: ?[]const u8 = null,
     /// When true, the window is created hidden (no visible window). Useful for headless testing in CI.
     hidden: bool = false,
     /// When true, embed scene files into the binary via @embedFile (for release builds).
