@@ -23,11 +23,15 @@ const ProjectConfig = config.ProjectConfig;
 pub const default_icon_bytes = @embedFile("assets/default_icon.png");
 
 /// Path, relative to the generated target dir, where the default icon
-/// is written when the project provides none. Lives under `assets/` so
-/// it sits alongside the project's own copied assets and is reachable
-/// by the same `@embedFile("assets/...")` codegen the resource pipeline
-/// already emits.
-pub const default_icon_rel_path = "assets/default_icon.png";
+/// is written when the project provides none.
+///
+/// It lands at the target-dir root — NOT under `assets/`. The
+/// assembler links the project's `assets/` into the target as a
+/// *directory symlink* back to the source (`scanner.linkDir`), so the
+/// target's `assets/` is not a real, writable directory: writing into
+/// it fails (`error.NotDir`) and would otherwise pollute the source
+/// project. The target-dir root is assembler-owned and safe to write.
+pub const default_icon_rel_path = "default_icon.png";
 
 /// Resolve the effective app-icon path for a project.
 ///
@@ -45,24 +49,20 @@ pub fn usesDefaultIcon(cfg: ProjectConfig) bool {
     return cfg.app_icon == null;
 }
 
-/// Inject the bundled default icon into `target_dir/assets/` when the
-/// project declares no `app_icon`. A no-op when the project ships its
-/// own icon — `app_icon` being set means the default must NOT be
+/// Inject the bundled default icon into the generated target dir when
+/// the project declares no `app_icon`. A no-op when the project ships
+/// its own icon — `app_icon` being set means the default must NOT be
 /// emitted (issue #66 override precedence).
 ///
-/// The `assets/` directory is created if missing; it normally already
-/// exists because `root.zig` links the project's `assets/` folder into
-/// the target before this runs, but a project without an `assets/` dir
-/// must still receive the default.
+/// The icon is written at the target-dir root (see
+/// `default_icon_rel_path`): `target_dir` is created by the assembler
+/// before this runs and is a real, writable directory, whereas
+/// `target_dir/assets` is a symlink to the source project.
 pub fn injectDefaultIcon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: []const u8) !void {
     if (!usesDefaultIcon(cfg)) return;
 
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
-
-    const assets_dir = try std.fs.path.join(allocator, &.{ target_dir, "assets" });
-    defer allocator.free(assets_dir);
-    try cwd.createDirPath(io, assets_dir);
 
     const icon_path = try std.fs.path.join(allocator, &.{ target_dir, default_icon_rel_path });
     defer allocator.free(icon_path);
