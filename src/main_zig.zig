@@ -2487,12 +2487,19 @@ pub fn generateMainZigFromTemplate(
     defer data.scalars.deinit();
     defer data.lists.deinit();
 
-    // Track allocations for cleanup
+    // Track allocations for cleanup. Capacity is reserved up front for
+    // every `appendAssumeCapacity` call site below — each emitted block
+    // is appended at most once, so reserving the literal call-site count
+    // is a safe upper bound. Reserving makes the appends infallible,
+    // closing the OOM window where a `toOwnedSlice`'d block is owned but
+    // not yet in this cleanup list (errdefer audit, #75).
+    const ALLOCS_BLOCK_COUNT = 18;
     var allocs: std.ArrayList([]const u8) = .empty;
     defer {
         for (allocs.items) |s| allocator.free(s);
         allocs.deinit(allocator);
     }
+    try allocs.ensureTotalCapacity(allocator, ALLOCS_BLOCK_COUNT);
 
     // ── Boolean flags ──
     try data.scalars.put("ecs_mode_mock", if (cfg.ecs == .mock) "1" else "");
@@ -2526,7 +2533,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("hook_imports_block", block);
     }
 
@@ -2544,7 +2551,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("event_imports_block", block);
     }
 
@@ -2562,7 +2569,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("enum_imports_block", block);
     }
 
@@ -2608,7 +2615,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("jsonc_scene_block", block);
     }
 
@@ -2620,7 +2627,7 @@ pub fn generateMainZigFromTemplate(
         try generateGameLayers(cfg.layers, bw);
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("game_layers_block", block);
     }
 
@@ -2630,7 +2637,7 @@ pub fn generateMainZigFromTemplate(
     // The block is kept as an empty string for template compatibility.
     {
         const block = try allocator.dupe(u8, "");
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("resource_registry_block", block);
     }
 
@@ -2646,7 +2653,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("all_hook_payloads_block", block);
     }
 
@@ -2669,7 +2676,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("game_hooks_block", block);
     }
 
@@ -2696,7 +2703,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("hooks_init_block", block);
     }
 
@@ -2719,7 +2726,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("game_events_block", block);
     }
 
@@ -2732,7 +2739,7 @@ pub fn generateMainZigFromTemplate(
         try bw.writeAll("const Prefabs = engine.PrefabRegistry(.{});\n\n");
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("prefab_registry_block", block);
     }
 
@@ -2765,7 +2772,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("component_registry_block", block);
     }
 
@@ -2801,7 +2808,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("system_registry_block", block);
     }
 
@@ -2834,7 +2841,7 @@ pub fn generateMainZigFromTemplate(
         try bw.writeAll("};\n\n");
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("all_scripts_block", block);
     }
 
@@ -2855,7 +2862,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("view_registry_block", block);
     }
 
@@ -2874,7 +2881,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("gizmo_registry_block", block);
     }
 
@@ -2894,7 +2901,7 @@ pub fn generateMainZigFromTemplate(
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
-        try allocs.append(allocator, block);
+        allocs.appendAssumeCapacity(block);
         try data.scalars.put("animation_registry_block", block);
     }
 
@@ -3259,7 +3266,7 @@ pub fn generateMainZigFromTemplate(
 
         var arr_list_l = alloc_writer_b.toArrayList();
         const lifecycle = try arr_list_l.toOwnedSlice(allocator);
-        try allocs.append(allocator, lifecycle);
+        allocs.appendAssumeCapacity(lifecycle);
         try data.scalars.put("lifecycle", lifecycle);
     }
 
