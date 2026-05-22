@@ -462,6 +462,109 @@ fn writePluginControllersBlock(bw: anytype, cfg: ProjectConfig) !void {
     try bw.writeAll("};\n\n");
 }
 
+/// Emit the `PluginEvents` tagged union (RFC-PLUGIN-EVENTS phase 1).
+///
+/// Walks every plugin module at comptime with `@hasDecl(mod, "Events")`
+/// — the same convention `Components` / `Systems` / `GizmoCategories`
+/// use — and folds each `pub const <name>` inside the `Events` struct
+/// into a union variant with a plugin-qualified tag
+/// (`<plugin>__<event>`). `.` is not a valid Zig identifier character,
+/// so the on-disk JSONC dot form (`box2d.collision_begin`) resolves to
+/// the qualified tag (`box2d__collision_begin`) when flow-codegen
+/// consumes this in phase 3.
+///
+/// Plugins without a `pub const Events` struct contribute zero
+/// variants (the `@hasDecl` guard makes them no-ops) so every shipped
+/// game keeps building unchanged — the success criterion on the
+/// phase-1 ticket.
+///
+/// The plugin "name" prefix is the same string used in
+/// `@import("<name>")` (project.labelle's `.plugins[].name`),
+/// sanitized to a valid Zig identifier — non-`[A-Za-z0-9_]` bytes
+/// collapse to `_`. Two plugins whose sanitized name collide would
+/// produce duplicate variant names, which `MergeHookPayloads`'
+/// duplicate-field check (`labelle-core/src/dispatcher.zig:158-163`)
+/// already rejects with a compile error.
+fn writePluginEventsBlock(bw: anytype, cfg: ProjectConfig) !void {
+    try bw.writeAll("// --- Plugin events (RFC-PLUGIN-EVENTS phase 1) ---\n");
+    try bw.writeAll("// Discovered at comptime from `pub const Events` on each plugin\n");
+    try bw.writeAll("// module — same convention as Components/Systems/GizmoCategories.\n");
+    try bw.writeAll("// Variant tag = `<plugin>__<event>` so a flow's dotted name\n");
+    try bw.writeAll("// (`box2d.collision_begin`) maps to a Zig identifier.\n");
+    try bw.writeAll("pub const PluginEvents = blk: {\n");
+    try bw.writeAll("    const _plugin_events_mods = .{\n");
+    for (cfg.plugins) |plugin| {
+        var name_buf: [128]u8 = undefined;
+        const sanitized = sanitizePluginIdent(plugin.name, &name_buf);
+        try bw.print("        .{{ .name = \"{s}\", .module = @import(\"{s}\") }},\n", .{ sanitized, plugin.name });
+    }
+    try bw.writeAll("    };\n");
+    try bw.writeAll("    // Count variants (one per `pub const <name>` on each plugin's `Events`).\n");
+    try bw.writeAll("    // The whole `blk:` body is comptime (we're assigning to a module-\n");
+    try bw.writeAll("    // level `const`), so `var` is enough — `comptime var` in a\n");
+    try bw.writeAll("    // comptime scope is redundant and Zig 0.16 rejects it.\n");
+    try bw.writeAll("    var _count: usize = 0;\n");
+    try bw.writeAll("    for (_plugin_events_mods) |_entry| {\n");
+    try bw.writeAll("        if (@hasDecl(_entry.module, \"Events\")) {\n");
+    try bw.writeAll("            const _E = @field(_entry.module, \"Events\");\n");
+    try bw.writeAll("            for (@typeInfo(_E).@\"struct\".decls) |_d| {\n");
+    try bw.writeAll("                if (@TypeOf(@field(_E, _d.name)) == type) _count += 1;\n");
+    try bw.writeAll("            }\n");
+    try bw.writeAll("        }\n");
+    try bw.writeAll("    }\n");
+    try bw.writeAll("    var _names: [_count][]const u8 = undefined;\n");
+    try bw.writeAll("    var _types: [_count]type = undefined;\n");
+    try bw.writeAll("    var _attrs: [_count]std.builtin.Type.UnionField.Attributes = undefined;\n");
+    try bw.writeAll("    var _idx: usize = 0;\n");
+    try bw.writeAll("    for (_plugin_events_mods) |_entry| {\n");
+    try bw.writeAll("        if (@hasDecl(_entry.module, \"Events\")) {\n");
+    try bw.writeAll("            const _E = @field(_entry.module, \"Events\");\n");
+    try bw.writeAll("            for (@typeInfo(_E).@\"struct\".decls) |_d| {\n");
+    try bw.writeAll("                const _Et = @field(_E, _d.name);\n");
+    try bw.writeAll("                if (@TypeOf(_Et) == type) {\n");
+    try bw.writeAll("                    _names[_idx] = _entry.name ++ \"__\" ++ _d.name;\n");
+    try bw.writeAll("                    _types[_idx] = _Et;\n");
+    try bw.writeAll("                    _attrs[_idx] = .{ .@\"align\" = @alignOf(_Et) };\n");
+    try bw.writeAll("                    _idx += 1;\n");
+    try bw.writeAll("                }\n");
+    try bw.writeAll("            }\n");
+    try bw.writeAll("        }\n");
+    try bw.writeAll("    }\n");
+    try bw.writeAll("    const _Repr = std.math.IntFittingRange(0, if (_count > 0) _count - 1 else 0);\n");
+    try bw.writeAll("    var _tag_values: [_count]_Repr = undefined;\n");
+    try bw.writeAll("    for (0.._count) |_i| _tag_values[_i] = @intCast(_i);\n");
+    try bw.writeAll("    const _Tag = @Enum(_Repr, .exhaustive, &_names, &_tag_values);\n");
+    try bw.writeAll("    break :blk @Union(.auto, _Tag, &_names, &_types, &_attrs);\n");
+    try bw.writeAll("};\n\n");
+}
+
+/// Sanitize a plugin name (e.g. `labelle-box2d`) into a Zig identifier
+/// fragment safe for embedding in a union variant tag. Non-identifier
+/// bytes (`-`, `.`, `/`, …) collapse to `_`. The output is written
+/// into the caller's buffer and returned as a sub-slice. The mapping
+/// is collapsing rather than escaping, so two plugin names that
+/// sanitize to the same identifier (e.g. `foo-bar` and `foo_bar`)
+/// would collide — but the resulting duplicate variant name is
+/// rejected by `MergeHookPayloads`' duplicate-field check at
+/// comptime, surfacing the conflict immediately rather than silently.
+fn sanitizePluginIdent(name: []const u8, buf: *[128]u8) []const u8 {
+    var i: usize = 0;
+    // A leading digit is invalid in a Zig identifier — prefix `_`.
+    if (name.len > 0 and std.ascii.isDigit(name[0])) {
+        buf[i] = '_';
+        i += 1;
+    }
+    for (name) |c| {
+        if (i >= buf.len) break;
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '_' => buf[i] = c,
+            else => buf[i] = '_',
+        }
+        i += 1;
+    }
+    return buf[0..i];
+}
+
 /// Build the setup code block for {{setup_code}} (loop-based backends).
 /// Wrapper style for `emitResourceLoad`. The two callers differ only
 /// in how they propagate load failures:
@@ -2686,15 +2789,25 @@ pub fn generateMainZigFromTemplate(
         try data.scalars.put("resource_registry_block", block);
     }
 
-    // AllHookPayloads block — merge engine payloads with game events if present
+    // AllHookPayloads block — merge engine payloads with game events
+    // (`events/*.zig` scan, labelle-engine#422) and plugin events
+    // (`pub const Events` on plugin modules, RFC-PLUGIN-EVENTS phase 1).
+    // PluginEvents is always a union (possibly empty) when any plugin
+    // exists, so it can sit inside the same `MergeHookPayloads` call —
+    // game events stay on the same merged `AllHookPayloads` (no parallel
+    // dispatcher, per RFC §2 "feed the existing pipeline").
     {
         var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
         errdefer alloc_writer_b.deinit();
         const bw = &alloc_writer_b.writer;
-        if (event_names.len == 0) {
+        const has_plugin_events = cfg.plugins.len > 0;
+        if (event_names.len == 0 and !has_plugin_events) {
             try bw.writeAll("const AllHookPayloads = engine.HookPayload(EcsBackend.Entity);\n\n");
         } else {
-            try bw.writeAll("const AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), GameEvents });\n\n");
+            try bw.writeAll("const AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity)");
+            if (event_names.len > 0) try bw.writeAll(", GameEvents");
+            if (has_plugin_events) try bw.writeAll(", PluginEvents");
+            try bw.writeAll(" });\n\n");
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
@@ -2752,15 +2865,36 @@ pub fn generateMainZigFromTemplate(
         try data.scalars.put("hooks_init_block", block);
     }
 
-    // Game events block
+    // Game events + Plugin events block.
+    //
+    // `GameEvents` is the game-side scan of `events/*.zig`
+    // (labelle-engine#422 — shipped). `PluginEvents` is the
+    // plugin-side discovery added by RFC-PLUGIN-EVENTS phase 1: walks
+    // every plugin module with `@hasDecl(plugin, "Events")` at
+    // comptime — same convention as `Components`/`Systems`/
+    // `GizmoCategories` — and folds each `pub const <name> = struct`
+    // declaration into a single tagged union with plugin-qualified
+    // variant names (`<plugin>__<event>`). `.` is not a valid Zig
+    // identifier character, so the on-disk JSONC dot form
+    // (`box2d.collision_begin`) resolves to the qualified tag
+    // (`box2d__collision_begin`) when flow-codegen consumes this in
+    // phase 3.
+    //
+    // Both decls are `pub` so flow-codegen-emitted hook handler
+    // structs (phase 3) can reference them by name via the existing
+    // module-level import path. The resolver is the comptime
+    // reflection itself (option (a) — generated comptime decl rather
+    // than a JSON sidecar): `@FieldType(PluginEvents, "<tag>")` and
+    // `@typeInfo(...).@"struct".fields` give the payload field list
+    // without a separate registry file to keep in sync.
     {
         var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
         errdefer alloc_writer_b.deinit();
         const bw = &alloc_writer_b.writer;
         if (event_names.len == 0) {
-            try bw.writeAll("const GameEvents = void;\n\n");
+            try bw.writeAll("pub const GameEvents = void;\n\n");
         } else {
-            try bw.writeAll("const GameEvents = union(enum) {\n");
+            try bw.writeAll("pub const GameEvents = union(enum) {\n");
             var pascal_buf: [128]u8 = undefined;
             for (event_names) |name| {
                 const ident = pathToIdent(name, &ident_buf);
@@ -2768,6 +2902,9 @@ pub fn generateMainZigFromTemplate(
                 try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
             }
             try bw.writeAll("};\n\n");
+        }
+        if (cfg.plugins.len > 0) {
+            try writePluginEventsBlock(bw, cfg);
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);

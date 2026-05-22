@@ -449,3 +449,327 @@ pub const GameModuleBinding = struct {
         try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"labelle-engine\")") != null);
     }
 };
+
+// ── RFC-PLUGIN-EVENTS phase 1 (labelle-assembler#174) ───────────────────
+//
+// Verify the assembler's `GameEvents` / `AllHookPayloads` codegen blocks
+// folded `PluginEvents` into the same merged payload union. The
+// assertions check the *emitted Zig source* — the comptime walk on
+// `@hasDecl(plugin, "Events")` only fires when the generated main.zig
+// is compiled with a plugin module in scope, which is end-to-end
+// covered by `bouncing-ball` building (verified manually). Here we
+// pin the codegen shape so a future template churn cannot silently
+// drop the discovery scaffolding.
+
+const tiny_template_with_events =
+    \\const std = @import("std");
+    \\const engine = @import("labelle-engine");
+    \\{{game_events_block}}{{all_hook_payloads_block}}{{lifecycle}}
+;
+
+const tiny_lifecycle_events =
+    \\pub fn main() !void {}
+    \\
+;
+
+pub const PluginEvents = struct {
+    test "no plugins, no game events: AllHookPayloads stays the original engine.HookPayload form" {
+        const allocator = std.testing.allocator;
+
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            // No plugins, no events/ scan — the pre-RFC backward-compat
+            // shape that every existing game keeps building on.
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_with_events,
+            cfg,
+            tiny_lifecycle_events,
+            &.{},
+            &.{}, // prefab_names
+            &.{}, // jsonc_scene_names
+            &.{}, // scene_manifests
+            &.{}, // component_names
+            &.{}, // hook_names
+            &.{}, // event_names
+            &.{}, // enum_names
+            &.{}, // view_names
+            &.{}, // gizmo_names
+            &.{}, // animation_names
+        );
+        defer allocator.free(main_zig);
+
+        // The legacy single-payload form — every shipped game has this
+        // exact line today, and our RFC-PLUGIN-EVENTS phase 1 must not
+        // touch it when neither game events nor plugins exist.
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            main_zig,
+            "const AllHookPayloads = engine.HookPayload(EcsBackend.Entity);",
+        ) != null);
+        // `PluginEvents` decl must NOT exist in the no-plugin case.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "PluginEvents") == null);
+    }
+
+    test "plugins present: emits a PluginEvents blk: union and merges it into AllHookPayloads" {
+        const allocator = std.testing.allocator;
+
+        // Mirrors bouncing-ball's `.plugins = .{.{ .name = \"box2d\" }}`:
+        // a single plugin with an identifier-safe name. The codegen
+        // doesn't load the plugin module — the `@hasDecl` walk is
+        // emitted as comptime Zig in main.zig, not run here.
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{
+                .{ .name = "box2d", .repo = "local:../labelle-box2d" },
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_with_events,
+            cfg,
+            tiny_lifecycle_events,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+        );
+        defer allocator.free(main_zig);
+
+        // PluginEvents decl is emitted as a `pub const` so flow-codegen
+        // (phase 3) can reference it via the module-level import path.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const PluginEvents = blk: {") != null);
+        // The comptime walk uses the same `@hasDecl(plugin, \"Events\")`
+        // convention `Components`/`Systems`/`GizmoCategories` already
+        // use (RFC §1, §2).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@hasDecl(_entry.module, \"Events\")") != null);
+        // Plugin-qualified variant tag — `<plugin>__<event>` — uses `__`
+        // as the separator because `.` is not a valid Zig identifier
+        // character. The codegen builds the name with `++ \"__\" ++`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_entry.name ++ \"__\" ++ _d.name") != null);
+        // The plugin module is imported by its project.labelle name —
+        // the exact same `@import(\"box2d\")` form `SystemRegistry`
+        // and `ComponentRegistryWithPlugins` already use.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"box2d\")") != null);
+        // Merged into the SAME AllHookPayloads — no parallel dispatcher.
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            main_zig,
+            "AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), PluginEvents })",
+        ) != null);
+
+        // Validate the emitted Zig parses cleanly — `@Union` / `@Enum`
+        // / `comptime var` arrangements are easy to break silently.
+        const sentinel_src = try allocator.dupeZ(u8, main_zig);
+        defer allocator.free(sentinel_src);
+        var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
+        defer ast.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "plugin name with dashes is sanitized to a Zig-identifier-safe prefix" {
+        const allocator = std.testing.allocator;
+
+        // A hyphenated name (`labelle-imgui`) is a plausible
+        // project.labelle entry; the variant tag `<plugin>__<event>`
+        // must collapse `-` to `_` so it parses as a Zig identifier.
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{
+                .{ .name = "labelle-imgui", .repo = "" },
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_with_events,
+            cfg,
+            tiny_lifecycle_events,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+        );
+        defer allocator.free(main_zig);
+
+        // `.name` is the sanitized identifier (used as the variant
+        // prefix). `.module` keeps the original string for `@import`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".name = \"labelle_imgui\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"labelle-imgui\")") != null);
+    }
+
+    test "GameEvents and PluginEvents both flow into the same AllHookPayloads merge" {
+        const allocator = std.testing.allocator;
+
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{
+                .{ .name = "box2d", .repo = "" },
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_with_events,
+            cfg,
+            tiny_lifecycle_events,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{"player_attacked"}, // event_names — one game event
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+        );
+        defer allocator.free(main_zig);
+
+        // Both unions appear in the merge expression, in this order —
+        // `engine.HookPayload(EcsBackend.Entity)` first (the lifecycle
+        // hooks), then `GameEvents` (events/*.zig scan), then
+        // `PluginEvents` (plugin `pub const Events` discovery).
+        const merge_str = "engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), GameEvents, PluginEvents })";
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, merge_str) != null);
+        // Game-side decl is also `pub` (so flow-codegen can reference
+        // it by name from a generated handler in phase 3).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const GameEvents = union(enum)") != null);
+    }
+};
+
+// ── Flow sort-order (RFC-PLUGIN-EVENTS O3, phase 1 fix) ─────────────────
+//
+// Pre-RFC, `flow_scanner.zig:188` hard-coded `.sort_order = null` for
+// every emitted ScriptEntry. That parked all flows in the unnumbered
+// tail of the script scanner's sort, with raw `rel_path` as the
+// tiebreaker — so `10_x.flow.jsonc` sorted before `2_x.flow.jsonc`
+// (string-lex). RFC-PLUGIN-EVENTS O3 makes flows follow the same
+// numeric-prefix convention scripts use (`script_scanner.zig:3-13`)
+// by reusing `extractSortOrder`. These tests pin the new behaviour
+// against the exact failure mode the previous code shipped.
+
+pub const FlowSortOrder = struct {
+    test "numeric-prefixed flows extract their sort_order from the basename" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const fx = try setupFixture(allocator, &tmp);
+        defer allocator.free(fx.game_dir);
+        defer allocator.free(fx.target_dir);
+
+        // Stem `01_input` carries a numeric prefix; scanner must lift
+        // it to `sort_order = 1` (parity with `01_input.zig` scripts).
+        try writeSample(tmp.dir, "game/scripts/flows/01_input.flow.jsonc", move_flow_body);
+
+        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir);
+        defer result.deinit();
+
+        // Two entries — the `move.flow.jsonc` from setupFixture plus our
+        // new `01_input.flow.jsonc`. The numbered one sorts first.
+        try std.testing.expectEqual(@as(usize, 2), result.entries.len);
+        try std.testing.expectEqualStrings("01_input", result.entries[0].name);
+        try std.testing.expectEqual(@as(?u32, 1), result.entries[0].sort_order);
+        try std.testing.expectEqualStrings("move", result.entries[1].name);
+        try std.testing.expectEqual(@as(?u32, null), result.entries[1].sort_order);
+    }
+
+    test "numeric-prefixed flows sort numerically (2 before 10), not alphabetically" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const io = std.testing.io;
+        try tmp.dir.createDirPath(io, "game/scripts/flows");
+        try tmp.dir.createDirPath(io, "game/.labelle/target");
+        const game_dir_z = try tmp.dir.realPathFileAlloc(io, "game", allocator);
+        defer allocator.free(game_dir_z);
+        const game_dir = try allocator.dupe(u8, game_dir_z);
+        defer allocator.free(game_dir);
+        const target_dir_z = try tmp.dir.realPathFileAlloc(io, "game/.labelle/target", allocator);
+        defer allocator.free(target_dir_z);
+        const target_dir = try allocator.dupe(u8, target_dir_z);
+        defer allocator.free(target_dir);
+        try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
+
+        // The exact failure mode the old `.sort_order = null` code
+        // shipped: `10_late` would sort *before* `2_early` because
+        // `'1' < '2'` in raw string order. The numeric sort_order fix
+        // makes `2` come first.
+        try writeSample(tmp.dir, "game/scripts/flows/10_late.flow.jsonc", move_flow_body);
+        try writeSample(tmp.dir, "game/scripts/flows/2_early.flow.jsonc", move_flow_body);
+
+        var result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir);
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(usize, 2), result.entries.len);
+        try std.testing.expectEqualStrings("2_early", result.entries[0].name);
+        try std.testing.expectEqual(@as(?u32, 2), result.entries[0].sort_order);
+        try std.testing.expectEqualStrings("10_late", result.entries[1].name);
+        try std.testing.expectEqual(@as(?u32, 10), result.entries[1].sort_order);
+    }
+
+    test "unprefixed flows keep sort_order=null and sort after numbered flows alphabetically" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const io = std.testing.io;
+        try tmp.dir.createDirPath(io, "game/scripts/flows");
+        try tmp.dir.createDirPath(io, "game/.labelle/target");
+        const game_dir_z = try tmp.dir.realPathFileAlloc(io, "game", allocator);
+        defer allocator.free(game_dir_z);
+        const game_dir = try allocator.dupe(u8, game_dir_z);
+        defer allocator.free(game_dir);
+        const target_dir_z = try tmp.dir.realPathFileAlloc(io, "game/.labelle/target", allocator);
+        defer allocator.free(target_dir_z);
+        const target_dir = try allocator.dupe(u8, target_dir_z);
+        defer allocator.free(target_dir);
+        try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
+
+        // Mix numbered + unnumbered: numbered sort first, unnumbered
+        // alphabetically after. Mirrors the script scanner's per-scope
+        // sort policy (`script_scanner.zig:489-504`).
+        try writeSample(tmp.dir, "game/scripts/flows/zebra.flow.jsonc", move_flow_body);
+        try writeSample(tmp.dir, "game/scripts/flows/01_first.flow.jsonc", move_flow_body);
+        try writeSample(tmp.dir, "game/scripts/flows/apple.flow.jsonc", move_flow_body);
+
+        var result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir);
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(usize, 3), result.entries.len);
+        try std.testing.expectEqualStrings("01_first", result.entries[0].name);
+        try std.testing.expectEqual(@as(?u32, 1), result.entries[0].sort_order);
+        try std.testing.expectEqualStrings("apple", result.entries[1].name);
+        try std.testing.expectEqual(@as(?u32, null), result.entries[1].sort_order);
+        try std.testing.expectEqualStrings("zebra", result.entries[2].name);
+        try std.testing.expectEqual(@as(?u32, null), result.entries[2].sort_order);
+    }
+};

@@ -132,6 +132,23 @@ pub fn scanAndEmit(
         const rel_stem = rel[0 .. rel.len - flow_ext.len];
         const display_name = std.fs.path.basename(rel_stem);
 
+        // Numeric-prefix sort key, mirroring the convention in
+        // `script_scanner.zig:3-13` and the resolution recorded as
+        // RFC-PLUGIN-EVENTS O3: `01_input.flow.jsonc` runs before
+        // `02_count.flow.jsonc`, unprefixed files sort alphabetically
+        // in the tail. The previous `.sort_order = null` parked every
+        // flow in the unnumbered tail and sorted by raw `rel` string,
+        // which got `10_x` before `2_x`. Pulling the prefix out of the
+        // *basename* (not the full `rel`) keeps the numeric range
+        // per-flow rather than across subdirectories.
+        //
+        // `extractSortOrder` reads digits up to a single `_`
+        // regardless of trailing extension, so feeding the
+        // `display_name` (already `<stem>` minus `.flow.jsonc`) works
+        // without a flow-specific variant of `stripPrefixAndExtension`
+        // — `02_foo` returns 2 the same way `02_foo.zig` does.
+        const sort_order = script_scanner.extractSortOrder(display_name);
+
         const src_path = try std.fs.path.join(allocator, &.{ src_flows, rel });
         defer allocator.free(src_path);
 
@@ -185,13 +202,34 @@ pub fn scanAndEmit(
             .name = name_owned,
             .filename = out_rel_zig,
             .states = &.{},
-            .sort_order = null,
+            .sort_order = sort_order,
             .subdir = null,
             .rel_path = rel_path,
             .plugin_name = null,
             .plugin_index = 0,
         });
     }
+
+    // Sort by (sort_order numeric, then alphabetical fallback), so
+    // numeric-prefixed flows fire in prefix order even when the
+    // string-sorted `rel_paths` would otherwise put `10_foo` before
+    // `2_foo`. Matches the script scanner's per-scope sort
+    // (`script_scanner.zig:467-507`) but stripped to the columns flows
+    // actually use — flows aren't state-gated and don't ship from
+    // plugins today, so the plugin/subdir/state arms collapse.
+    std.mem.sortUnstable(ScriptEntry, entries.items, {}, struct {
+        fn lessThan(_: void, a: ScriptEntry, b: ScriptEntry) bool {
+            const a_has = a.sort_order != null;
+            const b_has = b.sort_order != null;
+            if (a_has != b_has) return a_has;
+            if (a.sort_order) |ao| {
+                if (b.sort_order) |bo| {
+                    if (ao != bo) return ao < bo;
+                }
+            }
+            return std.mem.order(u8, a.rel_path, b.rel_path) == .lt;
+        }
+    }.lessThan);
 
     return .{
         .arena = arena,
