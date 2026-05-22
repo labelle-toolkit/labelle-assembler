@@ -326,9 +326,9 @@ pub const AllScriptsIntegration = struct {
         // shape used for hand-authored scripts. If this drifts the
         // generated build won't find the file at `scripts/flows/...`.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"scripts/flows/move.zig\")") != null);
-        // pathToIdent replaces `/` and `.` with `_`, so the binding
-        // name is `flows_move`.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const flows_move =") != null);
+        // pathToIdent escapes `/` to `_s_` (injective — see issue #172),
+        // so the binding name is `flows_s_move`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const flows_s_move =") != null);
     }
 
     test "nested flow ScriptEntry renders its subdirectory in the AllScripts @import path" {
@@ -377,9 +377,9 @@ pub const AllScriptsIntegration = struct {
         // flat `flows/patrol.zig` would silently resolve to the wrong
         // file (or fail the build).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"scripts/flows/enemy/patrol.zig\")") != null);
-        // pathToIdent collapses `/` and `.` to `_`, so the nested path
-        // binds as `flows_enemy_patrol`.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const flows_enemy_patrol =") != null);
+        // pathToIdent escapes each `/` to `_s_` (injective — see issue
+        // #172), so the nested path binds as `flows_s_enemy_s_patrol`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const flows_s_enemy_s_patrol =") != null);
 
         // The emitted block must still parse as valid Zig — the nested
         // import line is the only moving part versus the flat case.
