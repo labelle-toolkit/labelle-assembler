@@ -16,6 +16,7 @@ const build_files = @import("build_files.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
 const gui_resolve = @import("gui_resolve.zig");
+pub const app_icon = @import("app_icon.zig");
 
 // Force test discovery for files that aren't transitively reached by
 // any compiled function path during `addTest` runs.
@@ -26,6 +27,7 @@ test {
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
     _ = @import("deps_linker.zig");
+    _ = @import("app_icon.zig");
 }
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
@@ -263,6 +265,13 @@ pub fn generate(
 
     // Copy-only folders (no scanning needed)
     try scanner.linkDir(allocator, game_dir, target_dir, "assets");
+
+    // Inject the bundled default "Labelle" app icon when the project
+    // declares no `app_icon` of its own (issue #66). A project that
+    // sets `app_icon` ships its own icon, so the default is suppressed.
+    // Runs after the assets dir is linked so the default lands beside
+    // the project's own copied assets.
+    try app_icon.injectDefaultIcon(allocator, cfg, target_dir);
 
     // `tests/` mirrors the project source tree (e.g. `tests/components/foo.zig`
     // tests `components/foo.zig`). Linked + scanned so the generated
