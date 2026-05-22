@@ -2689,7 +2689,7 @@ pub const SUBFOLDERS = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const camera_u_control = @import(\"scripts/camera_control.zig\")") != null);
     }
 
-    test "component names with slashes use underscore PascalCase identifiers" {
+    test "component names resolve to a natural PascalCase type name" {
         const components = &[_][]const u8{ "physics/rigid_body", "health" };
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
@@ -2698,11 +2698,15 @@ pub const SUBFOLDERS = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, components, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // Subfolder component: `physics/rigid_body` -> injective ident
-        // `physics_s_rigid_u_body` (issue #172), PascalCased to
-        // `PhysicsSRigidUBody`. The import path keeps the original name.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".PhysicsSRigidUBody = @import(\"components/physics/rigid_body.zig\").PhysicsSRigidUBody") != null);
-        // Top-level component unchanged
+        // The component type name is the natural PascalCase of the path
+        // (`pathToPascal` — `/` and `_` are word boundaries), so
+        // `physics/rigid_body` -> `PhysicsRigidBody`. It must NOT run
+        // through `pathToIdent`'s injective `_`-escaping (issue #172):
+        // that escaping is for generated *symbol* names, whereas this
+        // name has to match the `pub const` declared in the user's
+        // file (e.g. `components/jump_anim.zig` -> `JumpAnim`).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".PhysicsRigidBody = @import(\"components/physics/rigid_body.zig\").PhysicsRigidBody") != null);
+        // Top-level component: `health` -> `Health`.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".Health = @import(\"components/health.zig\").Health") != null);
     }
 

@@ -2445,18 +2445,28 @@ fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
     return buf[0..i];
 }
 
-/// Convert snake_case to PascalCase: "rigid_body" -> "RigidBody", "health" -> "Health".
-fn snakeToPascal(name: []const u8, pascal_buf: *[128]u8) []const u8 {
+/// Derive a PascalCase type name from a script/component path:
+/// `jump_anim` -> `JumpAnim`, `enemy/patrol` -> `EnemyPatrol`,
+/// `health.zig` -> `Health`. Every non-alphanumeric byte (`_`, `/`,
+/// `.`, `+`, …) is treated as a word boundary.
+///
+/// Distinct from `pathToIdent`, which builds a *unique* identifier
+/// (issue #172) and so must *escape* separators rather than collapse
+/// them — feeding `pathToIdent`'s output here would turn `jump_anim`
+/// into `JumpUAnim` (the `_u_` underscore-escape leaks through).
+fn pathToPascal(name: []const u8, pascal_buf: *[128]u8) []const u8 {
+    const end = if (std.mem.endsWith(u8, name, ".zig")) name.len - 4 else name.len;
     var i: usize = 0;
     var capitalize_next = true;
-    for (name) |c| {
-        if (c == '_') {
-            capitalize_next = true;
-        } else {
-            if (i >= pascal_buf.len) break;
-            pascal_buf[i] = if (capitalize_next) std.ascii.toUpper(c) else c;
-            i += 1;
-            capitalize_next = false;
+    for (name[0..end]) |c| {
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9' => {
+                if (i >= pascal_buf.len) break;
+                pascal_buf[i] = if (capitalize_next) std.ascii.toUpper(c) else c;
+                i += 1;
+                capitalize_next = false;
+            },
+            else => capitalize_next = true,
         }
     }
     return pascal_buf[0..i];
@@ -2698,7 +2708,7 @@ pub fn generateMainZigFromTemplate(
             try bw.writeAll("const GameHooks = engine.MergeHooks(AllHookPayloads, .{");
             for (hook_names) |name| {
                 const ident = pathToIdent(name, &ident_buf);
-                const pascal = snakeToPascal(ident, &pascal_buf);
+                const pascal = pathToPascal(name, &pascal_buf);
                 try bw.print(" *{s}.{s},", .{ ident, pascal });
             }
             try bw.writeAll(" });\n\n");
@@ -2720,7 +2730,7 @@ pub fn generateMainZigFromTemplate(
             var pascal_buf: [128]u8 = undefined;
             for (hook_names) |name| {
                 const ident = pathToIdent(name, &ident_buf);
-                const pascal = snakeToPascal(ident, &pascal_buf);
+                const pascal = pathToPascal(name, &pascal_buf);
                 try bw.print("    var {s}_inst = {s}.{s}{{}};\n", .{ ident, ident, pascal });
             }
             try bw.writeAll("    var hooks = GameHooks{ .receivers = .{");
@@ -2748,7 +2758,7 @@ pub fn generateMainZigFromTemplate(
             var pascal_buf: [128]u8 = undefined;
             for (event_names) |name| {
                 const ident = pathToIdent(name, &ident_buf);
-                const pascal = snakeToPascal(ident, &pascal_buf);
+                const pascal = pathToPascal(name, &pascal_buf);
                 try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
             }
             try bw.writeAll("};\n\n");
@@ -2785,8 +2795,7 @@ pub fn generateMainZigFromTemplate(
         }
         var pascal_buf: [128]u8 = undefined;
         for (component_names) |name| {
-            const ident = pathToIdent(name, &ident_buf);
-            const pascal = snakeToPascal(ident, &pascal_buf);
+            const pascal = pathToPascal(name, &pascal_buf);
             try bw.print("    .{s} = @import(\"components/{s}.zig\").{s},\n", .{ pascal, name, pascal });
         }
         if (has_plugins) {
@@ -2922,8 +2931,7 @@ pub fn generateMainZigFromTemplate(
         if (animation_names.len > 0) {
             var anim_pascal_buf: [128]u8 = undefined;
             for (animation_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                const pascal = snakeToPascal(ident, &anim_pascal_buf);
+                const pascal = pathToPascal(name, &anim_pascal_buf);
                 try bw.print("const {s}Anim = engine.AnimationDef(@import(\"animations/{s}.zon\"));\n", .{ pascal, name });
             }
             try bw.writeAll("\n");
