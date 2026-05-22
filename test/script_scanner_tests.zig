@@ -761,4 +761,85 @@ pub const MemoryLeaks = struct {
 
         try expect.equal(scanner.getEntries().len, @as(usize, 2));
     }
+
+    // ── OOM-path cleanup (errdefer audit, issue #75) ──────────────────
+    //
+    // `checkAllAllocationFailures` runs the body once per allocation,
+    // failing the Nth alloc each pass, and asserts no memory leaked when
+    // the body returns `error.OutOfMemory`. Before the #75 errdefer
+    // fixes, an OOM between a `dupe`/`allocPrint` and the `append` that
+    // takes ownership leaked the first allocation — this test fails on
+    // the unfixed code and passes on the fixed code.
+
+    /// Build a scanner, scan `scripts_path`, then tear it down. Used as
+    /// the body for `checkAllAllocationFailures` — every allocation on
+    /// this path (entry dupes, rel-path prints, shared-list appends,
+    /// `parseDirStates`) must be cleaned up by `deinit` + the errdefers
+    /// when an earlier alloc is forced to fail.
+    fn scanDirUnderOom(failing: std.mem.Allocator, scripts_path: []const u8) !void {
+        const states_list = [_][]const u8{ "playing", "menu" };
+        var scanner = ScriptScanner.init(failing, &states_list);
+        defer scanner.deinit();
+        try scanner.scanDir(scripts_path);
+        // Exercise getEntriesForState too — its `result` ArrayList has
+        // its own errdefer cleanup.
+        const filtered = try scanner.getEntriesForState("playing");
+        failing.free(filtered);
+    }
+
+    test "scanDir cleans up on every OOM point (errdefer audit #75)" {
+        const alloc = std.testing.allocator;
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        try tmp_dir.dir.createDirPath(std.testing.io, "scripts");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/global.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io, "scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/01_movement.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io, "scripts/playing/sub");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/sub/02_ai.zig", .data = "" });
+        try tmp_dir.dir.createDirPath(std.testing.io, "scripts/playing+menu");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing+menu/camera.zig", .data = "" });
+
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
+        defer alloc.free(scripts_path);
+
+        try std.testing.checkAllAllocationFailures(alloc, scanDirUnderOom, .{scripts_path});
+    }
+
+    /// Body for the `scanPluginDir` OOM check — scans a game scripts dir
+    /// and then a plugin-shipped one, the latter being the path the #75
+    /// gemini-flagged leaks lived on (`name_dup`, per-entry `rel_path`,
+    /// plugin state-dir `subdir_name`).
+    fn scanPluginDirUnderOom(failing: std.mem.Allocator, game_path: []const u8, plugin_path: []const u8) !void {
+        const states_list = [_][]const u8{ "playing", "menu" };
+        var scanner = ScriptScanner.init(failing, &states_list);
+        defer scanner.deinit();
+        try scanner.scanDir(game_path);
+        try scanner.scanPluginDir(plugin_path, "myplugin");
+    }
+
+    test "scanPluginDir cleans up on every OOM point (errdefer audit #75)" {
+        const alloc = std.testing.allocator;
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        // Game scripts.
+        try tmp_dir.dir.createDirPath(std.testing.io, "scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/global.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/01_move.zig", .data = "" });
+        // Plugin-shipped scripts: a root-level script + a state subdir.
+        try tmp_dir.dir.createDirPath(std.testing.io, "plugin_scripts/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "plugin_scripts/01_plugin_global.zig", .data = "" });
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "plugin_scripts/playing/02_plugin_state.zig", .data = "" });
+
+        const game_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
+        defer alloc.free(game_path);
+        const plugin_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "plugin_scripts", alloc);
+        defer alloc.free(plugin_path);
+
+        try std.testing.checkAllAllocationFailures(alloc, scanPluginDirUnderOom, .{ game_path, plugin_path });
+    }
 };

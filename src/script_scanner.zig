@@ -70,10 +70,16 @@ pub const ScriptScanner = struct {
         plugin_index: u32 = 0,
     };
 
+    /// Errors `scanDir` / `scanPluginDir` / `scanZigFilesRecursive` can
+    /// surface. `DuplicateSortOrder` is the validation failure;
+    /// `OutOfMemory` covers every allocation. The directory-iterator
+    /// error set (`AccessDenied`, `SystemResources`, …) is folded in so
+    /// a failed `iter.next()` propagates instead of being silently
+    /// swallowed by a `catch return` — see issue #75.
     pub const ScanError = error{
         DuplicateSortOrder,
         OutOfMemory,
-    };
+    } || std.Io.Dir.Iterator.Error;
 
     pub fn init(allocator: Allocator, valid_states: []const []const u8) ScriptScanner {
         return .{
@@ -120,10 +126,16 @@ pub const ScriptScanner = struct {
         defer dir.close(io);
 
         var iter = dir.iterate();
-        while (iter.next(io) catch return) |entry| {
+        // Propagate iterator errors instead of swallowing them with
+        // `catch return` — a mid-scan AccessDenied/SystemResources would
+        // otherwise silently truncate the script list (issue #75).
+        while (try iter.next(io)) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
                 // Root-level script — runs in all states
                 const name_copy = try self.allocator.dupe(u8, entry.name);
+                // `name_copy` backs both `filename` and `rel_path` on the
+                // entry; free it if `addEntryWithPath`'s append OOMs.
+                errdefer self.allocator.free(name_copy);
                 try self.addEntryWithPath(name_copy, null, &.{}, name_copy);
             } else if (entry.kind == .directory) {
                 // Skip plugin sub-trees (`.plugin_<name>/`) — `scanPluginDir`
@@ -134,13 +146,34 @@ pub const ScriptScanner = struct {
                 // First-level directory — parse for state binding
                 const dir_states = try self.parseDirStates(entry.name);
                 if (dir_states.len == 0) continue;
+                // `parseDirStates` returns an owned slice of owned
+                // strings; free it if any step before it's handed to
+                // `shared_states` fails. Cleared once ownership transfers
+                // (see `transferred` flag below).
+                var transferred = false;
+                errdefer if (!transferred) {
+                    for (dir_states) |s| self.allocator.free(s);
+                    self.allocator.free(dir_states);
+                };
 
                 const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ scripts_dir, entry.name });
                 defer self.allocator.free(subdir_path);
+
+                // Reserve capacity for both shared-list appends *before*
+                // duping `subdir_name`, so that after the dupe the only
+                // remaining steps (the two appends) are infallible. This
+                // closes the OOM window where `subdir_name`/`dir_states`
+                // are owned but not yet in a cleanup list (issue #75).
+                try self.shared_subdirs.ensureUnusedCapacity(self.allocator, 1);
+                try self.shared_states.ensureUnusedCapacity(self.allocator, 1);
+
                 const subdir_name = try self.allocator.dupe(u8, entry.name);
-                // Track shared allocations for cleanup in deinit
-                try self.shared_subdirs.append(self.allocator, subdir_name);
-                try self.shared_states.append(self.allocator, dir_states);
+                errdefer if (!transferred) self.allocator.free(subdir_name);
+                // Infallible — ownership of both now belongs to the
+                // scanner; deinit frees them.
+                self.shared_subdirs.appendAssumeCapacity(subdir_name);
+                self.shared_states.appendAssumeCapacity(dir_states);
+                transferred = true;
                 // Recursively scan — deeper subdirs are organizational only
                 try self.scanZigFilesRecursive(subdir_path, subdir_name, dir_states, subdir_name);
             }
@@ -175,8 +208,11 @@ pub const ScriptScanner = struct {
         var dir = std.Io.Dir.cwd().openDir(io, plugin_scripts_dir, .{ .iterate = true }) catch return;
         defer dir.close(io);
 
+        // Reserve before duping so the append is infallible — otherwise
+        // an OOM in `append` leaks `name_dup` (issue #75).
+        try self.shared_plugin_names.ensureUnusedCapacity(self.allocator, 1);
         const name_dup = try self.allocator.dupe(u8, plugin_name);
-        try self.shared_plugin_names.append(self.allocator, name_dup);
+        self.shared_plugin_names.appendAssumeCapacity(name_dup);
 
         // Assign this plugin its position in the declaration order.
         // Increment first so plugin indices start at 1 — leaves 0 free as
@@ -198,22 +234,41 @@ pub const ScriptScanner = struct {
         defer self.allocator.free(rel_prefix);
 
         var iter = dir.iterate();
-        while (iter.next(io) catch return) |entry| {
+        // Propagate iterator errors — see the matching note in `scanDir`.
+        while (try iter.next(io)) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
                 const name_copy = try self.allocator.dupe(u8, entry.name);
+                // Free `name_copy` if either the rel_path build or the
+                // entry append below OOMs (issue #75).
+                errdefer self.allocator.free(name_copy);
                 const rel_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
+                errdefer self.allocator.free(rel_path);
                 try self.addEntryWithPath(name_copy, null, &.{}, rel_path);
             } else if (entry.kind == .directory) {
                 // Plugin state-scoped dirs follow the same convention as
                 // the game's scripts/: first-level dirs are state bindings.
                 const dir_states = try self.parseDirStates(entry.name);
                 if (dir_states.len == 0) continue;
+                var transferred = false;
+                errdefer if (!transferred) {
+                    for (dir_states) |s| self.allocator.free(s);
+                    self.allocator.free(dir_states);
+                };
 
                 const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ plugin_scripts_dir, entry.name });
                 defer self.allocator.free(subdir_path);
+
+                // Reserve before duping `subdir_name` so the two shared-
+                // list appends are infallible — closes the OOM leak
+                // window (issue #75).
+                try self.shared_subdirs.ensureUnusedCapacity(self.allocator, 1);
+                try self.shared_states.ensureUnusedCapacity(self.allocator, 1);
+
                 const subdir_name = try self.allocator.dupe(u8, entry.name);
-                try self.shared_subdirs.append(self.allocator, subdir_name);
-                try self.shared_states.append(self.allocator, dir_states);
+                errdefer if (!transferred) self.allocator.free(subdir_name);
+                self.shared_subdirs.appendAssumeCapacity(subdir_name);
+                self.shared_states.appendAssumeCapacity(dir_states);
+                transferred = true;
                 // The relative-path prefix threads through recursion so
                 // nested plugin dirs end up with `.plugin_<name>/<state>/...`.
                 const rel_prefix_with_state = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
@@ -270,6 +325,11 @@ pub const ScriptScanner = struct {
     /// Get entries filtered by state (includes global scripts).
     pub fn getEntriesForState(self: *const ScriptScanner, state: []const u8) ![]const ScriptEntry {
         var result: std.ArrayList(ScriptEntry) = .empty;
+        // Free the backing buffer if an `append` (or the final
+        // `toOwnedSlice`) OOMs — entries are shallow copies of
+        // scanner-owned memory, so only the list itself needs cleanup
+        // (issue #75).
+        errdefer result.deinit(self.allocator);
         for (self.entries.items) |entry| {
             if (entry.states.len == 0) {
                 // Global script — runs in all states
@@ -294,10 +354,15 @@ pub const ScriptScanner = struct {
         defer dir.close(io);
 
         var iter = dir.iterate();
-        while (iter.next(io) catch return) |entry| {
+        // Propagate iterator errors — see the matching note in `scanDir`.
+        while (try iter.next(io)) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
                 const name_copy = try self.allocator.dupe(u8, entry.name);
+                // Free `name_copy` if the rel_path build or the entry
+                // append below OOMs (issue #75).
+                errdefer self.allocator.free(name_copy);
                 const rel_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
+                errdefer self.allocator.free(rel_path);
                 try self.addEntryWithPath(name_copy, state_dir_name, states, rel_path);
             } else if (entry.kind == .directory) {
                 const sub_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name });
@@ -311,13 +376,23 @@ pub const ScriptScanner = struct {
 
     fn parseDirStates(self: *ScriptScanner, dir_name: []const u8) ![]const []const u8 {
         var states: std.ArrayList([]const u8) = .empty;
+        // On any error (a mid-loop `dupe`/`append` OOM, or `toOwnedSlice`
+        // failing), free every state string duped so far plus the list's
+        // backing buffer — otherwise the partial work leaks (issue #75).
+        errdefer {
+            for (states.items) |s| self.allocator.free(s);
+            states.deinit(self.allocator);
+        }
         var iter = std.mem.splitScalar(u8, dir_name, '+');
 
         while (iter.next()) |state_name| {
             if (state_name.len == 0) continue;
             if (!isValidStateName(state_name)) continue;
             if (!self.isKnownState(state_name)) continue;
-            try states.append(self.allocator, try self.allocator.dupe(u8, state_name));
+            // Reserve first so the append can't fail after the dupe —
+            // a dupe-then-failed-append would otherwise leak the dup.
+            try states.ensureUnusedCapacity(self.allocator, 1);
+            states.appendAssumeCapacity(try self.allocator.dupe(u8, state_name));
         }
 
         return try states.toOwnedSlice(self.allocator);
