@@ -8,16 +8,18 @@
             .url = "https://github.com/apotema/zspec/archive/v0.9.1.tar.gz",
             .hash = "zspec-0.9.1-jaKLbbX4AwBKANdetxzzWc3UTO0UY0lcJJzTagQHlt5K",
         },
-        // The pure-Zig `.flow.zon` parser + Zig-source codegen used by
+        // The pure-Zig `.flow.jsonc` parser + Zig-source codegen used by
         // `zig build generate` to emit script files — no imgui/zgui
         // editor stack. Formerly an in-tree sub-package of labelle-gui
         // consumed via `.path = "../labelle-gui/flow-codegen"`; that
         // relative path broke whenever this package was itself fetched
         // as a dependency (the sibling `../labelle-gui` isn't there).
         // Now its own URL-pinned repo so any consumer resolves it.
+        // Pinned to flow-codegen `main` (c6f29ef): JSON(C) flow parser +
+        // OnUpdate/OnCreate/OnDestroy/OnCall/OnEvent event types.
         .flow_codegen = .{
-            .url = "https://github.com/labelle-toolkit/flow-codegen/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "flow_codegen-0.1.0-PFKUp5g7AQArc7JihUzx3JXAZbYv4KXaW7I9ugZ20ooW",
+            .url = "git+https://github.com/labelle-toolkit/flow-codegen#c6f29ef08c904b9e27e11029ed478da8fe2cf2fd",
+            .hash = "flow_codegen-0.1.0-PFKUp0u8AgAPcIvM54cYcGDGAQW9vNpkUapud067tprH",
         },
     },
     .paths = .{

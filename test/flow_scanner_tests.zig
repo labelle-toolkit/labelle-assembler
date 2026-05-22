@@ -38,22 +38,24 @@ test {
 /// recipe. OnCreate (not OnUpdate) keeps it clear of the `// TODO(#42)`
 /// stub the codegen emits for OnUpdate entity selection.
 ///
-/// The body is the flow graph as `flow_codegen` v0.1.0's parser
-/// consumes it; the `.flow.jsonc` extension is what assembler discovery
-/// keys on (RFC FLOWS-JSONC §1). flow-codegen's own parser switch to
-/// JSONC content is tracked separately in the flow-codegen repo.
+/// The body is the flow graph as `flow_codegen`'s parser consumes it —
+/// `.flow.jsonc` is JSONC (flat nodes, `edges` list) per RFC
+/// FLOWS-JSONC. The `.flow.jsonc` extension is what assembler discovery
+/// keys on (RFC FLOWS-JSONC §1).
 const move_flow_body =
-    \\.{
-    \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
-    \\    .nodes = .{
-    \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .GetComponent = .{ .type = "Position" } } },
-    \\        .{ .id = 2, .pos = .{0, 0}, .kind = .{ .BinOp = .{ .op = .add } } },
-    \\        .{ .id = 3, .pos = .{0, 0}, .kind = .{ .SetField = .{ .target = "Position.x" } } },
-    \\    },
-    \\    .links = .{
-    \\        .{ .from = .{ .node = 1, .pin = "x" }, .to = .{ .node = 2, .pin = "a" } },
-    \\        .{ .from = .{ .node = 2, .pin = "result" }, .to = .{ .node = 3, .pin = "value" } },
-    \\    },
+    \\{
+    \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
+    \\  "nodes": [
+    \\    { "id": 1, "type": "GetComponent", "pos": [0, 0], "component": "Position" },
+    \\    { "id": 2, "type": "Literal", "pos": [0, 0], "value": "1.0" },
+    \\    { "id": 3, "type": "BinOp", "pos": [0, 0], "op": "add" },
+    \\    { "id": 4, "type": "SetField", "pos": [0, 0], "target": "Position.x" }
+    \\  ],
+    \\  "edges": [
+    \\    { "from": { "node": 1, "pin": "x" }, "to": { "node": 3, "pin": "a" } },
+    \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
+    \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "value" } }
+    \\  ]
     \\}
     \\
 ;
@@ -184,13 +186,13 @@ pub const FlowScanner = struct {
         // `error.DuplicateNodeId`. Confirms scanner propagates typed
         // errors rather than swallowing them.
         const bad =
-            \\.{
-            \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
-            \\    .nodes = .{
-            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .Identifier = .{ .name = "a" } } },
-            \\        .{ .id = 1, .pos = .{0, 0}, .kind = .{ .Identifier = .{ .name = "b" } } },
-            \\    },
-            \\    .links = .{},
+            \\{
+            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Identifier", "pos": [0, 0], "name": "a" },
+            \\    { "id": 1, "type": "Identifier", "pos": [0, 0], "name": "b" }
+            \\  ],
+            \\  "edges": []
             \\}
             \\
         ;
