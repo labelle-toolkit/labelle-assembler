@@ -2429,6 +2429,12 @@ fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
             idx.* += bytes.len;
         }
     }.f;
+    // A leading digit makes the result invalid as a Zig identifier
+    // (`pub const 2x2_tile = ...` won't compile). Prefix a `_`. It
+    // can't alias an escape sequence — every escape is `_` followed
+    // by a letter (`u`/`s`/`d`/`p`/`x`), never a digit — so the
+    // mapping stays injective.
+    if (end > 0 and name[0] >= '0' and name[0] <= '9') append(buf, &i, "_");
     for (name[0..end]) |c| {
         switch (c) {
             'A'...'Z', 'a'...'z', '0'...'9' => append(buf, &i, &.{c}),
@@ -3400,6 +3406,20 @@ test "pathToIdent: dot and plus map to distinct escapes" {
     try std.testing.expectEqualStrings("a_s_b", pathToIdent("a/b", &s));
     // ...and none of them collide with each other.
     try std.testing.expect(!std.mem.eql(u8, pathToIdent("a.b", &d), pathToIdent("a+b", &p)));
+}
+
+test "pathToIdent: a leading digit is prefixed to stay a valid identifier" {
+    var a: [256]u8 = undefined;
+    var b: [256]u8 = undefined;
+    // `2x2_tile` would otherwise emit `2x2_u_tile`, which Zig rejects
+    // as an identifier. The `_` prefix keeps it valid.
+    try std.testing.expectEqualStrings("_2x2_u_tile", pathToIdent("2x2_tile", &a));
+    // The prefix must not collapse two distinct digit-leading paths.
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        pathToIdent("0a", &a),
+        pathToIdent("1a", &b),
+    ));
 }
 
 test "pathToIdent: every distinct path yields a distinct identifier" {
