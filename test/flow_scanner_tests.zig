@@ -330,6 +330,65 @@ pub const AllScriptsIntegration = struct {
         // name is `flows_move`.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const flows_move =") != null);
     }
+
+    test "nested flow ScriptEntry renders its subdirectory in the AllScripts @import path" {
+        const allocator = std.testing.allocator;
+
+        // Recursive discovery (RFC FLOWS-JSONC §5) emits `rel_path`
+        // values with subdirectories — `flows/enemy/patrol.zig` for a
+        // flow at `scripts/flows/enemy/patrol.flow.jsonc`. The AllScripts
+        // emit must carry that subdir through verbatim in the `@import`
+        // so the generated build resolves the mirrored on-disk layout.
+        const flow_entry: generator.script_scanner.ScriptScanner.ScriptEntry = .{
+            .name = "patrol",
+            .filename = "enemy/patrol.zig",
+            .states = &.{},
+            .sort_order = null,
+            .subdir = null,
+            .rel_path = "flows/enemy/patrol.zig",
+            .plugin_name = null,
+            .plugin_index = 0,
+        };
+        const entries: []const generator.script_scanner.ScriptScanner.ScriptEntry = &.{flow_entry};
+
+        const empty_names: []const []const u8 = &.{};
+        const empty_scene_manifests: []const generator.scene_manifest.SceneManifest = &.{};
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_engine_template,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tiny_lifecycle,
+            entries,
+            empty_names, // prefab_names
+            empty_names, // jsonc_scene_names
+            empty_scene_manifests,
+            empty_names, // component_names
+            empty_names, // hook_names
+            empty_names, // event_names
+            empty_names, // enum_names
+            empty_names, // view_names
+            empty_names, // gizmo_names
+            empty_names, // animation_names
+        );
+        defer allocator.free(main_zig);
+
+        // The subdirectory survives into the import path verbatim — a
+        // flat `flows/patrol.zig` would silently resolve to the wrong
+        // file (or fail the build).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"scripts/flows/enemy/patrol.zig\")") != null);
+        // pathToIdent collapses `/` and `.` to `_`, so the nested path
+        // binds as `flows_enemy_patrol`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const flows_enemy_patrol =") != null);
+
+        // The emitted block must still parse as valid Zig — the nested
+        // import line is the only moving part versus the flat case.
+        const sentinel_src = try allocator.dupeZ(u8, main_zig);
+        defer allocator.free(sentinel_src);
+        var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
+        defer ast.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
 };
 
 // ── `game` module binding (labelle-assembler#116) ──────────────────────

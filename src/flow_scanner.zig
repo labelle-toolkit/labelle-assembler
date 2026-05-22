@@ -176,9 +176,14 @@ pub fn scanAndEmit(
         // global-script shape (`states = &.{}`, `subdir = null`) so
         // the existing AllScripts emit picks them up via the simple
         // import branch rather than the state-wrapper branch.
+        //
+        // `filename` is the display/debug field — use the full mirrored
+        // relative path (`enemy/patrol.zig`, not the bare `patrol.zig`
+        // basename) so two flows that share a stem across subdirectories
+        // stay distinguishable in diagnostics.
         try entries.append(arena_alloc, .{
             .name = name_owned,
-            .filename = std.fs.path.basename(out_rel_zig),
+            .filename = out_rel_zig,
             .states = &.{},
             .sort_order = null,
             .subdir = null,
@@ -198,9 +203,17 @@ pub fn scanAndEmit(
 /// shape directly to stderr. Best-effort — stderr write failures are
 /// swallowed because there's nothing actionable a caller could do
 /// about them, and the typed error is what actually fails the build.
+///
+/// `rel_path` comes from a recursive walk, so a deeply nested flow can
+/// produce an arbitrarily long line — write the parts streamed rather
+/// than formatting through a fixed stack buffer that a long path would
+/// silently overflow (suppressing the diagnostic entirely).
 fn reportFlowError(rel_path: []const u8, err: anyerror) void {
     const io = config.globalIo();
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "flows/{s}: {s}\n", .{ rel_path, @errorName(err) }) catch return;
-    std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+    const stderr = std.Io.File.stderr();
+    stderr.writeStreamingAll(io, "flows/") catch {};
+    stderr.writeStreamingAll(io, rel_path) catch {};
+    stderr.writeStreamingAll(io, ": ") catch {};
+    stderr.writeStreamingAll(io, @errorName(err)) catch {};
+    stderr.writeStreamingAll(io, "\n") catch {};
 }
