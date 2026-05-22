@@ -456,14 +456,15 @@ pub fn generate(
 
     // ── Flow codegen (#94, Part B) ─────────────────────────────────────
     //
-    // Walk `<game>/scripts/flows/*.flow.zon`, emit a sibling `.zig`
-    // per file via the `flow_codegen` sub-package (shipped from
-    // labelle-gui), and append a synthetic `ScriptEntry` for each so
+    // Recursively walk `<game>/scripts/flows/**` for `*.flow.jsonc`,
+    // emit a sibling `.zig` per file via the `flow_codegen` sub-package
+    // (shipped from labelle-gui), and append a synthetic `ScriptEntry`
+    // for each so
     // the existing AllScripts block picks them up naturally on the
     // next emit pass. The tests target shares this codepath — flows
     // are global (state-less) scripts and contribute to both exe and
     // tests builds. Empty `scripts/flows/` is a silent no-op.
-    // flow_scanner already wrote a per-file `flows/<name>: <err>`
+    // flow_scanner already wrote a per-file `flows/<rel>: <err>`
     // diagnostic to stderr; propagate the typed error so `generate`
     // exits non-zero.
     var flow_result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir);
@@ -501,7 +502,7 @@ pub fn generate(
     if (!is_tests_target) {
         const scanned_entries = script_scan.getEntries();
         // Merge in the synthetic flow entries so AllScripts sees both
-        // hand-authored scripts and `.flow.zon`-derived ones. Flows
+        // hand-authored scripts and `.flow.jsonc`-derived ones. Flows
         // sort after every real script in the game block today (no
         // numeric prefix, alphabetical fallback), matching the file
         // layout on disk where `scripts/flows/*.zig` sits below

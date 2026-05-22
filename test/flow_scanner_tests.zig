@@ -1,13 +1,14 @@
-//! Integration tests for `flow_scanner` — the `.flow.zon` discovery
+//! Integration tests for `flow_scanner` — the `.flow.jsonc` discovery
 //! and codegen pass that Part B of labelle-gui#94 wires into the
-//! assembler.
+//! assembler. Discovery is a recursive `scripts/flows/**` scan
+//! (RFC FLOWS-JSONC §5).
 //!
 //! Layout exercised per test:
 //!
 //! ```
-//! <tmp>/game/scripts/flows/<stem>.flow.zon  ← author-edited source
+//! <tmp>/game/scripts/flows/**/<stem>.flow.jsonc ← author-edited source
 //! <tmp>/game/.labelle/target/scripts/      ← symlink → ../../scripts
-//! <tmp>/game/.labelle/target/scripts/flows/<stem>.zig
+//! <tmp>/game/.labelle/target/scripts/flows/**/<stem>.zig
 //! ```
 //!
 //! Tests run the scanner in-process against a real filesystem (not a
@@ -36,7 +37,12 @@ test {
 /// 3-node fixture matching the spec's "GetComponent + BinOp + SetField"
 /// recipe. OnCreate (not OnUpdate) keeps it clear of the `// TODO(#42)`
 /// stub the codegen emits for OnUpdate entity selection.
-const move_flow_zon =
+///
+/// The body is the flow graph as `flow_codegen` v0.1.0's parser
+/// consumes it; the `.flow.jsonc` extension is what assembler discovery
+/// keys on (RFC FLOWS-JSONC §1). flow-codegen's own parser switch to
+/// JSONC content is tracked separately in the flow-codegen repo.
+const move_flow_body =
     \\.{
     \\    .event = .{ .OnCreate = .{ .arg_entity = "entity" } },
     \\    .nodes = .{
@@ -77,8 +83,8 @@ fn setupFixture(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !struct 
     defer allocator.free(target_dir_z);
     const target_dir = try allocator.dupe(u8, target_dir_z);
 
-    // Plant the .flow.zon fixture.
-    try writeSample(tmp.dir, "game/scripts/flows/move.flow.zon", move_flow_zon);
+    // Plant the .flow.jsonc fixture.
+    try writeSample(tmp.dir, "game/scripts/flows/move.flow.jsonc", move_flow_body);
 
     // Symlink target/scripts → ../../scripts (matches scanner.linkDir).
     try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
@@ -87,7 +93,7 @@ fn setupFixture(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !struct 
 }
 
 pub const FlowScanner = struct {
-    test "emits a .zig per .flow.zon and the generated source parses as valid Zig" {
+    test "emits a .zig per .flow.jsonc and the generated source parses as valid Zig" {
         const allocator = std.testing.allocator;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -188,10 +194,67 @@ pub const FlowScanner = struct {
             \\}
             \\
         ;
-        try writeSample(tmp.dir, "game/scripts/flows/bad.flow.zon", bad);
+        try writeSample(tmp.dir, "game/scripts/flows/bad.flow.jsonc", bad);
 
         const result = flow_scanner.scanAndEmit(allocator, game_dir, target_dir);
         try std.testing.expectError(error.DuplicateNodeId, result);
+    }
+
+    test "recursively discovers .flow.jsonc files in scripts/flows/ subdirectories" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const fx = try setupFixture(allocator, &tmp);
+        defer allocator.free(fx.game_dir);
+        defer allocator.free(fx.target_dir);
+
+        // A second flow nested one directory deep — RFC FLOWS-JSONC §5
+        // makes flow discovery a recursive `scripts/flows/**` scan, so
+        // this must be picked up alongside the flat `move` flow.
+        try writeSample(tmp.dir, "game/scripts/flows/enemy/patrol.flow.jsonc", move_flow_body);
+
+        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir);
+        defer result.deinit();
+
+        // Two sources → two entries. Sorted by relative path:
+        // `enemy/patrol.flow.jsonc` < `move.flow.jsonc`.
+        try std.testing.expectEqual(@as(usize, 2), result.entries.len);
+        try std.testing.expectEqualStrings("patrol", result.entries[0].name);
+        // The emitted `.zig` mirrors the source's subdirectory layout
+        // so two flows sharing a stem in different dirs never collide.
+        try std.testing.expectEqualStrings("flows/enemy/patrol.zig", result.entries[0].rel_path);
+        try std.testing.expectEqualStrings("move", result.entries[1].name);
+        try std.testing.expectEqualStrings("flows/move.zig", result.entries[1].rel_path);
+
+        // The nested emission lands at the mirrored target path.
+        const out_path = try std.fs.path.join(allocator, &.{ fx.target_dir, "scripts", "flows", "enemy", "patrol.zig" });
+        defer allocator.free(out_path);
+        const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, out_path, allocator, .limited(64 * 1024));
+        defer allocator.free(source);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub fn onCreate") != null);
+    }
+
+    test "ignores non-.flow.jsonc files in scripts/flows/" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const fx = try setupFixture(allocator, &tmp);
+        defer allocator.free(fx.game_dir);
+        defer allocator.free(fx.target_dir);
+
+        // Stray files that aren't `*.flow.jsonc` — a legacy `.flow.zon`
+        // and a plain `.jsonc` — must not be picked up by discovery.
+        try writeSample(tmp.dir, "game/scripts/flows/legacy.flow.zon", move_flow_body);
+        try writeSample(tmp.dir, "game/scripts/flows/notes.jsonc", "{}\n");
+
+        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir);
+        defer result.deinit();
+
+        // Only `move.flow.jsonc` is a flow source.
+        try std.testing.expectEqual(@as(usize, 1), result.entries.len);
+        try std.testing.expectEqualStrings("move", result.entries[0].name);
     }
 };
 
