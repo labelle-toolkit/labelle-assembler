@@ -2,5 +2,7 @@
 # flow_scanner writes generated `.zig` next to the `.flow.jsonc` source
 # (the target's `scripts/` is a symlink back to this tree), so the
 # emitted file appears here on every `zig build generate` and is
-# regenerated every time — don't track it.
+# regenerated every time — don't track it. Recursive discovery mirrors
+# subdirectories, so the pattern must match nested output too.
 scripts/flows/*.zig
+scripts/flows/**/*.zig
