@@ -505,6 +505,89 @@ pub const BUILD_ZIG = struct {
         // module-graph wiring above the test step calls it.
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "fn overrideImport(") != null);
     }
+
+    test "chains in-project @libs/ plugin test step into test step (issue #82)" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{
+                .{ .name = "pathfinder", .repo = "@libs/pathfinder" },
+            },
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        // Per-lib `zig build test` shelled out from the master test step.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "addSystemCommand(&.{ \"zig\", \"build\", \"test\" })") != null);
+        // cwd points two levels up from the backend build dir into libs/.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.path(\"../../libs/pathfinder\")") != null);
+        // The lib test is wired as a dependency of the `test` step.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "test_step.dependOn(&lib_test.step)") != null);
+    }
+
+    test "chains every @libs/ plugin into test step (issue #82)" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{
+                .{ .name = "pathfinder", .repo = "@libs/pathfinder" },
+                .{ .name = "combat", .repo = "@libs/combat" },
+            },
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.path(\"../../libs/pathfinder\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.path(\"../../libs/combat\")") != null);
+        // One `addSystemCommand` per lib.
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, build_zig, "addSystemCommand(&.{ \"zig\", \"build\", \"test\" })"));
+    }
+
+    test "no @libs/ plugins emits no lib test chaining (issue #82)" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{},
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        // No libs → no `zig build test` fan-out at all.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"zig\", \"build\", \"test\"") == null);
+    }
+
+    test "out-of-project local: plugins are not chained as libs (issue #82)" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{
+                // local: paths can escape the project root — not part of
+                // this project's test surface.
+                .{ .name = "external", .repo = "local:../external" },
+            },
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"zig\", \"build\", \"test\"") == null);
+    }
+
+    test "lib test chaining present in is_tests_target build (issue #82)" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .null,
+            .ecs = .mock,
+            .plugins = &.{
+                .{ .name = "pathfinder", .repo = "@libs/pathfinder" },
+            },
+        }, .{ .is_tests_target = true });
+        defer std.testing.allocator.free(build_zig);
+
+        // The tests-only target is the canonical `zig build test` entry
+        // point, so it must also fan out to in-project libs.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.path(\"../../libs/pathfinder\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "test_step.dependOn(&lib_test.step)") != null);
+    }
 };
 
 // ── Plugin wiring ────────────────────────────────────────────────────

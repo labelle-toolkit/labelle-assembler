@@ -15,6 +15,22 @@ const build_zig_zon_tmpl = @embedFile("templates/build_zig_zon.txt");
 // build.zig generator
 // ============================================================
 
+/// Returns the project-relative directory of an in-project library
+/// plugin (`@libs/<lib>` → `libs/<lib>`), or null if the plugin is not
+/// an in-project library. Used to chain each lib's `test` step into the
+/// generated `test` step (issue #82).
+///
+/// Out-of-project `local:../foo` plugins are intentionally excluded:
+/// their `test` step is not part of *this* project's test surface, and
+/// their path can escape the project root. Only `@`-prefixed plugins
+/// whose resolved path lands under `libs/` qualify.
+fn inProjectLibDir(plugin: config.PluginDep) ?[]const u8 {
+    if (!std.mem.startsWith(u8, plugin.repo, "@")) return null;
+    const path = plugin.localPath();
+    if (!std.mem.startsWith(u8, path, "libs/")) return null;
+    return path;
+}
+
 pub const BuildZigOptions = struct {
     /// Emit a test-only build.zig: skip the exe step, the run step,
     /// and the backend artifact link. Used by `generateTestsTarget`
@@ -321,6 +337,25 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         }
         try tpl.writeSection(build_zig_tmpl, "tests_game_import", w);
         try tpl.writeSection(build_zig_tmpl, "tests_end", w);
+
+        // Chain each in-project library's `test` step into the master
+        // `test` step (issue #82). An `@libs/<lib>` plugin lives at
+        // `libs/<lib>/` under the project root and ships its own
+        // `build.zig`; `zig build test` here shells out to each one so a
+        // single invocation covers the game-side `tests/` files and
+        // every in-project library. Out-of-project `local:` plugins are
+        // skipped — they aren't part of this project's test surface.
+        for (cfg.plugins) |plugin| {
+            const lib_dir = inProjectLibDir(plugin) orelse continue;
+            // build.zig sits at `.labelle/<backend>_<platform>/`, so the
+            // lib dir is two levels up from the build root.
+            const lib_cwd = try std.fmt.allocPrint(allocator, "../../{s}", .{lib_dir});
+            defer allocator.free(lib_cwd);
+            try tpl.renderSection(build_zig_tmpl, "lib_test_step", .{
+                .lib_cwd = lib_cwd,
+                .lib_name = plugin.name,
+            }, w);
+        }
 
         // Test-only target (issue #83): close the build function without
         // installing/running the exe. Otherwise emit the regular footer

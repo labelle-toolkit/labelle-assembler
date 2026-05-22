@@ -7,9 +7,15 @@ pub fn freeNames(allocator: std.mem.Allocator, names: []const []const u8) void {
     allocator.free(names);
 }
 
-/// Copy files from src_base/folder to dst_base/folder (recursively) and return
-/// sorted file stems matching the given extension. Subfolder paths are preserved
-/// in the returned names (e.g., "enemies/goblin" for prefabs/enemies/goblin.zon).
+/// Mirror files from src_base/folder to dst_base/folder (recursively) and
+/// return sorted file stems matching the given extension. Subfolder paths are
+/// preserved in the returned names (e.g., "enemies/goblin" for
+/// prefabs/enemies/goblin.zon).
+///
+/// This is a true mirror: destination entries that no longer have a matching
+/// source are pruned, so deleting a source file does not leave a stale orphan
+/// in the generated tree (issue #45). The destination must be a
+/// generator-owned directory — see `copyAndScanRecursive` for the rationale.
 pub fn copyAndScan(allocator: std.mem.Allocator, src_base: []const u8, dst_base: []const u8, folder: []const u8, ext: []const u8) ![][]const u8 {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -40,6 +46,20 @@ pub fn copyAndScan(allocator: std.mem.Allocator, src_base: []const u8, dst_base:
 
 /// Recursive helper for copyAndScan. `prefix` is the relative path from the
 /// folder root (empty string for the top level, "enemies" for a subfolder, etc.).
+///
+/// This is a true *mirror*: after copying every source entry it sweeps the
+/// destination directory and removes anything that no longer has a matching
+/// source entry. Without this sweep, deleting a source file would leave a
+/// stale "orphan" copy behind — and because the generated `main.zig` builds
+/// its comptime registry by walking the target tree, that orphan would keep
+/// being compiled and run (see issue #45).
+///
+/// The sweep is safe because every caller of this helper points the
+/// destination at a fully generator-owned directory (e.g.
+/// `<target>/<plugin-dir>/` or `<target>/scripts/.plugin_<name>/`). The
+/// generated target tree is exclusively managed by the assembler — no
+/// hand-written files live there — so deleting non-source entries cannot
+/// destroy user content.
 fn copyAndScanRecursive(
     allocator: std.mem.Allocator,
     cwd: std.Io.Dir,
@@ -60,6 +80,15 @@ fn copyAndScanRecursive(
     var dst_dir = try cwd.openDir(io, dst_path, .{});
     defer dst_dir.close(io);
 
+    // Track the names we copy/recurse into at this level so the orphan
+    // sweep below can tell which destination entries are still backed by
+    // a source. Owned strings are freed at function exit.
+    var written: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (written.items) |w| allocator.free(w);
+        written.deinit(allocator);
+    }
+
     var iter = src_dir.iterate();
     while (try iter.next(io)) |entry| {
         if (std.mem.eql(u8, entry.name, ".bridge.zig")) continue;
@@ -72,6 +101,8 @@ fn copyAndScanRecursive(
                 const out_file = try dst_dir.createFile(io, entry.name, .{});
                 defer out_file.close(io);
                 try out_file.writeStreamingAll(io, content);
+
+                try written.append(allocator, try allocator.dupe(u8, entry.name));
 
                 // Collect stem if extension matches
                 if (std.mem.endsWith(u8, entry.name, ext)) {
@@ -94,9 +125,60 @@ fn copyAndScanRecursive(
                     try allocator.dupe(u8, entry.name);
                 defer allocator.free(sub_prefix);
                 try copyAndScanRecursive(allocator, cwd, sub_src, sub_dst, sub_prefix, ext, names);
+
+                try written.append(allocator, try allocator.dupe(u8, entry.name));
             },
             else => {},
         }
+    }
+
+    try pruneOrphans(allocator, cwd, dst_path, written.items);
+}
+
+/// Walk `dst_path` and delete any entry whose name is not in `keep`.
+/// Used as the "sweep" half of the mark-and-sweep mirror in
+/// `copyAndScanRecursive`. `.bridge.zig` is preserved — it's a legacy
+/// artifact the copy pass deliberately never overwrites, so the sweep
+/// must not treat it as an orphan either.
+fn pruneOrphans(
+    allocator: std.mem.Allocator,
+    cwd: std.Io.Dir,
+    dst_path: []const u8,
+    keep: []const []const u8,
+) !void {
+    const io = config.globalIo();
+    var dst_dir = cwd.openDir(io, dst_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dst_dir.close(io);
+
+    // Collect orphan names first, then delete — mutating a directory
+    // while iterating it is not guaranteed to be safe across platforms.
+    var orphans: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (orphans.items) |o| allocator.free(o);
+        orphans.deinit(allocator);
+    }
+
+    var iter = dst_dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".bridge.zig")) continue;
+        var kept = false;
+        for (keep) |k| {
+            if (std.mem.eql(u8, k, entry.name)) {
+                kept = true;
+                break;
+            }
+        }
+        if (!kept) try orphans.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+
+    for (orphans.items) |name| {
+        // `deleteTree` handles files, symlinks, and subdirectories
+        // uniformly so a source directory turning into a file (or
+        // vice versa) is also reconciled.
+        try dst_dir.deleteTree(io, name);
     }
 }
 
@@ -110,10 +192,13 @@ pub fn writeFile(dir_path: []const u8, filename: []const u8, content: []const u8
     try file.writeStreamingAll(io, content);
 }
 
-/// Copy files from `src_dir` to `dst_dir` (recursively) and return sorted
-/// file stems matching the given extension. Mirrors `copyAndScan` but takes
+/// Mirror files from `src_dir` to `dst_dir` (recursively) and return sorted
+/// file stems matching the given extension. Like `copyAndScan` but takes
 /// two fully-resolved absolute paths instead of a base+folder pair, so the
 /// source and destination don't have to share a relative folder name.
+///
+/// As with `copyAndScan`, destination orphans (files whose source was
+/// deleted) are pruned — see `copyAndScanRecursive` (issue #45).
 ///
 /// Motivating use: plugin-shipped scripts at `<plugin>/scripts/**` need to
 /// land at `<target>/scripts/.plugin_<name>/**`. Those two paths don't share

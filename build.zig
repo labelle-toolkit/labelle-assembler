@@ -99,6 +99,7 @@ pub fn build(b: *std.Build) void {
         "test/deps_linker_tests.zig",
         "test/template_dynamic_test.zig",
         "test/scanner_symlink_tests.zig",
+        "test/scanner_orphan_tests.zig",
         "test/flow_scanner_tests.zig",
     };
 
