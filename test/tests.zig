@@ -1109,9 +1109,10 @@ pub const PLUGIN_CONTROLLERS = struct {
         // on disk, and the generated code must reference it by that path.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"scripts/.plugin_pathfinder/01_advance.zig\")") != null);
 
-        // The Zig identifier used for the const decl has `.` rewritten so
-        // the generated source compiles.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_plugin_pathfinder_01_advance") != null);
+        // The Zig identifier used for the const decl escapes the leading
+        // `.` (`_d_`), every literal `_` (`_u_`) and the `/` (`_s_`) via the
+        // injective pathToIdent (issue #172) so the generated source compiles.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_d_plugin_u_pathfinder_s_01_u_advance") != null);
     }
 
     test "plugin block preserves .plugins declaration order in _plugin_mods tuple" {
@@ -1324,10 +1325,10 @@ pub const SCENE_ASSET_MANIFESTS = struct {
         }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // Decl uses underscored ident...
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const world_intro: []const []const u8 = &.{ \"background\" };") != null);
+        // Decl uses the injective `_s_`-escaped ident (issue #172)...
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const world_s_intro: []const []const u8 = &.{ \"background\" };") != null);
         // ...but the entries[] preserves the original slash-style name.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".{ .name = \"world/intro\", .assets = @This().world_intro }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".{ .name = \"world/intro\", .assets = @This().world_s_intro }") != null);
     }
 
     test "no scenes emits no SceneAssetManifests struct" {
@@ -1837,8 +1838,9 @@ pub const SCRIPTS = struct {
 
         // Global script: direct import, no wrapper
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const movement = @import(\"scripts/movement.zig\")") != null);
-        // State-scoped script: wrapper with game_states (identifier derived from rel_path)
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_01_pathfinder = struct {") != null);
+        // State-scoped script: wrapper with game_states (identifier derived from rel_path;
+        // injective pathToIdent escapes `/` to `_s_` and literal `_` to `_u_` — issue #172)
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_s_01_u_pathfinder = struct {") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_inner = @import(\"scripts/playing/01_pathfinder.zig\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const game_states = .{") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"playing\",") != null);
@@ -1856,7 +1858,8 @@ pub const SCRIPTS = struct {
         }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_paused_camera = struct {") != null);
+        // `playing+paused/camera.zig`: `+` -> `_p_`, `/` -> `_s_` (injective — issue #172).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_p_paused_s_camera = struct {") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"playing\",") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"paused\",") != null);
     }
@@ -2674,16 +2677,19 @@ pub const SUBFOLDERS = struct {
         }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // State-scoped scripts: identifier derived from rel_path, import uses full path
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_systems_movement = struct {") != null);
+        // State-scoped scripts: identifier derived from rel_path (each `/`
+        // escaped to `_s_` by the injective pathToIdent — issue #172),
+        // import uses full path.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_s_systems_s_movement = struct {") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"scripts/playing/systems/movement.zig\")") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_systems_combat = struct {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const playing_s_systems_s_combat = struct {") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"scripts/playing/systems/combat.zig\")") != null);
-        // Global script: direct import
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const camera_control = @import(\"scripts/camera_control.zig\")") != null);
+        // Global script: direct import. The literal `_` in the basename is
+        // escaped to `_u_` by the injective pathToIdent (issue #172).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const camera_u_control = @import(\"scripts/camera_control.zig\")") != null);
     }
 
-    test "component names with slashes use underscore PascalCase identifiers" {
+    test "component names resolve to a natural PascalCase type name" {
         const components = &[_][]const u8{ "physics/rigid_body", "health" };
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
@@ -2692,9 +2698,15 @@ pub const SUBFOLDERS = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, components, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        // Subfolder component: path with slash, PascalCase from flattened ident
+        // The component type name is the natural PascalCase of the path
+        // (`pathToPascal` — `/` and `_` are word boundaries), so
+        // `physics/rigid_body` -> `PhysicsRigidBody`. It must NOT run
+        // through `pathToIdent`'s injective `_`-escaping (issue #172):
+        // that escaping is for generated *symbol* names, whereas this
+        // name has to match the `pub const` declared in the user's
+        // file (e.g. `components/jump_anim.zig` -> `JumpAnim`).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".PhysicsRigidBody = @import(\"components/physics/rigid_body.zig\").PhysicsRigidBody") != null);
-        // Top-level component unchanged
+        // Top-level component: `health` -> `Health`.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".Health = @import(\"components/health.zig\").Health") != null);
     }
 
@@ -2707,8 +2719,8 @@ pub const SUBFOLDERS = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, gizmos, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".debug_collision = @import(\"gizmos/debug/collision.zon\")") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".editor_grid = @import(\"gizmos/editor/grid.zon\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".debug_s_collision = @import(\"gizmos/debug/collision.zon\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".editor_s_grid = @import(\"gizmos/editor/grid.zon\")") != null);
     }
 
     test "view names with slashes use underscore identifiers" {
@@ -2720,7 +2732,7 @@ pub const SUBFOLDERS = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, views, empty_names, empty_names);
         defer std.testing.allocator.free(main_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".panels_inventory = @import(\"views/panels/inventory.zon\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".panels_s_inventory = @import(\"views/panels/inventory.zon\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".hud = @import(\"views/hud.zon\")") != null);
     }
 };
