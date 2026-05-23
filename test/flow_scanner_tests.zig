@@ -615,10 +615,17 @@ pub const PluginEvents = struct {
         // and `ComponentRegistryWithPlugins` already use.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"box2d\")") != null);
         // Merged into the SAME AllHookPayloads — no parallel dispatcher.
+        // RFC-PLUGIN-EVENTS phase 3: when plugins declare events,
+        // `GameEvents` widens to fold in `PluginEvents` (via the
+        // assembler-emitted `MergeHookPayloads(.{ GameEventsRaw,
+        // PluginEvents })`), so `AllHookPayloads` only references the
+        // widened `GameEvents`. Without any events/*.zig scan,
+        // `GameEvents = PluginEvents` directly (skipping the merge).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const GameEvents = PluginEvents;") != null);
         try std.testing.expect(std.mem.indexOf(
             u8,
             main_zig,
-            "AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), PluginEvents })",
+            "AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), GameEvents })",
         ) != null);
 
         // Validate the emitted Zig parses cleanly — `@Union` / `@Enum`
@@ -670,7 +677,7 @@ pub const PluginEvents = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"labelle-imgui\")") != null);
     }
 
-    test "GameEvents and PluginEvents both flow into the same AllHookPayloads merge" {
+    test "GameEvents widens to fold PluginEvents into the same AllHookPayloads merge" {
         const allocator = std.testing.allocator;
 
         const cfg: generator.ProjectConfig = .{
@@ -701,15 +708,24 @@ pub const PluginEvents = struct {
         );
         defer allocator.free(main_zig);
 
-        // Both unions appear in the merge expression, in this order —
-        // `engine.HookPayload(EcsBackend.Entity)` first (the lifecycle
-        // hooks), then `GameEvents` (events/*.zig scan), then
-        // `PluginEvents` (plugin `pub const Events` discovery).
-        const merge_str = "engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), GameEvents, PluginEvents })";
+        // RFC-PLUGIN-EVENTS phase 3: when both game events AND plugins
+        // are present, the assembler emits `GameEventsRaw` (the
+        // events/*.zig scan) + `PluginEvents` (the plugin walk) and
+        // **widens** `GameEvents` to fold both into a single merged
+        // union via `MergeHookPayloads`. The engine main template's
+        // `GameConfig(..., GameEvents)` slot lands on the merged type
+        // unchanged (no template rename), so `game.emit(...)` accepts
+        // both flavours.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const GameEventsRaw = union(enum)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const PluginEvents = blk:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const GameEvents = engine.core.MergeHookPayloads(.{ GameEventsRaw, PluginEvents })") != null);
+
+        // `AllHookPayloads` only references the widened `GameEvents`
+        // (not `PluginEvents` again) — referencing both would re-emit
+        // every plugin variant twice and trip `MergeHookPayloads`'
+        // duplicate-field check.
+        const merge_str = "engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), GameEvents })";
         try std.testing.expect(std.mem.indexOf(u8, main_zig, merge_str) != null);
-        // Game-side decl is also `pub` (so flow-codegen can reference
-        // it by name from a generated handler in phase 3).
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const GameEvents = union(enum)") != null);
     }
 };
 

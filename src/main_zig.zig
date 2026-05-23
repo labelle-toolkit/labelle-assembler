@@ -2801,12 +2801,17 @@ pub fn generateMainZigFromTemplate(
         errdefer alloc_writer_b.deinit();
         const bw = &alloc_writer_b.writer;
         const has_plugin_events = cfg.plugins.len > 0;
+        // When plugins declare events, the assembler emits a widened
+        // `GameEvents` that already folds in `PluginEvents` (see the
+        // game_events_block emission below). So `AllHookPayloads` only
+        // needs to merge `GameEvents` once — referencing `PluginEvents`
+        // here too would re-emit every plugin variant twice and trip
+        // `MergeHookPayloads`' duplicate-field check.
         if (event_names.len == 0 and !has_plugin_events) {
             try bw.writeAll("const AllHookPayloads = engine.HookPayload(EcsBackend.Entity);\n\n");
         } else {
             try bw.writeAll("const AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity)");
-            if (event_names.len > 0) try bw.writeAll(", GameEvents");
-            if (has_plugin_events) try bw.writeAll(", PluginEvents");
+            if (event_names.len > 0 or has_plugin_events) try bw.writeAll(", GameEvents");
             try bw.writeAll(" });\n\n");
         }
         var arr_list_b = alloc_writer_b.toArrayList();
@@ -2888,56 +2893,72 @@ pub fn generateMainZigFromTemplate(
     // `@typeInfo(...).@"struct".fields` give the payload field list
     // without a separate registry file to keep in sync.
     //
-    // **Phase 3 follow-up:** the engine's `Game.emit(event: GameEvents)`
+    // **Phase 3 widening:** the engine's `Game.emit(event: GameEvents)`
     // accepts a single union type, but plugins (RFC-PLUGIN-EVENTS phase
     // 2, e.g. labelle-box2d 6c44691) now `game.emit(.{ .box2d__... = .{...} })`.
-    // So when plugins declare events, the *template parameter* fed to
-    // `GameConfig` is the union of `GameEvents` and `PluginEvents` (built
-    // by `core.MergeHookPayloads`) — emitted here as `MergedGameEvents`
-    // and substituted in the `GameConfig(..., GameEvents)` slot of the
-    // engine main template. Same merged-payload substrate the engine's
-    // own hook dispatch (`AllHookPayloads`) already uses.
+    // So when plugins declare events, `GameEvents` is **widened** to the
+    // union of the game-side scan and `PluginEvents` — emitted via
+    // `pub const GameEvents = engine.core.MergeHookPayloads(.{ GameEventsRaw, PluginEvents })`
+    // — and `GameConfig(..., GameEvents)` (the existing engine template
+    // slot, unchanged) now sees the merged type. The raw game-side scan
+    // is kept under a private alias `GameEventsRaw` so the merge has a
+    // stable second operand even when `events/*.zig` is empty.
+    //
+    // No engine template change required: the `GameEvents,` token in
+    // `codegen/main.zig.template` keeps its v1 shape; only the
+    // **meaning** of `GameEvents` widens when plugins declare events.
+    // Every project without plugin events keeps the v1 semantics
+    // verbatim — `GameEvents` is either `void` or the events/*.zig
+    // union.
     {
         var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
         errdefer alloc_writer_b.deinit();
         const bw = &alloc_writer_b.writer;
-        if (event_names.len == 0) {
-            try bw.writeAll("pub const GameEvents = void;\n\n");
-        } else {
-            try bw.writeAll("pub const GameEvents = union(enum) {\n");
-            var pascal_buf: [128]u8 = undefined;
-            for (event_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                const pascal = pathToPascal(name, &pascal_buf);
-                try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
-            }
-            try bw.writeAll("};\n\n");
-        }
-        if (cfg.plugins.len > 0) {
-            try writePluginEventsBlock(bw, cfg);
-        }
-        // `MergedGameEvents` is the `GameEvents` parameter actually fed
-        // into `GameConfig`. Resolution rules — picked so the engine's
-        // `has_events = GameEvents != void` check keeps its existing
-        // semantics for unaffected projects:
-        //
-        //   - no plugins, no game events     → `void` (no behaviour change)
-        //   - game events only               → the `GameEvents` union
-        //   - plugins only                   → `PluginEvents`
-        //   - both                           → `MergeHookPayloads(.{ GameEvents, PluginEvents })`
-        //
-        // `MergeHookPayloads` rejects a `void` input, hence the per-case
-        // dispatch rather than always merging.
+
         const has_plugin_events_local = cfg.plugins.len > 0;
         const has_game_events_local = event_names.len > 0;
-        if (!has_plugin_events_local and !has_game_events_local) {
-            try bw.writeAll("pub const MergedGameEvents = void;\n\n");
-        } else if (has_plugin_events_local and has_game_events_local) {
-            try bw.writeAll("pub const MergedGameEvents = engine.core.MergeHookPayloads(.{ GameEvents, PluginEvents });\n\n");
-        } else if (has_plugin_events_local) {
-            try bw.writeAll("pub const MergedGameEvents = PluginEvents;\n\n");
+
+        // The raw game-side scan keeps its v1 shape; the alias is what
+        // the merge feeds on when plugins are also in play. For
+        // plugin-less projects with no game events, `GameEventsRaw` is
+        // omitted and `GameEvents = void` is emitted directly (the
+        // pre-RFC shape every shipped game already has).
+        if (has_plugin_events_local) {
+            // Need a name for the raw events to feed into the merge.
+            // Without game events, the alias is `void` and we end up
+            // with `GameEvents = PluginEvents` directly (skipping the
+            // merge — `MergeHookPayloads` rejects `void`).
+            if (has_game_events_local) {
+                try bw.writeAll("pub const GameEventsRaw = union(enum) {\n");
+                var pascal_buf: [128]u8 = undefined;
+                for (event_names) |name| {
+                    const ident = pathToIdent(name, &ident_buf);
+                    const pascal = pathToPascal(name, &pascal_buf);
+                    try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
+                }
+                try bw.writeAll("};\n\n");
+            }
+            try writePluginEventsBlock(bw, cfg);
+            if (has_game_events_local) {
+                try bw.writeAll("pub const GameEvents = engine.core.MergeHookPayloads(.{ GameEventsRaw, PluginEvents });\n\n");
+            } else {
+                try bw.writeAll("pub const GameEvents = PluginEvents;\n\n");
+            }
         } else {
-            try bw.writeAll("pub const MergedGameEvents = GameEvents;\n\n");
+            // No plugins — the v1 emission verbatim, every shipped
+            // pre-RFC game keeps its exact shape.
+            if (has_game_events_local) {
+                try bw.writeAll("pub const GameEvents = union(enum) {\n");
+                var pascal_buf: [128]u8 = undefined;
+                for (event_names) |name| {
+                    const ident = pathToIdent(name, &ident_buf);
+                    const pascal = pathToPascal(name, &pascal_buf);
+                    try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
+                }
+                try bw.writeAll("};\n\n");
+            } else {
+                try bw.writeAll("pub const GameEvents = void;\n\n");
+            }
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
