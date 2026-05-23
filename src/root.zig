@@ -12,6 +12,7 @@ pub const lazy_inference = @import("lazy_inference.zig");
 pub const main_zig = @import("main_zig.zig");
 pub const script_scanner = @import("script_scanner.zig");
 pub const flow_scanner = @import("flow_scanner.zig");
+pub const flow_catalog = @import("flow_catalog.zig");
 const build_files = @import("build_files.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
@@ -28,6 +29,7 @@ test {
     _ = @import("cache.zig");
     _ = @import("deps_linker.zig");
     _ = @import("app_icon.zig");
+    _ = @import("flow_catalog.zig");
 }
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
@@ -603,6 +605,30 @@ pub fn generate(
             merged_entries,
         );
         defer plugin_flow_decls.deinit();
+
+        // RFC-FLOW-VOCABULARY phase 4 follow-up: emit a per-project
+        // `flow_catalog.json` sidecar so the labelle-gui flow editor
+        // can read its palette from the project instead of carrying a
+        // hand-maintained mirror of every plugin's `FlowNodes` block.
+        // The discovery walks the same source files
+        // `discoverPluginFlowDecls` does (plugins' `src/root.zig` +
+        // game-script modules); the extra pass is independent and
+        // does NOT block codegen — a parse failure here is logged via
+        // the `flow_catalog` internals' graceful degradation and the
+        // resulting sidecar simply omits the affected module.
+        _ = flow_catalog.emitFlowCatalogSidecar(
+            allocator,
+            cfg,
+            game_dir,
+            target_dir,
+            scripts_target_for_flow,
+            merged_entries,
+        ) catch |err| {
+            // Don't fail the whole `generate` over a sidecar that's
+            // additive. Log it and move on; the gui's static fallback
+            // covers the editor regardless.
+            std.debug.print("labelle-assembler: flow_catalog sidecar emission failed: {s}\n", .{@errorName(err)});
+        };
 
         // Backend lifecycle template — only the exe target needs it.
         // Loading it for the tests target would fail unnecessarily if the
