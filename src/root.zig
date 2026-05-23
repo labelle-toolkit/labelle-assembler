@@ -616,11 +616,18 @@ pub fn generate(
         // does NOT block codegen — a parse failure here is logged via
         // the `flow_catalog` internals' graceful degradation and the
         // resulting sidecar simply omits the affected module.
+        // The sidecar is **project-level**, not per-backend — a flow's
+        // catalog (plugin verbs, events, pin types) is backend-independent.
+        // Wave-4's per-backend layout (`<project>/.labelle/<backend>/...`)
+        // forced the editor to pick a backend it had no business knowing
+        // about and emitted N identical copies.
+        const labelle_dir = try std.fs.path.join(allocator, &.{ game_dir, ".labelle" });
+        defer allocator.free(labelle_dir);
         _ = flow_catalog.emitFlowCatalogSidecar(
             allocator,
             cfg,
             game_dir,
-            target_dir,
+            labelle_dir,
             scripts_target_for_flow,
             merged_entries,
         ) catch |err| {
