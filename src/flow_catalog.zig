@@ -908,12 +908,30 @@ fn writeCatalogJson(w: *std.Io.Writer, groups: []const ModuleGroup) !void {
         }
         try w.writeAll("      \"pin_styles\": [");
         if (g.pin_styles.len == 0) {
-            try w.writeAll("]\n");
+            try w.writeAll("],\n");
         } else {
             try w.writeAll("\n");
             for (g.pin_styles, 0..) |s, si| {
                 try writePinStyleJson(w, s);
                 if (si + 1 < g.pin_styles.len) try w.writeAll(",");
+                try w.writeAll("\n");
+            }
+            try w.writeAll("      ],\n");
+        }
+        // ── events ─────────────────────────────────────────────
+        // labelle-engine#578 (engine lifecycle) + RFC-PLUGIN-EVENTS
+        // (plugin events). `discoverInSource` populates this from
+        // each module's `pub const Events` block; the editor renders
+        // the entries as Event-node variants in the palette and uses
+        // each event's typed payload pins to wire downstream nodes.
+        try w.writeAll("      \"events\": [");
+        if (g.events.len == 0) {
+            try w.writeAll("]\n");
+        } else {
+            try w.writeAll("\n");
+            for (g.events, 0..) |e, ei| {
+                try writeEventJson(w, e);
+                if (ei + 1 < g.events.len) try w.writeAll(",");
                 try w.writeAll("\n");
             }
             try w.writeAll("      ]\n");
@@ -970,6 +988,43 @@ fn writePinStyleJson(w: *std.Io.Writer, s: PinStyleEntry) !void {
     try w.writeAll(", \"label\": ");
     try writeJsonString(w, s.label);
     try w.print(", \"color\": [{d}, {d}, {d}] }}", .{ s.color[0], s.color[1], s.color[2] });
+}
+
+/// Emit one event entry as JSON, shape:
+///   `{ "qualified": "box2d.collision_begin",
+///      "name": "collision_begin",
+///      "pins": [ { "name", "label", "zig_type", "dir" }, ... ] }`
+/// `dir` is always `"output"` for events — the on-disk Event-node form
+/// fans the payload struct's fields out as data outputs (consumed by
+/// downstream `SetVariable` / `CustomNode` nodes). Mirrors the pin
+/// shape `writeFlowNodeJson` emits minus the `default` field (events
+/// payloads don't carry defaults — they're produced, never authored).
+fn writeEventJson(w: *std.Io.Writer, e: EventEntry) !void {
+    try w.writeAll("        {\n          \"qualified\": ");
+    try writeJsonString(w, e.qualified);
+    try w.writeAll(",\n          \"name\": ");
+    try writeJsonString(w, e.name);
+    try w.writeAll(",\n          \"pins\": [");
+    if (e.pins.len == 0) {
+        try w.writeAll("]\n");
+    } else {
+        try w.writeAll("\n");
+        for (e.pins, 0..) |p, pi| {
+            try w.writeAll("            { \"name\": ");
+            try writeJsonString(w, p.name);
+            try w.writeAll(", \"label\": ");
+            try writeJsonString(w, p.label);
+            try w.writeAll(", \"zig_type\": ");
+            try writeJsonString(w, p.zig_type);
+            try w.writeAll(", \"dir\": ");
+            try writeJsonString(w, p.dir);
+            try w.writeAll(" }");
+            if (pi + 1 < e.pins.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("          ]\n");
+    }
+    try w.writeAll("        }");
 }
 
 /// Write a JSON string literal — wraps in double quotes, escapes the
