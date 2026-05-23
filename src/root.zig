@@ -583,6 +583,27 @@ pub fn generate(
         @memcpy(merged_entries[0..scanned_entries.len], scanned_entries);
         @memcpy(merged_entries[scanned_entries.len..], flow_result.entries);
 
+        // Discover `pub const FlowNodes` + `pub const PinStyles` decls
+        // across plugins AND game-script modules (RFC-FLOW-VOCABULARY
+        // phase 2). Mirrors `discoverPluginEvents` for plugins;
+        // extends to game scripts per RFC §5. Game-script entries are
+        // resolved against the copied source under
+        // `<target>/scripts/<rel_path>` so the discovery walks the
+        // exact files the generated `main.zig` will `@import`.
+        // Plugin-shipped scripts are skipped here — they're covered
+        // by their containing plugin's `src/root.zig` walk in the same
+        // pass — see `discoverPluginFlowDecls` for the rationale.
+        const scripts_target_for_flow = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
+        defer allocator.free(scripts_target_for_flow);
+        var plugin_flow_decls = try main_zig.discoverPluginFlowDecls(
+            allocator,
+            cfg,
+            game_dir,
+            scripts_target_for_flow,
+            merged_entries,
+        );
+        defer plugin_flow_decls.deinit();
+
         // Backend lifecycle template — only the exe target needs it.
         // Loading it for the tests target would fail unnecessarily if the
         // null backend's `desktop.txt` is missing from the cache, since
@@ -592,7 +613,26 @@ pub fn generate(
         defer allocator.free(backend_tmpl);
         const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
         defer allocator.free(engine_template);
-        const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, merged_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names, plugin_events.entries);
+        const main_zig_content = try main_zig.generateMainZigFromTemplate(
+            allocator,
+            engine_template,
+            cfg,
+            backend_tmpl,
+            merged_entries,
+            prefab_names,
+            jsonc_scene_names,
+            scene_manifests,
+            component_names,
+            hook_names,
+            event_names,
+            enum_names,
+            view_names,
+            gizmo_names,
+            animation_names,
+            plugin_events.entries,
+            plugin_flow_decls.flow_nodes,
+            plugin_flow_decls.pin_styles,
+        );
         defer allocator.free(main_zig_content);
         try scanner.writeFile(target_dir, "main.zig", main_zig_content);
     }

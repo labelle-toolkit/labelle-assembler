@@ -322,6 +322,8 @@ pub const AllScriptsIntegration = struct {
             empty_names, // gizmo_names
             empty_names, // animation_names
             &[_]generator.main_zig.PluginEvent{}, // plugin_events
+            &[_]generator.main_zig.PluginFlowNode{}, // plugin_flow_nodes
+            &[_]generator.main_zig.PluginPinStyle{}, // plugin_pin_styles
         );
         defer allocator.free(main_zig);
 
@@ -374,6 +376,8 @@ pub const AllScriptsIntegration = struct {
             empty_names, // gizmo_names
             empty_names, // animation_names
             &[_]generator.main_zig.PluginEvent{}, // plugin_events
+            &[_]generator.main_zig.PluginFlowNode{}, // plugin_flow_nodes
+            &[_]generator.main_zig.PluginPinStyle{}, // plugin_pin_styles
         );
         defer allocator.free(main_zig);
 
@@ -548,6 +552,8 @@ pub const PluginEvents = struct {
             &.{}, // gizmo_names
             &.{}, // animation_names
             &.{}, // plugin_events
+            &.{}, // plugin_flow_nodes
+            &.{}, // plugin_pin_styles
         );
         defer allocator.free(main_zig);
 
@@ -602,6 +608,8 @@ pub const PluginEvents = struct {
             &.{},
             &.{},
             &pe, // plugin_events
+            &.{}, // plugin_flow_nodes
+            &.{}, // plugin_pin_styles
         );
         defer allocator.free(main_zig);
 
@@ -677,6 +685,8 @@ pub const PluginEvents = struct {
             &.{},
             &.{},
             &pe, // plugin_events
+            &.{}, // plugin_flow_nodes
+            &.{}, // plugin_pin_styles
         );
         defer allocator.free(main_zig);
 
@@ -720,6 +730,8 @@ pub const PluginEvents = struct {
             &.{},
             &.{},
             &pe, // plugin_events
+            &.{}, // plugin_flow_nodes
+            &.{}, // plugin_pin_styles
         );
         defer allocator.free(main_zig);
 
@@ -1011,6 +1023,8 @@ pub const FlowHandlerWiring = struct {
             &.{}, // gizmo_names
             &.{}, // animation_names
             &.{}, // plugin_events
+            &.{}, // plugin_flow_nodes
+            &.{}, // plugin_pin_styles
         );
         defer allocator.free(main_zig);
 
@@ -1092,6 +1106,8 @@ pub const FlowHandlerWiring = struct {
             &.{},
             &.{},
             &[_]generator.main_zig.PluginEvent{}, // plugin_events
+            &[_]generator.main_zig.PluginFlowNode{}, // plugin_flow_nodes
+            &[_]generator.main_zig.PluginPinStyle{}, // plugin_pin_styles
         );
         defer allocator.free(main_zig);
 
@@ -1189,6 +1205,8 @@ pub const FlowHandlerWiring = struct {
             &.{},
             &.{},
             &[_]generator.main_zig.PluginEvent{},
+            &[_]generator.main_zig.PluginFlowNode{},
+            &[_]generator.main_zig.PluginPinStyle{},
         );
         defer allocator.free(main_zig);
 
@@ -1267,6 +1285,8 @@ pub const FlowHandlerWiring = struct {
             &.{},
             &.{},
             &[_]generator.main_zig.PluginEvent{},
+            &[_]generator.main_zig.PluginFlowNode{},
+            &[_]generator.main_zig.PluginPinStyle{},
         );
         defer allocator.free(main_zig);
 
@@ -1320,6 +1340,8 @@ pub const FlowHandlerWiring = struct {
             &.{},
             &.{},
             &[_]generator.main_zig.PluginEvent{}, // plugin_events
+            &[_]generator.main_zig.PluginFlowNode{}, // plugin_flow_nodes
+            &[_]generator.main_zig.PluginPinStyle{}, // plugin_pin_styles
         );
         defer allocator.free(main_zig);
 
@@ -1329,5 +1351,770 @@ pub const FlowHandlerWiring = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.MergeHooks(") == null);
         // `hooks_init` keeps the empty-struct init form.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var hooks = GameHooks{};") != null);
+    }
+};
+
+// ── RFC-FLOW-VOCABULARY phase 2 (labelle-assembler#177) ─────────────────
+//
+// Verify the assembler's `PluginFlowNodes` / `PluginPinStyles`
+// registry codegen — the discovery walk extends the
+// `Events`/`Components`/`Systems` convention to `FlowNodes`/`PinStyles`,
+// scoped to both plugin modules and game-script modules per RFC §5.
+//
+// The discovery walk runs against real `.zig` source on disk (same
+// as `discoverPluginEvents` for events) — these tests drive it
+// with both an in-process `discoverPluginFlowDecls` call against a
+// fixture project AND with a pre-built decl slice fed directly to
+// `generateMainZigFromTemplate` so codegen-shape regressions and
+// discovery-shape regressions surface in distinct test cases.
+
+const PluginFlowNode = generator.main_zig.PluginFlowNode;
+const PluginPinStyle = generator.main_zig.PluginPinStyle;
+
+const tiny_template_phase2 =
+    \\const std = @import("std");
+    \\const engine = @import("labelle-engine");
+    \\{{game_events_block}}{{lifecycle}}
+;
+
+const tiny_lifecycle_phase2 =
+    \\pub fn main() !void {}
+    \\
+;
+
+pub const PluginFlowNodesAndPinStyles = struct {
+    test "no FlowNodes / no PinStyles: empty PluginFlowNodes / PluginPinStyles struct{}" {
+        // Back-compat path: a game with no plugin contributing FlowNodes
+        // and no game scripts declaring them gets empty shells. The
+        // editor and flow-codegen reflect on `@typeInfo(PluginFlowNodes)`
+        // uniformly, so an empty struct{} keeps a single code path
+        // downstream instead of a special-case branch.
+        const allocator = std.testing.allocator;
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_phase2,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tiny_lifecycle_phase2,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &[_]generator.main_zig.PluginEvent{}, // plugin_events
+            &[_]PluginFlowNode{}, // plugin_flow_nodes
+            &[_]PluginPinStyle{}, // plugin_pin_styles
+        );
+        defer allocator.free(main_zig);
+
+        // Both registries are always emitted — uniform reflection
+        // surface even when discovery found zero entries.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const PluginFlowNodes = struct {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const PluginPinStyles = struct {") != null);
+
+        // No qualified entries — empty discovery means an empty body
+        // (modulo the unconditional `resolve` helper on PluginFlowNodes).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "__") == null or
+            // The "__" might appear inside the docstring `<plugin>__<event>`
+            // — the only deterministic check is that no `FlowNodes.` /
+            // `PinStyles.` decl-rhs aliases got written.
+            std.mem.indexOf(u8, main_zig, ".FlowNodes.") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".PinStyles.") == null);
+
+        // `resolve` is emitted unconditionally so callers don't need to
+        // gate on registry size before calling the resolver.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn resolve(") != null);
+
+        // Emitted Zig parses cleanly.
+        const sentinel_src = try allocator.dupeZ(u8, main_zig);
+        defer allocator.free(sentinel_src);
+        var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
+        defer ast.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "plugin FlowNodes: emits qualified <plugin>__<name> entries aliased to source decls" {
+        // Mirrors RFC §1 + ticket §2: each discovered FlowNode entry
+        // is `pub const <plugin>__<name> = @import("<plugin>").FlowNodes.<name>;`
+        // — the alias carries the FlowNode-factory return value
+        // (display_name, category, docs, kind, pins) and the `impl`
+        // comptime decl through to downstream reflection.
+        const allocator = std.testing.allocator;
+
+        const flow_nodes = [_]PluginFlowNode{
+            .{
+                .module_import_path = "box2d",
+                .module_sanitized = "box2d",
+                .node_name = "apply_impulse",
+                .is_script = false,
+            },
+            .{
+                .module_import_path = "box2d",
+                .module_sanitized = "box2d",
+                .node_name = "get_velocity",
+                .is_script = false,
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_phase2,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tiny_lifecycle_phase2,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &[_]generator.main_zig.PluginEvent{},
+            &flow_nodes,
+            &[_]PluginPinStyle{},
+        );
+        defer allocator.free(main_zig);
+
+        // Plugin-qualified naming convention matches the
+        // RFC-PLUGIN-EVENTS shape: `<plugin>__<name>`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const box2d__apply_impulse = @import(\"box2d\").FlowNodes.apply_impulse;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const box2d__get_velocity = @import(\"box2d\").FlowNodes.get_velocity;") != null);
+
+        // The emitted Zig must parse cleanly — a typo in the decl
+        // shape would silently round-trip past the indexOf checks.
+        const sentinel_src = try allocator.dupeZ(u8, main_zig);
+        defer allocator.free(sentinel_src);
+        var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
+        defer ast.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "game-script FlowNodes: rel_path resolves through @import(\"scripts/<rel>\") (RFC §5)" {
+        // RFC §5: any module under the project tree exporting
+        // `FlowNodes` is a palette source — not just plugins. Game
+        // scripts use the `@import("scripts/<rel_path>")` form, same
+        // as the existing `all_scripts_block`. The sanitized identifier
+        // for `hits.zig` is `hits` (no escapes); for `flows/hit_counter.zig`
+        // the `/` collapses to `_s_` via `pathToIdent`.
+        const allocator = std.testing.allocator;
+
+        const flow_nodes = [_]PluginFlowNode{
+            .{
+                .module_import_path = "hits.zig",
+                .module_sanitized = "hits",
+                .node_name = "set_hits",
+                .is_script = true,
+            },
+            .{
+                .module_import_path = "hits.zig",
+                .module_sanitized = "hits",
+                .node_name = "get_hits",
+                .is_script = true,
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_phase2,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tiny_lifecycle_phase2,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &[_]generator.main_zig.PluginEvent{},
+            &flow_nodes,
+            &[_]PluginPinStyle{},
+        );
+        defer allocator.free(main_zig);
+
+        // Game-script aliases use `@import("scripts/<rel_path>")`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const hits__set_hits = @import(\"scripts/hits.zig\").FlowNodes.set_hits;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const hits__get_hits = @import(\"scripts/hits.zig\").FlowNodes.get_hits;") != null);
+    }
+
+    test "PinStyles: deduped last-write-wins, keyed by type name" {
+        // Per RFC §1, "later declarations win for any duplicate type
+        // key". The assembler dedupes upstream of the emitter so the
+        // generated registry has at most one entry per type name.
+        const allocator = std.testing.allocator;
+
+        const pin_styles = [_]PluginPinStyle{
+            // First declaration of BodyId — gets overridden.
+            .{
+                .module_import_path = "box2d",
+                .module_sanitized = "box2d",
+                .type_name = "BodyId",
+                .is_script = false,
+            },
+            // PluginA's JointId — kept.
+            .{
+                .module_import_path = "box2d",
+                .module_sanitized = "box2d",
+                .type_name = "JointId",
+                .is_script = false,
+            },
+            // Second BodyId — this is the one that survives dedupe.
+            .{
+                .module_import_path = "physics2",
+                .module_sanitized = "physics2",
+                .type_name = "BodyId",
+                .is_script = false,
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_phase2,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tiny_lifecycle_phase2,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &[_]generator.main_zig.PluginEvent{},
+            &[_]PluginFlowNode{},
+            &pin_styles,
+        );
+        defer allocator.free(main_zig);
+
+        // JointId from box2d survives (no conflict).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const JointId = @import(\"box2d\").PinStyles.JointId;") != null);
+        // BodyId is the LATER physics2 declaration — last-write-wins.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const BodyId = @import(\"physics2\").PinStyles.BodyId;") != null);
+        // The earlier box2d.BodyId did NOT survive dedupe — Zig would
+        // reject the duplicate `pub const` if it had.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"box2d\").PinStyles.BodyId") == null);
+
+        // Parse-check — duplicate decls would surface here.
+        const sentinel_src = try allocator.dupeZ(u8, main_zig);
+        defer allocator.free(sentinel_src);
+        var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
+        defer ast.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "PinStyles: game-script module emits @import(\"scripts/<rel>\") form" {
+        // Same per-source-kind import shape as FlowNodes — a game
+        // script declaring `pub const PinStyles = struct { ... }` is
+        // referenced through `@import("scripts/<rel_path>")`.
+        const allocator = std.testing.allocator;
+
+        const pin_styles = [_]PluginPinStyle{
+            .{
+                .module_import_path = "ui_types.zig",
+                .module_sanitized = "ui_u_types",
+                .type_name = "Widget",
+                .is_script = true,
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_phase2,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tiny_lifecycle_phase2,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &[_]generator.main_zig.PluginEvent{},
+            &[_]PluginFlowNode{},
+            &pin_styles,
+        );
+        defer allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const Widget = @import(\"scripts/ui_types.zig\").PinStyles.Widget;") != null);
+    }
+
+    test "resolve(): name resolver maps dotted form to qualified ident" {
+        // Ticket §3: flow-codegen's eventual `CustomNode` lowering
+        // calls `PluginFlowNodes.resolve("box2d.apply_impulse")` and
+        // expects the canonical qualified field name back. The
+        // generator emits the resolver as a comptime function on
+        // `PluginFlowNodes`, so we verify its source shape here.
+        const allocator = std.testing.allocator;
+
+        const flow_nodes = [_]PluginFlowNode{
+            .{
+                .module_import_path = "box2d",
+                .module_sanitized = "box2d",
+                .node_name = "apply_impulse",
+                .is_script = false,
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_phase2,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tiny_lifecycle_phase2,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &[_]generator.main_zig.PluginEvent{},
+            &flow_nodes,
+            &[_]PluginPinStyle{},
+        );
+        defer allocator.free(main_zig);
+
+        // Resolver source — comptime; pure string ops over the dotted
+        // form. Body shape pinned because flow-codegen's phase-3
+        // `CustomNode` lowering depends on the contract.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn resolve(comptime dotted: []const u8) ?[]const u8") != null);
+        // Splits on `.`, joins on `__` — same convention `PluginEvents`
+        // uses for its event-name lookup.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.mem.indexOfScalar(u8, dotted, '.')") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "module ++ \"__\" ++ node") != null);
+        // Membership check via @hasDecl on the enclosing struct —
+        // `@field(PluginFlowNodes, resolved)` then reaches the entry
+        // value.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@hasDecl(@This(), qualified)") != null);
+    }
+
+    test "FlowNodes + PinStyles: both blocks emit together in the same generated file" {
+        // Integration: verify a project that contributes both
+        // FlowNodes AND PinStyles gets both registries emitted in the
+        // expected shape, neither silently dropped.
+        const allocator = std.testing.allocator;
+
+        const flow_nodes = [_]PluginFlowNode{
+            .{
+                .module_import_path = "box2d",
+                .module_sanitized = "box2d",
+                .node_name = "set_velocity",
+                .is_script = false,
+            },
+        };
+        const pin_styles = [_]PluginPinStyle{
+            .{
+                .module_import_path = "box2d",
+                .module_sanitized = "box2d",
+                .type_name = "BodyId",
+                .is_script = false,
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_phase2,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tiny_lifecycle_phase2,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &[_]generator.main_zig.PluginEvent{},
+            &flow_nodes,
+            &pin_styles,
+        );
+        defer allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const box2d__set_velocity = @import(\"box2d\").FlowNodes.set_velocity;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const BodyId = @import(\"box2d\").PinStyles.BodyId;") != null);
+
+        // Order pin — FlowNodes block precedes PinStyles block so the
+        // generated source has a stable read order (both end up under
+        // the same `{{game_events_block}}` scalar).
+        const idx_flow = std.mem.indexOf(u8, main_zig, "pub const PluginFlowNodes = struct {").?;
+        const idx_pin = std.mem.indexOf(u8, main_zig, "pub const PluginPinStyles = struct {").?;
+        try std.testing.expect(idx_flow < idx_pin);
+    }
+};
+
+// ── Discovery walk integration tests ────────────────────────────────────
+//
+// The previous suite drove `generateMainZigFromTemplate` directly with
+// pre-built decl slices. This suite exercises `discoverPluginFlowDecls`
+// — the AST walk that builds those slices from real `.zig` files —
+// against a tmp-dir fixture that mirrors the on-disk layout `generate`
+// hands the discovery function (`<plugin>/src/root.zig` and
+// `<scripts_root>/<rel_path>`).
+
+pub const FlowDeclsDiscovery = struct {
+    /// Lay down a fake plugin tree inside the test tmp dir: a
+    /// `<plugin_name>/src/root.zig` with the given source body.
+    /// Returns the absolute plugin directory path (allocator-owned)
+    /// — `discoverPluginFlowDecls` resolves `local:<path>` against
+    /// `project_dir` to find the same dir.
+    fn writePluginRootZig(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, plugin_name: []const u8, src: []const u8) ![]u8 {
+        const io = std.testing.io;
+        const src_sub = try std.fmt.allocPrint(allocator, "{s}/src", .{plugin_name});
+        defer allocator.free(src_sub);
+        try tmp.dir.createDirPath(io, src_sub);
+
+        const root_sub = try std.fmt.allocPrint(allocator, "{s}/src/root.zig", .{plugin_name});
+        defer allocator.free(root_sub);
+        try tmp.dir.writeFile(io, .{ .sub_path = root_sub, .data = src });
+
+        const plugin_dir_z = try tmp.dir.realPathFileAlloc(io, plugin_name, allocator);
+        defer allocator.free(plugin_dir_z);
+        return allocator.dupe(u8, plugin_dir_z);
+    }
+
+    /// Plant a game-script file at `<scripts_sub>/<rel_path>` inside
+    /// the tmp dir. `scripts_sub` is the path of the scripts root
+    /// relative to `tmp.dir` (e.g. `game/scripts`).
+    fn writeScript(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, scripts_sub: []const u8, rel_path: []const u8, src: []const u8) !void {
+        const io = std.testing.io;
+        const full_sub = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ scripts_sub, rel_path });
+        defer allocator.free(full_sub);
+        if (std.fs.path.dirname(full_sub)) |d| try tmp.dir.createDirPath(io, d);
+        try tmp.dir.writeFile(io, .{ .sub_path = full_sub, .data = src });
+    }
+
+    test "discovers plugin FlowNodes from <plugin>/src/root.zig" {
+        const allocator = std.testing.allocator;
+        const io = std.testing.io;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const tmp_path_z = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(tmp_path_z);
+        const tmp_path = try allocator.dupe(u8, tmp_path_z);
+        defer allocator.free(tmp_path);
+
+        // Synthetic plugin with two FlowNodes. The discovery walk is
+        // AST-based — it looks for `pub const FlowNodes = struct { ... }`
+        // and folds every `pub const <name>` member. The init RHS shape
+        // doesn't matter to the walk; `labelle.FlowNode(...)` is just
+        // what the real call would look like.
+        const root_src =
+            \\const labelle = @import("labelle-core");
+            \\
+            \\pub const FlowNodes = struct {
+            \\    pub const apply_impulse = labelle.FlowNode(.{ .impl = applyImpulseImpl });
+            \\    pub const get_velocity = labelle.FlowNode(.{ .impl = getVelocityImpl });
+            \\};
+            \\
+            \\fn applyImpulseImpl(game: anytype, entity: u32) void { _ = game; _ = entity; }
+            \\fn getVelocityImpl(game: anytype, entity: u32) f32 { _ = game; _ = entity; return 0.0; }
+            \\
+        ;
+        const plugin_dir = try writePluginRootZig(allocator, &tmp, "fake_box2d", root_src);
+        defer allocator.free(plugin_dir);
+
+        // `local:<abs>` resolves via cache.resolvePlugin to the path we
+        // just wrote. Same shape `discoverPluginEvents` tolerates.
+        const repo = try std.fmt.allocPrint(allocator, "local:{s}", .{plugin_dir});
+        defer allocator.free(repo);
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "fake_box2d", .repo = repo }},
+        };
+
+        var decls = try generator.main_zig.discoverPluginFlowDecls(
+            allocator,
+            cfg,
+            tmp_path, // project_dir — `local:` is resolved relative to here
+            "/nonexistent/scripts", // scripts_root — no game scripts in this case
+            &.{}, // script_entries
+        );
+        defer decls.deinit();
+
+        // Two FlowNodes discovered, both qualified by the plugin name.
+        try std.testing.expectEqual(@as(usize, 2), decls.flow_nodes.len);
+        try std.testing.expectEqualStrings("fake_box2d", decls.flow_nodes[0].module_import_path);
+        try std.testing.expectEqualStrings("fake_box2d", decls.flow_nodes[0].module_sanitized);
+        // The walk preserves declaration order — `apply_impulse` first.
+        try std.testing.expectEqualStrings("apply_impulse", decls.flow_nodes[0].node_name);
+        try std.testing.expectEqualStrings("get_velocity", decls.flow_nodes[1].node_name);
+        // `is_script = false` for plugin entries.
+        try std.testing.expect(!decls.flow_nodes[0].is_script);
+
+        // No PinStyles declared — empty list.
+        try std.testing.expectEqual(@as(usize, 0), decls.pin_styles.len);
+    }
+
+    test "discovers game-script FlowNodes per RFC §5" {
+        const allocator = std.testing.allocator;
+        const io = std.testing.io;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "scripts");
+        const tmp_path_z = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(tmp_path_z);
+        const tmp_path = try allocator.dupe(u8, tmp_path_z);
+        defer allocator.free(tmp_path);
+        const scripts_root_z = try tmp.dir.realPathFileAlloc(io, "scripts", allocator);
+        defer allocator.free(scripts_root_z);
+        const scripts_root = try allocator.dupe(u8, scripts_root_z);
+        defer allocator.free(scripts_root);
+
+        // Canonical example from RFC §5 — game script declaring its
+        // own FlowNodes block. The discovery walk treats it the same
+        // way it treats a plugin module.
+        const hits_src =
+            \\const labelle = @import("labelle-core");
+            \\
+            \\var hits: i32 = 0;
+            \\
+            \\pub const FlowNodes = struct {
+            \\    pub const set_hits = labelle.FlowNode(.{ .impl = setTotal });
+            \\    pub const get_hits = labelle.FlowNode(.{ .impl = currentTotal });
+            \\};
+            \\
+            \\fn setTotal(game: anytype, n: i32) void { _ = game; hits = n; }
+            \\fn currentTotal(game: anytype) i32 { _ = game; return hits; }
+            \\
+        ;
+        try writeScript(allocator, &tmp, "scripts", "hits.zig", hits_src);
+
+        // Game-owned script entry — `plugin_name == null` is the
+        // discriminator the discovery walk uses to gate the walk.
+        const entries = [_]generator.script_scanner.ScriptScanner.ScriptEntry{
+            .{
+                .name = "hits",
+                .filename = "hits.zig",
+                .states = &.{},
+                .sort_order = null,
+                .subdir = null,
+                .rel_path = "hits.zig",
+                .plugin_name = null,
+            },
+        };
+
+        var decls = try generator.main_zig.discoverPluginFlowDecls(
+            allocator,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tmp_path,
+            scripts_root,
+            &entries,
+        );
+        defer decls.deinit();
+
+        try std.testing.expectEqual(@as(usize, 2), decls.flow_nodes.len);
+        // Game scripts use the rel_path as the import path; the
+        // sanitized form runs through `pathToIdent` (strips `.zig`,
+        // escapes `/`, `_`, etc.). For a flat `hits.zig` the result
+        // is the bare `hits`.
+        try std.testing.expectEqualStrings("hits.zig", decls.flow_nodes[0].module_import_path);
+        try std.testing.expectEqualStrings("hits", decls.flow_nodes[0].module_sanitized);
+        try std.testing.expectEqualStrings("set_hits", decls.flow_nodes[0].node_name);
+        try std.testing.expectEqualStrings("get_hits", decls.flow_nodes[1].node_name);
+        try std.testing.expect(decls.flow_nodes[0].is_script);
+    }
+
+    test "discovers PinStyles from both plugins and game scripts" {
+        const allocator = std.testing.allocator;
+        const io = std.testing.io;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "scripts");
+        const tmp_path_z = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(tmp_path_z);
+        const tmp_path = try allocator.dupe(u8, tmp_path_z);
+        defer allocator.free(tmp_path);
+
+        // Plugin contributes PinStyles + FlowNodes both.
+        const plugin_src =
+            \\const labelle = @import("labelle-core");
+            \\
+            \\pub const FlowNodes = struct {
+            \\    pub const apply_force = labelle.FlowNode(.{ .impl = stub });
+            \\};
+            \\
+            \\pub const PinStyles = struct {
+            \\    pub const BodyId = labelle.PinStyle{ .label = "Body" };
+            \\};
+            \\
+            \\fn stub(game: anytype) void { _ = game; }
+            \\
+        ;
+        const plugin_dir = try writePluginRootZig(allocator, &tmp, "fake_phys", plugin_src);
+        defer allocator.free(plugin_dir);
+
+        const scripts_root_z = try tmp.dir.realPathFileAlloc(io, "scripts", allocator);
+        defer allocator.free(scripts_root_z);
+        const scripts_root = try allocator.dupe(u8, scripts_root_z);
+        defer allocator.free(scripts_root);
+
+        const widgets_src =
+            \\const labelle = @import("labelle-core");
+            \\
+            \\pub const PinStyles = struct {
+            \\    pub const Widget = labelle.PinStyle{ .label = "UI Widget" };
+            \\};
+            \\
+            \\pub const Widget = struct { id: u32 };
+            \\
+        ;
+        try writeScript(allocator, &tmp, "scripts", "ui_widgets.zig", widgets_src);
+
+        const repo = try std.fmt.allocPrint(allocator, "local:{s}", .{plugin_dir});
+        defer allocator.free(repo);
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "fake_phys", .repo = repo }},
+        };
+        const entries = [_]generator.script_scanner.ScriptScanner.ScriptEntry{
+            .{
+                .name = "ui_widgets",
+                .filename = "ui_widgets.zig",
+                .states = &.{},
+                .sort_order = null,
+                .subdir = null,
+                .rel_path = "ui_widgets.zig",
+                .plugin_name = null,
+            },
+        };
+
+        var decls = try generator.main_zig.discoverPluginFlowDecls(
+            allocator,
+            cfg,
+            tmp_path,
+            scripts_root,
+            &entries,
+        );
+        defer decls.deinit();
+
+        // The plugin contributed 1 FlowNode + 1 PinStyle, the game
+        // script contributed 1 PinStyle. Total: 1 FN, 2 PS.
+        try std.testing.expectEqual(@as(usize, 1), decls.flow_nodes.len);
+        try std.testing.expectEqualStrings("apply_force", decls.flow_nodes[0].node_name);
+        try std.testing.expect(!decls.flow_nodes[0].is_script);
+
+        try std.testing.expectEqual(@as(usize, 2), decls.pin_styles.len);
+        // Plugin entry first (plugin pass runs before script pass).
+        try std.testing.expectEqualStrings("BodyId", decls.pin_styles[0].type_name);
+        try std.testing.expect(!decls.pin_styles[0].is_script);
+        // Game-script entry second.
+        try std.testing.expectEqualStrings("Widget", decls.pin_styles[1].type_name);
+        try std.testing.expect(decls.pin_styles[1].is_script);
+    }
+
+    test "empty discovery: no plugins, no scripts declaring FlowNodes — returns empty slices, no error" {
+        const allocator = std.testing.allocator;
+
+        // No plugins, no entries — both lists must come back empty
+        // without any allocation churn. The empty-case path is what
+        // every pre-RFC project hits unchanged.
+        var decls = try generator.main_zig.discoverPluginFlowDecls(
+            allocator,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            "/nonexistent/project",
+            "/nonexistent/scripts",
+            &.{},
+        );
+        defer decls.deinit();
+
+        try std.testing.expectEqual(@as(usize, 0), decls.flow_nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), decls.pin_styles.len);
+    }
+
+    test "skips plugin-shipped scripts (plugin's root.zig already covers them)" {
+        // Plugin-shipped scripts (entries with `plugin_name != null`)
+        // are skipped by the game-script pass because their plugin
+        // already gets walked at its `src/root.zig` root level. Re-
+        // walking them as scripts would double-count entries. This
+        // test pins the gate at the assembler level: a script entry
+        // with `plugin_name` set contributes zero to the discovery
+        // result.
+        const allocator = std.testing.allocator;
+        const io = std.testing.io;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "scripts");
+        const tmp_path_z = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(tmp_path_z);
+        const tmp_path = try allocator.dupe(u8, tmp_path_z);
+        defer allocator.free(tmp_path);
+
+        const scripts_root_z = try tmp.dir.realPathFileAlloc(io, "scripts", allocator);
+        defer allocator.free(scripts_root_z);
+        const scripts_root = try allocator.dupe(u8, scripts_root_z);
+        defer allocator.free(scripts_root);
+
+        // Write a plugin-shipped script that DOES declare FlowNodes.
+        // Even though the file exists and parses, the discovery walk
+        // skips it because of the `plugin_name != null` gate.
+        const ps_src =
+            \\const labelle = @import("labelle-core");
+            \\pub const FlowNodes = struct {
+            \\    pub const should_be_skipped = labelle.FlowNode(.{ .impl = stub });
+            \\};
+            \\fn stub(game: anytype) void { _ = game; }
+            \\
+        ;
+        try writeScript(allocator, &tmp, "scripts", ".plugin_foo/helper.zig", ps_src);
+
+        const entries = [_]generator.script_scanner.ScriptScanner.ScriptEntry{
+            .{
+                .name = "helper",
+                .filename = "helper.zig",
+                .states = &.{},
+                .sort_order = null,
+                .subdir = null,
+                .rel_path = ".plugin_foo/helper.zig",
+                // The discriminator — non-null `plugin_name` means
+                // "owned by plugin `foo`; skip the script-pass walk".
+                .plugin_name = "foo",
+            },
+        };
+
+        var decls = try generator.main_zig.discoverPluginFlowDecls(
+            allocator,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tmp_path,
+            scripts_root,
+            &entries,
+        );
+        defer decls.deinit();
+
+        // The plugin-shipped script's FlowNode was NOT picked up.
+        try std.testing.expectEqual(@as(usize, 0), decls.flow_nodes.len);
     }
 };

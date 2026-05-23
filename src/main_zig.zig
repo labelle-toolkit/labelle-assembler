@@ -136,6 +136,300 @@ pub fn discoverPluginEvents(
     };
 }
 
+// ── RFC-FLOW-VOCABULARY phase 2 — FlowNodes + PinStyles discovery ──────
+//
+// Walk each plugin's `src/root.zig` and each game-script `.zig` file for
+// `pub const FlowNodes` and `pub const PinStyles` declarations. The
+// convention parallels `Events` / `Components` / `Systems`:
+//
+//   pub const FlowNodes = struct {
+//       pub const apply_impulse = labelle.FlowNode(.{ .impl = applyImpulseImpl });
+//       pub const get_velocity  = labelle.FlowNode(.{ .impl = getVelocityImpl });
+//   };
+//
+//   pub const PinStyles = struct {
+//       pub const BodyId = labelle.PinStyle{ .label = "Body", .color = ... };
+//   };
+//
+// Per RFC §5, any module under the project tree (plugins OR game
+// scripts) that exports `FlowNodes` is a palette source. The
+// emitted `PluginFlowNodes` registry the editor and flow-codegen
+// (phase 3 `CustomNode` lowering) consume is keyed by a
+// plugin-qualified identifier (`<module>__<name>`), same convention
+// as `PluginEvents`, so a flow's on-disk dotted name
+// (`box2d.apply_impulse`) maps to a Zig identifier
+// (`box2d__apply_impulse`).
+//
+// Phase 5 (parallel ticket) adds the actual `FlowNodes` declarations
+// to labelle-box2d; this discovery is the first real consumer.
+
+/// One discovered `pub const <name> = labelle.FlowNode(...)` decl
+/// inside a `pub const FlowNodes = struct { ... }` block. Both the
+/// import path and the module-qualified identifier are kept so the
+/// emitter can write the registry entry verbatim without re-deriving
+/// either at codegen time.
+pub const PluginFlowNode = struct {
+    /// Identifier used by Zig's `@import(...)` for the source
+    /// module. For plugins, this is the project.labelle `.name` (the
+    /// same string `@import` resolves against in the generated
+    /// main.zig). For game-script modules, this is the relative path
+    /// under `scripts/` (e.g. `hits.zig` or `flows/hit_counter.zig`),
+    /// emitted as `@import("scripts/<rel_path>")` to match how
+    /// `all_scripts_block` already references game scripts.
+    module_import_path: []const u8,
+    /// Sanitized identifier form of the source module. For plugins
+    /// this is the same `sanitizePluginIdent` output as
+    /// `PluginEvent.plugin_sanitized` (e.g. `labelle-box2d` →
+    /// `labelle_box2d`). For game-script modules this is
+    /// `pathToIdent` of the rel_path (escaped per the standard
+    /// path→ident mapping so `flows/hit_counter.zig` becomes
+    /// `flows_s_hit_u_counter`). Used as the prefix in the qualified
+    /// registry decl name `<module_sanitized>__<node_name>`.
+    module_sanitized: []const u8,
+    /// Bare node identifier as declared inside `FlowNodes` (e.g.
+    /// `apply_impulse`).
+    node_name: []const u8,
+    /// `true` when the source is a game-script module; `false` for
+    /// plugin modules. Drives which `@import` form the emitter
+    /// writes — plugins resolve as `@import("<name>")`, scripts as
+    /// `@import("scripts/<rel_path>")`.
+    is_script: bool,
+};
+
+/// One discovered `pub const <TypeName> = labelle.PinStyle{ ... }`
+/// decl inside a `pub const PinStyles = struct { ... }` block. The
+/// editor merges these on top of `default_pin_styles`; per RFC §1,
+/// later declarations win for duplicate type keys, so the assembler
+/// dedups by `type_name` (last-write-wins) before emitting.
+pub const PluginPinStyle = struct {
+    /// Same shape as `PluginFlowNode.module_import_path`.
+    module_import_path: []const u8,
+    /// Same shape as `PluginFlowNode.module_sanitized`.
+    module_sanitized: []const u8,
+    /// Zig type name (e.g. `BodyId`). The emitted registry uses this
+    /// verbatim as the decl name — duplicates across modules collapse
+    /// to last-write-wins.
+    type_name: []const u8,
+    /// Same meaning as `PluginFlowNode.is_script`.
+    is_script: bool,
+};
+
+/// Collection of discovered FlowNodes + PinStyles with an
+/// allocator-aware `deinit`. Same ownership story as `PluginEvents`
+/// — every string field on every entry is a heap-allocated dupe so
+/// callers need not keep source buffers alive.
+pub const PluginFlowDecls = struct {
+    flow_nodes: []PluginFlowNode,
+    pin_styles: []PluginPinStyle,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *PluginFlowDecls) void {
+        for (self.flow_nodes) |fn_| {
+            self.allocator.free(fn_.module_import_path);
+            self.allocator.free(fn_.module_sanitized);
+            self.allocator.free(fn_.node_name);
+        }
+        self.allocator.free(self.flow_nodes);
+        self.flow_nodes = &.{};
+        for (self.pin_styles) |ps| {
+            self.allocator.free(ps.module_import_path);
+            self.allocator.free(ps.module_sanitized);
+            self.allocator.free(ps.type_name);
+        }
+        self.allocator.free(self.pin_styles);
+        self.pin_styles = &.{};
+    }
+};
+
+/// Walk one `.zig` source buffer for `pub const FlowNodes` and
+/// `pub const PinStyles` decls, appending each discovered nested
+/// member to the corresponding output list. The two outputs share
+/// the same `module_import_path` / `module_sanitized` / `is_script`
+/// values (passed in by the caller), so the per-module identification
+/// is decided once at the call site rather than re-derived per entry.
+///
+/// Buffer is the file contents; the caller owns it. The parsed AST
+/// is local to this function; only `allocator.dupe`d strings outlive
+/// the call.
+fn scanFlowDeclsInSource(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    module_import_path: []const u8,
+    module_sanitized: []const u8,
+    is_script: bool,
+    flow_nodes_out: *std.ArrayList(PluginFlowNode),
+    pin_styles_out: *std.ArrayList(PluginPinStyle),
+) !void {
+    const src_z = try allocator.dupeZ(u8, src);
+    defer allocator.free(src_z);
+
+    var ast = try std.zig.Ast.parse(allocator, src_z, .zig);
+    defer ast.deinit(allocator);
+
+    const root_decls = ast.rootDecls();
+    for (root_decls) |decl_idx| {
+        var buf: [2]std.zig.Ast.Node.Index = undefined;
+        const vd = ast.fullVarDecl(decl_idx) orelse continue;
+        // Non-pub helpers (e.g. an internal `const FlowNodes` used by
+        // the module itself) are skipped silently — same precedent
+        // `discoverPluginEvents` follows.
+        if (vd.visib_token == null) continue;
+        const name_tok = vd.ast.mut_token + 1;
+        const decl_name = ast.tokenSlice(name_tok);
+
+        const is_flow_nodes = std.mem.eql(u8, decl_name, "FlowNodes");
+        const is_pin_styles = std.mem.eql(u8, decl_name, "PinStyles");
+        if (!is_flow_nodes and !is_pin_styles) continue;
+
+        const init_node = vd.ast.init_node.unwrap() orelse continue;
+        const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
+
+        for (container.ast.members) |m| {
+            const member_vd = ast.fullVarDecl(m) orelse continue;
+            if (member_vd.visib_token == null) continue;
+            // Skip non-value members defensively. The init token for a
+            // `pub const apply_impulse = labelle.FlowNode(.{...})` is
+            // always present; a `pub const X: T = …` (typed) decl also
+            // exposes init_node. The `unwrap()` filter just ensures we
+            // never trip on a malformed entry.
+            _ = member_vd.ast.init_node.unwrap() orelse continue;
+
+            const member_name_tok = member_vd.ast.mut_token + 1;
+            const member_name = ast.tokenSlice(member_name_tok);
+
+            if (is_flow_nodes) {
+                try flow_nodes_out.append(allocator, .{
+                    .module_import_path = try allocator.dupe(u8, module_import_path),
+                    .module_sanitized = try allocator.dupe(u8, module_sanitized),
+                    .node_name = try allocator.dupe(u8, member_name),
+                    .is_script = is_script,
+                });
+            } else {
+                try pin_styles_out.append(allocator, .{
+                    .module_import_path = try allocator.dupe(u8, module_import_path),
+                    .module_sanitized = try allocator.dupe(u8, module_sanitized),
+                    .type_name = try allocator.dupe(u8, member_name),
+                    .is_script = is_script,
+                });
+            }
+        }
+    }
+}
+
+/// Discover `pub const FlowNodes` and `pub const PinStyles` decls
+/// across both plugin modules and game-script modules.
+///
+/// **Plugins** are walked via `<plugin>/src/root.zig` (same convention
+/// as `discoverPluginEvents`). Plugins without a `FlowNodes` or
+/// `PinStyles` decl contribute zero entries — the back-compat path
+/// every existing plugin takes today.
+///
+/// **Game scripts** are walked from `scripts_root`. Each
+/// `ScriptEntry` whose `plugin_name == null` (i.e. game-owned, not a
+/// plugin-shipped script) is parsed from
+/// `<scripts_root>/<entry.rel_path>`. Per RFC §5, any module in the
+/// project tree that exports `FlowNodes` is a palette source — the
+/// canonical example is `bouncing-ball/scripts/hits.zig`.
+///
+/// Plugin-shipped scripts (those with `entry.plugin_name != null`,
+/// which live under `<scripts_root>/.plugin_<name>/...`) are skipped
+/// here: their containing plugin already gets walked at its
+/// `src/root.zig` root decl level. Re-walking them as game scripts
+/// would double-count entries and break the qualified-name
+/// convention.
+///
+/// Missing source files / parse errors on individual modules are
+/// skipped silently rather than failing the whole `generate` —
+/// matches the `discoverPluginEvents` tolerance for plugins without
+/// a `src/root.zig`. A genuinely broken script will surface its
+/// error later when the generated `main.zig` tries to compile it.
+pub fn discoverPluginFlowDecls(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    project_dir: []const u8,
+    scripts_root: []const u8,
+    script_entries: []const ScriptEntry,
+) !PluginFlowDecls {
+    var flow_nodes: std.ArrayList(PluginFlowNode) = .empty;
+    errdefer {
+        for (flow_nodes.items) |e| {
+            allocator.free(e.module_import_path);
+            allocator.free(e.module_sanitized);
+            allocator.free(e.node_name);
+        }
+        flow_nodes.deinit(allocator);
+    }
+    var pin_styles: std.ArrayList(PluginPinStyle) = .empty;
+    errdefer {
+        for (pin_styles.items) |e| {
+            allocator.free(e.module_import_path);
+            allocator.free(e.module_sanitized);
+            allocator.free(e.type_name);
+        }
+        pin_styles.deinit(allocator);
+    }
+
+    // ── Plugin pass ─────────────────────────────────────────────
+    for (cfg.plugins) |plugin| {
+        const plugin_dir = cache.resolvePlugin(allocator, plugin, project_dir) catch continue;
+        defer allocator.free(plugin_dir);
+
+        const root_path = try std.fs.path.join(allocator, &.{ plugin_dir, "src", "root.zig" });
+        defer allocator.free(root_path);
+
+        const io = config.globalIo();
+        const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, allocator, .limited(8 * 1024 * 1024)) catch continue;
+        defer allocator.free(src);
+
+        var name_buf: [128]u8 = undefined;
+        const sanitized = sanitizePluginIdent(plugin.name, &name_buf);
+
+        scanFlowDeclsInSource(
+            allocator,
+            src,
+            plugin.name,
+            sanitized,
+            false, // is_script
+            &flow_nodes,
+            &pin_styles,
+        ) catch continue; // tolerate per-plugin parse failures
+    }
+
+    // ── Game-script pass (RFC §5) ───────────────────────────────
+    // Only walks game-owned entries — plugin-shipped scripts are
+    // already covered by their plugin's root.zig pass above. See
+    // the function's doc-comment for the rationale.
+    var ident_buf: [256]u8 = undefined;
+    for (script_entries) |entry| {
+        if (entry.plugin_name != null) continue;
+
+        const script_path = try std.fs.path.join(allocator, &.{ scripts_root, entry.rel_path });
+        defer allocator.free(script_path);
+
+        const io = config.globalIo();
+        const src = std.Io.Dir.cwd().readFileAlloc(io, script_path, allocator, .limited(8 * 1024 * 1024)) catch continue;
+        defer allocator.free(src);
+
+        const sanitized = pathToIdent(entry.rel_path, &ident_buf);
+
+        scanFlowDeclsInSource(
+            allocator,
+            src,
+            entry.rel_path,
+            sanitized,
+            true, // is_script
+            &flow_nodes,
+            &pin_styles,
+        ) catch continue;
+    }
+
+    return .{
+        .flow_nodes = try flow_nodes.toOwnedSlice(allocator),
+        .pin_styles = try pin_styles.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+}
+
 
 /// Validate that no two prefab paths collapse to the same basename.
 /// Returns a heap-allocated error message on collision (caller
@@ -642,6 +936,156 @@ pub fn writePluginEventsBlock(bw: anytype, plugin_events: []const PluginEvent) !
         );
     }
     try bw.writeAll("};\n\n");
+}
+
+/// Emit the `PluginFlowNodes` registry (RFC-FLOW-VOCABULARY phase 2).
+///
+/// One `pub const <module>__<name>` entry per discovered FlowNode,
+/// aliased to the source-module decl so all metadata (display_name,
+/// category, docs, kind, pins) **and** the `impl` comptime decl
+/// survive intact for downstream reflection. Plugins and game
+/// scripts use different `@import` forms — plugins resolve as
+/// `@import("<plugin>")`, game scripts as `@import("scripts/<rel>")`.
+///
+/// Plus a comptime `resolve` decl: given a dotted name like
+/// `"box2d.apply_impulse"`, returns the canonical qualified field
+/// name (`"box2d__apply_impulse"`) and a `@hasDecl(PluginFlowNodes,
+/// resolved)` check confirms membership. Mechanism mirrors how
+/// flow-codegen's RFC-PLUGIN-EVENTS phase 3 resolver looked up event
+/// names via `@FieldType(game.PluginEvents, "<tag>")`. Callers do
+/// `@field(PluginFlowNodes, resolved)` to reach the entry value.
+///
+/// Empty discovery (no plugins/game scripts declare `FlowNodes`)
+/// emits a `void`-equivalent: an empty `struct {}` with a stub
+/// `resolve` that always returns `null`, so flow-codegen's eventual
+/// `CustomNode` lowering doesn't need a separate empty-case branch.
+pub fn writePluginFlowNodesBlock(bw: anytype, flow_nodes: []const PluginFlowNode) !void {
+    try bw.writeAll("// --- Plugin flow nodes (RFC-FLOW-VOCABULARY phase 2) ---\n");
+    try bw.writeAll("// Discovered at assembler time from `pub const FlowNodes` on each\n");
+    try bw.writeAll("// plugin's `src/root.zig` AND each game-script module under\n");
+    try bw.writeAll("// `scripts/` (RFC §5: any module exporting FlowNodes contributes).\n");
+    try bw.writeAll("// Each entry aliases the source decl directly so the FlowNode\n");
+    try bw.writeAll("// factory's metadata + `impl` comptime decl pass through to\n");
+    try bw.writeAll("// downstream consumers (flow-codegen `CustomNode` lowering in\n");
+    try bw.writeAll("// phase 3, labelle-gui palette UI in phase 4).\n");
+    try bw.writeAll("pub const PluginFlowNodes = struct {\n");
+    for (flow_nodes) |fn_| {
+        if (fn_.is_script) {
+            try bw.print(
+                "    pub const {s}__{s} = @import(\"scripts/{s}\").FlowNodes.{s};\n",
+                .{ fn_.module_sanitized, fn_.node_name, fn_.module_import_path, fn_.node_name },
+            );
+        } else {
+            try bw.print(
+                "    pub const {s}__{s} = @import(\"{s}\").FlowNodes.{s};\n",
+                .{ fn_.module_sanitized, fn_.node_name, fn_.module_import_path, fn_.node_name },
+            );
+        }
+    }
+    // Name resolver — emitted unconditionally so callers can use a
+    // single canonical entry point regardless of whether discovery
+    // found anything. The implementation matches what
+    // RFC-PLUGIN-EVENTS used for event-name resolution: split the
+    // dotted form on `.`, swap to `__`, return the joined identifier
+    // when it names a public decl on `PluginFlowNodes`. Pure comptime
+    // — flow-codegen calls this during `CustomNode` lowering.
+    try bw.writeAll("\n");
+    try bw.writeAll("    /// Comptime name resolver for flow-codegen's `CustomNode`\n");
+    try bw.writeAll("    /// lowering. Given a dotted node name (`\"box2d.apply_impulse\"`),\n");
+    try bw.writeAll("    /// returns the canonical qualified identifier\n");
+    try bw.writeAll("    /// (`\"box2d__apply_impulse\"`) iff a matching decl exists on\n");
+    try bw.writeAll("    /// this struct, else `null`. Callers reach the entry value via\n");
+    try bw.writeAll("    /// `@field(PluginFlowNodes, resolved)`.\n");
+    try bw.writeAll("    pub fn resolve(comptime dotted: []const u8) ?[]const u8 {\n");
+    try bw.writeAll("        const dot = std.mem.indexOfScalar(u8, dotted, '.') orelse return null;\n");
+    try bw.writeAll("        const module = dotted[0..dot];\n");
+    try bw.writeAll("        const node = dotted[dot + 1 ..];\n");
+    try bw.writeAll("        if (node.len == 0) return null;\n");
+    try bw.writeAll("        const qualified = module ++ \"__\" ++ node;\n");
+    try bw.writeAll("        if (!@hasDecl(@This(), qualified)) return null;\n");
+    try bw.writeAll("        return qualified;\n");
+    try bw.writeAll("    }\n");
+    try bw.writeAll("};\n\n");
+}
+
+/// Emit the `PluginPinStyles` registry (RFC-FLOW-VOCABULARY phase 2).
+///
+/// One `pub const <TypeName>` entry per discovered `PinStyle`, aliased
+/// to the source-module decl. Keyed by the Zig **type name** (e.g.
+/// `BodyId`), so two plugins both declaring a `BodyId` style would
+/// emit duplicate decls — the assembler deduplicates upstream
+/// (last-write-wins, matching the RFC §1 contract) so the emitted
+/// block has at most one entry per type name.
+///
+/// Empty discovery emits an empty `struct { }` — same shape as the
+/// populated case so callers can iterate `@typeInfo(PluginPinStyles)`
+/// uniformly. The editor layers these on top of `default_pin_styles`
+/// (which already ship in `labelle-core`), so an empty plugin-side
+/// registry just means "no per-type overrides beyond the defaults".
+pub fn writePluginPinStylesBlock(bw: anytype, pin_styles: []const PluginPinStyle) !void {
+    try bw.writeAll("// --- Plugin pin styles (RFC-FLOW-VOCABULARY phase 2) ---\n");
+    try bw.writeAll("// Discovered at assembler time from `pub const PinStyles` on each\n");
+    try bw.writeAll("// plugin's `src/root.zig` AND each game-script module under\n");
+    try bw.writeAll("// `scripts/`. The editor layers these on top of\n");
+    try bw.writeAll("// `labelle-core`'s `default_pin_styles` (primitives + EntityId).\n");
+    try bw.writeAll("// Keyed by Zig type name; duplicates across modules are deduped\n");
+    try bw.writeAll("// last-write-wins by the assembler before emission, matching\n");
+    try bw.writeAll("// the RFC §1 contract.\n");
+    try bw.writeAll("pub const PluginPinStyles = struct {\n");
+    for (pin_styles) |ps| {
+        if (ps.is_script) {
+            try bw.print(
+                "    pub const {s} = @import(\"scripts/{s}\").PinStyles.{s};\n",
+                .{ ps.type_name, ps.module_import_path, ps.type_name },
+            );
+        } else {
+            try bw.print(
+                "    pub const {s} = @import(\"{s}\").PinStyles.{s};\n",
+                .{ ps.type_name, ps.module_import_path, ps.type_name },
+            );
+        }
+    }
+    try bw.writeAll("};\n\n");
+}
+
+/// Deduplicate `PluginPinStyle` entries by `type_name`, keeping the
+/// last occurrence (RFC §1: "later declarations win for any
+/// duplicate type key"). Allocates a new slice owned by the caller;
+/// strings inside are still borrowed from the input entries' lifetime
+/// (the caller's `PluginFlowDecls`). Iteration over the input is
+/// reverse: the first time we see a type name, we keep it (which
+/// corresponds to the last-write in the input order); a second sight
+/// is dropped.
+///
+/// Quadratic over the entry count — fine for the small registry
+/// sizes (≤ a few dozen per typical project); a HashMap would be
+/// overkill and would force a string allocation for every key.
+pub fn dedupePinStyles(
+    allocator: std.mem.Allocator,
+    pin_styles: []const PluginPinStyle,
+) ![]PluginPinStyle {
+    var kept: std.ArrayList(PluginPinStyle) = .empty;
+    errdefer kept.deinit(allocator);
+    // Walk in reverse so the first time we see a name corresponds to
+    // the last declaration in input order; later passes that already
+    // recorded the name skip the entry.
+    var i: usize = pin_styles.len;
+    while (i > 0) {
+        i -= 1;
+        const ps = pin_styles[i];
+        var already = false;
+        for (kept.items) |k| {
+            if (std.mem.eql(u8, k.type_name, ps.type_name)) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) try kept.append(allocator, ps);
+    }
+    // Reverse `kept` to restore source order (filtered).
+    const out = try kept.toOwnedSlice(allocator);
+    std.mem.reverse(PluginPinStyle, out);
+    return out;
 }
 
 /// Sanitize a plugin name (e.g. `labelle-box2d`) into a Zig identifier
@@ -2709,6 +3153,13 @@ pub fn generateMainZigFromTemplate(
     gizmo_names: []const []const u8,
     animation_names: []const []const u8,
     plugin_events: []const PluginEvent,
+    // RFC-FLOW-VOCABULARY phase 2 — discovered FlowNodes/PinStyles from
+    // plugin AND game-script modules. Both lists may be empty; the
+    // emitter writes a `PluginFlowNodes = struct {}` / `PluginPinStyles
+    // = struct {}` shell either way so downstream code paths
+    // (flow-codegen phase 3, labelle-gui phase 4) can reflect uniformly.
+    plugin_flow_nodes: []const PluginFlowNode,
+    plugin_pin_styles: []const PluginPinStyle,
 ) ![]const u8 {
     // Surface basename collisions at generate time, before any
     // code emission — otherwise two prefabs with the same filename
@@ -3205,6 +3656,19 @@ pub fn generateMainZigFromTemplate(
                 try bw.writeAll("pub const GameEvents = void;\n\n");
             }
         }
+
+        // RFC-FLOW-VOCABULARY phase 2 — emit the PluginFlowNodes and
+        // PluginPinStyles registries inside the same generated block so
+        // the engine template stays unchanged. Both decls are always
+        // emitted (empty `struct {}` when discovery found nothing) so
+        // downstream consumers can do uniform reflection. See the
+        // file header on `writePluginFlowNodesBlock` for the
+        // mechanism + RFC §5 (game-script-as-source) for the scope.
+        try writePluginFlowNodesBlock(bw, plugin_flow_nodes);
+        const deduped_styles = try dedupePinStyles(allocator, plugin_pin_styles);
+        defer allocator.free(deduped_styles);
+        try writePluginPinStylesBlock(bw, deduped_styles);
+
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
         allocs.appendAssumeCapacity(block);
