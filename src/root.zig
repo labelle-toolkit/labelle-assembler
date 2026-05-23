@@ -9,7 +9,7 @@ pub const scanner = @import("scanner.zig");
 pub const scene_manifest = @import("scene_manifest.zig");
 pub const asset_validator = @import("asset_validator.zig");
 pub const lazy_inference = @import("lazy_inference.zig");
-const main_zig = @import("main_zig.zig");
+pub const main_zig = @import("main_zig.zig");
 pub const script_scanner = @import("script_scanner.zig");
 pub const flow_scanner = @import("flow_scanner.zig");
 const build_files = @import("build_files.zig");
@@ -133,19 +133,26 @@ const game_shim_prelude =
 
 /// Generate the per-project `game.zig` shim. Caller owns the returned
 /// bytes. Built from `game_shim_prelude` plus a `PluginEvents` block
-/// (RFC-PLUGIN-EVENTS phase 3) when the project declares plugins, so
-/// flow-codegen's new-form `OnEvent` handler can resolve event names
-/// against `@FieldType(game.PluginEvents, "<tag>")` through the same
-/// `@import("game")` flow files already use. The block is identical
-/// to the one `main_zig.writePluginEventsBlock` emits into `main.zig`
-/// — same `@hasDecl(plugin, "Events")` comptime walk, same qualified
-/// variant tags. The `overrideImport(game_mod, "<plugin>", ...)` calls
-/// in `build_files.generateBuildZig` wire each plugin module into
+/// (RFC-PLUGIN-EVENTS phase 3) when at least one plugin actually
+/// declares events, so flow-codegen's new-form `OnEvent` handler can
+/// resolve event names against `@FieldType(game.PluginEvents, "<tag>")`
+/// through the same `@import("game")` flow files already use. The block
+/// is identical to the one `main_zig.writePluginEventsBlock` emits into
+/// `main.zig` — same assembler-time AST walk, same qualified variant
+/// tags. The `overrideImport(game_mod, "<plugin>", ...)` calls in
+/// `build_files.generateBuildZig` wire each plugin module into
 /// `game_mod` so the `@import("<plugin>")` calls inside the block
 /// resolve.
+///
+/// Caller passes the pre-computed `plugin_events` list (see
+/// `main_zig.discoverPluginEvents`) so the discovery happens once per
+/// `generate` invocation rather than twice (shim + main.zig). When the
+/// list is empty (declared plugins but no `Events` decls) the shim
+/// omits the block entirely — there's nothing for flow-codegen to
+/// reflect against.
 pub fn generateGameShim(
     allocator: std.mem.Allocator,
-    cfg: ProjectConfig,
+    plugin_events: []const main_zig.PluginEvent,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -153,8 +160,8 @@ pub fn generateGameShim(
 
     try w.writeAll(game_shim_prelude);
 
-    if (cfg.plugins.len > 0) {
-        try main_zig.writePluginEventsBlock(w, cfg);
+    if (plugin_events.len > 0) {
+        try main_zig.writePluginEventsBlock(w, plugin_events);
     }
 
     var arr_list = aw.toArrayList();
@@ -530,17 +537,27 @@ pub fn generate(
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
 
+    // Discover each plugin's `pub const Events` decls at assembler time
+    // by AST-walking `<plugin>/src/root.zig`. The shim + main.zig
+    // emission below both consume this list to build the literal
+    // `PluginEvents = union(enum) { … }` (or `void` when empty) — see
+    // the file header on `main_zig.writePluginEventsBlock` for why the
+    // builtin `@Union(.auto, …)` path was retired (zero-field result is
+    // uninstantiable, breaks the plugin-controllers example).
+    var plugin_events = try main_zig.discoverPluginEvents(allocator, cfg, game_dir);
+    defer plugin_events.deinit();
+
     // Emit the `game.zig` shim — a tiny re-export module that surfaces
     // `Game` and `EntityId` so generated flow files at
     // `scripts/flows/*.zig` can `@import("game")`. See
-    // labelle-assembler#116. When the project declares plugins the shim
-    // also re-exports `PluginEvents` so new-form `OnEvent` flow handlers
-    // (RFC-PLUGIN-EVENTS phase 3) can reflect payload signatures
-    // through the same `@import("game")` they already use. The matching
-    // `addImport("game", game_mod)` and per-plugin
+    // labelle-assembler#116. When at least one plugin declares events,
+    // the shim also re-exports `PluginEvents` so new-form `OnEvent`
+    // flow handlers (RFC-PLUGIN-EVENTS phase 3) can reflect payload
+    // signatures through the same `@import("game")` they already use.
+    // The matching `addImport("game", game_mod)` and per-plugin
     // `overrideImport(game_mod, "<plugin>", plugin_mod)` calls live in
     // `build_files.generateBuildZig`.
-    const game_shim = try generateGameShim(allocator, cfg);
+    const game_shim = try generateGameShim(allocator, plugin_events.entries);
     defer allocator.free(game_shim);
     try scanner.writeFile(target_dir, "game.zig", game_shim);
 
@@ -575,7 +592,7 @@ pub fn generate(
         defer allocator.free(backend_tmpl);
         const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
         defer allocator.free(engine_template);
-        const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, merged_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names);
+        const main_zig_content = try main_zig.generateMainZigFromTemplate(allocator, engine_template, cfg, backend_tmpl, merged_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names, plugin_events.entries);
         defer allocator.free(main_zig_content);
         try scanner.writeFile(target_dir, "main.zig", main_zig_content);
     }

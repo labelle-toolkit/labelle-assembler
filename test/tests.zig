@@ -169,6 +169,8 @@ const ScriptEntry = generate.script_scanner.ScriptScanner.ScriptEntry;
 const empty_entries: []const ScriptEntry = &.{};
 const SceneManifest = generate.scene_manifest.SceneManifest;
 const empty_scene_manifests: []const SceneManifest = &.{};
+const PluginEvent = generate.main_zig.PluginEvent;
+const empty_plugin_events: []const PluginEvent = &.{};
 
 /// Helper: create global ScriptEntry values from a list of names (for testing).
 /// Names are treated as filenames like "foo.zig" (no prefix, no state).
@@ -757,7 +759,7 @@ pub const MAIN_ZIG = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "MockEcsBackend") != null);
@@ -769,7 +771,7 @@ pub const MAIN_ZIG = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .zflecs,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "EcsAdapter") != null);
@@ -785,7 +787,7 @@ pub const MAIN_ZIG = struct {
             .target_fps = 120,
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "1024") != null);
@@ -799,7 +801,7 @@ pub const MAIN_ZIG = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "StubGui") != null);
@@ -812,7 +814,7 @@ pub const MAIN_ZIG = struct {
             .backend = .raylib,
             .ecs = .mock,
             .resolved_gui = testGuiRenderInterface("clay"),
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "gui_backend") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "StubGui") == null);
@@ -824,7 +826,7 @@ pub const MAIN_ZIG = struct {
             .backend = .raylib,
             .ecs = .mock,
             .resolved_gui = testGuiRawBackend("imgui"),
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.init()") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.shutdown()") != null);
@@ -836,7 +838,7 @@ pub const MAIN_ZIG = struct {
             .backend = .raylib,
             .ecs = .mock,
             .resolved_gui = testGuiRenderInterface("clay"),
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.init()") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.shutdown()") == null);
@@ -871,7 +873,7 @@ pub const MAIN_ZIG = struct {
             .height = 768,
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "setScreenHeight") != null);
@@ -883,7 +885,7 @@ pub const MAIN_ZIG = struct {
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn main()") != null);
@@ -909,7 +911,7 @@ pub const NULL_BACKEND = struct {
             .name = "test-game",
             .backend = .null,
             .ecs = .mock,
-        }, null_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, null_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Real `pub fn main()` orchestrates the lifecycle — not a sokol
@@ -928,7 +930,7 @@ pub const NULL_BACKEND = struct {
             .name = "test-game",
             .backend = .null,
             .ecs = .mock,
-        }, null_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, null_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // LABELLE_PREVIEW handshake: parse env, dial editor, send hello,
@@ -946,7 +948,7 @@ pub const NULL_BACKEND = struct {
             .name = "test-game",
             .backend = .null,
             .ecs = .mock,
-        }, null_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, null_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // No GPU → no GL/D3D11/Metal readback helpers, no publishFrame
@@ -968,7 +970,7 @@ pub const NULL_BACKEND = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(raylib_main);
 
         // Frame-counter loop is null-only; raylib uses windowShouldClose.
@@ -981,7 +983,7 @@ pub const NULL_BACKEND = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(sokol_main);
 
         // Sokol uses callback exports, not a frame counter.
@@ -1017,7 +1019,7 @@ pub const PLUGIN_CONTROLLERS = struct {
             .backend = .raylib,
             .ecs = .mock,
             .plugins = plugins_two,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Scaffold struct is emitted
@@ -1043,7 +1045,7 @@ pub const PLUGIN_CONTROLLERS = struct {
             .backend = .raylib,
             .ecs = .mock,
             .plugins = plugins_two,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "try PluginControllers.setup(&g);") != null);
@@ -1056,7 +1058,7 @@ pub const PLUGIN_CONTROLLERS = struct {
             .backend = .sokol,
             .ecs = .mock,
             .plugins = plugins_two,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Callback backends can't `try` in `void` init, so setup uses `catch @panic`.
@@ -1071,7 +1073,7 @@ pub const PLUGIN_CONTROLLERS = struct {
             .backend = .raylib,
             .ecs = .mock,
             .plugins = &.{},
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "PluginControllers") == null);
@@ -1102,7 +1104,7 @@ pub const PLUGIN_CONTROLLERS = struct {
             .backend = .raylib,
             .ecs = .mock,
             .plugins = plugins_two,
-        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Plugin script lives under `<target>/scripts/.plugin_pathfinder/…`
@@ -1125,7 +1127,7 @@ pub const PLUGIN_CONTROLLERS = struct {
             .backend = .raylib,
             .ecs = .mock,
             .plugins = plugins_two,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         const pathfinder_idx = std.mem.indexOf(u8, main_zig, "@import(\"pathfinder\")") orelse return error.NotFound;
@@ -1147,7 +1149,7 @@ pub const SOKOL = struct {
             .height = 600,
             .backend = .sokol,
             .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "setScreenHeight") != null);
@@ -1158,7 +1160,7 @@ pub const SOKOL = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn init() callconv(.c)") != null);
@@ -1171,7 +1173,7 @@ pub const SOKOL = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var runner: Runner = undefined;") != null);
@@ -1186,7 +1188,7 @@ pub const SOKOL = struct {
             .backend = .sokol,
             .ecs = .mock,
             .initial_scene = "main_menu",
-        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"main_menu\")") != null);
@@ -1199,7 +1201,7 @@ pub const SOKOL = struct {
             .backend = .sokol,
             .ecs = .mock,
             .resolved_gui = testGuiRawBackend("imgui"),
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "GuiBackend.init()") != null);
@@ -1219,7 +1221,7 @@ pub const SOKOL = struct {
             .backend = .sokol,
             .platform = .wasm,
             .ecs = .mock,
-        }, sokol_alloc_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_alloc_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // The module-scope decl must still be emitted — that's where
@@ -1243,7 +1245,7 @@ pub const SOKOL = struct {
             .backend = .sokol,
             .platform = .desktop,
             .ecs = .mock,
-        }, sokol_alloc_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_alloc_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var gpa = std.heap.DebugAllocator") != null);
@@ -1260,7 +1262,7 @@ pub const EMBED_SCENES = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"scenes/intro.jsonc\")") != null);
@@ -1284,7 +1286,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Comptime struct + per-scene named decls.
@@ -1307,7 +1309,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const menu: []const []const u8 = &.{};") != null);
@@ -1322,7 +1324,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Decl uses the injective `_s_`-escaped ident (issue #172)...
@@ -1336,7 +1338,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "SceneAssetManifests") == null);
@@ -1351,7 +1353,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"path\\\\asset\"") != null);
@@ -1368,7 +1370,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // The setup block should thread SceneAssetManifests.entries into
@@ -1387,7 +1389,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "inline for (SceneAssetManifests.entries) |scene_asset_entry|") != null);
@@ -1435,7 +1437,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try expectImageBackendWiring(main_zig);
@@ -1446,7 +1448,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try expectImageBackendWiring(main_zig);
@@ -1462,7 +1464,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try expectImageBackendWiring(main_zig);
@@ -1473,7 +1475,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
             .name = "test-game",
             .backend = .bgfx,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try expectImageBackendWiring(main_zig);
@@ -1484,7 +1486,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
             .name = "test-game",
             .backend = .wgpu,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try expectImageBackendWiring(main_zig);
@@ -1502,7 +1504,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
             .resources = &.{
                 .{ .name = "sprites", .json = "assets/sprites.json", .texture = "assets/sprites.png" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // The rule: `setBackend` populates the hook BEFORE any
@@ -1530,7 +1532,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
             .resources = &.{
                 .{ .name = "sprites", .json = "assets/sprites.json", .texture = "assets/sprites.png" },
             },
-        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         const set_backend_idx = std.mem.indexOf(u8, main_zig, "engine.ImageLoader.setBackend(.{") orelse return error.SetBackendMissing;
@@ -1546,7 +1548,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // The side-table is the load-bearing bit — without it we'd
@@ -1582,7 +1584,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Assert the field-for-field copy shape — a mismatch here
@@ -1814,7 +1816,7 @@ pub const SCRIPTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "const AllScripts = struct {") != null);
@@ -1833,7 +1835,7 @@ pub const SCRIPTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Global script: direct import, no wrapper
@@ -1855,7 +1857,7 @@ pub const SCRIPTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // `playing+paused/camera.zig`: `+` -> `_p_`, `/` -> `_s_` (injective — issue #172).
@@ -1870,7 +1872,7 @@ pub const SCRIPTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "const Runner = engine.ScriptRunner(AllScripts, GameContext, EcsBackend)") != null);
@@ -1886,7 +1888,7 @@ pub const SCRIPTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "const GameContext = @import(\"scripts/context.zig\").GameContext(EcsBackend)") != null);
@@ -1899,7 +1901,7 @@ pub const SCRIPTS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "const GameContext = struct {}") != null);
@@ -1915,7 +1917,7 @@ pub const PREFABS_AND_SCENES = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Prefabs are embedded at runtime, not compiled via PrefabRegistry
@@ -1937,7 +1939,7 @@ pub const VIEWS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, views, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, views, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "const Views = engine.ViewRegistry(.{") != null);
@@ -1952,7 +1954,7 @@ pub const VIEWS = struct {
             .backend = .raylib,
             .ecs = .mock,
             .resolved_gui = testGuiRenderInterface("clay"),
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, views, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, views, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.guiBegin()") != null);
@@ -1965,7 +1967,7 @@ pub const VIEWS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "const Views = engine.EmptyViewRegistry") != null);
@@ -1985,7 +1987,7 @@ pub const LAYERS = struct {
                 .{ .name = "world", .order = 1, .space = .world },
                 .{ .name = "hud", .order = 2, .space = .screen },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "const GameLayers = enum(u8)") != null);
@@ -2015,7 +2017,7 @@ pub const RESOURCES = struct {
                 .{ .name = "characters", .json = "assets/characters.json", .texture = "assets/characters.png", .lazy = false },
                 .{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png", .lazy = false },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Resources are embedded via @embedFile + loadAtlasFromMemory
@@ -2032,7 +2034,7 @@ pub const RESOURCES = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory") == null);
@@ -2046,7 +2048,7 @@ pub const RESOURCES = struct {
             .resources = &.{
                 .{ .name = "characters", .json = "assets/characters.json", .texture = "assets/characters.png", .lazy = true },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerAtlasFromMemory(\"characters\"") != null);
@@ -2068,7 +2070,7 @@ pub const RESOURCES = struct {
             .resources = &.{
                 .{ .name = "characters", .json = "assets/characters.json", .texture = "assets/characters.png" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"characters\"") != null);
@@ -2094,7 +2096,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "world", .json = "atlases/world.json", .texture = "atlases/world.png", .lazy = false },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"world\"") != null);
@@ -2110,7 +2112,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "boss_theme", .sound = "audio/boss.ogg", .lazy = false },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSoundFromMemory(\"boss_theme\", \"ogg\", @embedFile(\"audio/boss.ogg\"))") != null);
@@ -2126,7 +2128,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "sfx_click", .sound = "audio/click.wav", .lazy = true },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerSoundFromMemory(\"sfx_click\", \"wav\", @embedFile(\"audio/click.wav\"))") != null);
@@ -2149,7 +2151,7 @@ pub const RESOURCE_EMISSION = struct {
                     .lazy = false,
                 },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Locally-materialised ranges array.
@@ -2174,7 +2176,7 @@ pub const RESOURCE_EMISSION = struct {
                 // No font_params — defaults pulled from FontBakeParams{}.
                 .{ .name = "default_font", .font = "fonts/default.otf", .lazy = false },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Default pixel_height = 16, atlas 512×512, ASCII printable range.
@@ -2194,7 +2196,7 @@ pub const RESOURCE_EMISSION = struct {
                 .{ .name = "boss", .sound = "audio/boss.ogg", .lazy = false },
                 .{ .name = "ui_font", .font = "fonts/m5x7.ttf", .lazy = false },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         const world_pos = std.mem.indexOf(u8, main_zig, "loadAtlasFromMemory(\"world\"") orelse return error.AtlasMissing;
@@ -2215,7 +2217,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "bad", .sound = "audio/song.mp3", .lazy = false },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         try std.testing.expectError(error.UnsupportedResourceExtension, result);
     }
 
@@ -2227,7 +2229,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "bad", .font = "fonts/wrong.png", .lazy = false },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         try std.testing.expectError(error.UnsupportedResourceExtension, result);
     }
 
@@ -2239,7 +2241,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "empty" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         try std.testing.expectError(error.InvalidResource, result);
     }
 
@@ -2251,7 +2253,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "half", .texture = "atlas.png" }, // missing .json
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         try std.testing.expectError(error.InvalidResource, result);
     }
 
@@ -2263,7 +2265,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "tangle", .sound = "x.wav", .font = "y.ttf" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         try std.testing.expectError(error.InvalidResource, result);
     }
 
@@ -2281,7 +2283,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "ui-font", .font = "fonts/ui.ttf" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         try std.testing.expectError(error.InvalidFontResourceName, result);
     }
 
@@ -2293,7 +2295,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "8bit_font", .font = "fonts/8bit.ttf" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         try std.testing.expectError(error.InvalidFontResourceName, result);
     }
 
@@ -2305,7 +2307,7 @@ pub const RESOURCE_EMISSION = struct {
             .resources = &.{
                 .{ .name = "display.regular", .font = "fonts/display.ttf" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         try std.testing.expectError(error.InvalidFontResourceName, result);
     }
 
@@ -2322,7 +2324,7 @@ pub const RESOURCE_EMISSION = struct {
                 .{ .name = "boss-theme", .sound = "audio/boss.ogg" },
                 .{ .name = "ui-atlas", .json = "atlases/ui.json", .texture = "atlases/ui.png" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSoundFromMemory(\"boss-theme\"") != null);
@@ -2352,7 +2354,7 @@ pub const GATED_ADAPTER_WIRING = struct {
             .resources = &.{
                 .{ .name = "world", .json = "atlases/world.json", .texture = "atlases/world.png" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "ImageBackendAdapter") != null);
@@ -2368,7 +2370,7 @@ pub const GATED_ADAPTER_WIRING = struct {
             .resources = &.{
                 .{ .name = "boss_theme", .sound = "audio/boss.ogg" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "AudioBackendAdapter") != null);
@@ -2385,7 +2387,7 @@ pub const GATED_ADAPTER_WIRING = struct {
             .resources = &.{
                 .{ .name = "ui_font", .font = "fonts/ui.ttf" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "FontBackendAdapter") != null);
@@ -2404,7 +2406,7 @@ pub const GATED_ADAPTER_WIRING = struct {
                 .{ .name = "boss_theme", .sound = "audio/boss.ogg" },
                 .{ .name = "ui_font", .font = "fonts/ui.ttf" },
             },
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "ImageBackendAdapter") != null);
@@ -2433,7 +2435,7 @@ pub const GATED_ADAPTER_WIRING = struct {
             .resources = &.{
                 .{ .name = "boss_theme", .sound = "audio/boss.ogg" },
             },
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "AudioBackendAdapter") != null);
@@ -2448,7 +2450,7 @@ pub const GATED_ADAPTER_WIRING = struct {
             .resources = &.{
                 .{ .name = "ui_font", .font = "fonts/ui.ttf" },
             },
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "FontBackendAdapter") != null);
@@ -2589,7 +2591,7 @@ pub const HIDDEN_WINDOW = struct {
             .backend = .raylib,
             .ecs = .mock,
             .hidden = true,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.setConfigFlags(.{ .window_hidden = true })") != null);
@@ -2601,7 +2603,7 @@ pub const HIDDEN_WINDOW = struct {
             .backend = .raylib,
             .ecs = .mock,
             .hidden = false,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "window_hidden") == null);
@@ -2613,7 +2615,7 @@ pub const HIDDEN_WINDOW = struct {
             .backend = .sokol,
             .ecs = .mock,
             .hidden = true,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.setConfigFlags(.{ .window_hidden = true })") != null);
@@ -2629,7 +2631,7 @@ pub const SUBFOLDERS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Registered name is the basename only — every `spawnPrefab`
@@ -2659,7 +2661,7 @@ pub const SUBFOLDERS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, prefabs, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         try std.testing.expectError(error.PrefabBasenameCollision, result);
     }
 
@@ -2674,7 +2676,7 @@ pub const SUBFOLDERS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // State-scoped scripts: identifier derived from rel_path (each `/`
@@ -2695,7 +2697,7 @@ pub const SUBFOLDERS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, components, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, components, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // The component type name is the natural PascalCase of the path
@@ -2716,7 +2718,7 @@ pub const SUBFOLDERS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, gizmos, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, gizmos, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".debug_s_collision = @import(\"gizmos/debug/collision.zon\")") != null);
@@ -2729,7 +2731,7 @@ pub const SUBFOLDERS = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, views, empty_names, empty_names);
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, views, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".panels_s_inventory = @import(\"views/panels/inventory.zon\")") != null);
@@ -2948,7 +2950,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, preview_loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Argv parser is wired through the engine's re-export.
@@ -3011,7 +3013,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, preview_sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // No module-level `_preview` decl — `g.preview` is the
@@ -3101,7 +3103,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // labelle-assembler#140 — Phase B raylib migration. The PBO ring,
@@ -3166,7 +3168,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
-        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_read_pixels") == null);
@@ -3195,7 +3197,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Post-#140 migration: the SHM-vs-IOSurface comptime branch lives
@@ -3266,7 +3268,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Comptime gating — the entire GL path hides behind
@@ -3361,7 +3363,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Metal enable gate — aliased from the backend module.
@@ -3419,7 +3421,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Source-order: backend pre-frame hook fires BEFORE g.render()
@@ -3468,7 +3470,7 @@ pub const PREVIEW_MODE = struct {
                 .name = "test-game",
                 .backend = backend,
                 .ecs = .mock,
-            }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+            }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
             defer std.testing.allocator.free(main_zig);
 
             try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.beginFrameStream(") == null);
@@ -3490,7 +3492,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Raylib backend hooks present.
@@ -3522,7 +3524,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // Comptime gate.
@@ -3645,7 +3647,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
-        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_sokol_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig_sdl);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig_sdl, "_sokol_preview_gl_enabled") == null);
@@ -3692,7 +3694,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
-        }, preview_sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         // hideWindow is referenced in the generated source.
@@ -3747,7 +3749,7 @@ pub const PREVIEW_MODE = struct {
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
-        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names);
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.hideWindow") == null);

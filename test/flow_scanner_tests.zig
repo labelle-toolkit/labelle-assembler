@@ -321,6 +321,7 @@ pub const AllScriptsIntegration = struct {
             empty_names, // view_names
             empty_names, // gizmo_names
             empty_names, // animation_names
+            &[_]generator.main_zig.PluginEvent{}, // plugin_events
         );
         defer allocator.free(main_zig);
 
@@ -372,6 +373,7 @@ pub const AllScriptsIntegration = struct {
             empty_names, // view_names
             empty_names, // gizmo_names
             empty_names, // animation_names
+            &[_]generator.main_zig.PluginEvent{}, // plugin_events
         );
         defer allocator.free(main_zig);
 
@@ -438,12 +440,9 @@ pub const GameModuleBinding = struct {
 
     test "game.zig shim re-exports Game and EntityId from labelle-engine" {
         const allocator = std.testing.allocator;
-        const cfg: generator.ProjectConfig = .{
-            .name = "test-game",
-            .backend = .raylib,
-            .ecs = .mock,
-        };
-        const src = try generator.generateGameShim(allocator, cfg);
+        // No plugins (or no plugin events) → empty list.
+        const empty_pe: []const generator.main_zig.PluginEvent = &.{};
+        const src = try generator.generateGameShim(allocator, empty_pe);
         defer allocator.free(src);
 
         // `@import("game")` users expect both decls at the root.
@@ -455,9 +454,9 @@ pub const GameModuleBinding = struct {
         // the engine's hook semantics.
         try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"labelle-engine\")") != null);
 
-        // No plugins → no `PluginEvents` block. The shim stays a tiny
-        // re-export of `Game`/`EntityId`; only projects with plugins
-        // (and the resolver phase 3 needs) get the union.
+        // No plugin events → no `PluginEvents` block. The shim stays a tiny
+        // re-export of `Game`/`EntityId`; only projects with events to
+        // resolve (phase 3) get the union.
         try std.testing.expect(std.mem.indexOf(u8, src, "PluginEvents") == null);
     }
 
@@ -465,19 +464,18 @@ pub const GameModuleBinding = struct {
         // RFC-PLUGIN-EVENTS phase 3 shim caveat: new-form `OnEvent`
         // flow handlers reflect against `@FieldType(game.PluginEvents,
         // "<tag>")`, so the `game.zig` shim must expose the union next
-        // to `Game`/`EntityId`. With plugins, the shim's emitted block
-        // is the same comptime walk `writePluginEventsBlock` writes
-        // into `main.zig`.
+        // to `Game`/`EntityId`. The shim emission is now driven by the
+        // pre-discovered event list — same shape `writePluginEventsBlock`
+        // writes into `main.zig`.
         const allocator = std.testing.allocator;
-        const cfg: generator.ProjectConfig = .{
-            .name = "test-game",
-            .backend = .raylib,
-            .ecs = .mock,
-            .plugins = &.{
-                .{ .name = "box2d", .repo = "@plugins/box2d", .version = "0.0.0" },
+        const pe = [_]generator.main_zig.PluginEvent{
+            .{
+                .plugin_import_name = "box2d",
+                .plugin_sanitized = "box2d",
+                .event_name = "collision_begin",
             },
         };
-        const src = try generator.generateGameShim(allocator, cfg);
+        const src = try generator.generateGameShim(allocator, &pe);
         defer allocator.free(src);
 
         // The static prelude still re-exports the engine types verbatim.
@@ -489,13 +487,13 @@ pub const GameModuleBinding = struct {
         // reflects on this union, so the shim must spell `pub const
         // PluginEvents` and import the plugin module by its declared
         // name.
-        try std.testing.expect(std.mem.indexOf(u8, src, "pub const PluginEvents = blk: {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const PluginEvents = union(enum) {") != null);
         try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"box2d\")") != null);
         // Qualified-tag mapping is mechanical: `<plugin>.<event>` →
         // `<plugin>__<event>`. The shim builds the tag the same way
         // `main.zig` does, so the resolver consumes a single canonical
         // form.
-        try std.testing.expect(std.mem.indexOf(u8, src, "\"__\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "box2d__collision_begin") != null);
     }
 };
 
@@ -549,6 +547,7 @@ pub const PluginEvents = struct {
             &.{}, // view_names
             &.{}, // gizmo_names
             &.{}, // animation_names
+            &.{}, // plugin_events
         );
         defer allocator.free(main_zig);
 
@@ -564,13 +563,15 @@ pub const PluginEvents = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "PluginEvents") == null);
     }
 
-    test "plugins present: emits a PluginEvents blk: union and merges it into AllHookPayloads" {
+    test "plugins present: emits a PluginEvents union(enum) literal and merges it into AllHookPayloads" {
         const allocator = std.testing.allocator;
 
         // Mirrors bouncing-ball's `.plugins = .{.{ .name = \"box2d\" }}`:
-        // a single plugin with an identifier-safe name. The codegen
-        // doesn't load the plugin module — the `@hasDecl` walk is
-        // emitted as comptime Zig in main.zig, not run here.
+        // a single plugin with an identifier-safe name. The discovery
+        // walk runs at assembler time (against `<plugin>/src/root.zig`),
+        // but here we drive the codegen directly with a pre-built
+        // `plugin_events` slice so the test doesn't depend on a real
+        // checkout on disk.
         const cfg: generator.ProjectConfig = .{
             .name = "test-game",
             .backend = .raylib,
@@ -578,6 +579,10 @@ pub const PluginEvents = struct {
             .plugins = &.{
                 .{ .name = "box2d", .repo = "local:../labelle-box2d" },
             },
+        };
+
+        const pe = [_]generator.main_zig.PluginEvent{
+            .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
         };
 
         const main_zig = try generator.generateMainZigFromTemplate(
@@ -596,20 +601,18 @@ pub const PluginEvents = struct {
             &.{},
             &.{},
             &.{},
+            &pe, // plugin_events
         );
         defer allocator.free(main_zig);
 
-        // PluginEvents decl is emitted as a `pub const` so flow-codegen
-        // (phase 3) can reference it via the module-level import path.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const PluginEvents = blk: {") != null);
-        // The comptime walk uses the same `@hasDecl(plugin, \"Events\")`
-        // convention `Components`/`Systems`/`GizmoCategories` already
-        // use (RFC §1, §2).
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@hasDecl(_entry.module, \"Events\")") != null);
+        // PluginEvents decl is emitted as a `pub const union(enum)`
+        // literal — no `@Union` builtin (its zero-field result is
+        // uninstantiable, see writePluginEventsBlock for context).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const PluginEvents = union(enum) {") != null);
         // Plugin-qualified variant tag — `<plugin>__<event>` — uses `__`
         // as the separator because `.` is not a valid Zig identifier
-        // character. The codegen builds the name with `++ \"__\" ++`.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_entry.name ++ \"__\" ++ _d.name") != null);
+        // character. The codegen writes the field out directly.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "box2d__collision_begin") != null);
         // The plugin module is imported by its project.labelle name —
         // the exact same `@import(\"box2d\")` form `SystemRegistry`
         // and `ComponentRegistryWithPlugins` already use.
@@ -628,8 +631,9 @@ pub const PluginEvents = struct {
             "AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), GameEvents })",
         ) != null);
 
-        // Validate the emitted Zig parses cleanly — `@Union` / `@Enum`
-        // / `comptime var` arrangements are easy to break silently.
+        // Validate the emitted Zig parses cleanly — a literal
+        // `union(enum)` with the wrong field syntax would silently
+        // round-trip past the indexOf checks above.
         const sentinel_src = try allocator.dupeZ(u8, main_zig);
         defer allocator.free(sentinel_src);
         var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
@@ -652,6 +656,10 @@ pub const PluginEvents = struct {
             },
         };
 
+        const pe = [_]generator.main_zig.PluginEvent{
+            .{ .plugin_import_name = "labelle-imgui", .plugin_sanitized = "labelle_imgui", .event_name = "frame_start" },
+        };
+
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_template_with_events,
@@ -668,12 +676,14 @@ pub const PluginEvents = struct {
             &.{},
             &.{},
             &.{},
+            &pe, // plugin_events
         );
         defer allocator.free(main_zig);
 
-        // `.name` is the sanitized identifier (used as the variant
-        // prefix). `.module` keeps the original string for `@import`.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".name = \"labelle_imgui\"") != null);
+        // The sanitized identifier is used as the variant tag prefix
+        // (`<plugin_sanitized>__<event>`); the original name is what
+        // `@import(...)` resolves against.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle_imgui__frame_start") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"labelle-imgui\")") != null);
     }
 
@@ -687,6 +697,10 @@ pub const PluginEvents = struct {
             .plugins = &.{
                 .{ .name = "box2d", .repo = "" },
             },
+        };
+
+        const pe = [_]generator.main_zig.PluginEvent{
+            .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
         };
 
         const main_zig = try generator.generateMainZigFromTemplate(
@@ -705,6 +719,7 @@ pub const PluginEvents = struct {
             &.{},
             &.{},
             &.{},
+            &pe, // plugin_events
         );
         defer allocator.free(main_zig);
 
@@ -717,7 +732,7 @@ pub const PluginEvents = struct {
         // unchanged (no template rename), so `game.emit(...)` accepts
         // both flavours.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const GameEventsRaw = union(enum)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const PluginEvents = blk:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const PluginEvents = union(enum)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const GameEvents = engine.core.MergeHookPayloads(.{ GameEventsRaw, PluginEvents })") != null);
 
         // `AllHookPayloads` only references the widened `GameEvents`
@@ -995,6 +1010,7 @@ pub const FlowHandlerWiring = struct {
             &.{}, // view_names
             &.{}, // gizmo_names
             &.{}, // animation_names
+            &.{}, // plugin_events
         );
         defer allocator.free(main_zig);
 
@@ -1075,6 +1091,7 @@ pub const FlowHandlerWiring = struct {
             &.{},
             &.{},
             &.{},
+            &[_]generator.main_zig.PluginEvent{}, // plugin_events
         );
         defer allocator.free(main_zig);
 
@@ -1133,6 +1150,7 @@ pub const FlowHandlerWiring = struct {
             &.{},
             &.{},
             &.{},
+            &[_]generator.main_zig.PluginEvent{}, // plugin_events
         );
         defer allocator.free(main_zig);
 

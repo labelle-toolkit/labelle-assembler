@@ -2,6 +2,7 @@
 const std = @import("std");
 const tpl = @import("template.zig");
 const config = @import("config.zig");
+const cache = @import("cache.zig");
 const script_scanner = @import("script_scanner.zig");
 const scene_manifest = @import("scene_manifest.zig");
 
@@ -11,6 +12,129 @@ const LayerDef = config.LayerDef;
 const ResourceDef = config.ResourceDef;
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
 const SceneManifest = scene_manifest.SceneManifest;
+
+/// A single discovered `pub const <event_name> = struct {...}` declaration
+/// inside a plugin's `pub const Events = struct { ... }`. Owned by
+/// `PluginEvents.deinit` — both strings are heap-allocated dupes so the
+/// caller need not keep the plugin's source buffer alive.
+pub const PluginEvent = struct {
+    /// Plugin name as it appears in `project.labelle` (e.g. `box2d`,
+    /// `labelle-physics`). Used for the `@import("<name>")` reference
+    /// emitted into the union variant type.
+    plugin_import_name: []const u8,
+    /// Sanitized identifier form of `plugin_import_name` (e.g.
+    /// `labelle-physics` → `labelle_physics`). Used as the prefix in
+    /// the qualified variant tag.
+    plugin_sanitized: []const u8,
+    /// Bare event identifier (e.g. `collision_begin`).
+    event_name: []const u8,
+};
+
+/// Collection of `PluginEvent`s with an allocator-aware `deinit`. The
+/// list itself and every string inside it live in the same allocator.
+pub const PluginEvents = struct {
+    entries: []PluginEvent,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *PluginEvents) void {
+        for (self.entries) |e| {
+            self.allocator.free(e.plugin_import_name);
+            self.allocator.free(e.plugin_sanitized);
+            self.allocator.free(e.event_name);
+        }
+        self.allocator.free(self.entries);
+        self.entries = &.{};
+    }
+};
+
+/// Walk each plugin's source tree and collect every `pub const <name> = struct`
+/// declaration sitting inside the plugin's top-level `pub const Events = struct`.
+/// Mirrors the on-disk convention RFC-PLUGIN-EVENTS phase 1 codified, but at
+/// assembler time so the emitted `PluginEvents` union can be a written-out
+/// `union(enum) { … }` literal — `@Union(.auto, …)` with zero fields produces
+/// an uninstantiable type (rejected by `std.ArrayList`'s `@memset(undefined)`
+/// in 0.16), which is the root cause of the plugin-controllers CI failure.
+///
+/// Plugins without `src/root.zig` or without a `Events` decl contribute zero
+/// entries — that's the back-compat path every existing plugin (labelle-fsm,
+/// labelle-pathfinding, the plugin-controllers demo plugin) takes.
+pub fn discoverPluginEvents(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    project_dir: []const u8,
+) !PluginEvents {
+    var entries: std.ArrayList(PluginEvent) = .empty;
+    errdefer {
+        for (entries.items) |e| {
+            allocator.free(e.plugin_import_name);
+            allocator.free(e.plugin_sanitized);
+            allocator.free(e.event_name);
+        }
+        entries.deinit(allocator);
+    }
+
+    for (cfg.plugins) |plugin| {
+        const plugin_dir = cache.resolvePlugin(allocator, plugin, project_dir) catch continue;
+        defer allocator.free(plugin_dir);
+
+        const root_path = try std.fs.path.join(allocator, &.{ plugin_dir, "src", "root.zig" });
+        defer allocator.free(root_path);
+
+        const io = config.globalIo();
+        const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, allocator, .limited(8 * 1024 * 1024)) catch continue;
+        defer allocator.free(src);
+
+        const src_z = try allocator.dupeZ(u8, src);
+        defer allocator.free(src_z);
+
+        var ast = try std.zig.Ast.parse(allocator, src_z, .zig);
+        defer ast.deinit(allocator);
+
+        var name_buf: [128]u8 = undefined;
+        const sanitized = sanitizePluginIdent(plugin.name, &name_buf);
+
+        const root_decls = ast.rootDecls();
+        for (root_decls) |decl_idx| {
+            var buf: [2]std.zig.Ast.Node.Index = undefined;
+            const vd = ast.fullVarDecl(decl_idx) orelse continue;
+            // Only `pub const Events = …` qualifies — non-pub or
+            // non-`Events` declarations are skipped silently so
+            // a plugin can have its own internal `const Events` helper
+            // without leaking into the union.
+            if (vd.visib_token == null) continue;
+            const name_tok = vd.ast.mut_token + 1;
+            const decl_name = ast.tokenSlice(name_tok);
+            if (!std.mem.eql(u8, decl_name, "Events")) continue;
+
+            const init_node = vd.ast.init_node.unwrap() orelse continue;
+            const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
+
+            for (container.ast.members) |m| {
+                const member_vd = ast.fullVarDecl(m) orelse continue;
+                if (member_vd.visib_token == null) continue;
+                // Skip non-type members — `pub const FOO = 42;` inside
+                // `Events` is unusual but not a syntax error, and we
+                // only care about struct/union type aliases.
+                const event_init = member_vd.ast.init_node.unwrap() orelse continue;
+                if (ast.fullContainerDecl(&buf, event_init) == null) continue;
+
+                const event_name_tok = member_vd.ast.mut_token + 1;
+                const event_name = ast.tokenSlice(event_name_tok);
+
+                try entries.append(allocator, .{
+                    .plugin_import_name = try allocator.dupe(u8, plugin.name),
+                    .plugin_sanitized = try allocator.dupe(u8, sanitized),
+                    .event_name = try allocator.dupe(u8, event_name),
+                });
+            }
+        }
+    }
+
+    return .{
+        .entries = try entries.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+}
 
 
 /// Validate that no two prefab paths collapse to the same basename.
@@ -464,77 +588,59 @@ fn writePluginControllersBlock(bw: anytype, cfg: ProjectConfig) !void {
 
 /// Emit the `PluginEvents` tagged union (RFC-PLUGIN-EVENTS phase 1).
 ///
-/// Walks every plugin module at comptime with `@hasDecl(mod, "Events")`
-/// — the same convention `Components` / `Systems` / `GizmoCategories`
-/// use — and folds each `pub const <name>` inside the `Events` struct
-/// into a union variant with a plugin-qualified tag
-/// (`<plugin>__<event>`). `.` is not a valid Zig identifier character,
-/// so the on-disk JSONC dot form (`box2d.collision_begin`) resolves to
-/// the qualified tag (`box2d__collision_begin`) when flow-codegen
-/// consumes this in phase 3.
+/// Plugin events are discovered **at assembler time** by parsing each
+/// plugin's `src/root.zig` AST (see `discoverPluginEvents`) and folding
+/// every `pub const <name> = struct` inside the plugin's top-level
+/// `pub const Events = struct { … }` into a union variant with a
+/// plugin-qualified tag (`<plugin>__<event>`). `.` is not a valid Zig
+/// identifier character, so the on-disk JSONC dot form
+/// (`box2d.collision_begin`) resolves to the qualified tag
+/// (`box2d__collision_begin`) when flow-codegen consumes this in
+/// phase 3.
+///
+/// Why a literal `union(enum) { … }` rather than the comptime
+/// `@Union(.auto, …)` builtin: `@Union` with zero fields returns an
+/// "uninstantiable" type. `std.ArrayList(T)`'s deinit path does
+/// `@memset(self.items, undefined)`, which the 0.16 compiler rejects
+/// for uninstantiable unions ("cannot coerce to uninstantiable type").
+/// That manifests as the plugin-controllers CI failure on every
+/// post-`9f8c5fc` commit. Writing the union out as source bypasses the
+/// builtin entirely and, in the empty-discovery case, we emit `void`
+/// instead (the engine's `has_events = GameEvents != void` gate then
+/// elides the event buffer at type level).
 ///
 /// Plugins without a `pub const Events` struct contribute zero
-/// variants (the `@hasDecl` guard makes them no-ops) so every shipped
-/// game keeps building unchanged — the success criterion on the
-/// phase-1 ticket.
+/// entries — that's the back-compat path every existing plugin
+/// (labelle-fsm, labelle-pathfinding, the demo plugin) takes.
 ///
 /// The plugin "name" prefix is the same string used in
 /// `@import("<name>")` (project.labelle's `.plugins[].name`),
 /// sanitized to a valid Zig identifier — non-`[A-Za-z0-9_]` bytes
 /// collapse to `_`. Two plugins whose sanitized name collide would
-/// produce duplicate variant names, which `MergeHookPayloads`'
-/// duplicate-field check (`labelle-core/src/dispatcher.zig:158-163`)
-/// already rejects with a compile error.
-pub fn writePluginEventsBlock(bw: anytype, cfg: ProjectConfig) !void {
+/// produce duplicate variant names, which Zig rejects at the union
+/// declaration itself.
+pub fn writePluginEventsBlock(bw: anytype, plugin_events: []const PluginEvent) !void {
     try bw.writeAll("// --- Plugin events (RFC-PLUGIN-EVENTS phase 1) ---\n");
-    try bw.writeAll("// Discovered at comptime from `pub const Events` on each plugin\n");
-    try bw.writeAll("// module — same convention as Components/Systems/GizmoCategories.\n");
+    try bw.writeAll("// Discovered at assembler time from `pub const Events` on each\n");
+    try bw.writeAll("// plugin's `src/root.zig` — same convention as the comptime walk\n");
+    try bw.writeAll("// (Components/Systems/GizmoCategories) but materialised statically\n");
+    try bw.writeAll("// so the union is a real source-level type (the comptime `@Union`\n");
+    try bw.writeAll("// builtin's zero-field result is uninstantiable in std.ArrayList).\n");
     try bw.writeAll("// Variant tag = `<plugin>__<event>` so a flow's dotted name\n");
     try bw.writeAll("// (`box2d.collision_begin`) maps to a Zig identifier.\n");
-    try bw.writeAll("pub const PluginEvents = blk: {\n");
-    try bw.writeAll("    const _plugin_events_mods = .{\n");
-    for (cfg.plugins) |plugin| {
-        var name_buf: [128]u8 = undefined;
-        const sanitized = sanitizePluginIdent(plugin.name, &name_buf);
-        try bw.print("        .{{ .name = \"{s}\", .module = @import(\"{s}\") }},\n", .{ sanitized, plugin.name });
+    if (plugin_events.len == 0) {
+        // No plugin contributed an `Events` decl — emit `void` and let
+        // `has_events = GameEvents != void` elide the event buffer.
+        try bw.writeAll("pub const PluginEvents = void;\n\n");
+        return;
     }
-    try bw.writeAll("    };\n");
-    try bw.writeAll("    // Count variants (one per `pub const <name>` on each plugin's `Events`).\n");
-    try bw.writeAll("    // The whole `blk:` body is comptime (we're assigning to a module-\n");
-    try bw.writeAll("    // level `const`), so `var` is enough — `comptime var` in a\n");
-    try bw.writeAll("    // comptime scope is redundant and Zig 0.16 rejects it.\n");
-    try bw.writeAll("    var _count: usize = 0;\n");
-    try bw.writeAll("    for (_plugin_events_mods) |_entry| {\n");
-    try bw.writeAll("        if (@hasDecl(_entry.module, \"Events\")) {\n");
-    try bw.writeAll("            const _E = @field(_entry.module, \"Events\");\n");
-    try bw.writeAll("            for (@typeInfo(_E).@\"struct\".decls) |_d| {\n");
-    try bw.writeAll("                if (@TypeOf(@field(_E, _d.name)) == type) _count += 1;\n");
-    try bw.writeAll("            }\n");
-    try bw.writeAll("        }\n");
-    try bw.writeAll("    }\n");
-    try bw.writeAll("    var _names: [_count][]const u8 = undefined;\n");
-    try bw.writeAll("    var _types: [_count]type = undefined;\n");
-    try bw.writeAll("    var _attrs: [_count]std.builtin.Type.UnionField.Attributes = undefined;\n");
-    try bw.writeAll("    var _idx: usize = 0;\n");
-    try bw.writeAll("    for (_plugin_events_mods) |_entry| {\n");
-    try bw.writeAll("        if (@hasDecl(_entry.module, \"Events\")) {\n");
-    try bw.writeAll("            const _E = @field(_entry.module, \"Events\");\n");
-    try bw.writeAll("            for (@typeInfo(_E).@\"struct\".decls) |_d| {\n");
-    try bw.writeAll("                const _Et = @field(_E, _d.name);\n");
-    try bw.writeAll("                if (@TypeOf(_Et) == type) {\n");
-    try bw.writeAll("                    _names[_idx] = _entry.name ++ \"__\" ++ _d.name;\n");
-    try bw.writeAll("                    _types[_idx] = _Et;\n");
-    try bw.writeAll("                    _attrs[_idx] = .{ .@\"align\" = @alignOf(_Et) };\n");
-    try bw.writeAll("                    _idx += 1;\n");
-    try bw.writeAll("                }\n");
-    try bw.writeAll("            }\n");
-    try bw.writeAll("        }\n");
-    try bw.writeAll("    }\n");
-    try bw.writeAll("    const _Repr = std.math.IntFittingRange(0, if (_count > 0) _count - 1 else 0);\n");
-    try bw.writeAll("    var _tag_values: [_count]_Repr = undefined;\n");
-    try bw.writeAll("    for (0.._count) |_i| _tag_values[_i] = @intCast(_i);\n");
-    try bw.writeAll("    const _Tag = @Enum(_Repr, .exhaustive, &_names, &_tag_values);\n");
-    try bw.writeAll("    break :blk @Union(.auto, _Tag, &_names, &_types, &_attrs);\n");
+    try bw.writeAll("pub const PluginEvents = union(enum) {\n");
+    for (plugin_events) |e| {
+        try bw.print(
+            "    {s}__{s}: @import(\"{s}\").Events.{s},\n",
+            .{ e.plugin_sanitized, e.event_name, e.plugin_import_name, e.event_name },
+        );
+    }
     try bw.writeAll("};\n\n");
 }
 
@@ -2602,6 +2708,7 @@ pub fn generateMainZigFromTemplate(
     view_names: []const []const u8,
     gizmo_names: []const []const u8,
     animation_names: []const []const u8,
+    plugin_events: []const PluginEvent,
 ) ![]const u8 {
     // Surface basename collisions at generate time, before any
     // code emission — otherwise two prefabs with the same filename
@@ -2800,7 +2907,12 @@ pub fn generateMainZigFromTemplate(
         var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
         errdefer alloc_writer_b.deinit();
         const bw = &alloc_writer_b.writer;
-        const has_plugin_events = cfg.plugins.len > 0;
+        // Gate on **discovered** events, not declared plugins — a project
+        // can declare a plugin whose `Events` decl is empty (or absent, e.g.
+        // the plugin-controllers demo plugin), in which case `PluginEvents`
+        // is emitted as `void` and must NOT be folded into `GameEvents`
+        // (`MergeHookPayloads` rejects `void` operands).
+        const has_plugin_events = plugin_events.len > 0;
         // When plugins declare events, the assembler emits a widened
         // `GameEvents` that already folds in `PluginEvents` (see the
         // game_events_block emission below). So `AllHookPayloads` only
@@ -2970,7 +3082,13 @@ pub fn generateMainZigFromTemplate(
         errdefer alloc_writer_b.deinit();
         const bw = &alloc_writer_b.writer;
 
-        const has_plugin_events_local = cfg.plugins.len > 0;
+        // Gate on **discovered** plugin events, not declared plugins —
+        // a project can declare a plugin whose `Events` is empty/absent
+        // (e.g. the plugin-controllers demo plugin), and in that case
+        // we want the v1 emission shape verbatim ("no plugin events"),
+        // not a `GameEvents = PluginEvents = void` path that would
+        // confuse downstream consumers.
+        const has_plugin_events_local = plugin_events.len > 0;
         const has_game_events_local = event_names.len > 0;
 
         // The raw game-side scan keeps its v1 shape; the alias is what
@@ -2993,7 +3111,7 @@ pub fn generateMainZigFromTemplate(
                 }
                 try bw.writeAll("};\n\n");
             }
-            try writePluginEventsBlock(bw, cfg);
+            try writePluginEventsBlock(bw, plugin_events);
             if (has_game_events_local) {
                 try bw.writeAll("pub const GameEvents = engine.core.MergeHookPayloads(.{ GameEventsRaw, PluginEvents });\n\n");
             } else {
