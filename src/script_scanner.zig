@@ -68,6 +68,17 @@ pub const ScriptScanner = struct {
         /// by declaration order. Zero for game scripts (they sort first
         /// via the `plugin_name == null` check regardless).
         plugin_index: u32 = 0,
+        /// True when the generated `.zig` for this entry exports a
+        /// `pub const FlowEventHandler = struct { ... };` decl — i.e.
+        /// the entry is a new-form `OnEvent` flow whose codegen
+        /// (flow-codegen `1182a80`, RFC-PLUGIN-EVENTS phase 3) emits a
+        /// handler struct the assembler needs to thread into the
+        /// `GameHooks` receiver tuple (phase 4 — labelle-assembler#175).
+        /// Lifecycle flows (`tick`/`onCreate`/`onDestroy`), legacy
+        /// `OnEvent` flows (still `setup()`-style raw-slot binding), and
+        /// every non-flow script keep this `false` and are skipped by
+        /// the receiver-tuple wiring. Set only by `flow_scanner.zig`.
+        has_event_handler: bool = false,
     };
 
     /// Errors `scanDir` / `scanPluginDir` / `scanZigFilesRecursive` can

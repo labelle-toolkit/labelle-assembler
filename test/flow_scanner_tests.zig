@@ -838,3 +838,309 @@ pub const FlowSortOrder = struct {
         try std.testing.expectEqual(@as(?u32, null), result.entries[2].sort_order);
     }
 };
+
+// ── RFC-PLUGIN-EVENTS phase 4 (labelle-assembler#175) ───────────────────
+//
+// `flow_scanner` flips `ScriptEntry.has_event_handler` on new-form
+// `OnEvent` flows (those whose `event.OnEvent.name` is set —
+// `flow_io.zig:333-360` validates the form) so the assembler's
+// `game_hooks_block` / `hooks_init_block` emit knows which entries
+// own a `pub const FlowEventHandler = struct { ... };` decl
+// (flow-codegen `1182a80`, `codegen.zig:654-752`). Lifecycle flows
+// (`OnCreate` / `OnUpdate` / `OnDestroy` / `OnCall`) and legacy
+// `OnEvent` (still `setup()`-style raw-slot binding via
+// `module`+`callback`) keep the default `false` and stay out of the
+// receiver tuple. These tests pin the marker behaviour so phase 4's
+// `GameHooks` wiring picks up the right entries.
+
+const new_form_on_event_flow_body =
+    \\{
+    \\  "name": "hit_counter",
+    \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
+    \\  "nodes": [
+    \\    { "id": 1, "type": "Literal", "pos": [0, 0], "value": "1.0" },
+    \\    { "id": 2, "type": "Output", "pos": [0, 0], "name": "out", "value_type": "f32" }
+    \\  ],
+    \\  "edges": [
+    \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+    \\  ]
+    \\}
+    \\
+;
+
+pub const FlowEventHandlerMarker = struct {
+    test "new-form OnEvent flow sets ScriptEntry.has_event_handler = true" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const fx = try setupFixture(allocator, &tmp);
+        defer allocator.free(fx.game_dir);
+        defer allocator.free(fx.target_dir);
+
+        // Plant a new-form `OnEvent` flow next to the lifecycle `move`
+        // flow `setupFixture` ships. The new-form flow carries `name`
+        // (RFC §7), so flow-codegen's `renderNewFormEventEntry` emits a
+        // `pub const FlowEventHandler` decl and flow_scanner flips the
+        // marker.
+        try writeSample(tmp.dir, "game/scripts/flows/hit_counter.flow.jsonc", new_form_on_event_flow_body);
+
+        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir);
+        defer result.deinit();
+
+        // Two entries. `hit_counter` is the new-form OnEvent flow,
+        // `move` is the lifecycle OnCreate flow from the fixture.
+        try std.testing.expectEqual(@as(usize, 2), result.entries.len);
+        for (result.entries) |entry| {
+            if (std.mem.eql(u8, entry.name, "hit_counter")) {
+                try std.testing.expect(entry.has_event_handler);
+            } else {
+                // Lifecycle (OnCreate) flow — no `FlowEventHandler`
+                // decl, stays out of the receiver tuple.
+                try std.testing.expectEqualStrings("move", entry.name);
+                try std.testing.expect(!entry.has_event_handler);
+            }
+        }
+    }
+};
+
+// ── RFC-PLUGIN-EVENTS phase 4: `GameHooks` receiver-tuple wiring ────
+//
+// Verifies the assembler threads flow handler structs through both
+// `game_hooks_block` (the type-level tuple in `MergeHooks(...)`) and
+// `hooks_init_block` (the runtime `var <ident>_flow_handler` decls +
+// `&<ident>_flow_handler` entries in the receivers tuple). The
+// engine's `setHooks` walks the latter tuple and injects `*Game`
+// into each receiver's `game_ptr` field (`labelle-engine/src/game.zig:419-429`),
+// so threading correctly is the contract that makes the runtime
+// dispatch fire (the integration test in
+// `bouncing-ball/tests/runtime_dispatch_test.zig` exercises that
+// end-to-end).
+
+const tiny_template_with_hooks =
+    \\const std = @import("std");
+    \\const engine = @import("labelle-engine");
+    \\{{game_events_block}}{{all_hook_payloads_block}}{{game_hooks_block}}{{all_scripts_block}}const lifecycle_marker = struct {
+    \\    pub fn main() !void {
+    \\{{hooks_init_block}}
+    \\    }
+    \\};
+    \\{{lifecycle}}
+;
+
+const tiny_lifecycle_hooks =
+    \\// trailing — body is the embedded `lifecycle_marker.main`.
+    \\
+;
+
+pub const FlowHandlerWiring = struct {
+    test "new-form OnEvent flow is threaded into GameHooks receiver tuple" {
+        const allocator = std.testing.allocator;
+
+        // Synthetic entry matching exactly what `flow_scanner` emits
+        // for a new-form `OnEvent` flow. Other entries on the same
+        // slice (legacy / lifecycle) keep `has_event_handler = false`
+        // and must be skipped by the emission.
+        const flow_entries: []const generator.script_scanner.ScriptScanner.ScriptEntry = &.{
+            // Lifecycle flow — `setup()`-style, no event handler.
+            .{
+                .name = "tick",
+                .filename = "tick.zig",
+                .states = &.{},
+                .sort_order = null,
+                .subdir = null,
+                .rel_path = "flows/tick.zig",
+                .has_event_handler = false,
+            },
+            // New-form OnEvent flow — phase 3 codegen emits
+            // `pub const FlowEventHandler` for this entry, so phase 4
+            // appends it to the GameHooks tuple.
+            .{
+                .name = "hit_counter",
+                .filename = "hit_counter.zig",
+                .states = &.{},
+                .sort_order = null,
+                .subdir = null,
+                .rel_path = "flows/hit_counter.zig",
+                .has_event_handler = true,
+            },
+        };
+
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{
+                // Plugin presence is what makes `PluginEvents` non-empty
+                // and unlocks the new-form event flow path.
+                .{ .name = "box2d", .repo = "" },
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_with_hooks,
+            cfg,
+            tiny_lifecycle_hooks,
+            flow_entries,
+            &.{}, // prefab_names
+            &.{}, // jsonc_scene_names
+            &.{}, // scene_manifests
+            &.{}, // component_names
+            &.{}, // hook_names — zero engine-side hooks, so the
+                  // GameHooks tuple is ONLY the flow handler. This is
+                  // the bouncing-ball shape (no hooks/, one flow).
+            &.{}, // event_names
+            &.{}, // enum_names
+            &.{}, // view_names
+            &.{}, // gizmo_names
+            &.{}, // animation_names
+        );
+        defer allocator.free(main_zig);
+
+        // Phase 4 contract part 1: `GameHooks = engine.MergeHooks(...)`
+        // — NOT `struct {}` — because there IS a receiver in the
+        // tuple. The receiver type is the inline `@import` because
+        // `AllScripts` is declared after `GameHooks` in the engine
+        // template, so we can't borrow the alias.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const GameHooks = engine.MergeHooks(AllHookPayloads, .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "*@import(\"scripts/flows/hit_counter.zig\").FlowEventHandler") != null);
+        // Lifecycle flow must NOT appear in the tuple — `tick.zig`
+        // has no `FlowEventHandler` decl, only an OnCreate-style
+        // entrypoint.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "*@import(\"scripts/flows/tick.zig\")") == null);
+
+        // Phase 4 contract part 2: a stable `var <ident>_flow_handler`
+        // declaration so `&<ident>_flow_handler` can take a pointer.
+        // `pathToIdent` escapes `/` to `_s_` (injective — issue #172),
+        // so the binding name is `flows_s_hit_u_counter_flow_handler`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var flows_s_hit_u_counter_flow_handler: @import(\"scripts/flows/hit_counter.zig\").FlowEventHandler = .{};") != null);
+
+        // Phase 4 contract part 3: the address of the materialised
+        // handler is wired into the merged-hooks receiver tuple. This
+        // is what `setHooks` walks to inject `game_ptr` and what
+        // `MergeHooks.emit` walks on each dispatch.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "&flows_s_hit_u_counter_flow_handler") != null);
+
+        // Sanity: the emitted Zig parses cleanly — the inline
+        // `@import` inside a tuple literal is a common Zig 0.16
+        // sharp-edge to keep an eye on.
+        const sentinel_src = try allocator.dupeZ(u8, main_zig);
+        defer allocator.free(sentinel_src);
+        var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
+        defer ast.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "multiple new-form OnEvent flows preserve scanner-sorted order in the receiver tuple" {
+        // RFC-PLUGIN-EVENTS O3: when two flows listen to the same (or
+        // different) events, they fire in scanner-sorted order —
+        // numeric-prefix first, alphabetical fallback. `flow_scanner`
+        // already sorts entries this way before handing them to
+        // `generateMainZigFromTemplate`, so phase 4's job is to
+        // preserve that order through to the emitted tuple. This
+        // test pins the order through the codegen layer.
+        const allocator = std.testing.allocator;
+
+        // Scanner-sort order would put `01_first` before `02_second`,
+        // and both before unprefixed `apple`. Feed them to the emitter
+        // in that order and assert the receiver tuple reads the same
+        // way.
+        const flow_entries: []const generator.script_scanner.ScriptScanner.ScriptEntry = &.{
+            .{ .name = "01_first", .filename = "01_first.zig", .states = &.{}, .sort_order = 1, .subdir = null, .rel_path = "flows/01_first.zig", .has_event_handler = true },
+            .{ .name = "02_second", .filename = "02_second.zig", .states = &.{}, .sort_order = 2, .subdir = null, .rel_path = "flows/02_second.zig", .has_event_handler = true },
+            .{ .name = "apple", .filename = "apple.zig", .states = &.{}, .sort_order = null, .subdir = null, .rel_path = "flows/apple.zig", .has_event_handler = true },
+        };
+
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{ .{ .name = "box2d", .repo = "" } },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_with_hooks,
+            cfg,
+            tiny_lifecycle_hooks,
+            flow_entries,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+        );
+        defer allocator.free(main_zig);
+
+        // The receiver tuple is a single bracketed list; find each
+        // entry's offset and assert they appear in scanner order. The
+        // exact `&<ident>_flow_handler` form is what `setHooks` /
+        // `MergeHooks.emit` walks at runtime.
+        const idx_01 = std.mem.indexOf(u8, main_zig, "&flows_s_01_u_first_flow_handler").?;
+        const idx_02 = std.mem.indexOf(u8, main_zig, "&flows_s_02_u_second_flow_handler").?;
+        const idx_apple = std.mem.indexOf(u8, main_zig, "&flows_s_apple_flow_handler").?;
+        try std.testing.expect(idx_01 < idx_02);
+        try std.testing.expect(idx_02 < idx_apple);
+    }
+
+    test "no new-form OnEvent flows: GameHooks stays struct{} when no hooks/ either" {
+        // Regression guard: a project with only lifecycle flows (or
+        // legacy `OnEvent` flows) and no hooks/ must keep the v1
+        // `const GameHooks = struct {};` shape. Threading a phantom
+        // `MergeHooks(...)` here would change the `Game.setHooks`
+        // codepath (`HooksIsMerged` branch in `game.zig:412`) for
+        // every shipped game that doesn't use new-form events.
+        const allocator = std.testing.allocator;
+
+        const flow_entries: []const generator.script_scanner.ScriptScanner.ScriptEntry = &.{
+            // Lifecycle flow only — no `FlowEventHandler` to wire.
+            .{
+                .name = "tick",
+                .filename = "tick.zig",
+                .states = &.{},
+                .sort_order = null,
+                .subdir = null,
+                .rel_path = "flows/tick.zig",
+                .has_event_handler = false,
+            },
+        };
+
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_with_hooks,
+            cfg,
+            tiny_lifecycle_hooks,
+            flow_entries,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+        );
+        defer allocator.free(main_zig);
+
+        // Empty-hooks shape unchanged.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const GameHooks = struct {};") != null);
+        // No `MergeHooks` decl — phase 4 wiring stays out of the way.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.MergeHooks(") == null);
+        // `hooks_init` keeps the empty-struct init form.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var hooks = GameHooks{};") != null);
+    }
+};

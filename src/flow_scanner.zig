@@ -198,6 +198,25 @@ pub fn scanAndEmit(
         // relative path (`enemy/patrol.zig`, not the bare `patrol.zig`
         // basename) so two flows that share a stem across subdirectories
         // stay distinguishable in diagnostics.
+        // New-form `OnEvent` flows are the ones flow-codegen `1182a80`
+        // emits a `pub const FlowEventHandler` decl for (renderNewFormEventEntry
+        // in flow-codegen/src/codegen.zig:654). Mark them so phase 4's
+        // assembler wiring (`main_zig.zig` game_hooks/hooks_init blocks)
+        // can pick them out and append a `*FlowEventHandler` into the
+        // `GameHooks` receiver tuple. Legacy `OnEvent` (still
+        // `setup()`-style raw-slot binding via module+callback) and
+        // lifecycle flows (`OnTick`/`OnCreate`/`OnDestroy`/`OnCall`/
+        // `OnUpdate`) keep the default `false` and are skipped.
+        const has_event_handler = blk: {
+            const ev = loaded.flow.event;
+            if (ev != .OnEvent) break :blk false;
+            // The new form is gated on `name` being set; the legacy
+            // form keeps `module`+`callback`. `buildEvent` in
+            // flow-codegen rejects mixed-form inputs, so a non-null
+            // `name` is sufficient to identify a new-form flow.
+            break :blk ev.OnEvent.name != null;
+        };
+
         try entries.append(arena_alloc, .{
             .name = name_owned,
             .filename = out_rel_zig,
@@ -207,6 +226,7 @@ pub fn scanAndEmit(
             .rel_path = rel_path,
             .plugin_name = null,
             .plugin_index = 0,
+            .has_event_handler = has_event_handler,
         });
     }
 

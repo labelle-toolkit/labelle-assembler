@@ -2820,12 +2820,34 @@ pub fn generateMainZigFromTemplate(
         try data.scalars.put("all_hook_payloads_block", block);
     }
 
+    // Count + collect new-form flow handlers (RFC-PLUGIN-EVENTS phase 4,
+    // labelle-assembler#175). flow-codegen emits `pub const FlowEventHandler`
+    // for new-form `OnEvent` flows; flow_scanner flips
+    // `ScriptEntry.has_event_handler` on those. We thread them into the
+    // existing `GameHooks` receiver tuple in scanner-sorted order — the
+    // order `script_entries` arrives in already encodes the per-flow
+    // numeric-prefix-then-alphabetical sort (`flow_scanner.zig:220-232`,
+    // O3 in the RFC), so iterating in slice order Just Works.
+    //
+    // The handler module is referenced via an inline `@import("scripts/<rel_path>")`
+    // because `AllScripts` (which holds these imports under stable
+    // identifiers) is declared *after* `GameHooks` in the template
+    // (`labelle-engine/codegen/main.zig.template:20` vs `:35`), so we
+    // can't borrow the alias. Spelling the import inline keeps the
+    // wiring local to these two blocks without adding a new template
+    // slot ahead of `game_hooks_block`. An ident derived from `rel_path`
+    // names the per-handler `var` declaration in `hooks_init_block`.
+    var flow_handler_count: usize = 0;
+    for (script_entries) |entry| {
+        if (entry.has_event_handler) flow_handler_count += 1;
+    }
+
     // Game hooks block
     {
         var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
         errdefer alloc_writer_b.deinit();
         const bw = &alloc_writer_b.writer;
-        if (hook_names.len == 0) {
+        if (hook_names.len == 0 and flow_handler_count == 0) {
             try bw.writeAll("const GameHooks = struct {};\n\n");
         } else {
             var pascal_buf: [128]u8 = undefined;
@@ -2834,6 +2856,16 @@ pub fn generateMainZigFromTemplate(
                 const ident = pathToIdent(name, &ident_buf);
                 const pascal = pathToPascal(name, &pascal_buf);
                 try bw.print(" *{s}.{s},", .{ ident, pascal });
+            }
+            // Flow handler receiver types — appended after hooks so the
+            // scanner sort (flows-among-flows) sits inside a single
+            // tail block, leaving the existing hook order at the head
+            // unchanged. `rel_path` is e.g. `flows/hit_counter.zig`,
+            // matching the on-disk layout the `AllScripts` block already
+            // imports.
+            for (script_entries) |entry| {
+                if (!entry.has_event_handler) continue;
+                try bw.print(" *@import(\"scripts/{s}\").FlowEventHandler,", .{entry.rel_path});
             }
             try bw.writeAll(" });\n\n");
         }
@@ -2848,7 +2880,7 @@ pub fn generateMainZigFromTemplate(
         var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
         errdefer alloc_writer_b.deinit();
         const bw = &alloc_writer_b.writer;
-        if (hook_names.len == 0) {
+        if (hook_names.len == 0 and flow_handler_count == 0) {
             try bw.writeAll("    var hooks = GameHooks{};\n");
         } else {
             var pascal_buf: [128]u8 = undefined;
@@ -2857,10 +2889,33 @@ pub fn generateMainZigFromTemplate(
                 const pascal = pathToPascal(name, &pascal_buf);
                 try bw.print("    var {s}_inst = {s}.{s}{{}};\n", .{ ident, ident, pascal });
             }
+            // Materialise each flow handler so it has a stable address
+            // the `&` operator can produce a pointer to. `pathToIdent`
+            // makes the `rel_path` injective into the Zig identifier
+            // namespace (issue #173), so multiple flows in subdirs
+            // can't collide on the same `<ident>_flow_handler` name.
+            // `setHooks` walks the receiver tuple and injects
+            // `*AssembledGame` into `game_ptr` for every receiver that
+            // declares such a field (`labelle-engine/src/game.zig:419-429`),
+            // so no extra init step is needed here — the existing walk
+            // reaches these entries the same way it does the hook ones.
+            for (script_entries) |entry| {
+                if (!entry.has_event_handler) continue;
+                const ident = pathToIdent(entry.rel_path, &ident_buf);
+                try bw.print(
+                    "    var {s}_flow_handler: @import(\"scripts/{s}\").FlowEventHandler = .{{}};\n",
+                    .{ ident, entry.rel_path },
+                );
+            }
             try bw.writeAll("    var hooks = GameHooks{ .receivers = .{");
             for (hook_names) |name| {
                 const ident = pathToIdent(name, &ident_buf);
                 try bw.print(" &{s}_inst,", .{ident});
+            }
+            for (script_entries) |entry| {
+                if (!entry.has_event_handler) continue;
+                const ident = pathToIdent(entry.rel_path, &ident_buf);
+                try bw.print(" &{s}_flow_handler,", .{ident});
             }
             try bw.writeAll(" } };\n");
         }
