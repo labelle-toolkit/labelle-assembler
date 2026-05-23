@@ -2054,6 +2054,118 @@ pub const FlowDeclsDiscovery = struct {
         try std.testing.expectEqual(@as(usize, 0), decls.pin_styles.len);
     }
 
+    test "captures .constructs hint from FlowNode factory call (O5)" {
+        // RFC-FLOW-VOCABULARY §1 / O5 — a `FlowNode(.{ ..., .constructs = "..." })`
+        // factory call carries an editor hint declaring the Zig type the
+        // node returns. The scanner extracts the literal string from the
+        // source text and threads it onto `PluginFlowNode.constructs`;
+        // an omitted field leaves the value `null`.
+        const allocator = std.testing.allocator;
+        const io = std.testing.io;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const tmp_path_z = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(tmp_path_z);
+        const tmp_path = try allocator.dupe(u8, tmp_path_z);
+        defer allocator.free(tmp_path);
+
+        const root_src =
+            \\const labelle = @import("labelle-core");
+            \\
+            \\pub const FlowNodes = struct {
+            \\    pub const ray_cast = labelle.FlowNode(.{
+            \\        .impl = rayCastImpl,
+            \\        .docs = "Returns a RayResult — wire it into a SetVariable.",
+            \\        .constructs = "labelle_box2d.RayResult",
+            \\    });
+            \\    pub const apply_impulse = labelle.FlowNode(.{
+            \\        .impl = applyImpulseImpl,
+            \\    });
+            \\};
+            \\
+            \\const RayResult = struct { hit: bool };
+            \\fn rayCastImpl(game: anytype, x: f32) RayResult { _ = game; _ = x; return .{ .hit = true }; }
+            \\fn applyImpulseImpl(game: anytype, entity: u32) void { _ = game; _ = entity; }
+            \\
+        ;
+        const plugin_dir = try writePluginRootZig(allocator, &tmp, "fake_box2d", root_src);
+        defer allocator.free(plugin_dir);
+
+        const repo = try std.fmt.allocPrint(allocator, "local:{s}", .{plugin_dir});
+        defer allocator.free(repo);
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "fake_box2d", .repo = repo }},
+        };
+
+        var decls = try generator.main_zig.discoverPluginFlowDecls(
+            allocator,
+            cfg,
+            tmp_path,
+            "/nonexistent/scripts",
+            &.{},
+        );
+        defer decls.deinit();
+
+        try std.testing.expectEqual(@as(usize, 2), decls.flow_nodes.len);
+        // First entry has `constructs` set — the value matches verbatim.
+        try std.testing.expectEqualStrings("ray_cast", decls.flow_nodes[0].node_name);
+        try std.testing.expect(decls.flow_nodes[0].constructs != null);
+        try std.testing.expectEqualStrings(
+            "labelle_box2d.RayResult",
+            decls.flow_nodes[0].constructs.?,
+        );
+        // Second entry has no `.constructs` — value stays `null`.
+        try std.testing.expectEqualStrings("apply_impulse", decls.flow_nodes[1].node_name);
+        try std.testing.expect(decls.flow_nodes[1].constructs == null);
+    }
+
+    test "writePluginFlowNodesBlock surfaces constructs as a doc-comment (O5)" {
+        // RFC-FLOW-VOCABULARY §1 / O5 — the emitter writes `/// constructs: <value>`
+        // above the alias decl so the generated file is self-documenting.
+        // The alias itself carries the value through the FlowNode
+        // factory's struct field, so downstream consumers can also read
+        // it via reflection; the comment is the human-readable signal.
+        const allocator = std.testing.allocator;
+
+        const flow_nodes = [_]PluginFlowNode{
+            .{
+                .module_import_path = "fake_box2d",
+                .module_sanitized = "fake_box2d",
+                .node_name = "ray_cast",
+                .is_script = false,
+                .constructs = "labelle_box2d.RayResult",
+            },
+            .{
+                .module_import_path = "fake_box2d",
+                .module_sanitized = "fake_box2d",
+                .node_name = "apply_impulse",
+                .is_script = false,
+                .constructs = null,
+            },
+        };
+
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        try generator.main_zig.writePluginFlowNodesBlock(&aw.writer, &flow_nodes);
+        const out = aw.written();
+
+        // The constructs hint appears as a doc-comment above ray_cast.
+        try std.testing.expect(std.mem.indexOf(u8, out, "/// constructs: labelle_box2d.RayResult") != null);
+        // The alias decl follows directly.
+        try std.testing.expect(std.mem.indexOf(u8, out, "pub const fake_box2d__ray_cast = @import(\"fake_box2d\").FlowNodes.ray_cast;") != null);
+        // The apply_impulse alias has no `/// constructs:` comment.
+        const apply_idx = std.mem.indexOf(u8, out, "pub const fake_box2d__apply_impulse").?;
+        // Look in the ~64 bytes leading up to the alias — that's the
+        // doc-comment slot for the immediately preceding entry.
+        const window_start = if (apply_idx > 80) apply_idx - 80 else 0;
+        const window = out[window_start..apply_idx];
+        try std.testing.expect(std.mem.indexOf(u8, window, "/// constructs:") == null);
+    }
+
     test "skips plugin-shipped scripts (plugin's root.zig already covers them)" {
         // Plugin-shipped scripts (entries with `plugin_name != null`)
         // are skipped by the game-script pass because their plugin

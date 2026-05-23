@@ -194,6 +194,16 @@ pub const PluginFlowNode = struct {
     /// writes — plugins resolve as `@import("<name>")`, scripts as
     /// `@import("scripts/<rel_path>")`.
     is_script: bool,
+    /// Fully-qualified Zig type name the node constructs, captured
+    /// from a `.constructs = "..."` field in the source `FlowNode`
+    /// factory call, or `null` when the source omits it
+    /// (RFC-FLOW-VOCABULARY §1, open question O5). The string is
+    /// extracted textually from the init expression — the AST scan
+    /// doesn't evaluate the factory call, so the source must spell
+    /// the value as a literal `"..."` string. Threaded through to
+    /// the editor (phase 4) so the palette can suggest constructor
+    /// nodes for struct-typed `SetVariable` targets.
+    constructs: ?[]const u8 = null,
 };
 
 /// One discovered `pub const <TypeName> = labelle.PinStyle{ ... }`
@@ -228,6 +238,7 @@ pub const PluginFlowDecls = struct {
             self.allocator.free(fn_.module_import_path);
             self.allocator.free(fn_.module_sanitized);
             self.allocator.free(fn_.node_name);
+            if (fn_.constructs) |c| self.allocator.free(c);
         }
         self.allocator.free(self.flow_nodes);
         self.flow_nodes = &.{};
@@ -240,6 +251,88 @@ pub const PluginFlowDecls = struct {
         self.pin_styles = &.{};
     }
 };
+
+/// Extract the literal string value of a `.constructs = "..."` field
+/// from the source text of a `FlowNode(.{...})` factory call
+/// (RFC-FLOW-VOCABULARY §1 / O5). Returns an allocator-owned dupe of
+/// the unescaped value, or `null` when the field is absent / not a
+/// plain string literal.
+///
+/// Scan strategy is deliberately tolerant: walks the source byte by
+/// byte while tracking whether we're inside a string or comment, so a
+/// `.constructs` keyword appearing inside another string (e.g. as part
+/// of `.docs`) doesn't trigger a false match. Stops at the first
+/// match — multiple `.constructs` fields aren't valid Zig anyway, so
+/// "last wins" never comes into play. A truly malformed factory call
+/// surfaces as a Zig compile error at the consumer site, not here.
+fn extractConstructsString(allocator: std.mem.Allocator, src: []const u8) ?[]u8 {
+    const needle = ".constructs";
+    var i: usize = 0;
+    while (i + needle.len <= src.len) : (i += 1) {
+        const c = src[i];
+        // Skip over Zig string literals so a `.docs = ".constructs = ..."`
+        // doesn't false-match. The scanner only handles the `"..."`
+        // form (no `\\` multiline strings) — the factory's typical
+        // usage stays well within that subset.
+        if (c == '"') {
+            i += 1;
+            while (i < src.len) : (i += 1) {
+                if (src[i] == '\\' and i + 1 < src.len) {
+                    i += 1; // skip escaped char
+                    continue;
+                }
+                if (src[i] == '"') break;
+            }
+            continue;
+        }
+        // Skip line comments.
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            while (i < src.len and src[i] != '\n') : (i += 1) {}
+            continue;
+        }
+        if (!std.mem.startsWith(u8, src[i..], needle)) continue;
+        // Verify the byte before isn't an identifier char — otherwise
+        // we'd match `.subconstructs` or `.foo_constructs`.
+        if (i > 0) {
+            const prev = src[i - 1];
+            if ((prev >= 'a' and prev <= 'z') or (prev >= 'A' and prev <= 'Z') or
+                (prev >= '0' and prev <= '9') or prev == '_')
+            {
+                continue;
+            }
+        }
+        // Verify the byte after the keyword isn't an identifier char
+        // either (so `.constructs_x` is rejected).
+        const after_kw = i + needle.len;
+        if (after_kw < src.len) {
+            const next = src[after_kw];
+            if ((next >= 'a' and next <= 'z') or (next >= 'A' and next <= 'Z') or
+                (next >= '0' and next <= '9') or next == '_')
+            {
+                continue;
+            }
+        }
+        // Skip whitespace and the `=`, expect a `"..."` literal.
+        var j = after_kw;
+        while (j < src.len and (src[j] == ' ' or src[j] == '\t' or src[j] == '\n' or src[j] == '\r')) : (j += 1) {}
+        if (j >= src.len or src[j] != '=') return null;
+        j += 1;
+        while (j < src.len and (src[j] == ' ' or src[j] == '\t' or src[j] == '\n' or src[j] == '\r')) : (j += 1) {}
+        if (j >= src.len or src[j] != '"') return null;
+        const start = j + 1;
+        var k = start;
+        while (k < src.len) : (k += 1) {
+            if (src[k] == '\\' and k + 1 < src.len) {
+                k += 1;
+                continue;
+            }
+            if (src[k] == '"') break;
+        }
+        if (k >= src.len) return null;
+        return allocator.dupe(u8, src[start..k]) catch null;
+    }
+    return null;
+}
 
 /// Walk one `.zig` source buffer for `pub const FlowNodes` and
 /// `pub const PinStyles` decls, appending each discovered nested
@@ -292,17 +385,28 @@ fn scanFlowDeclsInSource(
             // always present; a `pub const X: T = …` (typed) decl also
             // exposes init_node. The `unwrap()` filter just ensures we
             // never trip on a malformed entry.
-            _ = member_vd.ast.init_node.unwrap() orelse continue;
+            const member_init = member_vd.ast.init_node.unwrap() orelse continue;
 
             const member_name_tok = member_vd.ast.mut_token + 1;
             const member_name = ast.tokenSlice(member_name_tok);
 
             if (is_flow_nodes) {
+                // RFC-FLOW-VOCABULARY §1 / O5 — capture an optional
+                // `.constructs = "..."` field from the factory call's
+                // source text. The scanner doesn't evaluate the
+                // expression (would require a full compile), so it
+                // extracts the literal string verbatim. A non-string
+                // `.constructs` (e.g. a comptime expression) is
+                // silently ignored — that's a forward-compatible
+                // refinement, not a contract worth enforcing here.
+                const init_src = ast.getNodeSource(member_init);
+                const constructs_value = extractConstructsString(allocator, init_src);
                 try flow_nodes_out.append(allocator, .{
                     .module_import_path = try allocator.dupe(u8, module_import_path),
                     .module_sanitized = try allocator.dupe(u8, module_sanitized),
                     .node_name = try allocator.dupe(u8, member_name),
                     .is_script = is_script,
+                    .constructs = constructs_value,
                 });
             } else {
                 try pin_styles_out.append(allocator, .{
@@ -356,6 +460,7 @@ pub fn discoverPluginFlowDecls(
             allocator.free(e.module_import_path);
             allocator.free(e.module_sanitized);
             allocator.free(e.node_name);
+            if (e.constructs) |c| allocator.free(c);
         }
         flow_nodes.deinit(allocator);
     }
@@ -970,6 +1075,15 @@ pub fn writePluginFlowNodesBlock(bw: anytype, flow_nodes: []const PluginFlowNode
     try bw.writeAll("// phase 3, labelle-gui palette UI in phase 4).\n");
     try bw.writeAll("pub const PluginFlowNodes = struct {\n");
     for (flow_nodes) |fn_| {
+        // RFC-FLOW-VOCABULARY §1 / O5 — surface the captured `.constructs`
+        // hint as a doc-comment above the alias. The alias itself carries
+        // the value through the FlowNode factory's struct field, so
+        // downstream consumers can also read it via reflection
+        // (`PluginFlowNodes.<qualified>.constructs`); the comment is a
+        // human-readable signal for anyone reading the generated file.
+        if (fn_.constructs) |c| {
+            try bw.print("    /// constructs: {s}\n", .{c});
+        }
         if (fn_.is_script) {
             try bw.print(
                 "    pub const {s}__{s} = @import(\"scripts/{s}\").FlowNodes.{s};\n",
