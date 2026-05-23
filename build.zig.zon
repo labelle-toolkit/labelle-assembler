@@ -15,16 +15,26 @@
         // relative path broke whenever this package was itself fetched
         // as a dependency (the sibling `../labelle-gui` isn't there).
         // Now its own URL-pinned repo so any consumer resolves it.
-        // Pinned to flow-codegen `main` (64baa55): RFC-PLUGIN-EVENTS
-        // phase 7 — adds the optional `priority: ?i32` field on
-        // `OnEvent` for consumable-event listener ordering
-        // (labelle-core#16). Phase 3 codegen (`FlowEventHandler`/
-        // `game_ptr`, `Emit` node lowering, legacy → name converter)
-        // landed in 1182a80; phases 1 / 2 in 602aebd (this repo) and
-        // labelle-box2d 6c44691.
+        //
+        // Pinned to flow-codegen `main` (4073b58): RFC-FLOW-VOCABULARY
+        // phase 6 — retires the legacy `event:` header; flows now use
+        // pure node-form `Event/Emit` with name-routed dispatch. Phase
+        // 3 (CustomNode + v1→v2 converter) landed in df31f1e; phases
+        // 1+2 (events-as-nodes, variables, nullable variable ops,
+        // multi-trigger flows) in 8948602 and a8be4c1. The assembler
+        // test suite expects this vocabulary — older pins (e.g.
+        // 64baa55) cause the flow_scanner tests to fail (8 failures).
+        //
+        // NOTE on labelle-assembler#176 (zig fetch EndOfStream):
+        // that error is Zig's git smart-http transport reporting
+        // GitHub's "no such object" response for an unknown 40-char
+        // sha. If you see it on a pin bump, double-check the full sha
+        // exists in the remote (`git ls-remote ... <sha>` or `git
+        // -C ../flow-codegen rev-parse <sha>`). Truncated/typo'd
+        // shas surface as EndOfStream, not a clear "not found".
         .flow_codegen = .{
-            .url = "git+https://github.com/labelle-toolkit/flow-codegen#64baa555bbf4a4d861113b7a3ce71aa0ef75ff05",
-            .hash = "flow_codegen-0.1.0-PFKUp8q2AwDIb1AkFLQFpLYX1osK9gjNU87-WJxsSFF4",
+            .url = "git+https://github.com/labelle-toolkit/flow-codegen.git?ref=main#4073b589c149cddf9a26dbe1ae15723f8b95e33f",
+            .hash = "flow_codegen-0.1.0-PFKUp_1MBADpxcvwB1DpThBANfrOfjdoP26ZJLTmxg4R",
         },
     },
     .paths = .{
