@@ -73,67 +73,114 @@ pub fn discoverPluginEvents(
         entries.deinit(allocator);
     }
 
+    // ── Engine pass (labelle-engine#578) ─────────────────────────────
+    //
+    // The engine is a peer dependency, not a plugin, so it doesn't
+    // appear in `cfg.plugins` — but it does declare a `pub const
+    // Events` block (`labelle-engine/src/root.zig`) that flows want to
+    // listen to under the `engine.<event>` dotted form. Walk the
+    // engine's `src/root.zig` here so the same `Events` discovery
+    // pipeline that handles plugins folds in `engine__game_init` /
+    // `engine__tick` / etc. without a separate code path.
+    //
+    // The "name" stored on each discovered `PluginEvent` is the
+    // literal string `engine` — this matches the on-disk JSONC dot
+    // form (`engine.tick`) and the qualified tag the engine's
+    // `emitEngineEvent` helper passes to `@unionInit(GameEvents,
+    // "engine__<event>", ...)`. The actual Zig module name is
+    // `labelle-engine` (not `engine`) — `writePluginEventsBlock`
+    // special-cases the `engine` prefix when emitting the `@import`
+    // target.
+    blk_engine: {
+        const engine_dir = cache.resolveFrameworkPackage(
+            allocator,
+            "engine",
+            cfg.engine_version,
+            project_dir,
+        ) catch break :blk_engine;
+        defer allocator.free(engine_dir);
+        try discoverEventsFromRoot(allocator, &entries, engine_dir, "engine");
+    }
+
+    // ── Plugin pass ─────────────────────────────────────────────────
     for (cfg.plugins) |plugin| {
         const plugin_dir = cache.resolvePlugin(allocator, plugin, project_dir) catch continue;
         defer allocator.free(plugin_dir);
-
-        const root_path = try std.fs.path.join(allocator, &.{ plugin_dir, "src", "root.zig" });
-        defer allocator.free(root_path);
-
-        const io = config.globalIo();
-        const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, allocator, .limited(8 * 1024 * 1024)) catch continue;
-        defer allocator.free(src);
-
-        const src_z = try allocator.dupeZ(u8, src);
-        defer allocator.free(src_z);
-
-        var ast = try std.zig.Ast.parse(allocator, src_z, .zig);
-        defer ast.deinit(allocator);
-
-        var name_buf: [128]u8 = undefined;
-        const sanitized = sanitizePluginIdent(plugin.name, &name_buf);
-
-        const root_decls = ast.rootDecls();
-        for (root_decls) |decl_idx| {
-            var buf: [2]std.zig.Ast.Node.Index = undefined;
-            const vd = ast.fullVarDecl(decl_idx) orelse continue;
-            // Only `pub const Events = …` qualifies — non-pub or
-            // non-`Events` declarations are skipped silently so
-            // a plugin can have its own internal `const Events` helper
-            // without leaking into the union.
-            if (vd.visib_token == null) continue;
-            const name_tok = vd.ast.mut_token + 1;
-            const decl_name = ast.tokenSlice(name_tok);
-            if (!std.mem.eql(u8, decl_name, "Events")) continue;
-
-            const init_node = vd.ast.init_node.unwrap() orelse continue;
-            const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
-
-            for (container.ast.members) |m| {
-                const member_vd = ast.fullVarDecl(m) orelse continue;
-                if (member_vd.visib_token == null) continue;
-                // Skip non-type members — `pub const FOO = 42;` inside
-                // `Events` is unusual but not a syntax error, and we
-                // only care about struct/union type aliases.
-                const event_init = member_vd.ast.init_node.unwrap() orelse continue;
-                if (ast.fullContainerDecl(&buf, event_init) == null) continue;
-
-                const event_name_tok = member_vd.ast.mut_token + 1;
-                const event_name = ast.tokenSlice(event_name_tok);
-
-                try entries.append(allocator, .{
-                    .plugin_import_name = try allocator.dupe(u8, plugin.name),
-                    .plugin_sanitized = try allocator.dupe(u8, sanitized),
-                    .event_name = try allocator.dupe(u8, event_name),
-                });
-            }
-        }
+        try discoverEventsFromRoot(allocator, &entries, plugin_dir, plugin.name);
     }
 
     return .{
         .entries = try entries.toOwnedSlice(allocator),
         .allocator = allocator,
     };
+}
+
+/// Helper: load `<module_dir>/src/root.zig`, AST-walk it for a top-
+/// level `pub const Events = struct { ... }` declaration, and append
+/// every `pub const <event_name> = struct {...}` child as a
+/// `PluginEvent` keyed by `module_name`. Used by both the engine pass
+/// and the plugin loop in `discoverPluginEvents`.
+///
+/// Missing `src/root.zig` (or unreadable source / parse failure) is
+/// silently tolerated — the same back-compat path every existing
+/// plugin without an `Events` decl already takes.
+fn discoverEventsFromRoot(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayList(PluginEvent),
+    module_dir: []const u8,
+    module_name: []const u8,
+) !void {
+    const root_path = try std.fs.path.join(allocator, &.{ module_dir, "src", "root.zig" });
+    defer allocator.free(root_path);
+
+    const io = config.globalIo();
+    const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, allocator, .limited(8 * 1024 * 1024)) catch return;
+    defer allocator.free(src);
+
+    const src_z = try allocator.dupeZ(u8, src);
+    defer allocator.free(src_z);
+
+    var ast = try std.zig.Ast.parse(allocator, src_z, .zig);
+    defer ast.deinit(allocator);
+
+    var name_buf: [128]u8 = undefined;
+    const sanitized = sanitizePluginIdent(module_name, &name_buf);
+
+    const root_decls = ast.rootDecls();
+    for (root_decls) |decl_idx| {
+        var buf: [2]std.zig.Ast.Node.Index = undefined;
+        const vd = ast.fullVarDecl(decl_idx) orelse continue;
+        // Only `pub const Events = …` qualifies — non-pub or
+        // non-`Events` declarations are skipped silently so
+        // a module can have its own internal `const Events` helper
+        // without leaking into the union.
+        if (vd.visib_token == null) continue;
+        const name_tok = vd.ast.mut_token + 1;
+        const decl_name = ast.tokenSlice(name_tok);
+        if (!std.mem.eql(u8, decl_name, "Events")) continue;
+
+        const init_node = vd.ast.init_node.unwrap() orelse continue;
+        const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
+
+        for (container.ast.members) |m| {
+            const member_vd = ast.fullVarDecl(m) orelse continue;
+            if (member_vd.visib_token == null) continue;
+            // Skip non-type members — `pub const FOO = 42;` inside
+            // `Events` is unusual but not a syntax error, and we
+            // only care about struct/union type aliases.
+            const event_init = member_vd.ast.init_node.unwrap() orelse continue;
+            if (ast.fullContainerDecl(&buf, event_init) == null) continue;
+
+            const event_name_tok = member_vd.ast.mut_token + 1;
+            const event_name = ast.tokenSlice(event_name_tok);
+
+            try entries.append(allocator, .{
+                .plugin_import_name = try allocator.dupe(u8, module_name),
+                .plugin_sanitized = try allocator.dupe(u8, sanitized),
+                .event_name = try allocator.dupe(u8, event_name),
+            });
+        }
+    }
 }
 
 // ── RFC-FLOW-VOCABULARY phase 2 — FlowNodes + PinStyles discovery ──────
@@ -1035,9 +1082,19 @@ pub fn writePluginEventsBlock(bw: anytype, plugin_events: []const PluginEvent) !
     }
     try bw.writeAll("pub const PluginEvents = union(enum) {\n");
     for (plugin_events) |e| {
+        // The engine is discovered alongside plugins (labelle-engine
+        // #578) but its Zig module name is `labelle-engine`, not
+        // `engine` (the latter is just the dotted-form prefix used in
+        // the qualified variant tag and on-disk JSONC names). Special-
+        // case the resolver so `@import("...").Events.<name>` lands on
+        // the right module. Plugins keep their identity-mapped name.
+        const import_name = if (std.mem.eql(u8, e.plugin_import_name, "engine"))
+            "labelle-engine"
+        else
+            e.plugin_import_name;
         try bw.print(
             "    {s}__{s}: @import(\"{s}\").Events.{s},\n",
-            .{ e.plugin_sanitized, e.event_name, e.plugin_import_name, e.event_name },
+            .{ e.plugin_sanitized, e.event_name, import_name, e.event_name },
         );
     }
     try bw.writeAll("};\n\n");

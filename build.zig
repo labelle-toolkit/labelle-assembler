@@ -101,6 +101,10 @@ pub fn build(b: *std.Build) void {
         "test/scanner_symlink_tests.zig",
         "test/scanner_orphan_tests.zig",
         "test/flow_scanner_tests.zig",
+        // labelle-engine#578 — engine-side extension to
+        // `discoverPluginEvents` (engine pass walks
+        // `labelle-engine/src/root.zig` for `pub const Events`).
+        "test/engine_events_discovery_test.zig",
     };
 
     for (test_files) |test_file| {
