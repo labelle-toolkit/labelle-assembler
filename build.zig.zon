@@ -15,11 +15,14 @@
         // relative path broke whenever this package was itself fetched
         // as a dependency (the sibling `../labelle-gui` isn't there).
         // Now its own URL-pinned repo so any consumer resolves it.
-        // Pinned to flow-codegen `main` (c6f29ef): JSON(C) flow parser +
-        // OnUpdate/OnCreate/OnDestroy/OnCall/OnEvent event types.
+        // Pinned to flow-codegen `main` (1182a80): RFC-PLUGIN-EVENTS
+        // phase 3 — new-form `OnEvent` codegen
+        // (`FlowEventHandler`/`game_ptr`), `Emit` node lowering,
+        // legacy → name converter. Phase 1 / 2 already shipped in
+        // 602aebd (this repo) and labelle-box2d 6c44691.
         .flow_codegen = .{
-            .url = "git+https://github.com/labelle-toolkit/flow-codegen#c6f29ef08c904b9e27e11029ed478da8fe2cf2fd",
-            .hash = "flow_codegen-0.1.0-PFKUp0u8AgAPcIvM54cYcGDGAQW9vNpkUapud067tprH",
+            .url = "git+https://github.com/labelle-toolkit/flow-codegen#1182a8097864c199f77411f773fa996bf5db3711",
+            .hash = "flow_codegen-0.1.0-PFKUp26WAwDJlm7iBtVTfNOmE3kH8cXq-9_VK1O5Bumt",
         },
     },
     .paths = .{
