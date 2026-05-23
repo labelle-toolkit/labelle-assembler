@@ -148,12 +148,40 @@ pub const PinStyleEntry = struct {
     color: [3]u8,
 };
 
+/// One `pub const <name> = struct {...}` decl inside a module's
+/// top-level `pub const Events` block (labelle-engine#578 — engine
+/// lifecycle events; RFC-PLUGIN-EVENTS phase 1 — plugin events).
+/// The editor's palette renders these as Event-node variants under
+/// the contributing module's section.
+///
+/// Mirrors the on-disk JSONC dot form (`engine.tick`) so a flow's
+/// `Event` node `.name` field round-trips through the catalog.
+pub const EventEntry = struct {
+    /// Dotted form (`"engine.tick"`, `"box2d.collision_begin"`).
+    /// Matches the `Event` node's on-disk `.name` value verbatim.
+    qualified: []const u8,
+    /// Bare event identifier (`"tick"`, `"collision_begin"`).
+    /// Editor surfaces this as the node body label when no explicit
+    /// display override is present.
+    name: []const u8,
+    /// Each payload struct field as a `PinDetail`. `dir` is always
+    /// `"output"` — the on-disk Event-node form fans out the payload
+    /// fields as data outputs that downstream `SetVariable` /
+    /// `CustomNode` nodes consume.
+    pins: []const PinDetail,
+};
+
 /// Per-module group of catalog entries. The editor renders one
 /// collapsible palette section per group keyed by `name`.
 pub const ModuleGroup = struct {
     name: []const u8,
     flow_nodes: []FlowNodeEntry,
     pin_styles: []PinStyleEntry,
+    /// Events (labelle-engine#578) — fired through the buffered
+    /// `Game.emit` path and listenable as `Event` nodes in flows.
+    /// Defaults to an empty slice for modules that declare no
+    /// `Events` block, so the JSON shape stays uniform.
+    events: []EventEntry = &.{},
 };
 
 /// The full catalog as it ends up on disk. Self-describes its source
@@ -254,19 +282,26 @@ pub fn emitFlowCatalogSidecar(
     for (groups.items) |g| total += g.flow_nodes.len;
 
     // ── Build the JSON in `allocator` so it survives arena teardown ──
-    // `Writer.Allocating.deinit` always frees the writer's internal
-    // buffer; `toOwnedSlice` resets the buffer to empty + transfers the
-    // bytes out. Order matters: take ownership first, then `deinit`
-    // (which is now a no-op on the empty writer), then free the slice
-    // after we've used it. Errors before `toOwnedSlice` are caught by
-    // the `errdefer`.
+    // `Writer.Allocating.deinit` frees the writer's internal buffer
+    // when called (and is a no-op once `toOwnedSlice` has cleared it).
+    // We hold one function-wide `errdefer alloc_writer.deinit()` so
+    // the writer's growable buffer is freed on every error path —
+    // including failures inside `writeCatalogJson` *and* inside
+    // `toOwnedSlice` itself (which can fail; it remaps / shrinks the
+    // buffer and propagates `Allocator.Error`). The earlier narrower
+    // errdefer (scoped inside an inner block over `writeCatalogJson`
+    // only) plus an unconditional `deinit` placed *after*
+    // `toOwnedSlice` left a leak window — an OOM during the
+    // `toOwnedSlice` shrink leaked the writer's buffer. The
+    // regression test below pins the new contract.
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
-    {
-        errdefer alloc_writer.deinit();
-        try writeCatalogJson(&alloc_writer.writer, groups.items);
-    }
+    errdefer alloc_writer.deinit();
+    try writeCatalogJson(&alloc_writer.writer, groups.items);
     const json_bytes = try alloc_writer.toOwnedSlice();
-    alloc_writer.deinit();
+    // `toOwnedSlice` cleared the writer's buffer; the outer errdefer
+    // is now harmless (deinit early-returns on empty). Free the
+    // transferred bytes when we leave the function — `writeSidecar`
+    // consumes them via a borrow.
     defer allocator.free(json_bytes);
 
     // ── Write the sidecar ───────────────────────────────────────
@@ -304,6 +339,7 @@ fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const
 
     var nodes: std.ArrayList(FlowNodeEntry) = .empty;
     var styles: std.ArrayList(PinStyleEntry) = .empty;
+    var events: std.ArrayList(EventEntry) = .empty;
 
     var found_anything = false;
     const root_decls = ast.rootDecls();
@@ -316,7 +352,8 @@ fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const
 
         const is_flow_nodes = std.mem.eql(u8, decl_name, "FlowNodes");
         const is_pin_styles = std.mem.eql(u8, decl_name, "PinStyles");
-        if (!is_flow_nodes and !is_pin_styles) continue;
+        const is_events = std.mem.eql(u8, decl_name, "Events");
+        if (!is_flow_nodes and !is_pin_styles and !is_events) continue;
 
         const init_node = vd.ast.init_node.unwrap() orelse continue;
         const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
@@ -338,7 +375,7 @@ fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const
                 ) catch continue;
                 try nodes.append(aa, entry);
                 found_anything = true;
-            } else {
+            } else if (is_pin_styles) {
                 const entry = extractPinStyleEntry(
                     aa,
                     &ast,
@@ -346,6 +383,19 @@ fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const
                     member_init,
                 ) catch continue;
                 try styles.append(aa, entry);
+                found_anything = true;
+            } else {
+                // Events block (labelle-engine#578). Only valid
+                // shape is `pub const <name> = struct { ... };`.
+                if (ast.fullContainerDecl(&buf, member_init) == null) continue;
+                const entry = extractEventEntry(
+                    aa,
+                    &ast,
+                    member_name,
+                    member_init,
+                    module_name,
+                ) catch continue;
+                try events.append(aa, entry);
                 found_anything = true;
             }
         }
@@ -356,6 +406,50 @@ fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const
         .name = try aa.dupe(u8, module_name),
         .flow_nodes = try nodes.toOwnedSlice(aa),
         .pin_styles = try styles.toOwnedSlice(aa),
+        .events = try events.toOwnedSlice(aa),
+    };
+}
+
+/// Pull payload-field metadata out of an `Events` decl's struct
+/// init: `pub const tick = struct { dt: f32 }`. Each field of the
+/// inner struct becomes one output `PinDetail` so the editor's
+/// `Event` node can route the field as a typed source pin.
+fn extractEventEntry(
+    aa: std.mem.Allocator,
+    ast: *std.zig.Ast,
+    decl_name: []const u8,
+    init_node: std.zig.Ast.Node.Index,
+    module_name: []const u8,
+) !EventEntry {
+    var buf: [2]std.zig.Ast.Node.Index = undefined;
+    const container = ast.fullContainerDecl(&buf, init_node) orelse return error.NotAStruct;
+
+    var pin_list: std.ArrayList(PinDetail) = .empty;
+    for (container.ast.members) |m| {
+        // Only field members count — skip nested decls (Zig allows
+        // `pub const Foo = ...` inside a struct, but a payload that
+        // declares nested types is not a flat field-bag and we
+        // don't have a meaningful pin to emit for them).
+        const fd = ast.fullContainerField(m) orelse continue;
+        const fname_tok = fd.ast.main_token;
+        const fname = ast.tokenSlice(fname_tok);
+        const ftype_node = fd.ast.type_expr.unwrap() orelse continue;
+        const ftype = ast.getNodeSource(ftype_node);
+
+        const label = try titlecaseFromIdent(aa, fname);
+        try pin_list.append(aa, .{
+            .name = try aa.dupe(u8, fname),
+            .label = label,
+            .zig_type = try aa.dupe(u8, ftype),
+            .dir = "output",
+            .default = null,
+        });
+    }
+
+    return .{
+        .qualified = try std.fmt.allocPrint(aa, "{s}.{s}", .{ module_name, decl_name }),
+        .name = try aa.dupe(u8, decl_name),
+        .pins = try pin_list.toOwnedSlice(aa),
     };
 }
 
@@ -1185,4 +1279,52 @@ test "emitFlowCatalogSidecar: writes a sidecar that round-trips to a parseable f
     const root = parsed.value.object;
     try std.testing.expect(root.contains("generated_at"));
     try std.testing.expectEqual(@as(usize, 0), root.get("plugins").?.array.items.len);
+}
+
+// ─── Allocator-failure leak regression ─────────────────────────────────
+//
+// Pre-fix, `emitFlowCatalogSidecar` leaked the
+// `std.Io.Writer.Allocating` internal buffer if `toOwnedSlice` itself
+// failed: the `errdefer alloc_writer.deinit()` sat inside a narrow
+// inner block scoped to the `writeCatalogJson` call, and the
+// unconditional `deinit` followed the failure-prone `toOwnedSlice`.
+// Wave 4 review (labelle-gui#170 phase 4 follow-up) flagged the
+// pattern. The fix promotes the errdefer to function scope so it
+// covers `toOwnedSlice` as well.
+//
+// This test drives `emitFlowCatalogSidecar` through every allocation
+// index with a `FailingAllocator` and asserts the bookkeeping
+// balances after each forced failure. We can't use
+// `std.testing.checkAllAllocationFailures` directly — the underlying
+// `std.Io.Writer` translates allocator failures into
+// `error.WriteFailed`, which the helper treats as a non-OOM bug and
+// aborts on. We tolerate every error the impl propagates
+// (OutOfMemory, WriteFailed, …) — only the FailingAllocator's
+// freed-vs-allocated tally matters for the leak invariant.
+
+test "emitFlowCatalogSidecar: no allocator leak at any failure point" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = config.globalIo();
+    const target_dir_z = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(target_dir_z);
+    const target_dir = target_dir_z[0..target_dir_z.len];
+
+    const cfg = ProjectConfig{ .name = "tmp" };
+
+    // Count the success-path allocations.
+    const total_allocs = blk: {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        _ = try emitFlowCatalogSidecar(fa.allocator(), cfg, target_dir, target_dir, target_dir, &.{});
+        break :blk fa.alloc_index;
+    };
+
+    // Force-fail each allocation index in turn and assert the
+    // FailingAllocator's freed/allocated tally balances.
+    var i: usize = 0;
+    while (i < total_allocs) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = i });
+        _ = emitFlowCatalogSidecar(fa.allocator(), cfg, target_dir, target_dir, target_dir, &.{}) catch {};
+        try std.testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
+    }
 }
