@@ -217,6 +217,21 @@ pub fn scanAndEmit(
             break :blk ev.OnEvent.name != null;
         };
 
+        // Lift the on-disk `priority` (RFC-PLUGIN-EVENTS O4 / phase 7,
+        // labelle-core#16) onto the script entry so the receiver-tuple
+        // sort in `main_zig.writeGameHooksAndInit` can find it without
+        // re-parsing the flow. Only meaningful for new-form `OnEvent`
+        // flows (lifecycle / legacy forms don't subscribe to a
+        // consumable event); we still read it on every parsed flow to
+        // keep the data flow uniform — a priority on a non-`OnEvent`
+        // flow is silently ignored downstream (the entry's
+        // `has_event_handler = false` keeps it out of the receiver
+        // tuple entirely).
+        const event_priority: ?i32 = if (loaded.flow.event == .OnEvent)
+            loaded.flow.event.OnEvent.priority
+        else
+            null;
+
         try entries.append(arena_alloc, .{
             .name = name_owned,
             .filename = out_rel_zig,
@@ -227,6 +242,7 @@ pub fn scanAndEmit(
             .plugin_name = null,
             .plugin_index = 0,
             .has_event_handler = has_event_handler,
+            .event_priority = event_priority,
         });
     }
 

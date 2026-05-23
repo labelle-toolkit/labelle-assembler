@@ -15,14 +15,16 @@
         // relative path broke whenever this package was itself fetched
         // as a dependency (the sibling `../labelle-gui` isn't there).
         // Now its own URL-pinned repo so any consumer resolves it.
-        // Pinned to flow-codegen `main` (1182a80): RFC-PLUGIN-EVENTS
-        // phase 3 — new-form `OnEvent` codegen
-        // (`FlowEventHandler`/`game_ptr`), `Emit` node lowering,
-        // legacy → name converter. Phase 1 / 2 already shipped in
-        // 602aebd (this repo) and labelle-box2d 6c44691.
+        // Pinned to flow-codegen `main` (64baa55): RFC-PLUGIN-EVENTS
+        // phase 7 — adds the optional `priority: ?i32` field on
+        // `OnEvent` for consumable-event listener ordering
+        // (labelle-core#16). Phase 3 codegen (`FlowEventHandler`/
+        // `game_ptr`, `Emit` node lowering, legacy → name converter)
+        // landed in 1182a80; phases 1 / 2 in 602aebd (this repo) and
+        // labelle-box2d 6c44691.
         .flow_codegen = .{
-            .url = "git+https://github.com/labelle-toolkit/flow-codegen#1182a8097864c199f77411f773fa996bf5db3711",
-            .hash = "flow_codegen-0.1.0-PFKUp26WAwDJlm7iBtVTfNOmE3kH8cXq-9_VK1O5Bumt",
+            .url = "git+https://github.com/labelle-toolkit/flow-codegen#64baa555bbf4a4d861113b7a3ce71aa0ef75ff05",
+            .hash = "flow_codegen-0.1.0-PFKUp8q2AwDIb1AkFLQFpLYX1osK9gjNU87-WJxsSFF4",
         },
     },
     .paths = .{

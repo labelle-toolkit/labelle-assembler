@@ -1106,6 +1106,175 @@ pub const FlowHandlerWiring = struct {
         try std.testing.expect(idx_02 < idx_apple);
     }
 
+    test "consumable-event priority front-loads flows ahead of the scanner-sorted tail" {
+        // RFC-PLUGIN-EVENTS O4 / phase 7 (labelle-core#16). A flow that
+        // listens to a consumable event sets `priority` in its
+        // `.flow.jsonc`; `flow_scanner` lifts that onto
+        // `ScriptEntry.event_priority`, and the assembler sorts
+        // priority-set flows ahead of the scanner-sorted tail, priority
+        // descending. The runtime `MergeHooks.emit` then iterates the
+        // tuple in declaration order and breaks on the first handler
+        // that returns `true` — so the highest-priority consumer wins.
+        //
+        // This test pins the order through the codegen layer: feed three
+        // flows in scanner order with mixed priorities, assert the
+        // emitted receiver tuple front-loads them by priority (desc)
+        // and leaves the un-priority flow on the tail.
+        const allocator = std.testing.allocator;
+
+        // Input is in scanner-sorted order (`01_low` before `02_high`
+        // before unprefixed `notification`). With the phase-7 sort,
+        // the priority-set entries float to the front in desc order
+        // (high before low), and the no-priority flow sinks to the tail.
+        const flow_entries: []const generator.script_scanner.ScriptScanner.ScriptEntry = &.{
+            // Low-priority consumable listener — priority 10.
+            .{
+                .name = "01_low",
+                .filename = "01_low.zig",
+                .states = &.{},
+                .sort_order = 1,
+                .subdir = null,
+                .rel_path = "flows/01_low.zig",
+                .has_event_handler = true,
+                .event_priority = 10,
+            },
+            // High-priority consumable listener — priority 100. Sorts
+            // ahead of `01_low` despite the later scanner position.
+            .{
+                .name = "02_high",
+                .filename = "02_high.zig",
+                .states = &.{},
+                .sort_order = 2,
+                .subdir = null,
+                .rel_path = "flows/02_high.zig",
+                .has_event_handler = true,
+                .event_priority = 100,
+            },
+            // No-priority flow (notification listener, or a consumable
+            // listener happy with the default bucket). Stays on the
+            // scanner-sorted tail.
+            .{
+                .name = "notification",
+                .filename = "notification.zig",
+                .states = &.{},
+                .sort_order = null,
+                .subdir = null,
+                .rel_path = "flows/notification.zig",
+                .has_event_handler = true,
+                .event_priority = null,
+            },
+        };
+
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "box2d", .repo = "" }},
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_with_hooks,
+            cfg,
+            tiny_lifecycle_hooks,
+            flow_entries,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &[_]generator.main_zig.PluginEvent{},
+        );
+        defer allocator.free(main_zig);
+
+        const idx_high = std.mem.indexOf(u8, main_zig, "&flows_s_02_u_high_flow_handler").?;
+        const idx_low = std.mem.indexOf(u8, main_zig, "&flows_s_01_u_low_flow_handler").?;
+        const idx_notif = std.mem.indexOf(u8, main_zig, "&flows_s_notification_flow_handler").?;
+
+        // Priority-descending sort: `02_high` (100) before `01_low` (10).
+        try std.testing.expect(idx_high < idx_low);
+        // Priority-set flows precede the no-priority tail: both before
+        // the notification flow.
+        try std.testing.expect(idx_low < idx_notif);
+
+        // Same order in the type-level `MergeHooks(...)` tuple — the
+        // receiver-type tuple and the runtime tuple must agree on
+        // index-by-index (`MergeHooks.emit` looks each receiver up by
+        // tuple position).
+        const type_high = std.mem.indexOf(u8, main_zig, "*@import(\"scripts/flows/02_high.zig\").FlowEventHandler").?;
+        const type_low = std.mem.indexOf(u8, main_zig, "*@import(\"scripts/flows/01_low.zig\").FlowEventHandler").?;
+        const type_notif = std.mem.indexOf(u8, main_zig, "*@import(\"scripts/flows/notification.zig\").FlowEventHandler").?;
+        try std.testing.expect(type_high < type_low);
+        try std.testing.expect(type_low < type_notif);
+    }
+
+    test "ties on priority preserve scanner sort" {
+        // Stable-sort semantics: two flows sharing the same priority
+        // fall back to their input (scanner-sort) order. Otherwise the
+        // emitted tuple would jitter run-to-run, surfacing as flaky
+        // ordering-sensitive integration tests.
+        const allocator = std.testing.allocator;
+
+        const flow_entries: []const generator.script_scanner.ScriptScanner.ScriptEntry = &.{
+            .{
+                .name = "01_alpha",
+                .filename = "01_alpha.zig",
+                .states = &.{},
+                .sort_order = 1,
+                .subdir = null,
+                .rel_path = "flows/01_alpha.zig",
+                .has_event_handler = true,
+                .event_priority = 50,
+            },
+            .{
+                .name = "02_beta",
+                .filename = "02_beta.zig",
+                .states = &.{},
+                .sort_order = 2,
+                .subdir = null,
+                .rel_path = "flows/02_beta.zig",
+                .has_event_handler = true,
+                .event_priority = 50,
+            },
+        };
+
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "box2d", .repo = "" }},
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_with_hooks,
+            cfg,
+            tiny_lifecycle_hooks,
+            flow_entries,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &[_]generator.main_zig.PluginEvent{},
+        );
+        defer allocator.free(main_zig);
+
+        const idx_alpha = std.mem.indexOf(u8, main_zig, "&flows_s_01_u_alpha_flow_handler").?;
+        const idx_beta = std.mem.indexOf(u8, main_zig, "&flows_s_02_u_beta_flow_handler").?;
+        try std.testing.expect(idx_alpha < idx_beta);
+    }
+
     test "no new-form OnEvent flows: GameHooks stays struct{} when no hooks/ either" {
         // Regression guard: a project with only lifecycle flows (or
         // legacy `OnEvent` flows) and no hooks/ must keep the v1

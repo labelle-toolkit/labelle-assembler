@@ -79,6 +79,19 @@ pub const ScriptScanner = struct {
         /// every non-flow script keep this `false` and are skipped by
         /// the receiver-tuple wiring. Set only by `flow_scanner.zig`.
         has_event_handler: bool = false,
+        /// Optional dispatch-priority hint for the new-form `OnEvent`
+        /// flow this entry represents — populated from
+        /// `flow.event.OnEvent.priority` (RFC-PLUGIN-EVENTS O4 / phase 7,
+        /// flow-codegen#16). Meaningful only when the resolved event is
+        /// consumable; the assembler sorts flow handlers whose
+        /// `event_priority` is set ahead of the scanner-sorted tail,
+        /// priority-descending, so the highest-priority consumer is
+        /// invoked first by `MergeHooks.emit` (which on the consumable
+        /// path breaks out of the receiver loop the moment a handler
+        /// returns `true`). `null` (the on-disk default) keeps the entry
+        /// on the scanner sort — the contract for notification events
+        /// (O3). Set only by `flow_scanner.zig`.
+        event_priority: ?i32 = null,
     };
 
     /// Errors `scanDir` / `scanPluginDir` / `scanZigFilesRecursive` can

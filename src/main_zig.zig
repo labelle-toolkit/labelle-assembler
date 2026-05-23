@@ -2936,10 +2936,37 @@ pub fn generateMainZigFromTemplate(
     // labelle-assembler#175). flow-codegen emits `pub const FlowEventHandler`
     // for new-form `OnEvent` flows; flow_scanner flips
     // `ScriptEntry.has_event_handler` on those. We thread them into the
-    // existing `GameHooks` receiver tuple in scanner-sorted order — the
-    // order `script_entries` arrives in already encodes the per-flow
-    // numeric-prefix-then-alphabetical sort (`flow_scanner.zig:220-232`,
-    // O3 in the RFC), so iterating in slice order Just Works.
+    // existing `GameHooks` receiver tuple — by default in the
+    // scanner-sorted order `script_entries` arrives in
+    // (numeric-prefix-then-alphabetical; `flow_scanner.zig:220-232`, O3
+    // in the RFC).
+    //
+    // **Phase 7 layering (RFC-PLUGIN-EVENTS O4 / labelle-core#16).** A
+    // flow listening to a consumable event sets `priority` in its
+    // `.flow.jsonc`; `flow_scanner` lifts that onto
+    // `ScriptEntry.event_priority`. Flows with a priority sort to the
+    // front of the flow tail, priority descending; the rest stay on the
+    // scanner sort. The runtime `MergeHooks.emit`
+    // (`labelle-core/src/dispatcher.zig`) switches to the return-aware
+    // path automatically when the variant's payload declares
+    // `pub const consumable = true`, breaking the loop on the first
+    // handler that returns `true` — so the highest-priority consumer
+    // wins, which is the contract phase 7 promises.
+    //
+    // **Sort scope — whole flow tail, not per-event.** A single flow
+    // handler struct currently subscribes to exactly one event (one
+    // `OnEvent` per `.flow.jsonc`), but the assembler-side sort is
+    // over the **whole flow tail**, not partitioned per event. The
+    // reason: priority is only meaningful for consumable events, and a
+    // notification handler's relative position in the tail doesn't
+    // affect dispatch correctness (every notification listener runs
+    // regardless of order). Front-loading the priority-set flows ahead
+    // of notification flows is the simplest scope that satisfies the
+    // consumable-flavor contract without re-keying the tuple by event
+    // tag. If a future flow listens to multiple events (one consumable,
+    // one notification, with different priorities each), the
+    // single-priority shape no longer fits — that's the day a per-event
+    // sort becomes load-bearing; not now.
     //
     // The handler module is referenced via an inline `@import("scripts/<rel_path>")`
     // because `AllScripts` (which holds these imports under stable
@@ -2953,6 +2980,40 @@ pub fn generateMainZigFromTemplate(
     for (script_entries) |entry| {
         if (entry.has_event_handler) flow_handler_count += 1;
     }
+
+    // Priority-aware ordering of the flow tail. The list holds indices
+    // into `script_entries` for every entry with
+    // `has_event_handler == true`, in the order the receiver tuple
+    // must emit them: priority-set entries first (descending), then
+    // the rest in scanner order. A stable sort on (priority bucket,
+    // scanner index) keeps everything deterministic — the input is
+    // already in scanner order, so the tie-breaker is just "preserve
+    // relative position".
+    var flow_order: std.ArrayList(usize) = .empty;
+    defer flow_order.deinit(allocator);
+    try flow_order.ensureTotalCapacity(allocator, flow_handler_count);
+    for (script_entries, 0..) |entry, i| {
+        if (entry.has_event_handler) flow_order.appendAssumeCapacity(i);
+    }
+    const FlowSortCtx = struct {
+        entries: []const ScriptEntry,
+        fn lessThan(self: @This(), a: usize, b: usize) bool {
+            const ea = self.entries[a];
+            const eb = self.entries[b];
+            // Priority-set entries strictly precede priority-null
+            // entries; among priority-set entries, higher value first.
+            if (ea.event_priority != null and eb.event_priority == null) return true;
+            if (ea.event_priority == null and eb.event_priority != null) return false;
+            if (ea.event_priority) |pa| {
+                if (eb.event_priority) |pb| {
+                    if (pa != pb) return pa > pb;
+                }
+            }
+            // Same bucket: preserve the input scanner-sort order.
+            return a < b;
+        }
+    };
+    std.mem.sort(usize, flow_order.items, FlowSortCtx{ .entries = script_entries }, FlowSortCtx.lessThan);
 
     // Game hooks block
     {
@@ -2974,9 +3035,10 @@ pub fn generateMainZigFromTemplate(
             // tail block, leaving the existing hook order at the head
             // unchanged. `rel_path` is e.g. `flows/hit_counter.zig`,
             // matching the on-disk layout the `AllScripts` block already
-            // imports.
-            for (script_entries) |entry| {
-                if (!entry.has_event_handler) continue;
+            // imports. Iteration order is `flow_order` — priority-set
+            // flows first (desc), then scanner-sorted notification flows.
+            for (flow_order.items) |i| {
+                const entry = script_entries[i];
                 try bw.print(" *@import(\"scripts/{s}\").FlowEventHandler,", .{entry.rel_path});
             }
             try bw.writeAll(" });\n\n");
@@ -3011,8 +3073,14 @@ pub fn generateMainZigFromTemplate(
             // declares such a field (`labelle-engine/src/game.zig:419-429`),
             // so no extra init step is needed here — the existing walk
             // reaches these entries the same way it does the hook ones.
-            for (script_entries) |entry| {
-                if (!entry.has_event_handler) continue;
+            //
+            // Note: the `var` decls below can be emitted in any order
+            // (each one names a unique identifier) but we follow
+            // `flow_order` for clean diff-readability — the `var`s
+            // appear in the same order their `&` references will inside
+            // the tuple literal.
+            for (flow_order.items) |i| {
+                const entry = script_entries[i];
                 const ident = pathToIdent(entry.rel_path, &ident_buf);
                 try bw.print(
                     "    var {s}_flow_handler: @import(\"scripts/{s}\").FlowEventHandler = .{{}};\n",
@@ -3024,8 +3092,12 @@ pub fn generateMainZigFromTemplate(
                 const ident = pathToIdent(name, &ident_buf);
                 try bw.print(" &{s}_inst,", .{ident});
             }
-            for (script_entries) |entry| {
-                if (!entry.has_event_handler) continue;
+            // The tuple-literal order MUST match the receiver-type
+            // order in `GameHooks` above — `MergeHooks.emit` looks each
+            // receiver up by its tuple position. Iterate `flow_order`
+            // identically to the `game_hooks_block` loop.
+            for (flow_order.items) |i| {
+                const entry = script_entries[i];
                 const ident = pathToIdent(entry.rel_path, &ident_buf);
                 try bw.print(" &{s}_flow_handler,", .{ident});
             }
