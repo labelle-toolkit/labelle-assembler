@@ -148,6 +148,37 @@ pub const PinStyleEntry = struct {
     color: [3]u8,
 };
 
+/// One `pub const <name> = labelle.flow.Coercion(.{ .impl = ... })`
+/// decl inside a module's top-level `pub const Coercions` block
+/// (RFC-FLOW-VOCABULARY §2 / O4 — plugin-declared coercions). The
+/// editor consults `from_zig_type` / `to_zig_type` at wire-fit time
+/// to accept an edge between two pins whose Zig types differ but for
+/// which a registered coercion bridges; flow-codegen wraps the source
+/// expression in a `<plugin>__<name>.convert(...)` call at the edge
+/// site.
+///
+/// Mirrors the on-disk dotted form (`box2d.body_to_entity`) so the
+/// editor + flow-codegen share one canonical lookup key.
+pub const CoercionEntry = struct {
+    /// Dotted form (`"box2d.body_to_entity"`). Matches the qualified
+    /// emitted decl name on `PluginCoercions` (modulo `.` → `__`).
+    qualified: []const u8,
+    /// Bare coercion identifier (`"body_to_entity"`). Carried separately
+    /// from `qualified` so the editor can render it under the
+    /// contributing module's palette section.
+    name: []const u8,
+    /// Zig source text of the impl's single parameter type. Extracted
+    /// verbatim from the impl function's prototype.
+    from_zig_type: []const u8,
+    /// Zig source text of the impl's return type. The catalog never
+    /// emits a coercion whose return is `void` — the labelle-core
+    /// factory rejects it at comptime.
+    to_zig_type: []const u8,
+    /// Tooltip text (`.docs = "..."` on the factory call). Empty when
+    /// absent.
+    docs: []const u8,
+};
+
 /// One `pub const <name> = struct {...}` decl inside a module's
 /// top-level `pub const Events` block (labelle-engine#578 — engine
 /// lifecycle events; RFC-PLUGIN-EVENTS phase 1 — plugin events).
@@ -182,6 +213,14 @@ pub const ModuleGroup = struct {
     /// Defaults to an empty slice for modules that declare no
     /// `Events` block, so the JSON shape stays uniform.
     events: []EventEntry = &.{},
+    /// Coercions (RFC-FLOW-VOCABULARY §2 / O4) — plugin-declared
+    /// type-conversion bridges. The editor's wire-fit check accepts an
+    /// edge whose `(from_zig_type, to_zig_type)` matches a registered
+    /// coercion; flow-codegen wraps the source expression in
+    /// `<qualified>.convert(...)` at the edge site. Defaults to an
+    /// empty slice so the JSON shape stays uniform for modules without
+    /// a `Coercions` block.
+    coercions: []CoercionEntry = &.{},
 };
 
 /// The full catalog as it ends up on disk. Self-describes its source
@@ -363,6 +402,7 @@ fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const
     var nodes: std.ArrayList(FlowNodeEntry) = .empty;
     var styles: std.ArrayList(PinStyleEntry) = .empty;
     var events: std.ArrayList(EventEntry) = .empty;
+    var coercions: std.ArrayList(CoercionEntry) = .empty;
 
     var found_anything = false;
     const root_decls = ast.rootDecls();
@@ -376,7 +416,8 @@ fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const
         const is_flow_nodes = std.mem.eql(u8, decl_name, "FlowNodes");
         const is_pin_styles = std.mem.eql(u8, decl_name, "PinStyles");
         const is_events = std.mem.eql(u8, decl_name, "Events");
-        if (!is_flow_nodes and !is_pin_styles and !is_events) continue;
+        const is_coercions = std.mem.eql(u8, decl_name, "Coercions");
+        if (!is_flow_nodes and !is_pin_styles and !is_events and !is_coercions) continue;
 
         const init_node = vd.ast.init_node.unwrap() orelse continue;
         const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
@@ -407,7 +448,7 @@ fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const
                 ) catch continue;
                 try styles.append(aa, entry);
                 found_anything = true;
-            } else {
+            } else if (is_events) {
                 // Events block (labelle-engine#578). Only valid
                 // shape is `pub const <name> = struct { ... };`.
                 if (ast.fullContainerDecl(&buf, member_init) == null) continue;
@@ -420,6 +461,22 @@ fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const
                 ) catch continue;
                 try events.append(aa, entry);
                 found_anything = true;
+            } else {
+                // Coercions block (RFC-FLOW-VOCABULARY §2 / O4). The
+                // factory call shape is
+                // `labelle.flow.Coercion(.{ .impl = <fn> })`. We pull
+                // the impl name out of the call, then walk back to the
+                // fn's parameter list + return type to capture
+                // From/To Zig source text.
+                const entry = extractCoercionEntry(
+                    aa,
+                    &ast,
+                    member_name,
+                    member_init,
+                    module_name,
+                ) catch continue;
+                try coercions.append(aa, entry);
+                found_anything = true;
             }
         }
     }
@@ -430,6 +487,59 @@ fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const
         .flow_nodes = try nodes.toOwnedSlice(aa),
         .pin_styles = try styles.toOwnedSlice(aa),
         .events = try events.toOwnedSlice(aa),
+        .coercions = try coercions.toOwnedSlice(aa),
+    };
+}
+
+/// Pull `from_zig_type` + `to_zig_type` + `docs` out of a
+/// `labelle.flow.Coercion(.{ .impl = <ident>, .docs = "..." })` init.
+/// `impl` is resolved through the same source's root decls; its single
+/// parameter's type source and return-type source become `from` and
+/// `to`. A non-resolvable `impl` (defined in a sibling file) degrades
+/// to empty strings — the editor + flow-codegen fall back to refusing
+/// the wire in that case, same shape as the FlowNode pin walk.
+fn extractCoercionEntry(
+    aa: std.mem.Allocator,
+    ast: *std.zig.Ast,
+    decl_name: []const u8,
+    init_node: std.zig.Ast.Node.Index,
+    module_name: []const u8,
+) !CoercionEntry {
+    const init_src = ast.getNodeSource(init_node);
+    const cfg_src = innerCallArg(init_src);
+
+    const impl_name = scanFieldIdent(cfg_src, ".impl") orelse "";
+    const docs = scanFieldStringDup(aa, cfg_src, ".docs") catch null;
+
+    var from: []const u8 = "";
+    var to: []const u8 = "";
+
+    if (impl_name.len > 0) {
+        if (findFnByName(ast, impl_name)) |fn_node| {
+            var fn_buf: [1]std.zig.Ast.Node.Index = undefined;
+            if (ast.fullFnProto(&fn_buf, fn_node)) |fp| {
+                // A coercion's impl takes a single value parameter
+                // (the labelle-core factory rejects multi-param impls
+                // at comptime). Capture the first param's type source.
+                var it = fp.iterate(ast);
+                if (it.next()) |param| {
+                    if (param.type_expr) |ptype_node| {
+                        from = try aa.dupe(u8, ast.getNodeSource(ptype_node));
+                    }
+                }
+                if (fp.ast.return_type.unwrap()) |rt_node| {
+                    to = try aa.dupe(u8, ast.getNodeSource(rt_node));
+                }
+            }
+        }
+    }
+
+    return .{
+        .qualified = try std.fmt.allocPrint(aa, "{s}.{s}", .{ module_name, decl_name }),
+        .name = try aa.dupe(u8, decl_name),
+        .from_zig_type = if (from.len == 0) try aa.dupe(u8, "") else from,
+        .to_zig_type = if (to.len == 0) try aa.dupe(u8, "") else to,
+        .docs = docs orelse try aa.dupe(u8, ""),
     };
 }
 
@@ -926,12 +1036,30 @@ fn writeCatalogJson(w: *std.Io.Writer, groups: []const ModuleGroup) !void {
         // each event's typed payload pins to wire downstream nodes.
         try w.writeAll("      \"events\": [");
         if (g.events.len == 0) {
-            try w.writeAll("]\n");
+            try w.writeAll("],\n");
         } else {
             try w.writeAll("\n");
             for (g.events, 0..) |e, ei| {
                 try writeEventJson(w, e);
                 if (ei + 1 < g.events.len) try w.writeAll(",");
+                try w.writeAll("\n");
+            }
+            try w.writeAll("      ],\n");
+        }
+        // ── coercions (RFC-FLOW-VOCABULARY §2 / O4) ──────────
+        // `discoverInSource` populates this from each module's
+        // `pub const Coercions` block. The editor's wire-fit check
+        // accepts an edge whose (from_zig_type, to_zig_type) matches a
+        // registered coercion; flow-codegen wraps the source expression
+        // in `<qualified>.convert(...)` at the edge site.
+        try w.writeAll("      \"coercions\": [");
+        if (g.coercions.len == 0) {
+            try w.writeAll("]\n");
+        } else {
+            try w.writeAll("\n");
+            for (g.coercions, 0..) |c, ci| {
+                try writeCoercionJson(w, c);
+                if (ci + 1 < g.coercions.len) try w.writeAll(",");
                 try w.writeAll("\n");
             }
             try w.writeAll("      ]\n");
@@ -1025,6 +1153,29 @@ fn writeEventJson(w: *std.Io.Writer, e: EventEntry) !void {
         try w.writeAll("          ]\n");
     }
     try w.writeAll("        }");
+}
+
+/// Emit one coercion entry as JSON, shape:
+///   `{ "qualified": "box2d.body_to_entity",
+///      "name": "body_to_entity",
+///      "from_zig_type": "BodyId",
+///      "to_zig_type": "u32",
+///      "docs": "..." }`
+/// The editor's wire-fit check keys off `from_zig_type` +
+/// `to_zig_type`; flow-codegen's edge codegen reads `qualified` to
+/// produce the `<qualified>.convert(...)` call site.
+fn writeCoercionJson(w: *std.Io.Writer, c: CoercionEntry) !void {
+    try w.writeAll("        { \"qualified\": ");
+    try writeJsonString(w, c.qualified);
+    try w.writeAll(", \"name\": ");
+    try writeJsonString(w, c.name);
+    try w.writeAll(", \"from_zig_type\": ");
+    try writeJsonString(w, c.from_zig_type);
+    try w.writeAll(", \"to_zig_type\": ");
+    try writeJsonString(w, c.to_zig_type);
+    try w.writeAll(", \"docs\": ");
+    try writeJsonString(w, c.docs);
+    try w.writeAll(" }");
 }
 
 /// Write a JSON string literal — wraps in double quotes, escapes the
@@ -1269,6 +1420,97 @@ test "discoverInSource: returns null when neither block is declared" {
     defer arena.deinit();
     const result = try discoverInSource(arena.allocator(), src, "noop");
     try std.testing.expect(result == null);
+}
+
+test "discoverInSource: folds Coercions block into catalog with from/to types" {
+    // RFC-FLOW-VOCABULARY §2 / O4 — a module-level `pub const
+    // Coercions = struct { ... }` produces one `CoercionEntry` per
+    // factory call. From/To types resolve through the impl function's
+    // single-param + return-type source.
+    const src =
+        \\const flow = @import("flow");
+        \\pub const BodyId = enum(u32) { _ };
+        \\
+        \\pub const Coercions = struct {
+        \\    pub const body_to_entity = flow.Coercion(.{
+        \\        .impl = bodyToEntityImpl,
+        \\        .docs = "Reinterpret a BodyId as an EntityId.",
+        \\    });
+        \\};
+        \\
+        \\fn bodyToEntityImpl(b: BodyId) u32 { return @intFromEnum(b); }
+        \\
+    ;
+    const aa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(aa);
+    defer arena.deinit();
+    const group = (try discoverInSource(arena.allocator(), src, "box2d")) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqualStrings("box2d", group.name);
+    try std.testing.expectEqual(@as(usize, 1), group.coercions.len);
+    try std.testing.expectEqualStrings("box2d.body_to_entity", group.coercions[0].qualified);
+    try std.testing.expectEqualStrings("body_to_entity", group.coercions[0].name);
+    try std.testing.expectEqualStrings("BodyId", group.coercions[0].from_zig_type);
+    try std.testing.expectEqualStrings("u32", group.coercions[0].to_zig_type);
+    try std.testing.expectEqualStrings("Reinterpret a BodyId as an EntityId.", group.coercions[0].docs);
+}
+
+test "discoverInSource: JSON output includes coercions array per module" {
+    // Pin that the sidecar JSON carries a `coercions: [...]` field
+    // alongside `events: [...]` for each module group, even when the
+    // module declares no coercions. flow-codegen / editor parse
+    // assuming both keys are present.
+    const aa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(aa);
+    defer arena.deinit();
+    const ag = arena.allocator();
+
+    var groups: std.ArrayList(ModuleGroup) = .empty;
+    var coercions: std.ArrayList(CoercionEntry) = .empty;
+    try coercions.append(ag, .{
+        .qualified = "box2d.body_to_entity",
+        .name = "body_to_entity",
+        .from_zig_type = "BodyId",
+        .to_zig_type = "u32",
+        .docs = "doc",
+    });
+    try groups.append(ag, .{
+        .name = "box2d",
+        .flow_nodes = &.{},
+        .pin_styles = &.{},
+        .events = &.{},
+        .coercions = try coercions.toOwnedSlice(ag),
+    });
+    // Empty module — only the default empty `coercions` slice.
+    try groups.append(ag, .{
+        .name = "empty",
+        .flow_nodes = &.{},
+        .pin_styles = &.{},
+    });
+
+    var aw: std.Io.Writer.Allocating = .init(aa);
+    defer aw.deinit();
+    try writeCatalogJson(&aw.writer, groups.items);
+    const out = aw.writer.buffer[0..aw.writer.end];
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, out, .{});
+    defer parsed.deinit();
+    const plugins = parsed.value.object.get("plugins").?.array;
+    try std.testing.expectEqual(@as(usize, 2), plugins.items.len);
+    const box2d = plugins.items[0].object;
+    const co_arr = box2d.get("coercions").?.array;
+    try std.testing.expectEqual(@as(usize, 1), co_arr.items.len);
+    const co0 = co_arr.items[0].object;
+    try std.testing.expectEqualStrings("box2d.body_to_entity", co0.get("qualified").?.string);
+    try std.testing.expectEqualStrings("BodyId", co0.get("from_zig_type").?.string);
+    try std.testing.expectEqualStrings("u32", co0.get("to_zig_type").?.string);
+    // Empty module's coercions array is present and empty — keeps the
+    // shape uniform for downstream consumers.
+    const empty = plugins.items[1].object;
+    try std.testing.expect(empty.contains("coercions"));
+    try std.testing.expectEqual(@as(usize, 0), empty.get("coercions").?.array.items.len);
 }
 
 test "JSON output round-trips through std.json.parse" {

@@ -336,6 +336,7 @@ pub const AllScriptsIntegration = struct {
             &[_]generator.main_zig.PluginEvent{}, // plugin_events
             &[_]generator.main_zig.PluginFlowNode{}, // plugin_flow_nodes
             &[_]generator.main_zig.PluginPinStyle{}, // plugin_pin_styles
+            &[_]generator.main_zig.PluginCoercion{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -390,6 +391,7 @@ pub const AllScriptsIntegration = struct {
             &[_]generator.main_zig.PluginEvent{}, // plugin_events
             &[_]generator.main_zig.PluginFlowNode{}, // plugin_flow_nodes
             &[_]generator.main_zig.PluginPinStyle{}, // plugin_pin_styles
+            &[_]generator.main_zig.PluginCoercion{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -566,6 +568,7 @@ pub const PluginEvents = struct {
             &.{}, // plugin_events
             &.{}, // plugin_flow_nodes
             &.{}, // plugin_pin_styles
+            &.{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -622,6 +625,7 @@ pub const PluginEvents = struct {
             &pe, // plugin_events
             &.{}, // plugin_flow_nodes
             &.{}, // plugin_pin_styles
+            &.{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -699,6 +703,7 @@ pub const PluginEvents = struct {
             &pe, // plugin_events
             &.{}, // plugin_flow_nodes
             &.{}, // plugin_pin_styles
+            &.{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -744,6 +749,7 @@ pub const PluginEvents = struct {
             &pe, // plugin_events
             &.{}, // plugin_flow_nodes
             &.{}, // plugin_pin_styles
+            &.{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -1056,6 +1062,7 @@ pub const FlowHandlerWiring = struct {
             &.{}, // plugin_events
             &.{}, // plugin_flow_nodes
             &.{}, // plugin_pin_styles
+            &.{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -1139,6 +1146,7 @@ pub const FlowHandlerWiring = struct {
             &[_]generator.main_zig.PluginEvent{}, // plugin_events
             &[_]generator.main_zig.PluginFlowNode{}, // plugin_flow_nodes
             &[_]generator.main_zig.PluginPinStyle{}, // plugin_pin_styles
+            &[_]generator.main_zig.PluginCoercion{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -1238,6 +1246,7 @@ pub const FlowHandlerWiring = struct {
             &[_]generator.main_zig.PluginEvent{},
             &[_]generator.main_zig.PluginFlowNode{},
             &[_]generator.main_zig.PluginPinStyle{},
+            &[_]generator.main_zig.PluginCoercion{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -1318,6 +1327,7 @@ pub const FlowHandlerWiring = struct {
             &[_]generator.main_zig.PluginEvent{},
             &[_]generator.main_zig.PluginFlowNode{},
             &[_]generator.main_zig.PluginPinStyle{},
+            &[_]generator.main_zig.PluginCoercion{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -1373,6 +1383,7 @@ pub const FlowHandlerWiring = struct {
             &[_]generator.main_zig.PluginEvent{}, // plugin_events
             &[_]generator.main_zig.PluginFlowNode{}, // plugin_flow_nodes
             &[_]generator.main_zig.PluginPinStyle{}, // plugin_pin_styles
+            &[_]generator.main_zig.PluginCoercion{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -1401,6 +1412,7 @@ pub const FlowHandlerWiring = struct {
 
 const PluginFlowNode = generator.main_zig.PluginFlowNode;
 const PluginPinStyle = generator.main_zig.PluginPinStyle;
+const PluginCoercion = generator.main_zig.PluginCoercion;
 
 const tiny_template_phase2 =
     \\const std = @import("std");
@@ -1441,6 +1453,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
             &[_]generator.main_zig.PluginEvent{}, // plugin_events
             &[_]PluginFlowNode{}, // plugin_flow_nodes
             &[_]PluginPinStyle{}, // plugin_pin_styles
+            &[_]PluginCoercion{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -1512,6 +1525,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
             &[_]generator.main_zig.PluginEvent{},
             &flow_nodes,
             &[_]PluginPinStyle{},
+            &[_]PluginCoercion{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -1572,6 +1586,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
             &[_]generator.main_zig.PluginEvent{},
             &flow_nodes,
             &[_]PluginPinStyle{},
+            &[_]PluginCoercion{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -1629,6 +1644,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
             &[_]generator.main_zig.PluginEvent{},
             &[_]PluginFlowNode{},
             &pin_styles,
+            &[_]PluginCoercion{},
         );
         defer allocator.free(main_zig);
 
@@ -1682,6 +1698,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
             &[_]generator.main_zig.PluginEvent{},
             &[_]PluginFlowNode{},
             &pin_styles,
+            &[_]PluginCoercion{},
         );
         defer allocator.free(main_zig);
 
@@ -1724,6 +1741,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
             &[_]generator.main_zig.PluginEvent{},
             &flow_nodes,
             &[_]PluginPinStyle{},
+            &[_]PluginCoercion{}, // plugin_coercions
         );
         defer allocator.free(main_zig);
 
@@ -1783,6 +1801,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
             &[_]generator.main_zig.PluginEvent{},
             &flow_nodes,
             &pin_styles,
+            &[_]PluginCoercion{},
         );
         defer allocator.free(main_zig);
 
@@ -2259,5 +2278,168 @@ pub const FlowDeclsDiscovery = struct {
 
         // The plugin-shipped script's FlowNode was NOT picked up.
         try std.testing.expectEqual(@as(usize, 0), decls.flow_nodes.len);
+    }
+};
+
+// ── RFC-FLOW-VOCABULARY §2 / O4 — Coercions block discovery + emission ──
+//
+// Mirrors `FlowDeclsDiscovery`'s shape. Same AST walk shared via
+// `scanFlowDeclsInSource` produces `coercions[]` alongside
+// `flow_nodes[]` / `pin_styles[]`; `writePluginCoercionsBlock` emits
+// the `PluginCoercions = struct { ... }` registry the editor and
+// flow-codegen consume.
+
+pub const PluginCoercionsDiscovery = struct {
+    fn writePluginRootZig(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, plugin_name: []const u8, src: []const u8) ![]u8 {
+        const io = std.testing.io;
+        const src_sub = try std.fmt.allocPrint(allocator, "{s}/src", .{plugin_name});
+        defer allocator.free(src_sub);
+        try tmp.dir.createDirPath(io, src_sub);
+
+        const root_sub = try std.fmt.allocPrint(allocator, "{s}/src/root.zig", .{plugin_name});
+        defer allocator.free(root_sub);
+        try tmp.dir.writeFile(io, .{ .sub_path = root_sub, .data = src });
+
+        const plugin_dir_z = try tmp.dir.realPathFileAlloc(io, plugin_name, allocator);
+        defer allocator.free(plugin_dir_z);
+        return allocator.dupe(u8, plugin_dir_z);
+    }
+
+    test "discovers plugin Coercions from <plugin>/src/root.zig" {
+        const allocator = std.testing.allocator;
+        const io = std.testing.io;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const tmp_path_z = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(tmp_path_z);
+        const tmp_path = try allocator.dupe(u8, tmp_path_z);
+        defer allocator.free(tmp_path);
+
+        // Synthetic plugin declaring two coercions. The AST walk just
+        // looks for `pub const Coercions = struct { ... }` and folds
+        // every `pub const <name>` member; the init RHS shape isn't
+        // inspected at discovery time (the From/To types resolve later
+        // through Zig's comptime reflection on the emitted alias).
+        const root_src =
+            \\const labelle = @import("labelle-core");
+            \\
+            \\pub const BodyId = enum(u32) { _ };
+            \\
+            \\pub const Coercions = struct {
+            \\    pub const body_to_entity = labelle.flow.Coercion(.{ .impl = bodyToEntity });
+            \\    pub const int_to_float = labelle.flow.Coercion(.{ .impl = intToFloat });
+            \\};
+            \\
+            \\fn bodyToEntity(b: BodyId) u32 { return @intFromEnum(b); }
+            \\fn intToFloat(x: i32) f64 { return @floatFromInt(x); }
+            \\
+        ;
+        const plugin_dir = try writePluginRootZig(allocator, &tmp, "fake_box2d", root_src);
+        defer allocator.free(plugin_dir);
+
+        const repo = try std.fmt.allocPrint(allocator, "local:{s}", .{plugin_dir});
+        defer allocator.free(repo);
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "fake_box2d", .repo = repo }},
+        };
+
+        var decls = try generator.main_zig.discoverPluginFlowDecls(
+            allocator,
+            cfg,
+            tmp_path,
+            "/nonexistent/scripts",
+            &.{},
+        );
+        defer decls.deinit();
+
+        try std.testing.expectEqual(@as(usize, 2), decls.coercions.len);
+        try std.testing.expectEqualStrings("fake_box2d", decls.coercions[0].module_import_path);
+        try std.testing.expectEqualStrings("fake_box2d", decls.coercions[0].module_sanitized);
+        // Walk preserves declaration order.
+        try std.testing.expectEqualStrings("body_to_entity", decls.coercions[0].name);
+        try std.testing.expectEqualStrings("int_to_float", decls.coercions[1].name);
+        try std.testing.expect(!decls.coercions[0].is_script);
+
+        // FlowNodes / PinStyles slots are empty when the module only
+        // declares Coercions — verify the three lists are independent.
+        try std.testing.expectEqual(@as(usize, 0), decls.flow_nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), decls.pin_styles.len);
+    }
+
+    test "Coercions plugin entry emits the @import alias + From/To/convert reflect" {
+        // writePluginCoercionsBlock's emission shape is:
+        //   pub const <plugin>__<name> = @import("<plugin>").Coercions.<name>;
+        // plus the `resolve` + `findByTypes` helpers. This test pins the
+        // alias line and helper bodies' source shape.
+        const allocator = std.testing.allocator;
+
+        const coercions = [_]PluginCoercion{
+            .{
+                .module_import_path = "box2d",
+                .module_sanitized = "box2d",
+                .name = "body_to_entity",
+                .is_script = false,
+            },
+        };
+
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        try generator.main_zig.writePluginCoercionsBlock(&aw.writer, &coercions);
+        const out = aw.writer.buffer[0..aw.writer.end];
+
+        // The alias resolves against the source-module's `Coercions`
+        // namespace so the comptime decls (`From`, `To`, `convert`)
+        // pass through unchanged.
+        try std.testing.expect(std.mem.indexOf(u8, out, "pub const box2d__body_to_entity = @import(\"box2d\").Coercions.body_to_entity;") != null);
+        // resolve() and findByTypes() helpers — flow-codegen calls
+        // findByTypes during edge codegen.
+        try std.testing.expect(std.mem.indexOf(u8, out, "pub fn resolve(comptime dotted: []const u8) ?[]const u8") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "pub fn findByTypes(comptime From: type, comptime To: type) ?[]const u8") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "__is_labelle_coercion") != null);
+    }
+
+    test "Coercions: empty discovery emits the shell with stub helpers" {
+        // Every project, even ones declaring no Coercions, gets a
+        // `pub const PluginCoercions = struct { ... };` shell with the
+        // resolve + findByTypes helpers. flow-codegen always calls them
+        // — the empty case returns `null` and the wire-fit falls back
+        // to the built-in rules without a separate branch.
+        const allocator = std.testing.allocator;
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        try generator.main_zig.writePluginCoercionsBlock(&aw.writer, &.{});
+        const out = aw.writer.buffer[0..aw.writer.end];
+        try std.testing.expect(std.mem.indexOf(u8, out, "pub const PluginCoercions = struct {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "pub fn resolve(comptime dotted: []const u8) ?[]const u8") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "pub fn findByTypes(comptime From: type, comptime To: type) ?[]const u8") != null);
+        // No alias lines in the empty case.
+        try std.testing.expect(std.mem.indexOf(u8, out, "= @import(") == null);
+    }
+
+    test "Coercions: game-script module emits @import(\"scripts/<rel>\") form" {
+        // Same per-source-kind branching as FlowNodes / PinStyles —
+        // a game-script declaring `pub const Coercions` resolves
+        // through `@import("scripts/<rel_path>")`.
+        const allocator = std.testing.allocator;
+
+        const coercions = [_]PluginCoercion{
+            .{
+                .module_import_path = "flows/bridges.zig",
+                .module_sanitized = "flows_s_bridges",
+                .name = "to_entity",
+                .is_script = true,
+            },
+        };
+
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        try generator.main_zig.writePluginCoercionsBlock(&aw.writer, &coercions);
+        const out = aw.writer.buffer[0..aw.writer.end];
+
+        try std.testing.expect(std.mem.indexOf(u8, out, "pub const flows_s_bridges__to_entity = @import(\"scripts/flows/bridges.zig\").Coercions.to_entity;") != null);
     }
 };

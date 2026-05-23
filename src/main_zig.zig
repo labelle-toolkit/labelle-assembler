@@ -271,13 +271,40 @@ pub const PluginPinStyle = struct {
     is_script: bool,
 };
 
-/// Collection of discovered FlowNodes + PinStyles with an
+/// One discovered `pub const <name> = labelle.flow.Coercion(...)` decl
+/// inside a `pub const Coercions = struct { ... }` block
+/// (RFC-FLOW-VOCABULARY §2 / O4). Same ownership pattern as
+/// `PluginFlowNode` / `PluginPinStyle` — every string is a
+/// heap-allocated dupe owned by the enclosing `PluginFlowDecls`.
+///
+/// The qualified emitted decl name is `<module_sanitized>__<name>`
+/// matching the FlowNodes / Events convention.
+pub const PluginCoercion = struct {
+    /// Same shape as `PluginFlowNode.module_import_path`.
+    module_import_path: []const u8,
+    /// Same shape as `PluginFlowNode.module_sanitized`. Used as the
+    /// `<module>__<name>` prefix on the emitted registry decl.
+    module_sanitized: []const u8,
+    /// Bare coercion identifier as declared inside `Coercions` (e.g.
+    /// `body_to_entity`).
+    name: []const u8,
+    /// Same meaning as `PluginFlowNode.is_script`.
+    is_script: bool,
+};
+
+/// Collection of discovered FlowNodes + PinStyles + Coercions with an
 /// allocator-aware `deinit`. Same ownership story as `PluginEvents`
 /// — every string field on every entry is a heap-allocated dupe so
 /// callers need not keep source buffers alive.
 pub const PluginFlowDecls = struct {
     flow_nodes: []PluginFlowNode,
     pin_styles: []PluginPinStyle,
+    /// RFC-FLOW-VOCABULARY §2 / O4 — plugin-declared coercions. Empty
+    /// when no module declares a `pub const Coercions` block; the
+    /// emitter still writes an empty `PluginCoercions = struct {}`
+    /// shell so downstream reflection (flow-codegen edge wrap) is
+    /// uniform.
+    coercions: []PluginCoercion,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PluginFlowDecls) void {
@@ -296,6 +323,13 @@ pub const PluginFlowDecls = struct {
         }
         self.allocator.free(self.pin_styles);
         self.pin_styles = &.{};
+        for (self.coercions) |co| {
+            self.allocator.free(co.module_import_path);
+            self.allocator.free(co.module_sanitized);
+            self.allocator.free(co.name);
+        }
+        self.allocator.free(self.coercions);
+        self.coercions = &.{};
     }
 };
 
@@ -381,12 +415,13 @@ fn extractConstructsString(allocator: std.mem.Allocator, src: []const u8) ?[]u8 
     return null;
 }
 
-/// Walk one `.zig` source buffer for `pub const FlowNodes` and
-/// `pub const PinStyles` decls, appending each discovered nested
-/// member to the corresponding output list. The two outputs share
-/// the same `module_import_path` / `module_sanitized` / `is_script`
-/// values (passed in by the caller), so the per-module identification
-/// is decided once at the call site rather than re-derived per entry.
+/// Walk one `.zig` source buffer for `pub const FlowNodes`,
+/// `pub const PinStyles`, and `pub const Coercions` decls, appending
+/// each discovered nested member to the corresponding output list.
+/// The three outputs share the same `module_import_path` /
+/// `module_sanitized` / `is_script` values (passed in by the caller),
+/// so the per-module identification is decided once at the call site
+/// rather than re-derived per entry.
 ///
 /// Buffer is the file contents; the caller owns it. The parsed AST
 /// is local to this function; only `allocator.dupe`d strings outlive
@@ -399,6 +434,7 @@ fn scanFlowDeclsInSource(
     is_script: bool,
     flow_nodes_out: *std.ArrayList(PluginFlowNode),
     pin_styles_out: *std.ArrayList(PluginPinStyle),
+    coercions_out: *std.ArrayList(PluginCoercion),
 ) !void {
     const src_z = try allocator.dupeZ(u8, src);
     defer allocator.free(src_z);
@@ -419,7 +455,8 @@ fn scanFlowDeclsInSource(
 
         const is_flow_nodes = std.mem.eql(u8, decl_name, "FlowNodes");
         const is_pin_styles = std.mem.eql(u8, decl_name, "PinStyles");
-        if (!is_flow_nodes and !is_pin_styles) continue;
+        const is_coercions = std.mem.eql(u8, decl_name, "Coercions");
+        if (!is_flow_nodes and !is_pin_styles and !is_coercions) continue;
 
         const init_node = vd.ast.init_node.unwrap() orelse continue;
         const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
@@ -455,11 +492,28 @@ fn scanFlowDeclsInSource(
                     .is_script = is_script,
                     .constructs = constructs_value,
                 });
-            } else {
+            } else if (is_pin_styles) {
                 try pin_styles_out.append(allocator, .{
                     .module_import_path = try allocator.dupe(u8, module_import_path),
                     .module_sanitized = try allocator.dupe(u8, module_sanitized),
                     .type_name = try allocator.dupe(u8, member_name),
+                    .is_script = is_script,
+                });
+            } else {
+                // Coercions block (RFC-FLOW-VOCABULARY §2 / O4).
+                // Same shape as FlowNodes — each member is a
+                // `labelle.flow.Coercion(.{ .impl = ... })` factory
+                // call; the assembler doesn't need to peer inside the
+                // call because the From/To types are resolved at
+                // comptime in the emitted alias and surfaced via
+                // reflection (`PluginCoercions.<qualified>.From` etc.).
+                // The flow_catalog sidecar (parallel walk in
+                // `flow_catalog.zig`) extracts the textual types for
+                // the editor's wire-fit check.
+                try coercions_out.append(allocator, .{
+                    .module_import_path = try allocator.dupe(u8, module_import_path),
+                    .module_sanitized = try allocator.dupe(u8, module_sanitized),
+                    .name = try allocator.dupe(u8, member_name),
                     .is_script = is_script,
                 });
             }
@@ -520,6 +574,15 @@ pub fn discoverPluginFlowDecls(
         }
         pin_styles.deinit(allocator);
     }
+    var coercions: std.ArrayList(PluginCoercion) = .empty;
+    errdefer {
+        for (coercions.items) |e| {
+            allocator.free(e.module_import_path);
+            allocator.free(e.module_sanitized);
+            allocator.free(e.name);
+        }
+        coercions.deinit(allocator);
+    }
 
     // ── Plugin pass ─────────────────────────────────────────────
     for (cfg.plugins) |plugin| {
@@ -544,6 +607,7 @@ pub fn discoverPluginFlowDecls(
             false, // is_script
             &flow_nodes,
             &pin_styles,
+            &coercions,
         ) catch continue; // tolerate per-plugin parse failures
     }
 
@@ -572,12 +636,14 @@ pub fn discoverPluginFlowDecls(
             true, // is_script
             &flow_nodes,
             &pin_styles,
+            &coercions,
         ) catch continue;
     }
 
     return .{
         .flow_nodes = try flow_nodes.toOwnedSlice(allocator),
         .pin_styles = try pin_styles.toOwnedSlice(allocator),
+        .coercions = try coercions.toOwnedSlice(allocator),
         .allocator = allocator,
     };
 }
@@ -1216,6 +1282,96 @@ pub fn writePluginPinStylesBlock(bw: anytype, pin_styles: []const PluginPinStyle
             );
         }
     }
+    try bw.writeAll("};\n\n");
+}
+
+/// Emit the `PluginCoercions` registry (RFC-FLOW-VOCABULARY §2 / O4).
+///
+/// One `pub const <module>__<name>` entry per discovered Coercion,
+/// aliased to the source-module decl so the `From` / `To` types and
+/// the `convert` function survive reflection. Plugins and game
+/// scripts use different `@import` forms — plugins resolve as
+/// `@import("<plugin>")`, game scripts as `@import("scripts/<rel>")`.
+///
+/// Plus a comptime `resolve` decl: given a dotted name like
+/// `"box2d.body_to_entity"`, returns the canonical qualified field
+/// name (`"box2d__body_to_entity"`) and a `@hasDecl(PluginCoercions,
+/// resolved)` check confirms membership. Same shape as
+/// `PluginFlowNodes.resolve`.
+///
+/// Plus a comptime `findByTypes(From, To)` helper: scans the registry
+/// for an entry whose `From` and `To` match the given types and
+/// returns its qualified name (or `null`). flow-codegen consumes this
+/// at edge emission to decide whether to wrap an expression in a
+/// `<plugin>__<name>.convert(...)` call.
+///
+/// Empty discovery (no plugins/game scripts declare `Coercions`)
+/// emits a `struct {}` with the stub helpers, so downstream
+/// reflection doesn't need an empty-case branch.
+pub fn writePluginCoercionsBlock(bw: anytype, coercions: []const PluginCoercion) !void {
+    try bw.writeAll("// --- Plugin coercions (RFC-FLOW-VOCABULARY §2 / O4) ---\n");
+    try bw.writeAll("// Discovered at assembler time from `pub const Coercions` on each\n");
+    try bw.writeAll("// plugin's `src/root.zig` AND each game-script module under\n");
+    try bw.writeAll("// `scripts/`. Each entry aliases the source decl directly so the\n");
+    try bw.writeAll("// `From` / `To` comptime decls + `convert` function pass through\n");
+    try bw.writeAll("// to flow-codegen's edge-wrap path (it consults `findByTypes` to\n");
+    try bw.writeAll("// decide when to wrap an expression in `<qualified>.convert(...)`).\n");
+    try bw.writeAll("pub const PluginCoercions = struct {\n");
+    for (coercions) |co| {
+        if (co.is_script) {
+            try bw.print(
+                "    pub const {s}__{s} = @import(\"scripts/{s}\").Coercions.{s};\n",
+                .{ co.module_sanitized, co.name, co.module_import_path, co.name },
+            );
+        } else {
+            try bw.print(
+                "    pub const {s}__{s} = @import(\"{s}\").Coercions.{s};\n",
+                .{ co.module_sanitized, co.name, co.module_import_path, co.name },
+            );
+        }
+    }
+    // Name resolver — same shape as `PluginFlowNodes.resolve` so flow-codegen's
+    // CustomNode lowering and coercion wrap path share an identical pattern.
+    try bw.writeAll("\n");
+    try bw.writeAll("    /// Comptime name resolver — given a dotted coercion name\n");
+    try bw.writeAll("    /// (`\"box2d.body_to_entity\"`), returns the canonical qualified\n");
+    try bw.writeAll("    /// identifier (`\"box2d__body_to_entity\"`) iff a matching decl\n");
+    try bw.writeAll("    /// exists on this struct, else `null`. Callers reach the entry\n");
+    try bw.writeAll("    /// value via `@field(PluginCoercions, resolved)`.\n");
+    try bw.writeAll("    pub fn resolve(comptime dotted: []const u8) ?[]const u8 {\n");
+    try bw.writeAll("        const dot = std.mem.indexOfScalar(u8, dotted, '.') orelse return null;\n");
+    try bw.writeAll("        const module = dotted[0..dot];\n");
+    try bw.writeAll("        const name = dotted[dot + 1 ..];\n");
+    try bw.writeAll("        if (name.len == 0) return null;\n");
+    try bw.writeAll("        const qualified = module ++ \"__\" ++ name;\n");
+    try bw.writeAll("        if (!@hasDecl(@This(), qualified)) return null;\n");
+    try bw.writeAll("        return qualified;\n");
+    try bw.writeAll("    }\n");
+    // Type-keyed lookup — the wire-fit rule asks "is there a coercion for
+    // (From, To)?". Scans all decls at comptime; tiny registries (≤ dozens)
+    // mean linear walk is the right shape.
+    try bw.writeAll("\n");
+    try bw.writeAll("    /// Comptime type-keyed lookup — scans every entry on this\n");
+    try bw.writeAll("    /// struct for one whose `.From == From` and `.To == To`. Returns\n");
+    try bw.writeAll("    /// its qualified decl name (the same string `resolve` would\n");
+    try bw.writeAll("    /// return) when found, else `null`. flow-codegen calls this at\n");
+    try bw.writeAll("    /// edge-emission time to decide whether a wire across mismatched\n");
+    try bw.writeAll("    /// types is accepted via a declared coercion (RFC §2 rule 3).\n");
+    try bw.writeAll("    pub fn findByTypes(comptime From: type, comptime To: type) ?[]const u8 {\n");
+    try bw.writeAll("        const decls = @typeInfo(@This()).@\"struct\".decls;\n");
+    try bw.writeAll("        inline for (decls) |d| {\n");
+    try bw.writeAll("            const entry = @field(@This(), d.name);\n");
+    try bw.writeAll("            const ET = @TypeOf(entry);\n");
+    try bw.writeAll("            // Skip non-coercion decls (e.g. the resolve/findByTypes fns\n");
+    try bw.writeAll("            // themselves and any future helpers). A coercion entry is a\n");
+    try bw.writeAll("            // struct value carrying the `__is_labelle_coercion` marker;\n");
+    try bw.writeAll("            // anything else (functions, plain ints, etc.) is filtered.\n");
+    try bw.writeAll("            if (@typeInfo(ET) != .@\"struct\") continue;\n");
+    try bw.writeAll("            if (!@hasDecl(ET, \"__is_labelle_coercion\")) continue;\n");
+    try bw.writeAll("            if (ET.From == From and ET.To == To) return d.name;\n");
+    try bw.writeAll("        }\n");
+    try bw.writeAll("        return null;\n");
+    try bw.writeAll("    }\n");
     try bw.writeAll("};\n\n");
 }
 
@@ -3331,6 +3487,12 @@ pub fn generateMainZigFromTemplate(
     // (flow-codegen phase 3, labelle-gui phase 4) can reflect uniformly.
     plugin_flow_nodes: []const PluginFlowNode,
     plugin_pin_styles: []const PluginPinStyle,
+    /// RFC-FLOW-VOCABULARY §2 / O4 — plugin-declared coercions. Same
+    /// shape contract as `plugin_flow_nodes` / `plugin_pin_styles`:
+    /// emitter writes a `PluginCoercions = struct {}` shell when this
+    /// slice is empty so downstream comptime reflection (flow-codegen
+    /// edge wrap, labelle-gui wire-fit check) stays uniform.
+    plugin_coercions: []const PluginCoercion,
 ) ![]const u8 {
     // Surface basename collisions at generate time, before any
     // code emission — otherwise two prefabs with the same filename
@@ -3839,6 +4001,11 @@ pub fn generateMainZigFromTemplate(
         const deduped_styles = try dedupePinStyles(allocator, plugin_pin_styles);
         defer allocator.free(deduped_styles);
         try writePluginPinStylesBlock(bw, deduped_styles);
+        // RFC-FLOW-VOCABULARY §2 / O4 — emit PluginCoercions next to
+        // the other registries. The block carries its own `resolve` +
+        // `findByTypes` helpers so flow-codegen + the editor can do
+        // the wire-fit lookup without re-iterating the decls.
+        try writePluginCoercionsBlock(bw, plugin_coercions);
 
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);

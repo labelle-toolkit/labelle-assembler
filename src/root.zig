@@ -665,6 +665,7 @@ pub fn generate(
             plugin_events.entries,
             plugin_flow_decls.flow_nodes,
             plugin_flow_decls.pin_styles,
+            plugin_flow_decls.coercions,
         );
         defer allocator.free(main_zig_content);
         try scanner.writeFile(target_dir, "main.zig", main_zig_content);
