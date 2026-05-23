@@ -23,8 +23,8 @@
         // landed in 1182a80; phases 1 / 2 in 602aebd (this repo) and
         // labelle-box2d 6c44691.
         .flow_codegen = .{
-            .url = "git+https://github.com/labelle-toolkit/flow-codegen#1b5e4604c69bd9ea4ffdd5be0c25c19a09574d3a",
-            .hash = "flow_codegen-0.1.0-PFKUpxpLAwAlACuzD5GymioOi7klJODu_viSj74NdkAr",
+            .url = "git+https://github.com/labelle-toolkit/flow-codegen#64baa555bbf4a4d861113b7a3ce71aa0ef75ff05",
+            .hash = "flow_codegen-0.1.0-PFKUp8q2AwDIb1AkFLQFpLYX1osK9gjNU87-WJxsSFF4",
         },
     },
     .paths = .{

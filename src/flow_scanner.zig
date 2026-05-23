@@ -207,13 +207,15 @@ pub fn scanAndEmit(
         // `setup()`-style raw-slot binding via module+callback) and
         // lifecycle flows (`OnTick`/`OnCreate`/`OnDestroy`/`OnCall`/
         // `OnUpdate`) keep the default `false` and are skipped.
-        // Every `OnEvent` flow is a new-form flow today — the legacy
-        // `module`+`callback`+`params` form was retired in flow-codegen
-        // `1b5e460` (RFC-PLUGIN-EVENTS phase 6) and `Event.OnEvent.name`
-        // is now a required, non-optional field. Lifecycle flows
-        // (`OnUpdate`/`OnCreate`/`OnDestroy`/`OnCall`) keep the default
-        // `false` and are skipped.
-        const has_event_handler = loaded.flow.event == .OnEvent;
+        const has_event_handler = blk: {
+            const ev = loaded.flow.event;
+            if (ev != .OnEvent) break :blk false;
+            // The new form is gated on `name` being set; the legacy
+            // form keeps `module`+`callback`. `buildEvent` in
+            // flow-codegen rejects mixed-form inputs, so a non-null
+            // `name` is sufficient to identify a new-form flow.
+            break :blk ev.OnEvent.name != null;
+        };
 
         // Lift the on-disk `priority` (RFC-PLUGIN-EVENTS O4 / phase 7,
         // labelle-core#16) onto the script entry so the receiver-tuple
