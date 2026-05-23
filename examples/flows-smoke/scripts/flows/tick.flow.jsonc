@@ -1,17 +1,30 @@
-// Flows end-to-end smoke fixture — an OnCreate flow that nudges
-// `Position.x`. Reads the entity's `Position`, adds `1.0`, writes the
-// sum back to `Position.x`. Authored in `.flow.jsonc` (JSON with
-// comments) per the FLOWS-JSONC RFC.
+// Flows end-to-end smoke fixture — v2 Event-node form per RFC-FLOW-
+// VOCABULARY Phase 6. Listens to `engine.entity_created`
+// (labelle-engine#578 lifecycle Events), reads the entity's Position,
+// nudges `.x` by `1.0`, and writes back. The entity rides the event
+// payload (`payload.entity`) — no in-scope `entity` identifier on
+// graph-form flows.
+//
+// Pre-Phase-6, this fixture used the legacy `event: { type: "OnCreate"
+// , arg_entity: "entity" }` header form. The legacy header's lifecycle
+// shapes (OnCreate / OnUpdate / OnDestroy / OnCall) are now collapsed
+// into the same graph-form vocabulary the rest of the toolkit's flows
+// use — one event source (the `Event` node), one entity source (the
+// event's `entity` payload field, materialized via an `Identifier`
+// node that references `payload.entity`).
 {
   "name": "tick",
-  "event": { "type": "OnCreate", "arg_entity": "entity" },
   "nodes": [
-    { "id": 1, "type": "GetComponent", "pos": [0, 0], "component": "Position" },
-    { "id": 2, "type": "Literal", "pos": [0, 0], "value": "1.0" },
-    { "id": 3, "type": "BinOp", "pos": [0, 0], "op": "add" },
-    { "id": 4, "type": "SetField", "pos": [0, 0], "target": "Position.x" }
+    { "id": 5, "type": "Event", "name": "engine.entity_created", "pos": [0, -120] },
+    { "id": 6, "type": "Identifier", "name": "payload.entity", "pos": [0, -40] },
+    { "id": 1, "type": "GetComponent", "pos": [0, 40], "component": "Position" },
+    { "id": 2, "type": "Literal", "pos": [0, 80], "value": "1.0" },
+    { "id": 3, "type": "BinOp", "pos": [0, 120], "op": "add" },
+    { "id": 4, "type": "SetField", "pos": [0, 160], "target": "Position.x" }
   ],
   "edges": [
+    { "from": { "node": 6, "pin": "value" }, "to": { "node": 1, "pin": "entity" } },
+    { "from": { "node": 6, "pin": "value" }, "to": { "node": 4, "pin": "entity" } },
     { "from": { "node": 1, "pin": "x" }, "to": { "node": 3, "pin": "a" } },
     { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
     { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "value" } }

@@ -44,14 +44,17 @@ test {
 /// keys on (RFC FLOWS-JSONC §1).
 const move_flow_body =
     \\{
-    \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
     \\  "nodes": [
+    \\    { "id": 5, "type": "Event", "name": "engine.entity_created", "pos": [0, -120] },
+    \\    { "id": 6, "type": "Identifier", "name": "payload.entity", "pos": [0, -40] },
     \\    { "id": 1, "type": "GetComponent", "pos": [0, 0], "component": "Position" },
     \\    { "id": 2, "type": "Literal", "pos": [0, 0], "value": "1.0" },
     \\    { "id": 3, "type": "BinOp", "pos": [0, 0], "op": "add" },
     \\    { "id": 4, "type": "SetField", "pos": [0, 0], "target": "Position.x" }
     \\  ],
     \\  "edges": [
+    \\    { "from": { "node": 6, "pin": "value" }, "to": { "node": 1, "pin": "entity" } },
+    \\    { "from": { "node": 6, "pin": "value" }, "to": { "node": 4, "pin": "entity" } },
     \\    { "from": { "node": 1, "pin": "x" }, "to": { "node": 3, "pin": "a" } },
     \\    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "b" } },
     \\    { "from": { "node": 3, "pin": "result" }, "to": { "node": 4, "pin": "value" } }
@@ -127,7 +130,13 @@ pub const FlowScanner = struct {
         // documented `@import("game")` shape rather than something
         // bespoke we'd have to special-case in main.zig wiring.
         try std.testing.expect(std.mem.indexOf(u8, source, "@import(\"game\")") != null);
-        try std.testing.expect(std.mem.indexOf(u8, source, "pub fn onCreate") != null);
+        // Post Phase 6 (RFC-FLOW-VOCABULARY): the move fixture is an
+        // Event-node-form flow (Event node listening to
+        // `engine.entity_created`), so codegen emits a
+        // `FlowEventHandler` struct with an `engine__entity_created`
+        // dispatch method rather than the legacy lifecycle entry.
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const FlowEventHandler = struct") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub fn engine__entity_created") != null);
 
         // `std.zig.Ast.parse` requires a sentinel-terminated slice
         // — copy onto a [:0]u8 so the parser's tokenizer is happy.
@@ -187,8 +196,8 @@ pub const FlowScanner = struct {
         // errors rather than swallowing them.
         const bad =
             \\{
-            \\  "event": { "type": "OnCreate", "arg_entity": "entity" },
             \\  "nodes": [
+            \\    { "id": 99, "type": "Event", "name": "engine.entity_created", "pos": [0, 0] },
             \\    { "id": 1, "type": "Identifier", "pos": [0, 0], "name": "a" },
             \\    { "id": 1, "type": "Identifier", "pos": [0, 0], "name": "b" }
             \\  ],
@@ -234,7 +243,10 @@ pub const FlowScanner = struct {
         defer allocator.free(out_path);
         const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, out_path, allocator, .limited(64 * 1024));
         defer allocator.free(source);
-        try std.testing.expect(std.mem.indexOf(u8, source, "pub fn onCreate") != null);
+        // Post Phase 6 (RFC-FLOW-VOCABULARY): the fixture flow is
+        // Event-node-form, so codegen emits a `FlowEventHandler` rather
+        // than a lifecycle entry function.
+        try std.testing.expect(std.mem.indexOf(u8, source, "pub const FlowEventHandler = struct") != null);
     }
 
     test "ignores non-.flow.jsonc files in scripts/flows/" {
@@ -868,23 +880,21 @@ pub const FlowSortOrder = struct {
 
 // ── RFC-PLUGIN-EVENTS phase 4 (labelle-assembler#175) ───────────────────
 //
-// `flow_scanner` flips `ScriptEntry.has_event_handler` on new-form
-// `OnEvent` flows (those whose `event.OnEvent.name` is set —
-// `flow_io.zig:333-360` validates the form) so the assembler's
-// `game_hooks_block` / `hooks_init_block` emit knows which entries
-// own a `pub const FlowEventHandler = struct { ... };` decl
-// (flow-codegen `1182a80`, `codegen.zig:654-752`). Lifecycle flows
-// (`OnCreate` / `OnUpdate` / `OnDestroy` / `OnCall`) and legacy
-// `OnEvent` (still `setup()`-style raw-slot binding via
-// `module`+`callback`) keep the default `false` and stay out of the
+// `flow_scanner` flips `ScriptEntry.has_event_handler` on Event-driven
+// flows (every flow whose resolved `Flow.event` is `.OnEvent` —
+// synthesized by `flow_codegen` from an in-graph `Event` node) so the
+// assembler's `game_hooks_block` / `hooks_init_block` emit knows which
+// entries own a `pub const FlowEventHandler = struct { ... };` decl
+// (flow-codegen `codegen.zig` `renderNewFormEventEntry`). `OnCall`
+// subgraph entry points keep the default `false` and stay out of the
 // receiver tuple. These tests pin the marker behaviour so phase 4's
 // `GameHooks` wiring picks up the right entries.
 
 const new_form_on_event_flow_body =
     \\{
     \\  "name": "hit_counter",
-    \\  "event": { "type": "OnEvent", "name": "box2d.collision_begin" },
     \\  "nodes": [
+    \\    { "id": 99, "type": "Event", "name": "box2d.collision_begin", "pos": [0, 0] },
     \\    { "id": 1, "type": "Literal", "pos": [0, 0], "value": "1.0" },
     \\    { "id": 2, "type": "Output", "pos": [0, 0], "name": "out", "value_type": "f32" }
     \\  ],
@@ -895,8 +905,28 @@ const new_form_on_event_flow_body =
     \\
 ;
 
+// An `OnCall` subgraph entry — referenced by `Subflow` nodes, not
+// dispatched by an event. Its `FlowEventHandler` marker stays `false`
+// even after Phase 6 retires lifecycle headers, so it makes a good
+// negative case alongside the new-form event flow.
+const oncall_subgraph_flow_body =
+    \\{
+    \\  "name": "compute",
+    \\  "event": { "type": "OnCall" },
+    \\  "params": [ { "name": "x", "type": "f32" } ],
+    \\  "nodes": [
+    \\    { "id": 1, "type": "Param", "pos": [0, 0], "param": "x" },
+    \\    { "id": 2, "type": "Output", "pos": [0, 0], "name": "out", "value_type": "f32" }
+    \\  ],
+    \\  "edges": [
+    \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+    \\  ]
+    \\}
+    \\
+;
+
 pub const FlowEventHandlerMarker = struct {
-    test "new-form OnEvent flow sets ScriptEntry.has_event_handler = true" {
+    test "Event-node-form flow sets ScriptEntry.has_event_handler = true" {
         const allocator = std.testing.allocator;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -905,27 +935,28 @@ pub const FlowEventHandlerMarker = struct {
         defer allocator.free(fx.game_dir);
         defer allocator.free(fx.target_dir);
 
-        // Plant a new-form `OnEvent` flow next to the lifecycle `move`
-        // flow `setupFixture` ships. The new-form flow carries `name`
-        // (RFC §7), so flow-codegen's `renderNewFormEventEntry` emits a
-        // `pub const FlowEventHandler` decl and flow_scanner flips the
-        // marker.
+        // Plant an Event-node-form flow alongside the `move` flow the
+        // fixture ships (also Event-node-form, post-Phase 6). Both
+        // flows declare an in-graph `Event` node, so flow-codegen's
+        // `renderNewFormEventEntry` emits `pub const FlowEventHandler`
+        // for each and flow_scanner flips the marker.
         try writeSample(tmp.dir, "game/scripts/flows/hit_counter.flow.jsonc", new_form_on_event_flow_body);
+        // Also plant an `OnCall` subgraph — its marker stays `false`
+        // (subgraphs aren't event-driven, no `FlowEventHandler`).
+        try writeSample(tmp.dir, "game/scripts/flows/compute.flow.jsonc", oncall_subgraph_flow_body);
 
         var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir);
         defer result.deinit();
 
-        // Two entries. `hit_counter` is the new-form OnEvent flow,
-        // `move` is the lifecycle OnCreate flow from the fixture.
-        try std.testing.expectEqual(@as(usize, 2), result.entries.len);
+        // Three entries: `hit_counter` + `move` (both Event-node-form)
+        // and `compute` (OnCall subgraph).
+        try std.testing.expectEqual(@as(usize, 3), result.entries.len);
         for (result.entries) |entry| {
-            if (std.mem.eql(u8, entry.name, "hit_counter")) {
-                try std.testing.expect(entry.has_event_handler);
-            } else {
-                // Lifecycle (OnCreate) flow — no `FlowEventHandler`
-                // decl, stays out of the receiver tuple.
-                try std.testing.expectEqualStrings("move", entry.name);
+            if (std.mem.eql(u8, entry.name, "compute")) {
+                // OnCall subgraph — no `FlowEventHandler` decl.
                 try std.testing.expect(!entry.has_event_handler);
+            } else {
+                try std.testing.expect(entry.has_event_handler);
             }
         }
     }

@@ -198,35 +198,27 @@ pub fn scanAndEmit(
         // relative path (`enemy/patrol.zig`, not the bare `patrol.zig`
         // basename) so two flows that share a stem across subdirectories
         // stay distinguishable in diagnostics.
-        // New-form `OnEvent` flows are the ones flow-codegen `1182a80`
-        // emits a `pub const FlowEventHandler` decl for (renderNewFormEventEntry
-        // in flow-codegen/src/codegen.zig:654). Mark them so phase 4's
-        // assembler wiring (`main_zig.zig` game_hooks/hooks_init blocks)
-        // can pick them out and append a `*FlowEventHandler` into the
-        // `GameHooks` receiver tuple. Legacy `OnEvent` (still
-        // `setup()`-style raw-slot binding via module+callback) and
-        // lifecycle flows (`OnTick`/`OnCreate`/`OnDestroy`/`OnCall`/
-        // `OnUpdate`) keep the default `false` and are skipped.
-        const has_event_handler = blk: {
-            const ev = loaded.flow.event;
-            if (ev != .OnEvent) break :blk false;
-            // The new form is gated on `name` being set; the legacy
-            // form keeps `module`+`callback`. `buildEvent` in
-            // flow-codegen rejects mixed-form inputs, so a non-null
-            // `name` is sufficient to identify a new-form flow.
-            break :blk ev.OnEvent.name != null;
-        };
+        // Event-driven flows emit a `pub const FlowEventHandler` decl
+        // (renderNewFormEventEntry in flow-codegen/src/codegen.zig).
+        // Mark them so phase 4's assembler wiring (`main_zig.zig`
+        // game_hooks/hooks_init blocks) can pick them out and append a
+        // `*FlowEventHandler` into the `GameHooks` receiver tuple.
+        // `OnCall` subgraph entry points keep the default `false` and
+        // are skipped. Post Phase 6 (RFC-FLOW-VOCABULARY) the only way
+        // to produce an `OnEvent` event is from an in-graph `Event`
+        // node — the legacy header form (lifecycle + bare `OnEvent`)
+        // is gone — so the `event == .OnEvent` check is now sufficient.
+        const has_event_handler = loaded.flow.event == .OnEvent;
 
         // Lift the on-disk `priority` (RFC-PLUGIN-EVENTS O4 / phase 7,
         // labelle-core#16) onto the script entry so the receiver-tuple
         // sort in `main_zig.writeGameHooksAndInit` can find it without
-        // re-parsing the flow. Only meaningful for new-form `OnEvent`
-        // flows (lifecycle / legacy forms don't subscribe to a
-        // consumable event); we still read it on every parsed flow to
-        // keep the data flow uniform — a priority on a non-`OnEvent`
-        // flow is silently ignored downstream (the entry's
-        // `has_event_handler = false` keeps it out of the receiver
-        // tuple entirely).
+        // re-parsing the flow. Post Phase 6, priority is unreachable
+        // from `.flow.jsonc` (it lived on the retired `event:` header
+        // — Event nodes don't carry a priority field), so this reads
+        // `null` for every parsed flow today. The field is kept so the
+        // tuple sort keeps working should priority gain a graph-form
+        // expression later.
         const event_priority: ?i32 = if (loaded.flow.event == .OnEvent)
             loaded.flow.event.OnEvent.priority
         else
