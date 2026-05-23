@@ -437,7 +437,14 @@ pub const GameModuleBinding = struct {
     }
 
     test "game.zig shim re-exports Game and EntityId from labelle-engine" {
-        const src = generator.game_shim_source;
+        const allocator = std.testing.allocator;
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        };
+        const src = try generator.generateGameShim(allocator, cfg);
+        defer allocator.free(src);
 
         // `@import("game")` users expect both decls at the root.
         try std.testing.expect(std.mem.indexOf(u8, src, "pub const Game") != null);
@@ -447,6 +454,48 @@ pub const GameModuleBinding = struct {
         // codegen-emitted flow files assume `Game` / `EntityId` have
         // the engine's hook semantics.
         try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"labelle-engine\")") != null);
+
+        // No plugins → no `PluginEvents` block. The shim stays a tiny
+        // re-export of `Game`/`EntityId`; only projects with plugins
+        // (and the resolver phase 3 needs) get the union.
+        try std.testing.expect(std.mem.indexOf(u8, src, "PluginEvents") == null);
+    }
+
+    test "game.zig shim re-exports PluginEvents when plugins are declared" {
+        // RFC-PLUGIN-EVENTS phase 3 shim caveat: new-form `OnEvent`
+        // flow handlers reflect against `@FieldType(game.PluginEvents,
+        // "<tag>")`, so the `game.zig` shim must expose the union next
+        // to `Game`/`EntityId`. With plugins, the shim's emitted block
+        // is the same comptime walk `writePluginEventsBlock` writes
+        // into `main.zig`.
+        const allocator = std.testing.allocator;
+        const cfg: generator.ProjectConfig = .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{
+                .{ .name = "box2d", .repo = "@plugins/box2d", .version = "0.0.0" },
+            },
+        };
+        const src = try generator.generateGameShim(allocator, cfg);
+        defer allocator.free(src);
+
+        // The static prelude still re-exports the engine types verbatim.
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const Game") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const EntityId") != null);
+
+        // The plugin-events block — shape-pinned by the same union the
+        // assembler emits into `main.zig`. flow-codegen's resolver
+        // reflects on this union, so the shim must spell `pub const
+        // PluginEvents` and import the plugin module by its declared
+        // name.
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const PluginEvents = blk: {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"box2d\")") != null);
+        // Qualified-tag mapping is mechanical: `<plugin>.<event>` →
+        // `<plugin>__<event>`. The shim builds the tag the same way
+        // `main.zig` does, so the resolver consumes a single canonical
+        // form.
+        try std.testing.expect(std.mem.indexOf(u8, src, "\"__\"") != null);
     }
 };
 

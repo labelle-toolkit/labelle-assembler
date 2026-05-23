@@ -485,7 +485,7 @@ fn writePluginControllersBlock(bw: anytype, cfg: ProjectConfig) !void {
 /// produce duplicate variant names, which `MergeHookPayloads`'
 /// duplicate-field check (`labelle-core/src/dispatcher.zig:158-163`)
 /// already rejects with a compile error.
-fn writePluginEventsBlock(bw: anytype, cfg: ProjectConfig) !void {
+pub fn writePluginEventsBlock(bw: anytype, cfg: ProjectConfig) !void {
     try bw.writeAll("// --- Plugin events (RFC-PLUGIN-EVENTS phase 1) ---\n");
     try bw.writeAll("// Discovered at comptime from `pub const Events` on each plugin\n");
     try bw.writeAll("// module — same convention as Components/Systems/GizmoCategories.\n");
@@ -2887,6 +2887,16 @@ pub fn generateMainZigFromTemplate(
     // than a JSON sidecar): `@FieldType(PluginEvents, "<tag>")` and
     // `@typeInfo(...).@"struct".fields` give the payload field list
     // without a separate registry file to keep in sync.
+    //
+    // **Phase 3 follow-up:** the engine's `Game.emit(event: GameEvents)`
+    // accepts a single union type, but plugins (RFC-PLUGIN-EVENTS phase
+    // 2, e.g. labelle-box2d 6c44691) now `game.emit(.{ .box2d__... = .{...} })`.
+    // So when plugins declare events, the *template parameter* fed to
+    // `GameConfig` is the union of `GameEvents` and `PluginEvents` (built
+    // by `core.MergeHookPayloads`) — emitted here as `MergedGameEvents`
+    // and substituted in the `GameConfig(..., GameEvents)` slot of the
+    // engine main template. Same merged-payload substrate the engine's
+    // own hook dispatch (`AllHookPayloads`) already uses.
     {
         var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
         errdefer alloc_writer_b.deinit();
@@ -2905,6 +2915,29 @@ pub fn generateMainZigFromTemplate(
         }
         if (cfg.plugins.len > 0) {
             try writePluginEventsBlock(bw, cfg);
+        }
+        // `MergedGameEvents` is the `GameEvents` parameter actually fed
+        // into `GameConfig`. Resolution rules — picked so the engine's
+        // `has_events = GameEvents != void` check keeps its existing
+        // semantics for unaffected projects:
+        //
+        //   - no plugins, no game events     → `void` (no behaviour change)
+        //   - game events only               → the `GameEvents` union
+        //   - plugins only                   → `PluginEvents`
+        //   - both                           → `MergeHookPayloads(.{ GameEvents, PluginEvents })`
+        //
+        // `MergeHookPayloads` rejects a `void` input, hence the per-case
+        // dispatch rather than always merging.
+        const has_plugin_events_local = cfg.plugins.len > 0;
+        const has_game_events_local = event_names.len > 0;
+        if (!has_plugin_events_local and !has_game_events_local) {
+            try bw.writeAll("pub const MergedGameEvents = void;\n\n");
+        } else if (has_plugin_events_local and has_game_events_local) {
+            try bw.writeAll("pub const MergedGameEvents = engine.core.MergeHookPayloads(.{ GameEvents, PluginEvents });\n\n");
+        } else if (has_plugin_events_local) {
+            try bw.writeAll("pub const MergedGameEvents = PluginEvents;\n\n");
+        } else {
+            try bw.writeAll("pub const MergedGameEvents = GameEvents;\n\n");
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);

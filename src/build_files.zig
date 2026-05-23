@@ -165,6 +165,13 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
                 if (std.mem.eql(u8, plugin.name, sibling.name)) continue;
                 try w.print("    overrideImport(plugin_{s}_mod, \"{s}\", plugin_{s}_mod);\n", .{ plugin.name, sibling.name, sibling.name });
             }
+
+            // `game.zig` shim re-exports `PluginEvents` (RFC-PLUGIN-EVENTS
+            // phase 3) — wire each plugin into `game_mod` so the shim's
+            // `@import("<plugin>")` resolves. `overrideImport` is a no-op
+            // when the shim doesn't import the plugin (project with no
+            // plugins), so wiring every plugin is safe.
+            try w.print("    overrideImport(game_mod, \"{s}\", plugin_{s}_mod);\n", .{ plugin.name, plugin.name });
         }
     }
 
