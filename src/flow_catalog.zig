@@ -240,6 +240,29 @@ pub fn emitFlowCatalogSidecar(
 
     var groups: std.ArrayList(ModuleGroup) = .empty;
 
+    // ── Engine pass (labelle-engine#578) ────────────────────────
+    // The engine declares `pub const Events` for lifecycle hooks
+    // (game_init, tick, entity_created, …). Walk the engine's
+    // `src/root.zig` the same way the plugin loop walks each plugin
+    // so the sidecar has an `engine` palette section alongside
+    // `box2d`, `pathfinder`, etc. Unresolvable engine paths (older
+    // cached versions without an `Events` decl) silently no-op —
+    // back-compat with projects pinned to pre-578 engine releases.
+    blk_engine: {
+        const engine_dir = cache.resolveFrameworkPackage(
+            aa,
+            "engine",
+            cfg.engine_version,
+            project_dir,
+        ) catch break :blk_engine;
+        const root_path = std.fs.path.join(aa, &.{ engine_dir, "src", "root.zig" }) catch break :blk_engine;
+        const io = config.globalIo();
+        const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, aa, .limited(8 * 1024 * 1024)) catch break :blk_engine;
+        if (try discoverInSource(aa, src, "engine")) |group| {
+            try groups.append(aa, group);
+        }
+    }
+
     // ── Plugin pass ─────────────────────────────────────────────
     for (cfg.plugins) |plugin| {
         const plugin_dir = cache.resolvePlugin(aa, plugin, project_dir) catch continue;
