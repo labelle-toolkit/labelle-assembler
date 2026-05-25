@@ -430,7 +430,21 @@ pub const SOKOL = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "runner.deinit()") != null);
     }
 
-    test "initial_scene overrides default jsonc_scene_names[0]" {
+    test "initial_prefab overrides default jsonc_scene_names[0]" {
+        const jsonc_scenes = &[_][]const u8{ "intro", "main_menu", "gameplay" };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .initial_prefab = "main_menu",
+        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"main_menu\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"intro\")") == null);
+    }
+
+    test "initial_scene legacy alias still overrides default jsonc_scene_names[0]" {
         const jsonc_scenes = &[_][]const u8{ "intro", "main_menu", "gameplay" };
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
@@ -442,6 +456,31 @@ pub const SOKOL = struct {
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"main_menu\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"intro\")") == null);
+    }
+
+    test "initial_prefab wins over deprecated initial_scene when both set" {
+        var cfg = generate.ProjectConfig{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .initial_prefab = "main_menu",
+            .initial_scene = "intro",
+        };
+        cfg.normalizeInitialPrefab();
+        try std.testing.expectEqualStrings("main_menu", cfg.resolvedInitialPrefab().?);
+        try std.testing.expect(cfg.initial_scene == null);
+    }
+
+    test "normalizeInitialPrefab migrates legacy initial_scene" {
+        var cfg = generate.ProjectConfig{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .initial_scene = "intro",
+        };
+        cfg.normalizeInitialPrefab();
+        try std.testing.expectEqualStrings("intro", cfg.initial_prefab.?);
+        try std.testing.expect(cfg.initial_scene == null);
     }
 
     test "resolved_gui with lifecycle generates init in callback and shutdown in cleanup" {

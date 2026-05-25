@@ -1784,7 +1784,7 @@ fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_
             try w.print("    g.setState(\"{s}\");\n", .{cfg.states[0]});
         }
 
-        const initial = cfg.initial_scene orelse jsonc_scene_names[0];
+        const initial = cfg.resolvedInitialPrefab() orelse jsonc_scene_names[0];
         try w.print("    try g.setScene(\"{s}\");\n", .{initial});
         try w.writeByte('\n');
     }
@@ -3151,7 +3151,7 @@ fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc
             try w.print("    g.setState(\"{s}\");\n", .{cfg.states[0]});
         }
 
-        const initial = cfg.initial_scene orelse jsonc_scene_names[0];
+        const initial = cfg.resolvedInitialPrefab() orelse jsonc_scene_names[0];
         try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
     }
 
