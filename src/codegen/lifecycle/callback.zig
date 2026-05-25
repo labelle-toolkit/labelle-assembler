@@ -257,21 +257,21 @@ pub fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig
 /// `self`. Standalone functions above stay `pub` for the test surface
 /// (`test/tests.zig`'s `buildCallbackInitCode` shape assertion).
 pub fn Mixin(comptime Self: type) type {
+    // Capture the enclosing file's namespace so the same-name methods
+    // below can reach the standalone bodies without shadowing recursion.
+    // `@This()` evaluated here (in the factory body, outside the returned
+    // struct) resolves to the file namespace; survives file renames that
+    // an `@import("self.zig")` workaround would silently break.
+    const file = @This();
     return struct {
         pub fn buildCallbackInitCode(self: *Self) ![]const u8 {
-            return impl.buildCallbackInitCode(self.allocator, self.cfg, self.jsonc_scene_names, self.prefab_names);
+            return file.buildCallbackInitCode(self.allocator, self.cfg, self.jsonc_scene_names, self.prefab_names);
         }
         pub fn buildImmersiveEntryCode(self: *Self) ![]const u8 {
-            return impl.buildImmersiveEntryCode(self.allocator, self.cfg);
+            return file.buildImmersiveEntryCode(self.allocator, self.cfg);
         }
         pub fn buildCallbackCleanupCode(self: *Self) ![]const u8 {
-            return impl.buildCallbackCleanupCode(self.allocator, self.cfg);
+            return file.buildCallbackCleanupCode(self.allocator, self.cfg);
         }
     };
 }
-
-const impl = struct {
-    pub const buildCallbackInitCode = @import("callback.zig").buildCallbackInitCode;
-    pub const buildImmersiveEntryCode = @import("callback.zig").buildImmersiveEntryCode;
-    pub const buildCallbackCleanupCode = @import("callback.zig").buildCallbackCleanupCode;
-};

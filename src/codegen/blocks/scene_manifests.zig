@@ -96,20 +96,21 @@ pub fn writeSceneAssetManifests(
 /// instead of re-threading those two slices into every call site.
 /// Standalone functions above stay `pub` for the test surface.
 pub fn Mixin(comptime Self: type) type {
+    // Capture the enclosing file's namespace so the same-name methods
+    // below can reach the standalone bodies without shadowing recursion.
+    // `@This()` evaluated here (in the factory body, outside the returned
+    // struct) resolves to the file namespace; survives file renames that
+    // an `@import("self.zig")` workaround would silently break.
+    const file = @This();
     return struct {
         pub fn writeSceneAssetManifests(self: *Self, w: anytype, ident_buf: *[256]u8) !void {
-            return impl.writeSceneAssetManifests(w, self.jsonc_scene_names, self.scene_manifests, ident_buf);
+            return file.writeSceneAssetManifests(w, self.jsonc_scene_names, self.scene_manifests, ident_buf);
         }
         pub fn writeSceneInitialStateManifests(self: *Self, w: anytype) !void {
-            return impl.writeSceneInitialStateManifests(w, self.jsonc_scene_names, self.scene_manifests);
+            return file.writeSceneInitialStateManifests(w, self.jsonc_scene_names, self.scene_manifests);
         }
     };
 }
-
-const impl = struct {
-    pub const writeSceneAssetManifests = @import("scene_manifests.zig").writeSceneAssetManifests;
-    pub const writeSceneInitialStateManifests = @import("scene_manifests.zig").writeSceneInitialStateManifests;
-};
 
 /// Emit the `SceneInitialStateManifests` comptime struct that exposes each
 /// scene's declared `initial_state:` to labelle-engine's setSceneInitialState

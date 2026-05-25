@@ -412,26 +412,21 @@ pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
 /// stay `pub` for the test surface (`test/tests.zig`) and
 /// `root.zig` re-exports.
 pub fn Mixin(comptime Self: type) type {
+    // Capture the enclosing file's namespace so the same-name methods
+    // below can reach the standalone bodies without shadowing recursion.
+    // `@This()` evaluated here (in the factory body, outside the returned
+    // struct) resolves to the file namespace; survives file renames that
+    // an `@import("self.zig")` workaround would silently break.
+    const file = @This();
     return struct {
         pub fn writeImageBackendWiring(_: *Self, w: anytype, indent: []const u8) !void {
-            return impl.writeImageBackendWiring(w, indent);
+            return file.writeImageBackendWiring(w, indent);
         }
         pub fn writeAudioBackendWiring(_: *Self, w: anytype, indent: []const u8) !void {
-            return impl.writeAudioBackendWiring(w, indent);
+            return file.writeAudioBackendWiring(w, indent);
         }
         pub fn writeFontBackendWiring(_: *Self, w: anytype, indent: []const u8) !void {
-            return impl.writeFontBackendWiring(w, indent);
+            return file.writeFontBackendWiring(w, indent);
         }
     };
 }
-
-// Namespaced re-bind of the standalone bodies so the mixin's
-// same-name methods can reach them without shadowing recursion.
-// (Naming the nested mixin methods the same as the standalone
-// functions is intentional — that's the public dispatch contract;
-// the indirection here is just to break the inner-scope shadow.)
-const impl = struct {
-    pub const writeImageBackendWiring = @import("asset_wiring.zig").writeImageBackendWiring;
-    pub const writeAudioBackendWiring = @import("asset_wiring.zig").writeAudioBackendWiring;
-    pub const writeFontBackendWiring = @import("asset_wiring.zig").writeFontBackendWiring;
-};

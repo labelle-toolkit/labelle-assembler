@@ -120,13 +120,15 @@ pub fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
 /// and for direct calls from `lifecycle_loop` / `lifecycle_callback`'s
 /// loop bodies.
 pub fn Mixin(comptime Self: type) type {
+    // Capture the enclosing file's namespace so the same-name method
+    // below can reach the standalone body without shadowing recursion.
+    // `@This()` evaluated here (in the factory body, outside the returned
+    // struct) resolves to the file namespace; survives file renames that
+    // an `@import("self.zig")` workaround would silently break.
+    const file = @This();
     return struct {
         pub fn emitResourceLoad(_: *Self, w: anytype, res: ResourceDef, style: LoadStyle) !void {
-            return impl.emitResourceLoad(w, res, style);
+            return file.emitResourceLoad(w, res, style);
         }
     };
 }
-
-const impl = struct {
-    pub const emitResourceLoad = @import("resource_loader.zig").emitResourceLoad;
-};
