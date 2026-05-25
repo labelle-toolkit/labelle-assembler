@@ -14,6 +14,7 @@ const cache = @import("cache.zig");
 const script_scanner = @import("script_scanner.zig");
 const scene_manifest = @import("scene_manifest.zig");
 const scan = @import("codegen/scan.zig");
+const idents = @import("codegen/idents.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const PluginDep = config.PluginDep;
@@ -47,6 +48,18 @@ pub const dedupePinStyles = scan.dedupePinStyles;
 // move out in a later cut, this private alias goes with them.
 const sanitizePluginIdent = scan.sanitizePluginIdent;
 const pathToIdent = scan.pathToIdent;
+
+// Identifier / string-emit helpers extracted to `src/codegen/idents.zig`
+// in the second cut of the refactor (see docs/REFACTOR-PLAN-main-zig.md).
+// Kept as private aliases so existing call sites in this file
+// (`extWithoutDot(res.sound)`, `pathToPascal(name, &buf)`, …) don't
+// have to be sprinkled with `idents.` prefixes; the new module file is
+// the source of truth and these aliases vanish when each consuming
+// block writer / validator moves out.
+const extWithoutDot = idents.extWithoutDot;
+const isValidZigIdentifier = idents.isValidZigIdentifier;
+const writeZigString = idents.writeZigString;
+const pathToPascal = idents.pathToPascal;
 
 /// Validate that no two prefab paths collapse to the same basename.
 /// Returns a heap-allocated error message on collision (caller
@@ -785,40 +798,6 @@ pub fn writePluginCoercionsBlock(bw: anytype, coercions: []const PluginCoercion)
 ///   sokol-callback host has no error channel to unwind into. Emits
 ///   `g.loadXxxFromMemory(...) catch @panic("failed to load ...");`.
 const LoadStyle = enum { try_style, catch_panic_style };
-
-/// Strip the leading dot from a path extension. `".wav"` → `"wav"`,
-/// `""` / `"."` → `""`. Matches the contract of
-/// `Game.registerSoundFromMemory` / `registerFontFromMemory`'s
-/// `file_type` parameter (lower-case extension without the dot).
-fn extWithoutDot(path: []const u8) []const u8 {
-    const ext = std.fs.path.extension(path);
-    if (ext.len <= 1) return "";
-    return ext[1..];
-}
-
-/// Returns true iff `name` is a valid bare Zig identifier — first
-/// character `[A-Za-z_]`, rest `[A-Za-z0-9_]`. Doesn't reject Zig
-/// keywords; in practice resource names like `fn` are vanishingly
-/// rare and the resulting compile error names the line clearly.
-///
-/// Font resources need this guard because `emitResourceLoad` for
-/// `.font` interpolates the resource name into Zig identifier
-/// positions (`{name}_ranges`, `{name}_params`) — a hyphenated name
-/// like `"ui-font"` would generate `const ui-font_ranges = ...`, which
-/// is uncompilable. Atlas + sound emissions only place names inside
-/// string literals so they're unaffected. Bugbot caught the gap on
-/// #105.
-fn isValidZigIdentifier(name: []const u8) bool {
-    if (name.len == 0) return false;
-    const first = name[0];
-    const first_ok = (first >= 'A' and first <= 'Z') or (first >= 'a' and first <= 'z') or first == '_';
-    if (!first_ok) return false;
-    for (name[1..]) |c| {
-        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_';
-        if (!ok) return false;
-    }
-    return true;
-}
 
 /// Emit the loader call for one `ResourceDef`, dispatching on
 /// `res.kind()`:
@@ -2578,21 +2557,6 @@ fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
     return arr_list.toOwnedSlice(allocator);
 }
 
-/// Write a Zig double-quoted string literal for `s`, escaping `\` and `"` so
-/// that asset names or scene names containing those characters produce valid
-/// generated source rather than a compile error.
-fn writeZigString(w: anytype, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            else => try w.writeByte(c),
-        }
-    }
-    try w.writeByte('"');
-}
-
 /// Emit the `SceneAssetManifests` comptime struct that exposes each scene's
 /// declared `assets:` array to labelle-engine. The format is the codegen
 /// contract for the SceneEntry.assets consumer (labelle-engine issue #445):
@@ -2706,33 +2670,6 @@ fn writeSceneInitialStateManifests(
     try w.writeAll("};\n");
 }
 
-
-/// Derive a PascalCase type name from a script/component path:
-/// `jump_anim` -> `JumpAnim`, `enemy/patrol` -> `EnemyPatrol`,
-/// `health.zig` -> `Health`. Every non-alphanumeric byte (`_`, `/`,
-/// `.`, `+`, …) is treated as a word boundary.
-///
-/// Distinct from `pathToIdent`, which builds a *unique* identifier
-/// (issue #172) and so must *escape* separators rather than collapse
-/// them — feeding `pathToIdent`'s output here would turn `jump_anim`
-/// into `JumpUAnim` (the `_u_` underscore-escape leaks through).
-fn pathToPascal(name: []const u8, pascal_buf: *[128]u8) []const u8 {
-    const end = if (std.mem.endsWith(u8, name, ".zig")) name.len - 4 else name.len;
-    var i: usize = 0;
-    var capitalize_next = true;
-    for (name[0..end]) |c| {
-        switch (c) {
-            'A'...'Z', 'a'...'z', '0'...'9' => {
-                if (i >= pascal_buf.len) break;
-                pascal_buf[i] = if (capitalize_next) std.ascii.toUpper(c) else c;
-                i += 1;
-                capitalize_next = false;
-            },
-            else => capitalize_next = true,
-        }
-    }
-    return pascal_buf[0..i];
-}
 
 // ── Template-based generation (engine provides main.zig.template) ────────
 
