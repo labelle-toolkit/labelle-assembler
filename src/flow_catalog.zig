@@ -68,6 +68,23 @@
 //! name, kind = command if no return type, etc.). The editor's existing
 //! static catalog is the safety net — projects that haven't regenerated
 //! since this lands still work.
+//!
+//! ## Layout
+//!
+//! Pure file split (labelle-assembler#186) — implementation lives in
+//! per-concern submodules; this file is a thin façade that re-exports
+//! the public surface and hosts the top-level `emitFlowCatalogSidecar`
+//! orchestrator plus the module's tests:
+//!
+//! - `flow_catalog/types.zig` — on-disk data shape (PinDetail,
+//!   FlowNodeEntry, ModuleGroup, Catalog, …).
+//! - `flow_catalog/scanners.zig` — low-level AST + source-text scanners
+//!   (innerCallArg, scanField*, titlecaseFromIdent, …).
+//! - `flow_catalog/discovery.zig` — walks one source buffer for
+//!   FlowNodes / PinStyles / Events / Coercions blocks
+//!   (discoverInSource + extract*Entry).
+//! - `flow_catalog/json_writer.zig` — pretty-prints the catalog to JSON
+//!   and writes the sidecar file.
 
 const std = @import("std");
 const config = @import("config.zig");
@@ -75,180 +92,28 @@ const cache = @import("cache.zig");
 const script_scanner = @import("script_scanner.zig");
 const main_zig = @import("main_zig.zig");
 
+const types = @import("flow_catalog/types.zig");
+const scanners = @import("flow_catalog/scanners.zig");
+const discovery = @import("flow_catalog/discovery.zig");
+const json_writer = @import("flow_catalog/json_writer.zig");
+
 const ProjectConfig = config.ProjectConfig;
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
 
-/// Filename emitted next to `main.zig` in the generated target dir.
-pub const SIDECAR_FILENAME = "flow_catalog.json";
-
-/// One pin on a `FlowNodeEntry`. Mirrors the editor's
-/// `labelle-gui/src/flow_node_catalog.zig:Pin` shape so the loader can
-/// round-trip into the same in-memory representation.
-pub const PinDetail = struct {
-    /// Identifier as it appears in the impl function's parameter list.
-    name: []const u8,
-    /// Display label — defaults to titlecased `name`, overridden by
-    /// `.pins.<name> = .{ .label = "..." }` on the FlowNode config.
-    label: []const u8,
-    /// Zig source text of the parameter's type (`u32`, `f32`,
-    /// `EntityId`, `*PhysicsBody`, …). For the implicit output pin on a
-    /// reporter, this is the function's return-type source.
-    zig_type: []const u8,
-    /// `"input"` for impl parameters, `"output"` for the return-type
-    /// derived pin on a reporter. JSON-friendly tagged form so the
-    /// loader doesn't need a separate enum mapping.
-    dir: []const u8,
-    /// Author-supplied Zig source text of the pin's default, or `null`
-    /// when none was declared. Carries through the FlowNode config's
-    /// `.pins.<name> = .{ .default = "..." }` override.
-    default: ?[]const u8,
-};
-
-/// One catalog entry — a plugin- or game-script-declared FlowNode with
-/// every metadata field the editor consumes already resolved against
-/// the source.
-pub const FlowNodeEntry = struct {
-    /// Dotted form (`"box2d.apply_impulse"`). The editor's on-disk
-    /// `CustomNode.name` field uses the dotted form verbatim.
-    qualified: []const u8,
-    /// Palette section label — defaults to the contributing module's
-    /// name. Plugins / scripts can override via `.category = "..."`.
-    category: []const u8,
-    /// Human-readable label for the palette + node body. Defaults to
-    /// the bare decl name titlecased when no `.display_name = "..."`
-    /// override is present.
-    display_name: []const u8,
-    /// Tooltip text (`.docs = "..."`). Empty string when absent.
-    docs: []const u8,
-    /// `"command"` (rectangular, exec flow) or `"reporter"` (rounded,
-    /// data-only). Derived from return type when the FlowNode config
-    /// doesn't pin `.kind` explicitly.
-    kind: []const u8,
-    /// Pin definitions in display order. Inputs first, the optional
-    /// output pin (return value) last.
-    pins: []const PinDetail,
-    /// Zig source text of the impl's return type, or `null` when the
-    /// impl returns `void`. The output pin is already folded into
-    /// `pins`; this carries the type separately for the editor's
-    /// constructor-node decisions (#O5 follow-up) and connector colour.
-    return_type: ?[]const u8,
-};
-
-/// One per-type pin-display override discovered on a plugin / script
-/// `pub const PinStyles` block. Keyed by Zig type name; the editor
-/// merges these on top of its baked-in defaults.
-pub const PinStyleEntry = struct {
-    /// Zig type name as it appears in the source (the decl identifier).
-    zig_type: []const u8,
-    /// Display label — `.label = "..."` on the PinStyle literal.
-    label: []const u8,
-    /// 8-bit-per-channel RGB color the editor paints the pin in.
-    /// Source: `.color = .{ .r = N, .g = N, .b = N, ... }`. Alpha is
-    /// dropped because the editor treats pins as opaque.
-    color: [3]u8,
-};
-
-/// One `pub const <name> = labelle.flow.Coercion(.{ .impl = ... })`
-/// decl inside a module's top-level `pub const Coercions` block
-/// (RFC-FLOW-VOCABULARY §2 / O4 — plugin-declared coercions). The
-/// editor consults `from_zig_type` / `to_zig_type` at wire-fit time
-/// to accept an edge between two pins whose Zig types differ but for
-/// which a registered coercion bridges; flow-codegen wraps the source
-/// expression in a `<plugin>__<name>.convert(...)` call at the edge
-/// site.
-///
-/// Mirrors the on-disk dotted form (`box2d.body_to_entity`) so the
-/// editor + flow-codegen share one canonical lookup key.
-pub const CoercionEntry = struct {
-    /// Dotted form (`"box2d.body_to_entity"`). Matches the qualified
-    /// emitted decl name on `PluginCoercions` (modulo `.` → `__`).
-    qualified: []const u8,
-    /// Bare coercion identifier (`"body_to_entity"`). Carried separately
-    /// from `qualified` so the editor can render it under the
-    /// contributing module's palette section.
-    name: []const u8,
-    /// Zig source text of the impl's single parameter type. Extracted
-    /// verbatim from the impl function's prototype.
-    from_zig_type: []const u8,
-    /// Zig source text of the impl's return type. The catalog never
-    /// emits a coercion whose return is `void` — the labelle-core
-    /// factory rejects it at comptime.
-    to_zig_type: []const u8,
-    /// Tooltip text (`.docs = "..."` on the factory call). Empty when
-    /// absent.
-    docs: []const u8,
-};
-
-/// One `pub const <name> = struct {...}` decl inside a module's
-/// top-level `pub const Events` block (labelle-engine#578 — engine
-/// lifecycle events; RFC-PLUGIN-EVENTS phase 1 — plugin events).
-/// The editor's palette renders these as Event-node variants under
-/// the contributing module's section.
-///
-/// Mirrors the on-disk JSONC dot form (`engine.tick`) so a flow's
-/// `Event` node `.name` field round-trips through the catalog.
-pub const EventEntry = struct {
-    /// Dotted form (`"engine.tick"`, `"box2d.collision_begin"`).
-    /// Matches the `Event` node's on-disk `.name` value verbatim.
-    qualified: []const u8,
-    /// Bare event identifier (`"tick"`, `"collision_begin"`).
-    /// Editor surfaces this as the node body label when no explicit
-    /// display override is present.
-    name: []const u8,
-    /// Each payload struct field as a `PinDetail`. `dir` is always
-    /// `"output"` — the on-disk Event-node form fans out the payload
-    /// fields as data outputs that downstream `SetVariable` /
-    /// `CustomNode` nodes consume.
-    pins: []const PinDetail,
-};
-
-/// Per-module group of catalog entries. The editor renders one
-/// collapsible palette section per group keyed by `name`.
-pub const ModuleGroup = struct {
-    name: []const u8,
-    flow_nodes: []FlowNodeEntry,
-    pin_styles: []PinStyleEntry,
-    /// Events (labelle-engine#578) — fired through the buffered
-    /// `Game.emit` path and listenable as `Event` nodes in flows.
-    /// Defaults to an empty slice for modules that declare no
-    /// `Events` block, so the JSON shape stays uniform.
-    events: []EventEntry = &.{},
-    /// Coercions (RFC-FLOW-VOCABULARY §2 / O4) — plugin-declared
-    /// type-conversion bridges. The editor's wire-fit check accepts an
-    /// edge whose `(from_zig_type, to_zig_type)` matches a registered
-    /// coercion; flow-codegen wraps the source expression in
-    /// `<qualified>.convert(...)` at the edge site. Defaults to an
-    /// empty slice so the JSON shape stays uniform for modules without
-    /// a `Coercions` block.
-    coercions: []CoercionEntry = &.{},
-};
-
-/// The full catalog as it ends up on disk. Self-describes its source
-/// timestamp so the editor can compare against a cached snapshot.
-pub const Catalog = struct {
-    /// ISO-8601-ish UTC timestamp the sidecar was generated. Format:
-    /// `"YYYY-MM-DDTHH:MM:SSZ"` — minute-resolution is enough for the
-    /// editor's mtime cache.
-    generated_at: []const u8,
-    /// One entry per module that contributed at least one FlowNode or
-    /// PinStyle. Order matches discovery order (plugins first, then
-    /// game scripts) — which matches the existing
-    /// `discoverPluginFlowDecls` order, so the editor's palette is
-    /// stable across regenerations.
-    plugins: []ModuleGroup,
-    allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *Catalog) void {
-        // Strings + slices live in the catalog's arena (set up by
-        // `discoverDetailedFlowCatalog`); freeing the arena drops
-        // them all in one go. We keep an explicit `deinit` so the
-        // surrounding `generate` flow doesn't need to know about
-        // the arena.
-        // No-op here: arena pointer is held by the caller via the
-        // returned struct's allocator (the arena's child allocator).
-        _ = self;
-    }
-};
+// ── Public surface (re-exported from `types.zig`) ──────────────────────
+//
+// `src/root.zig` exposes the whole `flow_catalog` namespace, so anything
+// downstream might reach for these names needs to be visible here. The
+// submodules are accessible too, but the historical shape is flat —
+// keep that.
+pub const SIDECAR_FILENAME = types.SIDECAR_FILENAME;
+pub const PinDetail = types.PinDetail;
+pub const FlowNodeEntry = types.FlowNodeEntry;
+pub const PinStyleEntry = types.PinStyleEntry;
+pub const CoercionEntry = types.CoercionEntry;
+pub const EventEntry = types.EventEntry;
+pub const ModuleGroup = types.ModuleGroup;
+pub const Catalog = types.Catalog;
 
 /// Public entry point: discover every FlowNode + PinStyle in the
 /// project's plugins and game scripts, then write
@@ -297,7 +162,7 @@ pub fn emitFlowCatalogSidecar(
         const root_path = std.fs.path.join(aa, &.{ engine_dir, "src", "root.zig" }) catch break :blk_engine;
         const io = config.globalIo();
         const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, aa, .limited(8 * 1024 * 1024)) catch break :blk_engine;
-        if (try discoverInSource(aa, src, "engine")) |group| {
+        if (try discovery.discoverInSource(aa, src, "engine")) |group| {
             try groups.append(aa, group);
         }
     }
@@ -310,7 +175,7 @@ pub fn emitFlowCatalogSidecar(
         const io = config.globalIo();
         const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, aa, .limited(8 * 1024 * 1024)) catch continue;
 
-        const group = try discoverInSource(aa, src, plugin.name) orelse continue;
+        const group = try discovery.discoverInSource(aa, src, plugin.name) orelse continue;
         try groups.append(aa, group);
     }
 
@@ -333,9 +198,9 @@ pub fn emitFlowCatalogSidecar(
         // sees; we strip the `.zig` suffix and the path separators get
         // joined with `.` so the editor's palette reads
         // `flows.hit_counter` not `flows/hit_counter`.
-        const module_label = try scriptModuleLabel(aa, entry.rel_path);
+        const module_label = try discovery.scriptModuleLabel(aa, entry.rel_path);
 
-        const group = try discoverInSource(aa, src, module_label) orelse continue;
+        const group = try discovery.discoverInSource(aa, src, module_label) orelse continue;
         try groups.append(aa, group);
     }
 
@@ -358,7 +223,7 @@ pub fn emitFlowCatalogSidecar(
     // regression test below pins the new contract.
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer alloc_writer.deinit();
-    try writeCatalogJson(&alloc_writer.writer, groups.items);
+    try json_writer.writeCatalogJson(&alloc_writer.writer, groups.items);
     const json_bytes = try alloc_writer.toOwnedSlice();
     // `toOwnedSlice` cleared the writer's buffer; the outer errdefer
     // is now harmless (deinit early-returns on empty). Free the
@@ -367,919 +232,40 @@ pub fn emitFlowCatalogSidecar(
     defer allocator.free(json_bytes);
 
     // ── Write the sidecar ───────────────────────────────────────
-    try writeSidecar(target_dir, json_bytes);
+    try json_writer.writeSidecar(target_dir, json_bytes);
 
     return total;
-}
-
-/// Build a `<module>` label for a game-script `rel_path`. Strips a
-/// trailing `.zig` and replaces `/` with `.` so a nested script reads
-/// naturally as a palette section heading. `flows/hit_counter.zig`
-/// becomes `flows.hit_counter`; the editor's `CustomNode.name`
-/// references on disk match this dotted form prefix-wise.
-fn scriptModuleLabel(aa: std.mem.Allocator, rel_path: []const u8) ![]const u8 {
-    const stem = if (std.mem.endsWith(u8, rel_path, ".zig"))
-        rel_path[0 .. rel_path.len - ".zig".len]
-    else
-        rel_path;
-    var buf: std.ArrayList(u8) = .empty;
-    for (stem) |c| {
-        try buf.append(aa, if (c == '/' or c == '\\') '.' else c);
-    }
-    return buf.toOwnedSlice(aa);
-}
-
-/// Walk one source buffer for `pub const FlowNodes` + `pub const
-/// PinStyles` blocks and return a `ModuleGroup`, or `null` when
-/// neither block is present. All slices and strings in the result
-/// live in `aa`.
-fn discoverInSource(aa: std.mem.Allocator, src: []const u8, module_name: []const u8) !?ModuleGroup {
-    const src_z = try aa.dupeZ(u8, src);
-
-    var ast = try std.zig.Ast.parse(aa, src_z, .zig);
-    defer ast.deinit(aa);
-
-    var nodes: std.ArrayList(FlowNodeEntry) = .empty;
-    var styles: std.ArrayList(PinStyleEntry) = .empty;
-    var events: std.ArrayList(EventEntry) = .empty;
-    var coercions: std.ArrayList(CoercionEntry) = .empty;
-
-    var found_anything = false;
-    const root_decls = ast.rootDecls();
-    for (root_decls) |decl_idx| {
-        var buf: [2]std.zig.Ast.Node.Index = undefined;
-        const vd = ast.fullVarDecl(decl_idx) orelse continue;
-        if (vd.visib_token == null) continue;
-        const name_tok = vd.ast.mut_token + 1;
-        const decl_name = ast.tokenSlice(name_tok);
-
-        const is_flow_nodes = std.mem.eql(u8, decl_name, "FlowNodes");
-        const is_pin_styles = std.mem.eql(u8, decl_name, "PinStyles");
-        const is_events = std.mem.eql(u8, decl_name, "Events");
-        const is_coercions = std.mem.eql(u8, decl_name, "Coercions");
-        if (!is_flow_nodes and !is_pin_styles and !is_events and !is_coercions) continue;
-
-        const init_node = vd.ast.init_node.unwrap() orelse continue;
-        const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
-
-        for (container.ast.members) |m| {
-            const member_vd = ast.fullVarDecl(m) orelse continue;
-            if (member_vd.visib_token == null) continue;
-            const member_init = member_vd.ast.init_node.unwrap() orelse continue;
-            const member_name_tok = member_vd.ast.mut_token + 1;
-            const member_name = ast.tokenSlice(member_name_tok);
-
-            if (is_flow_nodes) {
-                const entry = extractFlowNodeEntry(
-                    aa,
-                    &ast,
-                    member_name,
-                    member_init,
-                    module_name,
-                ) catch continue;
-                try nodes.append(aa, entry);
-                found_anything = true;
-            } else if (is_pin_styles) {
-                const entry = extractPinStyleEntry(
-                    aa,
-                    &ast,
-                    member_name,
-                    member_init,
-                ) catch continue;
-                try styles.append(aa, entry);
-                found_anything = true;
-            } else if (is_events) {
-                // Events block (labelle-engine#578). Only valid
-                // shape is `pub const <name> = struct { ... };`.
-                if (ast.fullContainerDecl(&buf, member_init) == null) continue;
-                const entry = extractEventEntry(
-                    aa,
-                    &ast,
-                    member_name,
-                    member_init,
-                    module_name,
-                ) catch continue;
-                try events.append(aa, entry);
-                found_anything = true;
-            } else {
-                // Coercions block (RFC-FLOW-VOCABULARY §2 / O4). The
-                // factory call shape is
-                // `labelle.flow.Coercion(.{ .impl = <fn> })`. We pull
-                // the impl name out of the call, then walk back to the
-                // fn's parameter list + return type to capture
-                // From/To Zig source text.
-                const entry = extractCoercionEntry(
-                    aa,
-                    &ast,
-                    member_name,
-                    member_init,
-                    module_name,
-                ) catch continue;
-                try coercions.append(aa, entry);
-                found_anything = true;
-            }
-        }
-    }
-
-    if (!found_anything) return null;
-    return ModuleGroup{
-        .name = try aa.dupe(u8, module_name),
-        .flow_nodes = try nodes.toOwnedSlice(aa),
-        .pin_styles = try styles.toOwnedSlice(aa),
-        .events = try events.toOwnedSlice(aa),
-        .coercions = try coercions.toOwnedSlice(aa),
-    };
-}
-
-/// Pull `from_zig_type` + `to_zig_type` + `docs` out of a
-/// `labelle.flow.Coercion(.{ .impl = <ident>, .docs = "..." })` init.
-/// `impl` is resolved through the same source's root decls; its single
-/// parameter's type source and return-type source become `from` and
-/// `to`. A non-resolvable `impl` (defined in a sibling file) degrades
-/// to empty strings — the editor + flow-codegen fall back to refusing
-/// the wire in that case, same shape as the FlowNode pin walk.
-fn extractCoercionEntry(
-    aa: std.mem.Allocator,
-    ast: *std.zig.Ast,
-    decl_name: []const u8,
-    init_node: std.zig.Ast.Node.Index,
-    module_name: []const u8,
-) !CoercionEntry {
-    const init_src = ast.getNodeSource(init_node);
-    const cfg_src = innerCallArg(init_src);
-
-    const impl_name = scanFieldIdent(cfg_src, ".impl") orelse "";
-    const docs = scanFieldStringDup(aa, cfg_src, ".docs") catch null;
-
-    var from: []const u8 = "";
-    var to: []const u8 = "";
-
-    if (impl_name.len > 0) {
-        if (findFnByName(ast, impl_name)) |fn_node| {
-            var fn_buf: [1]std.zig.Ast.Node.Index = undefined;
-            if (ast.fullFnProto(&fn_buf, fn_node)) |fp| {
-                // A coercion's impl takes a single value parameter
-                // (the labelle-core factory rejects multi-param impls
-                // at comptime). Capture the first param's type source.
-                var it = fp.iterate(ast);
-                if (it.next()) |param| {
-                    if (param.type_expr) |ptype_node| {
-                        from = try aa.dupe(u8, ast.getNodeSource(ptype_node));
-                    }
-                }
-                if (fp.ast.return_type.unwrap()) |rt_node| {
-                    to = try aa.dupe(u8, ast.getNodeSource(rt_node));
-                }
-            }
-        }
-    }
-
-    return .{
-        .qualified = try std.fmt.allocPrint(aa, "{s}.{s}", .{ module_name, decl_name }),
-        .name = try aa.dupe(u8, decl_name),
-        .from_zig_type = if (from.len == 0) try aa.dupe(u8, "") else from,
-        .to_zig_type = if (to.len == 0) try aa.dupe(u8, "") else to,
-        .docs = docs orelse try aa.dupe(u8, ""),
-    };
-}
-
-/// Pull payload-field metadata out of an `Events` decl's struct
-/// init: `pub const tick = struct { dt: f32 }`. Each field of the
-/// inner struct becomes one output `PinDetail` so the editor's
-/// `Event` node can route the field as a typed source pin.
-fn extractEventEntry(
-    aa: std.mem.Allocator,
-    ast: *std.zig.Ast,
-    decl_name: []const u8,
-    init_node: std.zig.Ast.Node.Index,
-    module_name: []const u8,
-) !EventEntry {
-    var buf: [2]std.zig.Ast.Node.Index = undefined;
-    const container = ast.fullContainerDecl(&buf, init_node) orelse return error.NotAStruct;
-
-    var pin_list: std.ArrayList(PinDetail) = .empty;
-    for (container.ast.members) |m| {
-        // Only field members count — skip nested decls (Zig allows
-        // `pub const Foo = ...` inside a struct, but a payload that
-        // declares nested types is not a flat field-bag and we
-        // don't have a meaningful pin to emit for them).
-        const fd = ast.fullContainerField(m) orelse continue;
-        const fname_tok = fd.ast.main_token;
-        const fname = ast.tokenSlice(fname_tok);
-        const ftype_node = fd.ast.type_expr.unwrap() orelse continue;
-        const ftype = ast.getNodeSource(ftype_node);
-
-        const label = try titlecaseFromIdent(aa, fname);
-        try pin_list.append(aa, .{
-            .name = try aa.dupe(u8, fname),
-            .label = label,
-            .zig_type = try aa.dupe(u8, ftype),
-            .dir = "output",
-            .default = null,
-        });
-    }
-
-    return .{
-        .qualified = try std.fmt.allocPrint(aa, "{s}.{s}", .{ module_name, decl_name }),
-        .name = try aa.dupe(u8, decl_name),
-        .pins = try pin_list.toOwnedSlice(aa),
-    };
-}
-
-/// Pull out FlowNode metadata from a `labelle.FlowNode(.{...})` init
-/// node — including walking back into the impl function's parameter
-/// list for pin names and types.
-fn extractFlowNodeEntry(
-    aa: std.mem.Allocator,
-    ast: *std.zig.Ast,
-    decl_name: []const u8,
-    init_node: std.zig.Ast.Node.Index,
-    module_name: []const u8,
-) !FlowNodeEntry {
-    const init_src = ast.getNodeSource(init_node);
-
-    // Try to find the inner struct literal `.{...}` source — that's the
-    // FlowNode config. The init source is something like
-    // `labelle.FlowNode(.{ .impl = ..., .docs = "..." })`; we only need
-    // the bit between the outer parens.
-    const cfg_src = innerCallArg(init_src);
-
-    const impl_name = scanFieldIdent(cfg_src, ".impl") orelse "";
-    const docs = scanFieldStringDup(aa, cfg_src, ".docs") catch null;
-    const explicit_kind = scanFieldEnumLit(cfg_src, ".kind"); // ".command" or ".reporter" or null
-    const display_name = scanFieldStringDup(aa, cfg_src, ".display_name") catch null;
-    const category_override = scanFieldStringDup(aa, cfg_src, ".category") catch null;
-
-    // ── Pins ──
-    // Walk the impl function's parameter list (skip the first
-    // `game: anytype` per RFC §1). Each remaining param becomes one
-    // input pin. The return type, when non-void, becomes the output
-    // pin appended after the inputs.
-    var pin_list: std.ArrayList(PinDetail) = .empty;
-    var return_type: ?[]const u8 = null;
-    var has_return = false;
-
-    if (impl_name.len > 0) {
-        if (findFnByName(ast, impl_name)) |fn_node| {
-            var fn_buf: [1]std.zig.Ast.Node.Index = undefined;
-            if (ast.fullFnProto(&fn_buf, fn_node)) |fp| {
-                var it = fp.iterate(ast);
-                var idx: usize = 0;
-                while (it.next()) |param| : (idx += 1) {
-                    // Skip the implicit `game: anytype` (RFC §1).
-                    if (idx == 0) continue;
-                    const name_tok = param.name_token orelse continue;
-                    const pname = ast.tokenSlice(name_tok);
-                    const ptype_node = param.type_expr orelse continue;
-                    const ptype = ast.getNodeSource(ptype_node);
-
-                    const label = try resolvePinLabel(aa, cfg_src, pname);
-                    const default = scanPinDefault(aa, cfg_src, pname) catch null;
-                    try pin_list.append(aa, .{
-                        .name = try aa.dupe(u8, pname),
-                        .label = label,
-                        .zig_type = try aa.dupe(u8, ptype),
-                        .dir = "input",
-                        .default = default,
-                    });
-                }
-
-                if (fp.ast.return_type.unwrap()) |rt_node| {
-                    const rt = ast.getNodeSource(rt_node);
-                    // void / no-return-of-interest collapses to no output pin.
-                    if (!std.mem.eql(u8, std.mem.trim(u8, rt, " \t\r\n"), "void")) {
-                        return_type = try aa.dupe(u8, rt);
-                        has_return = true;
-                        // Add a single output pin named "result" by default —
-                        // the editor's existing static catalog uses ad-hoc
-                        // names (`x`/`y` for Vec2, `value` for a scalar,
-                        // `entity` for an EntityId) because it was hand-
-                        // written. The dynamic discovery here can't see
-                        // *inside* a returned struct without much heavier
-                        // type resolution, so we emit one pin sourcing the
-                        // declared return type verbatim and let the editor
-                        // surface struct destructuring in a follow-up.
-                        try pin_list.append(aa, .{
-                            .name = "result",
-                            .label = "Result",
-                            .zig_type = try aa.dupe(u8, rt),
-                            .dir = "output",
-                            .default = null,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Kind ──
-    // Explicit `.kind = .command` / `.kind = .reporter` always wins.
-    // Otherwise the FlowNode factory's runtime default kicks in:
-    // `void`-returning impls are commands, everything else is a reporter.
-    const kind: []const u8 = blk: {
-        if (explicit_kind) |ek| {
-            if (std.mem.eql(u8, ek, "command")) break :blk "command";
-            if (std.mem.eql(u8, ek, "reporter")) break :blk "reporter";
-        }
-        break :blk if (has_return) "reporter" else "command";
-    };
-
-    // ── Display name ──
-    // Falls back to the decl name titlecased
-    // (`apply_impulse` → `Apply Impulse`) so the palette reads clean
-    // without authors having to override it.
-    const dn = display_name orelse try titlecaseFromIdent(aa, decl_name);
-
-    // ── Qualified name ──
-    // Dotted form, matching the editor's on-disk `CustomNode.name`
-    // schema. Plugins use their project.labelle name; game scripts use
-    // the dotted module-label form built by `scriptModuleLabel`.
-    const qualified = try std.fmt.allocPrint(aa, "{s}.{s}", .{ module_name, decl_name });
-
-    return .{
-        .qualified = qualified,
-        .category = category_override orelse try aa.dupe(u8, module_name),
-        .display_name = dn,
-        .docs = docs orelse try aa.dupe(u8, ""),
-        .kind = kind,
-        .pins = try pin_list.toOwnedSlice(aa),
-        .return_type = return_type,
-    };
-}
-
-/// Pull out PinStyle metadata from a `labelle.PinStyle{...}` init
-/// literal. Both the `label` string and the `.color = .{ .r = N, ... }`
-/// fields are extracted via simple text scans against the source range.
-fn extractPinStyleEntry(
-    aa: std.mem.Allocator,
-    ast: *std.zig.Ast,
-    decl_name: []const u8,
-    init_node: std.zig.Ast.Node.Index,
-) !PinStyleEntry {
-    const init_src = ast.getNodeSource(init_node);
-    const label = (try scanFieldStringDup(aa, init_src, ".label")) orelse try aa.dupe(u8, decl_name);
-    const color = scanColorTriple(init_src) orelse [3]u8{ 200, 200, 200 };
-    return .{
-        .zig_type = try aa.dupe(u8, decl_name),
-        .label = label,
-        .color = color,
-    };
-}
-
-// ─── AST helpers ────────────────────────────────────────────────────────
-
-/// Find a top-level `fn <name>(...) ...` declaration in the parsed AST
-/// and return its `fn_decl` node index. Returns `null` when the
-/// function isn't visible at module scope — that's the case for impls
-/// imported from a sibling file, which we surface as "no pin info" in
-/// the catalog rather than failing the whole sidecar build.
-fn findFnByName(ast: *std.zig.Ast, name: []const u8) ?std.zig.Ast.Node.Index {
-    const root_decls = ast.rootDecls();
-    for (root_decls) |decl_idx| {
-        var fn_buf: [1]std.zig.Ast.Node.Index = undefined;
-        const fp = ast.fullFnProto(&fn_buf, decl_idx) orelse continue;
-        const name_tok = fp.name_token orelse continue;
-        if (std.mem.eql(u8, ast.tokenSlice(name_tok), name)) return decl_idx;
-    }
-    return null;
-}
-
-// ─── Source-text scanners ───────────────────────────────────────────────
-//
-// The FlowNode + PinStyle config literals are tiny, deeply structured,
-// and stable in shape across the toolkit. A focused text scan keyed off
-// the field names is far less code than a full struct-init walk for
-// the depth we need, and degrades gracefully when a future field
-// migration moves things around (we just stop seeing the field and the
-// editor uses defaults).
-//
-// All scanners take a slice that's already known to be the source text
-// of a single struct-init literal — `getNodeSource(init_node)`, or its
-// inner-paren form for a `Foo(.{...})` call.
-
-/// Strip the outer `Foo(...)` so we end up with the call's first
-/// argument's source. If the source doesn't look like a single-arg
-/// call, return it unchanged — the field scanners are defensive.
-fn innerCallArg(src: []const u8) []const u8 {
-    const lp = std.mem.indexOfScalar(u8, src, '(') orelse return src;
-    // Match the closing paren at the same nesting depth.
-    var depth: usize = 1;
-    var i = lp + 1;
-    while (i < src.len) : (i += 1) {
-        switch (src[i]) {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if (depth == 0) return src[lp + 1 .. i];
-            },
-            else => {},
-        }
-    }
-    return src;
-}
-
-/// Locate `<field> = ` in `src` and return the slice starting just
-/// after the `=` (with leading whitespace trimmed), or `null` when the
-/// field isn't present. The match is whole-token: we require the
-/// preceding byte to be `,`, `{`, or whitespace so `apply_impulse`'s
-/// `.impl` doesn't accidentally hit the substring `.impl` inside
-/// another field's value.
-fn locateField(src: []const u8, field: []const u8) ?[]const u8 {
-    var search_start: usize = 0;
-    while (std.mem.indexOfPos(u8, src, search_start, field)) |pos| {
-        // Boundary check — the byte before `field` must be a separator
-        // or the start of the slice. Without this, `.color` inside a
-        // composite like `.color_default` would match `.color`.
-        if (pos > 0) {
-            const prev = src[pos - 1];
-            switch (prev) {
-                ',', '{', ' ', '\t', '\n', '\r' => {},
-                else => {
-                    search_start = pos + 1;
-                    continue;
-                },
-            }
-        }
-        // The byte after `field` must be `=` (after optional whitespace).
-        var after = pos + field.len;
-        while (after < src.len and (src[after] == ' ' or src[after] == '\t')) after += 1;
-        if (after >= src.len or src[after] != '=') {
-            search_start = pos + 1;
-            continue;
-        }
-        after += 1;
-        while (after < src.len and (src[after] == ' ' or src[after] == '\t' or src[after] == '\n' or src[after] == '\r')) after += 1;
-        return src[after..];
-    }
-    return null;
-}
-
-/// Extract a bare identifier as the right-hand side of `<field> = `.
-/// Returns the identifier slice (borrowed from `src`) or `null` if no
-/// identifier is present.
-fn scanFieldIdent(src: []const u8, field: []const u8) ?[]const u8 {
-    const rhs = locateField(src, field) orelse return null;
-    var end: usize = 0;
-    while (end < rhs.len) : (end += 1) {
-        const c = rhs[end];
-        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_';
-        if (!ok) break;
-    }
-    if (end == 0) return null;
-    return rhs[0..end];
-}
-
-/// Extract a leading enum literal like `.command` from
-/// `<field> = .command,`. Returns the identifier after the `.` (or
-/// `null` when the field isn't an enum literal). The leading `.` is
-/// required to disambiguate enum literals from bare idents.
-fn scanFieldEnumLit(src: []const u8, field: []const u8) ?[]const u8 {
-    const rhs = locateField(src, field) orelse return null;
-    if (rhs.len == 0 or rhs[0] != '.') return null;
-    var end: usize = 1;
-    while (end < rhs.len) : (end += 1) {
-        const c = rhs[end];
-        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_';
-        if (!ok) break;
-    }
-    if (end == 1) return null;
-    return rhs[1..end];
-}
-
-/// Extract a string literal as the right-hand side of `<field> = `.
-/// Handles standard `"..."` strings with `\"` and `\\` escapes;
-/// multi-line `\\` strings aren't supported (none of the toolkit's
-/// FlowNode / PinStyle declarations use them). Returns an owned dupe
-/// in `aa`, or `null` when the field is absent or not a string. The
-/// `!` error union covers `aa.dupe` OOM only.
-fn scanFieldStringDup(aa: std.mem.Allocator, src: []const u8, field: []const u8) !?[]const u8 {
-    const rhs = locateField(src, field) orelse return null;
-    if (rhs.len == 0 or rhs[0] != '"') return null;
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(aa);
-    var i: usize = 1;
-    while (i < rhs.len) : (i += 1) {
-        const c = rhs[i];
-        if (c == '\\' and i + 1 < rhs.len) {
-            const e = rhs[i + 1];
-            try out.append(aa, switch (e) {
-                '"' => '"',
-                '\\' => '\\',
-                'n' => '\n',
-                't' => '\t',
-                'r' => '\r',
-                else => e,
-            });
-            i += 1;
-            continue;
-        }
-        if (c == '"') break;
-        try out.append(aa, c);
-    }
-    return try out.toOwnedSlice(aa);
-}
-
-/// Scan a `.color = .{ .r = N, .g = N, .b = N, .a = N }` struct
-/// literal and return the (r, g, b) triple. Defaults to `null` when
-/// the field isn't present or doesn't look like a Color literal. Alpha
-/// is intentionally dropped — the editor treats pins as opaque.
-fn scanColorTriple(src: []const u8) ?[3]u8 {
-    const rhs = locateField(src, ".color") orelse return null;
-    // We need a `.{` next. Allow either `Color{` or `.{` — the toolkit
-    // mixes both forms (labelle-box2d uses `core.flow.Color{ ... }`,
-    // user code might use `.{ ... }`).
-    var i: usize = 0;
-    while (i < rhs.len and (rhs[i] == '.' or rhs[i] == ' ' or rhs[i] == '\t' or (rhs[i] >= 'A' and rhs[i] <= 'Z') or (rhs[i] >= 'a' and rhs[i] <= 'z') or rhs[i] == '_')) : (i += 1) {}
-    if (i >= rhs.len or rhs[i] != '{') return null;
-    // Find the matching '}'.
-    var depth: usize = 1;
-    var j = i + 1;
-    while (j < rhs.len) : (j += 1) {
-        switch (rhs[j]) {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if (depth == 0) break;
-            },
-            else => {},
-        }
-    }
-    if (depth != 0) return null;
-    const body = rhs[i + 1 .. j];
-    const r = scanU8Field(body, ".r") orelse return null;
-    const g = scanU8Field(body, ".g") orelse return null;
-    const b = scanU8Field(body, ".b") orelse return null;
-    return [3]u8{ r, g, b };
-}
-
-/// Read `<field> = NNN` as a `u8`. Returns `null` on parse failure.
-fn scanU8Field(src: []const u8, field: []const u8) ?u8 {
-    const rhs = locateField(src, field) orelse return null;
-    var end: usize = 0;
-    while (end < rhs.len and rhs[end] >= '0' and rhs[end] <= '9') : (end += 1) {}
-    if (end == 0) return null;
-    return std.fmt.parseInt(u8, rhs[0..end], 10) catch null;
-}
-
-/// Resolve the display label for a pin: check the FlowNode config's
-/// `.pins.<name>.label` override, else titlecase `pname`. Returns an
-/// owned dupe in `aa`.
-fn resolvePinLabel(aa: std.mem.Allocator, cfg_src: []const u8, pname: []const u8) ![]const u8 {
-    // Locate the `.pins = .{ ... }` block first.
-    const pins_rhs = locateField(cfg_src, ".pins");
-    if (pins_rhs) |rhs| {
-        // Find the next `.<pname> = .{` inside the pins block.
-        // We don't care about being precise about the block's bounds —
-        // a stray `.<pname>` outside would only matter if the same
-        // identifier is used as both a pin name and another field
-        // label, which doesn't happen in any of the toolkit's
-        // FlowNodes today.
-        var field_buf: [128]u8 = undefined;
-        const field = std.fmt.bufPrint(&field_buf, ".{s}", .{pname}) catch return titlecaseFromIdent(aa, pname);
-        if (locateField(rhs, field)) |pin_rhs| {
-            // pin_rhs starts at the `.{`. Scan ahead for `.label = "..."`.
-            const lbl = scanFieldStringDup(aa, pin_rhs, ".label") catch null;
-            if (lbl) |s| return s;
-        }
-    }
-    return titlecaseFromIdent(aa, pname);
-}
-
-/// Extract the `.default = "..."` source-text override for one pin,
-/// or `null` when not declared.
-fn scanPinDefault(aa: std.mem.Allocator, cfg_src: []const u8, pname: []const u8) !?[]const u8 {
-    const pins_rhs = locateField(cfg_src, ".pins") orelse return null;
-    var field_buf: [128]u8 = undefined;
-    const field = std.fmt.bufPrint(&field_buf, ".{s}", .{pname}) catch return null;
-    const pin_rhs = locateField(pins_rhs, field) orelse return null;
-    return try scanFieldStringDup(aa, pin_rhs, ".default");
-}
-
-/// Map an identifier like `apply_impulse` to a titlecased display form
-/// (`Apply Impulse`). Splits on `_` and capitalises the first letter
-/// of each component. Returns an owned dupe.
-fn titlecaseFromIdent(aa: std.mem.Allocator, ident: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(aa);
-    var capitalize_next = true;
-    for (ident) |c| {
-        if (c == '_') {
-            try out.append(aa, ' ');
-            capitalize_next = true;
-            continue;
-        }
-        if (capitalize_next and c >= 'a' and c <= 'z') {
-            try out.append(aa, c - 32);
-        } else {
-            try out.append(aa, c);
-        }
-        capitalize_next = false;
-    }
-    return out.toOwnedSlice(aa);
-}
-
-// ─── JSON writer ────────────────────────────────────────────────────────
-
-/// Emit the full catalog as JSON. Hand-written for readability over the
-/// stdlib's `std.json.Stringify` because the structure is small and
-/// we want stable, pretty-printed output the user can diff and the
-/// editor can hand-parse without a schema.
-fn writeCatalogJson(w: *std.Io.Writer, groups: []const ModuleGroup) !void {
-    // ISO-8601 timestamp at minute resolution. The editor uses
-    // mtime-keyed caching (not this string) so the exact format isn't
-    // critical, but a human-readable one helps debugging.
-    var ts_buf: [32]u8 = undefined;
-    const ts = formatTimestamp(&ts_buf);
-
-    try w.writeAll("{\n");
-    try w.print("  \"generated_at\": \"{s}\",\n", .{ts});
-    try w.writeAll("  \"plugins\": [");
-    if (groups.len == 0) {
-        try w.writeAll("]\n}\n");
-        return;
-    }
-    try w.writeAll("\n");
-    for (groups, 0..) |g, gi| {
-        try w.writeAll("    {\n");
-        try w.print("      \"name\": ", .{});
-        try writeJsonString(w, g.name);
-        try w.writeAll(",\n");
-        try w.writeAll("      \"flow_nodes\": [");
-        if (g.flow_nodes.len == 0) {
-            try w.writeAll("],\n");
-        } else {
-            try w.writeAll("\n");
-            for (g.flow_nodes, 0..) |n, ni| {
-                try writeFlowNodeJson(w, n);
-                if (ni + 1 < g.flow_nodes.len) try w.writeAll(",");
-                try w.writeAll("\n");
-            }
-            try w.writeAll("      ],\n");
-        }
-        try w.writeAll("      \"pin_styles\": [");
-        if (g.pin_styles.len == 0) {
-            try w.writeAll("],\n");
-        } else {
-            try w.writeAll("\n");
-            for (g.pin_styles, 0..) |s, si| {
-                try writePinStyleJson(w, s);
-                if (si + 1 < g.pin_styles.len) try w.writeAll(",");
-                try w.writeAll("\n");
-            }
-            try w.writeAll("      ],\n");
-        }
-        // ── events ─────────────────────────────────────────────
-        // labelle-engine#578 (engine lifecycle) + RFC-PLUGIN-EVENTS
-        // (plugin events). `discoverInSource` populates this from
-        // each module's `pub const Events` block; the editor renders
-        // the entries as Event-node variants in the palette and uses
-        // each event's typed payload pins to wire downstream nodes.
-        try w.writeAll("      \"events\": [");
-        if (g.events.len == 0) {
-            try w.writeAll("],\n");
-        } else {
-            try w.writeAll("\n");
-            for (g.events, 0..) |e, ei| {
-                try writeEventJson(w, e);
-                if (ei + 1 < g.events.len) try w.writeAll(",");
-                try w.writeAll("\n");
-            }
-            try w.writeAll("      ],\n");
-        }
-        // ── coercions (RFC-FLOW-VOCABULARY §2 / O4) ──────────
-        // `discoverInSource` populates this from each module's
-        // `pub const Coercions` block. The editor's wire-fit check
-        // accepts an edge whose (from_zig_type, to_zig_type) matches a
-        // registered coercion; flow-codegen wraps the source expression
-        // in `<qualified>.convert(...)` at the edge site.
-        try w.writeAll("      \"coercions\": [");
-        if (g.coercions.len == 0) {
-            try w.writeAll("]\n");
-        } else {
-            try w.writeAll("\n");
-            for (g.coercions, 0..) |c, ci| {
-                try writeCoercionJson(w, c);
-                if (ci + 1 < g.coercions.len) try w.writeAll(",");
-                try w.writeAll("\n");
-            }
-            try w.writeAll("      ]\n");
-        }
-        try w.writeAll("    }");
-        if (gi + 1 < groups.len) try w.writeAll(",");
-        try w.writeAll("\n");
-    }
-    try w.writeAll("  ]\n}\n");
-}
-
-fn writeFlowNodeJson(w: *std.Io.Writer, n: FlowNodeEntry) !void {
-    try w.writeAll("        {\n");
-    try w.writeAll("          \"qualified\": ");
-    try writeJsonString(w, n.qualified);
-    try w.writeAll(",\n          \"display_name\": ");
-    try writeJsonString(w, n.display_name);
-    try w.writeAll(",\n          \"category\": ");
-    try writeJsonString(w, n.category);
-    try w.writeAll(",\n          \"docs\": ");
-    try writeJsonString(w, n.docs);
-    try w.writeAll(",\n          \"kind\": ");
-    try writeJsonString(w, n.kind);
-    try w.writeAll(",\n          \"pins\": [");
-    if (n.pins.len == 0) {
-        try w.writeAll("],\n");
-    } else {
-        try w.writeAll("\n");
-        for (n.pins, 0..) |p, pi| {
-            try w.writeAll("            { \"name\": ");
-            try writeJsonString(w, p.name);
-            try w.writeAll(", \"label\": ");
-            try writeJsonString(w, p.label);
-            try w.writeAll(", \"zig_type\": ");
-            try writeJsonString(w, p.zig_type);
-            try w.writeAll(", \"dir\": ");
-            try writeJsonString(w, p.dir);
-            try w.writeAll(", \"default\": ");
-            if (p.default) |d| try writeJsonString(w, d) else try w.writeAll("null");
-            try w.writeAll(" }");
-            if (pi + 1 < n.pins.len) try w.writeAll(",");
-            try w.writeAll("\n");
-        }
-        try w.writeAll("          ],\n");
-    }
-    try w.writeAll("          \"return_type\": ");
-    if (n.return_type) |rt| try writeJsonString(w, rt) else try w.writeAll("null");
-    try w.writeAll("\n        }");
-}
-
-fn writePinStyleJson(w: *std.Io.Writer, s: PinStyleEntry) !void {
-    try w.writeAll("        { \"zig_type\": ");
-    try writeJsonString(w, s.zig_type);
-    try w.writeAll(", \"label\": ");
-    try writeJsonString(w, s.label);
-    try w.print(", \"color\": [{d}, {d}, {d}] }}", .{ s.color[0], s.color[1], s.color[2] });
-}
-
-/// Emit one event entry as JSON, shape:
-///   `{ "qualified": "box2d.collision_begin",
-///      "name": "collision_begin",
-///      "pins": [ { "name", "label", "zig_type", "dir" }, ... ] }`
-/// `dir` is always `"output"` for events — the on-disk Event-node form
-/// fans the payload struct's fields out as data outputs (consumed by
-/// downstream `SetVariable` / `CustomNode` nodes). Mirrors the pin
-/// shape `writeFlowNodeJson` emits minus the `default` field (events
-/// payloads don't carry defaults — they're produced, never authored).
-fn writeEventJson(w: *std.Io.Writer, e: EventEntry) !void {
-    try w.writeAll("        {\n          \"qualified\": ");
-    try writeJsonString(w, e.qualified);
-    try w.writeAll(",\n          \"name\": ");
-    try writeJsonString(w, e.name);
-    try w.writeAll(",\n          \"pins\": [");
-    if (e.pins.len == 0) {
-        try w.writeAll("]\n");
-    } else {
-        try w.writeAll("\n");
-        for (e.pins, 0..) |p, pi| {
-            try w.writeAll("            { \"name\": ");
-            try writeJsonString(w, p.name);
-            try w.writeAll(", \"label\": ");
-            try writeJsonString(w, p.label);
-            try w.writeAll(", \"zig_type\": ");
-            try writeJsonString(w, p.zig_type);
-            try w.writeAll(", \"dir\": ");
-            try writeJsonString(w, p.dir);
-            try w.writeAll(" }");
-            if (pi + 1 < e.pins.len) try w.writeAll(",");
-            try w.writeAll("\n");
-        }
-        try w.writeAll("          ]\n");
-    }
-    try w.writeAll("        }");
-}
-
-/// Emit one coercion entry as JSON, shape:
-///   `{ "qualified": "box2d.body_to_entity",
-///      "name": "body_to_entity",
-///      "from_zig_type": "BodyId",
-///      "to_zig_type": "u32",
-///      "docs": "..." }`
-/// The editor's wire-fit check keys off `from_zig_type` +
-/// `to_zig_type`; flow-codegen's edge codegen reads `qualified` to
-/// produce the `<qualified>.convert(...)` call site.
-fn writeCoercionJson(w: *std.Io.Writer, c: CoercionEntry) !void {
-    try w.writeAll("        { \"qualified\": ");
-    try writeJsonString(w, c.qualified);
-    try w.writeAll(", \"name\": ");
-    try writeJsonString(w, c.name);
-    try w.writeAll(", \"from_zig_type\": ");
-    try writeJsonString(w, c.from_zig_type);
-    try w.writeAll(", \"to_zig_type\": ");
-    try writeJsonString(w, c.to_zig_type);
-    try w.writeAll(", \"docs\": ");
-    try writeJsonString(w, c.docs);
-    try w.writeAll(" }");
-}
-
-/// Write a JSON string literal — wraps in double quotes, escapes the
-/// subset of bytes JSON requires (`"`, `\`, control chars below 0x20)
-/// and pass-throughs everything else. UTF-8 source bytes ride along
-/// unchanged because JSON is UTF-8 itself.
-fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => try w.print("\\u{x:0>4}", .{c}),
-            else => try w.writeByte(c),
-        }
-    }
-    try w.writeByte('"');
-}
-
-/// Format the current UTC timestamp as `"YYYY-MM-DDTHH:MM:SSZ"`. Pure
-/// epoch arithmetic so we don't depend on system locale settings or a
-/// `strftime`-style call.
-fn formatTimestamp(buf: *[32]u8) []const u8 {
-    const epoch_secs: u64 = blk: {
-        // `std.time.timestamp` was removed in 0.16; use `clock_gettime`
-        // through libc the same way `tests.zig` does.
-        var ts: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.REALTIME, &ts);
-        break :blk @intCast(ts.sec);
-    };
-
-    // Days since 1970-01-01 + seconds-of-day.
-    const secs_per_day: u64 = 86400;
-    const day = epoch_secs / secs_per_day;
-    const sod = epoch_secs % secs_per_day;
-    const hour: u32 = @intCast(sod / 3600);
-    const minute: u32 = @intCast((sod % 3600) / 60);
-    const second: u32 = @intCast(sod % 60);
-
-    // Howard Hinnant's days-from-civil algorithm in reverse — Zig
-    // stdlib has the same calculation behind `std.time.epoch` but the
-    // shape moved between 0.15 and 0.16 enough that doing it inline
-    // is the smallest dependency.
-    var y: i64 = 1970;
-    var d_remain: i64 = @intCast(day);
-    while (true) {
-        const days_in_year: i64 = if (isLeapYear(y)) 366 else 365;
-        if (d_remain < days_in_year) break;
-        d_remain -= days_in_year;
-        y += 1;
-    }
-    var month: u32 = 1;
-    const months = [_]u32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    while (month <= 12) {
-        const days_in_month: i64 = blk: {
-            var dim: i64 = months[month - 1];
-            if (month == 2 and isLeapYear(y)) dim += 1;
-            break :blk dim;
-        };
-        if (d_remain < days_in_month) break;
-        d_remain -= days_in_month;
-        month += 1;
-    }
-    const day_of_month: u32 = @intCast(d_remain + 1);
-
-    return std.fmt.bufPrint(buf, "{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{ y, month, day_of_month, hour, minute, second }) catch "1970-01-01T00:00:00Z";
-}
-
-fn isLeapYear(y: i64) bool {
-    if (@mod(y, 4) != 0) return false;
-    if (@mod(y, 100) != 0) return true;
-    return @mod(y, 400) == 0;
-}
-
-/// Write `<target_dir>/flow_catalog.json`. Mirrors the pattern other
-/// generated artifacts (`main.zig`, `build.zig`) use.
-fn writeSidecar(target_dir: []const u8, bytes: []const u8) !void {
-    const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
-    var dir = try cwd.openDir(io, target_dir, .{});
-    defer dir.close(io);
-    const file = try dir.createFile(io, SIDECAR_FILENAME, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, bytes);
 }
 
 // Re-export the module-level types in case downstream tests want to
 // reach them without going through `emitFlowCatalogSidecar`'s public
 // surface.
 pub const _testing = struct {
-    pub const innerCallArg_ = innerCallArg;
-    pub const scanFieldIdent_ = scanFieldIdent;
-    pub const scanFieldStringDup_ = scanFieldStringDup;
-    pub const scanFieldEnumLit_ = scanFieldEnumLit;
-    pub const scanColorTriple_ = scanColorTriple;
-    pub const titlecaseFromIdent_ = titlecaseFromIdent;
-    pub const discoverInSource_ = discoverInSource;
-    pub const writeCatalogJson_ = writeCatalogJson;
+    pub const innerCallArg_ = scanners.innerCallArg;
+    pub const scanFieldIdent_ = scanners.scanFieldIdent;
+    pub const scanFieldStringDup_ = scanners.scanFieldStringDup;
+    pub const scanFieldEnumLit_ = scanners.scanFieldEnumLit;
+    pub const scanColorTriple_ = scanners.scanColorTriple;
+    pub const titlecaseFromIdent_ = scanners.titlecaseFromIdent;
+    pub const discoverInSource_ = discovery.discoverInSource;
+    pub const writeCatalogJson_ = json_writer.writeCatalogJson;
 };
 
 // ─── Tests ──────────────────────────────────────────────────────────────
+//
+// Tests retain their original location (file split is pure — no
+// behavior change) and exercise the public façade for the orchestrator
+// + leak-injection tests, plus the re-exported `_testing` aliases for
+// the scanner / discovery / json-writer surface.
+
+const innerCallArg = scanners.innerCallArg;
+const scanFieldIdent = scanners.scanFieldIdent;
+const scanFieldEnumLit = scanners.scanFieldEnumLit;
+const scanFieldStringDup = scanners.scanFieldStringDup;
+const scanColorTriple = scanners.scanColorTriple;
+const titlecaseFromIdent = scanners.titlecaseFromIdent;
+const discoverInSource = discovery.discoverInSource;
+const writeCatalogJson = json_writer.writeCatalogJson;
 
 test "innerCallArg returns the content between outer parens" {
     try std.testing.expectEqualStrings(".{ .impl = foo }", innerCallArg("Foo(.{ .impl = foo })"));
@@ -1647,4 +633,14 @@ test "emitFlowCatalogSidecar: no allocator leak at any failure point" {
         _ = emitFlowCatalogSidecar(fa.allocator(), cfg, target_dir, target_dir, target_dir, &.{}) catch {};
         try std.testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
     }
+}
+
+// Ensure submodule tests are discovered even when the public façade
+// doesn't transitively reach the submodules through a compiled path
+// during `addTest` runs.
+test {
+    _ = types;
+    _ = scanners;
+    _ = discovery;
+    _ = json_writer;
 }
