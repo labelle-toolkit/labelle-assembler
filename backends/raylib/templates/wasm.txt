@@ -8,7 +8,7 @@ const target_fps: u32 = {{fps}};
 // The game tick + render is driven by a per-frame callback.
 
 var g: AssembledGame = undefined;
-var hooks: GameHooks = undefined;
+{{hooks_init_block}}
 var g_allocator: std.mem.Allocator = undefined;
 var runner: Runner = undefined;
 
@@ -44,7 +44,6 @@ pub fn main() !void {
 {{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
     // Note: no defer closeWindow — Emscripten keeps running after main returns.
 
-    hooks = GameHooks{};
     g = AssembledGame.init(allocator);
 
     g.setHooks(&hooks);
