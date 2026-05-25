@@ -36,15 +36,23 @@ pub const SceneManifest = struct {
 /// this set triggers `error.UnknownSceneKey` so typos are caught at build time.
 ///
 /// The set unions every key the engine's JsoncSceneBridge currently consumes
-/// (`include`, `entities`) with cosmetic keys observed in real scenes
-/// (`name`, `scripts`) and the new `assets` key parsed here. Adding a real new
-/// scene-level key in the future means adding it here too — that is the
-/// intended speed bump.
+/// (`include`, `entities`, plus the unified `root` block from RFC #560)
+/// with cosmetic keys observed in real scenes (`name`, `scripts`) and the
+/// `assets` key parsed here. Adding a real new scene-level key in the
+/// future means adding it here too — that is the intended speed bump.
+///
+/// `root` is the unified-format wrapper introduced by
+/// labelle-engine#573 / RFC-UNIFY-SCENES-AND-PREFABS.md (§"Unified shape").
+/// A unified scene puts its entity list under `root.children` instead of
+/// the legacy top-level `entities` array; the assembler accepts both so
+/// in-tree projects can migrate file-by-file without breaking the pre-build
+/// scan (issue #181).
 const ALLOWED_TOP_LEVEL_KEYS: []const []const u8 = &.{
     "name",
     "assets",
     "include",
     "entities",
+    "root",
     "scripts",
     "initial_state",
 };
@@ -57,13 +65,19 @@ fn isAllowedTopLevelKey(key: []const u8) bool {
 }
 
 /// Errors surfaced from manifest parsing. `UnknownSceneKey`,
-/// `InvalidAssetsField`, and `InvalidInitialStateField` are hard build
-/// errors — the assembler must abort and print a clear message naming
-/// the offending file.
+/// `InvalidAssetsField`, `InvalidInitialStateField`, and
+/// `InvalidEntityShape` are hard build errors — the assembler must
+/// abort and print a clear message naming the offending file.
+///
+/// `InvalidEntityShape` covers RFC #560 §B2 violations: an entity
+/// entry that declares both `prefab` (reference mode) and `children`
+/// (authoring mode), plus malformed `root` blocks under the unified
+/// format.
 pub const ParseError = error{
     UnknownSceneKey,
     InvalidAssetsField,
     InvalidInitialStateField,
+    InvalidEntityShape,
     InvalidSceneJson,
     OutOfMemory,
 };
@@ -155,6 +169,81 @@ fn stripJsonc(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     return out;
 }
 
+/// Validate a unified-format `root` block. The block must be a JSON
+/// object; it carries either inline content (`components`/`children`)
+/// or a reference (`prefab`/`overrides`). Walks the `children` array
+/// recursively to enforce §B2 on every descendant.
+///
+/// Mirrors the engine loader's two-mode grammar (see
+/// labelle-engine/src/jsonc/unified_format.zig). The assembler doesn't
+/// need the full accessor surface — it only needs to descend the tree
+/// far enough to catch §B2 violations early, with a clear scene-path
+/// in the error message.
+fn validateRootBlock(value: std.json.Value, display_path: []const u8) ParseError!void {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => {
+            std.debug.print(
+                "labelle-assembler: scene '{s}' has 'root' but it is not a JSON object.\n" ++
+                    "  Expected: \"root\": {{ \"children\": [...] }} or \"root\": {{ \"prefab\": \"...\" }}.\n" ++
+                    "  See labelle-engine/RFC-UNIFY-SCENES-AND-PREFABS.md §\"Unified shape\".\n",
+                .{display_path},
+            );
+            return error.InvalidEntityShape;
+        },
+    };
+
+    // Reference-mode root: §B2 forbids `children` here just as for
+    // child entries. The RFC calls this out explicitly: "The same §B2
+    // rule applies here as at child entries: reference-mode root
+    // cannot declare `children` — instantiating doesn't author."
+    if (obj.get("prefab")) |_| {
+        if (obj.get("children")) |_| {
+            std.debug.print(
+                "labelle-assembler: scene '{s}' has a 'root' that declares both 'prefab' and 'children'.\n" ++
+                    "  RFC #560 §B2: reference-mode entries cannot carry children — instantiating doesn't author.\n" ++
+                    "  Either author a new prefab file that combines them, or drop one of the keys.\n",
+                .{display_path},
+            );
+            return error.InvalidEntityShape;
+        }
+    }
+
+    if (obj.get("children")) |children_val| {
+        try validateChildrenArray(children_val, display_path);
+    }
+}
+
+/// Validate a `children` (or legacy `entities`) array. Every entry
+/// must be a JSON object, and §B2 forbids the simultaneous presence
+/// of `prefab` and `children`. Recurses into nested `children`.
+fn validateChildrenArray(value: std.json.Value, display_path: []const u8) ParseError!void {
+    const arr = switch (value) {
+        .array => |a| a,
+        else => return, // Non-array `entities`/`children` is not this pass's concern.
+    };
+    for (arr.items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const has_prefab = obj.get("prefab") != null;
+        const has_children = obj.get("children") != null;
+        if (has_prefab and has_children) {
+            std.debug.print(
+                "labelle-assembler: scene '{s}' has a child entry that declares both 'prefab' and 'children'.\n" ++
+                    "  RFC #560 §B2: a reference-mode child cannot carry children — instantiating doesn't author.\n" ++
+                    "  Author a wrapper prefab that combines them, or drop one of the keys.\n",
+                .{display_path},
+            );
+            return error.InvalidEntityShape;
+        }
+        if (has_children) {
+            try validateChildrenArray(obj.get("children").?, display_path);
+        }
+    }
+}
+
 /// Parse a single scene file's source buffer. `scene_name` is the name the
 /// assembler uses elsewhere (e.g. "menu" or "world/intro") and `display_path`
 /// is the path printed in error messages so users can find the offending file.
@@ -197,12 +286,29 @@ pub fn parseSceneSource(
         if (!isAllowedTopLevelKey(entry.key_ptr.*)) {
             std.debug.print(
                 "labelle-assembler: unknown top-level key '{s}' in scene '{s}'.\n" ++
-                    "  Allowed keys: name, assets, include, entities, scripts, initial_state\n" ++
+                    "  Allowed keys: name, assets, include, entities, root, scripts, initial_state\n" ++
                     "  (Did-you-mean suggestions land in labelle-assembler#47.)\n",
                 .{ entry.key_ptr.*, display_path },
             );
             return error.UnknownSceneKey;
         }
+    }
+
+    // RFC #560 §B2 — walk the scene's entity tree and reject any reference
+    // entry (`prefab` set) that also declares `children`. Inline mode is
+    // authoring; reference mode is instantiating. Appending children at a
+    // reference site silently re-authors a recipe at the call site — the
+    // engine's unified loader (labelle-engine#573) rejects this at load
+    // time, and the assembler does the same so the failure surfaces against
+    // the assembler's scene-path-aware error message rather than a deeper
+    // engine panic. Walks both the unified `root.children` shape and the
+    // legacy top-level `entities` array; the engine accepts both for the
+    // migration window.
+    if (root.get("root")) |root_val| {
+        try validateRootBlock(root_val, display_path);
+    }
+    if (root.get("entities")) |entities_val| {
+        try validateChildrenArray(entities_val, display_path);
     }
 
     // Read assets — optional, default empty.
@@ -512,6 +618,189 @@ test "non-array assets field is a hard error" {
     ;
     const result = parseSceneSource(std.testing.allocator, "menu", "menu.jsonc", src);
     try std.testing.expectError(error.InvalidAssetsField, result);
+}
+
+// ── Unified-format scene tests (RFC #560 / labelle-engine#573) ────────
+
+test "unified-format scene with root.children loads" {
+    // The smoke-test shape from labelle-assembler#181: a scene
+    // authored in the unified format that previously got rejected
+    // with "unknown top-level key 'root'".
+    const src =
+        \\{
+        \\    "name": "main",
+        \\    "root": {
+        \\        "children": []
+        \\    }
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "main", "scenes/main.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+    try std.testing.expectEqualStrings("main", m.name);
+}
+
+test "unified-format scene with root reference (Mode B) loads" {
+    // Reference-mode root — instantiates an existing prefab as the
+    // scene root. Allowed by the unified format; the assembler must
+    // not reject it.
+    const src =
+        \\{
+        \\    "name": "level1",
+        \\    "root": {
+        \\        "prefab": "world",
+        \\        "overrides": { "Position": { "x": 0, "y": 0 } }
+        \\    }
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "level1", "scenes/level1.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+}
+
+test "unified-format scene with reference children inside root.children" {
+    const src =
+        \\{
+        \\    "name": "playground",
+        \\    "assets": ["background"],
+        \\    "root": {
+        \\        "children": [
+        \\            { "prefab": "player" },
+        \\            { "prefab": "enemy", "overrides": { "Health": { "hp": 5 } } },
+        \\            { "components": { "Position": { "x": 0, "y": 0 } } }
+        \\        ]
+        \\    }
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "playground", "scenes/playground.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+    try std.testing.expectEqual(@as(usize, 1), m.assets.len);
+}
+
+test "unified scene with initial_state + assets at file level" {
+    // File-level metadata (`name`, `assets`, `initial_state`) coexists
+    // with the unified `root` block. These keys live at the file level
+    // — only the entity tree moves into `root`.
+    const src =
+        \\{
+        \\    "name": "arena",
+        \\    "assets": ["combat"],
+        \\    "initial_state": "playing",
+        \\    "root": {
+        \\        "children": [
+        \\            { "prefab": "fighter" }
+        \\        ]
+        \\    }
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "arena", "scenes/arena.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+    try std.testing.expectEqualStrings("combat", m.assets[0]);
+    try std.testing.expectEqualStrings("playing", m.initial_state.?);
+}
+
+test "§B2 — child entry with both prefab and children is rejected" {
+    const src =
+        \\{
+        \\    "name": "main",
+        \\    "root": {
+        \\        "children": [
+        \\            {
+        \\                "prefab": "door",
+        \\                "children": [
+        \\                    { "prefab": "pressure_plate" }
+        \\                ]
+        \\            }
+        \\        ]
+        \\    }
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "main", "scenes/main.jsonc", src);
+    try std.testing.expectError(error.InvalidEntityShape, result);
+}
+
+test "§B2 — root with both prefab and children is rejected" {
+    // The RFC calls this out explicitly: reference-mode root cannot
+    // declare children. The assembler enforces the same rule the
+    // engine's unified loader does.
+    const src =
+        \\{
+        \\    "name": "broken",
+        \\    "root": {
+        \\        "prefab": "base",
+        \\        "children": [ { "prefab": "extra" } ]
+        \\    }
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "broken", "scenes/broken.jsonc", src);
+    try std.testing.expectError(error.InvalidEntityShape, result);
+}
+
+test "§B2 — nested child violation is detected (deep walk)" {
+    // The walker must recurse — a violation buried two levels deep
+    // is still a violation.
+    const src =
+        \\{
+        \\    "root": {
+        \\        "children": [
+        \\            {
+        \\                "components": { "Position": { "x": 0, "y": 0 } },
+        \\                "children": [
+        \\                    {
+        \\                        "prefab": "boss",
+        \\                        "children": [ { "prefab": "minion" } ]
+        \\                    }
+        \\                ]
+        \\            }
+        \\        ]
+        \\    }
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "deep", "scenes/deep.jsonc", src);
+    try std.testing.expectError(error.InvalidEntityShape, result);
+}
+
+test "§B2 — legacy entities array is also walked for violations" {
+    // Mixed legacy + unified projects must still have §B2 enforced
+    // on the legacy side until the migration completes.
+    const src =
+        \\{
+        \\    "name": "legacy",
+        \\    "entities": [
+        \\        {
+        \\            "prefab": "door",
+        \\            "children": [ { "prefab": "plate" } ]
+        \\        }
+        \\    ]
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "legacy", "scenes/legacy.jsonc", src);
+    try std.testing.expectError(error.InvalidEntityShape, result);
+}
+
+test "non-object root is a hard error" {
+    const src =
+        \\{
+        \\    "name": "broken",
+        \\    "root": []
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "broken", "scenes/broken.jsonc", src);
+    try std.testing.expectError(error.InvalidEntityShape, result);
+}
+
+test "legacy entities + unified root coexist (half-migrated scene)" {
+    // A scene mid-migration may temporarily carry both keys — the
+    // engine loader prefers `root.children` and warns about the
+    // legacy key (see unified_format.fileChildren). The assembler
+    // must accept the shape so it doesn't block the migration.
+    const src =
+        \\{
+        \\    "name": "transition",
+        \\    "entities": [],
+        \\    "root": { "children": [] }
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "transition", "scenes/transition.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
 }
 
 test "comment-only string content is preserved" {
