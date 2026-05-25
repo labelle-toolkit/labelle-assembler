@@ -194,6 +194,12 @@ fn stripJsonc(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     return out;
 }
 
+/// Maximum nesting depth accepted when walking `children` arrays.
+/// Game scenes are never legitimately deeper than a handful of levels;
+/// this cap prevents stack exhaustion on adversarially crafted or
+/// accidentally circular JSONC inputs.
+const MAX_CHILDREN_DEPTH: u32 = 64;
+
 /// Validate a unified-format `root` block. The block must be a JSON
 /// object; it carries either inline content (`components`/`children`)
 /// or a reference (`prefab`/`overrides`). Walks the `children` array
@@ -238,7 +244,7 @@ fn validateRootBlock(value: std.json.Value, display_path: []const u8) ParseError
     }
 
     if (maybe_children) |children_val| {
-        try validateChildrenArray(children_val, display_path);
+        try validateChildrenArrayDepth(children_val, display_path, 0);
     }
 }
 
@@ -246,6 +252,18 @@ fn validateRootBlock(value: std.json.Value, display_path: []const u8) ParseError
 /// must be a JSON object, and §B2 forbids the simultaneous presence
 /// of `prefab` and `children`. Recurses into nested `children`.
 fn validateChildrenArray(value: std.json.Value, display_path: []const u8) ParseError!void {
+    return validateChildrenArrayDepth(value, display_path, 0);
+}
+
+fn validateChildrenArrayDepth(value: std.json.Value, display_path: []const u8, depth: u32) ParseError!void {
+    if (depth > MAX_CHILDREN_DEPTH) {
+        stderrPrint(
+            "labelle-assembler: scene '{s}' has children nested more than {} levels deep.\n" ++
+                "  Check for circular includes or an unusually deep entity hierarchy.\n",
+            .{ display_path, MAX_CHILDREN_DEPTH },
+        );
+        return error.InvalidEntityShape;
+    }
     const arr = switch (value) {
         .array => |a| a,
         else => return, // Non-array `entities`/`children` is not this pass's concern.
@@ -270,7 +288,7 @@ fn validateChildrenArray(value: std.json.Value, display_path: []const u8) ParseE
             return error.InvalidEntityShape;
         }
         if (maybe_children) |children_val| {
-            try validateChildrenArray(children_val, display_path);
+            try validateChildrenArrayDepth(children_val, display_path, depth + 1);
         }
     }
 }
@@ -835,6 +853,47 @@ test "legacy entities + unified root coexist (half-migrated scene)" {
     ;
     const m = try parseSceneSource(std.testing.allocator, "transition", "scenes/transition.jsonc", src);
     defer freeManifest(std.testing.allocator, m);
+}
+
+test "children nested at exactly MAX_CHILDREN_DEPTH levels is accepted" {
+    // Build a chain: root.children → children → ... MAX_CHILDREN_DEPTH levels
+    // deep with a single leaf entity at the bottom.  The depth counter starts
+    // at 0 at the root's children array, so MAX_CHILDREN_DEPTH levels of
+    // nesting must all pass.
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.appendSlice("{\"root\":{\"children\":[");
+    var i: u32 = 0;
+    while (i < MAX_CHILDREN_DEPTH) : (i += 1) {
+        try buf.appendSlice("{\"children\":[");
+    }
+    try buf.appendSlice("{\"prefab\":\"leaf\"}");
+    i = 0;
+    while (i < MAX_CHILDREN_DEPTH) : (i += 1) {
+        try buf.appendSlice("]}");
+    }
+    try buf.appendSlice("]}}");
+    const m = try parseSceneSource(std.testing.allocator, "deep_ok", "deep_ok.jsonc", buf.items);
+    freeManifest(std.testing.allocator, m);
+}
+
+test "children nested beyond MAX_CHILDREN_DEPTH is a hard error" {
+    // One extra level beyond the cap must trigger error.InvalidEntityShape.
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.appendSlice("{\"root\":{\"children\":[");
+    var i: u32 = 0;
+    while (i < MAX_CHILDREN_DEPTH + 1) : (i += 1) {
+        try buf.appendSlice("{\"children\":[");
+    }
+    try buf.appendSlice("{\"prefab\":\"leaf\"}");
+    i = 0;
+    while (i < MAX_CHILDREN_DEPTH + 1) : (i += 1) {
+        try buf.appendSlice("]}");
+    }
+    try buf.appendSlice("]}}");
+    const result = parseSceneSource(std.testing.allocator, "deep_bad", "deep_bad.jsonc", buf.items);
+    try std.testing.expectError(error.InvalidEntityShape, result);
 }
 
 test "comment-only string content is preserved" {
