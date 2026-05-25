@@ -110,3 +110,25 @@ pub fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
         .invalid => return error.InvalidResourceDef,
     }
 }
+
+/// Mixin factory for `Codegen` (labelle-assembler#183, mixin conversion).
+///
+/// `emitResourceLoad` consults no shared state — `res` and `style` are
+/// the only inputs. The mixin exists so the orchestrator can dispatch
+/// through `ctx.emitResourceLoad(...)` uniformly with the other block
+/// writers. Standalone function above stays `pub` for the test surface
+/// and for direct calls from `lifecycle_loop` / `lifecycle_callback`'s
+/// loop bodies.
+pub fn Mixin(comptime Self: type) type {
+    // Capture the enclosing file's namespace so the same-name method
+    // below can reach the standalone body without shadowing recursion.
+    // `@This()` evaluated here (in the factory body, outside the returned
+    // struct) resolves to the file namespace; survives file renames that
+    // an `@import("self.zig")` workaround would silently break.
+    const file = @This();
+    return struct {
+        pub fn emitResourceLoad(_: *Self, w: anytype, res: ResourceDef, style: LoadStyle) !void {
+            return file.emitResourceLoad(w, res, style);
+        }
+    };
+}

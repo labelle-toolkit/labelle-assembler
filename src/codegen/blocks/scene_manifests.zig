@@ -89,6 +89,29 @@ pub fn writeSceneAssetManifests(
     try w.writeAll("};\n");
 }
 
+/// Mixin factory for `Codegen` (labelle-assembler#183, mixin conversion).
+///
+/// Pulls `jsonc_scene_names` + `scene_manifests` from `self` so the
+/// orchestrator can call `ctx.writeSceneAssetManifests(w, &ident_buf)`
+/// instead of re-threading those two slices into every call site.
+/// Standalone functions above stay `pub` for the test surface.
+pub fn Mixin(comptime Self: type) type {
+    // Capture the enclosing file's namespace so the same-name methods
+    // below can reach the standalone bodies without shadowing recursion.
+    // `@This()` evaluated here (in the factory body, outside the returned
+    // struct) resolves to the file namespace; survives file renames that
+    // an `@import("self.zig")` workaround would silently break.
+    const file = @This();
+    return struct {
+        pub fn writeSceneAssetManifests(self: *Self, w: anytype, ident_buf: *[256]u8) !void {
+            return file.writeSceneAssetManifests(w, self.jsonc_scene_names, self.scene_manifests, ident_buf);
+        }
+        pub fn writeSceneInitialStateManifests(self: *Self, w: anytype) !void {
+            return file.writeSceneInitialStateManifests(w, self.jsonc_scene_names, self.scene_manifests);
+        }
+    };
+}
+
 /// Emit the `SceneInitialStateManifests` comptime struct that exposes each
 /// scene's declared `initial_state:` to labelle-engine's setSceneInitialState
 /// API. Mirrors the SceneAssetManifests pattern (see above).

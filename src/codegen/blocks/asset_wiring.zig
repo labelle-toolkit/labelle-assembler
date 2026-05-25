@@ -400,3 +400,33 @@ pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}}});\n", .{indent});
     try w.print("\n", .{});
 }
+
+/// Mixin factory for `Codegen` (labelle-assembler#183, mixin conversion).
+///
+/// Returns thin delegator methods so the orchestrator can call
+/// `ctx.writeXxx(w, indent)` in the mixin shape modelled on
+/// `labelle-engine/src/game/*_mixin.zig`. The three writers are pure —
+/// they pull no state from `self` (the engine's audio_mixin shows the
+/// equivalent `_: *Game` shape) — so the mixin only exists to satisfy
+/// the dispatch-through-context contract. Standalone functions above
+/// stay `pub` for the test surface (`test/tests.zig`) and
+/// `root.zig` re-exports.
+pub fn Mixin(comptime Self: type) type {
+    // Capture the enclosing file's namespace so the same-name methods
+    // below can reach the standalone bodies without shadowing recursion.
+    // `@This()` evaluated here (in the factory body, outside the returned
+    // struct) resolves to the file namespace; survives file renames that
+    // an `@import("self.zig")` workaround would silently break.
+    const file = @This();
+    return struct {
+        pub fn writeImageBackendWiring(_: *Self, w: anytype, indent: []const u8) !void {
+            return file.writeImageBackendWiring(w, indent);
+        }
+        pub fn writeAudioBackendWiring(_: *Self, w: anytype, indent: []const u8) !void {
+            return file.writeAudioBackendWiring(w, indent);
+        }
+        pub fn writeFontBackendWiring(_: *Self, w: anytype, indent: []const u8) !void {
+            return file.writeFontBackendWiring(w, indent);
+        }
+    };
+}

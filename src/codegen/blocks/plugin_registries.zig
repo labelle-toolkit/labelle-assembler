@@ -75,6 +75,44 @@ pub fn writePluginControllersBlock(bw: anytype, cfg: ProjectConfig) !void {
     try bw.writeAll("};\n\n");
 }
 
+/// Mixin factory for `Codegen` (labelle-assembler#183, mixin conversion).
+///
+/// Pulls `cfg`, `plugin_events`, `plugin_flow_nodes`, `plugin_pin_styles`,
+/// `plugin_coercions` from `self` so the orchestrator dispatches
+/// `ctx.writePluginXxxBlock(w)` instead of re-threading the discovered
+/// scan results into every call. Standalone functions stay `pub` for
+/// the test surface (`flow_scanner_tests.zig`,
+/// `engine_events_discovery_test.zig`, `root.zig:generateGameShim`).
+pub fn Mixin(comptime Self: type) type {
+    // Capture the enclosing file's namespace so the same-name methods
+    // below can reach the standalone bodies without shadowing recursion.
+    // `@This()` evaluated here (in the factory body, outside the returned
+    // struct) resolves to the file namespace; survives file renames that
+    // an `@import("self.zig")` workaround would silently break.
+    const file = @This();
+    return struct {
+        pub fn writePluginControllersBlock(self: *Self, bw: anytype) !void {
+            return file.writePluginControllersBlock(bw, self.cfg);
+        }
+        pub fn writePluginEventsBlock(self: *Self, bw: anytype) !void {
+            return file.writePluginEventsBlock(bw, self.plugin_events);
+        }
+        pub fn writePluginFlowNodesBlock(self: *Self, bw: anytype) !void {
+            return file.writePluginFlowNodesBlock(bw, self.plugin_flow_nodes);
+        }
+        pub fn writePluginPinStylesBlock(_: *Self, bw: anytype, pin_styles: []const PluginPinStyle) !void {
+            // pin_styles is passed explicitly because the orchestrator
+            // deduplicates them via an allocator-owned temporary slice
+            // before emission — keeping that allocation lifecycle in the
+            // orchestrator avoids stashing the dedupe buffer on `self`.
+            return file.writePluginPinStylesBlock(bw, pin_styles);
+        }
+        pub fn writePluginCoercionsBlock(self: *Self, bw: anytype) !void {
+            return file.writePluginCoercionsBlock(bw, self.plugin_coercions);
+        }
+    };
+}
+
 /// Emit the `PluginEvents` tagged union (RFC-PLUGIN-EVENTS phase 1).
 ///
 /// Plugin events are discovered **at assembler time** by parsing each

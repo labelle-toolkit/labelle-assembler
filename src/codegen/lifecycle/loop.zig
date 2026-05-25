@@ -233,3 +233,28 @@ pub fn buildGuiDrawCode(allocator: std.mem.Allocator, cfg: ProjectConfig, view_n
     var arr_list = alloc_writer.toArrayList();
     return arr_list.toOwnedSlice(allocator);
 }
+
+/// Mixin factory for `Codegen` (labelle-assembler#183, mixin conversion).
+///
+/// Pulls `allocator`, `cfg`, `jsonc_scene_names`, `prefab_names`,
+/// `view_names` from `self` so the orchestrator dispatches
+/// `ctx.buildSetupCode()` / `ctx.buildGuiDrawCode()` without re-
+/// threading those slices. Standalone functions above stay `pub` for
+/// the test surface (`test/tests.zig`'s `buildSetupCode` shape
+/// assertions).
+pub fn Mixin(comptime Self: type) type {
+    // Capture the enclosing file's namespace so the same-name methods
+    // below can reach the standalone bodies without shadowing recursion.
+    // `@This()` evaluated here (in the factory body, outside the returned
+    // struct) resolves to the file namespace; survives file renames that
+    // an `@import("self.zig")` workaround would silently break.
+    const file = @This();
+    return struct {
+        pub fn buildSetupCode(self: *Self) ![]const u8 {
+            return file.buildSetupCode(self.allocator, self.cfg, self.jsonc_scene_names, self.prefab_names);
+        }
+        pub fn buildGuiDrawCode(self: *Self) ![]const u8 {
+            return file.buildGuiDrawCode(self.allocator, self.cfg, self.view_names);
+        }
+    };
+}
