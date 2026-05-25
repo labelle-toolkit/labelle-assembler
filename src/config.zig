@@ -423,10 +423,11 @@ pub const ProjectConfig = struct {
     gfx_version: []const u8 = GFX_VERSION,
     labelle_version: []const u8 = CLI_VERSION,
 
-    /// Explicit initial prefab name. When set, the generator loads this prefab on
-    /// startup instead of relying on filesystem scan order (the first discovered
-    /// prefab). Part of RFC #560 (unify scenes and prefabs): `.initial_scene` was
-    /// renamed to `.initial_prefab` for symmetry with the unified vocabulary.
+    /// Explicit initial prefab name. When set, the generator emits this prefab for
+    /// startup instead of relying on filesystem scan order (`jsonc_scene_names[0]`,
+    /// i.e. the first discovered scene in `scenes/*.jsonc`). Part of RFC #560
+    /// (unify scenes and prefabs): `.initial_scene` was renamed to `.initial_prefab`
+    /// for symmetry with the unified vocabulary.
     initial_prefab: ?[]const u8 = null,
     /// Deprecated legacy alias for `initial_prefab`. Still accepted in `project.labelle`
     /// for one or two release cycles (RFC #560 / issue #565). When both are present,
