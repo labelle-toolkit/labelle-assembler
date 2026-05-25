@@ -52,6 +52,13 @@ pub fn build(b: *std.Build) void {
     });
     assembler_exe.root_module.addOptions("build_options", options);
     assembler_exe.root_module.addImport("flow_codegen", flow_codegen_module);
+    // `src/flow_catalog/json_writer.zig` calls `std.posix.system.clock_gettime`
+    // for the sidecar's `generated_at` timestamp. On Linux/macOS Zig finds
+    // the libc symbols implicitly via the system loader, but Windows
+    // cross-compiles require explicit `linkLibC()` (Zig 0.16's `std.time.timestamp`
+    // was removed). Cheap addition for a build tool that already depends on
+    // libc transparently.
+    assembler_exe.root_module.link_libc = true;
     b.installArtifact(assembler_exe);
 
     const assembler_run = b.addRunArtifact(assembler_exe);
@@ -72,6 +79,7 @@ pub fn build(b: *std.Build) void {
     });
     src_tests.root_module.addOptions("build_options", options);
     src_tests.root_module.addImport("flow_codegen", flow_codegen_module);
+    src_tests.root_module.link_libc = true; // see assembler_exe comment above
     test_step.dependOn(&b.addRunArtifact(src_tests).step);
 
     // Subcommand tests — `src/main.zig` is the binary's root and reaches
@@ -86,6 +94,7 @@ pub fn build(b: *std.Build) void {
     });
     bin_tests.root_module.addOptions("build_options", options);
     bin_tests.root_module.addImport("flow_codegen", flow_codegen_module);
+    bin_tests.root_module.link_libc = true; // see assembler_exe comment above
     test_step.dependOn(&b.addRunArtifact(bin_tests).step);
 
     // BDD-style tests from test/. Each test target gets `generator`,

@@ -8,6 +8,7 @@
 //! schema.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("../config.zig");
 const types = @import("types.zig");
 
@@ -241,11 +242,28 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
 /// `strftime`-style call.
 fn formatTimestamp(buf: *[32]u8) []const u8 {
     const epoch_secs: u64 = blk: {
-        // `std.time.timestamp` was removed in 0.16; use `clock_gettime`
-        // through libc the same way `tests.zig` does.
-        var ts: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.REALTIME, &ts);
-        break :blk @intCast(ts.sec);
+        // `std.time.timestamp` was removed in 0.16; route per-platform:
+        //   - Windows: GetSystemTimeAsFileTime → 100-ns intervals since
+        //     1601-01-01 UTC, convert to Unix epoch seconds.
+        //   - POSIX: clock_gettime through libc.
+        if (builtin.os.tag == .windows) {
+            // Zig 0.16's std.os.windows doesn't expose GetSystemTimeAsFileTime
+            // as a helper — declare the extern locally. FILETIME is a 64-bit
+            // count of 100-ns intervals since 1601-01-01 UTC; Unix epoch
+            // (1970-01-01) is 11644473600 seconds after that.
+            const GetSystemTimeAsFileTime = struct {
+                extern "kernel32" fn GetSystemTimeAsFileTime(*std.os.windows.FILETIME) callconv(.winapi) void;
+            }.GetSystemTimeAsFileTime;
+            var ft: std.os.windows.FILETIME = undefined;
+            GetSystemTimeAsFileTime(&ft);
+            const ticks: u64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            const secs_1601: u64 = ticks / 10_000_000;
+            break :blk if (secs_1601 > 11644473600) secs_1601 - 11644473600 else 0;
+        } else {
+            var ts: std.posix.timespec = undefined;
+            _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+            break :blk @intCast(ts.sec);
+        }
     };
 
     // Days since 1970-01-01 + seconds-of-day.
