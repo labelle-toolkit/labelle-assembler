@@ -18,7 +18,6 @@
 //! validated upstream by `validateResources`, so this module just
 //! interpolates the name into the generated source.
 
-const std = @import("std");
 const config = @import("../../config.zig");
 const idents = @import("../idents.zig");
 
@@ -92,7 +91,7 @@ pub fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
             for (params.ranges) |r| {
                 try w.print("        .{{ .first = 0x{X}, .last = 0x{X} }},\n", .{ r.first, r.last });
             }
-            try w.print("    }};\n", .{});
+            try w.writeAll("    };\n");
             try w.print(
                 "    const {s}_params: engine.FontBakeParams = .{{ .pixel_height = {d}, .ranges = &{s}_ranges, .atlas_width = {d}, .atlas_height = {d} }};\n",
                 .{ res.name, params.pixel_height, res.name, params.atlas_width, params.atlas_height },
