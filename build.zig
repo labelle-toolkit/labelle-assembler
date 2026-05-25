@@ -111,6 +111,9 @@ pub fn build(b: *std.Build) void {
         "test/template_dynamic_test.zig",
         "test/scanner_symlink_tests.zig",
         "test/scanner_orphan_tests.zig",
+        // flow_scanner test shim — re-exports per-domain test sections
+        // from `test/flow_scanner/*.zig` so a single zspec dispatcher
+        // walks them all. The split was issue #185 (was 2445 lines).
         "test/flow_scanner_tests.zig",
         // labelle-engine#578 — engine-side extension to
         // `discoverPluginEvents` (engine pass walks
