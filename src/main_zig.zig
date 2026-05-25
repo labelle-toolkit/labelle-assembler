@@ -15,6 +15,7 @@ const script_scanner = @import("script_scanner.zig");
 const scene_manifest = @import("scene_manifest.zig");
 const scan = @import("codegen/scan.zig");
 const idents = @import("codegen/idents.zig");
+pub const validate = @import("codegen/validate.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const PluginDep = config.PluginDep;
@@ -61,31 +62,17 @@ const isValidZigIdentifier = idents.isValidZigIdentifier;
 const writeZigString = idents.writeZigString;
 const pathToPascal = idents.pathToPascal;
 
-/// Validate that no two prefab paths collapse to the same basename.
-/// Returns a heap-allocated error message on collision (caller
-/// owns); returns `null` when the set is unambiguous. Quadratic
-/// over the prefab list — fine for the expected ~10²-scale prefab
-/// counts, no need for a HashSet.
-fn checkBasenameCollisions(allocator: std.mem.Allocator, prefab_names: []const []const u8) !?[]const u8 {
-    for (prefab_names, 0..) |a, i| {
-        const a_base = std.fs.path.basename(a);
-        for (prefab_names[i + 1 ..]) |b| {
-            const b_base = std.fs.path.basename(b);
-            if (std.mem.eql(u8, a_base, b_base)) {
-                return try std.fmt.allocPrint(allocator, "duplicate prefab basename '{s}' (paths: '{s}', '{s}') — every prefab must have a unique filename across subfolders", .{ a_base, a, b });
-            }
-        }
-    }
-    return null;
-}
-
-/// Check if a script entry with the given name exists.
-fn hasContextEntry(entries: []const ScriptEntry) bool {
-    for (entries) |entry| {
-        if (std.mem.eql(u8, entry.name, "context")) return true;
-    }
-    return false;
-}
+// Validation helpers extracted to `src/codegen/validate.zig` in the
+// third cut of the refactor (see docs/REFACTOR-PLAN-main-zig.md).
+// `checkBasenameCollisions`, `hasContextEntry`, and `validateResources`
+// are pure validation passes — no template state, no codegen output —
+// so they were the third low-risk move. Kept as private aliases here
+// so the orchestrator call sites (`try validateResources(cfg)`, etc.)
+// don't need `validate.` prefixes; the new module is the source of
+// truth.
+const checkBasenameCollisions = validate.checkBasenameCollisions;
+const hasContextEntry = validate.hasContextEntry;
+const validateResources = validate.validateResources;
 
 /// Emit the image-backend wiring: an adapter namespace bridging the
 /// backend's `decodeImage`/`uploadTexture`/`unloadTexture` to
@@ -873,78 +860,6 @@ fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
             }
         },
         .invalid => return error.InvalidResourceDef,
-    }
-}
-
-/// Pre-emission validation pass over `cfg.resources`. Surfaces every
-/// malformed entry as a stderr diagnostic and returns `error.InvalidResource`
-/// after the first one — the user sees the offending resource name and
-/// what's wrong before any codegen happens. The CLI maps the structured
-/// errors from `ResourceDef.validate()` to actionable hints.
-fn validateResources(cfg: ProjectConfig) !void {
-    const io = config.globalIo();
-    for (cfg.resources) |res| {
-        switch (res.validate()) {
-            .ok => {},
-            .no_path => {
-                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
-                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' declares no asset path. Set one of `.json`+`.texture` (atlas), `.sound` (.wav/.ogg), or `.font` (.ttf/.otf).\n") catch {};
-                return error.InvalidResource;
-            },
-            .multiple_paths => {
-                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
-                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' sets more than one asset path. A resource is exactly one of atlas / sound / font.\n") catch {};
-                return error.InvalidResource;
-            },
-            .atlas_incomplete => {
-                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: atlas resource '") catch {};
-                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' is missing either `.json` or `.texture`. Both are required.\n") catch {};
-                return error.InvalidResource;
-            },
-            .font_params_misplaced => {
-                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
-                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' sets `.font_params` but is not a font resource. Remove `.font_params` or change to `.font = \"...\"`.\n") catch {};
-                return error.InvalidResource;
-            },
-        }
-        // Extension sanity for sound/font — surfaces obviously-wrong
-        // extensions (e.g. `.font = "x.png"`) at codegen time instead
-        // of letting the generated `@embedFile` swallow it silently
-        // alongside an empty file_type string.
-        if (res.kind() == .sound) {
-            const ext = extWithoutDot(res.sound);
-            if (!std.mem.eql(u8, ext, "wav") and !std.mem.eql(u8, ext, "ogg")) {
-                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: sound resource '") catch {};
-                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' has unsupported extension. Expected `.wav` or `.ogg`.\n") catch {};
-                return error.UnsupportedResourceExtension;
-            }
-        }
-        if (res.kind() == .font) {
-            const ext = extWithoutDot(res.font);
-            if (!std.mem.eql(u8, ext, "ttf") and !std.mem.eql(u8, ext, "otf")) {
-                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: font resource '") catch {};
-                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' has unsupported extension. Expected `.ttf` or `.otf`.\n") catch {};
-                return error.UnsupportedResourceExtension;
-            }
-            // Font emission interpolates `res.name` into Zig
-            // identifier positions (`{name}_ranges`, `{name}_params`).
-            // A hyphenated name like "ui-font" would otherwise produce
-            // uncompilable `const ui-font_ranges = ...`. Atlas + sound
-            // emissions don't have this constraint — those names only
-            // appear in string literals.
-            if (!isValidZigIdentifier(res.name)) {
-                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: font resource '") catch {};
-                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' has a name that is not a valid Zig identifier. Font resource names must start with [A-Za-z_] and contain only [A-Za-z0-9_] thereafter (the codegen uses the name as a local const identifier for the bake params).\n") catch {};
-                return error.InvalidFontResourceName;
-            }
-        }
     }
 }
 
