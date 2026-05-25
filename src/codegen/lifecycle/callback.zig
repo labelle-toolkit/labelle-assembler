@@ -18,37 +18,29 @@
 //! and controllers. Any reordering changes the generated `main.zig`
 //! and is detectable through `scripts/gen_all_examples.sh`.
 //!
-//! Pure move + re-export. The helper functions
+//! Pure move + re-export. The asset-wiring + resource-loader helpers
 //! (`writeImageBackendWiring`, `writeAudioBackendWiring`,
-//! `writeFontBackendWiring`, `emitResourceLoad`, `LoadStyle`,
-//! `pathToIdent`) still live in `main_zig.zig` because the
-//! `blocks/asset_wiring.zig` and `blocks/resource_loader.zig` sub-
-//! modules haven't been extracted yet (steps 4 and 5 of the plan).
-//! We reach them through `main_zig.zig` to avoid a churn-only
-//! intermediate move; when those blocks land, this import flips to
-//! the new module paths and the `pub` markers in `main_zig.zig` go
-//! back to private.
+//! `writeFontBackendWiring`, `emitResourceLoad`, `LoadStyle`) are
+//! pulled directly from `../blocks/asset_wiring.zig` and
+//! `../blocks/resource_loader.zig` — both blocks now live in this
+//! umbrella, so the previous routing through `main_zig.zig` (kept as
+//! a forward-compat shim during the staged extraction) is gone.
+//! `pathToIdent` comes straight from `codegen/scan.zig`.
 
 const std = @import("std");
 const config = @import("../../config.zig");
-const main_zig = @import("../../main_zig.zig");
 const scan = @import("../scan.zig");
+const asset_wiring = @import("../blocks/asset_wiring.zig");
+const resource_loader = @import("../blocks/resource_loader.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
-// `pathToIdent` already lives in `codegen/scan.zig` (extracted in the
-// PoC); reach it directly so this submodule doesn't pull in a transitive
-// re-import through `main_zig.zig`.
 const pathToIdent = scan.pathToIdent;
-
-// Helpers still living in main_zig.zig until the block extractions
-// land. Aliased here so the function bodies below read identically
-// to their pre-move shape — no `main_zig.` prefix sprinkling.
-const writeImageBackendWiring = main_zig.writeImageBackendWiring;
-const writeAudioBackendWiring = main_zig.writeAudioBackendWiring;
-const writeFontBackendWiring = main_zig.writeFontBackendWiring;
-const emitResourceLoad = main_zig.emitResourceLoad;
-const LoadStyle = main_zig.LoadStyle;
+const writeImageBackendWiring = asset_wiring.writeImageBackendWiring;
+const writeAudioBackendWiring = asset_wiring.writeAudioBackendWiring;
+const writeFontBackendWiring = asset_wiring.writeFontBackendWiring;
+const emitResourceLoad = resource_loader.emitResourceLoad;
+const LoadStyle = resource_loader.LoadStyle;
 
 /// Init code for callback-based backends (inside a `!void` helper, can use try).
 pub fn buildCallbackInitCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8, prefab_names: []const []const u8) ![]const u8 {

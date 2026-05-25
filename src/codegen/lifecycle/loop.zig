@@ -6,24 +6,24 @@
 //! across `writeXxxWiring` + `emitResourceLoad` is preserved byte-for-byte,
 //! verified with `scripts/gen_all_examples.sh`.
 //!
-//! Helpers reached through `main_zig.zig` (`writeImageBackendWiring`,
-//! `writeAudioBackendWiring`, `writeFontBackendWiring`, `emitResourceLoad`,
-//! `LoadStyle`) are still inline in the orchestrator on this branch — the
-//! parallel `blocks/asset_wiring.zig` + `blocks/resource_loader.zig` cuts
-//! (PRs #197, #199) move them out to their own modules; this file's imports
-//! flip to those locations as part of that merge.
+//! `writeImageBackendWiring`, `writeAudioBackendWiring`,
+//! `writeFontBackendWiring`, `emitResourceLoad`, and `LoadStyle` are
+//! imported directly from `../blocks/asset_wiring.zig` +
+//! `../blocks/resource_loader.zig` — both blocks are part of this
+//! umbrella, so the prior detour through `main_zig.zig` is gone.
 const std = @import("std");
 const config = @import("../../config.zig");
-const main_zig = @import("../../main_zig.zig");
 const scan = @import("../scan.zig");
+const asset_wiring = @import("../blocks/asset_wiring.zig");
+const resource_loader = @import("../blocks/resource_loader.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const ResourceDef = config.ResourceDef;
 
-const writeImageBackendWiring = main_zig.writeImageBackendWiring;
-const writeAudioBackendWiring = main_zig.writeAudioBackendWiring;
-const writeFontBackendWiring = main_zig.writeFontBackendWiring;
-const emitResourceLoad = main_zig.emitResourceLoad;
+const writeImageBackendWiring = asset_wiring.writeImageBackendWiring;
+const writeAudioBackendWiring = asset_wiring.writeAudioBackendWiring;
+const writeFontBackendWiring = asset_wiring.writeFontBackendWiring;
+const emitResourceLoad = resource_loader.emitResourceLoad;
 const pathToIdent = scan.pathToIdent;
 
 pub fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8, prefab_names: []const []const u8) ![]const u8 {
