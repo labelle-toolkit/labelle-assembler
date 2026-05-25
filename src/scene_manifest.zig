@@ -860,39 +860,41 @@ test "children nested at exactly MAX_CHILDREN_DEPTH levels is accepted" {
     // deep with a single leaf entity at the bottom.  The depth counter starts
     // at 0 at the root's children array, so MAX_CHILDREN_DEPTH levels of
     // nesting must all pass.
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
-    defer buf.deinit();
-    try buf.appendSlice("{\"root\":{\"children\":[");
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"root\":{\"children\":[");
     var i: u32 = 0;
     while (i < MAX_CHILDREN_DEPTH) : (i += 1) {
-        try buf.appendSlice("{\"children\":[");
+        try buf.appendSlice(allocator, "{\"children\":[");
     }
-    try buf.appendSlice("{\"prefab\":\"leaf\"}");
+    try buf.appendSlice(allocator, "{\"prefab\":\"leaf\"}");
     i = 0;
     while (i < MAX_CHILDREN_DEPTH) : (i += 1) {
-        try buf.appendSlice("]}");
+        try buf.appendSlice(allocator, "]}");
     }
-    try buf.appendSlice("]}}");
-    const m = try parseSceneSource(std.testing.allocator, "deep_ok", "deep_ok.jsonc", buf.items);
-    freeManifest(std.testing.allocator, m);
+    try buf.appendSlice(allocator, "]}}");
+    const m = try parseSceneSource(allocator, "deep_ok", "deep_ok.jsonc", buf.items);
+    freeManifest(allocator, m);
 }
 
 test "children nested beyond MAX_CHILDREN_DEPTH is a hard error" {
     // One extra level beyond the cap must trigger error.InvalidEntityShape.
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
-    defer buf.deinit();
-    try buf.appendSlice("{\"root\":{\"children\":[");
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"root\":{\"children\":[");
     var i: u32 = 0;
     while (i < MAX_CHILDREN_DEPTH + 1) : (i += 1) {
-        try buf.appendSlice("{\"children\":[");
+        try buf.appendSlice(allocator, "{\"children\":[");
     }
-    try buf.appendSlice("{\"prefab\":\"leaf\"}");
+    try buf.appendSlice(allocator, "{\"prefab\":\"leaf\"}");
     i = 0;
     while (i < MAX_CHILDREN_DEPTH + 1) : (i += 1) {
-        try buf.appendSlice("]}");
+        try buf.appendSlice(allocator, "]}");
     }
-    try buf.appendSlice("]}}");
-    const result = parseSceneSource(std.testing.allocator, "deep_bad", "deep_bad.jsonc", buf.items);
+    try buf.appendSlice(allocator, "]}}");
+    const result = parseSceneSource(allocator, "deep_bad", "deep_bad.jsonc", buf.items);
     try std.testing.expectError(error.InvalidEntityShape, result);
 }
 
