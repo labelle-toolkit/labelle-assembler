@@ -94,12 +94,26 @@ pub fn build(b: *std.Build) void {
     // attach (pure-Zig sub-package, no native deps) so the blanket
     // import isn't an unwanted runtime cost.
     const test_files = [_][]const u8{
-        "test/tests.zig",
+        // BDD test suites previously concentrated in test/tests.zig
+        // (3768 lines). Split by domain via #184. Shared fixtures live
+        // in test/helpers.zig.
+        "test/build_zig_zon_tests.zig",
+        "test/build_zig_tests.zig",
+        "test/main_zig_tests.zig",
+        "test/scene_asset_manifests_tests.zig",
+        "test/backend_wiring_tests.zig",
+        "test/scripts_prefabs_views_layers_tests.zig",
+        "test/resources_tests.zig",
+        "test/window_subfolders_imgui_tests.zig",
+        "test/preview_mode_tests.zig",
         "test/script_scanner_tests.zig",
         "test/deps_linker_tests.zig",
         "test/template_dynamic_test.zig",
         "test/scanner_symlink_tests.zig",
         "test/scanner_orphan_tests.zig",
+        // flow_scanner test shim — re-exports per-domain test sections
+        // from `test/flow_scanner/*.zig` so a single zspec dispatcher
+        // walks them all. The split was issue #185 (was 2445 lines).
         "test/flow_scanner_tests.zig",
         // labelle-engine#578 — engine-side extension to
         // `discoverPluginEvents` (engine pass walks

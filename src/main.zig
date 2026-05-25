@@ -57,7 +57,7 @@ const usage =
     \\
     \\Generate options:
     \\  --project-root <path>   Path to game project (containing project.labelle)
-    \\  --scene <name>          Override initial scene from project.labelle
+    \\  --scene <name>          Override the initial prefab from project.labelle
     \\  --platform <name>       Override target platform (desktop, wasm, ios, android)
     \\  --backend <name>        Override graphics backend (raylib, sokol, sdl, bgfx, wgpu)
     \\
@@ -193,7 +193,8 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
         std.process.exit(1);
     };
 
-    if (scene_override) |s| cfg.initial_scene = s;
+    cfg.normalizeInitialPrefab();
+    if (scene_override) |s| cfg.initial_prefab = s;
     if (platform_override) |p| cfg.platform = p;
     if (backend_override) |b| cfg.backend = b;
 

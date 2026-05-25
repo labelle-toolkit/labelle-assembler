@@ -174,7 +174,7 @@ pub fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_sc
             try w.print("    g.setState(\"{s}\");\n", .{cfg.states[0]});
         }
 
-        const initial = cfg.initial_scene orelse jsonc_scene_names[0];
+        const initial = cfg.resolvedInitialPrefab() orelse jsonc_scene_names[0];
         try w.print("    try g.setScene(\"{s}\");\n", .{initial});
         try w.writeByte('\n');
     }

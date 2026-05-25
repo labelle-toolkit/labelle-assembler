@@ -18,7 +18,7 @@
     // platform-specific deps.
     .backend = .null,
     .ecs = .mock,
-    .initial_scene = "main",
+    .initial_prefab = "main",
     .states = .{"playing"},
     .core_version = "local:../../../labelle-core",
     .engine_version = "local:../../../labelle-engine",
