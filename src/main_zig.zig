@@ -17,6 +17,7 @@ const scan = @import("codegen/scan.zig");
 const idents = @import("codegen/idents.zig");
 pub const validate = @import("codegen/validate.zig");
 pub const resource_loader = @import("codegen/blocks/resource_loader.zig");
+pub const scene_manifests_block = @import("codegen/blocks/scene_manifests.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const PluginDep = config.PluginDep;
@@ -74,6 +75,16 @@ const pathToPascal = idents.pathToPascal;
 const checkBasenameCollisions = validate.checkBasenameCollisions;
 const hasContextEntry = validate.hasContextEntry;
 const validateResources = validate.validateResources;
+
+// Scene-manifest block writers extracted to
+// `src/codegen/blocks/scene_manifests.zig` per step 5 of the cut plan
+// (see docs/REFACTOR-PLAN-main-zig.md, labelle-assembler#183). The
+// module is re-exported above as `scene_manifests_block` so external
+// callers can reach it through main_zig; these private aliases preserve
+// the existing call shape inside the orchestrator without sprinkling
+// `scene_manifests_block.` prefixes.
+const writeSceneAssetManifests = scene_manifests_block.writeSceneAssetManifests;
+const writeSceneInitialStateManifests = scene_manifests_block.writeSceneInitialStateManifests;
 
 // Resource-loader emit moved to `src/codegen/blocks/resource_loader.zig`
 // in step 5b of the refactor (see docs/REFACTOR-PLAN-main-zig.md).
@@ -1247,120 +1258,6 @@ fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
     var arr_list = alloc_writer.toArrayList();
     return arr_list.toOwnedSlice(allocator);
 }
-
-/// Emit the `SceneAssetManifests` comptime struct that exposes each scene's
-/// declared `assets:` array to labelle-engine. The format is the codegen
-/// contract for the SceneEntry.assets consumer (labelle-engine issue #445):
-///
-///     pub const SceneAssetManifests = struct {
-///         pub const menu: []const []const u8 = &.{ "background", "ship" };
-///         pub const world_intro: []const []const u8 = &.{};
-///
-///         pub const Entry = struct { name: []const u8, assets: []const []const u8 };
-///         pub const entries: []const Entry = &.{
-///             .{ .name = "menu",        .assets = menu },
-///             .{ .name = "world/intro", .assets = world_intro },
-///         };
-///     };
-///
-/// Per-scene decls give comptime access by ident; the `entries` array is the
-/// stable iteration order (matches the assembler's sorted scene-name order).
-fn writeSceneAssetManifests(
-    w: anytype,
-    jsonc_scene_names: []const []const u8,
-    scene_manifests: []const SceneManifest,
-    ident_buf: *[256]u8,
-) !void {
-    if (jsonc_scene_names.len == 0) return;
-    // In the production codegen path the two slices are produced together in
-    // root.zig and are always the same length. Existing main.zig generation
-    // tests, however, pass the legacy parameter set with an empty manifest
-    // slice — we treat that as "no asset metadata, all scenes empty" so old
-    // tests stay valid without a forced rewrite.
-    const have_manifests = scene_manifests.len == jsonc_scene_names.len;
-    std.debug.assert(have_manifests or scene_manifests.len == 0);
-
-    try w.writeAll("\n// --- Scene asset manifests (parsed from scenes/*.jsonc) ---\n");
-    try w.writeAll("pub const SceneAssetManifests = struct {\n");
-
-    // Per-scene named decls.
-    for (jsonc_scene_names, 0..) |name, idx| {
-        const ident = pathToIdent(name, ident_buf);
-        const assets: []const []const u8 = if (have_manifests) scene_manifests[idx].assets else &.{};
-        if (assets.len == 0) {
-            try w.print("    pub const {s}: []const []const u8 = &.{{}};\n", .{ident});
-        } else {
-            try w.print("    pub const {s}: []const []const u8 = &.{{ ", .{ident});
-            for (assets, 0..) |asset, i| {
-                if (i > 0) try w.writeAll(", ");
-                try writeZigString(w, asset);
-            }
-            try w.writeAll(" };\n");
-        }
-    }
-
-    // Stable iteration list. Engine code can do
-    //   for (SceneAssetManifests.entries) |e| { ... e.name, e.assets ... }
-    // without touching @typeInfo at all.
-    try w.writeAll("\n    pub const Entry = struct { name: []const u8, assets: []const []const u8 };\n");
-    try w.writeAll("    pub const entries: []const Entry = &.{\n");
-    for (jsonc_scene_names) |name| {
-        const ident = pathToIdent(name, ident_buf);
-        try w.writeAll("        .{ .name = ");
-        try writeZigString(w, name);
-        try w.print(", .assets = @This().{s} }},\n", .{ident});
-    }
-    try w.writeAll("    };\n");
-    try w.writeAll("};\n");
-}
-
-/// Emit the `SceneInitialStateManifests` comptime struct that exposes each
-/// scene's declared `initial_state:` to labelle-engine's setSceneInitialState
-/// API. Mirrors the SceneAssetManifests pattern (see above).
-///
-///     pub const SceneInitialStateManifests = struct {
-///         pub const Entry = struct { name: []const u8, initial_state: []const u8 };
-///         pub const entries: []const Entry = &.{
-///             .{ .name = "combat_arena", .initial_state = "playing" },
-///         };
-///     };
-///
-/// Unlike SceneAssetManifests, this struct ONLY lists scenes that actually
-/// declared an `initial_state` — scenes without one don't appear, so the
-/// generated `inline for (entries)` loop is a no-op for back-compat scenes.
-fn writeSceneInitialStateManifests(
-    w: anytype,
-    jsonc_scene_names: []const []const u8,
-    scene_manifests: []const SceneManifest,
-) !void {
-    if (jsonc_scene_names.len == 0) return;
-    if (scene_manifests.len != jsonc_scene_names.len) {
-        // Legacy parameter set (manifest slice empty) — emit a stub
-        // with no entries so the generated inline-for is a no-op.
-        try w.writeAll("\n// --- Scene initial-state manifests (parsed from scenes/*.jsonc) ---\n");
-        try w.writeAll("pub const SceneInitialStateManifests = struct {\n");
-        try w.writeAll("    pub const Entry = struct { name: []const u8, initial_state: []const u8 };\n");
-        try w.writeAll("    pub const entries: []const Entry = &.{};\n");
-        try w.writeAll("};\n");
-        return;
-    }
-
-    try w.writeAll("\n// --- Scene initial-state manifests (parsed from scenes/*.jsonc) ---\n");
-    try w.writeAll("pub const SceneInitialStateManifests = struct {\n");
-    try w.writeAll("    pub const Entry = struct { name: []const u8, initial_state: []const u8 };\n");
-    try w.writeAll("    pub const entries: []const Entry = &.{\n");
-    for (scene_manifests) |m| {
-        const state = m.initial_state orelse continue;
-        try w.writeAll("        .{ .name = ");
-        try writeZigString(w, m.name);
-        try w.writeAll(", .initial_state = ");
-        try writeZigString(w, state);
-        try w.writeAll(" },\n");
-    }
-    try w.writeAll("    };\n");
-    try w.writeAll("};\n");
-}
-
 
 // ── Template-based generation (engine provides main.zig.template) ────────
 
