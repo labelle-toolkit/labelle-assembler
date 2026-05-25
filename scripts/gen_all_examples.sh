@@ -26,9 +26,11 @@ for ex in "${EXAMPLES[@]}"; do
     continue
   fi
   echo "=== $ex ==="
-  "$BIN" install --project-root "$proj" >/dev/null 2>&1 || echo "install failed for $ex (continuing)"
-  # Wipe stale generated output, then regenerate.
+  # Wipe stale generated output BEFORE install so install gets to populate
+  # `.labelle/` (resolved plugin deps + cached config) from scratch and
+  # generate sees that fresh, install-populated state.
   rm -rf "$proj/.labelle"
+  "$BIN" install --project-root "$proj" >/dev/null 2>&1 || echo "install failed for $ex (continuing)"
   if "$BIN" generate --project-root "$proj" >/dev/null 2>"$OUT/$ex.stderr"; then
     # Copy generated tree for diff.
     if [ -d "$proj/.labelle" ]; then
