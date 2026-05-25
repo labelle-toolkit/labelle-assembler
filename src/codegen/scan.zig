@@ -43,7 +43,8 @@ fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
 
 /// A single discovered `pub const <event_name> = struct {...}` declaration
 /// inside a plugin's `pub const Events = struct { ... }`. Owned by
-/// `PluginEvents.deinit` — both strings are heap-allocated dupes so the
+/// `PluginEvents.deinit` — all three strings (`plugin_import_name`,
+/// `plugin_sanitized`, `event_name`) are heap-allocated dupes so the
 /// caller need not keep the plugin's source buffer alive.
 pub const PluginEvent = struct {
     /// Plugin name as it appears in `project.labelle` (e.g. `box2d`,
@@ -162,7 +163,15 @@ fn discoverEventsFromRoot(
     defer allocator.free(root_path);
 
     const io = config.globalIo();
-    const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, allocator, .limited(8 * 1024 * 1024)) catch return;
+    // Tolerate any non-OOM read failure (missing root.zig, parse errors,
+    // permission issues) — same back-compat path every existing plugin
+    // without an `Events` decl takes. OOM is *not* swallowed: it
+    // propagates so the caller's allocator sees a clean failure path
+    // instead of an empty-discovery false negative under memory pressure.
+    const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
     defer allocator.free(src);
 
     const src_z = try allocator.dupeZ(u8, src);
@@ -660,7 +669,14 @@ pub fn discoverPluginFlowDecls(
         defer allocator.free(root_path);
 
         const io = config.globalIo();
-        const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, allocator, .limited(8 * 1024 * 1024)) catch continue;
+        // Plugins without a `src/root.zig` (or with an unreadable one) are
+        // skipped per the back-compat policy. OOM is propagated rather
+        // than masked as "this plugin contributes nothing" — same
+        // rationale as `discoverEventsFromRoot`.
+        const src = std.Io.Dir.cwd().readFileAlloc(io, root_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
         defer allocator.free(src);
 
         var name_buf: [128]u8 = undefined;
@@ -690,7 +706,14 @@ pub fn discoverPluginFlowDecls(
         defer allocator.free(script_path);
 
         const io = config.globalIo();
-        const src = std.Io.Dir.cwd().readFileAlloc(io, script_path, allocator, .limited(8 * 1024 * 1024)) catch continue;
+        // Unreadable / missing script source is treated as "contributes
+        // nothing" — the generated `main.zig` will surface a clearer
+        // error when it tries to compile the script. OOM stays a hard
+        // failure rather than silently swallowing memory pressure.
+        const src = std.Io.Dir.cwd().readFileAlloc(io, script_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
         defer allocator.free(src);
 
         const sanitized = pathToIdent(entry.rel_path, &ident_buf);
@@ -707,10 +730,39 @@ pub fn discoverPluginFlowDecls(
         ) catch continue;
     }
 
+    // Each `toOwnedSlice` resets its source ArrayList to empty, so the
+    // top-level errdefer chains above stop covering already-detached
+    // slices the moment a *later* `toOwnedSlice` fails. Stage each
+    // owned slice into a local first and guard it with a slice-shaped
+    // errdefer so a mid-sequence OOM still frees everything cleanly
+    // before the struct-return packages them up.
+    const flow_nodes_slice = try flow_nodes.toOwnedSlice(allocator);
+    errdefer {
+        for (flow_nodes_slice) |e| {
+            allocator.free(e.module_import_path);
+            allocator.free(e.module_sanitized);
+            allocator.free(e.node_name);
+            if (e.constructs) |c| allocator.free(c);
+        }
+        allocator.free(flow_nodes_slice);
+    }
+
+    const pin_styles_slice = try pin_styles.toOwnedSlice(allocator);
+    errdefer {
+        for (pin_styles_slice) |e| {
+            allocator.free(e.module_import_path);
+            allocator.free(e.module_sanitized);
+            allocator.free(e.type_name);
+        }
+        allocator.free(pin_styles_slice);
+    }
+
+    const coercions_slice = try coercions.toOwnedSlice(allocator);
+
     return .{
-        .flow_nodes = try flow_nodes.toOwnedSlice(allocator),
-        .pin_styles = try pin_styles.toOwnedSlice(allocator),
-        .coercions = try coercions.toOwnedSlice(allocator),
+        .flow_nodes = flow_nodes_slice,
+        .pin_styles = pin_styles_slice,
+        .coercions = coercions_slice,
         .allocator = allocator,
     };
 }
