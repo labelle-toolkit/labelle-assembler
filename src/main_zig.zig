@@ -16,6 +16,7 @@ const scene_manifest = @import("scene_manifest.zig");
 const scan = @import("codegen/scan.zig");
 const idents = @import("codegen/idents.zig");
 pub const validate = @import("codegen/validate.zig");
+pub const resource_loader = @import("codegen/blocks/resource_loader.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const PluginDep = config.PluginDep;
@@ -73,6 +74,16 @@ const pathToPascal = idents.pathToPascal;
 const checkBasenameCollisions = validate.checkBasenameCollisions;
 const hasContextEntry = validate.hasContextEntry;
 const validateResources = validate.validateResources;
+
+// Resource-loader emit moved to `src/codegen/blocks/resource_loader.zig`
+// in step 5b of the refactor (see docs/REFACTOR-PLAN-main-zig.md).
+// `emitResourceLoad` is reached from BOTH lifecycle paths
+// (`buildSetupCode` with `.try_style`, the sokol callback init builder
+// with `.catch_panic_style`); the public re-export above and the local
+// aliases below keep both call sites unchanged while the lifecycle
+// builders still live in this file.
+pub const LoadStyle = resource_loader.LoadStyle;
+pub const emitResourceLoad = resource_loader.emitResourceLoad;
 
 /// Emit the image-backend wiring: an adapter namespace bridging the
 /// backend's `decodeImage`/`uploadTexture`/`unloadTexture` to
@@ -776,92 +787,14 @@ pub fn writePluginCoercionsBlock(bw: anytype, coercions: []const PluginCoercion)
 
 
 /// Build the setup code block for {{setup_code}} (loop-based backends).
-/// Wrapper style for `emitResourceLoad`. The two callers differ only
-/// in how they propagate load failures:
-///
-/// - `try_style` — used by `buildSetupCode`, whose enclosing function
-///   returns `!void`. Emits `try g.loadXxxFromMemory(...);`.
-/// - `catch_panic_style` — used by `buildCallbackInitCode`, whose
-///   sokol-callback host has no error channel to unwind into. Emits
-///   `g.loadXxxFromMemory(...) catch @panic("failed to load ...");`.
-const LoadStyle = enum { try_style, catch_panic_style };
-
-/// Emit the loader call for one `ResourceDef`, dispatching on
-/// `res.kind()`:
-///
-/// - `.atlas` → `g.{load,register}AtlasFromMemory(name, json, png, ".png")`
-/// - `.sound` → `g.{load,register}SoundFromMemory(name, ext, bytes)`
-/// - `.font`  → emits `{name}_ranges` const array + `{name}_params`
-///   const struct, then `g.{load,register}FontFromMemory(name, ext,
-///   bytes, &{name}_params)`. Materialising the params as a local
-///   `engine.FontBakeParams` lets the catalog's `WorkRequest.params`
-///   slot point at it without a runtime allocation; the const lives
-///   on the stack frame for `main()`'s lifetime.
-///
-/// Caller has already validated `res.kind() != .invalid` via
-/// `validateResources` — this function returns `error.InvalidResourceDef`
-/// if reached anyway to guard against future call-site additions.
-fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
-    const is_lazy = res.lazy orelse false;
-    switch (res.kind()) {
-        .atlas => {
-            const fn_name = if (is_lazy) "registerAtlasFromMemory" else "loadAtlasFromMemory";
-            switch (style) {
-                .try_style => try w.print(
-                    "    try g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\");\n",
-                    .{ fn_name, res.name, res.json, res.texture },
-                ),
-                .catch_panic_style => try w.print(
-                    "    g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas: {s}\");\n",
-                    .{ fn_name, res.name, res.json, res.texture, res.name },
-                ),
-            }
-        },
-        .sound => {
-            const fn_name = if (is_lazy) "registerSoundFromMemory" else "loadSoundFromMemory";
-            const ext = extWithoutDot(res.sound);
-            switch (style) {
-                .try_style => try w.print(
-                    "    try g.{s}(\"{s}\", \"{s}\", @embedFile(\"{s}\"));\n",
-                    .{ fn_name, res.name, ext, res.sound },
-                ),
-                .catch_panic_style => try w.print(
-                    "    g.{s}(\"{s}\", \"{s}\", @embedFile(\"{s}\")) catch @panic(\"failed to load sound: {s}\");\n",
-                    .{ fn_name, res.name, ext, res.sound, res.name },
-                ),
-            }
-        },
-        .font => {
-            const fn_name = if (is_lazy) "registerFontFromMemory" else "loadFontFromMemory";
-            const ext = extWithoutDot(res.font);
-            const params = res.font_params orelse @import("config.zig").FontBakeParams{};
-            // Materialise FontBakeParams locally so the slice field has
-            // a real address to point at. The trailing const sits in
-            // main()'s frame until process exit — same lifetime as
-            // `@embedFile` bytes on the catalog side.
-            try w.print("    const {s}_ranges = [_]engine.CodepointRange{{\n", .{res.name});
-            for (params.ranges) |r| {
-                try w.print("        .{{ .first = 0x{X}, .last = 0x{X} }},\n", .{ r.first, r.last });
-            }
-            try w.print("    }};\n", .{});
-            try w.print(
-                "    const {s}_params: engine.FontBakeParams = .{{ .pixel_height = {d}, .ranges = &{s}_ranges, .atlas_width = {d}, .atlas_height = {d} }};\n",
-                .{ res.name, params.pixel_height, res.name, params.atlas_width, params.atlas_height },
-            );
-            switch (style) {
-                .try_style => try w.print(
-                    "    try g.{s}(\"{s}\", \"{s}\", @embedFile(\"{s}\"), &{s}_params);\n",
-                    .{ fn_name, res.name, ext, res.font, res.name },
-                ),
-                .catch_panic_style => try w.print(
-                    "    g.{s}(\"{s}\", \"{s}\", @embedFile(\"{s}\"), &{s}_params) catch @panic(\"failed to load font: {s}\");\n",
-                    .{ fn_name, res.name, ext, res.font, res.name, res.name },
-                ),
-            }
-        },
-        .invalid => return error.InvalidResourceDef,
-    }
-}
+//
+// `LoadStyle` + `emitResourceLoad` were moved to
+// `src/codegen/blocks/resource_loader.zig` in step 5b of the refactor
+// (see docs/REFACTOR-PLAN-main-zig.md). Re-exported as `pub` above so
+// `root.zig` / `test/tests.zig` keep their existing imports, and
+// aliased privately so both lifecycle callers (`buildSetupCode` below
+// and the sokol callback init builder later in this file) continue to
+// reference the unqualified names.
 
 fn buildSetupCode(allocator: std.mem.Allocator, cfg: ProjectConfig, jsonc_scene_names: []const []const u8, prefab_names: []const []const u8) ![]const u8 {
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
