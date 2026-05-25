@@ -23,6 +23,24 @@ const script_scanner = @import("../script_scanner.zig");
 const ProjectConfig = config.ProjectConfig;
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
 
+/// Write a formatted message directly to stderr without a log-level prefix.
+///
+/// `std.log.err` is deliberately avoided here for the same reason as in
+/// `src/scene_manifest.zig`: the assembler's test suite has negative-path
+/// tests that `expectError(...)` from these emitters, and the test runner's
+/// log interceptor would flag any `std.log.err` call as a hard failure even
+/// when the surrounding test is *expecting* the error. Writing to stderr
+/// directly (via the process-wide Io from `config.globalIo()`) keeps the
+/// human-readable diagnostic in front of the user without tripping that
+/// trap. Mirrors the `writeStderr` helpers in `main.zig` / `cache_cmd.zig`,
+/// just with `bufPrint` for the `{d}` substitution; the format string is
+/// printed verbatim on bufPrint overflow so the user still sees *something*.
+fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
+    std.Io.File.stderr().writeStreamingAll(config.globalIo(), msg) catch {};
+}
+
 /// A single discovered `pub const <event_name> = struct {...}` declaration
 /// inside a plugin's `pub const Events = struct { ... }`. Owned by
 /// `PluginEvents.deinit` — both strings are heap-allocated dupes so the
@@ -184,10 +202,21 @@ fn discoverEventsFromRoot(
             const event_name_tok = member_vd.ast.mut_token + 1;
             const event_name = ast.tokenSlice(event_name_tok);
 
+            // Errdefer-per-dupe so a mid-chain OOM (or the final
+            // `append`) can't strand the already-duped strings. Each
+            // errdefer is cancelled once `append` succeeds and the
+            // entry takes ownership of all three slices.
+            const duped_import_name = try allocator.dupe(u8, module_name);
+            errdefer allocator.free(duped_import_name);
+            const duped_sanitized = try allocator.dupe(u8, sanitized);
+            errdefer allocator.free(duped_sanitized);
+            const duped_event_name = try allocator.dupe(u8, event_name);
+            errdefer allocator.free(duped_event_name);
+
             try entries.append(allocator, .{
-                .plugin_import_name = try allocator.dupe(u8, module_name),
-                .plugin_sanitized = try allocator.dupe(u8, sanitized),
-                .event_name = try allocator.dupe(u8, event_name),
+                .plugin_import_name = duped_import_name,
+                .plugin_sanitized = duped_sanitized,
+                .event_name = duped_event_name,
             });
         }
     }
@@ -494,19 +523,40 @@ fn scanFlowDeclsInSource(
                 // silently ignored — that's a forward-compatible
                 // refinement, not a contract worth enforcing here.
                 const init_src = ast.getNodeSource(member_init);
+                // Errdefer-per-allocation: `constructs_value` is an
+                // optional dupe owned by `extractConstructsString`;
+                // it leaks if any subsequent dupe or the `append`
+                // fails. Each errdefer is cancelled once `append`
+                // moves ownership into the entry.
                 const constructs_value = extractConstructsString(allocator, init_src);
+                errdefer if (constructs_value) |c| allocator.free(c);
+
+                const duped_path = try allocator.dupe(u8, module_import_path);
+                errdefer allocator.free(duped_path);
+                const duped_sanitized = try allocator.dupe(u8, module_sanitized);
+                errdefer allocator.free(duped_sanitized);
+                const duped_name = try allocator.dupe(u8, member_name);
+                errdefer allocator.free(duped_name);
+
                 try flow_nodes_out.append(allocator, .{
-                    .module_import_path = try allocator.dupe(u8, module_import_path),
-                    .module_sanitized = try allocator.dupe(u8, module_sanitized),
-                    .node_name = try allocator.dupe(u8, member_name),
+                    .module_import_path = duped_path,
+                    .module_sanitized = duped_sanitized,
+                    .node_name = duped_name,
                     .is_script = is_script,
                     .constructs = constructs_value,
                 });
             } else if (is_pin_styles) {
+                const duped_path = try allocator.dupe(u8, module_import_path);
+                errdefer allocator.free(duped_path);
+                const duped_sanitized = try allocator.dupe(u8, module_sanitized);
+                errdefer allocator.free(duped_sanitized);
+                const duped_name = try allocator.dupe(u8, member_name);
+                errdefer allocator.free(duped_name);
+
                 try pin_styles_out.append(allocator, .{
-                    .module_import_path = try allocator.dupe(u8, module_import_path),
-                    .module_sanitized = try allocator.dupe(u8, module_sanitized),
-                    .type_name = try allocator.dupe(u8, member_name),
+                    .module_import_path = duped_path,
+                    .module_sanitized = duped_sanitized,
+                    .type_name = duped_name,
                     .is_script = is_script,
                 });
             } else {
@@ -520,10 +570,17 @@ fn scanFlowDeclsInSource(
                 // The flow_catalog sidecar (parallel walk in
                 // `flow_catalog.zig`) extracts the textual types for
                 // the editor's wire-fit check.
+                const duped_path = try allocator.dupe(u8, module_import_path);
+                errdefer allocator.free(duped_path);
+                const duped_sanitized = try allocator.dupe(u8, module_sanitized);
+                errdefer allocator.free(duped_sanitized);
+                const duped_name = try allocator.dupe(u8, member_name);
+                errdefer allocator.free(duped_name);
+
                 try coercions_out.append(allocator, .{
-                    .module_import_path = try allocator.dupe(u8, module_import_path),
-                    .module_sanitized = try allocator.dupe(u8, module_sanitized),
-                    .name = try allocator.dupe(u8, member_name),
+                    .module_import_path = duped_path,
+                    .module_sanitized = duped_sanitized,
+                    .name = duped_name,
                     .is_script = is_script,
                 });
             }
@@ -754,7 +811,7 @@ pub fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
     const append = struct {
         fn f(b: *[256]u8, idx: *usize, bytes: []const u8) void {
             if (idx.* + bytes.len > b.len) {
-                std.debug.print("labelle: path too long for identifier (max {d} chars): too many escaped chars\n", .{b.len});
+                stderrPrint("labelle: path too long for identifier (max {d} chars): too many escaped chars\n", .{b.len});
                 @panic("path exceeds identifier buffer size");
             }
             @memcpy(b[idx.*..][0..bytes.len], bytes);
