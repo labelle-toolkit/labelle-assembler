@@ -3,10 +3,13 @@
 //!
 //! Extracted from `src/main_zig.zig` as the second step of the cut plan
 //! in `docs/REFACTOR-PLAN-main-zig.md` (labelle-assembler#183). These
-//! are pure leaf utilities — no allocations, no I/O, no template state
-//! — that several upcoming submodules (`validate.zig`, the per-block
-//! emitters, the lifecycle builders) will reach through this single
-//! module rather than re-importing back from `main_zig.zig`.
+//! are pure leaf utilities — no allocations, no filesystem I/O, no
+//! template state — that several upcoming submodules (`validate.zig`,
+//! the per-block emitters, the lifecycle builders) will reach through
+//! this single module rather than re-importing back from `main_zig.zig`.
+//! `writeZigString` does write to a caller-supplied `anytype` writer
+//! (and can propagate its error set); that's the only side effect any
+//! helper here has.
 //!
 //! Companion identifier helpers `pathToIdent` and `sanitizePluginIdent`
 //! live in `codegen/scan.zig` because they were already moved alongside
@@ -50,15 +53,21 @@ pub fn isValidZigIdentifier(name: []const u8) bool {
     return true;
 }
 
-/// Write a Zig double-quoted string literal for `s`, escaping `\` and `"` so
-/// that asset names or scene names containing those characters produce valid
-/// generated source rather than a compile error.
+/// Write a Zig double-quoted string literal for `s`, escaping `\`, `"`, and
+/// the common ASCII control characters (`\n`, `\r`, `\t`) so that asset
+/// names or scene names containing those characters produce valid generated
+/// source rather than a compile error. Other control bytes are uncommon in
+/// asset names and would surface a clear compile error if encountered —
+/// adding more escapes is a follow-up if real assets ever need them.
 pub fn writeZigString(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
     for (s) |c| {
         switch (c) {
             '"' => try w.writeAll("\\\""),
             '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
             else => try w.writeByte(c),
         }
     }
@@ -82,6 +91,18 @@ pub fn pathToPascal(name: []const u8, pascal_buf: *[128]u8) []const u8 {
         switch (c) {
             'A'...'Z', 'a'...'z', '0'...'9' => {
                 if (i >= pascal_buf.len) break;
+                // Zig identifiers can't start with a digit, so if the very
+                // first emitted byte would be `0..9` (e.g. paths like
+                // `01_player_movement.zig` once stripped of separators),
+                // prefix an underscore so the resulting type name is a
+                // valid bare identifier rather than something like
+                // `01PlayerMovement`. The buffer guard above already
+                // reserved one slot; reserve one more here.
+                if (i == 0 and c >= '0' and c <= '9') {
+                    if (i + 1 >= pascal_buf.len) break;
+                    pascal_buf[i] = '_';
+                    i += 1;
+                }
                 pascal_buf[i] = if (capitalize_next) std.ascii.toUpper(c) else c;
                 i += 1;
                 capitalize_next = false;
