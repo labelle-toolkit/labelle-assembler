@@ -75,6 +75,46 @@ pub fn writePluginControllersBlock(bw: anytype, cfg: ProjectConfig) !void {
     try bw.writeAll("};\n\n");
 }
 
+/// Mixin factory for `Codegen` (labelle-assembler#183, mixin conversion).
+///
+/// Pulls `cfg`, `plugin_events`, `plugin_flow_nodes`, `plugin_pin_styles`,
+/// `plugin_coercions` from `self` so the orchestrator dispatches
+/// `ctx.writePluginXxxBlock(w)` instead of re-threading the discovered
+/// scan results into every call. Standalone functions stay `pub` for
+/// the test surface (`flow_scanner_tests.zig`,
+/// `engine_events_discovery_test.zig`, `root.zig:generateGameShim`).
+pub fn Mixin(comptime Self: type) type {
+    return struct {
+        pub fn writePluginControllersBlock(self: *Self, bw: anytype) !void {
+            return impl.writePluginControllersBlock(bw, self.cfg);
+        }
+        pub fn writePluginEventsBlock(self: *Self, bw: anytype) !void {
+            return impl.writePluginEventsBlock(bw, self.plugin_events);
+        }
+        pub fn writePluginFlowNodesBlock(self: *Self, bw: anytype) !void {
+            return impl.writePluginFlowNodesBlock(bw, self.plugin_flow_nodes);
+        }
+        pub fn writePluginPinStylesBlock(_: *Self, bw: anytype, pin_styles: []const PluginPinStyle) !void {
+            // pin_styles is passed explicitly because the orchestrator
+            // deduplicates them via an allocator-owned temporary slice
+            // before emission — keeping that allocation lifecycle in the
+            // orchestrator avoids stashing the dedupe buffer on `self`.
+            return impl.writePluginPinStylesBlock(bw, pin_styles);
+        }
+        pub fn writePluginCoercionsBlock(self: *Self, bw: anytype) !void {
+            return impl.writePluginCoercionsBlock(bw, self.plugin_coercions);
+        }
+    };
+}
+
+const impl = struct {
+    pub const writePluginControllersBlock = @import("plugin_registries.zig").writePluginControllersBlock;
+    pub const writePluginEventsBlock = @import("plugin_registries.zig").writePluginEventsBlock;
+    pub const writePluginFlowNodesBlock = @import("plugin_registries.zig").writePluginFlowNodesBlock;
+    pub const writePluginPinStylesBlock = @import("plugin_registries.zig").writePluginPinStylesBlock;
+    pub const writePluginCoercionsBlock = @import("plugin_registries.zig").writePluginCoercionsBlock;
+};
+
 /// Emit the `PluginEvents` tagged union (RFC-PLUGIN-EVENTS phase 1).
 ///
 /// Plugin events are discovered **at assembler time** by parsing each

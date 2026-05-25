@@ -400,3 +400,38 @@ pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}}});\n", .{indent});
     try w.print("\n", .{});
 }
+
+/// Mixin factory for `Codegen` (labelle-assembler#183, mixin conversion).
+///
+/// Returns thin delegator methods so the orchestrator can call
+/// `ctx.writeXxx(w, indent)` in the mixin shape modelled on
+/// `labelle-engine/src/game/*_mixin.zig`. The three writers are pure —
+/// they pull no state from `self` (the engine's audio_mixin shows the
+/// equivalent `_: *Game` shape) — so the mixin only exists to satisfy
+/// the dispatch-through-context contract. Standalone functions above
+/// stay `pub` for the test surface (`test/tests.zig`) and
+/// `root.zig` re-exports.
+pub fn Mixin(comptime Self: type) type {
+    return struct {
+        pub fn writeImageBackendWiring(_: *Self, w: anytype, indent: []const u8) !void {
+            return impl.writeImageBackendWiring(w, indent);
+        }
+        pub fn writeAudioBackendWiring(_: *Self, w: anytype, indent: []const u8) !void {
+            return impl.writeAudioBackendWiring(w, indent);
+        }
+        pub fn writeFontBackendWiring(_: *Self, w: anytype, indent: []const u8) !void {
+            return impl.writeFontBackendWiring(w, indent);
+        }
+    };
+}
+
+// Namespaced re-bind of the standalone bodies so the mixin's
+// same-name methods can reach them without shadowing recursion.
+// (Naming the nested mixin methods the same as the standalone
+// functions is intentional — that's the public dispatch contract;
+// the indirection here is just to break the inner-scope shadow.)
+const impl = struct {
+    pub const writeImageBackendWiring = @import("asset_wiring.zig").writeImageBackendWiring;
+    pub const writeAudioBackendWiring = @import("asset_wiring.zig").writeAudioBackendWiring;
+    pub const writeFontBackendWiring = @import("asset_wiring.zig").writeFontBackendWiring;
+};

@@ -250,3 +250,28 @@ pub fn buildCallbackCleanupCode(allocator: std.mem.Allocator, cfg: ProjectConfig
     var arr_list = alloc_writer.toArrayList();
     return arr_list.toOwnedSlice(allocator);
 }
+
+/// Mixin factory for `Codegen` (labelle-assembler#183, mixin conversion).
+///
+/// Pulls `allocator`, `cfg`, `jsonc_scene_names`, `prefab_names` from
+/// `self`. Standalone functions above stay `pub` for the test surface
+/// (`test/tests.zig`'s `buildCallbackInitCode` shape assertion).
+pub fn Mixin(comptime Self: type) type {
+    return struct {
+        pub fn buildCallbackInitCode(self: *Self) ![]const u8 {
+            return impl.buildCallbackInitCode(self.allocator, self.cfg, self.jsonc_scene_names, self.prefab_names);
+        }
+        pub fn buildImmersiveEntryCode(self: *Self) ![]const u8 {
+            return impl.buildImmersiveEntryCode(self.allocator, self.cfg);
+        }
+        pub fn buildCallbackCleanupCode(self: *Self) ![]const u8 {
+            return impl.buildCallbackCleanupCode(self.allocator, self.cfg);
+        }
+    };
+}
+
+const impl = struct {
+    pub const buildCallbackInitCode = @import("callback.zig").buildCallbackInitCode;
+    pub const buildImmersiveEntryCode = @import("callback.zig").buildImmersiveEntryCode;
+    pub const buildCallbackCleanupCode = @import("callback.zig").buildCallbackCleanupCode;
+};

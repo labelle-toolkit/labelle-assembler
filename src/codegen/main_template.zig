@@ -29,13 +29,8 @@ const scene_manifest = @import("../scene_manifest.zig");
 const scan = @import("scan.zig");
 const idents = @import("idents.zig");
 const validate = @import("validate.zig");
-const asset_wiring = @import("blocks/asset_wiring.zig");
-const scene_manifests_block = @import("blocks/scene_manifests.zig");
-const resource_loader = @import("blocks/resource_loader.zig");
-const plugin_registries = @import("blocks/plugin_registries.zig");
 const preview = @import("preview.zig");
-const lifecycle_loop = @import("lifecycle/loop.zig");
-const lifecycle_callback = @import("lifecycle/callback.zig");
+const context = @import("context.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const PluginDep = config.PluginDep;
@@ -55,28 +50,12 @@ const pathToIdent = scan.pathToIdent;
 // Identifier helpers
 const pathToPascal = idents.pathToPascal;
 
-// Validation
+// Validation (pure helpers — not mixin-converted; see codegen/context.zig).
 const checkBasenameCollisions = validate.checkBasenameCollisions;
 const hasContextEntry = validate.hasContextEntry;
 const validateResources = validate.validateResources;
 
-// Scene manifests
-const writeSceneAssetManifests = scene_manifests_block.writeSceneAssetManifests;
-const writeSceneInitialStateManifests = scene_manifests_block.writeSceneInitialStateManifests;
-
-// Plugin registries
-const writePluginControllersBlock = plugin_registries.writePluginControllersBlock;
-const writePluginEventsBlock = plugin_registries.writePluginEventsBlock;
-const writePluginFlowNodesBlock = plugin_registries.writePluginFlowNodesBlock;
-const writePluginPinStylesBlock = plugin_registries.writePluginPinStylesBlock;
-const writePluginCoercionsBlock = plugin_registries.writePluginCoercionsBlock;
-
-// Lifecycle builders
-const buildSetupCode = lifecycle_loop.buildSetupCode;
-const buildGuiDrawCode = lifecycle_loop.buildGuiDrawCode;
-const buildCallbackInitCode = lifecycle_callback.buildCallbackInitCode;
-const buildImmersiveEntryCode = lifecycle_callback.buildImmersiveEntryCode;
-const buildCallbackCleanupCode = lifecycle_callback.buildCallbackCleanupCode;
+const Codegen = context.Codegen;
 
 // Preview-mode templates (extracted to codegen/preview.zig).
 const WASM_PANIC_WORKAROUND = preview.WASM_PANIC_WORKAROUND;
@@ -165,6 +144,31 @@ pub fn generateMainZigFromTemplate(
     // The diagnostic is written to stderr inside the helper so
     // each malformed entry surfaces its name and reason before bailout.
     try validateResources(cfg);
+
+    // Shared codegen context (labelle-assembler#183 mixin conversion).
+    // Borrows every slice passed in as positional args so the per-block
+    // call sites below dispatch as `ctx.writeXxx(...)` instead of
+    // re-threading the slices into every call. State + dispatch shape
+    // models `labelle-engine/src/game.zig`'s Game + *_mixin.zig pairing.
+    var ctx: Codegen = .{
+        .allocator = allocator,
+        .cfg = cfg,
+        .script_entries = script_entries,
+        .prefab_names = prefab_names,
+        .jsonc_scene_names = jsonc_scene_names,
+        .scene_manifests = scene_manifests,
+        .component_names = component_names,
+        .hook_names = hook_names,
+        .event_names = event_names,
+        .enum_names = enum_names,
+        .view_names = view_names,
+        .gizmo_names = gizmo_names,
+        .animation_names = animation_names,
+        .plugin_events = plugin_events,
+        .plugin_flow_nodes = plugin_flow_nodes,
+        .plugin_pin_styles = plugin_pin_styles,
+        .plugin_coercions = plugin_coercions,
+    };
 
     var data = tpl.TemplateData{
         .scalars = std.StringHashMap([]const u8).init(allocator),
@@ -292,12 +296,12 @@ pub fn generateMainZigFromTemplate(
             // without checking for missing keys. See also the upcoming
             // labelle-engine SceneEntry.assets field — this block is the
             // codegen contract that ticket reads.
-            try writeSceneAssetManifests(bw, jsonc_scene_names, scene_manifests, &ident_buf);
+            try ctx.writeSceneAssetManifests(bw, &ident_buf);
 
             // Same pattern for scene-declared `initial_state`
             // (labelle-engine#500) — emit only the scenes that opted in,
             // so the generated inline-for is a no-op for back-compat.
-            try writeSceneInitialStateManifests(bw, jsonc_scene_names, scene_manifests);
+            try ctx.writeSceneInitialStateManifests(bw);
         }
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
@@ -614,7 +618,7 @@ pub fn generateMainZigFromTemplate(
                 }
                 try bw.writeAll("};\n\n");
             }
-            try writePluginEventsBlock(bw, plugin_events);
+            try ctx.writePluginEventsBlock(bw);
             if (has_game_events_local) {
                 try bw.writeAll("pub const GameEvents = engine.core.MergeHookPayloads(.{ GameEventsRaw, PluginEvents });\n\n");
             } else {
@@ -644,15 +648,15 @@ pub fn generateMainZigFromTemplate(
         // downstream consumers can do uniform reflection. See the
         // file header on `writePluginFlowNodesBlock` for the
         // mechanism + RFC §5 (game-script-as-source) for the scope.
-        try writePluginFlowNodesBlock(bw, plugin_flow_nodes);
+        try ctx.writePluginFlowNodesBlock(bw);
         const deduped_styles = try dedupePinStyles(allocator, plugin_pin_styles);
         defer allocator.free(deduped_styles);
-        try writePluginPinStylesBlock(bw, deduped_styles);
+        try ctx.writePluginPinStylesBlock(bw, deduped_styles);
         // RFC-FLOW-VOCABULARY §2 / O4 — emit PluginCoercions next to
         // the other registries. The block carries its own `resolve` +
         // `findByTypes` helpers so flow-codegen + the editor can do
         // the wire-fit lookup without re-iterating the decls.
-        try writePluginCoercionsBlock(bw, plugin_coercions);
+        try ctx.writePluginCoercionsBlock(bw);
 
         var arr_list_b = alloc_writer_b.toArrayList();
         const block = try arr_list_b.toOwnedSlice(allocator);
@@ -730,7 +734,7 @@ pub fn generateMainZigFromTemplate(
             try bw.writeAll("});\n\n");
             try bw.writeAll("const DiscoveredGizmoCategories = PluginSystems.gizmoCategories();\n\n");
 
-            try writePluginControllersBlock(bw, cfg);
+            try ctx.writePluginControllersBlock(bw);
         } else {
             try bw.writeAll("const GizmoCatEntry = struct { name: []const u8, id: u8 };\n");
             try bw.writeAll("const DiscoveredGizmoCategories: []const GizmoCatEntry = &.{};\n\n");
@@ -867,7 +871,7 @@ pub fn generateMainZigFromTemplate(
             "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
             "        }\n";
 
-        const gui_draw_code = try buildGuiDrawCode(allocator, cfg, view_names);
+        const gui_draw_code = try ctx.buildGuiDrawCode();
         defer allocator.free(gui_draw_code);
 
         var w_buf: [16]u8 = undefined;
@@ -927,7 +931,7 @@ pub fn generateMainZigFromTemplate(
                 PREVIEW_INPUT_DISPATCH_STUB;
             const module_vars = try std.mem.concat(allocator, u8, &.{ sokol_runner, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch_cb });
             defer allocator.free(module_vars);
-            const init_code = try buildCallbackInitCode(allocator, cfg, jsonc_scene_names, prefab_names);
+            const init_code = try ctx.buildCallbackInitCode();
             defer allocator.free(init_code);
 
             const platform_comment: []const u8 = switch (cfg.platform) {
@@ -944,7 +948,7 @@ pub fn generateMainZigFromTemplate(
             };
 
             if (cfg.backend == .sokol) {
-                const cleanup_code = try buildCallbackCleanupCode(allocator, cfg);
+                const cleanup_code = try ctx.buildCallbackCleanupCode();
                 defer allocator.free(cleanup_code);
                 const is_wasm = cfg.platform == .wasm;
                 const allocator_decl: []const u8 = if (is_wasm)
@@ -1059,7 +1063,7 @@ pub fn generateMainZigFromTemplate(
                 // for non-Android / non-immersive projects; the shared
                 // sokol `desktop.txt` has no such hole, so an empty
                 // value there is a harmless no-op.
-                const immersive_entry = try buildImmersiveEntryCode(allocator, cfg);
+                const immersive_entry = try ctx.buildImmersiveEntryCode();
                 defer allocator.free(immersive_entry);
 
                 try tpl.render(lifecycle_tmpl, .{
@@ -1141,7 +1145,7 @@ pub fn generateMainZigFromTemplate(
                 }, bw);
             }
         } else {
-            const setup_code = try buildSetupCode(allocator, cfg, jsonc_scene_names, prefab_names);
+            const setup_code = try ctx.buildSetupCode();
             defer allocator.free(setup_code);
 
             // Raylib desktop gets the PBO async-readback block + the GL

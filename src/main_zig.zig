@@ -29,6 +29,16 @@ pub const plugin_registries = @import("codegen/blocks/plugin_registries.zig");
 pub const lifecycle_loop = @import("codegen/lifecycle/loop.zig");
 pub const lifecycle_callback = @import("codegen/lifecycle/callback.zig");
 pub const main_template = @import("codegen/main_template.zig");
+pub const context = @import("codegen/context.zig");
+
+/// Shared codegen context (labelle-assembler#183 mixin conversion).
+/// Models the engine's `Game` ↔ `*_mixin.zig` pairing — holds the
+/// state previously threaded through `generateMainZigFromTemplate` as
+/// positional args, and composes each block writer's `Mixin(Self)`
+/// factory into method-dispatch shape (`ctx.writeImageBackendWiring(...)`).
+/// The orchestrator is the only consumer today; the re-export here is
+/// for future call sites that want the dispatch shape.
+pub const Codegen = context.Codegen;
 
 const scan = @import("codegen/scan.zig");
 const preview = @import("codegen/preview.zig");
