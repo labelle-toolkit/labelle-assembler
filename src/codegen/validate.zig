@@ -87,7 +87,7 @@ pub fn validateResources(cfg: ProjectConfig) !void {
         // alongside an empty file_type string.
         if (res.kind() == .sound) {
             const ext = extWithoutDot(res.sound);
-            if (!std.mem.eql(u8, ext, "wav") and !std.mem.eql(u8, ext, "ogg")) {
+            if (!std.ascii.eqlIgnoreCase(ext, "wav") and !std.ascii.eqlIgnoreCase(ext, "ogg")) {
                 std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: sound resource '") catch {};
                 std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
                 std.Io.File.stderr().writeStreamingAll(io, "' has unsupported extension. Expected `.wav` or `.ogg`.\n") catch {};
@@ -96,7 +96,7 @@ pub fn validateResources(cfg: ProjectConfig) !void {
         }
         if (res.kind() == .font) {
             const ext = extWithoutDot(res.font);
-            if (!std.mem.eql(u8, ext, "ttf") and !std.mem.eql(u8, ext, "otf")) {
+            if (!std.ascii.eqlIgnoreCase(ext, "ttf") and !std.ascii.eqlIgnoreCase(ext, "otf")) {
                 std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: font resource '") catch {};
                 std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
                 std.Io.File.stderr().writeStreamingAll(io, "' has unsupported extension. Expected `.ttf` or `.otf`.\n") catch {};
