@@ -36,7 +36,14 @@ pub fn getCacheRoot(allocator: std.mem.Allocator) ![]const u8 {
     // Fall back to platform-appropriate home directory
     const home_env = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
     const home_dir = envLookup(allocator, home_env) orelse {
-        std.log.err("labelle: could not determine home directory ({s})", .{home_env});
+        // Production callers (`main.zig`) re-log this with subcommand
+        // context via `@errorName(err)`; the test runner treats every
+        // `std.log.err` as a test failure even when the caller catches
+        // the error (see flow_catalog leak-injection test, which walks
+        // every alloc index and expects no log output).
+        if (!builtin.is_test) {
+            std.log.err("labelle: could not determine home directory ({s})", .{home_env});
+        }
         return error.NoHomeDirectory;
     };
     defer allocator.free(home_dir);
