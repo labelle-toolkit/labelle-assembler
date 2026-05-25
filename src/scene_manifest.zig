@@ -15,6 +15,31 @@
 const std = @import("std");
 const config = @import("config.zig");
 
+/// Write a formatted diagnostic directly to stderr, matching the
+/// repo-wide convention (see `flow_scanner.reportFlowError`,
+/// `init_cmd.writeStderr`, `main_zig.validateResources`). We use a
+/// fixed stack buffer rather than `std.debug.print` because the
+/// project's test runner intercepts `std.log.err` to fail tests, and
+/// `std.debug.print` is documented at line ~363 as the previous
+/// workaround — but Gemini correctly pointed out that writing to
+/// stderr directly is the cleaner convention this codebase already
+/// uses elsewhere. The buffer is sized for the longest message in
+/// this file plus a reasonably long scene path; if a path is so
+/// pathological that it overflows we fall back to streaming the
+/// format string verbatim so the user still sees *something*.
+fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
+    const io = config.globalIo();
+    const stderr = std.Io.File.stderr();
+    var buf: [4096]u8 = undefined;
+    if (std.fmt.bufPrint(&buf, fmt, args)) |formatted| {
+        stderr.writeStreamingAll(io, formatted) catch {};
+    } else |_| {
+        // Buffer overflow — best-effort: write the unformatted template
+        // so the user at least sees the message kind and can find the file.
+        stderr.writeStreamingAll(io, fmt) catch {};
+    }
+}
+
 /// Parsed manifest for a single scene file.
 pub const SceneManifest = struct {
     /// Scene name as known by the assembler (path-style: "menu", "world/intro").
@@ -183,7 +208,7 @@ fn validateRootBlock(value: std.json.Value, display_path: []const u8) ParseError
     const obj = switch (value) {
         .object => |o| o,
         else => {
-            std.debug.print(
+            stderrPrint(
                 "labelle-assembler: scene '{s}' has 'root' but it is not a JSON object.\n" ++
                     "  Expected: \"root\": {{ \"children\": [...] }} or \"root\": {{ \"prefab\": \"...\" }}.\n" ++
                     "  See labelle-engine/RFC-UNIFY-SCENES-AND-PREFABS.md §\"Unified shape\".\n",
@@ -197,19 +222,22 @@ fn validateRootBlock(value: std.json.Value, display_path: []const u8) ParseError
     // child entries. The RFC calls this out explicitly: "The same §B2
     // rule applies here as at child entries: reference-mode root
     // cannot declare `children` — instantiating doesn't author."
-    if (obj.get("prefab")) |_| {
-        if (obj.get("children")) |_| {
-            std.debug.print(
-                "labelle-assembler: scene '{s}' has a 'root' that declares both 'prefab' and 'children'.\n" ++
-                    "  RFC #560 §B2: reference-mode entries cannot carry children — instantiating doesn't author.\n" ++
-                    "  Either author a new prefab file that combines them, or drop one of the keys.\n",
-                .{display_path},
-            );
-            return error.InvalidEntityShape;
-        }
+    //
+    // Hoist the two hash-map lookups into locals so we don't pay
+    // `obj.get` twice (once for the null check, once for the unwrap).
+    const maybe_prefab = obj.get("prefab");
+    const maybe_children = obj.get("children");
+    if (maybe_prefab != null and maybe_children != null) {
+        stderrPrint(
+            "labelle-assembler: scene '{s}' has a 'root' that declares both 'prefab' and 'children'.\n" ++
+                "  RFC #560 §B2: reference-mode entries cannot carry children — instantiating doesn't author.\n" ++
+                "  Either author a new prefab file that combines them, or drop one of the keys.\n",
+            .{display_path},
+        );
+        return error.InvalidEntityShape;
     }
 
-    if (obj.get("children")) |children_val| {
+    if (maybe_children) |children_val| {
         try validateChildrenArray(children_val, display_path);
     }
 }
@@ -227,10 +255,13 @@ fn validateChildrenArray(value: std.json.Value, display_path: []const u8) ParseE
             .object => |o| o,
             else => continue,
         };
-        const has_prefab = obj.get("prefab") != null;
-        const has_children = obj.get("children") != null;
-        if (has_prefab and has_children) {
-            std.debug.print(
+        // Hoist into locals so the second use (`children_val`) is a
+        // simple unwrap of the already-looked-up optional rather than
+        // a repeated hash-map probe + forced unwrap.
+        const maybe_prefab = obj.get("prefab");
+        const maybe_children = obj.get("children");
+        if (maybe_prefab != null and maybe_children != null) {
+            stderrPrint(
                 "labelle-assembler: scene '{s}' has a child entry that declares both 'prefab' and 'children'.\n" ++
                     "  RFC #560 §B2: a reference-mode child cannot carry children — instantiating doesn't author.\n" ++
                     "  Author a wrapper prefab that combines them, or drop one of the keys.\n",
@@ -238,8 +269,8 @@ fn validateChildrenArray(value: std.json.Value, display_path: []const u8) ParseE
             );
             return error.InvalidEntityShape;
         }
-        if (has_children) {
-            try validateChildrenArray(obj.get("children").?, display_path);
+        if (maybe_children) |children_val| {
+            try validateChildrenArray(children_val, display_path);
         }
     }
 }
@@ -260,7 +291,7 @@ pub fn parseSceneSource(
     defer allocator.free(stripped);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, stripped, .{}) catch |err| {
-        std.debug.print(
+        stderrPrint(
             "labelle-assembler: failed to parse scene '{s}': {s}\n",
             .{ display_path, @errorName(err) },
         );
@@ -271,7 +302,7 @@ pub fn parseSceneSource(
     const root = switch (parsed.value) {
         .object => |obj| obj,
         else => {
-            std.debug.print(
+            stderrPrint(
                 "labelle-assembler: scene '{s}' must have a top-level JSON object\n",
                 .{display_path},
             );
@@ -284,7 +315,7 @@ pub fn parseSceneSource(
     var key_iter = root.iterator();
     while (key_iter.next()) |entry| {
         if (!isAllowedTopLevelKey(entry.key_ptr.*)) {
-            std.debug.print(
+            stderrPrint(
                 "labelle-assembler: unknown top-level key '{s}' in scene '{s}'.\n" ++
                     "  Allowed keys: name, assets, include, entities, root, scripts, initial_state\n" ++
                     "  (Did-you-mean suggestions land in labelle-assembler#47.)\n",
@@ -317,7 +348,7 @@ pub fn parseSceneSource(
         const arr = switch (assets_val) {
             .array => |a| a,
             else => {
-                std.debug.print(
+                stderrPrint(
                     "labelle-assembler: scene '{s}' has 'assets' but it is not an array\n",
                     .{display_path},
                 );
@@ -339,7 +370,7 @@ pub fn parseSceneSource(
                         n += 1;
                     },
                     else => {
-                        std.debug.print(
+                        stderrPrint(
                             "labelle-assembler: scene '{s}' has a non-string entry in 'assets'\n",
                             .{display_path},
                         );
@@ -360,12 +391,15 @@ pub fn parseSceneSource(
         switch (state_val) {
             .string => |s| {
                 if (s.len == 0) {
-                    // Use std.debug.print, not std.log.err — the negative-
-                    // path tests in this file rely on these prints not
-                    // counting as logged errors (which would fail the
-                    // expectError tests). Same pattern as the assets
-                    // validation errors above.
-                    std.debug.print(
+                    // Use direct stderr writes (via `stderrPrint`), not
+                    // `std.log.err` — the negative-path tests in this
+                    // file rely on these messages not counting as
+                    // logged errors (which would fail the expectError
+                    // tests). Same pattern as the assets validation
+                    // errors above and the repo-wide convention used
+                    // in `flow_scanner.reportFlowError` and
+                    // `main_zig.validateResources`.
+                    stderrPrint(
                         "labelle-assembler: scene '{s}' has empty 'initial_state' string\n",
                         .{display_path},
                     );
@@ -374,7 +408,7 @@ pub fn parseSceneSource(
                 initial_state = try allocator.dupe(u8, s);
             },
             else => {
-                std.debug.print(
+                stderrPrint(
                     "labelle-assembler: scene '{s}' has 'initial_state' but it is not a string\n",
                     .{display_path},
                 );
@@ -428,7 +462,7 @@ pub fn parseSceneDir(
         defer allocator.free(rel);
 
         const source = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), rel, allocator, .limited(1024 * 1024)) catch |err| {
-            std.debug.print(
+            stderrPrint(
                 "labelle-assembler: could not read scene '{s}': {s}\n",
                 .{ rel, @errorName(err) },
             );
