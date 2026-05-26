@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+  # Fallback for the case where a tag is created via the GitHub API (e.g.
+  # `gh release create vX.Y.Z`) instead of `git push`. API-created tags do
+  # NOT fire the `push: tags:` event, which is how v0.32.3 ended up with a
+  # release record but no auto-built artifacts. Operators can re-run the
+  # matrix by hand against the tag if auto-fire is skipped.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build/release (e.g. v0.32.3)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -43,6 +54,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: labelle-assembler
+          # On `workflow_dispatch` the default ref is the workflow's branch,
+          # not the tag we want to release; pin it to the input tag so the
+          # build matches the release artifact name.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Checkout labelle-gui (flow_codegen)
         uses: actions/checkout@v4
@@ -57,8 +72,12 @@ jobs:
           version: 0.16.0
 
       - name: Build
+        env:
+          # On `push: tags:` GITHUB_REF_NAME is the tag; on workflow_dispatch
+          # it's the workflow's branch, so fall back to the dispatch input.
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           zig build \
             -Dtarget=${{ matrix.target }} \
             -Doptimize=ReleaseSafe \
@@ -103,3 +122,6 @@ jobs:
         with:
           generate_release_notes: true
           files: artifacts/*
+          # On `push: tags:` this is implicit; on workflow_dispatch we must
+          # pass the tag so assets land on the correct release.
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
