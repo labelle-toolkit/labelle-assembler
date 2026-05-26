@@ -226,7 +226,8 @@ pub const AUDIO_BACKEND_WIRING = struct {
     fn renderAudio() ![]const u8 {
         var alloc_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
         errdefer alloc_writer.deinit();
-        try generate.writeAudioBackendWiring(&alloc_writer.writer, "    ");
+        var ctx = h.emptyCodegen(std.testing.allocator);
+        try ctx.writeAudioBackendWiring(&alloc_writer.writer, "    ");
         return alloc_writer.toOwnedSlice();
     }
 
@@ -283,7 +284,8 @@ pub const FONT_BACKEND_WIRING = struct {
     fn renderFont() ![]const u8 {
         var alloc_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
         errdefer alloc_writer.deinit();
-        try generate.writeFontBackendWiring(&alloc_writer.writer, "    ");
+        var ctx = h.emptyCodegen(std.testing.allocator);
+        try ctx.writeFontBackendWiring(&alloc_writer.writer, "    ");
         return alloc_writer.toOwnedSlice();
     }
 

@@ -17,13 +17,18 @@
 //! them would be ceremony with no benefit. Only the block writers +
 //! lifecycle builders + orchestrator route through `Codegen`.
 //!
-//! Back-compat: the standalone module-level functions in each block
-//! module remain `pub` (tests + `flow_catalog.zig` + the `root.zig`
-//! re-export surface still call them as plain functions taking a
-//! writer first). The mixin methods are thin delegators — same
-//! function body, sourced args via `self.<field>` — so the bit-
-//! identical contract across every backend × platform generated
-//! `main.zig` holds verbatim.
+//! Mixin-only surface (labelle-assembler#206 follow-up): the
+//! standalone module-level functions in `scene_manifests.zig`,
+//! `plugin_registries.zig`, `lifecycle/loop.zig`, and
+//! `lifecycle/callback.zig` have been collapsed into their mixin
+//! methods — every external caller (orchestrator + tests +
+//! `root.zig:generateGameShim`) dispatches through a `Codegen` now.
+//! The only standalone helpers that remain are in
+//! `blocks/asset_wiring.zig` and `blocks/resource_loader.zig`; those
+//! are pure `(writer, indent[, ...])` functions that `lifecycle/{loop,
+//! callback}.zig` call directly from inside their mixin method bodies
+//! — they're sibling-module utility, not part of the external
+//! surface.
 
 const std = @import("std");
 const config = @import("../config.zig");

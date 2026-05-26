@@ -213,6 +213,33 @@ pub fn testGuiRenderInterface(name: []const u8) generate.ResolvedGui {
     };
 }
 
+/// Construct a minimal `Codegen` context with every field empty. Used
+/// by tests that exercise a single mixin method whose body reads no
+/// state from `self` (e.g. the asset-wiring writers — they just take a
+/// writer + indent). Mirrors what the production orchestrator hands
+/// `generateMainZigFromTemplate`, just with empty slices.
+pub fn emptyCodegen(allocator: std.mem.Allocator) generate.main_zig.Codegen {
+    return .{
+        .allocator = allocator,
+        .cfg = .{ .name = "test-game", .ecs = .mock },
+        .script_entries = &.{},
+        .prefab_names = &.{},
+        .jsonc_scene_names = &.{},
+        .scene_manifests = &.{},
+        .component_names = &.{},
+        .hook_names = &.{},
+        .event_names = &.{},
+        .enum_names = &.{},
+        .view_names = &.{},
+        .gizmo_names = &.{},
+        .animation_names = &.{},
+        .plugin_events = &.{},
+        .plugin_flow_nodes = &.{},
+        .plugin_pin_styles = &.{},
+        .plugin_coercions = &.{},
+    };
+}
+
 // Helper: create a ResolvedGui for testing (raw_backend with lifecycle + bridge)
 pub fn testGuiRawBackend(name: []const u8) generate.ResolvedGui {
     return .{

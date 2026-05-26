@@ -64,8 +64,6 @@ pub const initGlobalIo = config.initGlobalIo;
 pub const resolveGuiPlugin = gui_resolve.resolveGuiPlugin;
 
 pub const generateMainZigFromTemplate = main_zig.generateMainZigFromTemplate;
-pub const writeAudioBackendWiring = main_zig.writeAudioBackendWiring;
-pub const writeFontBackendWiring = main_zig.writeFontBackendWiring;
 pub const generateBuildZig = build_files.generateBuildZig;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
 pub const deps_linker = build_files.deps_linker;
@@ -164,7 +162,30 @@ pub fn generateGameShim(
     try w.writeAll(game_shim_prelude);
 
     if (plugin_events.len > 0) {
-        try main_zig.writePluginEventsBlock(w, plugin_events);
+        // Dispatch through a minimal `Codegen` context so the shim's
+        // emission path matches the orchestrator's — `writePluginEventsBlock`
+        // is a mixin method that reads `self.plugin_events`. Mirrors
+        // `main_template.zig`'s `ctx.writePluginEventsBlock(bw)` call.
+        var ctx: main_zig.Codegen = .{
+            .allocator = allocator,
+            .cfg = .{ .name = "", .ecs = .mock },
+            .script_entries = &.{},
+            .prefab_names = &.{},
+            .jsonc_scene_names = &.{},
+            .scene_manifests = &.{},
+            .component_names = &.{},
+            .hook_names = &.{},
+            .event_names = &.{},
+            .enum_names = &.{},
+            .view_names = &.{},
+            .gizmo_names = &.{},
+            .animation_names = &.{},
+            .plugin_events = plugin_events,
+            .plugin_flow_nodes = &.{},
+            .plugin_pin_styles = &.{},
+            .plugin_coercions = &.{},
+        };
+        try ctx.writePluginEventsBlock(w);
     }
 
     var arr_list = aw.toArrayList();
