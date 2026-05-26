@@ -569,13 +569,87 @@ pub const PluginFlowNodesAndPinStyles = struct {
         // `CustomNode` lowering depends on the contract.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn resolve(comptime dotted: []const u8) ?[]const u8") != null);
         // Splits on `.`, joins on `__` — same convention `PluginEvents`
-        // uses for its event-name lookup.
+        // uses for its event-name lookup. The module half passes through
+        // `sanitizeModuleIdent` so digit-leading plugin names line up
+        // with the `_`-prefixed decl shape (labelle-assembler#212).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.mem.indexOfScalar(u8, dotted, '.')") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "module ++ \"__\" ++ node") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "sanitizeModuleIdent(module) ++ \"__\" ++ node") != null);
         // Membership check via @hasDecl on the enclosing struct —
         // `@field(PluginFlowNodes, resolved)` then reaches the entry
         // value.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@hasDecl(@This(), qualified)") != null);
+    }
+
+    test "resolve(): digit-prefixed plugin name sanitises module half to match decl emit (#212)" {
+        // Regression for labelle-assembler#212: a plugin whose name
+        // starts with a digit (e.g. `3d_test`) has its decl-side ident
+        // prefixed with `_` by `sanitizePluginIdent` so the emitted
+        // `pub const _3d_test__foo` is valid Zig. Pre-fix the
+        // resolver body computed `qualified = module ++ "__" ++ node`
+        // straight from the user-supplied dotted name, which would
+        // miss the `_` prefix and silently return `null` for every
+        // dotted reference into a digit-leading plugin.
+        //
+        // The fix mirrors `sanitizePluginIdent`'s digit-prefix +
+        // non-identifier collapse in the generated `sanitizeModuleIdent`
+        // helper. This test pins:
+        //   1. The decl name keeps its `_3d_test__…` shape (unchanged).
+        //   2. The resolver dispatches through `sanitizeModuleIdent`
+        //      so the qualified ident it builds also picks up the `_`.
+        const allocator = std.testing.allocator;
+
+        const flow_nodes = [_]PluginFlowNode{
+            .{
+                .module_import_path = "3d_test",
+                .module_sanitized = "_3d_test",
+                .node_name = "render",
+                .is_script = false,
+            },
+        };
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_phase2,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            tiny_lifecycle_phase2,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &[_]generator.main_zig.PluginEvent{},
+            &flow_nodes,
+            &[_]PluginPinStyle{},
+            &[_]PluginCoercion{},
+        );
+        defer allocator.free(main_zig);
+
+        // Decl side: name carries the leading `_` per `sanitizePluginIdent`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const _3d_test__render = @import(\"3d_test\").FlowNodes.render;") != null);
+
+        // Resolver side: the body must funnel `module` through the
+        // sanitizer before joining — otherwise `resolve(\"3d_test.render\")`
+        // computes `3d_test__render` and misses the decl.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "sanitizeModuleIdent(module) ++ \"__\" ++ node") != null);
+        // The sanitizer itself must be emitted: comptime body that
+        // prefixes a `_` when the first byte is a digit.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn sanitizeModuleIdent(comptime name: []const u8) []const u8") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "name[0] >= '0' and name[0] <= '9'") != null);
+
+        // Emitted Zig parses cleanly — guards against a typo in the
+        // comptime helper that would silently round-trip the indexOf
+        // checks above.
+        const sentinel_src = try allocator.dupeZ(u8, main_zig);
+        defer allocator.free(sentinel_src);
+        var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
+        defer ast.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
     }
 
     test "FlowNodes + PinStyles: both blocks emit together in the same generated file" {
