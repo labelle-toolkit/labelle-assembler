@@ -71,19 +71,35 @@ var master_volume: f32 = 1.0;
 // The parse step has its own unit tests in `wav_parser.zig`; this
 // wrapper is just I/O glue that propagates errors as a null result
 // to match the `?[]f32` contract the rest of the module uses.
+//
+// Zig 0.16 removed `std.fs.cwd()` in favour of `std.Io.Dir.cwd()`, which
+// requires an `Io` parameter threaded through the call site. This is
+// the legacy path-based WAV loader — production audio loading goes
+// through the engine's asset catalog and never touches the FS directly.
+// Rather than thread `Io` through the backend for a one-shot legacy
+// loader, we use libc `fopen` / `fread` / `fclose` to keep the existing
+// `(path) ?[]f32` signature. The `link_libc = true` flag on the audio
+// module (see backends/wgpu/build.zig) pulls libc in.
+const SEEK_SET: c_int = 0;
+const SEEK_END: c_int = 2;
+extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
+extern "c" fn ftell(stream: *std.c.FILE) c_long;
 
 fn loadWav(path: [:0]const u8) ?[]f32 {
-    const file = std.fs.cwd().openFile(std.mem.span(path), .{}) catch return null;
-    defer file.close();
+    // Read the file from disk via libc. See the rationale block above.
+    const file = std.c.fopen(path.ptr, "rb") orelse return null;
+    defer _ = std.c.fclose(file);
 
-    const stat = file.stat() catch return null;
-    const file_size = stat.size;
-    if (file_size < 12) return null;
+    if (fseek(file, 0, SEEK_END) != 0) return null;
+    const file_size_signed = ftell(file);
+    if (file_size_signed < 12) return null;
+    if (fseek(file, 0, SEEK_SET) != 0) return null;
+    const file_size: usize = @intCast(file_size_signed);
 
     const file_buf = std.heap.page_allocator.alloc(u8, file_size) catch return null;
     defer std.heap.page_allocator.free(file_buf);
 
-    const bytes_read = file.readAll(file_buf) catch return null;
+    const bytes_read = std.c.fread(file_buf.ptr, 1, file_size, file);
     if (bytes_read != file_size) return null;
 
     return wav_parser.parseWav(std.heap.page_allocator, file_buf[0..bytes_read]) catch null;

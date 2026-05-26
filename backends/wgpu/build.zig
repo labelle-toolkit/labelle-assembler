@@ -4,20 +4,40 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const wgpu_dep = b.dependency("wgpu_native_zig", .{ .target = target, .optimize = optimize });
+    // `wgpu_native_zig` is `lazy = true` in build.zig.zon. Zig 0.16
+    // enforces this strictly — calling `b.dependency` on a lazy dep
+    // panics with "must use the lazyDependency function instead".
+    // Switch to `b.lazyDependency` and only wire wgpu-dependent
+    // imports when the dep is materialized.
+    //
+    // KNOWN BLOCKER (out of scope for #220, see PR body): upstream
+    // `apotema/wgpu_native_zig` @ fb54d9c8 is itself not yet Zig 0.16
+    // compatible. Its own `build.zig` calls `linkFramework`,
+    // `addLibraryPath`, `addObjectFile` directly on `*Compile`, which
+    // 0.16 moved onto `*Build.Module`. The 0.16 build-runner compiles
+    // every transitive `build.zig` upfront, so any `zig build` (or
+    // even `zig build --help`) errors out on those upstream sites
+    // until the fork is rebased. This patch keeps the assembler-side
+    // surface consistent with PR #218's sweep so the migration is
+    // ready to merge as soon as upstream catches up.
+    const wgpu_dep_opt = b.lazyDependency("wgpu_native_zig", .{ .target = target, .optimize = optimize });
     const zglfw_dep = b.dependency("zglfw", .{ .target = target, .optimize = optimize });
 
-    const wgpu_mod = wgpu_dep.module("wgpu");
+    const wgpu_mod_opt: ?*std.Build.Module = if (wgpu_dep_opt) |d| d.module("wgpu") else null;
     const zglfw_mod = zglfw_dep.module("root");
     const glfw_artifact = zglfw_dep.artifact("glfw");
 
     // ── Gfx backend module ──────────────────────────────────────────
+    // `link_libc = true` so the legacy `loadTexture` path-based loader
+    // can call libc `fopen` / `fread` / `fclose`. See the rationale
+    // block above `loadTexture` in src/gfx.zig.
     const gfx_mod = b.addModule("gfx", .{
         .root_source_file = b.path("src/gfx.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
-    gfx_mod.addImport("wgpu", wgpu_mod);
+    if (wgpu_mod_opt) |m| gfx_mod.addImport("wgpu", m);
 
     // ── Input backend module ────────────────────────────────────────
     const input_mod = b.addModule("input", .{
@@ -28,10 +48,14 @@ pub fn build(b: *std.Build) void {
     input_mod.addImport("zglfw", zglfw_mod);
 
     // ── Audio backend module ────────────────────────────────────────
+    // `link_libc = true` so the legacy `loadWav` path-based loader can
+    // call libc `fopen` / `fread` / `fclose`. See the rationale block
+    // above `loadWav` in src/audio.zig.
     const audio_mod = b.addModule("audio", .{
         .root_source_file = b.path("src/audio.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     _ = audio_mod; // No native audio dep — uses miniaudio or stub
 
@@ -42,7 +66,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     window_mod.addImport("zglfw", zglfw_mod);
-    window_mod.addImport("wgpu", wgpu_mod);
+    if (wgpu_mod_opt) |m| window_mod.addImport("wgpu", m);
 
     // ── Re-export native artifacts so consumers can link them ───────
     b.installArtifact(glfw_artifact);

@@ -2,7 +2,7 @@
     .fingerprint = 0x993952ebf33b101a,
     .name = .labelle_wgpu,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wgpu_native_zig = .{
             .url = "git+https://github.com/apotema/wgpu_native_zig#fb54d9c8cbefa0b8d0e8224aa8323b7974ae454f",

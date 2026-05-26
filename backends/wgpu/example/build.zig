@@ -27,22 +27,25 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
-    // Link native artifacts
-    exe.linkLibrary(wgpu_backend.artifact("glfw"));
-    exe.linkLibrary(wgpu_backend.artifact("zdawn"));
+    // Link native artifacts.
+    // Zig 0.16 moved `linkLibrary` / `linkSystemLibrary` / `addLibraryPath`
+    // (and friends like `addCSourceFile`, `addIncludePath`) from
+    // `*Build.Step.Compile` onto the executable's `root_module`.
+    exe.root_module.linkLibrary(wgpu_backend.artifact("glfw"));
+    exe.root_module.linkLibrary(wgpu_backend.artifact("zdawn"));
 
     // Dawn prebuilt library path (needed for libdawn native symbols)
     const target_result = target.result;
     if (target_result.os.tag == .macos) {
         if (target_result.cpu.arch.isAARCH64()) {
             const dawn = wgpu_backend.builder.dependency("dawn_aarch64_macos", .{});
-            exe.addLibraryPath(dawn.path(""));
+            exe.root_module.addLibraryPath(dawn.path(""));
         } else if (target_result.cpu.arch.isX86()) {
             const dawn = wgpu_backend.builder.dependency("dawn_x86_64_macos", .{});
-            exe.addLibraryPath(dawn.path(""));
+            exe.root_module.addLibraryPath(dawn.path(""));
         }
     }
-    exe.linkSystemLibrary("dawn");
+    exe.root_module.linkSystemLibrary("dawn", .{});
 
     b.installArtifact(exe);
 
