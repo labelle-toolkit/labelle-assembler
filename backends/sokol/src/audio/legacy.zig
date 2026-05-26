@@ -22,15 +22,36 @@ pub const WavData = struct {
     sample_rate: u32,
 };
 
+// Zig 0.16 removed `std.fs.cwd()` in favour of `std.Io.Dir.cwd()`, which
+// requires an `Io` parameter threaded through the call site. This is
+// the legacy path-based WAV loader — production audio loading goes
+// through Phase 4's `dr_wav` + asset catalog path, which never touches
+// the FS directly. Rather than thread `Io` through the backend for a
+// one-shot legacy loader, we use libc `fopen` / `fread` / `fclose` to
+// keep the existing `(path) ?WavData` signature. The `link_libc = true`
+// flag on the audio module (see backends/sokol/build.zig) already pulls
+// libc in for stb_vorbis / dr_wav, so this adds no new link-time cost.
+const SEEK_SET: c_int = 0;
+const SEEK_END: c_int = 2;
+extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
+extern "c" fn ftell(stream: *std.c.FILE) c_long;
+
 pub fn loadWavFile(path: [:0]const u8) ?WavData {
-    const file = std.fs.cwd().openFileZ(path, .{}) catch return null;
-    defer file.close();
+    // Read the file from disk via libc. See the rationale block above.
+    const file = std.c.fopen(path.ptr, "rb") orelse return null;
+    defer _ = std.c.fclose(file);
 
-    const stat = file.stat() catch return null;
-    if (stat.size < 44 or stat.size > 256 * 1024 * 1024) return null;
+    if (fseek(file, 0, SEEK_END) != 0) return null;
+    const file_size_signed = ftell(file);
+    if (file_size_signed < 44) return null;
+    if (fseek(file, 0, SEEK_SET) != 0) return null;
+    const file_size: usize = @intCast(file_size_signed);
+    if (file_size > 256 * 1024 * 1024) return null;
 
-    const data = file.readToEndAlloc(std.heap.page_allocator, @intCast(stat.size)) catch return null;
+    const data = std.heap.page_allocator.alloc(u8, file_size) catch return null;
     defer std.heap.page_allocator.free(data);
+    const read = std.c.fread(data.ptr, 1, file_size, file);
+    if (read != file_size) return null;
 
     const wav = parseWav(data) orelse return null;
     if (wav.sample_rate != 44100) {

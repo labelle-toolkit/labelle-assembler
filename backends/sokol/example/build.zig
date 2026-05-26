@@ -29,8 +29,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link the native sokol C library
-    exe.linkLibrary(sokol_clib);
+    // Link the native sokol C library.
+    // Zig 0.16 moved `linkLibrary` (and friends like `addCSourceFile`,
+    // `addIncludePath`, `linkSystemLibrary`) from `*Build.Step.Compile`
+    // onto the executable's `root_module`.
+    exe.root_module.linkLibrary(sokol_clib);
 
     b.installArtifact(exe);
 
