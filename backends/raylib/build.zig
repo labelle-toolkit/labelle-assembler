@@ -77,10 +77,17 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── Window backend module ───────────────────────────────────────
+    // `link_libc = true` is what makes `std.c.fopen` / `fwrite` / `fclose`
+    // (used by `takeScreenshot` after #229) compile under sema even for
+    // targets like `x86_64-windows-gnu`. raylib's own C artifact already
+    // pulls libc in for runtime linking — this just lets the module
+    // semantic-analyze cleanly without depending on transitive link
+    // state.
     const window_mod = b.addModule("window", .{
         .root_source_file = b.path("src/window.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     window_mod.addImport("raylib", raylib_mod);
 

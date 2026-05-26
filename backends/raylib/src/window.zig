@@ -58,71 +58,63 @@ pub fn drawText(text: [:0]const u8, x: i32, y: i32, font_size: i32, r: u8, g: u8
     rl.drawText(text, x, y, font_size, .{ .r = r, .g = g, .b = b, .a = a });
 }
 
-/// Returns true if `path` is an absolute filesystem path.
-///
-/// POSIX: leading '/'.
-/// Windows: drive-letter form ("C:\foo" / "C:/foo") or leading
-/// backslash ("\foo"). The drive-letter case is detected via the ':'
-/// at index 1 — anything else is treated as relative (raylib will
-/// then prepend cwd, which is the behavior the relative branch
-/// already relies on).
-fn isAbsolutePath(path: [:0]const u8) bool {
-    if (path.len == 0) return false;
-    if (builtin.target.os.tag == .windows) {
-        if (path[0] == '\\' or path[0] == '/') return true;
-        if (path.len >= 3 and path[1] == ':' and (path[2] == '\\' or path[2] == '/')) return true;
-        return false;
-    }
-    return path[0] == '/';
-}
-
 /// raylib's `TakeScreenshot` unconditionally prepends the binary's
 /// current working directory to the path it's handed, mangling
-/// absolute targets like `/tmp/foo.png` into
-/// `<cwd>//tmp/foo.png` (see labelle-assembler#224). For absolute
-/// paths we work around it by asking raylib to write to a relative
-/// temp file inside cwd and then renaming that file to the intended
-/// absolute target via libc `rename` (which handles absolute paths
-/// fine on every platform). Relative paths flow through unchanged.
+/// absolute targets like `/tmp/foo.png` into `<cwd>//tmp/foo.png`
+/// (see labelle-assembler#224).
+///
+/// The previous fix (#225) worked around this by asking raylib to
+/// write into cwd under a temp name and then `std.c.rename`ing onto
+/// the absolute target. That trick broke in three places (see
+/// labelle-assembler#229):
+///
+///   1. `rename` returns `EXDEV` across mounts — `/tmp` is tmpfs on
+///      most Linux installs, so the rename failed and the cleanup
+///      branch `unlink`ed the temp file, leaving the user with no
+///      screenshot at any path.
+///   2. `std.c.getpid` / `rename` / `unlink` aren't declared on
+///      Windows; the runtime OS gate didn't stop sema from analyzing
+///      the dead branch, so Windows cross-compiles failed.
+///   3. The Windows branch fell back to pid=0 in the temp name, so
+///      two concurrent runs in the same cwd raced on the same file.
+///
+/// Option 4 from the ticket — mirror sokol's
+/// `backends/sokol/src/screenshot/bmp.zig` pattern: grab the
+/// framebuffer via raylib, encode to PNG in memory via
+/// `ExportImageToMemory`, then write the bytes directly to the
+/// destination path with libc `fopen` / `fwrite` / `fclose`. No temp
+/// file, no rename, no cross-volume issue, no Windows-API hole, no
+/// pid collision. libc is already on the link line via raylib's
+/// own C dependencies.
 pub fn takeScreenshot(path: [:0]const u8) void {
-    if (!isAbsolutePath(path)) {
-        rl.takeScreenshot(path);
-        return;
-    }
-
-    // Pick a process-unique temp name so concurrent renderers (or a
-    // crashed previous run) can't clobber each other's intermediate
-    // file. `.png` extension matters — raylib picks the encoder by
-    // looking at the extension.
-    var name_buf: [64]u8 = undefined;
-    const pid: i32 = if (builtin.target.os.tag == .windows) 0 else @intCast(std.c.getpid());
-    const tmp_name = std.fmt.bufPrintZ(
-        &name_buf,
-        "_labelle_screenshot_{d}.png",
-        .{pid},
-    ) catch {
-        // bufPrintZ only fails if the buffer is too small; 64 bytes
-        // is far more than the formatted name needs, but if we ever
-        // hit it, fall through to a fixed name.
-        const fallback: [:0]const u8 = "_labelle_screenshot.png";
-        rl.takeScreenshot(fallback);
-        _ = std.c.rename(fallback.ptr, path.ptr);
+    const image = rl.loadImageFromScreen() catch {
+        std.log.warn("screenshot: LoadImageFromScreen failed", .{});
         return;
     };
+    defer rl.unloadImage(image);
 
-    rl.takeScreenshot(tmp_name);
-    // `rename` accepts the relative tmp path (resolved against the
-    // process cwd — the same cwd raylib just wrote into) and an
-    // absolute destination. On failure, try to delete the stale
-    // tmp file so it doesn't accumulate in cwd. POSIX `unlink` is
-    // ubiquitous; on Windows we fall through and leave the file —
-    // Option A's main consumer is desktop labelle, and on Windows
-    // the tmp file just lingers harmlessly until the next run
-    // overwrites it (same fixed name shape, same process cwd).
-    if (std.c.rename(tmp_name.ptr, path.ptr) != 0) {
-        if (builtin.target.os.tag != .windows) {
-            _ = std.c.unlink(tmp_name.ptr);
-        }
+    const png_bytes = rl.exportImageToMemory(image, ".png") catch {
+        std.log.warn("screenshot: ExportImageToMemory failed", .{});
+        return;
+    };
+    // Raylib allocates the PNG buffer with its internal allocator;
+    // free it via MemFree regardless of how the libc write below goes.
+    defer rl.memFree(@ptrCast(png_bytes.ptr));
+
+    // libc `fopen` handles absolute and relative paths uniformly on
+    // every supported target (POSIX + Windows MSVCRT/UCRT). The path
+    // is already a `[*:0]const u8`, no copy needed.
+    const fp = std.c.fopen(path.ptr, "wb") orelse {
+        std.log.warn("screenshot: fopen failed for {s}", .{path});
+        return;
+    };
+    defer _ = std.c.fclose(fp);
+    const written = std.c.fwrite(png_bytes.ptr, 1, png_bytes.len, fp);
+    if (written != png_bytes.len) {
+        std.log.warn(
+            "screenshot: short write to {s} ({d}/{d} bytes)",
+            .{ path, written, png_bytes.len },
+        );
     }
 }
 
