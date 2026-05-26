@@ -87,25 +87,141 @@ pub fn initGfx() void {
     });
 }
 
-/// Screenshot capture — best-effort. The raylib backend uses raylib's
-/// builtin `TakeScreenshot`, which reads the just-presented framebuffer
-/// and picks the format from the extension. sokol-gfx has no equivalent
-/// one-shot helper: a real implementation would have to drive a
-/// per-backend pixel readback (Metal blit-encoder, GL `glReadPixels`,
-/// D3D11 staging texture) plus a PNG/BMP encoder, all of which already
-/// exist in scattered form in this backend (`preview_pbo`, `preview_mtl`,
-/// `dr_wav` is audio-only) but are wired for the preview readback path.
+/// Screenshot capture — per-backend pixel readback + BMP encode
+/// (labelle-assembler#213). The raylib backend uses raylib's builtin
+/// `TakeScreenshot`; sokol-gfx has no equivalent, so we dispatch on
+/// `sg.queryBackend()` and run the native readback for each graphics
+/// API.
 ///
-/// For now the sokol template wires the call site exactly like raylib's
-/// so labelle-cli#227 can ship the CLI flag + engine helper, with sokol
-/// emitting a one-line warning instead of writing a file. Follow-up
-/// ticket should reuse `preview_pbo` / `preview_mtl`'s readback ring
-/// for a real implementation.
+/// Called from the generated `desktop.txt` between `window.endFrame()`
+/// (which ends with `sg.commit()`) and the next frame's `newFrame()`.
+/// At that point the swapchain has presented and the back buffer holds
+/// the just-rendered pixels — exactly the state each backend's
+/// readback API expects.
+///
+/// Output: 24-bit BMP via the vendored `screenshot/bmp.zig` writer
+/// (a copy of `labelle-gfx/src/window_utils.zig:writeBmp` — the sokol
+/// backend doesn't carry a `labelle-gfx` dep, and adding one for an
+/// 80-line pure-std encoder would widen the dep graph). PNG output is
+/// deliberately out of scope for this PR; see the issue for a
+/// follow-up.
+///
+/// Failure mode: any readback step that fails logs a `std.log.warn`
+/// and returns early. Screenshot failures never crash the game.
+///
+/// Memory: a one-shot `w*h*4` pixel buffer + the BMP file buffer come
+/// from `std.heap.page_allocator`. The backend module has no allocator
+/// in scope (it's stateless w.r.t. host allocators) and screenshots
+/// are infrequent enough that the page allocator's per-call overhead
+/// is irrelevant; threading the engine's allocator through would
+/// require a new vtable slot for one rarely-fired path.
 pub fn takeScreenshot(path: [:0]const u8) void {
+    const w_i = width();
+    const h_i = height();
+    if (w_i <= 0 or h_i <= 0) {
+        std.log.warn("screenshot: invalid framebuffer size ({d}x{d})", .{ w_i, h_i });
+        return;
+    }
+    const w: u32 = @intCast(w_i);
+    const h: u32 = @intCast(h_i);
+
+    var alloc = std.heap.page_allocator;
+    const pixels = alloc.alloc(u8, @as(usize, w) * @as(usize, h) * 4) catch {
+        std.log.warn("screenshot: pixel buffer alloc failed ({d}x{d})", .{ w, h });
+        return;
+    };
+    defer alloc.free(pixels);
+
+    // Channel order depends on the backend's native swapchain format:
+    // - GL / GLES → GL_RGBA readback → `writeBmp` (RGBA-to-BGR swizzle).
+    // - Metal / D3D11 → BGRA8Unorm swapchain → `writeBmpFromBgra` (no swizzle).
+    var got_bgra = false;
+    const backend = sg.queryBackend();
+    const ok = switch (backend) {
+        .METAL_MACOS, .METAL_IOS, .METAL_SIMULATOR => blk: {
+            got_bgra = true;
+            break :blk readbackMetal(pixels, w, h);
+        },
+        .GLCORE, .GLES3 => readbackGL(pixels, w, h),
+        .D3D11 => blk: {
+            got_bgra = true;
+            break :blk readbackD3D11(pixels, w, h);
+        },
+        .WGPU => readbackWGPU(pixels, w, h),
+        .DUMMY => false,
+        .VULKAN => false, // unreachable today (sokol disables Vulkan); guarded so the switch is exhaustive
+    };
+    if (!ok) {
+        std.log.warn(
+            "screenshot readback failed on backend {s}; no file written ({s})",
+            .{ @tagName(backend), path },
+        );
+        return;
+    }
+
+    const bmp = @import("screenshot/bmp.zig");
+    const result = if (got_bgra)
+        bmp.writeBmpFromBgra(alloc, path, pixels, w, h)
+    else
+        bmp.writeBmp(alloc, path, pixels, w, h);
+    result catch |err| {
+        std.log.warn("screenshot: BMP write failed ({s})", .{@errorName(err)});
+        return;
+    };
+    std.log.info("screenshot saved to {s} ({d}x{d})", .{ path, w, h });
+}
+
+// ── Per-backend readback helpers ─────────────────────────────────────
+// Each helper returns `false` on any failure path; the main
+// `takeScreenshot` switch logs and aborts cleanly. The Metal / GL /
+// D3D11 helpers live in `screenshot/*.zig` so this file stays focused
+// on the dispatch shape; WGPU's stub is so small it stays inline.
+
+fn readbackMetal(pixels: []u8, w: u32, h: u32) bool {
+    // Use an explicit `if (comptime ...) { ... } else { ... }` so the
+    // Darwin-only `screenshot/metal.zig` import is fully discarded by
+    // the compiler on non-Darwin targets — relying on dead-code
+    // elimination after a comptime-return can leave the import in the
+    // analysis graph and trip link-time references to libobjc.
+    if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
+        return @import("screenshot/metal.zig").readback(pixels, w, h, metalDevice());
+    } else {
+        std.log.warn("screenshot: Metal backend reported on non-Darwin target", .{});
+        return false;
+    }
+}
+
+fn readbackGL(pixels: []u8, w: u32, h: u32) bool {
+    return @import("screenshot/gl.zig").readback(pixels, w, h);
+}
+
+fn readbackD3D11(pixels: []u8, w: u32, h: u32) bool {
+    // Same comptime-gate shape as `readbackMetal` so the
+    // Windows-only `screenshot/d3d11.zig` import is dropped entirely
+    // on non-Windows builds.
+    if (comptime builtin.target.os.tag == .windows) {
+        return @import("screenshot/d3d11.zig").readback(pixels, w, h);
+    } else {
+        std.log.warn("screenshot: D3D11 backend reported on non-Windows target", .{});
+        return false;
+    }
+}
+
+fn readbackWGPU(_: []u8, _: u32, _: u32) bool {
+    // WebGPU's only readback path is async: `commandEncoder.copyTextureToBuffer`
+    // followed by `buffer.mapAsync(...)`. On wasm the JS event loop has to
+    // tick before the mapped data is available — i.e. the screenshot cannot
+    // be written synchronously inside `takeScreenshot`. Properly handling
+    // this requires plumbing an async-completion callback through the
+    // screenshot CLI flow (labelle-cli#227) — out of scope for this PR.
+    // Log so users on wgpu builds get a clear signal instead of a silent
+    // missing file, and file a follow-up if anyone actually needs wasm
+    // screenshots.
     std.log.warn(
-        "screenshot requested but not supported on sokol backend yet ({s})",
-        .{path},
+        "screenshot: wgpu readback is async and not yet wired through; no file written",
+        .{},
     );
+    return false;
 }
 
 /// Quiet-exit handler for the upstream sokol-gfx SIGSEGV in

@@ -184,6 +184,14 @@ pub fn build(b: *std.Build) void {
     const gfx_compile_check = b.addTest(.{ .root_module = gfx_mod });
     test_step.dependOn(&gfx_compile_check.step);
 
+    // Compile-check window.zig — pulls in sokol + the per-backend
+    // screenshot readback helpers (`screenshot/metal.zig`, `gl.zig`,
+    // `d3d11.zig`, `bmp.zig`). Regression lock for the screenshot
+    // implementation (labelle-assembler#213); without this the four
+    // helper files were unreached by any test target.
+    const window_compile_check = b.addTest(.{ .root_module = window_mod });
+    test_step.dependOn(&window_compile_check.step);
+
     // ── Phase 4 host-native test runs ────────────────────────────────
     //
     // The compile-checks above only ensure the bytecode builds. The
