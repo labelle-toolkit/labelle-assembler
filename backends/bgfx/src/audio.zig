@@ -137,21 +137,47 @@ fn decodeWav(file_data: []const u8) ?PcmData {
     };
 }
 
-fn loadWavFile(path: [:0]const u8) ?struct { pcm: PcmData, alloc: []u8 } {
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
+// Zig 0.16 removed `std.fs.cwd()` in favour of `std.Io.Dir.cwd()`, which
+// requires an `Io` parameter threaded through the call site. This is
+// the legacy path-based WAV loader — production audio loading goes
+// through the higher-level asset pipeline and rarely (if ever) touches
+// the FS directly through this entry point. Rather than thread `Io`
+// through the backend for a one-shot legacy loader, we use libc
+// `fopen` / `fread` / `fclose` to keep the existing
+// `(path) ?struct{...}` signature. `link_libc = true` is set on the
+// audio module (see backends/bgfx/build.zig) so libc is available at
+// link time at no extra cost (the bgfx backend's audio module has no
+// other C-library dependencies — see the audio module setup in
+// build.zig for the explicit `link_libc = true`).
+const SEEK_SET: c_int = 0;
+const SEEK_END: c_int = 2;
+extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
+extern "c" fn ftell(stream: *std.c.FILE) c_long;
 
-    const stat = file.stat() catch return null;
-    const file_size = stat.size;
-    if (file_size == 0) return null;
+fn loadWavFile(path: [:0]const u8) ?struct { pcm: PcmData, alloc: []u8 } {
+    // Read the file from disk via libc. See the rationale block above.
+    const file = std.c.fopen(path.ptr, "rb") orelse return null;
+    defer _ = std.c.fclose(file);
+
+    if (fseek(file, 0, SEEK_END) != 0) return null;
+    const file_size_signed = ftell(file);
+    if (file_size_signed < 44) return null; // minimum WAV size
+    if (fseek(file, 0, SEEK_SET) != 0) return null;
+    const file_size: usize = @intCast(file_size_signed);
 
     const allocator = std.heap.page_allocator;
     const data = allocator.alloc(u8, file_size) catch return null;
 
-    const bytes_read = file.readAll(data) catch {
+    const bytes_read = std.c.fread(data.ptr, 1, file_size, file);
+    if (bytes_read != file_size) {
+        // `fread` can return short on EOF mid-read without setting an error
+        // flag, so we must compare against the full requested size — not
+        // just the minimum WAV header — or we'd silently decode a truncated
+        // file. See PR #227 (cursor[bot] review).
+        std.log.warn("audio: short read on {s} ({d}/{d} bytes)", .{ path, bytes_read, file_size });
         allocator.free(data);
         return null;
-    };
+    }
     if (bytes_read < 44) { // minimum WAV size
         allocator.free(data);
         return null;

@@ -13,10 +13,13 @@ pub fn build(b: *std.Build) void {
     const glfw_artifact = zglfw_dep.artifact("glfw");
 
     // ── Gfx backend module ──────────────────────────────────────────
+    // `link_libc = true` is required by `src/gfx/texture.zig`'s
+    // libc-based file loader (post-0.16 swap from `std.fs.cwd()`).
     const gfx_mod = b.addModule("gfx", .{
         .root_source_file = b.path("src/gfx.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     gfx_mod.addImport("zbgfx", zbgfx_mod);
 
@@ -29,10 +32,13 @@ pub fn build(b: *std.Build) void {
     input_mod.addImport("zglfw", zglfw_mod);
 
     // ── Audio backend module ────────────────────────────────────────
+    // `link_libc = true` is required by `src/audio.zig`'s libc-based
+    // WAV file loader (post-0.16 swap from `std.fs.cwd()`).
     const audio_mod = b.addModule("audio", .{
         .root_source_file = b.path("src/audio.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     _ = audio_mod; // No native audio dep — uses miniaudio or stub
 
