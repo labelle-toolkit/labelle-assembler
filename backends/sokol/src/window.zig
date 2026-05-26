@@ -87,23 +87,44 @@ pub fn initGfx() void {
     });
 }
 
-/// Screenshot capture — best-effort. The raylib backend uses raylib's
-/// builtin `TakeScreenshot`, which reads the just-presented framebuffer
-/// and picks the format from the extension. sokol-gfx has no equivalent
-/// one-shot helper: a real implementation would have to drive a
-/// per-backend pixel readback (Metal blit-encoder, GL `glReadPixels`,
-/// D3D11 staging texture) plus a PNG/BMP encoder, all of which already
-/// exist in scattered form in this backend (`preview_pbo`, `preview_mtl`,
-/// `dr_wav` is audio-only) but are wired for the preview readback path.
+/// Screenshot capture — currently a logged warning. The raylib backend
+/// uses raylib's builtin `TakeScreenshot`, which reads the just-
+/// presented framebuffer and picks the format from the extension.
 ///
-/// For now the sokol template wires the call site exactly like raylib's
-/// so labelle-cli#227 can ship the CLI flag + engine helper, with sokol
-/// emitting a one-line warning instead of writing a file. Follow-up
-/// ticket should reuse `preview_pbo` / `preview_mtl`'s readback ring
-/// for a real implementation.
+/// Why this is still a stub after #213:
+///
+/// #213 specced "option 1" — render to an offscreen image with
+/// `usage = .{ .render_attachment = true, .copy_src = true }` then
+/// call `sg_query_image_data` to read pixels back. Auditing the pinned
+/// sokol-zig (`labelle-toolkit/sokol-zig @ 6b8609d`) shows none of
+/// those primitives exist:
+///
+///   - `ImageUsage` has no `render_attachment` / `copy_src` fields
+///     (the actual flags are `color_attachment`, `storage_image`,
+///     `resolve_attachment`, `depth_stencil_attachment`, plus the
+///     update-frequency flags). Render targets use `color_attachment`.
+///   - `sg_query_image_data` does not exist. sokol-gfx exposes only
+///     metadata queries (`sg_query_image_info`, `..._desc`, `..._width`,
+///     etc.) and the CPU→GPU upload `sg_update_image`. There is no
+///     GPU→CPU readback in the API — by upstream design, since it
+///     would force per-backend code into the portable layer.
+///   - The "preview_pbo / preview_mtl already do readback" claim in
+///     the prior stub was incorrect. `preview_mtl` renders INTO host-
+///     allocated IOSurfaces (shared memory the host reads directly);
+///     no `MTLBlitCommandEncoder` / `glReadPixels` / staging-texture
+///     copy exists anywhere in this backend.
+///
+/// The implementation gap and design options are filed in #214 —
+/// either accept per-backend native readback (option 2 the ticket
+/// rejected), patch our sokol-zig fork with a `sg_query_image_data`
+/// shim, or wait for upstream sokol to add readback. Until #214
+/// resolves, the stub stays so labelle-cli#227's `--screenshot=<path>`
+/// flag continues to plumb through without writing a file on sokol.
 pub fn takeScreenshot(path: [:0]const u8) void {
     std.log.warn(
-        "screenshot requested but not supported on sokol backend yet ({s})",
+        "screenshot requested but not supported on sokol backend yet " ++
+            "({s}); see labelle-assembler#214 for the sokol-gfx API gap " ++
+            "blocking implementation.",
         .{path},
     );
 }
