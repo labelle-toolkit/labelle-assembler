@@ -103,19 +103,28 @@ fn isAllowedTopLevelKey(key: []const u8) bool {
 }
 
 /// Errors surfaced from manifest parsing. `UnknownSceneKey`,
-/// `InvalidAssetsField`, `InvalidInitialStateField`, and
-/// `InvalidEntityShape` are hard build errors — the assembler must
-/// abort and print a clear message naming the offending file.
+/// `InvalidAssetsField`, `InvalidInitialStateField`,
+/// `InvalidEntityShape`, and `HybridForm` are hard build errors — the
+/// assembler must abort and print a clear message naming the offending
+/// file.
 ///
 /// `InvalidEntityShape` covers RFC #560 §B2 violations: an entity
 /// entry that declares both `prefab` (reference mode) and `children`
 /// (authoring mode), plus malformed `root` blocks under the unified
 /// format.
+///
+/// `HybridForm` covers the dual-accept contract corner case where a
+/// file carries BOTH a `root:` wrapper AND top-level flat-form
+/// entity-shape keys (`components` / `children` / `prefab` /
+/// `overrides`). Under dual-accept the walker can only descend one of
+/// the two — silently dropping the other would lose data for users
+/// mid-migration. We reject the shape outright instead.
 pub const ParseError = error{
     UnknownSceneKey,
     InvalidAssetsField,
     InvalidInitialStateField,
     InvalidEntityShape,
+    HybridForm,
     InvalidSceneJson,
     OutOfMemory,
 };
@@ -230,25 +239,60 @@ fn hasFlatEntityShapeKey(obj: std.json.ObjectMap) bool {
         obj.get("overrides") != null;
 }
 
-/// Validate a unified-format `root` block. The block must be a JSON
+/// Pure helper that classifies a parsed file's top-level object into
+/// the site label `validateRootBlock` will receive: `"root"` for a
+/// root-wrapped file, `"top level"` for a flat-form file, `null` for a
+/// file that has neither and so won't go through `validateRootBlock`
+/// at all (e.g. `include`-only scenes), and `error.HybridForm` if the
+/// file carries both shapes at once.
+///
+/// Extracted from the call-site in `parseSceneSource` so the
+/// label-selection rule is unit-testable without intercepting stderr.
+/// The label chosen here is what users see in §B2 error messages, so
+/// regressions in the label-selection logic must fail tests directly,
+/// not just whichever §B2 case happened to be exercised.
+pub fn classifyTopLevel(obj: std.json.ObjectMap) ParseError!?[]const u8 {
+    const has_root = obj.get("root") != null;
+    const has_flat = hasFlatEntityShapeKey(obj);
+    if (has_root and has_flat) return error.HybridForm;
+    if (has_root) return "root";
+    if (has_flat) return "top level";
+    return null;
+}
+
+/// Validate a unified-format root block. The block must be a JSON
 /// object; it carries either inline content (`components`/`children`)
 /// or a reference (`prefab`/`overrides`). Walks the `children` array
 /// recursively to enforce §B2 on every descendant.
+///
+/// `site_label` names the site being validated for the user's
+/// benefit: `"root"` for a root-wrapped block (where the offending
+/// keys live inside an explicit `root:` object), `"top level"` for a
+/// flat-form file (where the entity-shape keys live at the file's top
+/// level with no `root:` wrapper). Threading this label through keeps
+/// the error vocabulary aligned with the engine's unified-loader
+/// labels ("child entry", "reference-mode root", etc., per engine
+/// #586/#593) instead of pointing users at a `root:` key that may not
+/// exist in their file.
 ///
 /// Mirrors the engine loader's two-mode grammar (see
 /// labelle-engine/src/jsonc/unified_format.zig). The assembler doesn't
 /// need the full accessor surface — it only needs to descend the tree
 /// far enough to catch §B2 violations early, with a clear scene-path
 /// in the error message.
-fn validateRootBlock(value: std.json.Value, display_path: []const u8) ParseError!void {
+fn validateRootBlock(
+    value: std.json.Value,
+    display_path: []const u8,
+    site_label: []const u8,
+) ParseError!void {
     const obj = switch (value) {
         .object => |o| o,
         else => {
             stderrPrint(
-                "labelle-assembler: scene '{s}' has 'root' but it is not a JSON object.\n" ++
-                    "  Expected: \"root\": {{ \"children\": [...] }} or \"root\": {{ \"prefab\": \"...\" }}.\n" ++
+                "labelle-assembler: scene '{s}' has a {s} that is not a JSON object.\n" ++
+                    "  Expected an entity-shape object with \"children\": [...] or \"prefab\": \"...\".\n" ++
                     "  See labelle-engine/RFC-UNIFY-SCENES-AND-PREFABS.md §\"Unified shape\".\n",
-                .{display_path},
+                .{ display_path, site_label },
             );
             return error.InvalidEntityShape;
         },
@@ -265,10 +309,10 @@ fn validateRootBlock(value: std.json.Value, display_path: []const u8) ParseError
     const maybe_children = obj.get("children");
     if (maybe_prefab != null and maybe_children != null) {
         stderrPrint(
-            "labelle-assembler: scene '{s}' has a 'root' that declares both 'prefab' and 'children'.\n" ++
+            "labelle-assembler: scene '{s}' has a {s} that declares both 'prefab' and 'children'.\n" ++
                 "  RFC #560 §B2: reference-mode entries cannot carry children — instantiating doesn't author.\n" ++
                 "  Either author a new prefab file that combines them, or drop one of the keys.\n",
-            .{display_path},
+            .{ display_path, site_label },
         );
         return error.InvalidEntityShape;
     }
@@ -396,13 +440,33 @@ pub fn parseSceneSource(
     // Note we *also* still walk the legacy top-level `entities` array
     // for projects mid-migration; the engine accepts that shape for
     // the v1.x window.
-    if (root.get("root")) |root_val| {
-        try validateRootBlock(root_val, display_path);
-    } else if (hasFlatEntityShapeKey(root)) {
-        // Flat-form: the file IS the root entity. Re-use the same
-        // root-block validator so the §B2 / non-object / nested-depth
-        // checks behave identically to the wrapped form.
-        try validateRootBlock(.{ .object = root }, display_path);
+    // Classify the top level: root-wrapped, flat-form, neither, or
+    // hybrid (= both shapes at once → reject; see cursor #233). The
+    // classifier is a pure function so the label-selection rule is
+    // unit-testable directly without intercepting stderr.
+    const maybe_site_label = classifyTopLevel(root) catch |err| {
+        if (err == error.HybridForm) {
+            stderrPrint(
+                "labelle-assembler: scene '{s}' mixes a 'root' wrapper with top-level entity-shape keys.\n" ++
+                    "  Use one form or the other: either wrap the entity in \"root\": {{ ... }} (legacy unified shape)\n" ++
+                    "  or move everything to the file's top level (flat form, RFC #594 phase 2). Mixing both is\n" ++
+                    "  ambiguous — the assembler would have to silently drop one side.\n",
+                .{display_path},
+            );
+        }
+        return err;
+    };
+    if (maybe_site_label) |label| {
+        // For the root-wrapped form we descend into the `root` value;
+        // for the flat form the file's top-level object IS the root
+        // entity. The same validator handles both, with the site label
+        // threaded through so §B2 error messages name the actual site
+        // (no nonexistent `root:` key for flat-form users).
+        const block: std.json.Value = if (std.mem.eql(u8, label, "root"))
+            root.get("root").?
+        else
+            .{ .object = root };
+        try validateRootBlock(block, display_path, label);
     }
     if (root.get("entities")) |entities_val| {
         try validateChildrenArray(entities_val, display_path);
@@ -1106,4 +1170,61 @@ test "flat: metadata-only file (no entity-shape keys) parses (e.g. include-only)
     ;
     const m = try parseSceneSource(std.testing.allocator, "shared", "scenes/shared.jsonc", src);
     defer freeManifest(std.testing.allocator, m);
+}
+
+// ── Cursor #233 fixes: hybrid-form rejection + §B2 site labels ───────
+
+test "hybrid: file with both 'root' wrapper and flat entity-shape keys is rejected" {
+    // Cursor #233 finding 1 — dual-accept must not silently drop one
+    // side when a file carries both shapes. The §B2 walker only
+    // descends one branch, so a mixed file would lose data for users
+    // mid-migration. The classifier rejects the shape outright.
+    const src =
+        \\{
+        \\    "name": "mixed",
+        \\    "root": { "components": { "Position": { "x": 0, "y": 0 } } },
+        \\    "components": { "Other": {} }
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "mixed", "scenes/mixed.jsonc", src);
+    try std.testing.expectError(error.HybridForm, result);
+}
+
+test "§B2 site label — flat form classifies as 'top level' (not 'root')" {
+    // Cursor #233 finding 2 — when a flat-form file trips §B2, the
+    // error message must not point users at a `root:` key that
+    // doesn't exist in their file. We can't intercept stderr in
+    // tests, so the label-selection rule is exposed via the pure
+    // `classifyTopLevel` helper and verified directly. The label
+    // returned here is exactly what `validateRootBlock` will
+    // interpolate into the §B2 message — see `parseSceneSource` and
+    // the `{s}` format slot in the §B2 stderrPrint call.
+    //
+    // Shape: top-level `prefab` + `children`. parseSceneSource itself
+    // will reject this with InvalidEntityShape; we cover the
+    // end-to-end rejection in "flat: §B2 fires on flat reference-mode
+    // root with children" above.
+    const src =
+        \\{ "prefab": "x", "children": [] }
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, src, .{});
+    defer parsed.deinit();
+    const label = try classifyTopLevel(parsed.value.object);
+    try std.testing.expect(label != null);
+    try std.testing.expectEqualStrings("top level", label.?);
+}
+
+test "§B2 site label — root-wrapped form classifies as 'root' (regression pin)" {
+    // Cursor #233 finding 2 — regression sentinel for the
+    // pre-existing label. Users with root-wrapped files must keep
+    // seeing the "root" word in §B2 messages; if a future refactor
+    // swaps the label to "top level" for wrapped files, this fails.
+    const src =
+        \\{ "root": { "prefab": "x", "children": [] } }
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, src, .{});
+    defer parsed.deinit();
+    const label = try classifyTopLevel(parsed.value.object);
+    try std.testing.expect(label != null);
+    try std.testing.expectEqualStrings("root", label.?);
 }
