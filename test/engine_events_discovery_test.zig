@@ -116,7 +116,26 @@ test "writePluginEventsBlock special-cases `engine` prefix to @import(\"labelle-
 
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
     defer alloc_writer.deinit();
-    try generator.main_zig.writePluginEventsBlock(&alloc_writer.writer, &.{engine_event});
+    var ctx: generator.main_zig.Codegen = .{
+        .allocator = allocator,
+        .cfg = .{ .name = "test-game", .ecs = .mock },
+        .script_entries = &.{},
+        .prefab_names = &.{},
+        .jsonc_scene_names = &.{},
+        .scene_manifests = &.{},
+        .component_names = &.{},
+        .hook_names = &.{},
+        .event_names = &.{},
+        .enum_names = &.{},
+        .view_names = &.{},
+        .gizmo_names = &.{},
+        .animation_names = &.{},
+        .plugin_events = &.{engine_event},
+        .plugin_flow_nodes = &.{},
+        .plugin_pin_styles = &.{},
+        .plugin_coercions = &.{},
+    };
+    try ctx.writePluginEventsBlock(&alloc_writer.writer);
 
     const out = alloc_writer.writer.buffer[0..alloc_writer.writer.end];
 

@@ -618,7 +618,26 @@ pub const FlowDeclsDiscovery = struct {
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        try generator.main_zig.writePluginFlowNodesBlock(&aw.writer, &flow_nodes);
+        var ctx: generator.main_zig.Codegen = .{
+            .allocator = allocator,
+            .cfg = .{ .name = "test-game", .ecs = .mock },
+            .script_entries = &.{},
+            .prefab_names = &.{},
+            .jsonc_scene_names = &.{},
+            .scene_manifests = &.{},
+            .component_names = &.{},
+            .hook_names = &.{},
+            .event_names = &.{},
+            .enum_names = &.{},
+            .view_names = &.{},
+            .gizmo_names = &.{},
+            .animation_names = &.{},
+            .plugin_events = &.{},
+            .plugin_flow_nodes = &flow_nodes,
+            .plugin_pin_styles = &.{},
+            .plugin_coercions = &.{},
+        };
+        try ctx.writePluginFlowNodesBlock(&aw.writer);
         const out = aw.written();
 
         // The constructs hint appears as a doc-comment above ray_cast.

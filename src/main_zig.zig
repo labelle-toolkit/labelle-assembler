@@ -1,23 +1,22 @@
-/// main.zig generator — back-compat re-export shim.
+/// main.zig generator — namespace re-export shim.
 ///
 /// The structural refactor (labelle-assembler#183) split this file
-/// into ten focused submodules under `src/codegen/`. This shim keeps
-/// every existing `@import("main_zig.zig").Foo` call site working —
-/// `root.zig`, `test/tests.zig`, `flow_catalog.zig`, and any future
-/// in-tree caller can keep reaching the original names without
-/// knowing which submodule they now live in.
+/// into focused submodules under `src/codegen/`. The mixin-only
+/// follow-up (labelle-assembler#206 cleanup) removed the per-fn
+/// re-exports — every block writer now flows through `Codegen` from
+/// `codegen/context.zig`. Callers reach the writers via
+/// `ctx.writeXxx(...)` instead of the explicit-arg standalone form
+/// they used pre-#206.
 ///
 /// **The orchestrator itself** (`generateMainZigFromTemplate`) and
 /// its two end-of-file helpers (`generateGameLayers`,
 /// `generateResourceRegistry`) live in
-/// `src/codegen/main_template.zig` as of step 9 of the cut plan in
-/// `docs/REFACTOR-PLAN-main-zig.md`. See per-section comments below
-/// for the canonical location of every extracted helper.
+/// `src/codegen/main_template.zig`.
 ///
-/// Pure re-exports — no logic, no allocations, no state. Adding a
-/// new helper? Put it in the relevant submodule and add a `pub const`
-/// alias here only if existing callers expect to find it on
-/// `main_zig.zig`.
+/// What stays here: submodule namespace aliases (callers can still do
+/// `main_zig.scan.PluginEvent` for the discovery types), the
+/// `Codegen` alias itself, and a handful of types whose names live in
+/// the scan/preview submodules. No standalone block-writer functions.
 
 // ── Submodule namespaces (publicly re-exported so callers can do
 //    e.g. `main_zig.validate.X` if they prefer the namespaced form) ──
@@ -36,8 +35,10 @@ pub const context = @import("codegen/context.zig");
 /// state previously threaded through `generateMainZigFromTemplate` as
 /// positional args, and composes each block writer's `Mixin(Self)`
 /// factory into method-dispatch shape (`ctx.writeImageBackendWiring(...)`).
-/// The orchestrator is the only consumer today; the re-export here is
-/// for future call sites that want the dispatch shape.
+/// External callers that want to drive a block writer construct one
+/// of these with the relevant slices populated; everything else stays
+/// as `.{}` / `&.{}`. See `test/helpers.zig`'s `emptyCodegen` for the
+/// minimal shape.
 pub const Codegen = context.Codegen;
 
 const scan = @import("codegen/scan.zig");
@@ -54,28 +55,12 @@ pub const discoverPluginEvents = scan.discoverPluginEvents;
 pub const discoverPluginFlowDecls = scan.discoverPluginFlowDecls;
 pub const dedupePinStyles = scan.dedupePinStyles;
 
-// ── Lifecycle builders (codegen/lifecycle/{loop,callback}.zig) ────
-pub const buildSetupCode = lifecycle_loop.buildSetupCode;
-pub const buildGuiDrawCode = lifecycle_loop.buildGuiDrawCode;
-pub const buildCallbackInitCode = lifecycle_callback.buildCallbackInitCode;
-pub const buildImmersiveEntryCode = lifecycle_callback.buildImmersiveEntryCode;
-pub const buildCallbackCleanupCode = lifecycle_callback.buildCallbackCleanupCode;
-
-// ── Asset-backend wiring (codegen/blocks/asset_wiring.zig) ────────
-pub const writeImageBackendWiring = asset_wiring.writeImageBackendWiring;
-pub const writeAudioBackendWiring = asset_wiring.writeAudioBackendWiring;
-pub const writeFontBackendWiring = asset_wiring.writeFontBackendWiring;
-
-// ── Plugin registry block writers (codegen/blocks/plugin_registries.zig) ──
-pub const writePluginControllersBlock = plugin_registries.writePluginControllersBlock;
-pub const writePluginEventsBlock = plugin_registries.writePluginEventsBlock;
-pub const writePluginFlowNodesBlock = plugin_registries.writePluginFlowNodesBlock;
-pub const writePluginPinStylesBlock = plugin_registries.writePluginPinStylesBlock;
-pub const writePluginCoercionsBlock = plugin_registries.writePluginCoercionsBlock;
-
-// ── Resource loader emit (codegen/blocks/resource_loader.zig) ─────
+// ── Resource loader: `LoadStyle` is part of the standalone helper's
+//    public surface (passed to `emitResourceLoad` by lifecycle siblings
+//    within codegen/). Re-exported for any future external caller that
+//    wants to drive `ctx.emitResourceLoad(w, res, style)` — the mixin
+//    method takes `style` explicitly since it's per-call, not per-ctx.
 pub const LoadStyle = resource_loader.LoadStyle;
-pub const emitResourceLoad = resource_loader.emitResourceLoad;
 
 // ── Preview-mode templates (codegen/preview.zig) ──────────────────
 pub const WASM_PANIC_WORKAROUND = preview.WASM_PANIC_WORKAROUND;

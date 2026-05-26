@@ -233,6 +233,32 @@ const PluginFlowNode = generator.main_zig.PluginFlowNode;
 const PluginPinStyle = generator.main_zig.PluginPinStyle;
 const PluginCoercion = generator.main_zig.PluginCoercion;
 
+/// Build a minimal `Codegen` context whose only populated slice is
+/// `plugin_coercions`. Mirrors the production orchestrator path
+/// `main_template.zig` takes — `writePluginCoercionsBlock` only reads
+/// `self.plugin_coercions`, so the rest stay empty.
+fn coercionsCtx(allocator: std.mem.Allocator, coercions: []const PluginCoercion) generator.main_zig.Codegen {
+    return .{
+        .allocator = allocator,
+        .cfg = .{ .name = "test-game", .ecs = .mock },
+        .script_entries = &.{},
+        .prefab_names = &.{},
+        .jsonc_scene_names = &.{},
+        .scene_manifests = &.{},
+        .component_names = &.{},
+        .hook_names = &.{},
+        .event_names = &.{},
+        .enum_names = &.{},
+        .view_names = &.{},
+        .gizmo_names = &.{},
+        .animation_names = &.{},
+        .plugin_events = &.{},
+        .plugin_flow_nodes = &.{},
+        .plugin_pin_styles = &.{},
+        .plugin_coercions = coercions,
+    };
+}
+
 const tiny_template_phase2 =
     \\const std = @import("std");
     \\const engine = @import("labelle-engine");
@@ -343,7 +369,8 @@ pub const PluginCoercionsDiscovery = struct {
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        try generator.main_zig.writePluginCoercionsBlock(&aw.writer, &coercions);
+        var ctx = coercionsCtx(allocator, &coercions);
+        try ctx.writePluginCoercionsBlock(&aw.writer);
         const out = aw.writer.buffer[0..aw.writer.end];
 
         // The alias resolves against the source-module's `Coercions`
@@ -366,7 +393,8 @@ pub const PluginCoercionsDiscovery = struct {
         const allocator = std.testing.allocator;
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        try generator.main_zig.writePluginCoercionsBlock(&aw.writer, &.{});
+        var ctx = coercionsCtx(allocator, &.{});
+        try ctx.writePluginCoercionsBlock(&aw.writer);
         const out = aw.writer.buffer[0..aw.writer.end];
         try std.testing.expect(std.mem.indexOf(u8, out, "pub const PluginCoercions = struct {") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "pub fn resolve(comptime dotted: []const u8) ?[]const u8") != null);
@@ -392,7 +420,8 @@ pub const PluginCoercionsDiscovery = struct {
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        try generator.main_zig.writePluginCoercionsBlock(&aw.writer, &coercions);
+        var ctx = coercionsCtx(allocator, &coercions);
+        try ctx.writePluginCoercionsBlock(&aw.writer);
         const out = aw.writer.buffer[0..aw.writer.end];
 
         try std.testing.expect(std.mem.indexOf(u8, out, "pub const flows_s_bridges__to_entity = @import(\"scripts/flows/bridges.zig\").Coercions.to_entity;") != null);
