@@ -2,7 +2,7 @@
     .fingerprint = 0x9cd73c2cb5d6d1eb,
     .name = .labelle_bgfx,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Pinned to specific commits — same class of fix as #146.
         // Bumping either dep requires `zig fetch <new-url>` to get

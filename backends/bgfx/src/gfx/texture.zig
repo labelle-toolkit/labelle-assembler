@@ -55,20 +55,39 @@ pub fn destroyAllTextures() void {
     }
 }
 
-pub fn loadTexture(path: [:0]const u8) !Texture {
-    // Read file from disk
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.LoadFailed;
-    defer file.close();
+// Zig 0.16 removed `std.fs.cwd()` in favour of `std.Io.Dir.cwd()`, which
+// requires an `Io` parameter threaded through the call site. This file
+// is a demo/legacy convenience loader — production texture loading goes
+// through `uploadTexture` + a caller-owned `decodeImage` (see the
+// split-contract comment on `uploadTexture` below), which never touches
+// the FS directly. Rather than thread `Io` through the backend for a
+// one-shot loader, we use libc `fopen` / `fread` / `fclose` to keep the
+// existing `(path) !Texture` signature. `link_libc = true` is set on
+// the gfx module (see backends/bgfx/build.zig) so libc is available at
+// link time at no extra cost (the bgfx backend has hand-rolled BMP/TGA
+// decoders and does NOT link stb_image, so the libc link is added
+// explicitly for this loader).
+const SEEK_SET: c_int = 0;
+const SEEK_END: c_int = 2;
+extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
+extern "c" fn ftell(stream: *std.c.FILE) c_long;
 
-    const stat = file.stat() catch return error.LoadFailed;
-    const file_size = stat.size;
-    if (file_size < 18) return error.LoadFailed; // Too small for any image header
+pub fn loadTexture(path: [:0]const u8) !Texture {
+    // Read the file from disk via libc. See the rationale block above.
+    const file = std.c.fopen(path.ptr, "rb") orelse return error.LoadFailed;
+    defer _ = std.c.fclose(file);
+
+    if (fseek(file, 0, SEEK_END) != 0) return error.LoadFailed;
+    const file_size_signed = ftell(file);
+    if (file_size_signed < 18) return error.LoadFailed; // Too small for any image header
+    if (fseek(file, 0, SEEK_SET) != 0) return error.LoadFailed;
+    const file_size: usize = @intCast(file_size_signed);
 
     const allocator = std.heap.page_allocator;
     const data = allocator.alloc(u8, file_size) catch return error.LoadFailed;
     defer allocator.free(data);
 
-    const bytes_read = file.readAll(data) catch return error.LoadFailed;
+    const bytes_read = std.c.fread(data.ptr, 1, file_size, file);
     if (bytes_read < 18) return error.LoadFailed;
 
     const decoded = try decodeImage("", data[0..bytes_read], allocator);

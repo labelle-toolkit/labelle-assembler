@@ -27,9 +27,12 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
-    // Link native libraries re-exported by the backend
-    exe.linkLibrary(bgfx_backend.artifact("bgfx"));
-    exe.linkLibrary(bgfx_backend.artifact("glfw"));
+    // Link native libraries re-exported by the backend.
+    // Zig 0.16 moved `linkLibrary` (and friends like `addCSourceFile`,
+    // `addIncludePath`, `linkSystemLibrary`) from `*Build.Step.Compile`
+    // onto the executable's `root_module`.
+    exe.root_module.linkLibrary(bgfx_backend.artifact("bgfx"));
+    exe.root_module.linkLibrary(bgfx_backend.artifact("glfw"));
 
     b.installArtifact(exe);
 
