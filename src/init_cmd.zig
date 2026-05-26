@@ -233,6 +233,13 @@ pub fn scaffold(allocator: std.mem.Allocator, io: std.Io, opts: InitOptions) !vo
     // legacy `.zon` extension is silently ignored, so a freshly scaffolded
     // project with `main.zon` would build but render nothing (see #204).
     // Keep this in JSONC to match what the assembler actually loads.
+    //
+    // FORMAT: emit flat-form unified shape from day one (RFC #594 / engine
+    // #592). Top-level `"children"` — no `"root":` wrapper, no legacy
+    // `"entities"` key, no `"components"` on prefab refs (use
+    // `"overrides"`). The loader still dual-accepts the old shape, but new
+    // projects scaffold clean so `labelle audit unification` reports zero
+    // findings out of the box.
     {
         const path = try std.fs.path.join(allocator, &.{ dir, "scenes", "main.jsonc" });
         defer allocator.free(path);
@@ -241,7 +248,7 @@ pub fn scaffold(allocator: std.mem.Allocator, io: std.Io, opts: InitOptions) !vo
             .data =
                 \\{
                 \\    "name": "main",
-                \\    "entities": []
+                \\    "children": []
                 \\}
                 \\
             ,
@@ -389,6 +396,54 @@ test "scaffold pins real fetchable framework versions — #159 regression" {
     try std.testing.expect(config.isSemverVersion(cfg.core_version));
     try std.testing.expect(config.isSemverVersion(cfg.engine_version));
     try std.testing.expect(config.isSemverVersion(cfg.gfx_version));
+}
+
+test "scaffold emits flat-form scenes — RFC #594 / engine #592 regression" {
+    // Lock in "new projects start clean" for the v2.0 unified-format
+    // foundation. The four legacy patterns `labelle audit unification`
+    // flags are:
+    //   1. top-level `"entities"` key   (legacy_entities)
+    //   2. top-level `"root":` wrapper  (legacy_root_wrapper)
+    //   3. `"components"` on a prefab ref (legacy_components_on_ref)
+    //   4. legacy `"assets":` array      (legacy_assets)
+    //
+    // None of these may appear in a freshly scaffolded scene. This is the
+    // load-bearing guard for the assertion in PR engine#594 phase 2: a
+    // fresh `labelle init` produces an audit-clean tree.
+    //
+    // Detection here mirrors audit.zig's surface checks — top-level key
+    // names parsed out of the scaffolded JSONC. The audit binary itself
+    // lives in labelle-cli; we can't link it in here, but the shape it
+    // looks for is small enough to assert directly.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = config.globalIo();
+
+    try tmp.dir.createDirPath(io, "init-flat");
+    const project_dir = try tmp.dir.realPathFileAlloc(io, "init-flat", alloc);
+    defer alloc.free(project_dir);
+
+    try scaffold(alloc, io, .{ .name = "init-flat", .dir = project_dir });
+
+    const scene = try tmp.dir.readFileAlloc(
+        io,
+        "init-flat/scenes/main.jsonc",
+        alloc,
+        .limited(4096),
+    );
+    defer alloc.free(scene);
+
+    // Positive: flat-form must use top-level "children".
+    try std.testing.expect(std.mem.indexOf(u8, scene, "\"children\"") != null);
+
+    // Negative: none of the four legacy patterns may appear.
+    try std.testing.expect(std.mem.indexOf(u8, scene, "\"entities\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, scene, "\"root\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, scene, "\"components\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, scene, "\"assets\"") == null);
 }
 
 test "escapeZonString escapes quotes and backslashes" {
