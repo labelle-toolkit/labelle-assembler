@@ -141,10 +141,18 @@ pub fn build(b: *std.Build) void {
     audio_mod.addCSourceFile(.{ .file = b.path("src/dr_wav_impl.c"), .flags = &.{} });
 
     // ── Window backend module ───────────────────────────────────────
+    // `link_libc = true` is required because `screenshot/bmp.zig` writes
+    // the BMP file via libc `fopen` / `fwrite` / `fclose` — Zig 0.16
+    // dropped the allocator-free `std.fs.cwd()` helper and threading an
+    // `Io` through `takeScreenshot` (which is invoked from a deep
+    // callback) wasn't worth it for a 60-line writer. See bmp.zig's
+    // header comment and the matching libc shims in gfx/texture.zig and
+    // audio/legacy.zig (PR #218).
     const window_mod = b.addModule("window", .{
         .root_source_file = b.path("src/window.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     window_mod.addImport("sokol", sokol_mod);
 
