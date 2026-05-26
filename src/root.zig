@@ -30,6 +30,7 @@ test {
     _ = @import("deps_linker.zig");
     _ = @import("app_icon.zig");
     _ = @import("flow_catalog.zig");
+    _ = @import("codegen/idents.zig");
 }
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────

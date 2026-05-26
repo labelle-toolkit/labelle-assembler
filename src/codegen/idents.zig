@@ -74,6 +74,30 @@ pub fn writeZigString(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
 }
 
+/// Derive a game-event variant name from a scanned event file path
+/// (`linkAndScan` returns the stem, possibly with a subdir prefix like
+/// `combat/anim_transition`). Returns just the file basename, with the
+/// `.zig` extension stripped if present.
+///
+/// Distinct from `pathToIdent`, which path-escapes characters for
+/// uniqueness — appropriate when the identifier participates in a flat
+/// global namespace (e.g. plugin-namespaced events `box2d__collision`).
+/// Game events are validated against user-authored handler functions
+/// (e.g. `pub fn anim_transition(...)` in `hooks/animation_hooks.zig`),
+/// so the variant name MUST equal the basename the user typed — any
+/// `_u_` escape breaks engine 1.44.0's stricter handler check.
+///
+/// The basename is required to already be a valid Zig identifier
+/// because the user's handler function references it by name.
+pub fn eventVariantName(name: []const u8) []const u8 {
+    const end = if (std.mem.endsWith(u8, name, ".zig")) name.len - 4 else name.len;
+    const stem = name[0..end];
+    if (std.mem.lastIndexOfScalar(u8, stem, '/')) |slash| {
+        return stem[slash + 1 ..];
+    }
+    return stem;
+}
+
 /// Derive a PascalCase type name from a script/component path:
 /// `jump_anim` -> `JumpAnim`, `enemy/patrol` -> `EnemyPatrol`,
 /// `health.zig` -> `Health`. Every non-alphanumeric byte (`_`, `/`,
@@ -111,4 +135,30 @@ pub fn pathToPascal(name: []const u8, pascal_buf: *[128]u8) []const u8 {
         }
     }
     return pascal_buf[0..i];
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────
+
+test "eventVariantName: plain name is unchanged" {
+    try std.testing.expectEqualStrings("anim_transition", eventVariantName("anim_transition"));
+}
+
+test "eventVariantName: strips the .zig extension" {
+    try std.testing.expectEqualStrings("anim_transition", eventVariantName("anim_transition.zig"));
+}
+
+test "eventVariantName: preserves underscores (no _u_ escape)" {
+    // The regression: pre-fix `pathToIdent` was applied here, escaping
+    // every `_` to `_u_` and producing variant names that could never
+    // match user-authored handler functions.
+    try std.testing.expectEqualStrings("worker_eat_start", eventVariantName("worker_eat_start.zig"));
+    try std.testing.expectEqualStrings("fight_started", eventVariantName("fight_started"));
+}
+
+test "eventVariantName: takes the basename of a subdir-prefixed path" {
+    // `linkAndScan` returns `subdir/foo` for nested events. The variant
+    // name must be the basename only — that's what the user's handler
+    // function name reflects.
+    try std.testing.expectEqualStrings("foo", eventVariantName("subdir/foo"));
+    try std.testing.expectEqualStrings("foo", eventVariantName("a/b/foo.zig"));
 }

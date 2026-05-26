@@ -49,6 +49,7 @@ const pathToIdent = scan.pathToIdent;
 
 // Identifier helpers
 const pathToPascal = idents.pathToPascal;
+const eventVariantName = idents.eventVariantName;
 
 // Validation (pure helpers — not mixin-converted; see codegen/context.zig).
 const checkBasenameCollisions = validate.checkBasenameCollisions;
@@ -228,6 +229,13 @@ pub fn generateMainZigFromTemplate(
     }
 
     // Event imports block
+    //
+    // Use the file basename (no path escape) as the import alias so the
+    // alias matches the union variant name below, which in turn matches
+    // the user's handler function name. Plugin events use `pathToIdent`
+    // because plugin-namespaced names (`<plugin>__<event>`) need escapes
+    // for path safety; in-tree game events do not — the basename is
+    // already a valid Zig identifier (the user's handler references it).
     {
         var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
         errdefer alloc_writer_b.deinit();
@@ -235,7 +243,7 @@ pub fn generateMainZigFromTemplate(
         if (event_names.len > 0) {
             try bw.writeAll("\n// --- Event imports ---\n");
             for (event_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
+                const ident = eventVariantName(name);
                 try bw.print("const {s} = @import(\"events/{s}.zig\");\n", .{ ident, name });
             }
         }
@@ -612,7 +620,7 @@ pub fn generateMainZigFromTemplate(
                 try bw.writeAll("pub const GameEventsRaw = union(enum) {\n");
                 var pascal_buf: [128]u8 = undefined;
                 for (event_names) |name| {
-                    const ident = pathToIdent(name, &ident_buf);
+                    const ident = eventVariantName(name);
                     const pascal = pathToPascal(name, &pascal_buf);
                     try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
                 }
@@ -631,7 +639,7 @@ pub fn generateMainZigFromTemplate(
                 try bw.writeAll("pub const GameEvents = union(enum) {\n");
                 var pascal_buf: [128]u8 = undefined;
                 for (event_names) |name| {
-                    const ident = pathToIdent(name, &ident_buf);
+                    const ident = eventVariantName(name);
                     const pascal = pathToPascal(name, &pascal_buf);
                     try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
                 }

@@ -558,3 +558,60 @@ pub const EMBED_SCENES = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadScene(game") == null);
     }
 };
+
+pub const GAME_EVENT_VARIANT_NAMES = struct {
+    // Regression for the `_u_` underscore-escape leak: `pathToIdent` was
+    // applied to event-file basenames when building the `GameEvents`
+    // union, so a file `events/anim_transition.zig` produced a variant
+    // named `anim_u_transition` — which cannot match a user handler
+    // named `pub fn anim_transition(...)` under engine 1.44.0's
+    // stricter handler check (labelle-engine#16). The basename must
+    // pass through verbatim because the user writes the handler name
+    // by hand and expects it to match.
+    //
+    // The stock `engine_template` doesn't reference the
+    // `event_imports_block` / `game_events_block` slots (it's a
+    // backend-wiring smoke fixture), so each test wires up a minimal
+    // template that lays bare exactly those slots — enough to assert
+    // on the variant + import emissions without dragging in the rest
+    // of the orchestrator output.
+    const events_test_template =
+        \\{{event_imports_block}}
+        \\{{game_events_block}}
+        \\{{lifecycle}}
+    ;
+
+    test "preserves underscores in event-file basename as variant name" {
+        const event_names = &[_][]const u8{"anim_transition"};
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, events_test_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, event_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // Import alias uses the basename verbatim — `anim_transition`,
+        // NOT `anim_u_transition`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const anim_transition = @import(\"events/anim_transition.zig\")") != null);
+        // The union variant name matches what the user's handler
+        // function is named.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "anim_transition: anim_transition.AnimTransition") != null);
+        // No `_u_` escape leaks through.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "anim_u_transition") == null);
+    }
+
+    test "multi-underscore basenames pass through verbatim" {
+        const event_names = &[_][]const u8{ "worker_eat_start", "fight_started" };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, events_test_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, event_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "worker_eat_start: worker_eat_start.WorkerEatStart") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fight_started: fight_started.FightStarted") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "worker_u_eat_u_start") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fight_u_started") == null);
+    }
+};
