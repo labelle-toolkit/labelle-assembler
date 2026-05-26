@@ -44,7 +44,10 @@ pub fn readback(out: []u8, w: u32, h: u32) bool {
     // read from. Bail early so the extern declarations below never
     // become reachable on Darwin and the linker never looks for
     // libGL / glReadPixels symbols.
-    if (comptime builtin.os.tag == .macos or builtin.os.tag == .ios) {
+    // Use `builtin.target.os.tag` (not `builtin.os.tag`) — the latter
+    // resolves to the *host* OS and breaks cross-compilation to Darwin
+    // from a non-Apple host. cursor[bot] caught this on PR #223.
+    if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
         std.log.warn("screenshot: GL readback requested on Darwin (sokol uses Metal here)", .{});
         return false;
     }
