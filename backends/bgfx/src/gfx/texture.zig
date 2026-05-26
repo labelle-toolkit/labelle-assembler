@@ -88,6 +88,14 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     defer allocator.free(data);
 
     const bytes_read = std.c.fread(data.ptr, 1, file_size, file);
+    if (bytes_read != file_size) {
+        // `fread` can return short on EOF mid-read without setting an error
+        // flag, so we must compare against the full requested size — not
+        // just the minimum image header — or we'd silently decode a truncated
+        // file. See PR #227 (cursor[bot] review).
+        std.log.warn("texture: short read on {s} ({d}/{d} bytes)", .{ path, bytes_read, file_size });
+        return error.LoadFailed;
+    }
     if (bytes_read < 18) return error.LoadFailed;
 
     const decoded = try decodeImage("", data[0..bytes_read], allocator);

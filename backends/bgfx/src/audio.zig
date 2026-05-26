@@ -169,6 +169,15 @@ fn loadWavFile(path: [:0]const u8) ?struct { pcm: PcmData, alloc: []u8 } {
     const data = allocator.alloc(u8, file_size) catch return null;
 
     const bytes_read = std.c.fread(data.ptr, 1, file_size, file);
+    if (bytes_read != file_size) {
+        // `fread` can return short on EOF mid-read without setting an error
+        // flag, so we must compare against the full requested size — not
+        // just the minimum WAV header — or we'd silently decode a truncated
+        // file. See PR #227 (cursor[bot] review).
+        std.log.warn("audio: short read on {s} ({d}/{d} bytes)", .{ path, bytes_read, file_size });
+        allocator.free(data);
+        return null;
+    }
     if (bytes_read < 44) { // minimum WAV size
         allocator.free(data);
         return null;
