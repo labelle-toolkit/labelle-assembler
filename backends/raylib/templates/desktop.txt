@@ -22,6 +22,15 @@ const target_fps: u32 = {{fps}};
     g.getCamera().setPosition(0, @as(f32, @floatFromInt(screen_h)));
 
 {{preview_setup}}{{setup_code}}
+    // Screenshot capture request (labelle-cli#227). Reads
+    // `LABELLE_SCREENSHOT_PATH` once on startup; null when the env var
+    // is absent, so the per-frame check below is a `null` test the
+    // optimizer collapses on regular runs. `loop_start_ns` captures
+    // wall-clock at the first frame so `after_sec` is "seconds since
+    // the game entered its main loop" — matches `labelle run --after`.
+    var screenshot_req: ?engine.ScreenshotRequest = engine.requestedScreenshot();
+    const loop_start_ns: i128 = std.time.nanoTimestamp();
+
     while (!window.windowShouldClose()) {
         const dt: f32 = 0.016;
 {{preview_heartbeat}}{{tick_code}}        g.tick(dt);
@@ -32,5 +41,23 @@ const target_fps: u32 = {{fps}};
         g.renderGizmos();
 {{gui_draw_code}}        window.drawText(screen_title, 10, 10, 20, 180, 180, 180, 255);
 {{preview_readback}}        window.endDrawing();
+
+        // Fire the screenshot exactly once, after the configured
+        // delay. `takeScreenshot` reads the just-presented framebuffer,
+        // so it MUST run after `endDrawing` (raylib swaps in
+        // `endDrawing`). The `req = null` assignment after the call
+        // ensures one-shot semantics even if the loop iterates again.
+        if (screenshot_req) |req| {
+            const now_ns: i128 = std.time.nanoTimestamp();
+            const elapsed_sec: f32 = @as(f32, @floatFromInt(@as(i64, @intCast(now_ns - loop_start_ns)))) / 1_000_000_000.0;
+            if (elapsed_sec >= req.after_sec) {
+                window.takeScreenshot(req.path);
+                screenshot_req = null;
+                // Exit cleanly so CI / agent flows that use the
+                // screenshot as their signal don't have to wait for
+                // a separate `--timeout` to fire.
+                break;
+            }
+        }
     }
 }
