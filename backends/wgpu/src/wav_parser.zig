@@ -199,7 +199,7 @@ fn buildWav(
     const data_chunk_size: u32 = @intCast(pcm_bytes.len);
     const total_size: u32 = 4 + (8 + fmt_chunk_size) + (8 + data_chunk_size);
 
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     // errdefer — the happy path returns via `toOwnedSlice`, which
     // hands `buf`'s storage to the caller. Only clean up if an
     // earlier `try` bails out before that transfer.

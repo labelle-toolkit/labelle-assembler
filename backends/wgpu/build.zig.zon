@@ -2,11 +2,11 @@
     .fingerprint = 0x993952ebf33b101a,
     .name = .labelle_wgpu,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wgpu_native_zig = .{
-            .url = "git+https://github.com/apotema/wgpu_native_zig#fb54d9c8cbefa0b8d0e8224aa8323b7974ae454f",
-            .hash = "wgpu_native_zig-6.5.0-B9jeDFtzAwDsipOKKyeMPl-NxiS5g0L2EN_UIJnw2P6F",
+            .url = "git+https://github.com/snorm-dev/wgpu_native_zig#8aef4a9873637ba9444282f7a706eaa251f8d8e9",
+            .hash = "wgpu_native_zig-6.5.0-B9jeDCtzAwADQTiKl7pWvLrNC7pelV0GlH_ePoIse28g",
             .lazy = true,
         },
         .zglfw = .{
