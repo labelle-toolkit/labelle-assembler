@@ -104,15 +104,14 @@ const MTLResourceStorageModeManaged: u64 = 1 << 4;
 
 const is_macos = @import("builtin").target.os.tag == .macos;
 
-// labelle-assembler#222 issue 2: the sokol-zig fork pinned by the
-// current release does NOT export `_sapp_metal_get_current_drawable`.
-// Flip this flag to `true` in the follow-up release that bumps the
-// sokol pin to a fork commit that DOES export it — then the original
-// readback body becomes live again. Keeping it as a comptime flag
-// rather than a `git checkout`able edit means the follow-up diff is a
-// one-line toggle and the resurrection target stays type-checked by
-// the compiler (a stale dead-code branch would otherwise rot quietly).
-const fork_exports_drawable: bool = false;
+// labelle-assembler#222 issue 2: the sokol-zig fork now exports
+// `_sapp_metal_get_current_drawable` (see labelle-toolkit/sokol-zig#1,
+// merged at 887b30f). With the pin bump in `backends/sokol/build.zig.zon`
+// to that commit, the readback body is live. Keeping this as a comptime
+// flag (rather than ripping the gate) preserves the compile-time switch
+// for any future fork-rollback scenario and documents the link-edge
+// where the symbol becomes mandatory.
+const fork_exports_drawable: bool = true;
 
 /// Read the contents of the current drawable's texture into `out` (RGBA-
 /// sized buffer, w*h*4 bytes). Returns true on success, false on any
@@ -122,15 +121,11 @@ const fork_exports_drawable: bool = false;
 /// `mtl_device` is the MTLDevice pointer (from `window.metalDevice()`).
 pub fn readback(out: []u8, w: u32, h: u32, mtl_device: ?*const anyopaque) bool {
     if (comptime !fork_exports_drawable) {
-        // STUB until the sokol-zig fork patch + pin bump ships
-        // (labelle-assembler#222 issue 2). Declaring `extern fn
-        // sapp_metal_get_current_drawable` at module scope would
-        // trigger an undefined-symbol error at link time even though
-        // the call site is gated — the linker pulls in the unresolved
-        // symbol from the extern declaration alone. The params get used
-        // by the live branch below, so no `_ = param` discards here.
+        // STUB path retained for compile-time rollback safety. The
+        // live branch below requires the sokol-zig fork pin to export
+        // `_sapp_metal_get_current_drawable` (assembler#222 issue 2).
         std.log.warn(
-            "screenshot: Metal readback disabled until sokol-zig fork exports _sapp_metal_get_current_drawable (assembler#222 issue 2)",
+            "screenshot: Metal readback disabled (fork_exports_drawable=false)",
             .{},
         );
         return false;
@@ -138,10 +133,12 @@ pub fn readback(out: []u8, w: u32, h: u32, mtl_device: ?*const anyopaque) bool {
 
     // Keep the extern declaration *inside* the function body so the
     // symbol only enters the linker's search graph when the
-    // `fork_exports_drawable` branch above is alive. Module-scope
-    // externs leak through dead-code elimination on the link step.
+    // `fork_exports_drawable` branch above is alive. Use `extern "c"`
+    // (not bare `extern`) — the `"c"` is the canonical stdlib pattern
+    // for libc-resolved symbols and works across platforms (Windows
+    // MSVC included), matching `std.c.fopen` and friends.
     const sapp_metal_get_current_drawable = (struct {
-        extern fn sapp_metal_get_current_drawable() ?*const anyopaque;
+        extern "c" fn sapp_metal_get_current_drawable() ?*const anyopaque;
     }).sapp_metal_get_current_drawable;
 
     const device = @as(?*anyopaque, @constCast(mtl_device)) orelse {

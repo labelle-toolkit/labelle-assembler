@@ -28,10 +28,13 @@ const std = @import("std");
 /// Open `path` (UTF-8), write `data` verbatim, close. Returns
 /// `error.FileWriteFailed` on any libc-level failure. Allocates a
 /// null-terminated copy of the path because `fopen` is C and needs a
-/// `[*:0]const u8`; freed before return.
-fn writeBytesViaLibc(path: []const u8, data: []const u8) !void {
-    const path_z = try std.heap.page_allocator.dupeZ(u8, path);
-    defer std.heap.page_allocator.free(path_z);
+/// `[*:0]const u8`; freed before return. Uses the caller's allocator
+/// rather than `std.heap.page_allocator` so the call site controls the
+/// allocation strategy (matches the existing `allocator` param threaded
+/// through `writeBmp` / `writeBmpFromBgra`).
+fn writeBytesViaLibc(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
     const fp = std.c.fopen(path_z.ptr, "wb") orelse return error.FileWriteFailed;
     defer _ = std.c.fclose(fp);
     if (std.c.fwrite(data.ptr, 1, data.len, fp) != data.len) return error.FileWriteFailed;
@@ -95,7 +98,7 @@ pub fn writeBmp(
         }
     }
 
-    try writeBytesViaLibc(path, data);
+    try writeBytesViaLibc(allocator, path, data);
 }
 
 /// BGRA8 variant — same layout as the RGBA writer except channels 0/2 are
@@ -155,7 +158,7 @@ pub fn writeBmpFromBgra(
         }
     }
 
-    try writeBytesViaLibc(path, data);
+    try writeBytesViaLibc(allocator, path, data);
 }
 
 fn writeU32LE(buf: []u8, val: u32) void {

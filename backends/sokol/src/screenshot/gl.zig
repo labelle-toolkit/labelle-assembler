@@ -55,9 +55,9 @@ pub fn readback(out: []u8, w: u32, h: u32) bool {
     // them inside this `if` block (which is `comptime`-dead on Darwin)
     // is what actually prevents the linker references.
     const gl = struct {
-        extern fn glReadPixels(x: i32, y: i32, w: i32, h: i32, format: u32, type_: u32, data: ?*anyopaque) void;
-        extern fn glPixelStorei(pname: u32, param: i32) void;
-        extern fn glGetError() u32;
+        extern "c" fn glReadPixels(x: i32, y: i32, w: i32, h: i32, format: u32, type_: u32, data: ?*anyopaque) void;
+        extern "c" fn glPixelStorei(pname: u32, param: i32) void;
+        extern "c" fn glGetError() u32;
     };
 
     const total: usize = @as(usize, w) * @as(usize, h) * 4;
