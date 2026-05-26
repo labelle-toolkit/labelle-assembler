@@ -1,7 +1,10 @@
 /// SDL2 audio backend — satisfies the engine AudioInterface(Impl) contract.
 /// Implemented via SDL_mixer (Mix_* API).
 const std = @import("std");
+// SDL_DISABLE_ARM_NEON_H: see src/sdl.zig for rationale (Zig 0.16 arm_neon.h
+// FP8 type mismatch on macOS arm64).
 const c = @cImport({
+    @cDefine("SDL_DISABLE_ARM_NEON_H", "1");
     @cInclude("SDL2/SDL.h");
     @cInclude("SDL2/SDL_mixer.h");
 });
