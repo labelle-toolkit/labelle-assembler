@@ -102,8 +102,8 @@ pub fn initGfx() void {
 /// ticket should reuse `preview_pbo` / `preview_mtl`'s readback ring
 /// for a real implementation.
 pub fn takeScreenshot(path: [:0]const u8) void {
-    std.debug.print(
-        "labelle: screenshot requested but not supported on sokol backend yet ({s})\n",
+    std.log.warn(
+        "screenshot requested but not supported on sokol backend yet ({s})",
         .{path},
     );
 }
