@@ -4,6 +4,17 @@ var g: AssembledGame = undefined;
 {{hooks_init_block}}
 {{allocator_decl}}
 {{module_vars}}
+
+// Screenshot capture request (labelle-cli#227). `screenshot_req` is
+// the active request (null when the env var is unset, or after the
+// shot fires). `screenshot_start_ns` is set on the first frame so the
+// `--after` delay is measured from "main-loop entry", matching the
+// raylib backend's semantics. Sokol drives frames via callbacks, so
+// the state has to be module-scope here (the raylib template uses a
+// local in `main()` for the same reason it can — it owns the loop).
+var screenshot_req: ?@import("labelle-engine").ScreenshotRequest = null;
+var screenshot_start_ns: i128 = 0;
+var screenshot_initialized: bool = false;
 const screen_w: u32 = {{width}};
 const screen_h: u32 = {{height}};
 const screen_title = "{{title}}";
@@ -47,7 +58,28 @@ export fn frame() callconv(.c) void {
     // flush that used to happen at endFrame. See labelle-imgui#4.
     window.flushScene();
 {{gui_draw_code}}{{preview_readback}}    window.endFrame();
-{{preview_readback_post}}    // Clear one-shot pressed/released state AFTER scripts have consumed it.
+{{preview_readback_post}}
+    // Fire the screenshot exactly once, after the configured delay
+    // (labelle-cli#227). First-frame lazy-init avoids a separate
+    // sokol init-callback hook just to seed the start-time. The
+    // `null` test on subsequent frames is one cmp+branch the
+    // optimizer keeps near-free; on regular runs the parse returns
+    // null at first-frame init and the branch falls through forever.
+    if (!screenshot_initialized) {
+        screenshot_req = @import("labelle-engine").requestedScreenshot();
+        screenshot_start_ns = @import("labelle-engine").nowNs();
+        screenshot_initialized = true;
+    }
+    if (screenshot_req) |req| {
+        const now_ns: i128 = @import("labelle-engine").nowNs();
+        const elapsed_sec: f32 = @as(f32, @floatFromInt(@as(i64, @intCast(now_ns - screenshot_start_ns)))) / 1_000_000_000.0;
+        if (elapsed_sec >= req.after_sec) {
+            window.takeScreenshot(req.path);
+            screenshot_req = null;
+            window.requestQuit();
+        }
+    }
+    // Clear one-shot pressed/released state AFTER scripts have consumed it.
     // Calling newFrame at the top of frame() would race with sapp events
     // dispatched between frame callbacks and drop isKeyPressed reports.
     @import("backend_input").newFrame();

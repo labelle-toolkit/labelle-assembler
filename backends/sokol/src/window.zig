@@ -87,6 +87,27 @@ pub fn initGfx() void {
     });
 }
 
+/// Screenshot capture — best-effort. The raylib backend uses raylib's
+/// builtin `TakeScreenshot`, which reads the just-presented framebuffer
+/// and picks the format from the extension. sokol-gfx has no equivalent
+/// one-shot helper: a real implementation would have to drive a
+/// per-backend pixel readback (Metal blit-encoder, GL `glReadPixels`,
+/// D3D11 staging texture) plus a PNG/BMP encoder, all of which already
+/// exist in scattered form in this backend (`preview_pbo`, `preview_mtl`,
+/// `dr_wav` is audio-only) but are wired for the preview readback path.
+///
+/// For now the sokol template wires the call site exactly like raylib's
+/// so labelle-cli#227 can ship the CLI flag + engine helper, with sokol
+/// emitting a one-line warning instead of writing a file. Follow-up
+/// ticket should reuse `preview_pbo` / `preview_mtl`'s readback ring
+/// for a real implementation.
+pub fn takeScreenshot(path: [:0]const u8) void {
+    std.log.warn(
+        "screenshot requested but not supported on sokol backend yet ({s})",
+        .{path},
+    );
+}
+
 /// Quiet-exit handler for the upstream sokol-gfx SIGSEGV in
 /// `_sg_mtl_garbage_collect` during `sg_shutdown` (labelle-assembler#140).
 /// Bug lives in sokol-gfx's deferred-release queue, not our cleanup.
