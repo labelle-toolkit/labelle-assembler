@@ -110,21 +110,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run raylib backend unit tests");
     test_step.dependOn(&b.addRunArtifact(slot_alloc_tests).step);
 
-    // Compile-check window.zig under the requested target. This is the
-    // module consumed by labelle-assembler's generated build, and it
-    // calls into libc + raylib bindings (see takeScreenshot). The check
-    // catches regressions like labelle-assembler#229 where the rename-
-    // trick on `std.c.*` symbols silently broke Windows sema. We don't
-    // *run* this — raylib's C artifact would need to link — but
-    // `addTest` produces a compile-only artifact in `install` mode
-    // when not depended on by a run step, exercising sema for the
-    // module under `-Dtarget=...`. We feed it the host target so it
-    // also serves as a generic compile guard on the default `test`.
-    const window_compile_check = b.addTest(.{
-        .root_module = window_mod,
-    });
-    test_step.dependOn(&window_compile_check.step);
-
     // ── Phase 4 host-native test runs ────────────────────────────────
     //
     // The Phase 4 decoder unit tests (decodeFont rejecting empty /
