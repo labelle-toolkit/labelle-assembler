@@ -77,10 +77,17 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── Window backend module ───────────────────────────────────────
+    // `link_libc = true` is what makes `std.c.fopen` / `fwrite` / `fclose`
+    // (used by `takeScreenshot` after #229) compile under sema even for
+    // targets like `x86_64-windows-gnu`. raylib's own C artifact already
+    // pulls libc in for runtime linking — this just lets the module
+    // semantic-analyze cleanly without depending on transitive link
+    // state.
     const window_mod = b.addModule("window", .{
         .root_source_file = b.path("src/window.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     window_mod.addImport("raylib", raylib_mod);
 
@@ -102,6 +109,21 @@ pub fn build(b: *std.Build) void {
     });
     const test_step = b.step("test", "Run raylib backend unit tests");
     test_step.dependOn(&b.addRunArtifact(slot_alloc_tests).step);
+
+    // Compile-check window.zig under the requested target. This is the
+    // module consumed by labelle-assembler's generated build, and it
+    // calls into libc + raylib bindings (see takeScreenshot). The check
+    // catches regressions like labelle-assembler#229 where the rename-
+    // trick on `std.c.*` symbols silently broke Windows sema. We don't
+    // *run* this — raylib's C artifact would need to link — but
+    // `addTest` produces a compile-only artifact in `install` mode
+    // when not depended on by a run step, exercising sema for the
+    // module under `-Dtarget=...`. We feed it the host target so it
+    // also serves as a generic compile guard on the default `test`.
+    const window_compile_check = b.addTest(.{
+        .root_module = window_mod,
+    });
+    test_step.dependOn(&window_compile_check.step);
 
     // ── Phase 4 host-native test runs ────────────────────────────────
     //
