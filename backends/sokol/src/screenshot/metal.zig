@@ -21,8 +21,20 @@ const std = @import("std");
 // ── libobjc + Metal selector setup ────────────────────────────────────
 // sokol_app.h exposes the current drawable as `const void*`; cast it
 // back to an objc `id` (which `?*anyopaque` already models).
-extern fn sapp_metal_get_current_drawable() ?*const anyopaque;
-
+//
+// NOTE (labelle-assembler#222 issue 2): `_sapp_metal_get_current_drawable`
+// is NOT yet exported from the sokol-zig fork pinned by the current
+// release. Until that fork patch lands, declaring this `extern fn` at
+// module scope causes an undefined-symbol error at link time on macOS
+// builds — even though `readback` is only called when the active
+// graphics backend is Metal. The extern declaration alone is enough to
+// pull the unresolved symbol into the executable's link line.
+//
+// Mitigation: the extern lives INSIDE `readback` (and `readback` is
+// hard-stubbed to return `false` until the fork patch ships). When the
+// pending fork patch + sokol pin bump lands in a follow-up, restore the
+// real readback body by deleting the early-return stub and the inline
+// `extern fn` declarations move back out to module scope.
 extern fn sel_registerName(name: [*:0]const u8) callconv(.c) ?*anyopaque;
 const msgSend_void = @extern(
     *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) void,
@@ -92,6 +104,15 @@ const MTLResourceStorageModeManaged: u64 = 1 << 4;
 
 const is_macos = @import("builtin").target.os.tag == .macos;
 
+// labelle-assembler#222 issue 2: the sokol-zig fork now exports
+// `_sapp_metal_get_current_drawable` (see labelle-toolkit/sokol-zig#1,
+// merged at 887b30f). With the pin bump in `backends/sokol/build.zig.zon`
+// to that commit, the readback body is live. Keeping this as a comptime
+// flag (rather than ripping the gate) preserves the compile-time switch
+// for any future fork-rollback scenario and documents the link-edge
+// where the symbol becomes mandatory.
+const fork_exports_drawable: bool = true;
+
 /// Read the contents of the current drawable's texture into `out` (RGBA-
 /// sized buffer, w*h*4 bytes). Returns true on success, false on any
 /// readback step that can fail (no drawable, alloc failure, etc.).
@@ -99,6 +120,27 @@ const is_macos = @import("builtin").target.os.tag == .macos;
 /// `out` receives BGRA bytes on success — see `bmp.writeBmpFromBgra`.
 /// `mtl_device` is the MTLDevice pointer (from `window.metalDevice()`).
 pub fn readback(out: []u8, w: u32, h: u32, mtl_device: ?*const anyopaque) bool {
+    if (comptime !fork_exports_drawable) {
+        // STUB path retained for compile-time rollback safety. The
+        // live branch below requires the sokol-zig fork pin to export
+        // `_sapp_metal_get_current_drawable` (assembler#222 issue 2).
+        std.log.warn(
+            "screenshot: Metal readback disabled (fork_exports_drawable=false)",
+            .{},
+        );
+        return false;
+    }
+
+    // Keep the extern declaration *inside* the function body so the
+    // symbol only enters the linker's search graph when the
+    // `fork_exports_drawable` branch above is alive. Use `extern "c"`
+    // (not bare `extern`) — the `"c"` is the canonical stdlib pattern
+    // for libc-resolved symbols and works across platforms (Windows
+    // MSVC included), matching `std.c.fopen` and friends.
+    const sapp_metal_get_current_drawable = (struct {
+        extern "c" fn sapp_metal_get_current_drawable() ?*const anyopaque;
+    }).sapp_metal_get_current_drawable;
+
     const device = @as(?*anyopaque, @constCast(mtl_device)) orelse {
         std.log.warn("screenshot: Metal device unavailable", .{});
         return false;

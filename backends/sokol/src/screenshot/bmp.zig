@@ -13,8 +13,32 @@
 //! Input pixel layout: tightly-packed RGBA8 (R,G,B,A order), top-down
 //! (row 0 is the top of the image). BMP is bottom-up + BGR, so the writer
 //! handles both the row-flip and the channel swizzle.
+//!
+//! File I/O: Zig 0.16 removed `std.fs.cwd()` in favour of `std.Io.Dir.cwd()`,
+//! which threads an `Io` parameter through every call site. The screenshot
+//! path is invoked from a deep callback (`window.takeScreenshot`) that has
+//! no `Io` in scope; rather than rewire it for one 60-line writer we use
+//! libc `fopen` / `fwrite` / `fclose` here, mirroring the same approach
+//! used in `gfx/texture.zig` and `audio/legacy.zig` for the legacy
+//! path-based loaders. The consuming `window` module sets `link_libc = true`
+//! in `backends/sokol/build.zig`, so libc is already on the link line.
 
 const std = @import("std");
+
+/// Open `path` (UTF-8), write `data` verbatim, close. Returns
+/// `error.FileWriteFailed` on any libc-level failure. Allocates a
+/// null-terminated copy of the path because `fopen` is C and needs a
+/// `[*:0]const u8`; freed before return. Uses the caller's allocator
+/// rather than `std.heap.page_allocator` so the call site controls the
+/// allocation strategy (matches the existing `allocator` param threaded
+/// through `writeBmp` / `writeBmpFromBgra`).
+fn writeBytesViaLibc(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fp = std.c.fopen(path_z.ptr, "wb") orelse return error.FileWriteFailed;
+    defer _ = std.c.fclose(fp);
+    if (std.c.fwrite(data.ptr, 1, data.len, fp) != data.len) return error.FileWriteFailed;
+}
 
 /// Write `pixels` (RGBA8, top-down, `width * height * 4` bytes) to `path`
 /// as a 24-bit BMP. `allocator` is used only for the single output buffer
@@ -74,9 +98,7 @@ pub fn writeBmp(
         }
     }
 
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(data);
+    try writeBytesViaLibc(allocator, path, data);
 }
 
 /// BGRA8 variant — same layout as the RGBA writer except channels 0/2 are
@@ -136,9 +158,7 @@ pub fn writeBmpFromBgra(
         }
     }
 
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(data);
+    try writeBytesViaLibc(allocator, path, data);
 }
 
 fn writeU32LE(buf: []u8, val: u32) void {
