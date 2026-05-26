@@ -5,18 +5,24 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .sokol = .{
-            // Pinned to upstream floooh/sokol-zig. Historically this
-            // pointed at the labelle-toolkit fork of sokol-zig (branch
-            // `feat/expose-cached-metal-drawable`) which restored a
-            // `sapp_metal_get_current_drawable` accessor for an early
-            // Path B Metal/IOSurface readback experiment. We've since
-            // switched to Path A — an offscreen IOSurface-backed render
-            // target — which never reads the post-frame drawable, so
-            // the fork patch is no longer needed. See floooh/sokol#1510
-            // (closed) for the upstream rationale. Bumping requires
-            // `zig fetch --save=sokol <url>`.
-            .url = "https://github.com/floooh/sokol-zig/archive/8b1a651e6b8e76af3063a4094a5935432eb8afe2.tar.gz",
-            .hash = "sokol-0.1.0-pb1HK1lhNwCdIF2-WujvJqi1YoK7Qvgm14Ywmup5C6_q",
+            // MUST match the labelle-imgui top-level `.sokol` pin and
+            // the labelle-imgui `bridges/sokol/build.zig.zon` pin
+            // exactly — mismatched commits trigger duplicate-module
+            // errors at build time across consumers that pull both
+            // labelle-imgui and labelle-assembler (see labelle-assembler#207).
+            // Pinned to the labelle-toolkit fork of sokol-zig, branch
+            // `feat/with-sokol-imgui-no-app`, which adds the
+            // `with_sokol_imgui_no_app` build option on top of upstream
+            // floooh/sokol-zig @ 8b1a651. The option defines
+            // `SOKOL_IMGUI_NO_SOKOL_APP` when compiling sokol_imgui.c
+            // so labelle-imgui's headless preview mode can drive simgui
+            // via `simgui_new_frame(width/height/dpi_scale/...)`. The
+            // assembler doesn't pass that option itself — pinning the
+            // fork is purely to align the package hash with imgui's
+            // dependency tree. Default is false → backward compatible
+            // with upstream. Bumping requires `zig fetch --save=sokol <url>`.
+            .url = "https://github.com/labelle-toolkit/sokol-zig/archive/6b8609d022a095a757d66d8b00acd5c4cc80cdfc.tar.gz",
+            .hash = "sokol-0.1.0-pb1HK_FiNwBdV4BfvYXfUbDC1lhXcBeBOyy5zLCERSAa",
         },
         // emsdk is needed at WASM build time so we can plumb the
         // sysroot include path through to `stb_image_impl.c`. The
