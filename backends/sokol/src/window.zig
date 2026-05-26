@@ -178,11 +178,17 @@ pub fn takeScreenshot(path: [:0]const u8) void {
 // on the dispatch shape; WGPU's stub is so small it stays inline.
 
 fn readbackMetal(pixels: []u8, w: u32, h: u32) bool {
-    if (comptime !(builtin.target.os.tag == .macos or builtin.target.os.tag == .ios)) {
+    // Use an explicit `if (comptime ...) { ... } else { ... }` so the
+    // Darwin-only `screenshot/metal.zig` import is fully discarded by
+    // the compiler on non-Darwin targets — relying on dead-code
+    // elimination after a comptime-return can leave the import in the
+    // analysis graph and trip link-time references to libobjc.
+    if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
+        return @import("screenshot/metal.zig").readback(pixels, w, h, metalDevice());
+    } else {
         std.log.warn("screenshot: Metal backend reported on non-Darwin target", .{});
         return false;
     }
-    return @import("screenshot/metal.zig").readback(pixels, w, h, metalDevice());
 }
 
 fn readbackGL(pixels: []u8, w: u32, h: u32) bool {
@@ -190,11 +196,15 @@ fn readbackGL(pixels: []u8, w: u32, h: u32) bool {
 }
 
 fn readbackD3D11(pixels: []u8, w: u32, h: u32) bool {
-    if (comptime builtin.target.os.tag != .windows) {
+    // Same comptime-gate shape as `readbackMetal` so the
+    // Windows-only `screenshot/d3d11.zig` import is dropped entirely
+    // on non-Windows builds.
+    if (comptime builtin.target.os.tag == .windows) {
+        return @import("screenshot/d3d11.zig").readback(pixels, w, h);
+    } else {
         std.log.warn("screenshot: D3D11 backend reported on non-Windows target", .{});
         return false;
     }
-    return @import("screenshot/d3d11.zig").readback(pixels, w, h);
 }
 
 fn readbackWGPU(_: []u8, _: u32, _: u32) bool {

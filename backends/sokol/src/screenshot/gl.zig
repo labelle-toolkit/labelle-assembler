@@ -55,30 +55,25 @@ fn flipRowsInPlace(buf: []u8, w: u32, h: u32) void {
     const stride: usize = @as(usize, w) * 4;
     var top: u32 = 0;
     var bot: u32 = h - 1;
-    // Single-row scratch — `h` can be in the thousands so heap-allocing
-    // a half-buffer would be wasteful; one row's worth fits on the stack
-    // for any sane resolution (4096 width × 4 = 16 KiB).
-    var scratch: [4096 * 4]u8 = undefined;
+    // Small fixed scratch + chunked swap: works at full `@memcpy` speed
+    // for any width without a slow byte-wise fallback, and keeps the
+    // stack footprint tiny (16 KiB previously, 1 KiB now).
+    var scratch: [1024]u8 = undefined;
     while (top < bot) : ({
         top += 1;
         bot -= 1;
     }) {
         const top_off = @as(usize, top) * stride;
         const bot_off = @as(usize, bot) * stride;
-        const row_bytes = @min(stride, scratch.len);
-        if (stride > scratch.len) {
-            // Width > 4096 — extremely unusual; fall back to byte-wise
-            // swap so we don't truncate.
-            var i: usize = 0;
-            while (i < stride) : (i += 1) {
-                const tmp = buf[top_off + i];
-                buf[top_off + i] = buf[bot_off + i];
-                buf[bot_off + i] = tmp;
-            }
-        } else {
-            @memcpy(scratch[0..row_bytes], buf[top_off .. top_off + row_bytes]);
-            @memcpy(buf[top_off .. top_off + row_bytes], buf[bot_off .. bot_off + row_bytes]);
-            @memcpy(buf[bot_off .. bot_off + row_bytes], scratch[0..row_bytes]);
+        var chunk_offset: usize = 0;
+        while (chunk_offset < stride) {
+            const chunk_len = @min(stride - chunk_offset, scratch.len);
+            const t_slice = buf[top_off + chunk_offset ..][0..chunk_len];
+            const b_slice = buf[bot_off + chunk_offset ..][0..chunk_len];
+            @memcpy(scratch[0..chunk_len], t_slice);
+            @memcpy(t_slice, b_slice);
+            @memcpy(b_slice, scratch[0..chunk_len]);
+            chunk_offset += chunk_len;
         }
     }
 }

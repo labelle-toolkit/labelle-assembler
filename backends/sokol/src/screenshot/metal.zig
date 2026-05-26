@@ -40,6 +40,27 @@ const msgSend_contents = @extern(
     *const fn (obj: ?*anyopaque, sel: ?*anyopaque) callconv(.c) ?*anyopaque,
     .{ .name = "objc_msgSend" },
 );
+// Metal's `copyFromTexture:...sourceOrigin:sourceSize:...` takes MTLOrigin
+// and MTLSize structs BY VALUE. They are each three NSUInteger fields →
+// 24 bytes on 64-bit Darwin. Flattening them into six individual usize
+// args (as an earlier revision did) does NOT match the platform ABI:
+//   - ARM64 (AAPCS64 / Darwin): aggregates > 16 bytes are passed in memory
+//     (copied to the stack at the next 8-byte-aligned offset), not in
+//     six separate GPRs.
+//   - x86_64 SysV: aggregates > 16 bytes are also passed via memory.
+// Either way the callee reads each struct as a contiguous 24-byte chunk,
+// so we must declare them as `extern struct`s and pass them by value to
+// generate the correct argument layout.
+const MTLOrigin = extern struct {
+    x: usize,
+    y: usize,
+    z: usize,
+};
+const MTLSize = extern struct {
+    width: usize,
+    height: usize,
+    depth: usize,
+};
 const msgSend_copy = @extern(
     *const fn (
         encoder: ?*anyopaque,
@@ -47,12 +68,8 @@ const msgSend_copy = @extern(
         tex: ?*anyopaque,
         slice: usize,
         level: usize,
-        origin_x: usize,
-        origin_y: usize,
-        origin_z: usize,
-        size_w: usize,
-        size_h: usize,
-        size_d: usize,
+        origin: MTLOrigin,
+        size: MTLSize,
         buf: ?*anyopaque,
         offset: usize,
         bytes_per_row: usize,
@@ -154,12 +171,8 @@ pub fn readback(out: []u8, w: u32, h: u32, mtl_device: ?*const anyopaque) bool {
         texture,
         0, // sourceSlice
         0, // sourceLevel
-        0, // origin x
-        0, // origin y
-        0, // origin z
-        @as(usize, w), // size w
-        @as(usize, h), // size h
-        1, // size d
+        .{ .x = 0, .y = 0, .z = 0 },
+        .{ .width = @as(usize, w), .height = @as(usize, h), .depth = 1 },
         buffer,
         0, // dest offset
         bytes_per_row,

@@ -48,10 +48,23 @@ const D3D11_MAPPED_SUBRESOURCE = extern struct {
     DepthPitch: u32,
 };
 
+// ── IUnknown vtable (generic Release for any COM object) ──────────────
+// All ID3D11* / IDXGI* interfaces inherit IUnknown — Release sits at
+// slot 2 in every one of them. Using a dedicated IUnknownVTable for the
+// `.Release()` calls below makes intent obvious: we are not invoking a
+// view-specific method, just the universal IUnknown::Release.
+const IUnknownVTable = extern struct {
+    QueryInterface: *const anyopaque,
+    AddRef: *const anyopaque,
+    Release: *const fn (*anyopaque) callconv(.c) u32,
+};
+
 // ── ID3D11RenderTargetView vtable (we only need GetResource at slot 7) ──
-// IUnknown: 0=QueryInterface 1=AddRef 2=Release
+// IUnknown:         0=QueryInterface 1=AddRef 2=Release
 // ID3D11DeviceChild: 3=GetDevice 4=GetPrivateData 5=SetPrivateData 6=SetPrivateDataInterface
-// ID3D11View: 7=GetResource
+// ID3D11View:       7=GetResource
+// ID3D11RenderTargetView: 8=GetDesc
+// (Verified against MinGW-w64 `d3d11.h` `ID3D11RenderTargetViewVtbl`.)
 const RtvVTable = extern struct {
     QueryInterface: *const anyopaque,
     AddRef: *const anyopaque,
@@ -64,7 +77,9 @@ const RtvVTable = extern struct {
 };
 
 // ── ID3D11Texture2D vtable: 10=GetDesc ─────────────────────────────
-// IUnknown 0..2 + DeviceChild 3..6 + Resource 7..9 + Texture2D 10
+// IUnknown 0..2 + DeviceChild 3..6 + Resource 7..9 (GetType,
+// SetEvictionPriority, GetEvictionPriority) + Texture2D 10 (GetDesc).
+// (Verified against MinGW-w64 `d3d11.h` `ID3D11Texture2DVtbl`.)
 const Tex2dVTable = extern struct {
     QueryInterface: *const anyopaque,
     AddRef: *const anyopaque,
@@ -79,7 +94,13 @@ const Tex2dVTable = extern struct {
     GetDesc: *const fn (*anyopaque, *D3D11_TEXTURE2D_DESC) callconv(.c) void,
 };
 
-// ── ID3D11Device::CreateTexture2D = slot 5 ────────────────────────
+// ── ID3D11Device vtable ─────────────────────────────────────────────
+// ID3D11Device inherits IUnknown ONLY (NOT ID3D11DeviceChild — Device
+// is the top of the chain, every other interface has a GetDevice() that
+// points back at it). So the layout is:
+//   IUnknown: 0=QueryInterface 1=AddRef 2=Release
+//   ID3D11Device: 3=CreateBuffer 4=CreateTexture1D 5=CreateTexture2D ...
+// (Verified against MinGW-w64 `d3d11.h` `ID3D11DeviceVtbl`.)
 const DeviceVTable = extern struct {
     QueryInterface: *const anyopaque,
     AddRef: *const anyopaque,
@@ -197,7 +218,7 @@ pub fn readback(out: []u8, w: u32, h: u32) bool {
         std.log.warn("screenshot: RTV.GetResource returned null", .{});
         return false;
     };
-    defer _ = vt(RtvVTable, back_buffer).Release(back_buffer);
+    defer _ = vt(IUnknownVTable, back_buffer).Release(back_buffer);
 
     // Inspect the back buffer's descriptor — we need the actual width/
     // height to allocate the staging copy at the right size (sokol's
@@ -234,7 +255,7 @@ pub fn readback(out: []u8, w: u32, h: u32) bool {
         std.log.warn("screenshot: CreateTexture2D returned null", .{});
         return false;
     };
-    defer _ = vt(RtvVTable, staging).Release(staging);
+    defer _ = vt(IUnknownVTable, staging).Release(staging);
 
     // GPU-side copy back-buffer → staging.
     vt(CtxVTable, ctx).CopyResource(ctx, staging, back_buffer);
