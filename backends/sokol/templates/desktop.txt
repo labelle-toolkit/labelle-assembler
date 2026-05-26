@@ -67,11 +67,11 @@ export fn frame() callconv(.c) void {
     // null at first-frame init and the branch falls through forever.
     if (!screenshot_initialized) {
         screenshot_req = @import("labelle-engine").requestedScreenshot();
-        screenshot_start_ns = std.time.nanoTimestamp();
+        screenshot_start_ns = @import("labelle-engine").nowNs();
         screenshot_initialized = true;
     }
     if (screenshot_req) |req| {
-        const now_ns: i128 = std.time.nanoTimestamp();
+        const now_ns: i128 = @import("labelle-engine").nowNs();
         const elapsed_sec: f32 = @as(f32, @floatFromInt(@as(i64, @intCast(now_ns - screenshot_start_ns)))) / 1_000_000_000.0;
         if (elapsed_sec >= req.after_sec) {
             window.takeScreenshot(req.path);
