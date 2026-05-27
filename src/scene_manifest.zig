@@ -331,6 +331,56 @@ fn isBundleHeader(obj: std.json.ObjectMap) bool {
     return obj.get("meta") != null;
 }
 
+/// Parse an `assets:` field value (a JSON array of strings) into an
+/// owned `[]const []const u8`. Returned slice + strings are allocated
+/// from `allocator` and must be freed via `freeManifest`. An empty
+/// array yields `&.{}` (no allocation).
+///
+/// Shared between the object-form file-level `assets:` key (RFC #594
+/// flat-form / legacy unified) and the bundle `meta.assets` channel
+/// (RFC #596 axis 3) so both report identical error vocabulary.
+fn parseAssetsField(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    display_path: []const u8,
+) ParseError![]const []const u8 {
+    const arr = switch (value) {
+        .array => |a| a,
+        else => {
+            stderrPrint(
+                "labelle-assembler: scene '{s}' has 'assets' but it is not an array\n",
+                .{display_path},
+            );
+            return error.InvalidAssetsField;
+        },
+    };
+
+    if (arr.items.len == 0) return &.{};
+
+    var list = try allocator.alloc([]const u8, arr.items.len);
+    var n: usize = 0;
+    errdefer {
+        for (list[0..n]) |s| allocator.free(s);
+        allocator.free(list);
+    }
+    for (arr.items) |item| {
+        switch (item) {
+            .string => |s| {
+                list[n] = try allocator.dupe(u8, s);
+                n += 1;
+            },
+            else => {
+                stderrPrint(
+                    "labelle-assembler: scene '{s}' has a non-string entry in 'assets'\n",
+                    .{display_path},
+                );
+                return error.InvalidAssetsField;
+            },
+        }
+    }
+    return list;
+}
+
 /// Validate a top-level bundle Array per RFC #596 axis 3. Every entry
 /// must be a JSON object; the first MAY be a file-header (`{meta}`
 /// only — passed through with no validation), every other element is
@@ -562,9 +612,41 @@ pub fn parseSceneSource(
     // need preloads stay on the object-shape form during v1.x.
     if (parsed.value == .array) {
         try validateBundle(parsed.value.array, display_path);
+
+        // RFC #596 axis 3: a bundle may carry a `{meta: {...}}` header
+        // as its first element. The header is the bundle's only file-
+        // level metadata channel — `meta.assets` is the codegen-time
+        // preload list (counterpart to the object-form `assets:` key).
+        //
+        // `meta.initial_state` is deliberately NOT extracted here:
+        // engine #599 already consumes it at runtime via
+        // `applyFileMetaDirectives`. Reading it at codegen time would
+        // double-fire the directive. Only assets needs an assembler-
+        // side consumer because `SceneAssetManifests.<scene>` is a
+        // comptime const baked into the generated code.
+        var bundle_assets: []const []const u8 = &.{};
+        if (parsed.value.array.items.len > 0) {
+            if (parsed.value.array.items[0] == .object) {
+                const first_obj = parsed.value.array.items[0].object;
+                if (isBundleHeader(first_obj)) {
+                    if (first_obj.get("meta")) |meta_val| {
+                        if (meta_val == .object) {
+                            if (meta_val.object.get("assets")) |assets_val| {
+                                bundle_assets = try parseAssetsField(
+                                    allocator,
+                                    assets_val,
+                                    display_path,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         return .{
             .name = scene_name,
-            .assets = &.{},
+            .assets = bundle_assets,
             .initial_state = null,
         };
     }
@@ -654,41 +736,7 @@ pub fn parseSceneSource(
     // Read assets — optional, default empty.
     var assets: []const []const u8 = &.{};
     if (root.get("assets")) |assets_val| {
-        const arr = switch (assets_val) {
-            .array => |a| a,
-            else => {
-                stderrPrint(
-                    "labelle-assembler: scene '{s}' has 'assets' but it is not an array\n",
-                    .{display_path},
-                );
-                return error.InvalidAssetsField;
-            },
-        };
-
-        if (arr.items.len > 0) {
-            var list = try allocator.alloc([]const u8, arr.items.len);
-            var n: usize = 0;
-            errdefer {
-                for (list[0..n]) |s| allocator.free(s);
-                allocator.free(list);
-            }
-            for (arr.items) |item| {
-                switch (item) {
-                    .string => |s| {
-                        list[n] = try allocator.dupe(u8, s);
-                        n += 1;
-                    },
-                    else => {
-                        stderrPrint(
-                            "labelle-assembler: scene '{s}' has a non-string entry in 'assets'\n",
-                            .{display_path},
-                        );
-                        return error.InvalidAssetsField;
-                    },
-                }
-            }
-            assets = list;
-        }
+        assets = try parseAssetsField(allocator, assets_val, display_path);
     }
 
     // Read initial_state — optional, default null. Must be a plain
@@ -1038,6 +1086,79 @@ test "unified scene with initial_state + assets at file level" {
     defer freeManifest(std.testing.allocator, m);
     try std.testing.expectEqualStrings("combat", m.assets[0]);
     try std.testing.expectEqualStrings("playing", m.initial_state.?);
+}
+
+test "bundle parses meta.assets from header" {
+    // RFC #596 axis 3: a bundle's first element may be a
+    // `{meta: {...}}` header carrying file-level metadata. The
+    // assembler reads `meta.assets` so `SceneAssetManifests.<scene>`
+    // gets populated at codegen time (counterpart to engine #599's
+    // runtime `meta.initial_state` consumer).
+    const src =
+        \\[
+        \\    { "meta": { "assets": ["a", "b"] } },
+        \\    { "prefab": "x" }
+        \\]
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "menu", "scenes/menu.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+    try std.testing.expectEqual(@as(usize, 2), m.assets.len);
+    try std.testing.expectEqualStrings("a", m.assets[0]);
+    try std.testing.expectEqualStrings("b", m.assets[1]);
+    try std.testing.expect(m.initial_state == null);
+}
+
+test "bundle without meta header returns empty assets" {
+    // No `{meta}` header at index 0 — the bundle is entity-only.
+    // `manifest.assets` defaults to the empty slice.
+    const src =
+        \\[
+        \\    { "prefab": "x" },
+        \\    { "prefab": "y" }
+        \\]
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "menu", "scenes/menu.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+    try std.testing.expectEqual(@as(usize, 0), m.assets.len);
+}
+
+test "bundle with meta but no assets returns empty" {
+    // Header carries `initial_state` only (consumed at runtime by
+    // engine #599, NOT here). Assembler-side assets stays empty.
+    const src =
+        \\[
+        \\    { "meta": { "initial_state": "playing" } },
+        \\    { "prefab": "x" }
+        \\]
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "menu", "scenes/menu.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+    try std.testing.expectEqual(@as(usize, 0), m.assets.len);
+    // initial_state stays null on the codegen-side manifest — engine
+    // #599 reads the directive at runtime; doubling it would re-fire.
+    try std.testing.expect(m.initial_state == null);
+}
+
+test "bundle meta.assets non-array rejected" {
+    // Same error vocabulary as the object-form `assets:` validator —
+    // shared via `parseAssetsField`.
+    const src =
+        \\[
+        \\    { "meta": { "assets": "not-an-array" } }
+        \\]
+    ;
+    const result = parseSceneSource(std.testing.allocator, "menu", "scenes/menu.jsonc", src);
+    try std.testing.expectError(error.InvalidAssetsField, result);
+}
+
+test "bundle meta.assets non-string entry rejected" {
+    const src =
+        \\[
+        \\    { "meta": { "assets": [1, 2] } }
+        \\]
+    ;
+    const result = parseSceneSource(std.testing.allocator, "menu", "scenes/menu.jsonc", src);
+    try std.testing.expectError(error.InvalidAssetsField, result);
 }
 
 test "§B2 — child entry with both prefab and children is rejected" {
