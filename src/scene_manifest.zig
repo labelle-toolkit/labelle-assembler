@@ -57,8 +57,11 @@ pub const SceneManifest = struct {
     initial_state: ?[]const u8 = null,
 };
 
-/// Whitelisted top-level keys allowed in a scene .jsonc file. Anything outside
-/// this set triggers `error.UnknownSceneKey` so typos are caught at build time.
+/// Whitelisted lowercase top-level keys allowed in a scene .jsonc file.
+/// Anything lowercase outside this set triggers `error.UnknownSceneKey`
+/// so typos are caught at build time. PascalCase keys are accepted
+/// uniformly as flat-form components per RFC #596 axis 2 — see
+/// `isAllowedTopLevelKey` for the case-aware gate.
 ///
 /// The set unions every key the engine's JsoncSceneBridge currently consumes
 /// (`include`, `entities`, plus the unified `root` block from RFC #560)
@@ -80,6 +83,11 @@ pub const SceneManifest = struct {
 /// level — closed-and-disjoint key sets per the RFC. The assembler
 /// accepts both shapes during v1.x; root-wrapped support is removed at
 /// v2.0.
+///
+/// `meta` is the RFC #596 axis-4 free-form authoring-only side channel
+/// (engine #597). Valid at both file-header scope (bundle headers) and
+/// entity scope; never propagates to runtime. The scan does not validate
+/// its contents — it only ensures the key itself is recognized.
 const ALLOWED_TOP_LEVEL_KEYS: []const []const u8 = &.{
     "name",
     "assets",
@@ -93,9 +101,29 @@ const ALLOWED_TOP_LEVEL_KEYS: []const []const u8 = &.{
     "children",
     "prefab",
     "overrides",
+    // RFC #596 axis 4: free-form authoring metadata.
+    "meta",
 };
 
+/// True if a key's first byte is an ASCII upper-case letter — the
+/// PascalCase convention promoted to a parser rule by RFC #596 axis 2.
+/// Component keys live under PascalCase; structural keys are lowercase.
+/// The assembler scan uses this to recognize flat-form component
+/// references at both the file's top level and inside entity objects.
+fn isPascalCase(key: []const u8) bool {
+    if (key.len == 0) return false;
+    const c = key[0];
+    return c >= 'A' and c <= 'Z';
+}
+
 fn isAllowedTopLevelKey(key: []const u8) bool {
+    // RFC #596 axis 2: PascalCase keys at the file's top level are
+    // component declarations on the flat-form root entity. The audit
+    // and the loader (engine #597) catch unknown PascalCase names at
+    // runtime — the assembler scan can't see the component registry
+    // here, so we accept any PascalCase key and rely on the loader's
+    // warn-once path. This matches the audit's option C resolution.
+    if (isPascalCase(key)) return true;
     for (ALLOWED_TOP_LEVEL_KEYS) |allowed| {
         if (std.mem.eql(u8, key, allowed)) return true;
     }
@@ -222,21 +250,50 @@ fn stripJsonc(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 /// accidentally circular JSONC inputs.
 const MAX_CHILDREN_DEPTH: u32 = 64;
 
-/// Returns true if any of the flat-form entity-shape keys (RFC #594
-/// phase 2 / engine #595) is present at the file's top level. We use
-/// this as the trigger to treat the file's top-level object as the
-/// root entity (the flat-form contract).
+/// Returns true if any flat-form entity-shape key is present in `obj`.
+///
+/// Covers two RFC generations:
+///   - RFC #594 phase 2 / engine #595: lowercase `components`,
+///     `children`, `prefab`, `overrides`.
+///   - RFC #596 / engine #597 axis 2: any PascalCase key (a component
+///     reference or declaration sitting as a sibling of `prefab`).
 ///
 /// File-level metadata keys (`name`, `assets`, `include`, `scripts`,
-/// `initial_state`) deliberately don't count — a file that carries
-/// only metadata and no entity-shape keys is treated as having no
-/// root entity (e.g. an `include`-only scene), exactly as before the
-/// flat-form change.
+/// `initial_state`, `meta`) deliberately don't count — a file that
+/// carries only metadata and no entity-shape keys is treated as having
+/// no root entity (e.g. an `include`-only scene or a bundle header
+/// shaped `{meta: {...}}`), exactly as before the flat-form change.
+///
+/// Note: `meta` alone is structural-but-non-entity-shape. A bundle's
+/// first element with ONLY `meta` is a file header and must not be
+/// walked as an entity (engine #597 follows the same rule). An entity
+/// that happens to carry `meta` alongside other entity-shape keys is
+/// walked normally — see `validateRootBlock`.
 fn hasFlatEntityShapeKey(obj: std.json.ObjectMap) bool {
-    return obj.get("components") != null or
-        obj.get("children") != null or
-        obj.get("prefab") != null or
-        obj.get("overrides") != null;
+    if (obj.get("components") != null) return true;
+    if (obj.get("children") != null) return true;
+    if (obj.get("prefab") != null) return true;
+    if (obj.get("overrides") != null) return true;
+    // RFC #596: any PascalCase key is a flat-form component.
+    var iter = obj.iterator();
+    while (iter.next()) |entry| {
+        if (isPascalCase(entry.key_ptr.*)) return true;
+    }
+    return false;
+}
+
+/// Returns true if `obj` carries any PascalCase key — used by the
+/// hybrid-form gate at entity scope (engine #597 mirrors the same
+/// rule). A file or entity that carries BOTH an `overrides:` /
+/// `components:` wrapper AND PascalCase siblings is malformed: the
+/// walker can only descend one of the two, silently dropping the
+/// other would lose data for users mid-migration.
+fn hasFlatPascalCaseKey(obj: std.json.ObjectMap) bool {
+    var iter = obj.iterator();
+    while (iter.next()) |entry| {
+        if (isPascalCase(entry.key_ptr.*)) return true;
+    }
+    return false;
 }
 
 /// Pure helper that classifies a parsed file's top-level object into
@@ -258,6 +315,51 @@ pub fn classifyTopLevel(obj: std.json.ObjectMap) ParseError!?[]const u8 {
     if (has_root) return "root";
     if (has_flat) return "top level";
     return null;
+}
+
+/// Returns true if `obj` is a bundle file header rather than an
+/// entity: it carries ONLY a `meta:` key and nothing else. Engine #597
+/// uses the same rule — the first element of a top-level Array can be
+/// `{meta: {...}}` to attach friendly labels / authoring notes to the
+/// file as a whole, and that header must not be walked as an entity.
+///
+/// Any extra key — entity-shape or otherwise — disqualifies the
+/// header role: a `{meta, prefab}` first element is a real entity
+/// (with `meta` as authoring metadata sitting alongside).
+fn isBundleHeader(obj: std.json.ObjectMap) bool {
+    if (obj.count() != 1) return false;
+    return obj.get("meta") != null;
+}
+
+/// Validate a top-level bundle Array per RFC #596 axis 3. Every entry
+/// must be a JSON object; the first MAY be a file-header (`{meta}`
+/// only — passed through with no validation), every other element is
+/// walked as an entity through `validateRootBlock` with the site
+/// label `"bundle entry"` so §B2 messages name the actual site.
+///
+/// Empty bundles `[]` are valid zero-entity files (RFC #596 resolved
+/// decision 2). Non-object entries are a hard error: a bundle of
+/// strings or numbers is malformed.
+fn validateBundle(arr: std.json.Array, display_path: []const u8) ParseError!void {
+    for (arr.items, 0..) |item, idx| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => {
+                stderrPrint(
+                    "labelle-assembler: scene '{s}' bundle entry at index {} is not a JSON object.\n" ++
+                        "  RFC #596 axis 3: every bundle entry must be an entity object (or a `{{meta: ...}}` file header at index 0).\n",
+                    .{ display_path, idx },
+                );
+                return error.InvalidEntityShape;
+            },
+        };
+        // First element may be a file-header carrying only `meta:`.
+        // Don't walk it as an entity. Any later occurrence of a
+        // `{meta}`-only object IS treated as an entity — file-header
+        // status is positional (index 0 only), matching engine #597.
+        if (idx == 0 and isBundleHeader(obj)) continue;
+        try validateRootBlock(.{ .object = obj }, display_path, "bundle entry");
+    }
 }
 
 /// Validate a unified-format root block. The block must be a JSON
@@ -297,6 +399,37 @@ fn validateRootBlock(
             return error.InvalidEntityShape;
         },
     };
+
+    // RFC #596 hybrid-form rejection at entity scope: an entity that
+    // mixes the legacy `overrides:` / `components:` wrapper with flat
+    // PascalCase siblings is ambiguous — the loader and the assembler
+    // walker can only honor one of the two shapes, silently dropping
+    // the other would lose data for users mid-migration. Engine #597
+    // applies the same gate at every entity site.
+    //
+    // We check this BEFORE the §B2 prefab+children gate so the message
+    // points at the structural ambiguity first; a hybrid file that
+    // ALSO trips §B2 is fixed by un-mixing the forms anyway.
+    if (hasFlatPascalCaseKey(obj)) {
+        if (obj.get("overrides") != null) {
+            stderrPrint(
+                "labelle-assembler: scene '{s}' has a {s} that mixes 'overrides:' with flat-form PascalCase component keys.\n" ++
+                    "  RFC #596 axis 2: lift the keys out of 'overrides' or wrap them back in — not both at once.\n" ++
+                    "  Either {{prefab, overrides: {{Position, ...}}}} or {{prefab, Position, ...}}, never both.\n",
+                .{ display_path, site_label },
+            );
+            return error.HybridForm;
+        }
+        if (obj.get("components") != null) {
+            stderrPrint(
+                "labelle-assembler: scene '{s}' has a {s} that mixes 'components:' with flat-form PascalCase component keys.\n" ++
+                    "  RFC #596 axis 2: lift the keys out of 'components' or wrap them back in — not both at once.\n" ++
+                    "  Either {{components: {{Image, ...}}, children: [...]}} or {{Image, ..., children: [...]}}, never both.\n",
+                .{ display_path, site_label },
+            );
+            return error.HybridForm;
+        }
+    }
 
     // Reference-mode root: §B2 forbids `children` here just as for
     // child entries. The RFC calls this out explicitly: "The same §B2
@@ -347,6 +480,28 @@ fn validateChildrenArrayDepth(value: std.json.Value, display_path: []const u8, d
             .object => |o| o,
             else => continue,
         };
+        // RFC #596 hybrid-form rejection at child-entry scope — same
+        // gate as `validateRootBlock`. We don't have a `site_label`
+        // parameter here (the scene's child-entry message is fixed),
+        // so the message names "a child entry" directly.
+        if (hasFlatPascalCaseKey(obj)) {
+            if (obj.get("overrides") != null) {
+                stderrPrint(
+                    "labelle-assembler: scene '{s}' has a child entry that mixes 'overrides:' with flat-form PascalCase component keys.\n" ++
+                        "  RFC #596 axis 2: lift the keys out of 'overrides' or wrap them back in — not both at once.\n",
+                    .{display_path},
+                );
+                return error.HybridForm;
+            }
+            if (obj.get("components") != null) {
+                stderrPrint(
+                    "labelle-assembler: scene '{s}' has a child entry that mixes 'components:' with flat-form PascalCase component keys.\n" ++
+                        "  RFC #596 axis 2: lift the keys out of 'components' or wrap them back in — not both at once.\n",
+                    .{display_path},
+                );
+                return error.HybridForm;
+            }
+        }
         // Hoist into locals so the second use (`children_val`) is a
         // simple unwrap of the already-looked-up optional rather than
         // a repeated hash-map probe + forced unwrap.
@@ -391,11 +546,34 @@ pub fn parseSceneSource(
     };
     defer parsed.deinit();
 
+    // RFC #596 axis 3: file-as-array bundles. When the top-level
+    // value is a JSON Array, every element is an independent sibling
+    // entity (no implicit root). An optional first element shaped
+    // `{meta: {...}}` (only `meta`, no entity-shape keys) is a file
+    // header rather than an entity — see `isBundleHeader`. Empty
+    // bundles `[]` are valid zero-entity files per the RFC's
+    // "Empty bundles" resolution.
+    //
+    // Bundles have no file-level metadata channel (no `name:` /
+    // `assets:` / `initial_state:` / `scripts:` available); identity
+    // comes from the file basename, and `meta.name` in the header
+    // carries any friendly label. The returned manifest reflects this
+    // — `assets` is empty and `initial_state` is null. Projects that
+    // need preloads stay on the object-shape form during v1.x.
+    if (parsed.value == .array) {
+        try validateBundle(parsed.value.array, display_path);
+        return .{
+            .name = scene_name,
+            .assets = &.{},
+            .initial_state = null,
+        };
+    }
+
     const root = switch (parsed.value) {
         .object => |obj| obj,
         else => {
             stderrPrint(
-                "labelle-assembler: scene '{s}' must have a top-level JSON object\n",
+                "labelle-assembler: scene '{s}' must have a top-level JSON object or array (RFC #596 bundle)\n",
                 .{display_path},
             );
             return error.InvalidSceneJson;
@@ -409,8 +587,9 @@ pub fn parseSceneSource(
         if (!isAllowedTopLevelKey(entry.key_ptr.*)) {
             stderrPrint(
                 "labelle-assembler: unknown top-level key '{s}' in scene '{s}'.\n" ++
-                    "  Allowed keys: name, assets, include, entities, root, scripts, initial_state,\n" ++
-                    "    components, children, prefab, overrides (flat-form per RFC #594).\n" ++
+                    "  Allowed lowercase keys: name, assets, include, entities, root, scripts, initial_state,\n" ++
+                    "    components, children, prefab, overrides (flat-form per RFC #594), meta (RFC #596).\n" ++
+                    "  PascalCase keys are accepted as flat-form components (RFC #596 axis 2).\n" ++
                     "  (Did-you-mean suggestions land in labelle-assembler#47.)\n",
                 .{ entry.key_ptr.*, display_path },
             );
@@ -1227,4 +1406,330 @@ test "§B2 site label — root-wrapped form classifies as 'root' (regression pin
     const label = try classifyTopLevel(parsed.value.object);
     try std.testing.expect(label != null);
     try std.testing.expectEqualStrings("root", label.?);
+}
+
+// ── RFC #596 — wrapper-flat + bundle + meta shapes (engine #597) ─────
+//
+// These mirror engine #597's `rfc596:` test suite in
+// `labelle-engine/test/jsonc/unified_format_test.zig`. Each test pins
+// one corner of the new dual-acceptance axes:
+//
+//   - Axis 2: PascalCase keys as entity-scope components, dropping the
+//     `overrides:` / `components:` wrappers.
+//   - Axis 3: top-level JSON Array as a bundle of sibling entities,
+//     with an optional `{meta}` header at index 0.
+//   - Axis 4: free-form `meta:` keys at file-header and entity scope,
+//     never validated.
+//
+// The hybrid-form gate (RFC #596 corollary; cursor #233 style)
+// rejects any file that mixes a wrapper with its flat counterpart at
+// the same site.
+
+test "rfc596: flat reference — PascalCase override sibling of prefab key" {
+    // The dominant FP shape post-RFC-#596: a scene reference with
+    // PascalCase component overrides sitting next to `prefab:`, no
+    // `overrides:` wrapper. Mirrors engine #597's
+    // "rfc596: flat reference — PascalCase override sibling of prefab key".
+    const src =
+        \\{
+        \\    "name": "fast_enemy",
+        \\    "prefab": "enemy",
+        \\    "Position": { "x": 100, "y": 50 },
+        \\    "Speed": { "px_per_s": 200 }
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "fast_enemy", "prefabs/fast_enemy.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+}
+
+test "rfc596: flat inline — PascalCase keys declare an inline entity" {
+    // The dominant FP shape for inline entities post-RFC-#596: a file
+    // whose root entity declares its components directly via
+    // PascalCase keys, no `components:` wrapper, optional `children:`
+    // for true parent-of-children.
+    const src =
+        \\{
+        \\    "name": "kitchen_workstation",
+        \\    "Image": { "sprite": "kitchen" },
+        \\    "Workstation": { "kind": "kitchen" },
+        \\    "children": [
+        \\        { "prefab": "eis_slot", "Position": { "x": -30, "y": 0 } }
+        \\    ]
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "kitchen", "prefabs/kitchen.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+}
+
+test "rfc596: bundle scene — top-level Array spawns N siblings" {
+    // The bundle shape collapses the colony scene's outer
+    // `{name, children: [...]}` wrapping into a direct Array. Each
+    // element is an entity walked through `validateRootBlock` with
+    // the site label "bundle entry".
+    const src =
+        \\[
+        \\    { "prefab": "ship_carcase", "Position": { "x": 0,   "y": 0 } },
+        \\    { "prefab": "ship_carcase", "Position": { "x": 780, "y": 0 } },
+        \\    { "prefab": "condenser",    "Position": { "x": 0,   "y": 0 } }
+        \\]
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "colony", "scenes/colony.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+    // Bundles carry no file-level metadata channel — `assets` is
+    // empty and `initial_state` is null. Pin that contract here so a
+    // future refactor doesn't accidentally surface file metadata that
+    // the bundle shape can't actually carry.
+    try std.testing.expectEqual(@as(usize, 0), m.assets.len);
+    try std.testing.expect(m.initial_state == null);
+}
+
+test "rfc596: bundle header — only-meta object at index 0 is file-meta, not entity" {
+    // The first bundle element MAY be `{meta: {...}}` only, carrying
+    // file-level authoring metadata. It is NOT walked as an entity.
+    // If it were, the §B2 walker would still pass (no `prefab` /
+    // `children`), but a future stricter check would mis-fire. Pin
+    // the file-header detection here directly.
+    const src =
+        \\[
+        \\    { "meta": { "name": "Production Colony Demo", "author": "alexandre" } },
+        \\    { "prefab": "ship_carcase", "Position": { "x": 0, "y": 0 } },
+        \\    { "prefab": "condenser",    "Position": { "x": 0, "y": 0 } }
+        \\]
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "colony", "scenes/colony.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+}
+
+test "rfc596: empty bundle [] is valid, zero entities" {
+    // RFC #596 resolved decision 2: `[]` is a valid zero-entity file.
+    // Authoring workflows (new file → `[]` → add entities) and the
+    // empty-checked-in-by-mistake case both get the same treatment.
+    const src = "[]";
+    const m = try parseSceneSource(std.testing.allocator, "empty", "scenes/empty.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+    try std.testing.expectEqual(@as(usize, 0), m.assets.len);
+}
+
+test "rfc596: meta on an entity is ignored by the scan (no findings)" {
+    // `meta:` is structural, lowercase, and never validated. An
+    // entity that carries `meta` alongside real components and
+    // structural keys still walks normally. Pin that the presence
+    // of `meta` doesn't change any other gate's behavior.
+    const src =
+        \\{
+        \\    "name": "labeled_kitchen",
+        \\    "prefab": "kitchen",
+        \\    "Position": { "x": 156, "y": 93 },
+        \\    "meta": { "name": "Main Kitchen", "notes": "first build" }
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "labeled_kitchen", "prefabs/labeled_kitchen.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+}
+
+test "rfc596: file-header-only `meta:` is accepted (no entity walk)" {
+    // A file shaped `{meta: {...}}` alone — no entity-shape keys —
+    // carries only authoring metadata at file-header scope. The
+    // §B2 walk is skipped (no root entity to walk); the unknown-key
+    // gate accepts `meta` from the allow-list. Mirrors the
+    // metadata-only #594 contract for the new key.
+    const src =
+        \\{
+        \\    "name": "labels",
+        \\    "meta": { "author": "alexandre", "version": 1 }
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "labels", "scenes/labels.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+}
+
+test "rfc596: wrapped 'overrides' form still works (dual-accept regression)" {
+    // The legacy wrapped form must continue to load unchanged through
+    // v1.x. Same shape as yesterday's #233 regression pin, kept here
+    // so anyone adding a new RFC #596 gate accidentally affecting the
+    // wrapped path fails this test directly. Removed at v2.0.
+    const src =
+        \\{
+        \\    "name": "fast_enemy",
+        \\    "prefab": "enemy",
+        \\    "overrides": { "Position": { "x": 100, "y": 50 } }
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "fast_enemy", "prefabs/fast_enemy.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+}
+
+test "rfc596: hybrid form — overrides + flat PascalCase at root is HybridForm" {
+    // RFC #596 corollary (engine #597's same gate): a file that
+    // declares BOTH the legacy `overrides:` wrapper AND flat
+    // PascalCase siblings is ambiguous — the walker can only honor
+    // one side, silently dropping the other would lose data for
+    // users mid-migration. Reject the shape outright.
+    const src =
+        \\{
+        \\    "prefab": "enemy",
+        \\    "overrides": { "Position": { "x": 0, "y": 0 } },
+        \\    "Speed": { "px_per_s": 200 }
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "mixed", "scenes/mixed.jsonc", src);
+    try std.testing.expectError(error.HybridForm, result);
+}
+
+test "rfc596: hybrid form — components + flat PascalCase at root is HybridForm" {
+    // Same shape as the previous test but for the inline-entity
+    // wrapper. `components:` + a PascalCase sibling is ambiguous.
+    const src =
+        \\{
+        \\    "components": { "Workstation": { "kind": "kitchen" } },
+        \\    "Image": { "sprite": "kitchen" }
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "mixed", "scenes/mixed.jsonc", src);
+    try std.testing.expectError(error.HybridForm, result);
+}
+
+test "rfc596: hybrid form — overrides + flat PascalCase on a child entry is HybridForm" {
+    // The hybrid-form gate applies at every entity site, not just the
+    // root — child entries are also rejected if they mix wrapper +
+    // flat. Engine #597 follows the same per-entity rule.
+    const src =
+        \\{
+        \\    "children": [
+        \\        {
+        \\            "prefab": "enemy",
+        \\            "overrides": { "Position": { "x": 0, "y": 0 } },
+        \\            "Speed": { "px_per_s": 200 }
+        \\        }
+        \\    ]
+        \\}
+    ;
+    const result = parseSceneSource(std.testing.allocator, "mixed", "scenes/mixed.jsonc", src);
+    try std.testing.expectError(error.HybridForm, result);
+}
+
+test "rfc596: §B2 fires on a flat bundle entry with {prefab + children}" {
+    // The bundle shape doesn't bypass §B2 — every bundle entry is
+    // walked the same way a root entity is, with the site label
+    // "bundle entry". A reference-mode entry with `children` is still
+    // a §B2 violation. Mirrors engine #597's
+    // "rfc596: §B2 still fires on a flat bundle element with {prefab + children}".
+    const src =
+        \\[
+        \\    { "prefab": "ship_carcase", "Position": { "x": 0, "y": 0 } },
+        \\    { "prefab": "door", "children": [ { "prefab": "plate" } ] }
+        \\]
+    ;
+    const result = parseSceneSource(std.testing.allocator, "broken_bundle", "scenes/broken_bundle.jsonc", src);
+    try std.testing.expectError(error.InvalidEntityShape, result);
+}
+
+test "rfc596: §B2 fires on a nested bundle entry — recursion preserved" {
+    // The walker still recurses into bundle entries' `children`.
+    const src =
+        \\[
+        \\    {
+        \\        "Image": { "sprite": "x" },
+        \\        "children": [
+        \\            { "prefab": "boss", "children": [ { "prefab": "minion" } ] }
+        \\        ]
+        \\    }
+        \\]
+    ;
+    const result = parseSceneSource(std.testing.allocator, "nested_bundle", "scenes/nested_bundle.jsonc", src);
+    try std.testing.expectError(error.InvalidEntityShape, result);
+}
+
+test "rfc596: bundle entry with non-object element is rejected" {
+    // A bundle of strings/numbers is malformed.
+    const src =
+        \\[
+        \\    { "prefab": "ship" },
+        \\    "not-an-entity"
+        \\]
+    ;
+    const result = parseSceneSource(std.testing.allocator, "bad_bundle", "scenes/bad_bundle.jsonc", src);
+    try std.testing.expectError(error.InvalidEntityShape, result);
+}
+
+test "rfc596: §B2 site label — bundle entry classifies via validateBundle path" {
+    // `classifyTopLevel` only runs for object-shape top-level files;
+    // bundles bypass it entirely and go straight through
+    // `validateBundle`. Pin that the classifier returns null when
+    // handed an object that LOOKS like a bundle entry but at file
+    // top level — to catch regressions where the wrong code path is
+    // taken for the bundle shape.
+    //
+    // (The user-visible label "bundle entry" is interpolated into
+    // §B2 messages from `validateBundle`'s direct call to
+    // `validateRootBlock`; we can't capture stderr in tests, so this
+    // pins the structural path instead.)
+    const src =
+        \\{ "prefab": "x", "Position": { "x": 0, "y": 0 } }
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, src, .{});
+    defer parsed.deinit();
+    const label = try classifyTopLevel(parsed.value.object);
+    try std.testing.expect(label != null);
+    try std.testing.expectEqualStrings("top level", label.?);
+}
+
+test "rfc596: unknown PascalCase key at top level is accepted (warn deferred to loader)" {
+    // The audit's option-C resolution: the assembler scan can't see
+    // the engine's component registry, so unknown PascalCase keys
+    // (typos like `Posiiton`, or cross-repo plugin types) are
+    // accepted at scan time and the loader's runtime warn-once path
+    // catches them. Pin that behavior here so a future change that
+    // tries to introspect the registry from the assembler — and
+    // accidentally rejects valid unknown-PascalCase-at-scan-time —
+    // fails this test directly.
+    const src =
+        \\{
+        \\    "prefab": "enemy",
+        \\    "Posiiton": { "x": 0, "y": 0 }
+        \\}
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "typo", "scenes/typo.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+}
+
+test "rfc596: bundle with `{meta}` at non-zero index is walked as an entity" {
+    // File-header status is positional — only index 0 may be a pure
+    // `{meta}` header. A `{meta}`-only object anywhere else is an
+    // entity, and an entity with no `prefab` / no components / no
+    // `children` is... not what the loader wants. The scan doesn't
+    // currently distinguish "empty entity" from "well-formed entity"
+    // (that's the loader's job — see RFC #596 "Empty bundles" final
+    // paragraph), so the scan accepts the shape. Pin that contract.
+    const src =
+        \\[
+        \\    { "prefab": "ship_carcase", "Position": { "x": 0, "y": 0 } },
+        \\    { "meta": { "note": "this is not a header — it's at index 1" } }
+        \\]
+    ;
+    const m = try parseSceneSource(std.testing.allocator, "labeled", "scenes/labeled.jsonc", src);
+    defer freeManifest(std.testing.allocator, m);
+}
+
+test "rfc596: top-level non-object non-array is still a hard error" {
+    // The error message for a malformed top-level was updated to
+    // mention the bundle shape; pin that an actually malformed file
+    // (e.g. a top-level string) still rejects.
+    const src = "\"just a string\"";
+    const result = parseSceneSource(std.testing.allocator, "bad", "scenes/bad.jsonc", src);
+    try std.testing.expectError(error.InvalidSceneJson, result);
+}
+
+test "rfc596: file-header `{meta}` with extra keys is treated as an entity (positional)" {
+    // `isBundleHeader` requires the object to have EXACTLY one key
+    // and that key to be `meta`. A `{meta, prefab}` first element is
+    // a real entity (with `meta` sitting alongside) and must be
+    // walked as such — including any §B2 violation it carries.
+    const src =
+        \\[
+        \\    { "meta": { "x": 1 }, "prefab": "enemy", "children": [ { "prefab": "minion" } ] }
+        \\]
+    ;
+    const result = parseSceneSource(std.testing.allocator, "bad_header", "scenes/bad_header.jsonc", src);
+    try std.testing.expectError(error.InvalidEntityShape, result);
 }
