@@ -306,7 +306,9 @@ jobs:
           # `PluginFlowNodes` (#240 Gap 1) landed in the generated build.
           test -f scripts/flows/custom.zig
           test -f .labelle/raylib_desktop/scripts/flows/custom.zig
-          grep -q "PluginFlowNodes.logger__log_i32.impl" .labelle/raylib_desktop/scripts/flows/custom.zig
+          # Call reaches `impl` through `@TypeOf(...)` so Zig doesn't UFCS-bind
+          # the FlowNode value as impl's first arg (flow-codegen#28).
+          grep -qF "@TypeOf(game_mod.PluginFlowNodes.logger__log_i32).impl(game" .labelle/raylib_desktop/scripts/flows/custom.zig
           # Shim exposes PluginFlowNodes via the NAMED module (Gap 1+2).
           grep -q 'pub const PluginFlowNodes = struct' .labelle/raylib_desktop/game.zig
           grep -q 'logger__log_i32 = @import("script__logger")' .labelle/raylib_desktop/game.zig
