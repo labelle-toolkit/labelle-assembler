@@ -509,7 +509,10 @@ fn flowNodeIsVoid(ast: *std.zig.Ast, init_src: []const u8) bool {
     const fp = ast.fullFnProto(&fn_buf, fn_node) orelse return true;
     const rt_node = fp.ast.return_type.unwrap() orelse return true;
     const rt = std.mem.trim(u8, ast.getNodeSource(rt_node), " \t\r\n");
-    return std.mem.eql(u8, rt, "void");
+    // A fallible command (`!void` / `anyerror!void`) is still a command —
+    // the error union adds no output pin. Kept in lock-step with the
+    // editor-catalog inference in `flow_catalog/discovery.zig`.
+    return std.mem.eql(u8, rt, "void") or std.mem.endsWith(u8, rt, "!void");
 }
 
 /// Walk one `.zig` source buffer for `pub const FlowNodes`,
