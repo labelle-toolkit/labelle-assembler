@@ -19,6 +19,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const cache = @import("../cache.zig");
 const script_scanner = @import("../script_scanner.zig");
+const scanners = @import("../flow_catalog/scanners.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
@@ -289,6 +290,16 @@ pub const PluginFlowNode = struct {
     /// writes — plugins resolve as `@import("<name>")`, scripts as
     /// `@import("scripts/<rel_path>")`.
     is_script: bool,
+    /// `true` when the node's `impl` fn returns `void` — a **command**
+    /// (RFC-FLOW-VOCABULARY §6). flow-codegen's `CustomNode` lowering
+    /// emits a bare statement for commands and binds the result to
+    /// `n<id>_value` for reporters (non-void). The assembler computes
+    /// this once at discovery time so flow-codegen consumes the
+    /// precomputed flag rather than re-reflecting the impl. An explicit
+    /// `.kind = .command` / `.kind = .reporter` in the FlowNode factory
+    /// call overrides the inferred return-type default — same rule the
+    /// editor catalog applies in `flow_catalog/discovery.zig`.
+    is_void: bool = true,
     /// Fully-qualified Zig type name the node constructs, captured
     /// from a `.constructs = "..."` field in the source `FlowNode`
     /// factory call, or `null` when the source omits it
@@ -463,6 +474,47 @@ fn extractConstructsString(allocator: std.mem.Allocator, src: []const u8) ?[]u8 
     return null;
 }
 
+/// Resolve a FlowNode's command-vs-reporter shape — `true` for a
+/// `void`-returning (command) impl, `false` for a value-returning
+/// (reporter) one. Mirrors the editor-catalog rule in
+/// `flow_catalog/discovery.zig` so the two discovery paths agree:
+///
+///   1. An explicit `.kind = .command` / `.kind = .reporter` in the
+///      `labelle.FlowNode(.{...})` factory call always wins.
+///   2. Otherwise the impl's declared return type decides: `void` (or
+///      an impl we can't resolve / that omits a return type) is a
+///      command; anything else is a reporter.
+///
+/// `init_src` is the FlowNode factory call's source text; `ast` is the
+/// already-parsed module AST so we can walk back to the impl fn's
+/// prototype. A non-resolvable `impl` (defined in a sibling file)
+/// degrades to `is_void = true` — the command shape — matching the
+/// catalog's "no pin info" fallback, since we have no return type to
+/// promote it to a reporter.
+fn flowNodeIsVoid(ast: *std.zig.Ast, init_src: []const u8) bool {
+    const cfg_src = scanners.innerCallArg(init_src);
+
+    // Explicit `.kind` override — same precedence as the catalog.
+    if (scanners.scanFieldEnumLit(cfg_src, ".kind")) |ek| {
+        if (std.mem.eql(u8, ek, "command")) return true;
+        if (std.mem.eql(u8, ek, "reporter")) return false;
+    }
+
+    // Infer from the impl's return type. Skip the implicit
+    // `game: anytype` — we only care about the return, not the params.
+    const impl_name = scanners.scanFieldIdent(cfg_src, ".impl") orelse return true;
+    if (impl_name.len == 0) return true;
+    const fn_node = scanners.findFnByName(ast, impl_name) orelse return true;
+    var fn_buf: [1]std.zig.Ast.Node.Index = undefined;
+    const fp = ast.fullFnProto(&fn_buf, fn_node) orelse return true;
+    const rt_node = fp.ast.return_type.unwrap() orelse return true;
+    const rt = std.mem.trim(u8, ast.getNodeSource(rt_node), " \t\r\n");
+    // A fallible command (`!void` / `anyerror!void`) is still a command —
+    // the error union adds no output pin. Kept in lock-step with the
+    // editor-catalog inference in `flow_catalog/discovery.zig`.
+    return std.mem.eql(u8, rt, "void") or std.mem.endsWith(u8, rt, "!void");
+}
+
 /// Walk one `.zig` source buffer for `pub const FlowNodes`,
 /// `pub const PinStyles`, and `pub const Coercions` decls, appending
 /// each discovered nested member to the corresponding output list.
@@ -540,6 +592,12 @@ fn scanFlowDeclsInSource(
                 const constructs_value = extractConstructsString(allocator, init_src);
                 errdefer if (constructs_value) |c| allocator.free(c);
 
+                // Command-vs-reporter shape (RFC-FLOW-VOCABULARY §6).
+                // Resolved once here so flow-codegen's `CustomNode`
+                // lowering consumes the precomputed flag — no allocation,
+                // borrows nothing past this loop iteration.
+                const is_void = flowNodeIsVoid(&ast, init_src);
+
                 const duped_path = try allocator.dupe(u8, module_import_path);
                 errdefer allocator.free(duped_path);
                 const duped_sanitized = try allocator.dupe(u8, module_sanitized);
@@ -552,6 +610,7 @@ fn scanFlowDeclsInSource(
                     .module_sanitized = duped_sanitized,
                     .node_name = duped_name,
                     .is_script = is_script,
+                    .is_void = is_void,
                     .constructs = constructs_value,
                 });
             } else if (is_pin_styles) {

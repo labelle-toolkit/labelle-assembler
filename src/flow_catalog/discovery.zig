@@ -294,8 +294,10 @@ pub fn extractFlowNodeEntry(
 
                 if (fp.ast.return_type.unwrap()) |rt_node| {
                     const rt = ast.getNodeSource(rt_node);
-                    // void / no-return-of-interest collapses to no output pin.
-                    if (!std.mem.eql(u8, std.mem.trim(u8, rt, " \t\r\n"), "void")) {
+                    const rt_trim = std.mem.trim(u8, rt, " \t\r\n");
+                    // void / `!void` / no-return-of-interest collapses to no
+                    // output pin — a fallible command stays a command.
+                    if (!std.mem.eql(u8, rt_trim, "void") and !std.mem.endsWith(u8, rt_trim, "!void")) {
                         return_type = try aa.dupe(u8, rt);
                         has_return = true;
                         // Add a single output pin named "result" by default —
