@@ -531,6 +531,42 @@ pub fn generate(
         try script_scan.scanPluginDir(plugin_scripts_dst, plugin.name);
     }
 
+    // ── Flow-node discovery (RFC-FLOW-VOCABULARY phase 2) ──────────────
+    //
+    // Discover `pub const FlowNodes` + `pub const PinStyles` +
+    // `pub const Coercions` decls across plugins AND game-script modules
+    // (RFC §5). Hoisted ABOVE the flow scan below because flow codegen
+    // needs the FlowNode list to build the `CustomNodeRegistry` it
+    // consults to lower `CustomNode` nodes — without it every
+    // `CustomNode` reference errors as `UnknownFlowNode`
+    // (labelle-assembler#238). The same discovery result is reused for
+    // the `main.zig` emission later (no second walk).
+    //
+    // Discovery runs on the *real* script entries (`getEntries()`), not
+    // the merged list that includes the synthetic flow-derived entries:
+    // the generated `scripts/flows/*.zig` files don't declare
+    // `FlowNodes`, so they contribute zero flow nodes and feeding them
+    // in would be pointless (and they don't exist yet at this point in
+    // the pipeline anyway). By here every game + plugin-shipped script
+    // has already been fed to the scanner (the plugin-scripts loop above
+    // runs first), so `getEntries()` is the complete real-script set.
+    //
+    // Game-script entries resolve against the copied source under
+    // `<target>/scripts/<rel_path>` so the discovery walks the exact
+    // files the generated `main.zig` will `@import`. Plugin-shipped
+    // scripts are skipped here — they're covered by their containing
+    // plugin's `src/root.zig` walk in the same pass.
+    const scripts_target_for_flow = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
+    defer allocator.free(scripts_target_for_flow);
+    var plugin_flow_decls = try main_zig.discoverPluginFlowDecls(
+        allocator,
+        cfg,
+        game_dir,
+        scripts_target_for_flow,
+        script_scan.getEntries(),
+    );
+    defer plugin_flow_decls.deinit();
+
     // ── Flow codegen (#94, Part B) ─────────────────────────────────────
     //
     // Recursively walk `<game>/scripts/flows/**` for `*.flow.jsonc`,
@@ -543,8 +579,10 @@ pub fn generate(
     // tests builds. Empty `scripts/flows/` is a silent no-op.
     // flow_scanner already wrote a per-file `flows/<rel>: <err>`
     // diagnostic to stderr; propagate the typed error so `generate`
-    // exits non-zero.
-    var flow_result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir);
+    // exits non-zero. The discovered FlowNode list is threaded in so the
+    // scanner can build the `CustomNodeRegistry` for `CustomNode`
+    // lowering (#238).
+    var flow_result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir, plugin_flow_decls.flow_nodes);
     defer flow_result.deinit();
 
     // Generate build.zig.zon
@@ -607,26 +645,12 @@ pub fn generate(
         @memcpy(merged_entries[0..scanned_entries.len], scanned_entries);
         @memcpy(merged_entries[scanned_entries.len..], flow_result.entries);
 
-        // Discover `pub const FlowNodes` + `pub const PinStyles` decls
-        // across plugins AND game-script modules (RFC-FLOW-VOCABULARY
-        // phase 2). Mirrors `discoverPluginEvents` for plugins;
-        // extends to game scripts per RFC §5. Game-script entries are
-        // resolved against the copied source under
-        // `<target>/scripts/<rel_path>` so the discovery walks the
-        // exact files the generated `main.zig` will `@import`.
-        // Plugin-shipped scripts are skipped here — they're covered
-        // by their containing plugin's `src/root.zig` walk in the same
-        // pass — see `discoverPluginFlowDecls` for the rationale.
-        const scripts_target_for_flow = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
-        defer allocator.free(scripts_target_for_flow);
-        var plugin_flow_decls = try main_zig.discoverPluginFlowDecls(
-            allocator,
-            cfg,
-            game_dir,
-            scripts_target_for_flow,
-            merged_entries,
-        );
-        defer plugin_flow_decls.deinit();
+        // `plugin_flow_decls` + `scripts_target_for_flow` were discovered
+        // ABOVE the flow scan (the registry the scanner needs is built
+        // from the same FlowNode list). Reuse them here rather than
+        // walking the source tree twice — the synthetic flow entries the
+        // merge adds declare no `FlowNodes`, so re-running discovery on
+        // `merged_entries` would produce an identical FlowNode set.
 
         // RFC-FLOW-VOCABULARY phase 4 follow-up: emit a per-project
         // `flow_catalog.json` sidecar so the labelle-gui flow editor

@@ -26,8 +26,12 @@ const std = @import("std");
 const flow_codegen = @import("flow_codegen");
 const script_scanner = @import("script_scanner.zig");
 const config = @import("config.zig");
+const scan = @import("codegen/scan.zig");
+const discovery = @import("flow_catalog/discovery.zig");
 
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
+const PluginFlowNode = scan.PluginFlowNode;
+const CustomNodeRegistry = flow_codegen.codegen.CustomNodeRegistry;
 
 /// File extension flow files carry on disk. RFC FLOWS-JSONC retires
 /// `.flow.zon` in favour of `.flow.jsonc` — flows join scenes and
@@ -62,12 +66,45 @@ pub fn scanAndEmit(
     allocator: std.mem.Allocator,
     game_dir: []const u8,
     target_dir: []const u8,
+    flow_nodes: []const PluginFlowNode,
 ) !FlowScanResult {
     const io = config.globalIo();
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const arena_alloc = arena.allocator();
+
+    // Build the `CustomNodeRegistry` flow-codegen consults to lower
+    // `CustomNode` nodes (RFC-FLOW-VOCABULARY §1 + §5). Each discovered
+    // plugin / game-script `FlowNode` maps its on-disk **dotted** name
+    // (the `CustomNode.name` an author writes) → the qualified decl
+    // (`<module>__<node>`) the assembler's `PluginFlowNodes` block
+    // emits into `main.zig`. Without this every `CustomNode` reference
+    // errors as `UnknownFlowNode` (labelle-assembler#238). The registry
+    // + its key/value strings live in the result arena so they outlive
+    // every `renderFlowZig` call below; the registry's own
+    // `StringHashMap` allocates on the caller `allocator` and is freed
+    // before return (the entries it borrows are arena-owned).
+    var registry = CustomNodeRegistry.init(allocator);
+    defer registry.deinit();
+    for (flow_nodes) |fn_| {
+        // Dotted name: plugins use their `module_import_path` verbatim
+        // (already the dotted prefix, e.g. `box2d`); game scripts use
+        // the `scriptModuleLabel` form (`flows/hit_counter.zig` →
+        // `flows.hit_counter`) so the `<module>.<node>` key matches the
+        // editor's on-disk `CustomNode.name`.
+        const module_label = if (fn_.is_script)
+            try discovery.scriptModuleLabel(arena_alloc, fn_.module_import_path)
+        else
+            fn_.module_import_path;
+        const dotted = try std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ module_label, fn_.node_name });
+        // Qualified decl name — bit-identical to what
+        // `writePluginFlowNodesBlock` emits (`<module_sanitized>__<node>`)
+        // so flow-codegen's `game_mod.PluginFlowNodes.<qualified>.impl`
+        // call site resolves.
+        const qualified = try std.fmt.allocPrint(arena_alloc, "{s}__{s}", .{ fn_.module_sanitized, fn_.node_name });
+        try registry.add(dotted, .{ .qualified = qualified, .is_void = fn_.is_void });
+    }
 
     var entries: std.ArrayList(ScriptEntry) = .empty;
 
@@ -161,7 +198,7 @@ pub fn scanAndEmit(
         const generated = flow_codegen.codegen.renderFlowZig(
             allocator,
             loaded.flow,
-            .{ .flow_name = display_name },
+            .{ .flow_name = display_name, .custom_nodes = &registry },
         ) catch |err| {
             reportFlowError(rel, err);
             return err;

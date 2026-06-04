@@ -19,6 +19,7 @@ const discovery = @import("flow_scanner/discovery_tests.zig");
 pub const FlowScanner = discovery.FlowScanner;
 pub const FlowSortOrder = discovery.FlowSortOrder;
 pub const FlowEventHandlerMarker = discovery.FlowEventHandlerMarker;
+pub const CustomNodeRegistry = discovery.CustomNodeRegistry;
 
 const integration = @import("flow_scanner/integration_tests.zig");
 pub const AllScriptsIntegration = integration.AllScriptsIntegration;

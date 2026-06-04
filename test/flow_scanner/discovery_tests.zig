@@ -254,7 +254,7 @@ pub const FlowScanner = struct {
         defer allocator.free(fx.game_dir);
         defer allocator.free(fx.target_dir);
 
-        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir);
+        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir, &.{});
         defer result.deinit();
 
         // One source → one entry → one emitted file.
@@ -314,7 +314,7 @@ pub const FlowScanner = struct {
         defer allocator.free(target_dir);
         try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 
-        var result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir);
+        var result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir, &.{});
         defer result.deinit();
 
         try std.testing.expectEqual(@as(usize, 0), result.entries.len);
@@ -354,7 +354,7 @@ pub const FlowScanner = struct {
         ;
         try writeSample(tmp.dir, "game/scripts/flows/bad.flow.jsonc", bad);
 
-        const result = flow_scanner.scanAndEmit(allocator, game_dir, target_dir);
+        const result = flow_scanner.scanAndEmit(allocator, game_dir, target_dir, &.{});
         try std.testing.expectError(error.DuplicateNodeId, result);
     }
 
@@ -372,7 +372,7 @@ pub const FlowScanner = struct {
         // this must be picked up alongside the flat `move` flow.
         try writeSample(tmp.dir, "game/scripts/flows/enemy/patrol.flow.jsonc", move_flow_body);
 
-        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir);
+        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir, &.{});
         defer result.deinit();
 
         // Two sources → two entries. Sorted by relative path:
@@ -410,7 +410,7 @@ pub const FlowScanner = struct {
         try writeSample(tmp.dir, "game/scripts/flows/legacy.flow.zon", move_flow_body);
         try writeSample(tmp.dir, "game/scripts/flows/notes.jsonc", "{}\n");
 
-        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir);
+        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir, &.{});
         defer result.deinit();
 
         // Only `move.flow.jsonc` is a flow source.
@@ -433,7 +433,7 @@ pub const FlowSortOrder = struct {
         // it to `sort_order = 1` (parity with `01_input.zig` scripts).
         try writeSample(tmp.dir, "game/scripts/flows/01_input.flow.jsonc", move_flow_body);
 
-        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir);
+        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir, &.{});
         defer result.deinit();
 
         // Two entries — the `move.flow.jsonc` from setupFixture plus our
@@ -470,7 +470,7 @@ pub const FlowSortOrder = struct {
         try writeSample(tmp.dir, "game/scripts/flows/10_late.flow.jsonc", move_flow_body);
         try writeSample(tmp.dir, "game/scripts/flows/2_early.flow.jsonc", move_flow_body);
 
-        var result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir);
+        var result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir, &.{});
         defer result.deinit();
 
         try std.testing.expectEqual(@as(usize, 2), result.entries.len);
@@ -505,7 +505,7 @@ pub const FlowSortOrder = struct {
         try writeSample(tmp.dir, "game/scripts/flows/01_first.flow.jsonc", move_flow_body);
         try writeSample(tmp.dir, "game/scripts/flows/apple.flow.jsonc", move_flow_body);
 
-        var result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir);
+        var result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir, &.{});
         defer result.deinit();
 
         try std.testing.expectEqual(@as(usize, 3), result.entries.len);
@@ -515,6 +515,196 @@ pub const FlowSortOrder = struct {
         try std.testing.expectEqual(@as(?u32, null), result.entries[1].sort_order);
         try std.testing.expectEqualStrings("zebra", result.entries[2].name);
         try std.testing.expectEqual(@as(?u32, null), result.entries[2].sort_order);
+    }
+};
+
+// ── RFC-FLOW-VOCABULARY §1 — CustomNode lowering (labelle-assembler#238) ──
+//
+// The assembler must thread a `CustomNodeRegistry` into flow codegen so
+// `.flow.jsonc` `CustomNode` references resolve to the qualified
+// `game_mod.PluginFlowNodes.<module>__<node>` decls the
+// `PluginFlowNodes` block emits. Before #238 `scanAndEmit` always passed
+// a `null` registry, so *any* `CustomNode` failed with
+// `error.UnknownFlowNode` — the bug was latent only because no in-tree
+// flow referenced a CustomNode.
+//
+// These tests drive the full assembler path: discover a game-script
+// `FlowNodes` block (which computes the `is_void` command-vs-reporter
+// flag), feed the discovered node list into `scanAndEmit`, and assert the
+// generated `.zig` lowers the CustomNode to the right call shape — a bare
+// statement for a `void` command, a `const n<id>_value = ...` binding for
+// a value-returning reporter (RFC §6).
+
+// A game-script module declaring two FlowNodes: a `void`-returning
+// command (`log_i32`) and an `i32`-returning reporter (`read_count`).
+// The discovery walk resolves each impl's return type to set `is_void`,
+// which is exactly what decides the lowering shape below.
+const log_script_src =
+    \\const labelle = @import("labelle-core");
+    \\
+    \\var counter: i32 = 0;
+    \\
+    \\pub const FlowNodes = struct {
+    \\    pub const log_i32 = labelle.FlowNode(.{ .impl = logI32 });
+    \\    pub const read_count = labelle.FlowNode(.{ .impl = readCount });
+    \\};
+    \\
+    \\fn logI32(game: anytype, value: i32) void { _ = game; counter += value; }
+    \\fn readCount(game: anytype) i32 { _ = game; return counter; }
+    \\
+;
+
+// An `OnCall` subgraph that feeds a Literal into the `log_i32` command's
+// first positional pin (`arg0`). The command returns `void`, so codegen
+// must emit a bare `game_mod.PluginFlowNodes.log__log_i32.impl(game, ...)`
+// statement.
+const command_customnode_flow =
+    \\{
+    \\  "name": "do_log",
+    \\  "event": { "type": "OnCall" },
+    \\  "nodes": [
+    \\    { "id": 1, "type": "Literal", "pos": [0, 0], "value": "7" },
+    \\    { "id": 2, "type": "CustomNode", "pos": [120, 0], "name": "log.log_i32" }
+    \\  ],
+    \\  "edges": [
+    \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "arg0" } }
+    \\  ]
+    \\}
+    \\
+;
+
+// An `OnCall` subgraph that reads the reporter (`read_count`) and routes
+// its value to an `Output`. The reporter is non-void, so codegen must
+// bind the result to `const n<id>_value = game_mod.PluginFlowNodes.
+// log__read_count.impl(game)`.
+const reporter_customnode_flow =
+    \\{
+    \\  "name": "read",
+    \\  "event": { "type": "OnCall" },
+    \\  "nodes": [
+    \\    { "id": 1, "type": "CustomNode", "pos": [0, 0], "name": "log.read_count" },
+    \\    { "id": 2, "type": "Output", "pos": [120, 0], "name": "out", "value_type": "i32" }
+    \\  ],
+    \\  "edges": [
+    \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+    \\  ]
+    \\}
+    \\
+;
+
+pub const CustomNodeRegistry = struct {
+    test "CustomNode references lower to PluginFlowNodes impl calls instead of UnknownFlowNode" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const fx = try setupFixture(allocator, &tmp);
+        defer allocator.free(fx.game_dir);
+        defer allocator.free(fx.target_dir);
+        // setupFixture plants a `move.flow.jsonc` (no CustomNode); drop it
+        // so the assertions below target only the CustomNode fixtures.
+        try tmp.dir.deleteFile(std.testing.io, "game/scripts/flows/move.flow.jsonc");
+
+        // Plant the game-script `FlowNodes` module next to `flows/`, then
+        // the two CustomNode flows that reference it.
+        try writeSample(tmp.dir, "game/scripts/log.zig", log_script_src);
+        try writeSample(tmp.dir, "game/scripts/flows/do_log.flow.jsonc", command_customnode_flow);
+        try writeSample(tmp.dir, "game/scripts/flows/read.flow.jsonc", reporter_customnode_flow);
+
+        // Discover the script's FlowNodes — same call the orchestrator
+        // makes ahead of the flow scan (root.zig). The walk reads the
+        // source through `<target>/scripts/log.zig` (the symlink), and
+        // computes `is_void` per impl return type.
+        const scripts_root = try std.fs.path.join(allocator, &.{ fx.target_dir, "scripts" });
+        defer allocator.free(scripts_root);
+        const entries = [_]generator.script_scanner.ScriptScanner.ScriptEntry{
+            .{
+                .name = "log",
+                .filename = "log.zig",
+                .states = &.{},
+                .sort_order = null,
+                .subdir = null,
+                .rel_path = "log.zig",
+                .plugin_name = null,
+            },
+        };
+        var decls = try generator.main_zig.discoverPluginFlowDecls(
+            allocator,
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            fx.game_dir,
+            scripts_root,
+            &entries,
+        );
+        defer decls.deinit();
+
+        // The void command resolves `is_void = true`; the reporter resolves
+        // `is_void = false` — the flag that drives the lowering shape.
+        try std.testing.expectEqual(@as(usize, 2), decls.flow_nodes.len);
+        for (decls.flow_nodes) |fn_| {
+            if (std.mem.eql(u8, fn_.node_name, "log_i32")) {
+                try std.testing.expect(fn_.is_void);
+            } else {
+                try std.testing.expectEqualStrings("read_count", fn_.node_name);
+                try std.testing.expect(!fn_.is_void);
+            }
+        }
+
+        // Feed the discovered nodes into the scan — without #238 this
+        // errored as `UnknownFlowNode` on the first CustomNode.
+        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir, decls.flow_nodes);
+        defer result.deinit();
+
+        // Command lowering — a bare impl-call statement, no value binding.
+        {
+            const out_path = try std.fs.path.join(allocator, &.{ fx.target_dir, "scripts", "flows", "do_log.zig" });
+            defer allocator.free(out_path);
+            const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, out_path, allocator, .limited(64 * 1024));
+            defer allocator.free(source);
+            try std.testing.expect(std.mem.indexOf(u8, source, "game_mod.PluginFlowNodes.log__log_i32.impl(game,") != null);
+            // A command never binds a value for its own node.
+            try std.testing.expect(std.mem.indexOf(u8, source, "= game_mod.PluginFlowNodes.log__log_i32.impl") == null);
+
+            const sentinel_src = try allocator.dupeZ(u8, source);
+            defer allocator.free(sentinel_src);
+            var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
+            defer ast.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        }
+
+        // Reporter lowering — the result binds to `const n<id>_value = ...`.
+        {
+            const out_path = try std.fs.path.join(allocator, &.{ fx.target_dir, "scripts", "flows", "read.zig" });
+            defer allocator.free(out_path);
+            const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, out_path, allocator, .limited(64 * 1024));
+            defer allocator.free(source);
+            try std.testing.expect(std.mem.indexOf(u8, source, "= game_mod.PluginFlowNodes.log__read_count.impl(game)") != null);
+            try std.testing.expect(std.mem.indexOf(u8, source, "_value = game_mod.PluginFlowNodes.log__read_count.impl") != null);
+
+            const sentinel_src = try allocator.dupeZ(u8, source);
+            defer allocator.free(sentinel_src);
+            var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
+            defer ast.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        }
+    }
+
+    test "an unregistered CustomNode name surfaces as UnknownFlowNode" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const fx = try setupFixture(allocator, &tmp);
+        defer allocator.free(fx.game_dir);
+        defer allocator.free(fx.target_dir);
+        try tmp.dir.deleteFile(std.testing.io, "game/scripts/flows/move.flow.jsonc");
+
+        // A CustomNode naming a node that was never discovered — the
+        // registry is empty for it, so codegen must reject it rather than
+        // emit a dangling `PluginFlowNodes` reference.
+        try writeSample(tmp.dir, "game/scripts/flows/do_log.flow.jsonc", command_customnode_flow);
+
+        const result = flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir, &.{});
+        try std.testing.expectError(error.UnknownFlowNode, result);
     }
 };
 
@@ -538,7 +728,7 @@ pub const FlowEventHandlerMarker = struct {
         // (subgraphs aren't event-driven, no `FlowEventHandler`).
         try writeSample(tmp.dir, "game/scripts/flows/compute.flow.jsonc", oncall_subgraph_flow_body);
 
-        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir);
+        var result = try flow_scanner.scanAndEmit(allocator, fx.game_dir, fx.target_dir, &.{});
         defer result.deinit();
 
         // Three entries: `hit_counter` + `move` (both Event-node-form)
