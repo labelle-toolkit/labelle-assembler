@@ -3,6 +3,7 @@ const std = @import("std");
 const tpl = @import("template.zig");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
+const scan = @import("codegen/scan.zig");
 pub const deps_linker = @import("deps_linker.zig");
 
 const ProjectConfig = config.ProjectConfig;
@@ -31,11 +32,93 @@ fn inProjectLibDir(plugin: config.PluginDep) ?[]const u8 {
     return path;
 }
 
+/// Emit one `const <named>_mod = b.createModule(...)` per FlowNodes-bearing
+/// game script (labelle-assembler#240 Gap 2), plus an
+/// `overrideImport(game_mod, "<named>", <named>_mod)` so the shim's
+/// `PluginFlowNodes` can `@import("<named>")`.
+///
+/// The promoted module's `.imports` table mirrors a game script's import
+/// surface as seen from the root module: `labelle-core`, `labelle-gfx`,
+/// `labelle-engine`, the four backend modules, every plugin (each by its
+/// project.labelle `.name`, since game scripts `@import("<plugin>")` by
+/// that name), and — when present — `ecs_backend` / `gui_backend`. This is
+/// the exact set the exe/root module exposes, so a script's own
+/// `@import("labelle-engine")` / `@import("box2d")` resolves identically
+/// whether the file is path-imported by the root module or rooted in its
+/// own named module.
+///
+/// Must be called AFTER the deps/backend/ecs/gui/plugin module variables
+/// (`core_mod`, `engine_mod`, `backend_gfx`, `ecs_mod`, `gui_mod`,
+/// `plugin_<name>_mod`) and `game_mod` are all in scope, and BEFORE the
+/// exe/tests modules that import the named modules are created.
+fn emitPromotedScriptModules(
+    w: anytype,
+    cfg: ProjectConfig,
+    promoted_scripts: []const scan.PromotedScript,
+) !void {
+    if (promoted_scripts.len == 0) return;
+    try w.writeByte('\n');
+    try w.writeAll("    // Named modules for FlowNodes-bearing game scripts (#240 Gap 2).\n");
+    for (promoted_scripts) |s| {
+        try w.print("    const {s}_mod = b.createModule(.{{\n", .{s.module_name});
+        try w.print("        .root_source_file = b.path(\"scripts/{s}\"),\n", .{s.rel_path});
+        try w.writeAll("        .target = target,\n");
+        try w.writeAll("        .optimize = optimize,\n");
+        try w.writeAll("        .imports = &.{\n");
+        try w.writeAll("            .{ .name = \"labelle-core\", .module = core_mod },\n");
+        try w.writeAll("            .{ .name = \"labelle-gfx\", .module = gfx_mod },\n");
+        try w.writeAll("            .{ .name = \"labelle-engine\", .module = engine_mod },\n");
+        try w.writeAll("            .{ .name = \"backend_gfx\", .module = backend_gfx },\n");
+        try w.writeAll("            .{ .name = \"backend_input\", .module = backend_input },\n");
+        try w.writeAll("            .{ .name = \"backend_audio\", .module = backend_audio },\n");
+        try w.writeAll("            .{ .name = \"backend_window\", .module = backend_window },\n");
+        if (cfg.ecs != .mock) {
+            try w.writeAll("            .{ .name = \"ecs_backend\", .module = ecs_mod },\n");
+        }
+        if (cfg.hasGui()) {
+            try w.writeAll("            .{ .name = \"gui_backend\", .module = gui_mod },\n");
+        }
+        for (cfg.plugins) |plugin| {
+            try w.print("            .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
+        }
+        try w.writeAll("        },\n");
+        try w.writeAll("    });\n");
+        // The `game` module (shim) reaches the script via the named import
+        // too. `overrideImport` rather than `addImport` keeps the GPA-leak
+        // avoidance consistent with the plugin wiring above; it's a no-op
+        // if the shim doesn't reference this particular module.
+        try w.print("    overrideImport(game_mod, \"{s}\", {s}_mod);\n", .{ s.module_name, s.module_name });
+    }
+}
+
+/// Emit `<artifact>.root_module.addImport("<named>", <named>_mod)` for
+/// every promoted game-script module (labelle-assembler#240 Gap 2), so
+/// the exe/wasm/lib/test root module can `@import("<named>")` from
+/// main.zig's `AllScripts` + `PluginFlowNodes`. `artifact` is the build
+/// variable name (`exe`, `wasm`, `lib`, or `test_root`).
+fn emitPromotedScriptImports(
+    w: anytype,
+    artifact: []const u8,
+    promoted_scripts: []const scan.PromotedScript,
+) !void {
+    for (promoted_scripts) |s| {
+        try w.print("    {s}.root_module.addImport(\"{s}\", {s}_mod);\n", .{ artifact, s.module_name, s.module_name });
+    }
+}
+
 pub const BuildZigOptions = struct {
     /// Emit a test-only build.zig: skip the exe step, the run step,
     /// and the backend artifact link. Used by `generateTestsTarget`
     /// in root.zig for `.labelle/tests/build.zig` (issue #83).
     is_tests_target: bool = false,
+    /// Game scripts promoted to NAMED build-system modules because they
+    /// export `pub const FlowNodes` (labelle-assembler#240 Gap 2). Each
+    /// gets a `b.createModule` decl wired into BOTH the exe/root and
+    /// `game` modules so `@import("<named>")` resolves from either side
+    /// without the file landing in two modules at once. Defaults to
+    /// empty — projects with no FlowNodes-bearing scripts (the common
+    /// case) emit nothing here and keep their byte-identical build.zig.
+    promoted_scripts: []const scan.PromotedScript = &.{},
 };
 
 pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: BuildZigOptions) ![]const u8 {
@@ -175,6 +258,24 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         }
     }
 
+    // ── Named-module promotion for FlowNodes-bearing game scripts ──
+    // (labelle-assembler#240 Gap 2). A game script that exports
+    // `pub const FlowNodes` is referenced from BOTH the root module
+    // (main.zig's `AllScripts` for hook registration) AND the `game`
+    // module (the shim's `PluginFlowNodes`). Path-importing the same
+    // file from two module roots is a hard Zig error
+    // ("file exists in modules 'root' and 'game'"). Promoting it to a
+    // standalone NAMED module sidesteps that: the file is the root of
+    // its own module, and every consumer reaches it via
+    // `@import("<named>")`. Here we declare the module and wire it into
+    // `game_mod`; the exe/tests root modules pick it up via the
+    // `addImport` calls emitted after their creation below. The module
+    // mirrors a game script's import surface (engine + every plugin +
+    // ecs/gui backends) so the script's own `@import("labelle-engine")`
+    // / `@import("<plugin>")` resolve exactly as they do when the file
+    // is path-imported by the root module.
+    try emitPromotedScriptModules(w, cfg, opts.promoted_scripts);
+
     if (cfg.platform == .wasm) {
         // WASM: import emsdk helpers from backend
         switch (cfg.backend) {
@@ -199,6 +300,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         try tpl.writeSection(build_zig_tmpl, "wasm_exe_game_import", w);
 
         try tpl.writeSection(build_zig_tmpl, "wasm_exe_end", w);
+
+        // Promoted game-script modules → wasm root module (#240 Gap 2).
+        try emitPromotedScriptImports(w, "wasm", opts.promoted_scripts);
 
         // Link bridge artifact for WASM (raw_backend GUIs) BEFORE the
         // backend-specific link step. sokol-zig's `emLinkStep` snapshots
@@ -240,6 +344,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         try tpl.writeSection(build_zig_tmpl, "ios_exe_game_import", w);
 
         try tpl.writeSection(build_zig_tmpl, "ios_exe_end", w);
+
+        // Promoted game-script modules → iOS exe root module (#240 Gap 2).
+        try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
+
         try tpl.writeSection(build_zig_tmpl, "ios_link", w);
 
         // Bridge artifact (raw_backend GUIs)
@@ -268,6 +376,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         try tpl.writeSection(build_zig_tmpl, "android_exe_game_import", w);
 
         try tpl.writeSection(build_zig_tmpl, "android_exe_end", w);
+
+        // Promoted game-script modules → Android lib root module (#240 Gap 2).
+        try emitPromotedScriptImports(w, "lib", opts.promoted_scripts);
 
         // Pass target_sdk_version from AndroidConfig (default 34) for NDK library path
         const android_cfg = cfg.android orelse config.AndroidConfig{};
@@ -307,6 +418,11 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
             try tpl.writeSection(build_zig_tmpl, "exe_end", w);
 
+            // Wire each promoted game-script module into the exe's root
+            // module so main.zig's `AllScripts` + `PluginFlowNodes` can
+            // `@import("<named>")` (labelle-assembler#240 Gap 2).
+            try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
+
             // Link backend artifact
             switch (cfg.backend) {
                 .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib", w),
@@ -344,6 +460,13 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         }
         try tpl.writeSection(build_zig_tmpl, "tests_game_import", w);
         try tpl.writeSection(build_zig_tmpl, "tests_end", w);
+
+        // Wire promoted game-script modules into the test root module too
+        // — the merged `AllScripts` block compiles into the test binary
+        // exactly as it does the exe (labelle-assembler#240 Gap 2). The
+        // tests target (issue #83) shares this codepath, so its
+        // `__tests_root.zig` reaches the same named modules.
+        try emitPromotedScriptImports(w, "test_root", opts.promoted_scripts);
 
         // Chain each in-project library's `test` step into the master
         // `test` step (issue #82). An `@libs/<lib>` plugin lives at

@@ -362,7 +362,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
     }
 
-    test "game-script FlowNodes: rel_path resolves through @import(\"scripts/<rel>\") (RFC §5)" {
+    test "game-script FlowNodes: resolve through named module @import(\"script__<sanitized>\") (#240 Gap 2)" {
         // RFC §5: any module under the project tree exporting
         // `FlowNodes` is a palette source — not just plugins. Game
         // scripts use the `@import("scripts/<rel_path>")` form, same
@@ -409,9 +409,16 @@ pub const PluginFlowNodesAndPinStyles = struct {
         );
         defer allocator.free(main_zig);
 
-        // Game-script aliases use `@import("scripts/<rel_path>")`.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const hits__set_hits = @import(\"scripts/hits.zig\").FlowNodes.set_hits;") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const hits__get_hits = @import(\"scripts/hits.zig\").FlowNodes.get_hits;") != null);
+        // Game-script aliases use the NAMED module
+        // `@import("script__<module_sanitized>")` (labelle-assembler#240
+        // Gap 2) — NOT a path `@import("scripts/<rel>")`, which would put
+        // the script file in both the root and `game` modules. The
+        // `script__` prefix + sanitized name match the build.zig wiring
+        // (`scan.promotedScriptModuleName`).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const hits__set_hits = @import(\"script__hits\").FlowNodes.set_hits;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const hits__get_hits = @import(\"script__hits\").FlowNodes.get_hits;") != null);
+        // No path import of the script from the FlowNodes block.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@import(\"scripts/hits.zig\").FlowNodes") == null);
     }
 
     test "PinStyles: deduped last-write-wins, keyed by type name" {

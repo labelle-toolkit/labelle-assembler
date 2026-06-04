@@ -151,9 +151,24 @@ const game_shim_prelude =
 /// list is empty (declared plugins but no `Events` decls) the shim
 /// omits the block entirely — there's nothing for flow-codegen to
 /// reflect against.
+///
+/// `plugin_flow_nodes` (labelle-assembler#240 Gap 1) is the same
+/// discovered FlowNode list `main_zig.writePluginFlowNodesBlock` consumes
+/// for `main.zig`. Generated flow files emit
+/// `@import("game").PluginFlowNodes.<qualified>.impl(...)` for every
+/// `CustomNode`, so the shim must expose a `PluginFlowNodes` block whose
+/// decl names + `resolve`/`sanitizeModuleIdent` helpers are byte-identical
+/// to main.zig's — otherwise the flow file fails to compile with
+/// `struct 'game' has no member named 'PluginFlowNodes'`. The block is
+/// emitted only when at least one node was discovered: with no flow nodes
+/// no flow file references `game.PluginFlowNodes`, so the empty `struct {}`
+/// shell would be dead weight (and game-script nodes additionally need the
+/// named-module wiring in build.zig — Gap 2 — which `root.zig:generate`
+/// emits in lockstep).
 pub fn generateGameShim(
     allocator: std.mem.Allocator,
     plugin_events: []const main_zig.PluginEvent,
+    plugin_flow_nodes: []const main_zig.PluginFlowNode,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -161,11 +176,13 @@ pub fn generateGameShim(
 
     try w.writeAll(game_shim_prelude);
 
-    if (plugin_events.len > 0) {
+    if (plugin_events.len > 0 or plugin_flow_nodes.len > 0) {
         // Dispatch through a minimal `Codegen` context so the shim's
         // emission path matches the orchestrator's — `writePluginEventsBlock`
-        // is a mixin method that reads `self.plugin_events`. Mirrors
-        // `main_template.zig`'s `ctx.writePluginEventsBlock(bw)` call.
+        // / `writePluginFlowNodesBlock` are mixin methods that read
+        // `self.plugin_events` / `self.plugin_flow_nodes`. Mirrors
+        // `main_template.zig`'s `ctx.writePluginXxxBlock(bw)` calls so the
+        // shim's blocks are bit-identical to the ones emitted into main.zig.
         var ctx: main_zig.Codegen = .{
             .allocator = allocator,
             .cfg = .{ .name = "", .ecs = .mock },
@@ -181,11 +198,19 @@ pub fn generateGameShim(
             .gizmo_names = &.{},
             .animation_names = &.{},
             .plugin_events = plugin_events,
-            .plugin_flow_nodes = &.{},
+            .plugin_flow_nodes = plugin_flow_nodes,
             .plugin_pin_styles = &.{},
             .plugin_coercions = &.{},
         };
-        try ctx.writePluginEventsBlock(w);
+        if (plugin_events.len > 0) try ctx.writePluginEventsBlock(w);
+        // Gap 1 — surface `PluginFlowNodes` so flow files'
+        // `@import("game").PluginFlowNodes.<qualified>.impl(...)` resolves.
+        // Game-script nodes inside this block reference named modules
+        // (`@import("script__<sanitized>")`); the matching
+        // `overrideImport(game_mod, "script__<sanitized>", ...)` in
+        // `build_files.generateBuildZig` makes them resolvable from the
+        // `game` module.
+        if (plugin_flow_nodes.len > 0) try ctx.writePluginFlowNodesBlock(w);
     }
 
     var arr_list = aw.toArrayList();
@@ -594,8 +619,19 @@ pub fn generate(
     defer allocator.free(zon);
     try scanner.writeFile(target_dir, "build.zig.zon", zon);
 
+    // labelle-assembler#240 Gap 2 — game scripts exporting `FlowNodes`
+    // must be promoted to named build modules so the same file isn't a
+    // member of both the root (main.zig `AllScripts`) and `game` (shim
+    // `PluginFlowNodes`) modules. Derive the dedup'd set from the same
+    // discovered FlowNode list the shim + main.zig consume.
+    const promoted_scripts = try main_zig.collectPromotedScripts(allocator, plugin_flow_decls.flow_nodes);
+    defer main_zig.freePromotedScripts(allocator, promoted_scripts);
+
     // Generate build.zig
-    const build_zig = try build_files.generateBuildZig(allocator, cfg, .{ .is_tests_target = is_tests_target });
+    const build_zig = try build_files.generateBuildZig(allocator, cfg, .{
+        .is_tests_target = is_tests_target,
+        .promoted_scripts = promoted_scripts,
+    });
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
 
@@ -619,7 +655,10 @@ pub fn generate(
     // The matching `addImport("game", game_mod)` and per-plugin
     // `overrideImport(game_mod, "<plugin>", plugin_mod)` calls live in
     // `build_files.generateBuildZig`.
-    const game_shim = try generateGameShim(allocator, plugin_events.entries);
+    // `plugin_flow_decls.flow_nodes` was discovered ABOVE the flow scan
+    // (root.zig §flow discovery). Thread it in so the shim's
+    // `PluginFlowNodes` block (Gap 1) matches the one main.zig emits.
+    const game_shim = try generateGameShim(allocator, plugin_events.entries, plugin_flow_decls.flow_nodes);
     defer allocator.free(game_shim);
     try scanner.writeFile(target_dir, "game.zig", game_shim);
 

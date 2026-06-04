@@ -47,6 +47,21 @@ const PluginCoercion = scan.PluginCoercion;
 const dedupePinStyles = scan.dedupePinStyles;
 const pathToIdent = scan.pathToIdent;
 
+/// True iff `ident` (a game script's `pathToIdent(rel_path)`) names a
+/// game-script module that contributed at least one FlowNode and is
+/// therefore promoted to a named build module (labelle-assembler#240
+/// Gap 2). `module_sanitized` of an `is_script` flow node equals
+/// `pathToIdent(rel_path)`, so the comparison is a direct string match.
+/// Used by the `AllScripts` emitter to switch promoted scripts to the
+/// `@import("script__<ident>")` form.
+fn isFlowNodeScript(flow_nodes: []const PluginFlowNode, ident: []const u8) bool {
+    for (flow_nodes) |fn_| {
+        if (!fn_.is_script) continue;
+        if (std.mem.eql(u8, fn_.module_sanitized, ident)) return true;
+    }
+    return false;
+}
+
 // Identifier helpers
 const pathToPascal = idents.pathToPascal;
 const eventVariantName = idents.eventVariantName;
@@ -762,11 +777,31 @@ pub fn generateMainZigFromTemplate(
         for (script_entries) |entry| {
             if (std.mem.eql(u8, entry.name, "context")) continue;
             const ident = pathToIdent(entry.rel_path, &ident_buf);
+            // labelle-assembler#240 Gap 2 — a game script that exports
+            // `pub const FlowNodes` is promoted to a NAMED build module
+            // (it's also reached by the `game` shim's `PluginFlowNodes`).
+            // It MUST be `@import("script__<sanitized>")` here, not
+            // `@import("scripts/<rel>")`, or the file lands in both the
+            // root module (this block) and the `game` module → the
+            // "file exists in modules 'root' and 'game'" error. The
+            // sanitized prefix is byte-identical to `ident` because both
+            // are `pathToIdent(rel_path)`, matching
+            // `scan.promotedScriptModuleName`. Scripts without FlowNodes
+            // keep the path import.
+            const is_promoted = isFlowNodeScript(plugin_flow_nodes, ident);
+            // Buffer the named module name so the import expr below is a
+            // single `{s}` regardless of promotion. `script__` + `ident`.
+            var named_buf: [256 + "script__".len]u8 = undefined;
+            const import_target: []const u8 = if (is_promoted)
+                std.fmt.bufPrint(&named_buf, "script__{s}", .{ident}) catch return error.NameTooLong
+            else
+                entry.rel_path;
+            const import_prefix: []const u8 = if (is_promoted) "" else "scripts/";
             if (entry.states.len == 0) {
-                try bw.print("    pub const {s} = @import(\"scripts/{s}\");\n", .{ ident, entry.rel_path });
+                try bw.print("    pub const {s} = @import(\"{s}{s}\");\n", .{ ident, import_prefix, import_target });
             } else {
                 try bw.print("    pub const {s} = struct {{\n", .{ident});
-                try bw.print("        const _inner = @import(\"scripts/{s}\");\n", .{entry.rel_path});
+                try bw.print("        const _inner = @import(\"{s}{s}\");\n", .{ import_prefix, import_target });
                 try bw.writeAll("        pub const game_states = .{\n");
                 for (entry.states) |state| {
                     try bw.print("            \"{s}\",\n", .{state});

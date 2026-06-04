@@ -8,6 +8,16 @@ flow parser, codegen, component imports, `Game.getComponent` /
 `Game.setField`, and the OnCreate alias path — compiles into a real game
 binary.
 
+`scripts/flows/custom.flow.jsonc` extends the fixture with a
+game-script **CustomNode** (labelle-assembler#240): it calls
+`logger.log_i32`, a `pub const FlowNodes` node declared in
+`scripts/logger.zig`. Compiling that path proves the assembler (a) emits
+`PluginFlowNodes` into the `game` shim so the generated flow's
+`@import("game").PluginFlowNodes.<q>.impl(...)` resolves (Gap 1), and
+(b) promotes the FlowNodes-bearing game script to a *named* build module
+(`script__logger`) so it isn't a member of both the root module (via
+`AllScripts`) and the `game` module (via the shim) at once (Gap 2).
+
 CI builds this fixture but does not run the resulting binary (raylib
 needs a display); the build-only depth matches `examples/raylib` and
 `examples/asset-streaming-smoke`.

@@ -212,9 +212,21 @@ pub fn Mixin(comptime Self: type) type {
                     try bw.print("    /// constructs: {s}\n", .{c});
                 }
                 if (fn_.is_script) {
+                    // Game-script FlowNodes are promoted to NAMED build
+                    // modules (`script__<module_sanitized>`,
+                    // labelle-assembler#240 Gap 2) so the same file isn't
+                    // a member of both the root module (via `AllScripts`
+                    // in main.zig) and the `game` module (via the shim's
+                    // copy of this block). A path `@import("scripts/<rel>")`
+                    // would re-introduce the dual-module conflict
+                    // ("file exists in modules 'root' and 'game'"). The
+                    // `script__` prefix + `module_sanitized` are
+                    // byte-identical to `scan.promotedScriptModuleName`,
+                    // the single source of truth the build.zig wiring and
+                    // `AllScripts` promotion path also use.
                     try bw.print(
-                        "    pub const {s}__{s} = @import(\"scripts/{s}\").FlowNodes.{s};\n",
-                        .{ fn_.module_sanitized, fn_.node_name, fn_.module_import_path, fn_.node_name },
+                        "    pub const {s}__{s} = @import(\"script__{s}\").FlowNodes.{s};\n",
+                        .{ fn_.module_sanitized, fn_.node_name, fn_.module_sanitized, fn_.node_name },
                     );
                 } else {
                     try bw.print(
