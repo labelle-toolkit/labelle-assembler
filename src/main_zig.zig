@@ -51,8 +51,11 @@ pub const PluginFlowNode = scan.PluginFlowNode;
 pub const PluginPinStyle = scan.PluginPinStyle;
 pub const PluginCoercion = scan.PluginCoercion;
 pub const PluginFlowDecls = scan.PluginFlowDecls;
+pub const PromotedScript = scan.PromotedScript;
 pub const discoverPluginEvents = scan.discoverPluginEvents;
 pub const discoverPluginFlowDecls = scan.discoverPluginFlowDecls;
+pub const collectPromotedScripts = scan.collectPromotedScripts;
+pub const freePromotedScripts = scan.freePromotedScripts;
 pub const dedupePinStyles = scan.dedupePinStyles;
 
 // ── Resource loader: `LoadStyle` is part of the standalone helper's

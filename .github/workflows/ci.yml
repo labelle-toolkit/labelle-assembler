@@ -299,6 +299,21 @@ jobs:
           test -f scripts/flows/tick.zig
           test -f .labelle/raylib_desktop/scripts/flows/tick.zig
 
+          # Game-script CustomNode (labelle-assembler#240) — the
+          # `custom.flow.jsonc` references `logger.log_i32`, a FlowNode
+          # declared in `scripts/logger.zig`. Assert the flow lowered AND
+          # that the named-module promotion (#240 Gap 2) + shim
+          # `PluginFlowNodes` (#240 Gap 1) landed in the generated build.
+          test -f scripts/flows/custom.zig
+          test -f .labelle/raylib_desktop/scripts/flows/custom.zig
+          grep -q "PluginFlowNodes.logger__log_i32.impl" .labelle/raylib_desktop/scripts/flows/custom.zig
+          # Shim exposes PluginFlowNodes via the NAMED module (Gap 1+2).
+          grep -q 'pub const PluginFlowNodes = struct' .labelle/raylib_desktop/game.zig
+          grep -q 'logger__log_i32 = @import("script__logger")' .labelle/raylib_desktop/game.zig
+          # build.zig declares + wires the named module.
+          grep -q 'const script__logger_mod = b.createModule' .labelle/raylib_desktop/build.zig
+          grep -q 'overrideImport(game_mod, "script__logger"' .labelle/raylib_desktop/build.zig
+
           cd .labelle/raylib_desktop
 
           # Same labelle-cli-equivalent fixFingerprint dance as the

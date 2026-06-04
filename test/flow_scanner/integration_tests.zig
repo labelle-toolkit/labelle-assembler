@@ -398,7 +398,8 @@ pub const GameModuleBinding = struct {
         const allocator = std.testing.allocator;
         // No plugins (or no plugin events) → empty list.
         const empty_pe: []const generator.main_zig.PluginEvent = &.{};
-        const src = try generator.generateGameShim(allocator, empty_pe);
+        const empty_fn: []const generator.main_zig.PluginFlowNode = &.{};
+        const src = try generator.generateGameShim(allocator, empty_pe, empty_fn);
         defer allocator.free(src);
 
         // `@import("game")` users expect both decls at the root.
@@ -414,6 +415,9 @@ pub const GameModuleBinding = struct {
         // re-export of `Game`/`EntityId`; only projects with events to
         // resolve (phase 3) get the union.
         try std.testing.expect(std.mem.indexOf(u8, src, "PluginEvents") == null);
+
+        // No flow nodes → no `PluginFlowNodes` block either (#240 Gap 1).
+        try std.testing.expect(std.mem.indexOf(u8, src, "PluginFlowNodes") == null);
     }
 
     test "game.zig shim re-exports PluginEvents when plugins are declared" {
@@ -431,7 +435,8 @@ pub const GameModuleBinding = struct {
                 .event_name = "collision_begin",
             },
         };
-        const src = try generator.generateGameShim(allocator, &pe);
+        const empty_fn: []const generator.main_zig.PluginFlowNode = &.{};
+        const src = try generator.generateGameShim(allocator, &pe, empty_fn);
         defer allocator.free(src);
 
         // The static prelude still re-exports the engine types verbatim.
@@ -450,5 +455,38 @@ pub const GameModuleBinding = struct {
         // `main.zig` does, so the resolver consumes a single canonical
         // form.
         try std.testing.expect(std.mem.indexOf(u8, src, "box2d__collision_begin") != null);
+    }
+
+    test "game.zig shim re-exports PluginFlowNodes referencing named modules for game-script nodes (#240)" {
+        // #240 Gap 1: generated flow files do
+        // `@import("game").PluginFlowNodes.<qualified>.impl(...)`, so the
+        // shim must expose a `PluginFlowNodes` block. Gap 2: a game-script
+        // node must reference the NAMED module (`@import("script__<sanitized>")`),
+        // never a path `@import("scripts/<rel>")` — that's what keeps the
+        // file out of two modules at once.
+        const allocator = std.testing.allocator;
+        const empty_pe: []const generator.main_zig.PluginEvent = &.{};
+        const fn_nodes = [_]generator.main_zig.PluginFlowNode{
+            .{
+                .module_import_path = "bouncing_ball.zig",
+                .module_sanitized = "bouncing_u_ball",
+                .node_name = "log_i32",
+                .is_script = true,
+            },
+        };
+        const src = try generator.generateGameShim(allocator, empty_pe, &fn_nodes);
+        defer allocator.free(src);
+
+        // Block + qualified decl present.
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const PluginFlowNodes = struct {") != null);
+        // Game-script node → NAMED module import, byte-identical to the
+        // build.zig wiring's `script__<sanitized>` name.
+        try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"script__bouncing_u_ball\").FlowNodes.log_i32") != null);
+        // It must NOT path-import the script (that re-introduces the
+        // dual-module conflict).
+        try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"scripts/bouncing_ball.zig\")") == null);
+        // The resolver helper carries through so `game.PluginFlowNodes`
+        // resolves dotted names just like main.zig's copy.
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub fn resolve(comptime dotted: []const u8)") != null);
     }
 };

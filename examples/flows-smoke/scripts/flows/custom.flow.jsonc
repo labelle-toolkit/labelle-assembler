@@ -1,0 +1,31 @@
+// Game-script CustomNode end-to-end fixture (labelle-assembler#240).
+//
+// On `engine.entity_created` (labelle-engine#578 lifecycle Events), this
+// flow calls the game-script-declared CustomNode `logger.log_i32` —
+// discovered by the assembler's phase-2 FlowNodes walk from
+// `scripts/logger.zig`'s `pub const FlowNodes` block — passing a literal
+// `42`.
+//
+// The CustomNode lowers (flow-codegen #20, RFC-FLOW-VOCABULARY §1/§5) to:
+//
+//     game.PluginFlowNodes.logger__log_i32.impl(game, 42);
+//
+// which only compiles when:
+//   - the `game` shim exposes `PluginFlowNodes` (#240 Gap 1), and
+//   - `scripts/logger.zig` is a NAMED build module so it isn't a member
+//     of both the root module (`AllScripts`) and the `game` module
+//     (#240 Gap 2).
+//
+// As with `tick.flow.jsonc`, the `.jsonc` extension only keys discovery
+// today; the body is ZON (flow-codegen v0.1.0's parser consumes ZON).
+{
+  "name": "custom",
+  "nodes": [
+    { "id": 1, "type": "Event", "name": "engine.entity_created", "pos": [0, -120] },
+    { "id": 2, "type": "Literal", "pos": [0, -40], "value": "42" },
+    { "id": 3, "type": "CustomNode", "name": "logger.log_i32", "pos": [0, 40] }
+  ],
+  "edges": [
+    { "from": { "node": 2, "pin": "value" }, "to": { "node": 3, "pin": "arg0" } }
+  ]
+}
