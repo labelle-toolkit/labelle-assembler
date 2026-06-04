@@ -556,7 +556,7 @@ const log_script_src =
 
 // An `OnCall` subgraph that feeds a Literal into the `log_i32` command's
 // first positional pin (`arg0`). The command returns `void`, so codegen
-// must emit a bare `game_mod.PluginFlowNodes.log__log_i32.impl(game, ...)`
+// must emit a bare `@TypeOf(game_mod.PluginFlowNodes.log__log_i32).impl(game, ...)`
 // statement.
 const command_customnode_flow =
     \\{
@@ -660,9 +660,9 @@ pub const CustomNodeRegistry = struct {
             defer allocator.free(out_path);
             const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, out_path, allocator, .limited(64 * 1024));
             defer allocator.free(source);
-            try std.testing.expect(std.mem.indexOf(u8, source, "game_mod.PluginFlowNodes.log__log_i32.impl(game,") != null);
+            try std.testing.expect(std.mem.indexOf(u8, source, "@TypeOf(game_mod.PluginFlowNodes.log__log_i32).impl(game,") != null);
             // A command never binds a value for its own node.
-            try std.testing.expect(std.mem.indexOf(u8, source, "= game_mod.PluginFlowNodes.log__log_i32.impl") == null);
+            try std.testing.expect(std.mem.indexOf(u8, source, "= @TypeOf(game_mod.PluginFlowNodes.log__log_i32).impl") == null);
 
             const sentinel_src = try allocator.dupeZ(u8, source);
             defer allocator.free(sentinel_src);
@@ -677,8 +677,8 @@ pub const CustomNodeRegistry = struct {
             defer allocator.free(out_path);
             const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, out_path, allocator, .limited(64 * 1024));
             defer allocator.free(source);
-            try std.testing.expect(std.mem.indexOf(u8, source, "= game_mod.PluginFlowNodes.log__read_count.impl(game)") != null);
-            try std.testing.expect(std.mem.indexOf(u8, source, "_value = game_mod.PluginFlowNodes.log__read_count.impl") != null);
+            try std.testing.expect(std.mem.indexOf(u8, source, "= @TypeOf(game_mod.PluginFlowNodes.log__read_count).impl(game)") != null);
+            try std.testing.expect(std.mem.indexOf(u8, source, "_value = @TypeOf(game_mod.PluginFlowNodes.log__read_count).impl") != null);
 
             const sentinel_src = try allocator.dupeZ(u8, source);
             defer allocator.free(sentinel_src);

@@ -33,8 +33,8 @@
         // -C ../flow-codegen rev-parse <sha>`). Truncated/typo'd
         // shas surface as EndOfStream, not a clear "not found".
         .flow_codegen = .{
-            .url = "git+https://github.com/labelle-toolkit/flow-codegen.git?ref=main#4073b589c149cddf9a26dbe1ae15723f8b95e33f",
-            .hash = "flow_codegen-0.1.0-PFKUp_1MBADpxcvwB1DpThBANfrOfjdoP26ZJLTmxg4R",
+            .url = "git+https://github.com/labelle-toolkit/flow-codegen.git?ref=main#72265b99bab2865bb19dd25bab6c8a9e0b6b4d8c",
+            .hash = "flow_codegen-0.1.0-PFKUp0JKBQAojGR1oADXgVeuLgKA7YsNtMZtNVq4axIj",
         },
     },
     .paths = .{

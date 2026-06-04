@@ -25,19 +25,13 @@ pub fn setup(game: anytype) void {
 /// Void (command) flow node. `engine.core` re-exports labelle-core,
 /// where the `flow.FlowNode` factory lives.
 ///
-/// Signature note: flow-codegen lowers a `CustomNode` to
-/// `game.PluginFlowNodes.<qualified>.impl(game, <pins...>)`, where
-/// `<qualified>` is the FlowNode struct VALUE. Zig resolves `value.impl(...)`
-/// via UFCS and binds that struct value to `impl`'s first parameter (it
-/// must be `anytype` to accept it). So the first param here is the
-/// UFCS-bound FlowNode receiver (unused), the second is the
-/// codegen-threaded `game`, and the rest are the positional input pins.
-/// Collapsing that leading receiver into the call shape is flow-codegen's
-/// remaining work (flow-codegen#20) — this fixture's job is to prove the
-/// assembler-side MODULE WIRING (#240 Gaps 1+2) compiles, which requires
-/// the named-module promotion + shim `PluginFlowNodes` this PR adds.
-fn flowLogI32(_node: anytype, game: anytype, value: i32) void {
-    _ = _node;
+/// First param is the codegen-threaded `game` (per the FlowNode
+/// contract); the rest are the positional input pins. flow-codegen
+/// emits `@TypeOf(game.PluginFlowNodes.<qualified>).impl(game, <pins...>)`
+/// — a plain namespaced call with no UFCS receiver to absorb
+/// (flow-codegen#28). This fixture proves the assembler-side MODULE
+/// WIRING (#240 Gaps 1+2) compiles end-to-end with the real contract.
+fn flowLogI32(game: anytype, value: i32) void {
     _ = game;
     std.debug.print("logger.log_i32: {d}\n", .{value});
 }
