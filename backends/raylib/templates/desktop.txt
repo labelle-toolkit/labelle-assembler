@@ -32,7 +32,12 @@ const target_fps: u32 = {{fps}};
     const loop_start_ns: i128 = engine.nowNs();
 
     while (!window.windowShouldClose()) {
-        const dt: f32 = 0.016;
+        // Frame-rate-independent sim: derive dt from real frame time so render
+        // FPS can't drive game speed. Cap at 4 frames to prevent physics
+        // explosions after a stall/backgrounding. Mirrors wasm.txt's use of
+        // getFrameTime() — see Flying-Platform/flying-platform-labelle#504.
+        // @max(target_fps, 1) guards against a target_fps=0 (unlimited/vsync-only) config dividing by zero.
+        const dt: f32 = @min(window.getFrameTime(), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
 {{preview_heartbeat}}{{tick_code}}        g.tick(dt);
 
         window.beginDrawing();
