@@ -46,7 +46,11 @@ export fn frame() callconv(.c) void {
     // Keep design coords fixed so screen-space NDC mapping uses the design resolution
     // rather than the physical framebuffer size (which differs on HiDPI displays).
     BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
-    const dt: f32 = 1.0 / @as(f32, @floatFromInt(target_fps));
+    // Frame-rate-independent sim: derive dt from real frame time so render
+    // FPS (vsync / display refresh) can't drive game speed. Cap at 4 frames
+    // to prevent physics explosions after a stall/backgrounding. Mirrors
+    // mobile.txt — see Flying-Platform/flying-platform-labelle#504.
+    const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(target_fps)));
 {{preview_heartbeat}}{{tick_code}}    g.tick(dt);
 {{preview_pre_render}}    const pass_action = window.beginFrame();
     window.beginPass(pass_action);
