@@ -417,6 +417,96 @@ pub const FlowScanner = struct {
         try std.testing.expectEqual(@as(usize, 1), result.entries.len);
         try std.testing.expectEqualStrings("move", result.entries[0].name);
     }
+
+    // ── Cross-file Subflow resolution (labelle-assembler#243) ───────────
+    //
+    // A `Subflow` node referencing a flow defined in *another file* must
+    // resolve through the scanner's shared `FlowRegistry`. Before the
+    // two-pass fix, `scanAndEmit` rendered each flow with `renderFlowZig`
+    // (an empty internal registry), so the cross-file `Subflow` — and
+    // therefore the `Delay` whose deferred `body` is always a `Subflow`
+    // (flow-codegen#48) — failed with `error.UnknownFlowRef`. This test
+    // pins the fix: two files, `caller` routes a `Delay` → `Subflow` at
+    // `callee`, and the emitted `caller.zig` inlines the `callee`
+    // subgraph `fn`.
+    test "resolves a cross-file Subflow reference through the shared FlowRegistry" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const io = std.testing.io;
+        try tmp.dir.createDirPath(io, "game/scripts/flows");
+        try tmp.dir.createDirPath(io, "game/.labelle/target");
+        const game_dir_z = try tmp.dir.realPathFileAlloc(io, "game", allocator);
+        defer allocator.free(game_dir_z);
+        const game_dir = try allocator.dupe(u8, game_dir_z);
+        defer allocator.free(game_dir);
+        const target_dir_z = try tmp.dir.realPathFileAlloc(io, "game/.labelle/target", allocator);
+        defer allocator.free(target_dir_z);
+        const target_dir = try allocator.dupe(u8, target_dir_z);
+        defer allocator.free(target_dir);
+        try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
+
+        // `caller`: an OnCall entry whose Delay (id 1) defers a Subflow
+        // (id 2) targeting the `callee` flow defined in a *separate*
+        // file. The `body` exec edge from the Delay into the Subflow is
+        // the real-case shape the Delay node requires.
+        const caller_body =
+            \\{
+            \\  "name": "caller",
+            \\  "event": { "type": "OnCall" },
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Delay", "seconds": 1.5, "pos": [0, 0] },
+            \\    { "id": 2, "type": "Subflow", "flow": "callee", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [],
+            \\  "exec_edges": [
+            \\    { "from": { "node": 1, "pin": "body" }, "to": { "node": 2 } }
+            \\  ]
+            \\}
+            \\
+        ;
+        // `callee`: a minimal OnCall subgraph (no params) that sets a
+        // local variable — a standalone subgraph fn, no FlowEventHandler.
+        const callee_body =
+            \\{
+            \\  "event": { "type": "OnCall" },
+            \\  "locals": [ { "name": "sink", "type": "i32", "default": 0 } ],
+            \\  "nodes": [
+            \\    { "id": 1, "type": "Literal", "value": 7, "pos": [0, 0] },
+            \\    { "id": 2, "type": "SetVariable", "name": "sink", "pos": [0, 0] }
+            \\  ],
+            \\  "edges": [
+            \\    { "from": { "node": 1, "pin": "value" }, "to": { "node": 2, "pin": "value" } }
+            \\  ]
+            \\}
+            \\
+        ;
+        try writeSample(tmp.dir, "game/scripts/flows/caller.flow.jsonc", caller_body);
+        try writeSample(tmp.dir, "game/scripts/flows/callee.flow.jsonc", callee_body);
+
+        // Without the two-pass fix this returns `error.UnknownFlowRef`.
+        var result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir, &.{});
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(usize, 2), result.entries.len);
+
+        // The emitted `caller.zig` must inline the `callee` subgraph fn —
+        // proof the cross-file `Subflow` resolved and was lowered.
+        const out_path = try std.fs.path.join(allocator, &.{ target_dir, "scripts", "flows", "caller.zig" });
+        defer allocator.free(out_path);
+        const source = try std.Io.Dir.cwd().readFileAlloc(io, out_path, allocator, .limited(64 * 1024));
+        defer allocator.free(source);
+
+        try std.testing.expect(std.mem.indexOf(u8, source, "fn callee(game: anytype") != null);
+
+        // And it parses as valid Zig.
+        const sentinel_src = try allocator.dupeZ(u8, source);
+        defer allocator.free(sentinel_src);
+        var ast = try std.zig.Ast.parse(allocator, sentinel_src, .zig);
+        defer ast.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
 };
 
 pub const FlowSortOrder = struct {
