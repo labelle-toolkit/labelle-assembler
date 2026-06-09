@@ -135,15 +135,23 @@ fn emptySingleton(comptime T: type) *T {
 /// + Wyhash family). The cache drops it ~96%, going straight to the
 /// sparse-set lookup, and lifted Debug FPS ~+8% median / +24% at the dips.
 ///
-/// `Cache` is a per-`T` static (one instantiation per component type). It's
-/// validated against `self.instance_id`, not `&self.inner`, so a registry
-/// recreated at a reused address (new adapter → new id) cleanly misses and
-/// re-resolves rather than returning a freed storage pointer.
+/// `Cache` is a per-`T`, **threadlocal** static (one instantiation per
+/// component type, one copy per thread). Threadlocal is what keeps this
+/// race-free: the original `assure` map lives on the per-registry
+/// `self.components`, but a plain process-wide static would be shared across
+/// every adapter and thread — so any concurrent ECS access (e.g. a worker
+/// thread) would race on it. Per-thread storage removes the race entirely
+/// while staying far cheaper than the HashMap probe; each thread just
+/// re-resolves once per `T` on first touch.
+///
+/// The cache is validated against `self.instance_id`, not `&self.inner`, so
+/// a registry recreated at a reused address (new adapter → new id) cleanly
+/// misses and re-resolves rather than returning a freed storage pointer.
 inline fn cachedStorage(self: *Self, comptime T: type) @TypeOf(self.inner.assure(T)) {
     const StoragePtr = @TypeOf(self.inner.assure(T));
     const Cache = struct {
-        var ptr: ?StoragePtr = null;
-        var id: u64 = 0;
+        threadlocal var ptr: ?StoragePtr = null;
+        threadlocal var id: u64 = 0;
     };
     if (Cache.ptr) |p| {
         if (Cache.id == self.instance_id) return p;
