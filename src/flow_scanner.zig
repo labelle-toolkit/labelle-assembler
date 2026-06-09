@@ -13,7 +13,7 @@
 //! `.gitignore` the emitted files; the assembler treats them as freshly
 //! regenerated on every `zig build generate` pass.
 //!
-//! Errors from `flow_codegen.flow_io.parseFlow` / `codegen.renderFlowZig`
+//! Errors from `flow_codegen.flow_io.parseFlow` / `codegen.renderFlowFile`
 //! are surfaced as `flows/<rel>.flow.jsonc: <err>` lines written
 //! directly to stderr (matching the existing `main_zig.checkBasenameCollisions`
 //! diagnostic style) and the typed error is returned to the caller, so a
@@ -82,7 +82,7 @@ pub fn scanAndEmit(
     // emits into `main.zig`. Without this every `CustomNode` reference
     // errors as `UnknownFlowNode` (labelle-assembler#238). The registry
     // + its key/value strings live in the result arena so they outlive
-    // every `renderFlowZig` call below; the registry's own
+    // every `renderFlowFile` call below; the registry's own
     // `StringHashMap` allocates on the caller `allocator` and is freed
     // before return (the entries it borrows are arena-owned).
     var registry = CustomNodeRegistry.init(allocator);
@@ -160,7 +160,58 @@ pub fn scanAndEmit(
         }
     }.lt);
 
+    // ── Pass 1: load + register ─────────────────────────────────────
+    //
+    // Every `.flow.jsonc` is parsed up front and registered in a
+    // `flow_codegen.codegen.FlowRegistry` so pass 2's `renderFlowFile`
+    // can resolve cross-file `Subflow` references (RFC §6 —
+    // labelle-assembler#243). `renderFlowZig` built an *empty*
+    // registry internally, so a `Subflow` (and therefore `Delay`,
+    // whose deferred `body` is always a `Subflow` — flow-codegen#48)
+    // pointing at a flow in another file failed with
+    // `error.UnknownFlowRef`.
+    //
+    // The registry borrows `flow.name` + the whole `Flow` value from
+    // each `LoadedFlow`, whose backing arena owns those slices. So the
+    // `LoadedFlow`s MUST outlive the entire render pass — we collect
+    // them here and deinit every one at the very end (after pass 2),
+    // never per-iteration. This `FlowRegistry` is DISTINCT from the
+    // `CustomNodeRegistry` (`registry`) built above; both feed
+    // `renderFlowFile`.
+    var loaded_flows: std.ArrayList(flow_codegen.flow_io.LoadedFlow) = .empty;
+    defer {
+        for (loaded_flows.items) |*lf| lf.deinit();
+        loaded_flows.deinit(allocator);
+    }
+
+    var flow_registry = flow_codegen.codegen.FlowRegistry.init(allocator);
+    defer flow_registry.deinit();
+
     for (rel_paths.items) |rel| {
+        const src_path = try std.fs.path.join(allocator, &.{ src_flows, rel });
+        defer allocator.free(src_path);
+
+        const loaded = flow_codegen.flow_io.loadFromFile(io, allocator, src_path) catch |err| {
+            reportFlowError(rel, err);
+            return err;
+        };
+        try loaded_flows.append(allocator, loaded);
+
+        // `flow_registry` borrows from the just-appended `LoadedFlow`,
+        // which now lives for the whole render pass. A duplicate
+        // effective name surfaces here as `error.DuplicateFlowName`.
+        flow_registry.add(loaded.flow) catch |err| {
+            reportFlowError(rel, err);
+            return err;
+        };
+    }
+
+    // ── Pass 2: render + write ──────────────────────────────────────
+    //
+    // `rel_paths` and `loaded_flows` are index-aligned (pass 1 appended
+    // in `rel_paths` order), so each rendered flow pairs with its
+    // source path for diagnostics and the output path.
+    for (rel_paths.items, loaded_flows.items) |rel, loaded| {
         // `rel` is `<subdir>/.../<stem>.flow.jsonc` relative to
         // `scripts/flows/`. Strip the double extension to get the
         // logical flow path; the basename of that is the flow's
@@ -186,18 +237,16 @@ pub fn scanAndEmit(
         // — `02_foo` returns 2 the same way `02_foo.zig` does.
         const sort_order = script_scanner.extractSortOrder(display_name);
 
-        const src_path = try std.fs.path.join(allocator, &.{ src_flows, rel });
-        defer allocator.free(src_path);
-
-        var loaded = flow_codegen.flow_io.loadFromFile(io, allocator, src_path) catch |err| {
-            reportFlowError(rel, err);
-            return err;
-        };
-        defer loaded.deinit();
-
-        const generated = flow_codegen.codegen.renderFlowZig(
+        // Cross-file-aware render: `renderFlowFile` resolves `Subflow`
+        // refs through `flow_registry` and inlines each referenced
+        // subgraph as a `fn` in the emitted file (RFC §6). Unlike
+        // `renderFlowZig` it never builds an empty internal registry,
+        // so a `Subflow`/`Delay` pointing at another file now resolves
+        // instead of erroring `UnknownFlowRef`.
+        const generated = flow_codegen.codegen.renderFlowFile(
             allocator,
             loaded.flow,
+            &flow_registry,
             .{ .flow_name = display_name, .custom_nodes = &registry },
         ) catch |err| {
             reportFlowError(rel, err);
