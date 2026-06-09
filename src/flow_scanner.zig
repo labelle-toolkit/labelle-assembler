@@ -195,7 +195,18 @@ pub fn scanAndEmit(
             reportFlowError(rel, err);
             return err;
         };
-        try loaded_flows.append(allocator, loaded);
+        // Transfer ownership to `loaded_flows` (whose function-scope defer
+        // deinits each entry once). On append-OOM `loaded` isn't in the
+        // list yet, so deinit it here — but NOT via an `errdefer` spanning
+        // the rest of the loop: a `LoadedFlow` copy shares its arena
+        // POINTER, so once appended, a later error (e.g. the
+        // `flow_registry.add` below) deiniting it here AND through the
+        // list defer would double-free the arena (gemini #244).
+        loaded_flows.append(allocator, loaded) catch |err| {
+            var orphan = loaded;
+            orphan.deinit();
+            return err;
+        };
 
         // `flow_registry` borrows from the just-appended `LoadedFlow`,
         // which now lives for the whole render pass. A duplicate
