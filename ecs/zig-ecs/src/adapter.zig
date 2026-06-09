@@ -30,6 +30,16 @@ inner: zig_ecs.Registry,
 entity_count: usize,
 alive_entities: std.ArrayListUnmanaged(Entity),
 alloc: std.mem.Allocator,
+/// Unique per-adapter id, used to validate the per-component-type storage
+/// cache (`cachedStorage`). Keying the cache on this id rather than on
+/// `&self.inner` makes it immune to a registry being deinit'd and a new one
+/// allocated at the *same address* — that new adapter gets a fresh id, so
+/// the stale cached storage pointer is never returned.
+instance_id: u64,
+
+/// Monotonic source for `instance_id`. Starts at 1 so the cache's `id == 0`
+/// sentinel never matches a live adapter.
+var next_instance_id: std.atomic.Value(u64) = .init(1);
 
 fn toInternal(entity: Entity) InternalEntity {
     return @bitCast(entity);
@@ -45,6 +55,7 @@ pub fn init(allocator: std.mem.Allocator) Self {
         .entity_count = 0,
         .alive_entities = .empty,
         .alloc = allocator,
+        .instance_id = next_instance_id.fetchAdd(1, .monotonic),
     };
 }
 
@@ -115,8 +126,44 @@ fn emptySingleton(comptime T: type) *T {
 /// need for an explicit gate here — and for sized types `contains` is
 /// cheaper than `tryGet != null` because it skips the instance-pointer
 /// calculation. `inline` keeps the call site tight inside View.next().
+/// Resolve the storage for component type `T`, memoizing the pointer per
+/// `T` (perf, #509). `Registry.assure(T)` re-hashes a *comptime-constant*
+/// type id into a HashMap on EVERY component access to find a storage
+/// pointer that never changes for a given `T` over the registry's lifetime
+/// — profiling a 100-worker scene showed this `assure` HashMap path as the
+/// single biggest per-tick CPU cost (the `HashMapUnmanaged(u32,*anyopaque)`
+/// + Wyhash family). The cache drops it ~96%, going straight to the
+/// sparse-set lookup, and lifted Debug FPS ~+8% median / +24% at the dips.
+///
+/// `Cache` is a per-`T`, **threadlocal** static (one instantiation per
+/// component type, one copy per thread). Threadlocal is what keeps this
+/// race-free: the original `assure` map lives on the per-registry
+/// `self.components`, but a plain process-wide static would be shared across
+/// every adapter and thread — so any concurrent ECS access (e.g. a worker
+/// thread) would race on it. Per-thread storage removes the race entirely
+/// while staying far cheaper than the HashMap probe; each thread just
+/// re-resolves once per `T` on first touch.
+///
+/// The cache is validated against `self.instance_id`, not `&self.inner`, so
+/// a registry recreated at a reused address (new adapter → new id) cleanly
+/// misses and re-resolves rather than returning a freed storage pointer.
+inline fn cachedStorage(self: *Self, comptime T: type) @TypeOf(self.inner.assure(T)) {
+    const StoragePtr = @TypeOf(self.inner.assure(T));
+    const Cache = struct {
+        threadlocal var ptr: ?StoragePtr = null;
+        threadlocal var id: u64 = 0;
+    };
+    if (Cache.ptr) |p| {
+        if (Cache.id == self.instance_id) return p;
+    }
+    const s = self.inner.assure(T);
+    Cache.ptr = s;
+    Cache.id = self.instance_id;
+    return s;
+}
+
 inline fn storageContains(self: *Self, comptime T: type, ie: InternalEntity) bool {
-    return self.inner.assure(T).contains(ie);
+    return self.cachedStorage(T).contains(ie);
 }
 
 pub fn addComponent(self: *Self, entity: Entity, component: anytype) void {
@@ -128,7 +175,7 @@ pub fn getComponent(self: *Self, entity: Entity, comptime T: type) ?*T {
     if (comptime @sizeOf(T) == 0) {
         return if (self.storageContains(T, toInternal(entity))) emptySingleton(T) else null;
     }
-    return self.inner.tryGet(T, toInternal(entity));
+    return self.cachedStorage(T).tryGet(toInternal(entity));
 }
 
 pub fn hasComponent(self: *Self, entity: Entity, comptime T: type) bool {
