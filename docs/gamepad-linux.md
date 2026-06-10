@@ -50,7 +50,7 @@ joystick/gamepad node, no group membership or re-login required:
 ```sh
 sudo cp share/udev/99-labelle-gamepads.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
-sudo udevadm trigger
+sudo udevadm trigger --subsystem-match=input
 ```
 
 Then replug the controller (or re-trigger udev as above). The `uaccess` tag

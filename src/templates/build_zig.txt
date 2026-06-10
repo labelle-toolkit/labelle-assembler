@@ -307,12 +307,19 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
         // `udev_monitor_*`, `udev_enumerate_*`, etc. via `@extern "udev"`.
         // sokol's native Linux backend doesn't pull in libudev, so the
         // consumer must link it or the build fails with undefined
-        // `udev_*` symbols. Gated on `.linux` (the only target where the
-        // gamepad source compiles those externs in); macOS/Windows/web
-        // use platform-native detection sources with no libudev dep.
-        // The matching install instructions (input group / udev uaccess
-        // rule) live in docs/gamepad-linux.md.
-        .linux => exe.root_module.linkSystemLibrary("udev", .{}),
+        // `udev_*` symbols. Gated on DESKTOP `.linux` only; macOS/Windows/
+        // web use platform-native detection sources with no libudev dep.
+        // Android in Zig is also `os.tag == .linux` (abi `.android` /
+        // `.androideabi`) but has no libudev — and the Android build path
+        // links sokol via the separate `android_link` section, never this
+        // one — so excluding the Android ABI here keeps a desktop build
+        // cross-compiled with `-Dtarget=…-linux-android` from linking a
+        // libudev that doesn't exist on Android. The matching install
+        // instructions (input group / udev uaccess rule) live in
+        // docs/gamepad-linux.md.
+        .linux => if (target.result.abi != .android and target.result.abi != .androideabi) {
+            exe.root_module.linkSystemLibrary("udev", .{});
+        },
         else => {},
     }
 

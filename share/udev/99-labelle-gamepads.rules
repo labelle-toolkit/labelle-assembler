@@ -7,7 +7,7 @@
 # Install:
 #   sudo cp 99-labelle-gamepads.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules
-#   sudo udevadm trigger
+#   sudo udevadm trigger --subsystem-match=input
 # then replug the controller.
 #
 # How it works: udev already tags joystick/gamepad nodes with
