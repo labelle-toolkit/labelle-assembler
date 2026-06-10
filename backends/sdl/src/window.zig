@@ -19,7 +19,9 @@ pub fn setConfigFlags(flags: ConfigFlags) void {
 }
 
 pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
-    _ = c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO);
+    _ = c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO | c.SDL_INIT_GAMECONTROLLER);
+    // Bring up the gamepad subsystem and enumerate already-connected pads.
+    input.initGamepads();
     const window_flags: u32 = if (window_hidden) c.SDL_WINDOW_HIDDEN else c.SDL_WINDOW_SHOWN;
     sdl_window = c.SDL_CreateWindow(
         title.ptr,
@@ -38,6 +40,7 @@ pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
 }
 
 pub fn closeWindow() void {
+    input.deinitGamepads(); // close controllers before SDL_Quit
     audio.deinit(); // close mixer before SDL_Quit
     gfx.cleanup(); // release textures before destroying the renderer
     if (gfx.sdl_renderer) |r| c.SDL_DestroyRenderer(r);

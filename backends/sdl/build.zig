@@ -32,6 +32,11 @@ pub fn build(b: *std.Build) void {
     });
     addSdlPaths(b, sdl_mod, sdl_prefix);
 
+    // labelle-core — frozen gamepad event contract types consumed by the
+    // input backend (GamepadEvent / GamepadDescription, core#18).
+    const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
+    const core_mod = core_dep.module("labelle-core");
+
     // ── Gfx backend module ──────────────────────────────────────────
     const gfx_mod = b.addModule("gfx", .{
         .root_source_file = b.path("src/gfx.zig"),
@@ -47,6 +52,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     input_mod.addImport("sdl", sdl_mod);
+    input_mod.addImport("labelle_core", core_mod);
 
     // ── Audio backend module ────────────────────────────────────────
     // audio.zig has its own @cImport for SDL_mixer, so it needs the
@@ -80,6 +86,24 @@ pub fn build(b: *std.Build) void {
     });
     const test_step = b.step("test", "Run SDL backend build-helper tests");
     test_step.dependOn(&b.addRunArtifact(helper_tests).step);
+
+    // ── Input backend unit tests (gamepad mapping/ring logic) ───────
+    // Imports the same sdl + labelle-core modules and links SDL2 so the
+    // SDL_CONTROLLER_* constants resolve. These tests are hardware-free.
+    const input_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/input.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "sdl", .module = sdl_mod },
+                .{ .name = "labelle_core", .module = core_mod },
+            },
+        }),
+    });
+    addSdlPaths(b, input_tests.root_module, sdl_prefix);
+    input_tests.root_module.linkSystemLibrary("SDL2", .{});
+    test_step.dependOn(&b.addRunArtifact(input_tests).step);
 }
 
 fn addSdlPaths(b: *std.Build, mod: *std.Build.Module, prefix: []const u8) void {
