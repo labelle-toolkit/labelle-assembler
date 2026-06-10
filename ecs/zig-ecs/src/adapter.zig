@@ -35,11 +35,14 @@ alloc: std.mem.Allocator,
 /// `&self.inner` makes it immune to a registry being deinit'd and a new one
 /// allocated at the *same address* — that new adapter gets a fresh id, so
 /// the stale cached storage pointer is never returned.
-instance_id: u64,
+/// u32 (not u64): wasm32 baseline can't do 64-bit atomics (the `fetchAdd`
+/// below), and 4B unique ids per process is far more than enough for a
+/// cache-validation key. See labelle-engine#618.
+instance_id: u32,
 
 /// Monotonic source for `instance_id`. Starts at 1 so the cache's `id == 0`
 /// sentinel never matches a live adapter.
-var next_instance_id: std.atomic.Value(u64) = .init(1);
+var next_instance_id: std.atomic.Value(u32) = .init(1);
 
 fn toInternal(entity: Entity) InternalEntity {
     return @bitCast(entity);
@@ -151,7 +154,7 @@ inline fn cachedStorage(self: *Self, comptime T: type) @TypeOf(self.inner.assure
     const StoragePtr = @TypeOf(self.inner.assure(T));
     const Cache = struct {
         threadlocal var ptr: ?StoragePtr = null;
-        threadlocal var id: u64 = 0;
+        threadlocal var id: u32 = 0;
     };
     if (Cache.ptr) |p| {
         if (Cache.id == self.instance_id) return p;
