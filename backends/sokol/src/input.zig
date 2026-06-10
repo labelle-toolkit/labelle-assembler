@@ -29,6 +29,69 @@ const gc = if (gc_enabled) struct {
     extern "c" fn labelle_gc_connected(slot: u32) bool;
 } else struct {};
 
+// ── Android analog gamepad bridge (labelle-assembler#250) ──────────────
+//
+// sokol_app drops controller input on Android. The labelle-toolkit sokol fork
+// (branch `feat/forward-android-gamepad-events`) instead forwards the raw
+// gamepad data to a registered C callback. We register `androidGamepadCallback`
+// at `init`, accumulate per-device button/axis state in
+// `android_gamepad_state.zig` (mapping + quirk table), and resolve the
+// engine's `(gamepad_id, button/axis)` queries against it.
+//
+// The engine queries with `gamepad_id == Android device id`, because the #248
+// detection registry emits its hotplug `.slot` as the device id. The state
+// module keys its records on the same device id, so the two layers line up
+// without an extra translation table.
+//
+// All of this is gated behind `agp.is_android`: on every other target the
+// extern fork symbol is never referenced and the poll methods fall back to the
+// iOS GameController path (or the no-gamepad defaults).
+const agp = @import("android_gamepad_state.zig");
+
+const AndroidGamepadEventType = enum(c_int) {
+    invalid = 0,
+    key = 1,
+    motion = 2,
+};
+
+// Mirrors `sapp_android_gamepad_event` in the patched sokol_app.h. Field order
+// and types are ABI — keep in lockstep with the fork header.
+const SappAndroidGamepadEvent = extern struct {
+    type: AndroidGamepadEventType,
+    device_id: i32,
+    key_code: i32,
+    key_down: bool,
+    axis: [agp.FORWARDED_AXIS_COUNT]f32,
+};
+
+const android_gp = if (agp.is_android) struct {
+    extern "c" fn sapp_android_register_gamepad_callback(
+        cb: ?*const fn (ev: *const SappAndroidGamepadEvent) callconv(.c) void,
+    ) void;
+} else struct {};
+
+/// Forwarded-event sink, invoked by the sokol fork on the Android Looper
+/// thread. Exported with C linkage so the fork's registration can call it.
+/// `export` is harmless on non-Android targets (it is just never invoked, and
+/// the body is a comptime no-op there).
+export fn androidGamepadCallback(ev: *const SappAndroidGamepadEvent) callconv(.c) void {
+    if (comptime !agp.is_android) return;
+    switch (ev.type) {
+        .key => agp.applyKey(ev.device_id, ev.key_code, ev.key_down),
+        .motion => agp.applyMotion(ev.device_id, ev.axis),
+        .invalid => {},
+    }
+}
+
+/// Register the forwarded-gamepad callback with the sokol fork. Call once at
+/// startup (from `window.zig`'s init, alongside the detection-registry init).
+/// No-op off Android.
+pub fn initAndroidGamepad() void {
+    if (comptime agp.is_android) {
+        android_gp.sapp_android_register_gamepad_callback(&androidGamepadCallback);
+    }
+}
+
 // ── State ─────────────────────────────────────────────────
 
 var keys_down: [512]bool = [_]bool{false} ** 512;
@@ -174,18 +237,24 @@ var gamepad_prev_down: [MAX_GAMEPADS][MAX_GAMEPAD_BUTTONS]bool =
     [_][MAX_GAMEPAD_BUTTONS]bool{[_]bool{false} ** MAX_GAMEPAD_BUTTONS} ** MAX_GAMEPADS;
 
 pub fn isGamepadAvailable(gamepad_id: u32) bool {
+    if (comptime agp.is_android) return agp.connected(gamepad_id);
     if (!gc_enabled) return false;
     if (gamepad_id >= MAX_GAMEPADS) return false;
     return gc.labelle_gc_connected(gamepad_id);
 }
 
 pub fn isGamepadButtonDown(gamepad_id: u32, button: u32) bool {
+    if (comptime agp.is_android) return agp.buttonDown(gamepad_id, button);
     if (!gc_enabled) return false;
     if (gamepad_id >= MAX_GAMEPADS or button >= MAX_GAMEPAD_BUTTONS) return false;
     return gc.labelle_gc_button_down(gamepad_id, button);
 }
 
 pub fn isGamepadButtonPressed(gamepad_id: u32, button: u32) bool {
+    // On Android, edge detection lives in the state module (it snapshots
+    // prev-down across `newFrame`), keyed by Android device id rather than a
+    // fixed 0..3 slot.
+    if (comptime agp.is_android) return agp.buttonPressed(gamepad_id, button);
     if (!gc_enabled) return false;
     // Bounds-check before indexing `gamepad_prev_down` and before the extern
     // call — out-of-range queries report "not pressed" (matches isKeyPressed).
@@ -195,6 +264,7 @@ pub fn isGamepadButtonPressed(gamepad_id: u32, button: u32) bool {
 }
 
 pub fn getGamepadAxisValue(gamepad_id: u32, axis: u32) f32 {
+    if (comptime agp.is_android) return agp.axisValue(gamepad_id, axis);
     if (!gc_enabled) return 0;
     // Guard the axis too (not just gamepad_id) so an out-of-range index can't
     // cross the C ABI — matches the SDL backend's safe-0 return.
@@ -205,6 +275,10 @@ pub fn getGamepadAxisValue(gamepad_id: u32, axis: u32) f32 {
 /// Snapshot current gamepad button state so the next frame's
 /// `isGamepadButtonPressed` can compute the rising edge. No-op off ios/tvos.
 fn snapshotGamepadButtons() void {
+    if (comptime agp.is_android) {
+        agp.newFrame();
+        return;
+    }
     if (!gc_enabled) return;
     var g: u32 = 0;
     while (g < MAX_GAMEPADS) : (g += 1) {
@@ -299,8 +373,22 @@ pub fn handleEvent(ev: [*c]const sapp.Event) void {
 /// Re-export Event type for consumers that need it (e.g., GUI adapters).
 pub const Event = sapp.Event;
 
+/// One-shot guard so we register the Android forwarded-gamepad callback with
+/// the sokol fork exactly once, lazily, at the first frame. Registering here
+/// (rather than requiring the generated main to call a sokol-specific init)
+/// keeps the engine→backend contract unchanged. Idempotent: the fork just
+/// stores the latest pointer.
+var android_gp_registered: bool = false;
+
 /// Clear per-frame state (call at start of each frame).
 pub fn newFrame() void {
+    if (comptime agp.is_android) {
+        if (!android_gp_registered) {
+            initAndroidGamepad();
+            android_gp_registered = true;
+        }
+    }
+
     keys_pressed = [_]bool{false} ** 512;
     keys_released = [_]bool{false} ** 512;
     mouse_buttons_pressed = [_]bool{false} ** 3;
