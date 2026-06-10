@@ -1,5 +1,13 @@
 /// Raylib input backend — satisfies the engine InputInterface(Impl) contract.
+const std = @import("std");
 const rl = @import("raylib");
+const core = @import("labelle-core");
+
+const GamepadEvent = core.GamepadEvent;
+const GamepadDescription = core.GamepadDescription;
+
+/// raylib supports at most 4 gamepads (MAX_GAMEPADS).
+const MAX_GAMEPADS: u32 = 4;
 
 // ── Keyboard ──────────────────────────────────────────────
 
@@ -78,4 +86,124 @@ pub fn isGamepadButtonPressed(gamepad: u32, button: u32) bool {
 
 pub fn getGamepadAxisValue(gamepad: u32, axis: u32) f32 {
     return rl.getGamepadAxisMovement(@intCast(gamepad), @enumFromInt(axis));
+}
+
+// ── Gamepad hotplug (labelle-core#18) ─────────────────────
+//
+// raylib has no connection callback; hotplug is discovered by polling
+// rl.isGamepadAvailable() each frame. We keep the previous availability
+// snapshot module-level and edge-detect connect/disconnect transitions.
+
+var prev_available: [MAX_GAMEPADS]bool = [_]bool{false} ** MAX_GAMEPADS;
+
+/// Best-guess vendor family from raylib's gamepad name string. raylib does
+/// not expose a stable GUID, so glyph selection has to lean on the name.
+fn typeHintFromName(name: []const u8) core.gamepad.TypeHint {
+    if (containsIgnoreCase(name, "xbox")) return .xbox;
+    if (containsIgnoreCase(name, "playstation") or
+        containsIgnoreCase(name, "dualsense") or
+        containsIgnoreCase(name, "dualshock") or
+        containsIgnoreCase(name, "wireless controller")) return .playstation;
+    if (containsIgnoreCase(name, "nintendo") or
+        containsIgnoreCase(name, "switch") or
+        containsIgnoreCase(name, "joy-con") or
+        containsIgnoreCase(name, "pro controller")) return .nintendo;
+    if (name.len > 0) return .generic;
+    return .unknown;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+}
+
+/// Null-safe gamepad name lookup. The raylib-zig wrapper `rl.getGamepadName`
+/// returns `[:0]const u8` by calling `std.mem.span` on the raw C pointer — but
+/// the underlying `GetGamepadName` returns NULL when the driver exposes no name
+/// for an otherwise-available pad (some SDL/GLFW backends), which would panic
+/// the wrapper's `std.mem.span`. We call the C extern directly, null-check, and
+/// fall back to "" so an unnamed-but-connected pad still emits a clean event.
+fn gamepadName(slot: u32) [:0]const u8 {
+    const ptr = rl.cdef.GetGamepadName(@intCast(slot));
+    if (ptr == null) return "";
+    return std.mem.span(ptr);
+}
+
+/// Drain raylib's gamepad hotplug transitions into `out`, returning the
+/// number of events written (never more than `out.len`). Edge-detected
+/// against the previous poll: a slot that flips available→true emits a
+/// `connected` event (name + type_hint best-effort, guid=null,
+/// source_class=.gamepad); available→false emits a `disconnected` event.
+///
+/// The internal `prev_available` snapshot is advanced for a slot only once its
+/// transition has actually been written to `out`. If `out` fills up mid-drain,
+/// the pending edge is left un-acked and re-fires on the next poll rather than
+/// being lost. (Callers should still size `out` >= MAX_GAMEPADS so this never
+/// triggers in practice.)
+pub fn pollGamepadEvents(out: []GamepadEvent) usize {
+    var count: usize = 0;
+    var slot: u32 = 0;
+    while (slot < MAX_GAMEPADS) : (slot += 1) {
+        const now = rl.isGamepadAvailable(@intCast(slot));
+        const was = prev_available[slot];
+        if (now == was) continue;
+
+        // Out of buffer space: leave prev_available unchanged so this edge
+        // re-fires on the next drain instead of being silently dropped.
+        if (count >= out.len) continue;
+
+        if (now) {
+            const name = gamepadName(slot);
+            var ev = GamepadEvent.connected(slot, name);
+            ev.source_class = .gamepad;
+            ev.type_hint = typeHintFromName(name);
+            out[count] = ev;
+        } else {
+            out[count] = GamepadEvent.disconnected(slot);
+        }
+        prev_available[slot] = now;
+        count += 1;
+    }
+    return count;
+}
+
+/// Snapshot every currently-visible gamepad slot into `out` (state, not
+/// deltas), returning the number written (<= `out.len`). Disconnected slots
+/// are reported with `connected = false` and an empty name.
+pub fn describeGamepads(out: []GamepadDescription) usize {
+    var count: usize = 0;
+    var slot: u32 = 0;
+    while (slot < MAX_GAMEPADS and count < out.len) : (slot += 1) {
+        const available = rl.isGamepadAvailable(@intCast(slot));
+        var desc = GamepadDescription{ .slot = slot, .connected = available };
+        if (available) {
+            const name = gamepadName(slot);
+            desc.setName(name);
+            desc.source_class = .gamepad;
+            desc.type_hint = typeHintFromName(name);
+        }
+        out[count] = desc;
+        count += 1;
+    }
+    return count;
+}
+
+// ── Tests ─────────────────────────────────────────────────
+//
+// These exercise the pure name→type_hint classification logic, which is
+// the only part of the gamepad hotplug path that doesn't need a live
+// raylib window/device. pollGamepadEvents / describeGamepads call into
+// rl.isGamepadAvailable which requires an initialized window, so they're
+// out of scope for unit tests here.
+
+test "typeHintFromName classifies known vendor families" {
+    const TypeHint = core.gamepad.TypeHint;
+    try std.testing.expectEqual(TypeHint.xbox, typeHintFromName("Xbox Wireless Controller"));
+    try std.testing.expectEqual(TypeHint.xbox, typeHintFromName("XBOX 360 For Windows"));
+    try std.testing.expectEqual(TypeHint.playstation, typeHintFromName("Sony DualSense Wireless Controller"));
+    try std.testing.expectEqual(TypeHint.playstation, typeHintFromName("PLAYSTATION(R)3 Controller"));
+    try std.testing.expectEqual(TypeHint.playstation, typeHintFromName("Wireless Controller"));
+    try std.testing.expectEqual(TypeHint.nintendo, typeHintFromName("Nintendo Switch Pro Controller"));
+    try std.testing.expectEqual(TypeHint.nintendo, typeHintFromName("Joy-Con (L)"));
+    try std.testing.expectEqual(TypeHint.generic, typeHintFromName("Generic USB Joystick"));
+    try std.testing.expectEqual(TypeHint.unknown, typeHintFromName(""));
 }
