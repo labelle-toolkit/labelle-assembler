@@ -88,6 +88,43 @@ pub fn getTouchId(index: u32) u64 {
     return touch_ids[index];
 }
 
+// ── Gamepad back-button interception (Android, labelle-assembler#248) ─
+//
+// On Android the controller "B" button is reported by the system as
+// `KEYCODE_BACK`. sokol_app's Android backend hard-consumes `AKEYCODE_BACK`
+// in `_sapp_android_key_event` and calls `_sapp_android_shutdown()` directly
+// — it never forwards a sokol event for it. So a player pressing B on a
+// controller silently quits the game.
+//
+// We cannot intercept that from the Zig event callback for the *default*
+// sokol build, because sokol consumes the key before our `event_cb` runs.
+// What we CAN do here is provide the policy hook + state used by the
+// interception path, and treat a forwarded BACK/B (when a sokol patch or a
+// controller that does NOT alias B→BACK delivers it) as a gamepad button
+// rather than a window-close. `consume_back` defaults true so games don't
+// exit on B; flip it off if you want BACK to close the app.
+//
+// On-device wiring (PR checklist): the complete fix routes controller key
+// events through the JNI glue's listener path and only forwards true
+// navigation BACK (touch / system bar) to the quit path.
+pub var consume_back: bool = true;
+
+/// True if `keycode` is the Android BACK key — which is also what a
+/// controller B reports on Android. 0x04 == AKEYCODE_BACK. We deliberately
+/// do NOT include sokol's ESCAPE (256) here: on desktop, ESCAPE-to-quit is a
+/// game-level policy driven by `g.isRunning()`, not a window-close, so
+/// guarding it would silently break desktop quit handling.
+pub fn isBackKey(keycode: i32) bool {
+    return keycode == 0x04; // AKEYCODE_BACK
+}
+
+/// Whether a BACK/B key event should be swallowed (kept from quitting the
+/// app). Returns true when interception is enabled. The event callback uses
+/// this to decide whether to record the key vs. drop it.
+pub fn shouldConsumeBack(keycode: i32) bool {
+    return consume_back and isBackKey(keycode);
+}
+
 // ── Gamepad (not available via sokol_app — return defaults) ─
 
 pub fn isGamepadAvailable(_: u32) bool {
@@ -113,6 +150,12 @@ pub fn handleEvent(ev: [*c]const sapp.Event) void {
     switch (ev.*.type) {
         .KEY_DOWN => {
             const ki: i32 = @intFromEnum(ev.*.key_code);
+            // Intercept controller-B/BACK so it doesn't trigger an app quit.
+            // When interception is enabled we drop the key entirely (do not
+            // record it) so neither sokol nor game code treats it as a
+            // window-close. See `shouldConsumeBack` for the sokol-level
+            // limitation this works around.
+            if (shouldConsumeBack(ki)) return;
             if (ki >= 0 and ki < 512) {
                 const k: usize = @intCast(ki);
                 keys_down[k] = true;
@@ -121,6 +164,10 @@ pub fn handleEvent(ev: [*c]const sapp.Event) void {
         },
         .KEY_UP => {
             const ki: i32 = @intFromEnum(ev.*.key_code);
+            // Symmetric with KEY_DOWN: if we swallow the press, we must also
+            // swallow the release. Otherwise BACK/B records a `keys_released`
+            // with no matching press, producing a spurious release event.
+            if (shouldConsumeBack(ki)) return;
             if (ki >= 0 and ki < 512) {
                 const k: usize = @intCast(ki);
                 keys_down[k] = false;
@@ -181,4 +228,26 @@ pub fn newFrame() void {
     mouse_buttons_pressed = [_]bool{false} ** 3;
     mouse_buttons_released = [_]bool{false} ** 3;
     mouse_wheel = 0;
+}
+
+// ── Tests (pure back-key policy; no sokol calls) ──────────────────────────
+
+const std = @import("std");
+
+test "isBackKey matches Android AKEYCODE_BACK only" {
+    try std.testing.expect(isBackKey(0x04)); // AKEYCODE_BACK / controller B
+    try std.testing.expect(!isBackKey(256)); // ESCAPE — game-level quit, not guarded
+    try std.testing.expect(!isBackKey(65)); // 'A'
+}
+
+test "shouldConsumeBack honors the consume_back flag" {
+    const saved = consume_back;
+    defer consume_back = saved;
+
+    consume_back = true;
+    try std.testing.expect(shouldConsumeBack(0x04));
+    try std.testing.expect(!shouldConsumeBack(65));
+
+    consume_back = false;
+    try std.testing.expect(!shouldConsumeBack(0x04));
 }
