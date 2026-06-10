@@ -116,29 +116,43 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
 }
 
+/// Null-safe gamepad name lookup. The raylib-zig wrapper `rl.getGamepadName`
+/// returns `[:0]const u8` by calling `std.mem.span` on the raw C pointer — but
+/// the underlying `GetGamepadName` returns NULL when the driver exposes no name
+/// for an otherwise-available pad (some SDL/GLFW backends), which would panic
+/// the wrapper's `std.mem.span`. We call the C extern directly, null-check, and
+/// fall back to "" so an unnamed-but-connected pad still emits a clean event.
+fn gamepadName(slot: u32) [:0]const u8 {
+    const ptr = rl.cdef.GetGamepadName(@intCast(slot));
+    if (ptr == null) return "";
+    return std.mem.span(ptr);
+}
+
 /// Drain raylib's gamepad hotplug transitions into `out`, returning the
 /// number of events written (never more than `out.len`). Edge-detected
 /// against the previous poll: a slot that flips available→true emits a
 /// `connected` event (name + type_hint best-effort, guid=null,
 /// source_class=.gamepad); available→false emits a `disconnected` event.
 ///
-/// The internal `prev_available` snapshot is always updated for every slot,
-/// even when `out` is full — so a dropped event is not silently re-emitted
-/// on the next poll. (Callers should size `out` >= MAX_GAMEPADS to avoid
-/// losing transitions.)
+/// The internal `prev_available` snapshot is advanced for a slot only once its
+/// transition has actually been written to `out`. If `out` fills up mid-drain,
+/// the pending edge is left un-acked and re-fires on the next poll rather than
+/// being lost. (Callers should still size `out` >= MAX_GAMEPADS so this never
+/// triggers in practice.)
 pub fn pollGamepadEvents(out: []GamepadEvent) usize {
     var count: usize = 0;
     var slot: u32 = 0;
     while (slot < MAX_GAMEPADS) : (slot += 1) {
         const now = rl.isGamepadAvailable(@intCast(slot));
         const was = prev_available[slot];
-        prev_available[slot] = now;
         if (now == was) continue;
 
+        // Out of buffer space: leave prev_available unchanged so this edge
+        // re-fires on the next drain instead of being silently dropped.
         if (count >= out.len) continue;
 
         if (now) {
-            const name = rl.getGamepadName(@intCast(slot));
+            const name = gamepadName(slot);
             var ev = GamepadEvent.connected(slot, name);
             ev.source_class = .gamepad;
             ev.type_hint = typeHintFromName(name);
@@ -146,6 +160,7 @@ pub fn pollGamepadEvents(out: []GamepadEvent) usize {
         } else {
             out[count] = GamepadEvent.disconnected(slot);
         }
+        prev_available[slot] = now;
         count += 1;
     }
     return count;
@@ -161,7 +176,7 @@ pub fn describeGamepads(out: []GamepadDescription) usize {
         const available = rl.isGamepadAvailable(@intCast(slot));
         var desc = GamepadDescription{ .slot = slot, .connected = available };
         if (available) {
-            const name = rl.getGamepadName(@intCast(slot));
+            const name = gamepadName(slot);
             desc.setName(name);
             desc.source_class = .gamepad;
             desc.type_hint = typeHintFromName(name);
