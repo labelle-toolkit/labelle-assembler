@@ -13,6 +13,15 @@ pub fn build(b: *std.Build) void {
     const raylib_mod = raylib_dep.module("raylib");
     const raylib_artifact = raylib_dep.artifact("raylib");
 
+    // labelle-core supplies the cross-backend gamepad event contract
+    // (GamepadEvent / GamepadDescription) consumed by input.zig's
+    // pollGamepadEvents / describeGamepads (labelle-core#18). Dependency
+    // is path-pinned during local dev; consumers (the assembler) inject
+    // the canonical labelle-core module via overrideImport, so this just
+    // needs to resolve the `labelle-core` import for standalone builds.
+    const core_dep = b.dependency("labelle-core", .{ .target = target, .optimize = optimize });
+    const core_mod = core_dep.module("labelle-core");
+
     // ── Gfx backend module ──────────────────────────────────────────
     const gfx_mod = b.addModule("gfx", .{
         .root_source_file = b.path("src/gfx.zig"),
@@ -46,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     input_mod.addImport("raylib", raylib_mod);
+    input_mod.addImport("labelle-core", core_mod);
 
     // ── Audio backend module ────────────────────────────────────────
     const audio_mod = b.addModule("audio", .{
@@ -149,8 +159,23 @@ pub fn build(b: *std.Build) void {
     gfx_host_mod.addIncludePath(b.path("src"));
     gfx_host_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
 
+    // input.zig imports `raylib` (poll/describe gamepad helpers call into
+    // rl.isGamepadAvailable) and `labelle-core` (GamepadEvent contract), so
+    // its test binary links raylib's C artifact + host frameworks — same
+    // reason it rides the host-native `test-host` step, not the linker-free
+    // default `test` step.
+    const input_host_mod = b.createModule(.{
+        .root_source_file = b.path("src/input.zig"),
+        .target = host_target,
+        .optimize = optimize,
+    });
+    input_host_mod.addImport("raylib", raylib_mod);
+    input_host_mod.addImport("labelle-core", core_mod);
+    input_host_mod.linkLibrary(raylib_artifact);
+
     const audio_compile_check = b.addTest(.{ .root_module = audio_host_mod });
     const gfx_compile_check = b.addTest(.{ .root_module = gfx_host_mod });
+    const input_compile_check = b.addTest(.{ .root_module = input_host_mod });
 
     const test_host_step = b.step(
         "test-host",
@@ -158,5 +183,6 @@ pub fn build(b: *std.Build) void {
     );
     test_host_step.dependOn(&b.addRunArtifact(audio_compile_check).step);
     test_host_step.dependOn(&b.addRunArtifact(gfx_compile_check).step);
+    test_host_step.dependOn(&b.addRunArtifact(input_compile_check).step);
     test_host_step.dependOn(&b.addRunArtifact(slot_alloc_tests).step);
 }
