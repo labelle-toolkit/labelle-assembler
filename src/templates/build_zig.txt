@@ -360,6 +360,13 @@ fn linkIosFrameworks(exe: *std.Build.Step.Compile) void {
     exe.root_module.linkFramework("AudioToolbox", .{});
     exe.root_module.linkFramework("AVFoundation", .{});
     exe.root_module.linkFramework("QuartzCore", .{});
+    // GameController.framework — backs the ios/tvos gamepad bridge in
+    // labelle-core (`src/gamepad_source/ios.zig`). That file `@export`s the
+    // `labelle_gc_*` C symbols the sokol input backend consumes; the objc
+    // selectors it sends (`+[GCController controllers]`, `-extendedGamepad`,
+    // etc.) resolve against this framework. Without it the link fails with
+    // undefined `_OBJC_CLASS_$_GCController` (labelle-assembler#251).
+    exe.root_module.linkFramework("GameController", .{});
 }
 
 pub fn build(b: *std.Build) void {

@@ -1,7 +1,33 @@
 /// Sokol input backend — satisfies the engine InputInterface(Impl) contract.
 /// Uses sokol_app events for keyboard/mouse/touch state.
+const builtin = @import("builtin");
 const sokol = @import("sokol");
 const sapp = sokol.app;
+
+// ── iOS / tvOS gamepad bridge (labelle-assembler#251) ──────────────
+//
+// sokol_app has no gamepad pipeline of its own, so gamepad state on
+// ios/tvos comes from Apple's GameController.framework. The objc bridge
+// lives in labelle-core (`src/gamepad_source/ios.zig`) — it owns the single
+// `GCController` connection, so there is exactly one set of live state.
+//
+// This backend module has no dependency edge to labelle-core, so we reach
+// the GC state through a tiny exported C ABI rather than a Zig import: the
+// core file `@export`s `labelle_gc_*` and we re-declare them `extern` here.
+// Both sides are gated on ios/tvos, so on every other target these symbols
+// never exist and are never referenced — the gamepad poll methods below fall
+// back to the original "no gamepad" behavior.
+//
+// The exe links both labelle-core (which provides the symbols) and this
+// `input` module (which consumes them), and GameController.framework is
+// linked by the generated build.zig — so the link resolves on-device.
+const gc_enabled = builtin.target.os.tag == .ios or builtin.target.os.tag == .tvos;
+
+const gc = if (gc_enabled) struct {
+    extern "c" fn labelle_gc_button_down(slot: u32, button: u32) bool;
+    extern "c" fn labelle_gc_axis_value(slot: u32, axis: u32) f32;
+    extern "c" fn labelle_gc_connected(slot: u32) bool;
+} else struct {};
 
 // ── State ─────────────────────────────────────────────────
 
@@ -125,22 +151,63 @@ pub fn shouldConsumeBack(keycode: i32) bool {
     return consume_back and isBackKey(keycode);
 }
 
-// ── Gamepad (not available via sokol_app — return defaults) ─
+// ── Gamepad ───────────────────────────────────────────────
+//
+// On ios/tvos these forward to the GameController bridge in labelle-core
+// (see the `gc` extern block above). On every other target sokol_app has no
+// gamepad pipeline, so they return the original defaults.
+//
+// `isGamepadButtonPressed` needs a rising-edge: GameController is a pure
+// state API (`isPressed`), with no "pressed-this-frame" flag. We derive the
+// edge by comparing the current `down` state against the previous frame's,
+// snapshotted in `newFrame`. Button/axis numbering follows the engine's
+// canonical raylib-compatible `GamepadButton`/`GamepadAxis` enums — the same
+// values the core bridge maps to GCExtendedGamepad elements.
 
-pub fn isGamepadAvailable(_: u32) bool {
-    return false;
+const MAX_GAMEPADS = 4;
+const MAX_GAMEPAD_BUTTONS = 18; // raylib GamepadButton range [0, 17]
+
+// Previous-frame "down" snapshot, used to compute the rising edge in
+// `isGamepadButtonPressed`. Updated once per frame in `newFrame`.
+var gamepad_prev_down: [MAX_GAMEPADS][MAX_GAMEPAD_BUTTONS]bool =
+    [_][MAX_GAMEPAD_BUTTONS]bool{[_]bool{false} ** MAX_GAMEPAD_BUTTONS} ** MAX_GAMEPADS;
+
+pub fn isGamepadAvailable(gamepad_id: u32) bool {
+    if (!gc_enabled) return false;
+    return gc.labelle_gc_connected(gamepad_id);
 }
 
-pub fn isGamepadButtonDown(_: u32, _: u32) bool {
-    return false;
+pub fn isGamepadButtonDown(gamepad_id: u32, button: u32) bool {
+    if (!gc_enabled) return false;
+    return gc.labelle_gc_button_down(gamepad_id, button);
 }
 
-pub fn isGamepadButtonPressed(_: u32, _: u32) bool {
-    return false;
+pub fn isGamepadButtonPressed(gamepad_id: u32, button: u32) bool {
+    if (!gc_enabled) return false;
+    const now = gc.labelle_gc_button_down(gamepad_id, button);
+    if (gamepad_id >= MAX_GAMEPADS or button >= MAX_GAMEPAD_BUTTONS) {
+        // Out of our edge-tracking range — best-effort "down" (no edge).
+        return now;
+    }
+    return now and !gamepad_prev_down[gamepad_id][button];
 }
 
-pub fn getGamepadAxisValue(_: u32, _: u32) f32 {
-    return 0;
+pub fn getGamepadAxisValue(gamepad_id: u32, axis: u32) f32 {
+    if (!gc_enabled) return 0;
+    return gc.labelle_gc_axis_value(gamepad_id, axis);
+}
+
+/// Snapshot current gamepad button state so the next frame's
+/// `isGamepadButtonPressed` can compute the rising edge. No-op off ios/tvos.
+fn snapshotGamepadButtons() void {
+    if (!gc_enabled) return;
+    var g: u32 = 0;
+    while (g < MAX_GAMEPADS) : (g += 1) {
+        var btn: u32 = 0;
+        while (btn < MAX_GAMEPAD_BUTTONS) : (btn += 1) {
+            gamepad_prev_down[g][btn] = gc.labelle_gc_button_down(g, btn);
+        }
+    }
 }
 
 // ── Event handling ────────────────────────────────────────
@@ -228,6 +295,13 @@ pub fn newFrame() void {
     mouse_buttons_pressed = [_]bool{false} ** 3;
     mouse_buttons_released = [_]bool{false} ** 3;
     mouse_wheel = 0;
+
+    // Snapshot the gamepad button state at the frame boundary. Queries made
+    // during this frame compare the (continuously-updated) live state against
+    // this snapshot to derive `isGamepadButtonPressed`'s rising edge. Keyboard
+    // and mouse edges are event-driven (set in `handleEvent`); GameController
+    // has no event pipeline here, so the gamepad edge is sampled instead.
+    snapshotGamepadButtons();
 }
 
 // ── Tests (pure back-key policy; no sokol calls) ──────────────────────────
