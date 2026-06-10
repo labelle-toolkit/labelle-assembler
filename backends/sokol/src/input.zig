@@ -164,6 +164,10 @@ pub fn handleEvent(ev: [*c]const sapp.Event) void {
         },
         .KEY_UP => {
             const ki: i32 = @intFromEnum(ev.*.key_code);
+            // Symmetric with KEY_DOWN: if we swallow the press, we must also
+            // swallow the release. Otherwise BACK/B records a `keys_released`
+            // with no matching press, producing a spurious release event.
+            if (shouldConsumeBack(ki)) return;
             if (ki >= 0 and ki < 512) {
                 const k: usize = @intCast(ki);
                 keys_down[k] = false;

@@ -53,7 +53,9 @@ static jmethodID g_mid_get_sources = NULL;     // InputDevice.getSources()
 
 // Resolve InputDevice metadata for `device_id` and forward to Zig.
 static void emit_device_added(JNIEnv *env, jint device_id) {
-    if (!g_input_device_cls || !g_mid_get_device) {
+    // All cached method IDs must be present — calling a NULL jmethodID is UB.
+    if (!g_input_device_cls || !g_mid_get_device || !g_mid_get_name ||
+        !g_mid_get_descriptor || !g_mid_get_sources) {
         return;
     }
     jobject device = (*env)->CallStaticObjectMethod(
@@ -67,9 +69,22 @@ static void emit_device_added(JNIEnv *env, jint device_id) {
     }
 
     jint sources = (*env)->CallIntMethod(env, device, g_mid_get_sources);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, device);
+        return;
+    }
 
     jstring jname = (jstring)(*env)->CallObjectMethod(env, device, g_mid_get_name);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        jname = NULL;
+    }
     jstring jdesc = (jstring)(*env)->CallObjectMethod(env, device, g_mid_get_descriptor);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        jdesc = NULL;
+    }
 
     const char *name = jname ? (*env)->GetStringUTFChars(env, jname, NULL) : NULL;
     const char *desc = jdesc ? (*env)->GetStringUTFChars(env, jdesc, NULL) : NULL;
@@ -134,21 +149,34 @@ static void enumerate_existing(JNIEnv *env) {
         return;
     }
     jclass im_cls = (*env)->GetObjectClass(env, g_input_manager);
+    if (im_cls == NULL) {
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        return;
+    }
     jmethodID mid_ids = (*env)->GetMethodID(env, im_cls, "getInputDeviceIds", "()[I");
     if (!mid_ids) {
         (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, im_cls);
         return;
     }
     jintArray ids = (jintArray)(*env)->CallObjectMethod(env, g_input_manager, mid_ids);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+    }
     if (ids == NULL) {
+        (*env)->DeleteLocalRef(env, im_cls);
         return;
     }
     jsize n = (*env)->GetArrayLength(env, ids);
     jint *elems = (*env)->GetIntArrayElements(env, ids, NULL);
-    for (jsize i = 0; i < n; i++) {
-        emit_device_added(env, elems[i]);
+    if (elems != NULL) {
+        for (jsize i = 0; i < n; i++) {
+            emit_device_added(env, elems[i]);
+        }
+        (*env)->ReleaseIntArrayElements(env, ids, elems, JNI_ABORT);
     }
-    (*env)->ReleaseIntArrayElements(env, ids, elems, JNI_ABORT);
     (*env)->DeleteLocalRef(env, ids);
     (*env)->DeleteLocalRef(env, im_cls);
 }
@@ -161,6 +189,13 @@ static void cache_input_device_methods(JNIEnv *env) {
         return;
     }
     g_input_device_cls = (jclass)(*env)->NewGlobalRef(env, local);
+    (*env)->DeleteLocalRef(env, local);
+    if (g_input_device_cls == NULL) {
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        return;
+    }
     g_mid_get_device = (*env)->GetStaticMethodID(
         env, g_input_device_cls, "getDevice", "(I)Landroid/view/InputDevice;");
     g_mid_get_name = (*env)->GetMethodID(
@@ -169,12 +204,23 @@ static void cache_input_device_methods(JNIEnv *env) {
         env, g_input_device_cls, "getDescriptor", "()Ljava/lang/String;");
     g_mid_get_sources = (*env)->GetMethodID(
         env, g_input_device_cls, "getSources", "()I");
-    (*env)->DeleteLocalRef(env, local);
+    // A failed GetStaticMethodID/GetMethodID throws NoSuchMethodError; clear it
+    // so the env isn't left with a pending exception for later JNI calls.
+    // emit_device_added still guards against any NULL id before use.
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+    }
 }
 
 // Acquire the InputManager via Context.getSystemService(Context.INPUT_SERVICE).
 static void acquire_input_manager(JNIEnv *env, jobject activity) {
     jclass ctx_cls = (*env)->GetObjectClass(env, activity);
+    if (ctx_cls == NULL) {
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        return;
+    }
     jmethodID mid_get_service = (*env)->GetMethodID(
         env, ctx_cls, "getSystemService",
         "(Ljava/lang/String;)Ljava/lang/Object;");
@@ -185,7 +231,19 @@ static void acquire_input_manager(JNIEnv *env, jobject activity) {
     }
     // Context.INPUT_SERVICE == "input"
     jstring svc = (*env)->NewStringUTF(env, "input");
+    if (svc == NULL) {
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        (*env)->DeleteLocalRef(env, ctx_cls);
+        return;
+    }
     jobject im = (*env)->CallObjectMethod(env, activity, mid_get_service, svc);
+    // getSystemService can throw; clear before any later JNI call relies on a
+    // clean env, otherwise enumerate_existing / FindClass would misbehave.
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+    }
     if (im != NULL) {
         g_input_manager = (*env)->NewGlobalRef(env, im);
         (*env)->DeleteLocalRef(env, im);
