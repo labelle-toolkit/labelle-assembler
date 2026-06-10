@@ -108,6 +108,23 @@ pub fn build(b: *std.Build) void {
     });
     input_mod.addImport("sokol", sokol_mod);
 
+    // Android gamepad DETECTION glue (labelle-assembler#248). The JNI
+    // bridge calls into Android's InputManager to detect controller
+    // hotplug/identity; labelle-core's `gamepad_source/android.zig` declares
+    // the `extern fn labelle_android_gamepad_init/_shutdown` entry points
+    // this file defines, and the `export fn labelle_android_on_device_*`
+    // callbacks it invokes. The C TU is wrapped in `#ifdef __ANDROID__`, so
+    // it emits an empty object on every other target — safe to add
+    // unconditionally. Compiling it requires libc (jni.h / NDK headers), so
+    // gate `link_libc` on Android to keep desktop/wasm builds linker-free.
+    if (is_android) {
+        input_mod.link_libc = true;
+        input_mod.addCSourceFile(.{
+            .file = b.path("src/android_gamepad_jni.c"),
+            .flags = &.{},
+        });
+    }
+
     // ── Audio backend module ────────────────────────────────────────
     const audio_mod = b.addModule("audio", .{
         .root_source_file = b.path("src/audio.zig"),
@@ -191,6 +208,14 @@ pub fn build(b: *std.Build) void {
     // sokol_gfx + stb_truetype.
     const gfx_compile_check = b.addTest(.{ .root_module = gfx_mod });
     test_step.dependOn(&gfx_compile_check.step);
+
+    // Compile-check input.zig — pulls in sokol_app + (on Android) the JNI
+    // gamepad-detection C glue. Regression lock for labelle-assembler#248:
+    // verifies the back-key policy compiles and, on the Android target, that
+    // `android_gamepad_jni.c` links into the input module graph. Like the
+    // other checks this only builds the binary (cross-compile safe).
+    const input_compile_check = b.addTest(.{ .root_module = input_mod });
+    test_step.dependOn(&input_compile_check.step);
 
     // Compile-check window.zig — pulls in sokol + the per-backend
     // screenshot readback helpers (`screenshot/metal.zig`, `gl.zig`,
