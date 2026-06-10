@@ -128,6 +128,46 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(engine_mod, \"labelle-gfx\", gfx_mod)") != null);
     }
 
+    test "unifies labelle-core onto the raylib backend input module" {
+        // The raylib `input` module imports labelle-core (for GamepadEvent),
+        // so it must be forced onto the project core to avoid a second core
+        // module instance crossing the engine<->backend boundary. The raylib
+        // backend declares the import under the hyphenated name.
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input, \"labelle-core\", core_mod)") != null);
+    }
+
+    test "unifies labelle-core onto the sdl backend input module" {
+        // The SDL `input` module imports core under the UNDERSCORE name
+        // `labelle_core`, so the override key must match that exactly.
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sdl,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input, \"labelle_core\", core_mod)") != null);
+    }
+
+    test "backends without a core import get no backend_input override" {
+        // sokol / null backend `input` modules do not import labelle-core,
+        // so no `overrideImport(backend_input, ...)` line should be emitted.
+        for ([_]generate.Backend{ .sokol, .null }) |be| {
+            const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+                .name = "test-game",
+                .backend = be,
+                .ecs = .mock,
+            }, .{});
+            defer std.testing.allocator.free(build_zig);
+            try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input,") == null);
+        }
+    }
+
     test "resolved_gui wires gui_backend" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
