@@ -1,0 +1,41 @@
+// Gamepad input demo — raylib desktop.
+//
+// Shows connected gamepads, reacts live to connect/disconnect, and
+// displays which buttons are pressed plus stick/trigger values. Exercises
+// the merged gamepad detection (engine `gamepad_connected` /
+// `gamepad_disconnected` events + raylib hotplug polling) and the engine
+// input-mixin gamepad forwarders (`isGamepadAvailable` /
+// `isGamepadButtonDown` / `isGamepadButtonPressed` / `getGamepadAxisValue`).
+//
+// The HUD is drawn with Dear ImGui (the `imgui` GUI plugin, raylib bridge)
+// from `scripts/gamepad_hud.zig`. No external gamepad is required: with
+// nothing plugged in the demo shows a clean empty state.
+//
+// NOTE (stacking): `engine_version` points at the `eng-gpinput` worktree —
+// this example is STACKED on the engine input-mixin PR. Repin to the merged
+// engine version (or `local:../../../labelle-engine`) once that PR lands.
+.{
+    .name = "example_gamepad",
+    .title = "LaBelle - Gamepad Input Demo",
+    .width = 900,
+    .height = 640,
+    .target_fps = 60,
+    .backend = .raylib,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // Use the assembler's bundled imgui plugin (raylib bridge). Its
+    // `gui.labelle` declares the rlImGui raylib bridge; the script HUD draws
+    // through the full cimgui API via `@import("gui_backend").ig`.
+    .gui = .{ .path = "../../plugins/imgui" },
+    .layers = .{
+        .{ .name = "background", .order = 0, .space = .screen },
+        .{ .name = "world", .order = 1, .space = .world },
+        .{ .name = "ui", .order = 2, .space = .screen },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}

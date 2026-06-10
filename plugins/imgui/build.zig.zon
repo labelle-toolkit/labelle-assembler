@@ -1,6 +1,10 @@
 .{
     .name = .labelle_imgui,
     .version = "0.1.0",
+    // Required by Zig 0.16 when this manifest is resolved as a build root
+    // (the assembler links the GUI plugin as a path dep). Without it the
+    // raylib+imgui build fails with "missing top-level 'fingerprint' field".
+    .fingerprint = 0x782948a1755ca80e,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .cimgui = .{

@@ -220,6 +220,22 @@ jobs:
           cd .labelle/raylib_desktop
           zig build
 
+      # Gamepad input demo (raylib + imgui). Build-only, same recipe as the
+      # raylib example. Exercises the engine input-mixin gamepad forwarders
+      # (`isGamepad*` / `getGamepadAxisValue`) plus the raylib+imgui GUI path
+      # (rlImGui bridge). STACKED on the engine input-mixin PR: the example
+      # pins `engine_version` at that PR's branch. Once it merges, repin to
+      # `local:../../../labelle-engine` (the `main` checkout this job uses) and
+      # this step builds against the sibling engine checkout like the others.
+      - name: Generate + build the gamepad example
+        env:
+          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
+        run: |
+          cd labelle-assembler/examples/gamepad
+          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
+          cd .labelle/raylib_desktop
+          zig build
+
       # Null-backend headless example (labelle-assembler#129). Smoke-tests
       # the .null path end-to-end: generate → build → RUN. The example has
       # no plugins / GUI / assets — just a single per-frame script logging
