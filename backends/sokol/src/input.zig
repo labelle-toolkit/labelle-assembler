@@ -174,26 +174,28 @@ var gamepad_prev_down: [MAX_GAMEPADS][MAX_GAMEPAD_BUTTONS]bool =
 
 pub fn isGamepadAvailable(gamepad_id: u32) bool {
     if (!gc_enabled) return false;
+    if (gamepad_id >= MAX_GAMEPADS) return false;
     return gc.labelle_gc_connected(gamepad_id);
 }
 
 pub fn isGamepadButtonDown(gamepad_id: u32, button: u32) bool {
     if (!gc_enabled) return false;
+    if (gamepad_id >= MAX_GAMEPADS or button >= MAX_GAMEPAD_BUTTONS) return false;
     return gc.labelle_gc_button_down(gamepad_id, button);
 }
 
 pub fn isGamepadButtonPressed(gamepad_id: u32, button: u32) bool {
     if (!gc_enabled) return false;
+    // Bounds-check before indexing `gamepad_prev_down` and before the extern
+    // call — out-of-range queries report "not pressed" (matches isKeyPressed).
+    if (gamepad_id >= MAX_GAMEPADS or button >= MAX_GAMEPAD_BUTTONS) return false;
     const now = gc.labelle_gc_button_down(gamepad_id, button);
-    if (gamepad_id >= MAX_GAMEPADS or button >= MAX_GAMEPAD_BUTTONS) {
-        // Out of our edge-tracking range — best-effort "down" (no edge).
-        return now;
-    }
     return now and !gamepad_prev_down[gamepad_id][button];
 }
 
 pub fn getGamepadAxisValue(gamepad_id: u32, axis: u32) f32 {
     if (!gc_enabled) return 0;
+    if (gamepad_id >= MAX_GAMEPADS) return 0;
     return gc.labelle_gc_axis_value(gamepad_id, axis);
 }
 
@@ -203,9 +205,15 @@ fn snapshotGamepadButtons() void {
     if (!gc_enabled) return;
     var g: u32 = 0;
     while (g < MAX_GAMEPADS) : (g += 1) {
-        var btn: u32 = 0;
-        while (btn < MAX_GAMEPAD_BUTTONS) : (btn += 1) {
-            gamepad_prev_down[g][btn] = gc.labelle_gc_button_down(g, btn);
+        // Skip the per-button C-calls for slots with no controller (clear any
+        // stale state so a reconnect can't surface a ghost rising edge).
+        if (gc.labelle_gc_connected(g)) {
+            var btn: u32 = 0;
+            while (btn < MAX_GAMEPAD_BUTTONS) : (btn += 1) {
+                gamepad_prev_down[g][btn] = gc.labelle_gc_button_down(g, btn);
+            }
+        } else {
+            gamepad_prev_down[g] = [_]bool{false} ** MAX_GAMEPAD_BUTTONS;
         }
     }
 }
