@@ -166,6 +166,7 @@ pub fn shouldConsumeBack(keycode: i32) bool {
 
 const MAX_GAMEPADS = 4;
 const MAX_GAMEPAD_BUTTONS = 18; // raylib GamepadButton range [0, 17]
+const MAX_GAMEPAD_AXES = 6; // raylib GamepadAxis range [0, 5] (LX, LY, RX, RY, LT, RT)
 
 // Previous-frame "down" snapshot, used to compute the rising edge in
 // `isGamepadButtonPressed`. Updated once per frame in `newFrame`.
@@ -195,7 +196,9 @@ pub fn isGamepadButtonPressed(gamepad_id: u32, button: u32) bool {
 
 pub fn getGamepadAxisValue(gamepad_id: u32, axis: u32) f32 {
     if (!gc_enabled) return 0;
-    if (gamepad_id >= MAX_GAMEPADS) return 0;
+    // Guard the axis too (not just gamepad_id) so an out-of-range index can't
+    // cross the C ABI — matches the SDL backend's safe-0 return.
+    if (gamepad_id >= MAX_GAMEPADS or axis >= MAX_GAMEPAD_AXES) return 0;
     return gc.labelle_gc_axis_value(gamepad_id, axis);
 }
 
