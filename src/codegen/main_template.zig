@@ -1200,13 +1200,18 @@ pub fn generateMainZigFromTemplate(
             // takes the callback branch above, so this only fires for
             // raylib desktop.
             const is_raylib_desktop = cfg.backend == .raylib;
-            // See gate rationale on the sokol-callback site above: dispatch
-            // body declares imgui-specific externs, so non-imgui gui plugins
-            // must take the stub branch.
-            const input_dispatch: []const u8 = if (cfg.resolved_gui) |gui|
-                (if (std.mem.eql(u8, gui.name, "imgui")) PREVIEW_INPUT_DISPATCH else PREVIEW_INPUT_DISPATCH_STUB)
-            else
-                PREVIEW_INPUT_DISPATCH_STUB;
+            // Preview mouse-input forwarding is sokol-only: the
+            // `imgui_bridge_mouse_*` externs `PREVIEW_INPUT_DISPATCH`
+            // declares are exported solely by the *sokol* imgui bridge
+            // (`bridges/sokol`). The raylib imgui bridge (`bridges/raylib`,
+            // rlImGui) does NOT export them — rlImGui reads raylib's own
+            // input each frame — so a raylib+imgui build that emitted the
+            // imgui dispatch failed to link with
+            // `undefined symbol: _imgui_bridge_mouse_button`. This loop
+            // lifecycle path is reached by raylib desktop (and other loop
+            // backends), so it must always take the STUB; the imgui
+            // dispatch lives on the sokol-callback site above.
+            const input_dispatch: []const u8 = PREVIEW_INPUT_DISPATCH_STUB;
             const module_vars_loop = if (is_raylib_desktop)
                 try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, PREVIEW_READBACK_HELPERS, input_dispatch })
             else

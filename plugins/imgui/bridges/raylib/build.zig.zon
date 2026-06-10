@@ -1,6 +1,10 @@
 .{
     .name = .rlimgui_bridge,
     .version = "0.1.0",
+    // Required by Zig 0.16 when this manifest is resolved as a build root
+    // (the assembler links the bridge as a path dep). Without it the
+    // raylib+imgui build fails with "missing top-level 'fingerprint' field".
+    .fingerprint = 0x2bc4f54d09ba7dc3,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         // rlImGui pinned to main (2026-04-13). Was on
@@ -16,11 +20,14 @@
         // Pinned to match backends/raylib/build.zig.zon and
         // plugins/nuklear/bridges/raylib/build.zig.zon so all three
         // halves of the raylib path resolve the same upstream version.
-        // The pre-fix manifest used `refs/heads/devel.tar.gz` with a
-        // stale Zig 0.11 hash format (same class of fragility as #146).
+        // Bumped from the stale 5.6.0-dev pin (commit cd71c85) to 6.0.0
+        // (commit f25c517) to match backends/raylib: raylib-zig 5.6.0-dev's
+        // build.zig used `std.mem.trimLeft` / `std.process.getEnvVarOwned`,
+        // both removed in Zig 0.16, so the raylib+imgui path failed to build
+        // on the toolkit's pinned 0.16 toolchain.
         .@"raylib-zig" = .{
-            .url = "https://github.com/raylib-zig/raylib-zig/archive/cd71c85d571027ac8033357f83b124ee051825b3.tar.gz",
-            .hash = "raylib_zig-5.6.0-dev-KE8REENOBQC-m5nK7M2b5aKSIubJPbPLUYcRhT7aT3RN",
+            .url = "git+https://github.com/raylib-zig/raylib-zig#f25c5173b4c40ef53c7ccf6d8d51ead0892f9f22",
+            .hash = "raylib_zig-6.0.0-KE8REDJ4BQBu7lKwYNt6R4j5ywPeS37zqW6zrtjCcRwH",
         },
     },
     .paths = .{
