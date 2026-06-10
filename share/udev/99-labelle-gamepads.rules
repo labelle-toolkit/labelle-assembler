@@ -1,0 +1,26 @@
+# 99-labelle-gamepads.rules — grant the logged-in user access to gamepad /
+# joystick input device nodes so labelle's Linux (sokol) gamepad-detection
+# source can open /dev/input/event* without root or `input`-group membership.
+#
+# See docs/gamepad-linux.md (labelle-assembler#249).
+#
+# Install:
+#   sudo cp 99-labelle-gamepads.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+# then replug the controller.
+#
+# How it works: udev already tags joystick/gamepad nodes with
+# ID_INPUT_JOYSTICK=1 (the same property the detection source filters on).
+# We add the `uaccess` tag to those nodes, which tells systemd-logind to grant
+# access to whoever is the active session at the seat — the modern, group-less
+# approach. We tag BOTH the evdev `event*` node (what labelle reads) and the
+# legacy `js*` joydev node (so other tools keep working).
+
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_JOYSTICK}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="js*", ENV{ID_INPUT_JOYSTICK}=="1", TAG+="uaccess"
+
+# Some controllers are exposed as USB hidraw devices (e.g. for rumble / config
+# access). Uncomment to also grant uaccess to those — not required for
+# detection, only if you later read rumble/feature reports directly.
+#SUBSYSTEM=="hidraw", KERNEL=="hidraw*", TAG+="uaccess"

@@ -301,6 +301,18 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
             exe.root_module.linkFramework("IOSurface", .{});
             exe.root_module.linkFramework("CoreFoundation", .{});
         },
+        // labelle-core's Linux gamepad-detection source (gamepad_source/
+        // linux.zig, labelle-assembler#249) enumerates controllers and
+        // watches hotplug via libudev — it references `udev_new`,
+        // `udev_monitor_*`, `udev_enumerate_*`, etc. via `@extern "udev"`.
+        // sokol's native Linux backend doesn't pull in libudev, so the
+        // consumer must link it or the build fails with undefined
+        // `udev_*` symbols. Gated on `.linux` (the only target where the
+        // gamepad source compiles those externs in); macOS/Windows/web
+        // use platform-native detection sources with no libudev dep.
+        // The matching install instructions (input group / udev uaccess
+        // rule) live in docs/gamepad-linux.md.
+        .linux => exe.root_module.linkSystemLibrary("udev", .{}),
         else => {},
     }
 

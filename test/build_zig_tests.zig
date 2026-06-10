@@ -55,6 +55,40 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "sokol_clib") != null);
     }
 
+    test "sokol links libudev on linux for gamepad detection (#249)" {
+        // labelle-core's Linux gamepad-detection source uses libudev via
+        // @extern; the generated sokol build must link `-ludev` on linux
+        // or the consumer's link step fails with undefined `udev_*` symbols.
+        // The link is target-gated (`.linux =>` arm) so cross-compiles to
+        // macOS/Windows/web stay libudev-free.
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"udev\"") != null);
+        // Must be gated behind the linux target arm, not unconditional.
+        const udev_at = std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"udev\"").?;
+        const linux_arm = std.mem.lastIndexOf(u8, build_zig[0..udev_at], ".linux =>");
+        try std.testing.expect(linux_arm != null);
+    }
+
+    test "raylib build does not link libudev (#249)" {
+        // libudev is only needed by the sokol-native gamepad source path.
+        // raylib supplies its own gamepad polling, so its generated build
+        // must not drag in a libudev system dep.
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"udev\"") == null);
+    }
+
     test "wires sdl backend modules" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
