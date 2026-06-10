@@ -34,7 +34,7 @@
         .{ .name = "ui", .order = 2, .space = .screen },
     },
     .core_version = "local:../../../labelle-core",
-    .engine_version = "local:../../../eng-gpinput",
+    .engine_version = "local:../../../labelle-engine",
     .gfx_version = "local:../../../labelle-gfx",
     .labelle_version = "local:../../../labelle-cli",
     .assembler_version = "local:../../",
