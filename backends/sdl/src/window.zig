@@ -59,6 +59,9 @@ pub fn setTargetFPS(fps: i32) void {
 }
 
 pub fn beginDrawing() void {
+    // Clear per-frame keyboard/mouse edges, then pump events (which refreshes
+    // SDL's controller state), then snapshot gamepad button edges. Snapshotting
+    // after the pump keeps "pressed" detection from lagging a frame.
     input.newFrame();
     var event: c.SDL_Event = undefined;
     while (c.SDL_PollEvent(&event) != 0) {
@@ -67,6 +70,7 @@ pub fn beginDrawing() void {
         }
         input.handleEvent(&event);
     }
+    input.snapshotGamepads();
 }
 
 pub fn endDrawing() void {

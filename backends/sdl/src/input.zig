@@ -1,5 +1,6 @@
 /// SDL2 input backend — satisfies the engine InputInterface(Impl) contract.
 /// Event-driven: call handleEvent() from the SDL event loop, then query state.
+const std = @import("std");
 const c = @import("sdl").c;
 const core = @import("labelle_core");
 
@@ -62,16 +63,26 @@ var gamepad_ring: [GAMEPAD_EVENT_RING]GamepadEvent = undefined;
 var gamepad_ring_head: usize = 0;
 var gamepad_ring_len: usize = 0;
 
-/// Call at the start of each frame to reset per-frame state.
+/// Call at the start of each frame, BEFORE the SDL event pump, to clear the
+/// per-frame keyboard/mouse edge arrays that handleEvent() repopulates.
+///
+/// Gamepad button edges are intentionally NOT snapshotted here: SDL only
+/// refreshes controller state when events are pumped, so sampling buttons
+/// before the pump would lag a frame and miss brief taps. Call
+/// snapshotGamepads() after the event pump instead.
 pub fn newFrame() void {
     keys_pressed = [_]bool{false} ** MAX_KEYS;
     keys_released = [_]bool{false} ** MAX_KEYS;
     mouse_pressed = [_]bool{false} ** MAX_MOUSE_BUTTONS;
     mouse_released = [_]bool{false} ** MAX_MOUSE_BUTTONS;
     mouse_wheel = 0;
+}
 
-    // Snapshot per-frame gamepad button edges. Doing this once per frame (not
-    // per event) keeps "pressed" semantics aligned with the keyboard path.
+/// Snapshot per-frame gamepad button edges. Call AFTER the SDL event pump so
+/// SDL has refreshed controller state for this frame. Doing this once per
+/// frame (not per event) keeps "pressed" semantics aligned with the keyboard
+/// path.
+pub fn snapshotGamepads() void {
     for (&gamepad_slots) |*slot| {
         if (slot.controller == null) continue;
         slot.prev_buttons = slot.cur_buttons;
@@ -255,8 +266,10 @@ pub fn getGamepadAxisValue(gamepad: u32, axis: u32) f32 {
     const ctrl = gamepad_slots[gamepad].controller orelse return 0;
     const sdl_axis = engineAxisToSdl(axis) orelse return 0;
     // SDL axes are i16 (-32768..32767). Normalize to -1..1 (raylib convention).
+    // Dividing by 32767 maps the negative extreme (-32768) to -1.0000305, so
+    // clamp the low end to keep the result strictly within [-1, 1].
     const raw = c.SDL_GameControllerGetAxis(ctrl, sdl_axis);
-    return @as(f32, @floatFromInt(raw)) / 32767.0;
+    return @max(-1.0, @as(f32, @floatFromInt(raw)) / 32767.0);
 }
 
 // ── Gamepad hotplug events (core#18 contract) ─────────────────────────────
@@ -276,9 +289,10 @@ pub fn pollGamepadEvents(out: []GamepadEvent) usize {
 }
 
 /// Snapshot currently-visible devices for diagnostics. Reports occupied
-/// slots as connected; for joysticks SDL doesn't recognize as controllers
-/// (no mapping) it emits an `.unsupported` description so they aren't
-/// silently invisible.
+/// slots as connected; any other present device (a joystick SDL doesn't
+/// recognize as a controller, or a recognized controller that couldn't be
+/// opened — e.g. all slots full) gets a `connected = false` description so
+/// it isn't silently invisible.
 pub fn describeGamepads(out: []GamepadDescription) usize {
     if (!gamepad_subsystem_ready) initGamepads();
     var written: usize = 0;
@@ -301,23 +315,45 @@ pub fn describeGamepads(out: []GamepadDescription) usize {
         written += 1;
     }
 
-    // 2. Joysticks present but not usable as game controllers (no mapping).
+    // 2. Present but not occupying a slot. This covers two cases that section
+    //    1 misses: joysticks SDL can't map as game controllers (no mapping),
+    //    AND recognized controllers we couldn't open (slots exhausted or
+    //    SDL_GameControllerOpen failed). Dedup against open slots by *instance
+    //    id* — skipping every SDL_IsGameController device would hide the
+    //    latter case entirely.
     const n = c.SDL_NumJoysticks();
     var device_index: c_int = 0;
     while (device_index < n and written < out.len) : (device_index += 1) {
-        if (c.SDL_IsGameController(device_index) == c.SDL_TRUE) continue; // already covered
-        var desc = GamepadDescription{ .slot = @intCast(device_index), .connected = false };
+        const instance_id = c.SDL_JoystickGetDeviceInstanceID(device_index);
+        if (isInstanceOpen(instance_id)) continue; // already reported in section 1.
+
+        const is_controller = c.SDL_IsGameController(device_index) == c.SDL_TRUE;
+        // No player slot: this device has no queryable `gamepad` index. Use the
+        // first out-of-range value (MAX_GAMEPADS) as a non-queryable sentinel
+        // rather than SDL's device_index, which would collide with real player
+        // slots 0..N-1.
+        var desc = GamepadDescription{ .slot = MAX_GAMEPADS, .connected = false };
         if (c.SDL_JoystickNameForIndex(device_index)) |name_ptr| {
             desc.setName(spanZ(name_ptr));
         }
         desc.guid = guidBytes(c.SDL_JoystickGetDeviceGUID(device_index));
-        desc.source_class = .unknown;
-        desc.unavailable_reason = .unsupported;
+        desc.source_class = if (is_controller) .gamepad else .unknown;
+        // A recognized controller that isn't in a slot failed to open (e.g. no
+        // free slot); a non-controller joystick is simply unsupported.
+        desc.unavailable_reason = if (is_controller) .init_failed else .unsupported;
         out[written] = desc;
         written += 1;
     }
 
     return written;
+}
+
+/// True if an SDL joystick instance id is currently held by an open slot.
+fn isInstanceOpen(instance_id: c.SDL_JoystickID) bool {
+    for (gamepad_slots) |slot| {
+        if (slot.controller != null and slot.instance_id == instance_id) return true;
+    }
+    return false;
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────
@@ -404,9 +440,7 @@ fn guidBytes(guid: c.SDL_JoystickGUID) [16]u8 {
 
 /// Borrow a C NUL-terminated string as a Zig slice.
 fn spanZ(ptr: [*c]const u8) []const u8 {
-    var len: usize = 0;
-    while (ptr[len] != 0) : (len += 1) {}
-    return ptr[0..len];
+    return std.mem.span(ptr);
 }
 
 /// Map SDL_GameControllerType (with a name-substring fallback) to the
@@ -509,7 +543,7 @@ fn engineAxisToSdl(axis: u32) ?c.SDL_GameControllerAxis {
 
 // ── Tests (hardware-free) ─────────────────────────────────────────────────
 
-const testing = @import("std").testing;
+const testing = std.testing;
 
 test "engineButtonToSdl maps face/dpad/shoulder/system buttons" {
     try testing.expectEqual(@as(c.SDL_GameControllerButton, c.SDL_CONTROLLER_BUTTON_A), engineButtonToSdl(7).?);
