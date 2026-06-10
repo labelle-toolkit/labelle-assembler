@@ -35,6 +35,17 @@ extern void labelle_android_on_device_added(int device_id, int sources,
                                             size_t descriptor_len);
 extern void labelle_android_on_device_removed(int device_id);
 
+// ── Gamepad STATE hooks (labelle-assembler#250; android_gamepad_state.zig) ──
+// The state module lives in the same backend package. It can't see the device
+// NAME on its own (the forwarded AInputEvent only carries a device id), so we
+// seed the axis-routing quirk from the name here, where the InputDevice
+// reflection already has it. Drop the state on removal so a reconnect of the
+// same id starts clean.
+extern void labelle_android_gamepad_state_added(int device_id,
+                                                const char *name_ptr,
+                                                size_t name_len);
+extern void labelle_android_gamepad_state_removed(int device_id);
+
 // ── Module state ────────────────────────────────────────────────────────────
 static JavaVM *g_vm = NULL;
 static jobject g_input_manager = NULL; // global ref to the InputManager
@@ -94,6 +105,10 @@ static void emit_device_added(JNIEnv *env, jint device_id) {
         name ? name : "", name ? strlen(name) : 0,
         desc ? desc : "", desc ? strlen(desc) : 0);
 
+    // Seed the gamepad-state axis-routing quirk from the device name (#250).
+    labelle_android_gamepad_state_added(
+        (int)device_id, name ? name : "", name ? strlen(name) : 0);
+
     if (name) (*env)->ReleaseStringUTFChars(env, jname, name);
     if (desc) (*env)->ReleaseStringUTFChars(env, jdesc, desc);
     (*env)->DeleteLocalRef(env, device);
@@ -132,6 +147,7 @@ Java_com_labelle_LabelleInputDeviceListener_nativeOnDeviceRemoved(
     (void)env;
     (void)thiz;
     labelle_android_on_device_removed((int)device_id);
+    labelle_android_gamepad_state_removed((int)device_id);
 }
 
 JNIEXPORT void JNICALL

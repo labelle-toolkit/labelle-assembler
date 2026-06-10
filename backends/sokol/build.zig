@@ -217,6 +217,22 @@ pub fn build(b: *std.Build) void {
     const input_compile_check = b.addTest(.{ .root_module = input_mod });
     test_step.dependOn(&input_compile_check.step);
 
+    // Android gamepad STATE (labelle-assembler#250). The mapping table, quirk
+    // routing, and the per-device state machine are pure Zig — host-runnable
+    // with no sokol/JNI deps. Run them natively (unlike `input_compile_check`,
+    // which only builds) so the canonical raylib button/axis numbering and the
+    // quirk overrides stay locked. The Android-only `extern`/`@export` symbols
+    // in input.zig are gated behind `is_android`, so this host build of the
+    // standalone module never references them.
+    const android_gp_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/android_gamepad_state.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(android_gp_tests).step);
+
     // Compile-check window.zig — pulls in sokol + the per-backend
     // screenshot readback helpers (`screenshot/metal.zig`, `gl.zig`,
     // `d3d11.zig`, `bmp.zig`). Regression lock for the screenshot

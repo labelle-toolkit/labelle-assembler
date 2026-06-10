@@ -5,24 +5,35 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .sokol = .{
-            // MUST match the labelle-imgui top-level `.sokol` pin and
-            // the labelle-imgui `bridges/sokol/build.zig.zon` pin
-            // exactly — mismatched commits trigger duplicate-module
-            // errors at build time across consumers that pull both
-            // labelle-imgui and labelle-assembler (see labelle-assembler#207).
-            // Pinned to the labelle-toolkit fork of sokol-zig, branch
-            // `feat/with-sokol-imgui-no-app`, which adds the
-            // `with_sokol_imgui_no_app` build option on top of upstream
-            // floooh/sokol-zig @ 8b1a651. The option defines
-            // `SOKOL_IMGUI_NO_SOKOL_APP` when compiling sokol_imgui.c
-            // so labelle-imgui's headless preview mode can drive simgui
-            // via `simgui_new_frame(width/height/dpi_scale/...)`. The
-            // assembler doesn't pass that option itself — pinning the
-            // fork is purely to align the package hash with imgui's
-            // dependency tree. Default is false → backward compatible
-            // with upstream. Bumping requires `zig fetch --save=sokol <url>`.
-            .url = "https://github.com/labelle-toolkit/sokol-zig/archive/887b30f623b88a6815e015766523de3fa066fd8d.tar.gz",
-            .hash = "sokol-0.1.0-pb1HK-OCNwDtCJMfpeiJuF5TsFpITiO13canPXZMSksO",
+            // ⚠ LOCKSTEP: this commit MUST equal labelle-imgui's sokol
+            // pin (its top-level `.sokol` AND `bridges/sokol/build.zig.zon`)
+            // exactly — mismatched commits trigger duplicate-module errors
+            // across consumers that pull both labelle-imgui and
+            // labelle-assembler (see labelle-assembler#207). Both were
+            // 887b30f; this PR (labelle-assembler#250) bumps to ba7363f.
+            // labelle-imgui MUST bump to ba7363f in the same change set.
+            //
+            // Pinned to the labelle-toolkit fork of sokol-zig. The fork adds,
+            // on top of upstream floooh/sokol-zig @ 8b1a651:
+            //   (a) the `with_sokol_imgui_no_app` build option, which defines
+            //       `SOKOL_IMGUI_NO_SOKOL_APP` when compiling sokol_imgui.c so
+            //       labelle-imgui's headless preview can drive simgui via
+            //       `simgui_new_frame(width/height/dpi_scale/...)`. The
+            //       assembler doesn't pass that option itself — pinning the
+            //       fork aligns the package hash with imgui's dependency tree.
+            //       Default false → backward compatible with upstream.
+            //   (b) Android gamepad event forwarding (branch
+            //       `feat/forward-android-gamepad-events`, labelle-assembler#250):
+            //       `sapp_android_register_gamepad_callback()` forwards the
+            //       gamepad KEY / AINPUT_SOURCE_JOYSTICK MOTION AInputEvents
+            //       that upstream sokol_app.h drops. Gated to SOKOL_ANDROID
+            //       with a no-op stub everywhere else, and a no-op when no
+            //       callback is registered — purely additive, so it is
+            //       backward compatible for imgui too.
+            //
+            // Bumping requires `zig fetch --save=sokol <url>`.
+            .url = "https://github.com/labelle-toolkit/sokol-zig/archive/ba7363f01ad0438db10dba33424b6747ecc15cbf.tar.gz",
+            .hash = "sokol-0.1.0-pb1HKx2lNwB02YY5ZupcCFYC6eEQ0Guai3wOICvRHnyX",
         },
         // emsdk is needed at WASM build time so we can plumb the
         // sysroot include path through to `stb_image_impl.c`. The
