@@ -50,6 +50,15 @@ pub fn build(b: *std.Build) !void {
     const backend_window = backend_dep.module("window");
     const raylib_artifact = backend_dep.artifact("raylib");
 
+    // Unify labelle-core onto the backend modules too. The raylib `input`
+    // module imports labelle-core (for `GamepadEvent` and friends); without
+    // this, it resolves its OWN pinned core tarball — a *different* module
+    // instance than engine/gfx — and core structs that cross the
+    // engine↔backend boundary (e.g. `[]GamepadEvent`) fail to type-check.
+    // Only `input` imports core here; overriding gfx/audio/window (which
+    // don't) would silently add a dead import. See labelle-assembler#258.
+    overrideImport(backend_input, "labelle-core", core_mod);
+
 .backend_sokol
     // `with_imgui` flips sokol_imgui.c compilation on. MUST match the
     // imgui bridge's option set when the project includes imgui, or
@@ -76,6 +85,12 @@ pub fn build(b: *std.Build) !void {
     const backend_input = backend_dep.module("input");
     const backend_audio = backend_dep.module("audio");
     const backend_window = backend_dep.module("window");
+
+    // Unify labelle-core onto the backend `input` module — see the note in
+    // `.backend_raylib`. NOTE: the SDL backend declares this import under the
+    // underscore name `"labelle_core"` (not the hyphenated `"labelle-core"`),
+    // so the override key must match. See labelle-assembler#258.
+    overrideImport(backend_input, "labelle_core", core_mod);
 
 .backend_bgfx
     const backend_dep = b.dependency("labelle_bgfx", .{ .target = target, .optimize = optimize });
