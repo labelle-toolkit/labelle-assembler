@@ -10,24 +10,19 @@ turning each into a `GamepadEvent` (connect/disconnect, with a stable 16-byte
 GUID derived from the device's `input_id`). Reading axes/buttons (semantic
 state) is handled separately — this source is identity/detection only.
 
-This is why a sokol project's generated `build.zig` links `-ludev` on Linux
-(`exe.root_module.linkSystemLibrary("udev", .{})`, gated on the `.linux`
-target). The raylib/SDL backends supply their own gamepad polling and do not
-need libudev.
+libudev is **not** a build-time dependency. As of labelle-core#20 the
+detection source loads it at **runtime** via `std.DynLib` (a `dlopen` of
+`libudev.so.1`), so a sokol project's generated `build.zig` does **not** link
+`-ludev` and you do not need `libudev-dev` to build. The raylib/SDL backends
+supply their own gamepad polling and do not touch libudev at all.
 
-## Build-time requirement
+## Runtime requirement
 
-You need the libudev **development** package installed on the build host (and
-on any machine that links the binary):
-
-| Distro | Package |
-|--------|---------|
-| Debian / Ubuntu | `libudev-dev` |
-| Fedora / RHEL | `systemd-devel` |
-| Arch | `systemd` (provides `libudev`) |
-| Alpine | `eudev-dev` |
-
-If you cross-compile, the target sysroot must provide `libudev.so`.
+The detection source `dlopen`s `libudev.so.1` at startup. Virtually every
+desktop Linux system already ships it (it is part of systemd / eudev). If it is
+missing, the source **degrades gracefully**: it simply reports no controllers
+rather than failing — there is no hard dependency and nothing to install to
+*build* the binary.
 
 ## Runtime permissions
 
@@ -78,4 +73,3 @@ finish-args:
 `--device=input` (added in flatpak 1.11) exposes the input device nodes inside
 the sandbox. Without it the detection source sees no controllers (or only ones
 the portal forwards). `--device=all` also works but is broader than needed.
-```

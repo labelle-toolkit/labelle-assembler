@@ -55,12 +55,15 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "sokol_clib") != null);
     }
 
-    test "sokol links libudev on linux for gamepad detection (#249)" {
-        // labelle-core's Linux gamepad-detection source uses libudev via
-        // @extern; the generated sokol build must link `-ludev` on linux
-        // or the consumer's link step fails with undefined `udev_*` symbols.
-        // The link is target-gated (`.linux =>` arm) so cross-compiles to
-        // macOS/Windows/web stay libudev-free.
+    test "sokol build does not link libudev — core dlopens it at runtime (#249)" {
+        // labelle-core's Linux gamepad-detection source (gamepad_source/
+        // linux.zig) loads libudev at RUNTIME via std.DynLib (dlopen of
+        // `libudev.so.1`) as of labelle-core#20, degrading gracefully when
+        // it is absent. So the generated sokol build must NOT emit a
+        // build-time `linkSystemLibrary("udev", ...)` — doing so would
+        // reintroduce a hard build/runtime dependency that defeats core's
+        // graceful-degradation design. Runtime device-access setup lives in
+        // docs/gamepad-linux.md.
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
@@ -68,17 +71,13 @@ pub const BUILD_ZIG = struct {
         }, .{});
         defer std.testing.allocator.free(build_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"udev\"") != null);
-        // Must be gated behind the linux target arm, not unconditional.
-        const udev_at = std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"udev\"").?;
-        const linux_arm = std.mem.lastIndexOf(u8, build_zig[0..udev_at], ".linux =>");
-        try std.testing.expect(linux_arm != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"udev\"") == null);
     }
 
     test "raylib build does not link libudev (#249)" {
-        // libudev is only needed by the sokol-native gamepad source path.
-        // raylib supplies its own gamepad polling, so its generated build
-        // must not drag in a libudev system dep.
+        // No backend should emit a build-time libudev link — libudev is a
+        // runtime dlopen dependency of labelle-core, never a link-time one.
+        // raylib additionally supplies its own gamepad polling.
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .raylib,
@@ -189,9 +188,10 @@ pub const BUILD_ZIG = struct {
     }
 
     test "backends without a core import get no backend_input override" {
-        // sokol / null backend `input` modules do not import labelle-core,
-        // so no `overrideImport(backend_input, ...)` line should be emitted.
-        for ([_]generate.Backend{ .sokol, .null }) |be| {
+        // sokol / null / bgfx / wgpu backend `input` modules do not import
+        // labelle-core, so no `overrideImport(backend_input, ...)` line
+        // should be emitted (only raylib and sdl import core).
+        for ([_]generate.Backend{ .sokol, .null, .bgfx, .wgpu }) |be| {
             const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
                 .name = "test-game",
                 .backend = be,

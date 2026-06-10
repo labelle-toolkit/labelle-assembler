@@ -301,25 +301,14 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
             exe.root_module.linkFramework("IOSurface", .{});
             exe.root_module.linkFramework("CoreFoundation", .{});
         },
-        // labelle-core's Linux gamepad-detection source (gamepad_source/
-        // linux.zig, labelle-assembler#249) enumerates controllers and
-        // watches hotplug via libudev — it references `udev_new`,
-        // `udev_monitor_*`, `udev_enumerate_*`, etc. via `@extern "udev"`.
-        // sokol's native Linux backend doesn't pull in libudev, so the
-        // consumer must link it or the build fails with undefined
-        // `udev_*` symbols. Gated on DESKTOP `.linux` only; macOS/Windows/
-        // web use platform-native detection sources with no libudev dep.
-        // Android in Zig is also `os.tag == .linux` (abi `.android` /
-        // `.androideabi`) but has no libudev — and the Android build path
-        // links sokol via the separate `android_link` section, never this
-        // one — so excluding the Android ABI here keeps a desktop build
-        // cross-compiled with `-Dtarget=…-linux-android` from linking a
-        // libudev that doesn't exist on Android. The matching install
-        // instructions (input group / udev uaccess rule) live in
-        // docs/gamepad-linux.md.
-        .linux => if (target.result.abi != .android and target.result.abi != .androideabi) {
-            exe.root_module.linkSystemLibrary("udev", .{});
-        },
+        // NOTE: labelle-core's Linux gamepad-detection source
+        // (gamepad_source/linux.zig, labelle-assembler#249) does NOT need a
+        // build-time libudev link. As of labelle-core#20 it loads libudev at
+        // RUNTIME via std.DynLib (dlopen of `libudev.so.1`) and degrades
+        // gracefully when the library is absent — so the generated build must
+        // not link `-ludev`, which would reintroduce a hard build/runtime
+        // dependency. Runtime device-access setup (input group / udev
+        // `uaccess` rule, Flatpak `--device=input`) is in docs/gamepad-linux.md.
         else => {},
     }
 
