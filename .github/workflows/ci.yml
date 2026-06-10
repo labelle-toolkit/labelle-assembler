@@ -43,12 +43,17 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Install sokol system libs (Linux)
+      - name: Install sokol + SDL2 system libs (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libasound2-dev libgl1-mesa-dev libx11-dev libxi-dev libxcursor-dev
+            libasound2-dev libgl1-mesa-dev libx11-dev libxi-dev libxcursor-dev \
+            libsdl2-dev libsdl2-mixer-dev
+
+      - name: Install SDL2 system libs (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sdl2 sdl2_mixer
 
       - name: Build
         run: zig build
