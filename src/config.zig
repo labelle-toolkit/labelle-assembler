@@ -49,6 +49,22 @@ pub fn globalEnviron() std.process.Environ {
 /// rendering. See `backends/null/` for the no-op implementations.
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 pub const Platform = enum { desktop, ios, android, wasm };
+
+/// Desktop gamepad source selection (core#28 slice 5).
+///
+/// - `.auto` (default): the shared windowless-SDL desktop gamepad source
+///   (`backends/sdl_gamepad/`) is staged, SDL2 is linked, and the raylib /
+///   sokol desktop backends route their gamepad queries through it — on ALL
+///   desktop OSes including Linux. This is the existing, unchanged behavior.
+/// - `.none`: opt out entirely. `sdl_gamepad` is NOT staged, SDL2 is NOT
+///   linked, and both backends' desktop gamepad queries resolve to a
+///   truly-disabled path (return false/0/empty). For raylib this means NO
+///   GLFW-native fallback — gamepad input is off. No SDL anywhere in the
+///   generated build.
+///
+/// NOTE: a Linux→udev native path (so `.auto` could avoid SDL on Linux) is
+/// deferred; `.auto` keeps SDL on Linux for now.
+pub const GamepadSource = enum { auto, none };
 pub const EcsChoice = enum { mock, zig_ecs, zflecs, mr_ecs };
 
 /// CLI version — injected from root build.zig via build options.
@@ -408,6 +424,10 @@ pub const ProjectConfig = struct {
     backend: Backend = .raylib,
     platform: Platform = .desktop,
     ecs: EcsChoice = .mock,
+    /// Desktop gamepad source. `.auto` (default) stages + links + routes the
+    /// shared SDL desktop gamepad source for raylib/sokol desktop; `.none`
+    /// opts out entirely (no SDL, truly-disabled gamepad). See `GamepadSource`.
+    gamepad: GamepadSource = .auto,
     /// GUI plugin reference — parsed from project.labelle.
     /// null means no GUI (StubGui injected).
     gui: ?GuiPlugin = null,

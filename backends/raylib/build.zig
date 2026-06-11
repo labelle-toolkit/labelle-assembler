@@ -39,6 +39,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Desktop gamepad source toggle (core#28 slice 5). When true (default),
+    // the shared windowless-SDL desktop gamepad source is wired into `input`
+    // and SDL2 is linked on desktop; when false (opt-out, `.gamepad = .none`
+    // in project.labelle), the `sdl_gamepad` import is absent, no SDL2 is
+    // linked, and input.zig's gamepad queries resolve to the truly-disabled
+    // path (no GLFW-native fallback). The assembler forwards this from the
+    // generated build.zig via `b.dependency(..., .{ .gamepad_enabled = ... })`.
+    const gamepad_enabled = b.option(bool, "gamepad_enabled", "Wire the shared SDL desktop gamepad source + link SDL2 (default true; false = opt out, no SDL)") orelse true;
+
     const raylib_dep = b.dependency("raylib-zig", .{ .target = target, .optimize = optimize });
 
     const raylib_mod = raylib_dep.module("raylib");
@@ -61,9 +70,23 @@ pub fn build(b: *std.Build) void {
     // imports core under the `labelle_core` key) so the `GamepadEvent` types it
     // returns are the SAME instance `input.zig` and the engine see — without
     // this the `[]GamepadEvent` crossing the seam would not type-check.
-    const sdl_gp_dep = b.dependency("labelle_sdl_gamepad", .{ .target = target, .optimize = optimize });
-    const sdl_gp_mod = sdl_gp_dep.module("sdl_gamepad");
-    sdl_gp_mod.addImport("labelle_core", core_mod);
+    // Gated on `gamepad_enabled` AND a desktop target: when opted out OR on a
+    // non-desktop target (Android/iOS/wasm), the sub-package is not resolved as
+    // a dependency, so nothing pulls SDL into the graph and we don't require
+    // `labelle_sdl_gamepad` to be staged where it's never used.
+    const sdl_gp_mod: ?*std.Build.Module = if (gamepad_enabled and targetIsDesktop(target.result)) blk: {
+        const sdl_gp_dep = b.dependency("labelle_sdl_gamepad", .{ .target = target, .optimize = optimize });
+        const m = sdl_gp_dep.module("sdl_gamepad");
+        m.addImport("labelle_core", core_mod);
+        break :blk m;
+    } else null;
+
+    // `build_options` carried into `input.zig` so its comptime gamepad routing
+    // knows whether `sdl_gamepad` was wired. When false, input.zig does NOT
+    // `@import("sdl_gamepad")` (the module is absent) and returns the disabled
+    // path. Mirrored on the host test module below.
+    const input_opts = b.addOptions();
+    input_opts.addOption(bool, "gamepad_enabled", gamepad_enabled);
 
     // ── Gfx backend module ──────────────────────────────────────────
     const gfx_mod = b.addModule("gfx", .{
@@ -99,15 +122,18 @@ pub fn build(b: *std.Build) void {
     });
     input_mod.addImport("raylib", raylib_mod);
     input_mod.addImport("labelle-core", core_mod);
-    input_mod.addImport("sdl_gamepad", sdl_gp_mod);
+    input_mod.addImport("build_options", input_opts.createModule());
+    if (sdl_gp_mod) |m| input_mod.addImport("sdl_gamepad", m);
 
-    // Link SDL2 for the shared desktop gamepad source — DESKTOP targets only.
-    // The source gates every SDL `extern` behind a comptime desktop check, so
+    // Link SDL2 for the shared desktop gamepad source — DESKTOP targets only,
+    // and only when the gamepad source is wired (`gamepad_enabled`). The source
+    // gates every SDL `extern` behind a comptime desktop check, so
     // Android/iOS/wasm builds reference no SDL symbols and must pull no SDL.
+    // When opted out (`gamepad_enabled = false`) NO SDL is linked on any target.
     // No `@cImport`/include path is needed (the source uses `extern fn`); only
     // the link + (on macOS Homebrew) the library path matters. raylib's render
     // backend does NOT itself link SDL, so this is the only SDL on the line.
-    if (targetIsDesktop(target.result)) {
+    if (gamepad_enabled and targetIsDesktop(target.result)) {
         input_mod.link_libc = true;
         if (sdlLibPath(target.result.os.tag, builtin.target.os.tag)) |p| {
             input_mod.addLibraryPath(.{ .cwd_relative = p });
@@ -229,11 +255,13 @@ pub fn build(b: *std.Build) void {
     });
     input_host_mod.addImport("raylib", raylib_mod);
     input_host_mod.addImport("labelle-core", core_mod);
-    input_host_mod.addImport("sdl_gamepad", sdl_gp_mod);
+    input_host_mod.addImport("build_options", input_opts.createModule());
+    if (sdl_gp_mod) |m| input_host_mod.addImport("sdl_gamepad", m);
     input_host_mod.linkLibrary(raylib_artifact);
-    // The host is a desktop target, so input.zig references the SDL externs —
-    // link SDL2 (+ Homebrew lib path on macOS) so the test binary resolves.
-    if (targetIsDesktop(host_target.result)) {
+    // The host is a desktop target, so input.zig references the SDL externs
+    // when the gamepad source is wired — link SDL2 (+ Homebrew lib path on
+    // macOS) so the test binary resolves. Skipped entirely on opt-out.
+    if (gamepad_enabled and targetIsDesktop(host_target.result)) {
         input_host_mod.link_libc = true;
         if (sdlLibPath(host_target.result.os.tag, builtin.target.os.tag)) |p| {
             input_host_mod.addLibraryPath(.{ .cwd_relative = p });

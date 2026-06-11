@@ -4,13 +4,37 @@ const builtin = @import("builtin");
 const rl = @import("raylib");
 const core = @import("labelle-core");
 
+// Desktop gamepad source toggle (core#28 slice 5), forwarded from the backend
+// build.zig. When false (`.gamepad = .none` opt-out), the `sdl_gamepad` module
+// is NOT in the build graph, so we must not `@import` it — and the gamepad
+// surface below resolves to the truly-disabled path (no SDL, no GLFW-native
+// fallback). When true (default), behavior is byte-identical to before.
+const gamepad_enabled = @import("build_options").gamepad_enabled;
+
 // Shared windowless-SDL desktop gamepad source (core#28). On a DESKTOP target
-// the gamepad surface below routes to this instead of `rl.isGamepad*`: SDL's
-// per-device HID drivers decode controllers (Nintendo Switch / 8BitDo raw-HID)
-// that GLFW — the window/input library raylib bundles — cannot. The source
-// gates all its SDL `extern`s behind its own comptime `is_desktop`, so on
-// off-desktop targets it is pure-Zig no-ops and we keep raylib's behavior.
-const sdl_gp = @import("sdl_gamepad");
+// (and only when wired) the gamepad surface below routes to this instead of
+// `rl.isGamepad*`: SDL's per-device HID drivers decode controllers (Nintendo
+// Switch / 8BitDo raw-HID) that GLFW — the window/input library raylib bundles
+// — cannot. The source gates all its SDL `extern`s behind its own comptime
+// `is_desktop`, so on off-desktop targets it is pure-Zig no-ops and we keep
+// raylib's behavior. The `@import` lives inside the taken comptime branch so it
+// is NOT evaluated when the module is absent (opt-out).
+// Mirrors `targetIsDesktop` in build.zig: the build wires the `sdl_gamepad`
+// module ONLY when (gamepad_enabled AND desktop target), so the `@import` must
+// be gated identically — importing it on a non-desktop target (where it isn't
+// in the graph) is a compile error.
+const target_is_desktop = blk: {
+    const t = builtin.target;
+    if (t.abi == .android or t.abi == .androideabi) break :blk false;
+    if (t.cpu.arch.isWasm()) break :blk false;
+    break :blk switch (t.os.tag) {
+        .macos, .windows, .linux => true,
+        else => false,
+    };
+};
+const sdl_gp = if (gamepad_enabled and target_is_desktop) @import("sdl_gamepad") else struct {
+    pub const is_desktop = false;
+};
 
 const GamepadEvent = core.GamepadEvent;
 const GamepadDescription = core.GamepadDescription;
@@ -18,10 +42,17 @@ const GamepadDescription = core.GamepadDescription;
 /// raylib supports at most 4 gamepads (MAX_GAMEPADS).
 const MAX_GAMEPADS: u32 = 4;
 
-/// On desktop, source gamepad state/hotplug from the shared SDL source; off
-/// desktop, keep raylib's GLFW-backed path. Resolved at comptime so the unused
-/// branch (and its SDL refs / rl gamepad refs) is eliminated per target.
-const use_sdl_gamepad = sdl_gp.is_desktop;
+/// On desktop (with the source wired), gamepad state/hotplug comes from the
+/// shared SDL source; off desktop, keep raylib's GLFW-backed path. Resolved at
+/// comptime so the unused branch (and its SDL / rl gamepad refs) is eliminated
+/// per target. False whenever opted out (`gamepad_enabled = false`).
+const use_sdl_gamepad = gamepad_enabled and sdl_gp.is_desktop;
+
+/// True when gamepad input is entirely disabled: the opt-out build with no SDL
+/// source AND no GLFW-native fallback. In this mode every query short-circuits
+/// to false/0/empty BEFORE touching `rl.isGamepad*`. (When `gamepad_enabled`
+/// is true this is always false and the existing SDL/raylib routing stands.)
+const gamepad_disabled = !gamepad_enabled;
 
 // ── Keyboard ──────────────────────────────────────────────
 
@@ -87,21 +118,25 @@ pub fn getTouchId(index: u32) u64 {
 // ── Gamepad ───────────────────────────────────────────────
 
 pub fn isGamepadAvailable(gamepad: u32) bool {
+    if (comptime gamepad_disabled) return false;
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isAvailable(gamepad);
     return rl.isGamepadAvailable(@intCast(gamepad));
 }
 
 pub fn isGamepadButtonDown(gamepad: u32, button: u32) bool {
+    if (comptime gamepad_disabled) return false;
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonDown(gamepad, button);
     return rl.isGamepadButtonDown(@intCast(gamepad), @enumFromInt(button));
 }
 
 pub fn isGamepadButtonPressed(gamepad: u32, button: u32) bool {
+    if (comptime gamepad_disabled) return false;
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonPressed(gamepad, button);
     return rl.isGamepadButtonPressed(@intCast(gamepad), @enumFromInt(button));
 }
 
 pub fn getGamepadAxisValue(gamepad: u32, axis: u32) f32 {
+    if (comptime gamepad_disabled) return 0;
     if (comptime use_sdl_gamepad) return sdl_gp.Source.axisValue(gamepad, axis);
     return rl.getGamepadAxisMovement(@intCast(gamepad), @enumFromInt(axis));
 }
@@ -180,6 +215,7 @@ fn gamepadName(slot: u32) [:0]const u8 {
 /// being lost. (Callers should still size `out` >= MAX_GAMEPADS so this never
 /// triggers in practice.)
 pub fn pollGamepadEvents(out: []GamepadEvent) usize {
+    if (comptime gamepad_disabled) return 0;
     // On desktop, hotplug comes from the shared SDL source's event ring
     // (populated in `newFrame`→`Source.update`), not raylib's poll-based
     // availability edge-detect. The source already emits core `GamepadEvent`s.
@@ -215,6 +251,7 @@ pub fn pollGamepadEvents(out: []GamepadEvent) usize {
 /// deltas), returning the number written (<= `out.len`). Disconnected slots
 /// are reported with `connected = false` and an empty name.
 pub fn describeGamepads(out: []GamepadDescription) usize {
+    if (comptime gamepad_disabled) return 0;
     if (comptime use_sdl_gamepad) return sdl_gp.Source.describe(out);
 
     var count: usize = 0;

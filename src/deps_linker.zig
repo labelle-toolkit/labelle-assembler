@@ -68,9 +68,11 @@ pub fn createDepsLinks(
         // local plugins/gui are), so `../sdl_gamepad` resolves to
         // .labelle/deps/sdl_gamepad. Stage the sub-package there under exactly
         // that link name so the path resolves. Other backends don't depend on
-        // it, so only register it for raylib/sokol.
+        // it, so only register it for raylib/sokol. Gated on `cfg.gamepad ==
+        // .auto`: the opt-out (`.none`, core#28 slice 5) does NOT stage the
+        // sub-package at all, so no SDL ends up in the generated build.
         switch (cfg.backend) {
-            .raylib, .sokol => {
+            .raylib, .sokol => if (cfg.gamepad == .auto) {
                 const gp_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends/sdl_gamepad");
                 try deps.append(allocator, .{
                     .zon_name = try allocator.dupe(u8, "labelle_sdl_gamepad"),
