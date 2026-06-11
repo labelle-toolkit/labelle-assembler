@@ -66,9 +66,13 @@ pub fn forget(id: u32) void {
 /// e.g. a pad already plugged in at launch on a backend that reports it via
 /// a one-shot the demo missed.
 pub fn nameFor(id: u32) [:0]const u8 {
-    if (id >= MAX_GAMEPADS) return "Gamepad";
-    const e = &entries[id];
-    if (!e.known or e.name_len == 0) return "Gamepad";
+    // Look up by device id (NOT array slot): Android `InputDevice` ids are not
+    // dense 0..3 and routinely exceed MAX_GAMEPADS (e.g. 9), so indexing
+    // `entries[id]` both missed the stored entry and risked OOB. Mirror
+    // `record`/`typeHintFor`, which already key by id (labelle-assembler#270,
+    // same class of bug as labelle-engine#261).
+    const e = findById(id) orelse return "Gamepad";
+    if (e.name_len == 0) return "Gamepad";
     // The buffer is fixed and NUL-padded, so it is already NUL-terminated
     // after `name_len` bytes (NAME_CAP >= name_len + 1 unless name filled
     // the whole buffer; guard that edge by forcing a terminator).
@@ -96,4 +100,28 @@ pub fn knownIds(out: []u32) usize {
         }
     }
     return n;
+}
+
+// ── tests (host) ─────────────────────────────────────────────────────────
+
+const std = @import("std");
+
+test "nameFor/typeHintFor resolve a sparse Android device id (#270)" {
+    // Reset module state (process-global array) before/after.
+    entries = [_]Entry{.{}} ** MAX_GAMEPADS;
+    defer entries = [_]Entry{.{}} ** MAX_GAMEPADS;
+
+    // Android InputDevice id 9 is well above MAX_GAMEPADS — the old slot-indexed
+    // `nameFor` returned "Gamepad" and never surfaced the recorded name.
+    record(9, "Xbox Wireless Controller", "xbox");
+    try std.testing.expectEqualStrings("Xbox Wireless Controller", nameFor(9));
+    try std.testing.expectEqualStrings("xbox", typeHintFor(9));
+
+    // Unknown id still falls back cleanly.
+    try std.testing.expectEqualStrings("Gamepad", nameFor(3));
+    try std.testing.expectEqualStrings("unknown", typeHintFor(3));
+
+    // Forget clears it.
+    forget(9);
+    try std.testing.expectEqualStrings("Gamepad", nameFor(9));
 }
