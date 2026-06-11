@@ -168,9 +168,17 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle_{s}\");\n", .{ plugin.name, plugin.name, plugin.name });
     }
 
+    // `gamepad_enabled` flips the shared SDL desktop gamepad source on
+    // (core#28 slice 5). When `.auto`, the backend's build.zig wires
+    // `sdl_gamepad` + links SDL2 on desktop and routes through it; when
+    // `.none` (opt-out), the backend omits the import and links no SDL, and
+    // the input module's gamepad queries resolve to the truly-disabled path.
+    // Computed + substituted exactly like `with_imgui`.
+    const gamepad_enabled: []const u8 = if (cfg.gamepad == .auto) "true" else "false";
+
     // Backend dep — always the standard backend (never a merged GUI+backend package)
     switch (cfg.backend) {
-        .raylib => try tpl.writeSection(build_zig_tmpl, "backend_raylib", w),
+        .raylib => try tpl.renderSection(build_zig_tmpl, "backend_raylib", .{ .gamepad_enabled = gamepad_enabled }, w),
         .sokol => {
             // `with_imgui` must be true ONLY when the project's gui plugin
             // is imgui — sokol_imgui.c needs cimgui.h on its include path,
@@ -190,7 +198,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             } else if (cfg.platform == .android) {
                 try tpl.renderSection(build_zig_tmpl, "backend_sokol_android", .{ .with_imgui = with_imgui }, w);
             } else {
-                try tpl.renderSection(build_zig_tmpl, "backend_sokol", .{ .with_imgui = with_imgui }, w);
+                try tpl.renderSection(build_zig_tmpl, "backend_sokol", .{ .with_imgui = with_imgui, .gamepad_enabled = gamepad_enabled }, w);
             }
         },
         .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),

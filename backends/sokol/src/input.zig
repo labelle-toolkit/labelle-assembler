@@ -59,8 +59,19 @@ const agp = @import("android_gamepad_state.zig");
 // a desktop target. The source gates its own SDL `extern`s behind the same
 // comptime `is_desktop`, so Android/iOS/wasm reference no SDL and fall back to
 // the android_gamepad_state path / GameController bridge / no-gamepad defaults.
-const sdl_gp = @import("sdl_gamepad");
-const use_sdl_gamepad = sdl_gp.is_desktop;
+//
+// `gamepad_enabled` (core#28 slice 5) is forwarded from the backend build.zig.
+// When false (`.gamepad = .none` opt-out) the `sdl_gamepad` module is NOT in
+// the build graph, so we must not `@import` it; the `@import` therefore lives
+// inside the taken comptime branch. With the source absent `use_sdl_gamepad`
+// is false on desktop, so the gamepad queries fall through to the no-gamepad
+// defaults (`gc_enabled` is false off ios/tvos) — truly disabled, no SDL. The
+// Android / iOS branches are unaffected (the flag only governs the SDL path).
+const gamepad_enabled = @import("build_options").gamepad_enabled;
+const sdl_gp = if (gamepad_enabled) @import("sdl_gamepad") else struct {
+    pub const is_desktop = false;
+};
+const use_sdl_gamepad = gamepad_enabled and sdl_gp.is_desktop;
 
 const AndroidGamepadEventType = enum(c_int) {
     invalid = 0,

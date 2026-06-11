@@ -111,10 +111,29 @@ pub fn build(b: *std.Build) void {
     // is what flows through here. The generated build does not currently
     // overrideImport core onto the sokol input module, so there is no second
     // core instance to clash with on this backend.
-    const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
-    const sdl_gp_dep = b.dependency("labelle_sdl_gamepad", .{ .target = target, .optimize = optimize });
-    const sdl_gp_mod = sdl_gp_dep.module("sdl_gamepad");
-    sdl_gp_mod.addImport("labelle_core", core_dep.module("labelle-core"));
+    // Desktop gamepad source toggle (core#28 slice 5). When true (default) the
+    // shared SDL desktop gamepad source is wired into `input` + SDL2 linked on
+    // desktop; when false (opt-out, `.gamepad = .none`) the `sdl_gamepad`
+    // import is absent, no SDL2 is linked, and input.zig's desktop gamepad
+    // queries resolve to the disabled path (Android/iOS paths are unaffected).
+    // The assembler forwards this via `b.dependency(..., .gamepad_enabled)`.
+    // Gated so that when opted out, `labelle_sdl_gamepad` is not even resolved
+    // as a dependency (the generated zon no longer declares it).
+    const gamepad_enabled = b.option(bool, "gamepad_enabled", "Wire the shared SDL desktop gamepad source + link SDL2 (default true; false = opt out, no SDL)") orelse true;
+
+    const sdl_gp_mod: ?*std.Build.Module = if (gamepad_enabled) blk: {
+        const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
+        const sdl_gp_dep = b.dependency("labelle_sdl_gamepad", .{ .target = target, .optimize = optimize });
+        const m = sdl_gp_dep.module("sdl_gamepad");
+        m.addImport("labelle_core", core_dep.module("labelle-core"));
+        break :blk m;
+    } else null;
+
+    // `build_options` carried into `input.zig` so its comptime gamepad routing
+    // knows whether `sdl_gamepad` was wired. When false input.zig does not
+    // `@import("sdl_gamepad")` and the desktop gamepad path is disabled.
+    const input_opts = b.addOptions();
+    input_opts.addOption(bool, "gamepad_enabled", gamepad_enabled);
 
     // ── Gfx backend module ──────────────────────────────────────────
     const gfx_mod = b.addModule("gfx", .{
@@ -160,15 +179,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     input_mod.addImport("sokol", sokol_mod);
-    input_mod.addImport("sdl_gamepad", sdl_gp_mod);
+    input_mod.addImport("build_options", input_opts.createModule());
+    if (sdl_gp_mod) |m| input_mod.addImport("sdl_gamepad", m);
 
-    // Link SDL2 for the shared desktop gamepad source — DESKTOP targets ONLY.
-    // Android keeps `android_gamepad_state.zig` (no SDL); iOS/tvOS keep the
+    // Link SDL2 for the shared desktop gamepad source — DESKTOP targets ONLY,
+    // and only when the gamepad source is wired (`gamepad_enabled`). Android
+    // keeps `android_gamepad_state.zig` (no SDL); iOS/tvOS keep the
     // GameController bridge; wasm has no gamepad. The shared source gates its
     // SDL `extern`s behind a comptime desktop check, so those builds reference
-    // no SDL and must not link it. No `@cImport`/include path needed (the
-    // source uses `extern fn`); on macOS the Homebrew lib path is added.
-    if (targetIsDesktop(target.result)) {
+    // no SDL and must not link it. When opted out NO SDL is linked anywhere.
+    // No `@cImport`/include path needed (the source uses `extern fn`); on macOS
+    // the Homebrew lib path is added.
+    if (gamepad_enabled and targetIsDesktop(target.result)) {
         input_mod.link_libc = true;
         if (sdlLibPath(target.result.os.tag, builtin.target.os.tag)) |p| {
             input_mod.addLibraryPath(.{ .cwd_relative = p });
@@ -294,19 +316,23 @@ pub fn build(b: *std.Build) void {
     // proving the Android sokol path pulls no SDL. Verify with:
     //   zig build gating-obj -Dtarget=aarch64-linux-android
     //   nm -u zig-out/bin/sdl_gamepad_gating.o | grep -E 'SDL_[A-Z]'  # empty
-    const gating_obj = b.addObject(.{
-        .name = "sdl_gamepad_gating",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/gamepad_gating_probe.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "sdl_gamepad", .module = sdl_gp_mod },
-            },
-        }),
-    });
-    const gating_step = b.step("gating-obj", "Emit the gamepad surface as an object (no sokol_clib) for cross-compile SDL symbol gating");
-    gating_step.dependOn(&b.addInstallBinFile(gating_obj.getEmittedBin(), "sdl_gamepad_gating.o").step);
+    // Only meaningful when the gamepad source is wired; on opt-out there is no
+    // `sdl_gamepad` module to probe, so the step is omitted.
+    if (sdl_gp_mod) |m| {
+        const gating_obj = b.addObject(.{
+            .name = "sdl_gamepad_gating",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/gamepad_gating_probe.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "sdl_gamepad", .module = m },
+                },
+            }),
+        });
+        const gating_step = b.step("gating-obj", "Emit the gamepad surface as an object (no sokol_clib) for cross-compile SDL symbol gating");
+        gating_step.dependOn(&b.addInstallBinFile(gating_obj.getEmittedBin(), "sdl_gamepad_gating.o").step);
+    }
 
     // Android gamepad STATE (labelle-assembler#250). The mapping table, quirk
     // routing, and the per-device state machine are pure Zig — host-runnable
