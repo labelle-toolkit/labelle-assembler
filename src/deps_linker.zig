@@ -58,6 +58,28 @@ pub fn createDepsLinks(
         const zon_name = try std.fmt.allocPrint(allocator, "labelle_{s}", .{backend_name});
         const link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{backend_name});
         try deps.append(allocator, .{ .zon_name = zon_name, .link_name = link_name, .abs_path = backend_path });
+
+        // Backend-owned transitive sub-package: the shared windowless-SDL
+        // desktop gamepad source (`backends/sdl_gamepad/`, core#28). Both the
+        // raylib and sokol desktop backends declare it as a relative-path dep
+        // (`.labelle_sdl_gamepad = .{ .path = "../sdl_gamepad" }`) in their own
+        // build.zig.zon. The backend zon is staged verbatim into
+        // .labelle/deps/labelle-<backend>/ (its `.path` is NOT rewritten — only
+        // local plugins/gui are), so `../sdl_gamepad` resolves to
+        // .labelle/deps/sdl_gamepad. Stage the sub-package there under exactly
+        // that link name so the path resolves. Other backends don't depend on
+        // it, so only register it for raylib/sokol.
+        switch (cfg.backend) {
+            .raylib, .sokol => {
+                const gp_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends/sdl_gamepad");
+                try deps.append(allocator, .{
+                    .zon_name = try allocator.dupe(u8, "labelle_sdl_gamepad"),
+                    .link_name = try allocator.dupe(u8, "sdl_gamepad"),
+                    .abs_path = gp_path,
+                });
+            },
+            else => {},
+        }
     }
 
     switch (cfg.ecs) {
