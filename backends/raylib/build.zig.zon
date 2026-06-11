@@ -5,15 +5,14 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // GamepadEvent / GamepadDescription contract consumed by
-        // src/input.zig (pollGamepadEvents / describeGamepads). Pinned to
-        // the labelle-core#18/#19 gamepad-contract branch until it lands on
-        // a release tag — this PR is STACKED on labelle-core#19. Generated
+        // src/input.zig (pollGamepadEvents / describeGamepads). The contract
+        // (labelle-core#18/#19) landed in the v1.15.0 release tag. Generated
         // game builds pull `input` from this backend dependency and resolve
         // its `labelle-core` import through this pin (the assembler does not
         // overrideImport labelle-core onto backend modules).
         .@"labelle-core" = .{
-            .url = "git+https://github.com/labelle-toolkit/labelle-core.git?ref=feat/gamepad-event-contract#8fcf67641a1d6e021bc305ee62092944456f8f69",
-            .hash = "labelle_core-1.14.1-OauRcH-BAgDVjH3gOO534hhVb1n8Ey9uMjK5dRFaMazj",
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.15.0.tar.gz",
+            .hash = "labelle_core-1.15.0-OauRcIDMAwCys-pGbaVktdIZZk65hbXkrzzqd0Jk_XjY",
         },
         .@"raylib-zig" = .{
             .url = "git+https://github.com/raylib-zig/raylib-zig#f25c5173b4c40ef53c7ccf6d8d51ead0892f9f22",
