@@ -399,7 +399,7 @@ pub const GameModuleBinding = struct {
         // No plugins (or no plugin events) → empty list.
         const empty_pe: []const generator.main_zig.PluginEvent = &.{};
         const empty_fn: []const generator.main_zig.PluginFlowNode = &.{};
-        const src = try generator.generateGameShim(allocator, empty_pe, empty_fn);
+        const src = try generator.generateGameShim(allocator, empty_pe, empty_fn, .{});
         defer allocator.free(src);
 
         // `@import("game")` users expect both decls at the root.
@@ -436,7 +436,7 @@ pub const GameModuleBinding = struct {
             },
         };
         const empty_fn: []const generator.main_zig.PluginFlowNode = &.{};
-        const src = try generator.generateGameShim(allocator, &pe, empty_fn);
+        const src = try generator.generateGameShim(allocator, &pe, empty_fn, .{});
         defer allocator.free(src);
 
         // The static prelude still re-exports the engine types verbatim.
@@ -474,7 +474,7 @@ pub const GameModuleBinding = struct {
                 .is_script = true,
             },
         };
-        const src = try generator.generateGameShim(allocator, empty_pe, &fn_nodes);
+        const src = try generator.generateGameShim(allocator, empty_pe, &fn_nodes, .{});
         defer allocator.free(src);
 
         // Block + qualified decl present.
@@ -488,5 +488,72 @@ pub const GameModuleBinding = struct {
         // The resolver helper carries through so `game.PluginFlowNodes`
         // resolves dotted names just like main.zig's copy.
         try std.testing.expect(std.mem.indexOf(u8, src, "pub fn resolve(comptime dotted: []const u8)") != null);
+    }
+
+    test "tests-target shim instantiates Game over the real ecs backend (#275)" {
+        // labelle-assembler#275: the `.labelle/tests/` shim must NOT
+        // re-export `engine.Game` (mock backend). Instead it instantiates
+        // `Game` over `@import("ecs_backend")` so a plugin's ECS iteration
+        // (whose `QueryIterator.deinit` takes an allocator) compiles + runs
+        // headless under `labelle test`.
+        const allocator = std.testing.allocator;
+        const empty_pe: []const generator.main_zig.PluginEvent = &.{};
+        const empty_fn: []const generator.main_zig.PluginFlowNode = &.{};
+        const src = try generator.generateGameShim(allocator, empty_pe, empty_fn, .{
+            .is_tests_target = true,
+            .ecs = .zig_ecs,
+        });
+        defer allocator.free(src);
+
+        // Real ecs backend, not the mock re-export.
+        try std.testing.expect(std.mem.indexOf(u8, src, "const EcsBackend = @import(\"ecs_backend\");") != null);
+        // Not the default `pub const Game = engine.Game;` re-export
+        // (note: `engine.GameConfig(` legitimately contains `engine.Game`).
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const Game = engine.Game;") == null);
+        // Game is a GameConfig instantiation over EcsBackend + stub render.
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const Game = engine.GameConfig(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "engine.core.StubRender(EcsBackend.Entity)") != null);
+        // EntityId still surfaced for flow files.
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const EntityId = Game.EntityType;") != null);
+    }
+
+    test "tests-target shim with mock ecs uses MockEcsBackend (#275)" {
+        // A `.ecs = .mock` project has no `ecs_backend` module to import,
+        // so the tests shim must declare `engine.MockEcsBackend(u32)`
+        // directly — still a GameConfig instantiation (not the
+        // `engine.Game` re-export), keeping the shape uniform.
+        const allocator = std.testing.allocator;
+        const empty_pe: []const generator.main_zig.PluginEvent = &.{};
+        const empty_fn: []const generator.main_zig.PluginFlowNode = &.{};
+        const src = try generator.generateGameShim(allocator, empty_pe, empty_fn, .{
+            .is_tests_target = true,
+            .ecs = .mock,
+        });
+        defer allocator.free(src);
+
+        try std.testing.expect(std.mem.indexOf(u8, src, "const EcsBackend = engine.MockEcsBackend(u32);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"ecs_backend\")") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "pub const Game = engine.GameConfig(") != null);
+    }
+
+    test "tests-target build.zig wires ecs_backend into game_mod for non-mock ecs (#275)" {
+        // The tests shim's `@import("ecs_backend")` only resolves if the
+        // generated build.zig adds `ecs_backend` to `game_mod`'s import
+        // table. The exe target must NOT carry this wiring (its shim
+        // re-exports `engine.Game` and never imports ecs_backend).
+        const allocator = std.testing.allocator;
+        const cfg = generator.ProjectConfig{
+            .name = "t",
+            .ecs = .zig_ecs,
+            .plugins = &.{.{ .name = "box2d", .repo = "local:x" }},
+        };
+
+        const tests_bz = try generator.generateBuildZig(allocator, cfg, .{ .is_tests_target = true });
+        defer allocator.free(tests_bz);
+        try std.testing.expect(std.mem.indexOf(u8, tests_bz, "overrideImport(game_mod, \"ecs_backend\", ecs_mod);") != null);
+
+        const exe_bz = try generator.generateBuildZig(allocator, cfg, .{ .is_tests_target = false });
+        defer allocator.free(exe_bz);
+        try std.testing.expect(std.mem.indexOf(u8, exe_bz, "overrideImport(game_mod, \"ecs_backend\", ecs_mod);") == null);
     }
 };

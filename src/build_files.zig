@@ -214,6 +214,17 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         .mr_ecs => try tpl.renderSection(build_zig_tmpl, "ecs_adapter", .{ .ecs_dep_name = "labelle_mr_ecs" }, w),
     }
 
+    // labelle-assembler#275 — the tests target's `game.zig` shim
+    // instantiates `Game` over the REAL ECS backend (`@import("ecs_backend")`)
+    // so a backend-agnostic `labelle test` can drive plugin systems
+    // headless. The exe target's shim re-exports `engine.Game` and never
+    // imports `ecs_backend`, so this wiring is tests-only. `overrideImport`
+    // is a no-op for the mock backend (no `ecs_mod` exists, and the shim
+    // uses `engine.MockEcsBackend` directly), so the guard skips it.
+    if (opts.is_tests_target and cfg.ecs != .mock) {
+        try w.writeAll("    overrideImport(game_mod, \"ecs_backend\", ecs_mod);\n");
+    }
+
     // GUI plugin dep (manifest-driven — no switch on GUI type)
     if (cfg.resolved_gui) |gui| {
         const gui_mod_name = try std.fmt.allocPrint(allocator, "labelle_{s}", .{gui.name});
