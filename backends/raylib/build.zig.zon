@@ -14,6 +14,14 @@
             .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.15.0.tar.gz",
             .hash = "labelle_core-1.15.0-OauRcIDMAwCys-pGbaVktdIZZk65hbXkrzzqd0Jk_XjY",
         },
+        // Shared windowless-SDL desktop gamepad source (core#28). In-tree
+        // sub-package consumed by BOTH the raylib and sokol desktop backends
+        // via a relative path — the toolkit's own-build.zig sub-package
+        // convention for a narrow shared dep that should not be a separate
+        // repo. Routes desktop gamepad state/hotplug through one SDL copy.
+        .labelle_sdl_gamepad = .{
+            .path = "../sdl_gamepad",
+        },
         .@"raylib-zig" = .{
             .url = "git+https://github.com/raylib-zig/raylib-zig#f25c5173b4c40ef53c7ccf6d8d51ead0892f9f22",
             .hash = "raylib_zig-6.0.0-KE8REDJ4BQBu7lKwYNt6R4j5ywPeS37zqW6zrtjCcRwH",

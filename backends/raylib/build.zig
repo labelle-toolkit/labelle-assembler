@@ -1,4 +1,35 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// True when `t` is a native desktop OS (matches the shared source's comptime
+/// `is_desktop`): only there are the SDL `extern`s referenced and SDL must be
+/// linked. Android/iOS/wasm are excluded.
+fn targetIsDesktop(t: std.Target) bool {
+    if (t.abi == .android or t.abi == .androideabi) return false;
+    if (t.cpu.arch.isWasm()) return false;
+    return switch (t.os.tag) {
+        .macos, .windows, .linux => true,
+        else => false,
+    };
+}
+
+/// macOS Homebrew SDL2 library path for a NATIVE macOS host build (Zig does
+/// not search Homebrew by default). Returns null when cross-compiling or on
+/// Linux/Windows (system search resolves SDL2). No include path is needed.
+fn sdlLibPath(target_os: std.Target.Os.Tag, host_os: std.Target.Os.Tag) ?[]const u8 {
+    if (target_os != .macos or host_os != .macos) return null;
+    if (dirExists("/opt/homebrew/lib")) return "/opt/homebrew/lib";
+    if (dirExists("/usr/local/lib")) return "/usr/local/lib";
+    return null;
+}
+
+fn dirExists(path: []const u8) bool {
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    return true;
+}
 
 /// Re-export raylib-zig's emsdk helpers so consumers (generated build.zig) can
 /// use emccStep / emrunStep for WASM builds without a direct raylib-zig dep.
@@ -21,6 +52,18 @@ pub fn build(b: *std.Build) void {
     // needs to resolve the `labelle-core` import for standalone builds.
     const core_dep = b.dependency("labelle-core", .{ .target = target, .optimize = optimize });
     const core_mod = core_dep.module("labelle-core");
+
+    // Shared windowless-SDL desktop gamepad source (core#28). One copy lives
+    // in `backends/sdl_gamepad/`; both raylib and sokol desktop backends route
+    // their gamepad state/hotplug through it so the Switch/8BitDo raw-HID
+    // handshake GLFW can't decode is handled once. Imported under the
+    // `sdl_gamepad` key by `input.zig`. We unify labelle-core onto it (it
+    // imports core under the `labelle_core` key) so the `GamepadEvent` types it
+    // returns are the SAME instance `input.zig` and the engine see — without
+    // this the `[]GamepadEvent` crossing the seam would not type-check.
+    const sdl_gp_dep = b.dependency("labelle_sdl_gamepad", .{ .target = target, .optimize = optimize });
+    const sdl_gp_mod = sdl_gp_dep.module("sdl_gamepad");
+    sdl_gp_mod.addImport("labelle_core", core_mod);
 
     // ── Gfx backend module ──────────────────────────────────────────
     const gfx_mod = b.addModule("gfx", .{
@@ -56,6 +99,21 @@ pub fn build(b: *std.Build) void {
     });
     input_mod.addImport("raylib", raylib_mod);
     input_mod.addImport("labelle-core", core_mod);
+    input_mod.addImport("sdl_gamepad", sdl_gp_mod);
+
+    // Link SDL2 for the shared desktop gamepad source — DESKTOP targets only.
+    // The source gates every SDL `extern` behind a comptime desktop check, so
+    // Android/iOS/wasm builds reference no SDL symbols and must pull no SDL.
+    // No `@cImport`/include path is needed (the source uses `extern fn`); only
+    // the link + (on macOS Homebrew) the library path matters. raylib's render
+    // backend does NOT itself link SDL, so this is the only SDL on the line.
+    if (targetIsDesktop(target.result)) {
+        input_mod.link_libc = true;
+        if (sdlLibPath(target.result.os.tag, builtin.target.os.tag)) |p| {
+            input_mod.addLibraryPath(.{ .cwd_relative = p });
+        }
+        input_mod.linkSystemLibrary("SDL2", .{});
+    }
 
     // ── Audio backend module ────────────────────────────────────────
     const audio_mod = b.addModule("audio", .{
@@ -171,7 +229,17 @@ pub fn build(b: *std.Build) void {
     });
     input_host_mod.addImport("raylib", raylib_mod);
     input_host_mod.addImport("labelle-core", core_mod);
+    input_host_mod.addImport("sdl_gamepad", sdl_gp_mod);
     input_host_mod.linkLibrary(raylib_artifact);
+    // The host is a desktop target, so input.zig references the SDL externs —
+    // link SDL2 (+ Homebrew lib path on macOS) so the test binary resolves.
+    if (targetIsDesktop(host_target.result)) {
+        input_host_mod.link_libc = true;
+        if (sdlLibPath(host_target.result.os.tag, builtin.target.os.tag)) |p| {
+            input_host_mod.addLibraryPath(.{ .cwd_relative = p });
+        }
+        input_host_mod.linkSystemLibrary("SDL2", .{});
+    }
 
     const audio_compile_check = b.addTest(.{ .root_module = audio_host_mod });
     const gfx_compile_check = b.addTest(.{ .root_module = gfx_host_mod });

@@ -1,13 +1,27 @@
 /// Raylib input backend — satisfies the engine InputInterface(Impl) contract.
 const std = @import("std");
+const builtin = @import("builtin");
 const rl = @import("raylib");
 const core = @import("labelle-core");
+
+// Shared windowless-SDL desktop gamepad source (core#28). On a DESKTOP target
+// the gamepad surface below routes to this instead of `rl.isGamepad*`: SDL's
+// per-device HID drivers decode controllers (Nintendo Switch / 8BitDo raw-HID)
+// that GLFW — the window/input library raylib bundles — cannot. The source
+// gates all its SDL `extern`s behind its own comptime `is_desktop`, so on
+// off-desktop targets it is pure-Zig no-ops and we keep raylib's behavior.
+const sdl_gp = @import("sdl_gamepad");
 
 const GamepadEvent = core.GamepadEvent;
 const GamepadDescription = core.GamepadDescription;
 
 /// raylib supports at most 4 gamepads (MAX_GAMEPADS).
 const MAX_GAMEPADS: u32 = 4;
+
+/// On desktop, source gamepad state/hotplug from the shared SDL source; off
+/// desktop, keep raylib's GLFW-backed path. Resolved at comptime so the unused
+/// branch (and its SDL refs / rl gamepad refs) is eliminated per target.
+const use_sdl_gamepad = sdl_gp.is_desktop;
 
 // ── Keyboard ──────────────────────────────────────────────
 
@@ -73,19 +87,45 @@ pub fn getTouchId(index: u32) u64 {
 // ── Gamepad ───────────────────────────────────────────────
 
 pub fn isGamepadAvailable(gamepad: u32) bool {
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.isAvailable(gamepad);
     return rl.isGamepadAvailable(@intCast(gamepad));
 }
 
 pub fn isGamepadButtonDown(gamepad: u32, button: u32) bool {
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonDown(gamepad, button);
     return rl.isGamepadButtonDown(@intCast(gamepad), @enumFromInt(button));
 }
 
 pub fn isGamepadButtonPressed(gamepad: u32, button: u32) bool {
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonPressed(gamepad, button);
     return rl.isGamepadButtonPressed(@intCast(gamepad), @enumFromInt(button));
 }
 
 pub fn getGamepadAxisValue(gamepad: u32, axis: u32) f32 {
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.axisValue(gamepad, axis);
     return rl.getGamepadAxisMovement(@intCast(gamepad), @enumFromInt(axis));
+}
+
+/// Pump the shared SDL desktop gamepad source once per frame: drains hotplug
+/// events and refreshes the button-edge snapshot. No-op off desktop. The
+/// raylib desktop template calls this at the top of its frame loop (the
+/// raylib backend has no `newFrame` of its own — raylib's own gamepad state is
+/// pumped inside its window's event poll). Mirrors how the sokol backend calls
+/// the source's `update()` from its `newFrame`.
+pub fn newFrame() void {
+    if (comptime use_sdl_gamepad) sdl_gp.Source.update();
+}
+
+/// One-time init for the shared SDL source (lazy SDL subsystem init + startup
+/// controller enumeration). Safe to call repeatedly; no-op off desktop.
+pub fn initGamepad() void {
+    if (comptime use_sdl_gamepad) sdl_gp.Source.init();
+}
+
+/// Tear down the shared SDL source (close controllers, quit subsystems).
+/// No-op off desktop.
+pub fn deinitGamepad() void {
+    if (comptime use_sdl_gamepad) sdl_gp.Source.deinit();
 }
 
 // ── Gamepad hotplug (labelle-core#18) ─────────────────────
@@ -140,6 +180,11 @@ fn gamepadName(slot: u32) [:0]const u8 {
 /// being lost. (Callers should still size `out` >= MAX_GAMEPADS so this never
 /// triggers in practice.)
 pub fn pollGamepadEvents(out: []GamepadEvent) usize {
+    // On desktop, hotplug comes from the shared SDL source's event ring
+    // (populated in `newFrame`→`Source.update`), not raylib's poll-based
+    // availability edge-detect. The source already emits core `GamepadEvent`s.
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.pollEvents(out);
+
     var count: usize = 0;
     var slot: u32 = 0;
     while (slot < MAX_GAMEPADS) : (slot += 1) {
@@ -170,6 +215,8 @@ pub fn pollGamepadEvents(out: []GamepadEvent) usize {
 /// deltas), returning the number written (<= `out.len`). Disconnected slots
 /// are reported with `connected = false` and an empty name.
 pub fn describeGamepads(out: []GamepadDescription) usize {
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.describe(out);
+
     var count: usize = 0;
     var slot: u32 = 0;
     while (slot < MAX_GAMEPADS and count < out.len) : (slot += 1) {

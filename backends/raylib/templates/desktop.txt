@@ -12,6 +12,13 @@ const target_fps: u32 = {{fps}};
     defer window.closeWindow();
     window.setTargetFPS(target_fps);
 
+    // Init the shared windowless-SDL desktop gamepad source (core#28): opens
+    // the SDL gamecontroller subsystem and enumerates pads already attached at
+    // launch. No-op off desktop. Paired with the per-frame `newFrame()` pump
+    // below and the `deinitGamepad()` teardown on scope exit.
+    @import("backend_input").initGamepad();
+    defer @import("backend_input").deinitGamepad();
+
 {{hooks_init_block}}
     var g = AssembledGame.init(allocator);
     defer g.deinit();
@@ -32,6 +39,11 @@ const target_fps: u32 = {{fps}};
     const loop_start_ns: i128 = engine.nowNs();
 
     while (!window.windowShouldClose()) {
+        // Pump the shared SDL desktop gamepad source once per frame: drains
+        // hotplug events and refreshes the button-edge snapshot. No-op off
+        // desktop (raylib's own gamepad state is pumped inside GLFW's poll).
+        @import("backend_input").newFrame();
+
         // Frame-rate-independent sim: derive dt from real frame time so render
         // FPS can't drive game speed. Cap at 4 frames to prevent physics
         // explosions after a stall/backgrounding. Mirrors wasm.txt's use of

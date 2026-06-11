@@ -48,6 +48,20 @@ const gc = if (gc_enabled) struct {
 // iOS GameController path (or the no-gamepad defaults).
 const agp = @import("android_gamepad_state.zig");
 
+// ── Desktop gamepad bridge (core#28) ───────────────────────────────────
+//
+// sokol_app has NO desktop gamepad pipeline, so on macOS/Windows/Linux the
+// gamepad surface routes to the shared windowless-SDL source (the same copy
+// the raylib backend uses, `backends/sdl_gamepad/`). SDL's per-device HID
+// drivers decode controllers (Switch / 8BitDo) the platform layer can't.
+//
+// Gating mirrors the `agp.is_android` style: `use_sdl_gamepad` is true only on
+// a desktop target. The source gates its own SDL `extern`s behind the same
+// comptime `is_desktop`, so Android/iOS/wasm reference no SDL and fall back to
+// the android_gamepad_state path / GameController bridge / no-gamepad defaults.
+const sdl_gp = @import("sdl_gamepad");
+const use_sdl_gamepad = sdl_gp.is_desktop;
+
 const AndroidGamepadEventType = enum(c_int) {
     invalid = 0,
     key = 1,
@@ -249,6 +263,7 @@ var gamepad_prev_down: [MAX_GAMEPADS][MAX_GAMEPAD_BUTTONS]bool =
     [_][MAX_GAMEPAD_BUTTONS]bool{[_]bool{false} ** MAX_GAMEPAD_BUTTONS} ** MAX_GAMEPADS;
 
 pub fn isGamepadAvailable(gamepad_id: u32) bool {
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.isAvailable(gamepad_id);
     if (comptime agp.is_android) return agp.connected(gamepad_id);
     if (!gc_enabled) return false;
     if (gamepad_id >= MAX_GAMEPADS) return false;
@@ -256,6 +271,7 @@ pub fn isGamepadAvailable(gamepad_id: u32) bool {
 }
 
 pub fn isGamepadButtonDown(gamepad_id: u32, button: u32) bool {
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonDown(gamepad_id, button);
     if (comptime agp.is_android) return agp.buttonDown(gamepad_id, button);
     if (!gc_enabled) return false;
     if (gamepad_id >= MAX_GAMEPADS or button >= MAX_GAMEPAD_BUTTONS) return false;
@@ -263,6 +279,9 @@ pub fn isGamepadButtonDown(gamepad_id: u32, button: u32) bool {
 }
 
 pub fn isGamepadButtonPressed(gamepad_id: u32, button: u32) bool {
+    // On desktop the shared SDL source owns the prev/cur edge snapshot
+    // (refreshed in its `update()`), keyed by the dense 0..3 slot.
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonPressed(gamepad_id, button);
     // On Android, edge detection lives in the state module (it snapshots
     // prev-down across `newFrame`), keyed by Android device id rather than a
     // fixed 0..3 slot.
@@ -276,6 +295,7 @@ pub fn isGamepadButtonPressed(gamepad_id: u32, button: u32) bool {
 }
 
 pub fn getGamepadAxisValue(gamepad_id: u32, axis: u32) f32 {
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.axisValue(gamepad_id, axis);
     if (comptime agp.is_android) return agp.axisValue(gamepad_id, axis);
     if (!gc_enabled) return 0;
     // Guard the axis too (not just gamepad_id) so an out-of-range index can't
@@ -287,6 +307,14 @@ pub fn getGamepadAxisValue(gamepad_id: u32, axis: u32) f32 {
 /// Snapshot current gamepad button state so the next frame's
 /// `isGamepadButtonPressed` can compute the rising edge. No-op off ios/tvos.
 fn snapshotGamepadButtons() void {
+    // Desktop: pump the shared SDL source once per frame. `update()` drains
+    // hotplug events and refreshes the button-edge snapshot the source uses
+    // for `isButtonPressed`. This is the single per-frame pump point for the
+    // sokol desktop gamepad path.
+    if (comptime use_sdl_gamepad) {
+        sdl_gp.Source.update();
+        return;
+    }
     if (comptime agp.is_android) {
         agp.newFrame();
         return;

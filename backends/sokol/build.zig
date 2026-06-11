@@ -1,4 +1,36 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// True when `t` is a native desktop OS (matches the shared SDL source's
+/// comptime `is_desktop`): only there are the SDL `extern`s referenced and SDL
+/// must be linked. Android/iOS/tvOS/wasm are excluded — they keep their own
+/// gamepad path and pull no SDL.
+fn targetIsDesktop(t: std.Target) bool {
+    if (t.abi == .android or t.abi == .androideabi) return false;
+    if (t.cpu.arch.isWasm()) return false;
+    return switch (t.os.tag) {
+        .macos, .windows, .linux => true,
+        else => false,
+    };
+}
+
+/// macOS Homebrew SDL2 library path for a NATIVE macOS host build (Zig does
+/// not search Homebrew by default). Returns null when cross-compiling or on
+/// Linux/Windows (system search resolves SDL2). No include path is needed.
+fn sdlLibPath(target_os: std.Target.Os.Tag, host_os: std.Target.Os.Tag) ?[]const u8 {
+    if (target_os != .macos or host_os != .macos) return null;
+    if (dirExists("/opt/homebrew/lib")) return "/opt/homebrew/lib";
+    if (dirExists("/usr/local/lib")) return "/usr/local/lib";
+    return null;
+}
+
+fn dirExists(path: []const u8) bool {
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    return true;
+}
 
 /// Re-export sokol's emscripten linker helpers so consumers (generated build.zig)
 /// can use emLinkStep for WASM builds without a direct sokol dep.
@@ -63,6 +95,27 @@ pub fn build(b: *std.Build) void {
     const sokol_mod = sokol_dep.module("sokol");
     const sokol_clib = sokol_dep.artifact("sokol_clib");
 
+    // Shared windowless-SDL desktop gamepad source (core#28). One copy in
+    // `backends/sdl_gamepad/`, shared with the raylib backend. On DESKTOP the
+    // sokol input backend routes gamepad state/hotplug here (sokol_app has no
+    // desktop gamepad pipeline at all); on Android it keeps
+    // `android_gamepad_state.zig` (the existing forwarded-event path); on
+    // ios/tvos it keeps the GameController bridge. labelle-core is unified onto
+    // this module (it imports core under `labelle_core`) so the `GamepadEvent`
+    // types match the engine's across the seam. The sub-package gates its SDL
+    // `extern`s behind a comptime desktop check, so the Android/iOS/wasm sokol
+    // builds reference no SDL.
+    //
+    // labelle-core: the sokol input backend has no core dep of its own (it
+    // reaches ios state via a C ABI), so the sub-package's OWN labelle-core pin
+    // is what flows through here. The generated build does not currently
+    // overrideImport core onto the sokol input module, so there is no second
+    // core instance to clash with on this backend.
+    const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
+    const sdl_gp_dep = b.dependency("labelle_sdl_gamepad", .{ .target = target, .optimize = optimize });
+    const sdl_gp_mod = sdl_gp_dep.module("sdl_gamepad");
+    sdl_gp_mod.addImport("labelle_core", core_dep.module("labelle-core"));
+
     // ── Gfx backend module ──────────────────────────────────────────
     const gfx_mod = b.addModule("gfx", .{
         .root_source_file = b.path("src/gfx.zig"),
@@ -107,6 +160,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     input_mod.addImport("sokol", sokol_mod);
+    input_mod.addImport("sdl_gamepad", sdl_gp_mod);
+
+    // Link SDL2 for the shared desktop gamepad source — DESKTOP targets ONLY.
+    // Android keeps `android_gamepad_state.zig` (no SDL); iOS/tvOS keep the
+    // GameController bridge; wasm has no gamepad. The shared source gates its
+    // SDL `extern`s behind a comptime desktop check, so those builds reference
+    // no SDL and must not link it. No `@cImport`/include path needed (the
+    // source uses `extern fn`); on macOS the Homebrew lib path is added.
+    if (targetIsDesktop(target.result)) {
+        input_mod.link_libc = true;
+        if (sdlLibPath(target.result.os.tag, builtin.target.os.tag)) |p| {
+            input_mod.addLibraryPath(.{ .cwd_relative = p });
+        }
+        input_mod.linkSystemLibrary("SDL2", .{});
+    }
 
     // Android gamepad DETECTION glue (labelle-assembler#248). The JNI
     // bridge calls into Android's InputManager to detect controller
@@ -216,6 +284,29 @@ pub fn build(b: *std.Build) void {
     // other checks this only builds the binary (cross-compile safe).
     const input_compile_check = b.addTest(.{ .root_module = input_mod });
     test_step.dependOn(&input_compile_check.step);
+
+    // ── Cross-compile SDL-gating object (core#28) ───────────────────────
+    // Emits ONLY the gamepad-routing surface as an object for the requested
+    // target, via a standalone module that imports sdl_gamepad but NOT sokol
+    // (so it does not drag in sokol_clib, whose C compile needs the Android
+    // NDK sysroot). On a non-desktop target the shared source's `is_desktop`
+    // is false, so the object must contain NO undefined `SDL_*` symbols —
+    // proving the Android sokol path pulls no SDL. Verify with:
+    //   zig build gating-obj -Dtarget=aarch64-linux-android
+    //   nm -u zig-out/bin/sdl_gamepad_gating.o | grep -E 'SDL_[A-Z]'  # empty
+    const gating_obj = b.addObject(.{
+        .name = "sdl_gamepad_gating",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gamepad_gating_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "sdl_gamepad", .module = sdl_gp_mod },
+            },
+        }),
+    });
+    const gating_step = b.step("gating-obj", "Emit the gamepad surface as an object (no sokol_clib) for cross-compile SDL symbol gating");
+    gating_step.dependOn(&b.addInstallBinFile(gating_obj.getEmittedBin(), "sdl_gamepad_gating.o").step);
 
     // Android gamepad STATE (labelle-assembler#250). The mapping table, quirk
     // routing, and the per-device state machine are pure Zig — host-runnable
