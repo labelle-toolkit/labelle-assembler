@@ -70,9 +70,11 @@ pub fn build(b: *std.Build) void {
     // imports core under the `labelle_core` key) so the `GamepadEvent` types it
     // returns are the SAME instance `input.zig` and the engine see — without
     // this the `[]GamepadEvent` crossing the seam would not type-check.
-    // Gated on `gamepad_enabled`: when opted out, the sub-package is not even
-    // resolved as a dependency, so nothing pulls SDL into the graph.
-    const sdl_gp_mod: ?*std.Build.Module = if (gamepad_enabled) blk: {
+    // Gated on `gamepad_enabled` AND a desktop target: when opted out OR on a
+    // non-desktop target (Android/iOS/wasm), the sub-package is not resolved as
+    // a dependency, so nothing pulls SDL into the graph and we don't require
+    // `labelle_sdl_gamepad` to be staged where it's never used.
+    const sdl_gp_mod: ?*std.Build.Module = if (gamepad_enabled and targetIsDesktop(target.result)) blk: {
         const sdl_gp_dep = b.dependency("labelle_sdl_gamepad", .{ .target = target, .optimize = optimize });
         const m = sdl_gp_dep.module("sdl_gamepad");
         m.addImport("labelle_core", core_mod);

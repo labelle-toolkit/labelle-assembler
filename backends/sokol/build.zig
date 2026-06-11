@@ -121,7 +121,10 @@ pub fn build(b: *std.Build) void {
     // as a dependency (the generated zon no longer declares it).
     const gamepad_enabled = b.option(bool, "gamepad_enabled", "Wire the shared SDL desktop gamepad source + link SDL2 (default true; false = opt out, no SDL)") orelse true;
 
-    const sdl_gp_mod: ?*std.Build.Module = if (gamepad_enabled) blk: {
+    // Gated on `gamepad_enabled` AND a desktop target: non-desktop sokol builds
+    // (Android/iOS/wasm) never use the SDL source, so don't resolve/require it
+    // there — Android keeps its JNI gamepad path, iOS its GameController path.
+    const sdl_gp_mod: ?*std.Build.Module = if (gamepad_enabled and targetIsDesktop(target.result)) blk: {
         const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
         const sdl_gp_dep = b.dependency("labelle_sdl_gamepad", .{ .target = target, .optimize = optimize });
         const m = sdl_gp_dep.module("sdl_gamepad");

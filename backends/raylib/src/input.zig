@@ -19,7 +19,20 @@ const gamepad_enabled = @import("build_options").gamepad_enabled;
 // `is_desktop`, so on off-desktop targets it is pure-Zig no-ops and we keep
 // raylib's behavior. The `@import` lives inside the taken comptime branch so it
 // is NOT evaluated when the module is absent (opt-out).
-const sdl_gp = if (gamepad_enabled) @import("sdl_gamepad") else struct {
+// Mirrors `targetIsDesktop` in build.zig: the build wires the `sdl_gamepad`
+// module ONLY when (gamepad_enabled AND desktop target), so the `@import` must
+// be gated identically — importing it on a non-desktop target (where it isn't
+// in the graph) is a compile error.
+const target_is_desktop = blk: {
+    const t = builtin.target;
+    if (t.abi == .android or t.abi == .androideabi) break :blk false;
+    if (t.cpu.arch.isWasm()) break :blk false;
+    break :blk switch (t.os.tag) {
+        .macos, .windows, .linux => true,
+        else => false,
+    };
+};
+const sdl_gp = if (gamepad_enabled and target_is_desktop) @import("sdl_gamepad") else struct {
     pub const is_desktop = false;
 };
 

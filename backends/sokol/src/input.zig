@@ -68,7 +68,20 @@ const agp = @import("android_gamepad_state.zig");
 // defaults (`gc_enabled` is false off ios/tvos) — truly disabled, no SDL. The
 // Android / iOS branches are unaffected (the flag only governs the SDL path).
 const gamepad_enabled = @import("build_options").gamepad_enabled;
-const sdl_gp = if (gamepad_enabled) @import("sdl_gamepad") else struct {
+// Mirrors `targetIsDesktop` in build.zig: the SDL source module is wired ONLY
+// when (gamepad_enabled AND desktop target), so the `@import` must match — on
+// Android/iOS/wasm the module isn't in the graph (and those keep their JNI /
+// GameController / no-gamepad paths). Importing it there is a compile error.
+const target_is_desktop = blk: {
+    const t = builtin.target;
+    if (t.abi == .android or t.abi == .androideabi) break :blk false;
+    if (t.cpu.arch.isWasm()) break :blk false;
+    break :blk switch (t.os.tag) {
+        .macos, .windows, .linux => true,
+        else => false,
+    };
+};
+const sdl_gp = if (gamepad_enabled and target_is_desktop) @import("sdl_gamepad") else struct {
     pub const is_desktop = false;
 };
 const use_sdl_gamepad = gamepad_enabled and sdl_gp.is_desktop;
