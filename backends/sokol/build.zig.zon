@@ -4,6 +4,22 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        // Shared windowless-SDL desktop gamepad source (core#28). In-tree
+        // sub-package shared with the raylib backend via a relative path — the
+        // toolkit's own-build.zig sub-package convention. On desktop the sokol
+        // input backend routes gamepad through it; Android keeps
+        // android_gamepad_state.zig.
+        .labelle_sdl_gamepad = .{
+            .path = "../sdl_gamepad",
+        },
+        // Gamepad event contract (GamepadEvent / GamepadDescription, core#18).
+        // The sokol input backend itself has no core import; this pin is unified
+        // onto the shared sdl_gamepad module so its event types match the
+        // engine's. v1.15.0 release tag (same pin the raylib/sdl backends use).
+        .labelle_core = .{
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.15.0.tar.gz",
+            .hash = "labelle_core-1.15.0-OauRcIDMAwCys-pGbaVktdIZZk65hbXkrzzqd0Jk_XjY",
+        },
         .sokol = .{
             // ⚠ LOCKSTEP: this commit MUST equal labelle-imgui's sokol
             // pin (its top-level `.sokol` AND `bridges/sokol/build.zig.zon`)
