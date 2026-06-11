@@ -658,7 +658,10 @@ pub const Source = struct {
         return normalizeAxis(raw, isTriggerAxis(axis));
     }
 
-    /// Diagnostic enumeration: one entry per connected slot.
+    /// Diagnostic enumeration: one entry per slot (0..MAX_GAMEPADS-1), in
+    /// slot order, with `connected=false` for free slots — matching the
+    /// fixed-slot snapshot the raylib backend's `describeGamepads` documents.
+    /// Free slots are emitted with an empty name and default source class.
     pub fn describe(out: []GamepadDescription) usize {
         if (comptime !is_desktop) return 0;
         state.lock.lock();
@@ -666,14 +669,15 @@ pub const Source = struct {
         var n: usize = 0;
         for (state.slots, 0..) |s, i| {
             if (n >= out.len) break;
-            const ctrl = s.controller orelse continue;
-            var d = GamepadDescription{ .slot = @intCast(i), .connected = true };
-            if (sdl.SDL_GameControllerName(@ptrCast(ctrl))) |p| {
-                const name = std.mem.span(p);
-                d.setName(name);
-                d.type_hint = typeHintFromName(name);
+            var d = GamepadDescription{ .slot = @intCast(i), .connected = s.controller != null };
+            if (s.controller) |ctrl| {
+                if (sdl.SDL_GameControllerName(@ptrCast(ctrl))) |p| {
+                    const name = std.mem.span(p);
+                    d.setName(name);
+                    d.type_hint = typeHintFromName(name);
+                }
+                d.source_class = .gamepad;
             }
-            d.source_class = .gamepad;
             out[n] = d;
             n += 1;
         }
