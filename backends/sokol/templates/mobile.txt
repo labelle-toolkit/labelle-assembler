@@ -19,7 +19,12 @@ export fn init() callconv(.c) void {
 
     g.setHooks(&hooks);
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
-{{preview_setup}}{{init_code}}}
+{{preview_setup}}{{init_code}}    // Initialize the Android gamepad subsystem: registers the forwarded-event
+    // callback and runs the JNI InputManager enumeration so pads already
+    // connected at launch are detected (labelle-engine#261). Comptime no-op on
+    // non-Android sokol targets (desktop/wasm), so this is safe everywhere.
+    @import("backend_input").initAndroidGamepad();
+}
 
 {{gui_event_extern}}fn sokolEvent(ev: [*c]const @import("backend_input").Event) callconv(.c) void {
     @import("backend_input").handleEvent(ev);
