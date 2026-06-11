@@ -50,7 +50,10 @@ pub fn record(id: u32, name: []const u8, type_hint: [:0]const u8) void {
     };
     e.known = true;
     e.id = id;
-    const n = @min(name.len, NAME_CAP);
+    // Cap at NAME_CAP-1 so a terminator always fits within the fixed buffer
+    // (nameFor returns a sentinel-terminated slice; a name filling all
+    // NAME_CAP bytes would leave no room for the NUL → OOB).
+    const n = @min(name.len, NAME_CAP - 1);
     @memcpy(e.name[0..n], name[0..n]);
     e.name_len = n;
     e.type_hint = type_hint;
@@ -73,11 +76,11 @@ pub fn nameFor(id: u32) [:0]const u8 {
     // same class of bug as labelle-engine#261).
     const e = findById(id) orelse return "Gamepad";
     if (e.name_len == 0) return "Gamepad";
-    // The buffer is fixed and NUL-padded, so it is already NUL-terminated
-    // after `name_len` bytes (NAME_CAP >= name_len + 1 unless name filled
-    // the whole buffer; guard that edge by forcing a terminator).
-    if (e.name_len < NAME_CAP) e.name[e.name_len] = 0;
-    return e.name[0..e.name_len :0];
+    // `record` caps name_len at NAME_CAP-1, so the terminator always fits.
+    // Clamp defensively too, so the sentinel slice can never read out of bounds.
+    const n = @min(e.name_len, NAME_CAP - 1);
+    e.name[n] = 0;
+    return e.name[0..n :0];
 }
 
 /// Type hint string for `id` (e.g. "xbox", "playstation", "unknown").
@@ -124,4 +127,19 @@ test "nameFor/typeHintFor resolve a sparse Android device id (#270)" {
     // Forget clears it.
     forget(9);
     try std.testing.expectEqualStrings("Gamepad", nameFor(9));
+}
+
+test "nameFor handles a name that fills the buffer without OOB (#270)" {
+    entries = [_]Entry{.{}} ** MAX_GAMEPADS;
+    defer entries = [_]Entry{.{}} ** MAX_GAMEPADS;
+
+    // A name >= NAME_CAP previously made name_len == NAME_CAP, so the
+    // sentinel slice `e.name[0..name_len :0]` read out of bounds. record()
+    // now caps at NAME_CAP-1 and nameFor clamps, so this must not panic and
+    // returns the (truncated) name with a valid in-bounds terminator.
+    const long = "X" ** (NAME_CAP + 8);
+    record(2, long, "generic");
+    const got = nameFor(2);
+    try std.testing.expectEqual(@as(usize, NAME_CAP - 1), got.len);
+    try std.testing.expectEqual(@as(u8, 0), got.ptr[got.len]); // NUL in bounds
 }
