@@ -68,6 +68,11 @@ const android_gp = if (agp.is_android) struct {
     extern "c" fn sapp_android_register_gamepad_callback(
         cb: ?*const fn (ev: *const SappAndroidGamepadEvent) callconv(.c) void,
     ) void;
+    // JNI detection glue (android_gamepad_jni.c). Enumerates the InputManager
+    // device ids at startup and registers the device listener, seeding the
+    // gamepad state for controllers already connected before launch. The C
+    // signature is `void labelle_android_gamepad_init(const void *activity_ptr)`.
+    extern "c" fn labelle_android_gamepad_init(activity: ?*const anyopaque) void;
 } else struct {};
 
 /// Forwarded-event sink, invoked by the sokol fork on the Android Looper
@@ -88,7 +93,14 @@ export fn androidGamepadCallback(ev: *const SappAndroidGamepadEvent) callconv(.c
 /// No-op off Android.
 pub fn initAndroidGamepad() void {
     if (comptime agp.is_android) {
+        // Forwarded-event sink first, then the JNI enumeration: the latter
+        // walks the InputManager device ids and emits state-added for pads
+        // already connected at launch, so the HUD shows them without a button
+        // press. `androidGetNativeActivity()` wraps sokol's
+        // `sapp_android_get_native_activity()`; it is null before sokol has a
+        // running activity, and the C side no-ops on a null pointer.
         android_gp.sapp_android_register_gamepad_callback(&androidGamepadCallback);
+        android_gp.labelle_android_gamepad_init(sapp.androidGetNativeActivity());
     }
 }
 

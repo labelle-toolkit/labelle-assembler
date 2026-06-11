@@ -62,6 +62,20 @@ static jmethodID g_mid_get_sources = NULL;     // InputDevice.getSources()
 // are released before returning. Returns via the supplied callback-shaped
 // closure parameters is awkward in C, so callers copy out explicitly below.
 
+// android.view.InputDevice SOURCE_* bitmasks. A device's getSources() is a
+// bitmask; the low byte is the broad class. We only care about real
+// controllers — gamepad / joystick — so we can skip the keyboard, touchscreen,
+// d-pad-only remotes and other system input devices that getInputDeviceIds()
+// also returns. Mirrors `classifySources` in labelle-core
+// (gamepad_source/android.zig); keep the constants in lockstep.
+#define LBL_SOURCE_GAMEPAD 0x00000401
+#define LBL_SOURCE_JOYSTICK 0x01000010
+
+static int is_gamepad_sources(jint sources) {
+    return ((sources & LBL_SOURCE_GAMEPAD) == LBL_SOURCE_GAMEPAD) ||
+           ((sources & LBL_SOURCE_JOYSTICK) == LBL_SOURCE_JOYSTICK);
+}
+
 // Resolve InputDevice metadata for `device_id` and forward to Zig.
 static void emit_device_added(JNIEnv *env, jint device_id) {
     // All cached method IDs must be present — calling a NULL jmethodID is UB.
@@ -82,6 +96,17 @@ static void emit_device_added(JNIEnv *env, jint device_id) {
     jint sources = (*env)->CallIntMethod(env, device, g_mid_get_sources);
     if ((*env)->ExceptionCheck(env)) {
         (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, device);
+        return;
+    }
+
+    // getInputDeviceIds() returns ALL input devices (keyboards, touchscreens,
+    // power buttons, the virtual keyboard, …), not just controllers. Forwarding
+    // those as `gamepad_connected` makes the HUD list system devices instead of
+    // the pad. Only emit for devices that actually expose gamepad/joystick
+    // sources. (The engine also carries source_class, but it does not filter on
+    // emit, so we gate here at the discovery point.)
+    if (!is_gamepad_sources(sources)) {
         (*env)->DeleteLocalRef(env, device);
         return;
     }
@@ -274,7 +299,24 @@ void labelle_android_gamepad_init(const void *activity_ptr) {
     }
     const ANativeActivity *activity = (const ANativeActivity *)activity_ptr;
     g_vm = activity->vm;
-    JNIEnv *env = activity->env;
+
+    // `activity->env` is the JNIEnv of the thread that CREATED the activity
+    // (the Android main thread). sokol runs init_cb and the frame loop on its
+    // own render thread, where that env is INVALID — using it makes every JNI
+    // call below silently fail, so the InputManager enumeration found nothing
+    // and the HUD stayed empty (labelle-engine#261). Attach the current thread
+    // to the VM to obtain a JNIEnv valid HERE; fall back to the stored env only
+    // if attach somehow fails (harmless on a single-threaded config).
+    JNIEnv *env = NULL;
+    if (g_vm != NULL) {
+        jint rc = (*g_vm)->GetEnv(g_vm, (void **)&env, JNI_VERSION_1_6);
+        if (rc == JNI_EDETACHED) {
+            (*g_vm)->AttachCurrentThread(g_vm, &env, NULL);
+        }
+    }
+    if (env == NULL) {
+        env = activity->env; // last-ditch fallback
+    }
     if (env == NULL) {
         return;
     }

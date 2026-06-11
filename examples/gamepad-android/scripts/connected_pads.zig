@@ -10,12 +10,20 @@
 //! Process-global fixed array (raylib tracks at most 4 slots). No allocator,
 //! no lifecycle — a slot is "known" only between its connect and disconnect
 //! events.
+//!
+//! The engine `gamepad_connected.id` is the platform device id, which is NOT
+//! a dense 0..3 slot: on Android it is the raw `InputDevice` id (e.g. 9), well
+//! above raylib's 4-slot range. We therefore key entries by the device id and
+//! match the HUD's poll-by-slot loop (0..MAX_GAMEPADS) by also exposing a
+//! compact slot view, rather than indexing the array with the raw id (which
+//! silently dropped any id >= 4 — labelle-engine#261).
 
 const MAX_GAMEPADS: usize = 4;
 const NAME_CAP: usize = 64;
 
 const Entry = struct {
     known: bool = false,
+    id: u32 = 0,
     name: [NAME_CAP]u8 = [_]u8{0} ** NAME_CAP,
     name_len: usize = 0,
     type_hint: [:0]const u8 = "unknown",
@@ -23,11 +31,25 @@ const Entry = struct {
 
 var entries: [MAX_GAMEPADS]Entry = [_]Entry{.{}} ** MAX_GAMEPADS;
 
-/// Record a connect: store the device name + type hint for `id`.
+/// Find the entry holding device `id`, or null.
+fn findById(id: u32) ?*Entry {
+    for (&entries) |*e| {
+        if (e.known and e.id == id) return e;
+    }
+    return null;
+}
+
+/// Record a connect: store the device name + type hint for `id`. The id can be
+/// any platform device id; it is assigned the first free compact slot.
 pub fn record(id: u32, name: []const u8, type_hint: [:0]const u8) void {
-    if (id >= MAX_GAMEPADS) return;
-    var e = &entries[id];
+    var e = findById(id) orelse blk: {
+        for (&entries) |*slot| {
+            if (!slot.known) break :blk slot;
+        }
+        return; // all slots in use
+    };
     e.known = true;
+    e.id = id;
     const n = @min(name.len, NAME_CAP);
     @memcpy(e.name[0..n], name[0..n]);
     e.name_len = n;
@@ -36,8 +58,7 @@ pub fn record(id: u32, name: []const u8, type_hint: [:0]const u8) void {
 
 /// Forget a disconnected pad.
 pub fn forget(id: u32) void {
-    if (id >= MAX_GAMEPADS) return;
-    entries[id] = .{};
+    if (findById(id)) |e| e.* = .{};
 }
 
 /// Best-known device name for `id`. Falls back to a generic label when the
@@ -57,6 +78,22 @@ pub fn nameFor(id: u32) [:0]const u8 {
 
 /// Type hint string for `id` (e.g. "xbox", "playstation", "unknown").
 pub fn typeHintFor(id: u32) [:0]const u8 {
-    if (id >= MAX_GAMEPADS) return "unknown";
-    return entries[id].type_hint;
+    if (findById(id)) |e| return e.type_hint;
+    return "unknown";
+}
+
+/// Snapshot the device ids of all currently-known pads into `out`, returning
+/// the count written. Lets the HUD iterate the actual (possibly sparse)
+/// platform device ids instead of assuming a dense 0..3 slot range — Android
+/// `InputDevice` ids are not 0-based and routinely exceed 4
+/// (labelle-engine#261).
+pub fn knownIds(out: []u32) usize {
+    var n: usize = 0;
+    for (&entries) |*e| {
+        if (e.known and n < out.len) {
+            out[n] = e.id;
+            n += 1;
+        }
+    }
+    return n;
 }

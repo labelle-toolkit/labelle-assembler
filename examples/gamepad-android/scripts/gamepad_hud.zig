@@ -88,14 +88,13 @@ pub fn drawGui(game: anytype) void {
     ig.igTextDisabled("polls isGamepad* forwarders every frame (raylib, up to 4 pads)");
     ig.igSeparator();
 
-    // Count connected pads via the live availability poll. This reflects
-    // hotplug each frame — unplugging a pad drops it from the list, plugging
-    // one in adds it.
-    var connected: u32 = 0;
-    var slot: u32 = 0;
-    while (slot < MAX_GAMEPADS) : (slot += 1) {
-        if (game.isGamepadAvailable(slot)) connected += 1;
-    }
+    // Enumerate connected pads by their actual device ids. On Android the
+    // platform device id is sparse and not 0-based (e.g. a single Xbox pad is
+    // id 9), so a 0..MAX_GAMEPADS slot scan would miss it (labelle-engine#261).
+    // The connected-pad registry holds the real ids fed by the engine
+    // `gamepad_connected` event; iterate those and poll each by its id.
+    var ids: [MAX_GAMEPADS]u32 = undefined;
+    const connected = pads.knownIds(ids[0..]);
 
     // ── Empty state ────────────────────────────────────────────────────
     if (connected == 0) {
@@ -110,10 +109,9 @@ pub fn drawGui(game: anytype) void {
     }
 
     // ── Per-pad panels ─────────────────────────────────────────────────
-    slot = 0;
-    while (slot < MAX_GAMEPADS) : (slot += 1) {
-        if (!game.isGamepadAvailable(slot)) continue;
-        drawPad(game, slot);
+    for (ids[0..connected]) |id| {
+        if (!game.isGamepadAvailable(id)) continue;
+        drawPad(game, id);
     }
 }
 
