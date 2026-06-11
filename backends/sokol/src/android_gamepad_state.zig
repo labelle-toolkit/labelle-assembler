@@ -264,12 +264,38 @@ const MAX_DEVICES = 8;
 const Device = struct {
     active: bool = false,
     device_id: i32 = 0,
+    /// Effective button state queried by the engine: the OR of the raw keycode
+    /// state (`key_down`) and the hat-axis-derived dpad state. Recomputed on
+    /// every key/motion event so `buttonPressed` edge detection sees both.
     buttons_down: [MAX_BUTTONS]bool = [_]bool{false} ** MAX_BUTTONS,
+    /// Raw `AKEYCODE_*`-driven button state (one bit per canonical button).
+    /// Kept separate from `buttons_down` so a zero-valued hat motion event
+    /// cannot clobber a dpad press that arrived as a keycode, and vice-versa.
+    key_down: [MAX_BUTTONS]bool = [_]bool{false} ** MAX_BUTTONS,
     prev_down: [MAX_BUTTONS]bool = [_]bool{false} ** MAX_BUTTONS,
     /// Raw forwarded axis snapshot, indexed by FA_*.
     forwarded_axis: [FORWARDED_AXIS_COUNT]f32 = [_]f32{0} ** FORWARDED_AXIS_COUNT,
     quirk: Quirk = .{},
+
+    /// Recompute `buttons_down` from the two input sources. Non-dpad buttons
+    /// mirror `key_down`; the four dpad buttons additionally OR in the hat axis
+    /// (`FA_HAT_X`/`FA_HAT_Y`), since many pads (e.g. Xbox over Android) report
+    /// the dpad as a HAT MotionEvent rather than `AKEYCODE_DPAD_*` keys.
+    fn recompute(self: *Device) void {
+        self.buttons_down = self.key_down;
+        const hx = self.forwarded_axis[FA_HAT_X];
+        const hy = self.forwarded_axis[FA_HAT_Y];
+        // HAT axes are -1 / 0 / +1; treat anything past the deadzone as pressed.
+        if (hx < -HAT_DEADZONE) self.buttons_down[BTN_LEFT_FACE_LEFT] = true;
+        if (hx > HAT_DEADZONE) self.buttons_down[BTN_LEFT_FACE_RIGHT] = true;
+        if (hy < -HAT_DEADZONE) self.buttons_down[BTN_LEFT_FACE_UP] = true;
+        if (hy > HAT_DEADZONE) self.buttons_down[BTN_LEFT_FACE_DOWN] = true;
+    }
 };
+
+/// Hat axis press threshold. The hat reports discrete -1/0/+1, so any
+/// non-trivial deadzone works; 0.5 rejects noise without missing real presses.
+const HAT_DEADZONE: f32 = 0.5;
 
 /// Minimal test-and-set spinlock. The shared table is touched from two
 /// threads — sokol's Android Looper thread (the forwarded-event callback) and
@@ -377,7 +403,10 @@ pub fn applyKey(device_id: i32, keycode: i32, down: bool) void {
     table.mutex.lock();
     defer table.mutex.unlock();
     if (table.findOrAlloc(device_id)) |d| {
-        if (btn < MAX_BUTTONS) d.buttons_down[btn] = down;
+        if (btn < MAX_BUTTONS) {
+            d.key_down[btn] = down;
+            d.recompute();
+        }
     }
 }
 
@@ -387,6 +416,7 @@ pub fn applyMotion(device_id: i32, axes: [FORWARDED_AXIS_COUNT]f32) void {
     defer table.mutex.unlock();
     if (table.findOrAlloc(device_id)) |d| {
         d.forwarded_axis = axes;
+        d.recompute();
     }
 }
 
@@ -524,6 +554,63 @@ test "state: axis snapshot honors the device quirk" {
 
     try std.testing.expectEqual(@as(f32, 0.5), axisValue(uid, AXIS_RIGHT_X));
     try std.testing.expectEqual(@as(f32, -0.25), axisValue(uid, AXIS_RIGHT_Y));
+}
+
+test "state: hat axis synthesizes dpad buttons" {
+    table = .{};
+    const id: i32 = 9; // Xbox pad on the test tablet
+    const uid: u32 = @bitCast(id);
+
+    var axes = [_]f32{0} ** FORWARDED_AXIS_COUNT;
+    // Hat pushed up-left (X = -1, Y = -1).
+    axes[FA_HAT_X] = -1;
+    axes[FA_HAT_Y] = -1;
+    applyMotion(id, axes);
+    try std.testing.expect(buttonDown(uid, BTN_LEFT_FACE_LEFT));
+    try std.testing.expect(buttonDown(uid, BTN_LEFT_FACE_UP));
+    try std.testing.expect(!buttonDown(uid, BTN_LEFT_FACE_RIGHT));
+    try std.testing.expect(!buttonDown(uid, BTN_LEFT_FACE_DOWN));
+    // Rising edge fires once.
+    try std.testing.expect(buttonPressed(uid, BTN_LEFT_FACE_UP));
+    newFrame();
+    try std.testing.expect(!buttonPressed(uid, BTN_LEFT_FACE_UP));
+
+    // Hat pushed down-right.
+    axes[FA_HAT_X] = 1;
+    axes[FA_HAT_Y] = 1;
+    applyMotion(id, axes);
+    try std.testing.expect(buttonDown(uid, BTN_LEFT_FACE_RIGHT));
+    try std.testing.expect(buttonDown(uid, BTN_LEFT_FACE_DOWN));
+    try std.testing.expect(!buttonDown(uid, BTN_LEFT_FACE_LEFT));
+
+    // Hat centered → all dpad released.
+    axes[FA_HAT_X] = 0;
+    axes[FA_HAT_Y] = 0;
+    applyMotion(id, axes);
+    try std.testing.expect(!buttonDown(uid, BTN_LEFT_FACE_LEFT));
+    try std.testing.expect(!buttonDown(uid, BTN_LEFT_FACE_RIGHT));
+    try std.testing.expect(!buttonDown(uid, BTN_LEFT_FACE_UP));
+    try std.testing.expect(!buttonDown(uid, BTN_LEFT_FACE_DOWN));
+}
+
+test "state: hat motion does not clobber a keycode dpad press (and vice-versa)" {
+    table = .{};
+    const id: i32 = 3;
+    const uid: u32 = @bitCast(id);
+
+    // Dpad-up via keycode (pads that report dpad as AKEYCODE_DPAD_*).
+    applyKey(id, AKEYCODE_DPAD_UP, true);
+    try std.testing.expect(buttonDown(uid, BTN_LEFT_FACE_UP));
+
+    // A centered-hat motion event (e.g. a stick wiggle) must NOT clear it.
+    var axes = [_]f32{0} ** FORWARDED_AXIS_COUNT;
+    axes[FA_X] = 0.7; // left stick moved; hat stays centered
+    applyMotion(id, axes);
+    try std.testing.expect(buttonDown(uid, BTN_LEFT_FACE_UP));
+
+    // Releasing the key clears it.
+    applyKey(id, AKEYCODE_DPAD_UP, false);
+    try std.testing.expect(!buttonDown(uid, BTN_LEFT_FACE_UP));
 }
 
 test "out-of-range button/axis queries are safe" {
