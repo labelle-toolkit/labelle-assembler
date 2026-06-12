@@ -163,6 +163,71 @@ pub fn main() void {
     pump(2);
     std.debug.print("\n", .{});
 
+    // 7) Multi-gamepad: a second simultaneous pad must land in the next free
+    //    slot with fully independent state; detaching it must free its slot
+    //    without disturbing the first pad; and a later pad must reuse the
+    //    freed slot (lowest-free-slot policy). Pad 2 (not pad 1) is the one
+    //    detached here so the deferred cleanup of `js`/`dev` stays valid.
+    std.debug.print("Multi-gamepad (second simultaneous virtual pad):\n", .{});
+    const dev2 = SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER, 6, 15, 0);
+    if (dev2 < 0) {
+        std.debug.print("FATAL: second SDL_JoystickAttachVirtual failed: {s}\n", .{SDL_GetError()});
+        std.process.exit(1);
+    }
+    const js2 = SDL_JoystickOpen(dev2) orelse {
+        std.debug.print("FATAL: second SDL_JoystickOpen failed: {s}\n", .{SDL_GetError()});
+        std.process.exit(1);
+    };
+
+    f = 0;
+    while (f < 60 and !Source.isAvailable(1)) : (f += 1) pump(1);
+    check("second pad lands in slot 1", Source.isAvailable(1));
+    check("slot 0 still available alongside slot 1", Source.isAvailable(0));
+
+    // Button independence: press A on pad 2 only — down on slot 1, NOT slot 0.
+    if (gp.sdlButtonToCanonical(0)) |a_canon| {
+        _ = SDL_JoystickSetVirtualButton(js2, 0, 1);
+        pump(2);
+        check("A on pad 2 -> down on slot 1", Source.isButtonDown(1, a_canon));
+        check("A on pad 2 -> NOT down on slot 0", !Source.isButtonDown(0, a_canon));
+        _ = SDL_JoystickSetVirtualButton(js2, 0, 0);
+        pump(2);
+    }
+
+    // Axis independence: full left-X on pad 2; slot 0 stays centered.
+    _ = SDL_JoystickSetVirtualAxis(js2, SDL_AXIS_LEFTX, 32767);
+    pump(2);
+    check("left-X on pad 2 -> slot 1 reads +1.0", @abs(Source.axisValue(1, gp.Axis.left_x) - 1.0) < 0.1);
+    check("left-X on pad 2 -> slot 0 stays centered", @abs(Source.axisValue(0, gp.Axis.left_x)) < 0.1);
+    _ = SDL_JoystickSetVirtualAxis(js2, SDL_AXIS_LEFTX, 0);
+    pump(2);
+
+    // Detach pad 2: its slot frees, pad 1 keeps running.
+    SDL_JoystickClose(js2);
+    _ = SDL_JoystickDetachVirtual(dev2);
+    f = 0;
+    while (f < 60 and Source.isAvailable(1)) : (f += 1) pump(1);
+    check("detaching pad 2 frees slot 1", !Source.isAvailable(1));
+    check("slot 0 unaffected by pad 2 detach", Source.isAvailable(0));
+
+    // Lowest-free-slot reuse: a third pad must take the freed slot 1.
+    const dev3 = SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER, 6, 15, 0);
+    if (dev3 >= 0) {
+        if (SDL_JoystickOpen(dev3)) |js3| {
+            f = 0;
+            while (f < 60 and !Source.isAvailable(1)) : (f += 1) pump(1);
+            check("third pad reuses freed slot 1", Source.isAvailable(1));
+            SDL_JoystickClose(js3);
+            _ = SDL_JoystickDetachVirtual(dev3);
+            pump(2);
+        } else {
+            check("third pad opens", false);
+        }
+    } else {
+        check("third pad attaches", false);
+    }
+    std.debug.print("\n", .{});
+
     std.debug.print("== Summary: {d} passed, {d} failed ==\n", .{ passes, fails });
     if (fails != 0) std.process.exit(1);
 }

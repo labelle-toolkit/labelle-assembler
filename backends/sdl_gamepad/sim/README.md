@@ -8,7 +8,11 @@ Hardware-free verification harness for the shared `sdl_gamepad` source
   SDL 2.0.14+ — no driver, no admin, no physical hardware, no display),
   presses every button, sweeps every axis, and asserts the toolkit
   `Source` API (`isAvailable` / `isButtonDown` / `axisValue`) reports each
-  one back with the correct canonical mapping. Exits non-zero on any FAIL,
+  one back with the correct canonical mapping. Then attaches a SECOND
+  simultaneous pad and asserts multi-gamepad behavior: distinct slots,
+  state independence in both directions, slot freeing on detach without
+  disturbing the other pad, and lowest-free-slot reuse. Exits non-zero on
+  any FAIL,
   so it doubles as a CI smoke test — see the `Run the gamepad-sim
   harness` step in `.github/workflows/ci.yml`. Because the virtual device
   lives entirely inside SDL's joystick subsystem, this works the same on
