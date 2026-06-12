@@ -183,7 +183,7 @@ fn readbackMetal(pixels: []u8, w: u32, h: u32) bool {
     // the compiler on non-Darwin targets — relying on dead-code
     // elimination after a comptime-return can leave the import in the
     // analysis graph and trip link-time references to libobjc.
-    if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .ios) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         return @import("screenshot/metal.zig").readback(pixels, w, h, metalDevice());
     } else {
         std.log.warn("screenshot: Metal backend reported on non-Darwin target", .{});
@@ -200,7 +200,7 @@ fn readbackGL(pixels: []u8, w: u32, h: u32) bool {
     // spurious opengl32 link (the exact failure mode the sibling comments warn
     // about).
     if (comptime builtin.target.os.tag != .windows and
-        builtin.target.os.tag != .macos and builtin.target.os.tag != .ios)
+        !builtin.target.os.tag.isDarwin())
     {
         return @import("screenshot/gl.zig").readback(pixels, w, h);
     } else {

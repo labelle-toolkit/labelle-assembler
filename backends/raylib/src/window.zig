@@ -203,7 +203,11 @@ pub const preview_pbo = struct {
 
     fn wglProc(comptime T: type, name: [*:0]const u8) ?T {
         const p = wglGetProcAddress(name) orelse return null;
-        return @ptrFromInt(@intFromPtr(p));
+        // Some ICDs signal failure with the sentinels 1, 2, 3, or -1
+        // instead of null; treating those as callable pointers crashes.
+        const addr = @intFromPtr(p);
+        if (addr <= 3 or addr == std.math.maxInt(usize)) return null;
+        return @ptrFromInt(addr);
     }
 
     var gl2_cache: ?Gl2 = null;
