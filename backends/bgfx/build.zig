@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
         const ndk_arch_triple: []const u8 = switch (target.result.cpu.arch) {
             .aarch64 => "aarch64-linux-android",
             .x86_64 => "x86_64-linux-android",
-            .arm => "arm-linux-androideabi",
+            .arm, .thumb => "arm-linux-androideabi",
             .x86 => "i686-linux-android",
             else => @panic("unsupported Android arch for bgfx"),
         };
