@@ -31,21 +31,23 @@ pub fn build(b: *std.Build) void {
     // Zig 0.16 moved `linkLibrary` / `linkSystemLibrary` / `addLibraryPath`
     // (and friends like `addCSourceFile`, `addIncludePath`) from
     // `*Build.Step.Compile` onto the executable's `root_module`.
+    //
+    // The actual WebGPU runtime is the wgpu-native static library
+    // (`libwgpu_native.a`), which `wgpu_native_zig` already embeds into its
+    // `wgpu` module via `addObjectFile`. That module is imported by the
+    // backend's `gfx`/`window` modules, so the native symbols travel into
+    // this exe transitively — no explicit wgpu library link is needed here.
+    // We only need the GLFW windowing artifact plus, on Apple platforms, the
+    // system frameworks wgpu-native depends on (Metal/QuartzCore/Foundation),
+    // which upstream links at the Compile step rather than on the module.
     exe.root_module.linkLibrary(wgpu_backend.artifact("glfw"));
-    exe.root_module.linkLibrary(wgpu_backend.artifact("zdawn"));
 
-    // Dawn prebuilt library path (needed for libdawn native symbols)
     const target_result = target.result;
-    if (target_result.os.tag == .macos) {
-        if (target_result.cpu.arch.isAARCH64()) {
-            const dawn = wgpu_backend.builder.dependency("dawn_aarch64_macos", .{});
-            exe.root_module.addLibraryPath(dawn.path(""));
-        } else if (target_result.cpu.arch.isX86()) {
-            const dawn = wgpu_backend.builder.dependency("dawn_x86_64_macos", .{});
-            exe.root_module.addLibraryPath(dawn.path(""));
-        }
+    if (target_result.os.tag == .macos or target_result.os.tag == .ios) {
+        exe.root_module.linkFramework("Foundation", .{});
+        exe.root_module.linkFramework("QuartzCore", .{});
+        exe.root_module.linkFramework("Metal", .{});
     }
-    exe.root_module.linkSystemLibrary("dawn", .{});
 
     b.installArtifact(exe);
 
