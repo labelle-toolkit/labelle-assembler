@@ -379,7 +379,7 @@ fn initSpritePipeline() void {
             .alpha = .{ .src_factor = .one, .dst_factor = .one_minus_src_alpha, .operation = .add },
         },
     };
-    sprite_pipeline = dev.createRenderPipeline(&wgpu.RenderPipelineDescriptor{
+    const pipeline = dev.createRenderPipeline(&wgpu.RenderPipelineDescriptor{
         .layout = pipeline_layout,
         .vertex = .{
             .module = sprite_shader,
@@ -400,14 +400,32 @@ fn initSpritePipeline() void {
         return;
     };
 
-    sprite_vertex_buffer = dev.createBuffer(&wgpu.BufferDescriptor{
+    // Create the vertex/index buffers BEFORE publishing `sprite_pipeline`.
+    // drawSprites gates on `sprite_pipeline` alone and then unwraps the
+    // buffers, so the pipeline must not be visible until both buffers exist
+    // — otherwise a buffer-creation failure here would leave a non-null
+    // pipeline with null buffers and panic the first sprite draw.
+    const vbuf = dev.createBuffer(&wgpu.BufferDescriptor{
         .size = MAX_SPRITE_VERTEX_BYTES,
         .usage = wgpu.BufferUsages.vertex | wgpu.BufferUsages.copy_dst,
-    }) orelse return;
-    sprite_index_buffer = dev.createBuffer(&wgpu.BufferDescriptor{
+    }) orelse {
+        log.warn("wgpu sprite vertex buffer creation failed; sprite rendering disabled", .{});
+        pipeline.release();
+        return;
+    };
+    const ibuf = dev.createBuffer(&wgpu.BufferDescriptor{
         .size = MAX_SPRITE_INDEX_BYTES,
         .usage = wgpu.BufferUsages.index | wgpu.BufferUsages.copy_dst,
-    }) orelse return;
+    }) orelse {
+        log.warn("wgpu sprite index buffer creation failed; sprite rendering disabled", .{});
+        vbuf.release();
+        pipeline.release();
+        return;
+    };
+
+    sprite_vertex_buffer = vbuf;
+    sprite_index_buffer = ibuf;
+    sprite_pipeline = pipeline;
 }
 
 /// Lazily create + upload the GPU texture for a gfx texture id, returning its
@@ -504,6 +522,18 @@ pub fn closeWindow() void {
             slot.* = null;
         }
     }
+    if (sprite_pipeline) |p| {
+        p.release();
+        sprite_pipeline = null;
+    }
+    if (sprite_vertex_buffer) |b| {
+        b.release();
+        sprite_vertex_buffer = null;
+    }
+    if (sprite_index_buffer) |b| {
+        b.release();
+        sprite_index_buffer = null;
+    }
     if (sprite_sampler) |s| {
         s.release();
         sprite_sampler = null;
@@ -593,6 +623,14 @@ fn submitFrame(
     }
 
     // --- Sprites (textured quads, drawn on top of shapes) ---
+    // KNOWN LIMITATION: shapes and sprites are drained as two separate
+    // batches, so every sprite composites above every shape regardless of
+    // the per-call submission order — a game cannot draw a shape *over* a
+    // sprite within one frame. Immediate backends (raylib) preserve strict
+    // painter's order. Fixing this needs a single interleaved command
+    // stream tagged by primitive kind; tracked as a follow-up. The common
+    // case (sprites = world, shapes/gizmos = HUD on top) is unaffected by
+    // intent but inverted here — documented so it isn't mistaken for a bug.
     drawSprites(pass, sprite_vertices, sprite_indices, sprite_texture_ids);
 
     pass.end();
