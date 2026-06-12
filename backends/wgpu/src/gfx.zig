@@ -60,7 +60,9 @@ pub const transparent = Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
 // ── Vertex types ──────────────────────────────────────────────────────
 
 /// Color vertex for shape rendering (position + packed ABGR color).
-const ColorVertex = extern struct {
+/// Pub: it is the element type of `consumeShapeBatch`'s return slices,
+/// which the window module's render submitter consumes.
+pub const ColorVertex = extern struct {
     position: [2]f32,
     color_packed: u32, // ABGR packed
 

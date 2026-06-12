@@ -241,7 +241,17 @@ pub fn endDrawing() void {
     surface.?.getCurrentTexture(&surface_texture);
     const texture = surface_texture.texture orelse return;
     defer texture.release();
+    // Once a swapchain texture has been acquired it must ALWAYS be
+    // presented — even when an intermediate step below bails — or the
+    // acquire/present pairing breaks and a transient GPU failure can
+    // wedge the swapchain permanently. submitFrame's early returns just
+    // skip the draw; the present still runs.
+    defer _ = surface.?.present();
 
+    submitFrame(texture, batch.vertices, batch.indices);
+}
+
+fn submitFrame(texture: *wgpu.Texture, vertices: []const gfx.ColorVertex, indices: []const u32) void {
     const view = texture.createView(null) orelse return;
     defer view.release();
 
@@ -259,15 +269,15 @@ pub fn endDrawing() void {
         .color_attachments = &[_]wgpu.ColorAttachment{color_attachment},
     }) orelse return;
 
-    if (batch.indices.len > 0) {
-        const vbytes = batch.vertices.len * @sizeOf(ShapeVertex);
-        const ibytes = batch.indices.len * @sizeOf(u32);
-        queue.?.writeBuffer(vertex_buffer.?, 0, batch.vertices.ptr, vbytes);
-        queue.?.writeBuffer(index_buffer.?, 0, batch.indices.ptr, ibytes);
+    if (indices.len > 0) {
+        const vbytes = vertices.len * @sizeOf(ShapeVertex);
+        const ibytes = indices.len * @sizeOf(u32);
+        queue.?.writeBuffer(vertex_buffer.?, 0, vertices.ptr, vbytes);
+        queue.?.writeBuffer(index_buffer.?, 0, indices.ptr, ibytes);
         pass.setPipeline(shape_pipeline.?);
         pass.setVertexBuffer(0, vertex_buffer.?, 0, vbytes);
         pass.setIndexBuffer(index_buffer.?, .uint32, 0, ibytes);
-        pass.drawIndexed(@intCast(batch.indices.len), 1, 0, 0, 0);
+        pass.drawIndexed(@intCast(indices.len), 1, 0, 0, 0);
     }
     pass.end();
     pass.release();
@@ -275,8 +285,6 @@ pub fn endDrawing() void {
     const command = encoder.finish(null) orelse return;
     defer command.release();
     queue.?.submit(&[_]*const wgpu.CommandBuffer{command});
-
-    _ = surface.?.present();
 }
 
 pub fn clearBackground(r: u8, g: u8, b: u8, a: u8) void {
