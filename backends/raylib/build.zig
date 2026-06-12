@@ -138,6 +138,15 @@ pub fn build(b: *std.Build) void {
         if (sdlLibPath(target.result.os.tag, builtin.target.os.tag)) |p| {
             input_mod.addLibraryPath(.{ .cwd_relative = p });
         }
+        // Windows: Zig has no default SDL2 search path for the MinGW
+        // (`windows-gnu`) toolchain, so honor `LABELLE_SDL2_LIB` — the dir
+        // holding the import lib (`libSDL2.dll.a`) from the SDL2 MinGW devel
+        // package. `SDL2.dll` must be on PATH (or beside the exe) at runtime.
+        if (target.result.os.tag == .windows and builtin.target.os.tag == .windows) {
+            if (b.graph.environ_map.get("LABELLE_SDL2_LIB")) |p| {
+                input_mod.addLibraryPath(.{ .cwd_relative = p });
+            }
+        }
         input_mod.linkSystemLibrary("SDL2", .{});
     }
 
@@ -265,6 +274,11 @@ pub fn build(b: *std.Build) void {
         input_host_mod.link_libc = true;
         if (sdlLibPath(host_target.result.os.tag, builtin.target.os.tag)) |p| {
             input_host_mod.addLibraryPath(.{ .cwd_relative = p });
+        }
+        if (host_target.result.os.tag == .windows and builtin.target.os.tag == .windows) {
+            if (b.graph.environ_map.get("LABELLE_SDL2_LIB")) |p| {
+                input_host_mod.addLibraryPath(.{ .cwd_relative = p });
+            }
         }
         input_host_mod.linkSystemLibrary("SDL2", .{});
     }

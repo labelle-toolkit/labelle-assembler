@@ -16,7 +16,10 @@ fn targetIsDesktop(t: std.Target) bool {
 
 /// macOS Homebrew SDL2 library path for a NATIVE macOS host build (Zig does
 /// not search Homebrew by default). Returns null when cross-compiling or on
-/// Linux/Windows (system search resolves SDL2). No include path is needed.
+/// other hosts. On Windows the path is supplied out-of-band via the
+/// `LABELLE_SDL2_LIB` env var (see the call site) — Zig ships no default SDL2
+/// search path for the MinGW/`windows-gnu` toolchain. No include path is
+/// needed on any platform (the shared gamepad source uses `extern fn`).
 fn sdlLibPath(target_os: std.Target.Os.Tag, host_os: std.Target.Os.Tag) ?[]const u8 {
     if (target_os != .macos or host_os != .macos) return null;
     if (dirExists("/opt/homebrew/lib")) return "/opt/homebrew/lib";
@@ -197,6 +200,15 @@ pub fn build(b: *std.Build) void {
         input_mod.link_libc = true;
         if (sdlLibPath(target.result.os.tag, builtin.target.os.tag)) |p| {
             input_mod.addLibraryPath(.{ .cwd_relative = p });
+        }
+        // Windows: Zig has no default SDL2 search path for the MinGW
+        // (`windows-gnu`) toolchain, so honor `LABELLE_SDL2_LIB` — the dir
+        // holding the import lib (`libSDL2.dll.a`) from the SDL2 MinGW devel
+        // package. `SDL2.dll` must be on PATH (or beside the exe) at runtime.
+        if (target.result.os.tag == .windows and builtin.target.os.tag == .windows) {
+            if (b.graph.environ_map.get("LABELLE_SDL2_LIB")) |p| {
+                input_mod.addLibraryPath(.{ .cwd_relative = p });
+            }
         }
         input_mod.linkSystemLibrary("SDL2", .{});
     }
