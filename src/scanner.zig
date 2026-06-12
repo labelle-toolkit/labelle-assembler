@@ -425,21 +425,24 @@ pub fn copyDirRecursive(allocator: std.mem.Allocator, src_base: []const u8, dst_
 
     try cwd.createDirPath(io, dst_path);
 
-    var src_dir = cwd.openDir(io, src_path, .{ .iterate = true }) catch return;
+    // Only a missing source is a silent skip (matches linkDir); any other
+    // openDir failure must propagate or the caller would treat a partial
+    // (or empty) destination as a successful copy.
+    var src_dir = cwd.openDir(io, src_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
     defer src_dir.close(io);
 
     var iter = src_dir.iterate();
     while (try iter.next(io)) |entry| {
         switch (entry.kind) {
             .file => {
-                const content = try src_dir.readFileAlloc(io, entry.name, allocator, .limited(10 * 1024 * 1024));
-                defer allocator.free(content);
-
                 var dst_dir = try cwd.openDir(io, dst_path, .{});
                 defer dst_dir.close(io);
-                const out_file = try dst_dir.createFile(io, entry.name, .{});
-                defer out_file.close(io);
-                try out_file.writeStreamingAll(io, content);
+                // Streaming copy: no size cap and no whole-file allocation
+                // (assets routinely exceed any fixed readFileAlloc limit).
+                try src_dir.copyFile(entry.name, dst_dir, entry.name, io, .{});
             },
             .directory => {
                 const sub_folder = try std.fs.path.join(allocator, &.{ folder, entry.name });
