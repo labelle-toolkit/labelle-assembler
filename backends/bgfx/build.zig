@@ -44,44 +44,13 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── miniaudio playback device (#297) ────────────────────────────
-    // Compile miniaudio's implementation translation unit straight into
-    // the audio module. `src/audio.zig` opens an `ma_device` in its
-    // `ensureInit` lifecycle hook and drives the PCM mixer from the
-    // device's data callback. Zig 0.16 moved `addCSourceFile` /
-    // `addIncludePath` / `linkFramework` onto `*Build.Module`.
-    audio_mod.addIncludePath(b.path("libs/miniaudio"));
-    audio_mod.addCSourceFile(.{
-        .file = b.path("libs/miniaudio/miniaudio.c"),
-        .flags = &.{"-std=c99"},
-    });
-    // miniaudio's native backends need platform system libraries. Gate
-    // them on the target OS so the backend still builds for Linux /
-    // Windows (and cross-compiles) instead of hard-linking macOS-only
-    // frameworks everywhere. These propagate to any consumer that
-    // imports the `audio` module (e.g. the example exe), so the
-    // example links them transitively without restating them.
-    switch (target.result.os.tag) {
-        .macos => {
-            audio_mod.linkFramework("CoreAudio", .{});
-            audio_mod.linkFramework("AudioToolbox", .{});
-            audio_mod.linkFramework("CoreFoundation", .{});
-        },
-        .linux => {
-            // miniaudio dlopen()s the ALSA/PulseAudio shared libs at
-            // runtime, so only libdl/pthread/m are required at link
-            // time (libc above covers pthread on glibc).
-            audio_mod.linkSystemLibrary("dl", .{});
-            audio_mod.linkSystemLibrary("pthread", .{});
-            audio_mod.linkSystemLibrary("m", .{});
-        },
-        .windows => {
-            // WASAPI/DirectSound are reached via Ole32 + the standard
-            // Win32 libs; miniaudio loads the rest at runtime.
-            audio_mod.linkSystemLibrary("ole32", .{});
-            audio_mod.linkSystemLibrary("user32", .{});
-        },
-        else => {},
-    }
+    // Compile miniaudio's implementation translation unit + its per-OS
+    // system libs straight into the audio module (see `wireMiniaudio`).
+    // `src/audio.zig` opens an `ma_device` in its `ensureInit` lifecycle
+    // hook and drives the PCM mixer from the device's data callback. The
+    // links propagate to any consumer that imports the `audio` module
+    // (e.g. the example exe), so the example links them transitively.
+    wireMiniaudio(b, audio_mod, target.result.os.tag);
 
     // ── Window backend module ───────────────────────────────────────
     const window_mod = b.addModule("window", .{
@@ -128,11 +97,53 @@ pub fn build(b: *std.Build) void {
 
     // ── Audio backend tests ─────────────────────────────────────────
     // Build + run the audio module's unit tests (spinlock, mixer, WAV
-    // decode, unload ordering). The module carries miniaudio's C source,
-    // include path, libc, and the per-OS framework/system-lib links, so
-    // the test binary links the real device backend even though the
-    // tests themselves never open a device. Run on the host (these are
-    // executable native tests, not a cross-compile compile-check).
-    const audio_tests = b.addTest(.{ .root_module = audio_mod });
+    // decode, unload ordering). These RUN (they exercise the spinlock /
+    // mixer logic), so the test module is pinned to `host_target` rather
+    // than the build's `-Dtarget` — otherwise `zig build test
+    // -Dtarget=<foreign>` would try to execute a foreign binary and fail
+    // (same reasoning as `platform_tests`). It carries the same miniaudio
+    // C source + host system libs so it links the real device backend,
+    // even though the tests never open a device.
+    const audio_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/audio.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wireMiniaudio(b, audio_test_mod, host_target.result.os.tag);
+    const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
     test_step.dependOn(&b.addRunArtifact(audio_tests).step);
+}
+
+/// Attach miniaudio's implementation TU + include path, and link the
+/// per-OS system libraries its native backends need, to `mod`. Gated on
+/// `os_tag` so the backend still builds for Linux / Windows (and
+/// cross-compiles) instead of hard-linking macOS-only frameworks.
+fn wireMiniaudio(b: *std.Build, mod: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
+    mod.addIncludePath(b.path("libs/miniaudio"));
+    mod.addCSourceFile(.{
+        .file = b.path("libs/miniaudio/miniaudio.c"),
+        .flags = &.{"-std=c99"},
+    });
+    switch (os_tag) {
+        .macos => {
+            mod.linkFramework("CoreAudio", .{});
+            mod.linkFramework("AudioToolbox", .{});
+            mod.linkFramework("CoreFoundation", .{});
+        },
+        .linux => {
+            // miniaudio dlopen()s the ALSA/PulseAudio shared libs at
+            // runtime, so only libdl/pthread/m are needed at link time.
+            mod.linkSystemLibrary("dl", .{});
+            mod.linkSystemLibrary("pthread", .{});
+            mod.linkSystemLibrary("m", .{});
+        },
+        .windows => {
+            // WASAPI/DirectSound are reached via Ole32 + the standard
+            // Win32 libs; miniaudio loads the rest at runtime.
+            mod.linkSystemLibrary("ole32", .{});
+            mod.linkSystemLibrary("user32", .{});
+        },
+        else => {},
+    }
 }

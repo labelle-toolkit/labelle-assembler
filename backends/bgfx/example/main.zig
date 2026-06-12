@@ -533,7 +533,9 @@ pub fn main() void {
     // exercises the device callback → mixAudio path end to end. Loading
     // is non-fatal if the temp write or device open fails (e.g. headless
     // CI with no audio hardware).
-    const beep_path: [:0]const u8 = "/tmp/bgfx-audio-beep.wav";
+    // Relative path so the demo also works on Windows (no `/tmp`); written
+    // to the current working directory.
+    const beep_path: [:0]const u8 = "bgfx-audio-beep.wav";
     if (writeBeepWavFile(beep_path)) {
         sound_id = audio.loadSound(beep_path);
         sound_loaded = (sound_id != 0);

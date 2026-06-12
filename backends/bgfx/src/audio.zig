@@ -102,7 +102,11 @@ const DEVICE_SAMPLE_RATE: u32 = 48000;
 const DEVICE_CHANNELS: u32 = 2;
 
 var device: ma.ma_device = undefined;
-var device_initialized: bool = false;
+// `ensureInit` / `deinit` are called from the game thread only (the
+// AudioInterface control surface is single-threaded; only `mixAudio` runs
+// on the audio callback thread, and it never reads this). It's atomic
+// anyway for safe publication of the device's initialized state.
+var device_initialized: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 /// Audio-thread data callback. miniaudio hands us a frame budget and a
 /// raw output buffer for `ma_format_s16` / 2 channels; we reinterpret it
@@ -144,7 +148,7 @@ var frames_mixed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 /// `device_initialized` false — the rest of the backend keeps working as
 /// a silent state machine, exactly as before this device existed.
 pub fn ensureInit() void {
-    if (device_initialized) return;
+    if (device_initialized.load(.acquire)) return;
 
     var config = ma.ma_device_config_init(ma.ma_device_type_playback);
     config.playback.format = ma.ma_format_s16;
@@ -163,7 +167,7 @@ pub fn ensureInit() void {
         return;
     }
 
-    device_initialized = true;
+    device_initialized.store(true, .release);
     std.log.info(
         "audio: miniaudio playback device started: {d}Hz {d}ch s16",
         .{ device.sampleRate, DEVICE_CHANNELS },
@@ -175,10 +179,10 @@ pub fn ensureInit() void {
 /// thread before returning, so after it the slots are no longer touched
 /// by the callback and we can free them without taking `slot_lock`.
 pub fn deinit() void {
-    if (device_initialized) {
+    if (device_initialized.load(.acquire)) {
         // Joins the audio callback thread — no more `mixAudio` after this.
         ma.ma_device_uninit(&device);
-        device_initialized = false;
+        device_initialized.store(false, .release);
         std.log.info(
             "audio: miniaudio device stopped ({d} frames mixed)",
             .{frames_mixed.load(.monotonic)},
@@ -337,6 +341,14 @@ fn loadWavFile(path: [:0]const u8) ?struct { pcm: PcmData, alloc: []u8 } {
         allocator.free(data);
         return null;
     };
+
+    // Reject empty PCM. A 0-frame buffer played with looping makes the
+    // mixer's wrap math (`position % frame_count`) divide by zero / index
+    // out of bounds on the audio thread, so refuse it at load time.
+    if (pcm.frame_count == 0) {
+        allocator.free(data);
+        return null;
+    }
     pcm.raw_alloc = data;
 
     return .{ .pcm = pcm, .alloc = data };
