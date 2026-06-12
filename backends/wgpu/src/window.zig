@@ -3,10 +3,13 @@
 /// The CPU side of rendering lives in gfx.zig (NDC vertex batching); this
 /// file owns the GPU spine: instance → surface (Win32 HWND) → adapter →
 /// device/queue → surface configure, and the per-frame acquire → upload →
-/// render-pass → submit → present that drains gfx's shape batch. The batch
-/// vertices are already NDC, so the pipeline is a passthrough WGSL module
-/// with no uniforms/bind groups. Sprites + text atlases stay TODO (the
-/// shape path covers gizmo-rendered games end to end).
+/// render-pass → submit → present that drains gfx's shape + sprite batches.
+/// The batch vertices are already NDC, so both pipelines are passthrough
+/// WGSL modules with no projection uniform. Shapes draw first, then sprites
+/// on top (matching draw-call submission order); the sprite path samples a
+/// bound texture_2d and multiplies by the per-vertex color. Text atlases
+/// stay TODO — HUD text routes through gfx's bitmap-font glyph rects in the
+/// shape batch.
 const std = @import("std");
 const builtin = @import("builtin");
 const glfw = @import("zglfw");
@@ -30,6 +33,9 @@ pub fn setConfigFlags(flags: ConfigFlags) void {
 // ── GPU state ───────────────────────────────────────────────────────────
 
 const ShapeVertex = extern struct { position: [2]f32, color_packed: u32 };
+// Sprite vertex layout is owned by gfx.zig (the batch producer); alias it so
+// the GPU-side stride / attribute offsets stay in lockstep with the CPU side.
+const SpriteVertex = gfx.SpriteVertex;
 
 var gpu_ready = false;
 var io_threaded: ?std.Io.Threaded = null;
@@ -42,8 +48,34 @@ var vertex_buffer: ?*wgpu.Buffer = null;
 var index_buffer: ?*wgpu.Buffer = null;
 var clear_color = wgpu.Color{ .r = 0.96, .g = 0.96, .b = 0.96, .a = 1.0 };
 
+// Sprite (textured-quad) GPU state. The texture bind group layout (binding
+// 1 = texture_2d, binding 2 = sampler) is shared by every per-texture bind
+// group; binding 0 is unused so the sprite shader's group layout matches the
+// shape shader convention (kept simple — no uniform buffer since verts are
+// already NDC).
+var sprite_pipeline: ?*wgpu.RenderPipeline = null;
+var sprite_vertex_buffer: ?*wgpu.Buffer = null;
+var sprite_index_buffer: ?*wgpu.Buffer = null;
+var sprite_bind_group_layout: ?*wgpu.BindGroupLayout = null;
+var sprite_sampler: ?*wgpu.Sampler = null;
+
 const MAX_VERTEX_BYTES: u64 = 16384 * @sizeOf(ShapeVertex);
 const MAX_INDEX_BYTES: u64 = 32768 * @sizeOf(u32);
+const MAX_SPRITE_VERTEX_BYTES: u64 = 8192 * @sizeOf(SpriteVertex);
+const MAX_SPRITE_INDEX_BYTES: u64 = 16384 * @sizeOf(u32);
+
+// ── GPU texture handle table ─────────────────────────────────────────────
+// Maps a gfx texture id → its uploaded wgpu texture / view / bind group.
+// Textures are created lazily on first draw (gfx loads pixels on a worker
+// thread before the GPU may be ready), so this table is populated from
+// submitFrame on the main/GL thread.
+const MAX_GPU_TEXTURES = 256;
+const GpuTexture = struct {
+    texture: *wgpu.Texture,
+    view: *wgpu.TextureView,
+    bind_group: *wgpu.BindGroup,
+};
+var gpu_textures: [MAX_GPU_TEXTURES]?GpuTexture = [_]?GpuTexture{null} ** MAX_GPU_TEXTURES;
 
 extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
 
@@ -71,6 +103,41 @@ const shape_wgsl =
     \\@fragment
     \\fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     \\    return in.color;
+    \\}
+;
+
+/// Textured-quad shaders. Like the shape module, vertices arrive pre-baked to
+/// NDC so there is no projection uniform. The fragment stage samples the bound
+/// texture and modulates by the unpacked ABGR vertex color (tint). Binding 0
+/// is intentionally empty so the bind group layout's slot 0 stays unused,
+/// keeping a single-group convention.
+const sprite_wgsl =
+    \\struct VsOut {
+    \\    @builtin(position) pos: vec4<f32>,
+    \\    @location(0) uv: vec2<f32>,
+    \\    @location(1) color: vec4<f32>,
+    \\};
+    \\
+    \\@vertex
+    \\fn vs_main(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) color_packed: u32) -> VsOut {
+    \\    var out: VsOut;
+    \\    out.pos = vec4<f32>(position, 0.0, 1.0);
+    \\    out.uv = uv;
+    \\    out.color = vec4<f32>(
+    \\        f32(color_packed & 0xFFu) / 255.0,
+    \\        f32((color_packed >> 8u) & 0xFFu) / 255.0,
+    \\        f32((color_packed >> 16u) & 0xFFu) / 255.0,
+    \\        f32((color_packed >> 24u) & 0xFFu) / 255.0,
+    \\    );
+    \\    return out;
+    \\}
+    \\
+    \\@group(0) @binding(1) var t_diffuse: texture_2d<f32>;
+    \\@group(0) @binding(2) var s_diffuse: sampler;
+    \\
+    \\@fragment
+    \\fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    \\    return textureSample(t_diffuse, s_diffuse, in.uv) * in.color;
     \\}
 ;
 
@@ -233,7 +300,188 @@ fn initGpu() void {
         .usage = wgpu.BufferUsages.index | wgpu.BufferUsages.copy_dst,
     }) orelse return;
 
+    initSpritePipeline();
+
     gpu_ready = true;
+}
+
+/// Build the textured-quad pipeline: bind group layout (texture + sampler),
+/// a clamp/nearest sampler, the sprite render pipeline, and its vertex/index
+/// buffers. Failures here log + leave `sprite_pipeline` null; the shape path
+/// stays fully functional and sprite draws are skipped (with a warning) until
+/// the pipeline exists. Must run after `device`/`queue` are live.
+fn initSpritePipeline() void {
+    const dev = device orelse return;
+
+    const sprite_shader = dev.createShaderModule(&wgpu.shaderModuleWGSLDescriptor(.{
+        .code = sprite_wgsl,
+    })) orelse {
+        log.warn("wgpu sprite shader module creation failed; sprite rendering disabled", .{});
+        return;
+    };
+    defer sprite_shader.release();
+
+    // Bind group layout: binding 1 = sampled texture_2d, binding 2 = sampler.
+    const bgl_entries = [_]wgpu.BindGroupLayoutEntry{
+        .{
+            .binding = 1,
+            .visibility = wgpu.ShaderStages.fragment,
+            .texture = .{ .sample_type = .float, .view_dimension = .@"2d" },
+        },
+        .{
+            .binding = 2,
+            .visibility = wgpu.ShaderStages.fragment,
+            .sampler = .{ .@"type" = .filtering },
+        },
+    };
+    sprite_bind_group_layout = dev.createBindGroupLayout(&wgpu.BindGroupLayoutDescriptor{
+        .entry_count = bgl_entries.len,
+        .entries = &bgl_entries,
+    }) orelse {
+        log.warn("wgpu sprite bind group layout creation failed; sprite rendering disabled", .{});
+        return;
+    };
+
+    const pipeline_layout = dev.createPipelineLayout(&wgpu.PipelineLayoutDescriptor{
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = &[_]*wgpu.BindGroupLayout{sprite_bind_group_layout.?},
+    }) orelse {
+        log.warn("wgpu sprite pipeline layout creation failed; sprite rendering disabled", .{});
+        return;
+    };
+    defer pipeline_layout.release();
+
+    sprite_sampler = dev.createSampler(&wgpu.SamplerDescriptor{
+        .address_mode_u = .clamp_to_edge,
+        .address_mode_v = .clamp_to_edge,
+        .mag_filter = .nearest,
+        .min_filter = .nearest,
+    }) orelse {
+        log.warn("wgpu sprite sampler creation failed; sprite rendering disabled", .{});
+        return;
+    };
+
+    const attributes = [_]wgpu.VertexAttribute{
+        .{ .format = .float32x2, .offset = 0, .shader_location = 0 }, // position
+        .{ .format = .float32x2, .offset = 8, .shader_location = 1 }, // uv
+        .{ .format = .uint32, .offset = 16, .shader_location = 2 }, // color_packed
+    };
+    const vertex_layout = wgpu.VertexBufferLayout{
+        .array_stride = @sizeOf(SpriteVertex),
+        .attribute_count = attributes.len,
+        .attributes = &attributes,
+    };
+    // Same straight-alpha blend as the shape pipeline.
+    const color_target = wgpu.ColorTargetState{
+        .format = .bgra8_unorm,
+        .blend = &wgpu.BlendState{
+            .color = .{ .src_factor = .src_alpha, .dst_factor = .one_minus_src_alpha, .operation = .add },
+            .alpha = .{ .src_factor = .one, .dst_factor = .one_minus_src_alpha, .operation = .add },
+        },
+    };
+    const pipeline = dev.createRenderPipeline(&wgpu.RenderPipelineDescriptor{
+        .layout = pipeline_layout,
+        .vertex = .{
+            .module = sprite_shader,
+            .entry_point = wgpu.StringView.fromSlice("vs_main"),
+            .buffer_count = 1,
+            .buffers = &[_]wgpu.VertexBufferLayout{vertex_layout},
+        },
+        .fragment = &wgpu.FragmentState{
+            .module = sprite_shader,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = &[_]wgpu.ColorTargetState{color_target},
+        },
+        .primitive = .{},
+        .multisample = .{},
+    }) orelse {
+        log.warn("wgpu sprite pipeline creation failed; sprite rendering disabled", .{});
+        return;
+    };
+
+    // Create the vertex/index buffers BEFORE publishing `sprite_pipeline`.
+    // drawSprites gates on `sprite_pipeline` alone and then unwraps the
+    // buffers, so the pipeline must not be visible until both buffers exist
+    // — otherwise a buffer-creation failure here would leave a non-null
+    // pipeline with null buffers and panic the first sprite draw.
+    const vbuf = dev.createBuffer(&wgpu.BufferDescriptor{
+        .size = MAX_SPRITE_VERTEX_BYTES,
+        .usage = wgpu.BufferUsages.vertex | wgpu.BufferUsages.copy_dst,
+    }) orelse {
+        log.warn("wgpu sprite vertex buffer creation failed; sprite rendering disabled", .{});
+        pipeline.release();
+        return;
+    };
+    const ibuf = dev.createBuffer(&wgpu.BufferDescriptor{
+        .size = MAX_SPRITE_INDEX_BYTES,
+        .usage = wgpu.BufferUsages.index | wgpu.BufferUsages.copy_dst,
+    }) orelse {
+        log.warn("wgpu sprite index buffer creation failed; sprite rendering disabled", .{});
+        vbuf.release();
+        pipeline.release();
+        return;
+    };
+
+    sprite_vertex_buffer = vbuf;
+    sprite_index_buffer = ibuf;
+    sprite_pipeline = pipeline;
+}
+
+/// Lazily create + upload the GPU texture for a gfx texture id, returning its
+/// bind group (cached in `gpu_textures`). Runs on the main/GL thread from
+/// submitFrame. Returns null if the id is unknown or any GPU step fails.
+fn getOrCreateGpuTexture(id: u32) ?*wgpu.BindGroup {
+    if (id == 0 or id >= MAX_GPU_TEXTURES) return null;
+    if (gpu_textures[id]) |gt| return gt.bind_group;
+
+    const dev = device orelse return null;
+    const q = queue orelse return null;
+    const layout = sprite_bind_group_layout orelse return null;
+    const sampler = sprite_sampler orelse return null;
+
+    const px = gfx.getTexturePixels(id) orelse return null;
+    if (px.width == 0 or px.height == 0) return null;
+
+    const tex = dev.createTexture(&wgpu.TextureDescriptor{
+        .usage = wgpu.TextureUsages.texture_binding | wgpu.TextureUsages.copy_dst,
+        .size = .{ .width = px.width, .height = px.height, .depth_or_array_layers = 1 },
+        .format = .rgba8_unorm,
+    }) orelse return null;
+
+    // Upload RGBA8 rows (4 bytes/pixel, tightly packed — no row padding).
+    q.writeTexture(
+        &wgpu.TexelCopyTextureInfo{ .texture = tex, .origin = .{} },
+        px.pixels.ptr,
+        px.pixels.len,
+        &wgpu.TexelCopyBufferLayout{
+            .bytes_per_row = px.width * 4,
+            .rows_per_image = px.height,
+        },
+        &wgpu.Extent3D{ .width = px.width, .height = px.height, .depth_or_array_layers = 1 },
+    );
+
+    const view = tex.createView(null) orelse {
+        tex.release();
+        return null;
+    };
+
+    const bg_entries = [_]wgpu.BindGroupEntry{
+        .{ .binding = 1, .texture_view = view },
+        .{ .binding = 2, .sampler = sampler },
+    };
+    const bind_group = dev.createBindGroup(&wgpu.BindGroupDescriptor{
+        .layout = layout,
+        .entry_count = bg_entries.len,
+        .entries = &bg_entries,
+    }) orelse {
+        view.release();
+        tex.release();
+        return null;
+    };
+
+    gpu_textures[id] = .{ .texture = tex, .view = view, .bind_group = bind_group };
+    return bind_group;
 }
 
 pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
@@ -265,6 +513,36 @@ pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
 }
 
 pub fn closeWindow() void {
+    // Release lazily-created GPU textures + their views / bind groups.
+    for (&gpu_textures) |*slot| {
+        if (slot.*) |gt| {
+            gt.bind_group.release();
+            gt.view.release();
+            gt.texture.release();
+            slot.* = null;
+        }
+    }
+    if (sprite_pipeline) |p| {
+        p.release();
+        sprite_pipeline = null;
+    }
+    if (sprite_vertex_buffer) |b| {
+        b.release();
+        sprite_vertex_buffer = null;
+    }
+    if (sprite_index_buffer) |b| {
+        b.release();
+        sprite_index_buffer = null;
+    }
+    if (sprite_sampler) |s| {
+        s.release();
+        sprite_sampler = null;
+    }
+    if (sprite_bind_group_layout) |l| {
+        l.release();
+        sprite_bind_group_layout = null;
+    }
+
     if (glfw_window) |win| win.destroy();
     glfw.terminate();
     glfw_window = null;
@@ -284,12 +562,14 @@ pub fn beginDrawing() void {
     input.newFrame();
 }
 
-/// Drain the gfx shape batch into the GPU: acquire the surface texture,
-/// clear + draw the batched triangles, submit, present.
+/// Drain the gfx shape + sprite batches into the GPU: acquire the surface
+/// texture, clear + draw the batched triangles (shapes first, sprites on top),
+/// submit, present.
 pub fn endDrawing() void {
     if (!gpu_ready) return;
 
-    const batch = gfx.consumeShapeBatch();
+    const shape_batch = gfx.consumeShapeBatch();
+    const sprite_batch = gfx.consumeSpriteBatch();
 
     var surface_texture: wgpu.SurfaceTexture = undefined;
     surface.?.getCurrentTexture(&surface_texture);
@@ -302,10 +582,17 @@ pub fn endDrawing() void {
     // skip the draw; the present still runs.
     defer _ = surface.?.present();
 
-    submitFrame(texture, batch.vertices, batch.indices);
+    submitFrame(texture, shape_batch.vertices, shape_batch.indices, sprite_batch.vertices, sprite_batch.indices, sprite_batch.texture_ids);
 }
 
-fn submitFrame(texture: *wgpu.Texture, vertices: []const gfx.ColorVertex, indices: []const u32) void {
+fn submitFrame(
+    texture: *wgpu.Texture,
+    vertices: []const gfx.ColorVertex,
+    indices: []const u32,
+    sprite_vertices: []const SpriteVertex,
+    sprite_indices: []const u32,
+    sprite_texture_ids: []const u32,
+) void {
     const view = texture.createView(null) orelse return;
     defer view.release();
 
@@ -323,6 +610,7 @@ fn submitFrame(texture: *wgpu.Texture, vertices: []const gfx.ColorVertex, indice
         .color_attachments = &[_]wgpu.ColorAttachment{color_attachment},
     }) orelse return;
 
+    // --- Shapes / text / gizmos (drawn first, under sprites) ---
     if (indices.len > 0) {
         const vbytes = vertices.len * @sizeOf(ShapeVertex);
         const ibytes = indices.len * @sizeOf(u32);
@@ -333,12 +621,66 @@ fn submitFrame(texture: *wgpu.Texture, vertices: []const gfx.ColorVertex, indice
         pass.setIndexBuffer(index_buffer.?, .uint32, 0, ibytes);
         pass.drawIndexed(@intCast(indices.len), 1, 0, 0, 0);
     }
+
+    // --- Sprites (textured quads, drawn on top of shapes) ---
+    // KNOWN LIMITATION: shapes and sprites are drained as two separate
+    // batches, so every sprite composites above every shape regardless of
+    // the per-call submission order — a game cannot draw a shape *over* a
+    // sprite within one frame. Immediate backends (raylib) preserve strict
+    // painter's order. Fixing this needs a single interleaved command
+    // stream tagged by primitive kind; tracked as a follow-up. The common
+    // case (sprites = world, shapes/gizmos = HUD on top) is unaffected by
+    // intent but inverted here — documented so it isn't mistaken for a bug.
+    drawSprites(pass, sprite_vertices, sprite_indices, sprite_texture_ids);
+
     pass.end();
     pass.release();
 
     const command = encoder.finish(null) orelse return;
     defer command.release();
     queue.?.submit(&[_]*const wgpu.CommandBuffer{command});
+}
+
+/// Upload the sprite batch once, then issue one draw per contiguous run of
+/// quads that share a texture, binding that texture's bind group. The batch is
+/// laid out as 4 verts / 6 indices per quad, with one texture id per quad
+/// (see gfx.consumeSpriteBatch). Quads whose texture failed to upload are
+/// skipped so the rest of the batch still renders. Sprite rendering is a no-op
+/// if the pipeline failed to initialize.
+fn drawSprites(
+    pass: *wgpu.RenderPassEncoder,
+    vertices: []const SpriteVertex,
+    indices: []const u32,
+    texture_ids: []const u32,
+) void {
+    if (texture_ids.len == 0 or indices.len == 0) return;
+    const pipeline = sprite_pipeline orelse return;
+
+    const vbytes = vertices.len * @sizeOf(SpriteVertex);
+    const ibytes = indices.len * @sizeOf(u32);
+    if (vbytes > MAX_SPRITE_VERTEX_BYTES or ibytes > MAX_SPRITE_INDEX_BYTES) return;
+
+    queue.?.writeBuffer(sprite_vertex_buffer.?, 0, vertices.ptr, vbytes);
+    queue.?.writeBuffer(sprite_index_buffer.?, 0, indices.ptr, ibytes);
+    pass.setPipeline(pipeline);
+    pass.setVertexBuffer(0, sprite_vertex_buffer.?, 0, vbytes);
+    pass.setIndexBuffer(sprite_index_buffer.?, .uint32, 0, ibytes);
+
+    // Coalesce consecutive same-texture quads into a single drawIndexed call.
+    var quad: usize = 0;
+    while (quad < texture_ids.len) {
+        const tex_id = texture_ids[quad];
+        var run_end = quad + 1;
+        while (run_end < texture_ids.len and texture_ids[run_end] == tex_id) run_end += 1;
+
+        if (getOrCreateGpuTexture(tex_id)) |bind_group| {
+            pass.setBindGroup(0, bind_group, 0, null);
+            const index_count: u32 = @intCast((run_end - quad) * 6);
+            const first_index: u32 = @intCast(quad * 6);
+            pass.drawIndexed(index_count, 1, first_index, 0, 0);
+        }
+        quad = run_end;
+    }
 }
 
 pub fn clearBackground(r: u8, g: u8, b: u8, a: u8) void {

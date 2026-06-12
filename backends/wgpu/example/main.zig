@@ -129,6 +129,43 @@ var player_moving: bool = false;
 var sfx_id: u32 = 0;
 var music_id: u32 = 0;
 
+// Procedurally-generated checkerboard sprite (proves the textured-quad path).
+const SPRITE_SIZE = 32;
+var sprite_tex: ?gfx.Texture = null;
+
+/// Build a 32x32 RGBA8 checkerboard in-memory and upload it as a GPU texture.
+/// No asset file needed — exercises decode-free uploadTexture + the wgpu
+/// sprite pipeline end to end.
+fn makeCheckerSprite() ?gfx.Texture {
+    const S = struct {
+        var pixels: [SPRITE_SIZE * SPRITE_SIZE * 4]u8 = undefined;
+    };
+    var y: usize = 0;
+    while (y < SPRITE_SIZE) : (y += 1) {
+        var x: usize = 0;
+        while (x < SPRITE_SIZE) : (x += 1) {
+            const cell = ((x / 4) + (y / 4)) % 2 == 0;
+            const i = (y * SPRITE_SIZE + x) * 4;
+            if (cell) {
+                S.pixels[i + 0] = 255; // R
+                S.pixels[i + 1] = 80; // G
+                S.pixels[i + 2] = 200; // B
+                S.pixels[i + 3] = 255; // A
+            } else {
+                S.pixels[i + 0] = 40;
+                S.pixels[i + 1] = 220;
+                S.pixels[i + 2] = 255;
+                S.pixels[i + 3] = 255;
+            }
+        }
+    }
+    return gfx.uploadTexture(.{
+        .pixels = &S.pixels,
+        .width = SPRITE_SIZE,
+        .height = SPRITE_SIZE,
+    }) catch null;
+}
+
 // ── Delta time (fixed step approximation) ─────────────────────────────
 
 const DT = 1.0 / 60.0;
@@ -329,6 +366,31 @@ fn renderWorld() void {
         60, 200,
         gfx.color(255, 200, 50, 200),
     );
+
+    // --- Textured sprite (checkerboard) — proves the wgpu sprite path ---
+    if (sprite_tex) |tex| {
+        const src = gfx.Rectangle{ .x = 0, .y = 0, .width = SPRITE_SIZE, .height = SPRITE_SIZE };
+        // Two instances at different scales/rotations to show batching by texture.
+        const spin = time * 90.0; // degrees/sec
+        gfx.drawTexturePro(
+            tex,
+            src,
+            .{ .x = 250, .y = 250, .width = 96, .height = 96 },
+            .{ .x = 48, .y = 48 }, // rotate about center
+            spin,
+            gfx.white,
+        );
+        // Tinted, pulsing-alpha copy near the player.
+        const pulse: u8 = @intFromFloat(128.0 + (@sin(time * 4.0) + 1.0) / 2.0 * 127.0);
+        gfx.drawTexturePro(
+            tex,
+            src,
+            .{ .x = player.x, .y = player.y - 70, .width = 48, .height = 48 },
+            .{ .x = 0, .y = 0 },
+            0,
+            gfx.color(255, 255, 255, pulse),
+        );
+    }
 }
 
 // ── Render: Gizmos (world space) ──────────────────────────────────────
@@ -514,6 +576,9 @@ pub fn main() void {
     window.setTargetFPS(60);
     gfx.setScreenSize(SCREEN_W, SCREEN_H);
 
+    // --- Create the checkerboard sprite (in-memory, no asset file) ---
+    sprite_tex = makeCheckerSprite();
+
     // --- Load audio assets (best-effort, files may not exist) ---
     sfx_id = audio.loadSound("assets/jump.wav");
     music_id = audio.loadMusic("assets/bgm.wav");
@@ -550,6 +615,7 @@ pub fn main() void {
     }
 
     // --- Cleanup ---
+    if (sprite_tex) |tex| gfx.unloadTexture(tex);
     if (sfx_id != 0) audio.unloadSound(sfx_id);
     if (music_id != 0) audio.unloadMusic(music_id);
     window.closeWindow();
