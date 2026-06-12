@@ -312,7 +312,15 @@ pub fn linkDir(
         else => return err,
     }
 
-    try cwd.symLink(io, relative_target, dst_path, .{ .is_directory = true });
+    cwd.symLink(io, relative_target, dst_path, .{ .is_directory = true }) catch |err| {
+        // Windows needs admin / Developer Mode for symlinks — fall back
+        // to a copy-based layout, mirroring cache/disk.zig's fallback.
+        if (err == error.AccessDenied or err == error.PermissionDenied) {
+            try copyDirRecursive(allocator, src_base, dst_base, folder);
+            return;
+        }
+        return err;
+    };
 }
 
 /// Scan `src_base/folder` recursively for file stems matching `ext` and
