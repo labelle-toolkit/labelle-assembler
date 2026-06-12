@@ -1,24 +1,60 @@
 /// bgfx audio backend — satisfies the engine AudioInterface(Impl) contract.
-/// bgfx has no audio; this implements a minimal WAV decoder + PCM mixer
-/// and exposes a software PCM mixer; actual device / ring-buffer output
-/// (if any) is handled by higher-level platform code.
+/// bgfx has no audio of its own; this implements a minimal WAV decoder +
+/// software PCM mixer (`mixAudio`) and drives it with a miniaudio
+/// playback device (#297). The device is opened lazily by `ensureInit`
+/// (called from the first `loadSound`/`loadMusic`/`playSound`/`playMusic`)
+/// and closed by `deinit` (called by the host on shutdown).
 ///
 /// Thread safety:
-/// `mixAudio` is designed to be called from an audio callback thread (e.g. the
-/// platform's audio device callback). It reads shared state from `sounds` and
-/// `music_slots` arrays and advances playback positions.
+/// `mixAudio` runs on miniaudio's audio callback thread, concurrently with
+/// game-thread calls to load/play/unload. All access to the shared `sounds`
+/// and `music_slots` arrays is guarded by `slot_lock`, an atomic-flag
+/// spinlock (acquire on enter / release on exit). Zig 0.16 removed
+/// `std.Thread.Mutex`, so we use `std.atomic.Value(bool)` directly.
 ///
-/// WARNING: `unloadSound` and `unloadMusic` currently have a race condition with
-/// `mixAudio` — they free PCM data and reset slots while `mixAudio` may be
-/// reading from them on the audio callback thread. Calling unload while the mixer
-/// is active can cause use-after-free or null pointer dereference.
-///
-/// TODO: Add proper synchronization (mutex around slot access, or a lock-free
-/// command queue) to make unload safe to call while the audio callback is active.
+/// This fixes the former `unloadSound`/`unloadMusic` vs `mixAudio`
+/// use-after-free race (#298): unload now takes `slot_lock`, so it cannot
+/// free PCM data while the mixer is reading it. Critical sections are kept
+/// tight — the mixer holds the lock only while touching slot state, and
+/// the actual `free()` in unload happens after the slot has been detached
+/// and the lock released.
 const std = @import("std");
+
+const ma = @cImport({
+    @cInclude("miniaudio.h");
+});
 
 const MAX_SOUNDS = 256;
 const MAX_MUSIC = 32;
+
+// ── Slot-array spinlock (#298) ───────────────────────────────────────
+//
+// Guards `sounds` and `music_slots` against concurrent access by the
+// game thread and miniaudio's audio callback thread. Zig 0.16 removed
+// `std.Thread.Mutex`, so this is a hand-rolled test-and-test-and-set
+// spinlock over an atomic bool with acquire/release ordering.
+//
+// Contention is effectively zero (the mixer holds it for microseconds
+// per callback and game-thread audio calls are infrequent), so spinning
+// is cheaper than a futex here and needs no OS primitive.
+var slot_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn lockSlots() void {
+    while (true) {
+        // Fast path: try to flip false→true with acquire ordering.
+        if (!slot_lock.swap(true, .acquire)) return;
+        // Slow path: spin on a relaxed load until it looks free, then
+        // retry the swap (test-and-test-and-set to avoid cache-line
+        // ping-pong while contended).
+        while (slot_lock.load(.monotonic)) {
+            std.atomic.spinLoopHint();
+        }
+    }
+}
+
+fn unlockSlots() void {
+    slot_lock.store(false, .release);
+}
 
 // ── WAV PCM data ─────────────────────────────────────────────────────
 
@@ -53,6 +89,124 @@ var music_slots: [MAX_MUSIC]MusicSlot = [_]MusicSlot{.{}} ** MAX_MUSIC;
 var next_sound_id: u32 = 1;
 var next_music_id: u32 = 1;
 var master_volume: f32 = 1.0;
+
+// ── miniaudio playback device (#297) ─────────────────────────────────
+//
+// A single shared `ma_device` in playback mode (s16 / 2ch / 48 kHz).
+// Its data callback is the audio-thread entry point that drives
+// `mixAudio`. The device is opened lazily on first use (`ensureInit`)
+// and closed on `deinit`. `device_initialized` is the single source of
+// truth for whether the device + ma_context are live.
+
+const DEVICE_SAMPLE_RATE: u32 = 48000;
+const DEVICE_CHANNELS: u32 = 2;
+
+var device: ma.ma_device = undefined;
+// `ensureInit` / `deinit` are called from the game thread only (the
+// AudioInterface control surface is single-threaded; only `mixAudio` runs
+// on the audio callback thread, and it never reads this). It's atomic
+// anyway for safe publication of the device's initialized state.
+var device_initialized: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Audio-thread data callback. miniaudio hands us a frame budget and a
+/// raw output buffer for `ma_format_s16` / 2 channels; we reinterpret it
+/// as interleaved-stereo i16 and let the PCM mixer fill it. `mixAudio`
+/// takes `slot_lock` internally, so this is safe against concurrent
+/// load/unload on the game thread (#298).
+fn deviceDataCallback(
+    p_device: ?*ma.ma_device,
+    p_output: ?*anyopaque,
+    p_input: ?*const anyopaque,
+    frame_count: ma.ma_uint32,
+) callconv(.c) void {
+    _ = p_device;
+    _ = p_input; // playback-only device: no capture input
+    const out_ptr = p_output orelse return;
+    const out: [*]i16 = @ptrCast(@alignCast(out_ptr));
+    const frames: u32 = @intCast(frame_count);
+    const sample_count: usize = @as(usize, frames) * DEVICE_CHANNELS;
+
+    // Cheap proof-of-life so headless runs can confirm the callback is
+    // actually firing (audibility can't be asserted without a speaker).
+    // Log exactly once on the first invocation; thereafter just count.
+    const prev = frames_mixed.fetchAdd(frames, .monotonic);
+    if (prev == 0) {
+        std.log.info("audio: device callback firing (first {d} frames mixed)", .{frames});
+    }
+
+    mixAudio(out[0..sample_count], frames);
+}
+
+/// Cumulative frames pushed through the device callback. Read once at
+/// `deinit` to print a single proof-of-life line; not used for control
+/// flow. Atomic because it's written from the audio thread.
+var frames_mixed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// Open the playback device on first use. Idempotent and cheap to call
+/// from every public entry point that can start audio. If the device
+/// fails to open (e.g. no audio hardware in CI) we log once and leave
+/// `device_initialized` false — the rest of the backend keeps working as
+/// a silent state machine, exactly as before this device existed.
+pub fn ensureInit() void {
+    if (device_initialized.load(.acquire)) return;
+
+    var config = ma.ma_device_config_init(ma.ma_device_type_playback);
+    config.playback.format = ma.ma_format_s16;
+    config.playback.channels = DEVICE_CHANNELS;
+    config.sampleRate = DEVICE_SAMPLE_RATE;
+    config.dataCallback = deviceDataCallback;
+
+    if (ma.ma_device_init(null, &config, &device) != ma.MA_SUCCESS) {
+        std.log.warn("audio: failed to initialize miniaudio playback device", .{});
+        return;
+    }
+
+    if (ma.ma_device_start(&device) != ma.MA_SUCCESS) {
+        std.log.warn("audio: failed to start miniaudio playback device", .{});
+        ma.ma_device_uninit(&device);
+        return;
+    }
+
+    device_initialized.store(true, .release);
+    std.log.info(
+        "audio: miniaudio playback device started: {d}Hz {d}ch s16",
+        .{ device.sampleRate, DEVICE_CHANNELS },
+    );
+}
+
+/// Stop and close the playback device, then free all loaded PCM. Must be
+/// called by the host on shutdown. `ma_device_uninit` joins the audio
+/// thread before returning, so after it the slots are no longer touched
+/// by the callback and we can free them without taking `slot_lock`.
+pub fn deinit() void {
+    if (device_initialized.load(.acquire)) {
+        // Joins the audio callback thread — no more `mixAudio` after this.
+        ma.ma_device_uninit(&device);
+        device_initialized.store(false, .release);
+        std.log.info(
+            "audio: miniaudio device stopped ({d} frames mixed)",
+            .{frames_mixed.load(.monotonic)},
+        );
+    }
+
+    // Free any PCM the game didn't explicitly unload. The audio thread is
+    // gone, so no lock is needed.
+    for (&sounds) |*slot| {
+        if (slot.pcm) |pcm| {
+            if (pcm.raw_alloc.len > 0) std.heap.page_allocator.free(pcm.raw_alloc);
+        }
+        slot.* = .{};
+    }
+    for (&music_slots) |*slot| {
+        if (slot.pcm) |pcm| {
+            if (pcm.raw_alloc.len > 0) std.heap.page_allocator.free(pcm.raw_alloc);
+        }
+        slot.* = .{};
+    }
+    next_sound_id = 1;
+    next_music_id = 1;
+    master_volume = 1.0;
+}
 
 // ── WAV decoder ──────────────────────────────────────────────────────
 
@@ -187,6 +341,14 @@ fn loadWavFile(path: [:0]const u8) ?struct { pcm: PcmData, alloc: []u8 } {
         allocator.free(data);
         return null;
     };
+
+    // Reject empty PCM. A 0-frame buffer played with looping makes the
+    // mixer's wrap math (`position % frame_count`) divide by zero / index
+    // out of bounds on the audio thread, so refuse it at load time.
+    if (pcm.frame_count == 0) {
+        allocator.free(data);
+        return null;
+    }
     pcm.raw_alloc = data;
 
     return .{ .pcm = pcm, .alloc = data };
@@ -213,58 +375,75 @@ fn findFreeSoundSlot() ?u32 {
 }
 
 pub fn loadSound(path: [:0]const u8) u32 {
+    // Open the device on first load so playback works without the host
+    // calling an explicit init.
+    ensureInit();
+
+    // Decode off-lock — file IO + allocation must not block the mixer.
     const result = loadWavFile(path) orelse return 0;
 
+    lockSlots();
     const id = findFreeSoundSlot() orelse {
+        unlockSlots();
         std.heap.page_allocator.free(result.alloc);
         return 0;
     };
-
     sounds[id] = .{
         .pcm = result.pcm,
         .playing = false,
         .position = 0,
         .volume = 1.0,
     };
+    unlockSlots();
     return id;
 }
 
 pub fn unloadSound(id: u32) void {
-    if (id < MAX_SOUNDS) {
-        if (sounds[id].pcm) |pcm| {
-            if (pcm.raw_alloc.len > 0) {
-                std.heap.page_allocator.free(pcm.raw_alloc);
-            }
-        }
-        sounds[id] = .{};
+    if (id >= MAX_SOUNDS) return;
+
+    // Detach the slot under the lock so the mixer can't observe a
+    // half-freed PcmData, then free the backing allocation after
+    // releasing the lock — by which point the mixer no longer holds a
+    // pointer into it (#298).
+    lockSlots();
+    const pcm = sounds[id].pcm;
+    sounds[id] = .{};
+    unlockSlots();
+
+    if (pcm) |p| {
+        if (p.raw_alloc.len > 0) std.heap.page_allocator.free(p.raw_alloc);
     }
 }
 
 pub fn playSound(id: u32) void {
-    if (id < MAX_SOUNDS) {
-        sounds[id].playing = true;
-        sounds[id].position = 0;
-    }
+    ensureInit();
+    if (id >= MAX_SOUNDS) return;
+    lockSlots();
+    sounds[id].playing = true;
+    sounds[id].position = 0;
+    unlockSlots();
 }
 
 pub fn stopSound(id: u32) void {
-    if (id < MAX_SOUNDS) {
-        sounds[id].playing = false;
-        sounds[id].position = 0;
-    }
+    if (id >= MAX_SOUNDS) return;
+    lockSlots();
+    sounds[id].playing = false;
+    sounds[id].position = 0;
+    unlockSlots();
 }
 
 pub fn isSoundPlaying(id: u32) bool {
-    if (id < MAX_SOUNDS) {
-        return sounds[id].playing;
-    }
-    return false;
+    if (id >= MAX_SOUNDS) return false;
+    lockSlots();
+    defer unlockSlots();
+    return sounds[id].playing;
 }
 
 pub fn setSoundVolume(id: u32, volume: f32) void {
-    if (id < MAX_SOUNDS) {
-        sounds[id].volume = std.math.clamp(volume, 0.0, 1.0);
-    }
+    if (id >= MAX_SOUNDS) return;
+    lockSlots();
+    sounds[id].volume = std.math.clamp(volume, 0.0, 1.0);
+    unlockSlots();
 }
 
 // ── Music (streaming) ──────────────────────────────────────
@@ -286,13 +465,16 @@ fn findFreeMusicSlot() ?u32 {
 }
 
 pub fn loadMusic(path: [:0]const u8) u32 {
+    ensureInit();
+
     const result = loadWavFile(path) orelse return 0;
 
+    lockSlots();
     const id = findFreeMusicSlot() orelse {
+        unlockSlots();
         std.heap.page_allocator.free(result.alloc);
         return 0;
     };
-
     music_slots[id] = .{
         .pcm = result.pcm,
         .playing = false,
@@ -301,63 +483,70 @@ pub fn loadMusic(path: [:0]const u8) u32 {
         .volume = 1.0,
         .looping = true,
     };
+    unlockSlots();
     return id;
 }
 
 pub fn unloadMusic(id: u32) void {
-    if (id < MAX_MUSIC) {
-        if (music_slots[id].pcm) |pcm| {
-            if (pcm.raw_alloc.len > 0) {
-                std.heap.page_allocator.free(pcm.raw_alloc);
-            }
-        }
-        music_slots[id] = .{};
+    if (id >= MAX_MUSIC) return;
+
+    // Same detach-then-free ordering as `unloadSound` so the mixer can't
+    // UAF a music buffer mid-callback (#298).
+    lockSlots();
+    const pcm = music_slots[id].pcm;
+    music_slots[id] = .{};
+    unlockSlots();
+
+    if (pcm) |p| {
+        if (p.raw_alloc.len > 0) std.heap.page_allocator.free(p.raw_alloc);
     }
 }
 
 pub fn playMusic(id: u32) void {
-    if (id < MAX_MUSIC) {
-        music_slots[id].playing = true;
-        music_slots[id].paused = false;
-        music_slots[id].position = 0;
-    }
+    ensureInit();
+    if (id >= MAX_MUSIC) return;
+    lockSlots();
+    music_slots[id].playing = true;
+    music_slots[id].paused = false;
+    music_slots[id].position = 0;
+    unlockSlots();
 }
 
 pub fn stopMusic(id: u32) void {
-    if (id < MAX_MUSIC) {
-        music_slots[id].playing = false;
-        music_slots[id].paused = false;
-        music_slots[id].position = 0;
-    }
+    if (id >= MAX_MUSIC) return;
+    lockSlots();
+    music_slots[id].playing = false;
+    music_slots[id].paused = false;
+    music_slots[id].position = 0;
+    unlockSlots();
 }
 
 pub fn pauseMusic(id: u32) void {
-    if (id < MAX_MUSIC) {
-        if (music_slots[id].playing) {
-            music_slots[id].paused = true;
-        }
-    }
+    if (id >= MAX_MUSIC) return;
+    lockSlots();
+    if (music_slots[id].playing) music_slots[id].paused = true;
+    unlockSlots();
 }
 
 pub fn resumeMusic(id: u32) void {
-    if (id < MAX_MUSIC) {
-        if (music_slots[id].paused) {
-            music_slots[id].paused = false;
-        }
-    }
+    if (id >= MAX_MUSIC) return;
+    lockSlots();
+    if (music_slots[id].paused) music_slots[id].paused = false;
+    unlockSlots();
 }
 
 pub fn isMusicPlaying(id: u32) bool {
-    if (id < MAX_MUSIC) {
-        return music_slots[id].playing and !music_slots[id].paused;
-    }
-    return false;
+    if (id >= MAX_MUSIC) return false;
+    lockSlots();
+    defer unlockSlots();
+    return music_slots[id].playing and !music_slots[id].paused;
 }
 
 pub fn setMusicVolume(id: u32, volume: f32) void {
-    if (id < MAX_MUSIC) {
-        music_slots[id].volume = std.math.clamp(volume, 0.0, 1.0);
-    }
+    if (id >= MAX_MUSIC) return;
+    lockSlots();
+    music_slots[id].volume = std.math.clamp(volume, 0.0, 1.0);
+    unlockSlots();
 }
 
 pub fn updateMusic(id: u32) void {
@@ -371,18 +560,21 @@ pub fn updateMusic(id: u32) void {
 // ── PCM mixer ────────────────────────────────────────────────────────
 
 /// Mix all active sounds and music into a stereo i16 output buffer.
-/// Called by the platform audio callback to fill the output device.
+/// Called by the miniaudio device callback to fill the output device.
 ///
-/// NOTE: This function reads/writes shared `sounds`/`music_slots` state.
-/// Currently assumes single-threaded ownership (main thread only).
-/// If called from an audio callback thread, synchronization (mutex or
-/// lock-free command queue) must be added to avoid data races.
+/// Takes `slot_lock` for the duration of the mix so the game thread
+/// cannot free PCM data (`unloadSound`/`unloadMusic`) out from under it
+/// (#298). The critical section only reads slot state + advances
+/// positions; the buffer clear is done up front, outside the lock.
 pub fn mixAudio(output: []i16, frames_requested: u32) void {
     const frame_count = @min(frames_requested, @as(u32, @intCast(output.len / 2)));
 
-    // Clear output buffer
+    // Clear output buffer (no shared state touched yet — keep it off-lock).
     const clear_len: usize = @as(usize, frame_count) * 2;
     @memset(output[0..clear_len], 0);
+
+    lockSlots();
+    defer unlockSlots();
 
     // Mix active sounds
     for (0..MAX_SOUNDS) |i| {
@@ -459,5 +651,128 @@ fn mixPcmInto(
 // ── Global ────────────────────────────────────────────────
 
 pub fn setVolume(volume: f32) void {
+    // Guarded too: the mixer reads `master_volume` under `slot_lock`.
+    lockSlots();
     master_volume = std.math.clamp(volume, 0.0, 1.0);
+    unlockSlots();
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────
+//
+// These exercise the pure-Zig surface (spinlock, mixer, WAV decode,
+// unload detach/free ordering) without opening a miniaudio device, so
+// they run headlessly in CI. The device path is verified manually via
+// the example (see PR notes).
+
+const testing = std.testing;
+
+fn resetStateForTest() void {
+    sounds = [_]SoundSlot{.{}} ** MAX_SOUNDS;
+    music_slots = [_]MusicSlot{.{}} ** MAX_MUSIC;
+    next_sound_id = 1;
+    next_music_id = 1;
+    master_volume = 1.0;
+}
+
+test "spinlock is exclusive and re-acquirable" {
+    try testing.expect(!slot_lock.load(.monotonic));
+    lockSlots();
+    try testing.expect(slot_lock.load(.monotonic));
+    unlockSlots();
+    try testing.expect(!slot_lock.load(.monotonic));
+    // Re-acquire to prove release left it usable.
+    lockSlots();
+    unlockSlots();
+}
+
+test "mixAudio clears output when nothing is playing" {
+    resetStateForTest();
+    var buf = [_]i16{ 123, 45, -67, 89 }; // 2 stereo frames
+    mixAudio(&buf, 2);
+    for (buf) |s| try testing.expectEqual(@as(i16, 0), s);
+}
+
+test "mixAudio mixes a playing sound and stops at end" {
+    resetStateForTest();
+    // 2-frame stereo PCM: [L0,R0, L1,R1]
+    const pcm_samples = [_]i16{ 100, 200, 300, 400 };
+    sounds[1] = .{
+        .pcm = .{
+            .samples = &pcm_samples,
+            .channels = 2,
+            .sample_rate = 48000,
+            .frame_count = 2,
+            .raw_alloc = &.{}, // static backing — unload must not free it
+        },
+        .playing = true,
+        .position = 0,
+        .volume = 1.0,
+    };
+
+    var out = [_]i16{0} ** 4; // request 2 frames
+    mixAudio(&out, 2);
+    try testing.expectEqual(@as(i16, 100), out[0]);
+    try testing.expectEqual(@as(i16, 200), out[1]);
+    try testing.expectEqual(@as(i16, 300), out[2]);
+    try testing.expectEqual(@as(i16, 400), out[3]);
+    // Sound reached its end → auto-stopped.
+    try testing.expect(!sounds[1].playing);
+}
+
+test "unloadSound detaches slot then frees its allocation" {
+    resetStateForTest();
+    // `unloadSound` frees `raw_alloc` via page_allocator, so allocate it
+    // there. A double-free or use of the slot after free would trip the
+    // allocator / sanitizer.
+    const raw = try std.heap.page_allocator.alloc(u8, 8);
+    const samples: [*]const i16 = @ptrCast(@alignCast(raw.ptr));
+    sounds[1] = .{
+        .pcm = .{
+            .samples = samples[0..4],
+            .channels = 2,
+            .sample_rate = 48000,
+            .frame_count = 2,
+            .raw_alloc = raw,
+        },
+        .playing = true,
+        .position = 0,
+        .volume = 1.0,
+    };
+
+    unloadSound(1);
+    // Slot fully reset and PCM detached (the buffer is now freed).
+    try testing.expect(sounds[1].pcm == null);
+    try testing.expect(!sounds[1].playing);
+}
+
+test "WAV decoder accepts a minimal stereo s16 buffer" {
+    // Build a 44-byte-header WAV with one stereo frame.
+    var wav: [44 + 4]u8 = undefined;
+    @memcpy(wav[0..4], "RIFF");
+    std.mem.writeInt(u32, wav[4..8], 36 + 4, .little);
+    @memcpy(wav[8..12], "WAVE");
+    @memcpy(wav[12..16], "fmt ");
+    std.mem.writeInt(u32, wav[16..20], 16, .little);
+    std.mem.writeInt(u16, wav[20..22], 1, .little); // PCM
+    std.mem.writeInt(u16, wav[22..24], 2, .little); // stereo
+    std.mem.writeInt(u32, wav[24..28], 48000, .little);
+    std.mem.writeInt(u32, wav[28..32], 48000 * 4, .little);
+    std.mem.writeInt(u16, wav[32..34], 4, .little); // block align
+    std.mem.writeInt(u16, wav[34..36], 16, .little); // bits
+    @memcpy(wav[36..40], "data");
+    std.mem.writeInt(u32, wav[40..44], 4, .little);
+    std.mem.writeInt(i16, wav[44..46], 111, .little);
+    std.mem.writeInt(i16, wav[46..48], 222, .little);
+
+    const pcm = decodeWav(&wav) orelse return error.DecodeFailed;
+    try testing.expectEqual(@as(u16, 2), pcm.channels);
+    try testing.expectEqual(@as(u32, 48000), pcm.sample_rate);
+    try testing.expectEqual(@as(u32, 1), pcm.frame_count);
+    try testing.expectEqual(@as(i16, 111), pcm.samples[0]);
+    try testing.expectEqual(@as(i16, 222), pcm.samples[1]);
+}
+
+test "WAV decoder rejects non-RIFF data" {
+    var junk = [_]u8{0xAB} ** 64;
+    try testing.expect(decodeWav(&junk) == null);
 }

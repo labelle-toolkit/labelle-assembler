@@ -133,6 +133,89 @@ fn colorCycle(phase: f32) gfx.Color {
     return gfx.color(r, g, b, 255);
 }
 
+// ── In-memory WAV beep generator ───────────────────────────────────────
+//
+// `audio.loadSound` takes a file path, so to exercise the miniaudio
+// device (#297) without shipping a binary asset we synthesize a short
+// 440 Hz sine "beep" (0.5 s, 48 kHz, stereo i16), write a valid 44-byte
+// WAV to a temp file, and load that. Uses libc `fopen`/`fwrite`/`fclose`
+// to stay consistent with the backend's libc-based file IO and avoid
+// threading an `Io` through (Zig 0.16 removed `std.fs.cwd()`).
+
+const BEEP_SAMPLE_RATE: u32 = 48000;
+const BEEP_CHANNELS: u16 = 2;
+const BEEP_FREQ: f32 = 440.0;
+const BEEP_SECONDS: f32 = 0.5;
+
+extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern "c" fn fwrite(ptr: [*]const u8, size: usize, n: usize, stream: *anyopaque) usize;
+extern "c" fn fclose(stream: *anyopaque) c_int;
+
+fn writeU32Le(buf: []u8, v: u32) void {
+    std.mem.writeInt(u32, buf[0..4], v, .little);
+}
+fn writeU16Le(buf: []u8, v: u16) void {
+    std.mem.writeInt(u16, buf[0..2], v, .little);
+}
+
+/// Generate a beep WAV in `out` and return the number of bytes written.
+/// `out` must be large enough for the 44-byte header + PCM payload.
+fn generateBeepWav(out: []u8) usize {
+    const beep_frames: u32 = @intFromFloat(@as(f32, @floatFromInt(BEEP_SAMPLE_RATE)) * BEEP_SECONDS);
+    const bytes_per_sample: u16 = 2; // i16
+    const block_align: u16 = BEEP_CHANNELS * bytes_per_sample;
+    const byte_rate: u32 = BEEP_SAMPLE_RATE * block_align;
+    const data_size: u32 = beep_frames * block_align;
+
+    // 44-byte canonical PCM WAV header.
+    @memcpy(out[0..4], "RIFF");
+    writeU32Le(out[4..8], 36 + data_size); // file size - 8
+    @memcpy(out[8..12], "WAVE");
+    @memcpy(out[12..16], "fmt ");
+    writeU32Le(out[16..20], 16); // fmt chunk size
+    writeU16Le(out[20..22], 1); // PCM
+    writeU16Le(out[22..24], BEEP_CHANNELS);
+    writeU32Le(out[24..28], BEEP_SAMPLE_RATE);
+    writeU32Le(out[28..32], byte_rate);
+    writeU16Le(out[32..34], block_align);
+    writeU16Le(out[34..36], 16); // bits per sample
+    @memcpy(out[36..40], "data");
+    writeU32Le(out[40..44], data_size);
+
+    // Interleaved-stereo i16 sine samples with a short linear fade so the
+    // start/end don't click.
+    var i: u32 = 0;
+    var off: usize = 44;
+    const two_pi: f32 = std.math.tau;
+    const fade: u32 = BEEP_SAMPLE_RATE / 100; // ~10 ms
+    while (i < beep_frames) : (i += 1) {
+        const t: f32 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(BEEP_SAMPLE_RATE));
+        var amp: f32 = 0.3;
+        if (i < fade) amp *= @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(fade));
+        if (i >= beep_frames - fade) amp *= @as(f32, @floatFromInt(beep_frames - i)) / @as(f32, @floatFromInt(fade));
+        const s: f32 = @sin(two_pi * BEEP_FREQ * t) * amp * 32767.0;
+        const sample: i16 = @intFromFloat(std.math.clamp(s, -32768.0, 32767.0));
+        writeU16Le(out[off .. off + 2], @bitCast(sample));
+        writeU16Le(out[off + 2 .. off + 4], @bitCast(sample));
+        off += 4;
+    }
+    return off;
+}
+
+/// Synthesize the beep WAV and write it to `path`. Returns false on any
+/// IO failure (caller treats audio as non-fatal).
+fn writeBeepWavFile(path: [:0]const u8) bool {
+    // 44-byte header + 0.5s * 48k frames * 4 bytes/frame ≈ 96 KB.
+    const max_bytes: usize = 44 + @as(usize, @intFromFloat(@as(f32, @floatFromInt(BEEP_SAMPLE_RATE)) * BEEP_SECONDS)) * 4;
+    const buf = std.heap.page_allocator.alloc(u8, max_bytes) catch return false;
+    defer std.heap.page_allocator.free(buf);
+
+    const n = generateBeepWav(buf);
+    const file = fopen(path.ptr, "wb") orelse return false;
+    defer _ = fclose(file);
+    return fwrite(buf.ptr, 1, n, file) == n;
+}
+
 fn hexagonPoints(cx: f32, cy: f32, radius: f32, rotation_deg: f32) [6]gfx.Vector2 {
     var pts: [6]gfx.Vector2 = undefined;
     const rad = rotation_deg * (std.math.pi / 180.0);
@@ -445,12 +528,20 @@ pub fn main() void {
     window.setTargetFPS(60);
     gfx.setScreenSize(SCREEN_W, SCREEN_H);
 
-    // -- Audio: attempt to load sound and music files (non-fatal if missing)
-    sound_id = audio.loadSound("assets/jump.wav");
-    sound_loaded = (sound_id != 0);
-
-    music_id = audio.loadMusic("assets/bgm.wav");
-    music_loaded = (music_id != 0);
+    // -- Audio: synthesize a 440 Hz beep WAV to a temp file and load it.
+    // This opens the miniaudio playback device (#297) on first load and
+    // exercises the device callback → mixAudio path end to end. Loading
+    // is non-fatal if the temp write or device open fails (e.g. headless
+    // CI with no audio hardware).
+    // Relative path so the demo also works on Windows (no `/tmp`); written
+    // to the current working directory.
+    const beep_path: [:0]const u8 = "bgfx-audio-beep.wav";
+    if (writeBeepWavFile(beep_path)) {
+        sound_id = audio.loadSound(beep_path);
+        sound_loaded = (sound_id != 0);
+        // Play once on startup so the device callback has something to mix.
+        if (sound_loaded) audio.playSound(sound_id);
+    }
 
     // -- Main loop
     while (!window.windowShouldClose()) {
@@ -461,11 +552,14 @@ pub fn main() void {
         draw();
     }
 
-    // -- Cleanup
+    // -- Cleanup: unload (exercises the #298 unload-during-playback path)
+    // then shut down the device. `audio.deinit` joins the callback thread
+    // and frees any remaining PCM.
     if (sound_loaded) audio.unloadSound(sound_id);
     if (music_loaded) {
         audio.stopMusic(music_id);
         audio.unloadMusic(music_id);
     }
+    audio.deinit();
     window.closeWindow();
 }
