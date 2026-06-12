@@ -10,8 +10,8 @@
         // input.zig routes to (gamepad_source.Source.update/isButtonDown/…,
         // which landed in v1.16.0; v1.15.0 was detection-only).
         .@"labelle-core" = .{
-            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.16.0.tar.gz",
-            .hash = "labelle_core-1.16.0-OauRcOdRBACVTYpGX9NbCtlFi9fZg9VBGv6h3gybehMs",
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.16.1.tar.gz",
+            .hash = "labelle_core-1.16.1-OauRcDNUBAA0n4uPvKp3HETPvMZprHL_kRyUERdj4xqx",
         },
         // Shared windowless-SDL desktop gamepad source (core#28). In-tree
         // sub-package consumed by BOTH the raylib and sokol desktop backends
