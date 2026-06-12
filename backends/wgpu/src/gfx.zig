@@ -72,7 +72,9 @@ pub const ColorVertex = extern struct {
 };
 
 /// Sprite vertex with position, UV, and packed ABGR color.
-const SpriteVertex = extern struct {
+/// Pub: it is the element type of `consumeSpriteBatch`'s returned vertex
+/// slice, which the window module's render submitter consumes.
+pub const SpriteVertex = extern struct {
     position: [2]f32,
     uv: [2]f32,
     color_packed: u32, // ABGR packed
@@ -622,6 +624,30 @@ pub fn unloadTexture(texture: Texture) void {
         std.heap.page_allocator.free(px);
     }
     slot.* = .{};
+}
+
+/// CPU-side description of a loaded texture's pixel data, used by the GPU
+/// submitter (window.zig) to lazily create + upload a wgpu texture the
+/// first time the texture id is drawn. The `pixels` slice is borrowed
+/// (owned by the texture slot) and stays valid until `unloadTexture`.
+pub const TexturePixels = struct {
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+};
+
+/// Look up the RGBA8 pixel buffer for a texture id. Returns null for an
+/// unknown / inactive id. The returned slice is borrowed (see above).
+pub fn getTexturePixels(id: u32) ?TexturePixels {
+    if (id == 0 or id >= MAX_TEXTURES) return null;
+    const slot = &textures[id];
+    if (!slot.active) return null;
+    const px = slot.pixels orelse return null;
+    return .{
+        .pixels = px,
+        .width = @intCast(slot.width),
+        .height = @intCast(slot.height),
+    };
 }
 
 // ── Image decoding helpers ─────────────────────────────────────────────
