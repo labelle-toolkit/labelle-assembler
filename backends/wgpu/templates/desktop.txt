@@ -3,7 +3,7 @@ const screen_h: u32 = {{height}};
 const screen_title = "{{title}}";
 const target_fps: u32 = {{fps}};
 
-pub fn main() !void {
+{{module_vars}}pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

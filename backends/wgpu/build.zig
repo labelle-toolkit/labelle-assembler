@@ -67,6 +67,12 @@ pub fn build(b: *std.Build) void {
     });
     window_mod.addImport("zglfw", zglfw_mod);
     if (wgpu_mod_opt) |m| window_mod.addImport("wgpu", m);
+    // window.zig hands the created GLFW window to the input module
+    // (`input.setWindow`) and pumps `input.newFrame()` per frame.
+    window_mod.addImport("input", input_mod);
+    // The render submitter in window.zig drains gfx.zig's shape batch
+    // (consumeShapeBatch) and routes drawText into it.
+    window_mod.addImport("gfx", gfx_mod);
 
     // ── Re-export native artifacts so consumers can link them ───────
     b.installArtifact(glfw_artifact);
