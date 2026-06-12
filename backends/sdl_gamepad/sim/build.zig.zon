@@ -1,0 +1,17 @@
+.{
+    .name = .gamepad_sim,
+    .version = "0.0.0",
+    .fingerprint = 0x18fd4c9a2bc40fe6,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // The parent package: the toolkit's shared windowless-SDL gamepad
+        // source. Brings its own labelle_core pin (cached), so we get the
+        // fully-wired `sdl_gamepad` module without touching the toolkit.
+        .labelle_sdl_gamepad = .{ .path = ".." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

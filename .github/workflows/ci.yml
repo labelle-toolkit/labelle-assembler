@@ -237,6 +237,20 @@ jobs:
           cd .labelle/raylib_desktop
           zig build
 
+      # Hardware-free RUNTIME check of the shared sdl_gamepad source
+      # (backends/sdl_gamepad/sim — see its README). Attaches an
+      # in-process SDL2 virtual gamecontroller, drives every button and
+      # axis, and asserts the toolkit Source reports each one back with
+      # the correct canonical mapping. The gamepad example step above
+      # only proves the source COMPILES; this proves connect detection,
+      # button routing, axis scaling/sign, and the synthesized
+      # analog-trigger button actually behave — headless, no window, no
+      # input devices on the runner needed.
+      - name: Run the gamepad-sim harness
+        run: |
+          cd labelle-assembler/backends/sdl_gamepad/sim
+          zig build run
+
       # Null-backend headless example (labelle-assembler#129). Smoke-tests
       # the .null path end-to-end: generate → build → RUN. The example has
       # no plugins / GUI / assets — just a single per-frame script logging
