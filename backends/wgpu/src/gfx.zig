@@ -836,41 +836,56 @@ pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void
     const col = tint.toAbgr();
     const scale = size / @as(f32, FONT_GLYPH_H);
     const glyph_w: f32 = @as(f32, FONT_GLYPH_W) * scale;
-    const glyph_h: f32 = @as(f32, FONT_GLYPH_H) * scale;
+
+    // Worst case per glyph: alternating bits give 4 runs per row x 8 rows
+    // = 32 quads = 128 vertices / 192 indices.
+    const max_glyph_verts: usize = 32 * 4;
+    const max_glyph_idxs: usize = 32 * 6;
 
     var cursor_x = x;
     for (text) |ch| {
         if (ch == 0) break;
         if (ch >= 0x20 and ch <= 0x7E) {
-            const glyph = font_data[ch - 0x20];
-            // Skip entirely blank glyphs (e.g. space)
-            var has_pixels = false;
-            for (glyph) |row_bits| {
-                if (row_bits != 0) {
-                    has_pixels = true;
-                    break;
-                }
+            if (!hasShapeCapacity(max_glyph_verts, max_glyph_idxs)) {
+                log.warn("shape batch full, dropping text glyphs", .{});
+                return;
             }
 
-            if (has_pixels) {
-                // One filled rectangle per glyph (4 vertices, 6 indices).
-                if (!hasShapeCapacity(4, 6)) {
-                    log.warn("shape batch full, dropping text glyphs", .{});
-                    return;
+            const glyph = font_data[ch - 0x20];
+            for (glyph, 0..) |row_bits, row| {
+                if (row_bits == 0) continue;
+                const py = y + @as(f32, @floatFromInt(row)) * scale;
+
+                // Merge consecutive set bits (MSB = leftmost pixel) into
+                // horizontal run rectangles — one quad per run.
+                var c: usize = 0;
+                while (c < FONT_GLYPH_W) {
+                    if ((row_bits >> @intCast(FONT_GLYPH_W - 1 - c)) & 1 == 0) {
+                        c += 1;
+                        continue;
+                    }
+                    const run_start = c;
+                    while (c < FONT_GLYPH_W and (row_bits >> @intCast(FONT_GLYPH_W - 1 - c)) & 1 == 1) {
+                        c += 1;
+                    }
+                    const run_len = c - run_start;
+
+                    const px = cursor_x + @as(f32, @floatFromInt(run_start)) * scale;
+                    const pw = @as(f32, @floatFromInt(run_len)) * scale;
+                    const base: u32 = @intCast(shape_vertex_count);
+
+                    appendShapeVertex(ColorVertex.init(toNdcX(px), toNdcY(py), col));
+                    appendShapeVertex(ColorVertex.init(toNdcX(px + pw), toNdcY(py), col));
+                    appendShapeVertex(ColorVertex.init(toNdcX(px + pw), toNdcY(py + scale), col));
+                    appendShapeVertex(ColorVertex.init(toNdcX(px), toNdcY(py + scale), col));
+
+                    appendShapeIndex(base + 0);
+                    appendShapeIndex(base + 1);
+                    appendShapeIndex(base + 2);
+                    appendShapeIndex(base + 0);
+                    appendShapeIndex(base + 2);
+                    appendShapeIndex(base + 3);
                 }
-
-                const base: u32 = @intCast(shape_vertex_count);
-                appendShapeVertex(ColorVertex.init(toNdcX(cursor_x), toNdcY(y), col));
-                appendShapeVertex(ColorVertex.init(toNdcX(cursor_x + glyph_w), toNdcY(y), col));
-                appendShapeVertex(ColorVertex.init(toNdcX(cursor_x + glyph_w), toNdcY(y + glyph_h), col));
-                appendShapeVertex(ColorVertex.init(toNdcX(cursor_x), toNdcY(y + glyph_h), col));
-
-                appendShapeIndex(base + 0);
-                appendShapeIndex(base + 1);
-                appendShapeIndex(base + 2);
-                appendShapeIndex(base + 0);
-                appendShapeIndex(base + 2);
-                appendShapeIndex(base + 3);
             }
         }
         cursor_x += glyph_w;

@@ -117,6 +117,8 @@ fn initGpu() void {
         log.warn("wgpu device request failed; rendering disabled", .{});
         return;
     };
+    // The adapter is only needed to create the device; drop our reference now.
+    defer adapter.release();
     queue = device.?.getQueue() orelse return;
 
     surface.?.configure(&wgpu.SurfaceConfiguration{
