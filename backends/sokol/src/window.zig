@@ -192,7 +192,21 @@ fn readbackMetal(pixels: []u8, w: u32, h: u32) bool {
 }
 
 fn readbackGL(pixels: []u8, w: u32, h: u32) bool {
-    return @import("screenshot/gl.zig").readback(pixels, w, h);
+    // Same comptime-gate shape as `readbackMetal` / `readbackD3D11`: the GL
+    // backend is only ever selected on GL targets (desktop Linux, GLES on
+    // Android/wasm) — never on Windows (D3D11) or Darwin (Metal). Without the
+    // gate the `screenshot/gl.zig` import stays in the analysis graph on those
+    // targets and its `glReadPixels` / `glPixelStorei` externs force a
+    // spurious opengl32 link (the exact failure mode the sibling comments warn
+    // about).
+    if (comptime builtin.target.os.tag != .windows and
+        builtin.target.os.tag != .macos and builtin.target.os.tag != .ios)
+    {
+        return @import("screenshot/gl.zig").readback(pixels, w, h);
+    } else {
+        std.log.warn("screenshot: GL backend reported on non-GL target", .{});
+        return false;
+    }
 }
 
 fn readbackD3D11(pixels: []u8, w: u32, h: u32) bool {

@@ -164,39 +164,72 @@ pub const preview_pbo = struct {
     const GL_RGBA: c_uint = 0x1908;
     const GL_UNSIGNED_BYTE: c_uint = 0x1401;
 
-    // ── GL extern decls — raylib's libGL/CGL/WGL link gives us these. ──
+    const is_windows = builtin.target.os.tag == .windows;
+
+    // ── GL 1.1 entry points: exported by opengl32.dll on Windows and by
+    //    libGL/CGL elsewhere, so a direct @extern link reference resolves. ──
     const glPixelStorei = @extern(
         *const fn (pname: c_uint, param: c_int) callconv(.c) void,
         .{ .name = "glPixelStorei" },
-    );
-    const glGenBuffers = @extern(
-        *const fn (n: c_int, buffers: [*]c_uint) callconv(.c) void,
-        .{ .name = "glGenBuffers" },
-    );
-    const glDeleteBuffers = @extern(
-        *const fn (n: c_int, buffers: [*]const c_uint) callconv(.c) void,
-        .{ .name = "glDeleteBuffers" },
-    );
-    const glBindBuffer = @extern(
-        *const fn (target: c_uint, buffer: c_uint) callconv(.c) void,
-        .{ .name = "glBindBuffer" },
-    );
-    const glBufferData = @extern(
-        *const fn (target: c_uint, size: isize, data: ?*const anyopaque, usage: c_uint) callconv(.c) void,
-        .{ .name = "glBufferData" },
     );
     const glReadPixels = @extern(
         *const fn (x: c_int, y: c_int, w: c_int, h: c_int, fmt: c_uint, ty: c_uint, data: ?*anyopaque) callconv(.c) void,
         .{ .name = "glReadPixels" },
     );
-    const glMapBuffer = @extern(
-        *const fn (target: c_uint, access: c_uint) callconv(.c) ?*anyopaque,
-        .{ .name = "glMapBuffer" },
-    );
-    const glUnmapBuffer = @extern(
-        *const fn (target: c_uint) callconv(.c) u8,
-        .{ .name = "glUnmapBuffer" },
-    );
+
+    // ── GL 2.0+ entry points (VBO/PBO): NOT exported by opengl32.dll on
+    //    Windows — a link-time @extern there fails ("undefined symbol:
+    //    glGenBuffers"). Resolve them at runtime via wglGetProcAddress once a
+    //    GL context is current (raylib creates one in initWindow, before
+    //    frame() runs). On Linux/macOS the libGL/CGL link provides them, so
+    //    @extern stays. ──
+    const GenBuffersFn = *const fn (n: c_int, buffers: [*]c_uint) callconv(.c) void;
+    const DeleteBuffersFn = *const fn (n: c_int, buffers: [*]const c_uint) callconv(.c) void;
+    const BindBufferFn = *const fn (target: c_uint, buffer: c_uint) callconv(.c) void;
+    const BufferDataFn = *const fn (target: c_uint, size: isize, data: ?*const anyopaque, usage: c_uint) callconv(.c) void;
+    const MapBufferFn = *const fn (target: c_uint, access: c_uint) callconv(.c) ?*anyopaque;
+    const UnmapBufferFn = *const fn (target: c_uint) callconv(.c) u8;
+
+    const Gl2 = struct {
+        glGenBuffers: GenBuffersFn,
+        glDeleteBuffers: DeleteBuffersFn,
+        glBindBuffer: BindBufferFn,
+        glBufferData: BufferDataFn,
+        glMapBuffer: MapBufferFn,
+        glUnmapBuffer: UnmapBufferFn,
+    };
+
+    extern fn wglGetProcAddress(name: [*:0]const u8) callconv(.c) ?*anyopaque;
+
+    fn wglProc(comptime T: type, name: [*:0]const u8) ?T {
+        const p = wglGetProcAddress(name) orelse return null;
+        return @ptrFromInt(@intFromPtr(p));
+    }
+
+    var gl2_cache: ?Gl2 = null;
+
+    /// Lazily resolve the GL 2.0+ entry points. Returns null if a GL context
+    /// is not yet current (Windows) — the caller then no-ops for this frame.
+    fn gl2() ?Gl2 {
+        if (gl2_cache) |g| return g;
+        const g: Gl2 = if (is_windows) .{
+            .glGenBuffers = wglProc(GenBuffersFn, "glGenBuffers") orelse return null,
+            .glDeleteBuffers = wglProc(DeleteBuffersFn, "glDeleteBuffers") orelse return null,
+            .glBindBuffer = wglProc(BindBufferFn, "glBindBuffer") orelse return null,
+            .glBufferData = wglProc(BufferDataFn, "glBufferData") orelse return null,
+            .glMapBuffer = wglProc(MapBufferFn, "glMapBuffer") orelse return null,
+            .glUnmapBuffer = wglProc(UnmapBufferFn, "glUnmapBuffer") orelse return null,
+        } else .{
+            .glGenBuffers = @extern(GenBuffersFn, .{ .name = "glGenBuffers" }),
+            .glDeleteBuffers = @extern(DeleteBuffersFn, .{ .name = "glDeleteBuffers" }),
+            .glBindBuffer = @extern(BindBufferFn, .{ .name = "glBindBuffer" }),
+            .glBufferData = @extern(BufferDataFn, .{ .name = "glBufferData" }),
+            .glMapBuffer = @extern(MapBufferFn, .{ .name = "glMapBuffer" }),
+            .glUnmapBuffer = @extern(UnmapBufferFn, .{ .name = "glUnmapBuffer" }),
+        };
+        gl2_cache = g;
+        return g;
+    }
 
     // ── Module-scope state ──
     var allocator: std.mem.Allocator = undefined;
@@ -231,6 +264,15 @@ pub const preview_pbo = struct {
         const sw: u32 = @intCast(sw_i);
         const sh: u32 = @intCast(sh_i);
         const needed_bytes: usize = @as(usize, sw) * @as(usize, sh) * 4;
+
+        // Resolve GL 2.0+ entry points (runtime-loaded on Windows). No-op the
+        // frame if a GL context isn't current yet.
+        const g = gl2() orelse return;
+        const glGenBuffers = g.glGenBuffers;
+        const glBindBuffer = g.glBindBuffer;
+        const glBufferData = g.glBufferData;
+        const glMapBuffer = g.glMapBuffer;
+        const glUnmapBuffer = g.glUnmapBuffer;
 
         // Resize / first-frame: (re)negotiate the SHM ring with the editor
         // and (re)size the PBOs + CPU staging buffer.
@@ -310,7 +352,7 @@ pub const preview_pbo = struct {
             pixel_buf = &[_]u8{};
         }
         if (pbo_initialized) {
-            glDeleteBuffers(3, &pbos);
+            if (gl2()) |g| g.glDeleteBuffers(3, &pbos);
             pbo_initialized = false;
             pbos = .{ 0, 0, 0 };
         }
