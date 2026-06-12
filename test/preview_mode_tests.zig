@@ -888,6 +888,68 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
     }
 
+    test "every REAL backend template's generated main declares the _preview_* helpers it references" {
+        // Regression lock for the {{module_vars}}-slot-missing bug class:
+        // wgpu's and bgfx's desktop templates shipped with the
+        // {{preview_setup}}/{{preview_heartbeat}} slots (which USE
+        // `_preview_getenv`/`_preview_now_ms`) but without the
+        // {{module_vars}} slot (which DECLARES them), so their generated
+        // mains failed sema with "use of undeclared identifier". The
+        // synthetic lifecycle fixtures in this file all carry
+        // {{module_vars}}, which is exactly why the bug slipped through —
+        // this test renders codegen through the REAL template files read
+        // from backends/<be>/templates/.
+        const Case = struct { backend: generate.Backend, template: []const u8 };
+        const cases = [_]Case{
+            .{ .backend = .raylib, .template = "backends/raylib/templates/desktop.txt" },
+            .{ .backend = .sdl, .template = "backends/sdl/templates/desktop.txt" },
+            .{ .backend = .bgfx, .template = "backends/bgfx/templates/desktop.txt" },
+            .{ .backend = .wgpu, .template = "backends/wgpu/templates/desktop.txt" },
+            .{ .backend = .sokol, .template = "backends/sokol/templates/desktop.txt" },
+            .{ .backend = .null, .template = "backends/null/templates/headless.txt" },
+        };
+
+        const io = std.testing.io;
+        for (cases) |case| {
+            // Tests run with cwd = repo root; tolerate a subdir invocation
+            // by probing a couple of parents before giving up loudly.
+            var lifecycle: ?[]const u8 = null;
+            const prefixes = [_][]const u8{ "", "../", "../../" };
+            for (prefixes) |p| {
+                const path = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ p, case.template });
+                defer std.testing.allocator.free(path);
+                lifecycle = std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(64 * 1024)) catch continue;
+                break;
+            }
+            const tmpl = lifecycle orelse {
+                std.debug.print("could not read {s} — run `zig build test` from the repo root\n", .{case.template});
+                return error.TemplateNotFound;
+            };
+            defer std.testing.allocator.free(tmpl);
+
+            const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+                .name = "test-game",
+                .backend = case.backend,
+                .ecs = .mock,
+            }, tmpl, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+            defer std.testing.allocator.free(main_zig);
+
+            const pairs = [_][2][]const u8{
+                .{ "_preview_getenv(", "const _preview_getenv" },
+                .{ "_preview_now_ms(", "fn _preview_now_ms" },
+                .{ "_preview_clock_gettime(", "const _preview_clock_gettime" },
+            };
+            for (pairs) |pair| {
+                const used = std.mem.indexOf(u8, main_zig, pair[0]) != null;
+                const declared = std.mem.indexOf(u8, main_zig, pair[1]) != null;
+                if (used and !declared) {
+                    std.debug.print("{s} ({s}): generated main references `{s}...` but never declares it\n", .{ @tagName(case.backend), case.template, pair[0] });
+                    return error.UndeclaredPreviewHelper;
+                }
+            }
+        }
+    }
+
     test "raylib loop backend does NOT reference window.hideWindow (#137)" {
         // The hide-window fix is sokol-specific — raylib desktop has
         // no separate window-in-window surface, and `window.hideWindow`

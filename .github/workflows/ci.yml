@@ -237,6 +237,24 @@ jobs:
           cd .labelle/raylib_desktop
           zig build
 
+      # wgpu desktop example — build-only, same recipe. This backend
+      # previously had NO example build in CI at all, which let a codegen
+      # bug ship (its lifecycle template lacked the {{module_vars}} slot,
+      # so generated mains referenced undeclared `_preview_*` helpers and
+      # failed sema — caught only when a real project switched backends).
+      # bgfx has the same fixes applied but is NOT gated here yet: its C++
+      # compile alone runs tens of minutes, so it needs a caching strategy
+      # (its own job + zig-cache restore) before it can join — tracked as
+      # a follow-up.
+      - name: Generate + build the wgpu example
+        env:
+          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
+        run: |
+          cd labelle-assembler/examples/wgpu
+          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
+          cd .labelle/wgpu_desktop
+          zig build
+
       # Hardware-free RUNTIME check of the shared sdl_gamepad source
       # (backends/sdl_gamepad/sim — see its README). Attaches an
       # in-process SDL2 virtual gamecontroller, drives every button and

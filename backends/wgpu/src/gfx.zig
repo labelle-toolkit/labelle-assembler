@@ -60,7 +60,9 @@ pub const transparent = Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
 // ── Vertex types ──────────────────────────────────────────────────────
 
 /// Color vertex for shape rendering (position + packed ABGR color).
-const ColorVertex = extern struct {
+/// Pub: it is the element type of `consumeShapeBatch`'s return slices,
+/// which the window module's render submitter consumes.
+pub const ColorVertex = extern struct {
     position: [2]f32,
     color_packed: u32, // ABGR packed
 
@@ -302,25 +304,28 @@ pub fn resetSpriteBatch() void {
 /// Consume shape batch data for GPU submission (called once per frame at endDrawing).
 /// Resets the batch after returning — the returned slices are valid until the next draw call.
 pub fn consumeShapeBatch() struct { vertices: []const ColorVertex, indices: []const u32 } {
-    const batch = .{
-        .vertices = shape_vertices[0..shape_vertex_count],
-        .indices = shape_indices[0..shape_index_count],
-    };
+    const vcount = shape_vertex_count;
+    const icount = shape_index_count;
     resetShapeBatch();
-    return batch;
+    return .{
+        .vertices = shape_vertices[0..vcount],
+        .indices = shape_indices[0..icount],
+    };
 }
 
 /// Consume sprite batch data for GPU submission (called once per frame at endDrawing).
 /// Resets the batch after returning — the returned slices are valid until the next draw call.
 /// `texture_ids` has one entry per quad (every 4 vertices / 6 indices).
 pub fn consumeSpriteBatch() struct { vertices: []const SpriteVertex, indices: []const u32, texture_ids: []const u32 } {
-    const batch = .{
-        .vertices = sprite_vertices[0..sprite_vertex_count],
-        .indices = sprite_indices[0..sprite_index_count],
-        .texture_ids = sprite_texture_ids[0..sprite_quad_count],
-    };
+    const vcount = sprite_vertex_count;
+    const icount = sprite_index_count;
+    const qcount = sprite_quad_count;
     resetSpriteBatch();
-    return batch;
+    return .{
+        .vertices = sprite_vertices[0..vcount],
+        .indices = sprite_indices[0..icount],
+        .texture_ids = sprite_texture_ids[0..qcount],
+    };
 }
 
 /// Backward-compatible alias for `consumeShapeBatch`.
