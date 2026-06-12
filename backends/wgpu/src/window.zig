@@ -76,11 +76,66 @@ const shape_wgsl =
 
 const log = std.log.scoped(.wgpu_window);
 
-fn initGpu() void {
-    if (builtin.target.os.tag != .windows) {
-        log.warn("wgpu surface creation only wired for Windows so far; rendering disabled", .{});
-        return;
+// ── Apple platform surface (Cocoa NSWindow → CAMetalLayer) ───────────────
+// wgpu-native wants a CAMetalLayer to back the surface on macOS/iOS. GLFW
+// gives us the NSWindow; we attach a fresh CAMetalLayer to its content view
+// via the Objective-C runtime (no objc headers needed — three msgSends).
+// Symbols resolve through the Foundation/QuartzCore frameworks the consuming
+// executable links.
+const ObjcId = ?*anyopaque;
+extern "c" fn objc_getClass(name: [*:0]const u8) ObjcId;
+extern "c" fn sel_registerName(name: [*:0]const u8) ?*anyopaque;
+extern "c" fn objc_msgSend() void;
+
+fn attachMetalLayer(nswindow: *anyopaque) ?*anyopaque {
+    // objc_msgSend must be called through a prototype matching each message's
+    // exact ABI (arm64 has no generic variadic form), so cast per signature.
+    const msgId = @as(*const fn (ObjcId, ?*anyopaque) callconv(.c) ObjcId, @ptrCast(&objc_msgSend));
+    const msgSetBool = @as(*const fn (ObjcId, ?*anyopaque, i8) callconv(.c) void, @ptrCast(&objc_msgSend));
+    const msgSetId = @as(*const fn (ObjcId, ?*anyopaque, ObjcId) callconv(.c) void, @ptrCast(&objc_msgSend));
+
+    const metal_class = objc_getClass("CAMetalLayer") orelse return null;
+    const layer = msgId(metal_class, sel_registerName("layer")) orelse return null; // +[CAMetalLayer layer]
+
+    const content_view = msgId(nswindow, sel_registerName("contentView")) orelse return null;
+    msgSetBool(content_view, sel_registerName("setWantsLayer:"), 1); // setWantsLayer:YES
+    msgSetId(content_view, sel_registerName("setLayer:"), layer);
+    return layer;
+}
+
+fn createSurface(win: *glfw.Window) ?*wgpu.Surface {
+    switch (builtin.target.os.tag) {
+        .windows => {
+            const hwnd = glfw.getWin32Window(win) orelse {
+                log.warn("no Win32 HWND from GLFW; rendering disabled", .{});
+                return null;
+            };
+            const surface_desc = wgpu.surfaceDescriptorFromWindowsHWND(.{
+                .hinstance = GetModuleHandleW(null).?,
+                .hwnd = hwnd,
+            });
+            return instance.?.createSurface(&surface_desc);
+        },
+        .macos => {
+            const nswindow = glfw.getCocoaWindow(win) orelse {
+                log.warn("no Cocoa NSWindow from GLFW; rendering disabled", .{});
+                return null;
+            };
+            const layer = attachMetalLayer(nswindow) orelse {
+                log.warn("failed to attach CAMetalLayer; rendering disabled", .{});
+                return null;
+            };
+            const surface_desc = wgpu.surfaceDescriptorFromMetalLayer(.{ .layer = layer });
+            return instance.?.createSurface(&surface_desc);
+        },
+        else => {
+            log.warn("wgpu surface creation only wired for Windows/macOS so far; rendering disabled", .{});
+            return null;
+        },
     }
+}
+
+fn initGpu() void {
     const win = glfw_window orelse return;
 
     instance = wgpu.Instance.create(null) orelse {
@@ -88,16 +143,13 @@ fn initGpu() void {
         return;
     };
 
-    const hwnd = glfw.getWin32Window(win) orelse {
-        log.warn("no Win32 HWND from GLFW; rendering disabled", .{});
-        return;
-    };
-    const surface_desc = wgpu.surfaceDescriptorFromWindowsHWND(.{
-        .hinstance = GetModuleHandleW(null).?,
-        .hwnd = hwnd,
-    });
-    surface = instance.?.createSurface(&surface_desc) orelse {
+    surface = createSurface(win) orelse {
         log.warn("wgpu surface creation failed; rendering disabled", .{});
+        // createSurface returns null on platforms without a wired surface
+        // (e.g. Linux) as well as on a genuine failure — release the
+        // instance we just created so it doesn't leak on that path.
+        instance.?.release();
+        instance = null;
         return;
     };
 
