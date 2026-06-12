@@ -242,10 +242,9 @@ jobs:
       # bug ship (its lifecycle template lacked the {{module_vars}} slot,
       # so generated mains referenced undeclared `_preview_*` helpers and
       # failed sema — caught only when a real project switched backends).
-      # bgfx has the same fixes applied but is NOT gated here yet: its C++
-      # compile alone runs tens of minutes, so it needs a caching strategy
-      # (its own job + zig-cache restore) before it can join — tracked as
-      # a follow-up.
+      # bgfx has the same fixes applied but builds far too slowly to live
+      # in this job: it is gated by the dedicated, cached `bgfx-example`
+      # job below (#286).
       - name: Generate + build the wgpu example
         env:
           LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
@@ -480,3 +479,118 @@ jobs:
           fi
           echo "PASS: plugin-controllers lifecycle order matches canonical sequence"
           echo "  ($(wc -l < actual.txt | tr -d ' ') lifecycle events in order)"
+
+  # Dedicated, CACHED build of the bgfx example (#286). PR #284 fixed the
+  # bgfx lifecycle template ({{module_vars}} slot) and the example itself
+  # but left bgfx un-gated: the backend's C++ compile (bgfx/bimg/bx via
+  # zbgfx) runs ~50 minutes cold, far too slow for the shared
+  # examples-integration job above. This job makes that affordable by
+  # persisting the generated project's LOCAL .zig-cache across runs:
+  #
+  #   * mlugg/setup-zig already caches the GLOBAL zig cache, but the
+  #     expensive C++ object files of the generated example land in the
+  #     example's local `.labelle/bgfx_desktop/.zig-cache` — that is what
+  #     actions/cache below persists.
+  #   * Cold run (no cache, e.g. first run on this branch): ~50 min —
+  #     hence the generous timeout-minutes below.
+  #   * Warm run (cache hit): minutes — only the regenerated Zig code and
+  #     any changed C++ recompile.
+  #   * The key hashes backends/bgfx/** so a backend change rolls the
+  #     key, while the restore-keys prefix falls back to the most recent
+  #     previous cache: even with a rolled key the bulk of the compiled
+  #     C++ objects is restored and only the delta rebuilds.
+  #
+  # pull_request-only: push builds on main would only re-warm a cache the
+  # next PR can already restore via the prefix fallback.
+  bgfx-example:
+    name: bgfx example build (cached)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-cli
+          ref: main
+          path: labelle-cli
+
+      # Same sibling-checkout dance as the examples-integration job: the
+      # labelle-cli build unpacks its pinned labelle_assembler package
+      # into labelle-cli/zig-pkg/, where its relative path-dep on
+      # `../labelle-gui/flow-codegen` must resolve.
+      - name: Checkout labelle-gui for the labelle-cli build
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-cli/zig-pkg/labelle-gui
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-core
+          ref: main
+          path: labelle-core
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-engine
+          ref: main
+          path: labelle-engine
+
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gfx
+          ref: main
+          path: labelle-gfx
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libxext-dev libxfixes-dev \
+            libwayland-dev libxkbcommon-dev libasound2-dev \
+            libsdl2-dev
+
+      # Restored BEFORE generate: `labelle generate` rewrites the
+      # generated sources in .labelle/bgfx_desktop but leaves .zig-cache
+      # alone, so the restored C++ objects survive into the build.
+      - name: Restore bgfx example .zig-cache
+        uses: actions/cache@v4
+        with:
+          path: labelle-assembler/examples/bgfx/.labelle/bgfx_desktop/.zig-cache
+          key: bgfx-example-${{ hashFiles('labelle-assembler/backends/bgfx/**') }}
+          restore-keys: |
+            bgfx-example-
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Build labelle-cli
+        run: cd labelle-cli && zig build
+
+      - name: Generate + build the bgfx example
+        env:
+          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
+        run: |
+          cd labelle-assembler/examples/bgfx
+          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
+          cd .labelle/bgfx_desktop
+          zig build
