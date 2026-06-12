@@ -71,13 +71,23 @@ jobs:
         run: cd backends/sokol && zig build test
 
       - name: wgpu backend WAV parser tests
-        # Skipped during 0.16 migration: the wgpu_native_zig dep uses
-        # Compile.addObjectFile/linkLibC which moved to root_module in
-        # 0.16, and zglfw's pinned commit has similar 0.16 issues. Bump
-        # both as a follow-up — wgpu is not in the toolkit's first-tier
-        # backend rotation.
-        if: false
+        # Re-enabled: wgpu_native_zig + zglfw are now on 0.16-compatible
+        # pins, and `zig build test` builds only the pure WAV parser
+        # (host target, no native deps), so it stays cheap on both OSes.
         run: cd backends/wgpu && zig build test
+
+      # Build the standalone wgpu backend demo on macOS. This is the
+      # regression lock for the Apple render path: the example used to
+      # link a nonexistent Dawn `zdawn` artifact (panicked "unable to
+      # find artifact 'zdawn'"), and surface creation was Win32-only.
+      # Building here exercises example/build.zig (drops Dawn, links the
+      # Metal/QuartzCore/Foundation frameworks wgpu-native needs) AND
+      # compiles window.zig's CAMetalLayer surface path for real on an
+      # Apple target. macOS-only: the frameworks + Cocoa surface only
+      # exist here, and it's the platform the break shipped on.
+      - name: wgpu backend demo build (macOS)
+        if: runner.os == 'macOS'
+        run: cd backends/wgpu/example && zig build
 
       # Linux-only: raylib-zig transitively pulls hexops/xcode-frameworks
       # via `git+https://`, which Zig's git fetcher can't resolve on the
@@ -252,6 +262,22 @@ jobs:
         run: |
           cd labelle-assembler/examples/wgpu
           $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
+
+          # Lock the `link_wgpu` template: wgpu-native's static lib pulls
+          # Apple system frameworks, so the generated build MUST link
+          # Foundation/QuartzCore/Metal on macOS/iOS or those targets fail
+          # to link with undefined Metal symbols. This runner is Linux (so
+          # `zig build` below can't link-test the frameworks), but the
+          # generated build.zig is platform-agnostic — assert the framework
+          # links are present so a template regression is caught here even
+          # without a macOS runner. The standalone demo build in the
+          # build-and-test macOS job link-tests them for real.
+          for fw in Foundation QuartzCore Metal; do
+            grep -qF "linkFramework(\"$fw\"" .labelle/wgpu_desktop/build.zig \
+              || { echo "E: generated wgpu build.zig is missing linkFramework(\"$fw\") — link_wgpu template regression"; exit 1; }
+          done
+          echo "PASS: generated wgpu build.zig links Foundation/QuartzCore/Metal"
+
           cd .labelle/wgpu_desktop
           zig build
 

@@ -145,6 +145,11 @@ fn initGpu() void {
 
     surface = createSurface(win) orelse {
         log.warn("wgpu surface creation failed; rendering disabled", .{});
+        // createSurface returns null on platforms without a wired surface
+        // (e.g. Linux) as well as on a genuine failure — release the
+        // instance we just created so it doesn't leak on that path.
+        instance.?.release();
+        instance = null;
         return;
     };
 
