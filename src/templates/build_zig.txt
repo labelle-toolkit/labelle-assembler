@@ -98,6 +98,16 @@ pub fn build(b: *std.Build) !void {
         overrideImport(sdl_gp_mod, "labelle_core", core_mod);
     }
 
+    // Linux desktop core gamepad route (core#33 scope 2): there the sokol
+    // backend wires a DIRECT `labelle-core` import on `input` (reaching the
+    // udev/evdev gamepad source) instead of `sdl_gamepad`. Unify the app
+    // core onto it so gamepad state/event types match the engine's. `if`
+    // guard: the import only exists on Linux desktop builds — adding the
+    // override unconditionally would inject a dead import elsewhere (#258).
+    if (backend_input.import_table.get("labelle-core")) |_| {
+        overrideImport(backend_input, "labelle-core", core_mod);
+    }
+
 .backend_sokol_wasm
     // See `.backend_sokol` for why `with_imgui` must match the bridge.
     const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize, .with_imgui = {{with_imgui}} });

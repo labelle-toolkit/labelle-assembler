@@ -5,14 +5,13 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // GamepadEvent / GamepadDescription contract consumed by
-        // src/input.zig (pollGamepadEvents / describeGamepads). The contract
-        // (labelle-core#18/#19) landed in the v1.15.0 release tag. Generated
-        // game builds pull `input` from this backend dependency and resolve
-        // its `labelle-core` import through this pin (the assembler does not
-        // overrideImport labelle-core onto backend modules).
+        // src/input.zig (pollGamepadEvents / describeGamepads), plus — on
+        // desktop Linux (core#33) — the udev/evdev gamepad STATE source
+        // input.zig routes to (gamepad_source.Source.update/isButtonDown/…,
+        // which landed in v1.16.0; v1.15.0 was detection-only).
         .@"labelle-core" = .{
-            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.15.0.tar.gz",
-            .hash = "labelle_core-1.15.0-OauRcIDMAwCys-pGbaVktdIZZk65hbXkrzzqd0Jk_XjY",
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.16.0.tar.gz",
+            .hash = "labelle_core-1.16.0-OauRcOdRBACVTYpGX9NbCtlFi9fZg9VBGv6h3gybehMs",
         },
         // Shared windowless-SDL desktop gamepad source (core#28). In-tree
         // sub-package consumed by BOTH the raylib and sokol desktop backends

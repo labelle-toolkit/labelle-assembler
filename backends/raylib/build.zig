@@ -23,6 +23,15 @@ fn sdlLibPath(target_os: std.Target.Os.Tag, host_os: std.Target.Os.Tag) ?[]const
     return null;
 }
 
+/// Desktop Linux (not Android) routes gamepad to labelle-core's kernel-native
+/// udev/evdev source (core#33 scope 2): the `sdl_gamepad` module is not wired
+/// and NO SDL2 is linked there. input.zig gates its `@import("sdl_gamepad")`
+/// on the same predicate.
+fn targetUsesCoreGamepad(t: std.Target) bool {
+    if (t.abi == .android or t.abi == .androideabi) return false;
+    return t.os.tag == .linux;
+}
+
 fn dirExists(path: []const u8) bool {
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
@@ -74,7 +83,9 @@ pub fn build(b: *std.Build) void {
     // non-desktop target (Android/iOS/wasm), the sub-package is not resolved as
     // a dependency, so nothing pulls SDL into the graph and we don't require
     // `labelle_sdl_gamepad` to be staged where it's never used.
-    const sdl_gp_mod: ?*std.Build.Module = if (gamepad_enabled and targetIsDesktop(target.result)) blk: {
+    // Linux desktop is additionally excluded (core#33 scope 2): it routes to
+    // labelle-core's udev/evdev source instead, so SDL never enters the graph.
+    const sdl_gp_mod: ?*std.Build.Module = if (gamepad_enabled and targetIsDesktop(target.result) and !targetUsesCoreGamepad(target.result)) blk: {
         const sdl_gp_dep = b.dependency("labelle_sdl_gamepad", .{ .target = target, .optimize = optimize });
         const m = sdl_gp_dep.module("sdl_gamepad");
         m.addImport("labelle_core", core_mod);
@@ -133,7 +144,7 @@ pub fn build(b: *std.Build) void {
     // No `@cImport`/include path is needed (the source uses `extern fn`); only
     // the link + (on macOS Homebrew) the library path matters. raylib's render
     // backend does NOT itself link SDL, so this is the only SDL on the line.
-    if (gamepad_enabled and targetIsDesktop(target.result)) {
+    if (gamepad_enabled and targetIsDesktop(target.result) and !targetUsesCoreGamepad(target.result)) {
         input_mod.link_libc = true;
         if (sdlLibPath(target.result.os.tag, builtin.target.os.tag)) |p| {
             input_mod.addLibraryPath(.{ .cwd_relative = p });
@@ -148,6 +159,10 @@ pub fn build(b: *std.Build) void {
             }
         }
         input_mod.linkSystemLibrary("SDL2", .{});
+    } else if (gamepad_enabled and targetUsesCoreGamepad(target.result)) {
+        // Linux core route: no SDL, but core's udev source dlopens libudev at
+        // runtime via std.DynLib, which needs real dlopen — link libc.
+        input_mod.link_libc = true;
     }
 
     // ── Audio backend module ────────────────────────────────────────
@@ -265,12 +280,24 @@ pub fn build(b: *std.Build) void {
     input_host_mod.addImport("raylib", raylib_mod);
     input_host_mod.addImport("labelle-core", core_mod);
     input_host_mod.addImport("build_options", input_opts.createModule());
-    if (sdl_gp_mod) |m| input_host_mod.addImport("sdl_gamepad", m);
+    // The host's gamepad route can differ from the target's (e.g. cross-
+    // compiling to Linux from macOS), so the host test module resolves its
+    // own sdl_gamepad instance under the HOST predicate instead of reusing
+    // the target-gated `sdl_gp_mod`. Linux hosts take the core route and
+    // import nothing.
+    const host_uses_sdl = gamepad_enabled and targetIsDesktop(host_target.result) and !targetUsesCoreGamepad(host_target.result);
+    if (host_uses_sdl) {
+        const host_sdl_dep = b.dependency("labelle_sdl_gamepad", .{ .target = host_target, .optimize = optimize });
+        const m = host_sdl_dep.module("sdl_gamepad");
+        m.addImport("labelle_core", core_mod);
+        input_host_mod.addImport("sdl_gamepad", m);
+    }
     input_host_mod.linkLibrary(raylib_artifact);
     // The host is a desktop target, so input.zig references the SDL externs
     // when the gamepad source is wired — link SDL2 (+ Homebrew lib path on
-    // macOS) so the test binary resolves. Skipped entirely on opt-out.
-    if (gamepad_enabled and targetIsDesktop(host_target.result)) {
+    // macOS) so the test binary resolves. Skipped entirely on opt-out and on
+    // Linux hosts (core route: libc only, for std.DynLib's dlopen).
+    if (host_uses_sdl) {
         input_host_mod.link_libc = true;
         if (sdlLibPath(host_target.result.os.tag, builtin.target.os.tag)) |p| {
             input_host_mod.addLibraryPath(.{ .cwd_relative = p });
@@ -281,6 +308,8 @@ pub fn build(b: *std.Build) void {
             }
         }
         input_host_mod.linkSystemLibrary("SDL2", .{});
+    } else if (gamepad_enabled and targetUsesCoreGamepad(host_target.result)) {
+        input_host_mod.link_libc = true;
     }
 
     const audio_compile_check = b.addTest(.{ .root_module = audio_host_mod });

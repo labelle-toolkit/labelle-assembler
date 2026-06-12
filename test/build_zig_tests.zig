@@ -188,10 +188,11 @@ pub const BUILD_ZIG = struct {
     }
 
     test "backends without a core import get no backend_input override" {
-        // sokol / null / bgfx / wgpu backend `input` modules do not import
+        // null / bgfx / wgpu backend `input` modules do not import
         // labelle-core, so no `overrideImport(backend_input, ...)` line
-        // should be emitted (only raylib and sdl import core).
-        for ([_]generate.Backend{ .sokol, .null, .bgfx, .wgpu }) |be| {
+        // should be emitted. (raylib and sdl import core unconditionally;
+        // sokol imports it on desktop Linux only — covered below.)
+        for ([_]generate.Backend{ .null, .bgfx, .wgpu }) |be| {
             const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
                 .name = "test-game",
                 .backend = be,
@@ -200,6 +201,24 @@ pub const BUILD_ZIG = struct {
             defer std.testing.allocator.free(build_zig);
             try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input,") == null);
         }
+    }
+
+    test "sokol emits a GUARDED backend_input core override (Linux core gamepad route)" {
+        // On desktop Linux the sokol input module imports labelle-core
+        // DIRECTLY to reach the udev/evdev gamepad source (core#33 scope 2);
+        // on every other target that import is absent. The template therefore
+        // emits the override behind an import_table.get guard so it fires
+        // only when the import exists — asserting both halves here keeps the
+        // guard from being "simplified" away into a dead-import injection
+        // (#258) or dropped entirely (silent core type-split on Linux).
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "backend_input.import_table.get(\"labelle-core\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input, \"labelle-core\", core_mod)") != null);
     }
 
     test "resolved_gui wires gui_backend" {
