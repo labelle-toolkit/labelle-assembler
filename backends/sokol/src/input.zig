@@ -81,9 +81,18 @@ const target_is_desktop = blk: {
         else => false,
     };
 };
-const sdl_gp = if (gamepad_enabled and target_is_desktop) @import("sdl_gamepad") else struct {
+// Linux desktop routes to labelle-core's kernel-native udev/evdev source
+// instead of the SDL one (core#33 scope 2): same Source surface, no SDL2
+// link. Mirrors `targetUsesCoreGamepad` in build.zig — there the build wires
+// a direct `labelle-core` import (and no `sdl_gamepad`, no SDL2) on Linux,
+// so both `@import`s below must be gated identically.
+const target_is_linux_desktop = target_is_desktop and builtin.target.os.tag == .linux;
+
+const sdl_gp = if (gamepad_enabled and target_is_desktop and !target_is_linux_desktop) @import("sdl_gamepad") else struct {
     pub const is_desktop = false;
 };
+const use_core_gamepad = gamepad_enabled and target_is_linux_desktop;
+const core_gp = if (use_core_gamepad) @import("labelle-core").gamepad_source else struct {};
 const use_sdl_gamepad = gamepad_enabled and sdl_gp.is_desktop;
 
 const AndroidGamepadEventType = enum(c_int) {
@@ -287,6 +296,7 @@ var gamepad_prev_down: [MAX_GAMEPADS][MAX_GAMEPAD_BUTTONS]bool =
     [_][MAX_GAMEPAD_BUTTONS]bool{[_]bool{false} ** MAX_GAMEPAD_BUTTONS} ** MAX_GAMEPADS;
 
 pub fn isGamepadAvailable(gamepad_id: u32) bool {
+    if (comptime use_core_gamepad) return core_gp.Source.isAvailable(gamepad_id);
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isAvailable(gamepad_id);
     if (comptime agp.is_android) return agp.connected(gamepad_id);
     if (!gc_enabled) return false;
@@ -295,6 +305,7 @@ pub fn isGamepadAvailable(gamepad_id: u32) bool {
 }
 
 pub fn isGamepadButtonDown(gamepad_id: u32, button: u32) bool {
+    if (comptime use_core_gamepad) return core_gp.Source.isButtonDown(gamepad_id, button);
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonDown(gamepad_id, button);
     if (comptime agp.is_android) return agp.buttonDown(gamepad_id, button);
     if (!gc_enabled) return false;
@@ -303,8 +314,9 @@ pub fn isGamepadButtonDown(gamepad_id: u32, button: u32) bool {
 }
 
 pub fn isGamepadButtonPressed(gamepad_id: u32, button: u32) bool {
-    // On desktop the shared SDL source owns the prev/cur edge snapshot
-    // (refreshed in its `update()`), keyed by the dense 0..3 slot.
+    // On desktop the wired source owns the prev/cur edge snapshot (refreshed
+    // in its `update()`), keyed by the dense 0..3 slot.
+    if (comptime use_core_gamepad) return core_gp.Source.isButtonPressed(gamepad_id, button);
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonPressed(gamepad_id, button);
     // On Android, edge detection lives in the state module (it snapshots
     // prev-down across `newFrame`), keyed by Android device id rather than a
@@ -319,6 +331,7 @@ pub fn isGamepadButtonPressed(gamepad_id: u32, button: u32) bool {
 }
 
 pub fn getGamepadAxisValue(gamepad_id: u32, axis: u32) f32 {
+    if (comptime use_core_gamepad) return core_gp.Source.axisValue(gamepad_id, axis);
     if (comptime use_sdl_gamepad) return sdl_gp.Source.axisValue(gamepad_id, axis);
     if (comptime agp.is_android) return agp.axisValue(gamepad_id, axis);
     if (!gc_enabled) return 0;
@@ -331,10 +344,15 @@ pub fn getGamepadAxisValue(gamepad_id: u32, axis: u32) f32 {
 /// Snapshot current gamepad button state so the next frame's
 /// `isGamepadButtonPressed` can compute the rising edge. No-op off ios/tvos.
 fn snapshotGamepadButtons() void {
-    // Desktop: pump the shared SDL source once per frame. `update()` drains
-    // hotplug events and refreshes the button-edge snapshot the source uses
-    // for `isButtonPressed`. This is the single per-frame pump point for the
-    // sokol desktop gamepad path.
+    // Desktop: pump the wired gamepad source once per frame. `update()`
+    // refreshes the button-edge snapshot the source uses for
+    // `isButtonPressed` (and, on the Linux core source, pumps hotplug on an
+    // internal ~1/s throttle). This is the single per-frame pump point for
+    // the sokol desktop gamepad path.
+    if (comptime use_core_gamepad) {
+        core_gp.Source.update();
+        return;
+    }
     if (comptime use_sdl_gamepad) {
         sdl_gp.Source.update();
         return;

@@ -27,6 +27,15 @@ fn sdlLibPath(target_os: std.Target.Os.Tag, host_os: std.Target.Os.Tag) ?[]const
     return null;
 }
 
+/// Desktop Linux (not Android) routes gamepad to labelle-core's kernel-native
+/// udev/evdev source (core#33 scope 2): the `sdl_gamepad` module is not wired
+/// and NO SDL2 is linked there. input.zig gates its `@import("sdl_gamepad")`
+/// on the same predicate.
+fn targetUsesCoreGamepad(t: std.Target) bool {
+    if (t.abi == .android or t.abi == .androideabi) return false;
+    return t.os.tag == .linux;
+}
+
 fn dirExists(path: []const u8) bool {
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
@@ -127,7 +136,9 @@ pub fn build(b: *std.Build) void {
     // Gated on `gamepad_enabled` AND a desktop target: non-desktop sokol builds
     // (Android/iOS/wasm) never use the SDL source, so don't resolve/require it
     // there — Android keeps its JNI gamepad path, iOS its GameController path.
-    const sdl_gp_mod: ?*std.Build.Module = if (gamepad_enabled and targetIsDesktop(target.result)) blk: {
+    // Linux desktop is additionally excluded (core#33 scope 2): it routes to
+    // labelle-core's udev/evdev source instead, so SDL never enters the graph.
+    const sdl_gp_mod: ?*std.Build.Module = if (gamepad_enabled and targetIsDesktop(target.result) and !targetUsesCoreGamepad(target.result)) blk: {
         const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
         const sdl_gp_dep = b.dependency("labelle_sdl_gamepad", .{ .target = target, .optimize = optimize });
         const m = sdl_gp_dep.module("sdl_gamepad");
@@ -188,6 +199,17 @@ pub fn build(b: *std.Build) void {
     input_mod.addImport("build_options", input_opts.createModule());
     if (sdl_gp_mod) |m| input_mod.addImport("sdl_gamepad", m);
 
+    // Linux desktop core route (core#33 scope 2): input.zig reaches the
+    // kernel-native udev/evdev source through a DIRECT labelle-core import
+    // (the sokol input backend historically had no core dep of its own — it
+    // only existed transitively through sdl_gamepad). The generated build
+    // unifies the app's core onto this import (guarded overrideImport in the
+    // backend_sokol template section) so event/state types match the engine's.
+    if (gamepad_enabled and targetUsesCoreGamepad(target.result)) {
+        const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
+        input_mod.addImport("labelle-core", core_dep.module("labelle-core"));
+    }
+
     // Link SDL2 for the shared desktop gamepad source — DESKTOP targets ONLY,
     // and only when the gamepad source is wired (`gamepad_enabled`). Android
     // keeps `android_gamepad_state.zig` (no SDL); iOS/tvOS keep the
@@ -196,7 +218,7 @@ pub fn build(b: *std.Build) void {
     // no SDL and must not link it. When opted out NO SDL is linked anywhere.
     // No `@cImport`/include path needed (the source uses `extern fn`); on macOS
     // the Homebrew lib path is added.
-    if (gamepad_enabled and targetIsDesktop(target.result)) {
+    if (gamepad_enabled and targetIsDesktop(target.result) and !targetUsesCoreGamepad(target.result)) {
         input_mod.link_libc = true;
         if (sdlLibPath(target.result.os.tag, builtin.target.os.tag)) |p| {
             input_mod.addLibraryPath(.{ .cwd_relative = p });
@@ -211,6 +233,10 @@ pub fn build(b: *std.Build) void {
             }
         }
         input_mod.linkSystemLibrary("SDL2", .{});
+    } else if (gamepad_enabled and targetUsesCoreGamepad(target.result)) {
+        // Linux core route: no SDL, but core's udev source dlopens libudev at
+        // runtime via std.DynLib, which needs real dlopen — link libc.
+        input_mod.link_libc = true;
     }
 
     // Android gamepad DETECTION glue (labelle-assembler#248). The JNI

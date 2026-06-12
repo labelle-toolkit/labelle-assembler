@@ -32,7 +32,14 @@ const target_is_desktop = blk: {
         else => false,
     };
 };
-const sdl_gp = if (gamepad_enabled and target_is_desktop) @import("sdl_gamepad") else struct {
+// Linux desktop routes to labelle-core's kernel-native udev/evdev source
+// instead of the SDL one (core#33 scope 2): same Source surface, no SDL2
+// link. Mirrors `targetUsesCoreGamepad` in build.zig — there the build
+// neither resolves `sdl_gamepad` nor links SDL2 on Linux, so the SDL
+// `@import` below must exclude Linux identically.
+const target_is_linux_desktop = target_is_desktop and builtin.target.os.tag == .linux;
+
+const sdl_gp = if (gamepad_enabled and target_is_desktop and !target_is_linux_desktop) @import("sdl_gamepad") else struct {
     pub const is_desktop = false;
 };
 
@@ -42,10 +49,17 @@ const GamepadDescription = core.GamepadDescription;
 /// raylib supports at most 4 gamepads (MAX_GAMEPADS).
 const MAX_GAMEPADS: u32 = 4;
 
-/// On desktop (with the source wired), gamepad state/hotplug comes from the
-/// shared SDL source; off desktop, keep raylib's GLFW-backed path. Resolved at
-/// comptime so the unused branch (and its SDL / rl gamepad refs) is eliminated
-/// per target. False whenever opted out (`gamepad_enabled = false`).
+/// Linux desktop: gamepad state/hotplug comes from labelle-core's
+/// `gamepad_source` (the udev/evdev source — full Source parity with
+/// sdl_gamepad, verified by core's uinput CI harness). Resolved at comptime;
+/// on every other target `core.gamepad_source.Source` is a no-op fallback
+/// and this flag is false, so the branch is eliminated.
+const use_core_gamepad = gamepad_enabled and target_is_linux_desktop;
+
+/// Non-Linux desktop (with the source wired): gamepad state/hotplug comes
+/// from the shared SDL source; off desktop, keep raylib's GLFW-backed path.
+/// Resolved at comptime so the unused branch (and its SDL / rl gamepad refs)
+/// is eliminated per target. False whenever opted out.
 const use_sdl_gamepad = gamepad_enabled and sdl_gp.is_desktop;
 
 /// True when gamepad input is entirely disabled: the opt-out build with no SDL
@@ -119,47 +133,54 @@ pub fn getTouchId(index: u32) u64 {
 
 pub fn isGamepadAvailable(gamepad: u32) bool {
     if (comptime gamepad_disabled) return false;
+    if (comptime use_core_gamepad) return core.gamepad_source.Source.isAvailable(gamepad);
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isAvailable(gamepad);
     return rl.isGamepadAvailable(@intCast(gamepad));
 }
 
 pub fn isGamepadButtonDown(gamepad: u32, button: u32) bool {
     if (comptime gamepad_disabled) return false;
+    if (comptime use_core_gamepad) return core.gamepad_source.Source.isButtonDown(gamepad, button);
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonDown(gamepad, button);
     return rl.isGamepadButtonDown(@intCast(gamepad), @enumFromInt(button));
 }
 
 pub fn isGamepadButtonPressed(gamepad: u32, button: u32) bool {
     if (comptime gamepad_disabled) return false;
+    if (comptime use_core_gamepad) return core.gamepad_source.Source.isButtonPressed(gamepad, button);
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonPressed(gamepad, button);
     return rl.isGamepadButtonPressed(@intCast(gamepad), @enumFromInt(button));
 }
 
 pub fn getGamepadAxisValue(gamepad: u32, axis: u32) f32 {
     if (comptime gamepad_disabled) return 0;
+    if (comptime use_core_gamepad) return core.gamepad_source.Source.axisValue(gamepad, axis);
     if (comptime use_sdl_gamepad) return sdl_gp.Source.axisValue(gamepad, axis);
     return rl.getGamepadAxisMovement(@intCast(gamepad), @enumFromInt(axis));
 }
 
-/// Pump the shared SDL desktop gamepad source once per frame: drains hotplug
-/// events and refreshes the button-edge snapshot. No-op off desktop. The
-/// raylib desktop template calls this at the top of its frame loop (the
-/// raylib backend has no `newFrame` of its own — raylib's own gamepad state is
-/// pumped inside its window's event poll). Mirrors how the sokol backend calls
-/// the source's `update()` from its `newFrame`.
+/// Pump the desktop gamepad source once per frame: drains hotplug events and
+/// refreshes the button-edge snapshot. No-op off desktop. The raylib desktop
+/// template calls this at the top of its frame loop (the raylib backend has
+/// no `newFrame` of its own — raylib's own gamepad state is pumped inside its
+/// window's event poll). Mirrors how the sokol backend calls the source's
+/// `update()` from its `newFrame`. On Linux this is the core udev/evdev
+/// source (hotplug pump internally throttled to ~1/s); elsewhere the SDL one.
 pub fn newFrame() void {
+    if (comptime use_core_gamepad) return core.gamepad_source.Source.update();
     if (comptime use_sdl_gamepad) sdl_gp.Source.update();
 }
 
-/// One-time init for the shared SDL source (lazy SDL subsystem init + startup
+/// One-time init for the desktop gamepad source (subsystem init + startup
 /// controller enumeration). Safe to call repeatedly; no-op off desktop.
 pub fn initGamepad() void {
+    if (comptime use_core_gamepad) return core.gamepad_source.init();
     if (comptime use_sdl_gamepad) sdl_gp.Source.init();
 }
 
-/// Tear down the shared SDL source (close controllers, quit subsystems).
-/// No-op off desktop.
+/// Tear down the desktop gamepad source. No-op off desktop.
 pub fn deinitGamepad() void {
+    if (comptime use_core_gamepad) return core.gamepad_source.deinit();
     if (comptime use_sdl_gamepad) sdl_gp.Source.deinit();
 }
 
@@ -216,9 +237,10 @@ fn gamepadName(slot: u32) [:0]const u8 {
 /// triggers in practice.)
 pub fn pollGamepadEvents(out: []GamepadEvent) usize {
     if (comptime gamepad_disabled) return 0;
-    // On desktop, hotplug comes from the shared SDL source's event ring
-    // (populated in `newFrame`→`Source.update`), not raylib's poll-based
-    // availability edge-detect. The source already emits core `GamepadEvent`s.
+    // On desktop, hotplug comes from the wired source's event ring (populated
+    // in `newFrame`→`Source.update`), not raylib's poll-based availability
+    // edge-detect. Both sources already emit core `GamepadEvent`s.
+    if (comptime use_core_gamepad) return core.gamepad_source.pollEvents(out);
     if (comptime use_sdl_gamepad) return sdl_gp.Source.pollEvents(out);
 
     var count: usize = 0;
@@ -252,6 +274,7 @@ pub fn pollGamepadEvents(out: []GamepadEvent) usize {
 /// are reported with `connected = false` and an empty name.
 pub fn describeGamepads(out: []GamepadDescription) usize {
     if (comptime gamepad_disabled) return 0;
+    if (comptime use_core_gamepad) return core.gamepad_source.describe(out);
     if (comptime use_sdl_gamepad) return sdl_gp.Source.describe(out);
 
     var count: usize = 0;
