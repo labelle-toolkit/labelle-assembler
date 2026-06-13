@@ -232,12 +232,15 @@ pub const DrawSegment = struct {
 };
 
 /// A realistic frame has only a handful of shape/sprite kind switches, so a
-/// modest cap covers any sane workload. On overflow we fail safe: further
-/// distinct segments are dropped and their draws are folded into the last
-/// recorded segment ONLY when that segment is the same kind and adjacent in
-/// the index/quad streams (which it always is, since appends are
-/// monotonic) — so no geometry is lost, only the kind-ordering of the
-/// overflow tail collapses. A warning is logged once per overflowing frame.
+/// modest cap covers any sane workload. On overflow we fail safe by DROPPING
+/// the overflow draw from the segment stream: its geometry was already
+/// appended to the (separate) shape/sprite vertex+index buffers, but no
+/// segment references it, so it simply isn't drawn. We must NOT fold it into
+/// the trailing segment — by the time we reach the overflow check the tail is
+/// always the *opposite* kind (a same-kind tail is extended and returns
+/// earlier), and shape vs. sprite segments draw from different index buffers,
+/// so folding would make the draw over-read the wrong buffer. Only the
+/// overflow tail goes unrendered; a warning is logged once per such frame.
 const MAX_DRAW_SEGMENTS = 1024;
 
 var draw_segments: [MAX_DRAW_SEGMENTS]DrawSegment = undefined;
@@ -257,16 +260,13 @@ fn noteShapeDraw(index_start: u32, n_indices: u32) void {
         }
     }
     if (draw_segment_count >= MAX_DRAW_SEGMENTS) {
-        // Overflow: fold into the last segment if it is the same kind
-        // (it isn't here, since we fell through the extend-check above),
-        // otherwise drop the distinct segment but keep the geometry by
-        // attaching it to whatever trailing segment exists.
+        // Overflow: drop this draw from the segment stream (see
+        // MAX_DRAW_SEGMENTS doc). The tail here is always a sprite segment,
+        // which draws from the sprite index buffer — folding shape indices
+        // into it would over-read the wrong buffer, so we drop instead.
         if (!draw_segments_overflowed) {
-            log.warn("draw-segment list full ({d}); folding overflow draws, painter order of tail may collapse", .{MAX_DRAW_SEGMENTS});
+            log.warn("draw-segment list full ({d}); dropping overflow draws this frame", .{MAX_DRAW_SEGMENTS});
             draw_segments_overflowed = true;
-        }
-        if (draw_segment_count > 0) {
-            draw_segments[draw_segment_count - 1].index_count += n_indices;
         }
         return;
     }
@@ -291,17 +291,13 @@ fn noteSpriteDraw(index_start: u32, n_indices: u32, quad_start: u32) void {
         }
     }
     if (draw_segment_count >= MAX_DRAW_SEGMENTS) {
+        // Overflow: drop this draw from the segment stream (see
+        // MAX_DRAW_SEGMENTS doc). The tail here is always a shape segment,
+        // which draws from the shape index buffer — folding sprite indices
+        // into it would over-read the wrong buffer, so we drop instead.
         if (!draw_segments_overflowed) {
-            log.warn("draw-segment list full ({d}); folding overflow draws, painter order of tail may collapse", .{MAX_DRAW_SEGMENTS});
+            log.warn("draw-segment list full ({d}); dropping overflow draws this frame", .{MAX_DRAW_SEGMENTS});
             draw_segments_overflowed = true;
-        }
-        if (draw_segment_count > 0) {
-            const last = &draw_segments[draw_segment_count - 1];
-            last.index_count += n_indices;
-            // Only a sprite segment tracks quads; a shape segment at the
-            // tail would mis-bind, so only extend quad bookkeeping when the
-            // tail is actually a sprite segment.
-            if (last.kind == .sprite) last.quad_count += 1;
         }
         return;
     }
