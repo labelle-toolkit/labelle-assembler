@@ -1324,10 +1324,17 @@ fn buildFontAtlasPixels(buf: *[FONT_ATLAS_W * FONT_ATLAS_H * 4]u8) void {
     }
 }
 
+/// Latched once the atlas upload fails (e.g. texture-pool exhaustion) so
+/// `drawText` doesn't re-bake the 38 KB atlas and spam the log every call /
+/// every frame thereafter.
+var font_atlas_failed: bool = false;
+
 /// Build + upload the glyph atlas texture if it hasn't been built yet.
-/// Returns the texture id, or 0 on failure (upload error).
+/// Returns the texture id, or 0 on failure (upload error). The failure is
+/// latched so subsequent calls return 0 immediately without re-baking.
 fn ensureFontAtlas() u32 {
     if (font_atlas_texture_id != 0) return font_atlas_texture_id;
+    if (font_atlas_failed) return 0;
     var pixels: [FONT_ATLAS_W * FONT_ATLAS_H * 4]u8 = undefined;
     buildFontAtlasPixels(&pixels);
     // uploadTexture COPIES the pixels into a slot it owns, so a stack
@@ -1338,6 +1345,7 @@ fn ensureFontAtlas() u32 {
         .height = FONT_ATLAS_H,
     }) catch {
         log.warn("failed to upload glyph atlas; text will not render", .{});
+        font_atlas_failed = true;
         return 0;
     };
     font_atlas_texture_id = tex.id;
