@@ -46,7 +46,7 @@ const gc = if (gc_enabled) struct {
 // All of this is gated behind `agp.is_android`: on every other target the
 // extern fork symbol is never referenced and the poll methods fall back to the
 // iOS GameController path (or the no-gamepad defaults).
-const agp = @import("android_gamepad_state.zig");
+const agp = @import("android_gamepad");
 
 // ── Desktop gamepad bridge (core#28) ───────────────────────────────────
 //

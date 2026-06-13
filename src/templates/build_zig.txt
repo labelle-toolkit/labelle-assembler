@@ -734,6 +734,20 @@ pub fn build(b: *std.Build) void {
     const backend_app = backend_dep.module("android_app");
     const bgfx_artifact = backend_dep.artifact("bgfx");
 
+    // Unify the app's core onto the bgfx `input` module (#310 Stage 4). The
+    // bgfx Android backend adapter (`backends/bgfx/src/android.zig`, surfaced
+    // as `backend_input.android`) imports labelle-core for
+    // `AndroidBackendContext` — the vtable the generated main hands to
+    // `engine.core.registerAndroidBackend(...)`. Without this override `input`
+    // resolves its OWN pinned core tarball — a DIFFERENT module instance than
+    // engine/gfx — so the registered context's type would not match the
+    // engine's `engine.core.AndroidBackendContext` and the call fails to
+    // type-check. On Android the bgfx backend declares this import (`if` guard:
+    // it only exists on the Android build), so the override lands only there.
+    if (backend_input.import_table.get("labelle-core")) |_| {
+        overrideImport(backend_input, "labelle-core", core_mod);
+    }
+
 .android_exe_start
     const lib = b.addLibrary(.{
         .name = "game",

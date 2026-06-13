@@ -11,6 +11,22 @@ const is_android = builtin.target.os.tag == .linux and
 
 const glfw = if (is_android) struct {} else @import("zglfw");
 
+// ── Android analog gamepad state (#310 Stage 4 / #250) ──────────────
+//
+// The shared `android_gamepad` module (`../android_gamepad`, also used by the
+// sokol backend) owns the per-device button/axis state: the Android-keycode →
+// canonical `GamepadButton`/`GamepadAxis` mapping, the device-name axis-routing
+// quirk table, and the mutex-guarded device table. The bgfx NativeActivity
+// shell (`android_app.zig`) feeds it raw `AInputEvent` key/motion data; the
+// engine's `(gamepad_id, button/axis)` queries below resolve against it, keyed
+// by Android device id (the same id the #248 detection registry emits as its
+// hotplug `.slot`). All `agp` references are gated behind `is_android`, so off
+// Android the gamepad getters fall back to the GLFW desktop path.
+//
+// The module is imported on every target (its Android-only `extern`/`@export`
+// symbols are gated internally), but its state is only read on Android.
+const agp = @import("android_gamepad");
+
 const MAX_KEYS = 512;
 const MAX_MOUSE_BUTTONS = 8;
 
@@ -81,6 +97,12 @@ pub fn newFrame() void {
         if (!pointer_down and pointer_down_prev) mouse_released[0] = true;
         mouse_down[0] = pointer_down;
         pointer_down_prev = pointer_down;
+
+        // Snapshot gamepad button state at the frame boundary so the next
+        // frame's `isGamepadButtonPressed` can derive the rising edge (#310
+        // Stage 4). The shell feeds live key/motion state into `agp`
+        // asynchronously between frames via the `applyGamepad*` entry points.
+        agp.newFrame();
         return;
     }
 
@@ -200,27 +222,78 @@ pub fn clearTouch() void {
     touch_active = false;
 }
 
+// ── Android gamepad feed (called by the NativeActivity glue) ────────
+//
+// The bgfx shell (`android_app.zig`) routes gamepad `AInputEvent`s here:
+// key events (BUTTON_*/DPAD_*) via `applyGamepadKey`, and joystick/gamepad
+// motion events (analog axes + hat) via `applyGamepadMotion`. Both forward
+// into the shared `android_gamepad` state module (mapping + quirk + per-device
+// table). The per-frame edge snapshot happens in `newFrame` (`agp.newFrame`).
+// Off Android these are inert (the shell only calls them on Android) but kept
+// un-gated so the symbol is always present for the shell to reference — `agp`'s
+// apply* functions are pure-Zig no-op-safe on the host.
+
+/// Number of forwarded analog axes the shell fills before calling
+/// `applyGamepadMotion`. Re-exported from the shared state module so the shell
+/// sizes its axis buffer correctly (indices are `agp.FA_*`).
+pub const GAMEPAD_AXIS_COUNT = agp.FORWARDED_AXIS_COUNT;
+
+/// Feed a gamepad KEY event (down/up) keyed by Android device id. `keycode`
+/// is the raw `AKEYCODE_*` from `AKeyEvent_getKeyCode`.
+pub fn applyGamepadKey(device_id: i32, keycode: i32, down: bool) void {
+    agp.applyKey(device_id, keycode, down);
+}
+
+/// Feed a gamepad MOTION (analog axis snapshot) keyed by Android device id.
+/// `axes` is indexed by `agp.FA_*` (X, Y, Z, RZ, RX, RY, LTRIGGER, RTRIGGER,
+/// GAS, BRAKE, HAT_X, HAT_Y).
+pub fn applyGamepadMotion(device_id: i32, axes: [agp.FORWARDED_AXIS_COUNT]f32) void {
+    agp.applyMotion(device_id, axes);
+}
+
 // ── Gamepad ───────────────────────────────────────────────
 
 pub fn isGamepadAvailable(gamepad: u32) bool {
-    if (is_android) return false; // Android gamepads are a later phase
+    // Android (#310 Stage 4): resolve against the shared per-device state,
+    // keyed by Android device id. Connection is established by the JNI
+    // detection glue (InputManager enumeration) + first input event.
+    if (comptime is_android) return agp.connected(gamepad);
     return glfw.joystickPresent(@enumFromInt(gamepad));
 }
 
 pub fn isGamepadButtonDown(gamepad: u32, button: u32) bool {
-    _ = gamepad;
-    _ = button;
-    return false; // TODO: GLFW joystick buttons
+    if (comptime is_android) return agp.buttonDown(gamepad, button);
+    // TODO: GLFW joystick buttons. `agp` is pure Zig and host-importable, so
+    // the Android branch type-checks (and "uses" the params) on desktop too —
+    // no `_ = param` discards needed.
+    return false;
 }
 
 pub fn isGamepadButtonPressed(gamepad: u32, button: u32) bool {
-    _ = gamepad;
-    _ = button;
+    // Edge detection lives in the shared state module: it snapshots prev-down
+    // across `newFrame`, keyed by Android device id.
+    if (comptime is_android) return agp.buttonPressed(gamepad, button);
     return false;
 }
 
 pub fn getGamepadAxisValue(gamepad: u32, axis: u32) f32 {
-    _ = gamepad;
-    _ = axis;
+    if (comptime is_android) return agp.axisValue(gamepad, axis);
     return 0;
 }
+
+/// bgfx Android backend adapter for labelle-core's backend-agnostic JNI seam
+/// (labelle-core#310, Stage 4). Exposes `backendContext()`, which the generated
+/// bgfx-Android `main.zig` registers with core
+/// (`engine.core.registerAndroidBackend(...)`) so core's gamepad source and the
+/// engine's immersive mode can reach the running ANativeActivity / InputManager
+/// without core/engine linking any backend symbol directly. See `android.zig`.
+//
+// Android-only: the adapter imports `labelle-core` (for `AndroidBackendContext`)
+// and binds the shell's `labelle_bgfx_get_native_activity` C symbol, neither of
+// which is wired into the input module on desktop. Gate the re-export so
+// `android.zig` is only analyzed on Android (where `build.zig` wires core in);
+// on other targets it resolves to an empty namespace and is never compiled.
+pub const android = if (is_android)
+    @import("android.zig")
+else
+    struct {};

@@ -7,10 +7,20 @@
         // Shared windowless-SDL desktop gamepad source (core#28). In-tree
         // sub-package shared with the raylib backend via a relative path — the
         // toolkit's own-build.zig sub-package convention. On desktop the sokol
-        // input backend routes gamepad through it; Android keeps
-        // android_gamepad_state.zig.
+        // input backend routes gamepad through it; Android keeps the shared
+        // android_gamepad source below.
         .labelle_sdl_gamepad = .{
             .path = "../sdl_gamepad",
+        },
+        // Shared Android gamepad source (#310 Stage 4). In-tree sub-package
+        // shared with the bgfx backend: the per-device STATE machine
+        // (`android_gamepad_state.zig`, #250) as the `android_gamepad` module,
+        // plus the InputManager JNI DETECTION glue (`android_gamepad_jni.c`,
+        // #248) reached via `dep.path(...)` and compiled into `input` on
+        // Android (where the NDK sysroot is wired). Off Android nothing here is
+        // referenced.
+        .labelle_android_gamepad = .{
+            .path = "../android_gamepad",
         },
         // Gamepad event contract (GamepadEvent / GamepadDescription, core#18)
         // unified onto the shared sdl_gamepad module — and, on desktop Linux

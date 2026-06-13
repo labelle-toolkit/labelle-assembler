@@ -82,6 +82,31 @@ pub fn createDepsLinks(
             },
             else => {},
         }
+
+        // Backend-owned transitive sub-package: the shared Android gamepad
+        // source (`backends/android_gamepad/`, #310 Stage 4 — the #250 state
+        // machine + #248 InputManager JNI glue). Both the sokol and bgfx
+        // backends declare it as a relative-path dep
+        // (`.labelle_android_gamepad = .{ .path = "../android_gamepad" }`) in
+        // their own build.zig.zon. The backend zon is staged verbatim into
+        // .labelle/deps/labelle-<backend>/ (its `.path` is NOT rewritten), so
+        // `../android_gamepad` resolves to .labelle/deps/android_gamepad —
+        // stage the sub-package there under exactly that link name. Both
+        // backends import the `android_gamepad` MODULE on every target (its
+        // Android-only symbols are internally gated), so this is staged
+        // unconditionally for them — NOT gated on `cfg.gamepad` (unlike SDL,
+        // it pulls no system library and is a no-op off Android).
+        switch (cfg.backend) {
+            .sokol, .bgfx => {
+                const agp_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends/android_gamepad");
+                try deps.append(allocator, .{
+                    .zon_name = try allocator.dupe(u8, "labelle_android_gamepad"),
+                    .link_name = try allocator.dupe(u8, "android_gamepad"),
+                    .abs_path = agp_path,
+                });
+            },
+            else => {},
+        }
     }
 
     switch (cfg.ecs) {
