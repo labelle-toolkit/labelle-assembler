@@ -202,6 +202,121 @@ var sprite_index_count: usize = 0;
 var sprite_texture_ids: [MAX_SPRITE_QUADS]u32 = undefined;
 var sprite_quad_count: usize = 0;
 
+// ── Ordered draw-segment list ──────────────────────────────────────────
+//
+// Shapes and sprites live in two separate vertex/index buffers (distinct
+// vertex formats + pipelines), but a frame must still composite them in
+// strict submission order — a game may draw a shape *over* a sprite within
+// one frame. We record that order as a list of contiguous same-kind
+// segments. Each segment points into the index buffer of its kind (and,
+// for sprites, into `sprite_texture_ids`). Consecutive draws of the same
+// kind extend the current segment; a kind switch starts a new one. The
+// window submitter walks this list in order, switching pipelines per
+// segment, so painter's order is preserved with at most one drawIndexed
+// per kind-run (plus the existing same-texture coalescing inside a sprite
+// segment).
+
+pub const SegmentKind = enum { shape, sprite };
+
+/// One contiguous run of same-kind draws.
+/// - `index_start`/`index_count`: offset+length into the relevant kind's
+///   index buffer (shape_indices or sprite_indices).
+/// - `quad_start`/`quad_count`: offset+length into `sprite_texture_ids`;
+///   zero for shape segments.
+pub const DrawSegment = struct {
+    kind: SegmentKind,
+    index_start: u32,
+    index_count: u32,
+    quad_start: u32 = 0,
+    quad_count: u32 = 0,
+};
+
+/// A realistic frame has only a handful of shape/sprite kind switches, so a
+/// modest cap covers any sane workload. On overflow we fail safe by DROPPING
+/// the overflow draw from the segment stream: its geometry was already
+/// appended to the (separate) shape/sprite vertex+index buffers, but no
+/// segment references it, so it simply isn't drawn. We must NOT fold it into
+/// the trailing segment — by the time we reach the overflow check the tail is
+/// always the *opposite* kind (a same-kind tail is extended and returns
+/// earlier), and shape vs. sprite segments draw from different index buffers,
+/// so folding would make the draw over-read the wrong buffer. Only the
+/// overflow tail goes unrendered; a warning is logged once per such frame.
+const MAX_DRAW_SEGMENTS = 1024;
+
+var draw_segments: [MAX_DRAW_SEGMENTS]DrawSegment = undefined;
+var draw_segment_count: usize = 0;
+var draw_segments_overflowed: bool = false;
+
+/// Record that a shape draw of `n_indices` indices was just appended to the
+/// shape index buffer. Extends the trailing shape segment, or opens a new
+/// one on a kind switch. Call AFTER the indices have been appended is fine
+/// — we derive `index_start` from the pre-append count, which we pass in.
+fn noteShapeDraw(index_start: u32, n_indices: u32) void {
+    if (draw_segment_count > 0) {
+        const last = &draw_segments[draw_segment_count - 1];
+        if (last.kind == .shape) {
+            last.index_count += n_indices;
+            return;
+        }
+    }
+    if (draw_segment_count >= MAX_DRAW_SEGMENTS) {
+        // Overflow: drop this draw from the segment stream (see
+        // MAX_DRAW_SEGMENTS doc). The tail here is always a sprite segment,
+        // which draws from the sprite index buffer — folding shape indices
+        // into it would over-read the wrong buffer, so we drop instead.
+        if (!draw_segments_overflowed) {
+            log.warn("draw-segment list full ({d}); dropping overflow draws this frame", .{MAX_DRAW_SEGMENTS});
+            draw_segments_overflowed = true;
+        }
+        return;
+    }
+    draw_segments[draw_segment_count] = .{
+        .kind = .shape,
+        .index_start = index_start,
+        .index_count = n_indices,
+    };
+    draw_segment_count += 1;
+}
+
+/// Record that a sprite quad draw of `n_indices` indices (6) and one quad
+/// was just appended. Extends the trailing sprite segment, or opens a new
+/// one on a kind switch.
+fn noteSpriteDraw(index_start: u32, n_indices: u32, quad_start: u32) void {
+    if (draw_segment_count > 0) {
+        const last = &draw_segments[draw_segment_count - 1];
+        if (last.kind == .sprite) {
+            last.index_count += n_indices;
+            last.quad_count += 1;
+            return;
+        }
+    }
+    if (draw_segment_count >= MAX_DRAW_SEGMENTS) {
+        // Overflow: drop this draw from the segment stream (see
+        // MAX_DRAW_SEGMENTS doc). The tail here is always a shape segment,
+        // which draws from the shape index buffer — folding sprite indices
+        // into it would over-read the wrong buffer, so we drop instead.
+        if (!draw_segments_overflowed) {
+            log.warn("draw-segment list full ({d}); dropping overflow draws this frame", .{MAX_DRAW_SEGMENTS});
+            draw_segments_overflowed = true;
+        }
+        return;
+    }
+    draw_segments[draw_segment_count] = .{
+        .kind = .sprite,
+        .index_start = index_start,
+        .index_count = n_indices,
+        .quad_start = quad_start,
+        .quad_count = 1,
+    };
+    draw_segment_count += 1;
+}
+
+/// Reset the ordered segment list for the next frame.
+fn resetSegments() void {
+    draw_segment_count = 0;
+    draw_segments_overflowed = false;
+}
+
 // ── Texture storage ────────────────────────────────────────────────────
 
 const MAX_TEXTURES = 256;
@@ -336,6 +451,46 @@ pub const getShapeBatch = consumeShapeBatch;
 /// Backward-compatible alias for `consumeSpriteBatch`.
 pub const getSpriteBatch = consumeSpriteBatch;
 
+/// Unified per-frame snapshot for the GPU submitter: both vertex/index
+/// buffers, the per-quad texture ids, and the ordered draw-segment stream
+/// that records shape/sprite submission order. Slices are valid until the
+/// next draw call.
+pub const Frame = struct {
+    shape_vertices: []const ColorVertex,
+    shape_indices: []const u32,
+    sprite_vertices: []const SpriteVertex,
+    sprite_indices: []const u32,
+    sprite_texture_ids: []const u32,
+    segments: []const DrawSegment,
+};
+
+/// Consume the whole frame at once and reset all batch state — including
+/// the segment list — exactly ONCE. This is the path the window submitter
+/// uses. `consumeShapeBatch`/`consumeSpriteBatch` remain for standalone
+/// tests, but mixing them with `consumeFrame` in the same frame would
+/// double-drain the vertex/index buffers, so callers pick one.
+pub fn consumeFrame() Frame {
+    const shape_vcount = shape_vertex_count;
+    const shape_icount = shape_index_count;
+    const sprite_vcount = sprite_vertex_count;
+    const sprite_icount = sprite_index_count;
+    const qcount = sprite_quad_count;
+    const seg_count = draw_segment_count;
+
+    resetShapeBatch();
+    resetSpriteBatch();
+    resetSegments();
+
+    return .{
+        .shape_vertices = shape_vertices[0..shape_vcount],
+        .shape_indices = shape_indices[0..shape_icount],
+        .sprite_vertices = sprite_vertices[0..sprite_vcount],
+        .sprite_indices = sprite_indices[0..sprite_icount],
+        .sprite_texture_ids = sprite_texture_ids[0..qcount],
+        .segments = draw_segments[0..seg_count],
+    };
+}
+
 // ── Draw primitives (Backend contract) ─────────────────────────────────
 
 pub fn drawRectangleRec(rec: Rectangle, tint: Color) void {
@@ -349,6 +504,7 @@ pub fn drawRectangleRec(rec: Rectangle, tint: Color) void {
     const w = rec.width;
     const h = rec.height;
     const base: u32 = @intCast(shape_vertex_count);
+    const index_start: u32 = @intCast(shape_index_count);
 
     // 4 vertices for the rectangle
     appendShapeVertex(ColorVertex.init(toNdcX(x), toNdcY(y), col));
@@ -363,6 +519,8 @@ pub fn drawRectangleRec(rec: Rectangle, tint: Color) void {
     appendShapeIndex(base + 0);
     appendShapeIndex(base + 2);
     appendShapeIndex(base + 3);
+
+    noteShapeDraw(index_start, 6);
 }
 
 pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
@@ -373,6 +531,7 @@ pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
     }
     const col = tint.toAbgr();
     const base: u32 = @intCast(shape_vertex_count);
+    const index_start: u32 = @intCast(shape_index_count);
 
     // Center vertex
     appendShapeVertex(ColorVertex.init(toNdcX(center_x), toNdcY(center_y), col));
@@ -393,6 +552,8 @@ pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
         appendShapeIndex(base + i + 1);
         appendShapeIndex(base + i + 2);
     }
+
+    noteShapeDraw(index_start, segments * 3);
 }
 
 pub fn drawLine(start_x: f32, start_y: f32, end_x: f32, end_y: f32, thickness: f32, tint: Color) void {
@@ -412,6 +573,7 @@ pub fn drawLine(start_x: f32, start_y: f32, end_x: f32, end_y: f32, thickness: f
     const perp_y = dx / len * (thickness * 0.5);
 
     const base: u32 = @intCast(shape_vertex_count);
+    const index_start: u32 = @intCast(shape_index_count);
 
     // Quad from 4 offset vertices
     appendShapeVertex(ColorVertex.init(toNdcX(start_x + perp_x), toNdcY(start_y + perp_y), col));
@@ -425,6 +587,8 @@ pub fn drawLine(start_x: f32, start_y: f32, end_x: f32, end_y: f32, thickness: f
     appendShapeIndex(base + 0);
     appendShapeIndex(base + 2);
     appendShapeIndex(base + 3);
+
+    noteShapeDraw(index_start, 6);
 }
 
 pub fn drawTriangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, tint: Color) void {
@@ -434,6 +598,7 @@ pub fn drawTriangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, tint: 
     }
     const col = tint.toAbgr();
     const base: u32 = @intCast(shape_vertex_count);
+    const index_start: u32 = @intCast(shape_index_count);
 
     appendShapeVertex(ColorVertex.init(toNdcX(x1), toNdcY(y1), col));
     appendShapeVertex(ColorVertex.init(toNdcX(x2), toNdcY(y2), col));
@@ -442,6 +607,8 @@ pub fn drawTriangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, tint: 
     appendShapeIndex(base + 0);
     appendShapeIndex(base + 1);
     appendShapeIndex(base + 2);
+
+    noteShapeDraw(index_start, 3);
 }
 
 pub fn drawPoly(center_x: f32, center_y: f32, sides: i32, radius: f32, rotation: f32, tint: Color) void {
@@ -453,6 +620,7 @@ pub fn drawPoly(center_x: f32, center_y: f32, sides: i32, radius: f32, rotation:
     }
     const col = tint.toAbgr();
     const base: u32 = @intCast(shape_vertex_count);
+    const index_start: u32 = @intCast(shape_index_count);
 
     // Convert rotation from degrees to radians (consistent with drawTexturePro / raylib convention)
     const rot_rad = rotation * std.math.pi / 180.0;
@@ -476,6 +644,8 @@ pub fn drawPoly(center_x: f32, center_y: f32, sides: i32, radius: f32, rotation:
         appendShapeIndex(base + i + 1);
         appendShapeIndex(base + i + 2);
     }
+
+    noteShapeDraw(index_start, num_sides * 3);
 }
 
 // ── Texture / Sprite rendering ─────────────────────────────────────────
@@ -486,6 +656,10 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
         return;
     }
     const col = tint.toAbgr();
+
+    // Capture the pre-append offsets for the ordered segment record.
+    const seg_index_start: u32 = @intCast(sprite_index_count);
+    const seg_quad_start: u32 = @intCast(sprite_quad_count);
 
     // Track which texture this quad uses so the renderer can bind correctly.
     if (sprite_quad_count < MAX_SPRITE_QUADS) {
@@ -540,6 +714,8 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
     appendSpriteIndex(base + 0);
     appendSpriteIndex(base + 2);
     appendSpriteIndex(base + 3);
+
+    noteSpriteDraw(seg_index_start, 6, seg_quad_start);
 }
 
 // Zig 0.16 removed `std.fs.cwd()` in favour of `std.Io.Dir.cwd()`, which
@@ -1133,6 +1309,7 @@ pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void
                     const px = cursor_x + @as(f32, @floatFromInt(run_start)) * scale;
                     const pw = @as(f32, @floatFromInt(run_len)) * scale;
                     const base: u32 = @intCast(shape_vertex_count);
+                    const index_start: u32 = @intCast(shape_index_count);
 
                     appendShapeVertex(ColorVertex.init(toNdcX(px), toNdcY(py), col));
                     appendShapeVertex(ColorVertex.init(toNdcX(px + pw), toNdcY(py), col));
@@ -1145,6 +1322,8 @@ pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void
                     appendShapeIndex(base + 0);
                     appendShapeIndex(base + 2);
                     appendShapeIndex(base + 3);
+
+                    noteShapeDraw(index_start, 6);
                 }
             }
         }
@@ -1196,6 +1375,95 @@ pub fn worldToScreen(pos: Vector2, camera: Camera2D) Vector2 {
 // generator in PR #293's history) embedded as a byte array so the test
 // is self-contained and exercises the full sniff → inflate → unfilter →
 // RGBA8 pipeline.
+
+// ── Ordered draw-segment tests ─────────────────────────────────────────
+// Pure-CPU: drive the draw API and assert consumeFrame() yields segments
+// in submission order with correct index/quad ranges. No GPU needed.
+
+test "draw segments: shape -> sprite -> shape preserves submission order" {
+    // Clear any state leaked from a prior test in this process.
+    _ = consumeFrame();
+    setScreenSize(800, 600);
+
+    const tex = Texture{ .id = 1, .width = 16, .height = 16 };
+
+    // Shape (rect = 6 indices), then sprite (1 quad = 6 indices), then shape.
+    drawRectangleRec(.{ .x = 0, .y = 0, .width = 10, .height = 10 }, white);
+    drawTexturePro(tex, .{ .x = 0, .y = 0, .width = 16, .height = 16 }, .{ .x = 0, .y = 0, .width = 16, .height = 16 }, .{ .x = 0, .y = 0 }, 0, white);
+    drawRectangleRec(.{ .x = 20, .y = 20, .width = 10, .height = 10 }, red);
+
+    const frame = consumeFrame();
+
+    try std.testing.expectEqual(@as(usize, 3), frame.segments.len);
+
+    // Segment 0: shape, first 6 shape indices.
+    try std.testing.expectEqual(SegmentKind.shape, frame.segments[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), frame.segments[0].index_start);
+    try std.testing.expectEqual(@as(u32, 6), frame.segments[0].index_count);
+
+    // Segment 1: sprite, first 6 sprite indices, quad 0.
+    try std.testing.expectEqual(SegmentKind.sprite, frame.segments[1].kind);
+    try std.testing.expectEqual(@as(u32, 0), frame.segments[1].index_start);
+    try std.testing.expectEqual(@as(u32, 6), frame.segments[1].index_count);
+    try std.testing.expectEqual(@as(u32, 0), frame.segments[1].quad_start);
+    try std.testing.expectEqual(@as(u32, 1), frame.segments[1].quad_count);
+
+    // Segment 2: shape, next 6 shape indices (offset 6, since the sprite
+    // lives in a SEPARATE index buffer).
+    try std.testing.expectEqual(SegmentKind.shape, frame.segments[2].kind);
+    try std.testing.expectEqual(@as(u32, 6), frame.segments[2].index_start);
+    try std.testing.expectEqual(@as(u32, 6), frame.segments[2].index_count);
+
+    // Buffers: 2 shape rects = 8 verts / 12 indices; 1 sprite = 4 verts / 6
+    // indices / 1 texture id.
+    try std.testing.expectEqual(@as(usize, 8), frame.shape_vertices.len);
+    try std.testing.expectEqual(@as(usize, 12), frame.shape_indices.len);
+    try std.testing.expectEqual(@as(usize, 4), frame.sprite_vertices.len);
+    try std.testing.expectEqual(@as(usize, 6), frame.sprite_indices.len);
+    try std.testing.expectEqual(@as(usize, 1), frame.sprite_texture_ids.len);
+    try std.testing.expectEqual(@as(u32, 1), frame.sprite_texture_ids[0]);
+}
+
+test "draw segments: consecutive same-kind draws coalesce into one segment" {
+    _ = consumeFrame();
+    setScreenSize(800, 600);
+
+    const tex = Texture{ .id = 2, .width = 16, .height = 16 };
+
+    // sprite, sprite, shape: the two sprites must merge into one segment.
+    drawTexturePro(tex, .{ .x = 0, .y = 0, .width = 16, .height = 16 }, .{ .x = 0, .y = 0, .width = 16, .height = 16 }, .{ .x = 0, .y = 0 }, 0, white);
+    drawTexturePro(tex, .{ .x = 0, .y = 0, .width = 16, .height = 16 }, .{ .x = 16, .y = 0, .width = 16, .height = 16 }, .{ .x = 0, .y = 0 }, 0, white);
+    drawRectangleRec(.{ .x = 0, .y = 0, .width = 10, .height = 10 }, white);
+
+    const frame = consumeFrame();
+
+    try std.testing.expectEqual(@as(usize, 2), frame.segments.len);
+
+    // Segment 0: one sprite segment spanning both quads.
+    try std.testing.expectEqual(SegmentKind.sprite, frame.segments[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), frame.segments[0].index_start);
+    try std.testing.expectEqual(@as(u32, 12), frame.segments[0].index_count);
+    try std.testing.expectEqual(@as(u32, 0), frame.segments[0].quad_start);
+    try std.testing.expectEqual(@as(u32, 2), frame.segments[0].quad_count);
+
+    // Segment 1: the trailing shape.
+    try std.testing.expectEqual(SegmentKind.shape, frame.segments[1].kind);
+    try std.testing.expectEqual(@as(u32, 0), frame.segments[1].index_start);
+    try std.testing.expectEqual(@as(u32, 6), frame.segments[1].index_count);
+}
+
+test "draw segments: consumeFrame resets the segment list exactly once" {
+    _ = consumeFrame();
+    drawRectangleRec(.{ .x = 0, .y = 0, .width = 10, .height = 10 }, white);
+    const first = consumeFrame();
+    try std.testing.expectEqual(@as(usize, 1), first.segments.len);
+
+    // Next frame starts empty — no leakage.
+    const second = consumeFrame();
+    try std.testing.expectEqual(@as(usize, 0), second.segments.len);
+    try std.testing.expectEqual(@as(usize, 0), second.shape_indices.len);
+    try std.testing.expectEqual(@as(usize, 0), second.sprite_indices.len);
+}
 
 test "decodePng: 2x2 truecolor+alpha (filter None)" {
     // Pixels (row-major): (255,0,0,255) (0,255,0,128) / (0,0,255,255) (255,255,0,64)

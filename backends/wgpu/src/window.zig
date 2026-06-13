@@ -401,10 +401,10 @@ fn initSpritePipeline() void {
     };
 
     // Create the vertex/index buffers BEFORE publishing `sprite_pipeline`.
-    // drawSprites gates on `sprite_pipeline` alone and then unwraps the
-    // buffers, so the pipeline must not be visible until both buffers exist
-    // — otherwise a buffer-creation failure here would leave a non-null
-    // pipeline with null buffers and panic the first sprite draw.
+    // submitFrame gates sprite segments on `sprite_pipeline` alone and then
+    // unwraps the buffers, so the pipeline must not be visible until both
+    // buffers exist — otherwise a buffer-creation failure here would leave a
+    // non-null pipeline with null buffers and panic the first sprite draw.
     const vbuf = dev.createBuffer(&wgpu.BufferDescriptor{
         .size = MAX_SPRITE_VERTEX_BYTES,
         .usage = wgpu.BufferUsages.vertex | wgpu.BufferUsages.copy_dst,
@@ -562,14 +562,13 @@ pub fn beginDrawing() void {
     input.newFrame();
 }
 
-/// Drain the gfx shape + sprite batches into the GPU: acquire the surface
-/// texture, clear + draw the batched triangles (shapes first, sprites on top),
-/// submit, present.
+/// Drain the gfx frame into the GPU: acquire the surface texture, clear,
+/// then replay the ordered draw-segment stream so shapes and sprites
+/// composite in strict painter's (submission) order, submit, present.
 pub fn endDrawing() void {
     if (!gpu_ready) return;
 
-    const shape_batch = gfx.consumeShapeBatch();
-    const sprite_batch = gfx.consumeSpriteBatch();
+    const frame = gfx.consumeFrame();
 
     var surface_texture: wgpu.SurfaceTexture = undefined;
     surface.?.getCurrentTexture(&surface_texture);
@@ -582,17 +581,17 @@ pub fn endDrawing() void {
     // skip the draw; the present still runs.
     defer _ = surface.?.present();
 
-    submitFrame(texture, shape_batch.vertices, shape_batch.indices, sprite_batch.vertices, sprite_batch.indices, sprite_batch.texture_ids);
+    submitFrame(texture, frame);
 }
 
-fn submitFrame(
-    texture: *wgpu.Texture,
-    vertices: []const gfx.ColorVertex,
-    indices: []const u32,
-    sprite_vertices: []const SpriteVertex,
-    sprite_indices: []const u32,
-    sprite_texture_ids: []const u32,
-) void {
+/// Upload both vertex/index buffers once, then walk the ordered segment
+/// stream. Shapes and sprites keep separate vertex formats + pipelines, so
+/// each segment switches the pipeline/buffers for its kind and draws its
+/// index range. Draw order now follows per-call submission order via the
+/// segment stream — a shape can composite over a sprite within one frame,
+/// matching the immediate (raylib) backends. Sprite segments retain the
+/// same contiguous same-texture coalescing as before.
+fn submitFrame(texture: *wgpu.Texture, frame: gfx.Frame) void {
     const view = texture.createView(null) orelse return;
     defer view.release();
 
@@ -610,28 +609,51 @@ fn submitFrame(
         .color_attachments = &[_]wgpu.ColorAttachment{color_attachment},
     }) orelse return;
 
-    // --- Shapes / text / gizmos (drawn first, under sprites) ---
-    if (indices.len > 0) {
-        const vbytes = vertices.len * @sizeOf(ShapeVertex);
-        const ibytes = indices.len * @sizeOf(u32);
-        queue.?.writeBuffer(vertex_buffer.?, 0, vertices.ptr, vbytes);
-        queue.?.writeBuffer(index_buffer.?, 0, indices.ptr, ibytes);
-        pass.setPipeline(shape_pipeline.?);
-        pass.setVertexBuffer(0, vertex_buffer.?, 0, vbytes);
-        pass.setIndexBuffer(index_buffer.?, .uint32, 0, ibytes);
-        pass.drawIndexed(@intCast(indices.len), 1, 0, 0, 0);
+    // Byte sizes are frame-constant (the buffers are uploaded whole), so
+    // compute them once here and reuse for both the upload guards and the
+    // per-segment buffer binds below.
+    const shape_vbytes = frame.shape_vertices.len * @sizeOf(ShapeVertex);
+    const shape_ibytes = frame.shape_indices.len * @sizeOf(u32);
+    const sprite_vbytes = frame.sprite_vertices.len * @sizeOf(SpriteVertex);
+    const sprite_ibytes = frame.sprite_indices.len * @sizeOf(u32);
+
+    // Upload the shape vertex/index buffers once (guarded by the byte caps).
+    var shape_uploaded = false;
+    if (frame.shape_indices.len > 0 and shape_vbytes <= MAX_VERTEX_BYTES and shape_ibytes <= MAX_INDEX_BYTES) {
+        queue.?.writeBuffer(vertex_buffer.?, 0, frame.shape_vertices.ptr, shape_vbytes);
+        queue.?.writeBuffer(index_buffer.?, 0, frame.shape_indices.ptr, shape_ibytes);
+        shape_uploaded = true;
     }
 
-    // --- Sprites (textured quads, drawn on top of shapes) ---
-    // KNOWN LIMITATION: shapes and sprites are drained as two separate
-    // batches, so every sprite composites above every shape regardless of
-    // the per-call submission order — a game cannot draw a shape *over* a
-    // sprite within one frame. Immediate backends (raylib) preserve strict
-    // painter's order. Fixing this needs a single interleaved command
-    // stream tagged by primitive kind; tracked as a follow-up. The common
-    // case (sprites = world, shapes/gizmos = HUD on top) is unaffected by
-    // intent but inverted here — documented so it isn't mistaken for a bug.
-    drawSprites(pass, sprite_vertices, sprite_indices, sprite_texture_ids);
+    // Upload the sprite vertex/index buffers once (guarded by the byte caps).
+    var sprite_uploaded = false;
+    if (frame.sprite_indices.len > 0 and sprite_vbytes <= MAX_SPRITE_VERTEX_BYTES and sprite_ibytes <= MAX_SPRITE_INDEX_BYTES) {
+        queue.?.writeBuffer(sprite_vertex_buffer.?, 0, frame.sprite_vertices.ptr, sprite_vbytes);
+        queue.?.writeBuffer(sprite_index_buffer.?, 0, frame.sprite_indices.ptr, sprite_ibytes);
+        sprite_uploaded = true;
+    }
+
+    // Replay segments in submission order, switching pipeline per kind.
+    for (frame.segments) |seg| {
+        switch (seg.kind) {
+            .shape => {
+                if (!shape_uploaded) continue;
+                const sp = shape_pipeline orelse continue;
+                pass.setPipeline(sp);
+                pass.setVertexBuffer(0, vertex_buffer.?, 0, shape_vbytes);
+                pass.setIndexBuffer(index_buffer.?, .uint32, 0, shape_ibytes);
+                pass.drawIndexed(seg.index_count, 1, seg.index_start, 0, 0);
+            },
+            .sprite => {
+                if (!sprite_uploaded) continue;
+                const sp = sprite_pipeline orelse continue;
+                pass.setPipeline(sp);
+                pass.setVertexBuffer(0, sprite_vertex_buffer.?, 0, sprite_vbytes);
+                pass.setIndexBuffer(sprite_index_buffer.?, .uint32, 0, sprite_ibytes);
+                drawSpriteRange(pass, frame.sprite_texture_ids, seg.quad_start, seg.quad_count);
+            },
+        }
+    }
 
     pass.end();
     pass.release();
@@ -641,37 +663,28 @@ fn submitFrame(
     queue.?.submit(&[_]*const wgpu.CommandBuffer{command});
 }
 
-/// Upload the sprite batch once, then issue one draw per contiguous run of
-/// quads that share a texture, binding that texture's bind group. The batch is
-/// laid out as 4 verts / 6 indices per quad, with one texture id per quad
-/// (see gfx.consumeSpriteBatch). Quads whose texture failed to upload are
-/// skipped so the rest of the batch still renders. Sprite rendering is a no-op
-/// if the pipeline failed to initialize.
-fn drawSprites(
+/// Draw the quads in `[quad_start, quad_start+quad_count)` of an
+/// already-bound sprite pipeline/buffers, issuing one drawIndexed per
+/// contiguous run of quads that share a texture (binding that texture's
+/// bind group). Each quad is 4 verts / 6 indices; `first_index = quad*6`.
+/// Quads whose texture failed to upload are skipped so the rest still
+/// renders. Assumes the sprite pipeline + vertex/index buffers are already
+/// set by the caller for this segment.
+fn drawSpriteRange(
     pass: *wgpu.RenderPassEncoder,
-    vertices: []const SpriteVertex,
-    indices: []const u32,
     texture_ids: []const u32,
+    quad_start: u32,
+    quad_count: u32,
 ) void {
-    if (texture_ids.len == 0 or indices.len == 0) return;
-    const pipeline = sprite_pipeline orelse return;
+    const start: usize = quad_start;
+    const end: usize = start + quad_count;
+    if (end > texture_ids.len) return;
 
-    const vbytes = vertices.len * @sizeOf(SpriteVertex);
-    const ibytes = indices.len * @sizeOf(u32);
-    if (vbytes > MAX_SPRITE_VERTEX_BYTES or ibytes > MAX_SPRITE_INDEX_BYTES) return;
-
-    queue.?.writeBuffer(sprite_vertex_buffer.?, 0, vertices.ptr, vbytes);
-    queue.?.writeBuffer(sprite_index_buffer.?, 0, indices.ptr, ibytes);
-    pass.setPipeline(pipeline);
-    pass.setVertexBuffer(0, sprite_vertex_buffer.?, 0, vbytes);
-    pass.setIndexBuffer(sprite_index_buffer.?, .uint32, 0, ibytes);
-
-    // Coalesce consecutive same-texture quads into a single drawIndexed call.
-    var quad: usize = 0;
-    while (quad < texture_ids.len) {
+    var quad: usize = start;
+    while (quad < end) {
         const tex_id = texture_ids[quad];
         var run_end = quad + 1;
-        while (run_end < texture_ids.len and texture_ids[run_end] == tex_id) run_end += 1;
+        while (run_end < end and texture_ids[run_end] == tex_id) run_end += 1;
 
         if (getOrCreateGpuTexture(tex_id)) |bind_group| {
             pass.setBindGroup(0, bind_group, 0, null);
