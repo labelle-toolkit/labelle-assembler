@@ -1268,64 +1268,147 @@ fn initFontData() [95][8]u8 {
     return data;
 }
 
+// ── Glyph atlas ────────────────────────────────────────────────────────
+//
+// Text renders through the textured-sprite path: the embedded 8x8 bitmap
+// font is baked ONCE into an RGBA8 atlas texture, and each printable glyph
+// is drawn as a single sampled sprite quad (vs. the old per-pixel solid
+// shape-quad rasterizer). The atlas lays the 95 printable glyphs in a
+// FONT_ATLAS_COLS x FONT_ATLAS_ROWS grid; each cell carries the 8x8 glyph
+// plus FONT_ATLAS_PAD px of transparent padding on every side so nearest
+// sampling at a quad edge can never bleed into a neighbouring cell.
+//
+// Per-texel encoding: white RGB (255,255,255) with alpha = coverage (255
+// where the font bit is set, 0 where clear); padding texels are fully
+// transparent (0,0,0,0). The sprite fragment shader computes `texel *
+// vColor`, so a quad tinted by `tint` yields (tint.rgb, tint.a * coverage)
+// — correctly tinted text with crisp edges under the nearest sampler.
+const FONT_ATLAS_COLS = 16;
+const FONT_ATLAS_ROWS = 6; // 16*6 = 96 cells >= 95 glyphs
+const FONT_ATLAS_PAD = 1; // transparent border px around each glyph cell
+const FONT_ATLAS_CELL_W = FONT_GLYPH_W + 2 * FONT_ATLAS_PAD; // 10
+const FONT_ATLAS_CELL_H = FONT_GLYPH_H + 2 * FONT_ATLAS_PAD; // 10
+const FONT_ATLAS_W = FONT_ATLAS_COLS * FONT_ATLAS_CELL_W; // 160
+const FONT_ATLAS_H = FONT_ATLAS_ROWS * FONT_ATLAS_CELL_H; // 60
+
+/// Texture id of the baked glyph atlas, or 0 = "not built yet". Texture id
+/// 0 is never handed out (`next_texture_id` starts at 1), so it's a safe
+/// sentinel. Built lazily on the first `drawText`.
+var font_atlas_texture_id: u32 = 0;
+
+/// Render the embedded bitmap font into an RGBA8 pixel buffer laid out as
+/// the glyph atlas described above. White-RGB + alpha-coverage encoding;
+/// padding texels are transparent.
+fn buildFontAtlasPixels(buf: *[FONT_ATLAS_W * FONT_ATLAS_H * 4]u8) void {
+    // Start fully transparent — this also covers all padding texels.
+    @memset(buf, 0);
+    for (font_data, 0..) |glyph, gi| {
+        const cell_col = gi % FONT_ATLAS_COLS;
+        const cell_row = gi / FONT_ATLAS_COLS;
+        const origin_x = cell_col * FONT_ATLAS_CELL_W + FONT_ATLAS_PAD;
+        const origin_y = cell_row * FONT_ATLAS_CELL_H + FONT_ATLAS_PAD;
+        for (glyph, 0..) |row_bits, row| {
+            var c: usize = 0;
+            while (c < FONT_GLYPH_W) : (c += 1) {
+                const set = (row_bits >> @intCast(FONT_GLYPH_W - 1 - c)) & 1 == 1;
+                if (!set) continue; // leave transparent
+                const px = origin_x + c;
+                const py = origin_y + row;
+                const idx = (py * FONT_ATLAS_W + px) * 4;
+                buf[idx + 0] = 255; // R
+                buf[idx + 1] = 255; // G
+                buf[idx + 2] = 255; // B
+                buf[idx + 3] = 255; // A = coverage
+            }
+        }
+    }
+}
+
+/// Build + upload the glyph atlas texture if it hasn't been built yet.
+/// Returns the texture id, or 0 on failure (upload error).
+fn ensureFontAtlas() u32 {
+    if (font_atlas_texture_id != 0) return font_atlas_texture_id;
+    var pixels: [FONT_ATLAS_W * FONT_ATLAS_H * 4]u8 = undefined;
+    buildFontAtlasPixels(&pixels);
+    // uploadTexture COPIES the pixels into a slot it owns, so a stack
+    // buffer that dies at return is fine.
+    const tex = uploadTexture(.{
+        .pixels = pixels[0..],
+        .width = FONT_ATLAS_W,
+        .height = FONT_ATLAS_H,
+    }) catch {
+        log.warn("failed to upload glyph atlas; text will not render", .{});
+        return 0;
+    };
+    font_atlas_texture_id = tex.id;
+    return font_atlas_texture_id;
+}
+
 pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void {
+    const atlas_id = ensureFontAtlas();
+    if (atlas_id == 0) return; // atlas build failed; nothing to draw
+
     const col = tint.toAbgr();
     const scale = size / @as(f32, FONT_GLYPH_H);
     const glyph_w: f32 = @as(f32, FONT_GLYPH_W) * scale;
 
-    // Worst case per glyph: alternating bits give 4 runs per row x 8 rows
-    // = 32 quads = 128 vertices / 192 indices.
-    const max_glyph_verts: usize = 32 * 4;
-    const max_glyph_idxs: usize = 32 * 6;
+    const atlas_w_f: f32 = @as(f32, FONT_ATLAS_W);
+    const atlas_h_f: f32 = @as(f32, FONT_ATLAS_H);
 
     var cursor_x = x;
     for (text) |ch| {
-        if (ch == 0) break;
-        if (ch >= 0x20 and ch <= 0x7E) {
-            if (!hasShapeCapacity(max_glyph_verts, max_glyph_idxs)) {
-                log.warn("shape batch full, dropping text glyphs", .{});
+        if (ch == 0) break; // NUL terminator
+        // Printable, non-space glyphs emit one textured quad. Space (0x20)
+        // and out-of-range chars emit nothing but still advance the cursor,
+        // keeping metrics identical to the old rasterizer (width == n_chars
+        // * glyph_w).
+        if (ch > 0x20 and ch <= 0x7E) {
+            if (!hasSpriteCapacity(4, 6)) {
+                log.warn("sprite batch full, dropping text glyphs", .{});
                 return;
             }
 
-            const glyph = font_data[ch - 0x20];
-            for (glyph, 0..) |row_bits, row| {
-                if (row_bits == 0) continue;
-                const py = y + @as(f32, @floatFromInt(row)) * scale;
+            const gi: usize = ch - 0x20;
+            const cell_col = gi % FONT_ATLAS_COLS;
+            const cell_row = gi / FONT_ATLAS_COLS;
+            // Inner 8x8 region (padding excluded) — UVs map exactly to it,
+            // so nearest sampling never picks a padding/neighbour texel.
+            const inner_x: f32 = @floatFromInt(cell_col * FONT_ATLAS_CELL_W + FONT_ATLAS_PAD);
+            const inner_y: f32 = @floatFromInt(cell_row * FONT_ATLAS_CELL_H + FONT_ATLAS_PAD);
+            const uv_x0 = inner_x / atlas_w_f;
+            const uv_y0 = inner_y / atlas_h_f;
+            const uv_x1 = (inner_x + @as(f32, FONT_GLYPH_W)) / atlas_w_f;
+            const uv_y1 = (inner_y + @as(f32, FONT_GLYPH_H)) / atlas_h_f;
 
-                // Merge consecutive set bits (MSB = leftmost pixel) into
-                // horizontal run rectangles — one quad per run.
-                var c: usize = 0;
-                while (c < FONT_GLYPH_W) {
-                    if ((row_bits >> @intCast(FONT_GLYPH_W - 1 - c)) & 1 == 0) {
-                        c += 1;
-                        continue;
-                    }
-                    const run_start = c;
-                    while (c < FONT_GLYPH_W and (row_bits >> @intCast(FONT_GLYPH_W - 1 - c)) & 1 == 1) {
-                        c += 1;
-                    }
-                    const run_len = c - run_start;
+            // Screen rect for the whole glyph cell (same metrics as before).
+            const gx0 = cursor_x;
+            const gy0 = y;
+            const gx1 = cursor_x + glyph_w;
+            const gy1 = y + size;
 
-                    const px = cursor_x + @as(f32, @floatFromInt(run_start)) * scale;
-                    const pw = @as(f32, @floatFromInt(run_len)) * scale;
-                    const base: u32 = @intCast(shape_vertex_count);
-                    const index_start: u32 = @intCast(shape_index_count);
+            const seg_index_start: u32 = @intCast(sprite_index_count);
+            const seg_quad_start: u32 = @intCast(sprite_quad_count);
 
-                    appendShapeVertex(ColorVertex.init(toNdcX(px), toNdcY(py), col));
-                    appendShapeVertex(ColorVertex.init(toNdcX(px + pw), toNdcY(py), col));
-                    appendShapeVertex(ColorVertex.init(toNdcX(px + pw), toNdcY(py + scale), col));
-                    appendShapeVertex(ColorVertex.init(toNdcX(px), toNdcY(py + scale), col));
-
-                    appendShapeIndex(base + 0);
-                    appendShapeIndex(base + 1);
-                    appendShapeIndex(base + 2);
-                    appendShapeIndex(base + 0);
-                    appendShapeIndex(base + 2);
-                    appendShapeIndex(base + 3);
-
-                    noteShapeDraw(index_start, 6);
-                }
+            if (sprite_quad_count < MAX_SPRITE_QUADS) {
+                sprite_texture_ids[sprite_quad_count] = atlas_id;
+                sprite_quad_count += 1;
             }
+
+            const base: u32 = @intCast(sprite_vertex_count);
+            // TL, TR, BR, BL — matches drawTexturePro winding/index pattern.
+            appendSpriteVertex(SpriteVertex.init(toNdcX(gx0), toNdcY(gy0), uv_x0, uv_y0, col));
+            appendSpriteVertex(SpriteVertex.init(toNdcX(gx1), toNdcY(gy0), uv_x1, uv_y0, col));
+            appendSpriteVertex(SpriteVertex.init(toNdcX(gx1), toNdcY(gy1), uv_x1, uv_y1, col));
+            appendSpriteVertex(SpriteVertex.init(toNdcX(gx0), toNdcY(gy1), uv_x0, uv_y1, col));
+
+            appendSpriteIndex(base + 0);
+            appendSpriteIndex(base + 1);
+            appendSpriteIndex(base + 2);
+            appendSpriteIndex(base + 0);
+            appendSpriteIndex(base + 2);
+            appendSpriteIndex(base + 3);
+
+            noteSpriteDraw(seg_index_start, 6, seg_quad_start);
         }
         cursor_x += glyph_w;
     }
