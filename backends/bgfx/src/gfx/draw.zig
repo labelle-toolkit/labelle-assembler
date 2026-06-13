@@ -60,8 +60,11 @@ pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
     // so a pixel radius maps to different NDC spans on each axis.
     const sw: f32 = @floatFromInt(state.screenWidth());
     const sh: f32 = @floatFromInt(state.screenHeight());
-    const ndc_rx = scaled_radius * 2.0 / sw;
-    const ndc_ry = scaled_radius * 2.0 / sh;
+    // screenWidth/Height are the design canvas; apply the same design→physical
+    // fit toNdc uses so the circle stays round (and matching size) when the
+    // design is letterboxed into a differently-shaped surface.
+    const ndc_rx = scaled_radius * 2.0 / sw * state.fitScaleX();
+    const ndc_ry = scaled_radius * 2.0 / sh * state.fitScaleY();
 
     var vertices: [SEGMENTS * 3]PosTexColorVertex = undefined;
 
