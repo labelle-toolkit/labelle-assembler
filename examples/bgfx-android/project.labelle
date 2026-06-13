@@ -3,7 +3,8 @@
 // generated build compiles the game as a `lib<name>.so` for
 // `aarch64-linux-android`, importing the bgfx backend's Android-capable
 // gfx/input/audio/window modules plus the `android_app` NativeActivity
-// glue, and links the NDK libs (android, log, EGL, GLESv3, c++_shared).
+// glue, and links the NDK libs (android, log, EGL, GLESv3, m, dl). The C++
+// runtime comes from Zig's toolchain, not the NDK's libc++_shared.so.
 //
 // The generated `main.zig` owns the NativeActivity `android_main` entry:
 // it registers a one-shot engine-init callback (fired once bgfx is up on

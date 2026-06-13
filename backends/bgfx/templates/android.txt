@@ -85,6 +85,12 @@ fn gameInit() callconv(.c) void {
 // here — the activity lifecycle drives shutdown.
 fn gameFrame() callconv(.c) void {
     const dt: f32 = 0.016;
+    // Re-sync the engine's screen height to the live surface size every
+    // frame (cheap field write). The surface can be destroyed + recreated
+    // at a different size — rotation, or pause/resume — without gameInit
+    // re-running, so a once-at-init sync would go stale. Matches the sokol
+    // Android template, which refreshes dimensions per frame.
+    g.setScreenHeight(@as(f32, @floatFromInt(window.getScreenHeight())));
 {{preview_heartbeat}}{{tick_code}}    g.tick(dt);
 
     window.beginDrawing();
