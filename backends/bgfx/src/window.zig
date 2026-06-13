@@ -206,8 +206,19 @@ pub fn setTargetFPS(fps: i32) void {
 pub fn beginDrawing() void {
     const input = @import("input");
     input.newFrame();
-    // Touch view 0 to ensure it's processed even if no draw calls occur
     bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
+    // Touch view 0 so bgfx ALWAYS clears + presents it, even on a frame
+    // with zero draw calls. `setViewRect` alone does NOT do this — bgfx
+    // only processes a view that has submitted draws or an explicit
+    // `touch`. Without this, any frame that submits nothing to view 0
+    // (e.g. a scene whose only content is still loading, or an empty
+    // scene) is dropped entirely by bgfx: the clear never runs and the
+    // back buffer is presented black. This was the real cause of the
+    // "atlas blacks the screen" bug (#317) — loading an atlas left a
+    // window of draw-less frames, and those frames went black instead of
+    // showing the clear color. (The original comment here claimed to
+    // touch the view but only set the rect.)
+    bgfx.touch(0);
 }
 
 pub fn endDrawing() void {
