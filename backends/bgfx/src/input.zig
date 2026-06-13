@@ -113,6 +113,9 @@ pub fn newFrame() void {
         mouse_x = @floatCast(pos[0]);
         mouse_y = @floatCast(pos[1]);
     }
+
+    // Snapshot gamepad button edges for this frame's `isGamepadButtonPressed`.
+    snapshotGamepads();
 }
 
 // ── Keyboard ──────────────────────────────────────────────
@@ -252,6 +255,85 @@ pub fn applyGamepadMotion(device_id: i32, axes: [agp.FORWARDED_AXIS_COUNT]f32) v
 }
 
 // ── Gamepad ───────────────────────────────────────────────
+//
+// DESKTOP (GLFW): a controller is readable as a "gamepad" only when its GUID
+// has an SDL gamecontroller mapping (`glfw.getGamepadState`). We translate the
+// engine's canonical raylib-compatible numbering — buttons [0,17], axes [0,5]
+// (LX, LY, RX, RY, LT, RT), matching `android_gamepad` + the raylib/sdl
+// backends — to GLFW's standard layout. The two "trigger-as-button" canonical
+// codes (LEFT/RIGHT_TRIGGER_2) are derived from the analog trigger axes.
+//
+// NOTE: a controller GLFW can't map (e.g. a Switch-mode Nintendo Pro
+// Controller — only SDL's HIDAPI decodes those) reports *present*
+// (`joystickPresent`) but yields no gamepad state, so its buttons/axes read as
+// released/0. Use an X-input/Xbox pad, or the SDL backend, for those. On macOS,
+// reading input also needs Input Monitoring permission for the host binary.
+const MAX_GAMEPADS = 16; // GLFW joystick slots 0..15
+const CANON_BUTTON_COUNT = 18; // canonical GamepadButton range [0,17]
+// GLFW analog triggers rest at -1 and reach +1 fully pressed; treat past the
+// midpoint as "down" for the digital LEFT/RIGHT_TRIGGER_2 buttons.
+const TRIGGER_BUTTON_THRESHOLD: f32 = 0.0;
+
+// Rising-edge bookkeeping for `isGamepadButtonPressed`, snapshotted in
+// `newFrame` (mirrors the keyboard/mouse `*_pressed` pattern). Desktop-only;
+// the Android path uses `agp`'s own edge state.
+var gp_prev_down: [MAX_GAMEPADS][CANON_BUTTON_COUNT]bool =
+    [_][CANON_BUTTON_COUNT]bool{[_]bool{false} ** CANON_BUTTON_COUNT} ** MAX_GAMEPADS;
+var gp_pressed: [MAX_GAMEPADS][CANON_BUTTON_COUNT]bool =
+    [_][CANON_BUTTON_COUNT]bool{[_]bool{false} ** CANON_BUTTON_COUNT} ** MAX_GAMEPADS;
+
+/// Canonical button → GLFW gamepad button, or null when the canonical code is
+/// an analog-trigger button (10/12, derived from the axes) or has no GLFW
+/// equivalent (0 = UNKNOWN).
+fn canonToGlfwButton(button: u32) ?glfw.Gamepad.Button {
+    return switch (button) {
+        1 => .dpad_up,
+        2 => .dpad_right,
+        3 => .dpad_down,
+        4 => .dpad_left,
+        5 => .y, // RIGHT_FACE_UP
+        6 => .b, // RIGHT_FACE_RIGHT
+        7 => .a, // RIGHT_FACE_DOWN
+        8 => .x, // RIGHT_FACE_LEFT
+        9 => .left_bumper, // LEFT_TRIGGER_1
+        11 => .right_bumper, // RIGHT_TRIGGER_1
+        13 => .back, // MIDDLE_LEFT
+        14 => .guide, // MIDDLE
+        15 => .start, // MIDDLE_RIGHT
+        16 => .left_thumb,
+        17 => .right_thumb,
+        else => null,
+    };
+}
+
+/// Resolve a canonical button against an already-fetched GLFW gamepad state.
+fn glfwButtonDown(state: glfw.Gamepad.State, button: u32) bool {
+    if (button == 10) return state.axes[@intFromEnum(glfw.Gamepad.Axis.left_trigger)] > TRIGGER_BUTTON_THRESHOLD;
+    if (button == 12) return state.axes[@intFromEnum(glfw.Gamepad.Axis.right_trigger)] > TRIGGER_BUTTON_THRESHOLD;
+    const gb = canonToGlfwButton(button) orelse return false;
+    return state.buttons[@intFromEnum(gb)] == .press;
+}
+
+/// Desktop: snapshot per-gamepad button edges for `isGamepadButtonPressed`.
+/// One `getGamepadState` per slot per frame; derives all canonical buttons
+/// from that single state. Called from `newFrame` after `glfw.pollEvents`.
+fn snapshotGamepads() void {
+    var g: u32 = 0;
+    while (g < MAX_GAMEPADS) : (g += 1) {
+        const state = glfw.getGamepadState(@enumFromInt(g)) catch {
+            // Not a mapped gamepad (or disconnected): clear edges + prev.
+            gp_pressed[g] = [_]bool{false} ** CANON_BUTTON_COUNT;
+            gp_prev_down[g] = [_]bool{false} ** CANON_BUTTON_COUNT;
+            continue;
+        };
+        var b: u32 = 0;
+        while (b < CANON_BUTTON_COUNT) : (b += 1) {
+            const now = glfwButtonDown(state, b);
+            gp_pressed[g][b] = now and !gp_prev_down[g][b];
+            gp_prev_down[g][b] = now;
+        }
+    }
+}
 
 pub fn isGamepadAvailable(gamepad: u32) bool {
     // Android (#310 Stage 4): resolve against the shared per-device state,
@@ -263,22 +345,24 @@ pub fn isGamepadAvailable(gamepad: u32) bool {
 
 pub fn isGamepadButtonDown(gamepad: u32, button: u32) bool {
     if (comptime is_android) return agp.buttonDown(gamepad, button);
-    // TODO: GLFW joystick buttons. `agp` is pure Zig and host-importable, so
-    // the Android branch type-checks (and "uses" the params) on desktop too —
-    // no `_ = param` discards needed.
-    return false;
+    if (gamepad >= MAX_GAMEPADS or button >= CANON_BUTTON_COUNT) return false;
+    const state = glfw.getGamepadState(@enumFromInt(gamepad)) catch return false;
+    return glfwButtonDown(state, button);
 }
 
 pub fn isGamepadButtonPressed(gamepad: u32, button: u32) bool {
-    // Edge detection lives in the shared state module: it snapshots prev-down
-    // across `newFrame`, keyed by Android device id.
     if (comptime is_android) return agp.buttonPressed(gamepad, button);
-    return false;
+    // Rising edge computed in `newFrame` from the GLFW state snapshot.
+    if (gamepad >= MAX_GAMEPADS or button >= CANON_BUTTON_COUNT) return false;
+    return gp_pressed[gamepad][button];
 }
 
 pub fn getGamepadAxisValue(gamepad: u32, axis: u32) f32 {
     if (comptime is_android) return agp.axisValue(gamepad, axis);
-    return 0;
+    // Canonical axes 0..5 == GLFW axes 0..5 (LX, LY, RX, RY, LT, RT).
+    if (gamepad >= MAX_GAMEPADS or axis >= glfw.Gamepad.Axis.count) return 0;
+    const state = glfw.getGamepadState(@enumFromInt(gamepad)) catch return 0;
+    return state.axes[axis];
 }
 
 /// bgfx Android backend adapter for labelle-core's backend-agnostic JNI seam
