@@ -18,17 +18,16 @@ fn targetIsDesktop(t: std.Target) bool {
 /// not search Homebrew by default). Returns null when cross-compiling or on
 /// Linux/Windows (system search resolves SDL2). No include path is needed —
 /// sdl_gamepad uses `extern fn`. Mirrors raylib/sokol's `sdlLibPath`.
-fn sdlLibPath(target_os: std.Target.Os.Tag, host_os: std.Target.Os.Tag) ?[]const u8 {
+fn sdlLibPath(io: std.Io, target_os: std.Target.Os.Tag, host_os: std.Target.Os.Tag) ?[]const u8 {
     if (target_os != .macos or host_os != .macos) return null;
-    if (dirExists("/opt/homebrew/lib")) return "/opt/homebrew/lib";
-    if (dirExists("/usr/local/lib")) return "/usr/local/lib";
+    if (dirExists(io, "/opt/homebrew/lib")) return "/opt/homebrew/lib";
+    if (dirExists(io, "/usr/local/lib")) return "/usr/local/lib";
     return null;
 }
 
-fn dirExists(path: []const u8) bool {
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+fn dirExists(io: std.Io, path: []const u8) bool {
+    // Reuse the build graph's `Io` rather than spinning up a fresh
+    // `std.Io.Threaded` (thread pool) per probe.
     std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
     return true;
 }
@@ -161,14 +160,15 @@ pub fn build(b: *std.Build) void {
     // link + (on macOS Homebrew) the library path matters. Mirrors raylib/sokol.
     if (sdl_gp_mod != null) {
         input_mod.link_libc = true;
-        if (sdlLibPath(target.result.os.tag, builtin.target.os.tag)) |p| {
+        if (sdlLibPath(b.graph.io, target.result.os.tag, builtin.target.os.tag)) |p| {
             input_mod.addLibraryPath(.{ .cwd_relative = p });
         }
         // Windows: Zig has no default SDL2 search path for the MinGW
         // (`windows-gnu`) toolchain, so honor `LABELLE_SDL2_LIB` — the dir
         // holding the import lib (`libSDL2.dll.a`). `SDL2.dll` must be on PATH
-        // (or beside the exe) at runtime.
-        if (target.result.os.tag == .windows and builtin.target.os.tag == .windows) {
+        // (or beside the exe) at runtime. Gated on the TARGET os only, so it
+        // also applies when cross-compiling to Windows from a non-Windows host.
+        if (target.result.os.tag == .windows) {
             if (b.graph.environ_map.get("LABELLE_SDL2_LIB")) |p| {
                 input_mod.addLibraryPath(.{ .cwd_relative = p });
             }
