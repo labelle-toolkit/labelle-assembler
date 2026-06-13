@@ -23,9 +23,28 @@ const builtin = @import("builtin");
 // which Zig 0.16 rejects ("file exists in modules ...").
 const window = @import("window");
 const input = @import("input");
+// `root` is the compilation's root module — the generated game's
+// `main.zig` when this backend is consumed by an assembled project. We
+// read an optional `labelle_provides_android_main` declaration from it so
+// the game can own the `android_main` C entry point (registering its
+// init + tick callbacks before handing control to `run`). When that decl
+// is absent (e.g. the backend's own Android compile-check, which has no
+// game root), this module exports `android_main` itself. See phase 4
+// (#303) — the generated game needs to set up the engine/scene on the
+// first `INIT_WINDOW`, which it can only do from inside the entry it owns.
+const root = @import("root");
 
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
+
+/// True when the root (game) module declares it provides its own
+/// `android_main` export. The generated `main.zig` sets
+/// `pub const labelle_provides_android_main = true;` and exports an
+/// `android_main` that registers the init/tick callbacks then calls
+/// `run(app)`. When false (backend self-test, or a future shell-owned
+/// entry), this module's own `android_main` export is emitted instead.
+const game_owns_main = @hasDecl(root, "labelle_provides_android_main") and
+    root.labelle_provides_android_main;
 
 // ── Default surface size ────────────────────────────────────────────
 // The real width/height come from the `ANativeWindow` once it exists;
@@ -157,6 +176,24 @@ extern fn AMotionEvent_getPointerId(event: *AInputEvent, pointer_index: usize) i
 var bgfx_ready: bool = false;
 var is_resumed: bool = false;
 
+// ── sokol-compat: ANativeActivity accessor ──────────────────────────
+// The engine's `src/android.zig` reaches the running `ANativeActivity*`
+// through `sapp_android_get_native_activity()` — a symbol sokol_app
+// exports on Android (the engine binds it as `extern "c"` so it never has
+// to `@import("sokol")`). On a bgfx-on-Android build there is NO sokol in
+// the graph, so that symbol is undefined and the `.so` fails to `dlopen`
+// ("cannot locate symbol sapp_android_get_native_activity") — the first
+// thing the NativeActivity loader hits, crashing before `android_main`
+// ever runs (#303).
+//
+// The bgfx shell already owns the `ANativeActivity*` (the glue hands it to
+// us as `app.activity`). So we provide a drop-in export of the same symbol
+// that returns it — the engine's immersive-mode helper then resolves
+// against the bgfx backend exactly as it does against sokol_clib, with no
+// engine-side change. Stored from `run` (the glue calls `android_main` →
+// `run` with the populated `app`).
+var native_activity: ?*ANativeActivity = null;
+
 /// Optional per-frame tick callback, set by the game's entry before it
 /// hands control to the shell. Called once per loop iteration while the
 /// surface is live and the activity is resumed. Mirrors the desktop
@@ -173,6 +210,31 @@ pub fn setTickCallback(cb: TickFn) void {
     tick_fn = cb;
 }
 
+/// Optional one-shot surface-ready callback, set by the game before it
+/// hands control to the shell. Fired exactly once — on the FIRST
+/// `INIT_WINDOW`, AFTER `window.initWindow()` has brought bgfx up against
+/// the surface, and BEFORE the first `tick_fn`. This is where the
+/// generated game does engine + scene init: it can only run once bgfx is
+/// live (the engine's render pipeline binds bgfx state at init), and it
+/// must run before the first frame ticks. The desktop generated `main`
+/// has no analog — it owns a linear `init → loop` body — so this hook is
+/// Android-only by construction (it's only ever set from the Android
+/// entry).
+pub const InitFn = *const fn () callconv(.c) void;
+var init_fn: ?InitFn = null;
+
+/// Guards the one-shot `init_fn`: a TERM_WINDOW + later INIT_WINDOW
+/// (app backgrounded then resumed) re-creates the bgfx surface but must
+/// NOT re-run engine/scene init — the engine state persists across the
+/// surface teardown. Only the very first surface fires the game's init.
+var init_done: bool = false;
+
+/// Register the one-shot surface-ready (engine init) callback. Call from
+/// the game's `android_main` wrapper before entering `run`.
+pub fn setInitCallback(cb: InitFn) void {
+    init_fn = cb;
+}
+
 // ── Lifecycle: APP_CMD_* handler ────────────────────────────────────
 fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
     switch (cmd) {
@@ -187,6 +249,16 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
                 const wh: i32 = if (height > 0) height else default_height;
                 window.initWindow(ww, wh, "labelle");
                 bgfx_ready = true;
+
+                // Fire the game's one-shot engine/scene init exactly once,
+                // now that bgfx is live against the surface. A later
+                // INIT_WINDOW (resume after backgrounding) re-creates the
+                // surface but skips this — engine state survives the
+                // TERM_WINDOW teardown.
+                if (!init_done) {
+                    init_done = true;
+                    if (init_fn) |cb| cb();
+                }
             }
         },
         APP_CMD_TERM_WINDOW => {
@@ -269,6 +341,11 @@ pub fn run(app: *android_app) void {
     app.onAppCmd = onAppCmd;
     app.onInputEvent = onInputEvent;
 
+    // Stash the activity for the sokol-compat accessor the engine's
+    // immersive-mode helper calls (see `native_activity` above). The glue
+    // has populated `app.activity` by the time it calls us.
+    native_activity = app.activity;
+
     // Event + frame loop. `ALooper_pollOnce` returns the poll-source id;
     // we call `source.process(...)` which dispatches to our callbacks.
     // When the surface is live and we're resumed, tick a frame. The loop
@@ -320,10 +397,31 @@ pub fn run(app: *android_app) void {
 // `extern void android_main(struct android_app* app)` and calls it on the
 // app thread; this `export` provides that symbol. Off Android the symbol
 // is omitted entirely so desktop links are untouched.
+//
+// Skipped when the game owns `android_main` (`game_owns_main`): the
+// generated game's entry registers the init/tick callbacks then calls
+// `run(app)`, so emitting a second `android_main` here would be a
+// duplicate-symbol link error. The backend's own Android compile-check
+// has no game root, so `game_owns_main` is false there and this export
+// fires — keeping the existing phase-3 self-test green.
 comptime {
-    if (is_android) {
+    if (is_android and !game_owns_main) {
         @export(&androidMainExport, .{ .name = "android_main", .linkage = .strong });
     }
+}
+
+/// sokol-compat accessor (#303). The engine's `src/android.zig` binds
+/// `sapp_android_get_native_activity()` as `extern "c"` to reach the
+/// `ANativeActivity*` for immersive mode — a symbol sokol_app exports on
+/// Android. A bgfx-on-Android build has no sokol in the graph, so that
+/// symbol is otherwise undefined and the `.so` fails to `dlopen`. The
+/// generated `main.zig` exports a `sapp_android_get_native_activity` shim
+/// (`@export` from the ROOT module reliably lands in the `.so`; a strong
+/// `@export` from this imported module gets dead-stripped before it
+/// resolves the engine's undefined ref) that returns this value. Stashed
+/// from `run` once the glue hands us the populated `app`.
+pub fn getNativeActivity() ?*anyopaque {
+    return @ptrCast(native_activity);
 }
 
 fn androidMainExport(app: *android_app) callconv(.c) void {
@@ -340,6 +438,8 @@ comptime {
     _ = onAppCmd;
     _ = onInputEvent;
     _ = setTickCallback;
+    _ = setInitCallback;
+    _ = getNativeActivity;
 }
 
 test "android_app module compiles for the host as a no-op namespace" {

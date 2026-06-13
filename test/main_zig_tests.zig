@@ -6,6 +6,7 @@ const h = @import("helpers.zig");
 const engine_template = h.engine_template;
 const raylib_lifecycle = h.raylib_lifecycle;
 const sokol_lifecycle = h.sokol_lifecycle;
+const bgfx_android_lifecycle = h.bgfx_android_lifecycle;
 const null_lifecycle = h.null_lifecycle;
 const sokol_alloc_lifecycle = h.sokol_alloc_lifecycle;
 const empty_names = h.empty_names;
@@ -167,6 +168,30 @@ pub const MAIN_ZIG = struct {
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn main()") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "MockEcsBackend") != null);
+    }
+
+    test "bgfx android generates callback-driven main owning android_main" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .ecs = .mock,
+        }, bgfx_android_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // bgfx-android (#303) takes the CALLBACK path, not the desktop loop:
+        // the game exports `android_main`, opts the shell out of its own
+        // export, and registers init + tick callbacks. No `pub fn main()`
+        // and no `windowShouldClose` loop.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn android_main(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const labelle_provides_android_main = true;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "android_app.setInitCallback(&gameInit)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "android_app.setTickCallback(&gameFrame)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "android_app.run(app)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn main()") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "windowShouldClose") == null);
+        // Module-scope runner (assigned in gameInit), not an init-scope local.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var runner: Runner = undefined;") != null);
     }
 };
 

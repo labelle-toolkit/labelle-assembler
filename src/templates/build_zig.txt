@@ -717,6 +717,23 @@ pub fn build(b: *std.Build) void {
     // relocations. See labelle-assembler#147.
     sokol_clib.root_module.pic = true;
 
+.backend_bgfx_android
+    // bgfx Android backend (#303). The backend's build.zig detects the
+    // Android ABI from the resolved target and: builds gfx/input/audio/
+    // window for `aarch64-linux-android` (zglfw omitted — desktop-only),
+    // applies the NDK sysroot include/lib paths + `-fPIC` to the bgfx /
+    // bx / bimg C++ TUs, and exposes the `android_app` NativeActivity-glue
+    // module (which compiles the NDK's `android_native_app_glue.c` and
+    // exports the per-frame/init callback registration the generated
+    // `main.zig` drives). No glfw artifact exists on this path.
+    const backend_dep = b.dependency("labelle_bgfx", .{ .target = android_target, .optimize = optimize });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+    const backend_app = backend_dep.module("android_app");
+    const bgfx_artifact = backend_dep.artifact("bgfx");
+
 .android_exe_start
     const lib = b.addLibrary(.{
         .name = "game",
@@ -757,6 +774,47 @@ pub fn build(b: *std.Build) void {
     lib.root_module.linkSystemLibrary("log", .{});
     lib.root_module.linkSystemLibrary("GLESv3", .{});
     lib.root_module.linkSystemLibrary("EGL", .{});
+
+    // Zig does not bundle Android libc — provide a libc.txt that points the
+    // compiler at the NDK sysroot so Zig can resolve <stdio.h> and friends.
+    const libc_content = std.mem.concat(b.allocator, u8, &.{
+        "include_dir=",     b.pathJoin(&.{ ndk_sysroot, "usr/include" }),                               "\n",
+        "sys_include_dir=", b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }),              "\n",
+        "crt_dir=",         b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }), "\n",
+        "msvc_lib_dir=\n",
+        "kernel32_lib_dir=\n",
+        "gcc_dir=\n",
+    }) catch @panic("OOM");
+    const android_libc = b.addWriteFiles();
+    lib.setLibCFile(android_libc.add("android-libc.txt", libc_content));
+
+.android_exe_app_import
+                .{ .name = "backend_app", .module = backend_app },
+
+.android_link_bgfx
+    // bgfx Android link (#303). The `bgfx` artifact (with bx/bimg consumed
+    // as link objects) carries its NDK-sysroot-wired C++ TUs from the
+    // backend's build.zig; we link it into the .so. The `android_app`
+    // module — the NativeActivity glue + `android_native_app_glue.c` — is
+    // imported into the root module above; linking the bgfx artifact and
+    // declaring the Android system libs here completes the shell.
+    lib.root_module.linkLibrary(bgfx_artifact);
+    lib.root_module.link_libc = true;
+    lib.root_module.pic = true;
+    lib.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }) });
+    // NativeActivity shell + bgfx GLES/Vulkan renderer system libs.
+    // `android`/`log` back the glue + `__android_log_*`; `EGL`/`GLESv3`
+    // back bgfx's GLES renderer; `m`/`dl` are pulled by Bionic. The C++
+    // runtime is provided by Zig's own `-lc++` (bgfx/bx/bimg are consumed
+    // as STATIC archives into the .so), so we do NOT link the NDK's
+    // `libc++_shared.so` — it lives outside the per-API sysroot lib dir
+    // and would be a redundant second STL.
+    lib.root_module.linkSystemLibrary("android", .{});
+    lib.root_module.linkSystemLibrary("log", .{});
+    lib.root_module.linkSystemLibrary("EGL", .{});
+    lib.root_module.linkSystemLibrary("GLESv3", .{});
+    lib.root_module.linkSystemLibrary("m", .{});
+    lib.root_module.linkSystemLibrary("dl", .{});
 
     // Zig does not bundle Android libc — provide a libc.txt that points the
     // compiler at the NDK sysroot so Zig can resolve <stdio.h> and friends.

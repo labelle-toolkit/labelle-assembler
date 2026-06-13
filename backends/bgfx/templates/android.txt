@@ -1,0 +1,100 @@
+// bgfx Android lifecycle (NativeActivity).
+//
+// Unlike the bgfx DESKTOP template — which owns a linear
+// `pub fn main() { init; while (!shouldClose) { tick; render } }` body —
+// the Android shell (`backends/bgfx/src/android_app.zig`) owns the event +
+// frame loop. The NativeActivity glue calls our exported `android_main`
+// on a dedicated app thread; from there `android_app.run(app)` pumps the
+// ALooper, brings bgfx up on `INIT_WINDOW`, and calls back into the game
+// once per frame (`tick_fn`) plus once at surface-ready (`init_fn`).
+//
+// So this template inverts the desktop body into three callbacks:
+//   * `gameInit`  — engine + scene init, fired ONCE after bgfx is live
+//                   (registered via `android_app.setInitCallback`).
+//   * `gameFrame` — one engine frame: tick + render (registered via
+//                   `android_app.setTickCallback`).
+//   * `android_main` — the C entry the glue calls. Registers the two
+//                   callbacks, then hands the loop to `android_app.run`.
+//
+// `labelle_provides_android_main` tells the backend's `android_app.zig` to
+// suppress ITS own `android_main` export (otherwise a duplicate symbol);
+// the game owns the entry so it can register callbacks before the loop.
+const android_app = @import("backend_app");
+
+pub const labelle_provides_android_main = true;
+
+// sokol-compat shim (#303). The engine's `src/android.zig` reaches the
+// running `ANativeActivity*` via `extern "c" sapp_android_get_native_activity()`
+// — a symbol sokol_app exports on Android. A bgfx-on-Android build links no
+// sokol, so without this the `.so` fails to `dlopen` ("cannot locate symbol
+// sapp_android_get_native_activity"), crashing in the NativeActivity loader
+// before `android_main` ever runs. Export it from the ROOT module (reliably
+// lands in the `.so`, unlike a stripped weak def in the backend module),
+// forwarding to the activity the bgfx shell stashes from the glue.
+export fn sapp_android_get_native_activity() callconv(.c) ?*anyopaque {
+    return android_app.getNativeActivity();
+}
+
+// Android gamepad JNI bridge stubs (#303). labelle-core's
+// `gamepad_source/android.zig` binds `labelle_android_gamepad_init` /
+// `_shutdown` as `extern "c"` — the JNI listener the SOKOL fork's C code
+// defines. A bgfx-on-Android build links no sokol, so these are otherwise
+// undefined and the `.so` fails to `dlopen`. There is no bgfx Android
+// gamepad bridge yet (a separate ticket — see the backend×platform
+// matrix), so stub them as no-ops: gamepad detection is simply inert on
+// bgfx-Android for now, and the engine's gamepad path degrades gracefully
+// (no controllers reported) rather than crashing the loader. Wiring a real
+// JNI bridge later replaces these.
+export fn labelle_android_gamepad_init(activity: ?*const anyopaque) callconv(.c) void {
+    _ = activity;
+}
+export fn labelle_android_gamepad_shutdown() callconv(.c) void {}
+
+{{module_vars}}var g: AssembledGame = undefined;
+{{hooks_init_block}}
+var gpa = std.heap.DebugAllocator(.{}).init;
+
+const screen_w: u32 = {{width}};
+const screen_h: u32 = {{height}};
+const screen_title = "{{title}}";
+const target_fps: u32 = {{fps}};
+
+// {{platform_comment}}
+// One-shot surface-ready init: bgfx is already up against the
+// ANativeWindow surface (the shell called `window.initWindow` on
+// INIT_WINDOW just before firing this). Build the game, wire hooks, and
+// run the project's setup/scene-load code. Runs on the app thread, once.
+fn gameInit() callconv(.c) void {
+    const allocator = gpa.allocator();
+    g = AssembledGame.init(allocator);
+
+    g.setHooks(&hooks);
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+{{preview_setup}}{{init_code}}}
+
+// Per-frame tick: advance the engine, then render through bgfx. Mirrors
+// the desktop template's loop body (tick → beginDrawing → render →
+// endDrawing). The shell only calls this while the surface is live and
+// the activity is resumed, so no `isRunning()`/close handling is needed
+// here — the activity lifecycle drives shutdown.
+fn gameFrame() callconv(.c) void {
+    const dt: f32 = 0.016;
+{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
+
+    window.beginDrawing();
+    window.clearBackground(245, 245, 245, 255);
+    g.render();
+    g.renderGizmos();
+{{gui_draw_code}}    window.endDrawing();
+}
+
+// {{entry_comment}}
+// The NativeActivity glue (`android_native_app_glue.c`, compiled into the
+// `android_app` module) declares `extern void android_main(struct
+// android_app*)` and calls it on the app thread. We register the game's
+// init + frame callbacks, then hand the event/frame loop to the shell.
+export fn android_main(app: *android_app.android_app) callconv(.c) void {
+    android_app.setInitCallback(&gameInit);
+    android_app.setTickCallback(&gameFrame);
+    android_app.run(app);
+}
