@@ -90,6 +90,22 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+
+    // ── Unit tests for the CPU image decoders (PNG/BMP/TGA) ─────────
+    // gfx.zig only imports `std` (the `wgpu` import is gated behind the
+    // native artifact and unused by the decode path), so its decode
+    // tests build on any host. `link_libc = true` resolves the libc
+    // FILE externs used by the legacy `loadTexture` path-loader.
+    const gfx_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gfx.zig"),
+            .target = host_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
     const test_step = b.step("test", "Run wgpu backend unit tests");
     test_step.dependOn(&b.addRunArtifact(wav_parser_tests).step);
+    test_step.dependOn(&b.addRunArtifact(gfx_tests).step);
 }
