@@ -69,7 +69,13 @@ fn gameInit() callconv(.c) void {
     g = AssembledGame.init(allocator);
 
     g.setHooks(&hooks);
-    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    // Sync the engine's screen height to the REAL surface size, not the
+    // compile-time config: the shell created the ANativeWindow (and bgfx)
+    // at the device's native resolution just before this runs, so
+    // `window.getScreenHeight()` is the actual height. Using the config
+    // `screen_h` here would mis-map gizmo/UI coordinates on any device
+    // whose surface differs from the configured default.
+    g.setScreenHeight(@as(f32, @floatFromInt(window.getScreenHeight())));
 {{preview_setup}}{{init_code}}}
 
 // Per-frame tick: advance the engine, then render through bgfx. Mirrors

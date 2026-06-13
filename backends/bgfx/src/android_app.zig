@@ -43,8 +43,14 @@ const is_android = builtin.target.os.tag == .linux and
 /// `android_main` that registers the init/tick callbacks then calls
 /// `run(app)`. When false (backend self-test, or a future shell-owned
 /// entry), this module's own `android_main` export is emitted instead.
-const game_owns_main = @hasDecl(root, "labelle_provides_android_main") and
-    root.labelle_provides_android_main;
+// Explicit nested form rather than `@hasDecl(...) and root.<decl>`: although
+// `and` lazily short-circuits at comptime (so the bare form also compiles),
+// the if/else makes the "only read the decl when it exists" intent
+// unambiguous and avoids any reader doubt about analyzing a missing decl.
+const game_owns_main = if (@hasDecl(root, "labelle_provides_android_main"))
+    root.labelle_provides_android_main
+else
+    false;
 
 // ── Default surface size ────────────────────────────────────────────
 // The real width/height come from the `ANativeWindow` once it exists;
