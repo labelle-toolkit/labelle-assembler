@@ -580,16 +580,18 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
 }
 
 /// Pure CPU decode, safe from a worker thread. wgpu's backend ships
-/// hand-rolled BMP and TGA decoders (no stb_image link) — we try BMP
-/// first, then fall back to TGA. The caller's allocator owns the
-/// returned `pixels` buffer and frees it on both the success and the
-/// discard paths.
+/// hand-rolled BMP, TGA and PNG decoders (no stb_image link). We sniff
+/// the signature and dispatch: PNG first (it has an unambiguous 8-byte
+/// magic), then BMP, then TGA (which has no magic, so it's the
+/// last-resort fallback). The caller's allocator owns the returned
+/// `pixels` buffer and frees it on both the success and the discard
+/// paths.
 pub fn decodeImage(
     _: [:0]const u8,
     data: []const u8,
     allocator: std.mem.Allocator,
 ) !DecodedImage {
-    // TODO: Add PNG decoding (requires inflate/zlib decompression) or integrate stb_image
+    if (decodePng(data, allocator)) |img| return img;
     if (decodeBmp(data, allocator)) |img| return img;
     if (decodeTga(data, allocator)) |img| return img;
     return error.LoadFailed;
@@ -754,7 +756,239 @@ fn decodeTga(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
     return DecodedImage{ .pixels = pixels, .width = width, .height = height };
 }
 
-// TODO: Add PNG decoding (requires inflate/zlib decompression) or integrate stb_image
+/// Decode a non-interlaced, 8-bit PNG to RGBA8.
+///
+/// Supported subset (returns `null` for anything outside it):
+///   • Bit depth: 8 only (1/2/4/16 rejected).
+///   • Interlace: 0 (none) only — Adam7 interlacing is rejected.
+///   • Color types:
+///       0  grayscale            → gray replicated to RGB, A = 255
+///       2  truecolor (RGB)      → RGB, A = 255
+///       3  indexed (palette)    → PLTE lookup, optional tRNS for alpha
+///       4  grayscale+alpha      → gray replicated to RGB, A from sample
+///       6  truecolor+alpha      → RGBA passthrough
+///
+/// PNG pipeline: validate the 8-byte signature, walk IHDR/PLTE/tRNS/IDAT/
+/// IEND chunks, concatenate all IDAT data, zlib-inflate it (std
+/// `compress.flate` — no DEFLATE is hand-rolled), then unfilter the
+/// scanlines (filter types 0–4: None/Sub/Up/Average/Paeth) and expand
+/// each pixel to RGBA8. Chunk CRCs are not verified (we trust the
+/// inflate + structural checks). The caller's allocator owns the
+/// returned `pixels`.
+fn decodePng(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
+    const sig = [_]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    if (data.len < sig.len or !std.mem.eql(u8, data[0..sig.len], &sig)) return null;
+
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var bit_depth: u8 = 0;
+    var color_type: u8 = 0;
+    var interlace: u8 = 0;
+    var seen_ihdr = false;
+
+    // Palette (color type 3): up to 256 RGB entries + optional per-index alpha.
+    var palette: [256][3]u8 = undefined;
+    var palette_alpha: [256]u8 = [_]u8{255} ** 256;
+    var palette_len: usize = 0;
+
+    // Concatenated IDAT payload (the zlib stream). Owned here, freed below.
+    var idat: std.ArrayListUnmanaged(u8) = .empty;
+    defer idat.deinit(allocator);
+
+    // Walk chunks: 4-byte length, 4-byte type, length bytes data, 4-byte CRC.
+    var pos: usize = sig.len;
+    var saw_iend = false;
+    while (data.len - pos >= 8) {
+        const chunk_len = std.mem.readInt(u32, data[pos..][0..4], .big);
+        const ctype = data[pos + 4 ..][0..4];
+        const body_start = pos + 8;
+        // Bounds via subtraction so a malformed `chunk_len` (e.g.
+        // 0xFFFFFFFF) can't overflow `usize` and bypass the check. We
+        // need `chunk_len` body bytes plus a 4-byte trailing CRC.
+        if (data.len - body_start < chunk_len) return null; // truncated body
+        if (data.len - body_start - chunk_len < 4) return null; // missing CRC
+        const body_end = body_start + chunk_len;
+        const body = data[body_start..body_end];
+
+        if (std.mem.eql(u8, ctype, "IHDR")) {
+            if (chunk_len != 13) return null;
+            width = std.mem.readInt(u32, body[0..4], .big);
+            height = std.mem.readInt(u32, body[4..8], .big);
+            bit_depth = body[8];
+            color_type = body[9];
+            // body[10] = compression (only 0 defined), body[11] = filter
+            // method (only 0 defined), body[12] = interlace.
+            interlace = body[12];
+            seen_ihdr = true;
+        } else if (std.mem.eql(u8, ctype, "PLTE")) {
+            if (chunk_len % 3 != 0) return null;
+            palette_len = chunk_len / 3;
+            if (palette_len > 256) return null;
+            var i: usize = 0;
+            while (i < palette_len) : (i += 1) {
+                palette[i] = .{ body[i * 3 + 0], body[i * 3 + 1], body[i * 3 + 2] };
+            }
+        } else if (std.mem.eql(u8, ctype, "tRNS")) {
+            // For indexed images, tRNS is a list of per-index alpha values.
+            // (We only support tRNS for color type 3; other types fall back
+            // to opaque alpha, which is a documented limitation.)
+            if (color_type == 3) {
+                const n = @min(chunk_len, palette_alpha.len);
+                var i: usize = 0;
+                while (i < n) : (i += 1) palette_alpha[i] = body[i];
+            }
+        } else if (std.mem.eql(u8, ctype, "IDAT")) {
+            idat.appendSlice(allocator, body) catch return null;
+        } else if (std.mem.eql(u8, ctype, "IEND")) {
+            saw_iend = true;
+            break;
+        }
+
+        pos = body_end + 4; // skip CRC
+    }
+
+    if (!seen_ihdr or !saw_iend) return null;
+    if (width == 0 or height == 0) return null;
+    if (interlace != 0) return null; // Adam7 not supported
+    if (bit_depth != 8) return null; // only 8-bit samples supported
+    if (color_type == 3 and palette_len == 0) return null;
+
+    // Samples (bytes) per pixel in the raw (filtered) scanline.
+    const channels: usize = switch (color_type) {
+        0 => 1, // grayscale
+        2 => 3, // truecolor
+        3 => 1, // indexed (1 byte = palette index)
+        4 => 2, // grayscale + alpha
+        6 => 4, // truecolor + alpha
+        else => return null,
+    };
+
+    // Inflate the concatenated IDAT zlib stream. Each scanline is
+    // prefixed by a 1-byte filter type, so raw size = h * (1 + w*channels).
+    // `width`/`height` come straight from untrusted IHDR, so the size
+    // arithmetic uses checked ops — an overflowed product would otherwise
+    // under-allocate `raw` and let the unfilter loop write out of bounds.
+    const stride = std.math.mul(usize, width, channels) catch return null; // bytes per row, no filter byte
+    const row_len = std.math.add(usize, stride, 1) catch return null; // + filter byte
+    const raw_size = std.math.mul(usize, height, row_len) catch return null;
+
+    const raw = allocator.alloc(u8, raw_size) catch return null;
+    defer allocator.free(raw);
+
+    {
+        var in_reader = std.Io.Reader.fixed(idat.items);
+        var out_writer = std.Io.Writer.fixed(raw);
+        // Empty window buffer = "direct" mode; flate reads straight from the
+        // fixed input. `.zlib` container handles the 2-byte zlib header +
+        // Adler-32 footer that wraps PNG's DEFLATE stream.
+        var decompress = std.compress.flate.Decompress.init(&in_reader, .zlib, &.{});
+        const n = decompress.reader.streamRemaining(&out_writer) catch return null;
+        if (n != raw_size) return null; // wrong amount of data
+    }
+
+    // Output RGBA8 buffer. Checked arithmetic for the same untrusted-dims
+    // overflow reason as `raw_size` above. (No `errdefer` here: this
+    // function returns `?DecodedImage`, not an error union, so an errdefer
+    // would never fire — the failure paths below free `pixels` manually.)
+    const out_size = std.math.mul(usize, std.math.mul(usize, width, height) catch return null, 4) catch return null;
+    const pixels = allocator.alloc(u8, out_size) catch return null;
+
+    // Unfilter scanlines in place within `raw` (we overwrite the filtered
+    // bytes with reconstructed ones, row by row, top to bottom).
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        const row_off = y * (1 + stride);
+        const filter = raw[row_off];
+        const cur = raw[row_off + 1 ..][0..stride];
+        const prev: ?[]const u8 = if (y == 0)
+            null
+        else
+            raw[(y - 1) * (1 + stride) + 1 ..][0..stride];
+
+        var i: usize = 0;
+        while (i < stride) : (i += 1) {
+            const a: i32 = if (i >= channels) cur[i - channels] else 0; // left
+            const b: i32 = if (prev) |p| p[i] else 0; // up
+            const c: i32 = if (prev != null and i >= channels) prev.?[i - channels] else 0; // up-left
+            const x: i32 = cur[i];
+            const recon: i32 = switch (filter) {
+                0 => x, // None
+                1 => x + a, // Sub
+                2 => x + b, // Up
+                3 => x + @divFloor(a + b, 2), // Average
+                4 => x + paeth(a, b, c), // Paeth
+                else => {
+                    allocator.free(pixels);
+                    return null;
+                },
+            };
+            cur[i] = @truncate(@as(u32, @bitCast(recon)));
+        }
+
+        // Expand this reconstructed scanline to RGBA8.
+        var px: usize = 0;
+        while (px < width) : (px += 1) {
+            const dst = (y * @as(usize, width) + px) * 4;
+            switch (color_type) {
+                0 => { // grayscale
+                    const g = cur[px];
+                    pixels[dst + 0] = g;
+                    pixels[dst + 1] = g;
+                    pixels[dst + 2] = g;
+                    pixels[dst + 3] = 255;
+                },
+                2 => { // truecolor RGB
+                    const s = px * 3;
+                    pixels[dst + 0] = cur[s + 0];
+                    pixels[dst + 1] = cur[s + 1];
+                    pixels[dst + 2] = cur[s + 2];
+                    pixels[dst + 3] = 255;
+                },
+                3 => { // indexed
+                    const idx = cur[px];
+                    if (idx >= palette_len) {
+                        allocator.free(pixels);
+                        return null;
+                    }
+                    pixels[dst + 0] = palette[idx][0];
+                    pixels[dst + 1] = palette[idx][1];
+                    pixels[dst + 2] = palette[idx][2];
+                    pixels[dst + 3] = palette_alpha[idx];
+                },
+                4 => { // grayscale + alpha
+                    const s = px * 2;
+                    const g = cur[s + 0];
+                    pixels[dst + 0] = g;
+                    pixels[dst + 1] = g;
+                    pixels[dst + 2] = g;
+                    pixels[dst + 3] = cur[s + 1];
+                },
+                6 => { // truecolor + alpha
+                    const s = px * 4;
+                    pixels[dst + 0] = cur[s + 0];
+                    pixels[dst + 1] = cur[s + 1];
+                    pixels[dst + 2] = cur[s + 2];
+                    pixels[dst + 3] = cur[s + 3];
+                },
+                else => unreachable,
+            }
+        }
+    }
+
+    return DecodedImage{ .pixels = pixels, .width = width, .height = height };
+}
+
+/// PNG Paeth predictor (filter type 4). Operates on i32 to avoid the
+/// wraparound that the spec's byte arithmetic would otherwise mask.
+fn paeth(a: i32, b: i32, c: i32) i32 {
+    const p = a + b - c;
+    const pa = @abs(p - a);
+    const pb = @abs(p - b);
+    const pc = @abs(p - c);
+    if (pa <= pb and pa <= pc) return a;
+    if (pb <= pc) return b;
+    return c;
+}
 
 // ── Text rendering (bitmap font atlas) ─────────────────────────────────
 
@@ -955,4 +1189,66 @@ pub fn worldToScreen(pos: Vector2, camera: Camera2D) Vector2 {
         .x = (pos.x - camera.target.x) * camera.zoom + camera.offset.x,
         .y = (pos.y - camera.target.y) * camera.zoom + camera.offset.y,
     };
+}
+
+// ── PNG decoder tests ──────────────────────────────────────────────────
+// Each fixture is a real PNG (produced by zlib + the PNG spec, see the
+// generator in PR #293's history) embedded as a byte array so the test
+// is self-contained and exercises the full sniff → inflate → unfilter →
+// RGBA8 pipeline.
+
+test "decodePng: 2x2 truecolor+alpha (filter None)" {
+    // Pixels (row-major): (255,0,0,255) (0,255,0,128) / (0,0,255,255) (255,255,0,64)
+    const png_rgba_2x2 = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00, 0x16, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x08, 0x1b, 0x18, 0x80, 0x34, 0x10, 0x30, 0x38, 0x00, 0x00, 0x42, 0x15, 0x07, 0xba, 0x58, 0x65, 0x3e, 0xfa, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82 };
+    const img = decodePng(&png_rgba_2x2, std.testing.allocator) orelse return error.DecodeFailed;
+    defer std.testing.allocator.free(img.pixels);
+    try std.testing.expectEqual(@as(u32, 2), img.width);
+    try std.testing.expectEqual(@as(u32, 2), img.height);
+    const want = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 255, 255, 0, 64 };
+    try std.testing.expectEqualSlices(u8, &want, img.pixels);
+}
+
+test "decodePng: 3x1 truecolor RGB with Sub filter" {
+    // Pixels: (10,20,30) (40,60,80) (200,100,50), all alpha padded to 255.
+    const png_rgb_sub_3x1 = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x94, 0x82, 0x83, 0xe3, 0x00, 0x00, 0x00, 0x12, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xe4, 0x12, 0x91, 0x93, 0xd3, 0x30, 0x5a, 0xa0, 0xf1, 0x08, 0x00, 0x07, 0x36, 0x02, 0x60, 0x4d, 0x9d, 0x20, 0xcd, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82 };
+    const img = decodePng(&png_rgb_sub_3x1, std.testing.allocator) orelse return error.DecodeFailed;
+    defer std.testing.allocator.free(img.pixels);
+    try std.testing.expectEqual(@as(u32, 3), img.width);
+    try std.testing.expectEqual(@as(u32, 1), img.height);
+    const want = [_]u8{ 10, 20, 30, 255, 40, 60, 80, 255, 200, 100, 50, 255 };
+    try std.testing.expectEqualSlices(u8, &want, img.pixels);
+}
+
+test "decodePng: 2x2 indexed palette with tRNS alpha" {
+    // Palette: idx0=red(255,0,0) a=255, idx1=green(0,255,0) a=128.
+    // Indices row-major: 0,1 / 1,0
+    const png_indexed_2x2 = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x03, 0x00, 0x00, 0x00, 0x45, 0x68, 0xfd, 0x16, 0x00, 0x00, 0x00, 0x06, 0x50, 0x4c, 0x54, 0x45, 0xff, 0x00, 0x00, 0x00, 0xff, 0x00, 0xd2, 0x87, 0xef, 0x71, 0x00, 0x00, 0x00, 0x02, 0x74, 0x52, 0x4e, 0x53, 0xff, 0x80, 0x08, 0x0f, 0xb3, 0x6a, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60, 0x60, 0x04, 0x42, 0x00, 0x00, 0x0c, 0x00, 0x03, 0x15, 0x9e, 0x18, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82 };
+    const img = decodePng(&png_indexed_2x2, std.testing.allocator) orelse return error.DecodeFailed;
+    defer std.testing.allocator.free(img.pixels);
+    try std.testing.expectEqual(@as(u32, 2), img.width);
+    try std.testing.expectEqual(@as(u32, 2), img.height);
+    const want = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 128, 0, 255, 0, 128, 255, 0, 0, 255 };
+    try std.testing.expectEqualSlices(u8, &want, img.pixels);
+}
+
+test "decodePng: 1x2 grayscale+alpha with Up filter" {
+    // Row0 (gray=100, a=255), Row1 (gray=50, a=128); row1 uses Up filter.
+    const png_gray_alpha_up_1x2 = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x33, 0x88, 0x7e, 0xac, 0x00, 0x00, 0x00, 0x0e, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x48, 0xf9, 0xcf, 0x74, 0xae, 0x11, 0x00, 0x08, 0x19, 0x02, 0xb5, 0xd5, 0xbb, 0x84, 0x9c, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82 };
+    const img = decodePng(&png_gray_alpha_up_1x2, std.testing.allocator) orelse return error.DecodeFailed;
+    defer std.testing.allocator.free(img.pixels);
+    try std.testing.expectEqual(@as(u32, 1), img.width);
+    try std.testing.expectEqual(@as(u32, 2), img.height);
+    const want = [_]u8{ 100, 100, 100, 255, 50, 50, 50, 128 };
+    try std.testing.expectEqualSlices(u8, &want, img.pixels);
+}
+
+test "decodePng: rejects non-PNG and routes through decodeImage" {
+    const not_png = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    try std.testing.expect(decodePng(&not_png, std.testing.allocator) == null);
+
+    // decodeImage should dispatch a real PNG to the PNG decoder.
+    const png_rgba_2x2 = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00, 0x16, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x08, 0x1b, 0x18, 0x80, 0x34, 0x10, 0x30, 0x38, 0x00, 0x00, 0x42, 0x15, 0x07, 0xba, 0x58, 0x65, 0x3e, 0xfa, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82 };
+    const img = try decodeImage("", &png_rgba_2x2, std.testing.allocator);
+    defer std.testing.allocator.free(img.pixels);
+    try std.testing.expectEqual(@as(u32, 2), img.width);
 }
