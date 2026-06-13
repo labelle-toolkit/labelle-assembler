@@ -1603,3 +1603,100 @@ test "decodePng: rejects non-PNG and routes through decodeImage" {
     defer std.testing.allocator.free(img.pixels);
     try std.testing.expectEqual(@as(u32, 2), img.width);
 }
+
+// ── Glyph-atlas text tests ─────────────────────────────────────────────
+// Pure-CPU: drive drawText and inspect the sprite batch / segments / atlas
+// pixels. No GPU needed.
+
+test "drawText: emits one sprite quad per non-space printable glyph" {
+    _ = consumeFrame();
+    setScreenSize(800, 600);
+
+    const atlas_id = ensureFontAtlas();
+    try std.testing.expect(atlas_id != 0);
+
+    drawText("Hi", 10, 10, 16, white);
+
+    const frame = consumeFrame();
+
+    // "Hi" = 2 non-space printable glyphs -> 2 sprite quads (4 verts / 6
+    // indices each), all tagged with the atlas texture id.
+    try std.testing.expectEqual(@as(usize, 2), frame.sprite_texture_ids.len);
+    try std.testing.expectEqual(atlas_id, frame.sprite_texture_ids[0]);
+    try std.testing.expectEqual(atlas_id, frame.sprite_texture_ids[1]);
+    try std.testing.expectEqual(@as(usize, 8), frame.sprite_vertices.len);
+    try std.testing.expectEqual(@as(usize, 12), frame.sprite_indices.len);
+    // Text emits zero shape geometry now.
+    try std.testing.expectEqual(@as(usize, 0), frame.shape_vertices.len);
+
+    // The two coalesce into a single ordered sprite segment.
+    try std.testing.expectEqual(@as(usize, 1), frame.segments.len);
+    try std.testing.expectEqual(SegmentKind.sprite, frame.segments[0].kind);
+    try std.testing.expectEqual(@as(u32, 12), frame.segments[0].index_count);
+    try std.testing.expectEqual(@as(u32, 2), frame.segments[0].quad_count);
+}
+
+test "drawText: space emits no quad but advances the cursor" {
+    _ = consumeFrame();
+    setScreenSize(800, 600);
+    _ = ensureFontAtlas();
+
+    // NOTE: consumeFrame returns slices into the SAME global vertex buffer,
+    // so a later drawText overwrites an earlier frame's slice. Capture the
+    // few values we need immediately after each consume, before drawing again.
+
+    // "AB" = 2 glyphs; "A B" = 3 chars but the space emits no quad -> still 2.
+    drawText("AB", 0, 0, 16, white);
+    const f1 = consumeFrame();
+    try std.testing.expectEqual(@as(usize, 2), f1.sprite_texture_ids.len);
+    // Both strings put glyph 'A' at x=0 (quad 0 TL = sprite_vertices[0]) and
+    // 'B' at quad 1 TL = sprite_vertices[4]. Gap between them, in NDC.
+    const a_left_f1 = f1.sprite_vertices[0].position[0];
+    const gap_f1 = f1.sprite_vertices[4].position[0] - a_left_f1;
+
+    drawText("A B", 0, 0, 16, white);
+    const f2 = consumeFrame();
+    try std.testing.expectEqual(@as(usize, 2), f2.sprite_texture_ids.len);
+    const a_left_f2 = f2.sprite_vertices[0].position[0];
+    const gap_f2 = f2.sprite_vertices[4].position[0] - a_left_f2;
+
+    // 'A' starts at the same place in both strings.
+    try std.testing.expectApproxEqAbs(a_left_f1, a_left_f2, 1e-5);
+    // The space advanced the cursor: 'B' sits one extra glyph_w further
+    // right in "A B" than in "AB", so the gap is exactly doubled. Ratio is
+    // screen-size independent.
+    try std.testing.expect(gap_f1 > 0);
+    try std.testing.expectApproxEqAbs(2 * gap_f1, gap_f2, 1e-5);
+}
+
+test "buildFontAtlasPixels: coverage alpha set where glyph bit is set, padding transparent" {
+    var pixels: [FONT_ATLAS_W * FONT_ATLAS_H * 4]u8 = undefined;
+    buildFontAtlasPixels(&pixels);
+
+    // 'A' (0x41) glyph row 0 = 0x18 = 0b00011000 -> set bits at columns 3,4.
+    const gi: usize = 0x41 - 0x20;
+    const cell_col = gi % FONT_ATLAS_COLS;
+    const cell_row = gi / FONT_ATLAS_COLS;
+    const ox = cell_col * FONT_ATLAS_CELL_W + FONT_ATLAS_PAD;
+    const oy = cell_row * FONT_ATLAS_CELL_H + FONT_ATLAS_PAD;
+
+    // Set texel (row 0, col 3): white RGB + alpha 255.
+    {
+        const idx = ((oy + 0) * FONT_ATLAS_W + (ox + 3)) * 4;
+        try std.testing.expectEqual(@as(u8, 255), pixels[idx + 0]);
+        try std.testing.expectEqual(@as(u8, 255), pixels[idx + 1]);
+        try std.testing.expectEqual(@as(u8, 255), pixels[idx + 2]);
+        try std.testing.expectEqual(@as(u8, 255), pixels[idx + 3]);
+    }
+    // Clear texel (row 0, col 0): fully transparent.
+    {
+        const idx = ((oy + 0) * FONT_ATLAS_W + (ox + 0)) * 4;
+        try std.testing.expectEqual(@as(u8, 0), pixels[idx + 3]);
+    }
+    // Padding texel just left of the glyph's inner origin: fully transparent.
+    {
+        const idx = (oy * FONT_ATLAS_W + (ox - 1)) * 4;
+        try std.testing.expectEqual(@as(u8, 0), pixels[idx + 0]);
+        try std.testing.expectEqual(@as(u8, 0), pixels[idx + 3]);
+    }
+}
