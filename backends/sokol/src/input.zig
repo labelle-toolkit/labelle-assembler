@@ -461,7 +461,15 @@ pub const Event = sapp.Event;
 /// (`engine.core.registerAndroidBackend(...)`) so core's gamepad source and the
 /// engine's immersive mode can reach the running ANativeActivity / InputManager
 /// without core/engine linking any sokol symbol directly. See `android.zig`.
-pub const android = @import("android.zig");
+// Android-only: the adapter imports `labelle-core` (for `AndroidBackendContext`)
+// and references sokol's `androidGetNativeActivity`, neither of which is wired
+// into the input module on desktop/wasm. Gate the re-export so `android.zig` is
+// only analyzed on Android (where `build.zig` wires core in); on other targets
+// it resolves to an empty namespace and is never compiled.
+pub const android = if (builtin.target.abi == .android or builtin.target.abi == .androideabi)
+    @import("android.zig")
+else
+    struct {};
 
 /// One-shot guard so we register the Android forwarded-gamepad callback with
 /// the sokol fork exactly once, lazily, at the first frame. Registering here

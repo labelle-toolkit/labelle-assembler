@@ -61,8 +61,9 @@ pub const is_android = builtin.target.abi == .android or builtin.target.abi == .
 //   void labelle_android_gamepad_shutdown(void);
 // They are defined as no-ops off Android, so declaring them unconditionally is
 // safe — but we only ever wire them into a registered context on Android.
-extern "c" fn labelle_android_gamepad_init(activity: ?*anyopaque) callconv(.c) void;
-extern "c" fn labelle_android_gamepad_shutdown() callconv(.c) void;
+// `extern "c"` already implies the C calling convention — no `callconv(.c)`.
+extern "c" fn labelle_android_gamepad_init(activity: ?*anyopaque) void;
+extern "c" fn labelle_android_gamepad_shutdown() void;
 
 /// `callconv(.c)` adapter for the seam's `get_native_activity`. sokol's
 /// `sapp_android_get_native_activity()` returns `?*const anyopaque`; the seam's
