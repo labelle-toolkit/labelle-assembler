@@ -24,6 +24,9 @@
     .ecs = .mock,
     .initial_prefab = "main",
     .states = .{"playing"},
+    .resources = .{
+        .{ .name = "icons", .json = "assets/icon.json", .texture = "assets/icon.tga" },
+    },
     .layers = .{
         .{ .name = "far_background", .order = 0, .space = .screen },
         .{ .name = "terrain", .order = 1, .space = .world },
