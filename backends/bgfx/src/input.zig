@@ -27,6 +27,42 @@ const glfw = if (is_android) struct {} else @import("zglfw");
 // symbols are gated internally), but its state is only read on Android.
 const agp = @import("android_gamepad");
 
+// Desktop gamepad source toggle (core#28 slice 5), forwarded from the backend
+// build.zig. When true (default, `.gamepad = .auto`) the shared windowless-SDL
+// desktop gamepad source is wired in and the DESKTOP gamepad getters below route
+// to it: SDL's HIDAPI drivers decode controllers (Switch-mode Nintendo Pro
+// Controller / 8BitDo raw-HID) that GLFW — the toolkit bgfx uses for windowing —
+// cannot. When false (`.gamepad = .none` opt-out) the `sdl_gamepad` module is
+// NOT in the build graph, so we must not `@import` it, and the desktop getters
+// fall back to the GLFW path (#315). Mirrors raylib/sokol's input.zig.
+const gamepad_enabled = @import("build_options").gamepad_enabled;
+
+// Desktop predicate matching `targetIsDesktop` in build.zig — the build wires
+// the `sdl_gamepad` module ONLY when (gamepad_enabled AND desktop AND
+// !android), so the `@import` must be gated identically; importing it on a
+// target where it isn't in the graph is a compile error. The `@import` lives
+// inside the taken comptime branch so it is NOT evaluated when the module is
+// absent (opt-out / Android / wasm).
+const target_is_desktop = blk: {
+    const t = builtin.target;
+    if (t.abi == .android or t.abi == .androideabi) break :blk false;
+    if (t.cpu.arch.isWasm()) break :blk false;
+    break :blk switch (t.os.tag) {
+        .macos, .windows, .linux => true,
+        else => false,
+    };
+};
+
+const sdl_gp = if (gamepad_enabled and target_is_desktop) @import("sdl_gamepad") else struct {
+    pub const is_desktop = false;
+};
+
+/// Desktop (non-Android) with the SDL source wired: gamepad state/hotplug comes
+/// from the shared SDL source instead of GLFW. Resolved at comptime so the
+/// unused branch (and its SDL or GLFW gamepad refs) is eliminated per target.
+/// False whenever opted out, on Android, or off desktop.
+const use_sdl_gamepad = gamepad_enabled and sdl_gp.is_desktop;
+
 const MAX_KEYS = 512;
 const MAX_MOUSE_BUTTONS = 8;
 
@@ -115,7 +151,16 @@ pub fn newFrame() void {
     }
 
     // Snapshot gamepad button edges for this frame's `isGamepadButtonPressed`.
-    snapshotGamepads();
+    // When the SDL desktop source is wired (`.gamepad = .auto`), pump it once
+    // per frame: `update()` lazily inits SDL, drains hotplug, and refreshes the
+    // button snapshot used for the SDL Source's own rising-edge detection — so
+    // the GLFW snapshot is skipped (its getters aren't consulted). On
+    // `.gamepad = .none` the SDL module is absent and we keep the GLFW snapshot.
+    if (comptime use_sdl_gamepad) {
+        sdl_gp.Source.update();
+    } else {
+        snapshotGamepads();
+    }
 }
 
 // ── Keyboard ──────────────────────────────────────────────
@@ -340,11 +385,16 @@ pub fn isGamepadAvailable(gamepad: u32) bool {
     // keyed by Android device id. Connection is established by the JNI
     // detection glue (InputManager enumeration) + first input event.
     if (comptime is_android) return agp.connected(gamepad);
+    // Desktop with the SDL source wired (`.gamepad = .auto`): route through
+    // SDL's HIDAPI drivers (Switch/8BitDo raw-HID GLFW can't decode). The
+    // Source emits the same canonical numbering as the GLFW path.
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.isAvailable(gamepad);
     return glfw.joystickPresent(@enumFromInt(gamepad));
 }
 
 pub fn isGamepadButtonDown(gamepad: u32, button: u32) bool {
     if (comptime is_android) return agp.buttonDown(gamepad, button);
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonDown(gamepad, button);
     if (gamepad >= MAX_GAMEPADS or button >= CANON_BUTTON_COUNT) return false;
     const state = glfw.getGamepadState(@enumFromInt(gamepad)) catch return false;
     return glfwButtonDown(state, button);
@@ -352,6 +402,7 @@ pub fn isGamepadButtonDown(gamepad: u32, button: u32) bool {
 
 pub fn isGamepadButtonPressed(gamepad: u32, button: u32) bool {
     if (comptime is_android) return agp.buttonPressed(gamepad, button);
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonPressed(gamepad, button);
     // Rising edge computed in `newFrame` from the GLFW state snapshot.
     if (gamepad >= MAX_GAMEPADS or button >= CANON_BUTTON_COUNT) return false;
     return gp_pressed[gamepad][button];
@@ -359,6 +410,7 @@ pub fn isGamepadButtonPressed(gamepad: u32, button: u32) bool {
 
 pub fn getGamepadAxisValue(gamepad: u32, axis: u32) f32 {
     if (comptime is_android) return agp.axisValue(gamepad, axis);
+    if (comptime use_sdl_gamepad) return sdl_gp.Source.axisValue(gamepad, axis);
     // Canonical axes 0..5 == GLFW axes 0..5 (LX, LY, RX, RY, LT, RT).
     if (gamepad >= MAX_GAMEPADS or axis >= glfw.Gamepad.Axis.count) return 0;
     const state = glfw.getGamepadState(@enumFromInt(gamepad)) catch return 0;
