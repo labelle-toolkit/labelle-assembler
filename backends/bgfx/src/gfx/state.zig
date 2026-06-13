@@ -72,9 +72,9 @@ pub fn toNdcX(px: f32) f32 {
     return raw * fit_scale_x;
 }
 
-pub fn toNdcY(px: f32) f32 {
+pub fn toNdcY(py: f32) f32 {
     // Flip Y: screen top=0 maps to NDC +1
-    const raw = 1.0 - (px / @as(f32, @floatFromInt(design_h))) * 2.0;
+    const raw = 1.0 - (py / @as(f32, @floatFromInt(design_h))) * 2.0;
     return raw * fit_scale_y;
 }
 
