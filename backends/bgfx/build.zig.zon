@@ -15,6 +15,27 @@
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
             .hash = "zglfw-0.10.0-dev-zgVDNIG4IQBWN_sfMD-xfC9bJS2hbBN2W7jNlDLovcdC",
         },
+        // Shared Android gamepad source (#310 Stage 4). In-tree sub-package
+        // shared with the sokol backend: the per-device STATE machine
+        // (`android_gamepad_state.zig`, #250) as the `android_gamepad` module,
+        // plus the InputManager JNI DETECTION glue (`android_gamepad_jni.c`,
+        // #248) reached via `dep.path(...)` and compiled into `input` on
+        // Android. Off Android nothing here is referenced.
+        .labelle_android_gamepad = .{
+            .path = "../android_gamepad",
+        },
+        // labelle-core (#310 Stage 4). The bgfx Android backend adapter
+        // (`src/android.zig`) imports core for the `AndroidBackendContext`
+        // type it hands to `registerAndroidBackend`. The generated build
+        // `overrideImport`s the app's unified core onto the bgfx `input` module
+        // so the registered vtable's type matches the engine's; this pin only
+        // resolves the standalone Android compile-check. v1.16.1 carries the
+        // #310 Stage 1 seam (`AndroidBackendContext`/`registerAndroidBackend`),
+        // matching the sokol backend's pin.
+        .labelle_core = .{
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.16.1.tar.gz",
+            .hash = "labelle_core-1.16.1-OauRcDNUBAA0n4uPvKp3HETPvMZprHL_kRyUERdj4xqx",
+        },
     },
     .paths = .{
         "build.zig",

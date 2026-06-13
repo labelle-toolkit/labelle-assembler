@@ -100,6 +100,28 @@ const PREVIEW_READBACK_FRAME_METAL_SOKOL = preview.PREVIEW_READBACK_FRAME_METAL_
 const PREVIEW_READBACK_CLEANUP_SOKOL_D3D11 = preview.PREVIEW_READBACK_CLEANUP_SOKOL_D3D11;
 const PREVIEW_READBACK_CLEANUP_METAL_SOKOL = preview.PREVIEW_READBACK_CLEANUP_METAL_SOKOL;
 
+/// `{{android_backend_register}}` body for the bgfx-Android `gameInit` hole
+/// (#310 Stage 4). Registers the bgfx backend's Android JNI seam with core
+/// ONCE at startup — before the first frame polls the gamepad source — so
+/// core's gamepad source + the engine's immersive mode reach the running
+/// ANativeActivity / InputManager through the bgfx adapter's
+/// `AndroidBackendContext` instead of linking any backend symbol directly.
+/// Emitted unconditionally on bgfx-Android (gamepad detection needs it even
+/// when immersive mode is off), mirroring the sokol path's
+/// `buildImmersiveEntryCode`. Replaces the removed sokol-compat shims.
+const BGFX_ANDROID_BACKEND_REGISTER =
+    \\    // Register the bgfx Android backend seam with core (labelle-core#310):
+    \\    // core's gamepad source and the engine's immersive mode reach the
+    \\    // running ANativeActivity / InputManager JNI glue through this context
+    \\    // instead of linking any backend symbol directly. Runs once at startup,
+    \\    // before the first frame polls the gamepad source. The context comes
+    \\    // from the bgfx backend adapter surfaced as `backend_input.android`;
+    \\    // `engine.core` is labelle-engine's re-export of labelle-core. See
+    \\    // backends/bgfx/src/android.zig.
+    \\    engine.core.registerAndroidBackend(@import("backend_input").android.backendContext());
+    \\
+;
+
 // ── Template-based generation (engine provides main.zig.template) ────────
 
 /// Generate main.zig using the engine's codegen template.
@@ -1186,6 +1208,16 @@ pub fn generateMainZigFromTemplate(
                 // block, and the preview-mode readback slots are empty:
                 // bgfx has no on-device preview path yet (its desktop
                 // readback is a separate, unshipped ticket like sdl/wgpu).
+                //
+                // `{{android_backend_register}}` (#310 Stage 4): register the
+                // bgfx backend's Android JNI seam with core at the top of
+                // `gameInit`, before the first frame polls the gamepad source.
+                // Replaces the old sokol-compat shims (now removed from the
+                // template). Emitted UNCONDITIONALLY on bgfx-Android — gamepad
+                // detection needs it even when immersive mode is off — mirroring
+                // the sokol path (`buildImmersiveEntryCode`). `engine.core` is
+                // labelle-engine's re-export of labelle-core; the context comes
+                // from the bgfx backend adapter surfaced as `backend_input.android`.
                 try tpl.render(lifecycle_tmpl, .{
                     .module_vars = module_vars,
                     .width = w_str,
@@ -1200,6 +1232,7 @@ pub fn generateMainZigFromTemplate(
                     .entry_comment = entry_comment,
                     .preview_setup = "",
                     .preview_heartbeat = "",
+                    .android_backend_register = BGFX_ANDROID_BACKEND_REGISTER,
                 }, bw);
             } else {
                 // Raylib wasm: emscripten-driven callback loop. Preview

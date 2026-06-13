@@ -147,6 +147,45 @@ const ALOOPER_POLL_ERROR: c_int = -4;
 const AINPUT_EVENT_TYPE_KEY: i32 = 1;
 const AINPUT_EVENT_TYPE_MOTION: i32 = 2;
 
+// ── AKeyEvent actions (android/input.h) ─────────────────────────────
+const AKEY_EVENT_ACTION_DOWN: i32 = 0;
+const AKEY_EVENT_ACTION_UP: i32 = 1;
+
+// `AKEYCODE_BACK` — many controllers map the B / "circle" / select button to
+// the system BACK key. If we leave that unconsumed, Android performs back
+// navigation (the activity finishes — the game quits) the moment the player
+// presses B. We consume BACK only when it originates from a gamepad source
+// (so the real system BACK gesture/button is untouched). Mirrors sokol's
+// B->BACK guard (assembler#248).
+const AKEYCODE_BACK: i32 = 4;
+
+// ── AInputEvent source classes/sources (android/input.h) ────────────
+// A device's source is a bitmask; controllers expose GAMEPAD and/or
+// JOYSTICK. We treat a motion event as a gamepad axis report only when its
+// source carries JOYSTICK (analog sticks/triggers/hat live there); key
+// events from GAMEPAD/JOYSTICK/KEYBOARD-with-buttons carry the BUTTON_*/
+// DPAD_* keycodes the shared state module maps. Mirrors the source masks in
+// the JNI glue (`is_gamepad_sources`).
+const AINPUT_SOURCE_GAMEPAD: i32 = 0x00000401;
+const AINPUT_SOURCE_JOYSTICK: i32 = 0x01000010;
+
+// ── AMOTION_EVENT_AXIS_* (android/input.h) ──────────────────────────
+// The raw MotionEvent axis ids we sample into the shared state module's
+// forwarded-axis buffer (indexed by `input.GAMEPAD_AXIS_COUNT` / `agp.FA_*`).
+// Order here mirrors that buffer's FA_* layout.
+const AMOTION_EVENT_AXIS_X: i32 = 0;
+const AMOTION_EVENT_AXIS_Y: i32 = 1;
+const AMOTION_EVENT_AXIS_Z: i32 = 11;
+const AMOTION_EVENT_AXIS_RZ: i32 = 14;
+const AMOTION_EVENT_AXIS_RX: i32 = 12;
+const AMOTION_EVENT_AXIS_RY: i32 = 13;
+const AMOTION_EVENT_AXIS_LTRIGGER: i32 = 17;
+const AMOTION_EVENT_AXIS_RTRIGGER: i32 = 18;
+const AMOTION_EVENT_AXIS_GAS: i32 = 22;
+const AMOTION_EVENT_AXIS_BRAKE: i32 = 23;
+const AMOTION_EVENT_AXIS_HAT_X: i32 = 15;
+const AMOTION_EVENT_AXIS_HAT_Y: i32 = 16;
+
 // ── AMotionEvent actions (android/input.h), masked ──────────────────
 const AMOTION_EVENT_ACTION_MASK: i32 = 0xff;
 const AMOTION_EVENT_ACTION_DOWN: i32 = 0;
@@ -168,11 +207,16 @@ extern fn ANativeWindow_getWidth(window: *ANativeWindow) i32;
 extern fn ANativeWindow_getHeight(window: *ANativeWindow) i32;
 
 extern fn AInputEvent_getType(event: *AInputEvent) i32;
+extern fn AInputEvent_getSource(event: *AInputEvent) i32;
+extern fn AInputEvent_getDeviceId(event: *AInputEvent) i32;
 extern fn AMotionEvent_getAction(event: *AInputEvent) i32;
 extern fn AMotionEvent_getX(event: *AInputEvent, pointer_index: usize) f32;
 extern fn AMotionEvent_getY(event: *AInputEvent, pointer_index: usize) f32;
 extern fn AMotionEvent_getPointerCount(event: *AInputEvent) usize;
 extern fn AMotionEvent_getPointerId(event: *AInputEvent, pointer_index: usize) i32;
+extern fn AMotionEvent_getAxisValue(event: *AInputEvent, axis: i32, pointer_index: usize) f32;
+extern fn AKeyEvent_getAction(event: *AInputEvent) i32;
+extern fn AKeyEvent_getKeyCode(event: *AInputEvent) i32;
 
 // ── Shell state ─────────────────────────────────────────────────────
 // `bgfx_ready` guards the per-frame tick: we only draw once the surface
@@ -182,22 +226,20 @@ extern fn AMotionEvent_getPointerId(event: *AInputEvent, pointer_index: usize) i
 var bgfx_ready: bool = false;
 var is_resumed: bool = false;
 
-// ── sokol-compat: ANativeActivity accessor ──────────────────────────
-// The engine's `src/android.zig` reaches the running `ANativeActivity*`
-// through `sapp_android_get_native_activity()` — a symbol sokol_app
-// exports on Android (the engine binds it as `extern "c"` so it never has
-// to `@import("sokol")`). On a bgfx-on-Android build there is NO sokol in
-// the graph, so that symbol is undefined and the `.so` fails to `dlopen`
-// ("cannot locate symbol sapp_android_get_native_activity") — the first
-// thing the NativeActivity loader hits, crashing before `android_main`
-// ever runs (#303).
-//
-// The bgfx shell already owns the `ANativeActivity*` (the glue hands it to
-// us as `app.activity`). So we provide a drop-in export of the same symbol
-// that returns it — the engine's immersive-mode helper then resolves
-// against the bgfx backend exactly as it does against sokol_clib, with no
-// engine-side change. Stored from `run` (the glue calls `android_main` →
-// `run` with the populated `app`).
+// ── ANativeActivity accessor (#310 Stage 4) ─────────────────────────
+// Core's Android JNI seam (`AndroidBackendContext`, labelle-core#310) needs
+// the running `ANativeActivity*` to reach immersive mode + the InputManager
+// gamepad enumeration. The bgfx shell owns that pointer — the native_app_glue
+// hands it over as `app.activity`. We stash it from `run` and surface it two
+// ways:
+//   * `getNativeActivity()` — Zig accessor (compile-check / direct callers).
+//   * `labelle_bgfx_get_native_activity` — the C-ABI export the bgfx Android
+//     backend adapter (`backends/bgfx/src/android.zig`, surfaced as
+//     `backend_input.android`) binds `extern "c"` to build the seam's
+//     `get_native_activity` vtable entry. A C symbol (not a Zig import)
+//     deliberately breaks the would-be module cycle: the shell imports
+//     `input`, so `input` can't import the shell back — exactly how the sokol
+//     adapter reaches sokol_app's `sapp_android_get_native_activity()`.
 var native_activity: ?*ANativeActivity = null;
 
 /// Optional per-frame tick callback, set by the game's entry before it
@@ -294,16 +336,75 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
     }
 }
 
-// ── Touch: AInputEvent handler ──────────────────────────────────────
-// Returns 1 ("handled") for motion events we consume, 0 otherwise so the
-// glue lets the system process them. Touch is mapped to the backend's
-// pointer model: pointer 0's (x, y) becomes the mouse position and
-// down/up drives mouse button 0, exactly how `input.zig` reports the
-// desktop mouse — so the engine's existing mouse-driven UI/hit-testing
-// sees touch with no engine-side changes.
+// ── Input: AInputEvent handler (touch + gamepad) ────────────────────
+// Returns 1 ("handled") for events we consume, 0 otherwise so the glue lets
+// the system process them. Two paths:
+//
+//   * Touch (motion events from a touchscreen / mouse-like source) is mapped
+//     to the backend's pointer model: pointer 0's (x, y) becomes the mouse
+//     position and down/up drives mouse button 0, exactly how `input.zig`
+//     reports the desktop mouse — so the engine's existing mouse-driven
+//     UI/hit-testing sees touch with no engine-side changes.
+//   * Gamepad (#310 Stage 4): KEY events carry BUTTON_*/DPAD_* keycodes;
+//     JOYSTICK-source MOTION events carry analog sticks/triggers/hat. Both
+//     route into the shared `android_gamepad` state (via `input.zig`), keyed
+//     by `AInputEvent_getDeviceId` (the same id the JNI detection registry
+//     emits as its hotplug slot), so the engine's gamepad queries resolve.
 fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
     _ = app;
-    if (AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION) return 0;
+    const etype = AInputEvent_getType(event);
+    const source = AInputEvent_getSource(event);
+    const device_id = AInputEvent_getDeviceId(event);
+
+    if (etype == AINPUT_EVENT_TYPE_KEY) {
+        // Controller buttons (BUTTON_A/B/X/Y, L1/R1/L2/R2, thumbs, start/
+        // select/mode) and DPAD_* arrive as key events. Forward the raw
+        // keycode; the shared state module maps it to a canonical button
+        // (and ignores non-gamepad keys).
+        const keycode = AKeyEvent_getKeyCode(event);
+        const action = AKeyEvent_getAction(event);
+        if (action == AKEY_EVENT_ACTION_DOWN) {
+            input.applyGamepadKey(device_id, keycode, true);
+        } else if (action == AKEY_EVENT_ACTION_UP) {
+            input.applyGamepadKey(device_id, keycode, false);
+        }
+        // Consume BACK when it comes from a gamepad/joystick (controllers map
+        // B/select to AKEYCODE_BACK) so it doesn't quit the activity; leave
+        // the genuine system BACK (touchscreen/system source) unhandled so it
+        // still navigates. Other gamepad keys stay unconsumed (return 0) —
+        // the system does nothing useful with BUTTON_*/DPAD_*, and consuming
+        // them all would swallow HOME/volume on odd devices.
+        const from_pad = (source & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD or
+            (source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK;
+        if (keycode == AKEYCODE_BACK and from_pad) return 1;
+        return 0;
+    }
+
+    if (etype != AINPUT_EVENT_TYPE_MOTION) return 0;
+
+    // Joystick-source motion = gamepad analog axes (sticks, triggers, hat).
+    // Sample the raw MotionEvent axes into the forwarded-axis buffer the
+    // shared state module expects (FA_* order) and forward; the state module
+    // applies the per-device axis-routing quirk on read.
+    if ((source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
+        var axes = [_]f32{0} ** input.GAMEPAD_AXIS_COUNT;
+        // FA_* layout (android_gamepad_state.zig): X, Y, Z, RZ, RX, RY,
+        // LTRIGGER, RTRIGGER, GAS, BRAKE, HAT_X, HAT_Y.
+        axes[0] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_X, 0);
+        axes[1] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_Y, 0);
+        axes[2] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_Z, 0);
+        axes[3] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RZ, 0);
+        axes[4] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RX, 0);
+        axes[5] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RY, 0);
+        axes[6] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_LTRIGGER, 0);
+        axes[7] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RTRIGGER, 0);
+        axes[8] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_GAS, 0);
+        axes[9] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_BRAKE, 0);
+        axes[10] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_HAT_X, 0);
+        axes[11] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_HAT_Y, 0);
+        input.applyGamepadMotion(device_id, axes);
+        return 1;
+    }
 
     const action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
 
@@ -416,18 +517,28 @@ comptime {
     }
 }
 
-/// sokol-compat accessor (#303). The engine's `src/android.zig` binds
-/// `sapp_android_get_native_activity()` as `extern "c"` to reach the
-/// `ANativeActivity*` for immersive mode — a symbol sokol_app exports on
-/// Android. A bgfx-on-Android build has no sokol in the graph, so that
-/// symbol is otherwise undefined and the `.so` fails to `dlopen`. The
-/// generated `main.zig` exports a `sapp_android_get_native_activity` shim
-/// (`@export` from the ROOT module reliably lands in the `.so`; a strong
-/// `@export` from this imported module gets dead-stripped before it
-/// resolves the engine's undefined ref) that returns this value. Stashed
-/// from `run` once the glue hands us the populated `app`.
+/// Native-activity accessor (#310 Stage 4). Returns the running
+/// `ANativeActivity*` the glue handed us (stashed in `run`), or null before
+/// it exists. Surfaced both as this Zig accessor and as the C-ABI export
+/// below; the bgfx Android backend adapter (`android.zig`) binds the C symbol
+/// to populate core's `AndroidBackendContext.get_native_activity`.
 pub fn getNativeActivity() ?*anyopaque {
     return @ptrCast(native_activity);
+}
+
+/// C-ABI accessor the bgfx Android backend adapter binds `extern "c"` (see
+/// the `native_activity` block above for why this is a C symbol and not a Zig
+/// import). Strong export so it survives dead-stripping and resolves the
+/// adapter's undefined ref in the final `.so` link. Android-only — emitted in
+/// the `comptime` block below.
+fn getNativeActivityC() callconv(.c) ?*anyopaque {
+    return @ptrCast(native_activity);
+}
+
+comptime {
+    if (is_android) {
+        @export(&getNativeActivityC, .{ .name = "labelle_bgfx_get_native_activity", .linkage = .strong });
+    }
 }
 
 fn androidMainExport(app: *android_app) callconv(.c) void {

@@ -251,19 +251,28 @@ pub fn build(b: *std.Build) void {
         input_mod.link_libc = true;
     }
 
-    // Android gamepad DETECTION glue (labelle-assembler#248). The JNI
-    // bridge calls into Android's InputManager to detect controller
-    // hotplug/identity; labelle-core's `gamepad_source/android.zig` declares
-    // the `extern fn labelle_android_gamepad_init/_shutdown` entry points
-    // this file defines, and the `export fn labelle_android_on_device_*`
-    // callbacks it invokes. The C TU is wrapped in `#ifdef __ANDROID__`, so
-    // it emits an empty object on every other target — safe to add
-    // unconditionally. Compiling it requires libc (jni.h / NDK headers), so
-    // gate `link_libc` on Android to keep desktop/wasm builds linker-free.
+    // Android gamepad source (#310 Stage 4): the per-device STATE machine
+    // (`android_gamepad_state.zig`) and the InputManager JNI DETECTION glue
+    // (`android_gamepad_jni.c`) now live in the shared `../android_gamepad`
+    // sub-package, consumed by BOTH the sokol and bgfx Android backends.
+    //
+    // `input.zig` imports the state module under `android_gamepad` (mapping +
+    // quirk table + per-device button/axis state). The JNI glue calls into
+    // Android's InputManager to detect controller hotplug/identity;
+    // labelle-core's `gamepad_source/android.zig` declares the
+    // `extern fn labelle_android_gamepad_init/_shutdown` entry points it
+    // defines, and the `export fn labelle_android_on_device_*` callbacks it
+    // invokes. The C TU is wrapped in `#ifdef __ANDROID__`, so it emits an
+    // empty object on every other target. We pull its source via
+    // `dep.path(...)` (cross-package `b.path("..")` is rejected by Zig 0.16)
+    // and compile it into THIS module, where the Android NDK sysroot/libc is
+    // already wired. Gated on Android so desktop/wasm builds stay linker-free.
+    const android_gp_dep = b.dependency("labelle_android_gamepad", .{ .target = target, .optimize = optimize });
+    input_mod.addImport("android_gamepad", android_gp_dep.module("android_gamepad"));
     if (is_android) {
         input_mod.link_libc = true;
         input_mod.addCSourceFile(.{
-            .file = b.path("src/android_gamepad_jni.c"),
+            .file = android_gp_dep.path("src/android_gamepad_jni.c"),
             .flags = &.{},
         });
     }
@@ -387,21 +396,12 @@ pub fn build(b: *std.Build) void {
         gating_step.dependOn(&b.addInstallBinFile(gating_obj.getEmittedBin(), "sdl_gamepad_gating.o").step);
     }
 
-    // Android gamepad STATE (labelle-assembler#250). The mapping table, quirk
-    // routing, and the per-device state machine are pure Zig — host-runnable
-    // with no sokol/JNI deps. Run them natively (unlike `input_compile_check`,
-    // which only builds) so the canonical raylib button/axis numbering and the
-    // quirk overrides stay locked. The Android-only `extern`/`@export` symbols
-    // in input.zig are gated behind `is_android`, so this host build of the
-    // standalone module never references them.
-    const android_gp_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/android_gamepad_state.zig"),
-            .target = host_target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(android_gp_tests).step);
+    // Android gamepad STATE (labelle-assembler#250) — the mapping table, quirk
+    // routing, and per-device state machine — now live in the shared
+    // `../android_gamepad` sub-package (#310 Stage 4). Its pure-Zig unit tests
+    // run under `cd backends/android_gamepad && zig build test`, so they are no
+    // longer duplicated here; `input_compile_check` above still pulls the state
+    // module (imported as `android_gamepad`) into the sokol input graph.
 
     // Compile-check window.zig — pulls in sokol + the per-backend
     // screenshot readback helpers (`screenshot/metal.zig`, `gl.zig`,

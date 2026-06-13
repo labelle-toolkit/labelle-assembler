@@ -67,14 +67,49 @@ pub fn build(b: *std.Build) void {
     // ── Input backend module ────────────────────────────────────────
     // Desktop wires the `zglfw` import for GLFW polling; Android omits it
     // (zglfw is desktop-only) and `src/input.zig` comptime-gates every
-    // zglfw reference behind `is_android`, stubbing input until the
-    // touch path lands in phase 3 (#302).
+    // zglfw reference behind `is_android`.
     const input_mod = b.addModule("input", .{
         .root_source_file = b.path("src/input.zig"),
         .target = target,
         .optimize = optimize,
     });
     if (zglfw_mod) |m| input_mod.addImport("zglfw", m);
+
+    // Shared Android gamepad source (#310 Stage 4): the per-device STATE
+    // machine (`android_gamepad_state.zig`, #250) and the InputManager JNI
+    // DETECTION glue (`android_gamepad_jni.c`, #248), shared with the sokol
+    // backend via the `../android_gamepad` sub-package. `input.zig` imports the
+    // state module under `android_gamepad` (mapping + quirk + per-device button/
+    // axis state) on every target — its Android-only `extern`/`@export` symbols
+    // are gated internally, so off Android nothing is referenced. On Android we
+    // also compile the JNI glue into THIS module (where the NDK sysroot/libc is
+    // wired by `applyNdkSysroot` below). The .c is `#ifdef __ANDROID__`-gated,
+    // so it emits an empty object off Android. We pull its source via
+    // `dep.path(...)` because cross-package `b.path("..")` is rejected by Zig
+    // 0.16.
+    const android_gp_dep = b.dependency("labelle_android_gamepad", .{ .target = target, .optimize = optimize });
+    input_mod.addImport("android_gamepad", android_gp_dep.module("android_gamepad"));
+    if (is_android) {
+        // Android seam adapter (`src/android.zig`) imports labelle-core for the
+        // `AndroidBackendContext` type the generated bgfx-Android main registers
+        // with core. The generated build unifies the app's core onto this import
+        // (guarded overrideImport in the build_zig `backend_bgfx_android`
+        // section) so the registered vtable's type matches the engine's
+        // `engine.core.AndroidBackendContext`. Standalone (this build), the
+        // backend's own core pin resolves it for the Android compile-check.
+        const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
+        input_mod.addImport("labelle-core", core_dep.module("labelle-core"));
+
+        input_mod.link_libc = true;
+        // NDK sysroot for the JNI glue's jni.h / android/*.h. Reuse the same
+        // sysroot wiring bgfx/bx/bimg use; safe because `ndk` is non-null on
+        // Android. Must precede the C source add (see applyNdkSysroot).
+        if (ndk) |n| applyNdkSysroot(input_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+        input_mod.addCSourceFile(.{
+            .file = android_gp_dep.path("src/android_gamepad_jni.c"),
+            .flags = &.{},
+        });
+    }
 
     // ── Audio backend module ────────────────────────────────────────
     // `link_libc = true` is required by `src/audio.zig`'s libc-based

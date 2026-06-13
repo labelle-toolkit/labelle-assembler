@@ -23,32 +23,20 @@ const android_app = @import("backend_app");
 
 pub const labelle_provides_android_main = true;
 
-// sokol-compat shim (#303). The engine's `src/android.zig` reaches the
-// running `ANativeActivity*` via `extern "c" sapp_android_get_native_activity()`
-// — a symbol sokol_app exports on Android. A bgfx-on-Android build links no
-// sokol, so without this the `.so` fails to `dlopen` ("cannot locate symbol
-// sapp_android_get_native_activity"), crashing in the NativeActivity loader
-// before `android_main` ever runs. Export it from the ROOT module (reliably
-// lands in the `.so`, unlike a stripped weak def in the backend module),
-// forwarding to the activity the bgfx shell stashes from the glue.
-export fn sapp_android_get_native_activity() callconv(.c) ?*anyopaque {
-    return android_app.getNativeActivity();
-}
-
-// Android gamepad JNI bridge stubs (#303). labelle-core's
-// `gamepad_source/android.zig` binds `labelle_android_gamepad_init` /
-// `_shutdown` as `extern "c"` — the JNI listener the SOKOL fork's C code
-// defines. A bgfx-on-Android build links no sokol, so these are otherwise
-// undefined and the `.so` fails to `dlopen`. There is no bgfx Android
-// gamepad bridge yet (a separate ticket — see the backend×platform
-// matrix), so stub them as no-ops: gamepad detection is simply inert on
-// bgfx-Android for now, and the engine's gamepad path degrades gracefully
-// (no controllers reported) rather than crashing the loader. Wiring a real
-// JNI bridge later replaces these.
-export fn labelle_android_gamepad_init(activity: ?*const anyopaque) callconv(.c) void {
-    _ = activity;
-}
-export fn labelle_android_gamepad_shutdown() callconv(.c) void {}
+// Android backend seam (#310 Stage 4). The engine's `src/android.zig` and
+// core's `gamepad_source/android.zig` no longer link any backend symbol
+// directly — they route their Android JNI calls (immersive mode + the
+// InputManager gamepad enumeration) through an `AndroidBackendContext` vtable
+// the active backend registers at startup (`registerAndroidBackend`). The bgfx
+// backend's adapter (`backends/bgfx/src/android.zig`, surfaced as
+// `backend_input.android`) builds that context from the bgfx NativeActivity
+// shell's stored `ANativeActivity*` (`labelle_bgfx_get_native_activity`) plus
+// the shared InputManager JNI glue. `gameInit` registers it once at startup,
+// before the first frame's gamepad poll.
+//
+// This replaces the previous sokol-compat shims (`sapp_android_get_native_-
+// activity`, inert `labelle_android_gamepad_init/_shutdown`): the `.so` now
+// exports a REAL JNI bridge and no fake `sapp_*` symbols.
 
 {{module_vars}}var g: AssembledGame = undefined;
 {{hooks_init_block}}
@@ -65,7 +53,7 @@ const target_fps: u32 = {{fps}};
 // INIT_WINDOW just before firing this). Build the game, wire hooks, and
 // run the project's setup/scene-load code. Runs on the app thread, once.
 fn gameInit() callconv(.c) void {
-    const allocator = gpa.allocator();
+{{android_backend_register}}    const allocator = gpa.allocator();
     g = AssembledGame.init(allocator);
 
     g.setHooks(&hooks);
