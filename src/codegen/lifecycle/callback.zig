@@ -197,9 +197,26 @@ pub fn Mixin(comptime Self: type) type {
         }
 
         /// Body for the `{{immersive_entry}}` hole in the sokol
-        /// `mobile.txt` template — the
-        /// `engine.android.enableImmersiveMode()` call, emitted inside
-        /// `sokol_main()`.
+        /// `mobile.txt` template, emitted at the top of `sokol_main()`. On
+        /// Android it carries two things, in order:
+        ///
+        ///   1. **Backend-context registration (labelle-core#310, Stage 3).**
+        ///      Core's Android gamepad source + the engine's immersive call no
+        ///      longer link sokol's `sapp_*` / `labelle_android_gamepad_*`
+        ///      symbols directly — they route through an
+        ///      `AndroidBackendContext` vtable the active backend registers at
+        ///      startup. The sokol backend's adapter
+        ///      (`backends/sokol/src/android.zig`, surfaced as
+        ///      `backend_input.android`) builds that context; we register it
+        ///      here so sokol-Android keeps immersive mode + gamepad detection.
+        ///      This MUST run before `enableImmersiveMode()` (which reads the
+        ///      registered context's `get_native_activity`) and before the
+        ///      gamepad source initializes. Emitted on EVERY sokol-Android
+        ///      build, even when immersive mode is off, because gamepad
+        ///      detection needs it too.
+        ///   2. **Immersive mode (`.android.immersive_mode`).** The
+        ///      `engine.android.enableImmersiveMode()` call (only when opted
+        ///      in).
         ///
         /// **Why `sokol_main()` and not `init()`:** the legacy
         /// `Theme.NoTitleBar.Fullscreen` manifest theme `labelle-cli`
@@ -219,28 +236,56 @@ pub fn Mixin(comptime Self: type) type {
         /// background+foregrounds the app. See
         /// `labelle-engine/src/android.zig`.
         ///
-        /// Returns an empty string unless the target is Android with
-        /// `.android = .{ .immersive_mode = true }`; the placeholder
-        /// then expands to nothing (and is harmless in the shared sokol
-        /// desktop / wasm `desktop.txt`, which has no
-        /// `{{immersive_entry}}` hole at all).
+        /// Returns an empty string off Android; the placeholder then expands to
+        /// nothing (and is harmless in the shared sokol desktop / wasm
+        /// `desktop.txt`, which has no `{{immersive_entry}}` hole at all).
         pub fn buildImmersiveEntryCode(self: *Self) ![]const u8 {
             const allocator = self.allocator;
             const cfg = self.cfg;
             if (cfg.platform != .android) return allocator.dupe(u8, "");
-            const immersive = if (cfg.android) |a| a.immersive_mode else false;
-            if (!immersive) return allocator.dupe(u8, "");
-            return allocator.dupe(u8,
-                \\    // Android immersive mode (project.labelle `.android.immersive_mode`):
-                \\    // hide the status + navigation bars (immersive-sticky). Called from
-                \\    // `sokol_main()` — the UI thread, before sokol registers its own
-                \\    // ANativeActivity callbacks — so the hook catches the window's
-                \\    // first focus and the bars are hidden at launch. The helper only
-                \\    // installs a UI-thread callback hook; the JNI decor-view call runs
-                \\    // on the UI thread. See labelle-engine src/android.zig.
-                \\    engine.android.enableImmersiveMode();
+
+            var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+            errdefer alloc_writer.deinit();
+            const w = &alloc_writer.writer;
+
+            // (1) Register the sokol backend's Android JNI seam with core
+            //     (labelle-core#310). Routes core's gamepad source + the
+            //     engine's immersive call to sokol's native activity / JNI glue
+            //     without core/engine linking any sokol symbol directly. Runs
+            //     ONCE at startup, before the immersive call below and before
+            //     the gamepad source initializes. `engine.core` is
+            //     labelle-engine's re-export of labelle-core (the generated main
+            //     imports `engine`); the context comes from the sokol backend
+            //     adapter surfaced as `backend_input.android`.
+            try w.writeAll(
+                \\    // Register the sokol Android backend seam with core (labelle-core#310):
+                \\    // core's gamepad source and the engine's immersive mode reach the
+                \\    // running ANativeActivity / InputManager JNI glue through this context
+                \\    // instead of linking sokol's symbols directly. Must run before
+                \\    // `enableImmersiveMode()` (it reads `get_native_activity`) and before
+                \\    // the gamepad source initializes. See backends/sokol/src/android.zig.
+                \\    engine.core.registerAndroidBackend(@import("backend_input").android.backendContext());
                 \\
             );
+
+            // (2) Immersive mode — only when opted in.
+            const immersive = if (cfg.android) |a| a.immersive_mode else false;
+            if (immersive) {
+                try w.writeAll(
+                    \\    // Android immersive mode (project.labelle `.android.immersive_mode`):
+                    \\    // hide the status + navigation bars (immersive-sticky). Called from
+                    \\    // `sokol_main()` — the UI thread, before sokol registers its own
+                    \\    // ANativeActivity callbacks — so the hook catches the window's
+                    \\    // first focus and the bars are hidden at launch. The helper only
+                    \\    // installs a UI-thread callback hook; the JNI decor-view call runs
+                    \\    // on the UI thread. See labelle-engine src/android.zig.
+                    \\    engine.android.enableImmersiveMode();
+                    \\
+                );
+            }
+
+            var arr_list = alloc_writer.toArrayList();
+            return arr_list.toOwnedSlice(allocator);
         }
 
         /// Cleanup code for callback-based backends (in cleanup() C

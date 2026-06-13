@@ -102,6 +102,42 @@ pub const sokol_lifecycle =
     \\
 ;
 
+// Mirror of `backends/sokol/templates/mobile.txt` — trimmed to the
+// placeholders the sokol mobile (Android/iOS) callback path emits, with the
+// `{{immersive_entry}}` hole at the top of `sokol_main()`. Used to assert the
+// sokol-Android codegen emits the labelle-core#310 backend-context
+// registration (and, when opted in, the immersive call) into `sokol_main()`
+// ahead of the gamepad source init.
+pub const sokol_mobile_lifecycle =
+    \\{{module_vars}}var g: AssembledGame = undefined;
+    \\{{hooks_init_block}}
+    \\var gpa = std.heap.DebugAllocator(.{}).init;
+    \\const screen_w: u32 = {{width}};
+    \\const screen_h: u32 = {{height}};
+    \\const screen_title = "{{title}}";
+    \\const target_fps: u32 = {{fps}};
+    \\export fn init() callconv(.c) void {
+    \\{{hidden_setup}}    const allocator = gpa.allocator();
+    \\    g = AssembledGame.init(allocator);
+    \\    g.setHooks(&hooks);
+    \\{{init_code}}    @import("backend_input").initAndroidGamepad();
+    \\}
+    \\export fn frame() callconv(.c) void {
+    \\    const dt: f32 = 0.016;
+    \\{{tick_code}}    g.tick(dt);
+    \\    g.render();
+    \\{{gui_draw_code}}}
+    \\export fn cleanup() callconv(.c) void {
+    \\{{cleanup_code}}    g.deinit();
+    \\}
+    \\export fn sokol_main(argc: c_int, argv: [*][*:0]u8) window.Desc {
+    \\    _ = argc;
+    \\    _ = argv;
+    \\{{immersive_entry}}    return window.makeDesc(.{ .init_cb = &init });
+    \\}
+    \\
+;
+
 // Mirror of `backends/bgfx/templates/android.txt` (#303) — trimmed to the
 // placeholders the bgfx-android callback path emits. The game owns
 // `android_main`, registering the init + frame callbacks with the bgfx
