@@ -237,17 +237,21 @@ fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
         input.setTouchPointer(0, x, y, AMotionEvent_getPointerId(event, 0));
     }
 
+    // We model a single pointer (finger 0). Only the FIRST finger going
+    // down (ACTION_DOWN) and the LAST finger coming up (ACTION_UP) change
+    // the down-state. POINTER_DOWN/POINTER_UP are secondary fingers in a
+    // multi-touch gesture — the primary is still down, so they must NOT
+    // release it; they only refresh the primary's position (done above).
     switch (action) {
-        AMOTION_EVENT_ACTION_DOWN, AMOTION_EVENT_ACTION_POINTER_DOWN => {
+        AMOTION_EVENT_ACTION_DOWN => {
             input.setPointerDown(true);
         },
-        AMOTION_EVENT_ACTION_MOVE => {
-            // Position already updated above; keep down-state as-is.
-        },
-        AMOTION_EVENT_ACTION_UP, AMOTION_EVENT_ACTION_POINTER_UP, AMOTION_EVENT_ACTION_CANCEL => {
+        AMOTION_EVENT_ACTION_UP, AMOTION_EVENT_ACTION_CANCEL => {
             input.setPointerDown(false);
             input.clearTouch();
         },
+        // MOVE / POINTER_DOWN / POINTER_UP: position already refreshed
+        // above; keep the primary down-state unchanged.
         else => {},
     }
     return 1;
@@ -274,23 +278,26 @@ pub fn run(app: *android_app) void {
         var events: c_int = 0;
         var data: ?*anyopaque = null;
 
-        // Block (timeout -1) when there's nothing to draw, otherwise poll
-        // non-blocking (timeout 0) so we keep rendering frames. This is
-        // the standard native_app_glue idiom.
-        const timeout: c_int = if (bgfx_ready and is_resumed) 0 else -1;
-
-        // Drain all pending events before drawing.
-        while (true) {
-            const ident = ALooper_pollOnce(timeout, &fd, &events, &data);
-            if (ident < 0) break; // WAKE / TIMEOUT / ERROR — nothing to process
+        // Drain ALL pending events, then draw. The timeout is recomputed
+        // on every `pollOnce` call (the canonical native_app_glue idiom):
+        //   - active (surface live + resumed) → 0: returns immediately
+        //     once the queue is empty so we fall through and render every
+        //     frame.
+        //   - idle → -1: blocks until an event arrives, so we don't spin
+        //     while backgrounded / before the surface exists.
+        // No early break — processing only one event per frame (the prior
+        // bug) caps input throughput and adds latency.
+        while (ALooper_pollOnce(
+            if (bgfx_ready and is_resumed) 0 else -1,
+            &fd,
+            &events,
+            &data,
+        ) >= 0) {
             if (data) |d| {
                 const source: *android_poll_source = @ptrCast(@alignCast(d));
                 if (source.process) |proc| proc(source.app, source);
             }
             if (app.destroyRequested != 0) break;
-            // After the first drained event, switch to non-blocking so we
-            // don't stall when a draw is pending.
-            if (bgfx_ready and is_resumed) break;
         }
 
         if (app.destroyRequested != 0) break;
