@@ -798,12 +798,16 @@ fn decodePng(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
     // Walk chunks: 4-byte length, 4-byte type, length bytes data, 4-byte CRC.
     var pos: usize = sig.len;
     var saw_iend = false;
-    while (pos + 8 <= data.len) {
+    while (data.len - pos >= 8) {
         const chunk_len = std.mem.readInt(u32, data[pos..][0..4], .big);
         const ctype = data[pos + 4 ..][0..4];
         const body_start = pos + 8;
+        // Bounds via subtraction so a malformed `chunk_len` (e.g.
+        // 0xFFFFFFFF) can't overflow `usize` and bypass the check. We
+        // need `chunk_len` body bytes plus a 4-byte trailing CRC.
+        if (data.len - body_start < chunk_len) return null; // truncated body
+        if (data.len - body_start - chunk_len < 4) return null; // missing CRC
         const body_end = body_start + chunk_len;
-        if (body_end + 4 > data.len) return null; // truncated chunk (incl. CRC)
         const body = data[body_start..body_end];
 
         if (std.mem.eql(u8, ctype, "IHDR")) {
@@ -861,8 +865,12 @@ fn decodePng(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
 
     // Inflate the concatenated IDAT zlib stream. Each scanline is
     // prefixed by a 1-byte filter type, so raw size = h * (1 + w*channels).
-    const stride = @as(usize, width) * channels; // bytes per row, no filter byte
-    const raw_size = @as(usize, height) * (1 + stride);
+    // `width`/`height` come straight from untrusted IHDR, so the size
+    // arithmetic uses checked ops — an overflowed product would otherwise
+    // under-allocate `raw` and let the unfilter loop write out of bounds.
+    const stride = std.math.mul(usize, width, channels) catch return null; // bytes per row, no filter byte
+    const row_len = std.math.add(usize, stride, 1) catch return null; // + filter byte
+    const raw_size = std.math.mul(usize, height, row_len) catch return null;
 
     const raw = allocator.alloc(u8, raw_size) catch return null;
     defer allocator.free(raw);
@@ -878,10 +886,12 @@ fn decodePng(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
         if (n != raw_size) return null; // wrong amount of data
     }
 
-    // Output RGBA8 buffer.
-    const out_size = @as(usize, width) * @as(usize, height) * 4;
+    // Output RGBA8 buffer. Checked arithmetic for the same untrusted-dims
+    // overflow reason as `raw_size` above. (No `errdefer` here: this
+    // function returns `?DecodedImage`, not an error union, so an errdefer
+    // would never fire — the failure paths below free `pixels` manually.)
+    const out_size = std.math.mul(usize, std.math.mul(usize, width, height) catch return null, 4) catch return null;
     const pixels = allocator.alloc(u8, out_size) catch return null;
-    errdefer allocator.free(pixels);
 
     // Unfilter scanlines in place within `raw` (we overwrite the filtered
     // bytes with reconstructed ones, row by row, top to bottom).
