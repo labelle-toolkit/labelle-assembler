@@ -208,6 +208,18 @@ pub fn build(b: *std.Build) void {
     if (gamepad_enabled and targetUsesCoreGamepad(target.result)) {
         const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
         input_mod.addImport("labelle-core", core_dep.module("labelle-core"));
+    } else if (is_android) {
+        // Android seam adapter (labelle-core#310, Stage 3): `src/android.zig`
+        // builds the `core.AndroidBackendContext` literal the generated
+        // sokol-Android main registers with core, so it imports `labelle-core`
+        // for the `AndroidBackendContext` type. The generated build unifies the
+        // app's core onto this import (guarded overrideImport in the
+        // backend_sokol template section) so the registered vtable's type
+        // matches the engine's `engine.core.AndroidBackendContext`. (Mutually
+        // exclusive with the Linux-desktop core route above — Android is never
+        // a desktop target.)
+        const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
+        input_mod.addImport("labelle-core", core_dep.module("labelle-core"));
     }
 
     // Link SDL2 for the shared desktop gamepad source — DESKTOP targets ONLY,

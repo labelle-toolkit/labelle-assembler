@@ -7,6 +7,7 @@ const engine_template = h.engine_template;
 const raylib_lifecycle = h.raylib_lifecycle;
 const sokol_lifecycle = h.sokol_lifecycle;
 const bgfx_android_lifecycle = h.bgfx_android_lifecycle;
+const sokol_mobile_lifecycle = h.sokol_mobile_lifecycle;
 const null_lifecycle = h.null_lifecycle;
 const sokol_alloc_lifecycle = h.sokol_alloc_lifecycle;
 const empty_names = h.empty_names;
@@ -192,6 +193,69 @@ pub const MAIN_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "windowShouldClose") == null);
         // Module-scope runner (assigned in gameInit), not an init-scope local.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var runner: Runner = undefined;") != null);
+    }
+
+    test "sokol android registers the core Android backend seam before immersive (labelle-core#310)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .android,
+            .ecs = .mock,
+            .android = .{ .immersive_mode = true },
+        }, sokol_mobile_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // Stage 3 (labelle-core#310): the generated `sokol_main()` registers the
+        // sokol backend's AndroidBackendContext with core, sourced from the
+        // backend adapter (`backend_input.android.backendContext()`), via the
+        // engine's core re-export.
+        const reg = "engine.core.registerAndroidBackend(@import(\"backend_input\").android.backendContext());";
+        const reg_idx = std.mem.indexOf(u8, main_zig, reg);
+        try std.testing.expect(reg_idx != null);
+
+        // The immersive call is still emitted (immersive_mode = true)...
+        const imm_idx = std.mem.indexOf(u8, main_zig, "engine.android.enableImmersiveMode();");
+        try std.testing.expect(imm_idx != null);
+
+        // ...and registration MUST precede it — core's immersive path reads the
+        // registered context's `get_native_activity`, so registering after would
+        // make it a no-op. Both run inside `sokol_main()` (the UI thread, before
+        // sokol registers its own ANativeActivity callbacks), so this textual
+        // ordering is also the runtime ordering. Core's gamepad source likewise
+        // reads the context lazily at first poll (well after `sokol_main()`), so
+        // registering at the top of `sokol_main()` precedes every consumer.
+        try std.testing.expect(reg_idx.? < imm_idx.?);
+    }
+
+    test "sokol android registers the backend seam even when immersive mode is off" {
+        // Gamepad detection needs the context regardless of immersive mode, so
+        // the registration is emitted on every sokol-Android build; only the
+        // immersive call is gated on `.android.immersive_mode`.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .android,
+            .ecs = .mock,
+        }, sokol_mobile_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.core.registerAndroidBackend(") != null);
+        // No immersive call without the opt-in.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.android.enableImmersiveMode();") == null);
+    }
+
+    test "non-android sokol does NOT emit the Android backend registration" {
+        // Desktop sokol must not reference the Android seam — the registration
+        // is gated to sokol + Android in `buildImmersiveEntryCode`.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, sokol_mobile_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerAndroidBackend") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "enableImmersiveMode") == null);
     }
 };
 
