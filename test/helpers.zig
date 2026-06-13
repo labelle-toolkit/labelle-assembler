@@ -102,6 +102,42 @@ pub const sokol_lifecycle =
     \\
 ;
 
+// Mirror of `backends/bgfx/templates/android.txt` (#303) — trimmed to the
+// placeholders the bgfx-android callback path emits. The game owns
+// `android_main`, registering the init + frame callbacks with the bgfx
+// NativeActivity shell, which runs the loop. Used to assert the
+// bgfx+android codegen takes the callback lifecycle, not the desktop loop.
+pub const bgfx_android_lifecycle =
+    \\const android_app = @import("backend_app");
+    \\pub const labelle_provides_android_main = true;
+    \\{{module_vars}}var g: AssembledGame = undefined;
+    \\{{hooks_init_block}}
+    \\var gpa = std.heap.DebugAllocator(.{}).init;
+    \\const screen_w: u32 = {{width}};
+    \\const screen_h: u32 = {{height}};
+    \\const screen_title = "{{title}}";
+    \\const target_fps: u32 = {{fps}};
+    \\// {{platform_comment}}
+    \\fn gameInit() callconv(.c) void {
+    \\    const allocator = gpa.allocator();
+    \\    g = AssembledGame.init(allocator);
+    \\    g.setHooks(&hooks);
+    \\    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    \\{{preview_setup}}{{init_code}}}
+    \\fn gameFrame() callconv(.c) void {
+    \\    const dt: f32 = 0.016;
+    \\{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
+    \\    g.render();
+    \\{{gui_draw_code}}}
+    \\// {{entry_comment}}
+    \\export fn android_main(app: *android_app.android_app) callconv(.c) void {
+    \\    android_app.setInitCallback(&gameInit);
+    \\    android_app.setTickCallback(&gameFrame);
+    \\    android_app.run(app);
+    \\}
+    \\
+;
+
 // Mirror of `backends/null/templates/headless.txt` — the actual null
 // backend's lifecycle template — trimmed to the placeholders the loop
 // path emits. Used by the headless-runner tests below so the assertion

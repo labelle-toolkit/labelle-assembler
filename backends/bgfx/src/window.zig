@@ -30,6 +30,19 @@ var screen_h: i32 = 600;
 var window_hidden: bool = false;
 var clear_color: u32 = 0x1e1e2eff; // dark background RGBA
 
+/// The current surface dimensions. After `initWindow` these hold the real
+/// values — on Android that's the `ANativeWindow` size handed over at
+/// `INIT_WINDOW`, which can differ from the project's configured default
+/// (e.g. a 2000x1200 tablet surface vs. an 800x600 config). The generated
+/// Android entry reads `getScreenHeight()` post-init so the engine's
+/// coordinate mapping matches the actual surface rather than the config.
+pub fn getScreenWidth() i32 {
+    return screen_w;
+}
+pub fn getScreenHeight() i32 {
+    return screen_h;
+}
+
 /// The native `ANativeWindow*` surface handed over by the NativeActivity
 /// glue. bgfx's `PlatformData.nwh` is a `void*`, so we hold it as an
 /// opaque pointer here and pass it straight through at init time. Set by

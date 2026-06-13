@@ -113,6 +113,37 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "glfw_artifact") != null);
     }
 
+    test "bgfx android builds a NativeActivity shared library, not a glfw exe" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        // Android-targeted bgfx (#303): fetch the backend for the android
+        // target, pull the NativeActivity-glue `android_app` module, and
+        // build a dynamic library — NOT the desktop glfw executable.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_bgfx") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, ".target = android_target") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "backend_dep.module(\"android_app\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, ".name = \"backend_app\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, ".linkage = .dynamic") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkLibrary(bgfx_artifact)") != null);
+
+        // NDK shell libs for the bgfx GLES renderer + NativeActivity glue.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"GLESv3\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"EGL\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"android\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"log\"") != null);
+
+        // Desktop-only zglfw must NOT appear — it doesn't build for Android.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "glfw_artifact") == null);
+        // And the APK packaging step is wired in.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "Package and sign Android APK") != null);
+    }
+
     test "links wgpu glfw artifact" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",

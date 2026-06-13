@@ -931,10 +931,24 @@ pub fn generateMainZigFromTemplate(
 
         const hooks_init = data.scalars.get("hooks_init_block") orelse "    var hooks = GameHooks{};\n";
 
-        const use_callback_lifecycle = cfg.backend == .sokol or cfg.platform == .wasm;
+        // bgfx-on-Android (#303) inverts its desktop loop into the same
+        // init/frame callback shape sokol/wasm use: the NativeActivity
+        // shell (`backends/bgfx/src/android_app.zig`) owns the event+frame
+        // loop and calls back into the game per-frame. So it shares the
+        // callback-lifecycle path (module-scope `g`/`runner`, void-safe
+        // `init_code` via `buildCallbackInitCode`) rather than the
+        // procedural loop path the bgfx DESKTOP template uses.
+        const is_bgfx_android = cfg.backend == .bgfx and cfg.platform == .android;
+        const use_callback_lifecycle = cfg.backend == .sokol or cfg.platform == .wasm or is_bgfx_android;
 
         if (use_callback_lifecycle) {
-            const sokol_runner: []const u8 = if (cfg.backend == .sokol) "var runner: Runner = undefined;\n" else "";
+            // Module-scope `runner` decl — needed by every callback-path
+            // backend whose `init_code` ASSIGNS `runner = Runner.init(...)`
+            // (sokol mobile/desktop and bgfx-android both split init from
+            // the per-frame tick, so the runner can't be an init-scope
+            // local like the loop path). Raylib-wasm takes the `else`
+            // branch below and declares its own runner inside `main()`.
+            const callback_runner: []const u8 = if (cfg.backend == .sokol or is_bgfx_android) "var runner: Runner = undefined;\n" else "";
             // Sokol-backend builds get ALL THREE readback helper blocks
             // emitted side-by-side:
             //   - GL PBO ring (labelle-assembler#122 slice 1, #124) —
@@ -972,18 +986,22 @@ pub fn generateMainZigFromTemplate(
                 (if (std.mem.eql(u8, gui.name, "imgui")) PREVIEW_INPUT_DISPATCH else PREVIEW_INPUT_DISPATCH_STUB)
             else
                 PREVIEW_INPUT_DISPATCH_STUB;
-            const module_vars = try std.mem.concat(allocator, u8, &.{ sokol_runner, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch_cb });
+            const module_vars = try std.mem.concat(allocator, u8, &.{ callback_runner, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch_cb });
             defer allocator.free(module_vars);
             const init_code = try ctx.buildCallbackInitCode();
             defer allocator.free(init_code);
 
-            const platform_comment: []const u8 = switch (cfg.platform) {
+            const platform_comment: []const u8 = if (is_bgfx_android)
+                "Android: the bgfx NativeActivity shell (android_app.zig) drives the lifecycle"
+            else switch (cfg.platform) {
                 .ios => "iOS: sokol bindings accessed through engine.sokol (no direct sokol import)",
                 .android => "Android: sokol handles the app lifecycle via NativeActivity",
                 .wasm => "WASM: Emscripten drives the main loop via callbacks",
                 .desktop => "",
             };
-            const entry_comment: []const u8 = switch (cfg.platform) {
+            const entry_comment: []const u8 = if (is_bgfx_android)
+                "Android entry — the game owns android_main; the bgfx shell runs the loop"
+            else switch (cfg.platform) {
                 .ios => "iOS entry — no main(), sokol handles the app lifecycle",
                 .android => "Android entry — no main(), sokol handles the NativeActivity lifecycle",
                 .wasm => "WASM entry — Emscripten drives the main loop via callbacks",
@@ -1156,6 +1174,32 @@ pub fn generateMainZigFromTemplate(
                     .preview_readback_post = "",
                     .preview_cleanup = preview_cleanup_sokol,
                     .immersive_entry = immersive_entry,
+                }, bw);
+            } else if (is_bgfx_android) {
+                // bgfx-on-Android (#303): the generated game owns
+                // `android_main` and registers an init + frame callback
+                // with the bgfx NativeActivity shell, which drives the
+                // event/frame loop. Holes mirror `backends/bgfx/templates/
+                // android.txt`. `init_code` comes from the callback builder
+                // (void-safe — the shell's callback is `callconv(.c) void`,
+                // no error channel), `tick_code` is the shared engine-tick
+                // block, and the preview-mode readback slots are empty:
+                // bgfx has no on-device preview path yet (its desktop
+                // readback is a separate, unshipped ticket like sdl/wgpu).
+                try tpl.render(lifecycle_tmpl, .{
+                    .module_vars = module_vars,
+                    .width = w_str,
+                    .height = h_str,
+                    .title = cfg.title,
+                    .fps = fps_str,
+                    .init_code = init_code,
+                    .tick_code = tick_code,
+                    .gui_draw_code = gui_draw_code,
+                    .hooks_init_block = hooks_init,
+                    .platform_comment = platform_comment,
+                    .entry_comment = entry_comment,
+                    .preview_setup = "",
+                    .preview_heartbeat = "",
                 }, bw);
             } else {
                 // Raylib wasm: emscripten-driven callback loop. Preview

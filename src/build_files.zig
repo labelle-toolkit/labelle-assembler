@@ -202,7 +202,18 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         },
         .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),
-        .bgfx => try tpl.writeSection(build_zig_tmpl, "backend_bgfx", w),
+        .bgfx => {
+            // bgfx has an Android path (#303): the backend builds
+            // gfx/input/audio/window for `aarch64-linux-android` plus the
+            // `android_app` NativeActivity-glue module, and zglfw (desktop
+            // window toolkit) is omitted from the Android graph. Desktop
+            // keeps the GLFW-based `backend_bgfx` section.
+            if (cfg.platform == .android) {
+                try tpl.writeSection(build_zig_tmpl, "backend_bgfx_android", w);
+            } else {
+                try tpl.writeSection(build_zig_tmpl, "backend_bgfx", w);
+            }
+        },
         .wgpu => try tpl.writeSection(build_zig_tmpl, "backend_wgpu", w),
         .null => try tpl.writeSection(build_zig_tmpl, "backend_null", w),
     }
@@ -394,6 +405,15 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         }
         try tpl.writeSection(build_zig_tmpl, "android_exe_game_import", w);
 
+        // bgfx owns the NativeActivity `android_main` entry, so the
+        // generated `main.zig` imports the `android_app` shell module under
+        // `backend_app` (registers init/tick callbacks, drives `run`). The
+        // sokol Android path has no such import — sokol's C runtime
+        // provides the entry — so this is bgfx-only.
+        if (cfg.backend == .bgfx) {
+            try tpl.writeSection(build_zig_tmpl, "android_exe_app_import", w);
+        }
+
         try tpl.writeSection(build_zig_tmpl, "android_exe_end", w);
 
         // Promoted game-script modules → Android lib root module (#240 Gap 2).
@@ -403,7 +423,15 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         const android_cfg = cfg.android orelse config.AndroidConfig{};
         var sdk_buf: [10]u8 = undefined;
         const sdk_version_str = std.fmt.bufPrint(&sdk_buf, "{d}", .{android_cfg.target_sdk_version}) catch "34";
-        try tpl.renderSection(build_zig_tmpl, "android_link", .{ .target_sdk_version = sdk_version_str }, w);
+        // Backend-specific NDK link line: sokol consumes its `sokol_clib`
+        // static archive into the .so + links GLESv3/EGL; bgfx consumes
+        // the `bgfx` artifact + the `android_app` glue module and links
+        // GLESv3/EGL/android/log itself (#303).
+        if (cfg.backend == .bgfx) {
+            try tpl.renderSection(build_zig_tmpl, "android_link_bgfx", .{ .target_sdk_version = sdk_version_str }, w);
+        } else {
+            try tpl.renderSection(build_zig_tmpl, "android_link", .{ .target_sdk_version = sdk_version_str }, w);
+        }
 
         if (cfg.resolved_gui) |gui| {
             if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
