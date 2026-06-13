@@ -609,28 +609,28 @@ fn submitFrame(texture: *wgpu.Texture, frame: gfx.Frame) void {
         .color_attachments = &[_]wgpu.ColorAttachment{color_attachment},
     }) orelse return;
 
+    // Byte sizes are frame-constant (the buffers are uploaded whole), so
+    // compute them once here and reuse for both the upload guards and the
+    // per-segment buffer binds below.
+    const shape_vbytes = frame.shape_vertices.len * @sizeOf(ShapeVertex);
+    const shape_ibytes = frame.shape_indices.len * @sizeOf(u32);
+    const sprite_vbytes = frame.sprite_vertices.len * @sizeOf(SpriteVertex);
+    const sprite_ibytes = frame.sprite_indices.len * @sizeOf(u32);
+
     // Upload the shape vertex/index buffers once (guarded by the byte caps).
     var shape_uploaded = false;
-    if (frame.shape_indices.len > 0) {
-        const vbytes = frame.shape_vertices.len * @sizeOf(ShapeVertex);
-        const ibytes = frame.shape_indices.len * @sizeOf(u32);
-        if (vbytes <= MAX_VERTEX_BYTES and ibytes <= MAX_INDEX_BYTES) {
-            queue.?.writeBuffer(vertex_buffer.?, 0, frame.shape_vertices.ptr, vbytes);
-            queue.?.writeBuffer(index_buffer.?, 0, frame.shape_indices.ptr, ibytes);
-            shape_uploaded = true;
-        }
+    if (frame.shape_indices.len > 0 and shape_vbytes <= MAX_VERTEX_BYTES and shape_ibytes <= MAX_INDEX_BYTES) {
+        queue.?.writeBuffer(vertex_buffer.?, 0, frame.shape_vertices.ptr, shape_vbytes);
+        queue.?.writeBuffer(index_buffer.?, 0, frame.shape_indices.ptr, shape_ibytes);
+        shape_uploaded = true;
     }
 
     // Upload the sprite vertex/index buffers once (guarded by the byte caps).
     var sprite_uploaded = false;
-    if (frame.sprite_indices.len > 0) {
-        const vbytes = frame.sprite_vertices.len * @sizeOf(SpriteVertex);
-        const ibytes = frame.sprite_indices.len * @sizeOf(u32);
-        if (vbytes <= MAX_SPRITE_VERTEX_BYTES and ibytes <= MAX_SPRITE_INDEX_BYTES) {
-            queue.?.writeBuffer(sprite_vertex_buffer.?, 0, frame.sprite_vertices.ptr, vbytes);
-            queue.?.writeBuffer(sprite_index_buffer.?, 0, frame.sprite_indices.ptr, ibytes);
-            sprite_uploaded = true;
-        }
+    if (frame.sprite_indices.len > 0 and sprite_vbytes <= MAX_SPRITE_VERTEX_BYTES and sprite_ibytes <= MAX_SPRITE_INDEX_BYTES) {
+        queue.?.writeBuffer(sprite_vertex_buffer.?, 0, frame.sprite_vertices.ptr, sprite_vbytes);
+        queue.?.writeBuffer(sprite_index_buffer.?, 0, frame.sprite_indices.ptr, sprite_ibytes);
+        sprite_uploaded = true;
     }
 
     // Replay segments in submission order, switching pipeline per kind.
@@ -639,21 +639,17 @@ fn submitFrame(texture: *wgpu.Texture, frame: gfx.Frame) void {
             .shape => {
                 if (!shape_uploaded) continue;
                 const sp = shape_pipeline orelse continue;
-                const vbytes = frame.shape_vertices.len * @sizeOf(ShapeVertex);
-                const ibytes = frame.shape_indices.len * @sizeOf(u32);
                 pass.setPipeline(sp);
-                pass.setVertexBuffer(0, vertex_buffer.?, 0, vbytes);
-                pass.setIndexBuffer(index_buffer.?, .uint32, 0, ibytes);
+                pass.setVertexBuffer(0, vertex_buffer.?, 0, shape_vbytes);
+                pass.setIndexBuffer(index_buffer.?, .uint32, 0, shape_ibytes);
                 pass.drawIndexed(seg.index_count, 1, seg.index_start, 0, 0);
             },
             .sprite => {
                 if (!sprite_uploaded) continue;
                 const sp = sprite_pipeline orelse continue;
-                const vbytes = frame.sprite_vertices.len * @sizeOf(SpriteVertex);
-                const ibytes = frame.sprite_indices.len * @sizeOf(u32);
                 pass.setPipeline(sp);
-                pass.setVertexBuffer(0, sprite_vertex_buffer.?, 0, vbytes);
-                pass.setIndexBuffer(sprite_index_buffer.?, .uint32, 0, ibytes);
+                pass.setVertexBuffer(0, sprite_vertex_buffer.?, 0, sprite_vbytes);
+                pass.setIndexBuffer(sprite_index_buffer.?, .uint32, 0, sprite_ibytes);
                 drawSpriteRange(pass, frame.sprite_texture_ids, seg.quad_start, seg.quad_count);
             },
         }
