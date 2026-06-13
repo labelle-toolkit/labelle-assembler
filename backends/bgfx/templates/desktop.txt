@@ -3,6 +3,8 @@ const screen_h: u32 = {{height}};
 const screen_title = "{{title}}";
 const target_fps: u32 = {{fps}};
 
+const BackendGfxType = @import("backend_gfx");
+
 {{module_vars}}pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
@@ -23,6 +25,11 @@ const target_fps: u32 = {{fps}};
 {{preview_setup}}{{setup_code}}
     while (!window.windowShouldClose()) {
         const dt: f32 = 0.016;
+        // Aspect-fit the design canvas (config) into the real window size,
+        // so content renders correctly even if the window differs from the
+        // configured default. Per-frame is cheap and survives resizes.
+        BackendGfxType.setScreenSize(window.getScreenWidth(), window.getScreenHeight());
+        BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
 {{preview_heartbeat}}{{tick_code}}        g.tick(dt);
 
         window.beginDrawing();

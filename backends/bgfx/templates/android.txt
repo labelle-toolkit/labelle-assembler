@@ -20,6 +20,7 @@
 // suppress ITS own `android_main` export (otherwise a duplicate symbol);
 // the game owns the entry so it can register callbacks before the loop.
 const android_app = @import("backend_app");
+const BackendGfxType = @import("backend_gfx");
 
 pub const labelle_provides_android_main = true;
 
@@ -57,13 +58,14 @@ fn gameInit() callconv(.c) void {
     g = AssembledGame.init(allocator);
 
     g.setHooks(&hooks);
-    // Sync the engine's screen height to the REAL surface size, not the
-    // compile-time config: the shell created the ANativeWindow (and bgfx)
-    // at the device's native resolution just before this runs, so
-    // `window.getScreenHeight()` is the actual height. Using the config
-    // `screen_h` here would mis-map gizmo/UI coordinates on any device
-    // whose surface differs from the configured default.
-    g.setScreenHeight(@as(f32, @floatFromInt(window.getScreenHeight())));
+    // The engine works in the DESIGN canvas (config height) — the gfx
+    // backend aspect-fits design→surface (setScreenSize/setDesignSize in
+    // gameFrame), so the engine must NOT be told the raw surface height or
+    // its coordinate math conflicts with the backend's fit. Matches the
+    // sokol Android template (which uses the config `screen_h`, not the
+    // ANativeWindow size). (An earlier revision fed the real surface height
+    // here — correct only before the backend had a design-size system.)
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
 {{preview_setup}}{{init_code}}}
 
 // Per-frame tick: advance the engine, then render through bgfx. Mirrors
@@ -73,12 +75,16 @@ fn gameInit() callconv(.c) void {
 // here — the activity lifecycle drives shutdown.
 fn gameFrame() callconv(.c) void {
     const dt: f32 = 0.016;
-    // Re-sync the engine's screen height to the live surface size every
-    // frame (cheap field write). The surface can be destroyed + recreated
-    // at a different size — rotation, or pause/resume — without gameInit
-    // re-running, so a once-at-init sync would go stale. Matches the sokol
-    // Android template, which refreshes dimensions per frame.
-    g.setScreenHeight(@as(f32, @floatFromInt(window.getScreenHeight())));
+    // Engine works in the DESIGN canvas (config height); the gfx backend
+    // owns the design→surface aspect-fit below. Keep these consistent with
+    // gameInit and the sokol Android template.
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    // Feed the gfx backend the REAL surface size (physical) + the design
+    // canvas (config), so it aspect-fits the 800x600-style design space
+    // into the device's actual resolution. Per-frame because the surface
+    // can change (rotation, pause/resume). Mirrors the sokol Android template.
+    BackendGfxType.setScreenSize(window.getScreenWidth(), window.getScreenHeight());
+    BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
 {{preview_heartbeat}}{{tick_code}}    g.tick(dt);
 
     window.beginDrawing();
