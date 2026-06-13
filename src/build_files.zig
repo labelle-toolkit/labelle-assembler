@@ -211,7 +211,11 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             if (cfg.platform == .android) {
                 try tpl.writeSection(build_zig_tmpl, "backend_bgfx_android", w);
             } else {
-                try tpl.writeSection(build_zig_tmpl, "backend_bgfx", w);
+                // Desktop bgfx forwards `gamepad_enabled` like raylib/sokol so
+                // the backend wires the shared SDL desktop gamepad source
+                // (`.gamepad = .auto`) or falls back to its GLFW path
+                // (`.gamepad = .none`). See backends/bgfx/src/input.zig.
+                try tpl.renderSection(build_zig_tmpl, "backend_bgfx", .{ .gamepad_enabled = gamepad_enabled }, w);
             }
         },
         .wgpu => try tpl.writeSection(build_zig_tmpl, "backend_wgpu", w),

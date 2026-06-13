@@ -24,6 +24,16 @@
         .labelle_android_gamepad = .{
             .path = "../android_gamepad",
         },
+        // Shared windowless-SDL desktop gamepad source (core#28). In-tree
+        // sub-package shared with the raylib and sokol desktop backends via a
+        // relative path. On desktop targets, bgfx's `input` routes the gamepad
+        // getters through this SDL HIDAPI source (so Switch-mode pads read)
+        // instead of GLFW. The assembler stages it under .labelle/deps/ only
+        // when `.gamepad = .auto`; off Android/desktop-disabled nothing here is
+        // referenced.
+        .labelle_sdl_gamepad = .{
+            .path = "../sdl_gamepad",
+        },
         // labelle-core (#310 Stage 4). The bgfx Android backend adapter
         // (`src/android.zig`) imports core for the `AndroidBackendContext`
         // type it hands to `registerAndroidBackend`. The generated build

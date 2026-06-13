@@ -143,6 +143,13 @@ jobs:
         with:
           version: 0.16.0
 
+      # bgfx desktop links SDL2 when the gamepad source is enabled
+      # (`.gamepad = .auto`, the default) — the shared `sdl_gamepad` source
+      # reads controllers GLFW can't decode (Switch-mode pads). Same as the
+      # build-and-test job's sdl2 install.
+      - name: Install SDL2 (macOS)
+        run: brew install sdl2
+
       # Cache the compiled bgfx C++. The Zig global cache holds the heavy
       # zbgfx C/C++ objects; the per-project .zig-cache dirs hold the rest.
       # Both the XDG path (`~/.cache/zig`) and the macOS default
