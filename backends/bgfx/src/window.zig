@@ -162,7 +162,9 @@ pub fn closeWindow() void {
     bgfx.shutdown();
     if (is_android) {
         // No GLFW to tear down; the surface lifecycle is owned by the
-        // NativeActivity glue (phase 3).
+        // NativeActivity glue (phase 3). Clear the native-window handle so
+        // state is consistent after teardown.
+        android_native_window = null;
         glfw_window = null;
         return;
     }
@@ -173,10 +175,12 @@ pub fn closeWindow() void {
 
 pub fn windowShouldClose() bool {
     if (is_android) {
-        // The Android activity lifecycle (onDestroy) drives shutdown,
-        // not a per-frame close flag. Phase 3 (#302) wires this up;
-        // for now report "keep running" while a surface is present.
-        return android_native_window == null;
+        // The Android activity lifecycle (onDestroy) drives shutdown, not
+        // a per-frame close flag. Phase 3 (#302) wires the real signal;
+        // until then never request close — returning a "should close" here
+        // (e.g. before the surface is handed over at startup, when the
+        // handle is still null) would exit the main loop immediately.
+        return false;
     }
     if (glfw_window) |win| return win.shouldClose();
     return true;
