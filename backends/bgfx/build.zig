@@ -4,13 +4,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const zbgfx_dep = b.dependency("zbgfx", .{ .target = target, .optimize = optimize });
-    const zglfw_dep = b.dependency("zglfw", .{ .target = target, .optimize = optimize });
+    const is_android = target.result.os.tag == .linux and
+        (target.result.abi == .android or target.result.abi == .androideabi);
 
+    const zbgfx_dep = b.dependency("zbgfx", .{ .target = target, .optimize = optimize });
     const zbgfx_mod = zbgfx_dep.module("zbgfx");
-    const zglfw_mod = zglfw_dep.module("root");
     const bgfx_artifact = zbgfx_dep.artifact("bgfx");
-    const glfw_artifact = zglfw_dep.artifact("glfw");
+
+    // zglfw is desktop-only — it doesn't build for Android. Only fetch
+    // the zglfw dependency (and its artifact) off the Android path so the
+    // Android build graph never pulls it in. The window/input modules are
+    // wired without the `zglfw` import for Android (they comptime-gate it
+    // out; see src/window.zig + src/input.zig).
+    const zglfw_dep = if (is_android) null else b.dependency("zglfw", .{ .target = target, .optimize = optimize });
+    const zglfw_mod = if (zglfw_dep) |d| d.module("root") else null;
+    const glfw_artifact = if (zglfw_dep) |d| d.artifact("glfw") else null;
 
     // ── Android: feed bgfx's C/C++ the NDK sysroot headers ──────────
     // Zig's bundled libc++ `stdlib.h` pulls in `ldiv_t`/`lldiv` from the
@@ -18,32 +26,18 @@ pub fn build(b: *std.Build) void {
     // in Zig's tree. Without these include paths bx/bgfx/bimg fail to
     // compile for Android (`unknown type name 'ldiv_t'`). Mirror the
     // sokol-Android plumbing in `src/templates/build_zig.txt`. Gated on
-    // the Android ABI so desktop/cross builds are untouched. zglfw is
-    // desktop-only, so this is phase 1 of bgfx-on-Android (#300) — the
-    // glfw artifact + zglfw-dependent install is skipped below for
-    // Android so we can prove the bgfx/bx/bimg C++ compiles in isolation.
-    const is_android = target.result.os.tag == .linux and
-        (target.result.abi == .android or target.result.abi == .androideabi);
-    if (is_android) {
-        const ndk_sysroot = getAndroidNdkSysroot(b) orelse
-            @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
-        const ndk_arch_triple: []const u8 = switch (target.result.cpu.arch) {
-            .aarch64 => "aarch64-linux-android",
-            .x86_64 => "x86_64-linux-android",
-            .arm, .thumb => "arm-linux-androideabi",
-            .x86 => "i686-linux-android",
-            else => @panic("unsupported Android arch for bgfx"),
-        };
-        // Match the toolkit's default Android min_sdk (28, see
-        // `src/config.zig`). Must be >= 23: bx's `file.cpp` references
-        // `stdout`/`stderr`, which Bionic exposes as real symbols only
-        // from API 23 (below that they alias `__sF[]`, marked
-        // `__REMOVED_IN(23)` and rejected by clang availability).
-        const android_api = "28";
-        const inc_common = b.pathJoin(&.{ ndk_sysroot, "usr/include" });
-        const inc_arch = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple });
-        const lib_path = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, android_api });
-
+    // the Android ABI so desktop/cross builds are untouched.
+    //
+    // The same `usr/include` path also exposes `android/native_window.h`
+    // (for `ANativeWindow`) — phase 3 will compile the NativeActivity
+    // glue against it. Phase 2 only needs the Zig modules to compile, and
+    // they hand the surface across as an opaque `*anyopaque` (see
+    // src/window.zig), so no C header is pulled in yet.
+    //
+    // `ndk` is non-null only for Android; the resolved sysroot include
+    // paths are reused below to wire the Android gfx/window/input modules.
+    const ndk: ?NdkPaths = if (is_android) resolveNdkPaths(b, target) else null;
+    if (ndk) |n| {
         // zbgfx builds three separate static libs — `bx`, `bimg`, and
         // `bgfx` — each its own `*Compile` with its own `root_module`.
         // The consumer can only fetch the top-level `bgfx` artifact, but
@@ -51,10 +45,10 @@ pub fn build(b: *std.Build) void {
         // bgfx's link_objects to reach them, then apply the NDK sysroot
         // paths to every C/C++ module so all three find the Bionic
         // headers. (Include paths don't propagate across linkLibrary.)
-        applyNdkSysroot(bgfx_artifact.root_module, inc_common, inc_arch, lib_path, android_api);
+        applyNdkSysroot(bgfx_artifact.root_module, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
         for (bgfx_artifact.root_module.link_objects.items) |lo| {
             if (lo == .other_step) {
-                applyNdkSysroot(lo.other_step.root_module, inc_common, inc_arch, lib_path, android_api);
+                applyNdkSysroot(lo.other_step.root_module, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
             }
         }
     }
@@ -70,59 +64,66 @@ pub fn build(b: *std.Build) void {
     });
     gfx_mod.addImport("zbgfx", zbgfx_mod);
 
-    // ── Android phase-1 isolation (#300) ────────────────────────────
-    // The input/window modules + the glfw artifact depend on zglfw,
-    // which is desktop-only (Android wiring is phase 2, #301). For an
-    // Android target we install ONLY the bgfx artifact so the verifier
-    // proves bx/bgfx/bimg compile cleanly, and skip everything that
-    // would drag in zglfw. Desktop builds fall through unchanged.
-    if (is_android) {
-        b.installArtifact(bgfx_artifact);
-        return;
-    }
-
     // ── Input backend module ────────────────────────────────────────
+    // Desktop wires the `zglfw` import for GLFW polling; Android omits it
+    // (zglfw is desktop-only) and `src/input.zig` comptime-gates every
+    // zglfw reference behind `is_android`, stubbing input until the
+    // touch path lands in phase 3 (#302).
     const input_mod = b.addModule("input", .{
         .root_source_file = b.path("src/input.zig"),
         .target = target,
         .optimize = optimize,
     });
-    input_mod.addImport("zglfw", zglfw_mod);
+    if (zglfw_mod) |m| input_mod.addImport("zglfw", m);
 
     // ── Audio backend module ────────────────────────────────────────
     // `link_libc = true` is required by `src/audio.zig`'s libc-based
     // WAV file loader (post-0.16 swap from `std.fs.cwd()`) AND by
     // miniaudio (its CoreAudio/ALSA/WASAPI backends are C and need the
     // C runtime).
-    const audio_mod = b.addModule("audio", .{
-        .root_source_file = b.path("src/audio.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    //
+    // Android audio (AAudio/OpenSL) is out of phase-2 scope — this phase
+    // brings up gfx/window/input only (#301). Skip the audio module on
+    // Android so miniaudio's implementation TU isn't dragged into the
+    // Android build; it returns to the AAudio backend in a later phase.
+    if (!is_android) {
+        const audio_mod = b.addModule("audio", .{
+            .root_source_file = b.path("src/audio.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
 
-    // ── miniaudio playback device (#297) ────────────────────────────
-    // Compile miniaudio's implementation translation unit + its per-OS
-    // system libs straight into the audio module (see `wireMiniaudio`).
-    // `src/audio.zig` opens an `ma_device` in its `ensureInit` lifecycle
-    // hook and drives the PCM mixer from the device's data callback. The
-    // links propagate to any consumer that imports the `audio` module
-    // (e.g. the example exe), so the example links them transitively.
-    wireMiniaudio(b, audio_mod, target.result.os.tag);
+        // ── miniaudio playback device (#297) ────────────────────────
+        // Compile miniaudio's implementation translation unit + its
+        // per-OS system libs straight into the audio module (see
+        // `wireMiniaudio`). `src/audio.zig` opens an `ma_device` in its
+        // `ensureInit` lifecycle hook and drives the PCM mixer from the
+        // device's data callback. The links propagate to any consumer
+        // that imports the `audio` module (e.g. the example exe), so the
+        // example links them transitively.
+        wireMiniaudio(b, audio_mod, target.result.os.tag);
+    }
 
     // ── Window backend module ───────────────────────────────────────
+    // Desktop gets the `zglfw` import (GLFW lifecycle + native handle).
+    // Android omits it: `src/window.zig` comptime-gates the GLFW path out
+    // and instead reads an `ANativeWindow*` (handed over via
+    // `setAndroidNativeWindow`) into `PlatformData.nwh` at bgfx init.
     const window_mod = b.addModule("window", .{
         .root_source_file = b.path("src/window.zig"),
         .target = target,
         .optimize = optimize,
     });
-    window_mod.addImport("zglfw", zglfw_mod);
+    if (zglfw_mod) |m| window_mod.addImport("zglfw", m);
     window_mod.addImport("zbgfx", zbgfx_mod);
     window_mod.addImport("input", input_mod);
 
     // ── Re-export native artifacts so consumers can link them ───────
+    // bgfx is always re-exported. glfw is desktop-only (Android has no
+    // zglfw artifact), so only install it off the Android path.
     b.installArtifact(bgfx_artifact);
-    b.installArtifact(glfw_artifact);
+    if (glfw_artifact) |a| b.installArtifact(a);
 
     // ── Unit tests for the platform-dispatch helper ─────────────────
     // Always build + run on the host — platform.zig is pure Zig with
@@ -140,18 +141,31 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run bgfx backend unit tests");
     test_step.dependOn(&b.addRunArtifact(platform_tests).step);
 
-    // ── Compile-check window.zig ────────────────────────────────────
-    // window.zig does the real comptime dispatch on builtin.target.os.tag,
-    // so compiling it with `-Dtarget=<os>` is the only way to catch
-    // branches that don't build for a given OS. Forcing a test binary
-    // off window_mod pulls the full module graph (zbgfx + zglfw + input)
-    // into the build and errors on any per-OS breakage.
+    // ── Compile-check window.zig (+ input.zig via its import) ───────
+    // window.zig does the real comptime dispatch on builtin.target — both
+    // the per-OS desktop branches and the Android `is_android` path — so
+    // compiling it with `-Dtarget=<os>` is the only way to catch branches
+    // that don't build for a given target. Forcing a test binary off
+    // window_mod pulls the full module graph (zbgfx + input, plus zglfw on
+    // desktop) into the build and errors on any per-target breakage. For
+    // `-Dtarget=aarch64-linux-android` this is the vehicle that proves
+    // window/input compile with NO zglfw in the graph.
     //
     // Depend on the *compile* step, not a run step — we want this to
     // work under cross-compilation (`-Dtarget=x86_64-windows-gnu`,
-    // etc.) where the host can't execute the produced binary.
+    // `-Dtarget=aarch64-linux-android`, etc.) where the host can't
+    // execute the produced binary.
     const window_tests = b.addTest(.{ .root_module = window_mod });
     test_step.dependOn(&window_tests.step);
+
+    // ── Compile-check gfx.zig for the build target ──────────────────
+    // gfx.zig imports only zbgfx (no zglfw), so it already compiled for
+    // Android in phase 1 implicitly — but nothing in the test graph
+    // forced it. Add an explicit compile-check so `zig build test
+    // -Dtarget=aarch64-linux-android` covers all three Android modules
+    // (gfx/window/input) as required by phase 2.
+    const gfx_tests = b.addTest(.{ .root_module = gfx_mod });
+    test_step.dependOn(&gfx_tests.step);
 
     // ── Audio backend tests ─────────────────────────────────────────
     // Build + run the audio module's unit tests (spinlock, mixer, WAV
@@ -224,6 +238,43 @@ fn applyNdkSysroot(
     mod.addCMacro("__ANDROID_API__", android_api);
     // Android .so consumers need PIC in every archived .o (see #147).
     mod.pic = true;
+}
+
+/// Resolved Android NDK sysroot include/library paths + API level for a
+/// given target. Computed once in `build()` and threaded through
+/// `applyNdkSysroot` for each C/C++ module that needs the Bionic headers.
+const NdkPaths = struct {
+    inc_common: []const u8,
+    inc_arch: []const u8,
+    lib_path: []const u8,
+    android_api: []const u8,
+};
+
+/// Resolve the NDK sysroot paths for an Android `target`. Panics with an
+/// actionable message if the NDK can't be found or the arch is
+/// unsupported — the caller only invokes this when `is_android` is true.
+fn resolveNdkPaths(b: *std.Build, target: std.Build.ResolvedTarget) NdkPaths {
+    const ndk_sysroot = getAndroidNdkSysroot(b) orelse
+        @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
+    const ndk_arch_triple: []const u8 = switch (target.result.cpu.arch) {
+        .aarch64 => "aarch64-linux-android",
+        .x86_64 => "x86_64-linux-android",
+        .arm, .thumb => "arm-linux-androideabi",
+        .x86 => "i686-linux-android",
+        else => @panic("unsupported Android arch for bgfx"),
+    };
+    // Match the toolkit's default Android min_sdk (28, see
+    // `src/config.zig`). Must be >= 23: bx's `file.cpp` references
+    // `stdout`/`stderr`, which Bionic exposes as real symbols only from
+    // API 23 (below that they alias `__sF[]`, marked `__REMOVED_IN(23)`
+    // and rejected by clang availability).
+    const android_api = "28";
+    return .{
+        .inc_common = b.pathJoin(&.{ ndk_sysroot, "usr/include" }),
+        .inc_arch = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }),
+        .lib_path = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, android_api }),
+        .android_api = android_api,
+    };
 }
 
 /// Locate the Android NDK sysroot, mirroring the sokol-Android path in

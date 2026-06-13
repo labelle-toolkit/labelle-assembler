@@ -1,6 +1,15 @@
 /// bgfx input backend — satisfies the engine InputInterface(Impl) contract.
-/// Uses GLFW for input (bgfx doesn't provide input).
-const glfw = @import("zglfw");
+/// Uses GLFW for input on desktop (bgfx doesn't provide input). On
+/// Android zglfw isn't available, so the input functions are stubbed
+/// (real touch input is phase 3, #302) and `glfw` resolves to an empty
+/// namespace — every zglfw reference below is comptime-gated on
+/// `is_android` so the module compiles for `aarch64-linux-android`.
+const builtin = @import("builtin");
+
+const is_android = builtin.target.os.tag == .linux and
+    (builtin.target.abi == .android or builtin.target.abi == .androideabi);
+
+const glfw = if (is_android) struct {} else @import("zglfw");
 
 const MAX_KEYS = 512;
 const MAX_MOUSE_BUTTONS = 8;
@@ -17,10 +26,16 @@ var mouse_x: f32 = 0;
 var mouse_y: f32 = 0;
 var mouse_wheel: f32 = 0;
 
-var glfw_window: ?*glfw.Window = null;
+var glfw_window: if (is_android) ?*anyopaque else ?*glfw.Window = null;
 
-/// Bind to a GLFW window for input polling.
-pub fn setWindow(win: *glfw.Window) void {
+/// Bind to a GLFW window for input polling. Android has no GLFW window;
+/// the type is `*anyopaque` there and `setWindow` is a no-op (touch
+/// input is wired in phase 3, #302).
+pub fn setWindow(win: if (is_android) *anyopaque else *glfw.Window) void {
+    if (is_android) {
+        glfw_window = win;
+        return;
+    }
     glfw_window = win;
     _ = win.setScrollCallback(scrollCallback);
 }
@@ -30,12 +45,16 @@ fn scrollCallback(_: *glfw.Window, _: f64, yoffset: f64) callconv(.c) void {
 }
 
 /// Call at the start of each frame to reset per-frame state and poll GLFW.
+/// On Android the GLFW poll is skipped (no zglfw); touch state will be
+/// fed by the NativeActivity glue in phase 3.
 pub fn newFrame() void {
     keys_pressed = [_]bool{false} ** MAX_KEYS;
     keys_released = [_]bool{false} ** MAX_KEYS;
     mouse_pressed = [_]bool{false} ** MAX_MOUSE_BUTTONS;
     mouse_released = [_]bool{false} ** MAX_MOUSE_BUTTONS;
     mouse_wheel = 0;
+
+    if (is_android) return;
 
     glfw.pollEvents();
 
@@ -49,6 +68,7 @@ pub fn newFrame() void {
 // ── Keyboard ──────────────────────────────────────────────
 
 pub fn isKeyDown(key: u32) bool {
+    if (is_android) return false; // no keyboard on Android (phase 3 touch)
     if (glfw_window) |win| {
         return win.getKey(@enumFromInt(key)) == .press;
     }
@@ -74,6 +94,7 @@ pub fn getMouseY() f32 {
 }
 
 pub fn isMouseButtonDown(button: u32) bool {
+    if (is_android) return false; // no mouse on Android (phase 3 touch)
     if (glfw_window) |win| {
         return win.getMouseButton(@enumFromInt(button)) == .press;
     }
@@ -116,6 +137,7 @@ pub fn getTouchId(index: u32) u64 {
 // ── Gamepad ───────────────────────────────────────────────
 
 pub fn isGamepadAvailable(gamepad: u32) bool {
+    if (is_android) return false; // Android gamepads are a later phase
     return glfw.joystickPresent(@enumFromInt(gamepad));
 }
 
