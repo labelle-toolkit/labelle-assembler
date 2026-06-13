@@ -78,30 +78,29 @@ pub fn build(b: *std.Build) void {
 
     // ── Audio backend module ────────────────────────────────────────
     // `link_libc = true` is required by `src/audio.zig`'s libc-based
-    // WAV file loader (post-0.16 swap from `std.fs.cwd()`) AND by
-    // miniaudio (its CoreAudio/ALSA/WASAPI backends are C and need the
-    // C runtime).
+    // WAV file loader (post-0.16 swap from `std.fs.cwd()`) AND, on
+    // desktop, by miniaudio (its CoreAudio/ALSA/WASAPI backends are C and
+    // need the C runtime).
     //
-    // Android audio (AAudio/OpenSL) is out of phase-2 scope — this phase
-    // brings up gfx/window/input only (#301). Skip the audio module on
-    // Android so miniaudio's implementation TU isn't dragged into the
-    // Android build; it returns to the AAudio backend in a later phase.
+    // The audio module is registered on EVERY target — the backend's
+    // module contract must hold for Android consumers (#306):
+    // `backend_dep.module("audio")` is fetched by the generated
+    // `backend_bgfx_android` build (phase 4, #303). On Android it's a
+    // *device-less* mixer: `src/audio.zig` comptime-selects a no-op
+    // device backend (`is_android`), so NO miniaudio C TU and NO audio
+    // frameworks are compiled in. On desktop we additionally compile
+    // miniaudio + its per-OS system libs via `wireMiniaudio`; the real
+    // playback device (in `src/audio_device.zig`) drives the PCM mixer
+    // from its data callback. Those links propagate to any consumer that
+    // imports the `audio` module (e.g. the example exe).
+    const audio_mod = b.addModule("audio", .{
+        .root_source_file = b.path("src/audio.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     if (!is_android) {
-        const audio_mod = b.addModule("audio", .{
-            .root_source_file = b.path("src/audio.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-
-        // ── miniaudio playback device (#297) ────────────────────────
-        // Compile miniaudio's implementation translation unit + its
-        // per-OS system libs straight into the audio module (see
-        // `wireMiniaudio`). `src/audio.zig` opens an `ma_device` in its
-        // `ensureInit` lifecycle hook and drives the PCM mixer from the
-        // device's data callback. The links propagate to any consumer
-        // that imports the `audio` module (e.g. the example exe), so the
-        // example links them transitively.
+        // ── miniaudio playback device (#297) — desktop only ─────────
         wireMiniaudio(b, audio_mod, target.result.os.tag);
     }
 
@@ -166,6 +165,22 @@ pub fn build(b: *std.Build) void {
     // (gfx/window/input) as required by phase 2.
     const gfx_tests = b.addTest(.{ .root_module = gfx_mod });
     test_step.dependOn(&gfx_tests.step);
+
+    // ── Compile-check audio.zig for the build target (Android) ──────
+    // On the host, the audio tests below RUN against the real miniaudio
+    // device backend (pinned to `host_target`). That run-test can't cover
+    // `-Dtarget=aarch64-linux-android`: the host can't execute a foreign
+    // binary, and the device-less Android path selects a different
+    // `device_backend`. So for Android we add an explicit compile-check
+    // off `audio_mod` (the build-target module, no miniaudio wired) that
+    // emits objects for aarch64-linux-android — proving the device-less
+    // mixer (#306) compiles for the target the generated
+    // `backend_bgfx_android` build will fetch. Depend on the *compile*
+    // step, never a run step (same reasoning as window/input above).
+    if (is_android) {
+        const audio_android_tests = b.addTest(.{ .root_module = audio_mod });
+        test_step.dependOn(&audio_android_tests.step);
+    }
 
     // ── Android app-shell module (NativeActivity glue) ──────────────
     // Phase 3 (#302): the hand-rolled NativeActivity entry that sokol

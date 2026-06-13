@@ -18,11 +18,41 @@
 /// tight — the mixer holds the lock only while touching slot state, and
 /// the actual `free()` in unload happens after the slot has been detached
 /// and the lock released.
+///
+/// Android (#306): the miniaudio playback device is desktop-only — its C
+/// TU and the per-OS audio frameworks aren't built for Android (AAudio is
+/// a later task). On Android the device backend is a no-op stub, so this
+/// module is a *device-less* mixer: it decodes/loads/mixes exactly as on
+/// desktop, but nothing pumps `mixAudio`, so audio is silent on-device
+/// until the AAudio path lands. Selecting the backend at comptime
+/// (`device_backend`) keeps every `miniaudio.h` reference out of the
+/// Android build's semantic analysis.
 const std = @import("std");
+const builtin = @import("builtin");
 
-const ma = @cImport({
-    @cInclude("miniaudio.h");
-});
+const is_android = builtin.target.os.tag == .linux and
+    (builtin.target.abi == .android or builtin.target.abi == .androideabi);
+
+/// Device-less stub used on Android (and anywhere without a real output
+/// device). Mirrors `audio_device.zig`'s control surface so `ensureInit`
+/// / `deinit` call through it unchanged: starting is a no-op, stopping is
+/// a no-op, and zero frames are ever mixed.
+const NoopDevice = struct {
+    pub const MixFn = *const fn (output: []i16, frames_requested: u32) void;
+    pub fn ensureStarted(mix: MixFn) void {
+        _ = mix; // no device drives the mixer on this target
+    }
+    pub fn stop() void {}
+    pub fn framesMixed() u64 {
+        return 0;
+    }
+};
+
+// On Android the miniaudio `@cImport` (and `miniaudio.h` itself) must not
+// be analyzed — the header isn't on the include path and the device libs
+// aren't linked. `if (is_android)` is comptime, so only the taken branch
+// is semantically analyzed per target.
+const device_backend = if (is_android) NoopDevice else @import("audio_device.zig");
 
 const MAX_SOUNDS = 256;
 const MAX_MUSIC = 32;
@@ -90,107 +120,33 @@ var next_sound_id: u32 = 1;
 var next_music_id: u32 = 1;
 var master_volume: f32 = 1.0;
 
-// ── miniaudio playback device (#297) ─────────────────────────────────
+// ── Playback device (#297, #306) ─────────────────────────────────────
 //
-// A single shared `ma_device` in playback mode (s16 / 2ch / 48 kHz).
-// Its data callback is the audio-thread entry point that drives
-// `mixAudio`. The device is opened lazily on first use (`ensureInit`)
-// and closed on `deinit`. `device_initialized` is the single source of
-// truth for whether the device + ma_context are live.
+// The actual output device lives in `device_backend` (selected at
+// comptime above): the real miniaudio playback device on desktop, a
+// no-op stub on Android. `ensureInit` lazily starts it and wires
+// `mixAudio` as the audio-thread fill callback; `deinit` stops it. All
+// `ma_device` / `miniaudio.h` knowledge is confined to
+// `audio_device.zig`, so this module compiles for Android unchanged.
 
-const DEVICE_SAMPLE_RATE: u32 = 48000;
-const DEVICE_CHANNELS: u32 = 2;
-
-var device: ma.ma_device = undefined;
-// `ensureInit` / `deinit` are called from the game thread only (the
-// AudioInterface control surface is single-threaded; only `mixAudio` runs
-// on the audio callback thread, and it never reads this). It's atomic
-// anyway for safe publication of the device's initialized state.
-var device_initialized: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-/// Audio-thread data callback. miniaudio hands us a frame budget and a
-/// raw output buffer for `ma_format_s16` / 2 channels; we reinterpret it
-/// as interleaved-stereo i16 and let the PCM mixer fill it. `mixAudio`
-/// takes `slot_lock` internally, so this is safe against concurrent
-/// load/unload on the game thread (#298).
-fn deviceDataCallback(
-    p_device: ?*ma.ma_device,
-    p_output: ?*anyopaque,
-    p_input: ?*const anyopaque,
-    frame_count: ma.ma_uint32,
-) callconv(.c) void {
-    _ = p_device;
-    _ = p_input; // playback-only device: no capture input
-    const out_ptr = p_output orelse return;
-    const out: [*]i16 = @ptrCast(@alignCast(out_ptr));
-    const frames: u32 = @intCast(frame_count);
-    const sample_count: usize = @as(usize, frames) * DEVICE_CHANNELS;
-
-    // Cheap proof-of-life so headless runs can confirm the callback is
-    // actually firing (audibility can't be asserted without a speaker).
-    // Log exactly once on the first invocation; thereafter just count.
-    const prev = frames_mixed.fetchAdd(frames, .monotonic);
-    if (prev == 0) {
-        std.log.info("audio: device callback firing (first {d} frames mixed)", .{frames});
-    }
-
-    mixAudio(out[0..sample_count], frames);
-}
-
-/// Cumulative frames pushed through the device callback. Read once at
-/// `deinit` to print a single proof-of-life line; not used for control
-/// flow. Atomic because it's written from the audio thread.
-var frames_mixed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-
-/// Open the playback device on first use. Idempotent and cheap to call
-/// from every public entry point that can start audio. If the device
-/// fails to open (e.g. no audio hardware in CI) we log once and leave
-/// `device_initialized` false — the rest of the backend keeps working as
-/// a silent state machine, exactly as before this device existed.
+/// Open the playback device on first use, driving `mixAudio` from its
+/// audio-thread callback. Idempotent and cheap to call from every public
+/// entry point that can start audio. On Android this is a no-op (no
+/// device); the mixer state advances only when something pumps `mixAudio`.
 pub fn ensureInit() void {
-    if (device_initialized.load(.acquire)) return;
-
-    var config = ma.ma_device_config_init(ma.ma_device_type_playback);
-    config.playback.format = ma.ma_format_s16;
-    config.playback.channels = DEVICE_CHANNELS;
-    config.sampleRate = DEVICE_SAMPLE_RATE;
-    config.dataCallback = deviceDataCallback;
-
-    if (ma.ma_device_init(null, &config, &device) != ma.MA_SUCCESS) {
-        std.log.warn("audio: failed to initialize miniaudio playback device", .{});
-        return;
-    }
-
-    if (ma.ma_device_start(&device) != ma.MA_SUCCESS) {
-        std.log.warn("audio: failed to start miniaudio playback device", .{});
-        ma.ma_device_uninit(&device);
-        return;
-    }
-
-    device_initialized.store(true, .release);
-    std.log.info(
-        "audio: miniaudio playback device started: {d}Hz {d}ch s16",
-        .{ device.sampleRate, DEVICE_CHANNELS },
-    );
+    device_backend.ensureStarted(&mixAudio);
 }
 
 /// Stop and close the playback device, then free all loaded PCM. Must be
-/// called by the host on shutdown. `ma_device_uninit` joins the audio
-/// thread before returning, so after it the slots are no longer touched
-/// by the callback and we can free them without taking `slot_lock`.
+/// called by the host on shutdown. On desktop `device_backend.stop` joins
+/// the audio thread before returning, so after it the slots are no longer
+/// touched by the callback and we can free them without taking
+/// `slot_lock`. On Android `stop` is a no-op and no audio thread ever ran.
 pub fn deinit() void {
-    if (device_initialized.load(.acquire)) {
-        // Joins the audio callback thread — no more `mixAudio` after this.
-        ma.ma_device_uninit(&device);
-        device_initialized.store(false, .release);
-        std.log.info(
-            "audio: miniaudio device stopped ({d} frames mixed)",
-            .{frames_mixed.load(.monotonic)},
-        );
-    }
+    device_backend.stop();
 
     // Free any PCM the game didn't explicitly unload. The audio thread is
-    // gone, so no lock is needed.
+    // gone (or never existed, on Android), so no lock is needed.
     for (&sounds) |*slot| {
         if (slot.pcm) |pcm| {
             if (pcm.raw_alloc.len > 0) std.heap.page_allocator.free(pcm.raw_alloc);
@@ -560,7 +516,8 @@ pub fn updateMusic(id: u32) void {
 // ── PCM mixer ────────────────────────────────────────────────────────
 
 /// Mix all active sounds and music into a stereo i16 output buffer.
-/// Called by the miniaudio device callback to fill the output device.
+/// Called by the device backend's audio-thread callback to fill the
+/// output device (desktop). On Android nothing calls this yet (no device).
 ///
 /// Takes `slot_lock` for the duration of the mix so the game thread
 /// cannot free PCM data (`unloadSound`/`unloadMusic`) out from under it
