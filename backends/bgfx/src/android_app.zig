@@ -151,6 +151,14 @@ const AINPUT_EVENT_TYPE_MOTION: i32 = 2;
 const AKEY_EVENT_ACTION_DOWN: i32 = 0;
 const AKEY_EVENT_ACTION_UP: i32 = 1;
 
+// `AKEYCODE_BACK` — many controllers map the B / "circle" / select button to
+// the system BACK key. If we leave that unconsumed, Android performs back
+// navigation (the activity finishes — the game quits) the moment the player
+// presses B. We consume BACK only when it originates from a gamepad source
+// (so the real system BACK gesture/button is untouched). Mirrors sokol's
+// B->BACK guard (assembler#248).
+const AKEYCODE_BACK: i32 = 4;
+
 // ── AInputEvent source classes/sources (android/input.h) ────────────
 // A device's source is a bitmask; controllers expose GAMEPAD and/or
 // JOYSTICK. We treat a motion event as a gamepad axis report only when its
@@ -352,8 +360,7 @@ fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
         // Controller buttons (BUTTON_A/B/X/Y, L1/R1/L2/R2, thumbs, start/
         // select/mode) and DPAD_* arrive as key events. Forward the raw
         // keycode; the shared state module maps it to a canonical button
-        // (and ignores non-gamepad keys). We do NOT consume it (return 0) so
-        // system keys (BACK/HOME/volume) still reach their default handlers.
+        // (and ignores non-gamepad keys).
         const keycode = AKeyEvent_getKeyCode(event);
         const action = AKeyEvent_getAction(event);
         if (action == AKEY_EVENT_ACTION_DOWN) {
@@ -361,6 +368,15 @@ fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
         } else if (action == AKEY_EVENT_ACTION_UP) {
             input.applyGamepadKey(device_id, keycode, false);
         }
+        // Consume BACK when it comes from a gamepad/joystick (controllers map
+        // B/select to AKEYCODE_BACK) so it doesn't quit the activity; leave
+        // the genuine system BACK (touchscreen/system source) unhandled so it
+        // still navigates. Other gamepad keys stay unconsumed (return 0) —
+        // the system does nothing useful with BUTTON_*/DPAD_*, and consuming
+        // them all would swallow HOME/volume on odd devices.
+        const from_pad = (source & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD or
+            (source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK;
+        if (keycode == AKEYCODE_BACK and from_pad) return 1;
         return 0;
     }
 
