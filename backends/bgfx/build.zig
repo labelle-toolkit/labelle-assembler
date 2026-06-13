@@ -167,6 +167,66 @@ pub fn build(b: *std.Build) void {
     const gfx_tests = b.addTest(.{ .root_module = gfx_mod });
     test_step.dependOn(&gfx_tests.step);
 
+    // ── Android app-shell module (NativeActivity glue) ──────────────
+    // Phase 3 (#302): the hand-rolled NativeActivity entry that sokol
+    // hides inside sokol_app. Built ONLY for Android — it's the runtime
+    // glue that drives the ANativeWindow surface (phases 1–2 plumbed) and
+    // feeds touch into `input`. It compiles the NDK's
+    // `android_native_app_glue.c` (which provides the app thread + looper
+    // + `ANativeActivity_onCreate`) and exports our `android_main`.
+    //
+    // We build it as its OWN object compile-check rather than wiring it
+    // into the gfx/window/input modules: the full `.so` link (EGL /
+    // GLESv3 / libandroid / liblog) is phase 4 (#303), so here we only
+    // prove the module + glue + touch wiring COMPILE for
+    // aarch64-linux-android. The android libs the shell references
+    // (`android`, `log`) are declared on the module so they're recorded
+    // for the eventual link, but we depend on the *compile* step (object
+    // emission), never a run/link step that would demand those libs be
+    // present on the host.
+    if (ndk) |n| {
+        const android_app_mod = b.addModule("android_app", .{
+            .root_source_file = b.path("src/android_app.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        // android_app drives window + input directly.
+        android_app_mod.addImport("window", window_mod);
+        android_app_mod.addImport("input", input_mod);
+        android_app_mod.addImport("zbgfx", zbgfx_mod);
+
+        // Vendor the NDK's native_app_glue: its include dir (for
+        // <android_native_app_glue.h>) and its single C TU. The glue needs
+        // the Bionic headers (android/native_window.h, looper.h, input.h),
+        // which the NDK sysroot supplies — apply the same sysroot wiring
+        // bgfx/bx/bimg use.
+        applyNdkSysroot(android_app_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+        const glue_dir = androidNativeAppGlueDir(b) orelse
+            @panic("Could not find native_app_glue in the NDK (sources/android/native_app_glue).");
+        android_app_mod.addIncludePath(.{ .cwd_relative = glue_dir });
+        android_app_mod.addCSourceFile(.{
+            .file = .{ .cwd_relative = b.pathJoin(&.{ glue_dir, "android_native_app_glue.c" }) },
+            .flags = &.{ "-std=c11", "-Wall" },
+        });
+
+        // Declare the android libs the shell references for the eventual
+        // (phase-4) link. These are recorded on the module's link inputs;
+        // the compile-check below depends only on object emission, so a
+        // missing lib on the host can't break the build here.
+        android_app_mod.linkSystemLibrary("android", .{});
+        android_app_mod.linkSystemLibrary("log", .{});
+
+        // Compile-check: a test binary off the android_app module pulls
+        // the full graph (android_app + native_app_glue C + window/input,
+        // no zglfw) and emits objects for aarch64-linux-android. We depend
+        // on the *compile* step (`&t.step`), NOT a run step — the host
+        // can't execute an aarch64-linux-android binary, and we explicitly
+        // avoid a link that would need EGL/GLESv3 (phase 4).
+        const android_app_tests = b.addTest(.{ .root_module = android_app_mod });
+        test_step.dependOn(&android_app_tests.step);
+    }
+
     // ── Audio backend tests ─────────────────────────────────────────
     // Build + run the audio module's unit tests (spinlock, mixer, WAV
     // decode, unload ordering). These RUN (they exercise the spinlock /
@@ -319,6 +379,50 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
             if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| {
                 return sysroot;
             } else |_| {}
+        }
+    }
+    return null;
+}
+
+/// Locate the NDK's `android_native_app_glue` source directory
+/// (`<ndk>/sources/android/native_app_glue`), which ships
+/// `android_native_app_glue.c` + `.h`. Resolves the NDK root the same way
+/// `getAndroidNdkSysroot` does (ANDROID_NDK_HOME, then
+/// ANDROID_HOME/ndk/<latest>) but returns the glue dir rather than the
+/// sysroot. Returns null if it can't be found.
+fn androidNativeAppGlueDir(b: *std.Build) ?[]const u8 {
+    const io = b.graph.io;
+    const rel = &.{ "sources", "android", "native_app_glue" };
+
+    // 1. ANDROID_NDK_HOME
+    if (b.graph.environ_map.get("ANDROID_NDK_HOME")) |ndk_home| {
+        const dir = b.pathJoin(&.{ ndk_home, rel[0], rel[1], rel[2] });
+        if (std.Io.Dir.cwd().access(io, dir, .{})) |_| return dir else |_| {}
+    }
+
+    // 2. ANDROID_HOME/ndk/<latest>
+    if (b.graph.environ_map.get("ANDROID_HOME")) |home| {
+        const ndk_dir = b.pathJoin(&.{ home, "ndk" });
+        var dir = std.Io.Dir.cwd().openDir(io, ndk_dir, .{ .iterate = true }) catch return null;
+        defer dir.close(io);
+        var latest: ?[]const u8 = null;
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (entry.kind == .directory) {
+                if (latest) |prev| {
+                    if (std.mem.order(u8, entry.name, prev) == .gt) {
+                        b.allocator.free(prev);
+                        latest = b.allocator.dupe(u8, entry.name) catch null;
+                    }
+                } else {
+                    latest = b.allocator.dupe(u8, entry.name) catch null;
+                }
+            }
+        }
+        if (latest) |version| {
+            defer b.allocator.free(version);
+            const glue = b.pathJoin(&.{ ndk_dir, version, rel[0], rel[1], rel[2] });
+            if (std.Io.Dir.cwd().access(io, glue, .{})) |_| return glue else |_| {}
         }
     }
     return null;
