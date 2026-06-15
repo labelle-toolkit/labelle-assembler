@@ -285,6 +285,25 @@ pub fn requestQuit() void {
     sapp.requestQuit();
 }
 
+/// Query whether the window is currently fullscreen.
+/// Mirrors raylib's `IsWindowFullscreen`. Headless preview has no real
+/// window, so it's never fullscreen.
+pub fn isFullscreen() bool {
+    if (headless_mode) return false;
+    return sapp.isFullscreen();
+}
+
+/// Switch the window to fullscreen (`on=true`) or windowed (`on=false`).
+/// The generated frame callback polls `g.takeFullscreenRequest()` and
+/// calls this when a script flipped `game.setFullscreen`. sokol_app only
+/// exposes a *toggle*, so we read the current mode and toggle only when
+/// it differs from the requested one (idempotent). No-op in headless
+/// preview mode (no sokol_app window to resize).
+pub fn setFullscreen(on: bool) void {
+    if (headless_mode) return;
+    if (sapp.isFullscreen() != on) sapp.toggleFullscreen();
+}
+
 pub fn width() i32 {
     return if (headless_mode) headless_w else sapp.width();
 }

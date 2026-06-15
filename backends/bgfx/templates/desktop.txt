@@ -25,6 +25,15 @@ const BackendGfxType = @import("backend_gfx");
 {{preview_setup}}{{setup_code}}
     while (!window.windowShouldClose()) {
         const dt: f32 = 0.016;
+        // Apply a pending fullscreen/windowed switch requested via
+        // `game.setFullscreen`/`toggleFullscreen`. The engine owns the
+        // desired flag; the backend owns the platform call. Gated on BOTH
+        // the backend exposing `setFullscreen` and the engine exposing the
+        // drain, so the template stays compatible with backends/engines
+        // that predate the API (older example projects still build).
+        if (comptime @hasDecl(window, "setFullscreen") and @hasDecl(@TypeOf(g), "takeFullscreenRequest")) {
+            if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
+        }
         // Aspect-fit the design canvas (config) into the real window size,
         // so content renders correctly even if the window differs from the
         // configured default. Per-frame is cheap and survives resizes.
