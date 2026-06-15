@@ -44,9 +44,11 @@ export fn frame() callconv(.c) void {
     }
     // Apply a pending fullscreen/windowed switch requested via
     // `game.setFullscreen`/`toggleFullscreen`. The engine owns the desired
-    // flag; the backend owns the platform call. `@hasDecl` gate keeps
-    // backends that don't implement it compiling (the drain folds away).
-    if (comptime @hasDecl(window, "setFullscreen")) {
+    // flag; the backend owns the platform call. Gated on BOTH the backend
+    // exposing `setFullscreen` and the engine exposing the drain, so the
+    // template stays compatible with backends/engines that predate the API
+    // (the whole block folds away — older example projects still build).
+    if (comptime @hasDecl(window, "setFullscreen") and @hasDecl(@TypeOf(g), "takeFullscreenRequest")) {
         if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
     }
     BackendGfxType.setScreenSize(window.width(), window.height());
