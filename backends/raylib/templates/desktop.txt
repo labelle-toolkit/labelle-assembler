@@ -44,6 +44,14 @@ const target_fps: u32 = {{fps}};
         // desktop (raylib's own gamepad state is pumped inside GLFW's poll).
         @import("backend_input").newFrame();
 
+        // Apply a pending fullscreen/windowed switch requested via
+        // `game.setFullscreen`/`toggleFullscreen`. The engine owns the
+        // desired flag; the backend owns the platform call. `@hasDecl`
+        // gate keeps backends that don't implement it compiling.
+        if (comptime @hasDecl(window, "setFullscreen")) {
+            if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
+        }
+
         // Frame-rate-independent sim: derive dt from real frame time so render
         // FPS can't drive game speed. Cap at 4 frames to prevent physics
         // explosions after a stall/backgrounding. Mirrors wasm.txt's use of

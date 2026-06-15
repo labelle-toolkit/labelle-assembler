@@ -26,6 +26,21 @@ pub fn windowShouldClose() bool {
     return rl.windowShouldClose();
 }
 
+/// Query whether the window is currently fullscreen. Mirrors the sokol
+/// backend's `isFullscreen`.
+pub fn isFullscreen() bool {
+    return rl.isWindowFullscreen();
+}
+
+/// Switch the window to fullscreen (`on=true`) or windowed (`on=false`).
+/// The generated frame loop polls `g.takeFullscreenRequest()` and calls
+/// this when a script flipped `game.setFullscreen`. raylib only exposes a
+/// *toggle*, so we toggle only when the current mode differs from the
+/// requested one (idempotent).
+pub fn setFullscreen(on: bool) void {
+    if (rl.isWindowFullscreen() != on) rl.toggleFullscreen();
+}
+
 pub fn setTargetFPS(fps: i32) void {
     rl.setTargetFPS(fps);
 }

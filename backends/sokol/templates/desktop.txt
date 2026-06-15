@@ -42,6 +42,13 @@ export fn frame() callconv(.c) void {
         window.requestQuit();
         return;
     }
+    // Apply a pending fullscreen/windowed switch requested via
+    // `game.setFullscreen`/`toggleFullscreen`. The engine owns the desired
+    // flag; the backend owns the platform call. `@hasDecl` gate keeps
+    // backends that don't implement it compiling (the drain folds away).
+    if (comptime @hasDecl(window, "setFullscreen")) {
+        if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
+    }
     BackendGfxType.setScreenSize(window.width(), window.height());
     // Keep design coords fixed so screen-space NDC mapping uses the design resolution
     // rather than the physical framebuffer size (which differs on HiDPI displays).

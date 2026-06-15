@@ -27,6 +27,16 @@ var glfw_window: if (is_android) ?*anyopaque else ?*glfw.Window = null;
 var target_fps_val: i32 = 60;
 var screen_w: i32 = 800;
 var screen_h: i32 = 600;
+/// Windowed-mode geometry, captured the moment we go fullscreen so
+/// `setFullscreen(false)` restores the window to the same place + size
+/// (GLFW's `setMonitor` needs explicit windowed coords on the way back).
+var windowed_x: i32 = 0;
+var windowed_y: i32 = 0;
+var windowed_w: i32 = 800;
+var windowed_h: i32 = 600;
+/// VSYNC reset flag reused by `applyResize` — matches the value baked
+/// into `init.resolution.reset` at window creation.
+const RESET_VSYNC: u32 = 0x00000080;
 var window_hidden: bool = false;
 var clear_color: u32 = 0x1e1e2eff; // dark background RGBA
 
@@ -201,6 +211,55 @@ pub fn windowShouldClose() bool {
 
 pub fn setTargetFPS(fps: i32) void {
     target_fps_val = fps;
+}
+
+/// Update the cached surface size and resize the bgfx backbuffer to
+/// match. Called after a fullscreen/windowed switch changes the GLFW
+/// framebuffer dimensions; without the `bgfx.reset` the swapchain stays
+/// at the old size and the image stretches.
+fn applyResize(w: i32, h: i32) void {
+    screen_w = w;
+    screen_h = h;
+    // `.Count` = keep the current backbuffer format (no change).
+    bgfx.reset(@intCast(w), @intCast(h), RESET_VSYNC, .Count);
+    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
+}
+
+/// Query whether the window is currently fullscreen. Android is always
+/// fullscreen; desktop asks GLFW whether the window is bound to a monitor.
+pub fn isFullscreen() bool {
+    if (is_android) return true;
+    const win = glfw_window orelse return false;
+    return win.getMonitor() != null;
+}
+
+/// Switch to fullscreen (`on=true`) or windowed (`on=false`). Desktop
+/// only — Android is permanently fullscreen, so this is a no-op there.
+/// GLFW has no toggle primitive: going fullscreen binds the window to the
+/// primary monitor at its current video mode (saving the windowed
+/// geometry first); going windowed restores the saved geometry. Either
+/// way bgfx is reset to the new framebuffer size.
+pub fn setFullscreen(on: bool) void {
+    if (is_android) return;
+    const win = glfw_window orelse return;
+    const already = win.getMonitor() != null;
+    if (already == on) return;
+    if (on) {
+        // Remember where the window was so we can come back to it.
+        const pos = win.getPos();
+        const size = win.getSize();
+        windowed_x = pos[0];
+        windowed_y = pos[1];
+        windowed_w = size[0];
+        windowed_h = size[1];
+        const monitor = glfw.getPrimaryMonitor() orelse return;
+        const mode = glfw.getVideoMode(monitor) catch return;
+        win.setMonitor(monitor, 0, 0, mode.width, mode.height, mode.refresh_rate);
+        applyResize(mode.width, mode.height);
+    } else {
+        win.setMonitor(null, windowed_x, windowed_y, windowed_w, windowed_h, 0);
+        applyResize(windowed_w, windowed_h);
+    }
 }
 
 pub fn beginDrawing() void {
