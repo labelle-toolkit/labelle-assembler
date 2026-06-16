@@ -4,6 +4,7 @@ const std = @import("std");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const types = @import("types.zig");
+const astc = @import("astc.zig");
 
 const Texture = types.Texture;
 
@@ -152,6 +153,98 @@ pub fn unloadTexture(texture: Texture) void {
     if (texture.smp.id != 0) {
         sg.destroySampler(texture.smp);
     }
+}
+
+// ── GPU-compressed textures (ASTC) ──────────────────────────────────────────
+// The engine's `loadTextureFromMemory` seam (labelle-gfx) dispatches here when
+// the backend exposes `isCompressed`/`uploadCompressed` and the blob is
+// compressed, skipping the CPU decode entirely (labelle-gfx#269 / #341).
+//
+// sokol-specific constraint: sokol_gfx's pixel-format enum exposes ONLY ASTC
+// 4×4 (`ASTC_4x4_RGBA` / `ASTC_4x4_SRGBA`) — there is no 6×6/8×8/etc. So we map
+// ONLY block size 4×4 and return null (unsupported) for everything else; those
+// blobs fall back to the CPU decode path. See #339.
+
+/// Map an ASTC block size to the matching sokol `sg.PixelFormat`, or null if
+/// sokol has no enum for it. sokol only ships ASTC 4×4, so 4×4 is the only
+/// accepted block size; all other sizes return null. We pick the linear-RGBA
+/// format (not sRGB) to match the RGBA8 upload path's color handling.
+fn astcFormat(block_x: u8, block_y: u8) ?sg.PixelFormat {
+    return switch ((@as(u16, block_x) << 8) | block_y) {
+        0x0404 => .ASTC_4x4_RGBA,
+        else => null,
+    };
+}
+
+/// Everything needed to upload a validated 2D ASTC blob.
+const AstcUpload = struct { fmt: sg.PixelFormat, width: i32, height: i32, blocks: []const u8 };
+
+/// Validate an ASTC blob for a 2D sokol upload, or null if we can't take it
+/// as-is: not ASTC, malformed/truncated, 3D, a block size sokol can't express
+/// (anything but 4×4), or dimensions past `i32`. `isCompressed`/
+/// `uploadCompressed` share this so the "can upload as-is" probe and the actual
+/// upload never disagree.
+fn validateAstc(data: []const u8) ?AstcUpload {
+    const hdr = astc.parse(data) orelse return null;
+    if (hdr.depth != 1 or hdr.block_z != 1) return null; // sokol image is 2D here
+    const fmt = astcFormat(hdr.block_x, hdr.block_y) orelse return null;
+    const w = std.math.cast(i32, hdr.width) orelse return null;
+    const h = std.math.cast(i32, hdr.height) orelse return null;
+    return .{ .fmt = fmt, .width = w, .height = h, .blocks = hdr.blocks };
+}
+
+/// True if `data` is a GPU-compressed blob this backend can upload as-is.
+pub fn isCompressed(data: []const u8) bool {
+    return validateAstc(data) != null;
+}
+
+/// Upload an ASTC blob straight to the GPU — no CPU decode. sokol's
+/// `sg.makeImage` copies the compressed blocks out of the supplied subimage
+/// pointer, so the caller's buffer can be freed immediately after this returns.
+pub fn uploadCompressed(data: []const u8) !Texture {
+    const info = validateAstc(data) orelse return error.LoadFailed;
+
+    var img_desc: sg.ImageDesc = .{
+        .width = info.width,
+        .height = info.height,
+        .pixel_format = info.fmt,
+    };
+    // The compressed blocks (after the 16-byte header) go in verbatim; the
+    // subimage `size` is the compressed payload length, NOT width*height*4.
+    img_desc.data.mip_levels[0] = .{
+        .ptr = info.blocks.ptr,
+        .size = info.blocks.len,
+    };
+
+    const img = sg.makeImage(img_desc);
+    if (img.id == 0) return error.LoadFailed;
+
+    const smp = sg.makeSampler(.{
+        .min_filter = .NEAREST,
+        .mag_filter = .NEAREST,
+        .wrap_u = .CLAMP_TO_EDGE,
+        .wrap_v = .CLAMP_TO_EDGE,
+    });
+    if (smp.id == 0) {
+        sg.destroyImage(img);
+        return error.LoadFailed;
+    }
+
+    const view = sg.makeView(.{ .texture = .{ .image = img } });
+    if (view.id == 0) {
+        sg.destroySampler(smp);
+        sg.destroyImage(img);
+        return error.LoadFailed;
+    }
+
+    return Texture{
+        .id = img.id,
+        .img = img,
+        .view = view,
+        .smp = smp,
+        .width = info.width,
+        .height = info.height,
+    };
 }
 
 // ── Texture creation helper ─────────────────────────────────────────────

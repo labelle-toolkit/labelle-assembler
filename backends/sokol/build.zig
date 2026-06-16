@@ -347,6 +347,20 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(slots_tests).step);
 
+    // Run the ASTC container-parsing tests (#341). `gfx/astc.zig` is pure byte
+    // parsing with no sokol dependency, so it EXECUTES on the host (magic
+    // detection, block/image dims, ceil-to-block payload sizing, truncation).
+    // It's a verbatim copy of the bgfx backend's parser, so this keeps the
+    // container handling consistent across backends.
+    const astc_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gfx/astc.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(astc_run).step);
+
     // Compile-check audio.zig via a test binary off audio_mod. This
     // pulls in the full sokol module graph so it only works when the
     // host has sokol's system libs installed (libasound, libGL, libX11,
