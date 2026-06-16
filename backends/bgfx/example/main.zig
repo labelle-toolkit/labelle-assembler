@@ -17,6 +17,7 @@ const gfx = @import("gfx");
 const input = @import("input");
 const audio = @import("audio");
 const window = @import("window");
+const gamepad_overlay = @import("gamepad_overlay.zig");
 
 // ── GLFW key codes ─────────────────────────────────────────────────────
 
@@ -373,6 +374,9 @@ fn draw() void {
 
     // ── Screen-space HUD (no camera transform) ────────────────────
     drawHud();
+
+    // ── Gamepad overlay (lights up live when a controller is connected) ──
+    gamepad_overlay.draw(SCREEN_W_F, SCREEN_H_F);
 
     window.endDrawing();
 }
