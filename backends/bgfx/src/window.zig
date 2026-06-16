@@ -338,8 +338,48 @@ pub fn beginDrawing() void {
     bgfx.touch(0);
 }
 
+const INVALID_HANDLE: u16 = std.math.maxInt(u16);
+
+/// Pending screenshot path, set by `takeScreenshot` and consumed by the
+/// next `endDrawing`. Null when no capture is queued.
+var pending_screenshot: ?[:0]const u8 = null;
+
 pub fn endDrawing() void {
+    // Queue the backbuffer capture (if requested) BEFORE the frame swap so
+    // bgfx fulfils it for THIS frame's content — the scene + imgui overlay
+    // just submitted. Requesting after `bgfx.frame()` (a separate empty
+    // frame) would capture a cleared backbuffer with no draws.
+    if (pending_screenshot) |path| {
+        const invalid_fb = bgfx.FrameBufferHandle{ .idx = INVALID_HANDLE };
+        bgfx.requestScreenShot(invalid_fb, path.ptr);
+        pending_screenshot = null;
+    }
     _ = bgfx.frame(0);
+}
+
+/// Capture the current backbuffer to a file (labelle-cli#227 screenshot
+/// support, mirroring raylib/sokol's `window.takeScreenshot`).
+///
+/// bgfx has no synchronous readback: `requestScreenShot` queues a capture
+/// that bgfx fulfils on the NEXT `bgfx.frame()` by invoking the active
+/// callback's `screenShot`. We pass `BGFX_INVALID_HANDLE` (the backbuffer)
+/// and rely on bgfx's BUILT-IN default callback (no custom callback is
+/// installed at init), which writes the captured pixels to `<path>.tga`
+/// via its embedded image writer.
+///
+/// IMPORTANT: the request must be queued before the frame swap that
+/// presents the content. The frame loop calls `takeScreenshot` after
+/// `g.render()` + the GUI draw but on the SAME iteration whose `endDrawing`
+/// then does the swap — so we just stash the path and let `endDrawing`
+/// issue the request right before `bgfx.frame()`. (Calling
+/// `requestScreenShot` here followed by our own `bgfx.frame()` would swap
+/// an empty, content-less frame and capture that instead — the cause of
+/// the initial blank-screenshot bug.)
+///
+/// bgfx appends its own `.tga` extension, so a path like `/tmp/shot`
+/// yields `/tmp/shot.tga`.
+pub fn takeScreenshot(path: [:0]const u8) void {
+    pending_screenshot = path;
 }
 
 pub fn clearBackground(r: u8, g: u8, b: u8, a: u8) void {
