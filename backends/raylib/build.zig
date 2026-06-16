@@ -230,6 +230,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run raylib backend unit tests");
     test_step.dependOn(&b.addRunArtifact(slot_alloc_tests).step);
 
+    // ── ASTC container-parsing tests (#341) ─────────────────────────
+    // `src/astc.zig` is pure byte parsing with no raylib dependency, so it
+    // EXECUTES on the host (magic detection, block/image dims, ceil-to-block
+    // payload sizing, truncation). Pinned to `host_target` and run linker-free
+    // — no raylib C artifact is pulled in — so it rides the default `test` step
+    // alongside `slot_alloc_tests` (the compressed-upload glue in gfx.zig is
+    // exercised by the `gfx_compile_check` under `test-host`).
+    const astc_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/astc.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(astc_run).step);
+
     // ── Phase 4 host-native test runs ────────────────────────────────
     //
     // The Phase 4 decoder unit tests (decodeFont rejecting empty /
