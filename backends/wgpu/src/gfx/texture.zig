@@ -164,7 +164,10 @@ pub fn decodeBmp(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
     if (bpp != 24 and bpp != 32) return null; // Only uncompressed RGB/RGBA
 
     const bytes_per_pixel: u32 = @as(u32, bpp) / 8;
-    const row_size = ((width * bytes_per_pixel + 3) / 4) * 4; // BMP rows are 4-byte aligned
+    // Widen to usize before multiplying: a large `width` from an untrusted
+    // header would overflow the u32 product to 0, yielding row_size 0 and a
+    // corrupted decode (every row re-reads the same offset).
+    const row_size = ((@as(usize, width) * @as(usize, bytes_per_pixel) + 3) / 4) * 4; // BMP rows are 4-byte aligned
 
     // `width`/`height` come straight from untrusted BMP headers, so the
     // size arithmetic uses checked ops — an overflowed product would
