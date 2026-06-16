@@ -428,6 +428,14 @@ pub const ProjectConfig = struct {
     /// shared SDL desktop gamepad source for raylib/sokol desktop; `.none`
     /// opts out entirely (no SDL, truly-disabled gamepad). See `GamepadSource`.
     gamepad: GamepadSource = .auto,
+    /// Opt into SDL's HIDAPI raw-HID driver for the desktop gamepad source.
+    /// HIDAPI decodes Nintendo/8BitDo Switch-mode pads that GLFW/sokol can't,
+    /// but its per-connect device init blocks the render thread for ~2-3s on
+    /// some platforms (notably macOS Bluetooth Xbox pads). OFF by default — the
+    /// OS-native controller driver handles Xbox/PlayStation/standard pads with
+    /// no hitch. Set `true` only when you need Switch raw-HID decode and accept
+    /// the connect stall. No effect when `gamepad = .none`.
+    gamepad_hidapi: bool = false,
     /// GUI plugin reference — parsed from project.labelle.
     /// null means no GUI (StubGui injected).
     gui: ?GuiPlugin = null,
