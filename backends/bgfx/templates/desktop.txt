@@ -23,6 +23,14 @@ const BackendGfxType = @import("backend_gfx");
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
 
 {{preview_setup}}{{setup_code}}
+    // Screenshot capture request (labelle-cli#227). Reads
+    // `LABELLE_SCREENSHOT_PATH` once on startup; null when the env var is
+    // absent, so the per-frame check below collapses to a `null` test on
+    // regular runs. `loop_start_ns` captures wall-clock at the first frame
+    // so `after_sec` is "seconds since the game entered its main loop".
+    var screenshot_req: ?engine.ScreenshotRequest = engine.requestedScreenshot();
+    const loop_start_ns: i128 = engine.nowNs();
+
     while (!window.windowShouldClose()) {
         const dt: f32 = 0.016;
         // Apply a pending fullscreen/windowed switch requested via
@@ -46,6 +54,34 @@ const BackendGfxType = @import("backend_gfx");
         g.render();
         g.renderGizmos();
 {{gui_draw_code}}        window.drawText(screen_title, 10, 10, 20, 80, 80, 80, 255);
+
+        // Queue the screenshot exactly once, after the configured delay,
+        // BEFORE `endDrawing` so the capture lands on THIS frame's content
+        // (scene + GUI overlay just submitted). bgfx's `takeScreenshot`
+        // only stashes the path; `endDrawing` issues the bgfx capture
+        // request right before the frame swap and pumps the extra frames
+        // the multi-threaded render path needs to flush the async capture
+        // to disk. Gated on the backend exposing the API so the template
+        // stays compatible with older bgfx backends.
+        //
+        // We intentionally do NOT break out of the loop after the capture:
+        // unlike raylib's synchronous `TakeScreenshot`, bgfx's clean exit
+        // would run `gpa.deinit()`, and any pre-existing teardown leak in
+        // the engine/plugins surfaces as a panic under the game's debug
+        // allocator. Letting `--timeout` SIGTERM the process avoids that
+        // path; the `.tga` is already on disk by the time the timeout
+        // fires. (One-shot is preserved via `screenshot_req = null`.)
+        if (comptime @hasDecl(window, "takeScreenshot")) {
+            if (screenshot_req) |req| {
+                const now_ns: i128 = engine.nowNs();
+                const elapsed_sec: f32 = @as(f32, @floatFromInt(@as(i64, @intCast(now_ns - loop_start_ns)))) / 1_000_000_000.0;
+                if (elapsed_sec >= req.after_sec) {
+                    window.takeScreenshot(req.path);
+                    screenshot_req = null;
+                }
+            }
+        }
+
         window.endDrawing();
     }
 }
