@@ -1,6 +1,7 @@
 /// Raylib gfx backend — satisfies the labelle-gfx Backend(Impl) contract.
 const std = @import("std");
 const rl = @import("raylib");
+const astc = @import("astc.zig");
 
 // ── Backend types ──────────────────────────────────────────────────────
 
@@ -190,6 +191,71 @@ pub fn uploadTexture(decoded: DecodedImage) !Texture {
         .height = @intCast(decoded.height),
         .mipmaps = 1,
         .format = .uncompressed_r8g8b8a8,
+    };
+    const tex = rl.loadTextureFromImage(image) catch return error.LoadFailed;
+    if (tex.id == 0) return error.LoadFailed;
+    return .{ .id = @intCast(tex.id), .width = tex.width, .height = tex.height };
+}
+
+// ── GPU-compressed textures (ASTC) ──────────────────────────────────────────
+// The engine's `loadTextureFromMemory` seam (labelle-gfx) dispatches here when
+// the backend exposes `isCompressed`/`uploadCompressed` and the blob is
+// compressed, skipping the CPU decode entirely (labelle-gfx#269/#341).
+//
+// raylib-zig exposes no `rlLoadTextureCompressed` wrapper, but raylib's
+// `loadTextureFromImage` is the binding-native equivalent: it forwards the
+// `Image.format`/`Image.data` straight to `rlLoadTexture`, which—for a
+// compressed `PixelFormat`—uploads the verbatim block payload via
+// `glCompressedTexImage2D` (no CPU decode). So we wrap the compressed blocks in
+// an `Image` carrying the ASTC `PixelFormat` and reuse the same upload call as
+// `uploadTexture`. raylib computes the GPU mip size itself from
+// width/height/format (`rlGetPixelDataSize`); `mipmaps = 1` (mipmapCount=1).
+
+/// Map an ASTC block size to the matching raylib `PixelFormat`, or null if
+/// raylib/rlgl has no enum for it. raylib only ships the ASTC 4×4 and 8×8 LDR
+/// RGBA formats (`RL_PIXELFORMAT_COMPRESSED_ASTC_4x4_RGBA` / `_8x8_RGBA`); every
+/// other block size returns null so the caller falls back to a CPU decode.
+fn astcFormat(block_x: u8, block_y: u8) ?rl.PixelFormat {
+    return switch ((@as(u16, block_x) << 8) | block_y) {
+        0x0404 => .compressed_astc_4x4_rgba,
+        0x0808 => .compressed_astc_8x8_rgba,
+        else => null,
+    };
+}
+
+/// Everything needed to upload a validated 2D ASTC blob.
+const AstcUpload = struct { fmt: rl.PixelFormat, width: i32, height: i32, blocks: []const u8 };
+
+/// Validate an ASTC blob for a 2D raylib upload, or null if we can't take it
+/// as-is: not ASTC, malformed/truncated, 3D, an unsupported block size, or
+/// dimensions past `i32`. `isCompressed`/`uploadCompressed` share this so the
+/// "can upload as-is" probe and the actual upload never disagree.
+fn validateAstc(data: []const u8) ?AstcUpload {
+    const hdr = astc.parse(data) orelse return null;
+    if (hdr.depth != 1 or hdr.block_z != 1) return null; // raylib Image is 2D only
+    const fmt = astcFormat(hdr.block_x, hdr.block_y) orelse return null;
+    const w = std.math.cast(i32, hdr.width) orelse return null;
+    const h = std.math.cast(i32, hdr.height) orelse return null;
+    return .{ .fmt = fmt, .width = w, .height = h, .blocks = hdr.blocks };
+}
+
+/// True if `data` is a GPU-compressed blob this backend can upload as-is.
+pub fn isCompressed(data: []const u8) bool {
+    return validateAstc(data) != null;
+}
+
+/// Upload an ASTC blob straight to the GPU — no CPU decode. The compressed
+/// blocks are handed to raylib's `loadTextureFromImage`, which copies them to
+/// the GPU via `glCompressedTexImage2D` and does not retain the pointer, so the
+/// caller's buffer can be freed immediately after this returns.
+pub fn uploadCompressed(data: []const u8) !Texture {
+    const info = validateAstc(data) orelse return error.LoadFailed;
+    const image: rl.Image = .{
+        .data = @ptrCast(@constCast(info.blocks.ptr)),
+        .width = info.width,
+        .height = info.height,
+        .mipmaps = 1,
+        .format = info.fmt,
     };
     const tex = rl.loadTextureFromImage(image) catch return error.LoadFailed;
     if (tex.id == 0) return error.LoadFailed;
