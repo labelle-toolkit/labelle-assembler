@@ -427,6 +427,17 @@ const State = struct {
 
 var state: State = .{};
 
+/// Opt-in for SDL's HIDAPI raw-HID driver (Switch/8BitDo decode). OFF by
+/// default because HIDAPI's per-connect device init blocks the calling thread
+/// for seconds on some platforms. The backend's `input.zig` assigns this from
+/// its `build_options.gamepad_hidapi` (a comptime-constant bool) on the render
+/// thread before every SDL-source pump — idempotent, so the effective value is
+/// fixed; only the FIRST pump's `ensureInit` reads it (later writes are no-ops
+/// once SDL is initialized). Left at the default it stays off (native OS
+/// driver, no connect hitch). Plain `var` (not atomic): writer and reader are
+/// the same render thread.
+pub var hidapi_enabled: bool = false;
+
 // ── SDL plumbing (desktop only) ─────────────────────────────────────────
 
 /// Lazily init the SDL joystick/gamecontroller subsystems (no video, no
@@ -448,8 +459,16 @@ fn ensureInit() bool {
     if (state.initialized) return true;
     if (state.init_failed) return false;
 
-    // Decode Nintendo/8BitDo Switch-mode pads via SDL's raw-HID driver.
-    _ = sdl.SDL_SetHint(sdl.SDL_HINT_JOYSTICK_HIDAPI, "1");
+    // HIDAPI decodes Nintendo/8BitDo Switch-mode pads via SDL's raw-HID
+    // driver, but its per-connect device init blocks the calling thread for
+    // ~2-3s on some platforms (notably macOS Bluetooth Xbox pads), stalling
+    // the render loop on every controller connect. It is therefore OFF by
+    // default; opt in via the `gamepad_hidapi` build option (set from
+    // `.gamepad_hidapi = true` in project.labelle) when Switch-mode raw-HID
+    // decode is needed and the connect hitch is acceptable. The flag is
+    // pushed in by the backend's `input.zig` from `build_options` before the
+    // first `update()` triggers this lazy init.
+    _ = sdl.SDL_SetHint(sdl.SDL_HINT_JOYSTICK_HIDAPI, if (hidapi_enabled) "1" else "0");
     const rc = sdl.SDL_InitSubSystem(sdl.SDL_INIT_GAMECONTROLLER | sdl.SDL_INIT_JOYSTICK);
     if (rc != 0) {
         state.init_failed = true;

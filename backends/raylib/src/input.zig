@@ -10,6 +10,10 @@ const core = @import("labelle-core");
 // surface below resolves to the truly-disabled path (no SDL, no GLFW-native
 // fallback). When true (default), behavior is byte-identical to before.
 const gamepad_enabled = @import("build_options").gamepad_enabled;
+// Opt-in for HIDAPI raw-HID decode in the shared SDL gamepad source; OFF by
+// default (HIDAPI's per-connect init stalls the render thread for seconds on
+// some platforms). Pushed into the source before its lazy SDL init.
+const gamepad_hidapi = @import("build_options").gamepad_hidapi;
 
 // Shared windowless-SDL desktop gamepad source (core#28). On a DESKTOP target
 // (and only when wired) the gamepad surface below routes to this instead of
@@ -168,14 +172,20 @@ pub fn getGamepadAxisValue(gamepad: u32, axis: u32) f32 {
 /// source (hotplug pump internally throttled to ~1/s); elsewhere the SDL one.
 pub fn newFrame() void {
     if (comptime use_core_gamepad) return core.gamepad_source.Source.update();
-    if (comptime use_sdl_gamepad) sdl_gp.Source.update();
+    if (comptime use_sdl_gamepad) {
+        sdl_gp.hidapi_enabled = gamepad_hidapi;
+        sdl_gp.Source.update();
+    }
 }
 
 /// One-time init for the desktop gamepad source (subsystem init + startup
 /// controller enumeration). Safe to call repeatedly; no-op off desktop.
 pub fn initGamepad() void {
     if (comptime use_core_gamepad) return core.gamepad_source.init();
-    if (comptime use_sdl_gamepad) sdl_gp.Source.init();
+    if (comptime use_sdl_gamepad) {
+        sdl_gp.hidapi_enabled = gamepad_hidapi;
+        sdl_gp.Source.init();
+    }
 }
 
 /// Tear down the desktop gamepad source. No-op off desktop.

@@ -68,6 +68,10 @@ const agp = @import("android_gamepad");
 // defaults (`gc_enabled` is false off ios/tvos) — truly disabled, no SDL. The
 // Android / iOS branches are unaffected (the flag only governs the SDL path).
 const gamepad_enabled = @import("build_options").gamepad_enabled;
+// Opt-in for HIDAPI raw-HID decode in the shared SDL gamepad source; OFF by
+// default (HIDAPI's per-connect init stalls the render thread for seconds on
+// some platforms). Pushed into the source before its lazy SDL init.
+const gamepad_hidapi = @import("build_options").gamepad_hidapi;
 // Mirrors `targetIsDesktop` in build.zig: the SDL source module is wired ONLY
 // when (gamepad_enabled AND desktop target), so the `@import` must match — on
 // Android/iOS/wasm the module isn't in the graph (and those keep their JNI /
@@ -354,6 +358,7 @@ fn snapshotGamepadButtons() void {
         return;
     }
     if (comptime use_sdl_gamepad) {
+        sdl_gp.hidapi_enabled = gamepad_hidapi;
         sdl_gp.Source.update();
         return;
     }

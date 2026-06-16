@@ -132,6 +132,7 @@ pub fn build(b: *std.Build) void {
     // Gated so that when opted out, `labelle_sdl_gamepad` is not even resolved
     // as a dependency (the generated zon no longer declares it).
     const gamepad_enabled = b.option(bool, "gamepad_enabled", "Wire the shared SDL desktop gamepad source + link SDL2 (default true; false = opt out, no SDL)") orelse true;
+    const gamepad_hidapi = b.option(bool, "gamepad_hidapi", "Opt the SDL gamepad source into HIDAPI raw-HID decode (Switch/8BitDo); default false — HIDAPI per-connect init stalls the render thread for seconds on some platforms") orelse false;
 
     // Gated on `gamepad_enabled` AND a desktop target: non-desktop sokol builds
     // (Android/iOS/wasm) never use the SDL source, so don't resolve/require it
@@ -151,6 +152,7 @@ pub fn build(b: *std.Build) void {
     // `@import("sdl_gamepad")` and the desktop gamepad path is disabled.
     const input_opts = b.addOptions();
     input_opts.addOption(bool, "gamepad_enabled", gamepad_enabled);
+    input_opts.addOption(bool, "gamepad_hidapi", gamepad_hidapi);
 
     // ── Gfx backend module ──────────────────────────────────────────
     const gfx_mod = b.addModule("gfx", .{

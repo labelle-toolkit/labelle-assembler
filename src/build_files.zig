@@ -176,9 +176,15 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // Computed + substituted exactly like `with_imgui`.
     const gamepad_enabled: []const u8 = if (cfg.gamepad == .auto) "true" else "false";
 
+    // `gamepad_hidapi` opts the SDL desktop source into HIDAPI raw-HID decode
+    // (Switch/8BitDo). OFF by default: HIDAPI's per-connect device init stalls
+    // the render thread for seconds on some platforms. Substituted exactly like
+    // `gamepad_enabled`; forwarded to the backend's `input` build_options.
+    const gamepad_hidapi: []const u8 = if (cfg.gamepad_hidapi) "true" else "false";
+
     // Backend dep — always the standard backend (never a merged GUI+backend package)
     switch (cfg.backend) {
-        .raylib => try tpl.renderSection(build_zig_tmpl, "backend_raylib", .{ .gamepad_enabled = gamepad_enabled }, w),
+        .raylib => try tpl.renderSection(build_zig_tmpl, "backend_raylib", .{ .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi }, w),
         .sokol => {
             // `with_imgui` must be true ONLY when the project's gui plugin
             // is imgui — sokol_imgui.c needs cimgui.h on its include path,
@@ -198,7 +204,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             } else if (cfg.platform == .android) {
                 try tpl.renderSection(build_zig_tmpl, "backend_sokol_android", .{ .with_imgui = with_imgui }, w);
             } else {
-                try tpl.renderSection(build_zig_tmpl, "backend_sokol", .{ .with_imgui = with_imgui, .gamepad_enabled = gamepad_enabled }, w);
+                try tpl.renderSection(build_zig_tmpl, "backend_sokol", .{ .with_imgui = with_imgui, .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi }, w);
             }
         },
         .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),
@@ -215,7 +221,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
                 // the backend wires the shared SDL desktop gamepad source
                 // (`.gamepad = .auto`) or falls back to its GLFW path
                 // (`.gamepad = .none`). See backends/bgfx/src/input.zig.
-                try tpl.renderSection(build_zig_tmpl, "backend_bgfx", .{ .gamepad_enabled = gamepad_enabled }, w);
+                try tpl.renderSection(build_zig_tmpl, "backend_bgfx", .{ .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi }, w);
             }
         },
         .wgpu => try tpl.writeSection(build_zig_tmpl, "backend_wgpu", w),

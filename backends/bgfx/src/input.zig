@@ -36,6 +36,10 @@ const agp = @import("android_gamepad");
 // NOT in the build graph, so we must not `@import` it, and the desktop getters
 // fall back to the GLFW path (#315). Mirrors raylib/sokol's input.zig.
 const gamepad_enabled = @import("build_options").gamepad_enabled;
+// Opt-in for HIDAPI raw-HID decode in the shared SDL gamepad source; OFF by
+// default (HIDAPI's per-connect init stalls the render thread for seconds on
+// some platforms). Pushed into the source before its lazy SDL init.
+const gamepad_hidapi = @import("build_options").gamepad_hidapi;
 
 // Desktop predicate matching `targetIsDesktop` in build.zig — the build wires
 // the `sdl_gamepad` module ONLY when (gamepad_enabled AND desktop AND
@@ -166,6 +170,7 @@ pub fn newFrame() void {
     // the GLFW snapshot is skipped (its getters aren't consulted). On
     // `.gamepad = .none` the SDL module is absent and we keep the GLFW snapshot.
     if (comptime use_sdl_gamepad) {
+        sdl_gp.hidapi_enabled = gamepad_hidapi;
         sdl_gp.Source.update();
     } else {
         snapshotGamepads();

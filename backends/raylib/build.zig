@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
     // path (no GLFW-native fallback). The assembler forwards this from the
     // generated build.zig via `b.dependency(..., .{ .gamepad_enabled = ... })`.
     const gamepad_enabled = b.option(bool, "gamepad_enabled", "Wire the shared SDL desktop gamepad source + link SDL2 (default true; false = opt out, no SDL)") orelse true;
+    const gamepad_hidapi = b.option(bool, "gamepad_hidapi", "Opt the SDL gamepad source into HIDAPI raw-HID decode (Switch/8BitDo); default false — HIDAPI per-connect init stalls the render thread for seconds on some platforms") orelse false;
 
     const raylib_dep = b.dependency("raylib-zig", .{ .target = target, .optimize = optimize });
 
@@ -98,6 +99,7 @@ pub fn build(b: *std.Build) void {
     // path. Mirrored on the host test module below.
     const input_opts = b.addOptions();
     input_opts.addOption(bool, "gamepad_enabled", gamepad_enabled);
+    input_opts.addOption(bool, "gamepad_hidapi", gamepad_hidapi);
 
     // ── Gfx backend module ──────────────────────────────────────────
     const gfx_mod = b.addModule("gfx", .{

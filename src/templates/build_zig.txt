@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) !void {
     });
 
 .backend_raylib
-    const backend_dep = b.dependency("labelle_raylib", .{ .target = target, .optimize = optimize, .gamepad_enabled = {{gamepad_enabled}} });
+    const backend_dep = b.dependency("labelle_raylib", .{ .target = target, .optimize = optimize, .gamepad_enabled = {{gamepad_enabled}}, .gamepad_hidapi = {{gamepad_hidapi}} });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");
     const backend_audio = backend_dep.module("audio");
@@ -80,7 +80,7 @@ pub fn build(b: *std.Build) !void {
     // imgui bridge's option set when the project includes imgui, or
     // Zig caches two `sokol_clib` artifacts (and two `_sg` states) —
     // see comment in `backends/sokol/build.zig` (labelle-assembler#140).
-    const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize, .with_imgui = {{with_imgui}}, .gamepad_enabled = {{gamepad_enabled}} });
+    const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize, .with_imgui = {{with_imgui}}, .gamepad_enabled = {{gamepad_enabled}}, .gamepad_hidapi = {{gamepad_hidapi}} });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");
     const backend_audio = backend_dep.module("audio");
@@ -130,7 +130,7 @@ pub fn build(b: *std.Build) !void {
     overrideImport(backend_input, "labelle_core", core_mod);
 
 .backend_bgfx
-    const backend_dep = b.dependency("labelle_bgfx", .{ .target = target, .optimize = optimize, .gamepad_enabled = {{gamepad_enabled}} });
+    const backend_dep = b.dependency("labelle_bgfx", .{ .target = target, .optimize = optimize, .gamepad_enabled = {{gamepad_enabled}}, .gamepad_hidapi = {{gamepad_hidapi}} });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");
     const backend_audio = backend_dep.module("audio");
