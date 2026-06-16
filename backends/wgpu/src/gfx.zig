@@ -263,14 +263,33 @@ test "state: Retina 2x physical surface keeps design mapping (no top-left quarte
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), frame.shape_vertices[2].position[1], 1e-5);
 }
 
-test "state: screenToDesign inverts the physical->design mapping" {
-    // 800x600 design on a 1600x1200 (2x) surface: a physical-pixel click at
-    // the framebuffer center maps back to the design-canvas center.
+test "state: screenToDesign maps physical edges to design edges on HiDPI (#331)" {
+    // 800x600 design on a 1600x1200 (2x) surface (fit==1, design fills it).
+    // EDGES — not just the center — must map correctly: the old design-space
+    // bar formula returned (-400,-300) for the top-left, drifting clicks.
     setDesignSize(800, 600);
     setScreenSize(1600, 1200);
-    const d = screenToDesign(800, 600); // physical center
-    try std.testing.expectApproxEqAbs(@as(f32, 400.0), d.x, 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, 300.0), d.y, 1e-3);
+    const tl = screenToDesign(0, 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), tl.x, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), tl.y, 1e-3);
+    const br = screenToDesign(1600, 1200);
+    try std.testing.expectApproxEqAbs(@as(f32, 800), br.x, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 600), br.y, 1e-3);
+    const c = screenToDesign(800, 600);
+    try std.testing.expectApproxEqAbs(@as(f32, 400), c.x, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), c.y, 1e-3);
+}
+
+test "state: screenToDesign and designToPhysical round-trip incl. letterbox (#331)" {
+    setDesignSize(800, 600);
+    setScreenSize(2000, 1000); // wider -> pillarbox; fit_x != fit_y; screen != design
+    const samples = [_][2]f32{ .{ 0, 0 }, .{ 2000, 1000 }, .{ 1000, 500 }, .{ 500, 250 }, .{ 1750, 800 } };
+    for (samples) |s| {
+        const d = screenToDesign(s[0], s[1]);
+        const p = designToPhysical(.{ .x = d.x, .y = d.y });
+        try std.testing.expectApproxEqAbs(s[0], p.x, 1e-2);
+        try std.testing.expectApproxEqAbs(s[1], p.y, 1e-2);
+    }
 }
 
 // ── PNG decoder tests ──────────────────────────────────────────────────
