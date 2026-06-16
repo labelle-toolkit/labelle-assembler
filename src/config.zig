@@ -50,6 +50,31 @@ pub fn globalEnviron() std.process.Environ {
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 pub const Platform = enum { desktop, ios, android, wasm };
 
+/// Texture container a platform ships atlases in. `.png` (source, CPU-decoded
+/// at load) or `.astc` (GPU-native compressed, zero decode — see #340).
+pub const AssetFormat = enum { png, astc };
+
+/// Per-platform `AssetFormat` selection. ASTC support is mandatory on
+/// Android/iOS GLES/Metal and desktop GLES/Metal/Vulkan, but spotty on the web
+/// (Safari yes, desktop browsers via extensions) — so the default is `.png`
+/// everywhere and each platform opts into `.astc` explicitly.
+pub const AssetCompression = struct {
+    desktop: AssetFormat = .png,
+    android: AssetFormat = .png,
+    ios: AssetFormat = .png,
+    web: AssetFormat = .png,
+
+    /// The selected format for `platform`.
+    pub fn formatFor(self: AssetCompression, platform: Platform) AssetFormat {
+        return switch (platform) {
+            .desktop => self.desktop,
+            .android => self.android,
+            .ios => self.ios,
+            .wasm => self.web,
+        };
+    }
+};
+
 /// Desktop gamepad source selection (core#28 slice 5).
 ///
 /// - `.auto` (default): the shared windowless-SDL desktop gamepad source
@@ -464,6 +489,13 @@ pub const ProjectConfig = struct {
     initial_scene: ?[]const u8 = null,
     /// Sprite atlas resources — each entry declares a named atlas with frame data and texture.
     resources: []const ResourceDef = &.{},
+    /// Per-platform texture-compression selection. When a platform is set to
+    /// `.astc`, the generator references each atlas's pre-converted `<name>.astc`
+    /// sibling (produced by `labelle astc`) instead of the source `.png`, so the
+    /// engine uploads GPU-native compressed blocks with zero CPU decode
+    /// (labelle-gfx#269 / #340). Defaults to `.png` everywhere — fully opt-in,
+    /// and falls back to the `.png` when no `.astc` sibling exists.
+    asset_compression: AssetCompression = .{},
 
     /// Project app icon / launch image, as a path relative to the project
     /// root (e.g. `"assets/icon.png"`).
@@ -553,3 +585,15 @@ pub const ProjectConfig = struct {
         }
     }
 };
+
+test "AssetCompression.formatFor maps platforms; default is png everywhere" {
+    const def = AssetCompression{};
+    inline for (.{ Platform.desktop, .android, .ios, .wasm }) |p| {
+        try std.testing.expectEqual(AssetFormat.png, def.formatFor(p));
+    }
+    const mixed = AssetCompression{ .android = .astc, .ios = .astc, .desktop = .astc, .web = .png };
+    try std.testing.expectEqual(AssetFormat.astc, mixed.formatFor(.android));
+    try std.testing.expectEqual(AssetFormat.astc, mixed.formatFor(.ios));
+    try std.testing.expectEqual(AssetFormat.astc, mixed.formatFor(.desktop));
+    try std.testing.expectEqual(AssetFormat.png, mixed.formatFor(.wasm)); // web -> wasm
+}
