@@ -276,6 +276,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run bgfx backend unit tests");
     test_step.dependOn(&b.addRunArtifact(platform_tests).step);
 
+    // Run the gfx coordinate-math tests (#331). `gfx/state.zig` imports only
+    // `types.zig` (pure), so it runs on the host independent of zbgfx — and
+    // unlike the compile-only `gfx_tests` below, this EXECUTES the
+    // screenToDesign/designToPhysical inverse + round-trip assertions.
+    const state_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gfx/state.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(state_run).step);
+
     // ── Compile-check window.zig (+ input.zig via its import) ───────
     // window.zig does the real comptime dispatch on builtin.target — both
     // the per-OS desktop branches and the Android `is_android` path — so
