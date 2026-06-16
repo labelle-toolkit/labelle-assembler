@@ -40,9 +40,21 @@ pub fn newFrame() void {
     glfw.pollEvents();
 
     if (glfw_window) |win| {
+        // GLFW's cursor position is in LOGICAL window coordinates, but the
+        // engine maps input against the PHYSICAL framebuffer (gfx now renders
+        // at framebuffer pixels and `gfx.setScreenSize` receives them). Scale
+        // the cursor to framebuffer pixels using the window's own
+        // framebuffer/logical ratio so HiDPI/Retina hit-testing lands
+        // correctly: the camera's `framebufferToWorld` → `gfx.screenToDesign`
+        // then maps these physical pixels back to design space. Mirrors the
+        // bgfx backend's input scaling.
         const pos = win.getCursorPos();
-        mouse_x = @floatCast(pos[0]);
-        mouse_y = @floatCast(pos[1]);
+        const fb = win.getFramebufferSize();
+        const ws = win.getSize();
+        const sx: f64 = if (ws[0] > 0) @as(f64, @floatFromInt(fb[0])) / @as(f64, @floatFromInt(ws[0])) else 1.0;
+        const sy: f64 = if (ws[1] > 0) @as(f64, @floatFromInt(fb[1])) / @as(f64, @floatFromInt(ws[1])) else 1.0;
+        mouse_x = @floatCast(pos[0] * sx);
+        mouse_y = @floatCast(pos[1] * sy);
     }
 }
 
