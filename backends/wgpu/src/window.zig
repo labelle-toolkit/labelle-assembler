@@ -59,19 +59,21 @@ fn framebufferSize() [2]i32 {
 
 /// Reconcile the wgpu surface with the current physical framebuffer size.
 ///
-/// Called once per frame from `beginDrawing`. If the framebuffer changed
-/// since the last reconcile (a DPI move between monitors, a resize, or a
-/// fullscreen/windowed switch) and is non-zero, update the cached
-/// `screen_w/h`, reconfigure the wgpu surface to the new physical size, and
-/// tell gfx (`setScreenSize`) so the design→physical aspect-fit stays in
-/// step. The `> 0` guard skips minimized windows (a 0-size configure is
-/// invalid). Mirrors the bgfx backend's per-frame `ensureSurface`.
+/// Called once per frame from `beginDrawing`. The expensive part — the wgpu
+/// surface reconfigure — only runs when the framebuffer actually changed (a
+/// DPI move, resize, or fullscreen toggle), `> 0`-guarded to skip minimized
+/// windows. But `gfx.setScreenSize` is re-asserted EVERY frame: it's cheap,
+/// and it keeps gfx's physical dimensions authoritative even if some other
+/// code (an example main, a future codegen path) sets gfx's size to
+/// something else mid-frame — otherwise gfx could drift to logical size
+/// while the swapchain stays physical, breaking aspect-fit + `screenToDesign`
+/// input. Mirrors the bgfx backend's per-frame `ensureSurface`.
 fn ensureSurface() void {
     const fb = framebufferSize();
-    if (fb[0] > 0 and fb[1] > 0 and (fb[0] != screen_w or fb[1] != screen_h)) {
+    if (fb[0] <= 0 or fb[1] <= 0) return; // minimized — nothing valid to apply
+    if (fb[0] != screen_w or fb[1] != screen_h) {
         screen_w = fb[0];
         screen_h = fb[1];
-        gfx.setScreenSize(screen_w, screen_h);
         if (gpu_ready) {
             if (surface) |s| {
                 if (device) |dev| {
@@ -85,6 +87,8 @@ fn ensureSurface() void {
             }
         }
     }
+    // Re-assert gfx's physical size every frame (cheap), so it can't drift.
+    gfx.setScreenSize(screen_w, screen_h);
 }
 
 // ── GPU state ───────────────────────────────────────────────────────────
