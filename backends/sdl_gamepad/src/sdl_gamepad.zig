@@ -429,11 +429,13 @@ var state: State = .{};
 
 /// Opt-in for SDL's HIDAPI raw-HID driver (Switch/8BitDo decode). OFF by
 /// default because HIDAPI's per-connect device init blocks the calling thread
-/// for seconds on some platforms. The backend's `input.zig` sets this from its
-/// `build_options.gamepad_hidapi` before the lazy `ensureInit` runs; left at
-/// the default it stays off (native OS driver, no connect hitch). Plain `var`
-/// (not atomic): written once on the render thread before any SDL init, read
-/// inside `ensureInit` on that same thread.
+/// for seconds on some platforms. The backend's `input.zig` assigns this from
+/// its `build_options.gamepad_hidapi` (a comptime-constant bool) on the render
+/// thread before every SDL-source pump — idempotent, so the effective value is
+/// fixed; only the FIRST pump's `ensureInit` reads it (later writes are no-ops
+/// once SDL is initialized). Left at the default it stays off (native OS
+/// driver, no connect hitch). Plain `var` (not atomic): writer and reader are
+/// the same render thread.
 pub var hidapi_enabled: bool = false;
 
 // ── SDL plumbing (desktop only) ─────────────────────────────────────────
