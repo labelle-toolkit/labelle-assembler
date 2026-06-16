@@ -49,8 +49,18 @@ pub const IMAGE_BACKEND_WIRING = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn upload(decoded: engine.DecodedImage) anyerror!engine.AssetTexture") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn unload(texture: engine.AssetTexture) void") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.decodeImage(file_type, data, alloc)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(backend_decoded)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(.{") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.unloadTexture(tex)") != null);
+        // Compressed (ASTC) blobs route through a comptime-gated path: the
+        // `supports_compressed` flag requires the ENTIRE lifecycle (isCompressed
+        // + compressedDims + uploadCompressed), and both decode and upload wrap
+        // their compressed arms in `if (comptime supports_compressed)` so a
+        // backend lacking `uploadCompressed` never references the missing decl.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const supports_compressed = @hasDecl(BackendGfx, \"isCompressed\") and @hasDecl(BackendGfx, \"compressedDims\") and @hasDecl(BackendGfx, \"uploadCompressed\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (comptime supports_compressed)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.compressedDims(data)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".compressed = true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (decoded.compressed) break :blk try BackendGfx.uploadCompressed(decoded.pixels);") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.ImageLoader.setBackend(.{") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".decode = ImageBackendAdapter.decode") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".upload = ImageBackendAdapter.upload") != null);
@@ -191,7 +201,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
         // form — the `handle == MAX_IMAGE_ASSETS` sentinel is how the
         // rewrite signals "no free slot" after the scan.
         const guard_idx = std.mem.indexOf(u8, main_zig, "if (handle == MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;") orelse return error.GuardMissing;
-        const upload_call_idx = std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(backend_decoded)") orelse return error.UploadCallMissing;
+        const upload_call_idx = std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(.{") orelse return error.UploadCallMissing;
         try std.testing.expect(guard_idx < upload_call_idx);
 
         // Also lock in the slot-reuse behavior: the scan must run

@@ -74,6 +74,10 @@ pub const drawTexturePro = texture.drawTexturePro;
 // dispatches to these via `@hasDecl` when the blob is compressed (#341).
 pub const isCompressed = texture.isCompressed;
 pub const uploadCompressed = texture.uploadCompressed;
+// Header-only dims for the async asset-catalog adapter (engine#450), which
+// splits worker-thread decode from main-thread upload and so can't use the
+// synchronous seam — it reads dims here to set DecodedImage before upload.
+pub const compressedDims = texture.compressedDims;
 
 // ── Text rendering ─────────────────────────────────────────────────────
 
