@@ -276,6 +276,18 @@ const Device = struct {
     /// Raw forwarded axis snapshot, indexed by FA_*.
     forwarded_axis: [FORWARDED_AXIS_COUNT]f32 = [_]f32{0} ** FORWARDED_AXIS_COUNT,
     quirk: Quirk = .{},
+    /// Adaptive trigger routing, latched from observed input. The name-based
+    /// quirk picks a *default* trigger axis pair, but Android trigger-axis
+    /// routing is fragmented even within a single controller family — e.g. an
+    /// "Xbox Wireless Controller" was observed on-device (#314 / SM-T505)
+    /// reporting its triggers on GAS/BRAKE while the name quirk assumed
+    /// LTRIGGER/RTRIGGER, so `getGamepadAxisValue(.left/.right_trigger)` read 0
+    /// despite full pulls. The first time we see real signal on either the
+    /// LTRIGGER/RTRIGGER pair or the GAS/BRAKE pair we latch that choice and it
+    /// overrides the quirk for trigger reads. Null until observed (→ quirk
+    /// default). Only distinguishes those two pairs; Z/RZ-routed triggers
+    /// (e.g. some Switch pads) stay on the quirk and are never auto-flipped.
+    trigger_override: ?TriggerSource = null,
 
     /// Recompute `buttons_down` from the two input sources. Non-dpad buttons
     /// mirror `key_down`; the four dpad buttons additionally OR in the hat axis
@@ -291,7 +303,46 @@ const Device = struct {
         if (hy < -HAT_DEADZONE) self.buttons_down[BTN_LEFT_FACE_UP] = true;
         if (hy > HAT_DEADZONE) self.buttons_down[BTN_LEFT_FACE_DOWN] = true;
     }
+
+    /// Latch the trigger axis pair from observed signal. Only runs for pads
+    /// whose quirk leaves triggers at the `.ltrigger_rtrigger` default — the
+    /// genuinely ambiguous case (unknown pads, plus families like Xbox that the
+    /// table assumes use LTRIGGER/RTRIGGER but which some firmwares route to
+    /// GAS/BRAKE). An *explicit* `.gas_brake` or `.z_rz` quirk is hardware we
+    /// already know, so we trust it and never auto-flip it — that also stops a
+    /// stray LTRIGGER/RTRIGGER reading from clobbering a known `.gas_brake` pad.
+    ///
+    /// The LTRIGGER/RTRIGGER and GAS/BRAKE axes all rest at 0 and pull toward
+    /// +1, so a plain magnitude threshold can't false-latch a resting axis. The
+    /// first pair to cross the threshold wins; LTRIGGER/RTRIGGER is preferred
+    /// when both somehow report (it's the canonical pair). Once latched we never
+    /// re-evaluate, so a mid-session stray reading can't flip the routing.
+    fn observeTriggerRouting(self: *Device) void {
+        if (self.trigger_override != null) return;
+        if (self.quirk.triggers != .ltrigger_rtrigger) return; // trust explicit quirks
+        const fa = &self.forwarded_axis;
+        const lr = @max(@abs(fa[FA_LTRIGGER]), @abs(fa[FA_RTRIGGER]));
+        const gb = @max(@abs(fa[FA_GAS]), @abs(fa[FA_BRAKE]));
+        if (lr > TRIGGER_OBSERVE_THRESHOLD) {
+            self.trigger_override = .ltrigger_rtrigger;
+        } else if (gb > TRIGGER_OBSERVE_THRESHOLD) {
+            self.trigger_override = .gas_brake;
+        }
+    }
+
+    /// The quirk to use for *reads*, with the observed trigger override applied.
+    /// Copies the device quirk and overrides only `triggers`, so new `Quirk`
+    /// fields keep the device's configured value instead of silently defaulting.
+    fn effectiveQuirk(self: *const Device) Quirk {
+        var q = self.quirk;
+        if (self.trigger_override) |t| q.triggers = t;
+        return q;
+    }
 };
+
+/// Trigger-pair latch threshold. The trigger axes span [0, 1]; half-travel is
+/// well clear of rest noise and below a deliberate pull.
+const TRIGGER_OBSERVE_THRESHOLD: f32 = 0.5;
 
 /// Hat axis press threshold. The hat reports discrete -1/0/+1, so any
 /// non-trivial deadzone works; 0.5 rejects noise without missing real presses.
@@ -416,6 +467,7 @@ pub fn applyMotion(device_id: i32, axes: [FORWARDED_AXIS_COUNT]f32) void {
     defer table.mutex.unlock();
     if (table.findOrAlloc(device_id)) |d| {
         d.forwarded_axis = axes;
+        d.observeTriggerRouting();
         d.recompute();
     }
 }
@@ -449,7 +501,7 @@ pub fn axisValue(device_id: u32, axis: u32) f32 {
     table.mutex.lock();
     defer table.mutex.unlock();
     const d = table.find(@bitCast(device_id)) orelse return 0;
-    const fi = axisToForwardedIndex(axis, d.quirk) orelse return 0;
+    const fi = axisToForwardedIndex(axis, d.effectiveQuirk()) orelse return 0;
     return d.forwarded_axis[fi];
 }
 
@@ -554,6 +606,75 @@ test "state: axis snapshot honors the device quirk" {
 
     try std.testing.expectEqual(@as(f32, 0.5), axisValue(uid, AXIS_RIGHT_X));
     try std.testing.expectEqual(@as(f32, -0.25), axisValue(uid, AXIS_RIGHT_Y));
+}
+
+test "state: adaptive trigger routing latches GAS/BRAKE over the name quirk" {
+    // Reproduces #314: an "Xbox Wireless Controller" whose name quirk defaults
+    // to LTRIGGER/RTRIGGER but which actually reports triggers on GAS/BRAKE.
+    table = .{};
+    const id: i32 = 10;
+    const uid: u32 = @bitCast(id);
+    setDeviceQuirkByName(id, "Xbox Wireless Controller"); // → triggers .ltrigger_rtrigger
+
+    // Before any input, reads fall back to the quirk axes (LTRIGGER/RTRIGGER),
+    // which are idle — so triggers read 0 (the buggy pre-fix behaviour).
+    try std.testing.expectEqual(@as(f32, 0), axisValue(uid, AXIS_LEFT_TRIGGER));
+
+    // A motion event carries the real triggers on GAS (R2) / BRAKE (L2).
+    var axes = [_]f32{0} ** FORWARDED_AXIS_COUNT;
+    axes[FA_BRAKE] = 1.0; // left trigger fully pulled
+    axes[FA_GAS] = 0.8; // right trigger pulled
+    applyMotion(id, axes);
+
+    // The state module observes the GAS/BRAKE signal and latches gas_brake, so
+    // the engine-facing trigger reads now resolve to the correct axes.
+    try std.testing.expectEqual(@as(f32, 1.0), axisValue(uid, AXIS_LEFT_TRIGGER));
+    try std.testing.expectEqual(@as(f32, 0.8), axisValue(uid, AXIS_RIGHT_TRIGGER));
+
+    // Latch is sticky: a later frame where GAS/BRAKE return to rest keeps the
+    // routing (so a released trigger reads 0 from GAS/BRAKE, not the quirk axis).
+    var rest = [_]f32{0} ** FORWARDED_AXIS_COUNT;
+    rest[FA_LTRIGGER] = 0.3; // stray reading on the quirk axis must NOT leak through
+    applyMotion(id, rest);
+    try std.testing.expectEqual(@as(f32, 0), axisValue(uid, AXIS_LEFT_TRIGGER));
+}
+
+test "state: trigger routing stays on the quirk when LTRIGGER/RTRIGGER are real" {
+    table = .{};
+    const id: i32 = 11;
+    const uid: u32 = @bitCast(id);
+    // Default quirk (unknown name) → ltrigger_rtrigger.
+    var axes = [_]f32{0} ** FORWARDED_AXIS_COUNT;
+    axes[FA_LTRIGGER] = 0.9;
+    axes[FA_RTRIGGER] = 0.7;
+    applyMotion(id, axes);
+    try std.testing.expectEqual(@as(f32, 0.9), axisValue(uid, AXIS_LEFT_TRIGGER));
+    try std.testing.expectEqual(@as(f32, 0.7), axisValue(uid, AXIS_RIGHT_TRIGGER));
+}
+
+test "state: explicit gas_brake/z_rz quirks are never auto-overridden by stray LTRIGGER" {
+    // DualSense → explicit gas_brake. A stray reading on LTRIGGER/RTRIGGER must
+    // NOT flip it to ltrigger_rtrigger (the real triggers live on GAS/BRAKE).
+    table = .{};
+    const ds: i32 = 20;
+    const ds_uid: u32 = @bitCast(ds);
+    setDeviceQuirkByName(ds, "Sony DualSense Wireless Controller"); // gas_brake
+    var stray = [_]f32{0} ** FORWARDED_AXIS_COUNT;
+    stray[FA_LTRIGGER] = 1.0; // stray/garbage on the unused axis
+    stray[FA_BRAKE] = 0.6; // the real left trigger
+    applyMotion(ds, stray);
+    // Reads still resolve via gas_brake → left trigger from BRAKE, not LTRIGGER.
+    try std.testing.expectEqual(@as(f32, 0.6), axisValue(ds_uid, AXIS_LEFT_TRIGGER));
+
+    // Switch Pro → explicit z_rz triggers; also never auto-flipped.
+    const pro: i32 = 21;
+    const pro_uid: u32 = @bitCast(pro);
+    setDeviceQuirkByName(pro, "Nintendo Switch Pro Controller"); // z_rz triggers
+    var axes = [_]f32{0} ** FORWARDED_AXIS_COUNT;
+    axes[FA_LTRIGGER] = 1.0; // stray on LTRIGGER must not override z_rz
+    axes[FA_Z] = 0.4; // real left trigger on Z
+    applyMotion(pro, axes);
+    try std.testing.expectEqual(@as(f32, 0.4), axisValue(pro_uid, AXIS_LEFT_TRIGGER));
 }
 
 test "state: hat axis synthesizes dpad buttons" {
