@@ -49,6 +49,56 @@ pub fn setScreenSize(w: i32, h: i32) void {
     recomputeFitScale();
 }
 
+/// Convert a physical-pixel screen coordinate (a GLFW mouse / touch event
+/// in framebuffer pixels) to a design-pixel coordinate inside the
+/// pillarboxed/letterboxed canvas.
+///
+/// Input events arrive in raw framebuffer pixels (the bgfx `input` backend
+/// scales GLFW's logical cursor by the framebuffer/window ratio), but
+/// game-level math (`cam.screenToWorld`, sprite positions) works in design
+/// pixels. The camera's `framebufferToWorld` calls this (guarded by
+/// `@hasDecl`) so clicks land correctly on HiDPI/Retina; without it the
+/// camera treats framebuffer pixels as design pixels and is off by the
+/// pillarbox bars + the design→physical scale. Mirrors the sokol backend.
+pub fn screenToDesign(px: f32, py: f32) Vector2 {
+    const sw: f32 = @floatFromInt(screen_w);
+    const sh: f32 = @floatFromInt(screen_h);
+    const dw: f32 = @floatFromInt(design_w);
+    const dh: f32 = @floatFromInt(design_h);
+    if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
+        return .{ .x = px, .y = py };
+    }
+    const fitted_w = dw * fit_scale_x;
+    const fitted_h = dh * fit_scale_y;
+    const bar_x = (sw - fitted_w) * 0.5;
+    const bar_y = (sh - fitted_h) * 0.5;
+    return .{
+        .x = (px - bar_x) / fit_scale_x,
+        .y = (py - bar_y) / fit_scale_y,
+    };
+}
+
+/// Inverse of `screenToDesign`: design-pixel → physical-pixel inside the
+/// fitted canvas. Kept for parity with the sokol backend (used by the iOS
+/// soft-keyboard bridge there; harmless to expose here).
+pub fn designToPhysical(pos: Vector2) Vector2 {
+    const sw: f32 = @floatFromInt(screen_w);
+    const sh: f32 = @floatFromInt(screen_h);
+    const dw: f32 = @floatFromInt(design_w);
+    const dh: f32 = @floatFromInt(design_h);
+    if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
+        return pos;
+    }
+    const fitted_w = dw * fit_scale_x;
+    const fitted_h = dh * fit_scale_y;
+    const bar_x = (sw - fitted_w) * 0.5;
+    const bar_y = (sh - fitted_h) * 0.5;
+    return .{
+        .x = pos.x * fit_scale_x + bar_x,
+        .y = pos.y * fit_scale_y + bar_y,
+    };
+}
+
 // ── Camera coordinate transform ────────────────────────────────────────
 
 pub fn transformX(x: f32) f32 {
@@ -133,6 +183,16 @@ pub fn setDesignSize(w: i32, h: i32) void {
     design_w = @max(1, w);
     design_h = @max(1, h);
     recomputeFitScale();
+}
+
+/// Design (logical) canvas dimensions — parity with the sokol backend's
+/// public surface.
+pub fn getDesignWidth() i32 {
+    return design_w;
+}
+
+pub fn getDesignHeight() i32 {
+    return design_h;
 }
 
 pub fn screenToWorld(pos: Vector2, camera: Camera2D) Vector2 {

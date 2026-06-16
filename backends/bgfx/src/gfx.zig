@@ -44,6 +44,13 @@ pub const color = types.color;
 // ── State / shader management ──────────────────────────────────────────
 
 pub const setScreenSize = state.setScreenSize;
+// Physical↔design coordinate conversion for HiDPI input mapping. The
+// camera's `framebufferToWorld` calls `screenToDesign` (guarded by
+// `@hasDecl`) so mouse/touch in framebuffer pixels maps to design space.
+pub const screenToDesign = state.screenToDesign;
+pub const designToPhysical = state.designToPhysical;
+pub const getDesignWidth = state.getDesignWidth;
+pub const getDesignHeight = state.getDesignHeight;
 pub const shutdownPrograms = programs.shutdownPrograms;
 pub const areProgramsReady = programs.areProgramsReady;
 

@@ -34,23 +34,75 @@ var windowed_x: i32 = 0;
 var windowed_y: i32 = 0;
 var windowed_w: i32 = 800;
 var windowed_h: i32 = 600;
-/// VSYNC reset flag reused by `applyResize` — matches the value baked
+/// VSYNC reset flag reused by `ensureSurface` — matches the value baked
 /// into `init.resolution.reset` at window creation.
 const RESET_VSYNC: u32 = 0x00000080;
 var window_hidden: bool = false;
 var clear_color: u32 = 0x1e1e2eff; // dark background RGBA
 
-/// The current surface dimensions. After `initWindow` these hold the real
-/// values — on Android that's the `ANativeWindow` size handed over at
-/// `INIT_WINDOW`, which can differ from the project's configured default
-/// (e.g. a 2000x1200 tablet surface vs. an 800x600 config). The generated
-/// Android entry reads `getScreenHeight()` post-init so the engine's
-/// coordinate mapping matches the actual surface rather than the config.
+/// The current surface dimensions, in PHYSICAL framebuffer pixels.
+///
+/// On desktop (GLFW) `screen_w/h` are seeded from `getFramebufferSize()` at
+/// window creation and reconciled every frame by `ensureSurface()`, so on a
+/// HiDPI/Retina display they hold the physical drawable size (e.g. 1600x1200
+/// for a logical 800x600 window at 2x) — NOT the logical window size. That is
+/// exactly what the engine's `setScreenSize` needs: the gfx renderer maps the
+/// design resolution onto the physical framebuffer, so the GPU renders at full
+/// Retina sharpness and screen-space NDC stays correct.
+///
+/// On Android `screen_w/h` are the `ANativeWindow` surface size handed over at
+/// `INIT_WINDOW` — already physical — which can differ from the project's
+/// configured default (e.g. a 2000x1200 tablet surface vs. an 800x600 config).
+/// The generated Android entry reads `getScreenHeight()` post-init so the
+/// engine's coordinate mapping matches the actual surface rather than the
+/// config.
+// Return the LIVE framebuffer size, not the cached `screen_w/h`. The
+// generated frame loop calls `setScreenSize(getScreenWidth(), ...)` at the
+// top of the frame, before `beginDrawing`'s `ensureSurface()` reconciles
+// the cache — so reading the cache here would feed gfx the *previous*
+// physical size on the frame a resize/DPI/fullscreen change lands, while
+// the bgfx viewport already matched the new framebuffer (one-frame
+// aspect-fit mismatch). Querying live keeps gfx and the surface in step.
+// On Android `framebufferSize()` returns the cached native-surface dims.
 pub fn getScreenWidth() i32 {
-    return screen_w;
+    return framebufferSize()[0];
 }
 pub fn getScreenHeight() i32 {
-    return screen_h;
+    return framebufferSize()[1];
+}
+
+/// The physical framebuffer size of the render surface.
+///
+/// On Android there's no GLFW; `screen_w/h` already hold the native
+/// `ANativeWindow` surface dims (physical), so return those. On desktop query
+/// GLFW's framebuffer size — on a Retina/HiDPI display this is larger than the
+/// logical window size (e.g. 2x), and it's the size the GPU swapchain must
+/// match for crisp rendering.
+fn framebufferSize() [2]i32 {
+    if (is_android) return .{ screen_w, screen_h };
+    if (glfw_window) |win| {
+        const fb = win.getFramebufferSize();
+        return .{ @intCast(fb[0]), @intCast(fb[1]) };
+    }
+    return .{ screen_w, screen_h };
+}
+
+/// Reconcile the bgfx backbuffer with the current physical framebuffer size.
+///
+/// Called once per frame from `beginDrawing`. If the framebuffer changed since
+/// the last reconcile (a DPI move between monitors, a resize, or a
+/// fullscreen/windowed switch) and is non-zero, update the cached `screen_w/h`
+/// and `bgfx.reset` the swapchain to the new physical size. The `> 0` guard
+/// skips minimized windows (a 0-size reset is invalid). The viewport rect is
+/// set by `beginDrawing` right after this, so we don't touch `setViewRect` here.
+fn ensureSurface() void {
+    const fb = framebufferSize();
+    if (fb[0] > 0 and fb[1] > 0 and (fb[0] != screen_w or fb[1] != screen_h)) {
+        screen_w = fb[0];
+        screen_h = fb[1];
+        // `.Count` = keep the current backbuffer format (no change).
+        bgfx.reset(@intCast(screen_w), @intCast(screen_h), RESET_VSYNC, .Count);
+    }
 }
 
 /// The native `ANativeWindow*` surface handed over by the NativeActivity
@@ -95,7 +147,7 @@ fn initWindowAndroid(width: i32, height: i32) void {
     init.type = .Count; // auto-select renderer (GLES/Vulkan on Android)
     init.resolution.width = @intCast(width);
     init.resolution.height = @intCast(height);
-    init.resolution.reset = 0x00000080; // BGFX_RESET_VSYNC
+    init.resolution.reset = RESET_VSYNC;
 
     // On Android the native window handle is the `ANativeWindow*` handed
     // over by the NativeActivity glue. `ndt` is unused (no display
@@ -131,14 +183,22 @@ fn initWindowDesktop(width: i32, height: i32, title: [:0]const u8) void {
 
     const win = glfw_window orelse return;
 
+    // The window was requested at the LOGICAL `width/height`, but on a
+    // HiDPI/Retina display the backing framebuffer is larger (e.g. 2x). Render
+    // bgfx at the PHYSICAL framebuffer size from frame 0 so the drawable is
+    // sharp instead of a logical-res image stretched onto a Retina surface.
+    const fb = win.getFramebufferSize();
+    screen_w = @intCast(fb[0]);
+    screen_h = @intCast(fb[1]);
+
     // Initialize bgfx
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
 
     init.type = .Count; // auto-select renderer
-    init.resolution.width = @intCast(width);
-    init.resolution.height = @intCast(height);
-    init.resolution.reset = 0x00000080; // BGFX_RESET_VSYNC
+    init.resolution.width = @intCast(screen_w);
+    init.resolution.height = @intCast(screen_h);
+    init.resolution.reset = RESET_VSYNC;
 
     // Fill in bgfx's native display type (ndt) and native window handle
     // (nwh) for the build target. See src/platform.zig for the source
@@ -175,7 +235,7 @@ fn initWindowDesktop(width: i32, height: i32, title: [:0]const u8) void {
     _ = bgfx.init(&init);
 
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
-    bgfx.setViewRect(0, 0, 0, @intCast(width), @intCast(height));
+    bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
 
     const input = @import("input");
     input.setWindow(win);
@@ -213,18 +273,6 @@ pub fn setTargetFPS(fps: i32) void {
     target_fps_val = fps;
 }
 
-/// Update the cached surface size and resize the bgfx backbuffer to
-/// match. Called after a fullscreen/windowed switch changes the GLFW
-/// framebuffer dimensions; without the `bgfx.reset` the swapchain stays
-/// at the old size and the image stretches.
-fn applyResize(w: i32, h: i32) void {
-    screen_w = w;
-    screen_h = h;
-    // `.Count` = keep the current backbuffer format (no change).
-    bgfx.reset(@intCast(w), @intCast(h), RESET_VSYNC, .Count);
-    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
-}
-
 /// Query whether the window is currently fullscreen. Android is always
 /// fullscreen; desktop asks GLFW whether the window is bound to a monitor.
 pub fn isFullscreen() bool {
@@ -237,8 +285,15 @@ pub fn isFullscreen() bool {
 /// only — Android is permanently fullscreen, so this is a no-op there.
 /// GLFW has no toggle primitive: going fullscreen binds the window to the
 /// primary monitor at its current video mode (saving the windowed
-/// geometry first); going windowed restores the saved geometry. Either
-/// way bgfx is reset to the new framebuffer size.
+/// geometry first); going windowed restores the saved geometry.
+///
+/// The saved windowed geometry uses GLFW's LOGICAL screen coordinates
+/// (`getSize`/`getPos`), and `setMonitor` takes the monitor's video `mode`
+/// dimensions — both correct in GLFW's coordinate space. The resulting
+/// PHYSICAL framebuffer change is picked up by `ensureSurface()` on the next
+/// `beginDrawing` (the frame loop drains this fullscreen request before
+/// `beginDrawing` in the same frame), which resets the bgfx swapchain to the
+/// new framebuffer size — so no resize is done here.
 pub fn setFullscreen(on: bool) void {
     if (is_android) return;
     const win = glfw_window orelse return;
@@ -255,16 +310,19 @@ pub fn setFullscreen(on: bool) void {
         const monitor = glfw.getPrimaryMonitor() orelse return;
         const mode = glfw.getVideoMode(monitor) catch return;
         win.setMonitor(monitor, 0, 0, mode.width, mode.height, mode.refresh_rate);
-        applyResize(mode.width, mode.height);
     } else {
         win.setMonitor(null, windowed_x, windowed_y, windowed_w, windowed_h, 0);
-        applyResize(windowed_w, windowed_h);
     }
 }
 
 pub fn beginDrawing() void {
     const input = @import("input");
     input.newFrame();
+    // Reconcile the swapchain with the current physical framebuffer size
+    // (DPI move, resize, fullscreen toggle) before sizing the viewport. This
+    // runs every frame uniformly so HiDPI changes are picked up without a
+    // dedicated resize callback.
+    ensureSurface();
     bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
     // Touch view 0 so bgfx ALWAYS clears + presents it, even on a frame
     // with zero draw calls. `setViewRect` alone does NOT do this — bgfx
