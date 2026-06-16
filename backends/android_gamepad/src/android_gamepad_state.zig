@@ -304,16 +304,23 @@ const Device = struct {
         if (hy > HAT_DEADZONE) self.buttons_down[BTN_LEFT_FACE_DOWN] = true;
     }
 
-    /// Latch the trigger axis pair from observed signal. The Android trigger
-    /// axes (LTRIGGER/RTRIGGER and GAS/BRAKE) all rest at 0 and pull toward +1,
-    /// so a plain magnitude threshold can't false-latch a resting axis. The
-    /// first pair to cross the threshold wins and is remembered for the device;
-    /// LTRIGGER/RTRIGGER is preferred when both somehow report (it's the
-    /// canonical pair). Once latched we never re-evaluate, so a mid-session
-    /// stray reading can't flip an established routing.
+    /// Latch the trigger axis pair from observed signal. Only runs for pads
+    /// whose quirk leaves triggers at the `.ltrigger_rtrigger` default — the
+    /// genuinely ambiguous case (unknown pads, plus families like Xbox that the
+    /// table assumes use LTRIGGER/RTRIGGER but which some firmwares route to
+    /// GAS/BRAKE). An *explicit* `.gas_brake` or `.z_rz` quirk is hardware we
+    /// already know, so we trust it and never auto-flip it — that also stops a
+    /// stray LTRIGGER/RTRIGGER reading from clobbering a known `.gas_brake` pad.
+    ///
+    /// The LTRIGGER/RTRIGGER and GAS/BRAKE axes all rest at 0 and pull toward
+    /// +1, so a plain magnitude threshold can't false-latch a resting axis. The
+    /// first pair to cross the threshold wins; LTRIGGER/RTRIGGER is preferred
+    /// when both somehow report (it's the canonical pair). Once latched we never
+    /// re-evaluate, so a mid-session stray reading can't flip the routing.
     fn observeTriggerRouting(self: *Device) void {
         if (self.trigger_override != null) return;
-        const fa = self.forwarded_axis;
+        if (self.quirk.triggers != .ltrigger_rtrigger) return; // trust explicit quirks
+        const fa = &self.forwarded_axis;
         const lr = @max(@abs(fa[FA_LTRIGGER]), @abs(fa[FA_RTRIGGER]));
         const gb = @max(@abs(fa[FA_GAS]), @abs(fa[FA_BRAKE]));
         if (lr > TRIGGER_OBSERVE_THRESHOLD) {
@@ -324,13 +331,12 @@ const Device = struct {
     }
 
     /// The quirk to use for *reads*, with the observed trigger override applied.
-    /// Right-stick routing always comes from the name quirk (auto-detection
-    /// there would collide with Z/RZ triggers); only trigger routing adapts.
+    /// Copies the device quirk and overrides only `triggers`, so new `Quirk`
+    /// fields keep the device's configured value instead of silently defaulting.
     fn effectiveQuirk(self: *const Device) Quirk {
-        return .{
-            .right_stick = self.quirk.right_stick,
-            .triggers = self.trigger_override orelse self.quirk.triggers,
-        };
+        var q = self.quirk;
+        if (self.trigger_override) |t| q.triggers = t;
+        return q;
     }
 };
 
@@ -644,6 +650,31 @@ test "state: trigger routing stays on the quirk when LTRIGGER/RTRIGGER are real"
     applyMotion(id, axes);
     try std.testing.expectEqual(@as(f32, 0.9), axisValue(uid, AXIS_LEFT_TRIGGER));
     try std.testing.expectEqual(@as(f32, 0.7), axisValue(uid, AXIS_RIGHT_TRIGGER));
+}
+
+test "state: explicit gas_brake/z_rz quirks are never auto-overridden by stray LTRIGGER" {
+    // DualSense → explicit gas_brake. A stray reading on LTRIGGER/RTRIGGER must
+    // NOT flip it to ltrigger_rtrigger (the real triggers live on GAS/BRAKE).
+    table = .{};
+    const ds: i32 = 20;
+    const ds_uid: u32 = @bitCast(ds);
+    setDeviceQuirkByName(ds, "Sony DualSense Wireless Controller"); // gas_brake
+    var stray = [_]f32{0} ** FORWARDED_AXIS_COUNT;
+    stray[FA_LTRIGGER] = 1.0; // stray/garbage on the unused axis
+    stray[FA_BRAKE] = 0.6; // the real left trigger
+    applyMotion(ds, stray);
+    // Reads still resolve via gas_brake → left trigger from BRAKE, not LTRIGGER.
+    try std.testing.expectEqual(@as(f32, 0.6), axisValue(ds_uid, AXIS_LEFT_TRIGGER));
+
+    // Switch Pro → explicit z_rz triggers; also never auto-flipped.
+    const pro: i32 = 21;
+    const pro_uid: u32 = @bitCast(pro);
+    setDeviceQuirkByName(pro, "Nintendo Switch Pro Controller"); // z_rz triggers
+    var axes = [_]f32{0} ** FORWARDED_AXIS_COUNT;
+    axes[FA_LTRIGGER] = 1.0; // stray on LTRIGGER must not override z_rz
+    axes[FA_Z] = 0.4; // real left trigger on Z
+    applyMotion(pro, axes);
+    try std.testing.expectEqual(@as(f32, 0.4), axisValue(pro_uid, AXIS_LEFT_TRIGGER));
 }
 
 test "state: hat axis synthesizes dpad buttons" {
