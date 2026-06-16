@@ -75,6 +75,11 @@ pub const loadTexture = texture.loadTexture;
 pub const decodeImage = texture.decodeImage;
 pub const uploadTexture = texture.uploadTexture;
 pub const unloadTexture = texture.unloadTexture;
+// GPU-compressed (ASTC) upload — the labelle-gfx `loadTextureFromMemory` seam
+// dispatches to these via `@hasDecl` when the blob is compressed. sokol only
+// exposes ASTC 4×4, so non-4×4 blobs fall back to the CPU decode path (#341).
+pub const isCompressed = texture.isCompressed;
+pub const uploadCompressed = texture.uploadCompressed;
 
 // ── Phase 4 font surface (labelle-gfx#258, labelle-engine#448) ─────────
 
