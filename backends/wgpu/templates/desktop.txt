@@ -23,6 +23,15 @@ const target_fps: u32 = {{fps}};
 {{preview_setup}}{{setup_code}}
     while (!window.windowShouldClose()) {
         const dt: f32 = 0.016;
+        // Apply a pending fullscreen/windowed switch requested via
+        // `game.setFullscreen`/`toggleFullscreen`. The engine owns the
+        // desired flag; the backend owns the platform call. Gated on BOTH
+        // the backend exposing `setFullscreen` and the engine exposing the
+        // drain, so the template stays compatible with backends/engines
+        // that predate the API (older example projects still build).
+        if (comptime @hasDecl(window, "setFullscreen") and @hasDecl(@TypeOf(g), "takeFullscreenRequest")) {
+            if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
+        }
 {{preview_heartbeat}}{{tick_code}}        g.tick(dt);
 
         window.beginDrawing();

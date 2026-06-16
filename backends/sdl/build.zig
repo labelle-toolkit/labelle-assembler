@@ -104,6 +104,20 @@ pub fn build(b: *std.Build) void {
     addSdlPaths(b, input_tests.root_module, sdl_prefix);
     input_tests.root_module.linkSystemLibrary("SDL2", .{});
     test_step.dependOn(&b.addRunArtifact(input_tests).step);
+
+    // ── Compile-check window.zig ────────────────────────────────────
+    // window.zig owns the SDL window lifecycle, including the
+    // fullscreen toggle (SDL_SetWindowFullscreen / SDL_GetWindowFlags).
+    // Forcing a test binary off window_mod pulls the full module graph
+    // (sdl + gfx + input + audio) into the build so any breakage in the
+    // @cImport-backed fullscreen path is caught at `zig build test`.
+    // Depend on the compile step (not a run step) so it also works under
+    // cross-compilation where the host can't execute the binary; SDL
+    // include/lib paths are needed for the transitive @cInclude.
+    const window_tests = b.addTest(.{ .root_module = window_mod });
+    addSdlPaths(b, window_mod, sdl_prefix);
+    window_mod.linkSystemLibrary("SDL2", .{});
+    test_step.dependOn(&window_tests.step);
 }
 
 fn addSdlPaths(b: *std.Build, mod: *std.Build.Module, prefix: []const u8) void {

@@ -27,6 +27,20 @@ pub fn windowShouldClose() bool {
     return true;
 }
 
+/// The null backend has no window, so it is never fullscreen. Provided for
+/// parity with the real backends (sokol/raylib/bgfx/sdl/wgpu) so the engine's
+/// fullscreen API links and compiles cleanly against the headless backend.
+pub fn isFullscreen() bool {
+    return false;
+}
+
+/// No-op: the null backend has no window to switch. Mirrors the other
+/// backends' `setFullscreen` signature so the generated frame-loop drain
+/// (`window.setFullscreen(on)`) resolves on the headless backend too.
+pub fn setFullscreen(on: bool) void {
+    _ = on;
+}
+
 pub fn setTargetFPS(fps: i32) void {
     _ = fps;
 }
