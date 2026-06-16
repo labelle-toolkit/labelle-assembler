@@ -113,6 +113,14 @@ pub const decodeImage = texture.decodeImage;
 pub const uploadTexture = texture.uploadTexture;
 pub const unloadTexture = texture.unloadTexture;
 pub const getTexturePixels = texture.getTexturePixels;
+// GPU-compressed (ASTC) upload — the labelle-gfx `loadTextureFromMemory` seam
+// dispatches to `isCompressed`/`uploadCompressed` via `@hasDecl` when the blob
+// is compressed (#341). `getCompressedTexture` is read by the window submitter
+// to build the ASTC wgpu texture lazily on the main thread.
+pub const isCompressed = texture.isCompressed;
+pub const uploadCompressed = texture.uploadCompressed;
+pub const CompressedTexture = texture.CompressedTexture;
+pub const getCompressedTexture = texture.getCompressedTexture;
 
 // ── Text rendering ─────────────────────────────────────────────────────
 
