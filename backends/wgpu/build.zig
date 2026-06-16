@@ -105,9 +105,25 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // ── ASTC container-parsing tests (#341) ─────────────────────────
+    // `gfx/astc.zig` is pure byte parsing with no wgpu dependency, so it
+    // EXECUTES on the host (magic detection, block/image dims, ceil-to-block
+    // payload sizing, truncation) — a verbatim port of the bgfx backend's
+    // astc_run target. The wgpu-side seam tests (isCompressed /
+    // uploadCompressed / getCompressedTexture) ride in `gfx_tests` above,
+    // since they live in `gfx/texture.zig`.
+    const astc_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gfx/astc.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+
     const test_step = b.step("test", "Run wgpu backend unit tests");
     test_step.dependOn(&b.addRunArtifact(wav_parser_tests).step);
     test_step.dependOn(&b.addRunArtifact(gfx_tests).step);
+    test_step.dependOn(&b.addRunArtifact(astc_run).step);
 
     // ── Compile-check window.zig ────────────────────────────────────
     // window.zig owns the GLFW window lifecycle + the fullscreen toggle

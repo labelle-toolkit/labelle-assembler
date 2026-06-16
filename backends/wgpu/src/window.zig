@@ -99,6 +99,12 @@ const ShapeVertex = extern struct { position: [2]f32, color_packed: u32 };
 const SpriteVertex = gfx.SpriteVertex;
 
 var gpu_ready = false;
+/// Whether the adapter advertised — and the device was created with — the
+/// `texture_compression_astc` feature (#341). Gates `getOrCreateGpuTexture`'s
+/// compressed (ASTC) path: when false, ASTC slots can't be uploaded (creating
+/// an ASTC texture would fail), so they're skipped with a one-time warning.
+var astc_supported = false;
+var astc_unsupported_warned = false;
 var io_threaded: ?std.Io.Threaded = null;
 var instance: ?*wgpu.Instance = null;
 var surface: ?*wgpu.Surface = null;
@@ -292,11 +298,29 @@ fn initGpu() void {
         return;
     };
 
-    const device_resp = adapter.requestDeviceSync(instance.?, null, io, std.Io.Duration.fromMilliseconds(10));
+    // Request the ASTC compressed-texture feature so `uploadCompressed`'s
+    // ASTC textures can be created (#341 / labelle-gfx#269). It's a DEVICE
+    // FEATURE that must be enabled at device creation — without it, creating
+    // an `astc*_unorm` texture fails. Best-effort: only ask for it when the
+    // adapter actually advertises it (asking for an unsupported feature makes
+    // `requestDevice` fail outright, which would disable ALL rendering), so on
+    // hardware without ASTC we get a normal device and the loader simply can't
+    // produce ASTC textures. `astc_supported` gates the upload path below.
+    astc_supported = adapter.hasFeature(.texture_compression_astc);
+    var required_features = [_]wgpu.FeatureName{.texture_compression_astc};
+    const device_desc = wgpu.DeviceDescriptor{
+        .required_feature_count = if (astc_supported) required_features.len else 0,
+        .required_features = &required_features,
+        .required_limits = null,
+    };
+    const device_resp = adapter.requestDeviceSync(instance.?, &device_desc, io, std.Io.Duration.fromMilliseconds(10));
     device = device_resp.device orelse {
         log.warn("wgpu device request failed; rendering disabled", .{});
         return;
     };
+    if (astc_supported) {
+        log.info("wgpu: ASTC compressed-texture feature enabled", .{});
+    }
     // The adapter is only needed to create the device; drop our reference now.
     defer adapter.release();
     queue = device.?.getQueue() orelse return;
@@ -489,6 +513,74 @@ fn initSpritePipeline() void {
     sprite_pipeline = pipeline;
 }
 
+/// Map an ASTC block size to the matching wgpu `TextureFormat`, or null if it
+/// isn't one of the LDR block sizes the enum exposes. We use the Unorm (not
+/// sRGB) variants to match the backend's RGBA8 textures (`rgba8_unorm`) and
+/// surface (`bgra8_unorm`), so ASTC sprites sample with the same linear-vs-sRGB
+/// convention as the PNG/BMP path — no gamma mismatch between formats.
+fn astcFormat(block_x: u8, block_y: u8) ?wgpu.TextureFormat {
+    return switch ((@as(u16, block_x) << 8) | block_y) {
+        0x0404 => .astc4x4_unorm,
+        0x0504 => .astc5x4_unorm,
+        0x0505 => .astc5x5_unorm,
+        0x0605 => .astc6x5_unorm,
+        0x0606 => .astc6x6_unorm,
+        0x0805 => .astc8x5_unorm,
+        0x0806 => .astc8x6_unorm,
+        0x0808 => .astc8x8_unorm,
+        0x0a05 => .astc10x5_unorm,
+        0x0a06 => .astc10x6_unorm,
+        0x0a08 => .astc10x8_unorm,
+        0x0a0a => .astc10x10_unorm,
+        0x0c0a => .astc12x10_unorm,
+        0x0c0c => .astc12x12_unorm,
+        else => null,
+    };
+}
+
+/// Create + upload an ASTC wgpu texture from a validated compressed slot (#341).
+/// The block payload is written verbatim (zero CPU decode); the data layout is
+/// the COMPRESSED-block grid, not pixels: each row of blocks is 16 bytes per
+/// block, so `bytes_per_row = ceil(w/block_x) * 16` and `rows_per_image =
+/// ceil(h/block_y)`. Returns null when ASTC isn't enabled on the device (the
+/// adapter lacked the feature) or any GPU step fails.
+fn createAstcTexture(
+    dev: *wgpu.Device,
+    q: *wgpu.Queue,
+    c: gfx.CompressedTexture,
+) ?*wgpu.Texture {
+    if (!astc_supported) {
+        if (!astc_unsupported_warned) {
+            log.warn("wgpu: ASTC texture skipped — adapter lacks texture_compression_astc", .{});
+            astc_unsupported_warned = true;
+        }
+        return null;
+    }
+    if (c.width == 0 or c.height == 0) return null;
+    const fmt = astcFormat(c.block_x, c.block_y) orelse return null;
+
+    const tex = dev.createTexture(&wgpu.TextureDescriptor{
+        .usage = wgpu.TextureUsages.texture_binding | wgpu.TextureUsages.copy_dst,
+        .size = .{ .width = c.width, .height = c.height, .depth_or_array_layers = 1 },
+        .format = fmt,
+    }) orelse return null;
+
+    // Compressed data layout: blocks, not texels. One ASTC block = 16 bytes.
+    const blocks_x = (c.width + c.block_x - 1) / c.block_x;
+    const blocks_y = (c.height + c.block_y - 1) / c.block_y;
+    q.writeTexture(
+        &wgpu.TexelCopyTextureInfo{ .texture = tex, .origin = .{} },
+        c.blocks.ptr,
+        c.blocks.len,
+        &wgpu.TexelCopyBufferLayout{
+            .bytes_per_row = blocks_x * 16,
+            .rows_per_image = blocks_y,
+        },
+        &wgpu.Extent3D{ .width = c.width, .height = c.height, .depth_or_array_layers = 1 },
+    );
+    return tex;
+}
+
 /// Lazily create + upload the GPU texture for a gfx texture id, returning its
 /// bind group (cached in `gpu_textures`). Runs on the main/GL thread from
 /// submitFrame. Returns null if the id is unknown or any GPU step fails.
@@ -501,26 +593,35 @@ fn getOrCreateGpuTexture(id: u32) ?*wgpu.BindGroup {
     const layout = sprite_bind_group_layout orelse return null;
     const sampler = sprite_sampler orelse return null;
 
-    const px = gfx.getTexturePixels(id) orelse return null;
-    if (px.width == 0 or px.height == 0) return null;
+    // GPU-compressed (ASTC) slots upload the raw blocks as-is to an ASTC
+    // texture (#341); everything else is RGBA8. A compressed id never surfaces
+    // through `getTexturePixels` (it returns null for compressed slots), so the
+    // two paths are mutually exclusive.
+    const tex = if (gfx.getCompressedTexture(id)) |c|
+        createAstcTexture(dev, q, c) orelse return null
+    else blk: {
+        const px = gfx.getTexturePixels(id) orelse return null;
+        if (px.width == 0 or px.height == 0) return null;
 
-    const tex = dev.createTexture(&wgpu.TextureDescriptor{
-        .usage = wgpu.TextureUsages.texture_binding | wgpu.TextureUsages.copy_dst,
-        .size = .{ .width = px.width, .height = px.height, .depth_or_array_layers = 1 },
-        .format = .rgba8_unorm,
-    }) orelse return null;
+        const t = dev.createTexture(&wgpu.TextureDescriptor{
+            .usage = wgpu.TextureUsages.texture_binding | wgpu.TextureUsages.copy_dst,
+            .size = .{ .width = px.width, .height = px.height, .depth_or_array_layers = 1 },
+            .format = .rgba8_unorm,
+        }) orelse return null;
 
-    // Upload RGBA8 rows (4 bytes/pixel, tightly packed — no row padding).
-    q.writeTexture(
-        &wgpu.TexelCopyTextureInfo{ .texture = tex, .origin = .{} },
-        px.pixels.ptr,
-        px.pixels.len,
-        &wgpu.TexelCopyBufferLayout{
-            .bytes_per_row = px.width * 4,
-            .rows_per_image = px.height,
-        },
-        &wgpu.Extent3D{ .width = px.width, .height = px.height, .depth_or_array_layers = 1 },
-    );
+        // Upload RGBA8 rows (4 bytes/pixel, tightly packed — no row padding).
+        q.writeTexture(
+            &wgpu.TexelCopyTextureInfo{ .texture = t, .origin = .{} },
+            px.pixels.ptr,
+            px.pixels.len,
+            &wgpu.TexelCopyBufferLayout{
+                .bytes_per_row = px.width * 4,
+                .rows_per_image = px.height,
+            },
+            &wgpu.Extent3D{ .width = px.width, .height = px.height, .depth_or_array_layers = 1 },
+        );
+        break :blk t;
+    };
 
     const view = tex.createView(null) orelse {
         tex.release();
