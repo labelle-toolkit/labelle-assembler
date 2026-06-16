@@ -2,6 +2,7 @@
 /// helpers (`transformX`, `transformY`, `toNdcX`, `toNdcY`) every
 /// draw primitive needs. Owns the mutable globals so all the other
 /// submodules can stay state-free.
+const std = @import("std");
 const types = @import("types.zig");
 
 const Vector2 = types.Vector2;
@@ -68,13 +69,17 @@ pub fn screenToDesign(px: f32, py: f32) Vector2 {
     if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
         return .{ .x = px, .y = py };
     }
-    const fitted_w = dw * fit_scale_x;
-    const fitted_h = dh * fit_scale_y;
-    const bar_x = (sw - fitted_w) * 0.5;
-    const bar_y = (sh - fitted_h) * 0.5;
+    // Exact inverse of toNdc: physical framebuffer px → NDC (full-
+    // framebuffer viewport) → design. The fitted content spans NDC
+    // [-fit,+fit] = fit_scale*screen_w physical pixels (NOT design_w*fit),
+    // so the inverse must go through NDC, not a design-space bar. (#331:
+    // the old design-space bar was wrong whenever screen != design — i.e.
+    // on HiDPI/Retina — clicks drifted toward the edges.)
+    const ndc_x = (px / sw) * 2.0 - 1.0;
+    const ndc_y = 1.0 - (py / sh) * 2.0;
     return .{
-        .x = (px - bar_x) / fit_scale_x,
-        .y = (py - bar_y) / fit_scale_y,
+        .x = ((ndc_x / fit_scale_x) + 1.0) * 0.5 * dw,
+        .y = (1.0 - ndc_y / fit_scale_y) * 0.5 * dh,
     };
 }
 
@@ -89,13 +94,13 @@ pub fn designToPhysical(pos: Vector2) Vector2 {
     if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
         return pos;
     }
-    const fitted_w = dw * fit_scale_x;
-    const fitted_h = dh * fit_scale_y;
-    const bar_x = (sw - fitted_w) * 0.5;
-    const bar_y = (sh - fitted_h) * 0.5;
+    // Forward of toNdc: design → NDC → physical framebuffer px. Exact
+    // inverse of screenToDesign (#331).
+    const ndc_x = ((pos.x / dw) * 2.0 - 1.0) * fit_scale_x;
+    const ndc_y = (1.0 - (pos.y / dh) * 2.0) * fit_scale_y;
     return .{
-        .x = pos.x * fit_scale_x + bar_x,
-        .y = pos.y * fit_scale_y + bar_y,
+        .x = (ndc_x + 1.0) * 0.5 * sw,
+        .y = (1.0 - ndc_y) * 0.5 * sh,
     };
 }
 
@@ -207,4 +212,38 @@ pub fn worldToScreen(pos: Vector2, camera: Camera2D) Vector2 {
         .x = (pos.x - camera.target.x) * camera.zoom + camera.offset.x,
         .y = (pos.y - camera.target.y) * camera.zoom + camera.offset.y,
     };
+}
+
+// ── Coordinate-math tests (#331) ────────────────────────────────────────
+// `screenToDesign` / `designToPhysical` must be exact inverses of `toNdc`
+// (and of each other). The old design-space-bar formula was correct only
+// when screen == design; these lock the HiDPI case (screen 2x design) and
+// a letterboxed case. Run via the `state_run` test in build.zig.
+
+test "screenToDesign maps physical edges to design edges on HiDPI" {
+    const t = std.testing;
+    setDesignSize(800, 600);
+    setScreenSize(1600, 1200); // 2x Retina: fit == 1, design fills the surface
+    const tl = screenToDesign(0, 0);
+    try t.expectApproxEqAbs(@as(f32, 0), tl.x, 1e-3);
+    try t.expectApproxEqAbs(@as(f32, 0), tl.y, 1e-3);
+    const br = screenToDesign(1600, 1200);
+    try t.expectApproxEqAbs(@as(f32, 800), br.x, 1e-3);
+    try t.expectApproxEqAbs(@as(f32, 600), br.y, 1e-3);
+    const c = screenToDesign(800, 600);
+    try t.expectApproxEqAbs(@as(f32, 400), c.x, 1e-3);
+    try t.expectApproxEqAbs(@as(f32, 300), c.y, 1e-3);
+}
+
+test "screenToDesign and designToPhysical round-trip (incl. letterbox)" {
+    const t = std.testing;
+    setDesignSize(800, 600);
+    setScreenSize(2000, 1000); // wider -> pillarbox; fit_x != fit_y; screen != design
+    const samples = [_][2]f32{ .{ 0, 0 }, .{ 2000, 1000 }, .{ 1000, 500 }, .{ 500, 250 }, .{ 1750, 800 } };
+    for (samples) |s| {
+        const d = screenToDesign(s[0], s[1]);
+        const p = designToPhysical(.{ .x = d.x, .y = d.y });
+        try t.expectApproxEqAbs(s[0], p.x, 1e-2);
+        try t.expectApproxEqAbs(s[1], p.y, 1e-2);
+    }
 }

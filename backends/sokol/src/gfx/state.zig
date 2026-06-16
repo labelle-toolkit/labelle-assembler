@@ -57,13 +57,17 @@ pub fn screenToDesign(px: f32, py: f32) Vector2 {
     // events arrive in raw framebuffer pixels and need to be unmapped
     // back to design pixels regardless of which layer the draw loop
     // happens to be in mid-frame.
-    const fitted_w = dw * fit_scale_x;
-    const fitted_h = dh * fit_scale_y;
-    const bar_x = (sw - fitted_w) * 0.5;
-    const bar_y = (sh - fitted_h) * 0.5;
+    // Exact inverse of toNdc: physical framebuffer px → NDC (full-
+    // framebuffer viewport) → design. The fitted content spans NDC
+    // [-fit,+fit] = fit_scale*screen_w physical pixels (NOT design_w*fit),
+    // so the inverse must go through NDC, not a design-space bar. (#331:
+    // the old design-space bar was wrong whenever screen != design — i.e.
+    // on HiDPI/Retina — clicks drifted toward the edges.)
+    const ndc_x = (px / sw) * 2.0 - 1.0;
+    const ndc_y = 1.0 - (py / sh) * 2.0;
     return .{
-        .x = (px - bar_x) / fit_scale_x,
-        .y = (py - bar_y) / fit_scale_y,
+        .x = ((ndc_x / fit_scale_x) + 1.0) * 0.5 * dw,
+        .y = (1.0 - ndc_y / fit_scale_y) * 0.5 * dh,
     };
 }
 
@@ -81,13 +85,13 @@ pub fn designToPhysical(pos: Vector2) Vector2 {
     if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
         return pos;
     }
-    const fitted_w = dw * fit_scale_x;
-    const fitted_h = dh * fit_scale_y;
-    const bar_x = (sw - fitted_w) * 0.5;
-    const bar_y = (sh - fitted_h) * 0.5;
+    // Forward of toNdc: design → NDC → physical framebuffer px. Exact
+    // inverse of screenToDesign (#331).
+    const ndc_x = ((pos.x / dw) * 2.0 - 1.0) * fit_scale_x;
+    const ndc_y = (1.0 - (pos.y / dh) * 2.0) * fit_scale_y;
     return .{
-        .x = pos.x * fit_scale_x + bar_x,
-        .y = pos.y * fit_scale_y + bar_y,
+        .x = (ndc_x + 1.0) * 0.5 * sw,
+        .y = (1.0 - ndc_y) * 0.5 * sh,
     };
 }
 
