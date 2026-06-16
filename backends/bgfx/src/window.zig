@@ -56,11 +56,19 @@ var clear_color: u32 = 0x1e1e2eff; // dark background RGBA
 /// The generated Android entry reads `getScreenHeight()` post-init so the
 /// engine's coordinate mapping matches the actual surface rather than the
 /// config.
+// Return the LIVE framebuffer size, not the cached `screen_w/h`. The
+// generated frame loop calls `setScreenSize(getScreenWidth(), ...)` at the
+// top of the frame, before `beginDrawing`'s `ensureSurface()` reconciles
+// the cache — so reading the cache here would feed gfx the *previous*
+// physical size on the frame a resize/DPI/fullscreen change lands, while
+// the bgfx viewport already matched the new framebuffer (one-frame
+// aspect-fit mismatch). Querying live keeps gfx and the surface in step.
+// On Android `framebufferSize()` returns the cached native-surface dims.
 pub fn getScreenWidth() i32 {
-    return screen_w;
+    return framebufferSize()[0];
 }
 pub fn getScreenHeight() i32 {
-    return screen_h;
+    return framebufferSize()[1];
 }
 
 /// The physical framebuffer size of the render surface.
