@@ -64,6 +64,15 @@ pub fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     // GL texture id and produces white quads. See
     // labelle-toolkit/labelle-gfx#248.
     try w.print("{s}    var renderer_ref: ?*Renderer = null;\n", .{indent});
+    // A backend supports the compressed lifecycle only if it exposes the
+    // ENTIRE seam: detection (`isCompressed`), dimension probe
+    // (`compressedDims`) AND the GPU upload (`uploadCompressed`). Gating on a
+    // single comptime flag (rather than per-decl `@hasDecl` checks) means a
+    // backend that exposes the probe decls but NOT `uploadCompressed` never
+    // emits a dangling reference to the missing upload — the inner blocks
+    // below are wrapped in `if (comptime supports_compressed)` so they are
+    // not semantically analyzed when the flag is comptime-false.
+    try w.print("{s}    const supports_compressed = @hasDecl(BackendGfx, \"isCompressed\") and @hasDecl(BackendGfx, \"compressedDims\") and @hasDecl(BackendGfx, \"uploadCompressed\");\n", .{indent});
     try w.print("{s}\n", .{indent});
     try w.print("{s}    fn decode(\n", .{indent});
     try w.print("{s}        file_type: [:0]const u8,\n", .{indent});
@@ -75,9 +84,12 @@ pub fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     // header. This is the async-catalog counterpart to the synchronous
     // `loadTextureFromMemory` seam — the streaming path (engine#450) splits
     // worker-thread decode from main-thread upload, so the divert happens here.
-    // Guarded by `@hasDecl` so backends without compressed support (or a future
-    // headless backend) still generate valid code and just always CPU-decode.
-    try w.print("{s}        if (@hasDecl(BackendGfx, \"isCompressed\") and @hasDecl(BackendGfx, \"compressedDims\")) {{\n", .{indent});
+    // Guarded by `comptime supports_compressed` so backends without the full
+    // compressed lifecycle (or a future headless backend) still generate valid
+    // code and just always CPU-decode — the `BackendGfx.isCompressed` /
+    // `compressedDims` references inside are not analyzed when the flag is
+    // comptime-false.
+    try w.print("{s}        if (comptime supports_compressed) {{\n", .{indent});
     try w.print("{s}            if (BackendGfx.isCompressed(data)) {{\n", .{indent});
     try w.print("{s}                const dims = BackendGfx.compressedDims(data) orelse return error.LoadFailed;\n", .{indent});
     try w.print("{s}                return .{{ .pixels = try alloc.dupe(u8, data), .width = dims.width, .height = dims.height, .compressed = true }};\n", .{indent});
@@ -105,16 +117,21 @@ pub fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}        if (handle == MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;\n", .{indent});
     // Compressed blobs upload as-is via `uploadCompressed`; RGBA8 goes through
     // the normal `uploadTexture`. Either way the catalog frees `decoded.pixels`.
-    // The `uploadCompressed` arm is `@hasDecl`-guarded so backends without
-    // compressed support still compile (the `decode` step above never marks
-    // `.compressed` for them, so the comptime-false arm is unreachable).
-    try w.print("{s}        const tex = if (@hasDecl(BackendGfx, \"uploadCompressed\") and decoded.compressed)\n", .{indent});
-    try w.print("{s}            try BackendGfx.uploadCompressed(decoded.pixels)\n", .{indent});
-    try w.print("{s}        else try BackendGfx.uploadTexture(.{{\n", .{indent});
-    try w.print("{s}            .pixels = decoded.pixels,\n", .{indent});
-    try w.print("{s}            .width = decoded.width,\n", .{indent});
-    try w.print("{s}            .height = decoded.height,\n", .{indent});
-    try w.print("{s}        }});\n", .{indent});
+    // The `uploadCompressed` arm is wrapped in `if (comptime supports_compressed)`
+    // so backends WITHOUT the full compressed lifecycle never reference the
+    // missing `BackendGfx.uploadCompressed` (the inner block is not analyzed
+    // when the flag is comptime-false) — and `decode` never marks `.compressed`
+    // for them, so the compressed arm is unreachable at runtime anyway.
+    try w.print("{s}        const tex = blk: {{\n", .{indent});
+    try w.print("{s}            if (comptime supports_compressed) {{\n", .{indent});
+    try w.print("{s}                if (decoded.compressed) break :blk try BackendGfx.uploadCompressed(decoded.pixels);\n", .{indent});
+    try w.print("{s}            }}\n", .{indent});
+    try w.print("{s}            break :blk try BackendGfx.uploadTexture(.{{\n", .{indent});
+    try w.print("{s}                .pixels = decoded.pixels,\n", .{indent});
+    try w.print("{s}                .width = decoded.width,\n", .{indent});
+    try w.print("{s}                .height = decoded.height,\n", .{indent});
+    try w.print("{s}            }});\n", .{indent});
+    try w.print("{s}        }};\n", .{indent});
     try w.print("{s}        slots[handle] = tex;\n", .{indent});
     // Register the slot handle → real BackendTexture mapping with
     // the renderer so the sprite draw path resolves correctly.
