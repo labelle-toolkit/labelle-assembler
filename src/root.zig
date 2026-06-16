@@ -352,6 +352,37 @@ pub fn generate(
     defer allocator.free(mutable_resources);
     cfg.resources = mutable_resources;
 
+    const io = config.globalIo();
+
+    // Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
+    // target platform opts into ASTC (`asset_compression`) and `labelle astc`
+    // produced one. The runtime detects the ASTC magic and uploads the
+    // compressed blocks with zero CPU decode (labelle-gfx#269 / #340). Done
+    // BEFORE the `.rgba` swap so ASTC wins (the bigger memory + load win); the
+    // `.rgba` swap below then skips these (they no longer end in `.png`). Falls
+    // back to the source PNG when no `.astc` sibling exists.
+    var astc_path_allocs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (astc_path_allocs.items) |s| allocator.free(s);
+        astc_path_allocs.deinit(allocator);
+    }
+    if (cfg.asset_compression.formatFor(cfg.platform) == .astc) {
+        for (mutable_resources) |*res| {
+            if (res.texture.len == 0) continue;
+            if (!std.mem.endsWith(u8, res.texture, ".png")) continue;
+            const astc_rel = try std.mem.concat(allocator, u8, &.{ res.texture[0 .. res.texture.len - 4], ".astc" });
+            errdefer allocator.free(astc_rel);
+            const abs = try std.fs.path.join(allocator, &.{ game_dir, astc_rel });
+            defer allocator.free(abs);
+            std.Io.Dir.cwd().access(io, abs, .{}) catch {
+                allocator.free(astc_rel);
+                continue;
+            };
+            try astc_path_allocs.append(allocator, astc_rel);
+            res.texture = astc_rel;
+        }
+    }
+
     // Swap `.texture = "...png"` to the pre-baked `.rgba` sibling
     // when `labelle build --bake` produced one. The runtime decoder
     // detects the LRGBA magic and skips stb_image entirely. Leaves
@@ -362,7 +393,6 @@ pub fn generate(
         for (rgba_path_allocs.items) |s| allocator.free(s);
         rgba_path_allocs.deinit(allocator);
     }
-    const io = config.globalIo();
     for (mutable_resources) |*res| {
         if (res.texture.len == 0) continue;
         if (!std.mem.endsWith(u8, res.texture, ".png")) continue;
