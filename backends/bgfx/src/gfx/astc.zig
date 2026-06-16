@@ -32,10 +32,6 @@ pub const Header = struct {
     blocks: []const u8,
 };
 
-fn readU24Le(b: []const u8) u32 {
-    return @as(u32, b[0]) | (@as(u32, b[1]) << 8) | (@as(u32, b[2]) << 16);
-}
-
 /// True if `data` begins with the ASTC magic and is long enough for a header.
 pub fn isAstc(data: []const u8) bool {
     return data.len >= 16 and std.mem.eql(u8, data[0..4], &MAGIC);
@@ -51,9 +47,9 @@ pub fn parse(data: []const u8) ?Header {
     const bz = data[6];
     if (bx == 0 or by == 0 or bz == 0) return null;
 
-    const w = readU24Le(data[7..10]);
-    const h = readU24Le(data[10..13]);
-    const d = readU24Le(data[13..16]);
+    const w: u32 = std.mem.readInt(u24, data[7..10], .little);
+    const h: u32 = std.mem.readInt(u24, data[10..13], .little);
+    const d: u32 = std.mem.readInt(u24, data[13..16], .little);
     if (w == 0 or h == 0 or d == 0) return null;
 
     // Expected block payload = ceil(w/bx) * ceil(h/by) * ceil(d/bz) * 16 bytes.

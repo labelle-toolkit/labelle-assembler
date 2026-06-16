@@ -185,28 +185,41 @@ fn astcFormat(block_x: u8, block_y: u8) ?bgfx.TextureFormat {
     };
 }
 
+/// Everything needed to upload a validated 2D ASTC blob.
+const AstcUpload = struct { fmt: bgfx.TextureFormat, width: u16, height: u16, blocks: []const u8 };
+
+/// Validate an ASTC blob for a 2D bgfx upload, or null if we can't take it
+/// as-is: not ASTC, malformed/truncated, 3D, an unsupported block size, or
+/// dimensions past `u16`. `isCompressed`/`uploadCompressed` share this so the
+/// "can upload as-is" probe and the actual upload never disagree.
+fn validateAstc(data: []const u8) ?AstcUpload {
+    const hdr = astc.parse(data) orelse return null;
+    if (hdr.depth != 1 or hdr.block_z != 1) return null; // bgfx createTexture2D is 2D only
+    const fmt = astcFormat(hdr.block_x, hdr.block_y) orelse return null;
+    const w = std.math.cast(u16, hdr.width) orelse return null;
+    const h = std.math.cast(u16, hdr.height) orelse return null;
+    return .{ .fmt = fmt, .width = w, .height = h, .blocks = hdr.blocks };
+}
+
 /// True if `data` is a GPU-compressed blob this backend can upload as-is.
 pub fn isCompressed(data: []const u8) bool {
-    return astc.isAstc(data);
+    return validateAstc(data) != null;
 }
 
 /// Upload an ASTC blob straight to the GPU — no CPU decode. The compressed
 /// blocks are copied into bgfx's command queue (`bgfx.copy`), so the caller's
 /// buffer can be freed immediately after this returns.
 pub fn uploadCompressed(data: []const u8) !Texture {
-    const hdr = astc.parse(data) orelse return error.LoadFailed;
-    const fmt = astcFormat(hdr.block_x, hdr.block_y) orelse return error.LoadFailed;
-    const w = std.math.cast(u16, hdr.width) orelse return error.LoadFailed;
-    const h = std.math.cast(u16, hdr.height) orelse return error.LoadFailed;
+    const info = validateAstc(data) orelse return error.LoadFailed;
     const id = findFreeTextureSlot() orelse return error.LoadFailed;
 
-    const mem = bgfx.copy(hdr.blocks.ptr, @intCast(hdr.blocks.len));
+    const mem = bgfx.copy(info.blocks.ptr, @intCast(info.blocks.len));
     const handle = bgfx.createTexture2D(
-        w,
-        h,
+        info.width,
+        info.height,
         false,
         1,
-        fmt,
+        info.fmt,
         bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp,
         mem,
         0,
@@ -214,7 +227,7 @@ pub fn uploadCompressed(data: []const u8) !Texture {
     if (handle.idx == std.math.maxInt(u16)) return error.LoadFailed;
     texture_handles[id] = handle;
     texture_pixel_data[id] = null;
-    return .{ .id = id, .width = @intCast(hdr.width), .height = @intCast(hdr.height) };
+    return .{ .id = id, .width = @intCast(info.width), .height = @intCast(info.height) };
 }
 
 pub fn unloadTexture(texture: Texture) void {
