@@ -291,6 +291,18 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(state_run).step);
 
+    // Run the ASTC container-parsing tests (#341). `gfx/astc.zig` is pure byte
+    // parsing with no zbgfx dependency, so it EXECUTES on the host (magic
+    // detection, block/image dims, ceil-to-block payload sizing, truncation).
+    const astc_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gfx/astc.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(astc_run).step);
+
     // ── Compile-check window.zig (+ input.zig via its import) ───────
     // window.zig does the real comptime dispatch on builtin.target — both
     // the per-OS desktop branches and the Android `is_android` path — so

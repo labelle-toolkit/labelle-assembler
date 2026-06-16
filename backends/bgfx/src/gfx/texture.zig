@@ -9,6 +9,7 @@ const bgfx = @import("zbgfx").bgfx;
 const types = @import("types.zig");
 const state = @import("state.zig");
 const programs = @import("programs.zig");
+const astc = @import("astc.zig");
 
 const Texture = types.Texture;
 const Color = types.Color;
@@ -98,6 +99,9 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     }
     if (bytes_read < 18) return error.LoadFailed;
 
+    // GPU-compressed (ASTC) blobs upload as-is — no CPU decode.
+    if (astc.isAstc(data[0..bytes_read])) return uploadCompressed(data[0..bytes_read]);
+
     const decoded = try decodeImage("", data[0..bytes_read], allocator);
     defer allocator.free(decoded.pixels);
     return uploadTexture(decoded);
@@ -151,6 +155,66 @@ pub fn uploadTexture(decoded: DecodedImage) !Texture {
     texture_pixel_data[id] = null;
 
     return .{ .id = id, .width = @intCast(decoded.width), .height = @intCast(decoded.height) };
+}
+
+// ── GPU-compressed textures (ASTC) ──────────────────────────────────────────
+// The engine's `loadTextureFromMemory` seam (labelle-gfx) dispatches here when
+// the backend exposes `isCompressed`/`uploadCompressed` and the blob is
+// compressed, skipping the CPU decode entirely. bgfx has no PNG decoder, so for
+// a 4K atlas this is also the only zero-cost upload path (labelle-gfx#269/#341).
+
+/// Map an ASTC block size to the matching bgfx `TextureFormat`, or null if bgfx
+/// has no enum for it. Covers the full ASTC LDR block-size set bgfx exposes.
+fn astcFormat(block_x: u8, block_y: u8) ?bgfx.TextureFormat {
+    return switch ((@as(u16, block_x) << 8) | block_y) {
+        0x0404 => .ASTC4x4,
+        0x0504 => .ASTC5x4,
+        0x0505 => .ASTC5x5,
+        0x0605 => .ASTC6x5,
+        0x0606 => .ASTC6x6,
+        0x0805 => .ASTC8x5,
+        0x0806 => .ASTC8x6,
+        0x0808 => .ASTC8x8,
+        0x0a05 => .ASTC10x5,
+        0x0a06 => .ASTC10x6,
+        0x0a08 => .ASTC10x8,
+        0x0a0a => .ASTC10x10,
+        0x0c0a => .ASTC12x10,
+        0x0c0c => .ASTC12x12,
+        else => null,
+    };
+}
+
+/// True if `data` is a GPU-compressed blob this backend can upload as-is.
+pub fn isCompressed(data: []const u8) bool {
+    return astc.isAstc(data);
+}
+
+/// Upload an ASTC blob straight to the GPU — no CPU decode. The compressed
+/// blocks are copied into bgfx's command queue (`bgfx.copy`), so the caller's
+/// buffer can be freed immediately after this returns.
+pub fn uploadCompressed(data: []const u8) !Texture {
+    const hdr = astc.parse(data) orelse return error.LoadFailed;
+    const fmt = astcFormat(hdr.block_x, hdr.block_y) orelse return error.LoadFailed;
+    const w = std.math.cast(u16, hdr.width) orelse return error.LoadFailed;
+    const h = std.math.cast(u16, hdr.height) orelse return error.LoadFailed;
+    const id = findFreeTextureSlot() orelse return error.LoadFailed;
+
+    const mem = bgfx.copy(hdr.blocks.ptr, @intCast(hdr.blocks.len));
+    const handle = bgfx.createTexture2D(
+        w,
+        h,
+        false,
+        1,
+        fmt,
+        bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp,
+        mem,
+        0,
+    );
+    if (handle.idx == std.math.maxInt(u16)) return error.LoadFailed;
+    texture_handles[id] = handle;
+    texture_pixel_data[id] = null;
+    return .{ .id = id, .width = @intCast(hdr.width), .height = @intCast(hdr.height) };
 }
 
 pub fn unloadTexture(texture: Texture) void {
