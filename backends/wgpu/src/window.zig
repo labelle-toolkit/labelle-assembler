@@ -25,6 +25,13 @@ var screen_h: i32 = 600;
 var glfw_window: ?*glfw.Window = null;
 var target_fps_val: i32 = 60;
 var window_hidden: bool = false;
+/// Windowed-mode geometry, captured the moment we go fullscreen so
+/// `setFullscreen(false)` restores the window to the same place + size
+/// (GLFW's `setMonitor` needs explicit windowed coords on the way back).
+var windowed_x: i32 = 0;
+var windowed_y: i32 = 0;
+var windowed_w: i32 = 800;
+var windowed_h: i32 = 600;
 
 pub fn setConfigFlags(flags: ConfigFlags) void {
     window_hidden = flags.window_hidden;
@@ -551,6 +558,66 @@ pub fn closeWindow() void {
 pub fn windowShouldClose() bool {
     if (glfw_window) |win| return win.shouldClose();
     return true;
+}
+
+/// Update the cached surface size, reconfigure the wgpu swapchain to match,
+/// and tell gfx about the new pixel dimensions. Called after a
+/// fullscreen/windowed switch changes the GLFW framebuffer size; without the
+/// surface reconfigure the swapchain stays at the old size and the image
+/// stretches. No-op on the GPU reconfigure if the GPU never came up.
+fn applyResize(w: i32, h: i32) void {
+    screen_w = w;
+    screen_h = h;
+    gfx.setScreenSize(w, h);
+    if (gpu_ready) {
+        if (surface) |s| {
+            if (device) |dev| {
+                s.configure(&wgpu.SurfaceConfiguration{
+                    .device = dev,
+                    .format = .bgra8_unorm,
+                    .width = @intCast(w),
+                    .height = @intCast(h),
+                });
+            }
+        }
+    }
+}
+
+/// Query whether the window is currently fullscreen. Mirrors the bgfx
+/// backend: GLFW reports a window bound to a monitor as fullscreen. Returns
+/// false before the window exists.
+pub fn isFullscreen() bool {
+    const win = glfw_window orelse return false;
+    return win.getMonitor() != null;
+}
+
+/// Switch to fullscreen (`on=true`) or windowed (`on=false`). Mirrors the
+/// bgfx backend's GLFW approach: GLFW has no toggle primitive, so going
+/// fullscreen binds the window to the primary monitor at its current video
+/// mode (saving the windowed geometry first); going windowed restores the
+/// saved geometry. Either way the wgpu surface is reconfigured to the new
+/// framebuffer size. Idempotent — a no-op when already in the requested mode
+/// or before the window exists.
+pub fn setFullscreen(on: bool) void {
+    const win = glfw_window orelse return;
+    const already = win.getMonitor() != null;
+    if (already == on) return;
+    if (on) {
+        // Remember where the window was so we can come back to it.
+        const pos = win.getPos();
+        const size = win.getSize();
+        windowed_x = pos[0];
+        windowed_y = pos[1];
+        windowed_w = size[0];
+        windowed_h = size[1];
+        const monitor = glfw.getPrimaryMonitor() orelse return;
+        const mode = glfw.getVideoMode(monitor) catch return;
+        win.setMonitor(monitor, 0, 0, mode.width, mode.height, mode.refresh_rate);
+        applyResize(mode.width, mode.height);
+    } else {
+        win.setMonitor(null, windowed_x, windowed_y, windowed_w, windowed_h, 0);
+        applyResize(windowed_w, windowed_h);
+    }
 }
 
 pub fn setTargetFPS(fps: i32) void {

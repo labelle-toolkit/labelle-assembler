@@ -54,6 +54,33 @@ pub fn windowShouldClose() bool {
     return should_close;
 }
 
+/// Query whether the window is currently fullscreen. Mirrors the
+/// sokol/raylib/bgfx backends' `isFullscreen`. SDL stores the mode in the
+/// window flags; we treat either the desktop ("fake" borderless) or real
+/// video-mode fullscreen bit as fullscreen. Returns false before the
+/// window exists.
+pub fn isFullscreen() bool {
+    const win = sdl_window orelse return false;
+    const flags = c.SDL_GetWindowFlags(win);
+    return (flags & (c.SDL_WINDOW_FULLSCREEN | c.SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
+}
+
+/// Switch the window to fullscreen (`on=true`) or windowed (`on=false`).
+/// The generated frame loop polls `g.takeFullscreenRequest()` and calls
+/// this when a script flipped `game.setFullscreen`. Unlike raylib/sokol's
+/// toggle-only API, SDL takes the target mode directly; we still guard on
+/// the current state so the call is idempotent. Uses
+/// `SDL_WINDOW_FULLSCREEN_DESKTOP` (borderless desktop-resolution
+/// fullscreen) — it avoids a video-mode switch and matches the windowed
+/// pixel layout the renderer is already configured for. No-op before the
+/// window exists.
+pub fn setFullscreen(on: bool) void {
+    const win = sdl_window orelse return;
+    if (isFullscreen() == on) return;
+    const flags: u32 = if (on) c.SDL_WINDOW_FULLSCREEN_DESKTOP else 0;
+    _ = c.SDL_SetWindowFullscreen(win, flags);
+}
+
 pub fn setTargetFPS(fps: i32) void {
     target_fps_val = fps;
 }

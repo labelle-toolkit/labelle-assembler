@@ -108,4 +108,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run wgpu backend unit tests");
     test_step.dependOn(&b.addRunArtifact(wav_parser_tests).step);
     test_step.dependOn(&b.addRunArtifact(gfx_tests).step);
+
+    // ── Compile-check window.zig ────────────────────────────────────
+    // window.zig owns the GLFW window lifecycle + the fullscreen toggle
+    // (GLFW setMonitor → wgpu surface reconfigure). It references
+    // `wgpu.SurfaceConfiguration`, so it only compiles when the native
+    // wgpu dep is materialized. Gate the compile-check on the lazy dep so
+    // hosts without the wgpu artifact still build the rest of the test
+    // step; depend on the compile step (not a run step) so it works under
+    // cross-compilation where the produced binary can't be executed.
+    if (wgpu_mod_opt != null) {
+        const window_tests = b.addTest(.{ .root_module = window_mod });
+        test_step.dependOn(&window_tests.step);
+    }
 }
