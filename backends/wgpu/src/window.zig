@@ -209,6 +209,46 @@ fn createSurface(win: *glfw.Window) ?*wgpu.Surface {
     }
 }
 
+/// The physical framebuffer size of the render surface. GLFW's framebuffer
+/// size is larger than the logical window size on a Retina/HiDPI display
+/// (e.g. 2x); that's the size the wgpu surface must be configured at for crisp
+/// rendering. Falls back to the cached `screen_w/h` before the window exists.
+fn framebufferSize() [2]i32 {
+    if (glfw_window) |win| {
+        const fb = win.getFramebufferSize();
+        return .{ @intCast(fb[0]), @intCast(fb[1]) };
+    }
+    return .{ screen_w, screen_h };
+}
+
+/// Reconcile the wgpu surface + gfx screen size with the current physical
+/// framebuffer size. Called once per frame from `beginDrawing`. If the
+/// framebuffer changed (DPI move, resize, fullscreen toggle) and is non-zero,
+/// update `screen_w/h`, tell gfx the new pixel dimensions, and reconfigure the
+/// surface. The `> 0` guard skips minimized windows (a 0-size configure is
+/// invalid); the GPU reconfigure is guarded on `gpu_ready`/`surface`/`device`
+/// so it's a no-op if the GPU never came up.
+fn ensureSurface() void {
+    const fb = framebufferSize();
+    if (fb[0] <= 0 or fb[1] <= 0) return;
+    if (fb[0] == screen_w and fb[1] == screen_h) return;
+    screen_w = fb[0];
+    screen_h = fb[1];
+    gfx.setScreenSize(screen_w, screen_h);
+    if (gpu_ready) {
+        if (surface) |s| {
+            if (device) |dev| {
+                s.configure(&wgpu.SurfaceConfiguration{
+                    .device = dev,
+                    .format = .bgra8_unorm,
+                    .width = @intCast(screen_w),
+                    .height = @intCast(screen_h),
+                });
+            }
+        }
+    }
+}
+
 fn initGpu() void {
     const win = glfw_window orelse return;
 
@@ -510,7 +550,18 @@ pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
         null,
     ) catch return;
 
-    gfx.setScreenSize(width, height);
+    // The window was requested at the LOGICAL `width/height`, but on a
+    // HiDPI/Retina display the backing framebuffer is larger (e.g. 2x). Switch
+    // `screen_w/h` to the PHYSICAL framebuffer size so the wgpu surface is
+    // configured (in `initGpu`, which reads `screen_w/h`) and gfx maps NDC at
+    // full Retina resolution instead of stretching a logical-res image.
+    if (glfw_window) |win| {
+        const fb = win.getFramebufferSize();
+        screen_w = @intCast(fb[0]);
+        screen_h = @intCast(fb[1]);
+    }
+
+    gfx.setScreenSize(screen_w, screen_h);
     initGpu();
 
     const input = @import("input");
@@ -560,29 +611,6 @@ pub fn windowShouldClose() bool {
     return true;
 }
 
-/// Update the cached surface size, reconfigure the wgpu swapchain to match,
-/// and tell gfx about the new pixel dimensions. Called after a
-/// fullscreen/windowed switch changes the GLFW framebuffer size; without the
-/// surface reconfigure the swapchain stays at the old size and the image
-/// stretches. No-op on the GPU reconfigure if the GPU never came up.
-fn applyResize(w: i32, h: i32) void {
-    screen_w = w;
-    screen_h = h;
-    gfx.setScreenSize(w, h);
-    if (gpu_ready) {
-        if (surface) |s| {
-            if (device) |dev| {
-                s.configure(&wgpu.SurfaceConfiguration{
-                    .device = dev,
-                    .format = .bgra8_unorm,
-                    .width = @intCast(w),
-                    .height = @intCast(h),
-                });
-            }
-        }
-    }
-}
-
 /// Query whether the window is currently fullscreen. Mirrors the bgfx
 /// backend: GLFW reports a window bound to a monitor as fullscreen. Returns
 /// false before the window exists.
@@ -595,9 +623,16 @@ pub fn isFullscreen() bool {
 /// bgfx backend's GLFW approach: GLFW has no toggle primitive, so going
 /// fullscreen binds the window to the primary monitor at its current video
 /// mode (saving the windowed geometry first); going windowed restores the
-/// saved geometry. Either way the wgpu surface is reconfigured to the new
-/// framebuffer size. Idempotent — a no-op when already in the requested mode
-/// or before the window exists.
+/// saved geometry. Idempotent — a no-op when already in the requested mode or
+/// before the window exists.
+///
+/// The saved windowed geometry uses GLFW's LOGICAL screen coordinates
+/// (`getSize`/`getPos`), and `setMonitor` takes the monitor's video `mode`
+/// dimensions — both correct in GLFW's coordinate space. The resulting
+/// PHYSICAL framebuffer change is reconciled by `ensureSurface()` on the next
+/// `beginDrawing` (the frame loop drains this request before `beginDrawing` in
+/// the same frame), which reconfigures the wgpu surface and updates gfx's
+/// screen size — so no resize is done here.
 pub fn setFullscreen(on: bool) void {
     const win = glfw_window orelse return;
     const already = win.getMonitor() != null;
@@ -613,10 +648,8 @@ pub fn setFullscreen(on: bool) void {
         const monitor = glfw.getPrimaryMonitor() orelse return;
         const mode = glfw.getVideoMode(monitor) catch return;
         win.setMonitor(monitor, 0, 0, mode.width, mode.height, mode.refresh_rate);
-        applyResize(mode.width, mode.height);
     } else {
         win.setMonitor(null, windowed_x, windowed_y, windowed_w, windowed_h, 0);
-        applyResize(windowed_w, windowed_h);
     }
 }
 
@@ -627,6 +660,10 @@ pub fn setTargetFPS(fps: i32) void {
 pub fn beginDrawing() void {
     const input = @import("input");
     input.newFrame();
+    // Reconcile the surface + gfx screen size with the current physical
+    // framebuffer (DPI move, resize, fullscreen toggle) every frame uniformly,
+    // so HiDPI changes are picked up without a dedicated resize callback.
+    ensureSurface();
 }
 
 /// Drain the gfx frame into the GPU: acquire the surface texture, clear,
