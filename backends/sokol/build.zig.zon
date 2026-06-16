@@ -37,8 +37,8 @@
             // exactly — mismatched commits trigger duplicate-module errors
             // across consumers that pull both labelle-imgui and
             // labelle-assembler (see labelle-assembler#207). Both were
-            // 887b30f; this PR (labelle-assembler#250) bumps to ba7363f.
-            // labelle-imgui MUST bump to ba7363f in the same change set.
+            // 887b30f; this PR (labelle-assembler#250) bumped to ba7363f, now to 2114f00 (GLES3 ASTC ext fix, sokol-zig#3).
+            // labelle-imgui MUST bump to 2114f00 in the same change set.
             //
             // Pinned to the labelle-toolkit fork of sokol-zig. The fork adds,
             // on top of upstream floooh/sokol-zig @ 8b1a651:
@@ -59,8 +59,8 @@
             //       backward compatible for imgui too.
             //
             // Bumping requires `zig fetch --save=sokol <url>`.
-            .url = "https://github.com/labelle-toolkit/sokol-zig/archive/ba7363f01ad0438db10dba33424b6747ecc15cbf.tar.gz",
-            .hash = "sokol-0.1.0-pb1HKx2lNwB02YY5ZupcCFYC6eEQ0Guai3wOICvRHnyX",
+            .url = "https://github.com/labelle-toolkit/sokol-zig/archive/2114f00976bf0b00bc1e1ced7a6d01d59f679e8c.tar.gz",
+            .hash = "sokol-0.1.0-pb1HKx2mNwBtmW1xhHMfc0uxkmcvjrVG_IUmSqTrwjjn",
         },
         // emsdk is needed at WASM build time so we can plumb the
         // sysroot include path through to `stb_image_impl.c`. The
