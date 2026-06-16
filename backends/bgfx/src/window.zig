@@ -139,7 +139,7 @@ fn initWindowAndroid(width: i32, height: i32) void {
     init.type = .Count; // auto-select renderer (GLES/Vulkan on Android)
     init.resolution.width = @intCast(width);
     init.resolution.height = @intCast(height);
-    init.resolution.reset = 0x00000080; // BGFX_RESET_VSYNC
+    init.resolution.reset = RESET_VSYNC;
 
     // On Android the native window handle is the `ANativeWindow*` handed
     // over by the NativeActivity glue. `ndt` is unused (no display
@@ -190,7 +190,7 @@ fn initWindowDesktop(width: i32, height: i32, title: [:0]const u8) void {
     init.type = .Count; // auto-select renderer
     init.resolution.width = @intCast(screen_w);
     init.resolution.height = @intCast(screen_h);
-    init.resolution.reset = 0x00000080; // BGFX_RESET_VSYNC
+    init.resolution.reset = RESET_VSYNC;
 
     // Fill in bgfx's native display type (ndt) and native window handle
     // (nwh) for the build target. See src/platform.zig for the source
