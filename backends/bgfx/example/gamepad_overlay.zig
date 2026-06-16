@@ -12,6 +12,7 @@
 //! Android it's the *sparse* InputDevice id, so we scan a range and use the
 //! first connected pad rather than assuming 0.
 
+const builtin = @import("builtin");
 const gfx = @import("gfx");
 const input = @import("input");
 
@@ -38,7 +39,18 @@ const AXIS_RIGHT_Y: u32 = 3;
 const AXIS_LEFT_TRIGGER: u32 = 4;
 const AXIS_RIGHT_TRIGGER: u32 = 5;
 
-const SCAN_MAX: u32 = 64;
+const is_android = builtin.target.abi == .android or builtin.target.abi == .androideabi;
+
+// How many gamepad ids to probe for a connected pad. On Android the engine's
+// gamepad "slot" is the SPARSE InputDevice id, so we scan a wide range. On
+// desktop the ids are dense and small, and the GLFW fallback path
+// (`.gamepad = .none`) resolves `isGamepadAvailable` via `@enumFromInt(id)` on
+// GLFW's 16-value joystick enum — so the desktop range MUST stay within
+// [0, 15] to avoid an out-of-range enum. (The default SDL source bounds-checks
+// at 4; this cap keeps the no-SDL fallback safe too.) A device id beyond the
+// Android cap is not surfaced — acceptable for a demo overlay; a real app
+// would learn ids from the `gamepad_connected` event instead.
+const SCAN_MAX: u32 = if (is_android) 64 else 16;
 
 // Colours.
 const C_PANEL = gfx.Color{ .r = 0, .g = 0, .b = 0, .a = 150 };
@@ -150,7 +162,12 @@ fn drawTrigger(x: f32, y: f32, id: u32, axis: u32, comptime label: [:0]const u8)
     const w: f32 = 16;
     const h: f32 = 40;
     gfx.drawRectangleRec(.{ .x = x, .y = y, .width = w, .height = h }, C_TRACK);
-    // Triggers arrive 0..1 on the bgfx/Android path; clamp defensively.
+    // Triggers arrive 0..1 on the backends this overlay actually ships on —
+    // the SDL desktop source and the Android forwarded-axis state both
+    // normalize triggers to [0, 1], so a direct clamp is the right fill. (Only
+    // the no-SDL GLFW fallback, `.gamepad = .none`, reports raylib-style
+    // [-1, 1] triggers; there the bar would track the upper half — an accepted
+    // limitation of that non-default config, not the demo's target.)
     const t = clamp01(input.getGamepadAxisValue(id, axis));
     const fill = h * t;
     gfx.drawRectangleRec(.{ .x = x, .y = y + (h - fill), .width = w, .height = fill }, C_LIT);
