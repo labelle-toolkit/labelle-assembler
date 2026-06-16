@@ -53,10 +53,12 @@ pub const IMAGE_BACKEND_WIRING = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.unloadTexture(tex)") != null);
         // Compressed (ASTC) blobs route through a comptime-gated path: the
         // `supports_compressed` flag requires the ENTIRE lifecycle (isCompressed
-        // + compressedDims + uploadCompressed), and both decode and upload wrap
-        // their compressed arms in `if (comptime supports_compressed)` so a
-        // backend lacking `uploadCompressed` never references the missing decl.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const supports_compressed = @hasDecl(BackendGfx, \"isCompressed\") and @hasDecl(BackendGfx, \"compressedDims\") and @hasDecl(BackendGfx, \"uploadCompressed\");") != null);
+        // + compressedDims + uploadCompressed) AND the engine `DecodedImage`
+        // having a `compressed` field, and both decode and upload wrap their
+        // compressed arms in `if (comptime supports_compressed)` so a backend
+        // lacking `uploadCompressed` — or a released engine lacking the field —
+        // never references the missing decl/field.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const supports_compressed = @hasDecl(BackendGfx, \"isCompressed\") and @hasDecl(BackendGfx, \"compressedDims\") and @hasDecl(BackendGfx, \"uploadCompressed\") and @hasField(engine.DecodedImage, \"compressed\");") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (comptime supports_compressed)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.compressedDims(data)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".compressed = true") != null);

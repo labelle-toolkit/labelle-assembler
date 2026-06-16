@@ -72,7 +72,15 @@ pub fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     // emits a dangling reference to the missing upload — the inner blocks
     // below are wrapped in `if (comptime supports_compressed)` so they are
     // not semantically analyzed when the flag is comptime-false.
-    try w.print("{s}    const supports_compressed = @hasDecl(BackendGfx, \"isCompressed\") and @hasDecl(BackendGfx, \"compressedDims\") and @hasDecl(BackendGfx, \"uploadCompressed\");\n", .{indent});
+    //
+    // The flag ALSO requires `engine.DecodedImage` to have the `compressed`
+    // field. The compressed decode arm sets `.compressed = true` and the upload
+    // arm reads `decoded.compressed`; both only exist once the engine ships that
+    // field (engine#632). Gating on `@hasField` keeps the generated example
+    // back-compatible with an OLDER released engine that lacks the field — the
+    // whole compressed path is comptime-pruned and we fall back to CPU decode,
+    // so the assembler no longer requires the engine release to land first.
+    try w.print("{s}    const supports_compressed = @hasDecl(BackendGfx, \"isCompressed\") and @hasDecl(BackendGfx, \"compressedDims\") and @hasDecl(BackendGfx, \"uploadCompressed\") and @hasField(engine.DecodedImage, \"compressed\");\n", .{indent});
     try w.print("{s}\n", .{indent});
     try w.print("{s}    fn decode(\n", .{indent});
     try w.print("{s}        file_type: [:0]const u8,\n", .{indent});
