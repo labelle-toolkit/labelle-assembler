@@ -9,6 +9,7 @@ const bgfx = @import("zbgfx").bgfx;
 const types = @import("types.zig");
 const state = @import("state.zig");
 const programs = @import("programs.zig");
+const astc = @import("astc.zig");
 
 const Texture = types.Texture;
 const Color = types.Color;
@@ -98,6 +99,9 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     }
     if (bytes_read < 18) return error.LoadFailed;
 
+    // GPU-compressed (ASTC) blobs upload as-is — no CPU decode.
+    if (astc.isAstc(data[0..bytes_read])) return uploadCompressed(data[0..bytes_read]);
+
     const decoded = try decodeImage("", data[0..bytes_read], allocator);
     defer allocator.free(decoded.pixels);
     return uploadTexture(decoded);
@@ -151,6 +155,79 @@ pub fn uploadTexture(decoded: DecodedImage) !Texture {
     texture_pixel_data[id] = null;
 
     return .{ .id = id, .width = @intCast(decoded.width), .height = @intCast(decoded.height) };
+}
+
+// ── GPU-compressed textures (ASTC) ──────────────────────────────────────────
+// The engine's `loadTextureFromMemory` seam (labelle-gfx) dispatches here when
+// the backend exposes `isCompressed`/`uploadCompressed` and the blob is
+// compressed, skipping the CPU decode entirely. bgfx has no PNG decoder, so for
+// a 4K atlas this is also the only zero-cost upload path (labelle-gfx#269/#341).
+
+/// Map an ASTC block size to the matching bgfx `TextureFormat`, or null if bgfx
+/// has no enum for it. Covers the full ASTC LDR block-size set bgfx exposes.
+fn astcFormat(block_x: u8, block_y: u8) ?bgfx.TextureFormat {
+    return switch ((@as(u16, block_x) << 8) | block_y) {
+        0x0404 => .ASTC4x4,
+        0x0504 => .ASTC5x4,
+        0x0505 => .ASTC5x5,
+        0x0605 => .ASTC6x5,
+        0x0606 => .ASTC6x6,
+        0x0805 => .ASTC8x5,
+        0x0806 => .ASTC8x6,
+        0x0808 => .ASTC8x8,
+        0x0a05 => .ASTC10x5,
+        0x0a06 => .ASTC10x6,
+        0x0a08 => .ASTC10x8,
+        0x0a0a => .ASTC10x10,
+        0x0c0a => .ASTC12x10,
+        0x0c0c => .ASTC12x12,
+        else => null,
+    };
+}
+
+/// Everything needed to upload a validated 2D ASTC blob.
+const AstcUpload = struct { fmt: bgfx.TextureFormat, width: u16, height: u16, blocks: []const u8 };
+
+/// Validate an ASTC blob for a 2D bgfx upload, or null if we can't take it
+/// as-is: not ASTC, malformed/truncated, 3D, an unsupported block size, or
+/// dimensions past `u16`. `isCompressed`/`uploadCompressed` share this so the
+/// "can upload as-is" probe and the actual upload never disagree.
+fn validateAstc(data: []const u8) ?AstcUpload {
+    const hdr = astc.parse(data) orelse return null;
+    if (hdr.depth != 1 or hdr.block_z != 1) return null; // bgfx createTexture2D is 2D only
+    const fmt = astcFormat(hdr.block_x, hdr.block_y) orelse return null;
+    const w = std.math.cast(u16, hdr.width) orelse return null;
+    const h = std.math.cast(u16, hdr.height) orelse return null;
+    return .{ .fmt = fmt, .width = w, .height = h, .blocks = hdr.blocks };
+}
+
+/// True if `data` is a GPU-compressed blob this backend can upload as-is.
+pub fn isCompressed(data: []const u8) bool {
+    return validateAstc(data) != null;
+}
+
+/// Upload an ASTC blob straight to the GPU — no CPU decode. The compressed
+/// blocks are copied into bgfx's command queue (`bgfx.copy`), so the caller's
+/// buffer can be freed immediately after this returns.
+pub fn uploadCompressed(data: []const u8) !Texture {
+    const info = validateAstc(data) orelse return error.LoadFailed;
+    const id = findFreeTextureSlot() orelse return error.LoadFailed;
+
+    const mem = bgfx.copy(info.blocks.ptr, @intCast(info.blocks.len));
+    const handle = bgfx.createTexture2D(
+        info.width,
+        info.height,
+        false,
+        1,
+        info.fmt,
+        bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp,
+        mem,
+        0,
+    );
+    if (handle.idx == std.math.maxInt(u16)) return error.LoadFailed;
+    texture_handles[id] = handle;
+    texture_pixel_data[id] = null;
+    return .{ .id = id, .width = @intCast(info.width), .height = @intCast(info.height) };
 }
 
 pub fn unloadTexture(texture: Texture) void {
