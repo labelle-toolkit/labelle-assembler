@@ -49,8 +49,15 @@ pub const IMAGE_BACKEND_WIRING = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn upload(decoded: engine.DecodedImage) anyerror!engine.AssetTexture") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn unload(texture: engine.AssetTexture) void") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.decodeImage(file_type, data, alloc)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(backend_decoded)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(.{") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.unloadTexture(tex)") != null);
+        // Compressed (ASTC) blobs route through the @hasDecl-guarded path:
+        // decode diverts before the CPU decoder, upload uses uploadCompressed.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@hasDecl(BackendGfx, \"isCompressed\") and @hasDecl(BackendGfx, \"compressedDims\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.compressedDims(data)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".compressed = true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@hasDecl(BackendGfx, \"uploadCompressed\") and decoded.compressed") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "BackendGfx.uploadCompressed(decoded.pixels)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.ImageLoader.setBackend(.{") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".decode = ImageBackendAdapter.decode") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".upload = ImageBackendAdapter.upload") != null);
@@ -191,7 +198,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
         // form — the `handle == MAX_IMAGE_ASSETS` sentinel is how the
         // rewrite signals "no free slot" after the scan.
         const guard_idx = std.mem.indexOf(u8, main_zig, "if (handle == MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;") orelse return error.GuardMissing;
-        const upload_call_idx = std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(backend_decoded)") orelse return error.UploadCallMissing;
+        const upload_call_idx = std.mem.indexOf(u8, main_zig, "BackendGfx.uploadTexture(.{") orelse return error.UploadCallMissing;
         try std.testing.expect(guard_idx < upload_call_idx);
 
         // Also lock in the slot-reuse behavior: the scan must run

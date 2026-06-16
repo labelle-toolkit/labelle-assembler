@@ -198,6 +198,14 @@ pub fn isCompressed(data: []const u8) bool {
     return validateAstc(data) != null;
 }
 
+/// Image dimensions of a compressed blob, read from the ASTC header without
+/// decoding — lets the async asset-catalog adapter set a correct DecodedImage
+/// width/height before upload. Null if not an ASTC blob we accept.
+pub fn compressedDims(data: []const u8) ?struct { width: u32, height: u32 } {
+    const info = validateAstc(data) orelse return null;
+    return .{ .width = @intCast(info.width), .height = @intCast(info.height) };
+}
+
 /// Upload an ASTC blob straight to the GPU — no CPU decode. sokol's
 /// `sg.makeImage` copies the compressed blocks out of the supplied subimage
 /// pointer, so the caller's buffer can be freed immediately after this returns.

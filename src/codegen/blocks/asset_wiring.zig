@@ -70,6 +70,19 @@ pub fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}        data: []const u8,\n", .{indent});
     try w.print("{s}        alloc: std.mem.Allocator,\n", .{indent});
     try w.print("{s}    ) anyerror!engine.DecodedImage {{\n", .{indent});
+    // GPU-compressed blobs (ASTC) skip the CPU decoder entirely: dupe the
+    // raw bytes (the catalog frees them after upload) and read dims from the
+    // header. This is the async-catalog counterpart to the synchronous
+    // `loadTextureFromMemory` seam — the streaming path (engine#450) splits
+    // worker-thread decode from main-thread upload, so the divert happens here.
+    // Guarded by `@hasDecl` so backends without compressed support (or a future
+    // headless backend) still generate valid code and just always CPU-decode.
+    try w.print("{s}        if (@hasDecl(BackendGfx, \"isCompressed\") and @hasDecl(BackendGfx, \"compressedDims\")) {{\n", .{indent});
+    try w.print("{s}            if (BackendGfx.isCompressed(data)) {{\n", .{indent});
+    try w.print("{s}                const dims = BackendGfx.compressedDims(data) orelse return error.LoadFailed;\n", .{indent});
+    try w.print("{s}                return .{{ .pixels = try alloc.dupe(u8, data), .width = dims.width, .height = dims.height, .compressed = true }};\n", .{indent});
+    try w.print("{s}            }}\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
     try w.print("{s}        const d = try BackendGfx.decodeImage(file_type, data, alloc);\n", .{indent});
     try w.print("{s}        return .{{ .pixels = d.pixels, .width = d.width, .height = d.height }};\n", .{indent});
     try w.print("{s}    }}\n", .{indent});
@@ -90,12 +103,18 @@ pub fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}            }}\n", .{indent});
     try w.print("{s}        }}\n", .{indent});
     try w.print("{s}        if (handle == MAX_IMAGE_ASSETS) return error.ImageSlotsExhausted;\n", .{indent});
-    try w.print("{s}        const backend_decoded: BackendGfx.DecodedImage = .{{\n", .{indent});
+    // Compressed blobs upload as-is via `uploadCompressed`; RGBA8 goes through
+    // the normal `uploadTexture`. Either way the catalog frees `decoded.pixels`.
+    // The `uploadCompressed` arm is `@hasDecl`-guarded so backends without
+    // compressed support still compile (the `decode` step above never marks
+    // `.compressed` for them, so the comptime-false arm is unreachable).
+    try w.print("{s}        const tex = if (@hasDecl(BackendGfx, \"uploadCompressed\") and decoded.compressed)\n", .{indent});
+    try w.print("{s}            try BackendGfx.uploadCompressed(decoded.pixels)\n", .{indent});
+    try w.print("{s}        else try BackendGfx.uploadTexture(.{{\n", .{indent});
     try w.print("{s}            .pixels = decoded.pixels,\n", .{indent});
     try w.print("{s}            .width = decoded.width,\n", .{indent});
     try w.print("{s}            .height = decoded.height,\n", .{indent});
-    try w.print("{s}        }};\n", .{indent});
-    try w.print("{s}        const tex = try BackendGfx.uploadTexture(backend_decoded);\n", .{indent});
+    try w.print("{s}        }});\n", .{indent});
     try w.print("{s}        slots[handle] = tex;\n", .{indent});
     // Register the slot handle → real BackendTexture mapping with
     // the renderer so the sprite draw path resolves correctly.

@@ -80,6 +80,10 @@ pub const unloadTexture = texture.unloadTexture;
 // exposes ASTC 4×4, so non-4×4 blobs fall back to the CPU decode path (#341).
 pub const isCompressed = texture.isCompressed;
 pub const uploadCompressed = texture.uploadCompressed;
+// Header-only dims for the async asset-catalog adapter (engine#450), which
+// splits worker-thread decode from main-thread upload and so can't use the
+// synchronous seam — it reads dims here to set DecodedImage before upload.
+pub const compressedDims = texture.compressedDims;
 
 // ── Phase 4 font surface (labelle-gfx#258, labelle-engine#448) ─────────
 
