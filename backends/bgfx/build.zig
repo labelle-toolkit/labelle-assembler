@@ -106,7 +106,9 @@ pub fn build(b: *std.Build) void {
 
     // ── Gfx backend module ──────────────────────────────────────────
     // `link_libc = true` is required by `src/gfx/texture.zig`'s
-    // libc-based file loader (post-0.16 swap from `std.fs.cwd()`).
+    // libc-based file loader (post-0.16 swap from `std.fs.cwd()`) AND by
+    // stb_image (malloc/free/memcpy), which is compiled in below for PNG/
+    // JPG/BMP/TGA decode.
     const gfx_mod = b.addModule("gfx", .{
         .root_source_file = b.path("src/gfx.zig"),
         .target = target,
@@ -114,6 +116,25 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     gfx_mod.addImport("zbgfx", zbgfx_mod);
+    // `@cInclude("stb_shim.h")` in gfx/texture.zig needs src/ on the
+    // include path to find stb_shim.h → stb_image.h.
+    gfx_mod.addIncludePath(b.path("src"));
+
+    // Android: stb_image_impl.c (and the translate-c `@cImport` of
+    // stb_shim.h in gfx/texture.zig) need the NDK sysroot system-includes
+    // to find Bionic's <stdlib.h>/<string.h> etc., exactly like the
+    // bgfx/bx/bimg C++ compile above. Apply the SAME `applyNdkSysroot`
+    // helper. This MUST run BEFORE `addCSourceFile` so the include paths
+    // are attached when the consuming Compile step collects translation
+    // units (mirrors the ordering in the sokol backend's build.zig). On
+    // desktop the system libc headers resolve without extra wiring.
+    // (bgfx is desktop + Android only — no wasm/emsdk path, unlike sokol.)
+    if (ndk) |n| applyNdkSysroot(gfx_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+
+    // stb_image implementation TU — defines STB_IMAGE_IMPLEMENTATION +
+    // STBI_NO_STDIO and includes stb_image.h. This is what gives the bgfx
+    // backend PNG decoding at parity with the sokol/raylib backends.
+    gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
 
     // Shared windowless-SDL desktop gamepad source (core#28). One copy lives
     // in `backends/sdl_gamepad/`; the raylib, sokol AND bgfx desktop backends
