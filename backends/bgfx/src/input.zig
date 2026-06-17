@@ -36,6 +36,23 @@ const agp = @import("android_gamepad");
 // NOT in the build graph, so we must not `@import` it, and the desktop getters
 // fall back to the GLFW path (#315). Mirrors raylib/sokol's input.zig.
 const gamepad_enabled = @import("build_options").gamepad_enabled;
+// When true, the imgui bridge artifact is linked into the final game exe and
+// its `imgui_bridge_mouse_*` externs are defined, so `newFrame` forwards the
+// per-frame mouse/touch state to Dear ImGui (see `forwardGuiInput`). OFF by
+// default: a non-imgui build must not reference those externs or it fails to
+// link with an undefined symbol. The assembler sets `.gui_enabled = true` only
+// when the project's gui plugin is imgui (build_files.zig).
+const gui_enabled = @import("build_options").gui_enabled;
+
+// labelle-imgui bgfx-bridge input feed. These resolve at the final game-exe
+// link against the imgui bridge's exports — only when `gui_enabled` is true
+// (the bridge artifact is in the graph). Declared inside the comptime gate so
+// a non-imgui build never references the (then-undefined) symbols.
+const imgui = if (gui_enabled) struct {
+    extern fn imgui_bridge_mouse_pos(x: f32, y: f32) void;
+    extern fn imgui_bridge_mouse_button(button: i32, down: bool) void;
+    extern fn imgui_bridge_mouse_wheel(wheel_x: f32, wheel_y: f32) void;
+} else struct {};
 // Opt-in for HIDAPI raw-HID decode in the shared SDL gamepad source; OFF by
 // default (HIDAPI's per-connect init stalls the render thread for seconds on
 // some platforms). Pushed into the source before its lazy SDL init.
@@ -138,6 +155,10 @@ pub fn newFrame() void {
         mouse_down[0] = pointer_down;
         pointer_down_prev = pointer_down;
 
+        // Forward the touch pointer to Dear ImGui as mouse pos + button 0.
+        // No-op (comptime-eliminated) unless the imgui bridge is linked.
+        forwardGuiInput();
+
         // Snapshot gamepad button state at the frame boundary so the next
         // frame's `isGamepadButtonPressed` can derive the rising edge (#310
         // Stage 4). The shell feeds live key/motion state into `agp`
@@ -174,6 +195,65 @@ pub fn newFrame() void {
         sdl_gp.Source.update();
     } else {
         snapshotGamepads();
+    }
+
+    // Forward the GLFW mouse (cursor pos already in framebuffer pixels above,
+    // buttons read live, wheel accumulated by the scroll callback) to Dear
+    // ImGui. No-op (comptime-eliminated) unless the imgui bridge is linked.
+    forwardGuiInput();
+}
+
+// ── GUI (Dear ImGui) input forwarding ──────────────────────────────────
+//
+// Pushes this frame's mouse/touch state into the labelle-imgui bgfx bridge so
+// imgui widgets are interactive. Entirely comptime-eliminated when the imgui
+// bridge isn't linked (`gui_enabled == false`) — the `imgui` namespace is
+// empty there and this function body collapses to nothing.
+//
+// Called from `newFrame` AFTER `mouse_x`/`mouse_y` and the gamepad snapshot
+// are settled, on BOTH paths:
+//   - Desktop (GLFW): cursor pos is already scaled to framebuffer pixels;
+//     button down-state is read live via `glfw.getMouseButton`; the wheel is
+//     the `scrollCallback`-accumulated delta for this frame.
+//   - Android (NDK): the touch pointer is mirrored onto `mouse_x`/`mouse_y` +
+//     `mouse_down[0]`; there is no wheel.
+//
+// We forward mouse position every frame and the down-state of buttons 0..2
+// (left/right/middle) — imgui's `AddMouseButtonEvent` only enqueues an event
+// when the state actually changes, so calling it each frame with the current
+// state is the standard, cheap backend pattern (no edge tracking needed here).
+// The bridge feeds these straight into `ImGuiIO_Add*Event`. Coordinates are in
+// the same physical-framebuffer pixel space the bridge renders in.
+const GUI_FORWARDED_BUTTONS = 3; // left(0), right(1), middle(2)
+
+fn guiButtonDown(button: u32) bool {
+    if (is_android) {
+        // Only the primary pointer → mouse button 0 is modelled on Android.
+        return button < MAX_MOUSE_BUTTONS and mouse_down[button];
+    }
+    // Desktop: read the live GLFW button state (same source as the engine's
+    // `isMouseButtonDown`), so imgui and the engine agree on this frame.
+    if (glfw_window) |win| {
+        return win.getMouseButton(@enumFromInt(button)) == .press;
+    }
+    return false;
+}
+
+fn forwardGuiInput() void {
+    if (comptime !gui_enabled) return;
+
+    imgui.imgui_bridge_mouse_pos(mouse_x, mouse_y);
+
+    var b: u32 = 0;
+    while (b < GUI_FORWARDED_BUTTONS) : (b += 1) {
+        imgui.imgui_bridge_mouse_button(@intCast(b), guiButtonDown(b));
+    }
+
+    // Vertical wheel only (no horizontal source on either path). Skip the
+    // call when there's no scroll this frame to avoid resetting imgui's
+    // internal wheel accumulation needlessly.
+    if (mouse_wheel != 0) {
+        imgui.imgui_bridge_mouse_wheel(0, mouse_wheel);
     }
 }
 

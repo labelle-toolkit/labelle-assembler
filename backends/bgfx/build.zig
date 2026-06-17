@@ -49,6 +49,14 @@ pub fn build(b: *std.Build) void {
     // generated build.zig via `b.dependency(..., .{ .gamepad_enabled = ... })`.
     const gamepad_enabled = b.option(bool, "gamepad_enabled", "Wire the shared SDL desktop gamepad source + link SDL2 (default true; false = opt out, GLFW fallback)") orelse true;
     const gamepad_hidapi = b.option(bool, "gamepad_hidapi", "Opt the SDL gamepad source into HIDAPI raw-HID decode (Switch/8BitDo); default false — HIDAPI per-connect init stalls the render thread for seconds on some platforms") orelse false;
+    // When true, `input.zig` forwards the per-frame mouse/touch state to the
+    // labelle-imgui bgfx bridge's `imgui_bridge_mouse_*` externs so Dear ImGui
+    // widgets are interactive. OFF by default: those externs are only defined
+    // when the imgui bridge artifact is linked into the final game exe, so a
+    // non-imgui build must NOT reference them (it would fail to link with an
+    // undefined symbol). The assembler forwards `.gui_enabled = true` from the
+    // generated build.zig only when the project's gui plugin is imgui.
+    const gui_enabled = b.option(bool, "gui_enabled", "Forward mouse/touch input to the imgui bridge (default false; true only when the imgui bridge is linked)") orelse false;
 
     const zbgfx_dep = b.dependency("zbgfx", .{ .target = target, .optimize = optimize });
     const zbgfx_mod = zbgfx_dep.module("zbgfx");
@@ -140,6 +148,7 @@ pub fn build(b: *std.Build) void {
     const input_opts = b.addOptions();
     input_opts.addOption(bool, "gamepad_enabled", gamepad_enabled);
     input_opts.addOption(bool, "gamepad_hidapi", gamepad_hidapi);
+    input_opts.addOption(bool, "gui_enabled", gui_enabled);
 
     // ── Input backend module ────────────────────────────────────────
     // Desktop wires the `zglfw` import for GLFW polling; Android omits it

@@ -130,7 +130,7 @@ pub fn build(b: *std.Build) !void {
     overrideImport(backend_input, "labelle_core", core_mod);
 
 .backend_bgfx
-    const backend_dep = b.dependency("labelle_bgfx", .{ .target = target, .optimize = optimize, .gamepad_enabled = {{gamepad_enabled}}, .gamepad_hidapi = {{gamepad_hidapi}} });
+    const backend_dep = b.dependency("labelle_bgfx", .{ .target = target, .optimize = optimize, .gamepad_enabled = {{gamepad_enabled}}, .gamepad_hidapi = {{gamepad_hidapi}}, .gui_enabled = {{gui_enabled}} });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");
     const backend_audio = backend_dep.module("audio");
@@ -740,7 +740,7 @@ pub fn build(b: *std.Build) void {
     // module (which compiles the NDK's `android_native_app_glue.c` and
     // exports the per-frame/init callback registration the generated
     // `main.zig` drives). No glfw artifact exists on this path.
-    const backend_dep = b.dependency("labelle_bgfx", .{ .target = android_target, .optimize = optimize });
+    const backend_dep = b.dependency("labelle_bgfx", .{ .target = android_target, .optimize = optimize, .gui_enabled = {{gui_enabled}} });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");
     const backend_audio = backend_dep.module("audio");

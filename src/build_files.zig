@@ -214,14 +214,28 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // `android_app` NativeActivity-glue module, and zglfw (desktop
             // window toolkit) is omitted from the Android graph. Desktop
             // keeps the GLFW-based `backend_bgfx` section.
+            // `gui_enabled` for the bgfx backend's imgui input forwarding —
+            // only when the project's gui plugin is imgui (the bridge defining
+            // the `imgui_bridge_mouse_*` externs `input.zig` references). Same
+            // imgui-only predicate as sokol's `with_imgui`.
+            const bgfx_gui_enabled: []const u8 = if (cfg.resolved_gui) |gui|
+                if (std.mem.eql(u8, gui.name, "imgui")) "true" else "false"
+            else
+                "false";
             if (cfg.platform == .android) {
-                try tpl.writeSection(build_zig_tmpl, "backend_bgfx_android", w);
+                try tpl.renderSection(build_zig_tmpl, "backend_bgfx_android", .{ .gui_enabled = bgfx_gui_enabled }, w);
             } else {
                 // Desktop bgfx forwards `gamepad_enabled` like raylib/sokol so
                 // the backend wires the shared SDL desktop gamepad source
                 // (`.gamepad = .auto`) or falls back to its GLFW path
                 // (`.gamepad = .none`). See backends/bgfx/src/input.zig.
-                try tpl.renderSection(build_zig_tmpl, "backend_bgfx", .{ .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi }, w);
+                //
+                // `gui_enabled` flips the backend's mouse/touch → imgui-bridge
+                // input forwarding on. TRUE only when the gui plugin is imgui:
+                // the `imgui_bridge_mouse_*` externs `input.zig` then references
+                // are defined solely by the linked imgui bridge artifact, so a
+                // non-imgui build must keep this false or it fails to link.
+                try tpl.renderSection(build_zig_tmpl, "backend_bgfx", .{ .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi, .gui_enabled = bgfx_gui_enabled }, w);
             }
         },
         .wgpu => try tpl.writeSection(build_zig_tmpl, "backend_wgpu", w),
