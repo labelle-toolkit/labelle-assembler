@@ -122,6 +122,21 @@ const BGFX_ANDROID_BACKEND_REGISTER =
     \\
 ;
 
+/// Android immersive-mode call for bgfx-Android, appended to
+/// `{{android_backend_register}}` when `.android.immersive_mode` is set.
+/// The register block above must run first — `enableImmersiveMode()` reads
+/// the registered backend context's `get_native_activity` and installs a
+/// UI-thread callback hook that hides the status + navigation bars
+/// (immersive-sticky). Mirrors the sokol path's `buildImmersiveEntryCode`,
+/// whose immersive line bgfx never received. See labelle-engine src/android.zig.
+const BGFX_ANDROID_IMMERSIVE =
+    \\    // Android immersive mode (project.labelle `.android.immersive_mode`):
+    \\    // hide the status + navigation bars (immersive-sticky) via the
+    \\    // registered backend context. See labelle-engine src/android.zig.
+    \\    engine.android.enableImmersiveMode();
+    \\
+;
+
 // ── Template-based generation (engine provides main.zig.template) ────────
 
 /// Generate main.zig using the engine's codegen template.
@@ -1218,6 +1233,15 @@ pub fn generateMainZigFromTemplate(
                 // the sokol path (`buildImmersiveEntryCode`). `engine.core` is
                 // labelle-engine's re-export of labelle-core; the context comes
                 // from the bgfx backend adapter surfaced as `backend_input.android`.
+                // Append the immersive-mode call to the (always-emitted)
+                // backend register block when opted in — the bgfx path
+                // previously emitted only the register, so the bars never hid.
+                const bgfx_immersive = if (cfg.android) |a| a.immersive_mode else false;
+                const bgfx_android_register = if (bgfx_immersive)
+                    try std.mem.concat(allocator, u8, &.{ BGFX_ANDROID_BACKEND_REGISTER, BGFX_ANDROID_IMMERSIVE })
+                else
+                    try allocator.dupe(u8, BGFX_ANDROID_BACKEND_REGISTER);
+                defer allocator.free(bgfx_android_register);
                 try tpl.render(lifecycle_tmpl, .{
                     .module_vars = module_vars,
                     .width = w_str,
@@ -1232,7 +1256,7 @@ pub fn generateMainZigFromTemplate(
                     .entry_comment = entry_comment,
                     .preview_setup = "",
                     .preview_heartbeat = "",
-                    .android_backend_register = BGFX_ANDROID_BACKEND_REGISTER,
+                    .android_backend_register = bgfx_android_register,
                 }, bw);
             } else {
                 // Raylib wasm: emscripten-driven callback loop. Preview
