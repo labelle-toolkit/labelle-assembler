@@ -127,10 +127,38 @@ pub fn setWindow(win: if (is_android) *anyopaque else *glfw.Window) void {
     }
     glfw_window = win;
     _ = win.setScrollCallback(scrollCallback);
+    // Keyboard EDGE state (`isKeyPressed`/`isKeyReleased`) is driven by this
+    // callback. Without it `keys_pressed[]` was never populated, so every
+    // edge-triggered key (e.g. Esc → pause menu) silently did nothing on
+    // bgfx — only the live-poll `isKeyDown` worked. Mirrors `scrollCallback`.
+    _ = win.setKeyCallback(keyCallback);
 }
 
 fn scrollCallback(_: *glfw.Window, _: f64, yoffset: f64) callconv(.c) void {
     mouse_wheel = @floatCast(yoffset);
+}
+
+/// GLFW fires this during `glfw.pollEvents()` (called in `newFrame`, AFTER
+/// the per-frame edge arrays are cleared), so a key pressed since last frame
+/// shows up in `keys_pressed` for exactly this frame. GLFW key codes equal
+/// the engine's `KeyboardKey` values (the same convention `isKeyDown` relies
+/// on via `@enumFromInt`), so indexing the arrays by the GLFW code is
+/// correct. `GLFW_KEY_UNKNOWN` (-1) and any code past the table are ignored.
+fn keyCallback(_: *glfw.Window, key: glfw.Key, _: c_int, action: glfw.Action, _: glfw.Mods) callconv(.c) void {
+    const code: c_int = @intFromEnum(key);
+    if (code < 0 or code >= MAX_KEYS) return;
+    const k: usize = @intCast(code);
+    switch (action) {
+        .press => {
+            keys_pressed[k] = true;
+            keys_down[k] = true;
+        },
+        .release => {
+            keys_released[k] = true;
+            keys_down[k] = false;
+        },
+        .repeat => {}, // auto-repeat isn't a fresh press; held state stays in keys_down
+    }
 }
 
 /// Call at the start of each frame to reset per-frame state and poll GLFW.
