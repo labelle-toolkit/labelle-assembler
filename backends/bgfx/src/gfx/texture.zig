@@ -152,7 +152,11 @@ pub fn decodeImage(
 
     if (width <= 0 or height <= 0) return error.LoadFailed;
 
-    const len: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+    // Checked multiplication: a crafted/malformed image with huge dimensions
+    // could overflow `w*h*4` (esp. on 32-bit Android), wrapping to a small
+    // allocation that the caller then reads past with the original dims.
+    const wh = std.math.mul(usize, @as(usize, @intCast(width)), @as(usize, @intCast(height))) catch return error.LoadFailed;
+    const len = std.math.mul(usize, wh, 4) catch return error.LoadFailed;
     const owned = try allocator.alloc(u8, len);
     @memcpy(owned, @as([*]const u8, @ptrCast(raw))[0..len]);
 
