@@ -26,7 +26,20 @@ var design_h: i32 = 600;
 // Aspect-preserving design→physical fit, recomputed on any size change.
 var fit_scale_x: f32 = 1.0;
 var fit_scale_y: f32 = 1.0;
+// When false, `toNdcX/toNdcY` skip the fit so the design canvas stretches
+// to fill the whole framebuffer. The renderer toggles this off around
+// `screen_fill` layers (backdrops) so they cover the pillarbox bars instead
+// of leaving white stripes, and back on for world/UI layers. Mirrors sokol.
+var fit_active: bool = true;
 var active_camera: ?Camera2D = null;
+
+/// Toggle the aspect-fit. `false` for `screen_fill` layers (stretch to the
+/// full framebuffer), `true` for normal fitted layers. Backends that don't
+/// implement this make the gfx renderer fall back to treating `screen_fill`
+/// as a normal pillarboxed layer (the bug this fixes).
+pub fn setApplyFit(active: bool) void {
+    fit_active = active;
+}
 
 fn recomputeFitScale() void {
     const sw: f32 = @floatFromInt(screen_w);
@@ -122,15 +135,19 @@ pub fn transformY(y: f32) f32 {
 
 /// Convert a (camera-transformed) design-pixel X to NDC, then apply the
 /// aspect-fit so the design canvas letterboxes into the physical surface.
+/// When `fit_active` is false (the renderer toggles it off around
+/// `screen_fill` layers, via `setApplyFit`), the fit is skipped so the
+/// design canvas STRETCHES to fill the whole framebuffer — backdrops cover
+/// the pillarbox bars instead of leaving them as stripes. Mirrors sokol.
 pub fn toNdcX(px: f32) f32 {
     const raw = (px / @as(f32, @floatFromInt(design_w))) * 2.0 - 1.0;
-    return raw * fit_scale_x;
+    return if (fit_active) raw * fit_scale_x else raw;
 }
 
 pub fn toNdcY(py: f32) f32 {
     // Flip Y: screen top=0 maps to NDC +1
     const raw = 1.0 - (py / @as(f32, @floatFromInt(design_h))) * 2.0;
-    return raw * fit_scale_y;
+    return if (fit_active) raw * fit_scale_y else raw;
 }
 
 pub fn fitScaleX() f32 {

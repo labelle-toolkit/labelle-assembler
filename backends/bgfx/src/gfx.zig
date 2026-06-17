@@ -44,6 +44,9 @@ pub const color = types.color;
 // ── State / shader management ──────────────────────────────────────────
 
 pub const setScreenSize = state.setScreenSize;
+// Toggle aspect-fit off around `screen_fill` layers so backdrops stretch to
+// the full framebuffer (no pillarbox stripes). Mirrors sokol/raylib.
+pub const setApplyFit = state.setApplyFit;
 // Physical↔design coordinate conversion for HiDPI input mapping. The
 // camera's `framebufferToWorld` calls `screenToDesign` (guarded by
 // `@hasDecl`) so mouse/touch in framebuffer pixels maps to design space.
