@@ -32,6 +32,11 @@ const target_fps: u32 = {{fps}};
         if (comptime @hasDecl(window, "setFullscreen") and @hasDecl(@TypeOf(g), "takeFullscreenRequest")) {
             if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
         }
+        // Vsync: same engine-owned-flag / backend-applies split as fullscreen.
+        // Folds away on backends without `setVsync` or engines predating the API.
+        if (comptime @hasDecl(window, "setVsync") and @hasDecl(@TypeOf(g), "takeVsyncRequest")) {
+            if (g.takeVsyncRequest()) |on| window.setVsync(on);
+        }
 {{preview_heartbeat}}{{tick_code}}        g.tick(dt);
 
         window.beginDrawing();

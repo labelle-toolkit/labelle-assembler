@@ -34,9 +34,16 @@ var windowed_x: i32 = 0;
 var windowed_y: i32 = 0;
 var windowed_w: i32 = 800;
 var windowed_h: i32 = 600;
-/// VSYNC reset flag reused by `ensureSurface` — matches the value baked
-/// into `init.resolution.reset` at window creation.
+/// VSYNC reset flag (`BGFX_RESET_VSYNC`) — OR'd into the reset flags when
+/// vsync is enabled. `setVsync` toggles it in/out of `current_reset`.
 const RESET_VSYNC: u32 = 0x00000080;
+/// The reset flags currently in effect, reused by `ensureSurface` and
+/// seeded into `init.resolution.reset` at window creation. Starts with
+/// vsync ON to match every backend's prior hardcoded behaviour; flipped
+/// live by `setVsync`. (Toggling vsync is just adding/removing
+/// `RESET_VSYNC` and re-issuing `bgfx.reset` — the standard bgfx
+/// mechanism, works on every bgfx platform.)
+var current_reset: u32 = RESET_VSYNC;
 var window_hidden: bool = false;
 var clear_color: u32 = 0x1e1e2eff; // dark background RGBA
 
@@ -101,7 +108,7 @@ fn ensureSurface() void {
         screen_w = fb[0];
         screen_h = fb[1];
         // `.Count` = keep the current backbuffer format (no change).
-        bgfx.reset(@intCast(screen_w), @intCast(screen_h), RESET_VSYNC, .Count);
+        bgfx.reset(@intCast(screen_w), @intCast(screen_h), current_reset, .Count);
     }
 }
 
@@ -147,7 +154,7 @@ fn initWindowAndroid(width: i32, height: i32) void {
     init.type = .Count; // auto-select renderer (GLES/Vulkan on Android)
     init.resolution.width = @intCast(width);
     init.resolution.height = @intCast(height);
-    init.resolution.reset = RESET_VSYNC;
+    init.resolution.reset = current_reset;
 
     // On Android the native window handle is the `ANativeWindow*` handed
     // over by the NativeActivity glue. `ndt` is unused (no display
@@ -198,7 +205,7 @@ fn initWindowDesktop(width: i32, height: i32, title: [:0]const u8) void {
     init.type = .Count; // auto-select renderer
     init.resolution.width = @intCast(screen_w);
     init.resolution.height = @intCast(screen_h);
-    init.resolution.reset = RESET_VSYNC;
+    init.resolution.reset = current_reset;
 
     // Fill in bgfx's native display type (ndt) and native window handle
     // (nwh) for the build target. See src/platform.zig for the source
@@ -273,6 +280,39 @@ pub fn setTargetFPS(fps: i32) void {
     target_fps_val = fps;
 }
 
+// ── Frame timing ───────────────────────────────────────────────────────
+// bgfx has no built-in frame timer (unlike sokol's `sapp.frameDuration`),
+// so we measure the real frame period with a monotonic clock. The
+// generated frame loop derives `dt` from this so the sim is
+// frame-rate-INDEPENDENT. Previously the bgfx templates hardcoded
+// `dt = 0.016`, which tied game speed to the frame rate — vsync-off at
+// e.g. 300 FPS ran the sim ~3x too fast (workers walked too quickly).
+// `std.time.nanoTimestamp`/`Instant` were removed in Zig 0.16; libc
+// `clock_gettime(CLOCK_MONOTONIC)` is the portable replacement (same
+// approach as the engine's `nowNs`).
+var last_frame_ns: i128 = 0;
+const Timespec = extern struct { sec: i64, nsec: i64 };
+extern "c" fn clock_gettime(clk: c_int, tp: *Timespec) c_int;
+fn monotonicNs() i128 {
+    const clk_id: c_int = switch (builtin.os.tag) {
+        .macos, .ios, .watchos, .tvos => 6, // _CLOCK_MONOTONIC
+        else => 1, // CLOCK_MONOTONIC (Linux/Android)
+    };
+    var ts: Timespec = .{ .sec = 0, .nsec = 0 };
+    if (clock_gettime(clk_id, &ts) != 0) return 0;
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
+
+/// Real elapsed seconds since the previous `frameDuration` call. Returns a
+/// sane 1/60 on the first call (no baseline yet). The generated loop
+/// clamps this (e.g. `min(dt, 4/target_fps)`) to avoid a post-stall spike.
+pub fn frameDuration() f64 {
+    const now = monotonicNs();
+    defer last_frame_ns = now;
+    if (last_frame_ns == 0 or now <= last_frame_ns) return 1.0 / 60.0;
+    return @as(f64, @floatFromInt(now - last_frame_ns)) / @as(f64, std.time.ns_per_s);
+}
+
 /// Query whether the window is currently fullscreen. Android is always
 /// fullscreen; desktop asks GLFW whether the window is bound to a monitor.
 pub fn isFullscreen() bool {
@@ -312,6 +352,21 @@ pub fn setFullscreen(on: bool) void {
         win.setMonitor(monitor, 0, 0, mode.width, mode.height, mode.refresh_rate);
     } else {
         win.setMonitor(null, windowed_x, windowed_y, windowed_w, windowed_h, 0);
+    }
+}
+
+/// Enable/disable vsync at runtime. The generated frame loop drains the
+/// engine's `takeVsyncRequest()` and forwards the value here (mirrors
+/// `setFullscreen`). Vsync is just the `BGFX_RESET_VSYNC` bit in the reset
+/// flags — flip it and re-issue `bgfx.reset` at the current size. Works on
+/// every bgfx platform (desktop Metal/GL/D3D, Android GLES). `.Count`
+/// keeps the current backbuffer format.
+pub fn setVsync(on: bool) void {
+    const want: u32 = if (on) RESET_VSYNC else 0;
+    if ((current_reset & RESET_VSYNC) == want) return; // already in that mode
+    current_reset = (current_reset & ~RESET_VSYNC) | want;
+    if (screen_w > 0 and screen_h > 0) {
+        bgfx.reset(@intCast(screen_w), @intCast(screen_h), current_reset, .Count);
     }
 }
 

@@ -51,6 +51,11 @@ export fn frame() callconv(.c) void {
     if (comptime @hasDecl(window, "setFullscreen") and @hasDecl(@TypeOf(g), "takeFullscreenRequest")) {
         if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
     }
+    // Vsync: same engine-owned-flag / backend-applies split as fullscreen.
+    // Folds away on backends without `setVsync` or engines predating the API.
+    if (comptime @hasDecl(window, "setVsync") and @hasDecl(@TypeOf(g), "takeVsyncRequest")) {
+        if (g.takeVsyncRequest()) |on| window.setVsync(on);
+    }
     BackendGfxType.setScreenSize(window.width(), window.height());
     // Keep design coords fixed so screen-space NDC mapping uses the design resolution
     // rather than the physical framebuffer size (which differs on HiDPI displays).
