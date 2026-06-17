@@ -169,7 +169,7 @@ pub const bgfx_android_lifecycle =
     \\export fn android_main(app: *android_app.android_app) callconv(.c) void {
     \\    android_app.setInitCallback(&gameInit);
     \\    android_app.setTickCallback(&gameFrame);
-    \\{{immersive_register}}    android_app.run(app);
+    \\{{android_backend_register}}{{immersive_register}}    android_app.run(app);
     \\}
     \\
 ;
