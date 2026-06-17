@@ -315,11 +315,28 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
     const tw: f32 = @floatFromInt(texture.width);
     const th: f32 = @floatFromInt(texture.height);
 
-    // Source rect to UV coordinates
-    const uv0 = source.x / tw;
-    const tv0 = source.y / th;
-    const uv1 = (source.x + source.width) / tw;
-    const tv1 = (source.y + source.height) / th;
+    // Source rect → UVs. Negative source.width/height are the labelle-gfx
+    // convention for flip_x/flip_y (the renderer negates the rect dims when a
+    // sprite is flipped). The atlas frame always lives at
+    // [source.x, source.x + |width|] / [source.y, source.y + |height|], so we
+    // compute the UV bounds from the ABSOLUTE extents and SWAP u0/u1 (v0/v1)
+    // on the flip path. Using `(source.x + source.width)` directly with a
+    // negative width samples LEFT of source.x — into a NEIGHBORING atlas frame
+    // (usually another character's animation on a packed atlas). That's the
+    // "workers wearing each other's frames when they turn around" bug from
+    // flying-platform-labelle. Matches the sokol/raylib backends' fix.
+    const sw_abs = @abs(source.width);
+    const sh_abs = @abs(source.height);
+    const flip_x = source.width < 0;
+    const flip_y = source.height < 0;
+    const u_left = source.x / tw;
+    const u_right = (source.x + sw_abs) / tw;
+    const v_top = source.y / th;
+    const v_bottom = (source.y + sh_abs) / th;
+    const uv0 = if (flip_x) u_right else u_left;
+    const uv1 = if (flip_x) u_left else u_right;
+    const tv0 = if (flip_y) v_bottom else v_top;
+    const tv1 = if (flip_y) v_top else v_bottom;
 
     // Destination quad corners (before rotation)
     // Scale width, height, and origin by camera zoom for consistent coordinate space
