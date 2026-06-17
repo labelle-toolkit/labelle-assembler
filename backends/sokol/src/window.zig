@@ -304,6 +304,28 @@ pub fn setFullscreen(on: bool) void {
     if (sapp.isFullscreen() != on) sapp.toggleFullscreen();
 }
 
+/// Desired swap interval (1 = vsync on, 0 = off). Consumed by `makeDesc`
+/// at startup so the initial present rate honours the setting.
+///
+/// Unlike fullscreen (sokol exposes `sapp.toggleFullscreen`), sokol_app
+/// has **no runtime swap-interval setter** — `swap_interval` is read once
+/// at init. On macOS the present rate is additionally paced by the
+/// MTKView display link + the WindowServer compositor, so a clean *live*
+/// toggle isn't achievable through the public sokol API. Therefore on the
+/// sokol backend the vsync choice applies at the **next launch**; the
+/// engine flag still updates so the Options checkbox reflects intent, and
+/// the **bgfx** backend (FP's shipping backend) does the fully-live
+/// toggle. On Web/WASM vsync is browser-owned (requestAnimationFrame) and
+/// ignores this entirely. See labelle-assembler vsync-toggle plan.
+var desired_swap_interval: i32 = 1;
+
+/// Set the desired vsync state. The generated frame loop forwards
+/// `g.takeVsyncRequest()` here (mirrors `setFullscreen`). See
+/// `desired_swap_interval` for why this is apply-at-launch on sokol.
+pub fn setVsync(on: bool) void {
+    desired_swap_interval = if (on) 1 else 0;
+}
+
 pub fn width() i32 {
     return if (headless_mode) headless_w else sapp.width();
 }
@@ -601,6 +623,9 @@ pub fn makeDesc(desc: struct {
         .window_title = desc.title,
         .gl = if (is_android) .{ .major_version = 3, .minor_version = 0 } else .{},
         .high_dpi = true,
+        // Honour the desired vsync state at init (sokol reads this once;
+        // there's no runtime setter — see `setVsync`). Default 1 = vsync on.
+        .swap_interval = desired_swap_interval,
         .logger = .{ .func = slog.func },
     };
 }

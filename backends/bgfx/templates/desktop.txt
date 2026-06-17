@@ -32,7 +32,14 @@ const BackendGfxType = @import("backend_gfx");
     const loop_start_ns: i128 = engine.nowNs();
 
     while (!window.windowShouldClose()) {
-        const dt: f32 = 0.016;
+        // Frame-rate-independent sim: derive dt from the real frame period
+        // (bgfx has no built-in timer, so `window.frameDuration` measures it
+        // with a monotonic clock) instead of a fixed 0.016. The fixed value
+        // tied game speed to the frame rate — vsync-off at e.g. 300 FPS ran
+        // the sim ~3x too fast. Clamp to 4 frames at target_fps so a stall /
+        // backgrounding can't explode physics. Mirrors the sokol template.
+        // @max(target_fps, 1) guards a target_fps=0 (unlimited) config.
+        const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
         // Apply a pending fullscreen/windowed switch requested via
         // `game.setFullscreen`/`toggleFullscreen`. The engine owns the
         // desired flag; the backend owns the platform call. Gated on BOTH
@@ -41,6 +48,11 @@ const BackendGfxType = @import("backend_gfx");
         // that predate the API (older example projects still build).
         if (comptime @hasDecl(window, "setFullscreen") and @hasDecl(@TypeOf(g), "takeFullscreenRequest")) {
             if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
+        }
+        // Vsync: same engine-owned-flag / backend-applies split as fullscreen.
+        // Folds away on backends without `setVsync` or engines predating the API.
+        if (comptime @hasDecl(window, "setVsync") and @hasDecl(@TypeOf(g), "takeVsyncRequest")) {
+            if (g.takeVsyncRequest()) |on| window.setVsync(on);
         }
         // Aspect-fit the design canvas (config) into the real window size,
         // so content renders correctly even if the window differs from the
