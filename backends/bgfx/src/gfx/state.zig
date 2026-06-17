@@ -150,12 +150,15 @@ pub fn toNdcY(py: f32) f32 {
     return if (fit_active) raw * fit_scale_y else raw;
 }
 
+// Respect `fit_active` (like toNdcX/toNdcY): callers that scale sizes by the
+// fit (e.g. drawCircle radius, line thickness) must use 1.0 on `screen_fill`
+// layers, else shapes are mis-sized relative to their stretched positions.
 pub fn fitScaleX() f32 {
-    return fit_scale_x;
+    return if (fit_active) fit_scale_x else 1.0;
 }
 
 pub fn fitScaleY() f32 {
-    return fit_scale_y;
+    return if (fit_active) fit_scale_y else 1.0;
 }
 
 // ── Camera queries (used by drawCircle / drawLine / drawTexturePro) ──
