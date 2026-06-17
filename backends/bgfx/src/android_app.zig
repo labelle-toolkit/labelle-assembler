@@ -72,8 +72,47 @@ pub const ANativeWindow = opaque {};
 pub const AInputQueue = opaque {};
 pub const AInputEvent = opaque {};
 pub const ALooper = opaque {};
-pub const ANativeActivity = opaque {};
 pub const AConfiguration = opaque {};
+
+/// `android/native_activity.h` — `ANativeActivityCallbacks`. The framework
+/// invokes every entry on the UI/main thread. Field order is ABI-load-
+/// bearing — it must match the NDK header exactly so our chained
+/// `onWindowFocusChanged` lands in the right slot. We only name the focus
+/// callback we chain (immersive re-hide must run on the UI thread, which
+/// is the only thread these fire on); the rest are opaque pointers since
+/// the NDK glue owns them and we never call them ourselves.
+pub const ANativeActivityCallbacks = extern struct {
+    onStart: ?*const anyopaque,
+    onResume: ?*const anyopaque,
+    onSaveInstanceState: ?*const anyopaque,
+    onPause: ?*const anyopaque,
+    onStop: ?*const anyopaque,
+    onDestroy: ?*const anyopaque,
+    // `void (*)(ANativeActivity*, int hasFocus)`. The NDK glue installs its
+    // own handler here (it posts APP_CMD_GAINED_FOCUS/LOST_FOCUS). We chain
+    // it: save the glue's pointer, install `focusHook`, and forward. The
+    // framework fires this on the UI thread — the one thread where the
+    // engine's `WindowInsetsController.hide()` is legal.
+    onWindowFocusChanged: ?*const fn (*ANativeActivity, c_int) callconv(.c) void,
+    onNativeWindowCreated: ?*const anyopaque,
+    onNativeWindowResized: ?*const anyopaque,
+    onNativeWindowRedrawNeeded: ?*const anyopaque,
+    onNativeWindowDestroyed: ?*const anyopaque,
+    onInputQueueCreated: ?*const anyopaque,
+    onInputQueueDestroyed: ?*const anyopaque,
+    onContentRectChanged: ?*const anyopaque,
+    onConfigurationChanged: ?*const anyopaque,
+    onLowMemory: ?*const anyopaque,
+};
+
+/// `android/native_activity.h` — `ANativeActivity`. Only the leading
+/// `callbacks` pointer we touch (to chain `onWindowFocusChanged`) is
+/// typed; the rest is an opaque tail. The C struct begins with this
+/// pointer, so the offset is correct.
+pub const ANativeActivity = extern struct {
+    callbacks: *ANativeActivityCallbacks,
+    _tail: [11]?*anyopaque,
+};
 
 /// One poll source returned by `ALooper_pollOnce`. The glue fills
 /// `process` with its own `process_cmd` / `process_input`; we just call
@@ -226,6 +265,52 @@ extern fn AKeyEvent_getKeyCode(event: *AInputEvent) i32;
 var bgfx_ready: bool = false;
 var is_resumed: bool = false;
 
+// ── Immersive-mode UI-thread hook (bgfx-immersive) ──────────────────
+// Hiding the system bars (`WindowInsetsController.hide()`) MUST run on the
+// Android UI/main thread — Android throws if it runs anywhere else, even
+// on a thread attached to the JVM. native_app_glue runs the game (our
+// `gameFrame`) on its own APP thread, NOT the UI thread, so the hide can't
+// be driven from the frame loop.
+//
+// The fix: chain `ANativeActivity.callbacks.onWindowFocusChanged`. The
+// framework invokes that callback ON THE UI THREAD — at launch (the
+// window's first focus gain) and on every focus regain (returning from
+// the shade / recents / a notification, exactly when immersive-sticky
+// flags get cleared). We install `focusHook`, which forwards to the NDK
+// glue's own handler (so its APP_CMD_GAINED_FOCUS/LOST_FOCUS bookkeeping
+// is intact) and then, on focus gain, invokes a registered immersive
+// callback — the engine's UI-thread JNI hide.
+//
+// The shell never depends on the engine: it stores a bare
+// `*const fn() callconv(.c) void`. The generated `main.zig` (which owns
+// both the shell and the engine) registers
+// `engine.android.applyImmersiveUiThread` via `setImmersiveCallback`.
+pub const ImmersiveCb = *const fn () callconv(.c) void;
+var immersive_cb: ?ImmersiveCb = null;
+
+/// Register the immersive re-hide callback. Invoked on the UI thread from
+/// `focusHook` on every focus gain (launch + each regain). The generated
+/// `main.zig` passes `engine.android.applyImmersiveUiThread`. Call before
+/// `run()`. When unset (immersive disabled), `focusHook` just forwards.
+pub fn setImmersiveCallback(cb: ImmersiveCb) void {
+    immersive_cb = cb;
+}
+
+/// The NDK glue's original `onWindowFocusChanged`, saved so `focusHook`
+/// can forward to it. Set in `run()` before `focusHook` is installed.
+var glue_focus_cb: ?*const fn (*ANativeActivity, c_int) callconv(.c) void = null;
+
+/// Our chained `onWindowFocusChanged`. Runs on the UI thread, so the
+/// engine's `WindowInsetsController.hide()` (driven via `immersive_cb`)
+/// is thread-legal here. Forward to the glue first so its lifecycle
+/// bookkeeping is intact, then re-hide on focus gain.
+fn focusHook(activity: *ANativeActivity, has_focus: c_int) callconv(.c) void {
+    if (glue_focus_cb) |cb| cb(activity, has_focus);
+    if (has_focus != 0) {
+        if (immersive_cb) |cb| cb();
+    }
+}
+
 // ── ANativeActivity accessor (#310 Stage 4) ─────────────────────────
 // Core's Android JNI seam (`AndroidBackendContext`, labelle-core#310) needs
 // the running `ANativeActivity*` to reach immersive mode + the InputManager
@@ -320,6 +405,10 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
         },
         APP_CMD_GAINED_FOCUS, APP_CMD_RESUME, APP_CMD_START => {
             is_resumed = true;
+            // Immersive re-hide is NOT driven from here: it must run on the
+            // UI thread, and this handler runs on the glue's app thread. The
+            // re-hide is driven by `focusHook` (chained onWindowFocusChanged),
+            // which the framework invokes on the UI thread on focus gain.
         },
         APP_CMD_LOST_FOCUS, APP_CMD_PAUSE, APP_CMD_STOP => {
             is_resumed = false;
@@ -448,10 +537,26 @@ pub fn run(app: *android_app) void {
     app.onAppCmd = onAppCmd;
     app.onInputEvent = onInputEvent;
 
-    // Stash the activity for the sokol-compat accessor the engine's
+    // Stash the activity for the backend-seam accessor the engine's
     // immersive-mode helper calls (see `native_activity` above). The glue
     // has populated `app.activity` by the time it calls us.
     native_activity = app.activity;
+
+    // Chain `onWindowFocusChanged` so the engine's immersive re-hide runs
+    // on the UI thread (the only thread `WindowInsetsController.hide()` is
+    // legal on). The NDK glue installed its own handler in
+    // `ANativeActivity_onCreate` before spawning this app thread, so by now
+    // `app.activity.callbacks.onWindowFocusChanged` is the glue's pointer:
+    // save it, then install `focusHook`, which forwards to it and fires the
+    // immersive callback on focus gain. No-op when immersive is disabled
+    // (`immersive_cb` unset) — the hook just forwards. Done from `run`
+    // (app thread) but the slot write is a single pointer store the
+    // framework reads later on the UI thread; the glue never rewrites this
+    // slot after onCreate, so there is no race.
+    if (app.activity) |activity| {
+        glue_focus_cb = activity.callbacks.onWindowFocusChanged;
+        activity.callbacks.onWindowFocusChanged = &focusHook;
+    }
 
     // Event + frame loop. `ALooper_pollOnce` returns the poll-source id;
     // we call `source.process(...)` which dispatches to our callbacks.
@@ -557,6 +662,8 @@ comptime {
     _ = setTickCallback;
     _ = setInitCallback;
     _ = getNativeActivity;
+    _ = setImmersiveCallback;
+    _ = &focusHook;
 }
 
 test "android_app module compiles for the host as a no-op namespace" {

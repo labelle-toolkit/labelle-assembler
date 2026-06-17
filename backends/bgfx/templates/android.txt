@@ -54,7 +54,7 @@ const target_fps: u32 = {{fps}};
 // INIT_WINDOW just before firing this). Build the game, wire hooks, and
 // run the project's setup/scene-load code. Runs on the app thread, once.
 fn gameInit() callconv(.c) void {
-{{android_backend_register}}    const allocator = gpa.allocator();
+    const allocator = gpa.allocator();
     g = AssembledGame.init(allocator);
 
     g.setHooks(&hooks);
@@ -102,5 +102,5 @@ fn gameFrame() callconv(.c) void {
 export fn android_main(app: *android_app.android_app) callconv(.c) void {
     android_app.setInitCallback(&gameInit);
     android_app.setTickCallback(&gameFrame);
-    android_app.run(app);
+{{android_backend_register}}{{immersive_register}}    android_app.run(app);
 }
