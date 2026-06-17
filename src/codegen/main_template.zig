@@ -100,15 +100,20 @@ const PREVIEW_READBACK_FRAME_METAL_SOKOL = preview.PREVIEW_READBACK_FRAME_METAL_
 const PREVIEW_READBACK_CLEANUP_SOKOL_D3D11 = preview.PREVIEW_READBACK_CLEANUP_SOKOL_D3D11;
 const PREVIEW_READBACK_CLEANUP_METAL_SOKOL = preview.PREVIEW_READBACK_CLEANUP_METAL_SOKOL;
 
-/// `{{android_backend_register}}` body for the bgfx-Android `gameInit` hole
-/// (#310 Stage 4). Registers the bgfx backend's Android JNI seam with core
-/// ONCE at startup — before the first frame polls the gamepad source — so
-/// core's gamepad source + the engine's immersive mode reach the running
-/// ANativeActivity / InputManager through the bgfx adapter's
+/// `{{android_backend_register}}` body for the bgfx-Android `android_main`
+/// hole (#310 Stage 4). Registers the bgfx backend's Android JNI seam with
+/// core ONCE at startup — emitted in `android_main` BEFORE `run()`, so it
+/// runs before the event loop starts and therefore before the first
+/// `onWindowFocusChanged` (the immersive re-hide path) AND before the first
+/// gamepad poll. (It previously sat in `gameInit`, which the shell fires on
+/// the first INIT_WINDOW *inside* the loop — that runs after the window's
+/// first focus event, so the launch immersive hide found no context
+/// registered and no-op'd. Moving it ahead of `run` fixes the launch hide.)
+/// Core's gamepad source + the engine's immersive mode then reach the
+/// running ANativeActivity / InputManager through the bgfx adapter's
 /// `AndroidBackendContext` instead of linking any backend symbol directly.
 /// Emitted unconditionally on bgfx-Android (gamepad detection needs it even
-/// when immersive mode is off), mirroring the sokol path's
-/// `buildImmersiveEntryCode`. Replaces the removed sokol-compat shims.
+/// when immersive mode is off). Replaces the removed sokol-compat shims.
 const BGFX_ANDROID_BACKEND_REGISTER =
     \\    // Register the bgfx Android backend seam with core (labelle-core#310):
     \\    // core's gamepad source and the engine's immersive mode reach the
@@ -119,21 +124,6 @@ const BGFX_ANDROID_BACKEND_REGISTER =
     \\    // `engine.core` is labelle-engine's re-export of labelle-core. See
     \\    // backends/bgfx/src/android.zig.
     \\    engine.core.registerAndroidBackend(@import("backend_input").android.backendContext());
-    \\
-;
-
-/// Android immersive-mode call for bgfx-Android, appended to
-/// `{{android_backend_register}}` when `.android.immersive_mode` is set.
-/// The register block above must run first — `enableImmersiveMode()` reads
-/// the registered backend context's `get_native_activity` and installs a
-/// UI-thread callback hook that hides the status + navigation bars
-/// (immersive-sticky). Mirrors the sokol path's `buildImmersiveEntryCode`,
-/// whose immersive line bgfx never received. See labelle-engine src/android.zig.
-const BGFX_ANDROID_IMMERSIVE =
-    \\    // Android immersive mode (project.labelle `.android.immersive_mode`):
-    \\    // hide the status + navigation bars (immersive-sticky) via the
-    \\    // registered backend context. See labelle-engine src/android.zig.
-    \\    engine.android.enableImmersiveMode();
     \\
 ;
 
@@ -1233,15 +1223,38 @@ pub fn generateMainZigFromTemplate(
                 // the sokol path (`buildImmersiveEntryCode`). `engine.core` is
                 // labelle-engine's re-export of labelle-core; the context comes
                 // from the bgfx backend adapter surfaced as `backend_input.android`.
-                // Append the immersive-mode call to the (always-emitted)
-                // backend register block when opted in — the bgfx path
-                // previously emitted only the register, so the bars never hid.
+                //
+                // Immersive mode (bgfx-immersive). The engine's hook-based
+                // `enableImmersiveMode()` does NOT work on bgfx: native_app_glue
+                // owns `onContentRectChanged`, so the launch hook installs too
+                // late / clobbers the glue and the system-bar hide never fires.
+                // And the hide (`WindowInsetsController.hide()`) MUST run on the
+                // UI thread — the glue runs `gameFrame` on its app thread, so it
+                // can't be driven from the frame loop either (Android throws even
+                // from a JVM-attached app-thread; verified on-device).
+                //
+                // Instead the bgfx shell chains `onWindowFocusChanged` — a
+                // framework callback the OS fires ON THE UI THREAD at launch and
+                // on every focus regain — and invokes a registered callback from
+                // there. We register the engine's UI-thread hide
+                // (`engine.android.applyImmersiveUiThread`) via the shell's
+                // `setImmersiveCallback` in `android_main`, before `run()`. The
+                // generated `main` owns both the shell (`android_app`) and the
+                // engine, satisfying the backend-cannot-depend-on-engine rule.
                 const bgfx_immersive = if (cfg.android) |a| a.immersive_mode else false;
-                const bgfx_android_register = if (bgfx_immersive)
-                    try std.mem.concat(allocator, u8, &.{ BGFX_ANDROID_BACKEND_REGISTER, BGFX_ANDROID_IMMERSIVE })
+                const immersive_register: []const u8 = if (bgfx_immersive)
+                    "    // Android immersive mode (project.labelle `.android.immersive_mode`):\n" ++
+                    "    // register the engine's UI-thread system-bar hide with the bgfx shell.\n" ++
+                    "    // The shell chains onWindowFocusChanged (a UI-thread framework callback)\n" ++
+                    "    // and invokes this on launch + every focus regain, so the bars hide at\n" ++
+                    "    // launch and re-hide after a swipe / returning from the shade. The\n" ++
+                    "    // hook-based enableImmersiveMode() can't work under native_app_glue.\n" ++
+                    "    // See labelle-engine src/android.zig (applyImmersiveUiThread) and\n" ++
+                    "    // backends/bgfx/src/android_app.zig (setImmersiveCallback / focusHook).\n" ++
+                    "    android_app.setImmersiveCallback(&engine.android.applyImmersiveUiThread);\n"
                 else
-                    BGFX_ANDROID_BACKEND_REGISTER;
-                defer if (bgfx_immersive) allocator.free(bgfx_android_register);
+                    "";
+
                 try tpl.render(lifecycle_tmpl, .{
                     .module_vars = module_vars,
                     .width = w_str,
@@ -1256,7 +1269,8 @@ pub fn generateMainZigFromTemplate(
                     .entry_comment = entry_comment,
                     .preview_setup = "",
                     .preview_heartbeat = "",
-                    .android_backend_register = bgfx_android_register,
+                    .android_backend_register = BGFX_ANDROID_BACKEND_REGISTER,
+                    .immersive_register = immersive_register,
                 }, bw);
             } else {
                 // Raylib wasm: emscripten-driven callback loop. Preview

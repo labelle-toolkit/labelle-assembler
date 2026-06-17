@@ -195,6 +195,54 @@ pub const MAIN_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var runner: Runner = undefined;") != null);
     }
 
+    test "bgfx android immersive registers the UI-thread hide callback (bgfx-immersive)" {
+        // The engine's hook-based `enableImmersiveMode()` cannot work on bgfx
+        // (native_app_glue owns onContentRectChanged) and the hide must run on
+        // the UI thread (not the glue app thread the frame loop runs on). So the
+        // codegen registers the engine's UI-thread hide with the shell, which
+        // chains onWindowFocusChanged (a UI-thread callback). Assert the
+        // registration lands in `android_main`, before `run`.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .ecs = .mock,
+            .android = .{ .immersive_mode = true },
+        }, bgfx_android_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // The UI-thread hide is registered with the shell.
+        const reg = "android_app.setImmersiveCallback(&engine.android.applyImmersiveUiThread);";
+        const reg_idx = std.mem.indexOf(u8, main_zig, reg);
+        try std.testing.expect(reg_idx != null);
+
+        // Registration must precede `run(app)` — the shell installs the focus
+        // chain inside `run`, reading the registered callback.
+        const run_idx = std.mem.indexOf(u8, main_zig, "android_app.run(app)");
+        try std.testing.expect(run_idx != null);
+        try std.testing.expect(reg_idx.? < run_idx.?);
+
+        // bgfx must NOT call the no-op sokol hook path. (The emitted comment
+        // mentions enableImmersiveMode by name, so match the CALL form.)
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.android.enableImmersiveMode(") == null);
+    }
+
+    test "bgfx android does NOT register the immersive callback when immersive is off" {
+        // Without the opt-in, no immersive call of any kind: the shell still
+        // chains onWindowFocusChanged but with no callback registered it just
+        // forwards, so applyImmersiveUiThread is never referenced.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .ecs = .mock,
+        }, bgfx_android_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "setImmersiveCallback") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "applyImmersiveUiThread") == null);
+    }
+
     test "sokol android registers the core Android backend seam before immersive (labelle-core#310)" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
