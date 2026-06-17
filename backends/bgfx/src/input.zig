@@ -87,7 +87,6 @@ const use_sdl_gamepad = gamepad_enabled and sdl_gp.is_desktop;
 const MAX_KEYS = 512;
 const MAX_MOUSE_BUTTONS = 8;
 
-var keys_down: [MAX_KEYS]bool = [_]bool{false} ** MAX_KEYS;
 var keys_pressed: [MAX_KEYS]bool = [_]bool{false} ** MAX_KEYS;
 var keys_released: [MAX_KEYS]bool = [_]bool{false} ** MAX_KEYS;
 
@@ -126,12 +125,19 @@ pub fn setWindow(win: if (is_android) *anyopaque else *glfw.Window) void {
         return;
     }
     glfw_window = win;
-    _ = win.setScrollCallback(scrollCallback);
-    // Keyboard EDGE state (`isKeyPressed`/`isKeyReleased`) is driven by this
-    // callback. Without it `keys_pressed[]` was never populated, so every
-    // edge-triggered key (e.g. Esc → pause menu) silently did nothing on
-    // bgfx — only the live-poll `isKeyDown` worked. Mirrors `scrollCallback`.
-    _ = win.setKeyCallback(keyCallback);
+    // `comptime`-gate the desktop-only GLFW callback registration so
+    // `setWindow` stays well-typed under any analysis on Android (where
+    // `win` is `*anyopaque` and has no `.set*Callback` — relying on the
+    // earlier comptime-dead `return` alone is fragile across refactors).
+    if (comptime !is_android) {
+        _ = win.setScrollCallback(scrollCallback);
+        // Keyboard EDGE state (`isKeyPressed`/`isKeyReleased`) is driven by
+        // this callback. Without it `keys_pressed[]` was never populated, so
+        // every edge-triggered key (e.g. Esc → pause menu) silently did
+        // nothing on bgfx — only live-poll `isKeyDown` worked. Mirrors
+        // `scrollCallback`.
+        _ = win.setKeyCallback(keyCallback);
+    }
 }
 
 fn scrollCallback(_: *glfw.Window, _: f64, yoffset: f64) callconv(.c) void {
@@ -149,15 +155,9 @@ fn keyCallback(_: *glfw.Window, key: glfw.Key, _: c_int, action: glfw.Action, _:
     if (code < 0 or code >= MAX_KEYS) return;
     const k: usize = @intCast(code);
     switch (action) {
-        .press => {
-            keys_pressed[k] = true;
-            keys_down[k] = true;
-        },
-        .release => {
-            keys_released[k] = true;
-            keys_down[k] = false;
-        },
-        .repeat => {}, // auto-repeat isn't a fresh press; held state stays in keys_down
+        .press => keys_pressed[k] = true,
+        .release => keys_released[k] = true,
+        .repeat => {}, // auto-repeat isn't a fresh press; live held-state is isKeyDown
     }
 }
 
