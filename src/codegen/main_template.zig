@@ -1240,8 +1240,8 @@ pub fn generateMainZigFromTemplate(
                 const bgfx_android_register = if (bgfx_immersive)
                     try std.mem.concat(allocator, u8, &.{ BGFX_ANDROID_BACKEND_REGISTER, BGFX_ANDROID_IMMERSIVE })
                 else
-                    try allocator.dupe(u8, BGFX_ANDROID_BACKEND_REGISTER);
-                defer allocator.free(bgfx_android_register);
+                    BGFX_ANDROID_BACKEND_REGISTER;
+                defer if (bgfx_immersive) allocator.free(bgfx_android_register);
                 try tpl.render(lifecycle_tmpl, .{
                     .module_vars = module_vars,
                     .width = w_str,
