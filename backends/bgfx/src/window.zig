@@ -341,18 +341,22 @@ pub fn beginDrawing() void {
 const INVALID_HANDLE: u16 = std.math.maxInt(u16);
 
 /// Pending screenshot path, set by `takeScreenshot` and consumed by the
-/// next `endDrawing`. Null when no capture is queued.
-var pending_screenshot: ?[:0]const u8 = null;
+/// next `endDrawing`. We COPY the caller's path into this static buffer
+/// rather than stash the slice: `endDrawing` runs a frame later, so a
+/// caller passing a stack/arena-temporary string would otherwise leave a
+/// dangling pointer.
+var pending_screenshot_buf: [1024:0]u8 = undefined;
+var has_pending_screenshot: bool = false;
 
 pub fn endDrawing() void {
     // Queue the backbuffer capture (if requested) BEFORE the frame swap so
     // bgfx fulfils it for THIS frame's content — the scene + imgui overlay
     // just submitted. Requesting after `bgfx.frame()` (a separate empty
     // frame) would capture a cleared backbuffer with no draws.
-    if (pending_screenshot) |path| {
+    if (has_pending_screenshot) {
         const invalid_fb = bgfx.FrameBufferHandle{ .idx = INVALID_HANDLE };
-        bgfx.requestScreenShot(invalid_fb, path.ptr);
-        pending_screenshot = null;
+        bgfx.requestScreenShot(invalid_fb, &pending_screenshot_buf);
+        has_pending_screenshot = false;
     }
     _ = bgfx.frame(0);
 }
@@ -378,8 +382,17 @@ pub fn endDrawing() void {
 ///
 /// bgfx appends its own `.tga` extension, so a path like `/tmp/shot`
 /// yields `/tmp/shot.tga`.
+///
+/// The path is COPIED into a static buffer (consumed a frame later in
+/// `endDrawing`), so a caller may pass a temporary string safely.
 pub fn takeScreenshot(path: [:0]const u8) void {
-    pending_screenshot = path;
+    if (path.len >= pending_screenshot_buf.len) {
+        std.log.err("bgfx screenshot path too long (max {d} bytes): {s}", .{ pending_screenshot_buf.len - 1, path });
+        return;
+    }
+    // Copy including the null terminator so the buffer is a valid C string.
+    @memcpy(pending_screenshot_buf[0 .. path.len + 1], path[0 .. path.len + 1]);
+    has_pending_screenshot = true;
 }
 
 pub fn clearBackground(r: u8, g: u8, b: u8, a: u8) void {

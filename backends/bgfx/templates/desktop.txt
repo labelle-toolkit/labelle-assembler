@@ -74,7 +74,7 @@ const BackendGfxType = @import("backend_gfx");
         if (comptime @hasDecl(window, "takeScreenshot")) {
             if (screenshot_req) |req| {
                 const now_ns: i128 = engine.nowNs();
-                const elapsed_sec: f32 = @as(f32, @floatFromInt(@as(i64, @intCast(now_ns - loop_start_ns)))) / 1_000_000_000.0;
+                const elapsed_sec: f32 = @as(f32, @floatFromInt(now_ns - loop_start_ns)) / 1_000_000_000.0;
                 if (elapsed_sec >= req.after_sec) {
                     window.takeScreenshot(req.path);
                     screenshot_req = null;
