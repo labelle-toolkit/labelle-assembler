@@ -331,6 +331,10 @@ fn monotonicNs() i128 {
 /// clamps this (e.g. `min(dt, 4/target_fps)`) to avoid a post-stall spike.
 pub fn frameDuration() f64 {
     const now = monotonicNs();
+    // A failed reading (0) must not become the new baseline — keep the last
+    // good one so the next frame measures a real delta rather than a giant
+    // since-epoch span.
+    if (now == 0) return 1.0 / 60.0;
     defer last_frame_ns = now;
     if (last_frame_ns == 0 or now <= last_frame_ns) return 1.0 / 60.0;
     return @as(f64, @floatFromInt(now - last_frame_ns)) / @as(f64, std.time.ns_per_s);
