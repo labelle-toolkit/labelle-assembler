@@ -1,15 +1,27 @@
-/// Texture handle pool, image decode (BMP / TGA), GPU upload, and the
-/// `drawTexturePro` primitive that samples the stored bgfx handle.
-/// Owns the `texture_handles` / `texture_pixel_data` arrays —
-/// `programs.shutdownPrograms` calls `destroyAllTextures` here on
-/// teardown so the bgfx handles get released in the same pass as the
-/// shader uniforms.
+/// Texture handle pool, image decode (PNG / JPG / BMP / TGA / … via
+/// stb_image), GPU upload, and the `drawTexturePro` primitive that
+/// samples the stored bgfx handle. Owns the `texture_handles` /
+/// `texture_pixel_data` arrays — `programs.shutdownPrograms` calls
+/// `destroyAllTextures` here on teardown so the bgfx handles get released
+/// in the same pass as the shader uniforms.
 const std = @import("std");
 const bgfx = @import("zbgfx").bgfx;
 const types = @import("types.zig");
 const state = @import("state.zig");
 const programs = @import("programs.zig");
 const astc = @import("astc.zig");
+
+// stb_image goes through a tiny shim that empties out clang's nullability
+// qualifiers before include. Zig 0.16's translate-c rejects `_Nonnull` on
+// array parameters in Bionic's stdlib.h on the Android NDK 27 sysroot —
+// see Flying-Platform/flying-platform-labelle#450. Macro-replacing
+// `_Nonnull` / `_Nullable` to nothing makes the preprocessor strip them
+// before translate-c sees the declarations. This is the SAME shim the
+// sokol backend uses (backends/sokol/src/stb_shim.h), minus the
+// stb_truetype include — bgfx has its own bitmap font.
+pub const stbi = @cImport({
+    @cInclude("stb_shim.h");
+});
 
 const Texture = types.Texture;
 const Color = types.Color;
@@ -64,10 +76,9 @@ pub fn destroyAllTextures() void {
 // the FS directly. Rather than thread `Io` through the backend for a
 // one-shot loader, we use libc `fopen` / `fread` / `fclose` to keep the
 // existing `(path) !Texture` signature. `link_libc = true` is set on
-// the gfx module (see backends/bgfx/build.zig) so libc is available at
-// link time at no extra cost (the bgfx backend has hand-rolled BMP/TGA
-// decoders and does NOT link stb_image, so the libc link is added
-// explicitly for this loader).
+// the gfx module (see backends/bgfx/build.zig) — stb_image already pulls
+// libc in for malloc/free/memcpy, so this loader's fopen/fread/fclose
+// add no new link-time cost.
 const SEEK_SET: c_int = 0;
 const SEEK_END: c_int = 2;
 extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
@@ -107,9 +118,17 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     return uploadTexture(decoded);
 }
 
-/// Pure CPU decode, safe from a worker thread. The bgfx backend ships
-/// hand-rolled BMP and TGA decoders (no stb_image link) — we try BMP
-/// first, then fall back to TGA. The caller's allocator owns the
+/// Pure CPU decode, safe from a worker thread. Decodes via stb_image,
+/// which covers PNG / JPG / BMP / TGA / GIF / PSD / HDR / PIC / PNM —
+/// forcing 4 output channels so the result is always RGBA8 to match
+/// `DecodedImage` and `uploadTexture`'s `.RGBA8` format. stb gives a
+/// top-left-origin buffer, the same orientation the upload path + sprite
+/// shader expect.
+///
+/// stb allocates the decoded buffer with its OWN malloc, but the engine
+/// frees `decoded.pixels` with the Zig `allocator`, so we MUST copy stb's
+/// buffer into `allocator` and then `stbi_image_free` stb's original —
+/// never hand stb's raw pointer to the Zig allocator. The caller owns the
 /// returned `pixels` buffer and frees it on both the success and the
 /// discard paths.
 pub fn decodeImage(
@@ -117,10 +136,31 @@ pub fn decodeImage(
     data: []const u8,
     allocator: std.mem.Allocator,
 ) !DecodedImage {
-    // TODO: Add PNG decoding (requires inflate/zlib decompression) or integrate stb_image
-    if (tryDecodeBmp(data, allocator)) |img| return img;
-    if (tryDecodeTga(data, allocator)) |img| return img;
-    return error.LoadFailed;
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var channels: c_int = 0;
+    const raw = stbi.stbi_load_from_memory(
+        @ptrCast(data.ptr),
+        @intCast(data.len),
+        &width,
+        &height,
+        &channels,
+        4, // force RGBA8
+    );
+    if (raw == null) return error.LoadFailed;
+    defer stbi.stbi_image_free(raw);
+
+    if (width <= 0 or height <= 0) return error.LoadFailed;
+
+    const len: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+    const owned = try allocator.alloc(u8, len);
+    @memcpy(owned, @as([*]const u8, @ptrCast(raw))[0..len]);
+
+    return .{
+        .pixels = owned,
+        .width = @intCast(width),
+        .height = @intCast(height),
+    };
 }
 
 /// Main/GL-thread GPU upload. bgfx copies the pixel buffer into its own
@@ -348,99 +388,5 @@ pub const DecodedImage = struct {
     height: u32,
 };
 
-/// Decode an uncompressed 24-bit or 32-bit BMP to RGBA8.
-/// Handles BGR-to-RGB conversion, row padding, and top-down/bottom-up orientation.
-fn tryDecodeBmp(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
-    if (data.len < 54) return null;
-    if (data[0] != 'B' or data[1] != 'M') return null;
-
-    const pixel_offset = std.mem.readInt(u32, data[10..14], .little);
-    const w_signed = std.mem.readInt(i32, data[18..22], .little);
-    const h_signed = std.mem.readInt(i32, data[22..26], .little);
-    const bpp = std.mem.readInt(u16, data[28..30], .little);
-
-    if (w_signed <= 0) return null;
-    const width: u32 = @intCast(w_signed);
-    // BMP height can be negative (top-down); handle both.
-    const flip = h_signed > 0;
-    const height: u32 = if (h_signed < 0) @intCast(-h_signed) else @intCast(h_signed);
-
-    if (bpp != 24 and bpp != 32) return null; // Only uncompressed RGB/RGBA
-
-    const bytes_per_pixel: u32 = @as(u32, bpp) / 8;
-    const row_size = ((width * bytes_per_pixel + 3) / 4) * 4; // BMP rows are 4-byte aligned
-
-    const out_size = @as(usize, width) * @as(usize, height) * 4;
-    const pixels = allocator.alloc(u8, out_size) catch return null;
-
-    var y: u32 = 0;
-    while (y < height) : (y += 1) {
-        const src_y = if (flip) height - 1 - y else y;
-        const row_off = @as(usize, pixel_offset) + @as(usize, src_y) * @as(usize, row_size);
-        var x: u32 = 0;
-        while (x < width) : (x += 1) {
-            const src = row_off + @as(usize, x) * @as(usize, bytes_per_pixel);
-            const dst = (@as(usize, y) * @as(usize, width) + @as(usize, x)) * 4;
-            if (src + bytes_per_pixel > data.len or dst + 4 > pixels.len) {
-                allocator.free(pixels);
-                return null;
-            }
-            // BMP stores BGR(A)
-            pixels[dst + 0] = data[src + 2]; // R
-            pixels[dst + 1] = data[src + 1]; // G
-            pixels[dst + 2] = data[src + 0]; // B
-            pixels[dst + 3] = if (bytes_per_pixel == 4) data[src + 3] else 255;
-        }
-    }
-
-    return DecodedImage{ .pixels = pixels, .width = width, .height = height };
-}
-
-/// Decode an uncompressed TGA (type 2) to RGBA8.
-/// Handles 24/32-bit pixels, BGR-to-RGB conversion, and orientation via descriptor bit 5.
-fn tryDecodeTga(data: []const u8, allocator: std.mem.Allocator) ?DecodedImage {
-    if (data.len < 18) return null;
-
-    const image_type = data[2];
-    if (image_type != 2) return null; // Only uncompressed true-color
-
-    const width: u32 = std.mem.readInt(u16, data[12..14], .little);
-    const height: u32 = std.mem.readInt(u16, data[14..16], .little);
-    const bpp = data[16];
-    const descriptor = data[17];
-
-    if (width == 0 or height == 0) return null;
-    if (bpp != 24 and bpp != 32) return null;
-
-    const id_len: usize = data[0];
-    const pixel_offset: usize = 18 + id_len;
-    const bytes_per_pixel: usize = @as(usize, bpp) / 8;
-    // Bit 5 of descriptor: 0 = bottom-up (default TGA), 1 = top-down
-    const top_down = (descriptor & 0x20) != 0;
-
-    const out_size = @as(usize, width) * @as(usize, height) * 4;
-    const pixels = allocator.alloc(u8, out_size) catch return null;
-
-    var y: u32 = 0;
-    while (y < height) : (y += 1) {
-        const src_y = if (!top_down) height - 1 - y else y;
-        var x: u32 = 0;
-        while (x < width) : (x += 1) {
-            const src = pixel_offset + (@as(usize, src_y) * @as(usize, width) + @as(usize, x)) * bytes_per_pixel;
-            const dst = (@as(usize, y) * @as(usize, width) + @as(usize, x)) * 4;
-            if (src + bytes_per_pixel > data.len or dst + 4 > pixels.len) {
-                allocator.free(pixels);
-                return null;
-            }
-            // TGA stores BGR(A)
-            pixels[dst + 0] = data[src + 2]; // R
-            pixels[dst + 1] = data[src + 1]; // G
-            pixels[dst + 2] = data[src + 0]; // B
-            pixels[dst + 3] = if (bytes_per_pixel == 4) data[src + 3] else 255;
-        }
-    }
-
-    return DecodedImage{ .pixels = pixels, .width = width, .height = height };
-}
-
-// TODO: Add PNG decoding (requires inflate/zlib decompression) or integrate stb_image
+// BMP and TGA loaders removed — stb_image (compiled in via
+// stb_image_impl.c) handles PNG/JPG/BMP/TGA and more. See `decodeImage`.

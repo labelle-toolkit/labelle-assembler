@@ -9,7 +9,7 @@
 ///   - `gfx/state.zig`     — screen / camera state + coordinate helpers
 ///   - `gfx/programs.zig`  — shader programs, vertex layout, white texture, submit helpers
 ///   - `gfx/draw.zig`      — shape primitives (rect / circle / line / triangle / polygon)
-///   - `gfx/texture.zig`   — image decode (BMP / TGA) + texture handle pool + drawTexturePro
+///   - `gfx/texture.zig`   — image decode (PNG/JPG/BMP/TGA via stb_image) + texture handle pool + drawTexturePro
 ///   - `gfx/font.zig`      — embedded 8x8 bitmap font + drawText
 ///
 /// Submodules are private file-system neighbours. The public surface
