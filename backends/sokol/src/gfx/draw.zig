@@ -218,3 +218,18 @@ pub fn drawLine(start_x: f32, start_y: f32, end_x: f32, end_y: f32, _: f32, tint
     sgl.v2f(state.toNdcX(end_x), state.toNdcY(end_y));
     sgl.end();
 }
+
+/// Filled triangle through the three absolute vertices `v1`, `v2`,
+/// `v3` (design-pixel space — the retained engine has already applied
+/// position + scale). Submitted as a single sgl triangle, mirroring
+/// how `drawCircle` / `drawRectanglePro` fill via sgl primitives with
+/// `state.toNdc*` coordinate conversion. Winding is irrelevant — sgl
+/// triangles are not back-face culled.
+pub fn drawTriangle(v1: Vector2, v2: Vector2, v3: Vector2, tint: Color) void {
+    sgl.beginTriangles();
+    sgl.c4b(tint.r, tint.g, tint.b, tint.a);
+    sgl.v2f(state.toNdcX(v1.x), state.toNdcY(v1.y));
+    sgl.v2f(state.toNdcX(v2.x), state.toNdcY(v2.y));
+    sgl.v2f(state.toNdcX(v3.x), state.toNdcY(v3.y));
+    sgl.end();
+}

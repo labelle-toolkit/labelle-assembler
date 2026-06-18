@@ -105,6 +105,14 @@ pub fn drawLine(start_x: f32, start_y: f32, end_x: f32, end_y: f32, thickness: f
     rl.drawLineEx(.{ .x = start_x, .y = start_y }, .{ .x = end_x, .y = end_y }, thickness, tint.toRl());
 }
 
+/// Filled triangle through the three absolute vertices. raylib's
+/// `DrawTriangle` wants vertices in counter-clockwise winding;
+/// `drawTriangleFan` would be needed for arbitrary winding, but the
+/// retained-engine geometry is authored CCW so the direct call is fine.
+pub fn drawTriangle(v1: Vector2, v2: Vector2, v3: Vector2, tint: Color) void {
+    rl.drawTriangle(v1.toRl(), v2.toRl(), v3.toRl(), tint.toRl());
+}
+
 pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void {
     rl.drawText(text, @intFromFloat(x), @intFromFloat(y), @intFromFloat(size), tint.toRl());
 }

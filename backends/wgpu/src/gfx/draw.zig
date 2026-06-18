@@ -120,7 +120,11 @@ pub fn drawLine(start_x: f32, start_y: f32, end_x: f32, end_y: f32, thickness: f
     batch.noteShapeDraw(index_start, 6);
 }
 
-pub fn drawTriangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, tint: Color) void {
+/// Filled triangle through the three absolute vertices `v1`, `v2`,
+/// `v3` (design-pixel space — position + scale already applied by the
+/// caller). Point/Color signature matches the labelle-gfx Backend
+/// contract; the three vertices are batched as one shape triangle.
+pub fn drawTriangle(v1: Vector2, v2: Vector2, v3: Vector2, tint: Color) void {
     if (!batch.hasShapeCapacity(3, 3)) {
         log.warn("shape batch full, dropping triangle primitive", .{});
         return;
@@ -129,9 +133,9 @@ pub fn drawTriangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, tint: 
     const base: u32 = @intCast(batch.shapeVertexCount());
     const index_start: u32 = @intCast(batch.shapeIndexCount());
 
-    batch.appendShapeVertex(ColorVertex.init(toNdcX(x1), toNdcY(y1), col));
-    batch.appendShapeVertex(ColorVertex.init(toNdcX(x2), toNdcY(y2), col));
-    batch.appendShapeVertex(ColorVertex.init(toNdcX(x3), toNdcY(y3), col));
+    batch.appendShapeVertex(ColorVertex.init(toNdcX(v1.x), toNdcY(v1.y), col));
+    batch.appendShapeVertex(ColorVertex.init(toNdcX(v2.x), toNdcY(v2.y), col));
+    batch.appendShapeVertex(ColorVertex.init(toNdcX(v3.x), toNdcY(v3.y), col));
 
     batch.appendShapeIndex(base + 0);
     batch.appendShapeIndex(base + 1);
