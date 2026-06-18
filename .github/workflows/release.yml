@@ -41,6 +41,10 @@ jobs:
             os: ubuntu-latest
 
     runs-on: ${{ matrix.os }}
+    # Bound the per-platform release build so a wedged runner can't stall
+    # a release for hours. Cross-compiling the assembler binary is a few
+    # minutes; 20 covers any platform without risking a hang.
+    timeout-minutes: 20
 
     # build.zig.zon has a `.path = "../labelle-gui/flow-codegen"` dep, so the
     # gui sibling has to live next to the assembler checkout. actions/checkout
@@ -109,6 +113,9 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    # Just downloads the built artifacts and creates the GitHub release —
+    # seconds of work; 10 is plenty and bounds a stuck runner.
+    timeout-minutes: 10
 
     steps:
       - name: Download all artifacts
