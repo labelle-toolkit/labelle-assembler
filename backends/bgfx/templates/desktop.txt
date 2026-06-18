@@ -39,7 +39,14 @@ const BackendGfxType = @import("backend_gfx");
         // did nothing. Mirrors the sokol template. Gated so backends that
         // predate `requestQuit` still build.
         if (comptime @hasDecl(window, "requestQuit")) {
-            if (!g.isRunning()) window.requestQuit();
+            if (!g.isRunning()) {
+                window.requestQuit();
+                // Break immediately — don't run another tick/render/draw on a
+                // game that's already shutting down (avoids touching state the
+                // quit may have torn down). Matches the sokol template, which
+                // returns from its frame callback right after requestQuit.
+                break;
+            }
         }
         // Frame-rate-independent sim: derive dt from the real frame period
         // (bgfx has no built-in timer, so `window.frameDuration` measures it
