@@ -239,6 +239,21 @@ pub fn newFrame() void {
         const sy: f64 = if (ws[1] > 0) @as(f64, @floatFromInt(fb[1])) / @as(f64, @floatFromInt(ws[1])) else 1.0;
         mouse_x = @floatCast(pos[0] * sx);
         mouse_y = @floatCast(pos[1] * sy);
+
+        // Derive this-frame mouse button press/release EDGES. GLFW gives only
+        // live down-state, so (mirroring the keyboard `keys_pressed`/`released`
+        // and the Android pointer path) compare each button's live state
+        // against `mouse_down[]` — the persisted previous-frame state — to set
+        // the one-frame `mouse_pressed`/`mouse_released` arrays the engine's
+        // `isMouseButtonPressed`/`Released` read. Without this they were always
+        // false on desktop; only live-poll `isMouseButtonDown` worked.
+        var b: u32 = 0;
+        while (b < MAX_MOUSE_BUTTONS) : (b += 1) {
+            const cur = win.getMouseButton(@enumFromInt(b)) == .press;
+            if (cur and !mouse_down[b]) mouse_pressed[b] = true;
+            if (!cur and mouse_down[b]) mouse_released[b] = true;
+            mouse_down[b] = cur;
+        }
     }
 
     // Snapshot gamepad button edges for this frame's `isGamepadButtonPressed`.
