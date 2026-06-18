@@ -13,6 +13,11 @@ jobs:
         os: [ubuntu-latest, macos-latest]
 
     runs-on: ${{ matrix.os }}
+    # Cap the job so a hung/stuck runner can't spin for hours (GitHub's
+    # default is 6h). A normal Zig build+test here is a few minutes; 10
+    # leaves headroom while still failing fast on a wedged runner — a
+    # ubuntu runner once hung this job IN_PROGRESS for ~28 min.
+    timeout-minutes: 10
 
     # All steps run from inside the labelle-assembler checkout so the
     # `../labelle-gui/flow-codegen` path-dep in build.zig.zon resolves
@@ -119,6 +124,11 @@ jobs:
   bgfx-build:
     name: bgfx backend build + test (macOS)
     runs-on: macos-latest
+    # Higher cap than the other jobs: bgfx's C++ (bgfx/bx/bimg) takes tens
+    # of minutes from a COLD cache (a zbgfx bump busts the key), so a flat
+    # 10 would false-fail legit cold builds. Warm-cache runs are minutes;
+    # 30 bounds a genuine hang without breaking the cold path.
+    timeout-minutes: 30
 
     # Same sibling-checkout layout as build-and-test: run from inside the
     # labelle-assembler checkout so the `../labelle-gui/flow-codegen`
@@ -188,6 +198,10 @@ jobs:
   examples-integration:
     name: Examples integration test
     runs-on: ubuntu-latest
+    # Builds several example projects end-to-end; normally a few minutes.
+    # 15 gives headroom for the multi-repo checkout + apt install while
+    # still bounding a wedged runner well under GitHub's 6h default.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout labelle-assembler
