@@ -32,6 +32,22 @@ const BackendGfxType = @import("backend_gfx");
     const loop_start_ns: i128 = engine.nowNs();
 
     while (!window.windowShouldClose()) {
+        // Honor `game.quit()` (e.g. the menu Exit button). The engine keeps
+        // quit backend-agnostic — it only flips its `running` flag — so the
+        // backend loop must forward that to the platform close. Without this
+        // the bgfx loop only exited on the window's own close button and Exit
+        // did nothing. Mirrors the sokol template. Gated so backends that
+        // predate `requestQuit` still build.
+        if (comptime @hasDecl(window, "requestQuit")) {
+            if (!g.isRunning()) {
+                window.requestQuit();
+                // Break immediately — don't run another tick/render/draw on a
+                // game that's already shutting down (avoids touching state the
+                // quit may have torn down). Matches the sokol template, which
+                // returns from its frame callback right after requestQuit.
+                break;
+            }
+        }
         // Frame-rate-independent sim: derive dt from the real frame period
         // (bgfx has no built-in timer, so `window.frameDuration` measures it
         // with a monotonic clock) instead of a fixed 0.016. The fixed value
