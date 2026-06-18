@@ -167,7 +167,7 @@ fn keyCallback(_: *glfw.Window, key: glfw.Key, _: c_int, action: glfw.Action, _:
     // is skipped: imgui auto-repeats from the held-down state + DeltaTime, so
     // a held Backspace keeps deleting. (No-op / comptime-eliminated unless the
     // imgui bridge is linked.)
-    if (gui_enabled) {
+    if (comptime gui_enabled) {
         switch (action) {
             .press => imgui.imgui_bridge_key(code, true),
             .release => imgui.imgui_bridge_key(code, false),
@@ -186,6 +186,7 @@ fn keyCallback(_: *glfw.Window, key: glfw.Key, _: c_int, action: glfw.Action, _:
 /// GLFW char callback → imgui text input. Only registered when the imgui
 /// bridge is linked (`gui_enabled`); the bridge drops control chars.
 fn charCallback(_: *glfw.Window, codepoint: u32) callconv(.c) void {
+    if (comptime !gui_enabled) return;
     imgui.imgui_bridge_char(codepoint);
 }
 
