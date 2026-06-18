@@ -276,6 +276,18 @@ pub fn windowShouldClose() bool {
     return true;
 }
 
+/// Forwarded from the desktop loop when `game.quit()` flips the engine's
+/// `running` flag (e.g. the menu Exit button). Sets GLFW's close flag so the
+/// next `windowShouldClose()` exits the loop — the engine keeps `quit()`
+/// backend-agnostic (it only flips `running`), so without this the bgfx loop
+/// only ever exited on the window's own close button and Exit did nothing.
+/// Mirrors the sokol backend's `sapp.requestQuit`. Android shutdown is driven
+/// by the activity lifecycle, not this flag (see `windowShouldClose`).
+pub fn requestQuit() void {
+    if (is_android) return;
+    if (glfw_window) |win| win.setShouldClose(true);
+}
+
 pub fn setTargetFPS(fps: i32) void {
     target_fps_val = fps;
 }
