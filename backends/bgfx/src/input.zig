@@ -52,6 +52,12 @@ const imgui = if (gui_enabled) struct {
     extern fn imgui_bridge_mouse_pos(x: f32, y: f32) void;
     extern fn imgui_bridge_mouse_button(button: i32, down: bool) void;
     extern fn imgui_bridge_mouse_wheel(wheel_x: f32, wheel_y: f32) void;
+    // Keyboard: a typed character (for text fields) and key down/up (for
+    // backspace/enter/arrows/modifiers). Without these, imgui text inputs
+    // ignore the keyboard on bgfx — only mouse worked. Fed from the GLFW
+    // char + key callbacks (event-driven, not polled in `forwardGuiInput`).
+    extern fn imgui_bridge_char(codepoint: u32) void;
+    extern fn imgui_bridge_key(key: i32, down: bool) void;
 } else struct {};
 // Opt-in for HIDAPI raw-HID decode in the shared SDL gamepad source; OFF by
 // default (HIDAPI's per-connect init stalls the render thread for seconds on
@@ -137,6 +143,10 @@ pub fn setWindow(win: if (is_android) *anyopaque else *glfw.Window) void {
         // nothing on bgfx — only live-poll `isKeyDown` worked. Mirrors
         // `scrollCallback`.
         _ = win.setKeyCallback(keyCallback);
+        // Char callback drives imgui text input (typed characters). Only
+        // wired when the imgui bridge is linked — `charCallback` references
+        // the (then-defined) `imgui_bridge_char` export.
+        if (comptime gui_enabled) _ = win.setCharCallback(charCallback);
     }
 }
 
@@ -152,6 +162,18 @@ fn scrollCallback(_: *glfw.Window, _: f64, yoffset: f64) callconv(.c) void {
 /// correct. `GLFW_KEY_UNKNOWN` (-1) and any code past the table are ignored.
 fn keyCallback(_: *glfw.Window, key: glfw.Key, _: c_int, action: glfw.Action, _: glfw.Mods) callconv(.c) void {
     const code: c_int = @intFromEnum(key);
+    // Forward to imgui so text fields see Backspace/Enter/Delete/arrows and
+    // the Ctrl/Shift/Super modifiers. The bridge maps GLFW→ImGuiKey. Repeat
+    // is skipped: imgui auto-repeats from the held-down state + DeltaTime, so
+    // a held Backspace keeps deleting. (No-op / comptime-eliminated unless the
+    // imgui bridge is linked.)
+    if (gui_enabled) {
+        switch (action) {
+            .press => imgui.imgui_bridge_key(code, true),
+            .release => imgui.imgui_bridge_key(code, false),
+            .repeat => {},
+        }
+    }
     if (code < 0 or code >= MAX_KEYS) return;
     const k: usize = @intCast(code);
     switch (action) {
@@ -159,6 +181,12 @@ fn keyCallback(_: *glfw.Window, key: glfw.Key, _: c_int, action: glfw.Action, _:
         .release => keys_released[k] = true,
         .repeat => {}, // auto-repeat isn't a fresh press; live held-state is isKeyDown
     }
+}
+
+/// GLFW char callback → imgui text input. Only registered when the imgui
+/// bridge is linked (`gui_enabled`); the bridge drops control chars.
+fn charCallback(_: *glfw.Window, codepoint: u32) callconv(.c) void {
+    imgui.imgui_bridge_char(codepoint);
 }
 
 /// Call at the start of each frame to reset per-frame state and poll GLFW.
