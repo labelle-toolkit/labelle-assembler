@@ -696,7 +696,7 @@ fn runHeadless(desc: struct {
     h: i32 = 600,
 }) void {
     const device = MTLCreateSystemDefaultDevice() orelse {
-        std.debug.print("labelle: runHeadless: MTLCreateSystemDefaultDevice returned null; aborting preview.\n", .{});
+        std.debug.print("labelle: runHeadless: MTLCreateSystemDefaultDevice returned null; aborting headless/preview run.\n", .{});
         return;
     };
 
@@ -713,15 +713,22 @@ fn runHeadless(desc: struct {
     desc.init_cb();
     defer desc.cleanup_cb();
 
-    // Perf-measurement knobs (headless mode only):
+    // Perf-measurement knobs — HEADLESS mode only. `runHeadless` also backs
+    // the `LABELLE_PREVIEW` editor path, which must keep its normal ~60 Hz,
+    // run-until-killed behaviour, so gate the knobs on `LABELLE_HEADLESS`
+    // being set rather than reading them unconditionally:
     //   * LABELLE_HEADLESS_UNCAPPED — skip the per-frame nanosleep so the loop
     //     runs flat-out, giving accurate per-frame timing.
     //   * LABELLE_HEADLESS_TICKS=<N> — quit cleanly after N frame callbacks
     //     (0/unset = run until externally killed). A clean exit lets the
     //     existing `cleanup_cb` run so buffered stdio flushes.
-    const uncapped = envTruthy("LABELLE_HEADLESS_UNCAPPED");
-    const max_ticks: u64 = if (getenv("LABELLE_HEADLESS_TICKS")) |raw|
-        (std.fmt.parseInt(u64, std.mem.span(raw), 10) catch 0)
+    const is_headless = envTruthy("LABELLE_HEADLESS");
+    const uncapped = is_headless and envTruthy("LABELLE_HEADLESS_UNCAPPED");
+    const max_ticks: u64 = if (is_headless)
+        (if (getenv("LABELLE_HEADLESS_TICKS")) |raw|
+            (std.fmt.parseInt(u64, std.mem.span(raw), 10) catch 0)
+        else
+            0)
     else
         0;
 
