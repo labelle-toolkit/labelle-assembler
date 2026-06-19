@@ -1,10 +1,15 @@
 //! Metal pixel readback for screenshot capture (labelle-assembler#213).
 //!
-//! Strategy: grab the current `CAMetalDrawable` from sokol_app, blit its
-//! texture into a freshly-allocated MTLBuffer with storageModeShared
-//! (macOS) / storageModeManaged + synchronize (iOS), then read bytes.
-//! The drawable's native pixel format is BGRA8Unorm — we copy bytes
-//! verbatim and let `screenshot.bmp.writeBmpFromBgra` skip the swizzle.
+//! Strategy: grab a source `MTLTexture`, blit it into a freshly-allocated
+//! MTLBuffer with storageModeShared (macOS) / storageModeManaged +
+//! synchronize (iOS), then read bytes. Two entry points share the
+//! `blitTextureToBuffer` core:
+//!   - `readback` (windowed): source = current `CAMetalDrawable.texture`.
+//!   - `readbackFromTexture` (headless, assembler#368): source = the
+//!     offscreen color attachment sokol-gfx rendered into, since the
+//!     swapchain drawable is invalid when sokol_app never ran.
+//! Both source textures are BGRA8Unorm — we copy bytes verbatim and let
+//! `screenshot.bmp.writeBmpFromBgra` skip the swizzle.
 //!
 //! Called from `window.takeScreenshot` AFTER `window.endFrame()`, which
 //! ends with `sg.commit()` — the GPU queue has already submitted the
@@ -113,12 +118,14 @@ const is_macos = @import("builtin").target.os.tag == .macos;
 // where the symbol becomes mandatory.
 const fork_exports_drawable: bool = true;
 
-/// Read the contents of the current drawable's texture into `out` (RGBA-
-/// sized buffer, w*h*4 bytes). Returns true on success, false on any
+/// Read the contents of the current swapchain drawable's texture into `out`
+/// (RGBA-sized buffer, w*h*4 bytes). Returns true on success, false on any
 /// readback step that can fail (no drawable, alloc failure, etc.).
 ///
 /// `out` receives BGRA bytes on success — see `bmp.writeBmpFromBgra`.
 /// `mtl_device` is the MTLDevice pointer (from `window.metalDevice()`).
+///
+/// Windowed path: source the texture from the current `CAMetalDrawable`.
 pub fn readback(out: []u8, w: u32, h: u32, mtl_device: ?*const anyopaque) bool {
     if (comptime !fork_exports_drawable) {
         // STUB path retained for compile-time rollback safety. The
@@ -141,17 +148,51 @@ pub fn readback(out: []u8, w: u32, h: u32, mtl_device: ?*const anyopaque) bool {
         extern "c" fn sapp_metal_get_current_drawable() ?*const anyopaque;
     }).sapp_metal_get_current_drawable;
 
-    const device = @as(?*anyopaque, @constCast(mtl_device)) orelse {
-        std.log.warn("screenshot: Metal device unavailable", .{});
-        return false;
-    };
     const drawable = @as(?*anyopaque, @constCast(sapp_metal_get_current_drawable())) orelse {
         std.log.warn("screenshot: no current drawable (frame not rendered?)", .{});
         return false;
     };
 
-    const sel_release = sel_registerName("release");
     const sel_texture = sel_registerName("texture");
+    const texture = msgSend_id(drawable, sel_texture) orelse {
+        std.log.warn("screenshot: drawable has no texture", .{});
+        return false;
+    };
+    return blitTextureToBuffer(out, w, h, mtl_device, texture);
+}
+
+/// Headless path (labelle-assembler#368): read back from a caller-supplied
+/// offscreen `MTLTexture*` (the headless fallback color attachment) instead
+/// of the window swapchain — sokol_app never ran, so the swapchain drawable
+/// is invalid and `sapp_metal_get_current_drawable` aborts on `!_sapp.valid`.
+///
+/// The offscreen image is created BGRA8 (matching the swapchain format), so
+/// `out` again receives BGRA bytes — see `bmp.writeBmpFromBgra`.
+pub fn readbackFromTexture(
+    out: []u8,
+    w: u32,
+    h: u32,
+    mtl_device: ?*const anyopaque,
+    texture: ?*const anyopaque,
+) bool {
+    const tex = @as(?*anyopaque, @constCast(texture)) orelse {
+        std.log.warn("screenshot: headless offscreen texture is null", .{});
+        return false;
+    };
+    return blitTextureToBuffer(out, w, h, mtl_device, tex);
+}
+
+/// Shared blit core: copy `texture` into a freshly-allocated shared
+/// MTLBuffer, wait for completion, and memcpy `w*h*4` bytes into `out`.
+/// `out` receives the texture's native bytes verbatim (BGRA8 for both the
+/// swapchain drawable and the BGRA8 offscreen attachment).
+fn blitTextureToBuffer(out: []u8, w: u32, h: u32, mtl_device: ?*const anyopaque, texture: ?*anyopaque) bool {
+    const device = @as(?*anyopaque, @constCast(mtl_device)) orelse {
+        std.log.warn("screenshot: Metal device unavailable", .{});
+        return false;
+    };
+
+    const sel_release = sel_registerName("release");
     const sel_newCommandQueue = sel_registerName("newCommandQueue");
     const sel_commandBuffer = sel_registerName("commandBuffer");
     const sel_blitCommandEncoder = sel_registerName("blitCommandEncoder");
@@ -164,11 +205,6 @@ pub fn readback(out: []u8, w: u32, h: u32, mtl_device: ?*const anyopaque) bool {
         "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:",
     );
     const sel_synchronizeResource = sel_registerName("synchronizeResource:");
-
-    const texture = msgSend_id(drawable, sel_texture) orelse {
-        std.log.warn("screenshot: drawable has no texture", .{});
-        return false;
-    };
 
     const bytes_per_row: usize = @as(usize, w) * 4;
     const total: usize = bytes_per_row * @as(usize, h);

@@ -191,6 +191,17 @@ fn readbackMetal(pixels: []u8, w: u32, h: u32) bool {
     // elimination after a comptime-return can leave the import in the
     // analysis graph and trip link-time references to libobjc.
     if (comptime builtin.target.os.tag.isDarwin()) {
+        // Headless mode never ran sokol_app, so the swapchain drawable is
+        // invalid (`sapp_metal_get_current_drawable` aborts on
+        // `!_sapp.valid`). The frame was rendered into the offscreen
+        // fallback color attachment instead — read that texture back.
+        if (headless_mode) {
+            const tex = headlessColorTexture() orelse {
+                std.log.warn("screenshot: headless offscreen texture unavailable", .{});
+                return false;
+            };
+            return @import("screenshot/metal.zig").readbackFromTexture(pixels, w, h, metalDevice(), tex);
+        }
         return @import("screenshot/metal.zig").readback(pixels, w, h, metalDevice());
     } else {
         std.log.warn("screenshot: Metal backend reported on non-Darwin target", .{});
@@ -425,15 +436,26 @@ fn headlessFallbackAttachments() sg.Attachments {
     // id as the lazy-init sentinel.
     if (headless_fallback_color_view.id != 0) return headless_fallback_attachments;
 
+    // Size the offscreen target to the actual headless framebuffer so the
+    // game renders the full frame (not a 16×16 stub) — the headless
+    // screenshot path (labelle-assembler#368) reads this color image back
+    // as the captured image, so it must match `width()`/`height()`.
+    // Guard against a zero size (pre-`runHeadless`) with a 16×16 floor.
+    const fb_w: i32 = if (headless_w > 0) headless_w else 16;
+    const fb_h: i32 = if (headless_h > 0) headless_h else 16;
+
     // Build everything in locals first; only commit to module-scope
     // statics when all four handles validate. If any creation fails
     // (pool exhaustion / driver error), return an empty
     // `sg.Attachments` and leave `headless_fallback_color_view.id == 0`
     // so the next call retries the lazy-init cleanly instead of
     // caching broken attachments forever.
+    //
+    // BGRA8 matches the Metal swapchain's native format so the screenshot
+    // readback can reuse `writeBmpFromBgra` (no channel swizzle).
     const color_img = sg.makeImage(.{
-        .width = 16,
-        .height = 16,
+        .width = fb_w,
+        .height = fb_h,
         .pixel_format = .BGRA8,
         .usage = .{ .color_attachment = true, .immutable = true },
     });
@@ -446,8 +468,8 @@ fn headlessFallbackAttachments() sg.Attachments {
         return .{};
     }
     const depth_img = sg.makeImage(.{
-        .width = 16,
-        .height = 16,
+        .width = fb_w,
+        .height = fb_h,
         .pixel_format = .DEPTH_STENCIL,
         .usage = .{ .depth_stencil_attachment = true, .immutable = true },
     });
@@ -477,6 +499,27 @@ fn headlessFallbackAttachments() sg.Attachments {
     headless_fallback_depth_view = depth_view;
     headless_fallback_attachments = att;
     return att;
+}
+
+/// Native `MTLTexture*` backing the headless offscreen color attachment,
+/// or null if the fallback hasn't been created yet / on non-Metal builds.
+/// The headless screenshot path (labelle-assembler#368) reads this texture
+/// back instead of the (invalid, never-presented) window swapchain drawable
+/// — `sapp_metal_get_current_drawable` aborts on `!_sapp.valid` headless.
+///
+/// `sg.mtlQueryImageInfo` returns the (double-buffered) native texture
+/// array; `active_slot` selects the slot the most recent pass rendered into.
+pub fn headlessColorTexture() ?*const anyopaque {
+    if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .ios) return null;
+    // Ensure the attachment exists (lazy-inits if a frame hasn't rendered).
+    _ = headlessFallbackAttachments();
+    if (headless_fallback_color_img.id == 0) return null;
+    const info = sg.mtlQueryImageInfo(headless_fallback_color_img);
+    const slot: usize = @intCast(@max(0, info.active_slot));
+    // Defensive: `tex` is a fixed 2-slot array; never index past it even
+    // if sokol-gfx ever reports an unexpected `active_slot`.
+    if (slot >= info.tex.len) return null;
+    return info.tex[slot];
 }
 
 /// Flush queued sokol-gl primitives (sprites, gizmos, sgl-rendered text)
