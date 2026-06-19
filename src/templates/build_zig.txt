@@ -29,6 +29,17 @@ pub fn build(b: *std.Build) !void {
     overrideImport(engine_mod, "labelle-core", core_mod);
     overrideImport(engine_mod, "labelle-gfx", gfx_mod);
 
+    // gfx ships its own sub-packages (`camera`, `spatial_grid`, `tilemap`),
+    // each of which imports `labelle-core`. Before gfx#276 those imports were
+    // internal-only, so a distinct core instance was harmless. gfx#276 threads
+    // the project `y_axis` (a `core.YAxis`) from `gfx`'s renderer into
+    // `camera.CameraWith(..., y_axis)`, so the sub-package's `labelle-core`
+    // MUST be the same instance as `core_mod` — otherwise two `core.YAxis`
+    // enums (gfx's `core_mod` vs the sub-package's own pinned core tarball)
+    // don't unify and sema fails with "expected 'YAxis', found 'YAxis'".
+    // Unify each sub-package that actually imports core onto `core_mod`.
+    unifyGfxSubpackageCore(gfx_mod, core_mod);
+
 .game_mod_decl
     // `game` module — local shim (game.zig) re-exporting engine's `Game`
     // and `EntityId` so generated flow files at `scripts/flows/*.zig`
@@ -335,6 +346,22 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
     gop.value_ptr.* = module;
 }
 
+/// Unify `labelle-core` onto gfx's sub-packages (`camera`, `spatial_grid`,
+/// `tilemap`) so a `core.YAxis` (and any other core type) produced inside the
+/// `labelle-gfx` module unifies with the type the sub-package expects. gfx#276
+/// crosses this boundary by passing the project `y_axis` into
+/// `camera.CameraWith(...)`. Only override sub-packages that actually import
+/// core (a no-op otherwise — keeps this resilient if gfx restructures).
+fn unifyGfxSubpackageCore(gfx_mod: *std.Build.Module, core_mod: *std.Build.Module) void {
+    const sub_names = [_][]const u8{ "camera", "spatial_grid", "tilemap" };
+    for (sub_names) |sub_name| {
+        const sub = gfx_mod.import_table.get(sub_name) orelse continue;
+        if (sub.import_table.get("labelle-core") != null) {
+            overrideImport(sub, "labelle-core", core_mod);
+        }
+    }
+}
+
 .link_sokol
     exe.root_module.linkLibrary(sokol_clib);
 
@@ -487,6 +514,10 @@ pub fn build(b: *std.Build) void {
     overrideImport(engine_mod, "labelle-core", core_mod);
     overrideImport(engine_mod, "labelle-gfx", gfx_mod);
 
+    // gfx#276: unify core onto gfx's sub-packages (camera/spatial_grid/tilemap)
+    // so the renderer's `core.YAxis` unifies with `camera.CameraWith`'s.
+    unifyGfxSubpackageCore(gfx_mod, core_mod);
+
 .game_mod_decl_ios
     // `game` module — see labelle-assembler#116. iOS-targeted variant.
     const game_mod = b.createModule(.{
@@ -571,6 +602,22 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
         gop.key_ptr.* = name;
     }
     gop.value_ptr.* = module;
+}
+
+/// Unify `labelle-core` onto gfx's sub-packages (`camera`, `spatial_grid`,
+/// `tilemap`) so a `core.YAxis` (and any other core type) produced inside the
+/// `labelle-gfx` module unifies with the type the sub-package expects. gfx#276
+/// crosses this boundary by passing the project `y_axis` into
+/// `camera.CameraWith(...)`. Only override sub-packages that actually import
+/// core (a no-op otherwise — keeps this resilient if gfx restructures).
+fn unifyGfxSubpackageCore(gfx_mod: *std.Build.Module, core_mod: *std.Build.Module) void {
+    const sub_names = [_][]const u8{ "camera", "spatial_grid", "tilemap" };
+    for (sub_names) |sub_name| {
+        const sub = gfx_mod.import_table.get(sub_name) orelse continue;
+        if (sub.import_table.get("labelle-core") != null) {
+            overrideImport(sub, "labelle-core", core_mod);
+        }
+    }
 }
 
 .header_android
@@ -694,6 +741,10 @@ pub fn build(b: *std.Build) void {
     overrideImport(gfx_mod, "labelle-core", core_mod);
     overrideImport(engine_mod, "labelle-core", core_mod);
     overrideImport(engine_mod, "labelle-gfx", gfx_mod);
+
+    // gfx#276: unify core onto gfx's sub-packages (camera/spatial_grid/tilemap)
+    // so the renderer's `core.YAxis` unifies with `camera.CameraWith`'s.
+    unifyGfxSubpackageCore(gfx_mod, core_mod);
 
 .game_mod_decl_android
     // `game` module — see labelle-assembler#116. Android-targeted variant.
@@ -938,6 +989,22 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
     gop.value_ptr.* = module;
 }
 
+/// Unify `labelle-core` onto gfx's sub-packages (`camera`, `spatial_grid`,
+/// `tilemap`) so a `core.YAxis` (and any other core type) produced inside the
+/// `labelle-gfx` module unifies with the type the sub-package expects. gfx#276
+/// crosses this boundary by passing the project `y_axis` into
+/// `camera.CameraWith(...)`. Only override sub-packages that actually import
+/// core (a no-op otherwise — keeps this resilient if gfx restructures).
+fn unifyGfxSubpackageCore(gfx_mod: *std.Build.Module, core_mod: *std.Build.Module) void {
+    const sub_names = [_][]const u8{ "camera", "spatial_grid", "tilemap" };
+    for (sub_names) |sub_name| {
+        const sub = gfx_mod.import_table.get(sub_name) orelse continue;
+        if (sub.import_table.get("labelle-core") != null) {
+            overrideImport(sub, "labelle-core", core_mod);
+        }
+    }
+}
+
 .tests_start
     // ── Test step ──────────────────────────────────────────────────
     // Single test compile unit rooted at `__tests_root.zig` (generated
@@ -1016,6 +1083,20 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
     gop.value_ptr.* = module;
 }
 
+/// Unify `labelle-core` onto gfx's sub-packages (`camera`, `spatial_grid`,
+/// `tilemap`) so a `core.YAxis` produced inside `labelle-gfx` unifies with the
+/// type each sub-package expects (gfx#276 passes `y_axis` into
+/// `camera.CameraWith(...)`). Only overrides sub-packages that import core.
+fn unifyGfxSubpackageCore(gfx_mod: *std.Build.Module, core_mod: *std.Build.Module) void {
+    const sub_names = [_][]const u8{ "camera", "spatial_grid", "tilemap" };
+    for (sub_names) |sub_name| {
+        const sub = gfx_mod.import_table.get(sub_name) orelse continue;
+        if (sub.import_table.get("labelle-core") != null) {
+            overrideImport(sub, "labelle-core", core_mod);
+        }
+    }
+}
+
 .footer
     b.installArtifact(exe);
 
@@ -1037,4 +1118,18 @@ fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Mod
     }
     // Replace value (existing or new)
     gop.value_ptr.* = module;
+}
+
+/// Unify `labelle-core` onto gfx's sub-packages (`camera`, `spatial_grid`,
+/// `tilemap`) so a `core.YAxis` produced inside `labelle-gfx` unifies with the
+/// type each sub-package expects (gfx#276 passes `y_axis` into
+/// `camera.CameraWith(...)`). Only overrides sub-packages that import core.
+fn unifyGfxSubpackageCore(gfx_mod: *std.Build.Module, core_mod: *std.Build.Module) void {
+    const sub_names = [_][]const u8{ "camera", "spatial_grid", "tilemap" };
+    for (sub_names) |sub_name| {
+        const sub = gfx_mod.import_table.get(sub_name) orelse continue;
+        if (sub.import_table.get("labelle-core") != null) {
+            overrideImport(sub, "labelle-core", core_mod);
+        }
+    }
 }

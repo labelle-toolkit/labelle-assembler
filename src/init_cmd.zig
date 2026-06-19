@@ -177,6 +177,12 @@ pub fn scaffold(allocator: std.mem.Allocator, io: std.Io, opts: InitOptions) !vo
             \\    .height = 600,
             \\    .target_fps = 60,
             \\    .backend = .{s},
+            \\    // Logical Y-axis convention (RFC-Y-AXIS-CONVENTION). `.down` is
+            \\    // the screen-native default for new projects (y=0 at the top,
+            \\    // +Y down); use `.up` for the math-/platformer-natural bottom
+            \\    // origin. This key is REQUIRED — an absent `.y_axis` is a hard
+            \\    // build error during the convention transition.
+            \\    .y_axis = .down,
             \\    .ecs = .{s},
             \\
         , .{ name_z, name_z, opts.backend, opts.ecs });
@@ -354,6 +360,9 @@ test "scaffold writes a project.labelle with the requested fields" {
     try std.testing.expect(std.mem.indexOf(u8, labelle, ".backend = .sokol") != null);
     try std.testing.expect(std.mem.indexOf(u8, labelle, ".ecs = .zflecs") != null);
     try std.testing.expect(std.mem.indexOf(u8, labelle, ".assembler_version = ") != null);
+    // RFC-Y-AXIS-CONVENTION (#370): a scaffolded project pins the explicit
+    // screen-native default so it satisfies the unset-`.y_axis` build guard.
+    try std.testing.expect(std.mem.indexOf(u8, labelle, ".y_axis = .down,") != null);
 }
 
 test "scaffold pins real fetchable framework versions — #159 regression" {

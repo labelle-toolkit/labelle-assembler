@@ -256,7 +256,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_template_phase2,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tiny_lifecycle_phase2,
             &.{},
             &.{},
@@ -328,7 +328,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_template_phase2,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tiny_lifecycle_phase2,
             &.{},
             &.{},
@@ -389,7 +389,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_template_phase2,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tiny_lifecycle_phase2,
             &.{},
             &.{},
@@ -454,7 +454,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_template_phase2,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tiny_lifecycle_phase2,
             &.{},
             &.{},
@@ -508,7 +508,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_template_phase2,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tiny_lifecycle_phase2,
             &.{},
             &.{},
@@ -551,7 +551,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_template_phase2,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tiny_lifecycle_phase2,
             &.{},
             &.{},
@@ -617,7 +617,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_template_phase2,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tiny_lifecycle_phase2,
             &.{},
             &.{},
@@ -685,7 +685,7 @@ pub const PluginFlowNodesAndPinStyles = struct {
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_template_phase2,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tiny_lifecycle_phase2,
             &.{},
             &.{},

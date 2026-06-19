@@ -32,7 +32,7 @@ test {
 
 pub const HIDDEN_WINDOW = struct {
     test "hidden=true generates window hidden flag in raylib" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -44,7 +44,7 @@ pub const HIDDEN_WINDOW = struct {
     }
 
     test "hidden=false does not generate window hidden flag" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -56,7 +56,7 @@ pub const HIDDEN_WINDOW = struct {
     }
 
     test "hidden=true generates window hidden flag in sokol" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -71,7 +71,7 @@ pub const HIDDEN_WINDOW = struct {
 pub const SUBFOLDERS = struct {
     test "subfolder prefabs register by basename + embedFile by full path" {
         const prefabs = &[_][]const u8{ "items/poop", "characters/worker", "player" };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -101,7 +101,7 @@ pub const SUBFOLDERS = struct {
         // this at generate time so the developer renames before
         // shipping.
         const prefabs = &[_][]const u8{ "enemies/goblin", "allies/goblin" };
-        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -116,7 +116,7 @@ pub const SUBFOLDERS = struct {
             .{ .name = "combat", .filename = "combat.zig", .states = playing_states, .sort_order = null, .subdir = "playing", .rel_path = "playing/systems/combat.zig" },
             .{ .name = "camera_control", .filename = "camera_control.zig", .states = &.{}, .sort_order = null, .subdir = null, .rel_path = "camera_control.zig" },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -137,7 +137,7 @@ pub const SUBFOLDERS = struct {
 
     test "component names resolve to a natural PascalCase type name" {
         const components = &[_][]const u8{ "physics/rigid_body", "health" };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -158,7 +158,7 @@ pub const SUBFOLDERS = struct {
 
     test "gizmo names with slashes use underscore identifiers" {
         const gizmos = &[_][]const u8{ "debug/collision", "editor/grid" };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -171,7 +171,7 @@ pub const SUBFOLDERS = struct {
 
     test "view names with slashes use underscore identifiers" {
         const views = &[_][]const u8{ "panels/inventory", "hud" };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,

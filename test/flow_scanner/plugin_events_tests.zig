@@ -248,7 +248,7 @@ pub const PluginEvents = struct {
     test "no plugins, no game events: AllHookPayloads stays the original engine.HookPayload form" {
         const allocator = std.testing.allocator;
 
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -300,7 +300,7 @@ pub const PluginEvents = struct {
         // but here we drive the codegen directly with a pre-built
         // `plugin_events` slice so the test doesn't depend on a real
         // checkout on disk.
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -378,7 +378,7 @@ pub const PluginEvents = struct {
         // A hyphenated name (`labelle-imgui`) is a plausible
         // project.labelle entry; the variant tag `<plugin>__<event>`
         // must collapse `-` to `_` so it parses as a Zig identifier.
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -424,7 +424,7 @@ pub const PluginEvents = struct {
     test "GameEvents widens to fold PluginEvents into the same AllHookPayloads merge" {
         const allocator = std.testing.allocator;
 
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,

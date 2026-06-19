@@ -1370,7 +1370,83 @@ pub fn generateMainZigFromTemplate(
     errdefer output_alloc_writer.deinit();
     try tpl.renderDynamic(engine_template, data, &output_alloc_writer.writer);
     var output_arr_list = output_alloc_writer.toArrayList();
-    return output_arr_list.toOwnedSlice(allocator);
+    errdefer output_arr_list.deinit(allocator);
+    const rendered = try output_arr_list.toOwnedSlice(allocator);
+    defer allocator.free(rendered);
+
+    // ── Thread the project Y-axis onto the generated game config ──
+    // RFC-Y-AXIS-CONVENTION (epic labelle-engine#640), assembler #370.
+    //
+    // The engine `codegen/main.zig.template` still emits the legacy
+    // `engine.GameConfig(...)` call (which delegates to `.down`); we rewrite
+    // that single call site to `engine.GameConfigWithYAxis(..., .up|.down)`
+    // so the convention comes from `project.labelle` rather than the engine
+    // default. `requireYAxis` first enforces the unset-guard — an absent
+    // `.y_axis` is a hard error so no existing game silently flips.
+    const y_axis = try cfg.requireYAxis();
+    return injectYAxis(allocator, rendered, y_axis);
+}
+
+/// Rewrite the generated game's `engine.GameConfig(...)` call into
+/// `engine.GameConfigWithYAxis(..., .up|.down)`, threading the project's
+/// logical Y-axis (RFC-Y-AXIS-CONVENTION / assembler #370) through the engine
+/// v1.60.0 entry point. The engine template emits the legacy `GameConfig`
+/// spelling (which defaults to `.down`); this renames the call and inserts the
+/// trailing `.up,` / `.down,` comptime argument before the call's closing
+/// `);`. Caller owns the returned bytes.
+///
+/// Robust to both the real engine template (last arg `GameEvents,`) and the
+/// trimmed test fixture (last arg `DiscoveredGizmoCategories,`): it anchors on
+/// the `engine.GameConfig(` token and the first `);` line that closes it, not
+/// on any particular argument list.
+fn injectYAxis(
+    allocator: std.mem.Allocator,
+    rendered: []const u8,
+    y_axis: config.YAxis,
+) ![]const u8 {
+    const open = "engine.GameConfig(";
+    const open_at = std.mem.indexOf(u8, rendered, open) orelse {
+        // No `engine.GameConfig(` call in this rendered output — nothing to
+        // rewrite, so hand back an owned copy unchanged. The real engine
+        // template always has the call; this branch covers minimal test
+        // fixtures (and any future engine template that doesn't emit it).
+        // The unset-`.y_axis` guard has already fired in the caller, so an
+        // absent key is still rejected regardless of template shape.
+        return allocator.dupe(u8, rendered);
+    };
+
+    // Find the closing `);` that terminates the call — the first occurrence
+    // after the open paren. The call body is multi-line with one arg per line,
+    // so the close is `\n);`.
+    const search_from = open_at + open.len;
+    const close_rel = std.mem.indexOf(u8, rendered[search_from..], "\n);") orelse {
+        const io = config.globalIo();
+        std.Io.File.stderr().writeStreamingAll(
+            io,
+            "labelle-assembler: could not find the closing `);` of the engine.GameConfig(...) call\n",
+        ) catch {};
+        return error.GameConfigCallNotFound;
+    };
+    const close_at = search_from + close_rel; // index of the '\n' before ");"
+
+    const y_tag = @tagName(y_axis);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    // [0, open_at) — everything before the call
+    try w.writeAll(rendered[0..open_at]);
+    // renamed entry point
+    try w.writeAll("engine.GameConfigWithYAxis(");
+    // [after-open, close_at) — the existing argument lines, verbatim
+    try w.writeAll(rendered[search_from..close_at]);
+    // the new trailing comptime arg, on its own line, then the original `);`
+    try w.print("\n    .{s},", .{y_tag});
+    try w.writeAll(rendered[close_at..]);
+
+    var arr = out.toArrayList();
+    errdefer arr.deinit(allocator);
+    return arr.toOwnedSlice(allocator);
 }
 
 /// Generate the GameLayers enum from project.labelle layer definitions.

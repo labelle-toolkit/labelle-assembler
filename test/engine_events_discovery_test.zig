@@ -83,7 +83,7 @@ test "discoverPluginEvents folds engine.Events under `engine` prefix" {
     defer allocator.free(engine_version);
 
     // Project with no plugins — the engine must still be picked up.
-    const cfg: generator.ProjectConfig = .{
+    const cfg: generator.ProjectConfig = .{ .y_axis = .up,
         .name = "test-game",
         .backend = .raylib,
         .ecs = .mock,
@@ -118,7 +118,7 @@ test "writePluginEventsBlock special-cases `engine` prefix to @import(\"labelle-
     defer alloc_writer.deinit();
     var ctx: generator.main_zig.Codegen = .{
         .allocator = allocator,
-        .cfg = .{ .name = "test-game", .ecs = .mock },
+        .cfg = .{ .name = "test-game", .ecs = .mock, .y_axis = .up },
         .script_entries = &.{},
         .prefab_names = &.{},
         .jsonc_scene_names = &.{},
@@ -179,7 +179,7 @@ test "engine + plugin events merge under their respective prefixes" {
     const plugin_repo = try std.fmt.allocPrint(allocator, "local:{s}", .{plugin_dir_z});
     defer allocator.free(plugin_repo);
 
-    const cfg: generator.ProjectConfig = .{
+    const cfg: generator.ProjectConfig = .{ .y_axis = .up,
         .name = "test-game",
         .backend = .raylib,
         .ecs = .mock,

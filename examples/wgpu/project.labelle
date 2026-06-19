@@ -2,6 +2,7 @@
     .name = "example_wgpu",
     .title = "LaBelle v2 — WebGPU",
     .backend = .wgpu,
+    .y_axis = .up,
     .ecs = .mock,
     .core_version = "local:../../../labelle-core",
     .engine_version = "local:../../../labelle-engine",

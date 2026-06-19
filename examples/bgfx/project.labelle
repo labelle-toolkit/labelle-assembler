@@ -2,6 +2,7 @@
     .name = "example_bgfx",
     .title = "LaBelle v2 — bgfx",
     .backend = .bgfx,
+    .y_axis = .up,
     .ecs = .mock,
     .core_version = "local:../../../labelle-core",
     .engine_version = "local:../../../labelle-engine",

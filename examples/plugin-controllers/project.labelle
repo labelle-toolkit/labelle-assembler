@@ -23,6 +23,7 @@
     // lets the loop exit cleanly after N frames so the deinit defer
     // actually runs (closing the runtime coverage gap PR #73 flagged).
     .backend = .null,
+    .y_axis = .up,
     .ecs = .mock,
     .initial_prefab = "main",
     .states = .{"playing"},

@@ -720,7 +720,7 @@ pub const CustomNodeRegistry = struct {
         };
         var decls = try generator.main_zig.discoverPluginFlowDecls(
             allocator,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             fx.game_dir,
             scripts_root,
             &entries,

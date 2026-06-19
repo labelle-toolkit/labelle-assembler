@@ -50,6 +50,22 @@ pub fn globalEnviron() std.process.Environ {
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 pub const Platform = enum { desktop, ios, android, wasm };
 
+/// Project logical Y-axis convention (RFC-Y-AXIS-CONVENTION, epic
+/// labelle-engine#640). Parsed from `project.labelle`'s `.y_axis` key and
+/// emitted onto the generated game's `engine.GameConfigWithYAxis(..., .up|.down)`
+/// call (mirrors the engine `core.YAxis` enum).
+///
+/// - `.up`: `y = 0` at the BOTTOM, +Y goes up — the math-/platformer-natural
+///   convention every labelle game shipped with before the convention split.
+/// - `.down`: `y = 0` at the TOP, +Y goes down — the screen-native default
+///   the framework moves to.
+///
+/// There is intentionally NO default here in `project.labelle`: an absent
+/// `.y_axis` is a hard error during the transition release (the unset-guard),
+/// so no existing game silently flips when the framework default becomes
+/// `.down`. See `requireYAxis` and RFC §4 / the Migration section.
+pub const YAxis = enum { up, down };
+
 /// Texture container a platform ships atlases in. `.png` (source, CPU-decoded
 /// at load) or `.astc` (GPU-native compressed, zero decode — see #340).
 pub const AssetFormat = enum { png, astc };
@@ -448,6 +464,15 @@ pub const ProjectConfig = struct {
     target_fps: u32 = 60,
     backend: Backend = .raylib,
     platform: Platform = .desktop,
+    /// Logical Y-axis convention (RFC-Y-AXIS-CONVENTION / epic
+    /// labelle-engine#640). Emitted onto the generated game's
+    /// `engine.GameConfigWithYAxis(..., .up|.down)` call. Optional in the
+    /// struct so the assembler can detect an *absent* key and raise the
+    /// transition-release unset-guard (`requireYAxis`) — an unset `.y_axis`
+    /// must be a hard error so no existing game silently flips. Existing
+    /// (y-up) games declare `.y_axis = .up`; new screen-native projects use
+    /// `.y_axis = .down`.
+    y_axis: ?YAxis = null,
     ecs: EcsChoice = .mock,
     /// Desktop gamepad source. `.auto` (default) stages + links + routes the
     /// shared SDL desktop gamepad source for raylib/sokol desktop; `.none`
@@ -555,6 +580,24 @@ pub const ProjectConfig = struct {
     /// Returns true if a GUI plugin is resolved and active.
     pub fn hasGui(self: ProjectConfig) bool {
         return self.resolved_gui != null;
+    }
+
+    /// The unset-`.y_axis` build guard (RFC-Y-AXIS-CONVENTION Migration §,
+    /// epic labelle-engine#640). During the transition release an *absent*
+    /// `.y_axis` is a hard error naming BOTH choices, so no existing game
+    /// silently flips upside-down when the framework default becomes `.down`.
+    /// Returns the parsed convention, or an error after writing the guidance
+    /// to stderr when the key is missing. Call before emitting the game config.
+    pub fn requireYAxis(self: ProjectConfig) error{MissingYAxis}!YAxis {
+        return self.y_axis orelse {
+            const io = globalIo();
+            const msg =
+                "labelle-assembler: project.labelle is missing `.y_axis`: " ++
+                "set `.y_axis = .up` to keep current (bottom-origin) behavior, " ++
+                "or `.y_axis = .down` for the new screen-native default.\n";
+            std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+            return error.MissingYAxis;
+        };
     }
 
     /// Resolves the explicit initial prefab name, honoring the deprecated

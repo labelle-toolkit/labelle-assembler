@@ -68,7 +68,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "buildSetupCode emits setBackend + adapters (raylib)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -79,7 +79,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "buildCallbackInitCode emits setBackend + adapters (sokol)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -95,7 +95,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
     // callback path). We still assert each variant individually so a
     // future split in the lifecycle selection can't silently drop one.
     test "buildSetupCode emits setBackend + adapters (sdl)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
@@ -106,7 +106,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "buildSetupCode emits setBackend + adapters (bgfx)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
             .ecs = .mock,
@@ -117,7 +117,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "buildSetupCode emits setBackend + adapters (wgpu)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .wgpu,
             .ecs = .mock,
@@ -132,7 +132,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
         const manifests = [_]SceneManifest{
             .{ .name = "menu", .assets = &[_][]const u8{} },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -160,7 +160,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
         const manifests = [_]SceneManifest{
             .{ .name = "menu", .assets = &[_][]const u8{} },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -179,7 +179,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "adapters stash the full backend Texture in a slot table (raylib)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -215,7 +215,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "adapter decode marshals engine.DecodedImage from backend DecodedImage" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,

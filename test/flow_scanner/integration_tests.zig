@@ -268,7 +268,7 @@ pub const AllScriptsIntegration = struct {
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_engine_template,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tiny_lifecycle,
             entries,
             empty_names, // prefab_names
@@ -323,7 +323,7 @@ pub const AllScriptsIntegration = struct {
         const main_zig = try generator.generateMainZigFromTemplate(
             allocator,
             tiny_engine_template,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tiny_lifecycle,
             entries,
             empty_names, // prefab_names
@@ -365,7 +365,7 @@ pub const GameModuleBinding = struct {
     test "generateBuildZig declares a game_mod from a local game.zig and wires it into the exe imports" {
         const allocator = std.testing.allocator;
 
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
