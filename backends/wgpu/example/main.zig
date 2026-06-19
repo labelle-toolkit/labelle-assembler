@@ -361,9 +361,9 @@ fn renderWorld() void {
 
     // --- Decorative triangle ---
     gfx.drawTriangle(
-        100, 150,
-        140, 200,
-        60, 200,
+        .{ .x = 100, .y = 150 },
+        .{ .x = 140, .y = 200 },
+        .{ .x = 60, .y = 200 },
         gfx.color(255, 200, 50, 200),
     );
 
@@ -472,12 +472,9 @@ fn drawVelocityArrow(cx: f32, cy: f32, vx: f32, vy: f32, col: gfx.Color) void {
         const px = -ny * arrow_size; // perpendicular
         const py = nx * arrow_size;
         gfx.drawTriangle(
-            end_x,
-            end_y,
-            end_x - nx * arrow_size + px,
-            end_y - ny * arrow_size + py,
-            end_x - nx * arrow_size - px,
-            end_y - ny * arrow_size - py,
+            .{ .x = end_x, .y = end_y },
+            .{ .x = end_x - nx * arrow_size + px, .y = end_y - ny * arrow_size + py },
+            .{ .x = end_x - nx * arrow_size - px, .y = end_y - ny * arrow_size - py },
             col,
         );
     }
