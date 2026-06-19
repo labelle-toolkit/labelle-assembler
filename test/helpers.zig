@@ -29,9 +29,11 @@ pub const engine_template =
     \\{{game_layers_block}}
     \\{{resource_registry_block}}const AllHookPayloads = engine.HookPayload(EcsBackend.Entity);
     \\
-    \\{{game_hooks_block}}const Renderer = gfx.GfxRenderer(BackendGfx, GameLayers, EcsBackend.Entity);
+    \\{{game_hooks_block}}// Project Y-axis convention (engine#642) — single source of truth.
+    \\const project_y_axis: engine.core.YAxis = .up;
+    \\const Renderer = gfx.GfxRendererWith(BackendGfx, GameLayers, EcsBackend.Entity, project_y_axis);
     \\
-    \\const AssembledGame = engine.GameConfig(
+    \\const AssembledGame = engine.GameConfigWithYAxis(
     \\    Renderer,
     \\    EcsBackend,
     \\    BackendInput,
@@ -41,6 +43,7 @@ pub const engine_template =
     \\    LogSink,
     \\    Components,
     \\    DiscoveredGizmoCategories,
+    \\    project_y_axis,
     \\);
     \\{{prefab_registry_block}}{{component_registry_block}}{{system_registry_block}}{{all_scripts_block}}const Scripts = engine.ScriptRegistry(AllScripts);
     \\

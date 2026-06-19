@@ -308,7 +308,7 @@ pub const MAIN_ZIG = struct {
 
     // ── RFC-Y-AXIS-CONVENTION (#370) ────────────────────────────────────
 
-    test "y_axis = .up emits GameConfigWithYAxis(..., .up)" {
+    test "y_axis = .up overrides the project_y_axis const to .up" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
             .backend = .raylib,
@@ -317,15 +317,15 @@ pub const MAIN_ZIG = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
         defer std.testing.allocator.free(main_zig);
 
-        // The legacy `engine.GameConfig(` spelling is rewritten to the
-        // y-axis-aware entry point...
+        // The engine template's single `project_y_axis` const is overridden to
+        // the project's choice; it feeds both `GfxRendererWith` and the
+        // y-axis-aware `GameConfigWithYAxis` (so output flip + input picking agree).
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.GameConfigWithYAxis(") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.GameConfig(") == null);
-        // ...and the trailing comptime arg carries the project's choice.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "    .up,\n);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const project_y_axis: engine.core.YAxis = .up;") != null);
     }
 
-    test "y_axis = .down emits GameConfigWithYAxis(..., .down)" {
+    test "y_axis = .down overrides the project_y_axis const to .down" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .name = "test-game",
             .backend = .raylib,
@@ -334,8 +334,10 @@ pub const MAIN_ZIG = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
         defer std.testing.allocator.free(main_zig);
 
+        // The const is flipped to .down — and the .up default is gone.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.GameConfigWithYAxis(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "    .down,\n);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const project_y_axis: engine.core.YAxis = .down;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const project_y_axis: engine.core.YAxis = .up;") == null);
     }
 
     test "absent y_axis triggers the unset-guard hard error" {
