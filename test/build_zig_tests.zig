@@ -192,6 +192,28 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(engine_mod, \"labelle-gfx\", gfx_mod)") != null);
     }
 
+    test "unifies labelle-core onto gfx's sub-packages (camera/spatial_grid/tilemap) — gfx#276 diamond" {
+        // gfx#276 threads the project `y_axis` (a core.YAxis) from the gfx
+        // renderer into `camera.CameraWith(...)`. The camera/spatial_grid/
+        // tilemap sub-packages pin their OWN labelle-core, so without unifying
+        // them onto `core_mod` the two `core.YAxis` enums don't match and the
+        // example fails to compile ("expected 'YAxis', found 'YAxis'").
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        // The helper is defined and invoked from the deps section.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "fn unifyGfxSubpackageCore(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "unifyGfxSubpackageCore(gfx_mod, core_mod);") != null);
+        // It targets each of gfx's sub-packages by name.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"camera\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"spatial_grid\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"tilemap\"") != null);
+    }
+
     test "unifies labelle-core onto the raylib backend input module" {
         // The raylib `input` module imports labelle-core (for GamepadEvent),
         // so it must be forced onto the project core to avoid a second core
