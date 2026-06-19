@@ -59,6 +59,10 @@ pub fn drawRectangleRec(rec: Rectangle, tint: Color) void {
     _ = .{ rec, tint };
 }
 
+pub fn drawTriangle(v1: Vector2, v2: Vector2, v3: Vector2, tint: Color) void {
+    _ = .{ v1, v2, v3, tint };
+}
+
 pub fn drawCircle(center_x: f32, center_y: f32, radius: f32, tint: Color) void {
     _ = .{ center_x, center_y, radius, tint };
 }

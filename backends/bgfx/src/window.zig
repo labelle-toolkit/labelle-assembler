@@ -180,6 +180,15 @@ fn initWindowDesktop(width: i32, height: i32, title: [:0]const u8) void {
     // Tell GLFW not to create an OpenGL context — bgfx manages its own
     glfw.windowHint(.client_api, .no_api);
 
+    // Headless / `--headless` runs (set via `setConfigFlags`) create the
+    // GLFW window UNMAPPED. bgfx still needs a real native surface to init
+    // its swapchain and to read the backbuffer back for `--screenshot`, so
+    // true surfaceless rendering isn't viable cross-platform here; an
+    // invisible window gives the same "no window pops up" CI behaviour while
+    // keeping the render + readback path intact. The matching
+    // exit-after-N-ticks loop lives in `templates/desktop.txt`.
+    if (window_hidden) glfw.windowHint(.visible, false);
+
     glfw_window = glfw.createWindow(
         @intCast(width),
         @intCast(height),
@@ -290,6 +299,50 @@ pub fn requestQuit() void {
 
 pub fn setTargetFPS(fps: i32) void {
     target_fps_val = fps;
+}
+
+// ── `labelle run` automation knobs (assembler#361) ─────────────────────
+// The CLI surfaces `--headless` / `--uncapped` / `--ticks=N` as the env
+// vars below (set by labelle-cli; `--uncapped` and `--ticks` both imply
+// `--headless`). The generated desktop loop reads these via the helpers
+// here to: run the GLFW window unmapped (headless — see `initWindowDesktop`),
+// disable vsync so the loop runs flat-out (uncapped), and break after N
+// frames (ticks). Mirrors the sokol backend's `runHeadless` knobs, except
+// bgfx keeps the real GLFW/bgfx loop (it needs a native surface to render +
+// read the backbuffer for `--screenshot`), so "headless" here means an
+// invisible window rather than a truly windowless run. libc `getenv` keeps
+// the helpers self-contained (Zig 0.16 dropped `std.posix.getenv`); on
+// Android these env vars are never set, so all three fold to their defaults.
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+fn envTruthy(name: [*:0]const u8) bool {
+    if (is_android) return false;
+    if (getenv(name)) |raw| return std.mem.span(raw).len > 0;
+    return false;
+}
+
+/// True when `labelle run --headless` (or `--uncapped`/`--ticks`, which
+/// imply it) was passed. The desktop loop uses this to create the window
+/// hidden via `setConfigFlags`.
+pub fn isHeadless() bool {
+    return envTruthy("LABELLE_HEADLESS");
+}
+
+/// True when `--uncapped` was passed (only honoured under `--headless`).
+/// The desktop loop turns vsync off so the loop is not display-paced.
+pub fn isUncapped() bool {
+    return isHeadless() and envTruthy("LABELLE_HEADLESS_UNCAPPED");
+}
+
+/// Frame count after which the desktop loop should exit cleanly, or 0 for
+/// "run until closed" (the default / non-headless case). Parsed from
+/// `LABELLE_HEADLESS_TICKS`; a malformed value degrades to 0 (run forever)
+/// rather than crashing the game.
+pub fn headlessTicks() u64 {
+    if (!isHeadless()) return 0;
+    if (is_android) return 0;
+    const raw = getenv("LABELLE_HEADLESS_TICKS") orelse return 0;
+    return std.fmt.parseInt(u64, std.mem.span(raw), 10) catch 0;
 }
 
 // ── Frame timing ───────────────────────────────────────────────────────
