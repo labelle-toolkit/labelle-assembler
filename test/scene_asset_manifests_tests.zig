@@ -37,7 +37,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .{ .name = "menu", .assets = &[_][]const u8{"background"} },
             .{ .name = "gameplay", .assets = &[_][]const u8{ "ship", "rooms" } },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -60,7 +60,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
         const manifests = [_]SceneManifest{
             .{ .name = "menu", .assets = &[_][]const u8{} },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -75,7 +75,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
         const manifests = [_]SceneManifest{
             .{ .name = "world/intro", .assets = &[_][]const u8{"background"} },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -89,7 +89,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
     }
 
     test "no scenes emits no SceneAssetManifests struct" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -104,7 +104,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
         const manifests = [_]SceneManifest{
             .{ .name = "menu", .assets = &[_][]const u8{ "path\\asset", "say\"hi" } },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -121,7 +121,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
             .{ .name = "menu", .assets = &[_][]const u8{"background"} },
             .{ .name = "gameplay", .assets = &[_][]const u8{ "ship", "rooms" } },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -140,7 +140,7 @@ pub const SCENE_ASSET_MANIFESTS = struct {
         const manifests = [_]SceneManifest{
             .{ .name = "menu", .assets = &[_][]const u8{"background"} },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,

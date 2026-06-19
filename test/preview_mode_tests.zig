@@ -95,7 +95,7 @@ pub const PREVIEW_MODE = struct {
     }
     test "loop backend emits argv parse + Preview lifecycle + heartbeat — original" {
         if (true) return error.SkipZigTest;
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -158,7 +158,7 @@ pub const PREVIEW_MODE = struct {
     }
     test "sokol callback backend emits module-level Preview + init/frame/cleanup wiring — original" {
         if (true) return error.SkipZigTest;
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -248,7 +248,7 @@ pub const PREVIEW_MODE = struct {
     ;
 
     test "raylib desktop emits PBO readback + publishFrame between render and endDrawing" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -313,7 +313,7 @@ pub const PREVIEW_MODE = struct {
         // link or compile against the wrong driver. The conditional on
         // `cfg.backend == .raylib` in `main_zig.zig` is what keeps the
         // readback block out of sdl/bgfx/wgpu — this asserts that.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
@@ -342,7 +342,7 @@ pub const PREVIEW_MODE = struct {
     // branch is exercised when the generated game is compiled for a
     // specific OS, not here.
     test "raylib desktop emits both SHM and IOSurface preview lifecycle calls" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -413,7 +413,7 @@ pub const PREVIEW_MODE = struct {
     ;
 
     test "sokol desktop emits PBO readback + publishFrame between flushScene and endFrame" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -508,7 +508,7 @@ pub const PREVIEW_MODE = struct {
         //     three lifecycle hooks
         // The GL slice (#124) is unchanged — sokol-Linux still has its
         // inline PBO template emitted here.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -566,7 +566,7 @@ pub const PREVIEW_MODE = struct {
         // driven from inside `window.preview_mtl.beginFrame()` and
         // cleared by `window.preview_mtl.endFrame()`. The codegen
         // template just calls these around `g.render()`.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -615,7 +615,7 @@ pub const PREVIEW_MODE = struct {
         // The sokol path is covered separately by the dedicated sokol
         // tests above.
         for ([_]generate.Backend{.sdl}) |backend| {
-            const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
                 .name = "test-game",
                 .backend = backend,
                 .ecs = .mock,
@@ -637,7 +637,7 @@ pub const PREVIEW_MODE = struct {
         // is untouched. After #140 migration, both backends use the
         // backend-module seam; raylib's bridges + lifecycle hooks
         // appear in main_zig, sokol-specific names must NOT leak.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -669,7 +669,7 @@ pub const PREVIEW_MODE = struct {
         // `_sokol_preview_d3d11_enabled` (`builtin.os.tag == .windows`).
         // Both blocks ship side by side; their gates are mutually
         // exclusive so only one runs per target.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -792,7 +792,7 @@ pub const PREVIEW_MODE = struct {
         // pixel publish (their tickets are separate slices). And
         // wasm-raylib (callback branch but `cfg.backend != .sokol`)
         // also must stay unchanged. This guards both.
-        const main_zig_sdl = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig_sdl = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
@@ -839,7 +839,7 @@ pub const PREVIEW_MODE = struct {
     //      separate window-in-window surface; its `LABELLE_PREVIEW`
     //      block must not reference `window.hideWindow`.
     test "sokol callback emits window.hideWindow inside preview-connect arm (#137)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -927,7 +927,7 @@ pub const PREVIEW_MODE = struct {
             };
             defer std.testing.allocator.free(tmpl);
 
-            const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
                 .name = "test-game",
                 .backend = case.backend,
                 .ecs = .mock,
@@ -956,7 +956,7 @@ pub const PREVIEW_MODE = struct {
         // doesn't exist on the raylib backend's window module. Any
         // leak of the symbol into a non-sokol template would be a
         // hard link error.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,

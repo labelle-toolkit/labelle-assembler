@@ -33,7 +33,7 @@ test {
 pub const SCRIPTS = struct {
     test "generates AllScripts struct for global scripts" {
         const entries = globalEntries(&.{ "movement", "spawn", "gui" });
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -52,7 +52,7 @@ pub const SCRIPTS = struct {
             .{ .name = "movement", .filename = "movement.zig", .states = &.{}, .sort_order = null, .subdir = null, .rel_path = "movement.zig" },
             .{ .name = "pathfinder", .filename = "01_pathfinder.zig", .states = playing_states, .sort_order = 1, .subdir = "playing", .rel_path = "playing/01_pathfinder.zig" },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -74,7 +74,7 @@ pub const SCRIPTS = struct {
         const entries: []const ScriptEntry = &.{
             .{ .name = "camera", .filename = "camera.zig", .states = both_states, .sort_order = null, .subdir = "playing+paused", .rel_path = "playing+paused/camera.zig" },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -89,7 +89,7 @@ pub const SCRIPTS = struct {
 
     test "uses ScriptRunner for dispatch" {
         const entries = globalEntries(&.{ "movement", "spawn" });
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -105,7 +105,7 @@ pub const SCRIPTS = struct {
 
     test "detects context.zig for GameContext" {
         const entries = globalEntries(&.{ "context", "movement" });
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -118,7 +118,7 @@ pub const SCRIPTS = struct {
 
     test "uses empty struct when no context.zig" {
         const entries = globalEntries(&.{"movement"});
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -132,7 +132,7 @@ pub const SCRIPTS = struct {
 pub const PREFABS_AND_SCENES = struct {
     test "embeds prefabs via addEmbeddedPrefab" {
         const prefabs = &[_][]const u8{ "enemy", "player" };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -152,7 +152,7 @@ pub const PREFABS_AND_SCENES = struct {
 pub const VIEWS = struct {
     test "generates ViewRegistry from scanned views" {
         const views = &[_][]const u8{ "hud", "inventory" };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -166,7 +166,7 @@ pub const VIEWS = struct {
 
     test "auto-renders views in GUI section" {
         const views = &[_][]const u8{"hud"};
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -180,7 +180,7 @@ pub const VIEWS = struct {
     }
 
     test "uses EmptyViewRegistry when no views" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -193,7 +193,7 @@ pub const VIEWS = struct {
 
 pub const LAYERS = struct {
     test "generates GameLayers from project config" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,

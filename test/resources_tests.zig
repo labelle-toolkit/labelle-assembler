@@ -38,7 +38,7 @@ pub const RESOURCES = struct {
         // resolve null → lazy and the emitted call site would be
         // `registerAtlasFromMemory`. That separate default-flip
         // behavior is covered by the LAZY_DEFAULTS test block below.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -59,7 +59,7 @@ pub const RESOURCES = struct {
     }
 
     test "omits atlas loading when no resources" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -70,7 +70,7 @@ pub const RESOURCES = struct {
     }
 
     test "explicit lazy=true emits registerAtlasFromMemory" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -92,7 +92,7 @@ pub const RESOURCES = struct {
         // `lazy = null` that isn't referenced by any scene stays eager
         // so legacy projects keep decoding their atlases at startup.
         // Picking `lazy` here would silently break unmigrated projects.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -109,7 +109,7 @@ pub const RESOURCES = struct {
 
 pub const RESOURCE_EMISSION = struct {
     test "atlas emission stays on the legacy loadAtlasFromMemory path" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -125,7 +125,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "sound resource emits loadSoundFromMemory with extension-derived file_type" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -141,7 +141,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "lazy sound resource emits registerSoundFromMemory" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -159,7 +159,7 @@ pub const RESOURCE_EMISSION = struct {
         const ranges = [_]generate.CodepointRange{
             .{ .first = 0x20, .last = 0x7F },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -188,7 +188,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "font resource without explicit font_params uses defaults" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -207,7 +207,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "mixed resources emit one call per kind, in declared order" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -230,7 +230,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "validation rejects sound resource with unsupported extension" {
-        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -242,7 +242,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "validation rejects font resource with unsupported extension" {
-        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -254,7 +254,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "validation rejects no-path resource" {
-        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -266,7 +266,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "validation rejects atlas-incomplete resource" {
-        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -278,7 +278,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "validation rejects multiple-path resource" {
-        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -296,7 +296,7 @@ pub const RESOURCE_EMISSION = struct {
         // name like "ui-font" would generate `const ui-font_ranges = ...`
         // which is uncompilable. Validation rejects up front with a
         // clean diagnostic naming the bad resource.
-        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -308,7 +308,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "validation rejects font resource name starting with digit" {
-        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -320,7 +320,7 @@ pub const RESOURCE_EMISSION = struct {
     }
 
     test "validation rejects font resource name with dot" {
-        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -336,7 +336,7 @@ pub const RESOURCE_EMISSION = struct {
         // atlas and sound names only appear inside string literals
         // in the emitted code, so they accept any name. This guard
         // ensures we don't over-restrict.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -354,7 +354,7 @@ pub const RESOURCE_EMISSION = struct {
 
 pub const GATED_ADAPTER_WIRING = struct {
     test "no audio/font resources → only image adapter wiring emitted (raylib setup path)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -370,7 +370,7 @@ pub const GATED_ADAPTER_WIRING = struct {
     }
 
     test "sound resource → audio adapter wiring emitted (raylib setup path)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -387,7 +387,7 @@ pub const GATED_ADAPTER_WIRING = struct {
     }
 
     test "font resource → font adapter wiring emitted (raylib setup path)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -404,7 +404,7 @@ pub const GATED_ADAPTER_WIRING = struct {
     }
 
     test "mixed resources → both audio and font adapters emitted" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -435,7 +435,7 @@ pub const GATED_ADAPTER_WIRING = struct {
     test "sokol callback path also gates audio/font adapters" {
         // Sokol/wasm uses buildCallbackInitCode rather than
         // buildSetupCode — the gating must hold there too.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -450,7 +450,7 @@ pub const GATED_ADAPTER_WIRING = struct {
     }
 
     test "sokol callback path: font-only project gets font adapter, not audio" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,

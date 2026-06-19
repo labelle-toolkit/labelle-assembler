@@ -34,7 +34,7 @@ test {
 
 pub const MAIN_ZIG = struct {
     test "uses MockEcsBackend for mock ecs" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -46,7 +46,7 @@ pub const MAIN_ZIG = struct {
     }
 
     test "uses EcsAdapter for real ecs" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .zflecs,
@@ -58,7 +58,7 @@ pub const MAIN_ZIG = struct {
     }
 
     test "contains window dimensions" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .title = "My Game",
             .width = 1024,
@@ -76,7 +76,7 @@ pub const MAIN_ZIG = struct {
     }
 
     test "no gui uses StubGui" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -88,7 +88,7 @@ pub const MAIN_ZIG = struct {
     }
 
     test "resolved_gui wires gui_backend in main.zig" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -100,7 +100,7 @@ pub const MAIN_ZIG = struct {
     }
 
     test "resolved_gui with lifecycle generates init/shutdown" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -112,7 +112,7 @@ pub const MAIN_ZIG = struct {
     }
 
     test "resolved_gui render_interface omits init/shutdown" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -147,7 +147,7 @@ pub const MAIN_ZIG = struct {
     }
 
     test "sets renderer screen height" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .height = 768,
             .backend = .raylib,
@@ -160,7 +160,7 @@ pub const MAIN_ZIG = struct {
     }
 
     test "sdl generates loop-based main" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
@@ -172,7 +172,7 @@ pub const MAIN_ZIG = struct {
     }
 
     test "bgfx android generates callback-driven main owning android_main" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
             .platform = .android,
@@ -202,7 +202,7 @@ pub const MAIN_ZIG = struct {
         // codegen registers the engine's UI-thread hide with the shell, which
         // chains onWindowFocusChanged (a UI-thread callback). Assert the
         // registration lands in `android_main`, before `run`.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
             .platform = .android,
@@ -231,7 +231,7 @@ pub const MAIN_ZIG = struct {
         // Without the opt-in, no immersive call of any kind: the shell still
         // chains onWindowFocusChanged but with no callback registered it just
         // forwards, so applyImmersiveUiThread is never referenced.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
             .platform = .android,
@@ -244,7 +244,7 @@ pub const MAIN_ZIG = struct {
     }
 
     test "sokol android registers the core Android backend seam before immersive (labelle-core#310)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .platform = .android,
@@ -279,7 +279,7 @@ pub const MAIN_ZIG = struct {
         // Gamepad detection needs the context regardless of immersive mode, so
         // the registration is emitted on every sokol-Android build; only the
         // immersive call is gated on `.android.immersive_mode`.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .platform = .android,
@@ -295,7 +295,7 @@ pub const MAIN_ZIG = struct {
     test "non-android sokol does NOT emit the Android backend registration" {
         // Desktop sokol must not reference the Android seam — the registration
         // is gated to sokol + Android in `buildImmersiveEntryCode`.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -305,11 +305,56 @@ pub const MAIN_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerAndroidBackend") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "enableImmersiveMode") == null);
     }
+
+    // ── RFC-Y-AXIS-CONVENTION (#370) ────────────────────────────────────
+
+    test "y_axis = .up emits GameConfigWithYAxis(..., .up)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .y_axis = .up,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // The legacy `engine.GameConfig(` spelling is rewritten to the
+        // y-axis-aware entry point...
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.GameConfigWithYAxis(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.GameConfig(") == null);
+        // ...and the trailing comptime arg carries the project's choice.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "    .up,\n);") != null);
+    }
+
+    test "y_axis = .down emits GameConfigWithYAxis(..., .down)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .y_axis = .down,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.GameConfigWithYAxis(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "    .down,\n);") != null);
+    }
+
+    test "absent y_axis triggers the unset-guard hard error" {
+        // The safety net (RFC Migration): an unset `.y_axis` is rejected so
+        // no existing game silently flips when the framework default flips to
+        // `.down`. The error is surfaced as `error.MissingYAxis`.
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            // .y_axis intentionally omitted
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        try std.testing.expectError(error.MissingYAxis, result);
+    }
 };
 
 pub const NULL_BACKEND = struct {
     test "null backend generates headless main with no sokol_app.run" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .null,
             .ecs = .mock,
@@ -328,7 +373,7 @@ pub const NULL_BACKEND = struct {
     }
 
     test "null backend wires LABELLE_PREVIEW env-var (control plane works)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .null,
             .ecs = .mock,
@@ -346,7 +391,7 @@ pub const NULL_BACKEND = struct {
     }
 
     test "null backend does NOT emit PREVIEW_READBACK_* blocks" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .null,
             .ecs = .mock,
@@ -368,7 +413,7 @@ pub const NULL_BACKEND = struct {
         // Regression-lock: the headless main pattern must NOT appear in
         // raylib's or sokol's generated output, and each backend's
         // existing rendering wiring stays intact.
-        const raylib_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const raylib_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -381,7 +426,7 @@ pub const NULL_BACKEND = struct {
         // Rendering path intact.
         try std.testing.expect(std.mem.indexOf(u8, raylib_main, "g.render()") != null);
 
-        const sokol_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const sokol_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -402,7 +447,7 @@ pub const PLUGIN_CONTROLLERS = struct {
     };
 
     test "plugins present emits PluginControllers scaffold with @hasDecl discovery" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -428,7 +473,7 @@ pub const PLUGIN_CONTROLLERS = struct {
     }
 
     test "plugins present wires controllers into setup_code (loop backend)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -441,7 +486,7 @@ pub const PLUGIN_CONTROLLERS = struct {
     }
 
     test "plugins present wires controllers into init/cleanup (sokol callback backend)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -456,7 +501,7 @@ pub const PLUGIN_CONTROLLERS = struct {
     }
 
     test "no plugins omits all controller scaffolding (backward-compat)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -487,7 +532,7 @@ pub const PLUGIN_CONTROLLERS = struct {
         };
         const entries: []const generate.script_scanner.ScriptScanner.ScriptEntry = &.{plugin_script_entry};
 
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -510,7 +555,7 @@ pub const PLUGIN_CONTROLLERS = struct {
         // controller setup/deinit AND (later, step 3) the plugin-script block
         // order. This test pins the first invariant so a refactor can't silently
         // swap plugins around.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -530,7 +575,7 @@ pub const PLUGIN_CONTROLLERS = struct {
 
 pub const SOKOL = struct {
     test "sets renderer screen height" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .height = 600,
             .backend = .sokol,
@@ -542,7 +587,7 @@ pub const SOKOL = struct {
     }
 
     test "generates callback-style main" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -555,7 +600,7 @@ pub const SOKOL = struct {
     }
 
     test "uses module-level runner var" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -569,7 +614,7 @@ pub const SOKOL = struct {
 
     test "initial_prefab overrides default jsonc_scene_names[0]" {
         const jsonc_scenes = &[_][]const u8{ "intro", "main_menu", "gameplay" };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -583,7 +628,7 @@ pub const SOKOL = struct {
 
     test "initial_scene legacy alias still overrides default jsonc_scene_names[0]" {
         const jsonc_scenes = &[_][]const u8{ "intro", "main_menu", "gameplay" };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -621,7 +666,7 @@ pub const SOKOL = struct {
     }
 
     test "resolved_gui with lifecycle generates init in callback and shutdown in cleanup" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -641,7 +686,7 @@ pub const SOKOL = struct {
     // For wasm, the inner declaration must be omitted (allocator is
     // already in scope from the module-level `{{allocator_decl}}`).
     test "wasm: no duplicate const allocator declaration in main.zig" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .platform = .wasm,
@@ -665,7 +710,7 @@ pub const SOKOL = struct {
     // `initInner` can refer to `allocator` (the module scope only has
     // `var gpa = ...`, not `const allocator = ...`).
     test "desktop: initInner declares allocator from gpa" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .platform = .desktop,
@@ -681,7 +726,7 @@ pub const SOKOL = struct {
 pub const EMBED_SCENES = struct {
     test "scenes are always embedded via @embedFile" {
         const jsonc_scenes = &[_][]const u8{ "intro", "gameplay" };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -720,7 +765,7 @@ pub const GAME_EVENT_VARIANT_NAMES = struct {
 
     test "preserves underscores in event-file basename as variant name" {
         const event_names = &[_][]const u8{"anim_transition"};
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, events_test_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, events_test_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -739,7 +784,7 @@ pub const GAME_EVENT_VARIANT_NAMES = struct {
 
     test "multi-underscore basenames pass through verbatim" {
         const event_names = &[_][]const u8{ "worker_eat_start", "fight_started" };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, events_test_template, .{
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, events_test_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,

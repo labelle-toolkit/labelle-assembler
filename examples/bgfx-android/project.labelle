@@ -21,6 +21,7 @@
     .height = 600,
     .target_fps = 60,
     .backend = .bgfx,
+    .y_axis = .up,
     .ecs = .mock,
     .initial_prefab = "main",
     .states = .{"playing"},

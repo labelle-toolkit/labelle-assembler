@@ -240,7 +240,7 @@ const PluginCoercion = generator.main_zig.PluginCoercion;
 fn coercionsCtx(allocator: std.mem.Allocator, coercions: []const PluginCoercion) generator.main_zig.Codegen {
     return .{
         .allocator = allocator,
-        .cfg = .{ .name = "test-game", .ecs = .mock },
+        .cfg = .{ .name = "test-game", .ecs = .mock, .y_axis = .up },
         .script_entries = &.{},
         .prefab_names = &.{},
         .jsonc_scene_names = &.{},
@@ -321,7 +321,7 @@ pub const PluginCoercionsDiscovery = struct {
 
         const repo = try std.fmt.allocPrint(allocator, "local:{s}", .{plugin_dir});
         defer allocator.free(repo);
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,

@@ -311,7 +311,7 @@ pub const FlowDeclsDiscovery = struct {
         // just wrote. Same shape `discoverPluginEvents` tolerates.
         const repo = try std.fmt.allocPrint(allocator, "local:{s}", .{plugin_dir});
         defer allocator.free(repo);
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -393,7 +393,7 @@ pub const FlowDeclsDiscovery = struct {
 
         var decls = try generator.main_zig.discoverPluginFlowDecls(
             allocator,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tmp_path,
             scripts_root,
             &entries,
@@ -461,7 +461,7 @@ pub const FlowDeclsDiscovery = struct {
 
         const repo = try std.fmt.allocPrint(allocator, "local:{s}", .{plugin_dir});
         defer allocator.free(repo);
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -511,7 +511,7 @@ pub const FlowDeclsDiscovery = struct {
         // every pre-RFC project hits unchanged.
         var decls = try generator.main_zig.discoverPluginFlowDecls(
             allocator,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             "/nonexistent/project",
             "/nonexistent/scripts",
             &.{},
@@ -562,7 +562,7 @@ pub const FlowDeclsDiscovery = struct {
 
         const repo = try std.fmt.allocPrint(allocator, "local:{s}", .{plugin_dir});
         defer allocator.free(repo);
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -620,7 +620,7 @@ pub const FlowDeclsDiscovery = struct {
         defer aw.deinit();
         var ctx: generator.main_zig.Codegen = .{
             .allocator = allocator,
-            .cfg = .{ .name = "test-game", .ecs = .mock },
+            .cfg = .{ .name = "test-game", .ecs = .mock, .y_axis = .up },
             .script_entries = &.{},
             .prefab_names = &.{},
             .jsonc_scene_names = &.{},
@@ -706,7 +706,7 @@ pub const FlowDeclsDiscovery = struct {
 
         var decls = try generator.main_zig.discoverPluginFlowDecls(
             allocator,
-            .{ .name = "test-game", .backend = .raylib, .ecs = .mock },
+            .{ .name = "test-game", .backend = .raylib, .ecs = .mock, .y_axis = .up },
             tmp_path,
             scripts_root,
             &entries,

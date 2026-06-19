@@ -277,7 +277,7 @@ pub const FlowHandlerWiring = struct {
             },
         };
 
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -367,7 +367,7 @@ pub const FlowHandlerWiring = struct {
             .{ .name = "apple", .filename = "apple.zig", .states = &.{}, .sort_order = null, .subdir = null, .rel_path = "flows/apple.zig", .has_event_handler = true },
         };
 
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -467,7 +467,7 @@ pub const FlowHandlerWiring = struct {
             },
         };
 
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -548,7 +548,7 @@ pub const FlowHandlerWiring = struct {
             },
         };
 
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -605,7 +605,7 @@ pub const FlowHandlerWiring = struct {
             },
         };
 
-        const cfg: generator.ProjectConfig = .{
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,

@@ -293,7 +293,7 @@ pub fn testGuiRenderInterface(name: []const u8) generate.ResolvedGui {
 pub fn emptyCodegen(allocator: std.mem.Allocator) generate.main_zig.Codegen {
     return .{
         .allocator = allocator,
-        .cfg = .{ .name = "test-game", .ecs = .mock },
+        .cfg = .{ .name = "test-game", .ecs = .mock, .y_axis = .up },
         .script_entries = &.{},
         .prefab_names = &.{},
         .jsonc_scene_names = &.{},

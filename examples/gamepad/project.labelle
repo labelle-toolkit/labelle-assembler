@@ -21,6 +21,7 @@
     .height = 640,
     .target_fps = 60,
     .backend = .raylib,
+    .y_axis = .up,
     .ecs = .mock,
     .initial_prefab = "main",
     .states = .{"playing"},

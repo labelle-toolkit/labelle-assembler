@@ -17,6 +17,7 @@
     // frame count and exits cleanly. Cross-platform — null has no
     // platform-specific deps.
     .backend = .null,
+    .y_axis = .up,
     .ecs = .mock,
     .initial_prefab = "main",
     .states = .{"playing"},
