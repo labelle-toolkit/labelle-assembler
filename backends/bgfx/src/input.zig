@@ -247,8 +247,7 @@ pub fn newFrame() void {
         // the one-frame `mouse_pressed`/`mouse_released` arrays the engine's
         // `isMouseButtonPressed`/`Released` read. Without this they were always
         // false on desktop; only live-poll `isMouseButtonDown` worked.
-        var b: u32 = 0;
-        while (b < MAX_MOUSE_BUTTONS) : (b += 1) {
+        for (0..MAX_MOUSE_BUTTONS) |b| {
             const cur = win.getMouseButton(@enumFromInt(b)) == .press;
             if (cur and !mouse_down[b]) mouse_pressed[b] = true;
             if (!cur and mouse_down[b]) mouse_released[b] = true;
