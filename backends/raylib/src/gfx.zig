@@ -110,7 +110,18 @@ pub fn drawLine(start_x: f32, start_y: f32, end_x: f32, end_y: f32, thickness: f
 /// `drawTriangleFan` would be needed for arbitrary winding, but the
 /// retained-engine geometry is authored CCW so the direct call is fine.
 pub fn drawTriangle(v1: Vector2, v2: Vector2, v3: Vector2, tint: Color) void {
-    rl.drawTriangle(v1.toRl(), v2.toRl(), v3.toRl(), tint.toRl());
+    // raylib's DrawTriangle only fills vertices wound counter-clockwise in its
+    // y-down screen space (signed cross < 0); a clockwise winding (cross > 0)
+    // renders nothing. sokol/wgpu are winding-agnostic, so normalize here by
+    // swapping v2/v3 when the input is clockwise — making the primitive
+    // backend-consistent regardless of caller winding (e.g. the wgpu example's
+    // decorative triangle + velocity arrowheads).
+    const cross = (v2.x - v1.x) * (v3.y - v1.y) - (v2.y - v1.y) * (v3.x - v1.x);
+    if (cross > 0) {
+        rl.drawTriangle(v1.toRl(), v3.toRl(), v2.toRl(), tint.toRl());
+    } else {
+        rl.drawTriangle(v1.toRl(), v2.toRl(), v3.toRl(), tint.toRl());
+    }
 }
 
 pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void {
