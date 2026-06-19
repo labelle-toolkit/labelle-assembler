@@ -32,6 +32,32 @@ fn inProjectLibDir(plugin: config.PluginDep) ?[]const u8 {
     return path;
 }
 
+/// Sanitize a project name into a safe desktop-executable name
+/// (labelle-assembler#362). Every project used to build to an
+/// identically-named `zig-out/bin/game`, so concurrent games were
+/// indistinguishable to `pgrep`/`pkill`. Naming the binary after the
+/// project makes a running game identifiable by `pgrep -f <name>`.
+///
+/// Keeps only `[A-Za-z0-9_-]` (matching `labelle-cli`'s docker run path,
+/// which derives the same name independently); every other byte is
+/// dropped. Falls back to `"game"` when the result is empty, so the
+/// generated `build.zig` always has a valid `exe.name`. Caller owns the
+/// returned slice.
+pub fn sanitizeExeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (name) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '_' or c == '-';
+        if (ok) try buf.append(allocator, c);
+    }
+    if (buf.items.len == 0) {
+        buf.deinit(allocator);
+        return allocator.dupe(u8, "game");
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Emit one `const <named>_mod = b.createModule(...)` per FlowNodes-bearing
 /// game script (labelle-assembler#240 Gap 2), plus an
 /// `overrideImport(game_mod, "<named>", <named>_mod)` so the shim's
@@ -473,7 +499,14 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // to the test step below, then to a stripped footer that closes the
         // build function without referencing `exe`.
         if (!opts.is_tests_target) {
-            try tpl.writeSection(build_zig_tmpl, "exe_start", w);
+            // Name the desktop binary after the project (sanitized) so a
+            // running game is identifiable by `pgrep -f <name>` instead of
+            // every project building to an indistinguishable `bin/game`
+            // (labelle-assembler#362). `labelle run` is unaffected — it uses
+            // `zig build run`, which resolves the artifact by step, not path.
+            const exe_name = try sanitizeExeName(allocator, cfg.name);
+            defer allocator.free(exe_name);
+            try tpl.renderSection(build_zig_tmpl, "exe_start", .{ .exe_name = exe_name }, w);
 
             for (cfg.plugins) |plugin| {
                 try w.print("                .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });

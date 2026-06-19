@@ -342,6 +342,35 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "fn overrideImport(") != null);
     }
 
+    test "names desktop exe after the sanitized project name (#362)" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "energy flow!",
+            .backend = .bgfx,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        // The exe is named after the project so concurrent games are
+        // distinguishable to `pgrep`; non-`[A-Za-z0-9_-]` bytes are dropped.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, ".name = \"energyflow\"") != null);
+        // The hardcoded `bin/game` name is gone from the exe step.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "addExecutable") != null);
+    }
+
+    test "falls back to game when the sanitized exe name is empty (#362)" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "!!!",
+            .backend = .bgfx,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        // The exe-name line (`.name = "game",` directly preceding the
+        // `.root_module = b.createModule` of `addExecutable`) is distinct
+        // from the `.{ .name = "game", .module = game_mod }` import line.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, ".name = \"game\",\n        .root_module") != null);
+    }
+
     test "chains in-project @libs/ plugin test step into test step (issue #82)" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",

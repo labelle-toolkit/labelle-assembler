@@ -399,7 +399,7 @@ jobs:
 
           # Null backend has no window / display server / GL context,
           # so the binary either runs to completion (rc=0) or crashes.
-          ./zig-out/bin/game > run.log 2>&1
+          ./zig-out/bin/null_headless_demo > run.log 2>&1
 
           # Pin the canonical 5-frame sequence — surfaces a runaway
           # loop or a missed counter bump immediately. Drop log
@@ -537,7 +537,7 @@ jobs:
           # (default 5). No window, no GL context, no display server —
           # the binary either runs to completion (rc=0) or crashes
           # (anything else). No `timeout` wrapper needed.
-          ./zig-out/bin/game > run.log 2>&1
+          ./zig-out/bin/plugin_controllers_demo > run.log 2>&1
 
           # Extract only the tagged lifecycle events we care about.
           # Drops log timestamps and log level prefix.
