@@ -211,7 +211,7 @@ pub const LAYERS = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "hud,") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".bg => .{ .order = 0, .space = .screen }") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".world => .{ .order = 1, .space = .world }") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GfxRenderer(BackendGfx, GameLayers,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "GfxRendererWith(BackendGfx, GameLayers,") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "config.GameLayers") == null);
     }
 };

@@ -1377,72 +1377,66 @@ pub fn generateMainZigFromTemplate(
     // ── Thread the project Y-axis onto the generated game config ──
     // RFC-Y-AXIS-CONVENTION (epic labelle-engine#640), assembler #370.
     //
-    // The engine `codegen/main.zig.template` still emits the legacy
-    // `engine.GameConfig(...)` call (which delegates to `.down`); we rewrite
-    // that single call site to `engine.GameConfigWithYAxis(..., .up|.down)`
-    // so the convention comes from `project.labelle` rather than the engine
-    // default. `requireYAxis` first enforces the unset-guard — an absent
-    // `.y_axis` is a hard error so no existing game silently flips.
+    // The engine `codegen/main.zig.template` (≥ v1.61.0, engine#642) declares a
+    // single source-of-truth `const project_y_axis: engine.core.YAxis = .up;`
+    // that feeds BOTH the renderer (`GfxRendererWith`) and `GameConfigWithYAxis`.
+    // We override that const's value with the project's `.y_axis` so the
+    // convention comes from `project.labelle`, not the engine default.
+    // `requireYAxis` first enforces the unset-guard — an absent `.y_axis` is a
+    // hard error so no existing game silently flips.
     const y_axis = try cfg.requireYAxis();
     return injectYAxis(allocator, rendered, y_axis);
 }
 
-/// Rewrite the generated game's `engine.GameConfig(...)` call into
-/// `engine.GameConfigWithYAxis(..., .up|.down)`, threading the project's
-/// logical Y-axis (RFC-Y-AXIS-CONVENTION / assembler #370) through the engine
-/// v1.60.0 entry point. The engine template emits the legacy `GameConfig`
-/// spelling (which defaults to `.down`); this renames the call and inserts the
-/// trailing `.up,` / `.down,` comptime argument before the call's closing
-/// `);`. Caller owns the returned bytes.
+/// Override the value of the engine template's single source-of-truth
+/// `const project_y_axis: engine.core.YAxis = .up;` with the project's logical
+/// Y-axis (RFC-Y-AXIS-CONVENTION / assembler #370). That const feeds BOTH the
+/// renderer (`GfxRendererWith(..., project_y_axis)`) and the game config
+/// (`GameConfigWithYAxis(..., project_y_axis)`), so overriding it once makes
+/// output flip and input picking agree under the chosen convention. Caller owns
+/// the returned bytes.
 ///
-/// Robust to both the real engine template (last arg `GameEvents,`) and the
-/// trimmed test fixture (last arg `DiscoveredGizmoCategories,`): it anchors on
-/// the `engine.GameConfig(` token and the first `);` line that closes it, not
-/// on any particular argument list.
+/// Anchors on the `const project_y_axis: engine.core.YAxis = ` declaration and
+/// replaces the value token up to its `;`, independent of the template default.
+/// (Earlier engine templates emitted a bare `engine.GameConfig(...)` call; that
+/// form is gone as of engine#642 — overriding the const is the current seam.)
 fn injectYAxis(
     allocator: std.mem.Allocator,
     rendered: []const u8,
     y_axis: config.YAxis,
 ) ![]const u8 {
-    const open = "engine.GameConfig(";
-    const open_at = std.mem.indexOf(u8, rendered, open) orelse {
-        // No `engine.GameConfig(` call in this rendered output — nothing to
-        // rewrite, so hand back an owned copy unchanged. The real engine
-        // template always has the call; this branch covers minimal test
-        // fixtures (and any future engine template that doesn't emit it).
-        // The unset-`.y_axis` guard has already fired in the caller, so an
-        // absent key is still rejected regardless of template shape.
+    const anchor = "const project_y_axis: engine.core.YAxis = ";
+    const anchor_at = std.mem.indexOf(u8, rendered, anchor) orelse {
+        // No `project_y_axis` declaration — nothing to override, so hand back an
+        // owned copy unchanged. The real engine template (≥ v1.61.0) always has
+        // it; this branch covers minimal test fixtures. The unset-`.y_axis`
+        // guard has already fired in the caller, so an absent key is still
+        // rejected regardless of template shape.
         return allocator.dupe(u8, rendered);
     };
 
-    // Find the closing `);` that terminates the call — the first occurrence
-    // after the open paren. The call body is multi-line with one arg per line,
-    // so the close is `\n);`.
-    const search_from = open_at + open.len;
-    const close_rel = std.mem.indexOf(u8, rendered[search_from..], "\n);") orelse {
+    const val_at = anchor_at + anchor.len; // first byte of the value token
+    const semi_rel = std.mem.indexOfScalar(u8, rendered[val_at..], ';') orelse {
         const io = config.globalIo();
         std.Io.File.stderr().writeStreamingAll(
             io,
-            "labelle-assembler: could not find the closing `);` of the engine.GameConfig(...) call\n",
+            "labelle-assembler: malformed `project_y_axis` declaration (no terminating `;`)\n",
         ) catch {};
-        return error.GameConfigCallNotFound;
+        return error.YAxisConstMalformed;
     };
-    const close_at = search_from + close_rel; // index of the '\n' before ");"
+    const semi_at = val_at + semi_rel; // index of the ';'
 
     const y_tag = @tagName(y_axis);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    // [0, open_at) — everything before the call
-    try w.writeAll(rendered[0..open_at]);
-    // renamed entry point
-    try w.writeAll("engine.GameConfigWithYAxis(");
-    // [after-open, close_at) — the existing argument lines, verbatim
-    try w.writeAll(rendered[search_from..close_at]);
-    // the new trailing comptime arg, on its own line, then the original `);`
-    try w.print("\n    .{s},", .{y_tag});
-    try w.writeAll(rendered[close_at..]);
+    // [0, val_at) — everything up to and including "= "
+    try w.writeAll(rendered[0..val_at]);
+    // the project's axis, replacing the template default
+    try w.print(".{s}", .{y_tag});
+    // [semi_at, end) — from the ';' onward, verbatim
+    try w.writeAll(rendered[semi_at..]);
 
     var arr = out.toArrayList();
     errdefer arr.deinit(allocator);
