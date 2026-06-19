@@ -1370,6 +1370,7 @@ pub fn generateMainZigFromTemplate(
     errdefer output_alloc_writer.deinit();
     try tpl.renderDynamic(engine_template, data, &output_alloc_writer.writer);
     var output_arr_list = output_alloc_writer.toArrayList();
+    errdefer output_arr_list.deinit(allocator);
     const rendered = try output_arr_list.toOwnedSlice(allocator);
     defer allocator.free(rendered);
 
@@ -1444,6 +1445,7 @@ fn injectYAxis(
     try w.writeAll(rendered[close_at..]);
 
     var arr = out.toArrayList();
+    errdefer arr.deinit(allocator);
     return arr.toOwnedSlice(allocator);
 }
 
