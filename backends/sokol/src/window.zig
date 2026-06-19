@@ -516,6 +516,9 @@ pub fn headlessColorTexture() ?*const anyopaque {
     if (headless_fallback_color_img.id == 0) return null;
     const info = sg.mtlQueryImageInfo(headless_fallback_color_img);
     const slot: usize = @intCast(@max(0, info.active_slot));
+    // Defensive: `tex` is a fixed 2-slot array; never index past it even
+    // if sokol-gfx ever reports an unexpected `active_slot`.
+    if (slot >= info.tex.len) return null;
     return info.tex[slot];
 }
 
