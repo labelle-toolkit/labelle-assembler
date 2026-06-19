@@ -150,17 +150,18 @@ const BackendGfxType = @import("backend_gfx");
         // on `--timeout` SIGTERM'ing the process. `endDrawing` has already
         // presented (and, for `--screenshot`, queued the capture for) this
         // frame, so the count covers the frame just drawn. 0 = run forever.
-        // A still-pending screenshot (`screenshot_req != null`) or a
-        // just-fired one mid-flush holds the exit open: the former so
-        // `--ticks` can't cut off a capture whose `--after` delay hasn't
-        // elapsed yet, the latter so the async bgfx readback can flush to
-        // disk first. Without this, `--ticks` + `--screenshot` together would
-        // exit before the file lands.
+        // The counter advances EVERY frame (so the run length tracks `--ticks`,
+        // not `N + screenshot delay`); only the EXIT is held open while a
+        // screenshot is still pending (`screenshot_req != null`, so `--ticks`
+        // can't cut off a capture whose `--after` delay hasn't elapsed) or
+        // mid-flush (so the async bgfx readback can flush to disk first).
+        // Without that gate, `--ticks` + `--screenshot` together would exit
+        // before the file lands.
+        if (headless_max_ticks != 0) headless_tick_count += 1;
         if (screenshot_flush_left > 0) screenshot_flush_left -= 1;
         const screenshot_blocks_exit = screenshot_req != null or screenshot_flush_left > 0;
-        if (headless_max_ticks != 0 and !screenshot_blocks_exit) {
-            headless_tick_count += 1;
-            if (headless_tick_count >= headless_max_ticks) break;
+        if (headless_max_ticks != 0 and headless_tick_count >= headless_max_ticks and !screenshot_blocks_exit) {
+            break;
         }
     }
 }
