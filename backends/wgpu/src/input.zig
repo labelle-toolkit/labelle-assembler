@@ -55,6 +55,19 @@ pub fn newFrame() void {
         const sy: f64 = if (ws[1] > 0) @as(f64, @floatFromInt(fb[1])) / @as(f64, @floatFromInt(ws[1])) else 1.0;
         mouse_x = @floatCast(pos[0] * sx);
         mouse_y = @floatCast(pos[1] * sy);
+
+        // Derive this-frame mouse button press/release EDGES. GLFW exposes only
+        // live down-state, so compare each button against `mouse_down[]` (the
+        // persisted previous-frame state) to set the one-frame
+        // `mouse_pressed`/`mouse_released` arrays the engine's
+        // `isMouseButtonPressed`/`Released` read. Without this they were always
+        // false; only live-poll `isMouseButtonDown` worked. Mirrors bgfx.
+        for (0..MAX_MOUSE_BUTTONS) |b| {
+            const cur = win.getMouseButton(@enumFromInt(b)) == .press;
+            if (cur and !mouse_down[b]) mouse_pressed[b] = true;
+            if (!cur and mouse_down[b]) mouse_released[b] = true;
+            mouse_down[b] = cur;
+        }
     }
 }
 
