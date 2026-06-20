@@ -433,6 +433,47 @@ pub fn build(b: *std.Build) void {
         // avoid a link that would need EGL/GLESv3 (phase 4).
         const android_app_tests = b.addTest(.{ .root_module = android_app_mod });
         test_step.dependOn(&android_app_tests.step);
+
+        // ── Phase 4 (#303): full Android app link → libgame.so ──────────
+        // Standalone bgfx-Android video demo (FP#549) proving the VideoPlayer
+        // draws through bgfx on-device. Reuses the compile-verified module graph
+        // and adds the EGL / GLESv3 link the compile-checks above deferred.
+        const app_mod = b.createModule(.{
+            .root_source_file = b.path("example/android_video.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        app_mod.addImport("backend_app", android_app_mod);
+        app_mod.addImport("backend_gfx", gfx_mod);
+        app_mod.addImport("window", window_mod);
+        applyNdkSysroot(app_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+        app_mod.linkSystemLibrary("android", .{});
+        app_mod.linkSystemLibrary("log", .{});
+        app_mod.linkSystemLibrary("mediandk", .{});
+        app_mod.linkSystemLibrary("EGL", .{});
+        app_mod.linkSystemLibrary("GLESv3", .{});
+
+        app_mod.linkLibrary(bgfx_artifact);
+        const app_lib = b.addLibrary(.{
+            .name = "game",
+            .linkage = .dynamic,
+            .root_module = app_mod,
+        });
+        // Zig won't self-provide bionic libc — point the link at the NDK's
+        // libc (headers + crt objects) via a generated libc paths file.
+        // include_dir + sys_include_dir carry the TWO NDK header roots
+        // (usr/include and usr/include/<triple>) so zig's bundled libc++ build
+        // finds both <linux/types.h> and the arch <asm/types.h>.
+        const libc_conf = b.fmt(
+            "include_dir={s}\nsys_include_dir={s}\ncrt_dir={s}\nmsvc_lib_dir=\nkernel32_lib_dir=\ngcc_dir=\n",
+            .{ n.inc_arch, n.inc_common, n.lib_path },
+        );
+        const libc_wf = b.addWriteFiles();
+        app_lib.setLibCFile(libc_wf.add("android-libc.txt", libc_conf));
+
+        const app_step = b.step("android-app", "Link the bgfx-Android video demo (libgame.so)");
+        app_step.dependOn(&b.addInstallArtifact(app_lib, .{}).step);
     }
 
     // ── Audio backend tests ─────────────────────────────────────────
