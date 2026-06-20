@@ -444,13 +444,29 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
+        // Android audio-track decoder module (FP#549 audio): decodes the
+        // mp4's AAC track via AMediaExtractor/AMediaCodec → 48k stereo PCM.
+        // Needs the NDK sysroot (Bionic headers) and links mediandk, same as
+        // the rest of the Android media path.
+        const android_audio_mod = b.addModule("android_audio", .{
+            .root_source_file = b.path("src/video/android_audio.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        applyNdkSysroot(android_audio_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+        android_audio_mod.linkSystemLibrary("mediandk", .{});
+
         app_mod.addImport("backend_app", android_app_mod);
         app_mod.addImport("backend_gfx", gfx_mod);
         app_mod.addImport("window", window_mod);
+        app_mod.addImport("audio", audio_mod);
+        app_mod.addImport("android_audio", android_audio_mod);
         applyNdkSysroot(app_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
         app_mod.linkSystemLibrary("android", .{});
         app_mod.linkSystemLibrary("log", .{});
         app_mod.linkSystemLibrary("mediandk", .{});
+        app_mod.linkSystemLibrary("aaudio", .{});
         app_mod.linkSystemLibrary("EGL", .{});
         app_mod.linkSystemLibrary("GLESv3", .{});
 

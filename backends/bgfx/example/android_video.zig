@@ -11,6 +11,8 @@ const std = @import("std");
 const android_app = @import("backend_app");
 const gfx = @import("backend_gfx");
 const window = @import("window");
+const audio = @import("audio");
+const android_audio = @import("android_audio");
 
 pub const labelle_provides_android_main = true;
 
@@ -28,6 +30,26 @@ const Player = gfx.VideoPlayer(gfx.AndroidVideoDecoder);
 var player: ?Player = null;
 var asset_mgr: ?*AAssetManager = null;
 
+// The clip's decoded audio track, loaded into labelle's streaming-music
+// mixer. The VideoPlayer drives it via the audio hooks below; the `.clock`
+// hook (audio device position) is the master clock that makes the SAME
+// PTS-accurate A/V sync that runs on desktop run here on Android.
+var vid_music_id: u32 = 0;
+
+fn vidAudioStart(_: ?*anyopaque) void {
+    if (vid_music_id != 0) audio.playMusic(vid_music_id);
+}
+fn vidAudioUpdate(_: ?*anyopaque) void {
+    if (vid_music_id != 0) audio.updateMusic(vid_music_id);
+}
+fn vidAudioStop(_: ?*anyopaque) void {
+    if (vid_music_id != 0) audio.stopMusic(vid_music_id);
+}
+/// Audio device playback position — the master clock for PTS-accurate sync.
+fn vidAudioClock(_: ?*anyopaque) f64 {
+    return if (vid_music_id != 0) audio.musicPositionSeconds(vid_music_id) else 0;
+}
+
 const screen_w: u32 = 1024;
 const screen_h: u32 = 768;
 const target_fps: u32 = 60;
@@ -43,6 +65,35 @@ fn gameInit() callconv(.c) void {
     if (fd < 0) return;
     const dec = gfx.AndroidVideoDecoder.openFd(gpa.allocator(), fd, start, len) catch return;
     player = Player.init(gpa.allocator(), dec, 24.0) catch return;
+
+    // ── Audio track → music mixer → VideoPlayer clock (PTS sync) ─────────
+    // Re-open the asset for a FRESH fd: the video decoder owns the one above
+    // (its AMediaExtractor keeps reading it), so the audio decoder needs its
+    // own. Decode the whole AAC track to 48k stereo PCM, load it as music,
+    // and attach the hooks so the player drives audio in lockstep and reads
+    // its position as the master clock. Best-effort: a missing audio track or
+    // no AAudio device leaves the demo video-only (vid_music_id stays 0).
+    if (AAssetManager_open(am, "intro.mp4", AASSET_MODE_STREAMING)) |a_asset| {
+        defer AAsset_close(a_asset);
+        var a_start: i64 = 0;
+        var a_len: i64 = 0;
+        const a_fd = AAsset_openFileDescriptor64(a_asset, &a_start, &a_len);
+        if (a_fd >= 0) {
+            if (android_audio.decodeTrack(gpa.allocator(), a_fd, a_start, a_len)) |pcm| {
+                var p = pcm;
+                defer p.deinit(gpa.allocator());
+                vid_music_id = audio.loadMusicFromPcm(p.samples, 2, 48000);
+                if (vid_music_id != 0) {
+                    player.?.setAudio(.{
+                        .start = &vidAudioStart,
+                        .update = &vidAudioUpdate,
+                        .stop = &vidAudioStop,
+                        .clock = &vidAudioClock, // master clock → PTS sync
+                    });
+                }
+            } else |_| {}
+        }
+    }
 }
 
 /// Per-frame: advance + draw the video fullscreen through bgfx.
