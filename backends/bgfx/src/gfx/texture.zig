@@ -201,6 +201,62 @@ pub fn uploadTexture(decoded: DecodedImage) !Texture {
     return .{ .id = id, .width = @intCast(decoded.width), .height = @intCast(decoded.height) };
 }
 
+// ── Dynamic textures (runtime-updated pixels) ───────────────────────────────
+// Path A "display half" (Flying-Platform/flying-platform-labelle#549): a blank
+// RGBA8 texture created once, then re-uploaded every frame via `updateTexture`.
+// This is the sink a video player feeds decoded+converted RGBA frames into —
+// bgfx then draws it like any other texture (`drawTexturePro`). bgfx only
+// allows updates on a MUTABLE texture, i.e. one created with `null` initial
+// memory (an immutable texture is one created WITH data — that's the normal
+// `uploadTexture` path). `bgfx.copy` takes its own copy of the pixels on every
+// update, so the caller may overwrite/reuse its frame buffer immediately
+// (double-buffer safe), exactly as the upload path does.
+
+/// Create a blank, updatable RGBA8 texture of `width`x`height`. Passes `null`
+/// memory so the texture is mutable and can be re-uploaded with `updateTexture`
+/// each frame (unlike `uploadTexture`, which bakes data in at create time).
+pub fn createDynamicTexture(width: u32, height: u32) !Texture {
+    const id = findFreeTextureSlot() orelse return error.LoadFailed;
+    const w: u16 = std.math.cast(u16, width) orelse return error.LoadFailed;
+    const h: u16 = std.math.cast(u16, height) orelse return error.LoadFailed;
+
+    const handle = bgfx.createTexture2D(
+        w,
+        h,
+        false,
+        1,
+        .RGBA8,
+        bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp,
+        null, // mutable: no initial data, updatable via updateTexture2D
+        0,
+    );
+    if (handle.idx == std.math.maxInt(u16)) return error.LoadFailed;
+
+    texture_handles[id] = handle;
+    texture_pixel_data[id] = null;
+    return .{ .id = id, .width = @intCast(width), .height = @intCast(height) };
+}
+
+/// Re-upload a full RGBA8 frame to a dynamic texture created by
+/// `createDynamicTexture`. `pixels` must be exactly width*height*4 bytes
+/// (tightly packed, top-left origin — same orientation as the decode path).
+/// No-ops on a bad id/handle or a size mismatch so a malformed frame can't
+/// scribble past the texture.
+pub fn updateTexture(texture: Texture, pixels: []const u8) void {
+    if (texture.id >= MAX_TEXTURES) return;
+    const handle = texture_handles[texture.id];
+    if (handle.idx == std.math.maxInt(u16)) return;
+
+    const w: u16 = std.math.cast(u16, texture.width) orelse return;
+    const h: u16 = std.math.cast(u16, texture.height) orelse return;
+    const expected = @as(usize, @intCast(texture.width)) * @as(usize, @intCast(texture.height)) * 4;
+    if (pixels.len != expected) return;
+
+    const mem = bgfx.copy(pixels.ptr, @intCast(pixels.len));
+    // pitch = max(u16) → bgfx treats the row stride as tightly packed (w*bpp).
+    bgfx.updateTexture2D(handle, 0, 0, 0, 0, w, h, mem, std.math.maxInt(u16));
+}
+
 // ── GPU-compressed textures (ASTC) ──────────────────────────────────────────
 // The engine's `loadTextureFromMemory` seam (labelle-gfx) dispatches here when
 // the backend exposes `isCompressed`/`uploadCompressed` and the blob is

@@ -72,6 +72,10 @@ pub const loadTexture = texture.loadTexture;
 pub const decodeImage = texture.decodeImage;
 pub const uploadTexture = texture.uploadTexture;
 pub const unloadTexture = texture.unloadTexture;
+// Dynamic textures: create-blank + per-frame re-upload. The "display half" of
+// in-engine video (#549) — a decoder feeds RGBA frames into `updateTexture`.
+pub const createDynamicTexture = texture.createDynamicTexture;
+pub const updateTexture = texture.updateTexture;
 pub const drawTexturePro = texture.drawTexturePro;
 // GPU-compressed (ASTC) upload — the labelle-gfx `loadTextureFromMemory` seam
 // dispatches to these via `@hasDecl` when the blob is compressed (#341).
