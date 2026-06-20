@@ -88,6 +88,40 @@ pub fn i420ToRgba(
     }
 }
 
+/// Generic YUV 4:2:0 → RGBA8, driven entirely by per-plane **row stride** and
+/// **pixel stride** — the `AImage` / `AIMAGE_FORMAT_YUV_420_888` model. This is
+/// the format-agnostic path: the Android decoder renders into an `AImageReader`,
+/// and `AImage` exposes whatever the device produced (planar I420, semi-planar
+/// NV12, or a vendor/tiled `COLOR_FormatYUV420Flexible`) as Y/U/V planes with
+/// strides. A `pixel_stride` of 1 ⇒ planar; 2 ⇒ interleaved/semi-planar — both
+/// fall out of the same loop, so one converter covers every real device.
+/// `u`/`v` may point into the same interleaved buffer (NV12) or separate planes.
+pub fn yuv420ToRgba(
+    y: []const u8,
+    y_row_stride: u32,
+    y_pixel_stride: u32,
+    u: []const u8,
+    v: []const u8,
+    uv_row_stride: u32,
+    uv_pixel_stride: u32,
+    width: u32,
+    height: u32,
+    out: []u8,
+) void {
+    std.debug.assert(out.len == @as(usize, width) * height * 4);
+    var row: u32 = 0;
+    while (row < height) : (row += 1) {
+        var col: u32 = 0;
+        while (col < width) : (col += 1) {
+            const yi = row * y_row_stride + col * y_pixel_stride;
+            // Chroma is 2×2 sub-sampled: one (U,V) per 2×2 luma block.
+            const ci = (row / 2) * uv_row_stride + (col / 2) * uv_pixel_stride;
+            const o = (row * width + col) * 4;
+            yuvToRgba(y[yi], u[ci], v[ci], out[o..][0..4]);
+        }
+    }
+}
+
 // ── Tests (host-runnable — no NDK) ───────────────────────────────────────
 
 test "nv12: neutral chroma maps Y=16→black, Y=235→white" {
@@ -130,6 +164,32 @@ test "i420 matches nv12 for the same logical frame" {
     nv12ToRgba(&y, &nv12_uv, w, h, w, w, &a);
     i420ToRgba(&y, &i420_u, &i420_v, w, h, w, w, &b);
     try std.testing.expectEqualSlices(u8, &a, &b);
+}
+
+test "yuv420ToRgba (YUV_420_888): semi-planar pixel_stride=2 matches nv12ToRgba" {
+    const w = 2;
+    const h = 2;
+    const y = [_]u8{ 60, 120, 180, 240 };
+    const uv = [_]u8{ 90, 200 }; // interleaved U,V — one pair for the 2×2 block
+    var ref: [w * h * 4]u8 = undefined;
+    var got: [w * h * 4]u8 = undefined;
+    nv12ToRgba(&y, &uv, w, h, w, w, &ref);
+    // AImage NV12: U plane points at uv[0], V plane at uv[1], pixel_stride=2.
+    yuv420ToRgba(&y, w, 1, uv[0..], uv[1..], w, 2, w, h, &got);
+    try std.testing.expectEqualSlices(u8, &ref, &got);
+}
+
+test "yuv420ToRgba (YUV_420_888): planar pixel_stride=1 matches i420ToRgba" {
+    const w = 2;
+    const h = 2;
+    const y = [_]u8{ 60, 120, 180, 240 };
+    const u = [_]u8{90};
+    const v = [_]u8{200};
+    var ref: [w * h * 4]u8 = undefined;
+    var got: [w * h * 4]u8 = undefined;
+    i420ToRgba(&y, &u, &v, w, h, w, w, &ref);
+    yuv420ToRgba(&y, w, 1, &u, &v, w, 1, w, h, &got);
+    try std.testing.expectEqualSlices(u8, &ref, &got);
 }
 
 test "stride padding is honoured (y_stride > width)" {

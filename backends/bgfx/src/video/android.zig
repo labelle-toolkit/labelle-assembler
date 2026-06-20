@@ -2,9 +2,18 @@
 //! (Flying-Platform/flying-platform-labelle#549).
 //!
 //! Uses `AMediaExtractor` (demux the mp4 container) + `AMediaCodec` (hardware
-//! H.264 decode) in **ByteBuffer mode**, then converts the YUV output to RGBA8
-//! (`video/yuv.zig`) and hands it to the bgfx dynamic texture (`updateTexture`,
-//! Half 1) — the same sink the desktop ffmpeg pipe feeds.
+//! H.264 decode) rendering into an **`AImageReader` (YUV_420_888)**, then reads
+//! the frame's Y/U/V planes via `AImage` and converts to RGBA8 (`video/yuv.zig`)
+//! for the bgfx dynamic texture (`updateTexture`, Half 1) — the same sink the
+//! desktop ffmpeg pipe feeds.
+//!
+//! Why ImageReader and not raw ByteBuffer: real devices emit a wide range of
+//! `AMediaCodec` color formats — planar, semi-planar, and especially
+//! `COLOR_FormatYUV420Flexible` / proprietary *tiled* layouts that aren't
+//! CPU-readable as-is. Rendering into a YUV_420_888 `AImageReader` normalizes
+//! all of them into Y/U/V planes with explicit row/pixel strides, so one
+//! `yuv.yuv420ToRgba` converts every device. (A ByteBuffer/NV12-only path
+//! worked on the emulator but would black-screen many real handsets.)
 //!
 //! These are pure C NDK APIs (no JNI/Java), so they're called from Zig via
 //! `extern`. The decoder is **comptime-gated to the Android ABI**: off Android
@@ -12,20 +21,17 @@
 //! the NDK symbols.
 //!
 //! Verified on-device: the `apk/` NativeActivity harness decodes a real H.264
-//! clip on a Pixel-7 API-34 emulator (arm64) — extract → AMediaCodec decode →
-//! YUV→RGBA, 10 frames, RESULT PASS. (AMediaCodec needs a real app process for
-//! its Binder/JVM context, which is why the bare-CLI harness can't get past
-//! codec creation — see `apk/native.zig`.) The host-testable colour conversion
-//! lives in `yuv.zig`.
+//! clip on a Pixel-7 API-34 emulator (arm64) — extract → AMediaCodec → AImage
+//! YUV_420_888 → RGBA, 10 frames, RESULT PASS. (AMediaCodec needs a real app
+//! process for its Binder/JVM context, which is why the bare-CLI harness can't
+//! get past codec creation — see `apk/native.zig`.) The host-testable colour
+//! conversion lives in `yuv.zig`.
 //!
-//! Known follow-ups (next slices, deliberately out of this first cut):
-//!   - `COLOR_FormatYUV420Flexible` / proprietary tiled vendor formats (need
-//!     AImageReader or per-vendor layout); this cut handles the two standard
-//!     planar/semi-planar formats.
-//!   - crop rectangle + slice-height vs height (we read stride/slice-height
-//!     when present).
-//!   - Surface/OES zero-copy path (faster, but doesn't fit bgfx cleanly — see
-//!     the #549 analysis); ByteBuffer is the portable first cut.
+//! Known follow-ups (next slices):
+//!   - crop rectangle (the AImage may be padded beyond w×h on some devices).
+//!   - on a real handset (vs the emulator) confirm a Flexible/tiled clip; the
+//!     plane-stride path is built for it but only emulator-verified so far.
+//!   - audio-track decode (this is video-only) + AAudio output device (#306).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -70,6 +76,9 @@ const AndroidVideoDecoder = struct {
     const Extractor = opaque {};
     const Codec = opaque {};
     const Format = opaque {};
+    const ImageReader = opaque {};
+    const Image = opaque {};
+    const Window = opaque {};
 
     const BufferInfo = extern struct {
         offset: i32,
@@ -105,29 +114,39 @@ const AndroidVideoDecoder = struct {
     extern fn AMediaCodec_getOutputFormat(*Codec) ?*Format;
     extern fn AMediaCodec_releaseOutputBuffer(*Codec, idx: usize, render: bool) i32;
 
+    // NDK ImageReader / Image (media/NdkImageReader.h, NdkImage.h). The decoder
+    // renders into the reader's surface; `AImage` then exposes whatever the
+    // device produced as YUV_420_888 Y/U/V planes with row + pixel strides — so
+    // any vendor / `COLOR_FormatYUV420Flexible` / tiled layout reads uniformly.
+    // This is the robustness fix vs the old ByteBuffer/NV12-only path.
+    extern fn AImageReader_new(width: i32, height: i32, format: i32, max_images: i32, reader: *?*ImageReader) i32;
+    extern fn AImageReader_getWindow(*ImageReader, window: *?*Window) i32;
+    extern fn AImageReader_acquireLatestImage(*ImageReader, image: *?*Image) i32;
+    extern fn AImageReader_delete(*ImageReader) void;
+    extern fn AImage_getNumberOfPlanes(*const Image, num: *i32) i32;
+    extern fn AImage_getPlaneData(*const Image, plane: i32, data: *?[*]u8, len: *i32) i32;
+    extern fn AImage_getPlaneRowStride(*const Image, plane: i32, stride: *i32) i32;
+    extern fn AImage_getPlanePixelStride(*const Image, plane: i32, stride: *i32) i32;
+    extern fn AImage_getTimestamp(*const Image, ts: *i64) i32;
+    extern fn AImage_delete(*Image) void;
+
     const AMEDIA_OK: i32 = 0;
     const FLAG_EOS: u32 = 4; // AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM
     const INFO_TRY_AGAIN: isize = -1;
     const INFO_FORMAT_CHANGED: isize = -2;
     const INFO_BUFFERS_CHANGED: isize = -3;
+    const FORMAT_YUV_420_888: i32 = 0x23; // AIMAGE_FORMAT_YUV_420_888
 
     // AMediaFormat keys.
     const KEY_MIME: [*:0]const u8 = "mime";
     const KEY_WIDTH: [*:0]const u8 = "width";
     const KEY_HEIGHT: [*:0]const u8 = "height";
-    const KEY_COLOR_FORMAT: [*:0]const u8 = "color-format";
-    const KEY_STRIDE: [*:0]const u8 = "stride";
-    const KEY_SLICE_HEIGHT: [*:0]const u8 = "slice-height";
-
-    // MediaCodec color formats we handle in ByteBuffer mode.
-    const COLOR_I420: i32 = 19; // COLOR_FormatYUV420Planar
-    const COLOR_NV12: i32 = 21; // COLOR_FormatYUV420SemiPlanar
 
     extractor: *Extractor,
     codec: *Codec,
+    reader: *ImageReader,
     w: u32,
     h: u32,
-    color_format: i32,
     input_done: bool,
 
     /// Open a video stream from a file descriptor (the APK asset fd from
@@ -149,7 +168,6 @@ const AndroidVideoDecoder = struct {
         var mime_len: usize = 0;
         var w: i32 = 0;
         var h: i32 = 0;
-        var color: i32 = COLOR_NV12;
         while (track < n) : (track += 1) {
             const fmt = AMediaExtractor_getTrackFormat(ex, track) orelse continue;
             defer AMediaFormat_delete(fmt);
@@ -160,7 +178,6 @@ const AndroidVideoDecoder = struct {
             if (span.len + 1 > mime_buf.len) continue;
             _ = AMediaFormat_getInt32(fmt, KEY_WIDTH, &w);
             _ = AMediaFormat_getInt32(fmt, KEY_HEIGHT, &h);
-            _ = AMediaFormat_getInt32(fmt, KEY_COLOR_FORMAT, &color);
             @memcpy(mime_buf[0..span.len], span);
             mime_buf[span.len] = 0;
             mime_len = span.len;
@@ -171,21 +188,32 @@ const AndroidVideoDecoder = struct {
         const mime: [*:0]const u8 = mime_buf[0..mime_len :0].ptr;
         if (AMediaExtractor_selectTrack(ex, track) != AMEDIA_OK) return error.DecoderInit;
 
+        // Output to a YUV_420_888 ImageReader (format-agnostic, CPU-readable).
+        var reader_opt: ?*ImageReader = null;
+        if (AImageReader_new(@max(w, 1), @max(h, 1), FORMAT_YUV_420_888, 4, &reader_opt) != AMEDIA_OK)
+            return error.DecoderInit;
+        const reader = reader_opt orelse return error.DecoderInit;
+        errdefer AImageReader_delete(reader);
+        var window_opt: ?*Window = null;
+        if (AImageReader_getWindow(reader, &window_opt) != AMEDIA_OK) return error.DecoderInit;
+        const window = window_opt orelse return error.DecoderInit;
+
         const codec = AMediaCodec_createDecoderByType(mime) orelse return error.DecoderInit;
         errdefer AMediaCodec_delete(codec);
         const cfg_fmt = AMediaExtractor_getTrackFormat(ex, track) orelse return error.DecoderInit;
         defer AMediaFormat_delete(cfg_fmt);
-        // surface = null -> ByteBuffer (CPU-readable YUV) output.
-        if (AMediaCodec_configure(codec, cfg_fmt, null, null, 0) != AMEDIA_OK)
+        // Render into the ImageReader's surface (decoder normalizes its vendor
+        // format to YUV_420_888 by the time AImage exposes the planes).
+        if (AMediaCodec_configure(codec, cfg_fmt, @ptrCast(window), null, 0) != AMEDIA_OK)
             return error.DecoderInit;
         if (AMediaCodec_start(codec) != AMEDIA_OK) return error.DecoderInit;
 
         return .{
             .extractor = ex,
             .codec = codec,
+            .reader = reader,
             .w = @intCast(@max(w, 0)),
             .h = @intCast(@max(h, 0)),
-            .color_format = color,
             .input_done = false,
         };
     }
@@ -223,73 +251,91 @@ const AndroidVideoDecoder = struct {
             }
         }
 
-        // -- Drain output.
+        // -- Drain output → render decoded frames into the ImageReader surface.
         var info: BufferInfo = undefined;
         const out_idx = AMediaCodec_dequeueOutputBuffer(self.codec, &info, 2000);
         if (out_idx == INFO_FORMAT_CHANGED) {
             self.refreshFormat();
             return null;
         }
-        if (out_idx < 0) return null; // TRY_AGAIN / BUFFERS_CHANGED — caller retries
+        if (out_idx >= 0) {
+            // render = true: send the frame to the ImageReader's surface.
+            _ = AMediaCodec_releaseOutputBuffer(self.codec, @intCast(out_idx), true);
+        }
 
-        const idx: usize = @intCast(out_idx);
-        var size: usize = 0;
-        const got = if (AMediaCodec_getOutputBuffer(self.codec, idx, &size)) |buf|
-            self.convert(buf[0..size], out)
-        else
-            false;
-        _ = AMediaCodec_releaseOutputBuffer(self.codec, idx, false);
-        // presentation_time_us is the real container PTS — the A/V sync clock.
-        return if (got) @as(f64, @floatFromInt(info.presentation_time_us)) / 1_000_000.0 else null;
+        // -- Acquire the most recent rendered frame as a YUV_420_888 AImage.
+        // The render is asynchronous, so an image may not be ready every call;
+        // the caller's catch-up loop retries.
+        var img_opt: ?*Image = null;
+        if (AImageReader_acquireLatestImage(self.reader, &img_opt) != AMEDIA_OK) return null;
+        const img = img_opt orelse return null;
+        defer AImage_delete(img);
+        if (!self.convertImage(img, out)) return null;
+        var ts_ns: i64 = 0;
+        _ = AImage_getTimestamp(img, &ts_ns);
+        return @as(f64, @floatFromInt(ts_ns)) / 1_000_000_000.0; // PTS seconds
     }
 
-    /// Read the decoder's output format for stride/slice-height/color updates
-    /// (emitted once via INFO_FORMAT_CHANGED before the first frame).
+    /// Refresh w/h after an output-format change (emitted once before the first
+    /// frame). The ImageReader is fixed-size from the track format, which matches
+    /// for typical streams.
     fn refreshFormat(self: *AndroidVideoDecoder) void {
         const fmt = AMediaCodec_getOutputFormat(self.codec) orelse return;
         defer AMediaFormat_delete(fmt);
         var v: i32 = 0;
-        if (AMediaFormat_getInt32(fmt, KEY_COLOR_FORMAT, &v)) self.color_format = v;
         if (AMediaFormat_getInt32(fmt, KEY_WIDTH, &v)) self.w = @intCast(@max(v, 0));
         if (AMediaFormat_getInt32(fmt, KEY_HEIGHT, &v)) self.h = @intCast(@max(v, 0));
     }
 
-    /// Convert a decoded YUV buffer to RGBA8 using the negotiated color format.
-    fn convert(self: *AndroidVideoDecoder, buf: []const u8, out: []u8) bool {
-        const fmt = AMediaCodec_getOutputFormat(self.codec) orelse return false;
-        defer AMediaFormat_delete(fmt);
-        var stride: i32 = @intCast(self.w);
-        var slice: i32 = @intCast(self.h);
-        _ = AMediaFormat_getInt32(fmt, KEY_STRIDE, &stride);
-        _ = AMediaFormat_getInt32(fmt, KEY_SLICE_HEIGHT, &slice);
-        const y_stride: u32 = @intCast(@max(stride, @as(i32, @intCast(self.w))));
-        const sh: u32 = @intCast(@max(slice, @as(i32, @intCast(self.h))));
+    /// Convert a YUV_420_888 AImage to RGBA8. The plane row/pixel strides make
+    /// this format-agnostic — planar, semi-planar, and vendor/Flexible layouts
+    /// all read through the same `yuv.yuv420ToRgba`.
+    fn convertImage(self: *AndroidVideoDecoder, img: *Image, out: []u8) bool {
+        var num: i32 = 0;
+        if (AImage_getNumberOfPlanes(img, &num) != AMEDIA_OK or num < 3) return false;
 
-        const y_size = @as(usize, y_stride) * sh;
-        if (buf.len < y_size) return false;
-        const y_plane = buf[0..y_size];
-        const chroma_stride = y_stride; // half-width pairs == width bytes for NV12
-        switch (self.color_format) {
-            COLOR_NV12 => {
-                if (buf.len < y_size + (y_size / 2)) return false;
-                yuv.nv12ToRgba(y_plane, buf[y_size..], self.w, self.h, y_stride, chroma_stride, out);
-                return true;
-            },
-            COLOR_I420 => {
-                const c_size = (@as(usize, y_stride / 2)) * (sh / 2);
-                if (buf.len < y_size + 2 * c_size) return false;
-                const u = buf[y_size .. y_size + c_size];
-                const v = buf[y_size + c_size ..];
-                yuv.i420ToRgba(y_plane, u, v, self.w, self.h, y_stride, y_stride / 2, out);
-                return true;
-            },
-            else => return false, // Flexible / vendor format — next slice
-        }
+        var yd: ?[*]u8 = null;
+        var ud: ?[*]u8 = null;
+        var vd: ?[*]u8 = null;
+        var yl: i32 = 0;
+        var ul: i32 = 0;
+        var vl: i32 = 0;
+        if (AImage_getPlaneData(img, 0, &yd, &yl) != AMEDIA_OK) return false;
+        if (AImage_getPlaneData(img, 1, &ud, &ul) != AMEDIA_OK) return false;
+        if (AImage_getPlaneData(img, 2, &vd, &vl) != AMEDIA_OK) return false;
+        const yp = yd orelse return false;
+        const up = ud orelse return false;
+        const vp = vd orelse return false;
+        if (yl <= 0 or ul <= 0 or vl <= 0) return false;
+
+        var y_row: i32 = 0;
+        var uv_row: i32 = 0;
+        var y_px: i32 = 0;
+        var uv_px: i32 = 0;
+        _ = AImage_getPlaneRowStride(img, 0, &y_row);
+        _ = AImage_getPlaneRowStride(img, 1, &uv_row);
+        _ = AImage_getPlanePixelStride(img, 0, &y_px);
+        _ = AImage_getPlanePixelStride(img, 1, &uv_px);
+
+        yuv.yuv420ToRgba(
+            yp[0..@intCast(yl)],
+            @intCast(@max(y_row, 1)),
+            @intCast(@max(y_px, 1)),
+            up[0..@intCast(ul)],
+            vp[0..@intCast(vl)],
+            @intCast(@max(uv_row, 1)),
+            @intCast(@max(uv_px, 1)),
+            self.w,
+            self.h,
+            out,
+        );
+        return true;
     }
 
     pub fn deinit(self: *AndroidVideoDecoder) void {
         _ = AMediaCodec_stop(self.codec);
         AMediaCodec_delete(self.codec);
+        AImageReader_delete(self.reader);
         AMediaExtractor_delete(self.extractor);
     }
 };
