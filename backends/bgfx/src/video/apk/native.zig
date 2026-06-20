@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const android = @import("android");
+const android_audio = @import("android_audio");
 const audio = @import("audio");
 
 extern "c" fn usleep(usec: u32) c_int;
@@ -102,16 +103,41 @@ fn runTest(activity: *c.ANativeActivity) void {
         log("RESULT FAIL: no frames in {d} tries", .{tries});
     }
 
-    // -- AAudio output device test (#306): start the device (mixing silence is
-    // fine — we only need the callback to fire) and confirm it's pulling frames.
+    // -- Android audio-track decode (FP#549) + AAudio playback (#306).
+    // Re-open the asset for a fresh fd, decode the audio track to 48k stereo,
+    // hand it to the mixer, play it, and confirm the AAudio device pulled it.
+    const a2 = c.AAssetManager_open(am, "dectest.mp4", c.AASSET_MODE_STREAMING);
+    if (a2 == null) {
+        log("AUDIO: re-open asset FAILED", .{});
+        return;
+    }
+    defer _ = c.AAsset_close(a2);
+    var s2: c.off64_t = 0;
+    var l2: c.off64_t = 0;
+    const fd2 = c.AAsset_openFileDescriptor64(a2, &s2, &l2);
+    if (fd2 < 0) {
+        log("AUDIO: asset fd FAILED", .{});
+        return;
+    }
+
+    var apcm = android_audio.decodeTrack(std.heap.page_allocator, fd2, s2, l2) catch |e| {
+        log("AUDIO decode FAILED: {s}", .{@errorName(e)});
+        return;
+    };
+    defer apcm.deinit(std.heap.page_allocator);
+    const first: i16 = if (apcm.samples.len > 0) apcm.samples[0] else 0;
+    log("AUDIO decoded {d} frames @48k stereo (sample[0]={d})", .{ apcm.frames, first });
+
+    const mid = audio.loadMusicFromPcm(apcm.samples, 2, 48000);
+    if (mid != 0) audio.playMusic(mid);
     audio.ensureInit();
     _ = usleep(500_000); // let the audio thread run ~0.5s
     const mixed = audio.deviceFramesMixed();
     log("AAUDIO frames mixed in ~0.5s = {d}", .{mixed});
-    if (mixed > 0) {
-        log("AAUDIO PASS: output device live (#306)", .{});
+    if (apcm.frames > 0 and mid != 0 and mixed > 0) {
+        log("AUDIO PASS: decoded audio track played via AAudio (#306/#549)", .{});
     } else {
-        log("AAUDIO FAIL: device produced no frames", .{});
+        log("AUDIO FAIL", .{});
     }
     audio.deinit();
 }

@@ -440,6 +440,43 @@ pub fn loadMusic(path: [:0]const u8) u32 {
     return id;
 }
 
+/// Register an already-decoded interleaved PCM_16 buffer as a looping music
+/// stream. Used by the Android audio-track decoder (`video/android_audio.zig`)
+/// to feed decoded video audio into the mixer — the in-memory counterpart of
+/// `loadMusic`. `sample_rate` should be the device rate (48000): the mixer does
+/// not resample, so the caller must already be at device rate. Copies `samples`
+/// into an owned, properly-aligned buffer.
+pub fn loadMusicFromPcm(samples: []const i16, channels: u16, sample_rate: u32) u32 {
+    if (samples.len == 0 or channels == 0) return 0;
+    ensureInit();
+
+    const owned = std.heap.page_allocator.alloc(i16, samples.len) catch return 0;
+    @memcpy(owned, samples);
+
+    lockSlots();
+    const id = findFreeMusicSlot() orelse {
+        unlockSlots();
+        std.heap.page_allocator.free(owned);
+        return 0;
+    };
+    music_slots[id] = .{
+        .pcm = .{
+            .samples = owned,
+            .channels = channels,
+            .sample_rate = sample_rate,
+            .frame_count = @intCast(samples.len / channels),
+            .raw_alloc = std.mem.sliceAsBytes(owned),
+        },
+        .playing = false,
+        .paused = false,
+        .position = 0,
+        .volume = 1.0,
+        .looping = true,
+    };
+    unlockSlots();
+    return id;
+}
+
 pub fn unloadMusic(id: u32) void {
     if (id >= MAX_MUSIC) return;
 
