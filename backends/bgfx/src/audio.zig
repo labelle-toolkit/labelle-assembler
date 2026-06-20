@@ -513,6 +513,20 @@ pub fn updateMusic(id: u32) void {
     _ = id;
 }
 
+/// Current playback position of a music stream in seconds, derived from the
+/// frame `position` advanced on the audio thread by `mixAudio`. This is the
+/// real audio-device clock — the master clock for A/V sync (#549). Read without
+/// locking: a torn `position` read only perturbs the result by microseconds,
+/// harmless for video-frame selection. Returns 0 if the id is unloaded or the
+/// device hasn't pumped yet (e.g. Android NoopDevice, #306).
+pub fn musicPositionSeconds(id: u32) f64 {
+    if (id == 0 or id >= MAX_MUSIC) return 0;
+    const slot = &music_slots[id];
+    const pcm = slot.pcm orelse return 0;
+    if (pcm.sample_rate == 0) return 0;
+    return @as(f64, @floatFromInt(slot.position)) / @as(f64, @floatFromInt(pcm.sample_rate));
+}
+
 // ── PCM mixer ────────────────────────────────────────────────────────
 
 /// Mix all active sounds and music into a stereo i16 output buffer.

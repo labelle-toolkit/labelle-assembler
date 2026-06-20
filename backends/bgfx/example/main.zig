@@ -258,6 +258,10 @@ fn vidAudioUpdate(_: ?*anyopaque) void {
 fn vidAudioStop(_: ?*anyopaque) void {
     if (vid_music_id != 0) audio.stopMusic(vid_music_id);
 }
+/// Audio device playback position — the master clock for PTS-accurate A/V sync.
+fn vidAudioClock(_: ?*anyopaque) f64 {
+    return if (vid_music_id != 0) audio.musicPositionSeconds(vid_music_id) else 0;
+}
 
 /// Generate a self-contained H.264 clip (with audio), open the ffmpeg decoder,
 /// hand it to a VideoPlayer, then extract the audio track to a WAV and attach it
@@ -266,13 +270,18 @@ fn vidAudioStop(_: ?*anyopaque) void {
 fn initVideo() void {
     const alloc = std.heap.page_allocator;
     gfx.DesktopVideoDecoder.generateTestClip(alloc, VIDEO_CLIP, DYN_W, DYN_H) catch return;
-    const dec = gfx.DesktopVideoDecoder.open(alloc, VIDEO_CLIP, DYN_W, DYN_H) catch return;
+    const dec = gfx.DesktopVideoDecoder.open(alloc, VIDEO_CLIP, DYN_W, DYN_H, VIDEO_FPS) catch return;
     player = DesktopPlayer.init(alloc, dec, VIDEO_FPS) catch return;
 
     gfx.DesktopVideoDecoder.extractAudioWav(alloc, VIDEO_CLIP, VIDEO_AUDIO) catch return;
     vid_music_id = audio.loadMusic(VIDEO_AUDIO);
     if (vid_music_id != 0) {
-        player.?.setAudio(.{ .start = &vidAudioStart, .update = &vidAudioUpdate, .stop = &vidAudioStop });
+        player.?.setAudio(.{
+            .start = &vidAudioStart,
+            .update = &vidAudioUpdate,
+            .stop = &vidAudioStop,
+            .clock = &vidAudioClock, // master clock → PTS-accurate sync
+        });
     }
 }
 

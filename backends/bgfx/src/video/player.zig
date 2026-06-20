@@ -17,14 +17,23 @@ const types = @import("../gfx/types.zig");
 /// track (started with the video, ticked each frame, stopped on teardown)
 /// WITHOUT `gfx` depending on the `audio` module. The caller wires these to
 /// labelle's audio API (`playMusic`/`updateMusic`/`stopMusic`). Leave null for a
-/// silent clip. Audio is best-effort A/V sync — both start together and run at
-/// their own rates; PTS-accurate sync is a later refinement.
+/// silent clip.
+///
+/// `clock` returns the audio device's current playback position in seconds — the
+/// **master clock** for PTS-accurate A/V sync (wire it to
+/// `audio.musicPositionSeconds`). When null, the player falls back to wall-clock
+/// pacing off the per-frame `dt`.
 pub const AudioHooks = struct {
     ctx: ?*anyopaque = null,
     start: ?*const fn (ctx: ?*anyopaque) void = null,
     update: ?*const fn (ctx: ?*anyopaque) void = null,
     stop: ?*const fn (ctx: ?*anyopaque) void = null,
+    clock: ?*const fn (ctx: ?*anyopaque) f64 = null,
 };
+
+/// Cap on frames decoded-and-dropped in one `update` while catching up, so a
+/// long stall can't trigger a decode spiral that stalls the render thread.
+const MAX_CATCHUP_FRAMES = 4;
 
 pub fn Player(comptime Decoder: type) type {
     return struct {
@@ -34,27 +43,30 @@ pub fn Player(comptime Decoder: type) type {
         tex: types.Texture,
         pixels: []u8,
         allocator: std.mem.Allocator,
-        accum: f32 = 0, // seconds toward the next frame
-        frame_dt: f32,
         audio: AudioHooks = .{},
         started: bool = false,
+        // PTS-accurate sync state (all in seconds):
+        play_time: f64 = 0, // master clock — driven by the audio device, or dt
+        last_clock: f64 = 0, // previous audio-clock reading (for the delta)
+        cur_pts: f64 = -1, // PTS of the frame currently on the texture
 
         /// Take an already-opened decoder (opening is platform-specific), create
-        /// a dynamic texture sized to it, and allocate the RGBA frame buffer.
+        /// a dynamic texture sized to it, decode the first frame, and upload it.
         pub fn init(allocator: std.mem.Allocator, decoder: Decoder, fps: f32) !Self {
+            _ = fps; // pacing is now driven by frame PTS, not a fixed rate
             var dec = decoder;
             const w = dec.width();
             const h = dec.height();
             const tex = try texture.createDynamicTexture(w, h);
             errdefer texture.unloadTexture(tex);
             const pixels = try allocator.alloc(u8, @as(usize, w) * h * 4);
-            return .{
-                .decoder = dec,
-                .tex = tex,
-                .pixels = pixels,
-                .allocator = allocator,
-                .frame_dt = if (fps > 0) 1.0 / fps else 1.0 / 24.0,
-            };
+
+            var self: Self = .{ .decoder = dec, .tex = tex, .pixels = pixels, .allocator = allocator };
+            if (self.decoder.decodeFrame(pixels)) |pts| {
+                self.cur_pts = pts;
+                texture.updateTexture(tex, pixels);
+            }
+            return self;
         }
 
         /// Attach an audio track (started/ticked/stopped with the video).
@@ -62,23 +74,40 @@ pub fn Player(comptime Decoder: type) type {
             self.audio = hooks;
         }
 
-        /// Advance playback by `dt` seconds: when a frame is due, decode the next
-        /// one and upload it to the GPU texture. Holds the last frame otherwise,
-        /// so the render loop runs at its own rate without stalling on decode.
-        /// Starts the audio track on the first tick and ticks it every frame.
+        /// PTS-accurate A/V sync. The audio device is the master clock: we
+        /// advance `play_time` by the *audio clock's* elapsed delta (loop-safe —
+        /// a negative delta at a loop boundary contributes zero), then present
+        /// the video frame whose PTS the master clock has reached — decoding past
+        /// (dropping) frames that are late and holding the current one when the
+        /// next is still in the future. Without an audio clock it falls back to
+        /// `dt` pacing, still selecting frames by PTS (so VFR is handled).
         pub fn update(self: *Self, dt: f32) void {
             if (!self.started) {
                 self.started = true;
                 if (self.audio.start) |f| f(self.audio.ctx);
+                if (self.audio.clock) |c| self.last_clock = c(self.audio.ctx);
             }
             if (self.audio.update) |f| f(self.audio.ctx);
 
-            self.accum += dt;
-            if (self.accum < self.frame_dt) return;
-            self.accum -= self.frame_dt;
-            if (self.decoder.decodeFrame(self.pixels)) {
-                texture.updateTexture(self.tex, self.pixels);
+            // Advance the master clock.
+            if (self.audio.clock) |c| {
+                const now = c(self.audio.ctx);
+                const delta = now - self.last_clock;
+                self.last_clock = now;
+                self.play_time += if (delta > 0) delta else 0; // skip loop-wrap/pause
+            } else {
+                self.play_time += dt;
             }
+
+            // Present the frame the master clock has reached; drop late frames.
+            var uploaded = false;
+            var caught: u32 = 0;
+            while (self.cur_pts < self.play_time and caught < MAX_CATCHUP_FRAMES) : (caught += 1) {
+                const pts = self.decoder.decodeFrame(self.pixels) orelse break;
+                self.cur_pts = pts;
+                uploaded = true;
+            }
+            if (uploaded) texture.updateTexture(self.tex, self.pixels);
         }
 
         /// Draw the current video frame into `dest` (screen or world space, per

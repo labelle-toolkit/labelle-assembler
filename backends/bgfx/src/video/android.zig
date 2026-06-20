@@ -56,8 +56,8 @@ const UnsupportedDecoder = struct {
     pub fn height(_: *const UnsupportedDecoder) u32 {
         return 0;
     }
-    pub fn decodeFrame(_: *UnsupportedDecoder, _: []u8) bool {
-        return false;
+    pub fn decodeFrame(_: *UnsupportedDecoder, _: []u8) ?f64 {
+        return null;
     }
     pub fn deinit(_: *UnsupportedDecoder) void {}
 };
@@ -198,10 +198,11 @@ const AndroidVideoDecoder = struct {
     }
 
     /// Pump one decode step and, if a frame came out, convert it to RGBA8 into
-    /// `out` (width*height*4 bytes). Returns true if `out` was filled. Feeds at
-    /// most one input sample per call and drains one output buffer.
-    pub fn decodeFrame(self: *AndroidVideoDecoder, out: []u8) bool {
-        if (out.len != @as(usize, self.w) * self.h * 4) return false;
+    /// `out` (width*height*4 bytes). Returns the frame's presentation timestamp
+    /// in seconds (for A/V sync), or null if no frame was produced this call.
+    /// Feeds at most one input sample per call and drains one output buffer.
+    pub fn decodeFrame(self: *AndroidVideoDecoder, out: []u8) ?f64 {
+        if (out.len != @as(usize, self.w) * self.h * 4) return null;
 
         // -- Feed input.
         if (!self.input_done) {
@@ -227,9 +228,9 @@ const AndroidVideoDecoder = struct {
         const out_idx = AMediaCodec_dequeueOutputBuffer(self.codec, &info, 2000);
         if (out_idx == INFO_FORMAT_CHANGED) {
             self.refreshFormat();
-            return false;
+            return null;
         }
-        if (out_idx < 0) return false; // TRY_AGAIN / BUFFERS_CHANGED — caller retries
+        if (out_idx < 0) return null; // TRY_AGAIN / BUFFERS_CHANGED — caller retries
 
         const idx: usize = @intCast(out_idx);
         var size: usize = 0;
@@ -238,7 +239,8 @@ const AndroidVideoDecoder = struct {
         else
             false;
         _ = AMediaCodec_releaseOutputBuffer(self.codec, idx, false);
-        return got;
+        // presentation_time_us is the real container PTS — the A/V sync clock.
+        return if (got) @as(f64, @floatFromInt(info.presentation_time_us)) / 1_000_000.0 else null;
     }
 
     /// Read the decoder's output format for stride/slice-height/color updates

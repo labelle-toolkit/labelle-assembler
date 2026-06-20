@@ -85,7 +85,7 @@ fn runTest(activity: *c.ANativeActivity) void {
     var frames: u32 = 0;
     var tries: u32 = 0;
     while (frames < 10 and tries < 2000) : (tries += 1) {
-        if (dec.decodeFrame(buf)) {
+        if (dec.decodeFrame(buf)) |_| {
             frames += 1;
             if (frames == 1) {
                 log("frame0 px0 = ({d},{d},{d},{d})", .{ buf[0], buf[1], buf[2], buf[3] });

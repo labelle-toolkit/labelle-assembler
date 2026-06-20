@@ -22,6 +22,8 @@ pub const VideoDecoder = struct {
     w: u32,
     h: u32,
     frame_bytes: usize,
+    fps: f32,
+    frame_index: u64 = 0, // for the nominal CFR presentation timestamp
 
     /// Generate a self-contained H.264 test clip *with an audio track* (a 440 Hz
     /// sine), so demos need no bundled asset and can exercise the audio path.
@@ -49,15 +51,16 @@ pub const VideoDecoder = struct {
         if (system(cmd.ptr) != 0) return error.FfmpegAudioExtractFailed;
     }
 
-    /// Decode `path` into a looping RGBA8 frame stream at `w`×`h`.
-    pub fn open(allocator: std.mem.Allocator, path: []const u8, w: u32, h: u32) !VideoDecoder {
+    /// Decode `path` into a looping RGBA8 frame stream at `w`×`h`. `fps` is the
+    /// clip's frame rate, used to derive each frame's presentation timestamp.
+    pub fn open(allocator: std.mem.Allocator, path: []const u8, w: u32, h: u32, fps: f32) !VideoDecoder {
         const cmd = try std.fmt.allocPrintSentinel(allocator,
             "ffmpeg -hide_banner -loglevel error -stream_loop -1 -i {s} " ++
             "-f rawvideo -pix_fmt rgba -s {d}x{d} pipe:1",
             .{ path, w, h }, 0);
         defer allocator.free(cmd);
         const stream = popen(cmd.ptr, "r") orelse return error.PopenFailed;
-        return .{ .stream = stream, .w = w, .h = h, .frame_bytes = @as(usize, w) * h * 4 };
+        return .{ .stream = stream, .w = w, .h = h, .frame_bytes = @as(usize, w) * h * 4, .fps = fps };
     }
 
     pub fn width(self: *const VideoDecoder) u32 {
@@ -67,16 +70,22 @@ pub const VideoDecoder = struct {
         return self.h;
     }
 
-    /// Read one RGBA8 frame into `buf` (width*height*4 bytes). False on stream end.
-    pub fn decodeFrame(self: *VideoDecoder, buf: []u8) bool {
-        if (buf.len != self.frame_bytes) return false;
+    /// Read one RGBA8 frame into `buf` (width*height*4 bytes). Returns the
+    /// frame's presentation timestamp in seconds (nominal CFR: frame_index/fps),
+    /// or null on stream end. ffmpeg rawvideo carries no timestamps, so for a
+    /// constant-rate clip the index-derived PTS is exact; the A/V sync still
+    /// runs off the audio master clock regardless.
+    pub fn decodeFrame(self: *VideoDecoder, buf: []u8) ?f64 {
+        if (buf.len != self.frame_bytes) return null;
         var off: usize = 0;
         while (off < buf.len) {
             const n = fread(buf.ptr + off, 1, buf.len - off, self.stream);
-            if (n == 0) return false;
+            if (n == 0) return null;
             off += n;
         }
-        return true;
+        const pts = @as(f64, @floatFromInt(self.frame_index)) / @as(f64, self.fps);
+        self.frame_index += 1;
+        return pts;
     }
 
     pub fn deinit(self: *VideoDecoder) void {
