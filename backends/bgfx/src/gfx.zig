@@ -93,6 +93,10 @@ pub const compressedDims = texture.compressedDims;
 pub const VideoPlayer = @import("video/player.zig").Player;
 pub const DesktopVideoDecoder = @import("video/desktop.zig").VideoDecoder;
 pub const AndroidVideoDecoder = @import("video/android.zig").VideoDecoder;
+// VideoBackend satisfies core.VideoInterface: a name → player handle pool the
+// assembler wires into the engine's VideoImpl slot, so a game plays a clip with
+// just its asset name (#549).
+pub const VideoBackend = @import("video/backend.zig").VideoBackend;
 
 // ── Text rendering ─────────────────────────────────────────────────────
 

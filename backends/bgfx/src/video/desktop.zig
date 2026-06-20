@@ -17,6 +17,34 @@ extern "c" fn pclose(stream: *anyopaque) c_int;
 extern "c" fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn system(command: [*:0]const u8) c_int;
 
+/// Probe a clip's native pixel dimensions + frame rate via `ffprobe`, so the
+/// VideoBackend can open a video by name without the caller specifying a size.
+/// Returns null if ffprobe is unavailable or the output can't be parsed.
+pub const Info = struct { w: u32, h: u32, fps: f32 };
+pub fn probe(allocator: std.mem.Allocator, path: []const u8) ?Info {
+    const cmd = std.fmt.allocPrintSentinel(allocator,
+        "ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate " ++
+        "-of csv=p=0:s=x {s}",
+        .{path}, 0) catch return null;
+    defer allocator.free(cmd);
+    const stream = popen(cmd.ptr, "r") orelse return null;
+    defer _ = pclose(stream);
+    var buf: [128]u8 = undefined;
+    const n = fread(&buf, 1, buf.len - 1, stream);
+    if (n == 0) return null;
+    // Output like "1920x1080x24/1"
+    var it = std.mem.splitScalar(u8, std.mem.trim(u8, buf[0..n], " \n\r\t"), 'x');
+    const w = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const h = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const rate = it.next() orelse return null; // "num/den"
+    var rit = std.mem.splitScalar(u8, rate, '/');
+    const num = std.fmt.parseFloat(f32, rit.next() orelse "24") catch 24;
+    const den = std.fmt.parseFloat(f32, rit.next() orelse "1") catch 1;
+    const fps = if (den > 0) num / den else 24;
+    if (w == 0 or h == 0) return null;
+    return .{ .w = w, .h = h, .fps = if (fps > 0) fps else 24 };
+}
+
 pub const VideoDecoder = struct {
     stream: *anyopaque, // libc FILE*
     w: u32,
