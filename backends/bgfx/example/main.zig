@@ -230,6 +230,53 @@ fn hexagonPoints(cx: f32, cy: f32, radius: f32, rotation_deg: f32) [6]gfx.Vector
     return pts;
 }
 
+// ── Dynamic-texture (video-frame) demo ───────────────────────────────────
+//
+// Path A "display half" (#549): create ONE mutable RGBA8 texture, then re-upload
+// a freshly-generated frame every tick via `gfx.updateTexture`. A real intro
+// would memcpy a decoded+YUV→RGBA video frame into `dyn_pixels` here instead of
+// the synthetic plasma — the create-once / update-each-frame / draw-fullscreen
+// loop is identical. This is exactly the bgfx-side mechanism a MediaCodec/ffmpeg
+// decoder would feed.
+
+const DYN_W: u32 = 256;
+const DYN_H: u32 = 192;
+var dyn_tex: ?gfx.Texture = null;
+var dyn_pixels: ?[]u8 = null;
+
+fn initDynamicTexture() void {
+    dyn_pixels = std.heap.page_allocator.alloc(u8, DYN_W * DYN_H * 4) catch return;
+    dyn_tex = gfx.createDynamicTexture(DYN_W, DYN_H) catch null;
+}
+
+/// Fill `dyn_pixels` with an animated plasma (proves the pixels are genuinely
+/// re-uploaded each frame, not a static texture) and push it to the GPU.
+fn updateDynamicTexture() void {
+    const px = dyn_pixels orelse return;
+    const tex = dyn_tex orelse return;
+    const f: u32 = @truncate(frame_count);
+    var y: u32 = 0;
+    while (y < DYN_H) : (y += 1) {
+        var x: u32 = 0;
+        while (x < DYN_W) : (x += 1) {
+            const i = (y * DYN_W + x) * 4;
+            px[i + 0] = @truncate(x *% 2 +% f *% 2); // R: diagonal bands drifting right
+            px[i + 1] = @truncate(y *% 2 +% f); // G: bands drifting down
+            px[i + 2] = @truncate(x +% y +% f *% 3); // B: fast counter-scroll
+            px[i + 3] = 255; // A
+        }
+    }
+    gfx.updateTexture(tex, px); // bgfx.copy + updateTexture2D
+}
+
+fn drawDynamicTexture() void {
+    const tex = dyn_tex orelse return;
+    const src = gfx.Rectangle{ .x = 0, .y = 0, .width = @floatFromInt(DYN_W), .height = @floatFromInt(DYN_H) };
+    const dest = gfx.Rectangle{ .x = 240, .y = 180, .width = 320, .height = 240 };
+    gfx.drawTexturePro(tex, src, dest, .{ .x = 0, .y = 0 }, 0, gfx.white);
+    gfx.drawText("Dynamic texture: per-frame updateTexture() upload (#549)", 232, 164, 10, gfx.color(255, 255, 255, 220));
+}
+
 // ── Update ─────────────────────────────────────────────────────────────
 
 fn update() void {
@@ -337,6 +384,9 @@ fn draw() void {
     window.beginDrawing();
     window.clearBackground(30, 30, 46, 255);
 
+    // Re-upload this frame's pixels to the dynamic texture (#549 display half).
+    updateDynamicTexture();
+
     // ── World-space rendering (camera-transformed) ─────────────────
     gfx.beginMode2D(camera);
 
@@ -374,6 +424,9 @@ fn draw() void {
 
     // ── Screen-space HUD (no camera transform) ────────────────────
     drawHud();
+
+    // ── Dynamic-texture panel (screen-space, drawn on top) ────────
+    drawDynamicTexture();
 
     // ── Gamepad overlay (lights up live when a controller is connected) ──
     gamepad_overlay.draw(SCREEN_W_F, SCREEN_H_F);
@@ -532,6 +585,9 @@ pub fn main() void {
     window.setTargetFPS(60);
     gfx.setScreenSize(SCREEN_W, SCREEN_H);
 
+    // -- Dynamic-texture demo: one mutable texture, re-uploaded each frame.
+    initDynamicTexture();
+
     // -- Audio: synthesize a 440 Hz beep WAV to a temp file and load it.
     // This opens the miniaudio playback device (#297) on first load and
     // exercises the device callback → mixAudio path end to end. Loading
@@ -565,5 +621,10 @@ pub fn main() void {
         audio.unloadMusic(music_id);
     }
     audio.deinit();
+
+    // -- Dynamic-texture cleanup
+    if (dyn_tex) |t| gfx.unloadTexture(t);
+    if (dyn_pixels) |p| std.heap.page_allocator.free(p);
+
     window.closeWindow();
 }
