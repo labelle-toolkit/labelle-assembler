@@ -123,10 +123,12 @@ const AndroidVideoDecoder = struct {
     extern fn AImageReader_getWindow(*ImageReader, window: *?*Window) i32;
     extern fn AImageReader_acquireLatestImage(*ImageReader, image: *?*Image) i32;
     extern fn AImageReader_delete(*ImageReader) void;
+    const CropRect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
     extern fn AImage_getNumberOfPlanes(*const Image, num: *i32) i32;
     extern fn AImage_getPlaneData(*const Image, plane: i32, data: *?[*]u8, len: *i32) i32;
     extern fn AImage_getPlaneRowStride(*const Image, plane: i32, stride: *i32) i32;
     extern fn AImage_getPlanePixelStride(*const Image, plane: i32, stride: *i32) i32;
+    extern fn AImage_getCropRect(*const Image, rect: *CropRect) i32;
     extern fn AImage_getTimestamp(*const Image, ts: *i64) i32;
     extern fn AImage_delete(*Image) void;
 
@@ -316,15 +318,33 @@ const AndroidVideoDecoder = struct {
         _ = AImage_getPlaneRowStride(img, 1, &uv_row);
         _ = AImage_getPlanePixelStride(img, 0, &y_px);
         _ = AImage_getPlanePixelStride(img, 1, &uv_px);
+        const ys: u32 = @intCast(@max(y_row, 1));
+        const yx: u32 = @intCast(@max(y_px, 1));
+        const us: u32 = @intCast(@max(uv_row, 1));
+        const ux: u32 = @intCast(@max(uv_px, 1));
+
+        // Crop rect: the buffer may be padded beyond the display frame (e.g.
+        // 1080 → 1088). Offset each plane to the crop's top-left so we sample the
+        // real frame, not alignment padding. Defaults to (0,0) when absent.
+        var crop: CropRect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        _ = AImage_getCropRect(img, &crop);
+        const cl: u32 = @intCast(@max(crop.left, 0));
+        const ct: u32 = @intCast(@max(crop.top, 0));
+        const y_off: usize = @as(usize, ct) * ys + @as(usize, cl) * yx;
+        const uv_off: usize = @as(usize, ct / 2) * us + @as(usize, cl / 2) * ux;
+        const yl_u: usize = @intCast(yl);
+        const ul_u: usize = @intCast(ul);
+        const vl_u: usize = @intCast(vl);
+        if (y_off >= yl_u or uv_off >= ul_u or uv_off >= vl_u) return false;
 
         yuv.yuv420ToRgba(
-            yp[0..@intCast(yl)],
-            @intCast(@max(y_row, 1)),
-            @intCast(@max(y_px, 1)),
-            up[0..@intCast(ul)],
-            vp[0..@intCast(vl)],
-            @intCast(@max(uv_row, 1)),
-            @intCast(@max(uv_px, 1)),
+            yp[y_off..yl_u],
+            ys,
+            yx,
+            up[uv_off..ul_u],
+            vp[uv_off..vl_u],
+            us,
+            ux,
             self.w,
             self.h,
             out,
