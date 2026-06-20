@@ -242,23 +242,48 @@ const DYN_H: u32 = 192;
 const VIDEO_FPS: f32 = 24.0;
 const VIDEO_CLIP = "bgfx-video-test.mp4";
 
+const VIDEO_AUDIO = "bgfx-video-audio.wav";
 const DesktopPlayer = gfx.VideoPlayer(gfx.DesktopVideoDecoder);
 var player: ?DesktopPlayer = null;
+var vid_music_id: u32 = 0;
 
-/// Generate a self-contained H.264 clip, open the ffmpeg decoder, and hand it to
-/// a VideoPlayer (which creates the dynamic texture). Best-effort: if ffmpeg is
-/// missing the demo just runs without the video panel.
+// Audio hooks: the VideoPlayer drives the clip's audio track through labelle's
+// streaming-music API, started/ticked/stopped in lockstep with the video.
+fn vidAudioStart(_: ?*anyopaque) void {
+    if (vid_music_id != 0) audio.playMusic(vid_music_id);
+}
+fn vidAudioUpdate(_: ?*anyopaque) void {
+    if (vid_music_id != 0) audio.updateMusic(vid_music_id);
+}
+fn vidAudioStop(_: ?*anyopaque) void {
+    if (vid_music_id != 0) audio.stopMusic(vid_music_id);
+}
+
+/// Generate a self-contained H.264 clip (with audio), open the ffmpeg decoder,
+/// hand it to a VideoPlayer, then extract the audio track to a WAV and attach it
+/// via labelle's music API. Best-effort: missing ffmpeg → no video panel; no
+/// audio device (Android #306) → silent but otherwise identical.
 fn initVideo() void {
     const alloc = std.heap.page_allocator;
     gfx.DesktopVideoDecoder.generateTestClip(alloc, VIDEO_CLIP, DYN_W, DYN_H) catch return;
     const dec = gfx.DesktopVideoDecoder.open(alloc, VIDEO_CLIP, DYN_W, DYN_H) catch return;
     player = DesktopPlayer.init(alloc, dec, VIDEO_FPS) catch return;
+
+    gfx.DesktopVideoDecoder.extractAudioWav(alloc, VIDEO_CLIP, VIDEO_AUDIO) catch return;
+    vid_music_id = audio.loadMusic(VIDEO_AUDIO);
+    if (vid_music_id != 0) {
+        player.?.setAudio(.{ .start = &vidAudioStart, .update = &vidAudioUpdate, .stop = &vidAudioStop });
+    }
 }
 
 fn drawVideo() void {
     if (player) |*p| {
         p.draw(.{ .x = 240, .y = 180, .width = 320, .height = 240 });
-        gfx.drawText("gfx.VideoPlayer: ffmpeg H.264 -> dynamic texture (#549)", 232, 164, 10, gfx.color(255, 255, 255, 220));
+        const label: [:0]const u8 = if (vid_music_id != 0)
+            "gfx.VideoPlayer: H.264 video + audio (#549)"
+        else
+            "gfx.VideoPlayer: H.264 video (no audio device) (#549)";
+        gfx.drawText(label, 232, 164, 10, gfx.color(255, 255, 255, 220));
     }
 }
 

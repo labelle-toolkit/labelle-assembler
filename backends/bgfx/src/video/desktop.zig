@@ -23,15 +23,30 @@ pub const VideoDecoder = struct {
     h: u32,
     frame_bytes: usize,
 
-    /// Generate a self-contained H.264 test clip (so demos need no bundled asset).
+    /// Generate a self-contained H.264 test clip *with an audio track* (a 440 Hz
+    /// sine), so demos need no bundled asset and can exercise the audio path.
     pub fn generateTestClip(allocator: std.mem.Allocator, path: []const u8, w: u32, h: u32) !void {
         const cmd = try std.fmt.allocPrintSentinel(allocator,
-            "ffmpeg -hide_banner -loglevel error -y -f lavfi " ++
-            "-i testsrc2=duration=6:size={d}x{d}:rate=24 " ++
-            "-c:v libx264 -pix_fmt yuv420p {s}",
+            "ffmpeg -hide_banner -loglevel error -y " ++
+            "-f lavfi -i testsrc2=duration=6:size={d}x{d}:rate=24 " ++
+            "-f lavfi -i sine=frequency=440:duration=6 " ++
+            "-c:v libx264 -pix_fmt yuv420p -c:a aac -shortest {s}",
             .{ w, h, path }, 0);
         defer allocator.free(cmd);
         if (system(cmd.ptr) != 0) return error.FfmpegEncodeFailed;
+    }
+
+    /// Extract the clip's audio track to a 48 kHz stereo s16 WAV — the format
+    /// labelle's `audio.loadMusic` decodes. Returns error if the clip has no
+    /// audio or ffmpeg fails. (Android's AMediaCodec path would decode the audio
+    /// track in-process instead; see the #549 / #306 notes.)
+    pub fn extractAudioWav(allocator: std.mem.Allocator, clip_path: []const u8, wav_path: []const u8) !void {
+        const cmd = try std.fmt.allocPrintSentinel(allocator,
+            "ffmpeg -hide_banner -loglevel error -y -i {s} " ++
+            "-vn -ar 48000 -ac 2 -c:a pcm_s16le {s}",
+            .{ clip_path, wav_path }, 0);
+        defer allocator.free(cmd);
+        if (system(cmd.ptr) != 0) return error.FfmpegAudioExtractFailed;
     }
 
     /// Decode `path` into a looping RGBA8 frame stream at `w`×`h`.

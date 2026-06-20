@@ -13,6 +13,19 @@ const std = @import("std");
 const texture = @import("../gfx/texture.zig");
 const types = @import("../gfx/types.zig");
 
+/// Audio lifecycle injected by the game/example so the player can drive an audio
+/// track (started with the video, ticked each frame, stopped on teardown)
+/// WITHOUT `gfx` depending on the `audio` module. The caller wires these to
+/// labelle's audio API (`playMusic`/`updateMusic`/`stopMusic`). Leave null for a
+/// silent clip. Audio is best-effort A/V sync — both start together and run at
+/// their own rates; PTS-accurate sync is a later refinement.
+pub const AudioHooks = struct {
+    ctx: ?*anyopaque = null,
+    start: ?*const fn (ctx: ?*anyopaque) void = null,
+    update: ?*const fn (ctx: ?*anyopaque) void = null,
+    stop: ?*const fn (ctx: ?*anyopaque) void = null,
+};
+
 pub fn Player(comptime Decoder: type) type {
     return struct {
         const Self = @This();
@@ -23,6 +36,8 @@ pub fn Player(comptime Decoder: type) type {
         allocator: std.mem.Allocator,
         accum: f32 = 0, // seconds toward the next frame
         frame_dt: f32,
+        audio: AudioHooks = .{},
+        started: bool = false,
 
         /// Take an already-opened decoder (opening is platform-specific), create
         /// a dynamic texture sized to it, and allocate the RGBA frame buffer.
@@ -42,10 +57,22 @@ pub fn Player(comptime Decoder: type) type {
             };
         }
 
+        /// Attach an audio track (started/ticked/stopped with the video).
+        pub fn setAudio(self: *Self, hooks: AudioHooks) void {
+            self.audio = hooks;
+        }
+
         /// Advance playback by `dt` seconds: when a frame is due, decode the next
         /// one and upload it to the GPU texture. Holds the last frame otherwise,
         /// so the render loop runs at its own rate without stalling on decode.
+        /// Starts the audio track on the first tick and ticks it every frame.
         pub fn update(self: *Self, dt: f32) void {
+            if (!self.started) {
+                self.started = true;
+                if (self.audio.start) |f| f(self.audio.ctx);
+            }
+            if (self.audio.update) |f| f(self.audio.ctx);
+
             self.accum += dt;
             if (self.accum < self.frame_dt) return;
             self.accum -= self.frame_dt;
@@ -67,6 +94,7 @@ pub fn Player(comptime Decoder: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (self.audio.stop) |f| f(self.audio.ctx);
             self.decoder.deinit();
             texture.unloadTexture(self.tex);
             self.allocator.free(self.pixels);
