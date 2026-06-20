@@ -33,26 +33,16 @@ const builtin = @import("builtin");
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
 
-/// Device-less stub used on Android (and anywhere without a real output
-/// device). Mirrors `audio_device.zig`'s control surface so `ensureInit`
-/// / `deinit` call through it unchanged: starting is a no-op, stopping is
-/// a no-op, and zero frames are ever mixed.
-const NoopDevice = struct {
-    pub const MixFn = *const fn (output: []i16, frames_requested: u32) void;
-    pub fn ensureStarted(mix: MixFn) void {
-        _ = mix; // no device drives the mixer on this target
-    }
-    pub fn stop() void {}
-    pub fn framesMixed() u64 {
-        return 0;
-    }
-};
-
-// On Android the miniaudio `@cImport` (and `miniaudio.h` itself) must not
-// be analyzed — the header isn't on the include path and the device libs
-// aren't linked. `if (is_android)` is comptime, so only the taken branch
-// is semantically analyzed per target.
-const device_backend = if (is_android) NoopDevice else @import("audio_device.zig");
+// Output device, selected per target. On Android it's the AAudio device
+// (#306); on desktop it's the miniaudio device. Both expose the same
+// `ensureStarted`/`stop`/`framesMixed` surface, so `ensureInit`/`deinit` call
+// through unchanged. `if (is_android)` is comptime, so only the taken branch is
+// analyzed — the desktop miniaudio `@cImport` is never seen on Android, and the
+// AAudio externs are never seen on desktop.
+const device_backend = if (is_android)
+    @import("audio_device_android.zig")
+else
+    @import("audio_device.zig");
 
 const MAX_SOUNDS = 256;
 const MAX_MUSIC = 32;
@@ -135,6 +125,13 @@ var master_volume: f32 = 1.0;
 /// device); the mixer state advances only when something pumps `mixAudio`.
 pub fn ensureInit() void {
     device_backend.ensureStarted(&mixAudio);
+}
+
+/// Cumulative frames pushed through the output device callback. >0 confirms the
+/// device (miniaudio on desktop, AAudio on Android, #306) is live and pulling
+/// from the mixer. Used for headless / on-device proof-of-life.
+pub fn deviceFramesMixed() u64 {
+    return device_backend.framesMixed();
 }
 
 /// Stop and close the playback device, then free all loaded PCM. Must be

@@ -14,6 +14,9 @@
 
 const std = @import("std");
 const android = @import("android");
+const audio = @import("audio");
+
+extern "c" fn usleep(usec: u32) c_int;
 
 const c = @cImport({
     @cInclude("decode_shim.h");
@@ -98,4 +101,17 @@ fn runTest(activity: *c.ANativeActivity) void {
     } else {
         log("RESULT FAIL: no frames in {d} tries", .{tries});
     }
+
+    // -- AAudio output device test (#306): start the device (mixing silence is
+    // fine — we only need the callback to fire) and confirm it's pulling frames.
+    audio.ensureInit();
+    _ = usleep(500_000); // let the audio thread run ~0.5s
+    const mixed = audio.deviceFramesMixed();
+    log("AAUDIO frames mixed in ~0.5s = {d}", .{mixed});
+    if (mixed > 0) {
+        log("AAUDIO PASS: output device live (#306)", .{});
+    } else {
+        log("AAUDIO FAIL: device produced no frames", .{});
+    }
+    audio.deinit();
 }
