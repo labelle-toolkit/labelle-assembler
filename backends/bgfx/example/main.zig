@@ -18,7 +18,6 @@ const input = @import("input");
 const audio = @import("audio");
 const window = @import("window");
 const gamepad_overlay = @import("gamepad_overlay.zig");
-const video = @import("video.zig");
 
 // ── GLFW key codes ─────────────────────────────────────────────────────
 
@@ -231,89 +230,36 @@ fn hexagonPoints(cx: f32, cy: f32, radius: f32, rotation_deg: f32) [6]gfx.Vector
     return pts;
 }
 
-// ── Dynamic-texture (video-frame) demo ───────────────────────────────────
+// ── In-engine video via gfx.VideoPlayer (#549 Path A) ─────────────────────
 //
-// Path A "display half" (#549): create ONE mutable RGBA8 texture, then re-upload
-// a freshly-generated frame every tick via `gfx.updateTexture`. A real intro
-// would memcpy a decoded+YUV→RGBA video frame into `dyn_pixels` here instead of
-// the synthetic plasma — the create-once / update-each-frame / draw-fullscreen
-// loop is identical. This is exactly the bgfx-side mechanism a MediaCodec/ffmpeg
-// decoder would feed.
+// The backend now ships the whole decode→texture wiring: gfx.VideoPlayer owns a
+// dynamic texture and a decoder, decodes frames, and uploads + draws them. Here
+// we drive it with the desktop ffmpeg decoder; on Android the identical player
+// drives gfx.AndroidVideoDecoder (hardware-verified, see src/video/apk/).
 
 const DYN_W: u32 = 256;
 const DYN_H: u32 = 192;
-var dyn_tex: ?gfx.Texture = null;
-var dyn_pixels: ?[]u8 = null;
-
-// -- Half 2: ffmpeg-decoded video feeding the dynamic texture --
 const VIDEO_FPS: f32 = 24.0;
 const VIDEO_CLIP = "bgfx-video-test.mp4";
-var vid: ?video.VideoPipe = null;
-var vid_accum: f32 = 0; // seconds accumulated toward the next video frame
-var vid_active: bool = false;
 
-fn initDynamicTexture() void {
-    dyn_pixels = std.heap.page_allocator.alloc(u8, DYN_W * DYN_H * 4) catch return;
-    dyn_tex = gfx.createDynamicTexture(DYN_W, DYN_H) catch null;
-}
+const DesktopPlayer = gfx.VideoPlayer(gfx.DesktopVideoDecoder);
+var player: ?DesktopPlayer = null;
 
-/// Generate a self-contained H.264 clip and open an ffmpeg decode pipe. Video
-/// playback is best-effort: if ffmpeg is missing or fails, we silently fall
-/// back to the synthetic-plasma path so the demo still runs.
+/// Generate a self-contained H.264 clip, open the ffmpeg decoder, and hand it to
+/// a VideoPlayer (which creates the dynamic texture). Best-effort: if ffmpeg is
+/// missing the demo just runs without the video panel.
 fn initVideo() void {
     const alloc = std.heap.page_allocator;
-    video.VideoPipe.generateTestClip(alloc, VIDEO_CLIP, DYN_W, DYN_H) catch return;
-    vid = video.VideoPipe.open(alloc, VIDEO_CLIP, DYN_W, DYN_H) catch return;
-    vid_active = true;
+    gfx.DesktopVideoDecoder.generateTestClip(alloc, VIDEO_CLIP, DYN_W, DYN_H) catch return;
+    const dec = gfx.DesktopVideoDecoder.open(alloc, VIDEO_CLIP, DYN_W, DYN_H) catch return;
+    player = DesktopPlayer.init(alloc, dec, VIDEO_FPS) catch return;
 }
 
-/// Push the next texture frame. With a live video pipe (Half 2), pace decoded
-/// frames at the clip's fps and upload them; otherwise fall back to the
-/// synthetic plasma (Half 1). Either way it's the same `updateTexture` sink.
-fn updateDynamicTexture() void {
-    const px = dyn_pixels orelse return;
-    const tex = dyn_tex orelse return;
-
-    if (vid_active) {
-        // Pace reads to the clip's frame rate; ffmpeg has decoded ahead, so a
-        // read drains the pipe quickly without stalling the 60 fps loop.
-        vid_accum += dt;
-        if (vid_accum < 1.0 / VIDEO_FPS) return; // hold last frame this tick
-        vid_accum -= 1.0 / VIDEO_FPS;
-        if (vid.?.readFrame(px)) {
-            gfx.updateTexture(tex, px);
-        } else {
-            vid_active = false; // pipe ended/failed → stop; plasma takes over
-        }
-        return;
+fn drawVideo() void {
+    if (player) |*p| {
+        p.draw(.{ .x = 240, .y = 180, .width = 320, .height = 240 });
+        gfx.drawText("gfx.VideoPlayer: ffmpeg H.264 -> dynamic texture (#549)", 232, 164, 10, gfx.color(255, 255, 255, 220));
     }
-
-    // Fallback: animated plasma (proves per-frame upload without a decoder).
-    const f: u32 = @truncate(frame_count);
-    var y: u32 = 0;
-    while (y < DYN_H) : (y += 1) {
-        var x: u32 = 0;
-        while (x < DYN_W) : (x += 1) {
-            const i = (y * DYN_W + x) * 4;
-            px[i + 0] = @truncate(x *% 2 +% f *% 2);
-            px[i + 1] = @truncate(y *% 2 +% f);
-            px[i + 2] = @truncate(x +% y +% f *% 3);
-            px[i + 3] = 255;
-        }
-    }
-    gfx.updateTexture(tex, px); // bgfx.copy + updateTexture2D
-}
-
-fn drawDynamicTexture() void {
-    const tex = dyn_tex orelse return;
-    const src = gfx.Rectangle{ .x = 0, .y = 0, .width = @floatFromInt(DYN_W), .height = @floatFromInt(DYN_H) };
-    const dest = gfx.Rectangle{ .x = 240, .y = 180, .width = 320, .height = 240 };
-    gfx.drawTexturePro(tex, src, dest, .{ .x = 0, .y = 0 }, 0, gfx.white);
-    const label: [:0]const u8 = if (vid_active)
-        "Video: ffmpeg-decoded H.264 -> updateTexture (#549 Half 2)"
-    else
-        "Dynamic texture: synthetic plasma fallback (#549 Half 1)";
-    gfx.drawText(label, 232, 164, 10, gfx.color(255, 255, 255, 220));
 }
 
 // ── Update ─────────────────────────────────────────────────────────────
@@ -423,8 +369,8 @@ fn draw() void {
     window.beginDrawing();
     window.clearBackground(30, 30, 46, 255);
 
-    // Re-upload this frame's pixels to the dynamic texture (#549 display half).
-    updateDynamicTexture();
+    // Advance video playback (decodes + uploads a frame when due).
+    if (player) |*p| p.update(dt);
 
     // ── World-space rendering (camera-transformed) ─────────────────
     gfx.beginMode2D(camera);
@@ -464,8 +410,8 @@ fn draw() void {
     // ── Screen-space HUD (no camera transform) ────────────────────
     drawHud();
 
-    // ── Dynamic-texture panel (screen-space, drawn on top) ────────
-    drawDynamicTexture();
+    // ── Video panel (screen-space, drawn on top) ──────────────────
+    drawVideo();
 
     // ── Gamepad overlay (lights up live when a controller is connected) ──
     gamepad_overlay.draw(SCREEN_W_F, SCREEN_H_F);
@@ -625,8 +571,7 @@ pub fn main() void {
     gfx.setScreenSize(SCREEN_W, SCREEN_H);
 
     // -- Dynamic-texture demo: one mutable texture, re-uploaded each frame.
-    initDynamicTexture();
-    initVideo(); // Half 2: ffmpeg decode → dynamic texture (falls back to plasma)
+    initVideo(); // gfx.VideoPlayer: ffmpeg decode → dynamic texture
 
     // -- Audio: synthesize a 440 Hz beep WAV to a temp file and load it.
     // This opens the miniaudio playback device (#297) on first load and
@@ -663,9 +608,7 @@ pub fn main() void {
     audio.deinit();
 
     // -- Dynamic-texture cleanup
-    if (vid) |*v| v.deinit();
-    if (dyn_tex) |t| gfx.unloadTexture(t);
-    if (dyn_pixels) |p| std.heap.page_allocator.free(p);
+    if (player) |*p| p.deinit();
 
     window.closeWindow();
 }

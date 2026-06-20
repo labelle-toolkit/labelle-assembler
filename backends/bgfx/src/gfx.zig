@@ -86,6 +86,14 @@ pub const uploadCompressed = texture.uploadCompressed;
 // synchronous seam — it reads dims here to set DecodedImage before upload.
 pub const compressedDims = texture.compressedDims;
 
+// ── In-engine video (#549 Path A) ──────────────────────────────────────
+// VideoPlayer wires a decoder → dynamic texture → drawTexturePro. Generic over
+// the decoder so the same player drives ffmpeg (desktop) or AMediaCodec
+// (Android). The Android decoder is hardware-verified (see video/apk/).
+pub const VideoPlayer = @import("video/player.zig").Player;
+pub const DesktopVideoDecoder = @import("video/desktop.zig").VideoDecoder;
+pub const AndroidVideoDecoder = @import("video/android.zig").VideoDecoder;
+
 // ── Text rendering ─────────────────────────────────────────────────────
 
 pub const drawText = font.drawText;
