@@ -9,8 +9,14 @@
 //! These are pure C NDK APIs (no JNI/Java), so they're called from Zig via
 //! `extern`. The decoder is **comptime-gated to the Android ABI**: off Android
 //! it resolves to an `Unsupported` stub so host/desktop builds never reference
-//! the NDK symbols. It is therefore **build-verified on CI only** (the NDK
-//! sysroot isn't present on dev hosts) — the host-testable part is `yuv.zig`.
+//! the NDK symbols.
+//!
+//! Verified on-device: the `apk/` NativeActivity harness decodes a real H.264
+//! clip on a Pixel-7 API-34 emulator (arm64) — extract → AMediaCodec decode →
+//! YUV→RGBA, 10 frames, RESULT PASS. (AMediaCodec needs a real app process for
+//! its Binder/JVM context, which is why the bare-CLI harness can't get past
+//! codec creation — see `apk/native.zig`.) The host-testable colour conversion
+//! lives in `yuv.zig`.
 //!
 //! Known follow-ups (next slices, deliberately out of this first cut):
 //!   - `COLOR_FormatYUV420Flexible` / proprietary tiled vendor formats (need
@@ -136,7 +142,11 @@ const AndroidVideoDecoder = struct {
         const n = AMediaExtractor_getTrackCount(ex);
         var track: usize = 0;
         var found = false;
-        var mime: [*:0]const u8 = undefined;
+        // The mime string from AMediaFormat_getString is owned by the format
+        // and freed by AMediaFormat_delete — copy it out before the format dies,
+        // or createDecoderByType reads a dangling pointer.
+        var mime_buf: [64]u8 = undefined;
+        var mime_len: usize = 0;
         var w: i32 = 0;
         var h: i32 = 0;
         var color: i32 = COLOR_NV12;
@@ -145,22 +155,27 @@ const AndroidVideoDecoder = struct {
             defer AMediaFormat_delete(fmt);
             var m: [*:0]const u8 = undefined;
             if (!AMediaFormat_getString(fmt, KEY_MIME, &m)) continue;
-            if (!std.mem.startsWith(u8, std.mem.span(m), "video/")) continue;
+            const span = std.mem.span(m);
+            if (!std.mem.startsWith(u8, span, "video/")) continue;
+            if (span.len + 1 > mime_buf.len) continue;
             _ = AMediaFormat_getInt32(fmt, KEY_WIDTH, &w);
             _ = AMediaFormat_getInt32(fmt, KEY_HEIGHT, &h);
             _ = AMediaFormat_getInt32(fmt, KEY_COLOR_FORMAT, &color);
-            mime = m;
+            @memcpy(mime_buf[0..span.len], span);
+            mime_buf[span.len] = 0;
+            mime_len = span.len;
             found = true;
             break;
         }
         if (!found) return error.NoVideoTrack;
+        const mime: [*:0]const u8 = mime_buf[0..mime_len :0].ptr;
         if (AMediaExtractor_selectTrack(ex, track) != AMEDIA_OK) return error.DecoderInit;
 
         const codec = AMediaCodec_createDecoderByType(mime) orelse return error.DecoderInit;
         errdefer AMediaCodec_delete(codec);
         const cfg_fmt = AMediaExtractor_getTrackFormat(ex, track) orelse return error.DecoderInit;
         defer AMediaFormat_delete(cfg_fmt);
-        // surface = null → ByteBuffer (CPU-readable YUV) output.
+        // surface = null -> ByteBuffer (CPU-readable YUV) output.
         if (AMediaCodec_configure(codec, cfg_fmt, null, null, 0) != AMEDIA_OK)
             return error.DecoderInit;
         if (AMediaCodec_start(codec) != AMEDIA_OK) return error.DecoderInit;
