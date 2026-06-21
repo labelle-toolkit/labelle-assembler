@@ -1,6 +1,6 @@
 # RFC: Pluggable backends — make the assembler backend-agnostic
 
-**Status:** Draft (revision 3 — contracts are independently pluggable, not bundled; full-stack packages + per-contract overrides over one monorepo with lazy deps; audio is the worked example + pilot extraction)
+**Status:** Draft (revision 4 — per-contract struct is the canonical declaration; `render` is the anchor with a render→window→input cascade, audio independent; bare enum demoted to sugar)
 
 **Tracking:** labelle-toolkit/labelle-assembler#377
 
@@ -112,16 +112,35 @@ audio — exactly the duplication a "one backend = all four contracts" bundling
 
 So a project's "backend" is a **composition** of per-contract providers. Some
 libs supply several contracts (sokol = render + window + input + audio); some
-supply one (bgfx = render only). The declaration is **full-stack packages with
-per-contract overrides** — the common case stays one word, any slot is
-overridable:
+supply one (bgfx = render only). The **canonical declaration is the per-contract
+struct** — it's self-documenting (you see the slots) rather than relying on
+knowing what `.sokol` secretly pulls in:
 
 ```zig
-.backend = .sokol,                                // sokol's render+window+input+audio
-.backend = .{ .render = .bgfx },                  // bgfx render; audio auto-defaults to miniaudio
-.backend = .{ .render = .bgfx, .audio = .sdl },   // …unless you override the slot
-.backend = .{ .render = .{ .repo = "github:someone/labelle-vulkan" } }, // a stranger's provider
+.backend = .{ .render = .sokol },
+//          ⇒ window=.sokol_app, input=.sokol_app, audio=.sokol_audio  (sokol is full-stack)
+
+.backend = .{ .render = .bgfx, .audio = .miniaudio },
+//          ⇒ window=.glfw, input=.glfw  (bgfx has neither — cascade to the desktop default)
+//          ⇒ audio=.miniaudio            (pinned)
+
+.backend = .{ .render = .{ .repo = "github:someone/labelle-vulkan" } },  // a stranger's provider
 ```
+
+(The bare `.backend = .sokol` is accepted only as sugar for `.{ .render = .sokol }`.)
+
+**`render` is the anchor and the other slots cascade**, because they aren't
+equally independent:
+- **render → window** — a renderer needs a *compatible* window (bgfx renders into
+  a surface a window hands it; sokol_gfx pairs with sokol_app). The render
+  provider declares its default window: `.bgfx` ⇒ `glfw`, `.sokol` ⇒ `sokol_app`.
+- **window → input** — input comes *with* the window lib (GLFW and sokol_app both
+  deliver it), so input defaults from the window, not render.
+- **audio** — fully independent (its own device + thread); defaults to the render
+  provider's own if it has one (`.sokol` ⇒ `sokol_audio`), else `miniaudio`.
+
+You pin `render` plus any slot you want to differ from the cascade. The
+defaulting is **principled** (the render⇄window coupling), not a magic table.
 
 ### Audio — the worked example
 Audio decomposes one level further: the duplicated part (WAV/OGG decode + PCM
