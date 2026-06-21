@@ -33,26 +33,16 @@ const builtin = @import("builtin");
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
 
-/// Device-less stub used on Android (and anywhere without a real output
-/// device). Mirrors `audio_device.zig`'s control surface so `ensureInit`
-/// / `deinit` call through it unchanged: starting is a no-op, stopping is
-/// a no-op, and zero frames are ever mixed.
-const NoopDevice = struct {
-    pub const MixFn = *const fn (output: []i16, frames_requested: u32) void;
-    pub fn ensureStarted(mix: MixFn) void {
-        _ = mix; // no device drives the mixer on this target
-    }
-    pub fn stop() void {}
-    pub fn framesMixed() u64 {
-        return 0;
-    }
-};
-
-// On Android the miniaudio `@cImport` (and `miniaudio.h` itself) must not
-// be analyzed — the header isn't on the include path and the device libs
-// aren't linked. `if (is_android)` is comptime, so only the taken branch
-// is semantically analyzed per target.
-const device_backend = if (is_android) NoopDevice else @import("audio_device.zig");
+// Output device, selected per target. On Android it's the AAudio device
+// (#306); on desktop it's the miniaudio device. Both expose the same
+// `ensureStarted`/`stop`/`framesMixed` surface, so `ensureInit`/`deinit` call
+// through unchanged. `if (is_android)` is comptime, so only the taken branch is
+// analyzed — the desktop miniaudio `@cImport` is never seen on Android, and the
+// AAudio externs are never seen on desktop.
+const device_backend = if (is_android)
+    @import("audio_device_android.zig")
+else
+    @import("audio_device.zig");
 
 const MAX_SOUNDS = 256;
 const MAX_MUSIC = 32;
@@ -135,6 +125,13 @@ var master_volume: f32 = 1.0;
 /// device); the mixer state advances only when something pumps `mixAudio`.
 pub fn ensureInit() void {
     device_backend.ensureStarted(&mixAudio);
+}
+
+/// Cumulative frames pushed through the output device callback. >0 confirms the
+/// device (miniaudio on desktop, AAudio on Android, #306) is live and pulling
+/// from the mixer. Used for headless / on-device proof-of-life.
+pub fn deviceFramesMixed() u64 {
+    return device_backend.framesMixed();
 }
 
 /// Stop and close the playback device, then free all loaded PCM. Must be
@@ -443,6 +440,43 @@ pub fn loadMusic(path: [:0]const u8) u32 {
     return id;
 }
 
+/// Register an already-decoded interleaved PCM_16 buffer as a looping music
+/// stream. Used by the Android audio-track decoder (`video/android_audio.zig`)
+/// to feed decoded video audio into the mixer — the in-memory counterpart of
+/// `loadMusic`. `sample_rate` should be the device rate (48000): the mixer does
+/// not resample, so the caller must already be at device rate. Copies `samples`
+/// into an owned, properly-aligned buffer.
+pub fn loadMusicFromPcm(samples: []const i16, channels: u16, sample_rate: u32) u32 {
+    if (samples.len == 0 or channels == 0) return 0;
+    ensureInit();
+
+    const owned = std.heap.page_allocator.alloc(i16, samples.len) catch return 0;
+    @memcpy(owned, samples);
+
+    lockSlots();
+    const id = findFreeMusicSlot() orelse {
+        unlockSlots();
+        std.heap.page_allocator.free(owned);
+        return 0;
+    };
+    music_slots[id] = .{
+        .pcm = .{
+            .samples = owned,
+            .channels = channels,
+            .sample_rate = sample_rate,
+            .frame_count = @intCast(samples.len / channels),
+            .raw_alloc = std.mem.sliceAsBytes(owned),
+        },
+        .playing = false,
+        .paused = false,
+        .position = 0,
+        .volume = 1.0,
+        .looping = true,
+    };
+    unlockSlots();
+    return id;
+}
+
 pub fn unloadMusic(id: u32) void {
     if (id >= MAX_MUSIC) return;
 
@@ -511,6 +545,20 @@ pub fn updateMusic(id: u32) void {
     // kept for API compatibility but intentionally does nothing to
     // avoid frame-rate-based timing drift and duplicate advancement.
     _ = id;
+}
+
+/// Current playback position of a music stream in seconds, derived from the
+/// frame `position` advanced on the audio thread by `mixAudio`. This is the
+/// real audio-device clock — the master clock for A/V sync (#549). Read without
+/// locking: a torn `position` read only perturbs the result by microseconds,
+/// harmless for video-frame selection. Returns 0 if the id is unloaded or the
+/// device hasn't pumped yet (e.g. Android NoopDevice, #306).
+pub fn musicPositionSeconds(id: u32) f64 {
+    if (id == 0 or id >= MAX_MUSIC) return 0;
+    const slot = &music_slots[id];
+    const pcm = slot.pcm orelse return 0;
+    if (pcm.sample_rate == 0) return 0;
+    return @as(f64, @floatFromInt(slot.position)) / @as(f64, @floatFromInt(pcm.sample_rate));
 }
 
 // ── PCM mixer ────────────────────────────────────────────────────────

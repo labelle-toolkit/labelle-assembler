@@ -230,51 +230,70 @@ fn hexagonPoints(cx: f32, cy: f32, radius: f32, rotation_deg: f32) [6]gfx.Vector
     return pts;
 }
 
-// ── Dynamic-texture (video-frame) demo ───────────────────────────────────
+// ── In-engine video via gfx.VideoPlayer (#549 Path A) ─────────────────────
 //
-// Path A "display half" (#549): create ONE mutable RGBA8 texture, then re-upload
-// a freshly-generated frame every tick via `gfx.updateTexture`. A real intro
-// would memcpy a decoded+YUV→RGBA video frame into `dyn_pixels` here instead of
-// the synthetic plasma — the create-once / update-each-frame / draw-fullscreen
-// loop is identical. This is exactly the bgfx-side mechanism a MediaCodec/ffmpeg
-// decoder would feed.
+// The backend now ships the whole decode→texture wiring: gfx.VideoPlayer owns a
+// dynamic texture and a decoder, decodes frames, and uploads + draws them. Here
+// we drive it with the desktop ffmpeg decoder; on Android the identical player
+// drives gfx.AndroidVideoDecoder (hardware-verified, see src/video/apk/).
 
 const DYN_W: u32 = 256;
 const DYN_H: u32 = 192;
-var dyn_tex: ?gfx.Texture = null;
-var dyn_pixels: ?[]u8 = null;
+const VIDEO_FPS: f32 = 24.0;
+const VIDEO_CLIP = "bgfx-video-test.mp4";
 
-fn initDynamicTexture() void {
-    dyn_pixels = std.heap.page_allocator.alloc(u8, DYN_W * DYN_H * 4) catch return;
-    dyn_tex = gfx.createDynamicTexture(DYN_W, DYN_H) catch null;
+const VIDEO_AUDIO = "bgfx-video-audio.wav";
+const DesktopPlayer = gfx.VideoPlayer(gfx.DesktopVideoDecoder);
+var player: ?DesktopPlayer = null;
+var vid_music_id: u32 = 0;
+
+// Audio hooks: the VideoPlayer drives the clip's audio track through labelle's
+// streaming-music API, started/ticked/stopped in lockstep with the video.
+fn vidAudioStart(_: ?*anyopaque) void {
+    if (vid_music_id != 0) audio.playMusic(vid_music_id);
+}
+fn vidAudioUpdate(_: ?*anyopaque) void {
+    if (vid_music_id != 0) audio.updateMusic(vid_music_id);
+}
+fn vidAudioStop(_: ?*anyopaque) void {
+    if (vid_music_id != 0) audio.stopMusic(vid_music_id);
+}
+/// Audio device playback position — the master clock for PTS-accurate A/V sync.
+fn vidAudioClock(_: ?*anyopaque) f64 {
+    return if (vid_music_id != 0) audio.musicPositionSeconds(vid_music_id) else 0;
 }
 
-/// Fill `dyn_pixels` with an animated plasma (proves the pixels are genuinely
-/// re-uploaded each frame, not a static texture) and push it to the GPU.
-fn updateDynamicTexture() void {
-    const px = dyn_pixels orelse return;
-    const tex = dyn_tex orelse return;
-    const f: u32 = @truncate(frame_count);
-    var y: u32 = 0;
-    while (y < DYN_H) : (y += 1) {
-        var x: u32 = 0;
-        while (x < DYN_W) : (x += 1) {
-            const i = (y * DYN_W + x) * 4;
-            px[i + 0] = @truncate(x *% 2 +% f *% 2); // R: diagonal bands drifting right
-            px[i + 1] = @truncate(y *% 2 +% f); // G: bands drifting down
-            px[i + 2] = @truncate(x +% y +% f *% 3); // B: fast counter-scroll
-            px[i + 3] = 255; // A
-        }
+/// Generate a self-contained H.264 clip (with audio), open the ffmpeg decoder,
+/// hand it to a VideoPlayer, then extract the audio track to a WAV and attach it
+/// via labelle's music API. Best-effort: missing ffmpeg → no video panel; no
+/// audio device (Android #306) → silent but otherwise identical.
+fn initVideo() void {
+    const alloc = std.heap.page_allocator;
+    gfx.DesktopVideoDecoder.generateTestClip(alloc, VIDEO_CLIP, DYN_W, DYN_H) catch return;
+    const dec = gfx.DesktopVideoDecoder.open(alloc, VIDEO_CLIP, DYN_W, DYN_H, VIDEO_FPS) catch return;
+    player = DesktopPlayer.init(alloc, dec, VIDEO_FPS) catch return;
+
+    gfx.DesktopVideoDecoder.extractAudioWav(alloc, VIDEO_CLIP, VIDEO_AUDIO) catch return;
+    vid_music_id = audio.loadMusic(VIDEO_AUDIO);
+    if (vid_music_id != 0) {
+        player.?.setAudio(.{
+            .start = &vidAudioStart,
+            .update = &vidAudioUpdate,
+            .stop = &vidAudioStop,
+            .clock = &vidAudioClock, // master clock → PTS-accurate sync
+        });
     }
-    gfx.updateTexture(tex, px); // bgfx.copy + updateTexture2D
 }
 
-fn drawDynamicTexture() void {
-    const tex = dyn_tex orelse return;
-    const src = gfx.Rectangle{ .x = 0, .y = 0, .width = @floatFromInt(DYN_W), .height = @floatFromInt(DYN_H) };
-    const dest = gfx.Rectangle{ .x = 240, .y = 180, .width = 320, .height = 240 };
-    gfx.drawTexturePro(tex, src, dest, .{ .x = 0, .y = 0 }, 0, gfx.white);
-    gfx.drawText("Dynamic texture: per-frame updateTexture() upload (#549)", 232, 164, 10, gfx.color(255, 255, 255, 220));
+fn drawVideo() void {
+    if (player) |*p| {
+        p.draw(.{ .x = 240, .y = 180, .width = 320, .height = 240 });
+        const label: [:0]const u8 = if (vid_music_id != 0)
+            "gfx.VideoPlayer: H.264 video + audio (#549)"
+        else
+            "gfx.VideoPlayer: H.264 video (no audio device) (#549)";
+        gfx.drawText(label, 232, 164, 10, gfx.color(255, 255, 255, 220));
+    }
 }
 
 // ── Update ─────────────────────────────────────────────────────────────
@@ -384,8 +403,8 @@ fn draw() void {
     window.beginDrawing();
     window.clearBackground(30, 30, 46, 255);
 
-    // Re-upload this frame's pixels to the dynamic texture (#549 display half).
-    updateDynamicTexture();
+    // Advance video playback (decodes + uploads a frame when due).
+    if (player) |*p| p.update(dt);
 
     // ── World-space rendering (camera-transformed) ─────────────────
     gfx.beginMode2D(camera);
@@ -425,8 +444,8 @@ fn draw() void {
     // ── Screen-space HUD (no camera transform) ────────────────────
     drawHud();
 
-    // ── Dynamic-texture panel (screen-space, drawn on top) ────────
-    drawDynamicTexture();
+    // ── Video panel (screen-space, drawn on top) ──────────────────
+    drawVideo();
 
     // ── Gamepad overlay (lights up live when a controller is connected) ──
     gamepad_overlay.draw(SCREEN_W_F, SCREEN_H_F);
@@ -586,7 +605,7 @@ pub fn main() void {
     gfx.setScreenSize(SCREEN_W, SCREEN_H);
 
     // -- Dynamic-texture demo: one mutable texture, re-uploaded each frame.
-    initDynamicTexture();
+    initVideo(); // gfx.VideoPlayer: ffmpeg decode → dynamic texture
 
     // -- Audio: synthesize a 440 Hz beep WAV to a temp file and load it.
     // This opens the miniaudio playback device (#297) on first load and
@@ -623,8 +642,7 @@ pub fn main() void {
     audio.deinit();
 
     // -- Dynamic-texture cleanup
-    if (dyn_tex) |t| gfx.unloadTexture(t);
-    if (dyn_pixels) |p| std.heap.page_allocator.free(p);
+    if (player) |*p| p.deinit();
 
     window.closeWindow();
 }

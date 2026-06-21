@@ -738,6 +738,11 @@ pub fn generateMainZigFromTemplate(
         } else {
             try bw.writeAll("const Components = engine.ComponentRegistry(.{\n");
         }
+        // Built-in engine component available to every project's prefabs/scenes
+        // (#549) — a `VideoComponent` can be declared in a prefab/scene `.jsonc`
+        // like any game component (`{ "VideoComponent": { "path": "intro", … } }`)
+        // and the engine's video system plays it at the entity's position.
+        try bw.writeAll("    .VideoComponent = engine.core.VideoComponent,\n");
         var pascal_buf: [128]u8 = undefined;
         for (component_names) |name| {
             const pascal = pathToPascal(name, &pascal_buf);

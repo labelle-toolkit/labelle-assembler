@@ -232,17 +232,24 @@ jobs:
           ref: main
           path: labelle-cli/zig-pkg/labelle-gui
 
-      - uses: actions/checkout@v4
-        with:
-          repository: labelle-toolkit/labelle-core
-          ref: main
-          path: labelle-core
+      # Stacked-PR sibling checkout: this PR (FP#549 in-engine video) needs
+      # labelle-core's VideoInterface/VideoComponent and labelle-engine's
+      # VideoImpl slot, which live on the `feat/video-interface` branch of each.
+      # Try that branch first, fall back to the default branch the job otherwise
+      # uses, so this keeps working once the video branches merge/are deleted.
+      - name: Checkout labelle-core (video branch first)
+        run: |
+          git clone --depth 1 --branch feat/video-interface \
+            https://github.com/labelle-toolkit/labelle-core.git labelle-core \
+          || git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-core.git labelle-core
 
-      - uses: actions/checkout@v4
-        with:
-          repository: labelle-toolkit/labelle-engine
-          ref: main
-          path: labelle-engine
+      - name: Checkout labelle-engine (video branch first)
+        run: |
+          git clone --depth 1 --branch feat/video-interface \
+            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine \
+          || git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine
 
       - uses: actions/checkout@v4
         with:
@@ -360,17 +367,24 @@ jobs:
           ref: main
           path: labelle-cli/zig-pkg/labelle-gui
 
-      - uses: actions/checkout@v4
-        with:
-          repository: labelle-toolkit/labelle-core
-          ref: main
-          path: labelle-core
+      # Stacked-PR sibling checkout: this PR (FP#549 in-engine video) needs
+      # labelle-core's VideoInterface/VideoComponent and labelle-engine's
+      # VideoImpl slot, which live on the `feat/video-interface` branch of each.
+      # Try that branch first, fall back to the default branch the job otherwise
+      # uses, so this keeps working once the video branches merge/are deleted.
+      - name: Checkout labelle-core (video branch first)
+        run: |
+          git clone --depth 1 --branch feat/video-interface \
+            https://github.com/labelle-toolkit/labelle-core.git labelle-core \
+          || git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-core.git labelle-core
 
-      - uses: actions/checkout@v4
-        with:
-          repository: labelle-toolkit/labelle-engine
-          ref: main
-          path: labelle-engine
+      - name: Checkout labelle-engine (video branch first)
+        run: |
+          git clone --depth 1 --branch feat/video-interface \
+            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine \
+          || git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine
 
       - uses: actions/checkout@v4
         with:
