@@ -28,15 +28,22 @@ extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
 // codec verification requires packaging the decoder in an APK (converges with
 // the Path B Android shell work).
 
-pub fn main() void {
-    const path: [*:0]const u8 = "/data/local/tmp/dectest.mp4";
+pub fn main(init: std.process.Init.Minimal) void {
+    // Path from the first CLI arg if given, else the on-device default. The
+    // args iterator yields sentinel-terminated slices, usable as `[*:0]const u8`.
+    var path: [*:0]const u8 = "/data/local/tmp/dectest.mp4";
+    var args = init.args.iterate();
+    _ = args.skip(); // argv[0] (program name)
+    if (args.next()) |arg| path = arg.ptr;
 
     const fd = open(path, O_RDONLY);
     if (fd < 0) {
         std.debug.print("FAIL: cannot open {s}\n", .{path});
         return;
     }
-    defer _ = close(fd);
+    // No `defer close(fd)`: ownership transfers to VideoDecoder.openFd, which
+    // closes it in deinit (success) or via errdefer (failure). Closing here too
+    // would double-close.
 
     const len = lseek(fd, 0, SEEK_END);
     _ = lseek(fd, 0, SEEK_SET);

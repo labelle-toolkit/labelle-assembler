@@ -146,12 +146,20 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
             if (X.AMediaCodec_getOutputBuffer(codec, idx, &size)) |buf| {
                 const start: usize = @intCast(@max(info.offset, 0));
                 const nbytes: usize = @intCast(@max(info.size, 0));
-                // The codec buffer is byte-aligned, so read i16 samples as
-                // unaligned and append. (appendSlice needs []const i16.)
-                const sl = std.mem.bytesAsSlice(i16, buf[start .. start + (nbytes & ~@as(usize, 1))]);
-                if (raw.items.len + sl.len <= MAX_FRAMES * 4) {
-                    raw.ensureUnusedCapacity(allocator, sl.len) catch return error.OutOfMemory;
-                    for (sl) |s| raw.appendAssumeCapacity(s);
+                // The codec output buffer may be only byte-aligned, so we can't
+                // `bytesAsSlice(i16, …)` (that requires i16 alignment → UB/trap).
+                // Read each little-endian sample unaligned with `readInt`.
+                const sample_bytes = buf[start .. start + (nbytes & ~@as(usize, 1))];
+                const sample_count = sample_bytes.len / 2;
+                if (raw.items.len + sample_count <= MAX_FRAMES * 4) {
+                    raw.ensureUnusedCapacity(allocator, sample_count) catch return error.OutOfMemory;
+                    var bi: usize = 0;
+                    // `bi + 1 < len` (not `len - 1`) avoids a usize underflow when
+                    // the codec emits a zero-size buffer (valid before EOS).
+                    while (bi + 1 < sample_bytes.len) : (bi += 2) {
+                        const s = std.mem.readInt(i16, sample_bytes[bi..][0..2], .little);
+                        raw.appendAssumeCapacity(s);
+                    }
                 }
             }
             _ = X.AMediaCodec_releaseOutputBuffer(codec, idx, false);

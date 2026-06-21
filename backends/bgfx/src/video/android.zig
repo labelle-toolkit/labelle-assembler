@@ -37,6 +37,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const yuv = @import("yuv.zig");
 
+extern fn close(c_int) c_int;
+
 const is_android = builtin.abi == .android or builtin.abi == .androideabi;
 
 /// Public decoder type. Real implementation on Android; a stub elsewhere so the
@@ -48,6 +50,7 @@ pub const Error = error{
     NoVideoTrack,
     UnsupportedColorFormat,
     DecoderInit,
+    MissingDimensions,
     OutOfMemory,
 };
 
@@ -94,6 +97,7 @@ const AndroidVideoDecoder = struct {
     extern fn AMediaExtractor_getTrackFormat(*Extractor, idx: usize) ?*Format;
     extern fn AMediaExtractor_selectTrack(*Extractor, idx: usize) i32;
     extern fn AMediaExtractor_readSampleData(*Extractor, buf: [*]u8, capacity: usize) isize;
+    extern fn AMediaExtractor_getSampleTime(*Extractor) i64;
     extern fn AMediaExtractor_advance(*Extractor) bool;
     extern fn AMediaExtractor_delete(*Extractor) void;
 
@@ -147,6 +151,10 @@ const AndroidVideoDecoder = struct {
     extractor: *Extractor,
     codec: *Codec,
     reader: *ImageReader,
+    // The decoder OWNS this fd (handed over by `backend.zig` from
+    // `AAsset_openFileDescriptor64`): it's `close()`d in `deinit` so loop/replay
+    // can't leak a descriptor. `backend.zig` must NOT close it.
+    fd: c_int,
     w: u32,
     h: u32,
     input_done: bool,
@@ -155,6 +163,10 @@ const AndroidVideoDecoder = struct {
     /// `AAsset_openFileDescriptor`, with its offset/length). Selects the first
     /// `video/*` track and configures a hardware decoder in ByteBuffer mode.
     pub fn openFd(_: std.mem.Allocator, fd: c_int, offset: i64, length: i64) Error!AndroidVideoDecoder {
+        // Ownership transfers here: the decoder now owns `fd`. On any error path
+        // close it (the returned struct never gets built); on success the field
+        // takes over and `deinit` closes it. backend.zig must not close it.
+        errdefer _ = close(fd);
         const ex = AMediaExtractor_new() orelse return error.DecoderInit;
         errdefer AMediaExtractor_delete(ex);
         if (AMediaExtractor_setDataSourceFd(ex, fd, offset, length) != AMEDIA_OK)
@@ -178,8 +190,10 @@ const AndroidVideoDecoder = struct {
             const span = std.mem.span(m);
             if (!std.mem.startsWith(u8, span, "video/")) continue;
             if (span.len + 1 > mime_buf.len) continue;
-            _ = AMediaFormat_getInt32(fmt, KEY_WIDTH, &w);
-            _ = AMediaFormat_getInt32(fmt, KEY_HEIGHT, &h);
+            // Require real dimensions: a missing width/height key would leave
+            // w/h at 0, giving a 1×1 ImageReader and a zero-sized texture.
+            if (!AMediaFormat_getInt32(fmt, KEY_WIDTH, &w)) return error.MissingDimensions;
+            if (!AMediaFormat_getInt32(fmt, KEY_HEIGHT, &h)) return error.MissingDimensions;
             @memcpy(mime_buf[0..span.len], span);
             mime_buf[span.len] = 0;
             mime_len = span.len;
@@ -214,6 +228,7 @@ const AndroidVideoDecoder = struct {
             .extractor = ex,
             .codec = codec,
             .reader = reader,
+            .fd = fd,
             .w = @intCast(@max(w, 0)),
             .h = @intCast(@max(h, 0)),
             .input_done = false,
@@ -246,7 +261,11 @@ const AndroidVideoDecoder = struct {
                         _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, 0, 0, FLAG_EOS);
                         self.input_done = true;
                     } else {
-                        _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, @intCast(n), 0, 0);
+                        // Tag the sample with the extractor's current presentation
+                        // time (clamped ≥ 0) for PTS accuracy — read BEFORE advance.
+                        const sample_us = AMediaExtractor_getSampleTime(self.extractor);
+                        const time_us: u64 = @intCast(@max(sample_us, 0));
+                        _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, @intCast(n), time_us, 0);
                         _ = AMediaExtractor_advance(self.extractor);
                     }
                 }
@@ -278,15 +297,19 @@ const AndroidVideoDecoder = struct {
         return @as(f64, @floatFromInt(ts_ns)) / 1_000_000_000.0; // PTS seconds
     }
 
-    /// Refresh w/h after an output-format change (emitted once before the first
-    /// frame). The ImageReader is fixed-size from the track format, which matches
-    /// for typical streams.
+    /// An output-format change is emitted once before the first frame. We
+    /// deliberately do NOT re-read width/height here.
+    ///
+    /// `openFd` already sized `self.w`/`self.h` (and thus the ImageReader) from
+    /// the track's display dimensions, and `Player.init` allocated its texture +
+    /// `pixels` buffer from `width()`/`height()` before any frame is decoded.
+    /// Mutating the dims now — to the aligned/coded size (e.g. 1080 → 1088) OR to
+    /// a crop rect that differs from the open dims — would desync that buffer, so
+    /// `decodeFrame`'s `out.len != w*h*4` guard would then reject every frame
+    /// (black screen). Keep the allocation dimensions stable; crop-accurate
+    /// display, if ever needed, belongs at draw time as a source-rect crop.
     fn refreshFormat(self: *AndroidVideoDecoder) void {
-        const fmt = AMediaCodec_getOutputFormat(self.codec) orelse return;
-        defer AMediaFormat_delete(fmt);
-        var v: i32 = 0;
-        if (AMediaFormat_getInt32(fmt, KEY_WIDTH, &v)) self.w = @intCast(@max(v, 0));
-        if (AMediaFormat_getInt32(fmt, KEY_HEIGHT, &v)) self.h = @intCast(@max(v, 0));
+        _ = self;
     }
 
     /// Convert a YUV_420_888 AImage to RGBA8. The plane row/pixel strides make
@@ -357,5 +380,8 @@ const AndroidVideoDecoder = struct {
         AMediaCodec_delete(self.codec);
         AImageReader_delete(self.reader);
         AMediaExtractor_delete(self.extractor);
+        // The decoder owns the asset fd (see the struct field comment); release
+        // it so loop/replay can't leak descriptors. backend.zig must not close it.
+        _ = close(self.fd);
     }
 };
