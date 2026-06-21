@@ -17,15 +17,37 @@ extern "c" fn pclose(stream: *anyopaque) c_int;
 extern "c" fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn system(command: [*:0]const u8) c_int;
 
+/// Single-quote a path for safe interpolation into a `/bin/sh` command, so paths
+/// with spaces (or shell metacharacters) work and can't be an injection surface.
+/// Wraps the whole path in `'…'` and escapes any embedded single quote as the
+/// standard `'\''` sequence (close-quote, escaped quote, re-open-quote). Caller
+/// owns the returned buffer.
+fn shellQuote(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '\'');
+    for (path) |c| {
+        if (c == '\'') {
+            try buf.appendSlice(allocator, "'\\''");
+        } else {
+            try buf.append(allocator, c);
+        }
+    }
+    try buf.append(allocator, '\'');
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Probe a clip's native pixel dimensions + frame rate via `ffprobe`, so the
 /// VideoBackend can open a video by name without the caller specifying a size.
 /// Returns null if ffprobe is unavailable or the output can't be parsed.
 pub const Info = struct { w: u32, h: u32, fps: f32 };
 pub fn probe(allocator: std.mem.Allocator, path: []const u8) ?Info {
+    const qpath = shellQuote(allocator, path) catch return null;
+    defer allocator.free(qpath);
     const cmd = std.fmt.allocPrintSentinel(allocator,
         "ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate " ++
         "-of csv=p=0:s=x {s}",
-        .{path}, 0) catch return null;
+        .{qpath}, 0) catch return null;
     defer allocator.free(cmd);
     const stream = popen(cmd.ptr, "r") orelse return null;
     defer _ = pclose(stream);
@@ -59,12 +81,14 @@ pub const VideoDecoder = struct {
     /// Generate a self-contained H.264 test clip *with an audio track* (a 440 Hz
     /// sine), so demos need no bundled asset and can exercise the audio path.
     pub fn generateTestClip(allocator: std.mem.Allocator, path: []const u8, w: u32, h: u32) !void {
+        const qpath = try shellQuote(allocator, path);
+        defer allocator.free(qpath);
         const cmd = try std.fmt.allocPrintSentinel(allocator,
             "ffmpeg -hide_banner -loglevel error -y " ++
             "-f lavfi -i testsrc2=duration=6:size={d}x{d}:rate=24 " ++
             "-f lavfi -i sine=frequency=440:duration=6 " ++
             "-c:v libx264 -pix_fmt yuv420p -c:a aac -shortest {s}",
-            .{ w, h, path }, 0);
+            .{ w, h, qpath }, 0);
         defer allocator.free(cmd);
         if (system(cmd.ptr) != 0) return error.FfmpegEncodeFailed;
     }
@@ -74,10 +98,14 @@ pub const VideoDecoder = struct {
     /// audio or ffmpeg fails. (Android's AMediaCodec path would decode the audio
     /// track in-process instead; see the #549 / #306 notes.)
     pub fn extractAudioWav(allocator: std.mem.Allocator, clip_path: []const u8, wav_path: []const u8) !void {
+        const qclip = try shellQuote(allocator, clip_path);
+        defer allocator.free(qclip);
+        const qwav = try shellQuote(allocator, wav_path);
+        defer allocator.free(qwav);
         const cmd = try std.fmt.allocPrintSentinel(allocator,
             "ffmpeg -hide_banner -loglevel error -y -i {s} " ++
             "-vn -ar 48000 -ac 2 -c:a pcm_s16le {s}",
-            .{ clip_path, wav_path }, 0);
+            .{ qclip, qwav }, 0);
         defer allocator.free(cmd);
         if (system(cmd.ptr) != 0) return error.FfmpegAudioExtractFailed;
     }
@@ -97,10 +125,12 @@ pub const VideoDecoder = struct {
     }
 
     fn spawn(allocator: std.mem.Allocator, path: []const u8, w: u32, h: u32) !*anyopaque {
+        const qpath = try shellQuote(allocator, path);
+        defer allocator.free(qpath);
         const cmd = try std.fmt.allocPrintSentinel(allocator,
             "ffmpeg -hide_banner -loglevel error -i {s} " ++
             "-f rawvideo -pix_fmt rgba -s {d}x{d} pipe:1",
-            .{ path, w, h }, 0);
+            .{ qpath, w, h }, 0);
         defer allocator.free(cmd);
         return popen(cmd.ptr, "r") orelse error.PopenFailed;
     }
