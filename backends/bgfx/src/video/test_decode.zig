@@ -41,7 +41,9 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.debug.print("FAIL: cannot open {s}\n", .{path});
         return;
     }
-    defer _ = close(fd);
+    // No `defer close(fd)`: ownership transfers to VideoDecoder.openFd, which
+    // closes it in deinit (success) or via errdefer (failure). Closing here too
+    // would double-close.
 
     const len = lseek(fd, 0, SEEK_END);
     _ = lseek(fd, 0, SEEK_SET);
