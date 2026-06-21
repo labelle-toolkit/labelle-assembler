@@ -16,6 +16,7 @@ extern "c" fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern "c" fn pclose(stream: *anyopaque) c_int;
 extern "c" fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn system(command: [*:0]const u8) c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
 
 /// Single-quote a path for safe interpolation into a `/bin/sh` command, so paths
 /// with spaces (or shell metacharacters) work and can't be an injection surface.
@@ -110,6 +111,36 @@ pub const VideoDecoder = struct {
         if (system(cmd.ptr) != 0) return error.FfmpegAudioExtractFailed;
     }
 
+    /// Decode the clip's audio track to in-memory 48 kHz stereo s16 PCM
+    /// (interleaved) via ffmpeg — the format `audio.loadMusicFromPcm` wants.
+    /// Returns null if the clip has no audio track or ffmpeg fails. Caller owns
+    /// the returned slice. (Android decodes the track in-process with
+    /// AMediaCodec instead — see video/android_audio.zig.)
+    pub fn decodeAudioPcm(allocator: std.mem.Allocator, path: []const u8) ?[]i16 {
+        const qpath = shellQuote(allocator, path) catch return null;
+        defer allocator.free(qpath);
+        const cmd = std.fmt.allocPrintSentinel(allocator,
+            "ffmpeg -hide_banner -loglevel error -i {s} -vn -f s16le -ar 48000 -ac 2 pipe:1",
+            .{qpath}, 0) catch return null;
+        defer allocator.free(cmd);
+        const stream = popen(cmd.ptr, "r") orelse return null;
+        defer _ = pclose(stream);
+
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(allocator);
+        var buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = fread(&buf, 1, buf.len, stream);
+            if (n == 0) break;
+            bytes.appendSlice(allocator, buf[0..n]) catch return null;
+        }
+        if (bytes.items.len < 2) return null; // no audio track decoded
+        const n_samples = bytes.items.len / 2;
+        const out = allocator.alloc(i16, n_samples) catch return null;
+        @memcpy(std.mem.sliceAsBytes(out), bytes.items[0 .. n_samples * 2]);
+        return out;
+    }
+
     /// Decode `path` into a play-once RGBA8 frame stream at `w`×`h`. `fps` is the
     /// clip's frame rate, used to derive each frame's presentation timestamp.
     /// Plays once and reports end-of-stream (`eof`) so the engine can drive loop
@@ -180,3 +211,27 @@ pub const VideoDecoder = struct {
         _ = pclose(self.stream);
     }
 };
+
+test "decodeAudioPcm: decodes a clip's audio track to 48k stereo PCM" {
+    const alloc = std.testing.allocator;
+    // `/tmp` is fine: this backend (and its tests) only build on POSIX hosts
+    // (Linux/macOS) — bgfx here has no Windows target. Cleaned up after.
+    const clip = "/tmp/labelle_audio_decode_test.mp4";
+    // generateTestClip writes a 6 s clip with a 440 Hz sine audio track.
+    try VideoDecoder.generateTestClip(alloc, clip, 320, 240);
+    defer _ = unlink(clip);
+
+    const pcm = VideoDecoder.decodeAudioPcm(alloc, clip) orelse return error.NoAudioDecoded;
+    defer alloc.free(pcm);
+
+    // ~6 s × 48000 × 2ch ≈ 576k samples — assert we got a substantial, even
+    // (stereo-interleaved) buffer, not a stub/empty.
+    try std.testing.expect(pcm.len > 48000);
+    try std.testing.expectEqual(@as(usize, 0), pcm.len % 2);
+    // The sine carries energy — it must not be all-silence.
+    var nonzero: usize = 0;
+    for (pcm) |s| {
+        if (s != 0) nonzero += 1;
+    }
+    try std.testing.expect(nonzero > pcm.len / 4);
+}
