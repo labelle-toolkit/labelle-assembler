@@ -21,6 +21,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("../gfx/types.zig");
 const state = @import("../gfx/state.zig");
+const fit = @import("fit.zig");
 const player_mod = @import("player.zig");
 const desktop = @import("desktop.zig");
 const android = @import("android.zig");
@@ -122,43 +123,23 @@ pub const VideoBackend = struct {
     /// sprite layer); the toggle is bracketed so other draws are unaffected.
     pub fn drawVideoFullscreen(id: u32, fit_tag: u8) void {
         const s = slotPtr(id) orelse return;
-        const sw: f32 = @floatFromInt(state.getDesignWidth());
-        const sh: f32 = @floatFromInt(state.getDesignHeight());
-        const vw: f32 = @floatFromInt(s.w);
-        const vh: f32 = @floatFromInt(s.h);
-        const full_src = types.Rectangle{ .x = 0, .y = 0, .width = vw, .height = vh };
-        const full_dst = types.Rectangle{ .x = 0, .y = 0, .width = sw, .height = sh };
-
+        // Crop/letterbox geometry lives in fit.zig (host-tested). cover
+        // center-crops the source; contain letterboxes the dest; stretch fills.
+        const r = fit.fitRects(
+            fit_tag,
+            @floatFromInt(s.w),
+            @floatFromInt(s.h),
+            @floatFromInt(state.getDesignWidth()),
+            @floatFromInt(state.getDesignHeight()),
+        );
+        // Backdrop: fill the framebuffer edge-to-edge (no aspect pillarbox);
+        // bracket the toggle so other draws are unaffected.
         state.setApplyFit(false);
         defer state.setApplyFit(true);
-
-        if (vw == 0 or vh == 0 or sw == 0 or sh == 0) {
-            s.player.drawRegion(full_src, full_dst);
-            return;
-        }
-        const screen_ar = sw / sh;
-        const video_ar = vw / vh;
-        switch (fit_tag) {
-            1 => { // cover — center-crop the source to the screen aspect, fill
-                var cw = vw;
-                var ch = vh;
-                if (video_ar > screen_ar) {
-                    cw = vh * screen_ar; // too wide: crop sides
-                } else {
-                    ch = vw / screen_ar; // too tall: crop top/bottom
-                }
-                const src = types.Rectangle{ .x = (vw - cw) / 2, .y = (vh - ch) / 2, .width = cw, .height = ch };
-                s.player.drawRegion(src, full_dst);
-            },
-            2 => { // contain — fit whole video inside, letterbox/pillarbox
-                const scale = @min(sw / vw, sh / vh);
-                const dw = vw * scale;
-                const dh = vh * scale;
-                const dst = types.Rectangle{ .x = (sw - dw) / 2, .y = (sh - dh) / 2, .width = dw, .height = dh };
-                s.player.drawRegion(full_src, dst);
-            },
-            else => s.player.drawRegion(full_src, full_dst), // stretch
-        }
+        s.player.drawRegion(
+            .{ .x = r.src.x, .y = r.src.y, .width = r.src.width, .height = r.src.height },
+            .{ .x = r.dest.x, .y = r.dest.y, .width = r.dest.width, .height = r.dest.height },
+        );
     }
 
     pub fn isVideoPlaying(id: u32) bool {
