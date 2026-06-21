@@ -89,13 +89,13 @@ pub const VideoBackend = struct {
             // error paths). We must NOT close `fd` here (no double close).
             const fd = AAsset_openFileDescriptor64(asset, &start, &len);
             if (fd < 0) return 0;
-            var dec = android.VideoDecoder.openFd(alloc, fd, start, len) catch return 0;
+            const dec = android.VideoDecoder.openFd(alloc, fd, start, len) catch return 0;
             const w = dec.width();
             const h = dec.height();
-            const pl = Player.init(alloc, dec, 24.0) catch {
-                dec.deinit();
-                return 0;
-            };
+            // Player.init's errdefer deinits the decoder on failure (it owns the
+            // fd), so do NOT deinit here too — that would double-close the fd and
+            // double-delete the codec. Matches the desktop branch below.
+            const pl = Player.init(alloc, dec, 24.0) catch return 0;
             slots[idx] = .{ .player = pl, .w = w, .h = h, .used = true };
         } else {
             var pathbuf: [512]u8 = undefined;

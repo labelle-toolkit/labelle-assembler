@@ -147,13 +147,6 @@ const AndroidVideoDecoder = struct {
     const KEY_MIME: [*:0]const u8 = "mime";
     const KEY_WIDTH: [*:0]const u8 = "width";
     const KEY_HEIGHT: [*:0]const u8 = "height";
-    // Crop rectangle keys (present when the decoder pads the coded size up to a
-    // hardware alignment, e.g. 1080 → 1088): the display frame is the *inclusive*
-    // crop rect, so display_w = right - left + 1, display_h = bottom - top + 1.
-    const KEY_CROP_LEFT: [*:0]const u8 = "crop-left";
-    const KEY_CROP_TOP: [*:0]const u8 = "crop-top";
-    const KEY_CROP_RIGHT: [*:0]const u8 = "crop-right";
-    const KEY_CROP_BOTTOM: [*:0]const u8 = "crop-bottom";
 
     extractor: *Extractor,
     codec: *Codec,
@@ -304,35 +297,19 @@ const AndroidVideoDecoder = struct {
         return @as(f64, @floatFromInt(ts_ns)) / 1_000_000_000.0; // PTS seconds
     }
 
-    /// Refresh w/h after an output-format change (emitted once before the first
-    /// frame).
+    /// An output-format change is emitted once before the first frame. We
+    /// deliberately do NOT re-read width/height here.
     ///
-    /// Hardware decoders report the *aligned/coded* width/height in the output
-    /// format — rounded up to a 16/32-pixel multiple (e.g. 1080 → 1088) — which
-    /// is NOT the real display size. Overwriting `self.w`/`self.h` with those
-    /// would mis-size the texture and corrupt rendering. So we only update the
-    /// reported dimensions from the *crop rectangle* (the true display frame, an
-    /// inclusive rect → w = right-left+1, h = bottom-top+1); absent a crop rect we
-    /// KEEP the display dimensions read at `openFd` time. The aligned size still
-    /// governs the plane strides used when reading the buffer, but `width()`/
-    /// `height()` and the ImageReader/texture must stay the real video size.
+    /// `openFd` already sized `self.w`/`self.h` (and thus the ImageReader) from
+    /// the track's display dimensions, and `Player.init` allocated its texture +
+    /// `pixels` buffer from `width()`/`height()` before any frame is decoded.
+    /// Mutating the dims now — to the aligned/coded size (e.g. 1080 → 1088) OR to
+    /// a crop rect that differs from the open dims — would desync that buffer, so
+    /// `decodeFrame`'s `out.len != w*h*4` guard would then reject every frame
+    /// (black screen). Keep the allocation dimensions stable; crop-accurate
+    /// display, if ever needed, belongs at draw time as a source-rect crop.
     fn refreshFormat(self: *AndroidVideoDecoder) void {
-        const fmt = AMediaCodec_getOutputFormat(self.codec) orelse return;
-        defer AMediaFormat_delete(fmt);
-        var left: i32 = 0;
-        var top: i32 = 0;
-        var right: i32 = 0;
-        var bottom: i32 = 0;
-        const have_crop = AMediaFormat_getInt32(fmt, KEY_CROP_LEFT, &left) and
-            AMediaFormat_getInt32(fmt, KEY_CROP_TOP, &top) and
-            AMediaFormat_getInt32(fmt, KEY_CROP_RIGHT, &right) and
-            AMediaFormat_getInt32(fmt, KEY_CROP_BOTTOM, &bottom);
-        if (have_crop and right >= left and bottom >= top) {
-            self.w = @intCast(right - left + 1);
-            self.h = @intCast(bottom - top + 1);
-        }
-        // No crop rect → keep the openFd display dimensions; do NOT adopt the
-        // aligned width/height the format would otherwise report.
+        _ = self;
     }
 
     /// Convert a YUV_420_888 AImage to RGBA8. The plane row/pixel strides make
