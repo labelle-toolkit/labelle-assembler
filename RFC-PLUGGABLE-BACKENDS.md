@@ -1,10 +1,10 @@
 # RFC: Pluggable backends — make the assembler backend-agnostic
 
-**Status:** Draft (revision 1)
+**Status:** Draft (revision 2 — codegen-splice reframed as a `Game`-lifecycle hook contract; the residuals are the build-splice + the lifecycle ABI)
 
 **Tracking:** labelle-toolkit/labelle-assembler#377
 
-**POC:** runnable Zig 0.16 prototype on #377 (window / render / context contracts) — referenced throughout; it de-risks the runtime side of this RFC.
+**POC:** runnable Zig 0.16 prototypes on #377 — the runtime contracts (window / render / context handoff) and the codegen-splice (`Game`-lifecycle hooks vs entry-point shapes). Referenced throughout; together they de-risk both the runtime contract and the code-splice.
 
 ## Problem
 
@@ -149,16 +149,34 @@ crate to see "here's everything I must implement, here's the version I pin."
 - Extracted to their own repo(s) — one `labelle-backends` monorepo, or
   per-backend repos. Each implements the ABI contracts + ships a manifest.
 
-## The codegen splice (the hard assembler-side problem)
+## The codegen splice — a `Game`-lifecycle hook contract, not a text merge
 
-Today `templates/desktop.txt` bakes the backend's window + run-loop *together*
-with the assembler's engine wiring (registries, scene/script setup, the
-`project_y_axis` const, hooks). Pluggability requires **splitting that seam**: an
-assembler-owned **generic skeleton** (backend-blind — the POC's `run`) into which
-the backend **splices** its run-loop fragment via defined hook points, plus a
-build fragment the assembler composes. Designing this manifest/fragment contract
-is the core remaining work — the runtime contract is proven; this is where "can a
-stranger really plug in" gets decided.
+The instinctive model — the assembler **splices the backend's run-loop text**
+into a `main()` template — is not just fragile, it's **impossible**: the
+entry-point *shape* is platform-specific. Desktop owns a `while` loop (a real
+`pub fn main`); mobile and wasm do **not** — the OS / browser pumps callbacks
+(sokol_app, `ANativeActivity`, the browser's rAF). No single `main()` text can
+span them.
+
+The real split (POC-validated, #377): the assembler emits **one backend-blind
+`Game`** — `init` / `frame` / `deinit` lifecycle hooks that touch only the
+contracts (the registries, scene/script setup, the `project_y_axis` const, the
+per-frame work — i.e. everything `templates/desktop.txt` bakes today *minus* the
+run-loop). The **backend ships its own entry point** — whatever shape its
+platform requires — and drives those hooks, importing the generated `Game`
+module. Composition is at the **module/type level (comptime), not a text
+merge.** The POC drives the identical `Game` through a desktop `while`-loop *and*
+an OS-callback pump → same output, the game never knowing which.
+
+So the *code* splice is largely answered. The two genuinely hard residuals are:
+- **The build splice** — generically wiring a resolved backend's native deps +
+  module graph + the core-diamond from its manifest. The hook insight solves
+  *code* composition, not `build.zig` composition. (This is where the
+  core-diamond pain from the Y-axis epic lives — see open question #5.)
+- **The full lifecycle ABI** — `frame` alone is too thin. The `Game` hook surface
+  must carry input/resize events and, the gnarly part, mobile **suspend/resume +
+  GPU context-loss**, delivered by the entry point to the game (see open
+  question #1). That surface area is where the real design depth now sits.
 
 ## Migration plan (incremental, not a big bang)
 
@@ -176,10 +194,11 @@ stranger really plug in" gets decided.
 
 ## Open questions
 
-1. **The codegen-splice / manifest contract** — the hook points + build
-   fragments a backend ships, and how the assembler composes them blind. *The
-   crux*, and the next thing to POC (one layer up from where the runtime POC
-   stopped).
+1. **The `Game`-lifecycle ABI** — the run-loop splice itself is now answered (a
+   hook contract, see above), but the full hook *surface* is not: beyond
+   `frame`, the entry point must deliver input/resize events and especially
+   mobile **suspend/resume + GPU context-loss** to the game. Pinning that
+   surface is the direct successor to the codegen-splice crux.
 2. **Where the contracts live + versioning** — gfx owns `render`; does it
    relocate into the ABI crate, or stay in gfx and be re-exported? How does a
    backend pin "I implement contract vN"? The version matrix (N backends ×
