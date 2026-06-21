@@ -20,6 +20,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("../gfx/types.zig");
+const state = @import("../gfx/state.zig");
 const player_mod = @import("player.zig");
 const desktop = @import("desktop.zig");
 const android = @import("android.zig");
@@ -109,6 +110,19 @@ pub const VideoBackend = struct {
 
     pub fn drawVideo(id: u32, x: f32, y: f32, w: f32, h: f32) void {
         if (slotPtr(id)) |s| s.player.draw(.{ .x = x, .y = y, .width = w, .height = h });
+    }
+
+    /// Fill the whole framebuffer with the current frame — a background. Stretches
+    /// to the full surface (no aspect pillarbox), like a `screen_fill` sprite
+    /// layer; the fit toggle is bracketed so other draws are unaffected.
+    pub fn drawVideoFullscreen(id: u32) void {
+        if (slotPtr(id)) |s| {
+            const dw: f32 = @floatFromInt(state.getDesignWidth());
+            const dh: f32 = @floatFromInt(state.getDesignHeight());
+            state.setApplyFit(false);
+            s.player.draw(.{ .x = 0, .y = 0, .width = dw, .height = dh });
+            state.setApplyFit(true);
+        }
     }
 
     pub fn isVideoPlaying(id: u32) bool {
