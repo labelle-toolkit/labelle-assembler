@@ -52,6 +52,9 @@ pub const VideoDecoder = struct {
     frame_bytes: usize,
     fps: f32,
     frame_index: u64 = 0, // for the nominal CFR presentation timestamp
+    eof_flag: bool = false, // set once the pipe drains (stream end)
+    path_buf: [512]u8 = undefined, // stored for replay() (re-spawn)
+    path_len: usize = 0,
 
     /// Generate a self-contained H.264 test clip *with an audio track* (a 440 Hz
     /// sine), so demos need no bundled asset and can exercise the audio path.
@@ -79,16 +82,40 @@ pub const VideoDecoder = struct {
         if (system(cmd.ptr) != 0) return error.FfmpegAudioExtractFailed;
     }
 
-    /// Decode `path` into a looping RGBA8 frame stream at `w`×`h`. `fps` is the
+    /// Decode `path` into a play-once RGBA8 frame stream at `w`×`h`. `fps` is the
     /// clip's frame rate, used to derive each frame's presentation timestamp.
+    /// Plays once and reports end-of-stream (`eof`) so the engine can drive loop
+    /// (via `replay`) or fire the finished event — rather than ffmpeg looping
+    /// internally, which would hide the stream end.
     pub fn open(allocator: std.mem.Allocator, path: []const u8, w: u32, h: u32, fps: f32) !VideoDecoder {
+        const stream = try spawn(allocator, path, w, h);
+        var dec = VideoDecoder{ .stream = stream, .w = w, .h = h, .frame_bytes = @as(usize, w) * h * 4, .fps = fps };
+        const n = @min(path.len, dec.path_buf.len);
+        @memcpy(dec.path_buf[0..n], path[0..n]);
+        dec.path_len = n;
+        return dec;
+    }
+
+    fn spawn(allocator: std.mem.Allocator, path: []const u8, w: u32, h: u32) !*anyopaque {
         const cmd = try std.fmt.allocPrintSentinel(allocator,
-            "ffmpeg -hide_banner -loglevel error -stream_loop -1 -i {s} " ++
+            "ffmpeg -hide_banner -loglevel error -i {s} " ++
             "-f rawvideo -pix_fmt rgba -s {d}x{d} pipe:1",
             .{ path, w, h }, 0);
         defer allocator.free(cmd);
-        const stream = popen(cmd.ptr, "r") orelse return error.PopenFailed;
-        return .{ .stream = stream, .w = w, .h = h, .frame_bytes = @as(usize, w) * h * 4, .fps = fps };
+        return popen(cmd.ptr, "r") orelse error.PopenFailed;
+    }
+
+    pub fn eof(self: *const VideoDecoder) bool {
+        return self.eof_flag;
+    }
+
+    /// Restart from the beginning by re-spawning ffmpeg (for engine-driven loop).
+    pub fn replay(self: *VideoDecoder, allocator: std.mem.Allocator) void {
+        const stream = spawn(allocator, self.path_buf[0..self.path_len], self.w, self.h) catch return;
+        _ = pclose(self.stream);
+        self.stream = stream;
+        self.frame_index = 0;
+        self.eof_flag = false;
     }
 
     pub fn width(self: *const VideoDecoder) u32 {
@@ -108,7 +135,10 @@ pub const VideoDecoder = struct {
         var off: usize = 0;
         while (off < buf.len) {
             const n = fread(buf.ptr + off, 1, buf.len - off, self.stream);
-            if (n == 0) return null;
+            if (n == 0) {
+                self.eof_flag = true;
+                return null;
+            }
             off += n;
         }
         const pts = @as(f64, @floatFromInt(self.frame_index)) / @as(f64, self.fps);

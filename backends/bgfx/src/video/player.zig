@@ -49,6 +49,7 @@ pub fn Player(comptime Decoder: type) type {
         play_time: f64 = 0, // master clock — driven by the audio device, or dt
         last_clock: f64 = 0, // previous audio-clock reading (for the delta)
         cur_pts: f64 = -1, // PTS of the frame currently on the texture
+        ended: bool = false, // stream drained (set when the decoder reports eof)
 
         /// Take an already-opened decoder (opening is platform-specific), create
         /// a dynamic texture sized to it, decode the first frame, and upload it.
@@ -108,6 +109,32 @@ pub fn Player(comptime Decoder: type) type {
                 uploaded = true;
             }
             if (uploaded) texture.updateTexture(self.tex, self.pixels);
+
+            // End-of-stream: the decoder drained (only meaningful for decoders
+            // that report it; looping/never-ending sources never set it).
+            if (comptime @hasDecl(Decoder, "eof")) {
+                if (self.decoder.eof()) self.ended = true;
+            }
+        }
+
+        /// True once the stream has played to the end (play-once clips). Loops are
+        /// restarted by the engine via `replay` before this is observed.
+        pub fn isEnded(self: *const Self) bool {
+            return self.ended;
+        }
+
+        /// Restart playback from the beginning (engine-driven loop / replay).
+        pub fn replay(self: *Self) void {
+            if (comptime @hasDecl(Decoder, "replay")) self.decoder.replay(self.allocator);
+            self.play_time = 0;
+            self.last_clock = 0;
+            self.cur_pts = -1;
+            self.ended = false;
+            self.started = false; // re-arm the audio start on the next update
+            if (self.decoder.decodeFrame(self.pixels)) |pts| {
+                self.cur_pts = pts;
+                texture.updateTexture(self.tex, self.pixels);
+            }
         }
 
         /// Draw the current video frame into `dest` (screen or world space, per

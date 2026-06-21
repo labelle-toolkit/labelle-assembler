@@ -158,7 +158,13 @@ pub const VideoBackend = struct {
     }
 
     pub fn isVideoPlaying(id: u32) bool {
-        return slotPtr(id) != null;
+        if (slotPtr(id)) |s| return !s.player.isEnded();
+        return false;
+    }
+
+    /// Restart a finished clip from the beginning (engine-driven loop).
+    pub fn replayVideo(id: u32) void {
+        if (slotPtr(id)) |s| s.player.replay();
     }
 
     pub fn videoDimensions(id: u32) struct { w: u32, h: u32 } {
