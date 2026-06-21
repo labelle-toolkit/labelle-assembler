@@ -1,6 +1,6 @@
 # RFC: Pluggable backends — make the assembler backend-agnostic
 
-**Status:** Draft (revision 2 — codegen-splice reframed as a `Game`-lifecycle hook contract; the residuals are the build-splice + the lifecycle ABI)
+**Status:** Draft (revision 3 — contracts are independently pluggable, not bundled; full-stack packages + per-contract overrides over one monorepo with lazy deps; audio is the worked example + pilot extraction)
 
 **Tracking:** labelle-toolkit/labelle-assembler#377
 
@@ -99,19 +99,56 @@ A runnable POC de-risks all of the above:
   engine never name a context. The diff between v2 and v3 was confined entirely
   to the two packages.
 
-## The backend as a package
+## Backends compose independently-pluggable contracts
 
-A backend becomes a resolved-by-name dependency, declared like a plugin:
+The four contracts are **independently pluggable, not bundled per lib** — and
+audio is the proof. `AudioInterface` already lives in **labelle-core** (every
+backend's `audio.zig` "satisfies the engine `AudioInterface(Impl)` contract"), so
+audio was never coupled to rendering at the contract level. Yet bgfx and wgpu
+*each reimplement* a WAV decoder + PCM mixer (bgfx 735 lines + a miniaudio
+device, wgpu 296 lines, software-only) purely because their render lib has no
+audio — exactly the duplication a "one backend = all four contracts" bundling
+*forces*.
+
+So a project's "backend" is a **composition** of per-contract providers. Some
+libs supply several contracts (sokol = render + window + input + audio); some
+supply one (bgfx = render only). The declaration is **full-stack packages with
+per-contract overrides** — the common case stays one word, any slot is
+overridable:
 
 ```zig
-.backend = .{ .name = "my-vulkan-thing", .repo = "github:someone/labelle-vulkan" },
+.backend = .sokol,                                // sokol's render+window+input+audio
+.backend = .{ .render = .bgfx },                  // bgfx render; audio auto-defaults to miniaudio
+.backend = .{ .render = .bgfx, .audio = .sdl },   // …unless you override the slot
+.backend = .{ .render = .{ .repo = "github:someone/labelle-vulkan" } }, // a stranger's provider
 ```
 
-Each backend package provides: the four runtime impls + their private context
-wiring + a **manifest** declaring its codegen contribution, build deps, supported
-platforms, and which contract versions it implements. The existing plugin rails
-(`resolvePlugin`, manifest-driven codegen, `overrideImport`, the deps linker)
-are reused.
+### Audio — the worked example
+Audio decomposes one level further: the duplicated part (WAV/OGG decode + PCM
+mixer) is backend-agnostic; only the *output device* is platform-specific.
+- a shared **`labelle-audio`** = the `AudioInterface` impl (decode + mix), written
+  once, and
+- a pluggable **audio-device** sink: providers `sokol_audio`, `miniaudio`,
+  `sdl_audio`, `raudio`, `null`.
+
+"sokol has its own, bgfx has none" maps cleanly: sokol's device = `sokol_audio`;
+bgfx's device = `miniaudio`; the mixer above them is shared — deleting ~3
+reimplementations. Audio is the **ideal first extraction**: already contracted
+(`core.AudioInterface`), and with **zero GPU-context sharing** (its own device +
+thread), so the hardest part of this RFC — the context handoff — simply does not
+apply to it.
+
+### Packaging: one monorepo + lazy deps (not a repo explosion)
+Contract granularity and repo count are **orthogonal** — per-contract composition
+never required per-contract repos. The official providers live in a **single
+`labelle-backends` monorepo** (one thing to maintain), and slim-fetch is
+preserved by **Zig lazy deps**: each provider declares its native dep `lazy =
+true`, so `render = bgfx` fetches bgfx's ~812 MB and *not* sokol's ~2 GB even
+though both live in the same repo. Third parties publish their own repo with
+their own provider and point a slot at it — not the toolkit's burden.
+
+The existing plugin rails (`resolvePlugin`, manifest-driven codegen,
+`overrideImport`, the deps linker) are reused for resolution + wiring.
 
 ## Per-layer changes
 
@@ -181,16 +218,22 @@ So the *code* splice is largely answered. The two genuinely hard residuals are:
 ## Migration plan (incremental, not a big bang)
 
 1. **Stand up `labelle-platform-abi`** with the four contracts + `assertBackend`;
-   make gfx's existing `Backend` conform (no behaviour change).
-2. **Convert ONE backend** (sokol — it's the headless-validatable one, so we can
-   screenshot-verify) to implement the contracts from a separate location, *while
-   keeping the enum* as a resolver shorthand. Prove a generated game still builds
-   + runs.
-3. **Open the resolver** — `.backend` accepts `.{ .name, .repo }`; the closed
-   enum values become **shorthands** that resolve to the official backend
-   packages. **Backward-compatible**: existing `.backend = .sokol` keeps working,
-   resolving to `labelle-toolkit/labelle-sokol@<ver>`.
-4. **Extract the remaining backends**; slim the assembler.
+   make gfx's existing `Backend` conform (no behaviour change). (`AudioInterface`
+   already lives in labelle-core — it just moves/re-exports.)
+2. **Pilot with audio** — the lowest-risk slot (already contracted, *zero*
+   context-sharing). Extract the shared `labelle-audio` mixer + the device
+   providers (`sokol_audio`/`miniaudio`/…) and collapse the per-backend mixer
+   duplication. Immediate, measurable payoff with no entry-point or context work.
+3. **Convert one full backend** (sokol — render+window+input; it's the
+   headless-screenshot-verifiable one) to implement the contracts from a separate
+   location, *while keeping the enum* as a resolver shorthand. Prove a generated
+   game still builds + runs.
+4. **Open the resolver** — `.backend` accepts a full-stack package *and*
+   per-contract overrides (`.{ .render = .bgfx, .audio = .miniaudio }`); the
+   closed enum values become **shorthands** resolving to the official providers.
+   **Backward-compatible**: `.backend = .sokol` keeps working.
+5. **Extract the remaining backends**; slim the assembler (lazy native deps per
+   provider).
 
 ## Open questions
 
@@ -203,8 +246,11 @@ So the *code* splice is largely answered. The two genuinely hard residuals are:
    relocate into the ABI crate, or stay in gfx and be re-exported? How does a
    backend pin "I implement contract vN"? The version matrix (N backends ×
    contracts × the core diamond) needs a story.
-3. **One `labelle-backends` monorepo vs per-backend repos** — independent release
-   cadence + slim fetch (per-repo) vs less coordination (monorepo).
+3. ~~One monorepo vs per-backend repos~~ — **resolved**: one `labelle-backends`
+   monorepo for the official providers (one thing to maintain), with slim-fetch
+   preserved by Zig **lazy deps** per provider; third parties publish their own
+   repo. Contract granularity and repo count are orthogonal, so per-contract
+   composition costs no extra repos.
 4. **Mobile/android + gamepad** (`android_gamepad`, `sdl_gamepad`, the
    `templates/mobile.txt` path) — extra contract surface beyond the desktop four.
 5. **The build-graph generalization** — the core-diamond unification + the
