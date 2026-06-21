@@ -894,6 +894,13 @@ pub fn build(b: *std.Build) void {
     lib.root_module.linkSystemLibrary("GLESv3", .{});
     lib.root_module.linkSystemLibrary("m", .{});
     lib.root_module.linkSystemLibrary("dl", .{});
+    // In-engine video (#549): the bgfx VideoBackend's Android decoder calls
+    // AMediaCodec/AMediaExtractor/AImageReader (libmediandk). Without it the app
+    // fails to dlopen at launch ("cannot locate symbol
+    // AMediaCodec_dequeueOutputBuffer"). `aaudio` backs the AAudio output
+    // device (#306). `android` (above) carries AAssetManager_* for name lookup.
+    lib.root_module.linkSystemLibrary("mediandk", .{});
+    lib.root_module.linkSystemLibrary("aaudio", .{});
 
     // Zig does not bundle Android libc — provide a libc.txt that points the
     // compiler at the NDK sysroot so Zig can resolve <stdio.h> and friends.
