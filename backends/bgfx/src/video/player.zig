@@ -122,6 +122,13 @@ pub fn Player(comptime Decoder: type) type {
             texture.drawTexturePro(self.tex, src, dest, .{ .x = 0, .y = 0 }, 0, types.white);
         }
 
+        /// Draw a sub-region `src` (in texture pixels) of the current frame into
+        /// `dest` — the seam for cover/contain fits (center-crop the source, or
+        /// letterbox the dest).
+        pub fn drawRegion(self: *const Self, src: types.Rectangle, dest: types.Rectangle) void {
+            texture.drawTexturePro(self.tex, src, dest, .{ .x = 0, .y = 0 }, 0, types.white);
+        }
+
         pub fn deinit(self: *Self) void {
             if (self.audio.stop) |f| f(self.audio.ctx);
             self.decoder.deinit();
