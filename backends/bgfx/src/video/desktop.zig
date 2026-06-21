@@ -16,6 +16,7 @@ extern "c" fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern "c" fn pclose(stream: *anyopaque) c_int;
 extern "c" fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn system(command: [*:0]const u8) c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
 
 /// Single-quote a path for safe interpolation into a `/bin/sh` command, so paths
 /// with spaces (or shell metacharacters) work and can't be an injection surface.
@@ -213,9 +214,12 @@ pub const VideoDecoder = struct {
 
 test "decodeAudioPcm: decodes a clip's audio track to 48k stereo PCM" {
     const alloc = std.testing.allocator;
+    // `/tmp` is fine: this backend (and its tests) only build on POSIX hosts
+    // (Linux/macOS) — bgfx here has no Windows target. Cleaned up after.
     const clip = "/tmp/labelle_audio_decode_test.mp4";
     // generateTestClip writes a 6 s clip with a 440 Hz sine audio track.
     try VideoDecoder.generateTestClip(alloc, clip, 320, 240);
+    defer _ = unlink(clip);
 
     const pcm = VideoDecoder.decodeAudioPcm(alloc, clip) orelse return error.NoAudioDecoded;
     defer alloc.free(pcm);
