@@ -37,6 +37,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const yuv = @import("yuv.zig");
 
+extern fn close(c_int) c_int;
+
 const is_android = builtin.abi == .android or builtin.abi == .androideabi;
 
 /// Public decoder type. Real implementation on Android; a stub elsewhere so the
@@ -48,6 +50,7 @@ pub const Error = error{
     NoVideoTrack,
     UnsupportedColorFormat,
     DecoderInit,
+    MissingDimensions,
     OutOfMemory,
 };
 
@@ -94,6 +97,7 @@ const AndroidVideoDecoder = struct {
     extern fn AMediaExtractor_getTrackFormat(*Extractor, idx: usize) ?*Format;
     extern fn AMediaExtractor_selectTrack(*Extractor, idx: usize) i32;
     extern fn AMediaExtractor_readSampleData(*Extractor, buf: [*]u8, capacity: usize) isize;
+    extern fn AMediaExtractor_getSampleTime(*Extractor) i64;
     extern fn AMediaExtractor_advance(*Extractor) bool;
     extern fn AMediaExtractor_delete(*Extractor) void;
 
@@ -143,10 +147,21 @@ const AndroidVideoDecoder = struct {
     const KEY_MIME: [*:0]const u8 = "mime";
     const KEY_WIDTH: [*:0]const u8 = "width";
     const KEY_HEIGHT: [*:0]const u8 = "height";
+    // Crop rectangle keys (present when the decoder pads the coded size up to a
+    // hardware alignment, e.g. 1080 → 1088): the display frame is the *inclusive*
+    // crop rect, so display_w = right - left + 1, display_h = bottom - top + 1.
+    const KEY_CROP_LEFT: [*:0]const u8 = "crop-left";
+    const KEY_CROP_TOP: [*:0]const u8 = "crop-top";
+    const KEY_CROP_RIGHT: [*:0]const u8 = "crop-right";
+    const KEY_CROP_BOTTOM: [*:0]const u8 = "crop-bottom";
 
     extractor: *Extractor,
     codec: *Codec,
     reader: *ImageReader,
+    // The decoder OWNS this fd (handed over by `backend.zig` from
+    // `AAsset_openFileDescriptor64`): it's `close()`d in `deinit` so loop/replay
+    // can't leak a descriptor. `backend.zig` must NOT close it.
+    fd: c_int,
     w: u32,
     h: u32,
     input_done: bool,
@@ -155,6 +170,10 @@ const AndroidVideoDecoder = struct {
     /// `AAsset_openFileDescriptor`, with its offset/length). Selects the first
     /// `video/*` track and configures a hardware decoder in ByteBuffer mode.
     pub fn openFd(_: std.mem.Allocator, fd: c_int, offset: i64, length: i64) Error!AndroidVideoDecoder {
+        // Ownership transfers here: the decoder now owns `fd`. On any error path
+        // close it (the returned struct never gets built); on success the field
+        // takes over and `deinit` closes it. backend.zig must not close it.
+        errdefer _ = close(fd);
         const ex = AMediaExtractor_new() orelse return error.DecoderInit;
         errdefer AMediaExtractor_delete(ex);
         if (AMediaExtractor_setDataSourceFd(ex, fd, offset, length) != AMEDIA_OK)
@@ -178,8 +197,10 @@ const AndroidVideoDecoder = struct {
             const span = std.mem.span(m);
             if (!std.mem.startsWith(u8, span, "video/")) continue;
             if (span.len + 1 > mime_buf.len) continue;
-            _ = AMediaFormat_getInt32(fmt, KEY_WIDTH, &w);
-            _ = AMediaFormat_getInt32(fmt, KEY_HEIGHT, &h);
+            // Require real dimensions: a missing width/height key would leave
+            // w/h at 0, giving a 1×1 ImageReader and a zero-sized texture.
+            if (!AMediaFormat_getInt32(fmt, KEY_WIDTH, &w)) return error.MissingDimensions;
+            if (!AMediaFormat_getInt32(fmt, KEY_HEIGHT, &h)) return error.MissingDimensions;
             @memcpy(mime_buf[0..span.len], span);
             mime_buf[span.len] = 0;
             mime_len = span.len;
@@ -214,6 +235,7 @@ const AndroidVideoDecoder = struct {
             .extractor = ex,
             .codec = codec,
             .reader = reader,
+            .fd = fd,
             .w = @intCast(@max(w, 0)),
             .h = @intCast(@max(h, 0)),
             .input_done = false,
@@ -246,7 +268,11 @@ const AndroidVideoDecoder = struct {
                         _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, 0, 0, FLAG_EOS);
                         self.input_done = true;
                     } else {
-                        _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, @intCast(n), 0, 0);
+                        // Tag the sample with the extractor's current presentation
+                        // time (clamped ≥ 0) for PTS accuracy — read BEFORE advance.
+                        const sample_us = AMediaExtractor_getSampleTime(self.extractor);
+                        const time_us: u64 = @intCast(@max(sample_us, 0));
+                        _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, @intCast(n), time_us, 0);
                         _ = AMediaExtractor_advance(self.extractor);
                     }
                 }
@@ -279,14 +305,34 @@ const AndroidVideoDecoder = struct {
     }
 
     /// Refresh w/h after an output-format change (emitted once before the first
-    /// frame). The ImageReader is fixed-size from the track format, which matches
-    /// for typical streams.
+    /// frame).
+    ///
+    /// Hardware decoders report the *aligned/coded* width/height in the output
+    /// format — rounded up to a 16/32-pixel multiple (e.g. 1080 → 1088) — which
+    /// is NOT the real display size. Overwriting `self.w`/`self.h` with those
+    /// would mis-size the texture and corrupt rendering. So we only update the
+    /// reported dimensions from the *crop rectangle* (the true display frame, an
+    /// inclusive rect → w = right-left+1, h = bottom-top+1); absent a crop rect we
+    /// KEEP the display dimensions read at `openFd` time. The aligned size still
+    /// governs the plane strides used when reading the buffer, but `width()`/
+    /// `height()` and the ImageReader/texture must stay the real video size.
     fn refreshFormat(self: *AndroidVideoDecoder) void {
         const fmt = AMediaCodec_getOutputFormat(self.codec) orelse return;
         defer AMediaFormat_delete(fmt);
-        var v: i32 = 0;
-        if (AMediaFormat_getInt32(fmt, KEY_WIDTH, &v)) self.w = @intCast(@max(v, 0));
-        if (AMediaFormat_getInt32(fmt, KEY_HEIGHT, &v)) self.h = @intCast(@max(v, 0));
+        var left: i32 = 0;
+        var top: i32 = 0;
+        var right: i32 = 0;
+        var bottom: i32 = 0;
+        const have_crop = AMediaFormat_getInt32(fmt, KEY_CROP_LEFT, &left) and
+            AMediaFormat_getInt32(fmt, KEY_CROP_TOP, &top) and
+            AMediaFormat_getInt32(fmt, KEY_CROP_RIGHT, &right) and
+            AMediaFormat_getInt32(fmt, KEY_CROP_BOTTOM, &bottom);
+        if (have_crop and right >= left and bottom >= top) {
+            self.w = @intCast(right - left + 1);
+            self.h = @intCast(bottom - top + 1);
+        }
+        // No crop rect → keep the openFd display dimensions; do NOT adopt the
+        // aligned width/height the format would otherwise report.
     }
 
     /// Convert a YUV_420_888 AImage to RGBA8. The plane row/pixel strides make
@@ -357,5 +403,8 @@ const AndroidVideoDecoder = struct {
         AMediaCodec_delete(self.codec);
         AImageReader_delete(self.reader);
         AMediaExtractor_delete(self.extractor);
+        // The decoder owns the asset fd (see the struct field comment); release
+        // it so loop/replay can't leak descriptors. backend.zig must not close it.
+        _ = close(self.fd);
     }
 };

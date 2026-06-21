@@ -83,6 +83,10 @@ pub const VideoBackend = struct {
             defer AAsset_close(asset);
             var start: i64 = 0;
             var len: i64 = 0;
+            // `AAsset_openFileDescriptor64` returns an independent (dup'd) fd, so
+            // closing the AAsset above is fine. Ownership of `fd` transfers to the
+            // decoder in `openFd` — it `close()`s it in `deinit` (and on its own
+            // error paths). We must NOT close `fd` here (no double close).
             const fd = AAsset_openFileDescriptor64(asset, &start, &len);
             if (fd < 0) return 0;
             var dec = android.VideoDecoder.openFd(alloc, fd, start, len) catch return 0;
