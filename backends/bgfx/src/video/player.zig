@@ -4,8 +4,13 @@
 //! Generic over the decoder so the same wiring drives either backend decoder:
 //!   - desktop: `video/desktop.zig` (ffmpeg)
 //!   - Android: `video/android.zig` (AMediaCodec)
-//! A decoder just needs `width()`, `height()`, `decodeFrame([]u8) bool`, and
-//! `deinit()`. The player owns the dynamic texture (`gfx/texture.zig`): it
+//! A decoder just needs `width()`, `height()`, `decodeFrame([]u8) ?f64`, and
+//! `deinit()`. `decodeFrame` fills the RGBA8 buffer and returns the decoded
+//! frame's presentation timestamp in seconds (the PTS, used for A/V sync), or
+//! `null` when no frame was produced / the stream ended. A decoder MAY also
+//! expose optional `eof()` and `replay(allocator)` decls, which the player uses
+//! via `@hasDecl` for end-of-stream detection and engine-driven looping. The
+//! player owns the dynamic texture (`gfx/texture.zig`): it
 //! creates one sized to the video, paces decoded frames to the clip fps, uploads
 //! each via `updateTexture`, and draws it with `drawTexturePro`.
 
@@ -56,6 +61,11 @@ pub fn Player(comptime Decoder: type) type {
         pub fn init(allocator: std.mem.Allocator, decoder: Decoder, fps: f32) !Self {
             _ = fps; // pacing is now driven by frame PTS, not a fixed rate
             var dec = decoder;
+            // `decoder` was moved into `dec`; if a fallible call below fails we'd
+            // otherwise leak it (the caller hands ownership in). Release it on any
+            // error path. Cancelled on success — the returned struct owns it and
+            // `deinit` calls `decoder.deinit()`.
+            errdefer dec.deinit();
             const w = dec.width();
             const h = dec.height();
             const tex = try texture.createDynamicTexture(w, h);
@@ -107,6 +117,10 @@ pub fn Player(comptime Decoder: type) type {
                 const pts = self.decoder.decodeFrame(self.pixels) orelse break;
                 self.cur_pts = pts;
                 uploaded = true;
+                // Caught up: this freshly decoded frame's PTS has reached (or
+                // overshot) the clock. Upload it (it's the best available next
+                // frame) but stop here — don't keep decoding into the future.
+                if (pts >= self.play_time) break;
             }
             if (uploaded) texture.updateTexture(self.tex, self.pixels);
 

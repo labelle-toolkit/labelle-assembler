@@ -270,6 +270,16 @@ pub fn build(b: *std.Build) void {
     if (!is_android) {
         // ── miniaudio playback device (#297) — desktop only ─────────
         wireMiniaudio(b, audio_mod, target.result.os.tag);
+    } else if (ndk) |n| {
+        // On Android the mixer is AAudio-backed (`audio_device_android.zig`,
+        // #306), which links `libaaudio`. The module's Zig source is pure
+        // `extern fn` (no `@cInclude`), so the device-less compile-check below
+        // emits its object without sysroot headers — but apply the SAME NDK
+        // sysroot the other Android modules use so the lib path / API level /
+        // PIC are wired for any consumer that actually *links* it (e.g. the
+        // libgame.so app link). Desktop never reaches this branch.
+        applyNdkSysroot(audio_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+        audio_mod.linkSystemLibrary("aaudio", .{});
     }
 
     // ── Window backend module ───────────────────────────────────────

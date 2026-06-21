@@ -109,6 +109,15 @@ pub fn yuv420ToRgba(
     out: []u8,
 ) void {
     std.debug.assert(out.len == @as(usize, width) * height * 4);
+    if (width == 0 or height == 0) return;
+    // Bound the plane reads so a release-unsafe build can't index OOB. The last
+    // sampled offsets are at the bottom-right pixel (luma) and its 2×2 chroma
+    // block (chroma planes are half-resolution, so use the last even row/col).
+    const last_y = (height - 1) * y_row_stride + (width - 1) * y_pixel_stride;
+    const last_c = ((height - 1) / 2) * uv_row_stride + ((width - 1) / 2) * uv_pixel_stride;
+    std.debug.assert(y.len > last_y);
+    std.debug.assert(u.len > last_c);
+    std.debug.assert(v.len > last_c);
     var row: u32 = 0;
     while (row < height) : (row += 1) {
         var col: u32 = 0;
