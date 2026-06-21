@@ -154,7 +154,9 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
                 if (raw.items.len + sample_count <= MAX_FRAMES * 4) {
                     raw.ensureUnusedCapacity(allocator, sample_count) catch return error.OutOfMemory;
                     var bi: usize = 0;
-                    while (bi < sample_bytes.len - 1) : (bi += 2) {
+                    // `bi + 1 < len` (not `len - 1`) avoids a usize underflow when
+                    // the codec emits a zero-size buffer (valid before EOS).
+                    while (bi + 1 < sample_bytes.len) : (bi += 2) {
                         const s = std.mem.readInt(i16, sample_bytes[bi..][0..2], .little);
                         raw.appendAssumeCapacity(s);
                     }
