@@ -61,8 +61,10 @@ pub const VideoBackend = struct {
         return if (s.used) s else null;
     }
 
-    /// Open a video by resource name. Returns a handle (0 = failure).
-    pub fn openVideo(name: [:0]const u8) u32 {
+    /// Open a video by resource name. `[]const u8` so a `VideoComponent` path
+    /// from a scene/JSON string works directly; null-terminated here for the
+    /// Android asset API. Returns a handle (0 = failure).
+    pub fn openVideo(name: []const u8) u32 {
         const idx = freeSlot() orelse return 0;
         if (is_android) {
             const act = labelle_bgfx_get_native_activity() orelse return 0;
@@ -71,7 +73,12 @@ pub const VideoBackend = struct {
             // assetManager…).
             const fields: [*]const ?*anyopaque = @ptrCast(@alignCast(act));
             const am: *AAssetManager = @ptrCast(fields[8] orelse return 0);
-            const asset = AAssetManager_open(am, name, AASSET_MODE_STREAMING) orelse return 0;
+            var namebuf: [256]u8 = undefined;
+            if (name.len >= namebuf.len) return 0;
+            @memcpy(namebuf[0..name.len], name);
+            namebuf[name.len] = 0;
+            const namez: [:0]const u8 = namebuf[0..name.len :0];
+            const asset = AAssetManager_open(am, namez.ptr, AASSET_MODE_STREAMING) orelse return 0;
             defer AAsset_close(asset);
             var start: i64 = 0;
             var len: i64 = 0;
