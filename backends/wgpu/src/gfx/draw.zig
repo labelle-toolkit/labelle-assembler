@@ -144,6 +144,47 @@ pub fn drawTriangle(v1: Vector2, v2: Vector2, v3: Vector2, tint: Color) void {
     batch.noteShapeDraw(index_start, 3);
 }
 
+/// Filled convex polygon through the absolute rim vertices in `points`
+/// (design-pixel space — centre + scale already applied by the caller).
+/// Slice/Color signature matches the labelle-gfx Backend contract; the
+/// rim is batched as a triangle fan anchored at `points[0]`.
+/// Max rim points a single polygon may carry. Guards the u32 index math
+/// below from overflow (a count this large could never fit the shape batch
+/// anyway); the gfx renderer already clamps polygon/arc tessellation to 128.
+pub const max_polygon_points: usize = 256;
+
+pub fn drawPolygon(points: []const Vector2, tint: Color) void {
+    if (points.len < 3) return;
+    if (points.len > max_polygon_points) {
+        log.warn("polygon has {d} rim points (> max {d}), dropping", .{ points.len, max_polygon_points });
+        return;
+    }
+    const num_verts: u32 = @intCast(points.len);
+    const num_triangles: u32 = num_verts - 2;
+    const num_indices: u32 = num_triangles * 3;
+    if (!batch.hasShapeCapacity(num_verts, num_indices)) {
+        log.warn("shape batch full, dropping polygon primitive", .{});
+        return;
+    }
+    const col = tint.toAbgr();
+    const base: u32 = @intCast(batch.shapeVertexCount());
+    const index_start: u32 = @intCast(batch.shapeIndexCount());
+
+    for (points) |p| {
+        batch.appendShapeVertex(ColorVertex.init(toNdcX(p.x), toNdcY(p.y), col));
+    }
+
+    // Fan triangles: (points[0], points[i+1], points[i+2]).
+    var i: u32 = 0;
+    while (i < num_triangles) : (i += 1) {
+        batch.appendShapeIndex(base);
+        batch.appendShapeIndex(base + i + 1);
+        batch.appendShapeIndex(base + i + 2);
+    }
+
+    batch.noteShapeDraw(index_start, num_indices);
+}
+
 pub fn drawPoly(center_x: f32, center_y: f32, sides: i32, radius: f32, rotation: f32, tint: Color) void {
     if (sides < 3 or radius <= 0) return;
     const num_sides: u32 = @intCast(sides);

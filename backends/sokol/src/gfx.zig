@@ -66,6 +66,7 @@ pub const drawRectanglePro = draw.drawRectanglePro;
 pub const drawRectangleLinesEx = draw.drawRectangleLinesEx;
 pub const drawCircle = draw.drawCircle;
 pub const drawTriangle = draw.drawTriangle;
+pub const drawPolygon = draw.drawPolygon;
 pub const drawLine = draw.drawLine;
 pub const drawText = font_atlas.drawText;
 
