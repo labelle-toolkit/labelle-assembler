@@ -148,11 +148,21 @@ pub fn drawTriangle(v1: Vector2, v2: Vector2, v3: Vector2, tint: Color) void {
 /// (design-pixel space — centre + scale already applied by the caller).
 /// Slice/Color signature matches the labelle-gfx Backend contract; the
 /// rim is batched as a triangle fan anchored at `points[0]`.
+/// Max rim points a single polygon may carry. Guards the u32 index math
+/// below from overflow (a count this large could never fit the shape batch
+/// anyway); the gfx renderer already clamps polygon/arc tessellation to 128.
+pub const max_polygon_points: usize = 256;
+
 pub fn drawPolygon(points: []const Vector2, tint: Color) void {
     if (points.len < 3) return;
+    if (points.len > max_polygon_points) {
+        log.warn("polygon has {d} rim points (> max {d}), dropping", .{ points.len, max_polygon_points });
+        return;
+    }
     const num_verts: u32 = @intCast(points.len);
     const num_triangles: u32 = num_verts - 2;
-    if (!batch.hasShapeCapacity(num_verts, num_triangles * 3)) {
+    const num_indices: u32 = num_triangles * 3;
+    if (!batch.hasShapeCapacity(num_verts, num_indices)) {
         log.warn("shape batch full, dropping polygon primitive", .{});
         return;
     }
@@ -172,7 +182,7 @@ pub fn drawPolygon(points: []const Vector2, tint: Color) void {
         batch.appendShapeIndex(base + i + 2);
     }
 
-    batch.noteShapeDraw(index_start, num_triangles * 3);
+    batch.noteShapeDraw(index_start, num_indices);
 }
 
 pub fn drawPoly(center_x: f32, center_y: f32, sides: i32, radius: f32, rotation: f32, tint: Color) void {

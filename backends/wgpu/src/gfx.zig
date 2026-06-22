@@ -219,6 +219,29 @@ test "draw segments: consecutive same-kind draws coalesce into one segment" {
     try std.testing.expectEqual(@as(u32, 6), frame.segments[1].index_count);
 }
 
+test "drawPolygon: fans rim points into shape indices" {
+    _ = consumeFrame();
+    setScreenSize(800, 600);
+    setDesignSize(800, 600);
+
+    // 5 rim points -> 5 shape verts, (5-2)=3 fan triangles -> 9 indices.
+    const pts = [_]Vector2{
+        .{ .x = 10, .y = 10 },
+        .{ .x = 30, .y = 10 },
+        .{ .x = 40, .y = 30 },
+        .{ .x = 25, .y = 45 },
+        .{ .x = 10, .y = 30 },
+    };
+    drawPolygon(&pts, white);
+
+    const frame = consumeFrame();
+    try std.testing.expectEqual(@as(usize, 1), frame.segments.len);
+    try std.testing.expectEqual(SegmentKind.shape, frame.segments[0].kind);
+    try std.testing.expectEqual(@as(u32, 9), frame.segments[0].index_count);
+    try std.testing.expectEqual(@as(usize, 5), frame.shape_vertices.len);
+    try std.testing.expectEqual(@as(usize, 9), frame.shape_indices.len);
+}
+
 test "draw segments: consumeFrame resets the segment list exactly once" {
     _ = consumeFrame();
     drawRectangleRec(.{ .x = 0, .y = 0, .width = 10, .height = 10 }, white);
