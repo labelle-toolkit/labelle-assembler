@@ -124,6 +124,20 @@ pub fn drawTriangle(v1: Vector2, v2: Vector2, v3: Vector2, tint: Color) void {
     }
 }
 
+/// Filled convex polygon through the absolute rim vertices in `points`
+/// (position + scale already applied by the caller). Slice/Color
+/// signature matches the labelle-gfx Backend contract. Decomposed into a
+/// triangle fan anchored at `points[0]` and routed through `drawTriangle`
+/// so raylib's CCW-only winding requirement is normalized per-triangle —
+/// no dependency on a `drawTriangleFan` binding that may be absent.
+pub fn drawPolygon(points: []const Vector2, tint: Color) void {
+    if (points.len < 3) return;
+    var i: usize = 1;
+    while (i + 1 < points.len) : (i += 1) {
+        drawTriangle(points[0], points[i], points[i + 1], tint);
+    }
+}
+
 pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void {
     rl.drawText(text, @intFromFloat(x), @intFromFloat(y), @intFromFloat(size), tint.toRl());
 }

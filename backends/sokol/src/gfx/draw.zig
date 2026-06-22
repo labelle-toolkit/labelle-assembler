@@ -233,3 +233,22 @@ pub fn drawTriangle(v1: Vector2, v2: Vector2, v3: Vector2, tint: Color) void {
     sgl.v2f(state.toNdcX(v3.x), state.toNdcY(v3.y));
     sgl.end();
 }
+
+/// Filled convex polygon through the absolute rim vertices in `points`
+/// (design-pixel space — centre + scale already applied by the caller).
+/// Slice/Color signature matches the labelle-gfx Backend contract;
+/// emitted as a triangle fan anchored at `points[0]`, mirroring how
+/// `drawTriangle` submits via sgl with `state.toNdc*` conversion.
+pub fn drawPolygon(points: []const Vector2, tint: Color) void {
+    if (points.len < 3) return;
+    const anchor = points[0];
+    sgl.beginTriangles();
+    sgl.c4b(tint.r, tint.g, tint.b, tint.a);
+    var i: usize = 1;
+    while (i + 1 < points.len) : (i += 1) {
+        sgl.v2f(state.toNdcX(anchor.x), state.toNdcY(anchor.y));
+        sgl.v2f(state.toNdcX(points[i].x), state.toNdcY(points[i].y));
+        sgl.v2f(state.toNdcX(points[i + 1].x), state.toNdcY(points[i + 1].y));
+    }
+    sgl.end();
+}

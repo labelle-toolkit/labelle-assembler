@@ -101,6 +101,7 @@ pub const drawRectangleRec = draw.drawRectangleRec;
 pub const drawCircle = draw.drawCircle;
 pub const drawLine = draw.drawLine;
 pub const drawTriangle = draw.drawTriangle;
+pub const drawPolygon = draw.drawPolygon;
 pub const drawPoly = draw.drawPoly;
 pub const drawTexturePro = draw.drawTexturePro;
 
