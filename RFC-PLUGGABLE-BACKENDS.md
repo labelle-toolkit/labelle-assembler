@@ -1,6 +1,6 @@
 # RFC: Pluggable backends — make the assembler backend-agnostic
 
-**Status:** Draft (revision 4 — per-contract struct is the canonical declaration; `render` is the anchor with a render→window→input cascade, audio independent; bare enum demoted to sugar)
+**Status:** Draft (revision 5 — folds in the rev-4 review: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; new Platform-packaging & manifest section; GUI-bridge open question; terminology + stale-wording fixes)
 
 **Tracking:** labelle-toolkit/labelle-assembler#377
 
@@ -59,11 +59,21 @@ A backend implements **four comptime contracts**, all mirroring gfx's existing
 `Backend(comptime Impl)` pattern (validate the `Impl` at comptime, delegate to
 it, gate optionals with `@hasDecl`):
 
-1. **render** — gfx's existing `Backend(Impl)` (`drawTriangle`,
-   `drawTexturePro`, `loadTexture`, …). The most-ready of the four.
+1. **render** — gfx's existing `Backend(Impl)`, and it is **more than draw
+   calls**. Alongside `drawTriangle`/`drawTexturePro`/`loadTexture` it carries the
+   *asset-streaming surface* the generated game already depends on:
+   `decodeImage` / `uploadTexture` / `unloadTexture`, the optional
+   compressed-texture decls, and the font decls. The ABI must capture this **full
+   surface** (see `src/codegen/blocks/asset_wiring.zig`) — otherwise a backend
+   could "conform" to the draw bag and still fail the generated build. Most-ready
+   of the four, but not as thin as a first read suggests.
 2. **input** — `getMouseX/Y`, `isKeyDown`, `getTouchX/Y`, gamepad, wheel. A
    method-bag.
-3. **audio** — `playSound`, `loadSound`, slots. A method-bag.
+3. **audio** — the engine's `AudioInterface(Impl)` — not just `playSound` /
+   `loadSound` but the loader surface too: `decodeAudio` / `uploadSound` /
+   `unloadSound`. The contract already lives in **labelle-core** (engine
+   re-exports it); the ABI package becomes the single canonical import — the
+   core-diamond in miniature.
 4. **window** — the inversion-of-control crux. The window **owns the run loop**
    and the per-frame render target:
    ```zig
@@ -129,18 +139,24 @@ knowing what `.sokol` secretly pulls in:
 
 (The bare `.backend = .sokol` is accepted only as sugar for `.{ .render = .sokol }`.)
 
-**`render` is the anchor and the other slots cascade**, because they aren't
-equally independent:
-- **render → window** — a renderer needs a *compatible* window (bgfx renders into
-  a surface a window hands it; sokol_gfx pairs with sokol_app). The render
-  provider declares its default window: `.bgfx` ⇒ `glfw`, `.sokol` ⇒ `sokol_app`.
+**`render` is the anchor and the other slots cascade — *per platform*.** The
+slots aren't equally independent, and the defaults are **platform-conditioned**:
+the resolver is `(platform, render) → window/input/audio`, not `render → …`.
+- **render → window** — a renderer needs a *compatible* window, and the default
+  is **per platform**: `.bgfx` on desktop ⇒ `glfw`, but `.bgfx` on **Android** ⇒
+  its own `NativeActivity`/app path (no GLFW); `.sokol` ⇒ `sokol_app` on every
+  platform it supports. So the render provider declares a *table* of
+  platform → default-window, not a single value.
 - **window → input** — input comes *with* the window lib (GLFW and sokol_app both
   deliver it), so input defaults from the window, not render.
 - **audio** — fully independent (its own device + thread); defaults to the render
   provider's own if it has one (`.sokol` ⇒ `sokol_audio`), else `miniaudio`.
 
 You pin `render` plus any slot you want to differ from the cascade. The
-defaulting is **principled** (the render⇄window coupling), not a magic table.
+defaulting is **principled** (the render⇄window coupling) and **platform-scoped**
+— see *Platform packaging & the manifest* below for where these per-platform
+defaults live. An *incompatible* override (e.g. `.render = .bgfx, .window =
+.sokol_app`) is a resolve-time error, not a silent fallback.
 
 ### Audio — the worked example
 Audio decomposes one level further: the duplicated part (WAV/OGG decode + PCM
@@ -160,21 +176,27 @@ apply to it.
 ### Packaging: one monorepo + lazy deps (not a repo explosion)
 Contract granularity and repo count are **orthogonal** — per-contract composition
 never required per-contract repos. The official providers live in a **single
-`labelle-backends` monorepo** (one thing to maintain), and slim-fetch is
-preserved by **Zig lazy deps**: each provider declares its native dep `lazy =
-true`, so `render = bgfx` fetches bgfx's ~812 MB and *not* sokol's ~2 GB even
-though both live in the same repo. Third parties publish their own repo with
-their own provider and point a slot at it — not the toolkit's burden.
+`labelle-backends` monorepo** (one thing to maintain). Slim-fetch is then a
+**packaging *requirement***, not an automatic property of a monorepo: it holds
+only if (a) each provider's heavyweight native dep is a **lazy, external** Zig
+dependency — *not* vendored into the fetched package — and (b) the root build
+graph does **not** reference an unused provider's dep during construction. Meet
+those and `render = bgfx` fetches bgfx's ~812 MB and *not* sokol's ~2 GB despite
+the shared repo; violate either (e.g. vendored deps, an eager root reference) and
+the monorepo re-introduces the ~4 GB. So this is a constraint the providers + the
+root package must satisfy, stated explicitly here so it isn't assumed for free.
+Third parties publish their own repo with their own provider and point a slot at
+it — not the toolkit's burden.
 
 The existing plugin rails (`resolvePlugin`, manifest-driven codegen,
 `overrideImport`, the deps linker) are reused for resolution + wiring.
 
 ## Per-layer changes
 
-### NEW — `labelle-platform-abi` (a thin leaf crate)
+### NEW — `labelle-platform-abi` (a thin leaf package)
 Houses the four comptime contracts + the shared value types; almost no deps.
 gfx, engine, and every backend depend on it. A backend author opens exactly one
-crate to see "here's everything I must implement, here's the version I pin."
+package to see "here's everything I must implement, here's the version I pin."
 
 ### labelle-gfx
 - Code barely changes — concrete backends move *out*, not *in* (no bloat, no
@@ -199,11 +221,12 @@ crate to see "here's everything I must implement, here's the version I pin."
 
 ### labelle-engine
 - The window / input / audio contracts (today implicit in the engine + the
-  generated game) get formalized and given a versioned home in the ABI crate.
+  generated game) get formalized and given a versioned home in the ABI package.
 
 ### The backends
-- Extracted to their own repo(s) — one `labelle-backends` monorepo, or
-  per-backend repos. Each implements the ABI contracts + ships a manifest.
+- Extracted to a single `labelle-backends` monorepo (Q#3 resolved — see
+  *Packaging* above). Each provider implements the ABI contracts + ships a
+  manifest; third parties publish their own repo and point a slot at it.
 
 ## The codegen splice — a `Game`-lifecycle hook contract, not a text merge
 
@@ -234,6 +257,54 @@ So the *code* splice is largely answered. The two genuinely hard residuals are:
   GPU context-loss**, delivered by the entry point to the game (see open
   question #1). That surface area is where the real design depth now sits.
 
+## Platform packaging & the manifest
+
+The contracts above are the *runtime* story. Orthogonal to them is the
+**(backend × platform) matrix** — the most platform-specific, most-hardcoded
+thing in the assembler today: every backend ships
+`templates/{desktop,mobile,android,wasm,headless}.txt`, plus the APK packaging
+(`package_apk.sh`, generated `AndroidManifest.xml`, the NDK build) and the
+wasm/emscripten shell. A `Platform` enum (`desktop`/`android`/`ios`/`wasm`) and
+per-platform asset compression already exist.
+
+So a backend is not "four contracts" — it is **four contracts × the platforms it
+supports**, where each platform needs its own **entry point**, **build target**,
+**packaging recipe**, **platform-manifest**, and **per-platform deps**. The
+per-platform entry points *are* the entry-shapes the codegen-splice identified
+(desktop `main()`, Android `NativeActivity`, wasm exports + rAF) — the
+`Game`-hook contract is shared across them; the manifest is what says "for *this*
+platform, here is my entry + how to package it."
+
+### The manifest is the linchpin
+A provider ships a manifest declaring the contracts it fills *and* its platform
+matrix:
+
+```zig
+.{
+    .name = "sokol",
+    .contracts = .{ .render, .window, .input, .audio },
+    .platforms = .{
+        .desktop = .{ .entry = "desktop.zig", .target = .native,                .package = .binary },
+        .android = .{ .entry = "android.zig", .target = "aarch64-linux-android", .package = .{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } }, .deps = .{ .ndk } },
+        .wasm    = .{ .entry = "wasm.zig",    .target = .emscripten,             .package = .{ .web = .{ .shell = "index.html.tmpl" } } },
+        // .ios = … — the provider declares it; the assembler never needs to know
+    },
+}
+```
+
+This is what lets the assembler stay blind to *both* the backend *and* the
+platform. It is also where the platform-qualified cascade defaults live (the
+`(platform, render) → window/input/audio` table from the declaration section).
+
+### Packaging decomposes like audio did
+The window provider's per-platform *entry / NDK glue* is backend-specific
+(sokol_app's Android entry ≠ bgfx's hand-rolled `NativeActivity`). But the
+*packaging itself* — `libgame.so` → APK, the `AndroidManifest` template, signing,
+the wasm bundle + HTML shell — is **platform-specific but backend-agnostic.** So a
+shared **platform-packager** (`android` / `ios` / `wasm`) becomes its own
+pluggable layer the manifest *references*, distinct from the window provider's
+entry — the same shape as `labelle-audio`'s shared mixer over pluggable devices.
+
 ## Migration plan (incremental, not a big bang)
 
 1. **Stand up `labelle-platform-abi`** with the four contracts + `assertBackend`;
@@ -259,10 +330,12 @@ So the *code* splice is largely answered. The two genuinely hard residuals are:
 1. **The `Game`-lifecycle ABI** — the run-loop splice itself is now answered (a
    hook contract, see above), but the full hook *surface* is not: beyond
    `frame`, the entry point must deliver input/resize events and especially
-   mobile **suspend/resume + GPU context-loss** to the game. Pinning that
-   surface is the direct successor to the codegen-splice crux.
+   mobile **suspend/resume + GPU context-loss** to the game. Pin it by
+   **inventorying what `templates/{desktop,mobile}.txt` inject today** (event
+   forwarding à la `sokolEvent`, screenshot state, GUI event hooks) so nothing
+   regresses. The direct successor to the codegen-splice crux.
 2. **Where the contracts live + versioning** — gfx owns `render`; does it
-   relocate into the ABI crate, or stay in gfx and be re-exported? How does a
+   relocate into the ABI package, or stay in gfx and be re-exported? How does a
    backend pin "I implement contract vN"? The version matrix (N backends ×
    contracts × the core diamond) needs a story.
 3. ~~One monorepo vs per-backend repos~~ — **resolved**: one `labelle-backends`
@@ -270,7 +343,19 @@ So the *code* splice is largely answered. The two genuinely hard residuals are:
    preserved by Zig **lazy deps** per provider; third parties publish their own
    repo. Contract granularity and repo count are orthogonal, so per-contract
    composition costs no extra repos.
-4. **Mobile/android + gamepad** (`android_gamepad`, `sdl_gamepad`, the
-   `templates/mobile.txt` path) — extra contract surface beyond the desktop four.
+4. **Gamepad as an input-extension** — `android_gamepad` / `sdl_gamepad` look
+   like input *extensions* composed alongside the window provider, not a fifth
+   top-level contract. State this explicitly so the ABI doesn't sprawl. (The
+   mobile/platform side moved to *Platform packaging & the manifest*.)
 5. **The build-graph generalization** — the core-diamond unification + the
-   per-backend native-dep wiring, done generically rather than per-backend.
+   per-provider native-dep wiring, done generically. This is the *build side* of
+   the manifest (see *Platform packaging*); with #1 it's the hardest remaining
+   work, so a minimal "what a provider's manifest ships" sketch would let it be
+   designed in parallel with the runtime ABI.
+6. **GUI-bridge compatibility** — raw backend GUIs (imgui bridges) are resolved
+   by the *closed enum* today (`gui_resolve.zig`) and gated by backend-specific
+   build flags (sokol `with_imgui`, bgfx `gui_enabled`). With per-contract
+   providers it is unspecified whether a GUI bridge targets render / window /
+   input / a full-stack composition — a project using `.render = .bgfx,
+   .window = .glfw` (or a third-party renderer) has no defined bridge lookup.
+   Needs a compatibility rule.
