@@ -241,14 +241,23 @@ pub fn drawTriangle(v1: Vector2, v2: Vector2, v3: Vector2, tint: Color) void {
 /// `drawTriangle` submits via sgl with `state.toNdc*` conversion.
 pub fn drawPolygon(points: []const Vector2, tint: Color) void {
     if (points.len < 3) return;
-    const anchor = points[0];
+    // Convert each vertex to NDC exactly once: the anchor up front and a
+    // sliding window over the rim, instead of re-converting per fan triangle.
+    const anchor_x = state.toNdcX(points[0].x);
+    const anchor_y = state.toNdcY(points[0].y);
     sgl.beginTriangles();
     sgl.c4b(tint.r, tint.g, tint.b, tint.a);
-    var i: usize = 1;
-    while (i + 1 < points.len) : (i += 1) {
-        sgl.v2f(state.toNdcX(anchor.x), state.toNdcY(anchor.y));
-        sgl.v2f(state.toNdcX(points[i].x), state.toNdcY(points[i].y));
-        sgl.v2f(state.toNdcX(points[i + 1].x), state.toNdcY(points[i + 1].y));
+    var prev_x = state.toNdcX(points[1].x);
+    var prev_y = state.toNdcY(points[1].y);
+    var i: usize = 2;
+    while (i < points.len) : (i += 1) {
+        const next_x = state.toNdcX(points[i].x);
+        const next_y = state.toNdcY(points[i].y);
+        sgl.v2f(anchor_x, anchor_y);
+        sgl.v2f(prev_x, prev_y);
+        sgl.v2f(next_x, next_y);
+        prev_x = next_x;
+        prev_y = next_y;
     }
     sgl.end();
 }
