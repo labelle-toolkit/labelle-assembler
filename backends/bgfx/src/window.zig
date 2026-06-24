@@ -3,6 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zbgfx = @import("zbgfx");
 const bgfx = zbgfx.bgfx;
+const gfx = @import("gfx");
 const platform = @import("platform.zig");
 
 /// Android has no GLFW (zglfw is desktop-only). The Android windowing
@@ -258,6 +259,14 @@ fn initWindowDesktop(width: i32, height: i32, title: [:0]const u8) void {
 }
 
 pub fn closeWindow() void {
+    // Release the sprite program (+ its shaders), the s_tex sampler
+    // uniform, the 1x1 white texture, the font atlas, and any uploaded
+    // textures BEFORE bgfx tears down — otherwise bgfx reports these live
+    // handles as leaks on clean shutdown (#384). Placed before the
+    // is_android split so it runs on both the desktop and Android paths;
+    // it is idempotent (valid-handle guarded), so it is a safe no-op if
+    // rendering never initialized.
+    gfx.shutdownPrograms();
     bgfx.shutdown();
     if (is_android) {
         // No GLFW to tear down; the surface lifecycle is owned by the
