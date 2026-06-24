@@ -295,6 +295,9 @@ pub fn build(b: *std.Build) void {
     if (zglfw_mod) |m| window_mod.addImport("zglfw", m);
     window_mod.addImport("zbgfx", zbgfx_mod);
     window_mod.addImport("input", input_mod);
+    // closeWindow() calls gfx.shutdownPrograms() to release the sprite
+    // program/uniform/textures before bgfx.shutdown() (#384).
+    window_mod.addImport("gfx", gfx_mod);
 
     // ── Re-export native artifacts so consumers can link them ───────
     // bgfx is always re-exported. glfw is desktop-only (Android has no
