@@ -1,8 +1,8 @@
 # RFC: Pluggable backends — make the assembler backend-agnostic
 
-**Status:** Draft (revision 10 — answers open Q#6: GUI bridges keyed by render provider name (not closed enum); two integration patterns (external C++ bridge + in-backend adapter via `build_options`); `with_imgui`/`gui_enabled` replaced by manifest-declared options. Rev 9 answered Q#4: gamepad is an input-extension, not a fifth contract. Rev 8 answered Q#2: the ABI package IS `labelle-core`; `Backend(Impl)` relocates from gfx to core; versioning via `contract_version` integer. Rev 7 answered Q#5: the build-graph manifest schema + core-diamond generalization + build-hook escape hatch + lazy native deps. Rev 6 answered Q#1: the `Game`-lifecycle hook surface. Rev 5: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; Platform-packaging & manifest section; terminology + stale-wording fixes)
+**Status:** Draft (revision 11 — addresses rev-10 review: collapses `labelle-platform-abi` to `labelle-core` everywhere; splits the build hook into `pre_wire`/`post_wire` (sokol's `with_imgui` is a shipped consumer that needs `b.dependency`-time options); reframes the Accept gate to the bgfx-Android pilot (audio has zero GPU context, can't validate `contextLost`); fixes the `contract_version` check to gate on equality with direction-branched diagnostics (`t < p` catches new-core+old-backend, the dominant ecosystem failure). Rev 10 answered all six open questions. Rev 5: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; Platform-packaging & manifest section; terminology + stale-wording fixes)
 
-**All six open questions now answered.** Q#1 (lifecycle ABI), Q#2 (contract home + versioning), Q#3 (monorepo — resolved rev 3), Q#4 (gamepad as input-extension), Q#5 (build-graph manifest), Q#6 (GUI-bridge compatibility). Residuals are migration-gated, not design-blockers — the RFC is ready to move from Draft to Accepted pending the audio-extraction pilot validating the context-handoff story.
+**All six open questions now answered.** Q#1 (lifecycle ABI), Q#2 (contract home + versioning), Q#3 (monorepo — resolved rev 3), Q#4 (gamepad as input-extension), Q#5 (build-graph manifest), Q#6 (GUI-bridge compatibility). Residuals are migration-gated, not design-blockers — the RFC is ready to move from Draft to Accepted pending the **bgfx-Android pilot** (migration step 3) validating the `contextLost` / surface-recreation story. The audio pilot (step 2) validates extraction mechanics but has zero GPU context to exercise.
 
 **Tracking:** labelle-toolkit/labelle-assembler#377
 
@@ -195,10 +195,12 @@ The existing plugin rails (`resolvePlugin`, manifest-driven codegen,
 
 ## Per-layer changes
 
-### NEW — `labelle-platform-abi` (a thin leaf package)
+### `labelle-core` (the existing leaf package — home of the ABI)
 Houses the four comptime contracts + the shared value types; almost no deps.
 gfx, engine, and every backend depend on it. A backend author opens exactly one
 package to see "here's everything I must implement, here's the version I pin."
+(See Q#2 for the full rationale of why the ABI package IS `labelle-core`, not
+a new crate — 7 of 8 contracts already live there.)
 
 ### labelle-gfx
 - Code barely changes — concrete backends move *out*, not *in* (no bloat, no
@@ -309,7 +311,7 @@ entry — the same shape as `labelle-audio`'s shared mixer over pluggable device
 
 ## Migration plan (incremental, not a big bang)
 
-1. **Stand up `labelle-platform-abi`** with the four contracts + `assertBackend`;
+1. **Formalize `labelle-core` as the ABI home** with the four contracts + `assertBackend`;
    make gfx's existing `Backend` conform (no behaviour change). (`AudioInterface`
    already lives in labelle-core — it just moves/re-exports.)
 2. **Pilot with audio** — the lowest-risk slot (already contracted, *zero*
@@ -388,7 +390,7 @@ without the backend reaching into engine internals or the assembler reaching
 into backend entry shapes:
 
 ```zig
-// labelle-platform-abi: the Game hook contract (versioned).
+// labelle-core: the Game hook contract (versioned).
 pub const GameHooks = struct {
     init:    *const fn (allocator: std.mem.Allocator, screen_w: u32, screen_h: u32) Game,
     deinit:  *const fn (*Game) void,
@@ -459,9 +461,17 @@ backend owns the entry-point *shape*, the assembler owns the per-frame *work*.
   re-running init — only the GPU surface is re-created. Whether `contextLost`
   should trigger a full `deinit`+`init` cycle or a narrower "re-upload GPU
   resources" hook (mirroring how gfx's asset catalog already gates renders
-  behind `post_load_render_gate` in `labelle-engine/src/game.zig`) needs the
-  audio-extraction pilot to land first — audio has zero GPU context, so it's
-  the cleanest test of whether the contract's context story is actually sound.
+  behind `post_load_render_gate` in `labelle-engine/src/game.zig`) needs a
+  **GPU-context pilot** to resolve — and the audio-extraction pilot (step 2
+  of the migration) is structurally *incapable* of exercising this, because
+  audio has zero GPU context. The audio pilot validates extraction mechanics
+  (contract home, versioning, build-graph wiring, lazy deps); it does NOT
+  validate `contextLost` or the surface-recreation cycle. **The GPU-context
+  pilot is bgfx-Android** (step 3 of the migration — sokol conversion): it
+  already has the `init_done` one-shot guard for the `TERM_WINDOW`+`INIT_WINDOW`
+  cycle, so it's where `contextLost` vs full `deinit`+`init` semantics get
+  decided in practice. The Accept-readiness gate is on the bgfx-Android pilot,
+  not the audio pilot.
 - **The event type.** `Event` is a tagged union (input keys/mouse/touch/resize/close).
   Today sokol forwards the raw `sapp.Event` and the input module switches on it;
   raylib polls. The contract needs a backend-neutral `Event` enum + payload,
@@ -892,10 +902,10 @@ sites.
 
 ### Where the contracts live — the answer
 
-**The ABI package is `labelle-core` itself**, not a new crate. The RFC
-originally proposed a new `labelle-platform-abi` package; the inventory
-shows 7 of 8 contracts already live in core, and the 8th (`Backend(Impl)`)
-relocates from gfx to core. The split:
+**The ABI package is `labelle-core` itself**, not a new package. The RFC
+originally proposed a new `labelle-platform-abi` package (rev 1-5); the
+inventory in this revision shows 7 of 8 contracts already live in core,
+and the 8th (`Backend(Impl)`) relocates from gfx to core. The split:
 
 - **Engine-facing contracts stay where they are** (`labelle-core/src/
   {audio,video,input,gui,gizmos,render,log}.zig`). Core already
@@ -990,18 +1000,30 @@ pub const targets_backend_contract: u32 = 2;
 
 **3. The assembler-generated adapter asserts compatibility at comptime.**
 The generated `BackendGfx = Backend(backend_gfx_module)` instantiation
-already validates required decls; add a version check:
+already validates required decls; add a version check that catches both
+directions of mismatch:
 
 ```zig
 // generated by asset_wiring.zig
 const BackendGfx = labelle_core.Backend(backend_gfx);
 comptime {
-    if (backend_gfx.targets_backend_contract > labelle_core.BACKEND_CONTRACT_VERSION)
-        @compileError("backend targets backend contract v"
-            ++ std.fmt.comptimePrint("{d}", .{backend_gfx.targets_backend_contract})
-            ++ " but this labelle-core provides v"
-            ++ std.fmt.comptimePrint("{d}", .{labelle_core.BACKEND_CONTRACT_VERSION})
-            ++ " — upgrade labelle-core or use an older backend");
+    const t = backend_gfx.targets_backend_contract;
+    const p = labelle_core.BACKEND_CONTRACT_VERSION;
+    // Backend targets a NEWER contract than core provides — rare, but
+    // diagnoses "old core + new backend" with a versioned message.
+    if (t > p)
+        @compileError(std.fmt.comptimePrint(
+            "backend targets backend-contract v{d} but this labelle-core provides v{d} — upgrade labelle-core or use an older backend",
+            .{ t, p }));
+    // Core bumped a REQUIRED decl the backend hasn't implemented yet —
+    // the DOMINANT ecosystem failure (new core + old third-party backend).
+    // Gate on strict equality so a breaking bump surfaces a versioned
+    // diagnostic instead of falling through to the raw
+    // `@compileError("Backend must define 'foo'")` the validator emits.
+    if (t < p)
+        @compileError(std.fmt.comptimePrint(
+            "backend targets backend-contract v{d} but this labelle-core is v{d} — a breaking contract change landed; upgrade the backend",
+            .{ t, p }));
 }
 ```
 
@@ -1098,11 +1120,14 @@ module's contract surface.
   `targets_backend_contract = 2` and depends on core via URL+hash. If
   core bumps to v3, the third-party backend's `@hasDecl`-gated calls
   still compile (optional methods don't bump the version), but its
-  required-decl set may be stale. The comptime version check catches
-  the required-decl mismatch; the optional-debl drift is silent (by
-  design — `@hasDecl`-gating is the back-compat mechanism). This is
-  acceptable: a third-party backend targeting v2 against a v3 core
-  either works (if no required decls changed) or fails with a clear
+  required-decl set may be stale. The `t < p` branch of the version
+  check catches this — surfacing a versioned diagnostic ("backend targets
+  v2 but this labelle-core is v3 — a breaking contract change landed;
+  upgrade the backend") instead of falling through to the raw
+  `@compileError("Backend must define 'foo'")` the validator emits. The
+  optional-decl drift is silent by design (`@hasDecl`-gating is the
+  back-compat mechanism): a third-party backend targeting v2 against a v3
+  core either works (if no required decls changed) or fails with a clear
   version error (if they did).
 
 ## Q#5 answer — the build-graph manifest
@@ -1322,25 +1347,40 @@ the Emscripten `emccStep` shell-out). Today these live as hardcoded
 
 The manifest's `.build_hook = "build.zig"` field lets a provider ship a
 **`build.zig` fragment** the assembler imports via `@import("provider")`
-and calls at the right injection point. The contract:
+and calls at **two** injection points — before and after the generic
+wiring. The contract:
 
 ```zig
-// Provider's build.zig — the hook the assembler calls.
-// Receives the build context (the resolved modules, the root artifact,
-// the target, the project config). Returns nothing; mutates the graph.
-pub fn wire(b: *std.Build, ctx: HookContext) void {
-    // Link the C archive with the options the GUI bridge requires
-    const clib = backend_dep.artifact("sokol_clib");
-    exe.root_module.linkLibrary(clib);
+// Provider's build.zig — the hooks the assembler calls.
+// HookContext carries the build, the target, the project config, and
+// (for post_wire) the resolved modules + root artifact.
+
+/// Called BEFORE `b.dependency` — the provider can set build options
+/// that affect how the dependency's artifact is built (sokol's
+/// `with_imgui`, gamepad flags). Returns an options struct the
+/// assembler passes to `b.dependency(name, options)`.
+pub fn preWire(b: *std.Build, ctx: HookContext) DependencyOptions {
+    return .{ .with_imgui = ctx.gui_is_imgui, .gamepad_enabled = ctx.gamepad };
+}
+
+/// Called AFTER generic module/artifact/system-lib wiring — the provider
+/// can supplement the graph (NDK sysroot, emcc shell-out, extra links).
+pub fn postWire(b: *std.Build, ctx: HookContext) void {
+    const clib = ctx.backend_dep.artifact("sokol_clib");
+    ctx.exe.root_module.linkLibrary(clib);
     // ... provider-specific wiring the manifest can't express statically
 }
 ```
 
 This is the escape hatch — the manifest covers the 90% case (modules +
 artifacts + system libs + frameworks + platform matrix); the build hook
-covers the 10% that needs to run build-graph logic. The assembler calls
-`wire` *after* the generic module/artifact/system-lib wiring so the hook
-can supplement (not replace) it.
+covers the 10% that needs to run build-graph logic. The `pre_wire`/`post_wire`
+split is necessary because some dynamic wiring (sokol's `with_imgui`,
+bgfx's `gui_enabled`) must affect `b.dependency`'s options struct *before*
+the artifact is built, while other wiring (NDK sysroot paths, emcc
+shell-out, extra `linkLibrary` calls) supplements the graph *after*
+generic wiring. A single `wire`-after-generic hook (the rev 7-9 design)
+is known-insufficient — sokol's `with_imgui` is a shipped consumer today.
 
 ### Lazy native deps — the slim-fetch requirement
 
@@ -1370,17 +1410,17 @@ fetches sokol's C source when a project actually resolves `.render =
 - The core-diamond generalization: walk the provider module graph and
   override every core import (8 hand-coded sites → 1 generic pass).
 - The build hook as the escape hatch for dynamic wiring (`with_imgui`
-  option-matching, NDK sysroot, emcc shell-out) the static manifest
-  can't express.
+- The build hook split: `pre_wire` (before `b.dependency`, returns options)
+  + `post_wire` (after generic wiring, supplements the graph). Sokol's
+  `with_imgui` is a shipped consumer today — the split is necessary, not
+  optional.
 - Lazy native deps as a concrete zon-level requirement (`lazy = true`
   per provider), not an abstract claim.
 
 **Still open (deliberately):**
-- **Hook injection ordering.** The `build_hook`'s `wire` runs after
-  generic wiring, but some hooks need to run *before* (e.g. sokol's
-  `with_imgui` must be set at `b.dependency` time, before the artifact
-  is built). May need `pre_wire` / `post_wire` split, or the manifest
-  declares build-options that feed `b.dependency`'s args struct.
+- ~~**Hook injection ordering.**~~ **Resolved**: the `pre_wire`/`post_wire`
+  split (above) handles both the `b.dependency`-time option case and the
+  post-generic-wiring supplement case.
 - **GUI bridge wiring.** Today the GUI bridge (imgui) is resolved by
   the closed enum (`gui_resolve.zig`) and linked via a separate
   `.gui_bridge` template section + `with_imgui`/`gui_enabled` flags
@@ -1406,7 +1446,9 @@ fetches sokol's C source when a project actually resolves `.render =
    `resume_` / `contextLost` (last four `@hasDecl`/null-gated). Per-frame work
    (screenshot, preview, GUI, `setScreenSize`/`setDesignSize`) stays codegen,
    not lifecycle. Residual: `contextLost` semantics + the `Event` type shape —
-   both gated on the audio-extraction pilot landing first.
+   gated on the **bgfx-Android pilot** (migration step 3), which exercises the
+   `TERM_WINDOW`+`INIT_WINDOW` surface-recreation cycle. The audio pilot
+   (step 2) validates extraction mechanics but has zero GPU context.
 2. ~~**Where the contracts live + versioning**~~ — **answered above**. The
    ABI package IS `labelle-core` (7 of 8 contracts already live there).
    `Backend(Impl)` + its value types relocate from gfx to core. Versioning:
@@ -1435,10 +1477,10 @@ fetches sokol's C source when a project actually resolves `.render =
    build-side schema (`.modules` / `.artifacts` / `.system_libs` /
    `.frameworks` / `.platforms` / `.build_hook`), the core-diamond
    generalization (8 hand-coded override sites → 1 generic graph walk),
-   the build-hook escape hatch for dynamic wiring, and lazy native deps
-   as a concrete zon-level requirement. Residual: hook injection ordering
-   (pre/post split), GUI bridge wiring (defers to #6), tests-target
-   manifest, migration sequencing.
+   the build-hook escape hatch (`pre_wire`/`post_wire` split) for dynamic
+   wiring, and lazy native deps as a concrete zon-level requirement.
+   Residual: GUI bridge wiring (defers to #6), tests-target manifest,
+   migration sequencing.
 6. ~~**GUI-bridge compatibility**~~ — **answered above**. The bridge lookup
    is keyed by **render provider name** (not a closed enum). Two integration
    patterns: external C++ bridge (default — standalone artifact link) and
