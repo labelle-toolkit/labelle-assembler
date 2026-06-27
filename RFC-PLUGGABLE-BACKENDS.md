@@ -1,8 +1,8 @@
 # RFC: Pluggable backends — make the assembler backend-agnostic
 
-**Status:** Draft (revision 11 — addresses rev-10 review: collapses `labelle-platform-abi` to `labelle-core` everywhere; splits the build hook into `pre_wire`/`post_wire` (sokol's `with_imgui` is a shipped consumer that needs `b.dependency`-time options); reframes the Accept gate to the bgfx-Android pilot (audio has zero GPU context, can't validate `contextLost`); fixes the `contract_version` check to gate on equality with direction-branched diagnostics (`t < p` catches new-core+old-backend, the dominant ecosystem failure). Rev 10 answered all six open questions. Rev 5: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; Platform-packaging & manifest section; terminology + stale-wording fixes)
+**Status:** Draft (revision 12 — addresses rev-11 review: distinguishes the runtime-playback `AudioInterface` (labelle-core, `playSound`/`stopSound`) from the separate audio *loader* contract (`Backend(Impl)` in labelle-engine/`audio_backend`, `decodeAudio`/`uploadSound`); fixes the versioning summary `N <= M` → `N == M` to match the strict-equality code sample; splits the pilot into step 3 (sokol-desktop, extraction mechanics) and a distinct step 4 (bgfx-Android GPU-context Accept gate); refreshes the build_zig.txt line count and the PR description; last "crate" → "package". Rev 11 — addresses rev-10 review: collapses `labelle-platform-abi` to `labelle-core` everywhere; splits the build hook into `pre_wire`/`post_wire` (sokol's `with_imgui` is a shipped consumer that needs `b.dependency`-time options); reframes the Accept gate to the bgfx-Android pilot (audio has zero GPU context, can't validate `contextLost`); fixes the `contract_version` check to gate on equality with direction-branched diagnostics (`t < p` catches new-core+old-backend, the dominant ecosystem failure). Rev 10 answered all six open questions. Rev 5: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; Platform-packaging & manifest section; terminology + stale-wording fixes)
 
-**All six open questions now answered.** Q#1 (lifecycle ABI), Q#2 (contract home + versioning), Q#3 (monorepo — resolved rev 3), Q#4 (gamepad as input-extension), Q#5 (build-graph manifest), Q#6 (GUI-bridge compatibility). Residuals are migration-gated, not design-blockers — the RFC is ready to move from Draft to Accepted pending the **bgfx-Android pilot** (migration step 3) validating the `contextLost` / surface-recreation story. The audio pilot (step 2) validates extraction mechanics but has zero GPU context to exercise.
+**All six open questions now answered.** Q#1 (lifecycle ABI), Q#2 (contract home + versioning), Q#3 (monorepo — resolved rev 3), Q#4 (gamepad as input-extension), Q#5 (build-graph manifest), Q#6 (GUI-bridge compatibility). Residuals are migration-gated, not design-blockers — the RFC is ready to move from Draft to Accepted pending the **bgfx-Android pilot** (migration step 4) validating the `contextLost` / surface-recreation story. The audio pilot (step 2) and sokol-desktop conversion (step 3) validate extraction mechanics but have zero surface-loss cycle to exercise.
 
 **Tracking:** labelle-toolkit/labelle-assembler#377
 
@@ -71,11 +71,19 @@ it, gate optionals with `@hasDecl`):
    of the four, but not as thin as a first read suggests.
 2. **input** — `getMouseX/Y`, `isKeyDown`, `getTouchX/Y`, gamepad, wheel. A
    method-bag.
-3. **audio** — the engine's `AudioInterface(Impl)` — not just `playSound` /
-   `loadSound` but the loader surface too: `decodeAudio` / `uploadSound` /
-   `unloadSound`. The contract already lives in **labelle-core** (engine
-   re-exports it); the ABI package becomes the single canonical import — the
-   core-diamond in miniature.
+3. **audio** — two distinct surfaces, only one of which is contracted in core
+   today. **Runtime playback** is `AudioInterface(Impl)` in **labelle-core**
+   (`src/audio.zig`): it requires only `playSound` / `stopSound`, with
+   `loadSound(path) → u32` / `unloadSound(id: u32)` / music / volume all
+   `@hasDecl`-gated. The **asset-loader** surface — `decodeAudio` /
+   `uploadSound` / `unloadSound(Sound)` — is a *separate* contract,
+   `Backend(Impl)` in **labelle-engine/`audio_backend`** (its own doc comment:
+   "Runtime audio playback (`AudioInterface`-style) lives in labelle-core and
+   stays there — this repo is decoder/loader-side only"). The loader half is
+   the worker-thread decode / main-thread upload split that mirrors gfx's
+   `DecodedImage`/`DecodedFont`. So the "already contracted" claim holds only
+   for playback; the ABI work's job is to give *both* halves one canonical
+   import — the core-diamond in miniature.
 4. **window** — the inversion-of-control crux. The window **owns the run loop**
    and the per-frame render target:
    ```zig
@@ -200,7 +208,7 @@ Houses the four comptime contracts + the shared value types; almost no deps.
 gfx, engine, and every backend depend on it. A backend author opens exactly one
 package to see "here's everything I must implement, here's the version I pin."
 (See Q#2 for the full rationale of why the ABI package IS `labelle-core`, not
-a new crate — 7 of 8 contracts already live there.)
+a new package — 7 of 8 contracts already live there.)
 
 ### labelle-gfx
 - Code barely changes — concrete backends move *out*, not *in* (no bloat, no
@@ -321,12 +329,19 @@ entry — the same shape as `labelle-audio`'s shared mixer over pluggable device
 3. **Convert one full backend** (sokol — render+window+input; it's the
    headless-screenshot-verifiable one) to implement the contracts from a separate
    location, *while keeping the enum* as a resolver shorthand. Prove a generated
-   game still builds + runs.
-4. **Open the resolver** — `.backend` accepts a full-stack package *and*
+   game still builds + runs. This validates the **desktop** extraction mechanics
+   for a render+window+input backend — but sokol-desktop has no surface-loss
+   cycle to exercise, so it is *not* the GPU-context gate.
+4. **GPU-context pilot — bgfx-Android.** Distinct from step 3: this is the only
+   pilot that can exercise the `TERM_WINDOW`+`INIT_WINDOW` surface-recreation
+   cycle (bgfx-Android already has the `init_done` one-shot guard for it). It is
+   where `contextLost` vs full `deinit`+`init` semantics get decided in practice
+   — **the Accept-readiness gate** for promoting this RFC out of Draft.
+5. **Open the resolver** — `.backend` accepts a full-stack package *and*
    per-contract overrides (`.{ .render = .bgfx, .audio = .miniaudio }`); the
    closed enum values become **shorthands** resolving to the official providers.
    **Backward-compatible**: `.backend = .sokol` keeps working.
-5. **Extract the remaining backends**; slim the assembler (lazy native deps per
+6. **Extract the remaining backends**; slim the assembler (lazy native deps per
    provider).
 
 ## Q#1 answer — the `Game`-lifecycle ABI
@@ -467,7 +482,9 @@ backend owns the entry-point *shape*, the assembler owns the per-frame *work*.
   audio has zero GPU context. The audio pilot validates extraction mechanics
   (contract home, versioning, build-graph wiring, lazy deps); it does NOT
   validate `contextLost` or the surface-recreation cycle. **The GPU-context
-  pilot is bgfx-Android** (step 3 of the migration — sokol conversion): it
+  pilot is bgfx-Android** (migration step 4 — a step distinct from step 3's
+  sokol-desktop conversion, which is screenshot-verifiable but has no
+  surface-loss cycle): it
   already has the `init_done` one-shot guard for the `TERM_WINDOW`+`INIT_WINDOW`
   cycle, so it's where `contextLost` vs full `deinit`+`init` semantics get
   decided in practice. The Accept-readiness gate is on the bgfx-Android pilot,
@@ -890,8 +907,15 @@ assembler-generated adapter (`asset_wiring.zig` emits `BackendGfx`) wraps
 the backend's raw `gfx.zig` module in the `Backend(Impl)` validation +
 dispatch wrapper. The backend's `gfx.zig` is the `Impl`; the generated
 `BackendGfx = Backend(backend_gfx_module)` is the validated facade the
-engine's asset catalog calls (`decodeImage`/`uploadTexture`/`unloadTexture`
-+ `decodeAudio`/`uploadSound`/`unloadSound` + font decls).
+engine's asset catalog calls for **images and fonts**
+(`decodeImage`/`uploadTexture`/`unloadTexture` + the `decodeFont`/
+`uploadFontAtlas`/`unloadFontAtlas` decls). The parallel **audio**-loader
+surface (`decodeAudio`/`uploadSound`/`unloadSound(Sound)`) is *not* part of
+this gfx `Backend(Impl)` — it is a second, structurally-identical
+backend-facing contract: `Backend(Impl)` in
+`labelle-engine/audio_backend/src/backend.zig`, wrapped by its own generated
+adapter. (Runtime playback — `playSound`/`stopSound` — stays in
+`labelle-core`'s `AudioInterface`; see the contract inventory above.)
 
 This is the "render is the anchor" framing from the main RFC, made
 concrete: `Backend(Impl)` is the render contract that *wraps* the
@@ -1074,7 +1098,9 @@ type-unification failure.
 **The matrix collapses to one number per contract** — not "N backends
 × contracts × core diamond." Each backend declares one
 `targets_backend_contract = N`; core carries one `BACKEND_CONTRACT_VERSION
-= M`; the assembler asserts `N <= M` at the adapter site. The
+= M`; the assembler asserts `N == M` at the adapter site (the generated
+check `@compileError`s on both `N > M` and `N < M` — see the code sample
+above). The
 core-diamond unification (Q#5) ensures there's one core module; the
 contract version (Q#2) ensures the backend's expectations match that
 module's contract surface.
@@ -1133,7 +1159,7 @@ module's contract surface.
 ## Q#5 answer — the build-graph manifest
 
 > Resolves open question #5. Grounded in `src/templates/build_zig.txt`
-> (1135 lines, 5 platform variants), `src/build_files.zig` (790 lines,
+> (1142 lines, 5 platform variants), `src/build_files.zig` (790 lines,
 > the generator that emits it), `src/deps_linker.zig` (673 lines, the
 > hardlink + zon-rewrite pass), `src/plugin_manifest.zig` (799 lines,
 > the existing manifest schema), and `src/cache/resolve.zig` (653 lines,
@@ -1446,9 +1472,10 @@ fetches sokol's C source when a project actually resolves `.render =
    `resume_` / `contextLost` (last four `@hasDecl`/null-gated). Per-frame work
    (screenshot, preview, GUI, `setScreenSize`/`setDesignSize`) stays codegen,
    not lifecycle. Residual: `contextLost` semantics + the `Event` type shape —
-   gated on the **bgfx-Android pilot** (migration step 3), which exercises the
+   gated on the **bgfx-Android pilot** (migration step 4), which exercises the
    `TERM_WINDOW`+`INIT_WINDOW` surface-recreation cycle. The audio pilot
-   (step 2) validates extraction mechanics but has zero GPU context.
+   (step 2) and sokol-desktop conversion (step 3) validate extraction
+   mechanics but have no surface-loss cycle to exercise.
 2. ~~**Where the contracts live + versioning**~~ — **answered above**. The
    ABI package IS `labelle-core` (7 of 8 contracts already live there).
    `Backend(Impl)` + its value types relocate from gfx to core. Versioning:
