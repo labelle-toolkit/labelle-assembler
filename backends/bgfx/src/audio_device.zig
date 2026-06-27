@@ -82,7 +82,13 @@ fn deviceDataCallback(
     // Shared device-sink contract: the device knows it's stereo, so it passes
     // `channels = 2` and a buffer of `frames * 2` interleaved i16 samples; the
     // mixer recovers the frame count from `out.len`.
-    if (mix_fn) |mix| mix(out[0..sample_count], 2);
+    if (mix_fn) |mix| {
+        mix(out[0..sample_count], 2);
+    } else {
+        // No mixer wired yet — emit silence, not whatever stale samples the
+        // device buffer happens to hold (matches the AAudio backend's @memset).
+        @memset(out[0..sample_count], 0);
+    }
 }
 
 /// Open + start the playback device on first use, wiring `mix` as the

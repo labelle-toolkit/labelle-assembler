@@ -162,7 +162,7 @@ pub fn loadMusic(path: [:0]const u8) u32 {
 /// device rate (48000): the mixer does not resample. Public signature keeps the
 /// `u16` channels arg bgfx exposed; the shared mixer takes `u8`, so we narrow.
 pub fn loadMusicFromPcm(samples: []const i16, channels: u16, sample_rate: u32) u32 {
-    if (channels == 0 or channels > 2) return 0;
+    if (samples.len == 0 or channels == 0 or channels > 2) return 0;
     return Audio.loadMusicFromPcm(samples, @intCast(channels), sample_rate);
 }
 
