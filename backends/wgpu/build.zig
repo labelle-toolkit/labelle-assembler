@@ -27,6 +27,15 @@ pub fn build(b: *std.Build) void {
     const zglfw_mod = zglfw_dep.module("root");
     const glfw_artifact = zglfw_dep.artifact("glfw");
 
+    // Shared audio engine (pluggable-backends RFC, Phase 2). `src/audio.zig`
+    // now forwards to `labelle_audio.Mixer(NullSink)` — wgpu has no real OS
+    // device, so it injects the shared `NullSink` and pumps the i16 mix manually
+    // via `mixOutput`. Wired into the `audio` module (and the host audio test
+    // module) under the `labelle-audio` import key. The mixer/decoder are pure
+    // Zig, so this resolves on every target.
+    const labelle_audio_dep = b.dependency("labelle_audio", .{ .target = target, .optimize = optimize });
+    const labelle_audio_mod = labelle_audio_dep.module("labelle-audio");
+
     // ── Gfx backend module ──────────────────────────────────────────
     // `link_libc = true` so the legacy `loadTexture` path-based loader
     // can call libc `fopen` / `fread` / `fclose`. See the rationale
@@ -48,16 +57,19 @@ pub fn build(b: *std.Build) void {
     input_mod.addImport("zglfw", zglfw_mod);
 
     // ── Audio backend module ────────────────────────────────────────
-    // `link_libc = true` so the legacy `loadWav` path-based loader can
-    // call libc `fopen` / `fread` / `fclose`. See the rationale block
-    // above `loadWav` in src/audio.zig.
+    // `link_libc = true` so the path-based `loadSound`/`loadMusic` shim can
+    // call libc `fopen` / `fread` / `fclose`. See the rationale block above
+    // `readFileBytes` in src/audio.zig.
     const audio_mod = b.addModule("audio", .{
         .root_source_file = b.path("src/audio.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    _ = audio_mod; // No native audio dep — uses miniaudio or stub
+    // Shared WAV decode + PCM mixer (Phase 2). `audio.zig` instantiates
+    // `labelle_audio.Mixer(NullSink)` and forwards every public fn to it.
+    // wgpu has no native audio device dep — the mix is software-pumped.
+    audio_mod.addImport("labelle-audio", labelle_audio_mod);
 
     // ── Window backend module ───────────────────────────────────────
     const window_mod = b.addModule("window", .{
@@ -77,19 +89,24 @@ pub fn build(b: *std.Build) void {
     // ── Re-export native artifacts so consumers can link them ───────
     b.installArtifact(glfw_artifact);
 
-    // ── Unit tests for the pure WAV parser ─────────────────────────
-    // `wav_parser.zig` has no native deps, so its test binary builds
-    // on any host without needing wgpu's native artifacts. This is
-    // the regression lock for #12 (integer overflow in the WAV
-    // chunk walker).
+    // ── Audio adapter smoke tests ──────────────────────────────────
+    // The WAV decode / mixer / spinlock / UAF behaviour now lives in (and is
+    // tested by) `labelle-audio` — the #12 overflow regression lock moved with
+    // the parser into `labelle-audio/src/wav.zig`. These thin tests confirm the
+    // wgpu adapter wires the shared `Mixer(NullSink)` correctly (the f32
+    // `mixOutput` shim). They RUN (NullSink needs no device), so the test
+    // module is pinned to `host_target`. The shared mixer is pure Zig, so it
+    // resolves for the host without any native audio dep.
     const host_target = b.resolveTargetQuery(.{});
-    const wav_parser_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wav_parser.zig"),
-            .target = host_target,
-            .optimize = optimize,
-        }),
+    const audio_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/audio.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .link_libc = true,
     });
+    const labelle_audio_host_dep = b.dependency("labelle_audio", .{ .target = host_target, .optimize = optimize });
+    audio_test_mod.addImport("labelle-audio", labelle_audio_host_dep.module("labelle-audio"));
+    const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
 
     // ── Unit tests for the CPU image decoders (PNG/BMP/TGA) ─────────
     // gfx.zig only imports `std` (the `wgpu` import is gated behind the
@@ -121,7 +138,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run wgpu backend unit tests");
-    test_step.dependOn(&b.addRunArtifact(wav_parser_tests).step);
+    test_step.dependOn(&b.addRunArtifact(audio_tests).step);
     test_step.dependOn(&b.addRunArtifact(gfx_tests).step);
     test_step.dependOn(&b.addRunArtifact(astc_run).step);
 

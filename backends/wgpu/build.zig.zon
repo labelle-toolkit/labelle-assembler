@@ -13,6 +13,16 @@
             .url = "git+https://github.com/zig-gamedev/zglfw#51003c105d23db378bb59ce415a387b22f1b0892",
             .hash = "zglfw-0.10.0-dev-zgVDNIy4IQDJNRy4jrP1As-SZxfJpuWhU1iJ-wBab_VD",
         },
+        // Shared audio engine (pluggable-backends RFC, Phase 2). The wgpu
+        // backend's `src/audio.zig` collapses its duplicated overflow-safe WAV
+        // decode + f32 PCM mixer onto `labelle_audio.Mixer(NullSink)` — wgpu has
+        // no real OS device, so it injects the shared `NullSink` and pumps the
+        // i16 mix manually via `mixOutput`. The generated app build must also
+        // wire this dep onto the `audio` module (mirrors the bgfx pilot).
+        .labelle_audio = .{
+            .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.2.1.tar.gz",
+            .hash = "labelle_audio-0.2.1-QQRmYI4eAQDChv7DVK74-HPS9_J2bJw5ZDKFOazffYjU",
+        },
     },
     .paths = .{
         "build.zig",
