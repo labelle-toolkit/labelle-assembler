@@ -182,8 +182,12 @@ pub fn setVolume(volume: f32) void {
 /// left untouched (the old mixer only wrote `mix_samples` too).
 pub fn mixOutput(output: []f32, frame_count: usize) void {
     const CHANNELS: usize = 2;
-    const total_samples = frame_count * CHANNELS;
-    const mix_samples = @min(total_samples, output.len);
+    // Clamp to whole stereo frames BEFORE multiplying — `frame_count * CHANNELS`
+    // would overflow/trap for a huge caller value. Bounding frames by
+    // `output.len / CHANNELS` first keeps the product ≤ output.len, and makes
+    // `mix_samples` always an even (frame-aligned) count.
+    const frames = @min(frame_count, output.len / CHANNELS);
+    const mix_samples = frames * CHANNELS;
 
     // i16 scratch, processed in frame-aligned chunks so a huge `frame_count`
     // doesn't blow the stack. 1024 stereo frames = 2048 i16 = 4 KiB.
@@ -204,6 +208,11 @@ pub fn mixOutput(output: []f32, frame_count: usize) void {
         }
         done += chunk;
     }
+
+    // Zero any tail we didn't mix (a partial trailing sample when output.len is
+    // odd, or the remainder when the caller's buffer is larger than frame_count)
+    // so the host never reads uninitialized samples — silence, not garbage.
+    if (mix_samples < output.len) @memset(output[mix_samples..], 0);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
