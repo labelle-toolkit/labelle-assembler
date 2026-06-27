@@ -37,13 +37,14 @@ test "uploadSound returns a non-zero slot, unloadSound tears it down" {
         .channels = 1,
     };
     const sound = try audio.uploadSound(decoded);
+    // `defer` guarantees teardown even if the assertion below fails — otherwise
+    // the slot would leak into the next test. The explicit unload before it then
+    // exercises the idempotent double-unload (a no-op in the shared mixer).
+    defer audio.unloadSound(sound);
     // The shared mixer reserves slot 0 as the "not loaded" sentinel, so a live
     // upload must land on a slot >= 1.
     try testing.expect(sound.slot_index != 0);
-    // Idempotent + UAF-safe teardown lives in the shared mixer; just confirm the
-    // adapter forwards without tripping.
     audio.unloadSound(sound);
-    audio.unloadSound(sound); // double-unload is a no-op
 }
 
 test "uploadSound + Sound round-trips the slot id through the extern handle" {

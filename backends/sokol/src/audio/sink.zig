@@ -121,12 +121,14 @@ pub fn ensureStarted(mix: MixFn) void {
 /// audio callback thread, so after it the mixer is no longer called and the
 /// caller can free PCM without taking the slot lock.
 ///
-/// `isvalid()` guards the test-host path where the mixer's `deinit` runs
-/// `stop()` without the device ever having validated — `saudio.shutdown`
-/// asserts `setup_called` and would abort otherwise.
+/// `device_started` is only set when `saudio.setup` succeeded *and* the device
+/// validated (see `ensureStarted`), so reaching here means `setup_called` is
+/// true — `saudio.shutdown` (which asserts `setup_called`, not `isvalid`) is
+/// safe to call unconditionally, and is *required* to reset sokol_audio's
+/// internal setup state even if the device later became invalid.
 pub fn stop() void {
     if (device_started.load(.acquire)) {
-        if (saudio.isvalid()) saudio.shutdown();
+        saudio.shutdown();
         device_started.store(false, .release);
         std.log.info(
             "audio: sokol_audio device stopped ({d} frames mixed)",

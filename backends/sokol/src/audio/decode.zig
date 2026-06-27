@@ -82,8 +82,11 @@ fn decodeWav(data: []const u8, allocator: std.mem.Allocator) !DecodedAudio {
     }
     defer _ = drwav.drwav_uninit(&wav);
 
-    const total_frames: usize = @intCast(wav.totalPCMFrameCount);
-    const channels: u8 = @intCast(wav.channels);
+    // std.math.cast (returns null on overflow) rather than @intCast (which
+    // panics in safety builds) — totalPCMFrameCount is u64 / channels is u32,
+    // and a malformed WAV could overflow usize/u8 (esp. on 32-bit / wasm32).
+    const total_frames = std.math.cast(usize, wav.totalPCMFrameCount) orelse return error.AudioTooLarge;
+    const channels = std.math.cast(u8, wav.channels) orelse return error.AudioDecodeFailed;
     if (total_frames == 0 or channels == 0) return error.AudioDecodeFailed;
 
     // Guard against 32-bit (incl. wasm32) `usize` wraparound on the
@@ -101,7 +104,7 @@ fn decodeWav(data: []const u8, allocator: std.mem.Allocator) !DecodedAudio {
 
     return .{
         .samples = samples,
-        .sample_rate = @intCast(wav.sampleRate),
+        .sample_rate = std.math.cast(u32, wav.sampleRate) orelse return error.AudioDecodeFailed,
         .channels = channels,
     };
 }
@@ -118,12 +121,14 @@ fn decodeOgg(data: []const u8, allocator: std.mem.Allocator) !DecodedAudio {
     defer stbv.stb_vorbis_close(vorbis);
 
     const info = stbv.stb_vorbis_get_info(vorbis);
-    const channels: u8 = @intCast(info.channels);
-    const sample_rate: u32 = @intCast(info.sample_rate);
+    // std.math.cast (null on overflow) rather than @intCast — a malformed OGG
+    // could report out-of-range channels/sample_rate/length.
+    const channels = std.math.cast(u8, info.channels) orelse return error.AudioDecodeFailed;
+    const sample_rate = std.math.cast(u32, info.sample_rate) orelse return error.AudioDecodeFailed;
     if (channels == 0) return error.AudioDecodeFailed;
 
     const total_samples_c = stbv.stb_vorbis_stream_length_in_samples(vorbis);
-    const total_frames: usize = @intCast(total_samples_c);
+    const total_frames = std.math.cast(usize, total_samples_c) orelse return error.AudioTooLarge;
     if (total_frames == 0) return error.AudioDecodeFailed;
 
     // Guard against 32-bit (incl. wasm32) `usize` wraparound on the
