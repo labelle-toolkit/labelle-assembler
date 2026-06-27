@@ -1,6 +1,6 @@
 # RFC: Pluggable backends — make the assembler backend-agnostic
 
-**Status:** Draft (revision 13 — addresses the rev-12 design review (7 points): names render's **draw vs loader sub-surfaces** (symmetric with the audio split); replaces the single under-specified `contextLost` with an explicit **`surfaceLost`/`surfaceRestored`** pair driving engine-side `gpuResourcesInvalidated` → `reuploadAssets` (no `deinit`/`init` overload); adds **provider identity** (canonical `<namespace>.<name>` IDs, `labelle.*` reserved, collision is a hard error), **capability negotiation** (declared `.capabilities` checked at resolve time → early project-level errors, not deep `@compileError`s), and **per-contract conformance suites** (behavior, not just `@hasDecl` shape) in a new "Opening the ecosystem" section; constrains the build hook to a versioned, documented `HookContext` (manifest ~95%, hook ~5%, no arbitrary work); migration pilots already split in rev 12 (audio=mechanics, sokol-desktop=full-stack, bgfx-Android=context gate). Rev 12 — addresses rev-11 review: distinguishes the runtime-playback `AudioInterface` (labelle-core, `playSound`/`stopSound`) from the separate audio *loader* contract (`Backend(Impl)` in labelle-engine/`audio_backend`, `decodeAudio`/`uploadSound`); fixes the versioning summary `N <= M` → `N == M` to match the strict-equality code sample; splits the pilot into step 3 (sokol-desktop, extraction mechanics) and a distinct step 4 (bgfx-Android GPU-context Accept gate); refreshes the build_zig.txt line count and the PR description; last "crate" → "package". Rev 11 — addresses rev-10 review: collapses `labelle-platform-abi` to `labelle-core` everywhere; splits the build hook into `pre_wire`/`post_wire` (sokol's `with_imgui` is a shipped consumer that needs `b.dependency`-time options); reframes the Accept gate to the bgfx-Android pilot (audio has zero GPU context, can't validate `contextLost`); fixes the `contract_version` check to gate on equality with direction-branched diagnostics (`t < p` catches new-core+old-backend, the dominant ecosystem failure). Rev 10 answered all six open questions. Rev 5: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; Platform-packaging & manifest section; terminology + stale-wording fixes)
+**Status:** Draft (revision 14 — **post-deployment**: Phases 1 & 2 SHIPPED (labelle-core #45 = the render contract in `backend_contract.zig`; labelle-audio v0.3.0 = shared `Mixer(Sink)` + `DeviceSink`, i16+f32; bgfx/wgpu/sokol collapsed, #388/#389/#390). Marks 1 & 2 DONE in the migration plan; **corrects the audio worked-example** — `raudio`/`sdl_audio` are *monolithic engines*, NOT shared-mixer device sinks (raylib/sdl delegate decode+mix wholesale, didn't collapse); adds the **composable-vs-monolithic provider** distinction to the resolver (Phase 5); flags the **WAV-shared/OGG-backend decode split** + the `writeAudioBackendWiring` codegen as **Phase-6 targets**; records that audio proved the *provider-composition* mechanic + no-codegen-change for a module dep, but **not** the run-loop splice — Phase 3 remains the gating crux. Rev 13 — addresses the rev-12 design review (7 points): names render's **draw vs loader sub-surfaces** (symmetric with the audio split); replaces the single under-specified `contextLost` with an explicit **`surfaceLost`/`surfaceRestored`** pair driving engine-side `gpuResourcesInvalidated` → `reuploadAssets` (no `deinit`/`init` overload); adds **provider identity** (canonical `<namespace>.<name>` IDs, `labelle.*` reserved, collision is a hard error), **capability negotiation** (declared `.capabilities` checked at resolve time → early project-level errors, not deep `@compileError`s), and **per-contract conformance suites** (behavior, not just `@hasDecl` shape) in a new "Opening the ecosystem" section; constrains the build hook to a versioned, documented `HookContext` (manifest ~95%, hook ~5%, no arbitrary work); migration pilots already split in rev 12 (audio=mechanics, sokol-desktop=full-stack, bgfx-Android=context gate). Rev 12 — addresses rev-11 review: distinguishes the runtime-playback `AudioInterface` (labelle-core, `playSound`/`stopSound`) from the separate audio *loader* contract (`Backend(Impl)` in labelle-engine/`audio_backend`, `decodeAudio`/`uploadSound`); fixes the versioning summary `N <= M` → `N == M` to match the strict-equality code sample; splits the pilot into step 3 (sokol-desktop, extraction mechanics) and a distinct step 4 (bgfx-Android GPU-context Accept gate); refreshes the build_zig.txt line count and the PR description; last "crate" → "package". Rev 11 — addresses rev-10 review: collapses `labelle-platform-abi` to `labelle-core` everywhere; splits the build hook into `pre_wire`/`post_wire` (sokol's `with_imgui` is a shipped consumer that needs `b.dependency`-time options); reframes the Accept gate to the bgfx-Android pilot (audio has zero GPU context, can't validate `contextLost`); fixes the `contract_version` check to gate on equality with direction-branched diagnostics (`t < p` catches new-core+old-backend, the dominant ecosystem failure). Rev 10 answered all six open questions. Rev 5: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; Platform-packaging & manifest section; terminology + stale-wording fixes)
 
 **All six open questions answered**, plus three ecosystem concerns added by the rev-12 review: Q#1 (lifecycle ABI), Q#2 (contract home + versioning), Q#3 (monorepo — resolved rev 3), Q#4 (gamepad as input-extension), Q#5 (build-graph manifest), Q#6 (GUI-bridge compatibility), and (rev 13) provider identity, capability negotiation, and conformance suites — see *Opening the ecosystem*. Residuals are migration-gated, not design-blockers — the RFC is ready to move from Draft to Accepted pending the **bgfx-Android pilot** (migration step 4) validating the `surfaceLost`/`surfaceRestored` re-upload story. The audio pilot (step 2) and sokol-desktop conversion (step 3) validate extraction mechanics but have zero surface-loss cycle to exercise.
 
@@ -187,14 +187,31 @@ mixer) and **decode** (WAV/OGG → PCM, the `decodeAudio`/`uploadSound` half tha
 belongs to the *separate* audio-loader contract, `Backend(Impl)` in
 `labelle-engine/audio_backend`). Only the *output device* is platform-specific.
 - a shared **`labelle-audio`** = the `AudioInterface` impl (playback + PCM mix),
-  plus the backend-agnostic WAV/OGG decoder sitting behind the loader contract,
-  written once, and
-- a pluggable **audio-device** sink: providers `sokol_audio`, `miniaudio`,
-  `sdl_audio`, `raudio`, `null`.
+  plus the backend-agnostic WAV decoder, written once, and
+- a pluggable **audio-device** sink (the `DeviceSink` contract): providers
+  `sokol_audio`, `miniaudio`, AAudio, `null`.
 
 "sokol has its own, bgfx has none" maps cleanly: sokol's device = `sokol_audio`;
 bgfx's device = `miniaudio`; the mixer above them is shared — deleting ~3
-reimplementations. Audio is the **ideal first extraction**: its **playback half
+reimplementations.
+
+> **Corrected by deployment (rev 14):** an earlier draft listed `sdl_audio` and
+> `raudio` as device sinks under the shared mixer. They are **not** — raylib
+> (raudio) and sdl (SDL_mixer) delegate *both* decode **and** mix to a full
+> third-party engine, so there's no mixer to collapse and no device-sink to wrap.
+> They are **monolithic providers**: a backend that supplies the *whole* audio
+> contract from one engine and bypasses the shared mixer entirely. This is a
+> distinct, generalizable category — see *Deployment notes* and the resolver
+> section: a provider may own a contract **monolithically** (raylib = all four
+> bundled; raudio = audio-as-one-engine) rather than **compose** from shared
+> logic + a pluggable sub-provider (bgfx render + glfw window + miniaudio sink).
+> The resolver and capability model must handle both.
+>
+> Also corrected: the shared decoder ships **WAV-only**; OGG decode stayed
+> backend-side (dr_wav/stb_vorbis), so the "loader half is shared" claim is only
+> half-true today. Unifying it (shared OGG, or a shared decoder package) is a
+> Phase-6 cleanup, tracked with the `writeAudioBackendWiring` codegen that still
+> assumes each backend provides `decodeAudio`. Audio is the **ideal first extraction**: its **playback half
 is already contracted** in core (`core.AudioInterface`) and its **loader half**
 has a ready home (the `audio_backend` `Backend(Impl)`), and it has **zero
 GPU-context sharing** (its own device + thread), so the hardest part of this RFC
@@ -338,20 +355,38 @@ entry — the same shape as `labelle-audio`'s shared mixer over pluggable device
 
 ## Migration plan (incremental, not a big bang)
 
-1. **Formalize `labelle-core` as the ABI home** with the four contracts + `assertBackend`;
-   make gfx's existing `Backend` conform (no behaviour change). (`AudioInterface`
-   already lives in labelle-core — it just moves/re-exports.)
-2. **Pilot with audio** — the lowest-risk slot (playback already contracted in
-   core, loader home ready, *zero* context-sharing). Extract the shared
-   `labelle-audio` mixer + the device
-   providers (`sokol_audio`/`miniaudio`/…) and collapse the per-backend mixer
-   duplication. Immediate, measurable payoff with no entry-point or context work.
+> **Status (rev 14): Phases 1 & 2 are SHIPPED.** See *Deployment notes* below for
+> what the rollout proved, corrected, and added to the later phases.
+
+1. ✅ **DONE — Formalize `labelle-core` as the ABI home** (labelle-core
+   #45/#387). The render `Backend(Impl)` + value types + `assertBackend` /
+   `missingBackendDecls` + a mock reference now live in
+   `labelle-core/src/backend_contract.zig`; gfx conforms. (No separate
+   `labelle-platform-abi` — core is the home, as rev 11 settled.)
+2. ✅ **DONE — Pilot with audio** (labelle-audio v0.3.0; #388/#389/#390). The
+   shared `labelle-audio` = `Mixer(comptime Sink)` (the `AudioInterface` impl:
+   decode + PCM mix, spinlock + UAF-safe unload) over a comptime `DeviceSink`
+   contract (`ensureStarted/stop/framesMixed`), **i16 by default + an f32 path**
+   (a sink declares `sample_format = .f32`). Collapsed **bgfx** (miniaudio+AAudio
+   sinks), **wgpu** (NullSink, software), **sokol** (sokol_audio f32 sink) —
+   ~1,900 lines of duplicated decode/mix deleted, public APIs byte-identical, and
+   **no assembler-codegen change needed** (the backend `audio` module carries the
+   dep transitively). **raylib + sdl did NOT collapse** — see the corrected worked
+   example below. Two loose ends it surfaced (now Phase-6 targets): OGG decode is
+   still backend-side (the shared decoder is WAV-only), and the assembler's
+   `writeAudioBackendWiring` still assumes per-backend `decodeAudio`.
 3. **Convert one full backend** (sokol — render+window+input; it's the
    headless-screenshot-verifiable one) to implement the contracts from a separate
    location, *while keeping the enum* as a resolver shorthand. Prove a generated
    game still builds + runs. This validates the **desktop** extraction mechanics
    for a render+window+input backend — but sokol-desktop has no surface-loss
-   cycle to exercise, so it is *not* the GPU-context gate.
+   cycle to exercise, so it is *not* the GPU-context gate. **Still the gating
+   crux:** audio (Phase 2) proved the *provider-composition* mechanic
+   (`Mixer(Sink)` + a comptime device contract) and that a module dep needs no
+   codegen change — but audio has no run loop, so it did **not** exercise the
+   codegen-splice (Q#1) of a window provider's run-loop/build fragments. Phase 3
+   is where that gets validated for the first time. (Sokol is already *half*
+   converted — its audio is a clean `DeviceSink` consumer post-Phase-2.)
 4. **GPU-context pilot — bgfx-Android.** Distinct from step 3: this is the only
    pilot that can exercise the `TERM_WINDOW`+`INIT_WINDOW` surface-recreation
    cycle (bgfx-Android already has the `init_done` one-shot guard for it). It is
@@ -361,9 +396,22 @@ entry — the same shape as `labelle-audio`'s shared mixer over pluggable device
 5. **Open the resolver** — `.backend` accepts a full-stack package *and*
    per-contract overrides (`.{ .render = .bgfx, .audio = .miniaudio }`); the
    closed enum values become **shorthands** resolving to the official providers.
-   **Backward-compatible**: `.backend = .sokol` keeps working.
+   **Backward-compatible**: `.backend = .sokol` keeps working. **Must model two
+   provider kinds** (deployment finding): *composable* (supplies one contract,
+   composes with sub-providers — bgfx render + glfw + miniaudio) and *monolithic*
+   (owns a contract from a bundled engine, bypasses the shared logic — raylib's
+   raudio, sdl's SDL_mixer). The capability/conformance machinery must let a
+   provider declare "I own this contract whole" so the resolver doesn't try to
+   compose a shared mixer onto an engine that already mixes.
 6. **Extract the remaining backends**; slim the assembler (lazy native deps per
-   provider).
+   provider). **Scope shrank:** Phase 2 already extracted *audio* for every
+   backend, so this is render/window/input only. **Concrete targets from the
+   audio rollout:** (a) generalize/remove `writeAudioBackendWiring`
+   (`src/codegen/blocks/asset_wiring.zig`), which still hard-codes per-backend
+   `decodeAudio`/`uploadSound` calls; (b) unify the decoder — OGG is still
+   backend-side while WAV is shared, so the "loader sub-surface is shared" goal is
+   only half-met (mirror the gfx `DecodedImage`/`DecodedFont` split for a shared
+   decoder).
 
 ## Q#1 answer — the `Game`-lifecycle ABI
 
