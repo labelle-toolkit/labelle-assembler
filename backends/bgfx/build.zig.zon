@@ -55,7 +55,8 @@
         // sub-packages above. The generated app build must also wire this dep
         // onto the `audio` module (see CLAUDE notes / report).
         .labelle_audio = .{
-            .path = "../../../labelle-audio",
+            .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.2.1.tar.gz",
+            .hash = "labelle_audio-0.2.1-QQRmYI4eAQDChv7DVK74-HPS9_J2bJw5ZDKFOazffYjU",
         },
     },
     .paths = .{
