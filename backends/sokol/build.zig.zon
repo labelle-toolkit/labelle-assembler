@@ -74,6 +74,10 @@
             .hash = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ",
             .lazy = true,
         },
+        .labelle_audio = .{
+            .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.3.0.tar.gz",
+            .hash = "labelle_audio-0.3.0-QQRmYIN4AQDEmFoqOoJavqaf6IfTf_CRQW0LyOK-4IfU",
+        },
     },
     .paths = .{
         "build.zig",
