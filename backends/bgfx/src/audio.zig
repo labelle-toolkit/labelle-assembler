@@ -1,268 +1,99 @@
 /// bgfx audio backend — satisfies the engine AudioInterface(Impl) contract.
-/// bgfx has no audio of its own; this implements a minimal WAV decoder +
-/// software PCM mixer (`mixAudio`) and drives it with a miniaudio
-/// playback device (#297). The device is opened lazily by `ensureInit`
-/// (called from the first `loadSound`/`loadMusic`/`playSound`/`playMusic`)
-/// and closed by `deinit` (called by the host on shutdown).
 ///
-/// Thread safety:
-/// `mixAudio` runs on miniaudio's audio callback thread, concurrently with
-/// game-thread calls to load/play/unload. All access to the shared `sounds`
-/// and `music_slots` arrays is guarded by `slot_lock`, an atomic-flag
-/// spinlock (acquire on enter / release on exit). Zig 0.16 removed
-/// `std.Thread.Mutex`, so we use `std.atomic.Value(bool)` directly.
+/// Phase 2 of the pluggable-backends RFC: the WAV decode + PCM mixer + slot
+/// management that this file used to reimplement (~580 lines) now live in the
+/// shared `labelle-audio` package. This file is a thin adapter:
 ///
-/// This fixes the former `unloadSound`/`unloadMusic` vs `mixAudio`
-/// use-after-free race (#298): unload now takes `slot_lock`, so it cannot
-/// free PCM data while the mixer is reading it. Critical sections are kept
-/// tight — the mixer holds the lock only while touching slot state, and
-/// the actual `free()` in unload happens after the slot has been detached
-/// and the lock released.
+///   * It instantiates `labelle_audio.Mixer(device_backend)`, where
+///     `device_backend` is bgfx's real OS playback device (miniaudio on
+///     desktop, AAudio on Android) selected at comptime. Those device modules
+///     satisfy the shared `DeviceSink` contract (`ensureStarted`/`stop`/
+///     `framesMixed`), so the shared mixer drives them directly.
+///   * Every `pub fn` below forwards to `Audio.*`, preserving bgfx's public
+///     audio API names + signatures verbatim (the engine/assembler call them by
+///     name).
+///   * The only bgfx-specific logic that remains is the libc file-read shim
+///     behind the path-based `loadSound`/`loadMusic`: the shared mixer is
+///     byte-buffer based (`loadSoundFromMemory`), so we read path→bytes via
+///     libc here and hand the bytes to the mixer.
 ///
-/// Android (#306): the miniaudio playback device is desktop-only — its C
-/// TU and the per-OS audio frameworks aren't built for Android (AAudio is
-/// a later task). On Android the device backend is a no-op stub, so this
-/// module is a *device-less* mixer: it decodes/loads/mixes exactly as on
-/// desktop, but nothing pumps `mixAudio`, so audio is silent on-device
-/// until the AAudio path lands. Selecting the backend at comptime
-/// (`device_backend`) keeps every `miniaudio.h` reference out of the
-/// Android build's semantic analysis.
+/// Thread-safety, the #298 unload/mix UAF fix, the spinlock, mono→stereo
+/// duplication, and the device-less Android behaviour are all provided by the
+/// shared mixer (see `labelle-audio/src/mixer.zig`); nothing about that
+/// behaviour changes here.
+///
+/// Android (#306): the AAudio device backend is selected by the same comptime
+/// `is_android` switch as before, so `miniaudio.h` is never seen on Android and
+/// the AAudio externs are never seen on desktop.
 const std = @import("std");
 const builtin = @import("builtin");
+const labelle_audio = @import("labelle-audio");
 
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
 
-// Output device, selected per target. On Android it's the AAudio device
-// (#306); on desktop it's the miniaudio device. Both expose the same
-// `ensureStarted`/`stop`/`framesMixed` surface, so `ensureInit`/`deinit` call
-// through unchanged. `if (is_android)` is comptime, so only the taken branch is
-// analyzed — the desktop miniaudio `@cImport` is never seen on Android, and the
-// AAudio externs are never seen on desktop.
+// Output device, selected per target — the shared `DeviceSink` the mixer
+// drives. On Android it's the AAudio device (#306); on desktop it's the
+// miniaudio device. Both expose `ensureStarted`/`stop`/`framesMixed`, so they
+// satisfy `labelle_audio.DeviceSink`. `if (is_android)` is comptime, so only
+// the taken branch is analyzed — the desktop miniaudio `@cImport` is never seen
+// on Android, and the AAudio externs are never seen on desktop.
 const device_backend = if (is_android)
     @import("audio_device_android.zig")
 else
     @import("audio_device.zig");
 
-const MAX_SOUNDS = 256;
-const MAX_MUSIC = 32;
+/// The shared PCM mixer, parameterized by bgfx's OS device as the `DeviceSink`.
+/// Owns WAV decode + slot arrays + the spinlock + the full AudioInterface
+/// surface; the public fns below forward to it.
+const Audio = labelle_audio.Mixer(device_backend);
 
-// ── Slot-array spinlock (#298) ───────────────────────────────────────
-//
-// Guards `sounds` and `music_slots` against concurrent access by the
-// game thread and miniaudio's audio callback thread. Zig 0.16 removed
-// `std.Thread.Mutex`, so this is a hand-rolled test-and-test-and-set
-// spinlock over an atomic bool with acquire/release ordering.
-//
-// Contention is effectively zero (the mixer holds it for microseconds
-// per callback and game-thread audio calls are infrequent), so spinning
-// is cheaper than a futex here and needs no OS primitive.
-var slot_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+// ── Lifecycle ────────────────────────────────────────────────────────
 
-fn lockSlots() void {
-    while (true) {
-        // Fast path: try to flip false→true with acquire ordering.
-        if (!slot_lock.swap(true, .acquire)) return;
-        // Slow path: spin on a relaxed load until it looks free, then
-        // retry the swap (test-and-test-and-set to avoid cache-line
-        // ping-pong while contended).
-        while (slot_lock.load(.monotonic)) {
-            std.atomic.spinLoopHint();
-        }
-    }
-}
-
-fn unlockSlots() void {
-    slot_lock.store(false, .release);
-}
-
-// ── WAV PCM data ─────────────────────────────────────────────────────
-
-const PcmData = struct {
-    samples: []const i16, // interleaved stereo PCM
-    channels: u16,
-    sample_rate: u32,
-    frame_count: u32, // total frames (samples / channels)
-    raw_alloc: []u8, // backing allocation for cleanup
-};
-
-// ── Sound state ──────────────────────────────────────────────────────
-
-const SoundSlot = struct {
-    pcm: ?PcmData = null,
-    playing: bool = false,
-    position: u32 = 0, // current frame position
-    volume: f32 = 1.0,
-};
-
-const MusicSlot = struct {
-    pcm: ?PcmData = null,
-    playing: bool = false,
-    paused: bool = false,
-    position: u32 = 0,
-    volume: f32 = 1.0,
-    looping: bool = true,
-};
-
-var sounds: [MAX_SOUNDS]SoundSlot = [_]SoundSlot{.{}} ** MAX_SOUNDS;
-var music_slots: [MAX_MUSIC]MusicSlot = [_]MusicSlot{.{}} ** MAX_MUSIC;
-var next_sound_id: u32 = 1;
-var next_music_id: u32 = 1;
-var master_volume: f32 = 1.0;
-
-// ── Playback device (#297, #306) ─────────────────────────────────────
-//
-// The actual output device lives in `device_backend` (selected at
-// comptime above): the real miniaudio playback device on desktop, a
-// no-op stub on Android. `ensureInit` lazily starts it and wires
-// `mixAudio` as the audio-thread fill callback; `deinit` stops it. All
-// `ma_device` / `miniaudio.h` knowledge is confined to
-// `audio_device.zig`, so this module compiles for Android unchanged.
-
-/// Open the playback device on first use, driving `mixAudio` from its
-/// audio-thread callback. Idempotent and cheap to call from every public
-/// entry point that can start audio. On Android this is a no-op (no
-/// device); the mixer state advances only when something pumps `mixAudio`.
+/// Open the playback device on first use, driving the mixer from its
+/// audio-thread callback. Idempotent and cheap to call from every public entry
+/// point that can start audio. On Android this is a no-op pump-wise until the
+/// AAudio stream opens (no device → mixer state advances only when pumped).
 pub fn ensureInit() void {
-    device_backend.ensureStarted(&mixAudio);
+    Audio.ensureInit();
 }
 
 /// Cumulative frames pushed through the output device callback. >0 confirms the
 /// device (miniaudio on desktop, AAudio on Android, #306) is live and pulling
 /// from the mixer. Used for headless / on-device proof-of-life.
 pub fn deviceFramesMixed() u64 {
-    return device_backend.framesMixed();
+    return Audio.deviceFramesMixed();
 }
 
-/// Stop and close the playback device, then free all loaded PCM. Must be
-/// called by the host on shutdown. On desktop `device_backend.stop` joins
-/// the audio thread before returning, so after it the slots are no longer
-/// touched by the callback and we can free them without taking
-/// `slot_lock`. On Android `stop` is a no-op and no audio thread ever ran.
+/// Stop and close the playback device, then free all loaded PCM. Must be called
+/// by the host on shutdown. The shared mixer's `deinit` stops the device (which
+/// joins the audio thread on desktop) before freeing the slots.
 pub fn deinit() void {
-    device_backend.stop();
-
-    // Free any PCM the game didn't explicitly unload. The audio thread is
-    // gone (or never existed, on Android), so no lock is needed.
-    for (&sounds) |*slot| {
-        if (slot.pcm) |pcm| {
-            if (pcm.raw_alloc.len > 0) std.heap.page_allocator.free(pcm.raw_alloc);
-        }
-        slot.* = .{};
-    }
-    for (&music_slots) |*slot| {
-        if (slot.pcm) |pcm| {
-            if (pcm.raw_alloc.len > 0) std.heap.page_allocator.free(pcm.raw_alloc);
-        }
-        slot.* = .{};
-    }
-    next_sound_id = 1;
-    next_music_id = 1;
-    master_volume = 1.0;
+    Audio.deinit();
 }
 
-// ── WAV decoder ──────────────────────────────────────────────────────
+// ── Path-based file-read shim ────────────────────────────────────────
+//
+// The shared mixer is byte-buffer based (`loadSoundFromMemory`), but bgfx's
+// public `loadSound`/`loadMusic` take a file path. Zig 0.16 removed
+// `std.fs.cwd()` in favour of `std.Io.Dir.cwd()`, which requires an `Io`
+// threaded through the call site. Rather than thread `Io` through the backend
+// for a one-shot legacy loader, we read the file via libc `fopen`/`fread`/
+// `fclose` — `link_libc = true` is set on the audio module (see
+// backends/bgfx/build.zig), so libc is available at no extra cost. The decoded
+// bytes are then handed to the shared mixer, which owns decode + ownership.
 
-const WavHeader = extern struct {
-    riff: [4]u8, // "RIFF"
-    file_size: u32,
-    wave: [4]u8, // "WAVE"
-};
-
-fn decodeWav(file_data: []const u8) ?PcmData {
-    if (file_data.len < @sizeOf(WavHeader) + 8) return null;
-
-    // Validate RIFF/WAVE header
-    if (!std.mem.eql(u8, file_data[0..4], "RIFF")) return null;
-    if (!std.mem.eql(u8, file_data[8..12], "WAVE")) return null;
-
-    // Parse chunks to find fmt and data
-    var channels: u16 = 0;
-    var sample_rate: u32 = 0;
-    var bits_per_sample: u16 = 0;
-    var data_offset: usize = 0;
-    var data_size: u32 = 0;
-    var audio_format: u16 = 0;
-
-    var offset: usize = 12; // skip RIFF header
-    while (offset + 8 <= file_data.len) {
-        const chunk_id = file_data[offset .. offset + 4];
-        const chunk_size: usize = @intCast(std.mem.readInt(u32, file_data[offset + 4 ..][0..4], .little));
-
-        // Validate chunk data fits within file bounds
-        if (offset + 8 + chunk_size > file_data.len) break;
-
-        if (std.mem.eql(u8, chunk_id, "fmt ")) {
-            if (chunk_size < 16) return null;
-            // Ensure fmt chunk has enough bytes for all fields we read (offset+24 from chunk start)
-            if (offset + 24 > file_data.len) return null;
-            audio_format = std.mem.readInt(u16, file_data[offset + 8 ..][0..2], .little);
-            channels = std.mem.readInt(u16, file_data[offset + 10 ..][0..2], .little);
-            sample_rate = std.mem.readInt(u32, file_data[offset + 12 ..][0..4], .little);
-            bits_per_sample = std.mem.readInt(u16, file_data[offset + 22 ..][0..2], .little);
-        } else if (std.mem.eql(u8, chunk_id, "data")) {
-            data_offset = offset + 8;
-            data_size = @intCast(chunk_size);
-        }
-
-        const advance = 8 + chunk_size;
-        if (offset + advance > file_data.len) break;
-        offset += advance;
-        // Chunks are 2-byte aligned
-        if (chunk_size % 2 != 0) {
-            if (offset + 1 > file_data.len) break;
-            offset += 1;
-        }
-    }
-
-    // Only support PCM format (1) with 16-bit samples
-    if (audio_format != 1) return null;
-    if (bits_per_sample != 16) return null;
-    if (channels == 0 or channels > 2) return null;
-    if (data_offset == 0 or data_size == 0) return null;
-    if (data_offset + data_size > file_data.len) {
-        // Clamp to available data
-        data_size = @intCast(file_data.len - data_offset);
-    }
-
-    const data_size_usize: usize = @intCast(data_size);
-    const sample_count: usize = data_size_usize / 2; // 16-bit samples
-    const frame_count: u32 = @intCast(sample_count / channels);
-
-    // Ensure PCM data is properly aligned for i16 before reinterpreting
-    if (data_offset % @alignOf(i16) != 0) return null;
-
-    // Reinterpret the raw bytes as i16 samples (WAV is always little-endian)
-    const samples_ptr: [*]const i16 = @ptrCast(@alignCast(file_data[data_offset..].ptr));
-
-    return PcmData{
-        .samples = samples_ptr[0..sample_count],
-        .channels = channels,
-        .sample_rate = sample_rate,
-        .frame_count = frame_count,
-        .raw_alloc = &.{}, // will be set by caller
-    };
-}
-
-// Zig 0.16 removed `std.fs.cwd()` in favour of `std.Io.Dir.cwd()`, which
-// requires an `Io` parameter threaded through the call site. This is
-// the legacy path-based WAV loader — production audio loading goes
-// through the higher-level asset pipeline and rarely (if ever) touches
-// the FS directly through this entry point. Rather than thread `Io`
-// through the backend for a one-shot legacy loader, we use libc
-// `fopen` / `fread` / `fclose` to keep the existing
-// `(path) ?struct{...}` signature. `link_libc = true` is set on the
-// audio module (see backends/bgfx/build.zig) so libc is available at
-// link time at no extra cost (the bgfx backend's audio module has no
-// other C-library dependencies — see the audio module setup in
-// build.zig for the explicit `link_libc = true`).
 const SEEK_SET: c_int = 0;
 const SEEK_END: c_int = 2;
 extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
 extern "c" fn ftell(stream: *std.c.FILE) c_long;
 
-fn loadWavFile(path: [:0]const u8) ?struct { pcm: PcmData, alloc: []u8 } {
-    // Read the file from disk via libc. See the rationale block above.
+/// Read an entire file into a freshly page-allocated buffer via libc. Returns
+/// null on any IO error or short read (a short `fread` can occur on EOF
+/// mid-read without setting an error flag, so we compare against the full
+/// requested size, see PR #227). Caller owns the returned slice and frees it
+/// via `std.heap.page_allocator`.
+fn readFileBytes(path: [:0]const u8) ?[]u8 {
     const file = std.c.fopen(path.ptr, "rb") orelse return null;
     defer _ = std.c.fclose(file);
 
@@ -277,514 +108,154 @@ fn loadWavFile(path: [:0]const u8) ?struct { pcm: PcmData, alloc: []u8 } {
 
     const bytes_read = std.c.fread(data.ptr, 1, file_size, file);
     if (bytes_read != file_size) {
-        // `fread` can return short on EOF mid-read without setting an error
-        // flag, so we must compare against the full requested size — not
-        // just the minimum WAV header — or we'd silently decode a truncated
-        // file. See PR #227 (cursor[bot] review).
         std.log.warn("audio: short read on {s} ({d}/{d} bytes)", .{ path, bytes_read, file_size });
         allocator.free(data);
         return null;
     }
-    if (bytes_read < 44) { // minimum WAV size
-        allocator.free(data);
-        return null;
-    }
-
-    var pcm = decodeWav(data[0..bytes_read]) orelse {
-        allocator.free(data);
-        return null;
-    };
-
-    // Reject empty PCM. A 0-frame buffer played with looping makes the
-    // mixer's wrap math (`position % frame_count`) divide by zero / index
-    // out of bounds on the audio thread, so refuse it at load time.
-    if (pcm.frame_count == 0) {
-        allocator.free(data);
-        return null;
-    }
-    pcm.raw_alloc = data;
-
-    return .{ .pcm = pcm, .alloc = data };
+    return data;
 }
 
-// ── Sound effects ──────────────────────────────────────────
+// ── Sound effects ────────────────────────────────────────────────────
 
-/// Find a free sound slot, scanning for recycled (unloaded) slots first,
-/// then falling back to the next unused ID.
-fn findFreeSoundSlot() ?u32 {
-    // Scan for recycled slots (start from 1; slot 0 is reserved/unused)
-    for (1..next_sound_id) |i| {
-        if (sounds[i].pcm == null) {
-            return @intCast(i);
-        }
-    }
-    // Fall back to the next never-used slot
-    if (next_sound_id < MAX_SOUNDS) {
-        const id = next_sound_id;
-        next_sound_id += 1;
-        return id;
-    }
-    return null;
-}
-
+/// Load a WAV file from `path` and register it as a sound effect. Reads the
+/// file via the libc shim, then hands the bytes to the shared mixer (which owns
+/// decode + the PCM). Returns the sound id, or 0 on failure.
 pub fn loadSound(path: [:0]const u8) u32 {
-    // Open the device on first load so playback works without the host
-    // calling an explicit init.
-    ensureInit();
-
-    // Decode off-lock — file IO + allocation must not block the mixer.
-    const result = loadWavFile(path) orelse return 0;
-
-    lockSlots();
-    const id = findFreeSoundSlot() orelse {
-        unlockSlots();
-        std.heap.page_allocator.free(result.alloc);
-        return 0;
-    };
-    sounds[id] = .{
-        .pcm = result.pcm,
-        .playing = false,
-        .position = 0,
-        .volume = 1.0,
-    };
-    unlockSlots();
-    return id;
+    const bytes = readFileBytes(path) orelse return 0;
+    defer std.heap.page_allocator.free(bytes);
+    return Audio.loadSoundFromMemory(bytes);
 }
 
 pub fn unloadSound(id: u32) void {
-    if (id >= MAX_SOUNDS) return;
-
-    // Detach the slot under the lock so the mixer can't observe a
-    // half-freed PcmData, then free the backing allocation after
-    // releasing the lock — by which point the mixer no longer holds a
-    // pointer into it (#298).
-    lockSlots();
-    const pcm = sounds[id].pcm;
-    sounds[id] = .{};
-    unlockSlots();
-
-    if (pcm) |p| {
-        if (p.raw_alloc.len > 0) std.heap.page_allocator.free(p.raw_alloc);
-    }
+    Audio.unloadSound(id);
 }
 
 pub fn playSound(id: u32) void {
-    ensureInit();
-    if (id >= MAX_SOUNDS) return;
-    lockSlots();
-    sounds[id].playing = true;
-    sounds[id].position = 0;
-    unlockSlots();
+    Audio.playSound(id);
 }
 
 pub fn stopSound(id: u32) void {
-    if (id >= MAX_SOUNDS) return;
-    lockSlots();
-    sounds[id].playing = false;
-    sounds[id].position = 0;
-    unlockSlots();
+    Audio.stopSound(id);
 }
 
 pub fn isSoundPlaying(id: u32) bool {
-    if (id >= MAX_SOUNDS) return false;
-    lockSlots();
-    defer unlockSlots();
-    return sounds[id].playing;
+    return Audio.isSoundPlaying(id);
 }
 
 pub fn setSoundVolume(id: u32, volume: f32) void {
-    if (id >= MAX_SOUNDS) return;
-    lockSlots();
-    sounds[id].volume = std.math.clamp(volume, 0.0, 1.0);
-    unlockSlots();
+    Audio.setSoundVolume(id, volume);
 }
 
-// ── Music (streaming) ──────────────────────────────────────
+// ── Music (streaming) ────────────────────────────────────────────────
 
-/// Find a free music slot, scanning for recycled (unloaded) slots first,
-/// then falling back to the next unused ID.
-fn findFreeMusicSlot() ?u32 {
-    for (1..next_music_id) |i| {
-        if (music_slots[i].pcm == null) {
-            return @intCast(i);
-        }
-    }
-    if (next_music_id < MAX_MUSIC) {
-        const id = next_music_id;
-        next_music_id += 1;
-        return id;
-    }
-    return null;
-}
-
+/// Load a WAV file from `path` and register it as a looping music stream. Same
+/// libc file-read shim as `loadSound`. Returns the music id, or 0 on failure.
 pub fn loadMusic(path: [:0]const u8) u32 {
-    ensureInit();
-
-    const result = loadWavFile(path) orelse return 0;
-
-    lockSlots();
-    const id = findFreeMusicSlot() orelse {
-        unlockSlots();
-        std.heap.page_allocator.free(result.alloc);
-        return 0;
-    };
-    music_slots[id] = .{
-        .pcm = result.pcm,
-        .playing = false,
-        .paused = false,
-        .position = 0,
-        .volume = 1.0,
-        .looping = true,
-    };
-    unlockSlots();
-    return id;
+    const bytes = readFileBytes(path) orelse return 0;
+    defer std.heap.page_allocator.free(bytes);
+    return Audio.loadMusicFromMemory(bytes);
 }
 
 /// Register an already-decoded interleaved PCM_16 buffer as a looping music
 /// stream. Used by the Android audio-track decoder (`video/android_audio.zig`)
-/// to feed decoded video audio into the mixer — the in-memory counterpart of
-/// `loadMusic`. `sample_rate` should be the device rate (48000): the mixer does
-/// not resample, so the caller must already be at device rate. Copies `samples`
-/// into an owned, properly-aligned buffer.
+/// to feed decoded video audio into the mixer. `sample_rate` should be the
+/// device rate (48000): the mixer does not resample. Public signature keeps the
+/// `u16` channels arg bgfx exposed; the shared mixer takes `u8`, so we narrow.
 pub fn loadMusicFromPcm(samples: []const i16, channels: u16, sample_rate: u32) u32 {
-    if (samples.len == 0 or channels == 0) return 0;
-    ensureInit();
-
-    const owned = std.heap.page_allocator.alloc(i16, samples.len) catch return 0;
-    @memcpy(owned, samples);
-
-    lockSlots();
-    const id = findFreeMusicSlot() orelse {
-        unlockSlots();
-        std.heap.page_allocator.free(owned);
-        return 0;
-    };
-    music_slots[id] = .{
-        .pcm = .{
-            .samples = owned,
-            .channels = channels,
-            .sample_rate = sample_rate,
-            .frame_count = @intCast(samples.len / channels),
-            .raw_alloc = std.mem.sliceAsBytes(owned),
-        },
-        .playing = false,
-        .paused = false,
-        .position = 0,
-        .volume = 1.0,
-        .looping = true,
-    };
-    unlockSlots();
-    return id;
+    if (channels == 0 or channels > 2) return 0;
+    return Audio.loadMusicFromPcm(samples, @intCast(channels), sample_rate);
 }
 
 pub fn unloadMusic(id: u32) void {
-    if (id >= MAX_MUSIC) return;
-
-    // Same detach-then-free ordering as `unloadSound` so the mixer can't
-    // UAF a music buffer mid-callback (#298).
-    lockSlots();
-    const pcm = music_slots[id].pcm;
-    music_slots[id] = .{};
-    unlockSlots();
-
-    if (pcm) |p| {
-        if (p.raw_alloc.len > 0) std.heap.page_allocator.free(p.raw_alloc);
-    }
+    Audio.unloadMusic(id);
 }
 
 pub fn playMusic(id: u32) void {
-    ensureInit();
-    if (id >= MAX_MUSIC) return;
-    lockSlots();
-    music_slots[id].playing = true;
-    music_slots[id].paused = false;
-    music_slots[id].position = 0;
-    unlockSlots();
+    Audio.playMusic(id);
 }
 
 pub fn stopMusic(id: u32) void {
-    if (id >= MAX_MUSIC) return;
-    lockSlots();
-    music_slots[id].playing = false;
-    music_slots[id].paused = false;
-    music_slots[id].position = 0;
-    unlockSlots();
+    Audio.stopMusic(id);
 }
 
 pub fn pauseMusic(id: u32) void {
-    if (id >= MAX_MUSIC) return;
-    lockSlots();
-    if (music_slots[id].playing) music_slots[id].paused = true;
-    unlockSlots();
+    Audio.pauseMusic(id);
 }
 
 pub fn resumeMusic(id: u32) void {
-    if (id >= MAX_MUSIC) return;
-    lockSlots();
-    if (music_slots[id].paused) music_slots[id].paused = false;
-    unlockSlots();
+    Audio.resumeMusic(id);
 }
 
 pub fn isMusicPlaying(id: u32) bool {
-    if (id >= MAX_MUSIC) return false;
-    lockSlots();
-    defer unlockSlots();
-    return music_slots[id].playing and !music_slots[id].paused;
+    return Audio.isMusicPlaying(id);
 }
 
 pub fn setMusicVolume(id: u32, volume: f32) void {
-    if (id >= MAX_MUSIC) return;
-    lockSlots();
-    music_slots[id].volume = std.math.clamp(volume, 0.0, 1.0);
-    unlockSlots();
+    Audio.setMusicVolume(id, volume);
 }
 
+/// No-op (kept for API compatibility). Music position is advanced exclusively
+/// on the audio thread by the mixer's device callback, so advancing here would
+/// double-advance / drift.
 pub fn updateMusic(id: u32) void {
-    // Music playback position is advanced exclusively in `mixAudio`,
-    // which is driven by the audio device callback. This function is
-    // kept for API compatibility but intentionally does nothing to
-    // avoid frame-rate-based timing drift and duplicate advancement.
-    _ = id;
+    Audio.updateMusic(id);
 }
 
-/// Current playback position of a music stream in seconds, derived from the
-/// frame `position` advanced on the audio thread by `mixAudio`. This is the
-/// real audio-device clock — the master clock for A/V sync (#549). Returns 0 if
-/// the id is unloaded or the device hasn't pumped yet (e.g. Android NoopDevice,
-/// #306).
-///
-/// The audio thread mutates `slot.position`/`slot.pcm` under `slot_lock` in
-/// `mixAudio`, so we take the same lock for a tiny critical section — copy out
-/// the position + sample rate — then compute outside it. (Reading unlocked would
-/// be a data race / UB, not just a torn read.)
+/// Current playback position of a music stream in seconds, read off the
+/// audio-thread-advanced frame position (the real audio-device clock; master
+/// clock for A/V sync, #549). 0 if the id is unloaded or the device hasn't
+/// pumped yet (e.g. Android before the AAudio stream opens).
 pub fn musicPositionSeconds(id: u32) f64 {
-    if (id == 0 or id >= MAX_MUSIC) return 0;
-    lockSlots();
-    const slot = &music_slots[id];
-    const sample_rate = if (slot.pcm) |pcm| pcm.sample_rate else 0;
-    const position = slot.position;
-    unlockSlots();
-    if (sample_rate == 0) return 0;
-    return @as(f64, @floatFromInt(position)) / @as(f64, @floatFromInt(sample_rate));
+    return Audio.musicPositionSeconds(id);
 }
 
-// ── PCM mixer ────────────────────────────────────────────────────────
+// ── Mixer + global ───────────────────────────────────────────────────
 
-/// Mix all active sounds and music into a stereo i16 output buffer.
-/// Called by the device backend's audio-thread callback to fill the
-/// output device (desktop). On Android nothing calls this yet (no device).
-///
-/// Takes `slot_lock` for the duration of the mix so the game thread
-/// cannot free PCM data (`unloadSound`/`unloadMusic`) out from under it
-/// (#298). The critical section only reads slot state + advances
-/// positions; the buffer clear is done up front, outside the lock.
+/// Mix all active sounds and music into a stereo i16 output buffer. Called by
+/// the device backend's audio-thread callback (desktop). Forwards to the shared
+/// mixer with `channels = 2` (bgfx's device is always stereo). The shared mixer
+/// recovers the frame count from `output.len`, so the legacy `frames` arg is
+/// accepted for signature compatibility but the buffer length is authoritative;
+/// we clamp the buffer to the requested frames so a caller passing a larger
+/// scratch buffer still only fills `frames` worth.
 pub fn mixAudio(output: []i16, frames_requested: u32) void {
-    const frame_count = @min(frames_requested, @as(u32, @intCast(output.len / 2)));
-
-    // Clear output buffer (no shared state touched yet — keep it off-lock).
-    const clear_len: usize = @as(usize, frame_count) * 2;
-    @memset(output[0..clear_len], 0);
-
-    lockSlots();
-    defer unlockSlots();
-
-    // Mix active sounds
-    for (0..MAX_SOUNDS) |i| {
-        var slot = &sounds[i];
-        if (!slot.playing) continue;
-        const pcm = slot.pcm orelse continue;
-
-        const vol = slot.volume * master_volume;
-        mixPcmInto(output, frame_count, pcm, &slot.position, vol, false);
-
-        if (slot.position >= pcm.frame_count) {
-            slot.playing = false;
-            slot.position = 0;
-        }
-    }
-
-    // Mix active music
-    for (0..MAX_MUSIC) |i| {
-        var slot = &music_slots[i];
-        if (!slot.playing or slot.paused) continue;
-        const pcm = slot.pcm orelse continue;
-
-        const vol = slot.volume * master_volume;
-        mixPcmInto(output, frame_count, pcm, &slot.position, vol, slot.looping);
-
-        if (!slot.looping and slot.position >= pcm.frame_count) {
-            slot.playing = false;
-            slot.position = 0;
-        }
-    }
+    const max_frames: u32 = @intCast(output.len / 2);
+    const frames = @min(frames_requested, max_frames);
+    Audio.mix(output[0 .. @as(usize, frames) * 2], 2);
 }
-
-fn mixPcmInto(
-    output: []i16,
-    frame_count: u32,
-    pcm: PcmData,
-    position: *u32,
-    volume: f32,
-    looping: bool,
-) void {
-    var pos = position.*;
-    var frame: u32 = 0;
-
-    while (frame < frame_count) : (frame += 1) {
-        if (pos >= pcm.frame_count) {
-            if (looping) {
-                pos = 0;
-            } else {
-                break;
-            }
-        }
-
-        const sample_idx: usize = @as(usize, pos) * @as(usize, pcm.channels);
-        const left: f32 = @floatFromInt(pcm.samples[sample_idx]);
-        const right: f32 = if (pcm.channels >= 2)
-            @floatFromInt(pcm.samples[sample_idx + 1])
-        else
-            left; // mono: duplicate to both channels
-
-        const out_idx: usize = @as(usize, frame) * 2;
-        const mixed_l = @as(f32, @floatFromInt(output[out_idx])) + left * volume;
-        const mixed_r = @as(f32, @floatFromInt(output[out_idx + 1])) + right * volume;
-
-        // Clamp to i16 range
-        output[out_idx] = @intFromFloat(std.math.clamp(mixed_l, -32768.0, 32767.0));
-        output[out_idx + 1] = @intFromFloat(std.math.clamp(mixed_r, -32768.0, 32767.0));
-
-        pos += 1;
-    }
-
-    position.* = pos;
-}
-
-// ── Global ────────────────────────────────────────────────
 
 pub fn setVolume(volume: f32) void {
-    // Guarded too: the mixer reads `master_volume` under `slot_lock`.
-    lockSlots();
-    master_volume = std.math.clamp(volume, 0.0, 1.0);
-    unlockSlots();
+    Audio.setVolume(volume);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
 //
-// These exercise the pure-Zig surface (spinlock, mixer, WAV decode,
-// unload detach/free ordering) without opening a miniaudio device, so
-// they run headlessly in CI. The device path is verified manually via
-// the example (see PR notes).
+// The decode/mixer/spinlock/UAF behaviour is now tested in `labelle-audio`
+// itself. These thin smoke tests confirm the bgfx adapter wires the shared
+// mixer correctly (forwarding + the stereo `mixAudio` shim), exercised
+// headlessly via the device backend without opening a real device.
 
 const testing = std.testing;
 
-fn resetStateForTest() void {
-    sounds = [_]SoundSlot{.{}} ** MAX_SOUNDS;
-    music_slots = [_]MusicSlot{.{}} ** MAX_MUSIC;
-    next_sound_id = 1;
-    next_music_id = 1;
-    master_volume = 1.0;
-}
-
-test "spinlock is exclusive and re-acquirable" {
-    try testing.expect(!slot_lock.load(.monotonic));
-    lockSlots();
-    try testing.expect(slot_lock.load(.monotonic));
-    unlockSlots();
-    try testing.expect(!slot_lock.load(.monotonic));
-    // Re-acquire to prove release left it usable.
-    lockSlots();
-    unlockSlots();
-}
-
 test "mixAudio clears output when nothing is playing" {
-    resetStateForTest();
+    Audio.resetForTest();
     var buf = [_]i16{ 123, 45, -67, 89 }; // 2 stereo frames
     mixAudio(&buf, 2);
     for (buf) |s| try testing.expectEqual(@as(i16, 0), s);
 }
 
-test "mixAudio mixes a playing sound and stops at end" {
-    resetStateForTest();
-    // 2-frame stereo PCM: [L0,R0, L1,R1]
-    const pcm_samples = [_]i16{ 100, 200, 300, 400 };
-    sounds[1] = .{
-        .pcm = .{
-            .samples = &pcm_samples,
-            .channels = 2,
-            .sample_rate = 48000,
-            .frame_count = 2,
-            .raw_alloc = &.{}, // static backing — unload must not free it
-        },
-        .playing = true,
-        .position = 0,
-        .volume = 1.0,
-    };
-
-    var out = [_]i16{0} ** 4; // request 2 frames
-    mixAudio(&out, 2);
-    try testing.expectEqual(@as(i16, 100), out[0]);
-    try testing.expectEqual(@as(i16, 200), out[1]);
-    try testing.expectEqual(@as(i16, 300), out[2]);
-    try testing.expectEqual(@as(i16, 400), out[3]);
-    // Sound reached its end → auto-stopped.
-    try testing.expect(!sounds[1].playing);
+test "loadMusicFromPcm round-trips a stereo buffer and reports position" {
+    Audio.resetForTest();
+    // 2 stereo frames at 48 kHz.
+    const pcm = [_]i16{ 100, 200, 300, 400 };
+    const id = loadMusicFromPcm(&pcm, 2, 48000);
+    try testing.expect(id != 0);
+    defer unloadMusic(id);
+    try testing.expectEqual(@as(f64, 0), musicPositionSeconds(id));
 }
 
-test "unloadSound detaches slot then frees its allocation" {
-    resetStateForTest();
-    // `unloadSound` frees `raw_alloc` via page_allocator, so allocate it
-    // there. A double-free or use of the slot after free would trip the
-    // allocator / sanitizer.
-    const raw = try std.heap.page_allocator.alloc(u8, 8);
-    const samples: [*]const i16 = @ptrCast(@alignCast(raw.ptr));
-    sounds[1] = .{
-        .pcm = .{
-            .samples = samples[0..4],
-            .channels = 2,
-            .sample_rate = 48000,
-            .frame_count = 2,
-            .raw_alloc = raw,
-        },
-        .playing = true,
-        .position = 0,
-        .volume = 1.0,
-    };
-
-    unloadSound(1);
-    // Slot fully reset and PCM detached (the buffer is now freed).
-    try testing.expect(sounds[1].pcm == null);
-    try testing.expect(!sounds[1].playing);
-}
-
-test "WAV decoder accepts a minimal stereo s16 buffer" {
-    // Build a 44-byte-header WAV with one stereo frame.
-    var wav: [44 + 4]u8 = undefined;
-    @memcpy(wav[0..4], "RIFF");
-    std.mem.writeInt(u32, wav[4..8], 36 + 4, .little);
-    @memcpy(wav[8..12], "WAVE");
-    @memcpy(wav[12..16], "fmt ");
-    std.mem.writeInt(u32, wav[16..20], 16, .little);
-    std.mem.writeInt(u16, wav[20..22], 1, .little); // PCM
-    std.mem.writeInt(u16, wav[22..24], 2, .little); // stereo
-    std.mem.writeInt(u32, wav[24..28], 48000, .little);
-    std.mem.writeInt(u32, wav[28..32], 48000 * 4, .little);
-    std.mem.writeInt(u16, wav[32..34], 4, .little); // block align
-    std.mem.writeInt(u16, wav[34..36], 16, .little); // bits
-    @memcpy(wav[36..40], "data");
-    std.mem.writeInt(u32, wav[40..44], 4, .little);
-    std.mem.writeInt(i16, wav[44..46], 111, .little);
-    std.mem.writeInt(i16, wav[46..48], 222, .little);
-
-    const pcm = decodeWav(&wav) orelse return error.DecodeFailed;
-    try testing.expectEqual(@as(u16, 2), pcm.channels);
-    try testing.expectEqual(@as(u32, 48000), pcm.sample_rate);
-    try testing.expectEqual(@as(u32, 1), pcm.frame_count);
-    try testing.expectEqual(@as(i16, 111), pcm.samples[0]);
-    try testing.expectEqual(@as(i16, 222), pcm.samples[1]);
-}
-
-test "WAV decoder rejects non-RIFF data" {
-    var junk = [_]u8{0xAB} ** 64;
-    try testing.expect(decodeWav(&junk) == null);
+test "loadMusicFromPcm rejects an out-of-range channel count" {
+    Audio.resetForTest();
+    const pcm = [_]i16{ 1, 2, 3, 4 };
+    try testing.expectEqual(@as(u32, 0), loadMusicFromPcm(&pcm, 3, 48000));
 }
