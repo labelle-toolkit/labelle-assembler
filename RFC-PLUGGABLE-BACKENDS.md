@@ -180,19 +180,25 @@ defaults live. An *incompatible* override (e.g. `.render = .bgfx, .window =
 .sokol_app`) is a resolve-time error, not a silent fallback.
 
 ### Audio — the worked example
-Audio decomposes one level further: the duplicated part (WAV/OGG decode + PCM
-mixer) is backend-agnostic; only the *output device* is platform-specific.
-- a shared **`labelle-audio`** = the `AudioInterface` impl (decode + mix), written
-  once, and
+Audio decomposes one level further, along the same **runtime-vs-loader** seam the
+contract section drew. The duplicated work is backend-agnostic and splits in two:
+**playback/mix** (the `AudioInterface` surface — `playSound`/`stopSound` + the PCM
+mixer) and **decode** (WAV/OGG → PCM, the `decodeAudio`/`uploadSound` half that
+belongs to the *separate* audio-loader contract, `Backend(Impl)` in
+`labelle-engine/audio_backend`). Only the *output device* is platform-specific.
+- a shared **`labelle-audio`** = the `AudioInterface` impl (playback + PCM mix),
+  plus the backend-agnostic WAV/OGG decoder sitting behind the loader contract,
+  written once, and
 - a pluggable **audio-device** sink: providers `sokol_audio`, `miniaudio`,
   `sdl_audio`, `raudio`, `null`.
 
 "sokol has its own, bgfx has none" maps cleanly: sokol's device = `sokol_audio`;
 bgfx's device = `miniaudio`; the mixer above them is shared — deleting ~3
-reimplementations. Audio is the **ideal first extraction**: already contracted
-(`core.AudioInterface`), and with **zero GPU-context sharing** (its own device +
-thread), so the hardest part of this RFC — the context handoff — simply does not
-apply to it.
+reimplementations. Audio is the **ideal first extraction**: its **playback half
+is already contracted** in core (`core.AudioInterface`) and its **loader half**
+has a ready home (the `audio_backend` `Backend(Impl)`), and it has **zero
+GPU-context sharing** (its own device + thread), so the hardest part of this RFC
+— the context handoff — simply does not apply to it.
 
 ### Packaging: one monorepo + lazy deps (not a repo explosion)
 Contract granularity and repo count are **orthogonal** — per-contract composition
@@ -335,8 +341,9 @@ entry — the same shape as `labelle-audio`'s shared mixer over pluggable device
 1. **Formalize `labelle-core` as the ABI home** with the four contracts + `assertBackend`;
    make gfx's existing `Backend` conform (no behaviour change). (`AudioInterface`
    already lives in labelle-core — it just moves/re-exports.)
-2. **Pilot with audio** — the lowest-risk slot (already contracted, *zero*
-   context-sharing). Extract the shared `labelle-audio` mixer + the device
+2. **Pilot with audio** — the lowest-risk slot (playback already contracted in
+   core, loader home ready, *zero* context-sharing). Extract the shared
+   `labelle-audio` mixer + the device
    providers (`sokol_audio`/`miniaudio`/…) and collapse the per-backend mixer
    duplication. Immediate, measurable payoff with no entry-point or context work.
 3. **Convert one full backend** (sokol — render+window+input; it's the
