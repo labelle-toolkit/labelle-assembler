@@ -1,8 +1,8 @@
 # RFC: Pluggable backends — make the assembler backend-agnostic
 
-**Status:** Draft (revision 12 — addresses rev-11 review: distinguishes the runtime-playback `AudioInterface` (labelle-core, `playSound`/`stopSound`) from the separate audio *loader* contract (`Backend(Impl)` in labelle-engine/`audio_backend`, `decodeAudio`/`uploadSound`); fixes the versioning summary `N <= M` → `N == M` to match the strict-equality code sample; splits the pilot into step 3 (sokol-desktop, extraction mechanics) and a distinct step 4 (bgfx-Android GPU-context Accept gate); refreshes the build_zig.txt line count and the PR description; last "crate" → "package". Rev 11 — addresses rev-10 review: collapses `labelle-platform-abi` to `labelle-core` everywhere; splits the build hook into `pre_wire`/`post_wire` (sokol's `with_imgui` is a shipped consumer that needs `b.dependency`-time options); reframes the Accept gate to the bgfx-Android pilot (audio has zero GPU context, can't validate `contextLost`); fixes the `contract_version` check to gate on equality with direction-branched diagnostics (`t < p` catches new-core+old-backend, the dominant ecosystem failure). Rev 10 answered all six open questions. Rev 5: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; Platform-packaging & manifest section; terminology + stale-wording fixes)
+**Status:** Draft (revision 13 — addresses the rev-12 design review (7 points): names render's **draw vs loader sub-surfaces** (symmetric with the audio split); replaces the single under-specified `contextLost` with an explicit **`surfaceLost`/`surfaceRestored`** pair driving engine-side `gpuResourcesInvalidated` → `reuploadAssets` (no `deinit`/`init` overload); adds **provider identity** (canonical `<namespace>.<name>` IDs, `labelle.*` reserved, collision is a hard error), **capability negotiation** (declared `.capabilities` checked at resolve time → early project-level errors, not deep `@compileError`s), and **per-contract conformance suites** (behavior, not just `@hasDecl` shape) in a new "Opening the ecosystem" section; constrains the build hook to a versioned, documented `HookContext` (manifest ~95%, hook ~5%, no arbitrary work); migration pilots already split in rev 12 (audio=mechanics, sokol-desktop=full-stack, bgfx-Android=context gate). Rev 12 — addresses rev-11 review: distinguishes the runtime-playback `AudioInterface` (labelle-core, `playSound`/`stopSound`) from the separate audio *loader* contract (`Backend(Impl)` in labelle-engine/`audio_backend`, `decodeAudio`/`uploadSound`); fixes the versioning summary `N <= M` → `N == M` to match the strict-equality code sample; splits the pilot into step 3 (sokol-desktop, extraction mechanics) and a distinct step 4 (bgfx-Android GPU-context Accept gate); refreshes the build_zig.txt line count and the PR description; last "crate" → "package". Rev 11 — addresses rev-10 review: collapses `labelle-platform-abi` to `labelle-core` everywhere; splits the build hook into `pre_wire`/`post_wire` (sokol's `with_imgui` is a shipped consumer that needs `b.dependency`-time options); reframes the Accept gate to the bgfx-Android pilot (audio has zero GPU context, can't validate `contextLost`); fixes the `contract_version` check to gate on equality with direction-branched diagnostics (`t < p` catches new-core+old-backend, the dominant ecosystem failure). Rev 10 answered all six open questions. Rev 5: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; Platform-packaging & manifest section; terminology + stale-wording fixes)
 
-**All six open questions now answered.** Q#1 (lifecycle ABI), Q#2 (contract home + versioning), Q#3 (monorepo — resolved rev 3), Q#4 (gamepad as input-extension), Q#5 (build-graph manifest), Q#6 (GUI-bridge compatibility). Residuals are migration-gated, not design-blockers — the RFC is ready to move from Draft to Accepted pending the **bgfx-Android pilot** (migration step 4) validating the `contextLost` / surface-recreation story. The audio pilot (step 2) and sokol-desktop conversion (step 3) validate extraction mechanics but have zero surface-loss cycle to exercise.
+**All six open questions answered**, plus three ecosystem concerns added by the rev-12 review: Q#1 (lifecycle ABI), Q#2 (contract home + versioning), Q#3 (monorepo — resolved rev 3), Q#4 (gamepad as input-extension), Q#5 (build-graph manifest), Q#6 (GUI-bridge compatibility), and (rev 13) provider identity, capability negotiation, and conformance suites — see *Opening the ecosystem*. Residuals are migration-gated, not design-blockers — the RFC is ready to move from Draft to Accepted pending the **bgfx-Android pilot** (migration step 4) validating the `surfaceLost`/`surfaceRestored` re-upload story. The audio pilot (step 2) and sokol-desktop conversion (step 3) validate extraction mechanics but have zero surface-loss cycle to exercise.
 
 **Tracking:** labelle-toolkit/labelle-assembler#377
 
@@ -61,14 +61,21 @@ A backend implements **four comptime contracts**, all mirroring gfx's existing
 `Backend(comptime Impl)` pattern (validate the `Impl` at comptime, delegate to
 it, gate optionals with `@hasDecl`):
 
-1. **render** — gfx's existing `Backend(Impl)`, and it is **more than draw
-   calls**. Alongside `drawTriangle`/`drawTexturePro`/`loadTexture` it carries the
-   *asset-streaming surface* the generated game already depends on:
-   `decodeImage` / `uploadTexture` / `unloadTexture`, the optional
-   compressed-texture decls, and the font decls. The ABI must capture this **full
-   surface** (see `src/codegen/blocks/asset_wiring.zig`) — otherwise a backend
-   could "conform" to the draw bag and still fail the generated build. Most-ready
-   of the four, but not as thin as a first read suggests.
+1. **render** — gfx's existing `Backend(Impl)`, and like audio it is **two named
+   sub-surfaces**, not one bag: (a) the **draw API** — `drawTriangle` /
+   `drawTexturePro` / `drawPolygon` / the shape + camera calls — the per-frame
+   render surface; and (b) the **asset-streaming/loader** sub-surface the
+   generated game already depends on: `decodeImage` / `uploadTexture` /
+   `unloadTexture`, the optional compressed-texture decls, and the font decls
+   (`decodeFont` / `uploadFontAtlas` / `unloadFontAtlas`). This is the same
+   runtime-vs-loader split audio has (playback vs `decodeAudio`/`uploadSound`);
+   the difference is render keeps both halves in one `Backend(Impl)` today
+   because the draw API and the GPU upload share the backend's render context.
+   Naming the two sub-surfaces is what stops a backend from "conforming" to the
+   draw bag yet failing the generated build because it skipped the loader half.
+   The ABI must capture this **full surface** (see
+   `src/codegen/blocks/asset_wiring.zig`). Most-ready of the four, but not as
+   thin as a first read suggests.
 2. **input** — `getMouseX/Y`, `isKeyDown`, `getTouchX/Y`, gamepad, wheel. A
    method-bag.
 3. **audio** — two distinct surfaces, only one of which is contracted in core
@@ -94,7 +101,11 @@ it, gate optionals with `@hasDecl`):
 **Capability differences are optional `@hasDecl`-gated decls** — e.g. headless
 screenshot support (sokol) vs not (raylib) — exactly how gfx already handles
 optional draw methods. (This is the same split we lived through fixing sokol
-headless screenshots; it falls straight out of the contract.)
+headless screenshots; it falls straight out of the contract.) These optionals
+get a **declarative mirror** — a `.capabilities` set in the provider manifest
+that the resolver checks *before* the build (see *Opening the ecosystem —
+capability negotiation*) — so a missing optional surfaces as an early,
+project-level error instead of a deep `@compileError` in generated code.
 
 ### Context is package-private, at comptime — NOT in the contract
 
@@ -215,8 +226,10 @@ a new package — 7 of 8 contracts already live there.)
   native deps pulled into gfx).
 - Promote `Backend(Impl)` from implicit/duck-typed → a **versioned, documented
   public contract**: a written spec, a `comptime assertBackend(Impl)` that fails
-  loudly, `mock_backend` as the reference/conformance impl, semver discipline
-  (adding a required `Impl` decl = breaking for every backend).
+  loudly, `mock_backend` as the reference impl, and a **shared conformance suite**
+  parameterized over the provider `Impl` (see *Opening the ecosystem —
+  conformance suites*) that checks *behavior*, not just shape. Semver discipline
+  applies (adding a required `Impl` decl = breaking for every backend).
 - Inherits the **core-diamond** as a first-class cross-repo concern: backends
   import labelle-core for shared types; composed builds must unify core across
   backend + gfx + engine (generalizing the `unifyGfxSubpackageCore` fix from the
@@ -335,7 +348,8 @@ entry — the same shape as `labelle-audio`'s shared mixer over pluggable device
 4. **GPU-context pilot — bgfx-Android.** Distinct from step 3: this is the only
    pilot that can exercise the `TERM_WINDOW`+`INIT_WINDOW` surface-recreation
    cycle (bgfx-Android already has the `init_done` one-shot guard for it). It is
-   where `contextLost` vs full `deinit`+`init` semantics get decided in practice
+   where the `surfaceLost`/`surfaceRestored` re-upload granularity gets decided
+   in practice (vs overloading `deinit`+`init`)
    — **the Accept-readiness gate** for promoting this RFC out of Draft.
 5. **Open the resolver** — `.backend` accepts a full-stack package *and*
    per-contract overrides (`.{ .render = .bgfx, .audio = .miniaudio }`); the
@@ -415,7 +429,9 @@ pub const GameHooks = struct {
     event:      ?*const fn (*Game, Event) void = null,         // input/resize/close
     suspend_:   ?*const fn (*Game) void = null,                 // mobile backgrounded
     resume_:    ?*const fn (*Game) void = null,                 // mobile foregrounded
-    contextLost:?*const fn (*Game) void = null,                 // GPU surface gone
+    // GPU surface lifecycle — explicit pair, NOT overloaded onto deinit/init
+    surfaceLost:     ?*const fn (*Game) void = null,           // surface gone (TERM_WINDOW); game state survives
+    surfaceRestored: ?*const fn (*Game) void = null,           // surface re-created (INIT_WINDOW) → engine reuploadAssets
 };
 ```
 
@@ -429,7 +445,7 @@ pub const GameHooks = struct {
 | `running` | #1 (isRunning → backend's requestQuit/windowShouldClose) |
 | `event` | #6 (sokol `sokolEvent` forwarding; raylib desktop gamepad pump can stay inside `frame` since it's poll-shaped, not event-shaped) |
 | `suspend_` / `resume_` | bgfx-Android `APP_CMD_PAUSE/STOP` / `RESUME/START` — today these gate `is_resumed` *inside* the backend's loop; promoting them to hooks lets the engine stop ticking scripts during background and re-init GPU state on resume |
-| `contextLost` | bgfx-Android `APP_CMD_TERM_WINDOW` + `INIT_WINDOW` cycle — today the `init_done` one-shot guard keeps engine state alive across surface teardown; `contextLost` + a paired `contextRestored` (or a re-`init` semantics) lets the backend tell the engine "GPU resources are gone, re-upload" without losing game state |
+| `surfaceLost` / `surfaceRestored` | bgfx-Android `APP_CMD_TERM_WINDOW` + `INIT_WINDOW` cycle — today the `init_done` one-shot guard keeps engine state alive across surface teardown. The pair is **explicit, not overloaded onto `deinit`/`init`**: `surfaceLost` = the GPU surface is gone but game state lives; `surfaceRestored` = surface re-created, at which point the engine runs `gpuResourcesInvalidated` → `reuploadAssets` (re-upload textures/atlases through the asset catalog) *without* a `deinit`+`init` cycle |
 
 **Capability differences stay `@hasDecl`-gated** — a backend without
 `suspend_`/`resume_` (desktop) simply leaves them `null`; the entry point's
@@ -453,7 +469,7 @@ bracket are **not** entry-point-shaped — they're per-frame work that today's
 templates splice via `{{...}}` holes. They stay in codegen: the assembler emits
 them *into* the `Game.frame` body (or the backend's frame callback, which is
 what the templates do today). The hook contract only pins the *envelope*
-(init/deinit/frame/event/suspend/resume/contextLost); the per-frame *contents*
+(init/deinit/frame/event/suspend/resume/surfaceLost/surfaceRestored); the per-frame *contents*
 remain the assembler's codegen job. This is the split the POC validated — the
 backend owns the entry-point *shape*, the assembler owns the per-frame *work*.
 
@@ -461,34 +477,34 @@ backend owns the entry-point *shape*, the assembler owns the per-frame *work*.
 
 **Closed by this section:**
 - The full hook surface beyond `frame`: `event`, `suspend_`, `resume_`,
-  `contextLost` are now pinned, each grounded in a concrete today-shipped
-  template behavior (sokol `sokolEvent`, bgfx-Android `APP_CMD_*`).
+  `surfaceLost`/`surfaceRestored` are now pinned, each grounded in a concrete
+  today-shipped template behavior (sokol `sokolEvent`, bgfx-Android `APP_CMD_*`).
 - The screenshot/preview/GUI question: they stay codegen (per-frame *work*),
   not lifecycle hooks (the *envelope*). The hook contract is thinner than a
   first read of "the lifecycle ABI" suggested.
 - Mobile suspend/resume + GPU context-loss: promoted from "the gnarly part"
-  to three concrete optional hooks, each with a documented mapping to the
-  Android `APP_CMD_*` events that already drive bgfx-Android today.
+  to four concrete optional hooks (`suspend_` / `resume_` / `surfaceLost` /
+  `surfaceRestored`), each with a documented mapping to the Android `APP_CMD_*`
+  events that already drive bgfx-Android today. The surface pair is explicit
+  rather than an overloaded `contextLost` so `deinit`/`init` keep their meaning.
 
 **Still open (deliberately):**
-- **`contextLost` vs re-`init` semantics.** bgfx-Android today uses `init_done`
-  (a one-shot) so engine state survives `TERM_WINDOW`+`INIT_WINDOW` *without*
-  re-running init — only the GPU surface is re-created. Whether `contextLost`
-  should trigger a full `deinit`+`init` cycle or a narrower "re-upload GPU
-  resources" hook (mirroring how gfx's asset catalog already gates renders
-  behind `post_load_render_gate` in `labelle-engine/src/game.zig`) needs a
-  **GPU-context pilot** to resolve — and the audio-extraction pilot (step 2
-  of the migration) is structurally *incapable* of exercising this, because
-  audio has zero GPU context. The audio pilot validates extraction mechanics
-  (contract home, versioning, build-graph wiring, lazy deps); it does NOT
-  validate `contextLost` or the surface-recreation cycle. **The GPU-context
-  pilot is bgfx-Android** (migration step 4 — a step distinct from step 3's
-  sokol-desktop conversion, which is screenshot-verifiable but has no
-  surface-loss cycle): it
-  already has the `init_done` one-shot guard for the `TERM_WINDOW`+`INIT_WINDOW`
-  cycle, so it's where `contextLost` vs full `deinit`+`init` semantics get
-  decided in practice. The Accept-readiness gate is on the bgfx-Android pilot,
-  not the audio pilot.
+- **`surfaceRestored` re-upload granularity.** The hook *taxonomy* is now
+  explicit — `surfaceLost`/`surfaceRestored` instead of one overloaded
+  `contextLost`, and the engine-side response is `gpuResourcesInvalidated` →
+  `reuploadAssets` rather than a `deinit`+`init` cycle (so `deinit`/`init` are
+  not overloaded for mobile surface recreation). What the **bgfx-Android pilot**
+  must still pin is the *granularity*: does `surfaceRestored` re-upload the whole
+  asset catalog, or only GPU-resident resources (textures, atlases, render
+  targets) while leaving CPU-side decoded payloads untouched — and does
+  `reuploadAssets` reuse the asset catalog's existing `post_load_render_gate`
+  path in `labelle-engine/src/game.zig` or need a dedicated re-upload pass?
+  bgfx-Android today uses the `init_done` one-shot so game state survives
+  `TERM_WINDOW`+`INIT_WINDOW`. The audio-extraction pilot (step 2) is structurally
+  *incapable* of exercising this — audio has zero GPU context — and sokol-desktop
+  (step 3) has no surface-loss cycle. **The GPU-context pilot is bgfx-Android**
+  (migration step 4), which is where the granularity gets decided in practice.
+  The Accept-readiness gate is on the bgfx-Android pilot, not the audio pilot.
 - **The event type.** `Event` is a tagged union (input keys/mouse/touch/resize/close).
   Today sokol forwards the raw `sapp.Event` and the input module switches on it;
   raylib polls. The contract needs a backend-neutral `Event` enum + payload,
@@ -496,9 +512,10 @@ backend owns the entry-point *shape*, the assembler owns the per-frame *work*.
   input module's parsed shape. The latter is less work and matches how
   `AudioInterface` already lives in core.
 - **iOS.** Sokol mobile targets Android + iOS; bgfx-Android has no iOS sibling
-  today. The `suspend_`/`resume_`/`contextLost` hooks are shaped to cover iOS
-  too (UIKit's `applicationDidEnterBackground`/`willEnterForeground` + Metal
-  device-loss), but no template exercises it yet. Pin when an iOS backend lands.
+  today. The `suspend_`/`resume_`/`surfaceLost`/`surfaceRestored` hooks are
+  shaped to cover iOS too (UIKit's `applicationDidEnterBackground`/
+  `willEnterForeground` + Metal device-loss), but no template exercises it yet.
+  Pin when an iOS backend lands.
 
 ## Q#4 answer — gamepad as an input-extension
 
@@ -1279,8 +1296,13 @@ needs to wire the build graph generically:
 // backend.labelle — the build-side manifest (extends plugin.labelle)
 .{
     .name = "sokol",
+    .id = "labelle.sokol",  // canonical namespaced ID (see "Provider identity")
     .manifest_version = 2,  // v2 adds the build-side fields
     .convention_dirs = &.{},  // back-compat with v1 (unused by backends)
+    .capabilities = &.{       // declared up front; resolver checks before build
+        .screenshots, .compressed_textures, .fonts, .gamepad_polling,
+        .raw_gui_adapter, .headless, .surface_loss,
+    },
 
     // ── Build-side ──
     .modules = .{
@@ -1339,7 +1361,13 @@ collapses to a single generic path:
 1. **Resolve** the provider(s) via the existing `cache.resolvePlugin`
    rail (name → repo → cached path). The closed `Backend` enum becomes
    shorthand for official providers (`.sokol` → the `labelle-backends`
-   monorepo's sokol provider).
+   monorepo's sokol provider, canonical ID `labelle.sokol`). **Validate
+   identity + capabilities before wiring**: error on canonical-ID collision
+   (or a third party claiming `labelle.*`), and check each resolved provider's
+   declared `.capabilities` against the project's required set (explicit
+   `.requires` + capabilities derived from platform/target/GUI) — a missing
+   capability is an early, readable error here, not a deep `@compileError`
+   later (see *Opening the ecosystem*).
 2. **Emit `b.dependency`** for each resolved provider module the project
    declared (`.render`, `.window`, `.audio`, `.input`), pulling the
    modules named in `.modules`.
@@ -1398,9 +1426,19 @@ pub fn postWire(b: *std.Build, ctx: HookContext) void {
 }
 ```
 
-This is the escape hatch — the manifest covers the 90% case (modules +
-artifacts + system libs + frameworks + platform matrix); the build hook
-covers the 10% that needs to run build-graph logic. The `pre_wire`/`post_wire`
+This is the escape hatch — the **typed manifest covers ~95%** (modules +
+artifacts + system libs + frameworks + capabilities + platform matrix); the
+build hook covers the ~5% that needs to run build-graph logic. To keep the hook
+from degrading into an *arbitrary backend build script*, it is **constrained by
+contract**: `HookContext` and `DependencyOptions` are **versioned** types (they
+bump with `manifest_version`, and the assembler asserts the provider targets a
+compatible version — same discipline as the runtime contracts); the hook may
+read only the **documented** `ctx` fields and may only construct build-graph
+nodes (`b.dependency`, `linkLibrary`, module wiring). No filesystem access
+outside the provider's own package, no network, and shell-outs limited to the
+platform-packager steps the manifest already models (emcc). A provider that
+needs more than the documented surface is a signal to **extend the manifest**,
+not the hook. The `pre_wire`/`post_wire`
 split is necessary because some dynamic wiring (sokol's `with_imgui`,
 bgfx's `gui_enabled`) must affect `b.dependency`'s options struct *before*
 the artifact is built, while other wiring (NDK sysroot paths, emcc
@@ -1465,16 +1503,134 @@ fetches sokol's C source when a project actually resolves `.render =
   headless-screenshot-verifiable one, same as Q#1's pilot), then delete
   the switch.
 
+## Opening the ecosystem — identity, capabilities, conformance
+
+Closing the backend enum turns three things that were implicit (safe only
+*because* the provider set was closed and toolkit-owned) into explicit contracts
+the moment a stranger can publish a provider. The review's framing — *a typed
+provider graph + capabilities + conformance, with hooks as a minimal escape
+hatch* — is the spine here. None of this blocks the pilots; all of it is
+required before the resolver opens to third parties (migration step 5).
+
+### Provider identity & collision rules
+
+Today `.sokol` / `.bgfx` are enum tags — globally unique by construction. Once
+`.render = .{ .repo = "github:someone/labelle-vulkan" }` is legal, **bare names
+collide**: two vendors can each ship a `vulkan` provider.
+
+Each provider declares a **canonical ID** in its manifest — a reverse-namespaced
+`<namespace>.<name>`:
+- **Official** providers live under the reserved `labelle.` namespace:
+  `labelle.sokol`, `labelle.bgfx`, `labelle.miniaudio` (the `labelle-backends`
+  monorepo owns it).
+- **Third-party**: `<vendor>.<name>` — `someone.vulkan`, `acme.sokol-fork`.
+
+Resolution rules:
+- The closed enum tags are **shorthands for `labelle.*` IDs only**
+  (`.render = .sokol` ⇒ `labelle.sokol`). A third-party provider is never
+  reachable by a bare tag — it is named by repo (which carries its ID) or by
+  full canonical ID once installed.
+- The assembler **errors on collision at resolve time**: two resolved providers
+  claiming the same canonical ID, or a third-party manifest claiming a
+  `labelle.*` ID, is a hard error — not a silent last-wins. This is the
+  provider-graph analog of the core-diamond unification check.
+- The **ID is the stable identity** (not the repo URL or cache path) used by the
+  GUI-bridge name-match (Q#6) and the capability table below, so a provider can
+  move repos without breaking bridges that target it.
+
+This reuses the plugin system's resolve-by-name rail (`resolvePlugin`); identity
+just makes the key explicit and namespaced instead of assuming a closed set.
+
+### Capability negotiation
+
+`@hasDecl`-gating answers "*can the backend's code call this?*" at comptime — but
+a project author hits that as a deep compile error in generated code, long after
+the wrong provider was chosen. **Capabilities** move the check **forward**, to
+resolve time, with a project-level diagnostic.
+
+Each provider declares a `.capabilities` set in its manifest; the assembler
+checks the project's *required* capabilities against the *resolved* providers'
+*declared* capabilities **before emitting the build graph**:
+
+```zig
+.capabilities = &.{
+    .screenshots,          // takeScreenshot() — headless CI, preview
+    .compressed_textures,  // KTX2/Basis decode path
+    .fonts,                // decodeFont / uploadFontAtlas
+    .gamepad_polling,      // input provides a gamepad source
+    .raw_gui_adapter,      // in-backend imgui adapter (Q#6), not just the C++ bridge
+    .headless,             // can run with no window surface
+    .surface_loss,         // implements surfaceLost / surfaceRestored (mobile)
+},
+```
+
+The project's required set is **explicit** (`.requires = &.{ .screenshots }` for
+a CI screenshot target) *or* **derived** by the assembler: a `.platform =
+.android` build requires `.surface_loss`; a GUI plugin needing an in-backend
+adapter requires `.raw_gui_adapter` from the render provider; a `--screenshot`
+target requires `.screenshots`. The error is the payoff:
+
+```
+error: render provider 'labelle.bgfx' does not support capability 'screenshots'
+       required by the headless screenshot target.
+       providers with 'screenshots': labelle.sokol, labelle.null
+```
+
+instead of a `@compileError("window has no takeScreenshot")` from deep inside
+generated `main.zig`. Capabilities are the **declarative mirror** of the
+`@hasDecl` optionals: the optional decl is the *mechanism*, the capability flag
+is the *advertisement* the resolver reads without compiling the provider.
+
+### Conformance suites — behavior, not just shape
+
+`assertBackend(Impl)` + `@hasDecl` check a provider has the *right shape* (decls
+exist, signatures match). They do **not** check it *behaves* correctly — that
+`uploadTexture` round-trips an image, that the input event mapping is consistent,
+that `surfaceRestored` actually re-uploads. With the provider set opening to
+authors the toolkit doesn't control, behavior matters more than shape.
+
+Each contract ships a **shared conformance suite** in `labelle-core` (next to the
+contract + its `mock_backend` reference impl), parameterized over the provider
+`Impl`:
+
+| Contract | Conformance suite checks |
+|---|---|
+| render — draw | the `mock_backend` records draw calls; the suite asserts the call sequence for a known scene matches a golden trace |
+| render — loader | decode→upload→render round-trips a known image to a known framebuffer; the compressed-texture path matches the uncompressed reference within tolerance; font atlas bakes the expected glyph metrics |
+| audio — loader | `decodeAudio` of a known WAV yields the expected sample count / rate / channels; `uploadSound`→`unloadSound` is leak-free under the test allocator |
+| input | a scripted event stream maps to the expected engine-level input state (key down/up edges, mouse/touch coords, gamepad axes) |
+| window lifecycle | `init`→`frame`*→`deinit` ordering; on a `surface_loss`-capable provider, `surfaceLost`→`surfaceRestored` preserves game state and re-uploads GPU resources |
+
+A provider's CI runs `zig build conformance` (a generated test target that
+instantiates the suites over its `Impl`); the `labelle-backends` monorepo runs
+all of them. A provider is **conformant iff it passes the suite for every
+capability it advertises** — which is what makes the capability table
+*trustworthy*: `.screenshots` then means "passed the screenshot conformance
+test", not merely "has a `takeScreenshot` decl".
+
+### Why this keeps hooks minimal
+
+These three together are what let the build hook stay a **~5% escape hatch**
+(above) rather than the integration surface: identity + the typed manifest
+describe *what* a provider is and *what* it can do, declaratively; conformance
+*proves* it; the hook only runs the residual build-graph logic the manifest
+can't express statically — with a versioned, documented `HookContext` and no
+licence for arbitrary work. That is the "typed provider graph + capabilities +
+conformance + minimal escape hatches" shape the review asks for.
+
 ## Open questions
 
 1. ~~**The `Game`-lifecycle ABI**~~ — **answered above**. The hook surface is
    `init` / `deinit` / `frame(dt)` / `running` / `event` / `suspend_` /
-   `resume_` / `contextLost` (last four `@hasDecl`/null-gated). Per-frame work
+   `resume_` / `surfaceLost` / `surfaceRestored` (last five `@hasDecl`/null-gated).
+   The surface pair is explicit (not an overloaded `contextLost`), so
+   `deinit`/`init` aren't reused for mobile surface recreation; the engine
+   responds via `gpuResourcesInvalidated` → `reuploadAssets`. Per-frame work
    (screenshot, preview, GUI, `setScreenSize`/`setDesignSize`) stays codegen,
-   not lifecycle. Residual: `contextLost` semantics + the `Event` type shape —
-   gated on the **bgfx-Android pilot** (migration step 4), which exercises the
-   `TERM_WINDOW`+`INIT_WINDOW` surface-recreation cycle. The audio pilot
-   (step 2) and sokol-desktop conversion (step 3) validate extraction
+   not lifecycle. Residual: the `surfaceRestored` re-upload *granularity* + the
+   `Event` type shape — gated on the **bgfx-Android pilot** (migration step 4),
+   which exercises the `TERM_WINDOW`+`INIT_WINDOW` surface-recreation cycle. The
+   audio pilot (step 2) and sokol-desktop conversion (step 3) validate extraction
    mechanics but have no surface-loss cycle to exercise.
 2. ~~**Where the contracts live + versioning**~~ — **answered above**. The
    ABI package IS `labelle-core` (7 of 8 contracts already live there).
@@ -1518,3 +1674,22 @@ fetches sokol's C source when a project actually resolves `.render =
    `render_interface` GUIs (clay, simple-*) are unaffected — no bridge, no
    change. Residual: the name-match predicate home (GUI manifest vs provider
    manifest), the sokol-imgui adapter module relocation, multiple GUI plugins.
+7. **Provider identity & collisions** *(added rev 13)* — **answered above**.
+   Each provider declares a canonical `<namespace>.<name>` ID; `labelle.*` is
+   reserved for the official monorepo and is what the enum shorthands resolve to;
+   the assembler errors on ID collision and on a third party claiming `labelle.*`.
+   The ID is the stable key for GUI bridges + capabilities. Residual: the on-disk
+   install registry for resolving a bare canonical ID (vs a repo URL).
+8. **Capability negotiation** *(added rev 13)* — **answered above**. Providers
+   declare a `.capabilities` set; the assembler checks project-required
+   capabilities (explicit `.requires` + derived from platform/target/GUI) against
+   the resolved providers *before* emitting the build graph, erroring with a
+   project-level message instead of a deep `@compileError`. Capabilities are the
+   declarative mirror of the `@hasDecl` optionals. Residual: the full
+   derived-requirement table (which platforms/targets imply which capabilities).
+9. **Conformance suites** *(added rev 13)* — **answered above**. Each contract
+   ships a shared conformance suite in `labelle-core` (next to its `mock_backend`),
+   parameterized over the provider `Impl`; a provider is "conformant" iff it
+   passes the suite for every capability it advertises — which is what makes the
+   capability table trustworthy. Residual: the golden-trace fixtures for the
+   draw-call and input-mapping suites.
