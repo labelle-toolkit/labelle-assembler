@@ -208,11 +208,11 @@ pub fn mixOutput(output: []f32, frame_count: usize) void {
         }
         done += chunk;
     }
-
-    // Zero any tail we didn't mix (a partial trailing sample when output.len is
-    // odd, or the remainder when the caller's buffer is larger than frame_count)
-    // so the host never reads uninitialized samples — silence, not garbage.
-    if (mix_samples < output.len) @memset(output[mix_samples..], 0);
+    // No partial-tail handling needed: `mix_samples` is frame-aligned (even), so
+    // the loop writes all of `[0..mix_samples]` with no early break, and the
+    // caller owns `[mix_samples..]` per this fn's "only writes the frames asked
+    // for" contract (Gemini's odd-sample break can't occur now that frames are
+    // clamped before the multiply).
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
