@@ -289,6 +289,17 @@ pub fn build(b: *std.Build) void {
     audio_mod.addImport("sokol", sokol_mod);
     audio_mod.addIncludePath(b.path("src"));
 
+    // Shared audio engine (Phase 2 of the pluggable-backends RFC). The WAV
+    // decode + PCM mixer + slot management this backend used to reimplement now
+    // live in `labelle-audio`; `src/audio.zig` instantiates
+    // `labelle_audio.Mixer(SokolSink)`, where `SokolSink` (src/audio/sink.zig)
+    // is the sokol_audio device adapted to the shared **f32** `DeviceSink`
+    // contract (sokol_audio's stream callback is f32, so the mixer renders
+    // straight into it — v0.3.0's f32 path). The generated app build must also
+    // wire this dep onto the `audio` module (mirrors bgfx — see report).
+    const labelle_audio_dep = b.dependency("labelle_audio", .{ .target = target, .optimize = optimize });
+    audio_mod.addImport("labelle-audio", labelle_audio_dep.module("labelle-audio"));
+
     // Mirror the emsdk sysroot include from gfx_mod: stb_vorbis and
     // dr_wav both pull in <stdlib.h> / <string.h> / <math.h> which
     // require emscripten's sysroot when cross-compiling to
@@ -333,19 +344,14 @@ pub fn build(b: *std.Build) void {
     // ── Unit tests ──────────────────────────────────────────────────
     const test_step = b.step("test", "Run sokol backend unit tests");
 
-    // Pure state-transition tests for audio_slots.zig. No sokol
-    // import, so this runs anywhere — no libasound/libGL/libX11
-    // system deps needed. This is the regression lock for the #10
-    // unloaded-slot leak fix.
+    // The audio slot/mixer/decode state-transition tests that used to live in
+    // `src/audio_slots.zig` (the #10 unloaded-slot leak lock, #110/#111 slot
+    // recycling) moved into the shared `labelle-audio` package along with the
+    // mixer + slot management itself (Phase 2 fan-out). They run under
+    // `labelle-audio`'s own `zig build test`; the sokol adapter's thin
+    // forwarding + the kept OGG/WAV decoder are exercised by `audio_compile_check`
+    // / `test-host` below.
     const host_target = b.resolveTargetQuery(.{});
-    const slots_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/audio_slots.zig"),
-            .target = host_target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(slots_tests).step);
 
     // Run the ASTC container-parsing tests (#341). `gfx/astc.zig` is pure byte
     // parsing with no sokol dependency, so it EXECUTES on the host (magic
@@ -442,5 +448,4 @@ pub fn build(b: *std.Build) void {
     );
     test_host_step.dependOn(&b.addRunArtifact(audio_compile_check).step);
     test_host_step.dependOn(&b.addRunArtifact(gfx_compile_check).step);
-    test_host_step.dependOn(&b.addRunArtifact(slots_tests).step);
 }
