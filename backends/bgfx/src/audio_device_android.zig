@@ -13,9 +13,12 @@
 
 const std = @import("std");
 
-/// Signature of the mixer the device drives on the audio thread. Matches
-/// `audio.mixAudio(output: []i16, frames_requested: u32)`.
-pub const MixFn = *const fn (output: []i16, frames_requested: u32) void;
+/// Signature of the mixer the device drives on the audio thread — the shared
+/// `labelle-audio` device-sink callback (`out: []i16, channels: u8`). The
+/// AAudio stream is always stereo, so it passes `channels = 2` and `out.len =
+/// frames * 2`. Importing the shared type makes the `DeviceSink` contract
+/// enforce the signature at the `Mixer(...)` instantiation site.
+pub const MixFn = @import("labelle-audio").MixCallback;
 
 const DEVICE_RATE: i32 = 48000;
 const DEVICE_CHANNELS: i32 = 2;
@@ -50,7 +53,9 @@ fn dataCallback(_: ?*AAudioStream, _: ?*anyopaque, audio_data: ?*anyopaque, num_
     const frames: u32 = @intCast(@max(num_frames, 0));
     const samples: usize = @as(usize, frames) * @as(usize, @intCast(DEVICE_CHANNELS));
     const out: [*]i16 = @ptrCast(@alignCast(audio_data));
-    if (mix_fn) |m| m(out[0..samples], frames) else @memset(out[0..samples], 0);
+    // Shared device-sink contract: stereo device → `channels = 2`, buffer is
+    // `frames * 2` interleaved i16; the mixer recovers frames from `out.len`.
+    if (mix_fn) |m| m(out[0..samples], 2) else @memset(out[0..samples], 0);
     _ = frames_mixed.fetchAdd(frames, .monotonic);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }

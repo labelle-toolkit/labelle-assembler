@@ -62,6 +62,15 @@ pub fn build(b: *std.Build) void {
     const zbgfx_mod = zbgfx_dep.module("zbgfx");
     const bgfx_artifact = zbgfx_dep.artifact("bgfx");
 
+    // Shared audio engine (pluggable-backends RFC, Phase 2). `src/audio.zig`
+    // now forwards to `labelle_audio.Mixer(device_backend)`; the device modules
+    // (`audio_device.zig` / `audio_device_android.zig`) satisfy its `DeviceSink`
+    // contract. Wired into the `audio` module (and the host audio test module)
+    // under the `labelle-audio` import key. Resolved on every target — the
+    // mixer/decoder are pure Zig and compile for Android unchanged.
+    const labelle_audio_dep = b.dependency("labelle_audio", .{ .target = target, .optimize = optimize });
+    const labelle_audio_mod = labelle_audio_dep.module("labelle-audio");
+
     // zglfw is desktop-only — it doesn't build for Android. Only fetch
     // the zglfw dependency (and its artifact) off the Android path so the
     // Android build graph never pulls it in. The window/input modules are
@@ -267,6 +276,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // Shared WAV decode + PCM mixer (Phase 2). `audio.zig` instantiates
+    // `labelle_audio.Mixer(device_backend)` and forwards every public fn to it.
+    audio_mod.addImport("labelle-audio", labelle_audio_mod);
     if (!is_android) {
         // ── miniaudio playback device (#297) — desktop only ─────────
         wireMiniaudio(b, audio_mod, target.result.os.tag);
@@ -520,6 +532,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // Wire the shared mixer into the host test module too (resolved for the
+    // host target so the run-test executes natively).
+    const labelle_audio_host_dep = b.dependency("labelle_audio", .{ .target = host_target, .optimize = optimize });
+    audio_test_mod.addImport("labelle-audio", labelle_audio_host_dep.module("labelle-audio"));
     wireMiniaudio(b, audio_test_mod, host_target.result.os.tag);
     const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
     test_step.dependOn(&b.addRunArtifact(audio_tests).step);

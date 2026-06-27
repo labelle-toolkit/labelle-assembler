@@ -46,6 +46,18 @@
             .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.16.1.tar.gz",
             .hash = "labelle_core-1.16.1-OauRcDNUBAA0n4uPvKp3HETPvMZprHL_kRyUERdj4xqx",
         },
+        // Shared audio engine (pluggable-backends RFC, Phase 2). The bgfx
+        // backend's `src/audio.zig` collapses its duplicated WAV decode + PCM
+        // mixer onto `labelle_audio.Mixer(Sink)`, keeping only its real OS
+        // device code (miniaudio desktop / AAudio Android) adapted to the
+        // shared `DeviceSink` contract. In-tree sibling checkout (own-build.zig
+        // sub-package), reached via a relative path like the other shared
+        // sub-packages above. The generated app build must also wire this dep
+        // onto the `audio` module (see CLAUDE notes / report).
+        .labelle_audio = .{
+            .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.2.1.tar.gz",
+            .hash = "labelle_audio-0.2.1-QQRmYI4eAQDChv7DVK74-HPS9_J2bJw5ZDKFOazffYjU",
+        },
     },
     .paths = .{
         "build.zig",

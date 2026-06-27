@@ -24,9 +24,13 @@ const ma = @cImport({
     @cInclude("miniaudio.h");
 });
 
-/// Signature of the mixer the device drives on the audio thread. Matches
-/// `audio.mixAudio(output: []i16, frames_requested: u32)`.
-pub const MixFn = *const fn (output: []i16, frames_requested: u32) void;
+/// Signature of the mixer the device drives on the audio thread — the shared
+/// `labelle-audio` device-sink callback (`out: []i16, channels: u8`). The
+/// device is always stereo, so it passes `channels = 2` and `out.len =
+/// frames * 2`; the mixer derives the frame count from `out.len`. Importing the
+/// shared type (rather than redeclaring it) makes the `DeviceSink` contract
+/// enforce the signature at the `Mixer(...)` instantiation site.
+pub const MixFn = @import("labelle-audio").MixCallback;
 
 const DEVICE_SAMPLE_RATE: u32 = 48000;
 const DEVICE_CHANNELS: u32 = 2;
@@ -75,7 +79,16 @@ fn deviceDataCallback(
         std.log.info("audio: device callback firing (first {d} frames mixed)", .{frames});
     }
 
-    if (mix_fn) |mix| mix(out[0..sample_count], frames);
+    // Shared device-sink contract: the device knows it's stereo, so it passes
+    // `channels = 2` and a buffer of `frames * 2` interleaved i16 samples; the
+    // mixer recovers the frame count from `out.len`.
+    if (mix_fn) |mix| {
+        mix(out[0..sample_count], 2);
+    } else {
+        // No mixer wired yet — emit silence, not whatever stale samples the
+        // device buffer happens to hold (matches the AAudio backend's @memset).
+        @memset(out[0..sample_count], 0);
+    }
 }
 
 /// Open + start the playback device on first use, wiring `mix` as the
