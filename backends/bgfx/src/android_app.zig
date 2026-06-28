@@ -8,7 +8,7 @@
 ///
 ///   * the activity lifecycle (`APP_CMD_*`): create/destroy the bgfx
 ///     surface on `INIT_WINDOW`/`TERM_WINDOW`, honor resume/pause, and
-///     translate `app.destroyRequested` into `window.windowShouldClose`.
+///     translate `app.destroyRequested` into `window.shouldQuit`.
 ///   * touch input (`AInputEvent`/`AMotionEvent_*`): fed into `input.zig`
 ///     as pointer-down + x/y so the engine sees touch as mouse-like
 ///     pointer input (mirrors the desktop mouse path).
@@ -330,7 +330,7 @@ var native_activity: ?*ANativeActivity = null;
 /// Optional per-frame tick callback, set by the game's entry before it
 /// hands control to the shell. Called once per loop iteration while the
 /// surface is live and the activity is resumed. Mirrors the desktop
-/// `while (!windowShouldClose()) { beginDrawing(); ...; endDrawing(); }`
+/// `while (!shouldQuit()) { beginFrame(); ...; endFrame(); }`
 /// loop, which the game owns on desktop; on Android the shell owns the
 /// loop and calls back into the game here.
 pub const TickFn = *const fn () callconv(.c) void;

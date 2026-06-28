@@ -400,7 +400,7 @@ fn update() void {
 // ── Draw ───────────────────────────────────────────────────────────────
 
 fn draw() void {
-    window.beginDrawing();
+    window.beginFrame();
     window.clearBackground(30, 30, 46, 255);
 
     // Advance video playback (decodes + uploads a frame when due).
@@ -450,7 +450,7 @@ fn draw() void {
     // ── Gamepad overlay (lights up live when a controller is connected) ──
     gamepad_overlay.draw(SCREEN_W_F, SCREEN_H_F);
 
-    window.endDrawing();
+    window.endFrame();
 }
 
 fn drawGizmos() void {
@@ -623,7 +623,7 @@ pub fn main() void {
     }
 
     // -- Main loop
-    while (!window.windowShouldClose()) {
+    while (!window.shouldQuit()) {
         // Quit on escape
         if (input.isKeyDown(KEY_ESCAPE)) break;
 

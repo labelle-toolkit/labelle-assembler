@@ -5,6 +5,8 @@ const zbgfx = @import("zbgfx");
 const bgfx = zbgfx.bgfx;
 const gfx = @import("gfx");
 const platform = @import("platform.zig");
+/// labelle-core, for the comptime window-contract conformance gate below.
+const core = @import("labelle-core");
 
 /// Android has no GLFW (zglfw is desktop-only). The Android windowing
 /// path is fed an `ANativeWindow*` by the NativeActivity glue at runtime
@@ -19,6 +21,17 @@ const is_android = builtin.target.os.tag == .linux and
 /// to an empty namespace so any accidental desktop-only reference fails
 /// at compile time rather than dragging in the zglfw module.
 const glfw = if (is_android) struct {} else @import("zglfw");
+
+// Prove this module satisfies labelle-core's canonical window contract (#386
+// Phase 3): `width`/`height`/`frameDuration`/`requestQuit` (required) plus the
+// loop-model `shouldQuit` and optional display/screenshot toggles. Fails the
+// build with a named-decl list if any required method is missing or misnamed —
+// the formal replacement for the prior raylib-dialect names. bgfx IS a loop
+// backend: it declares `shouldQuit`, so `core.Window(@This()).ownsLoop()` is
+// true and the shared run-loop templates gate on it.
+comptime {
+    core.assertWindow(@This());
+}
 
 pub const ConfigFlags = struct {
     window_hidden: bool = false,
@@ -61,21 +74,21 @@ var clear_color: u32 = 0x1e1e2eff; // dark background RGBA
 /// On Android `screen_w/h` are the `ANativeWindow` surface size handed over at
 /// `INIT_WINDOW` — already physical — which can differ from the project's
 /// configured default (e.g. a 2000x1200 tablet surface vs. an 800x600 config).
-/// The generated Android entry reads `getScreenHeight()` post-init so the
+/// The generated Android entry reads `height()` post-init so the
 /// engine's coordinate mapping matches the actual surface rather than the
 /// config.
 // Return the LIVE framebuffer size, not the cached `screen_w/h`. The
-// generated frame loop calls `setScreenSize(getScreenWidth(), ...)` at the
-// top of the frame, before `beginDrawing`'s `ensureSurface()` reconciles
+// generated frame loop calls `setScreenSize(width(), ...)` at the
+// top of the frame, before `beginFrame`'s `ensureSurface()` reconciles
 // the cache — so reading the cache here would feed gfx the *previous*
 // physical size on the frame a resize/DPI/fullscreen change lands, while
 // the bgfx viewport already matched the new framebuffer (one-frame
 // aspect-fit mismatch). Querying live keeps gfx and the surface in step.
 // On Android `framebufferSize()` returns the cached native-surface dims.
-pub fn getScreenWidth() i32 {
+pub fn width() i32 {
     return framebufferSize()[0];
 }
-pub fn getScreenHeight() i32 {
+pub fn height() i32 {
     return framebufferSize()[1];
 }
 
@@ -97,12 +110,12 @@ fn framebufferSize() [2]i32 {
 
 /// Reconcile the bgfx backbuffer with the current physical framebuffer size.
 ///
-/// Called once per frame from `beginDrawing`. If the framebuffer changed since
+/// Called once per frame from `beginFrame`. If the framebuffer changed since
 /// the last reconcile (a DPI move between monitors, a resize, or a
 /// fullscreen/windowed switch) and is non-zero, update the cached `screen_w/h`
 /// and `bgfx.reset` the swapchain to the new physical size. The `> 0` guard
 /// skips minimized windows (a 0-size reset is invalid). The viewport rect is
-/// set by `beginDrawing` right after this, so we don't touch `setViewRect` here.
+/// set by `beginFrame` right after this, so we don't touch `setViewRect` here.
 fn ensureSurface() void {
     const fb = framebufferSize();
     if (fb[0] > 0 and fb[1] > 0 and (fb[0] != screen_w or fb[1] != screen_h)) {
@@ -132,14 +145,14 @@ pub fn setConfigFlags(flags: ConfigFlags) void {
     window_hidden = flags.window_hidden;
 }
 
-pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
-    screen_w = width;
-    screen_h = height;
+pub fn initWindow(w: i32, h: i32, title: [:0]const u8) void {
+    screen_w = w;
+    screen_h = h;
 
     if (is_android) {
-        initWindowAndroid(width, height);
+        initWindowAndroid(w, h);
     } else {
-        initWindowDesktop(width, height, title);
+        initWindowDesktop(w, h, title);
     }
 }
 
@@ -148,13 +161,13 @@ pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
 /// `nwh` is null and bgfx init will fail gracefully — phase 2 only proves
 /// the plumbing compiles. bgfx selects the GLES/Vulkan renderer for
 /// Android from `RendererType.Count` (auto).
-fn initWindowAndroid(width: i32, height: i32) void {
+fn initWindowAndroid(w: i32, h: i32) void {
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
 
     init.type = .Count; // auto-select renderer (GLES/Vulkan on Android)
-    init.resolution.width = @intCast(width);
-    init.resolution.height = @intCast(height);
+    init.resolution.width = @intCast(w);
+    init.resolution.height = @intCast(h);
     init.resolution.reset = current_reset;
 
     // On Android the native window handle is the `ANativeWindow*` handed
@@ -171,11 +184,11 @@ fn initWindowAndroid(width: i32, height: i32) void {
     _ = bgfx.init(&init);
 
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
-    bgfx.setViewRect(0, 0, 0, @intCast(width), @intCast(height));
+    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
 }
 
 /// Desktop init path: GLFW window + bgfx, native handle per OS.
-fn initWindowDesktop(width: i32, height: i32, title: [:0]const u8) void {
+fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     glfw.init() catch return;
 
     // Tell GLFW not to create an OpenGL context — bgfx manages its own
@@ -191,8 +204,8 @@ fn initWindowDesktop(width: i32, height: i32, title: [:0]const u8) void {
     if (window_hidden) glfw.windowHint(.visible, false);
 
     glfw_window = glfw.createWindow(
-        @intCast(width),
-        @intCast(height),
+        @intCast(w),
+        @intCast(h),
         title,
         null,
         null,
@@ -281,7 +294,7 @@ pub fn closeWindow() void {
     glfw_window = null;
 }
 
-pub fn windowShouldClose() bool {
+pub fn shouldQuit() bool {
     if (is_android) {
         // The Android activity lifecycle (onDestroy) drives shutdown, not
         // a per-frame close flag. Phase 3 (#302) wires the real signal;
@@ -296,11 +309,11 @@ pub fn windowShouldClose() bool {
 
 /// Forwarded from the desktop loop when `game.quit()` flips the engine's
 /// `running` flag (e.g. the menu Exit button). Sets GLFW's close flag so the
-/// next `windowShouldClose()` exits the loop — the engine keeps `quit()`
+/// next `shouldQuit()` exits the loop — the engine keeps `quit()`
 /// backend-agnostic (it only flips `running`), so without this the bgfx loop
 /// only ever exited on the window's own close button and Exit did nothing.
 /// Mirrors the sokol backend's `sapp.requestQuit`. Android shutdown is driven
-/// by the activity lifecycle, not this flag (see `windowShouldClose`).
+/// by the activity lifecycle, not this flag (see `shouldQuit`).
 pub fn requestQuit() void {
     if (is_android) return;
     if (glfw_window) |win| win.setShouldClose(true);
@@ -432,8 +445,8 @@ pub fn isFullscreen() bool {
 /// (`getSize`/`getPos`), and `setMonitor` takes the monitor's video `mode`
 /// dimensions — both correct in GLFW's coordinate space. The resulting
 /// PHYSICAL framebuffer change is picked up by `ensureSurface()` on the next
-/// `beginDrawing` (the frame loop drains this fullscreen request before
-/// `beginDrawing` in the same frame), which resets the bgfx swapchain to the
+/// `beginFrame` (the frame loop drains this fullscreen request before
+/// `beginFrame` in the same frame), which resets the bgfx swapchain to the
 /// new framebuffer size — so no resize is done here.
 pub fn setFullscreen(on: bool) void {
     if (is_android) return;
@@ -471,7 +484,7 @@ pub fn setVsync(on: bool) void {
     }
 }
 
-pub fn beginDrawing() void {
+pub fn beginFrame() void {
     const input = @import("input");
     input.newFrame();
     // Reconcile the swapchain with the current physical framebuffer size
@@ -497,14 +510,14 @@ pub fn beginDrawing() void {
 const INVALID_HANDLE: u16 = std.math.maxInt(u16);
 
 /// Pending screenshot path, set by `takeScreenshot` and consumed by the
-/// next `endDrawing`. We COPY the caller's path into this static buffer
-/// rather than stash the slice: `endDrawing` runs a frame later, so a
+/// next `endFrame`. We COPY the caller's path into this static buffer
+/// rather than stash the slice: `endFrame` runs a frame later, so a
 /// caller passing a stack/arena-temporary string would otherwise leave a
 /// dangling pointer.
 var pending_screenshot_buf: [1024:0]u8 = undefined;
 var has_pending_screenshot: bool = false;
 
-pub fn endDrawing() void {
+pub fn endFrame() void {
     // Queue the backbuffer capture (if requested) BEFORE the frame swap so
     // bgfx fulfils it for THIS frame's content — the scene + imgui overlay
     // just submitted. Requesting after `bgfx.frame()` (a separate empty
@@ -529,8 +542,8 @@ pub fn endDrawing() void {
 ///
 /// IMPORTANT: the request must be queued before the frame swap that
 /// presents the content. The frame loop calls `takeScreenshot` after
-/// `g.render()` + the GUI draw but on the SAME iteration whose `endDrawing`
-/// then does the swap — so we just stash the path and let `endDrawing`
+/// `g.render()` + the GUI draw but on the SAME iteration whose `endFrame`
+/// then does the swap — so we just stash the path and let `endFrame`
 /// issue the request right before `bgfx.frame()`. (Calling
 /// `requestScreenShot` here followed by our own `bgfx.frame()` would swap
 /// an empty, content-less frame and capture that instead — the cause of
@@ -540,7 +553,7 @@ pub fn endDrawing() void {
 /// yields `/tmp/shot.tga`.
 ///
 /// The path is COPIED into a static buffer (consumed a frame later in
-/// `endDrawing`), so a caller may pass a temporary string safely.
+/// `endFrame`), so a caller may pass a temporary string safely.
 pub fn takeScreenshot(path: [:0]const u8) void {
     if (path.len >= pending_screenshot_buf.len) {
         std.log.err("bgfx screenshot path too long (max {d} bytes): {s}", .{ pending_screenshot_buf.len - 1, path });

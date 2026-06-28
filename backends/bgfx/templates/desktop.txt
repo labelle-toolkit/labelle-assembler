@@ -61,7 +61,7 @@ const BackendGfxType = @import("backend_gfx");
     var screenshot_req: ?engine.ScreenshotRequest = engine.requestedScreenshot();
     const loop_start_ns: i128 = engine.nowNs();
 
-    while (!window.windowShouldClose()) {
+    while (!window.shouldQuit()) {
         // Honor `game.quit()` (e.g. the menu Exit button). The engine keeps
         // quit backend-agnostic — it only flips its `running` flag — so the
         // backend loop must forward that to the platform close. Without this
@@ -103,20 +103,20 @@ const BackendGfxType = @import("backend_gfx");
         // Aspect-fit the design canvas (config) into the real window size,
         // so content renders correctly even if the window differs from the
         // configured default. Per-frame is cheap and survives resizes.
-        BackendGfxType.setScreenSize(window.getScreenWidth(), window.getScreenHeight());
+        BackendGfxType.setScreenSize(window.width(), window.height());
         BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
 {{preview_heartbeat}}{{tick_code}}        g.tick(dt);
 
-        window.beginDrawing();
+        window.beginFrame();
         window.clearBackground(245, 245, 245, 255);
         g.render();
         g.renderGizmos();
 {{gui_draw_code}}        window.drawText(screen_title, 10, 10, 20, 80, 80, 80, 255);
 
         // Queue the screenshot exactly once, after the configured delay,
-        // BEFORE `endDrawing` so the capture lands on THIS frame's content
+        // BEFORE `endFrame` so the capture lands on THIS frame's content
         // (scene + GUI overlay just submitted). bgfx's `takeScreenshot`
-        // only stashes the path; `endDrawing` issues the bgfx capture
+        // only stashes the path; `endFrame` issues the bgfx capture
         // request right before the frame swap and pumps the extra frames
         // the multi-threaded render path needs to flush the async capture
         // to disk. Gated on the backend exposing the API so the template
@@ -143,11 +143,11 @@ const BackendGfxType = @import("backend_gfx");
             }
         }
 
-        window.endDrawing();
+        window.endFrame();
 
         // `--ticks=N`: exit cleanly after N rendered frames so CI / agent
         // flows that just want "run for a bit then quit" don't have to rely
-        // on `--timeout` SIGTERM'ing the process. `endDrawing` has already
+        // on `--timeout` SIGTERM'ing the process. `endFrame` has already
         // presented (and, for `--screenshot`, queued the capture for) this
         // frame, so the count covers the frame just drawn. 0 = run forever.
         // The counter advances EVERY frame (so the run length tracks `--ticks`,

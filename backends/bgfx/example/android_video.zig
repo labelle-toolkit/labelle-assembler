@@ -102,16 +102,16 @@ fn gameFrame() callconv(.c) void {
         @as(f32, @floatCast(window.frameDuration())),
         4.0 / @as(f32, @floatFromInt(target_fps)),
     );
-    gfx.setScreenSize(window.getScreenWidth(), window.getScreenHeight());
+    gfx.setScreenSize(window.width(), window.height());
     gfx.setDesignSize(@intCast(screen_w), @intCast(screen_h));
 
-    window.beginDrawing();
+    window.beginFrame();
     window.clearBackground(10, 10, 16, 255);
     if (player) |*p| {
         p.update(dt);
         p.draw(.{ .x = 0, .y = 0, .width = @floatFromInt(screen_w), .height = @floatFromInt(screen_h) });
     }
-    window.endDrawing();
+    window.endFrame();
 }
 
 // The input module's gamepad JNI glue calls these device-detection callbacks,

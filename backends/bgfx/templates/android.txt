@@ -69,8 +69,8 @@ fn gameInit() callconv(.c) void {
 {{preview_setup}}{{init_code}}}
 
 // Per-frame tick: advance the engine, then render through bgfx. Mirrors
-// the desktop template's loop body (tick → beginDrawing → render →
-// endDrawing). The shell only calls this while the surface is live and
+// the desktop template's loop body (tick → beginFrame → render →
+// endFrame). The shell only calls this while the surface is live and
 // the activity is resumed, so no `isRunning()`/close handling is needed
 // here — the activity lifecycle drives shutdown.
 fn gameFrame() callconv(.c) void {
@@ -88,15 +88,15 @@ fn gameFrame() callconv(.c) void {
     // canvas (config), so it aspect-fits the 800x600-style design space
     // into the device's actual resolution. Per-frame because the surface
     // can change (rotation, pause/resume). Mirrors the sokol Android template.
-    BackendGfxType.setScreenSize(window.getScreenWidth(), window.getScreenHeight());
+    BackendGfxType.setScreenSize(window.width(), window.height());
     BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
 {{preview_heartbeat}}{{tick_code}}    g.tick(dt);
 
-    window.beginDrawing();
+    window.beginFrame();
     window.clearBackground(245, 245, 245, 255);
     g.render();
     g.renderGizmos();
-{{gui_draw_code}}    window.endDrawing();
+{{gui_draw_code}}    window.endFrame();
 }
 
 // {{entry_comment}}
