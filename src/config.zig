@@ -582,6 +582,20 @@ pub const ProjectConfig = struct {
         return self.resolved_gui != null;
     }
 
+    /// The canonical backend NAME as a string (e.g. "bgfx").
+    ///
+    /// This is the pluggable-backends seam (epic #386, Phase 5): name-layer
+    /// code reads `backendName()` instead of `@tagName(self.backend)` directly,
+    /// so the package-layout conventions (see `backend_registry`) are derived
+    /// from a string rather than a closed enum tag. Today this is just the
+    /// enum tag — the `Backend` enum remains the backward-compat shorthand and
+    /// `.backend` still parses as an enum value — but routing through this
+    /// method is what lets a future resolver hand the name layer a backend name
+    /// that has no enum tag (the explicit follow-up).
+    pub fn backendName(self: ProjectConfig) []const u8 {
+        return @tagName(self.backend);
+    }
+
     /// The unset-`.y_axis` build guard (RFC-Y-AXIS-CONVENTION Migration §,
     /// epic labelle-engine#640). During the transition release an *absent*
     /// `.y_axis` is a hard error naming BOTH choices, so no existing game

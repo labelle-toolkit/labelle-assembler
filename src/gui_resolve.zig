@@ -47,7 +47,7 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *config.ProjectConfig
         };
 
         const bridge_def = getBridgeForBackend(bridges, cfg.backend) orelse {
-            std.debug.print("labelle: GUI plugin '{s}' requires a bridge for backend '{s}', but none is declared in gui.labelle.\n", .{ manifest.name, @tagName(cfg.backend) });
+            std.debug.print("labelle: GUI plugin '{s}' requires a bridge for backend '{s}', but none is declared in gui.labelle.\n", .{ manifest.name, cfg.backendName() });
             std.debug.print("  available bridges:", .{});
             printAvailableBridges(bridges);
             std.debug.print("\n", .{});
@@ -58,12 +58,12 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *config.ProjectConfig
             // Local bridge path (relative to plugin directory)
             bridge_dir = try std.fs.path.resolve(allocator, &.{ plugin_dir, rel_path });
         } else {
-            std.debug.print("labelle: GUI plugin '{s}' bridge for '{s}' has no .path (remote bridge resolution not yet supported)\n", .{ manifest.name, @tagName(cfg.backend) });
+            std.debug.print("labelle: GUI plugin '{s}' bridge for '{s}' has no .path (remote bridge resolution not yet supported)\n", .{ manifest.name, cfg.backendName() });
             return error.GuiBridgeResolutionNotSupported;
         }
 
         if (bridge_def.adapter.len == 0) {
-            std.debug.print("labelle: GUI plugin '{s}' bridge for '{s}' has empty .adapter name\n", .{ manifest.name, @tagName(cfg.backend) });
+            std.debug.print("labelle: GUI plugin '{s}' bridge for '{s}' has empty .adapter name\n", .{ manifest.name, cfg.backendName() });
             return error.GuiBridgeMissingAdapter;
         }
 

@@ -5,6 +5,7 @@ const std = @import("std");
 // ── Submodules ─────────────────────────────────────────────────────────
 const config = @import("config.zig");
 const cache = @import("cache.zig");
+const backend_registry = @import("backend_registry.zig");
 pub const scanner = @import("scanner.zig");
 pub const scene_manifest = @import("scene_manifest.zig");
 pub const asset_validator = @import("asset_validator.zig");
@@ -29,6 +30,7 @@ test {
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
     _ = @import("deps_linker.zig");
+    _ = @import("backend_registry.zig");
     _ = @import("app_icon.zig");
     _ = @import("flow_catalog.zig");
     _ = @import("codegen/idents.zig");
@@ -417,7 +419,7 @@ pub fn generate(
     const target_name = if (target_name_override) |name|
         try allocator.dupe(u8, name)
     else
-        try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
+        try std.fmt.allocPrint(allocator, "{s}_{s}", .{ cfg.backendName(), @tagName(cfg.platform) });
     defer allocator.free(target_name);
     const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
     defer allocator.free(target_dir);
@@ -1000,8 +1002,6 @@ fn loadEngineTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: P
 
 /// Load the backend+platform lifecycle template from the CLI cache.
 fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: ProjectConfig) ![]const u8 {
-    const backend_name = @tagName(cfg.backend);
-
     // ── Manifest-driven main-loop template path (assembler#378) ─────────
     // When the manifest path is enabled (desktop + a backend that ships a
     // manifest), resolve the main-loop template from the backend manifest's
@@ -1012,11 +1012,11 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir)) {
         const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
         defer manifest_splice.freeManifest(allocator, m);
-        // `m.dir_name` is a runtime-parsed manifest field — allocPrint, not a
-        // fixed buffer + `catch unreachable` that could panic on a long name.
-        const sub = try std.fmt.allocPrint(allocator, "backends/{s}", .{m.dir_name});
-        defer allocator.free(sub);
-        const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, game_dir, sub);
+        // Package dir via the registry (centralized `backends/{name}`), keyed by
+        // the manifest's own `dir_name` — no enum, no inline path derivation.
+        const backend_info = try backend_registry.lookup(allocator, m.dir_name);
+        defer backend_registry.free(allocator, backend_info);
+        const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, game_dir, backend_info.subpath);
         defer allocator.free(backend_path);
         const tmpl_path = try std.fs.path.join(allocator, &.{ backend_path, manifest_splice.mainLoopTemplateRel(m) });
         defer allocator.free(tmpl_path);
@@ -1044,9 +1044,9 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     defer allocator.free(tmpl_filename);
 
     // Resolve backend path from the assembler cache slot.
-    var backend_subpath_buf: [128]u8 = undefined;
-    const backend_subpath = std.fmt.bufPrint(&backend_subpath_buf, "backends/{s}", .{backend_name}) catch unreachable;
-    const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, game_dir, backend_subpath);
+    const backend_info = try backend_registry.lookup(allocator, cfg.backendName());
+    defer backend_registry.free(allocator, backend_info);
+    const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, game_dir, backend_info.subpath);
     defer allocator.free(backend_path);
 
     const tmpl_path = try std.fs.path.join(allocator, &.{ backend_path, "templates", tmpl_filename });

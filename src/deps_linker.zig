@@ -7,6 +7,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
+const backend_registry = @import("backend_registry.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -51,13 +52,12 @@ pub fn createDepsLinks(
     }
 
     {
-        const backend_name = @tagName(cfg.backend);
-        var subpath_buf: [128]u8 = undefined;
-        const subpath = std.fmt.bufPrint(&subpath_buf, "backends/{s}", .{backend_name}) catch unreachable;
-        const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, subpath);
-        const zon_name = try std.fmt.allocPrint(allocator, "labelle_{s}", .{backend_name});
-        const link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{backend_name});
-        try deps.append(allocator, .{ .zon_name = zon_name, .link_name = link_name, .abs_path = backend_path });
+        const backend_info = try backend_registry.lookup(allocator, cfg.backendName());
+        defer allocator.free(backend_info.subpath);
+        const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, backend_info.subpath);
+        // zon_name / link_name are moved into the DepEntry (freed by
+        // freeDepEntries), so we don't free them here.
+        try deps.append(allocator, .{ .zon_name = backend_info.zon_name, .link_name = backend_info.link_name, .abs_path = backend_path });
 
         // Backend-owned transitive sub-package: the shared windowless-SDL
         // desktop gamepad source (`backends/sdl_gamepad/`, core#28). Both the

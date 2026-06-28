@@ -3,6 +3,7 @@ const std = @import("std");
 const tpl = @import("template.zig");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
+const backend_registry = @import("backend_registry.zig");
 const scan = @import("codegen/scan.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 pub const deps_linker = @import("deps_linker.zig");
@@ -772,12 +773,12 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
     }
 
     {
-        const bn = @tagName(cfg.backend);
+        const bn = cfg.backendName();
         var sb: [64]u8 = undefined;
         const section = std.fmt.bufPrint(&sb, "dep_{s}_path", .{bn}) catch unreachable;
-        var spb: [128]u8 = undefined;
-        const sp = std.fmt.bufPrint(&spb, "backends/{s}", .{bn}) catch unreachable;
-        const bp_abs = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, sp);
+        const backend_info = try backend_registry.lookup(allocator, bn);
+        defer backend_registry.free(allocator, backend_info);
+        const bp_abs = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, backend_info.subpath);
         defer allocator.free(bp_abs);
         const bp = try relativePath(allocator, abs_target, bp_abs);
         defer allocator.free(bp);
