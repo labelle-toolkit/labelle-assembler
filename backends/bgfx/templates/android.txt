@@ -21,7 +21,6 @@
 // the game owns the entry so it can register callbacks before the loop.
 const android_app = @import("backend_app");
 const BackendGfxType = @import("backend_gfx");
-const std = @import("std");
 
 pub const labelle_provides_android_main = true;
 
@@ -57,7 +56,7 @@ fn androidLogFn(
         .warn => 5,
         .err => 6,
     };
-    _ = __android_log_write(prio, "labelle", text.ptr);
+    _ = __android_log_write(prio, "labelle", text);
 }
 
 // Android backend seam (#310 Stage 4). The engine's `src/android.zig` and
