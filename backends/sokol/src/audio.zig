@@ -20,11 +20,13 @@
 ///
 ///   * `audio/sink.zig`   — the sokol_audio device + its f32 stream callback,
 ///                          satisfying the shared f32 `DeviceSink` contract.
-///   * `audio/decode.zig` — the Phase 4 OGG/WAV CPU decoder (`decodeAudio` +
-///                          `DecodedAudio`/`Sound`). KEPT because the shared
-///                          mixer decodes WAV only, while the assembler's
-///                          audio-asset wiring needs OGG (stb_vorbis). The
-///                          decoded i16 PCM is handed to the shared mixer.
+///   * `audio/decode.zig` — the Phase 4 OGG/WAV decode surface (`decodeAudio` +
+///                          `DecodedAudio`/`Sound`). The decode itself now
+///                          FORWARDS to the shared `labelle-audio-decode`
+///                          module (issue #391, pure-Zig WAV + stb_vorbis OGG);
+///                          this file keeps only the thin forward + the sokol
+///                          `Sound` ABI handle. The decoded i16 PCM is handed
+///                          to the shared mixer via `loadSoundFromPcm`.
 ///   * `audio/tests.zig`  — adapter smoke tests + decoder regression locks.
 ///
 /// Everything else — the spinlock, the #298 unload/mix UAF fix, mono→stereo

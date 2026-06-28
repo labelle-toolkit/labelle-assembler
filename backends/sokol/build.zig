@@ -300,27 +300,22 @@ pub fn build(b: *std.Build) void {
     const labelle_audio_dep = b.dependency("labelle_audio", .{ .target = target, .optimize = optimize });
     audio_mod.addImport("labelle-audio", labelle_audio_dep.module("labelle-audio"));
 
-    // Mirror the emsdk sysroot include from gfx_mod: stb_vorbis and
-    // dr_wav both pull in <stdlib.h> / <string.h> / <math.h> which
-    // require emscripten's sysroot when cross-compiling to
-    // wasm32-emscripten (labelle-cli#197, labelle-assembler#141). MUST
-    // be set BEFORE the `addCSourceFile` calls below — see gfx_mod's
-    // comment.
-    if (target.result.os.tag == .emscripten) {
-        if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
-            audio_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
-        }
-    }
-
-    // Phase 4 audio decoders (labelle-engine#447):
-    //   - stb_vorbis.c is both the API *and* the implementation — it is
-    //     a single .c file you compile directly, not a header + impl
-    //     translation-unit pair.
-    //   - dr_wav matches stb_image's split: header + an _impl.c TU
-    //     that defines the implementation macro before including the
-    //     header.
-    audio_mod.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
-    audio_mod.addCSourceFile(.{ .file = b.path("src/dr_wav_impl.c"), .flags = &.{} });
+    // Shared OGG/WAV CPU decoder (issue #391). The `decodeAudio` surface the
+    // assembler's `writeAudioBackendWiring` calls used to be a hand-rolled
+    // dr_wav + stb_vorbis copy living in `src/audio/decode.zig` (+ the four C
+    // files below). It now forwards to the shared `labelle-audio-decode` module
+    // from the SAME package (pure-Zig WAV via `wav.decode` + OGG via
+    // stb_vorbis, which the decode module carries internally).
+    //
+    // The mixer (`labelle-audio`) AND this decoder (`labelle-audio-decode`)
+    // coexist in ONE Compile here — the sokol-specific need (mixer + OGG). That
+    // is exactly what v0.4.0 could NOT build ("file exists in modules
+    // 'labelle-audio' and 'labelle-audio-decode'"): it packaged wav.zig into
+    // both module roots by path. v0.4.1 fixes it — decode reaches wav by NAME
+    // through the base module, so every shared file is rooted in exactly one
+    // module. The decode module declares `link_libc` (for stb_vorbis); it
+    // propagates onto the audio module.
+    audio_mod.addImport("labelle-audio-decode", labelle_audio_dep.module("labelle-audio-decode"));
 
     // ── Window backend module ───────────────────────────────────────
     // `link_libc = true` is required because `screenshot/bmp.zig` writes
