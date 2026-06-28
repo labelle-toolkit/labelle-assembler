@@ -6,6 +6,18 @@
 /// `is_android` so the module compiles for `aarch64-linux-android`.
 const builtin = @import("builtin");
 
+/// labelle-core, for the comptime input-contract conformance gate below.
+const core = @import("labelle-core");
+
+// Prove this module satisfies labelle-core's input contract — formerly only a
+// duck-typed claim in the doc comment above. The required core is small
+// (`isKeyDown` + `isKeyPressed`); the rest of the surface (mouse/touch/gamepad)
+// degrades gracefully via the contract's `@hasDecl` fallbacks. Fails the build
+// with a named-decl list if a required method is missing or misnamed.
+comptime {
+    core.assertInput(@This());
+}
+
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
 

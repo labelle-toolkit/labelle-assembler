@@ -231,17 +231,27 @@ pub fn build(b: *std.Build) void {
     // 0.16.
     const android_gp_dep = b.dependency("labelle_android_gamepad", .{ .target = target, .optimize = optimize });
     input_mod.addImport("android_gamepad", android_gp_dep.module("android_gamepad"));
-    if (is_android) {
-        // Android seam adapter (`src/android.zig`) imports labelle-core for the
-        // `AndroidBackendContext` type the generated bgfx-Android main registers
-        // with core. The generated build unifies the app's core onto this import
-        // (guarded overrideImport in the build_zig `backend_bgfx_android`
-        // section) so the registered vtable's type matches the engine's
-        // `engine.core.AndroidBackendContext`. Standalone (this build), the
-        // backend's own core pin resolves it for the Android compile-check.
-        const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
-        input_mod.addImport("labelle-core", core_dep.module("labelle-core"));
 
+    // labelle-core, imported on EVERY target so `src/input.zig` can prove it
+    // satisfies the engine input contract at comptime (`core.assertInput`) and
+    // `src/window.zig` the window contract (`core.assertWindow`, #386 Phase 3).
+    // Both asserts are comptime-only — no core type crosses the engine seam
+    // through these modules on desktop — so the backend's own pin resolves them
+    // standalone and the generated build needs no extra unification beyond the
+    // existing Android `input` override (which exists for `AndroidBackendContext`,
+    // a real type-crossing case). The single `core_mod` is shared by `input_mod`
+    // and `window_mod` so they reference one module instance.
+    const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
+    const core_mod = core_dep.module("labelle-core");
+    input_mod.addImport("labelle-core", core_mod);
+    if (is_android) {
+        // The Android seam adapter (`src/android.zig`, surfaced as
+        // `input.android`) also uses labelle-core for the `AndroidBackendContext`
+        // type the generated bgfx-Android main registers with core. That import
+        // is wired unconditionally above (shared `core_mod`); the generated build
+        // unifies the app's core onto it (guarded overrideImport in the build_zig
+        // `backend_bgfx_android` section) so the registered vtable's type matches
+        // the engine's `engine.core.AndroidBackendContext`.
         input_mod.link_libc = true;
         // NDK sysroot for the JNI glue's jni.h / android/*.h. Reuse the same
         // sysroot wiring bgfx/bx/bimg use; safe because `ndk` is non-null on
@@ -307,6 +317,11 @@ pub fn build(b: *std.Build) void {
     if (zglfw_mod) |m| window_mod.addImport("zglfw", m);
     window_mod.addImport("zbgfx", zbgfx_mod);
     window_mod.addImport("input", input_mod);
+    // labelle-core for the comptime `core.assertWindow(@This())` conformance
+    // gate in `src/window.zig` (#386 Phase 3). Comptime-only, so the backend's
+    // own pin (shared `core_mod`) resolves it on every target; no core type
+    // crosses the engine seam through the window module.
+    window_mod.addImport("labelle-core", core_mod);
     // closeWindow() calls gfx.shutdownPrograms() to release the sprite
     // program/uniform/textures before bgfx.shutdown() (#384).
     window_mod.addImport("gfx", gfx_mod);
