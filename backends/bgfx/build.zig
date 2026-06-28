@@ -244,6 +244,8 @@ pub fn build(b: *std.Build) void {
     const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
     const core_mod = core_dep.module("labelle-core");
     input_mod.addImport("labelle-core", core_mod);
+    // gfx.zig asserts the render contract (`core.assertBackend`) at comptime.
+    gfx_mod.addImport("labelle-core", core_mod);
     if (is_android) {
         // The Android seam adapter (`src/android.zig`, surfaced as
         // `input.android`) also uses labelle-core for the `AndroidBackendContext`
