@@ -63,6 +63,14 @@ pub fn build(b: *std.Build) void {
     const raylib_mod = raylib_dep.module("raylib");
     const raylib_artifact = raylib_dep.artifact("raylib");
 
+    // Shared multi-format CPU decoder (issue #391). `src/audio.zig`'s
+    // `decodeAudio` forwards to `labelle-audio-decode` (pure-Zig WAV +
+    // stb_vorbis OGG), replacing this backend's own dr_wav + stb_vorbis copies.
+    // The module carries its own `stb_vorbis.c` + include path and declares
+    // `link_libc = true` (propagates to whichever module imports it).
+    const labelle_audio_dep = b.dependency("labelle_audio", .{ .target = target, .optimize = optimize });
+    const audio_decode_mod = labelle_audio_dep.module("labelle-audio-decode");
+
     // labelle-core supplies the cross-backend gamepad event contract
     // (GamepadEvent / GamepadDescription) consumed by input.zig's
     // pollGamepadEvents / describeGamepads (labelle-core#18). Dependency
@@ -175,26 +183,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     audio_mod.addImport("raylib", raylib_mod);
-    audio_mod.addIncludePath(b.path("src"));
-    // Phase 4 audio decoders (labelle-engine#447):
-    //   - stb_vorbis.c is both the API *and* the implementation — it
-    //     is a single .c file you compile directly, not a header +
-    //     impl translation-unit pair.
-    //   - dr_wav matches stb_image's split: header + an _impl.c TU
-    //     that defines the implementation macro before including the
-    //     header.
-    audio_mod.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
-    audio_mod.addCSourceFile(.{ .file = b.path("src/dr_wav_impl.c"), .flags = &.{} });
-
-    // Mirror the emsdk sysroot include from gfx_mod: stb_vorbis and
-    // dr_wav both pull in <stdlib.h> / <string.h> / <math.h> which
-    // require emscripten's sysroot when cross-compiling to
-    // wasm32-emscripten.
-    if (target.result.os.tag == .emscripten) {
-        if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
-            audio_mod.addSystemIncludePath(emsdk_dep.path("upstream/emscripten/cache/sysroot/include"));
-        }
-    }
+    audio_mod.addImport("labelle-audio-decode", audio_decode_mod);
 
     // ── Window backend module ───────────────────────────────────────
     // `link_libc = true` is what makes `std.c.fopen` / `fwrite` / `fclose`
@@ -271,9 +260,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     audio_host_mod.addImport("raylib", raylib_mod);
-    audio_host_mod.addIncludePath(b.path("src"));
-    audio_host_mod.addCSourceFile(.{ .file = b.path("src/stb_vorbis.c"), .flags = &.{} });
-    audio_host_mod.addCSourceFile(.{ .file = b.path("src/dr_wav_impl.c"), .flags = &.{} });
+    // Host test build resolves its own decode module instance against the host
+    // target (mirrors slot_alloc_tests / the input host module pattern).
+    audio_host_mod.addImport(
+        "labelle-audio-decode",
+        b.dependency("labelle_audio", .{ .target = host_target, .optimize = optimize }).module("labelle-audio-decode"),
+    );
 
     const gfx_host_mod = b.createModule(.{
         .root_source_file = b.path("src/gfx.zig"),
