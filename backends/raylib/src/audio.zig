@@ -29,9 +29,29 @@ var music: [MAX_MUSIC]?rl.Music = [_]?rl.Music{null} ** MAX_MUSIC;
 var next_sound_id: u32 = 1;
 var next_music_id: u32 = 1;
 
+/// raylib refuses to create/play any `Sound`/`Music` until the audio
+/// device exists — without it `loadSoundFromWave` fails with "Failed to
+/// create data conversion pipeline" / "Failed to create buffer". The
+/// generated `main.zig` initializes the window but never the audio
+/// device, so we lazily bring it up the first time a game actually
+/// touches audio. Idempotent (guarded by `isAudioDeviceReady`) and
+/// main-thread only — every caller below runs on the main thread.
+fn ensureAudioDevice() void {
+    if (!rl.isAudioDeviceReady()) rl.initAudioDevice();
+}
+
 // ── Sound effects (legacy path-based) ──────────────────────────
 
+/// Load a sound effect from a filesystem path via raylib's own file loader.
+///
+/// FORMAT NOTE: the build disables raudio's OGG decoder to avoid a
+/// `stb_vorbis` duplicate-symbol clash with the shared `labelle-audio-decode`
+/// module (see `build.zig`). WAV is unaffected and works here. A `.ogg` path
+/// will fail to decode and return `0` — load OGG through the asset catalog
+/// (`loadSoundFromMemory` / declared `.sound` resources), which decodes OGG via
+/// the shared decoder, not raudio.
 pub fn loadSound(path: [:0]const u8) u32 {
+    ensureAudioDevice();
     const snd = rl.loadSound(path);
     // `snd.stream.buffer` is `*rAudioBuffer` (non-optional) in
     // raylib-zig 5.6.0-dev, so a `== null` check fails to typecheck.
@@ -99,7 +119,14 @@ pub fn setSoundVolume(id: u32, volume: f32) void {
 
 // ── Music (streaming) ──────────────────────────────────────
 
+/// Load a streaming music track from a filesystem path via raylib.
+///
+/// FORMAT NOTE: same as `loadSound` — raudio's OGG decoder is disabled, so a
+/// `.ogg` path returns `0`. WAV streaming works. There is no catalog-side
+/// streaming fallback for OGG music yet (the shared decoder is full-buffer, not
+/// a stream), so OGG background music on raylib is currently unsupported.
 pub fn loadMusic(path: [:0]const u8) u32 {
+    ensureAudioDevice();
     const mus = rl.loadMusicStream(path);
     // See `loadSound` above: `mus.stream.buffer` is now non-optional
     // in raylib-zig 5.6.0-dev. Use the canonical `IsMusicValid`.
@@ -182,6 +209,11 @@ pub fn updateMusic(id: u32) void {
 // ── Global ────────────────────────────────────────────────
 
 pub fn setVolume(volume: f32) void {
+    // `SetMasterVolume` before `InitAudioDevice` is undefined behaviour in
+    // raylib (it touches the uninitialised miniaudio context). A game may set
+    // master volume before loading any sound, so bring the device up first —
+    // idempotent, see `ensureAudioDevice`. (Review: gemini-code-assist, #393.)
+    ensureAudioDevice();
     rl.setMasterVolume(volume);
 }
 
@@ -268,6 +300,9 @@ pub fn uploadSound(decoded: DecodedAudio) !Sound {
     // `@divTrunc(samples.len, channels)` below would panic in debug
     // and be UB in release.
     if (decoded.channels == 0) return error.AudioInvalidChannels;
+
+    // Bring up the audio device on first use (see `ensureAudioDevice`).
+    ensureAudioDevice();
 
     // Reject sample counts that aren't an integer multiple of
     // channels — `@divTrunc` below would silently drop the
