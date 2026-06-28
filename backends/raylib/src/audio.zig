@@ -195,6 +195,11 @@ pub fn updateMusic(id: u32) void {
 // ── Global ────────────────────────────────────────────────
 
 pub fn setVolume(volume: f32) void {
+    // `SetMasterVolume` before `InitAudioDevice` is undefined behaviour in
+    // raylib (it touches the uninitialised miniaudio context). A game may set
+    // master volume before loading any sound, so bring the device up first —
+    // idempotent, see `ensureAudioDevice`. (Review: gemini-code-assist, #393.)
+    ensureAudioDevice();
     rl.setMasterVolume(volume);
 }
 
