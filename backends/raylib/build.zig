@@ -58,24 +58,30 @@ pub fn build(b: *std.Build) void {
     const gamepad_enabled = b.option(bool, "gamepad_enabled", "Wire the shared SDL desktop gamepad source + link SDL2 (default true; false = opt out, no SDL)") orelse true;
     const gamepad_hidapi = b.option(bool, "gamepad_hidapi", "Opt the SDL gamepad source into HIDAPI raw-HID decode (Switch/8BitDo); default false — HIDAPI per-connect init stalls the render thread for seconds on some platforms") orelse false;
 
-    // Disable raudio's bundled `stb_vorbis` (.ogg) + `dr_wav` (.wav) file-format
-    // decoders. The worker-thread `decodeAudio` path links `stb_vorbis` via the
-    // shared `labelle-audio-decode` module (#391), and raudio embeds its OWN copy
-    // for file playback — two external definitions of every `stb_vorbis_*` symbol
+    // Disable ONLY raudio's bundled `stb_vorbis` (.ogg) decoder. The
+    // worker-thread `decodeAudio` path links `stb_vorbis` via the shared
+    // `labelle-audio-decode` module (#391), and raudio embeds its OWN copy for
+    // file playback — two external definitions of every `stb_vorbis_*` symbol
     // → ~120 `lld-link: duplicate symbol` errors, failing any game that loads a
     // sound asset. (Invisible until then: otherwise `raudio.obj` is never pulled
-    // from `raylib.lib`.) The OGG flag is the load-bearing one. The WAV flag is
-    // belt-and-suspenders — `labelle-audio-decode` decodes WAV in pure Zig (no
-    // `dr_wav`), so there's no longer a labelle-side `drwav_*` to collide; it just
-    // trims raudio's now-unused WAV decoder. raylib's `config.h` `#ifndef`-guards
-    // each default, so `-D...=0` suppresses the include while keeping raudio's
+    // from `raylib.lib`.) raylib's `config.h` `#ifndef`-guards each default, so
+    // `-DSUPPORT_FILEFORMAT_OGG=0` suppresses the include while keeping raudio's
     // device + mixer (`InitAudioDevice`/`PlaySound`/`LoadSoundFromWave`) intact —
-    // playback uploads raw PCM via `loadSoundFromWave`, which needs no file-format
-    // support.
+    // catalog playback uploads raw PCM via `loadSoundFromWave`, no file-format
+    // support needed.
+    //
+    // WAV is deliberately LEFT ENABLED. `labelle-audio-decode` decodes WAV in
+    // pure Zig (no `dr_wav`), so raudio's `dr_wav` collides with nothing —
+    // disabling it bought no collision safety and only broke the legacy
+    // path-based `loadSound("x.wav")` / `loadMusic("x.wav")` surface (which
+    // routes through raylib's own file loaders). Keeping WAV on restores those.
+    // The residual gap is legacy path-based *OGG* file loading, which raudio can
+    // no longer decode; the asset catalog still loads OGG via the shared decoder.
+    // See the loader notes in `src/audio.zig`. (Review: coderabbitai, #393.)
     const raylib_dep = b.dependency("raylib-zig", .{
         .target = target,
         .optimize = optimize,
-        .config = @as([]const u8, "-DSUPPORT_FILEFORMAT_WAV=0 -DSUPPORT_FILEFORMAT_OGG=0"),
+        .config = @as([]const u8, "-DSUPPORT_FILEFORMAT_OGG=0"),
     });
 
     const raylib_mod = raylib_dep.module("raylib");

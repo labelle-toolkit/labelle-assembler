@@ -42,6 +42,14 @@ fn ensureAudioDevice() void {
 
 // ── Sound effects (legacy path-based) ──────────────────────────
 
+/// Load a sound effect from a filesystem path via raylib's own file loader.
+///
+/// FORMAT NOTE: the build disables raudio's OGG decoder to avoid a
+/// `stb_vorbis` duplicate-symbol clash with the shared `labelle-audio-decode`
+/// module (see `build.zig`). WAV is unaffected and works here. A `.ogg` path
+/// will fail to decode and return `0` — load OGG through the asset catalog
+/// (`loadSoundFromMemory` / declared `.sound` resources), which decodes OGG via
+/// the shared decoder, not raudio.
 pub fn loadSound(path: [:0]const u8) u32 {
     ensureAudioDevice();
     const snd = rl.loadSound(path);
@@ -111,6 +119,12 @@ pub fn setSoundVolume(id: u32, volume: f32) void {
 
 // ── Music (streaming) ──────────────────────────────────────
 
+/// Load a streaming music track from a filesystem path via raylib.
+///
+/// FORMAT NOTE: same as `loadSound` — raudio's OGG decoder is disabled, so a
+/// `.ogg` path returns `0`. WAV streaming works. There is no catalog-side
+/// streaming fallback for OGG music yet (the shared decoder is full-buffer, not
+/// a stream), so OGG background music on raylib is currently unsupported.
 pub fn loadMusic(path: [:0]const u8) u32 {
     ensureAudioDevice();
     const mus = rl.loadMusicStream(path);
