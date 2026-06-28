@@ -474,6 +474,13 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
                 bgfx_ready = false;
             }
             is_resumed = false;
+            // Reset the cold-start guard. `init_done` is module-global, so if
+            // Android keeps the process cached after destroying the Activity, a
+            // later relaunch's first INIT_WINDOW would otherwise take the RESTORE
+            // branch (`surfaceRestored`) against deinitialized/stale engine state
+            // instead of a clean cold init (`init_fn`) → crash. Resetting here
+            // guarantees the next Activity launch cold-inits. (Gemini + CodeRabbit.)
+            init_done = false;
         },
         else => {},
     }
