@@ -34,6 +34,7 @@ test {
     _ = @import("app_icon.zig");
     _ = @import("flow_catalog.zig");
     _ = @import("codegen/idents.zig");
+    _ = @import("codegen/manifest_splice.zig");
 }
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
@@ -1002,6 +1003,11 @@ fn loadEngineTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: P
 
 /// Load the backend+platform lifecycle template from the CLI cache.
 fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: ProjectConfig) ![]const u8 {
+    // External backends generate EXCLUSIVELY via their manifest — fail loudly if
+    // one ships none rather than falling through to the enum path below (which
+    // reads `cfg.backend ==`, meaningless for an external backend with no tag).
+    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir);
+
     // ── Manifest-driven main-loop template path (assembler#378) ─────────
     // When the manifest path is enabled (desktop + a backend that ships a
     // manifest), resolve the main-loop template from the backend manifest's
@@ -1012,11 +1018,10 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir)) {
         const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
         defer manifest_splice.freeManifest(allocator, m);
-        // Package dir via the registry (centralized `backends/{name}`), keyed by
-        // the manifest's own `dir_name` — no enum, no inline path derivation.
-        const backend_info = try backend_registry.lookup(allocator, m.dir_name);
-        defer backend_registry.free(allocator, backend_info);
-        const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, game_dir, backend_info.subpath);
+        // Package dir via the location seam: built-in → `backends/{name}` bundled
+        // slot; external → the plugin checkout (where its manifest was just read
+        // from). Both resolve to the same dir the manifest was loaded from.
+        const backend_path = try backend_registry.resolveBackendPackage(allocator, cfg, game_dir);
         defer allocator.free(backend_path);
         const tmpl_path = try std.fs.path.join(allocator, &.{ backend_path, manifest_splice.mainLoopTemplateRel(m) });
         defer allocator.free(tmpl_path);
@@ -1043,10 +1048,11 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     const tmpl_filename = try std.fmt.allocPrint(allocator, "{s}.txt", .{platform_name});
     defer allocator.free(tmpl_filename);
 
-    // Resolve backend path from the assembler cache slot.
-    const backend_info = try backend_registry.lookup(allocator, cfg.backendName());
-    defer backend_registry.free(allocator, backend_info);
-    const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, game_dir, backend_info.subpath);
+    // Resolve backend path via the location seam (built-in cache slot, or the
+    // external plugin checkout). For external backends this enum-path branch is
+    // unreachable — `requireManifestIfExternal` above guarantees an external
+    // backend has a manifest, so the manifest path is taken instead.
+    const backend_path = try backend_registry.resolveBackendPackage(allocator, cfg, game_dir);
     defer allocator.free(backend_path);
 
     const tmpl_path = try std.fs.path.join(allocator, &.{ backend_path, "templates", tmpl_filename });

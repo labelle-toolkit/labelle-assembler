@@ -223,6 +223,11 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // `backend_<tag>` / `link_<tag>` template sections. Every other backend ×
     // platform (no manifest, or non-desktop) falls through the enum `switch`
     // unchanged. bgfx-desktop opts in by shipping a manifest.
+    // External backends generate exclusively via the manifest splice; a
+    // manifest-less external package is a hard error here (the enum `switch`es
+    // below read `cfg.backend`, meaningless for an external backend with no tag).
+    if (opts.project_dir) |pd| try manifest_splice.requireManifestIfExternal(allocator, cfg, pd);
+
     const use_manifest = opts.project_dir != null and
         manifest_splice.manifestPathEnabled(allocator, cfg, opts.project_dir.?);
     var splice_manifest: ?manifest_splice.BackendManifest = null;
@@ -236,6 +241,12 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Splice: resolve the backend-dep build fragment from the manifest,
         // no `=> .<tag>` branch. Desktop-only (the gate guarantees it).
         try manifest_splice.renderBackendDepSection(allocator, m, cfg, opts.project_dir.?, w);
+    } else if (cfg.isExternal()) {
+        // Unreachable in practice: requireManifestIfExternal above guarantees an
+        // external backend reaches the splice branch. Guard so an external
+        // backend never falls into the built-in `switch (cfg.backend)` (which
+        // reads a meaningless enum tag for a backend named only by string).
+        return error.ExternalBackendNeedsManifest;
     } else switch (cfg.backend) {
         .raylib => try tpl.renderSection(build_zig_tmpl, "backend_raylib", .{ .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi }, w),
         .sokol => {
@@ -384,12 +395,13 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     try emitPromotedScriptModules(w, cfg, opts.promoted_scripts);
 
     if (cfg.platform == .wasm) {
-        // WASM: import emsdk helpers from backend
-        switch (cfg.backend) {
+        // WASM: import emsdk helpers from backend. Built-in-specific; skipped
+        // for an external backend (self-contained; declares its own wasm wiring).
+        if (!cfg.isExternal()) switch (cfg.backend) {
             .raylib => try tpl.writeSection(build_zig_tmpl, "wasm_emsdk_raylib", w),
             .sokol => try tpl.writeSection(build_zig_tmpl, "wasm_emsdk_sokol", w),
             else => {},
-        }
+        };
 
         // WASM: build as library, link via emcc
         try tpl.writeSection(build_zig_tmpl, "wasm_exe_start", w);
@@ -427,11 +439,12 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         }
 
-        switch (cfg.backend) {
+        // Built-in-specific wasm link; skipped for an external backend.
+        if (!cfg.isExternal()) switch (cfg.backend) {
             .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib_wasm", w),
             .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol_wasm", w),
             else => {},
-        }
+        };
 
         try tpl.writeSection(build_zig_tmpl, "wasm_footer", w);
     } else if (cfg.platform == .ios) {
@@ -559,6 +572,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
                 // Splice: resolve the link build fragment from the manifest,
                 // no `=> .<tag>` branch.
                 try manifest_splice.renderLinkSection(allocator, m, cfg, opts.project_dir.?, w);
+            } else if (cfg.isExternal()) {
+                // Guard: an external backend never falls into the built-in link
+                // switch (no enum tag). The splice branch above handles it.
+                return error.ExternalBackendNeedsManifest;
             } else switch (cfg.backend) {
                 .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib", w),
                 .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol", w),
@@ -774,15 +791,23 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
 
     {
         const bn = cfg.backendName();
-        var sb: [64]u8 = undefined;
-        const section = std.fmt.bufPrint(&sb, "dep_{s}_path", .{bn}) catch unreachable;
-        const backend_info = try backend_registry.lookup(allocator, bn);
-        defer backend_registry.free(allocator, backend_info);
-        const bp_abs = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, backend_info.subpath);
+        // Location seam: built-in → bundled slot; external → plugin checkout.
+        const bp_abs = try backend_registry.resolveBackendPackage(allocator, cfg, project_dir);
         defer allocator.free(bp_abs);
         const bp = try relativePath(allocator, abs_target, bp_abs);
         defer allocator.free(bp);
-        try tpl.renderSection(build_zig_zon_tmpl, section, .{ .backend_path = bp }, w);
+        if (cfg.isExternal()) {
+            // External backends have no per-name `dep_<name>_path` template
+            // section — emit the dep inline (same shape as the plugin loop and
+            // the built-in template sections: `.labelle_<name> = .{ .path }`).
+            try w.print("        .labelle_{s} = .{{ .path = \"{s}\" }},\n", .{ bn, bp });
+        } else {
+            // Built-in: keep the embedded per-name template section so the
+            // generated zon stays byte-identical to before this change.
+            var sb: [64]u8 = undefined;
+            const section = std.fmt.bufPrint(&sb, "dep_{s}_path", .{bn}) catch unreachable;
+            try tpl.renderSection(build_zig_zon_tmpl, section, .{ .backend_path = bp }, w);
+        }
     }
 
     switch (cfg.ecs) {

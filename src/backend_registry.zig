@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const cache = @import("cache.zig");
 
 /// Package-layout facts for a single backend, derived from its canonical name.
 /// The `subpath` / `zon_name` / `link_name` fields are allocator-owned (built
@@ -67,6 +68,45 @@ pub fn free(allocator: std.mem.Allocator, info: BackendInfo) void {
     allocator.free(info.subpath);
     allocator.free(info.zon_name);
     allocator.free(info.link_name);
+}
+
+/// Resolve the on-disk directory of the backend package for `cfg`, branching on
+/// whether the backend is EXTERNAL (`cfg.isExternal()`) or built-in.
+///
+/// This is the single package-LOCATION seam every backend-package site routes
+/// through (`manifest_splice.backendPackageDir`, `deps_linker`, the two
+/// `loadBackendTemplate` dir resolutions). It decouples *where* the backend
+/// package lives from *what convention names it* (`lookup`):
+///
+///   - external: located via the plugin-resolution infra
+///     (`cache.resolvePlugin(cfg.backend_package.?, ..)`) — `local:`/`@libs`/
+///     fetched repos all work, exactly as a plugin does.
+///   - built-in: located in the assembler-bundled cache slot
+///     (`cache.resolveBundledPackage(.., (lookup name).subpath)` →
+///     `backends/{name}`), unchanged from before.
+///
+/// Caller owns the returned path (free with `allocator.free`).
+pub fn resolveBackendPackage(
+    allocator: std.mem.Allocator,
+    cfg: config.ProjectConfig,
+    project_dir: ?[]const u8,
+) ![]const u8 {
+    if (cfg.backend_package) |bp| {
+        // External: reuse the plugin resolver — same `local:`/`@`/fetched-repo
+        // handling, no enum, no bundled cache slot. The package follows the
+        // `backends/{name}` convention internally but the dir itself is the
+        // plugin checkout root.
+        return cache.resolvePlugin(allocator, bp, project_dir);
+    }
+    const info = try lookup(allocator, cfg.backendName());
+    defer free(allocator, info);
+    return cache.resolveBundledPackage(
+        allocator,
+        cfg.labelle_version,
+        cfg.assembler_version,
+        project_dir,
+        info.subpath,
+    );
 }
 
 /// The built-in backend names, seeded directly from `config.Backend`'s tags so
@@ -153,4 +193,64 @@ test "lookup matches the inline convention for all 6 built-ins" {
         try std.testing.expectEqualStrings(zon_name, info.zon_name);
         try std.testing.expectEqualStrings(link_name, info.link_name);
     }
+}
+
+// ── External-backend (open-config) tests ─────────────────────────────
+// The open-config seam (epic #386 Phase 5): a backend named by string +
+// package (PluginDep) instead of the closed `config.Backend` enum.
+
+test "open-config: an external backend config reports isExternal / backendName by string" {
+    // A backend declared only by NAME + repo — no enum tag involved.
+    const cfg = config.ProjectConfig{
+        .name = "stubgame",
+        .backend_package = .{ .name = "stubbackend", .repo = "local:../stub" },
+    };
+    try std.testing.expect(cfg.isExternal());
+    // backendName comes from the package name, NOT @tagName(cfg.backend).
+    try std.testing.expectEqualStrings("stubbackend", cfg.backendName());
+    // And the registry resolves that string with no enum tag (name-keyed).
+    try std.testing.expect(!isBuiltin("stubbackend"));
+    const alloc = std.testing.allocator;
+    const info = try lookup(alloc, cfg.backendName());
+    defer free(alloc, info);
+    try std.testing.expectEqualStrings("stubbackend", info.name);
+    try std.testing.expectEqualStrings("labelle_stubbackend", info.zon_name);
+    try std.testing.expectEqualStrings("labelle-stubbackend", info.link_name);
+}
+
+test "open-config: a built-in config is not external and names via the enum" {
+    const cfg = config.ProjectConfig{ .name = "g", .backend = .bgfx };
+    try std.testing.expect(!cfg.isExternal());
+    try std.testing.expectEqualStrings("bgfx", cfg.backendName());
+}
+
+test "open-config: resolveBackendPackage routes an external backend to its local checkout" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A project dir with a sibling external-backend checkout next to it:
+    //   tmp/project/      (project_dir)
+    //   tmp/stubbackend/  (the external backend package)
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.createDirPath(std.testing.io, "stubbackend");
+
+    const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
+    defer alloc.free(project_abs);
+    const stub_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "stubbackend", alloc);
+    defer alloc.free(stub_abs);
+
+    const cfg = config.ProjectConfig{
+        .name = "stubgame",
+        .backend_package = .{ .name = "stubbackend", .repo = "local:../stubbackend" },
+    };
+
+    const resolved = try resolveBackendPackage(alloc, cfg, project_abs);
+    defer alloc.free(resolved);
+
+    // Routes through the PLUGIN resolver (local path), NOT the bundled
+    // `backends/` cache slot — so it lands on the sibling checkout.
+    try std.testing.expectEqualStrings(stub_abs, resolved);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "/backends/") == null);
 }

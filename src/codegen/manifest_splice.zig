@@ -42,7 +42,6 @@
 const std = @import("std");
 const tpl = @import("../template.zig");
 const config = @import("../config.zig");
-const cache = @import("../cache.zig");
 const backend_registry = @import("../backend_registry.zig");
 
 const ProjectConfig = config.ProjectConfig;
@@ -96,6 +95,35 @@ pub fn manifestPathEnabled(allocator: std.mem.Allocator, cfg: ProjectConfig, pro
     return manifestExists(allocator, cfg, project_dir);
 }
 
+/// Validate that an EXTERNAL backend actually ships a `backend.manifest.zon`.
+/// External backends have NO enum-path codegen fallback — the enum-path
+/// platform selection (`loadBackendTemplate`'s `cfg.backend == .null` /
+/// `cfg.backend == .sokol` branches) reads the closed enum, which is meaningless
+/// for a backend with no enum tag, and would silently fall to the `.raylib`
+/// default. So the manifest splice is their ONLY codegen route: a manifest-less
+/// external package is a hard error, surfaced here rather than producing a
+/// raylib-shaped build for a non-raylib backend.
+///
+/// No-op for built-ins (`!cfg.isExternal()`), which keep their enum-path
+/// fallback when they ship no manifest (raylib/sdl/wgpu/null). Call before the
+/// manifest-path decision in the generators.
+pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) !void {
+    if (!cfg.isExternal()) return;
+    if (!manifestExists(allocator, cfg, project_dir)) {
+        // `warn`, not `err`: the hard failure is the returned error
+        // (`ExternalBackendNeedsManifest`); this is the human-readable hint that
+        // accompanies it. Matches `loadManifest`'s `warn`-on-parse-failure, and
+        // keeps the negative-path test from being failed by the test runner's
+        // "logged N errors" gate.
+        std.log.warn(
+            "labelle-assembler: external backend '{s}' (backend_package) ships no backend.manifest.zon — " ++
+                "an external backend must declare its codegen via a manifest (the enum-path fallback does not apply to external backends).",
+            .{cfg.backendName()},
+        );
+        return error.ExternalBackendNeedsManifest;
+    }
+}
+
 /// Does the resolved backend package contain a `backend.manifest.zon`?
 /// Resolution failures / a missing file both mean "no manifest" → enum path.
 fn manifestExists(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) bool {
@@ -120,9 +148,10 @@ fn manifestExists(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir:
 /// arbitrary name+package is the next step, after which a third-party backend
 /// flows through this same registry lookup with no enum entry.
 fn backendPackageDir(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) ![]const u8 {
-    const backend_info = try backend_registry.lookup(allocator, cfg.backendName());
-    defer backend_registry.free(allocator, backend_info);
-    return cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, backend_info.subpath);
+    // Routed through `resolveBackendPackage` so an EXTERNAL backend (resolved via
+    // the plugin infra) reads its manifest from the plugin checkout, while a
+    // built-in resolves to its `backends/{name}` bundled slot exactly as before.
+    return backend_registry.resolveBackendPackage(allocator, cfg, project_dir);
 }
 
 /// Load + parse `backend.manifest.zon` from the backend package.
@@ -253,4 +282,71 @@ pub fn loopStyle(m: BackendManifest) BackendManifest.LoopStyle {
 /// package root.
 pub fn mainLoopTemplateRel(m: BackendManifest) []const u8 {
     return m.main_loop_template;
+}
+
+// ── Tests: external-backend manifest gate (open-config, epic #386 Phase 5) ──
+
+test "requireManifestIfExternal: external backend WITH a manifest is accepted" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // project_dir + a sibling stub backend that SHIPS backend.manifest.zon.
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.createDirPath(std.testing.io, "stubbackend");
+    {
+        const f = try tmp.dir.createFile(std.testing.io, "stubbackend/backend.manifest.zon", .{});
+        defer f.close(std.testing.io);
+        // Presence is all requireManifestIfExternal checks — contents unused.
+        try f.writeStreamingAll(std.testing.io, ".{}\n");
+    }
+
+    const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
+    defer alloc.free(project_abs);
+
+    const cfg = config.ProjectConfig{
+        .name = "stubgame",
+        .backend_package = .{ .name = "stubbackend", .repo = "local:../stubbackend" },
+    };
+
+    try requireManifestIfExternal(alloc, cfg, project_abs);
+}
+
+test "requireManifestIfExternal: external backend WITHOUT a manifest errors" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Sibling stub backend dir exists but ships NO backend.manifest.zon.
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.createDirPath(std.testing.io, "stubbackend");
+
+    const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
+    defer alloc.free(project_abs);
+
+    const cfg = config.ProjectConfig{
+        .name = "stubgame",
+        .backend_package = .{ .name = "stubbackend", .repo = "local:../stubbackend" },
+    };
+
+    try std.testing.expectError(
+        error.ExternalBackendNeedsManifest,
+        requireManifestIfExternal(alloc, cfg, project_abs),
+    );
+}
+
+test "requireManifestIfExternal: a built-in backend is a no-op even with no manifest" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
+    defer alloc.free(project_abs);
+
+    // Built-in raylib ships no manifest — must NOT error (keeps enum path).
+    const cfg = config.ProjectConfig{ .name = "g", .backend = .raylib };
+    try requireManifestIfExternal(alloc, cfg, project_abs);
 }

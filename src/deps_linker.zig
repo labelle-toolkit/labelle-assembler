@@ -17,6 +17,32 @@ pub const DepEntry = struct {
     abs_path: []const u8,
 };
 
+/// Whether the shared SDL desktop-gamepad sub-package (`backends/sdl_gamepad`)
+/// is staged for `cfg`. Built-in-specific: raylib/sokol/bgfx with `gamepad =
+/// .auto`. An EXTERNAL backend is self-contained — it stages none of these
+/// sub-packages (it declares its own gamepad source in its staged zon), so the
+/// gate is OFF regardless of the enum. This is the exact predicate the
+/// `if (!cfg.isExternal()) switch (cfg.backend)` site below uses, factored out
+/// so it's unit-testable without disk I/O.
+pub fn stagesSdlGamepad(cfg: ProjectConfig) bool {
+    if (cfg.isExternal()) return false;
+    return switch (cfg.backend) {
+        .raylib, .sokol, .bgfx => cfg.gamepad == .auto,
+        else => false,
+    };
+}
+
+/// Whether the shared Android gamepad sub-package (`backends/android_gamepad`)
+/// is staged for `cfg`. Built-in-specific: sokol/bgfx. OFF for an external
+/// backend (self-contained). Mirrors the gated `switch (cfg.backend)` site below.
+pub fn stagesAndroidGamepad(cfg: ProjectConfig) bool {
+    if (cfg.isExternal()) return false;
+    return switch (cfg.backend) {
+        .sokol, .bgfx => true,
+        else => false,
+    };
+}
+
 pub const DepsLinkOptions = struct {
     /// True (default) wipes `deps_dir` before re-creating it. The tests
     /// target (issue #83) sets this to false because the exe target's
@@ -65,7 +91,10 @@ pub fn createDepsLinks(
             defer allocator.free(backend_info.subpath);
             errdefer allocator.free(backend_info.zon_name);
             errdefer allocator.free(backend_info.link_name);
-            const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, backend_info.subpath);
+            // Location seam: built-in → bundled `backends/{name}` slot; external
+            // → the plugin checkout (`resolvePlugin`). The zon/link names follow
+            // the same `labelle_{name}` / `labelle-{name}` convention either way.
+            const backend_path = try backend_registry.resolveBackendPackage(allocator, cfg, project_dir);
             errdefer allocator.free(backend_path);
             try deps.append(allocator, .{ .zon_name = backend_info.zon_name, .link_name = backend_info.link_name, .abs_path = backend_path });
         }
@@ -85,16 +114,17 @@ pub fn createDepsLinks(
         // desktop reads gamepads through GLFW by default (#315) but GLFW can't
         // decode Switch-mode Nintendo pads; routing the desktop getters through
         // the SDL HIDAPI source fixes that, mirroring raylib/sokol.)
-        switch (cfg.backend) {
-            .raylib, .sokol, .bgfx => if (cfg.gamepad == .auto) {
-                const gp_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends/sdl_gamepad");
-                try deps.append(allocator, .{
-                    .zon_name = try allocator.dupe(u8, "labelle_sdl_gamepad"),
-                    .link_name = try allocator.dupe(u8, "sdl_gamepad"),
-                    .abs_path = gp_path,
-                });
-            },
-            else => {},
+        // Built-in-specific sub-package: skipped entirely for an EXTERNAL
+        // backend, which is self-contained — its staged `build.zig.zon`
+        // declares whatever gamepad source it needs. (`switch (cfg.backend)` is
+        // meaningless for an external backend with no enum tag.)
+        if (stagesSdlGamepad(cfg)) {
+            const gp_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends/sdl_gamepad");
+            try deps.append(allocator, .{
+                .zon_name = try allocator.dupe(u8, "labelle_sdl_gamepad"),
+                .link_name = try allocator.dupe(u8, "sdl_gamepad"),
+                .abs_path = gp_path,
+            });
         }
 
         // Backend-owned transitive sub-package: the shared Android gamepad
@@ -110,16 +140,15 @@ pub fn createDepsLinks(
         // Android-only symbols are internally gated), so this is staged
         // unconditionally for them — NOT gated on `cfg.gamepad` (unlike SDL,
         // it pulls no system library and is a no-op off Android).
-        switch (cfg.backend) {
-            .sokol, .bgfx => {
-                const agp_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends/android_gamepad");
-                try deps.append(allocator, .{
-                    .zon_name = try allocator.dupe(u8, "labelle_android_gamepad"),
-                    .link_name = try allocator.dupe(u8, "android_gamepad"),
-                    .abs_path = agp_path,
-                });
-            },
-            else => {},
+        // Built-in-specific sub-package: skipped for an external backend (self-
+        // contained; its staged zon declares its own Android gamepad source).
+        if (stagesAndroidGamepad(cfg)) {
+            const agp_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends/android_gamepad");
+            try deps.append(allocator, .{
+                .zon_name = try allocator.dupe(u8, "labelle_android_gamepad"),
+                .link_name = try allocator.dupe(u8, "android_gamepad"),
+                .abs_path = agp_path,
+            });
         }
     }
 
@@ -681,4 +710,37 @@ test "hardlinkTree: errors on missing source" {
 
     const result = hardlinkTree(alloc, missing_src, dest);
     try std.testing.expectError(error.FileNotFound, result);
+}
+
+// ── External-backend gating (open-config, epic #386 Phase 5) ─────────
+
+test "stagesSdlGamepad: built-in raylib/sokol/bgfx with auto stages it" {
+    inline for (.{ config.Backend.raylib, .sokol, .bgfx }) |b| {
+        try std.testing.expect(stagesSdlGamepad(.{ .name = "g", .backend = b, .gamepad = .auto }));
+        try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = b, .gamepad = .none }));
+    }
+    // Other built-ins never stage it.
+    try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .sdl, .gamepad = .auto }));
+    try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .null, .gamepad = .auto }));
+}
+
+test "stagesSdlGamepad/AndroidGamepad: an external backend stages NEITHER" {
+    // The behavioral switches are skipped for an external backend: it is
+    // self-contained, so no built-in gamepad sub-package is staged — even
+    // though `.gamepad = .auto` (default) and `.backend` is whatever (ignored).
+    const cfg = config.ProjectConfig{
+        .name = "stubgame",
+        .backend_package = .{ .name = "stubbackend", .repo = "local:../stub" },
+        .gamepad = .auto,
+    };
+    try std.testing.expect(cfg.isExternal());
+    try std.testing.expect(!stagesSdlGamepad(cfg));
+    try std.testing.expect(!stagesAndroidGamepad(cfg));
+}
+
+test "stagesAndroidGamepad: built-in sokol/bgfx stage it; others don't" {
+    try std.testing.expect(stagesAndroidGamepad(.{ .name = "g", .backend = .sokol }));
+    try std.testing.expect(stagesAndroidGamepad(.{ .name = "g", .backend = .bgfx }));
+    try std.testing.expect(!stagesAndroidGamepad(.{ .name = "g", .backend = .raylib }));
+    try std.testing.expect(!stagesAndroidGamepad(.{ .name = "g", .backend = .null }));
 }

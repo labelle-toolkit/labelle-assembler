@@ -463,6 +463,20 @@ pub const ProjectConfig = struct {
     height: u32 = 600,
     target_fps: u32 = 60,
     backend: Backend = .raylib,
+    /// External graphics backend declared by NAME + package (epic #386 Phase 5,
+    /// the open-config seam). When set, the backend is *external*: it is named
+    /// and located through the plugin-resolution infra (the registry +
+    /// `resolvePlugin`) exactly like a plugin, and the closed `.backend` enum is
+    /// IGNORED. When null (the default), the built-in `.backend` enum is the
+    /// selection — that fast-path is unchanged and byte-identical.
+    ///
+    /// Reuses `PluginDep` so an external backend can live anywhere a plugin can:
+    /// a `local:../path` checkout, an `@libs/...` in-project dir, or a fetched
+    /// `github` repo. The package follows the SAME `backends/{name}` convention
+    /// the registry derives (`labelle_{name}` zon dep, `labelle-{name}` link),
+    /// and MUST ship a `backend.manifest.zon` — the manifest splice is its only
+    /// codegen route (see `isExternal` / `backend_registry.resolveBackendPackage`).
+    backend_package: ?PluginDep = null,
     platform: Platform = .desktop,
     /// Logical Y-axis convention (RFC-Y-AXIS-CONVENTION / epic
     /// labelle-engine#640). Emitted onto the generated game's
@@ -593,7 +607,20 @@ pub const ProjectConfig = struct {
     /// method is what lets a future resolver hand the name layer a backend name
     /// that has no enum tag (the explicit follow-up).
     pub fn backendName(self: ProjectConfig) []const u8 {
+        if (self.backend_package) |bp| return bp.name;
         return @tagName(self.backend);
+    }
+
+    /// True when the project declares an EXTERNAL backend (`backend_package`
+    /// set) rather than a built-in `.backend` enum value. The external path is
+    /// purely additive: when this is false the assembler stays on the unchanged
+    /// built-in codepath (byte-identical output). The behavioral
+    /// `switch (cfg.backend)` sites (built-in-specific sub-package staging /
+    /// per-backend build fragments) are gated OFF when this is true — an
+    /// external backend is self-contained (its own staged `build.zig.zon`
+    /// declares its deps) and generates exclusively through its manifest.
+    pub fn isExternal(self: ProjectConfig) bool {
+        return self.backend_package != null;
     }
 
     /// The unset-`.y_axis` build guard (RFC-Y-AXIS-CONVENTION Migration §,
