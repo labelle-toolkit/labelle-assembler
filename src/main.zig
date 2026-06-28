@@ -214,7 +214,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
         std.process.exit(1);
     };
 
-    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ @tagName(cfg.backend), @tagName(cfg.platform) });
+    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ cfg.backendName(), @tagName(cfg.platform) });
     defer allocator.free(target_name);
     std.log.info("labelle-assembler: generated .labelle/{s}/", .{target_name});
 

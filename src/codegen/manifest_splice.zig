@@ -43,6 +43,7 @@ const std = @import("std");
 const tpl = @import("../template.zig");
 const config = @import("../config.zig");
 const cache = @import("../cache.zig");
+const backend_registry = @import("../backend_registry.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -110,16 +111,18 @@ fn manifestExists(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir:
 /// slot) the same way `loadBackendTemplate` / `deps_linker` do. Caller owns the
 /// returned path.
 ///
-/// SEAM (Phase 5): this is the one spot the splice still uses `@tagName` — to
-/// LOCATE the package so it can read the manifest (chicken-and-egg: the dir
-/// name lives in the manifest we haven't read yet). A production
-/// name→package registry would map a backend *name string* (from
-/// project.labelle) here, dropping the enum entirely. Everything downstream of
-/// the read uses manifest data (`dir_name`/`dep_name`), not the tag.
+/// Locate the backend package so the splice can read its manifest (chicken-and-
+/// egg: the dir name lives in the manifest we haven't read yet, so we resolve by
+/// the backend's *name*). Now routed through the `backend_registry` — keyed by
+/// `cfg.backendName()`, a string, NOT `@tagName` directly. The only residual
+/// enum coupling is config *parsing* (`.backend` is still the closed enum, so
+/// `backendName()` only yields built-in names today); opening config to an
+/// arbitrary name+package is the next step, after which a third-party backend
+/// flows through this same registry lookup with no enum entry.
 fn backendPackageDir(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) ![]const u8 {
-    var subpath_buf: [128]u8 = undefined;
-    const subpath = std.fmt.bufPrint(&subpath_buf, "backends/{s}", .{@tagName(cfg.backend)}) catch unreachable;
-    return cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, subpath);
+    const backend_info = try backend_registry.lookup(allocator, cfg.backendName());
+    defer backend_registry.free(allocator, backend_info);
+    return cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, backend_info.subpath);
 }
 
 /// Load + parse `backend.manifest.zon` from the backend package.

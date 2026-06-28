@@ -7,6 +7,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
+const backend_registry = @import("backend_registry.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -51,13 +52,23 @@ pub fn createDepsLinks(
     }
 
     {
-        const backend_name = @tagName(cfg.backend);
-        var subpath_buf: [128]u8 = undefined;
-        const subpath = std.fmt.bufPrint(&subpath_buf, "backends/{s}", .{backend_name}) catch unreachable;
-        const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, subpath);
-        const zon_name = try std.fmt.allocPrint(allocator, "labelle_{s}", .{backend_name});
-        const link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{backend_name});
-        try deps.append(allocator, .{ .zon_name = zon_name, .link_name = link_name, .abs_path = backend_path });
+        // Tight scope: `zon_name`/`link_name`/`backend_path` are MOVED into the
+        // DepEntry on a successful append (then owned by `deps`, freed by
+        // freeDepEntries). The errdefers cover only the allocate→append window —
+        // on success this inner block exits normally so they don't fire; on any
+        // error up to and including the append they free the not-yet-moved
+        // allocations. Scoped tightly so the later gamepad appends (also failable)
+        // can't re-trigger them into a double-free. `subpath` is never moved, so
+        // it's a plain `defer`.
+        {
+            const backend_info = try backend_registry.lookup(allocator, cfg.backendName());
+            defer allocator.free(backend_info.subpath);
+            errdefer allocator.free(backend_info.zon_name);
+            errdefer allocator.free(backend_info.link_name);
+            const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, backend_info.subpath);
+            errdefer allocator.free(backend_path);
+            try deps.append(allocator, .{ .zon_name = backend_info.zon_name, .link_name = backend_info.link_name, .abs_path = backend_path });
+        }
 
         // Backend-owned transitive sub-package: the shared windowless-SDL
         // desktop gamepad source (`backends/sdl_gamepad/`, core#28). Both the
