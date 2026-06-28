@@ -21,6 +21,15 @@ const programs = @import("gfx/programs.zig");
 const draw = @import("gfx/draw.zig");
 const texture = @import("gfx/texture.zig");
 const font = @import("gfx/font.zig");
+const core = @import("labelle-core");
+
+// Prove this façade satisfies the render contract at compile time — the formal
+// gate (names every missing decl) replacing the old "satisfies Backend(Impl)"
+// doc claim. Completes bgfx's contract trifecta alongside window.zig's
+// `assertWindow` and input.zig's `assertInput` (#386 Phase 3).
+comptime {
+    core.assertBackend(@This());
+}
 
 // ── Backend types ──────────────────────────────────────────────────────
 
