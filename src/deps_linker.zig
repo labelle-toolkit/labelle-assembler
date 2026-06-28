@@ -60,6 +60,16 @@ pub fn createDepsLinks(
     opts: DepsLinkOptions,
 ) ![]const DepEntry {
     var deps: std.ArrayList(DepEntry) = .empty;
+    // On any error return, the caller never receives `deps` (so can't call
+    // freeDepEntries) — free the already-appended entries + the list backing
+    // here. Fires ONLY on error; on success `toOwnedSlice` below transfers the
+    // backing and leaves `deps` empty, so this is a no-op. Complements (doesn't
+    // double-free with) the per-entry errdefers in the backend-dep block: those
+    // fire only when an append itself fails (entry not yet in `deps`).
+    errdefer {
+        freeDepEntries(allocator, deps.items);
+        deps.deinit(allocator);
+    }
 
     const core_path = try cache.resolveFrameworkPackage(allocator, "core", cfg.core_version, project_dir);
     try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "labelle_core"), .link_name = try allocator.dupe(u8, "labelle-core"), .abs_path = core_path });
