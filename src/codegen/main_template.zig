@@ -43,7 +43,7 @@ const manifest_splice = @import("manifest_splice.zig");
 /// refactor can thread it as a proper argument. Null keeps the enum path
 /// verbatim. For bgfx-desktop the manifest declares `.loop`, so the resolved
 /// `use_callback_lifecycle` is false — identical to the enum path.
-pub var loop_style_override: ?manifest_splice.BackendManifest.LoopStyle = null;
+pub threadlocal var loop_style_override: ?manifest_splice.BackendManifest.LoopStyle = null;
 
 const ProjectConfig = config.ProjectConfig;
 const PluginDep = config.PluginDep;

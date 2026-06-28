@@ -139,7 +139,7 @@ pub fn loadManifest(allocator: std.mem.Allocator, cfg: ProjectConfig, project_di
     return std.zon.parse.fromSliceAlloc(BackendManifest, allocator, raw_z, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
-        std.debug.print("labelle-assembler: failed to parse backend.manifest.zon at {s}: {any}\n", .{ manifest_path, err });
+        std.log.warn("labelle-assembler: failed to parse backend.manifest.zon at {s}: {any}", .{ manifest_path, err });
         return error.BackendManifestParseError;
     };
 }

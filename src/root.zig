@@ -1012,14 +1012,16 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir)) {
         const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
         defer manifest_splice.freeManifest(allocator, m);
-        var sub_buf: [128]u8 = undefined;
-        const sub = std.fmt.bufPrint(&sub_buf, "backends/{s}", .{m.dir_name}) catch unreachable;
+        // `m.dir_name` is a runtime-parsed manifest field — allocPrint, not a
+        // fixed buffer + `catch unreachable` that could panic on a long name.
+        const sub = try std.fmt.allocPrint(allocator, "backends/{s}", .{m.dir_name});
+        defer allocator.free(sub);
         const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, game_dir, sub);
         defer allocator.free(backend_path);
         const tmpl_path = try std.fs.path.join(allocator, &.{ backend_path, manifest_splice.mainLoopTemplateRel(m) });
         defer allocator.free(tmpl_path);
         return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), tmpl_path, allocator, .limited(64 * 1024)) catch |err| {
-            std.debug.print("labelle: could not read manifest template '{s}': {any}\n", .{ tmpl_path, err });
+            std.log.warn("labelle: could not read manifest template '{s}': {any}", .{ tmpl_path, err });
             return error.TemplateNotFound;
         };
     }
