@@ -109,19 +109,30 @@ pub fn manifestPathEnabled(allocator: std.mem.Allocator, cfg: ProjectConfig, pro
 /// manifest-path decision in the generators.
 pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) !void {
     if (!cfg.isExternal()) return;
-    if (!manifestExists(allocator, cfg, project_dir)) {
-        // `warn`, not `err`: the hard failure is the returned error
-        // (`ExternalBackendNeedsManifest`); this is the human-readable hint that
-        // accompanies it. Matches `loadManifest`'s `warn`-on-parse-failure, and
-        // keeps the negative-path test from being failed by the test runner's
-        // "logged N errors" gate.
-        std.log.warn(
-            "labelle-assembler: external backend '{s}' (backend_package) ships no backend.manifest.zon — " ++
-                "an external backend must declare its codegen via a manifest (the enum-path fallback does not apply to external backends).",
-            .{cfg.backendName()},
-        );
-        return error.ExternalBackendNeedsManifest;
-    }
+
+    // Probe the manifest DIRECTLY (don't reuse `manifestExists`, which swallows
+    // every error for built-in fallback probing). For external backends a broken
+    // `local:` path / plugin-resolution failure / OOM is a real configuration
+    // error and must propagate — only a genuinely absent manifest (FileNotFound)
+    // maps to `ExternalBackendNeedsManifest`.
+    const pkg_dir = try backendPackageDir(allocator, cfg, project_dir);
+    defer allocator.free(pkg_dir);
+    const manifest_path = try std.fs.path.join(allocator, &.{ pkg_dir, "backend.manifest.zon" });
+    defer allocator.free(manifest_path);
+
+    std.Io.Dir.cwd().access(config.globalIo(), manifest_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            // `warn`, not `err`: the hard failure is the returned error; this is
+            // the human-readable hint. Matches `loadManifest`'s warn-on-failure.
+            std.log.warn(
+                "labelle-assembler: external backend '{s}' (backend_package) ships no backend.manifest.zon — " ++
+                    "an external backend must declare its codegen via a manifest (the enum-path fallback does not apply to external backends).",
+                .{cfg.backendName()},
+            );
+            return error.ExternalBackendNeedsManifest;
+        },
+        else => return err, // real resolution/access failure — surface it, don't mask it
+    };
 }
 
 /// Does the resolved backend package contain a `backend.manifest.zon`?

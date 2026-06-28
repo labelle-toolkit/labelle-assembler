@@ -300,6 +300,39 @@ pub fn createDepsLinks(
             try rewriteZonPaths(allocator, resolution_src, abs_dest);
         }
 
+        // A LOCAL external backend (`backend_package` with a `local:`/`@libs`
+        // repo) is staged like a plugin into .labelle/deps/labelle-<name>, so its
+        // own relative `.path` deps need the same re-anchoring — otherwise they
+        // stay pointed at the original checkout. Built-in + non-local-external
+        // backends skip this (a built-in's zon has no rewritable local deps here;
+        // a fetched external resolves to a self-contained cache dir).
+        if (cfg.backend_package) |bp| blk: {
+            if (!bp.isLocal()) break :blk;
+
+            const link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{bp.name});
+            defer allocator.free(link_name);
+
+            const dest = try std.fs.path.join(allocator, &.{ deps_dir, link_name });
+            defer allocator.free(dest);
+
+            const backend_path = try cache.resolvePlugin(allocator, bp, project_dir);
+            defer allocator.free(backend_path);
+
+            const abs_src = cwd.realPathFileAlloc(io, backend_path, allocator) catch break :blk;
+            defer allocator.free(abs_src);
+
+            const abs_dest = cwd.realPathFileAlloc(io, dest, allocator) catch break :blk;
+            defer allocator.free(abs_dest);
+
+            const resolution_src = if (try firstPathDepResolvesInWorktree(allocator, abs_src))
+                try allocator.dupe(u8, abs_src)
+            else
+                try cache.toMainCheckoutPath(allocator, abs_src, project_dir);
+            defer allocator.free(resolution_src);
+
+            try rewriteZonPaths(allocator, resolution_src, abs_dest);
+        }
+
         // Also rewrite GUI plugin/bridge paths — the GUI is resolved separately
         // from cfg.plugins but may also have local .path deps.
         // rewriteZonPaths is a no-op if no .path entries exist, so always safe to call.
