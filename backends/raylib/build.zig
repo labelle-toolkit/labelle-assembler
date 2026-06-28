@@ -58,7 +58,20 @@ pub fn build(b: *std.Build) void {
     const gamepad_enabled = b.option(bool, "gamepad_enabled", "Wire the shared SDL desktop gamepad source + link SDL2 (default true; false = opt out, no SDL)") orelse true;
     const gamepad_hidapi = b.option(bool, "gamepad_hidapi", "Opt the SDL gamepad source into HIDAPI raw-HID decode (Switch/8BitDo); default false — HIDAPI per-connect init stalls the render thread for seconds on some platforms") orelse false;
 
-    const raylib_dep = b.dependency("raylib-zig", .{ .target = target, .optimize = optimize });
+    // Disable raudio's bundled `dr_wav` (.wav) and `stb_vorbis` (.ogg) file-format
+    // decoders. This backend ships and compiles its OWN copies (`src/dr_wav_impl.c`
+    // + `src/stb_vorbis.c`) for the worker-thread `decodeAudio` path, so raudio's
+    // copies are pure redundancy — and linking both defines `drwav_*`/`stb_vorbis_*`
+    // twice, failing any game that uses a sound asset with ~120 `lld-link: duplicate
+    // symbol` errors. raylib's `config.h` guards each default behind `#ifndef`, so a
+    // `-D...=0` here suppresses the include while keeping raudio's device + mixer
+    // (`InitAudioDevice`/`PlaySound`/`LoadSoundFromWave`) intact — playback uploads
+    // raw PCM via `loadSoundFromWave`, which needs no file-format support.
+    const raylib_dep = b.dependency("raylib-zig", .{
+        .target = target,
+        .optimize = optimize,
+        .config = @as([]const u8, "-DSUPPORT_FILEFORMAT_WAV=0 -DSUPPORT_FILEFORMAT_OGG=0"),
+    });
 
     const raylib_mod = raylib_dep.module("raylib");
     const raylib_artifact = raylib_dep.artifact("raylib");
