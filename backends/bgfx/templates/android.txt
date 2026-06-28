@@ -99,6 +99,19 @@ fn gameFrame() callconv(.c) void {
 {{gui_draw_code}}    window.endFrame();
 }
 
+// GPU-context-loss trampolines (epic #386 Phase 4). On Android,
+// APP_CMD_TERM_WINDOW destroys the GPU surface + every bgfx texture/shader,
+// and APP_CMD_INIT_WINDOW later recreates it. The bgfx shell fires these via
+// `setSurfaceLostCallback` / `setSurfaceRestoredCallback`; we forward to the
+// engine's `Game.surfaceLost()` / `surfaceRestored()`. `@hasDecl`-gated so an
+// OLDER engine without those methods still compiles (the call folds away).
+fn gameSurfaceLost() callconv(.c) void {
+    if (@hasDecl(@TypeOf(g), "surfaceLost")) g.surfaceLost();
+}
+fn gameSurfaceRestored() callconv(.c) void {
+    if (@hasDecl(@TypeOf(g), "surfaceRestored")) g.surfaceRestored();
+}
+
 // {{entry_comment}}
 // The NativeActivity glue (`android_native_app_glue.c`, compiled into the
 // `android_app` module) declares `extern void android_main(struct
@@ -107,5 +120,10 @@ fn gameFrame() callconv(.c) void {
 export fn android_main(app: *android_app.android_app) callconv(.c) void {
     android_app.setInitCallback(&gameInit);
     android_app.setTickCallback(&gameFrame);
+    // GPU-context-loss callbacks (#386 Phase 4): the shell fires these around
+    // the TERM_WINDOW teardown / INIT_WINDOW restore so the engine can drop
+    // and rebuild its GPU catalog (sprites) across a surface cycle.
+    android_app.setSurfaceLostCallback(&gameSurfaceLost);
+    android_app.setSurfaceRestoredCallback(&gameSurfaceRestored);
 {{android_backend_register}}{{immersive_register}}    android_app.run(app);
 }

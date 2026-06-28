@@ -16,6 +16,7 @@
 /// Compile target: `aarch64-linux-android`. This module is Android-only —
 /// on every other target it is a no-op namespace (see the `is_android`
 /// guard) so a stray import never breaks desktop builds.
+const std = @import("std");
 const builtin = @import("builtin");
 // `window` / `input` come in as named modules (wired in build.zig) — NOT
 // path imports. A `@import("window.zig")` here would make window.zig
@@ -368,6 +369,38 @@ pub fn setInitCallback(cb: InitFn) void {
     init_fn = cb;
 }
 
+/// GPU-context-loss callbacks (epic #386 Phase 4). On Android,
+/// `APP_CMD_TERM_WINDOW` destroys the GPU surface AND every bgfx
+/// texture/shader; `APP_CMD_INIT_WINDOW` later recreates the surface. The
+/// engine's catalog (sprites) is GPU state that must be forgotten on loss
+/// and rebuilt on restore — the engine exposes `Game.surfaceLost()` /
+/// `Game.surfaceRestored()` for exactly this. These bare C fn pointers are
+/// the shell's engine-agnostic seam (same pattern as `InitFn`/`TickFn`):
+/// the generated `main.zig` registers `@hasDecl`-gated trampolines that
+/// call the engine methods, so an OLDER engine without those methods still
+/// compiles.
+///
+/// `surface_lost_fn` fires on TERM_WINDOW BEFORE the bgfx teardown (the
+/// engine must forget its catalog handles while they're still nominally
+/// valid). `surface_restored_fn` fires on a NON-FIRST INIT_WINDOW, AFTER
+/// bgfx is back up — never on the first window (that path runs `init_fn`).
+pub const SurfaceFn = *const fn () callconv(.c) void;
+var surface_lost_fn: ?SurfaceFn = null;
+var surface_restored_fn: ?SurfaceFn = null;
+
+/// Register the surface-lost callback (engine `surfaceLost`). Fired on
+/// `APP_CMD_TERM_WINDOW` before bgfx is torn down. Call before `run()`.
+pub fn setSurfaceLostCallback(cb: SurfaceFn) void {
+    surface_lost_fn = cb;
+}
+
+/// Register the surface-restored callback (engine `surfaceRestored`). Fired
+/// on a re-init `APP_CMD_INIT_WINDOW` (NOT the first), after bgfx is back
+/// up. Call before `run()`.
+pub fn setSurfaceRestoredCallback(cb: SurfaceFn) void {
+    surface_restored_fn = cb;
+}
+
 // ── Lifecycle: APP_CMD_* handler ────────────────────────────────────
 fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
     switch (cmd) {
@@ -383,25 +416,41 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
                 window.initWindow(ww, wh, "labelle");
                 bgfx_ready = true;
 
-                // Fire the game's one-shot engine/scene init exactly once,
-                // now that bgfx is live against the surface. A later
-                // INIT_WINDOW (resume after backgrounding) re-creates the
-                // surface but skips this — engine state survives the
-                // TERM_WINDOW teardown.
+                // Cold init vs. surface restore (#386 Phase 4). The very
+                // first INIT_WINDOW runs the game's one-shot engine/scene
+                // init (`init_fn`) — engine state is built once and survives
+                // every later TERM/INIT cycle. A LATER INIT_WINDOW (resume
+                // after backgrounding) re-creates the bgfx surface against a
+                // brand-new context; the engine must rebuild its GPU catalog
+                // (sprites), so we fire `surface_restored_fn` instead.
+                // surfaceRestored therefore fires ONLY in the `else` — never
+                // on the first window.
                 if (!init_done) {
                     init_done = true;
                     if (init_fn) |cb| cb();
+                    std.log.info("bgfx: first surface (cold init)", .{});
+                } else {
+                    if (surface_restored_fn) |cb| cb();
+                    std.log.info("bgfx: re-init against new surface (restore)", .{});
                 }
             }
         },
         APP_CMD_TERM_WINDOW => {
-            // The surface is going away. Tear bgfx down and drop the
-            // handle so a later INIT_WINDOW re-inits cleanly.
+            // The surface is going away — bgfx destroys the GPU context AND
+            // every texture/shader. Ordering is LOAD-BEARING: notify the
+            // engine FIRST (`surface_lost_fn`) so it forgets its catalog
+            // handles while they're still nominally valid, THEN tear bgfx
+            // down (`teardownSurface` = shutdownPrograms-then-shutdown), THEN
+            // drop the native handle so a later INIT_WINDOW re-inits cleanly.
             if (bgfx_ready) {
-                window.closeWindow();
+                if (surface_lost_fn) |cb| cb();
+                window.teardownSurface();
                 bgfx_ready = false;
+                window.setAndroidNativeWindow(null);
+                std.log.info("bgfx: shutdownPrograms + bgfx.shutdown (surface lost)", .{});
+            } else {
+                window.setAndroidNativeWindow(null);
             }
-            window.setAndroidNativeWindow(null);
         },
         APP_CMD_GAINED_FOCUS, APP_CMD_RESUME, APP_CMD_START => {
             is_resumed = true;
@@ -415,6 +464,11 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
         },
         APP_CMD_DESTROY => {
             // Surface should already be gone via TERM_WINDOW; be defensive.
+            // Route through the same shutdownPrograms-then-shutdown order as
+            // the surface-lost path (via `closeWindow`, which also drops the
+            // native-window handle), but do NOT fire `surface_lost_fn`: the
+            // engine is about to deinit, so there's no restore to prepare for
+            // and notifying it would race its own teardown.
             if (bgfx_ready) {
                 window.closeWindow();
                 bgfx_ready = false;
@@ -661,6 +715,8 @@ comptime {
     _ = onInputEvent;
     _ = setTickCallback;
     _ = setInitCallback;
+    _ = setSurfaceLostCallback;
+    _ = setSurfaceRestoredCallback;
     _ = getNativeActivity;
     _ = setImmersiveCallback;
     _ = &focusHook;

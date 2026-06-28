@@ -271,16 +271,39 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     input.setWindow(win);
 }
 
+/// Tear down the gfx-level bgfx resources, then the bgfx context itself.
+///
+/// Ordering is LOAD-BEARING: `gfx.shutdownPrograms()` destroys the
+/// individual resources (sprite program + shaders, the `s_tex` sampler
+/// uniform, the 1x1 white texture, the bitmap font atlas, and every
+/// uploaded texture in the `texture_handles[]` pool) BEFORE `bgfx.shutdown()`
+/// destroys the context. Reversing this double-frees / asserts inside bgfx —
+/// `bgfx.shutdown()` invalidates the handles, so a later `destroyTexture`
+/// would operate on freed handles. `shutdownPrograms` ALSO resets the
+/// lazy-init flags it owns — `shaders_initialized`, `font_atlas_initialized`
+/// (via `font.destroyFontAtlas`), and the white-texture / sampler sentinels —
+/// so on an Android surface RESTORE the `ensure*` paths re-create everything
+/// against the new context. Without that reset the lazy guards would think
+/// the resources still exist and the screen would render black/garbage after
+/// `APP_CMD_INIT_WINDOW` re-inits bgfx.
+///
+/// Used both by `closeWindow()` (final teardown) and the Android
+/// surface-lost path (`APP_CMD_TERM_WINDOW`), where the context is torn down
+/// but the engine state survives for a later restore.
+pub fn teardownSurface() void {
+    gfx.shutdownPrograms();
+    bgfx.shutdown();
+}
+
 pub fn closeWindow() void {
     // Release the sprite program (+ its shaders), the s_tex sampler
     // uniform, the 1x1 white texture, the font atlas, and any uploaded
     // textures BEFORE bgfx tears down — otherwise bgfx reports these live
-    // handles as leaks on clean shutdown (#384). Placed before the
-    // is_android split so it runs on both the desktop and Android paths;
-    // it is idempotent (valid-handle guarded), so it is a safe no-op if
-    // rendering never initialized.
-    gfx.shutdownPrograms();
-    bgfx.shutdown();
+    // handles as leaks on clean shutdown (#384). `teardownSurface` enforces
+    // the shutdownPrograms-then-shutdown order; it is idempotent
+    // (valid-handle guarded), so it is a safe no-op if rendering never
+    // initialized. Runs on both the desktop and Android paths.
+    teardownSurface();
     if (is_android) {
         // No GLFW to tear down; the surface lifecycle is owned by the
         // NativeActivity glue (phase 3). Clear the native-window handle so
