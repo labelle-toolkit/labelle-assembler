@@ -14,6 +14,7 @@ pub const script_scanner = @import("script_scanner.zig");
 pub const flow_scanner = @import("flow_scanner.zig");
 pub const flow_catalog = @import("flow_catalog.zig");
 const build_files = @import("build_files.zig");
+const manifest_splice = @import("codegen/manifest_splice.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
 const gui_resolve = @import("gui_resolve.zig");
@@ -767,6 +768,10 @@ pub fn generate(
     const build_zig = try build_files.generateBuildZig(allocator, cfg, .{
         .is_tests_target = is_tests_target,
         .promoted_scripts = promoted_scripts,
+        // Manifest-driven backend splice (assembler#378): pass the project
+        // root so the splice can locate `backend.manifest.zon` + fragments.
+        // Only consulted when the gate (desktop + manifest present) fires.
+        .project_dir = game_dir,
     });
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
@@ -870,6 +875,21 @@ pub fn generate(
         defer allocator.free(backend_tmpl);
         const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
         defer allocator.free(engine_template);
+
+        // Manifest-driven run-loop splice (assembler#378): when the manifest
+        // path is enabled (desktop + a backend that ships a manifest), resolve
+        // the lifecycle style (callback vs loop) from the backend manifest's
+        // `loop_style` field and stash it where `generateMainZigFromTemplate`
+        // reads it — instead of the `cfg.backend == .sokol` enum branch inside
+        // that function. Scoped to this one call; cleared right after. Null
+        // override = enum path (bgfx-android, sokol-wasm, etc. unchanged).
+        if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir)) {
+            const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
+            defer manifest_splice.freeManifest(allocator, m);
+            main_zig.main_template.loop_style_override = manifest_splice.loopStyle(m);
+        }
+        defer main_zig.main_template.loop_style_override = null;
+
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,
             engine_template,
@@ -981,6 +1001,29 @@ fn loadEngineTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: P
 /// Load the backend+platform lifecycle template from the CLI cache.
 fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: ProjectConfig) ![]const u8 {
     const backend_name = @tagName(cfg.backend);
+
+    // ── Manifest-driven main-loop template path (assembler#378) ─────────
+    // When the manifest path is enabled (desktop + a backend that ships a
+    // manifest), resolve the main-loop template from the backend manifest's
+    // `main_loop_template` field instead of the enum→`<platform>.txt` mapping
+    // below. For bgfx-desktop this lands on the SAME `templates/desktop.txt`
+    // the enum path would have selected — the difference is the SELECTION is
+    // data (manifest), not an enum branch.
+    if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir)) {
+        const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
+        defer manifest_splice.freeManifest(allocator, m);
+        var sub_buf: [128]u8 = undefined;
+        const sub = std.fmt.bufPrint(&sub_buf, "backends/{s}", .{m.dir_name}) catch unreachable;
+        const backend_path = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, game_dir, sub);
+        defer allocator.free(backend_path);
+        const tmpl_path = try std.fs.path.join(allocator, &.{ backend_path, manifest_splice.mainLoopTemplateRel(m) });
+        defer allocator.free(tmpl_path);
+        return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), tmpl_path, allocator, .limited(64 * 1024)) catch |err| {
+            std.debug.print("labelle: could not read manifest template '{s}': {any}\n", .{ tmpl_path, err });
+            return error.TemplateNotFound;
+        };
+    }
+
     // Null backend has a single platform-independent template — `headless.txt`.
     // No window toolkit means there's nothing platform-specific to vary by:
     // the same `pub fn main() ... while (frame < max_frames) ...` loop runs

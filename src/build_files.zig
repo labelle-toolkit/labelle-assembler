@@ -4,6 +4,7 @@ const tpl = @import("template.zig");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
 const scan = @import("codegen/scan.zig");
+const manifest_splice = @import("codegen/manifest_splice.zig");
 pub const deps_linker = @import("deps_linker.zig");
 
 const ProjectConfig = config.ProjectConfig;
@@ -145,6 +146,12 @@ pub const BuildZigOptions = struct {
     /// empty — projects with no FlowNodes-bearing scripts (the common
     /// case) emit nothing here and keep their byte-identical build.zig.
     promoted_scripts: []const scan.PromotedScript = &.{},
+    /// Project root, used by the manifest-driven splice (pluggable-backends
+    /// RFC, assembler#378) to locate the backend package's
+    /// `backend.manifest.zon` + build fragments. Null (default) keeps the
+    /// enum path. Only consulted when `manifest_splice.manifestPathEnabled`
+    /// returns true (desktop target + a backend that ships a manifest).
+    project_dir: ?[]const u8 = null,
 };
 
 pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: BuildZigOptions) ![]const u8 {
@@ -208,8 +215,27 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // `gamepad_enabled`; forwarded to the backend's `input` build_options.
     const gamepad_hidapi: []const u8 = if (cfg.gamepad_hidapi) "true" else "false";
 
+    // ── Manifest-driven backend splice (pluggable-backends RFC, #378) ────
+    // When the resolved backend ships a `backend.manifest.zon` AND the target
+    // is desktop, load it ONCE here; the backend-dep and link sections below
+    // dispatch to the manifest fragments instead of the embedded
+    // `backend_<tag>` / `link_<tag>` template sections. Every other backend ×
+    // platform (no manifest, or non-desktop) falls through the enum `switch`
+    // unchanged. bgfx-desktop opts in by shipping a manifest.
+    const use_manifest = opts.project_dir != null and
+        manifest_splice.manifestPathEnabled(allocator, cfg, opts.project_dir.?);
+    var splice_manifest: ?manifest_splice.BackendManifest = null;
+    defer if (splice_manifest) |m| manifest_splice.freeManifest(allocator, m);
+    if (use_manifest) {
+        splice_manifest = try manifest_splice.loadManifest(allocator, cfg, opts.project_dir.?);
+    }
+
     // Backend dep — always the standard backend (never a merged GUI+backend package)
-    switch (cfg.backend) {
+    if (splice_manifest) |m| {
+        // Splice: resolve the backend-dep build fragment from the manifest,
+        // no `=> .<tag>` branch. Desktop-only (the gate guarantees it).
+        try manifest_splice.renderBackendDepSection(allocator, m, cfg, opts.project_dir.?, w);
+    } else switch (cfg.backend) {
         .raylib => try tpl.renderSection(build_zig_tmpl, "backend_raylib", .{ .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi }, w),
         .sokol => {
             // `with_imgui` must be true ONLY when the project's gui plugin
@@ -528,7 +554,11 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
 
             // Link backend artifact
-            switch (cfg.backend) {
+            if (splice_manifest) |m| {
+                // Splice: resolve the link build fragment from the manifest,
+                // no `=> .<tag>` branch.
+                try manifest_splice.renderLinkSection(allocator, m, cfg, opts.project_dir.?, w);
+            } else switch (cfg.backend) {
                 .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib", w),
                 .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol", w),
                 .sdl => try tpl.writeSection(build_zig_tmpl, "link_sdl", w),
