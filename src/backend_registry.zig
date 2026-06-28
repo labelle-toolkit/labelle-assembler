@@ -51,12 +51,14 @@ pub const BackendInfo = struct {
 /// returned `BackendInfo`'s `subpath` / `zon_name` / `link_name` are
 /// allocator-owned; free them with `free`. `name` borrows the caller's slice.
 pub fn lookup(allocator: std.mem.Allocator, name: []const u8) !BackendInfo {
-    return .{
-        .name = name,
-        .subpath = try std.fmt.allocPrint(allocator, "backends/{s}", .{name}),
-        .zon_name = try std.fmt.allocPrint(allocator, "labelle_{s}", .{name}),
-        .link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{name}),
-    };
+    // Allocate incrementally with errdefer so a mid-sequence OOM doesn't leak the
+    // fields already allocated (the struct never returns, so callers never `free`).
+    const subpath = try std.fmt.allocPrint(allocator, "backends/{s}", .{name});
+    errdefer allocator.free(subpath);
+    const zon_name = try std.fmt.allocPrint(allocator, "labelle_{s}", .{name});
+    errdefer allocator.free(zon_name);
+    const link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{name});
+    return .{ .name = name, .subpath = subpath, .zon_name = zon_name, .link_name = link_name };
 }
 
 /// Free the allocator-owned fields of an `info` returned by `lookup`.
