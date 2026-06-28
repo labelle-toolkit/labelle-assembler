@@ -31,6 +31,19 @@ const idents = @import("idents.zig");
 const validate = @import("validate.zig");
 const preview = @import("preview.zig");
 const context = @import("context.zig");
+const manifest_splice = @import("manifest_splice.zig");
+
+/// Manifest-driven run-loop splice (pluggable-backends RFC, assembler#378).
+/// When non-null, the run-loop style was resolved from the backend manifest's
+/// `loop_style` field and OVERRIDES the enum-based `use_callback_lifecycle`
+/// selection in `generateMainZigFromTemplate`. `root.zig` sets this
+/// immediately before the call and clears it after (so the override is scoped
+/// to that one generation). Module-level rather than a positional param on the
+/// ~130-arg generator purely to keep the splice's diff localized — a later
+/// refactor can thread it as a proper argument. Null keeps the enum path
+/// verbatim. For bgfx-desktop the manifest declares `.loop`, so the resolved
+/// `use_callback_lifecycle` is false — identical to the enum path.
+pub threadlocal var loop_style_override: ?manifest_splice.BackendManifest.LoopStyle = null;
 
 const ProjectConfig = config.ProjectConfig;
 const PluginDep = config.PluginDep;
@@ -971,7 +984,17 @@ pub fn generateMainZigFromTemplate(
         // `init_code` via `buildCallbackInitCode`) rather than the
         // procedural loop path the bgfx DESKTOP template uses.
         const is_bgfx_android = cfg.backend == .bgfx and cfg.platform == .android;
-        const use_callback_lifecycle = cfg.backend == .sokol or cfg.platform == .wasm or is_bgfx_android;
+        // Manifest-driven run-loop splice (assembler#378): when the backend
+        // manifest supplied a `loop_style`, resolve callback-vs-loop from THAT
+        // (data), not the `cfg.backend == .sokol` enum branch. For
+        // bgfx-desktop the manifest declares `.loop` → callback false (the
+        // desktop `while (!shouldQuit())` path); for sokol-desktop it declares
+        // `.callback` → true. Both match the enum path → byte-identical output.
+        // Null override keeps the enum path verbatim for every other target.
+        const use_callback_lifecycle = if (loop_style_override) |ls|
+            ls == .callback
+        else
+            cfg.backend == .sokol or cfg.platform == .wasm or is_bgfx_android;
 
         if (use_callback_lifecycle) {
             // Module-scope `runner` decl — needed by every callback-path
