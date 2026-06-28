@@ -26,6 +26,7 @@ pub const app_icon = @import("app_icon.zig");
 test {
     _ = @import("plugin_manifest.zig");
     _ = @import("scene_manifest.zig");
+    _ = @import("scene_manifest_test.zig");
     _ = @import("asset_validator.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
