@@ -1,6 +1,6 @@
 # RFC: Pluggable backends — make the assembler backend-agnostic
 
-**Status:** Draft (revision 14 — **post-deployment**: Phases 1 & 2 SHIPPED (labelle-core #45 = the render contract in `backend_contract.zig`; labelle-audio v0.3.0 = shared `Mixer(Sink)` + `DeviceSink`, i16+f32; bgfx/wgpu/sokol collapsed, #388/#389/#390). Marks 1 & 2 DONE in the migration plan; **corrects the audio worked-example** — `raudio`/`sdl_audio` are *monolithic engines*, NOT shared-mixer device sinks (raylib/sdl delegate decode+mix wholesale, didn't collapse); adds the **composable-vs-monolithic provider** distinction to the resolver (Phase 5); flags the **WAV-shared/OGG-backend decode split** + the `writeAudioBackendWiring` codegen as **Phase-6 targets**; records that audio proved the *provider-composition* mechanic + no-codegen-change for a module dep, but **not** the run-loop splice — Phase 3 remains the gating crux. Rev 13 — addresses the rev-12 design review (7 points): names render's **draw vs loader sub-surfaces** (symmetric with the audio split); replaces the single under-specified `contextLost` with an explicit **`surfaceLost`/`surfaceRestored`** pair driving engine-side `gpuResourcesInvalidated` → `reuploadAssets` (no `deinit`/`init` overload); adds **provider identity** (canonical `<namespace>.<name>` IDs, `labelle.*` reserved, collision is a hard error), **capability negotiation** (declared `.capabilities` checked at resolve time → early project-level errors, not deep `@compileError`s), and **per-contract conformance suites** (behavior, not just `@hasDecl` shape) in a new "Opening the ecosystem" section; constrains the build hook to a versioned, documented `HookContext` (manifest ~95%, hook ~5%, no arbitrary work); migration pilots already split in rev 12 (audio=mechanics, sokol-desktop=full-stack, bgfx-Android=context gate). Rev 12 — addresses rev-11 review: distinguishes the runtime-playback `AudioInterface` (labelle-core, `playSound`/`stopSound`) from the separate audio *loader* contract (`Backend(Impl)` in labelle-engine/`audio_backend`, `decodeAudio`/`uploadSound`); fixes the versioning summary `N <= M` → `N == M` to match the strict-equality code sample; splits the pilot into step 3 (sokol-desktop, extraction mechanics) and a distinct step 4 (bgfx-Android GPU-context Accept gate); refreshes the build_zig.txt line count and the PR description; last "crate" → "package". Rev 11 — addresses rev-10 review: collapses `labelle-platform-abi` to `labelle-core` everywhere; splits the build hook into `pre_wire`/`post_wire` (sokol's `with_imgui` is a shipped consumer that needs `b.dependency`-time options); reframes the Accept gate to the bgfx-Android pilot (audio has zero GPU context, can't validate `contextLost`); fixes the `contract_version` check to gate on equality with direction-branched diagnostics (`t < p` catches new-core+old-backend, the dominant ecosystem failure). Rev 10 answered all six open questions. Rev 5: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; Platform-packaging & manifest section; terminology + stale-wording fixes)
+**Status:** Draft (revision 15 — **build-splice POC**: a throwaway manifest-driven generation path for sokol-desktop produced **byte-identical** `main.zig`+`build.zig` with **no `=> .sokol` branch** in the splice logic, builds + runs (headless screenshot). Verdict: **the build splice is VIABLE** — externalizing the embedded `build_zig.txt` sections was the *easy* part. Refines the model to **"manifest declarations + a fixed assembler-computed param set + a capability-flag-keyed lifecycle block library," NOT pure-data**; names the three things that stay code (per-placeholder param *value* computation, backend-specific *generated* lifecycle blocks, cross-compile link ordering) and the **name→package registry** that replaces `@tagName` as the pluggability seam (Phase 5). See *Build-splice POC verdict*. Rev 14 — **post-deployment**: Phases 1 & 2 SHIPPED (labelle-core #45 = the render contract in `backend_contract.zig`; labelle-audio v0.3.0 = shared `Mixer(Sink)` + `DeviceSink`, i16+f32; bgfx/wgpu/sokol collapsed, #388/#389/#390). Marks 1 & 2 DONE in the migration plan; **corrects the audio worked-example** — `raudio`/`sdl_audio` are *monolithic engines*, NOT shared-mixer device sinks (raylib/sdl delegate decode+mix wholesale, didn't collapse); adds the **composable-vs-monolithic provider** distinction to the resolver (Phase 5); flags the **WAV-shared/OGG-backend decode split** + the `writeAudioBackendWiring` codegen as **Phase-6 targets**; records that audio proved the *provider-composition* mechanic + no-codegen-change for a module dep, but **not** the run-loop splice — Phase 3 remains the gating crux. Rev 13 — addresses the rev-12 design review (7 points): names render's **draw vs loader sub-surfaces** (symmetric with the audio split); replaces the single under-specified `contextLost` with an explicit **`surfaceLost`/`surfaceRestored`** pair driving engine-side `gpuResourcesInvalidated` → `reuploadAssets` (no `deinit`/`init` overload); adds **provider identity** (canonical `<namespace>.<name>` IDs, `labelle.*` reserved, collision is a hard error), **capability negotiation** (declared `.capabilities` checked at resolve time → early project-level errors, not deep `@compileError`s), and **per-contract conformance suites** (behavior, not just `@hasDecl` shape) in a new "Opening the ecosystem" section; constrains the build hook to a versioned, documented `HookContext` (manifest ~95%, hook ~5%, no arbitrary work); migration pilots already split in rev 12 (audio=mechanics, sokol-desktop=full-stack, bgfx-Android=context gate). Rev 12 — addresses rev-11 review: distinguishes the runtime-playback `AudioInterface` (labelle-core, `playSound`/`stopSound`) from the separate audio *loader* contract (`Backend(Impl)` in labelle-engine/`audio_backend`, `decodeAudio`/`uploadSound`); fixes the versioning summary `N <= M` → `N == M` to match the strict-equality code sample; splits the pilot into step 3 (sokol-desktop, extraction mechanics) and a distinct step 4 (bgfx-Android GPU-context Accept gate); refreshes the build_zig.txt line count and the PR description; last "crate" → "package". Rev 11 — addresses rev-10 review: collapses `labelle-platform-abi` to `labelle-core` everywhere; splits the build hook into `pre_wire`/`post_wire` (sokol's `with_imgui` is a shipped consumer that needs `b.dependency`-time options); reframes the Accept gate to the bgfx-Android pilot (audio has zero GPU context, can't validate `contextLost`); fixes the `contract_version` check to gate on equality with direction-branched diagnostics (`t < p` catches new-core+old-backend, the dominant ecosystem failure). Rev 10 answered all six open questions. Rev 5: full render/audio contract surface incl. loaders/fonts; platform-qualified cascade `(platform, render)`; lazy-deps reframed as a requirement; Platform-packaging & manifest section; terminology + stale-wording fixes)
 
 **All six open questions answered**, plus three ecosystem concerns added by the rev-12 review: Q#1 (lifecycle ABI), Q#2 (contract home + versioning), Q#3 (monorepo — resolved rev 3), Q#4 (gamepad as input-extension), Q#5 (build-graph manifest), Q#6 (GUI-bridge compatibility), and (rev 13) provider identity, capability negotiation, and conformance suites — see *Opening the ecosystem*. Residuals are migration-gated, not design-blockers — the RFC is ready to move from Draft to Accepted pending the **bgfx-Android pilot** (migration step 4) validating the `surfaceLost`/`surfaceRestored` re-upload story. The audio pilot (step 2) and sokol-desktop conversion (step 3) validate extraction mechanics but have zero surface-loss cycle to exercise.
 
@@ -304,6 +304,52 @@ So the *code* splice is largely answered. The two genuinely hard residuals are:
   must carry input/resize events and, the gnarly part, mobile **suspend/resume +
   GPU context-loss**, delivered by the entry point to the game (see open
   question #1). That surface area is where the real design depth now sits.
+
+### Build-splice POC verdict (rev 15) — VIABLE, with a refined model
+
+A throwaway POC (epic #386, Phase-3 entry) attacked the **build splice** residual
+head-on: a manifest-driven generation path for **sokol-desktop** that resolves
+the run-loop style + the `build.zig` backend/link fragments from a
+`backend.manifest.zon` in the backend package, with **no `switch(cfg.backend) =>
+.sokol` branch in the splice logic**. Result: generated `main.zig` + `build.zig`
+**byte-identical** to the enum path, builds, and runs (headless screenshot
+byte-identical too; a negative-control sentinel proved the manifest path is
+genuinely active, not a silent fallthrough). **So manifest-driven splicing is
+viable** — and the feared part, externalizing the embedded `build_zig.txt`
+sections to fragment files, was the *easiest* part (the template engine already
+does runtime placeholder maps; the lifecycle template already loads from the
+backend package).
+
+The POC's real value is mapping what **resists the data model** — the model is
+**"manifest declarations + a fixed set of assembler-computed params + a still-code
+lifecycle block library keyed by capability flags," NOT a pure-data manifest**:
+1. **Per-placeholder param *value* computation stays code.** A manifest can declare
+   *which* `{{placeholders}}` a fragment consumes (`with_imgui`, `gamepad_enabled`),
+   but the *value* derivation (`with_imgui` = imgui-gui-only; the gamepad rules) is
+   backend-specific logic. Options: a fixed assembler-computed param vocabulary
+   (what the POC did) or backend-shipped resolvers = sandboxed codegen-time
+   execution (much harder). Pick the fixed vocabulary.
+2. **Backend-specific *generated lifecycle logic* stays code.** `main_template.zig`
+   emits sokol-specific readback / preview / allocator / platform-render blocks. For
+   sokol-desktop they resolve identically (hence byte-identical), but a *new*
+   callback-style backend would hit residual `cfg.backend == .sokol` checks. A
+   manifest can *key* these by a capability flag ("wants the readback block") but
+   can't carry the block's *content* — it's generated code, not data.
+3. **Cross-compile link steps stay imperative.** wasm `emLinkStep`, iOS frameworks,
+   Android NDK ordering (the emcc dep-snapshot timing) are sequencing logic, not
+   declarative fragments — they don't fit the manifest at all.
+
+And the **chicken-and-egg / pluggability seam**: you need the package dir to read
+the manifest, but the dir name is *in* it. The POC resolves via `@tagName` once as
+a gate; **production replaces that gate with a name→package registry** (the same
+`@tagName(cfg.backend)` sites at `build_files.zig:745` / `deps_linker.zig:54` /
+`root.zig`). That registry *is* the thing that makes backends pluggable — Phase 5.
+
+Net for the phase plan: the build splice is **de-risked, not free**. Phase 6's
+real cost is (a) the name→package registry, (b) externalizing ~40 sections (the
+declarative ones are mechanical; the cross-compile link steps are not), and (c) a
+capability-flag-keyed lifecycle block library decoupling `callback.zig`/`loop.zig`
++ the `main_template.zig` sub-branches from the backend enum.
 
 ## Platform packaging & the manifest
 
