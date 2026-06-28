@@ -24,6 +24,41 @@ const BackendGfxType = @import("backend_gfx");
 
 pub const labelle_provides_android_main = true;
 
+// Route zig `std.log` to Android logcat (tag "labelle"). Without a `logFn`,
+// std.log writes to stderr — invisible in `adb logcat` — so engine/backend
+// diagnostics never reach the device log (e.g. the surface_lost/surface_restored
+// markers and "first surface (cold init)" from the bgfx-android lifecycle).
+// bgfx's own C logging routes separately, which is why only bgfx lines showed
+// before. This is set on the generated `main.zig` (the root module), so it
+// covers ALL std.log across engine + backend + game. (#386 Phase 4 observability.)
+pub const std_options: std.Options = .{
+    .logFn = androidLogFn,
+};
+
+extern "c" fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
+
+fn androidLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    _ = scope;
+    var buf: [1024]u8 = undefined;
+    const text = std.fmt.bufPrintZ(&buf, format, args) catch {
+        _ = __android_log_write(5, "labelle", "(log line truncated)");
+        return;
+    };
+    // ANDROID_LOG_*: DEBUG=3, INFO=4, WARN=5, ERROR=6.
+    const prio: c_int = switch (level) {
+        .debug => 3,
+        .info => 4,
+        .warn => 5,
+        .err => 6,
+    };
+    _ = __android_log_write(prio, "labelle", text);
+}
+
 // Android backend seam (#310 Stage 4). The engine's `src/android.zig` and
 // core's `gamepad_source/android.zig` no longer link any backend symbol
 // directly — they route their Android JNI calls (immersive mode + the
