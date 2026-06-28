@@ -6,10 +6,10 @@
 /// hybrid shapes) plus the pure classifier/validator helpers.
 ///
 /// Discovered via the `test {}` block in `root.zig`, which imports this
-/// file so `addTest` (rooted at `src/root.zig`) runs these tests. The
-/// helpers some tests reach for (`validateBundle`, `validateRootBlock`,
-/// `parseAssetsField`, `isBundleHeader`, `MAX_CHILDREN_DEPTH`) are
-/// `pub` in `scene_manifest.zig` solely so this file can reach them.
+/// file so `addTest` (rooted at `src/root.zig`) runs these tests. The test
+/// bodies use only the module's public API (`parseSceneSource`,
+/// `freeManifest`, `classifyTopLevel`) plus the `MAX_CHILDREN_DEPTH` const —
+/// which is `pub` in `scene_manifest.zig` solely so this file can reach it.
 const std = @import("std");
 const scene_manifest = @import("scene_manifest.zig");
 
