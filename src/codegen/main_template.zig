@@ -89,6 +89,9 @@ fn block(
     errdefer alloc_writer.deinit();
     try emitFn(ctx, &alloc_writer.writer, ident_buf);
     var arr_list = alloc_writer.toArrayList();
+    // `toArrayList` moved the buffer out of `alloc_writer` (its errdefer above is
+    // now a no-op), so guard `arr_list` until `toOwnedSlice` transfers ownership.
+    errdefer arr_list.deinit(allocator);
     const out = try arr_list.toOwnedSlice(allocator);
     allocs.appendAssumeCapacity(out);
     return out;
