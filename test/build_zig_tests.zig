@@ -144,6 +144,42 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "Package and sign Android APK") != null);
     }
 
+    test "external backend matching its enum tag uses the enum path on non-desktop (#386)" {
+        // bgfx extracted out-of-tree, selected via `.backend = .bgfx` while a
+        // package resolves it (the post-flip shape). On ANDROID the desktop-only
+        // manifest splice doesn't run, so the backend-dep section falls through
+        // to the enum `switch (cfg.backend)` — which is correct, because the tag
+        // is preserved and the android sections pull the backend from
+        // `b.dependency("labelle_bgfx")` (resolving to the fetched package). It
+        // must NOT raise ExternalBackendNeedsManifest. (Validated on-device: FP
+        // builds + runs against the external bgfx; the build_files guard that
+        // distinguishes "named by a tag" from "named only by string" is what
+        // lets the android path through.)
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .backend_package = .{ .name = "bgfx", .repo = "local:../bgfx" },
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.dependency(\"labelle_bgfx\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "backend_dep.module(\"android_app\")") != null);
+    }
+
+    test "external backend named ONLY by string (no matching tag) still needs a manifest (#386)" {
+        // A genuine third-party backend whose package name has no matching enum
+        // tag (`cfg.backend` sits at its `.raylib` default) cannot use the enum
+        // switch — that would emit raylib codegen. With no manifest splice
+        // (project_dir null here), it must hard-error rather than mis-emit.
+        try std.testing.expectError(error.ExternalBackendNeedsManifest, generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend_package = .{ .name = "thirdparty", .repo = "local:../tp" },
+            .ecs = .mock,
+        }, .{}));
+    }
+
     test "links wgpu glfw artifact" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",

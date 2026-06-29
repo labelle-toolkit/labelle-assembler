@@ -241,11 +241,19 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Splice: resolve the backend-dep build fragment from the manifest,
         // no `=> .<tag>` branch. Desktop-only (the gate guarantees it).
         try manifest_splice.renderBackendDepSection(allocator, m, cfg, opts.project_dir.?, w);
-    } else if (cfg.isExternal()) {
-        // Unreachable in practice: requireManifestIfExternal above guarantees an
-        // external backend reaches the splice branch. Guard so an external
-        // backend never falls into the built-in `switch (cfg.backend)` (which
-        // reads a meaningless enum tag for a backend named only by string).
+    } else if (cfg.isExternal() and !std.mem.eql(u8, cfg.backendName(), @tagName(cfg.backend))) {
+        // External backend whose package name does NOT match any enum tag (named
+        // only by string). The manifest splice is the only valid route for it,
+        // and it didn't run (non-desktop, or no project_dir), so the enum
+        // `switch (cfg.backend)` below would read a MEANINGLESS tag — hard error.
+        //
+        // But an external backend whose name DOES match its enum tag — e.g. the
+        // extracted bgfx selected via `.backend = .bgfx` (#386 Phase 6c), where
+        // the enum-as-shorthand resolves to a package while preserving the tag —
+        // falls through to the switch below intentionally: on a non-desktop
+        // target (where the desktop-only manifest splice doesn't run) the enum
+        // sections are exactly the right codegen, and they pull the backend from
+        // `b.dependency("labelle_<tag>")`, which resolves to the fetched package.
         return error.ExternalBackendNeedsManifest;
     } else switch (cfg.backend) {
         .raylib => try tpl.renderSection(build_zig_tmpl, "backend_raylib", .{ .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi }, w),
