@@ -457,6 +457,28 @@ pub const NULL_BACKEND = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions));
     }
 
+    test "external bgfx-android is NOT rejected — it has a real callback dispatch path (#386)" {
+        // The callback-external guard must reject only backends that would fall
+        // through to the raylib-wasm fallback. An EXTERNAL bgfx on Android keeps
+        // `cfg.backend == .bgfx` (the enum-as-shorthand preserves the tag), so
+        // `is_bgfx_android` still fires and the callback dispatch has a real
+        // branch — it must generate the bgfx-android callback main, not error.
+        // (Setting both `.backend = .bgfx` and `.backend_package` models the
+        // post-flip state: external resolution + preserved enum tag.)
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .backend_package = .{ .name = "bgfx", .repo = "local:../bgfx" },
+            .ecs = .mock,
+        }, bgfx_android_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // Took the bgfx-android callback path (owns android_main), not the error
+        // and not the raylib-wasm fallback.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn android_main(") != null);
+    }
+
     test "raylib + sokol unchanged — null doesn't leak into other backends" {
         // Regression-lock: the headless main pattern must NOT appear in
         // raylib's or sokol's generated output, and each backend's

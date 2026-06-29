@@ -166,16 +166,19 @@ pub fn Mixin(comptime Self: type) type {
             else
                 cfg.backend == .sokol or cfg.platform == .wasm or is_bgfx_android;
 
-            // Phase 6a wires only LOOP-style external backends through codegen.
-            // The callback dispatch below still keys off `cfg.backend` (`== .sokol`
-            // / bgfx-android), which is meaningless for an external backend —
-            // `cfg.backend` sits at its `.raylib` enum DEFAULT — so a callback-style
-            // external would fall through into the raylib-wasm callback branch and
-            // inherit raylib-specific preview wiring. Until that dispatch becomes
-            // manifest/capability-driven (epic #386 follow-up), fail fast with a
-            // clear project-level error rather than silently emitting wrong code.
-            // Built-ins are unaffected (`isExternal()` is false for them).
-            if (use_callback_lifecycle and cfg.isExternal()) {
+            // A callback-style EXTERNAL backend is only safe where the callback
+            // dispatch below has a real branch for it. That dispatch keys off
+            // `cfg.backend`, which the enum-as-shorthand PRESERVES even when the
+            // backend resolves to a package (#386): `.backend = .bgfx` stays
+            // `.bgfx`, so `is_bgfx_android` and the `== .sokol` branch still fire
+            // for an extracted bgfx/sokol. What has NO branch is a callback
+            // external that falls through to the raylib-wasm fallback (e.g. a
+            // third-party backend, whose `cfg.backend` sits at the `.raylib`
+            // default, or any external on wasm) — that would inherit
+            // raylib-specific wiring, so fail fast there. Built-ins are
+            // unaffected (`isExternal()` is false).
+            const callback_dispatch_handled = is_bgfx_android or cfg.backend == .sokol;
+            if (use_callback_lifecycle and cfg.isExternal() and !callback_dispatch_handled) {
                 // Silenced under test (the Zig test runner fails any test that
                 // emits a `std.log.err`, even when the error is the asserted
                 // outcome — see env.zig's HOME-missing log for the same gate).
