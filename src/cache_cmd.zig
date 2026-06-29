@@ -524,6 +524,15 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !voi
         try fetchAssemblerWithFallback(allocator, asm_ver);
     }
 
+    // External backend package (#386 Phase 6a): fetch a remote backend into the
+    // cache exactly like a plugin. Local (`local:`/`@libs`) backends report
+    // cached and are skipped — they already resolve to their checkout in place.
+    if (cfg.backend_package) |bp| {
+        if (!try cache.isPluginCached(allocator, bp)) {
+            try fetchBackendWithFallback(allocator, bp);
+        }
+    }
+
     for (cfg.plugins) |plugin| {
         if (!try cache.isPluginCached(allocator, plugin)) {
             try fetchPluginWithFallback(allocator, plugin);
@@ -592,6 +601,52 @@ fn fetchPluginWithFallback(allocator: std.mem.Allocator, plugin: config.PluginDe
     }
     std.log.info("  fetching plugin {s} {s} (remote)", .{ plugin.name, plugin.version });
     try cache.fetchPlugin(allocator, plugin);
+}
+
+/// Fetch an external backend package (#386 Phase 6a). A `backend_package` is a
+/// `PluginDep`, so it rides the exact same fetch path a plugin does: copy from a
+/// sibling `labelle-{name}` checkout when the assembler runs inside the monorepo
+/// (the backend author's local-dev story), else shallow-clone its `.repo`.
+///
+/// A failure here is fatal — the game cannot build without its backend — so we
+/// surface a clear, backend-named diagnostic in addition to the git-level error
+/// `fetchPlugin` already logs, then re-raise so `ensureCache` aborts.
+fn fetchBackendWithFallback(allocator: std.mem.Allocator, bp: config.PluginDep) !void {
+    // This is only reached for a NON-local backend that isn't cached (local
+    // backends always report cached). A non-local backend with an empty `.repo`
+    // or `.version` is a config error: `resolvePlugin` would probe a bogus
+    // `plugins///` cache slot and the clone would degrade to
+    // `git clone --branch "" https://.git`. Fail with a clear, actionable
+    // message instead of that confusing downstream git error.
+    if (bp.repo.len == 0 or bp.version.len == 0) {
+        std.log.err(
+            "labelle-assembler: external backend '{s}' needs both a '.repo' and a '.version' to fetch " ++
+                "(got repo='{s}', version='{s}'). Add them to '.backend_package', or use a 'local:' repo.",
+            .{ bp.name, bp.repo, bp.version },
+        );
+        return error.InvalidBackendPackage;
+    }
+    if (findRepoRoot(allocator)) |repo_root| {
+        defer allocator.free(repo_root);
+        const dir_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{bp.name});
+        defer allocator.free(dir_name);
+        const src = try std.fs.path.join(allocator, &.{ repo_root, dir_name });
+        defer allocator.free(src);
+        if (cache.dirExists(src)) {
+            std.log.info("  caching backend {s} {s} (local)", .{ bp.name, bp.version });
+            try cache.populatePlugin(allocator, bp, src);
+            return;
+        }
+    }
+    std.log.info("  fetching backend {s} {s} (remote)", .{ bp.name, bp.version });
+    cache.fetchPlugin(allocator, bp) catch |err| {
+        std.log.err(
+            "labelle-assembler: could not fetch external backend '{s}' from '{s}' (version '{s}'): {s}\n" ++
+                "  check the backend's '.repo'/'.version' in your project config and that the repo is reachable.",
+            .{ bp.name, bp.repo, bp.version, @errorName(err) },
+        );
+        return err;
+    };
 }
 
 /// Walk up from the assembler executable's directory looking for the
