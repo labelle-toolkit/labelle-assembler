@@ -75,8 +75,8 @@
             .lazy = true,
         },
         .labelle_audio = .{
-            .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.4.1.tar.gz",
-            .hash = "labelle_audio-0.4.1-QQRmYI7UBADw8tnp-pTegdPnZ84eqnnoAxTa486MMYTb",
+            .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.4.2.tar.gz",
+            .hash = "labelle_audio-0.4.2-QQRmYPTbBABcweqfq5lBsZsOS6Z4EnQ0qDXdESuITDrz",
         },
     },
     .paths = .{
