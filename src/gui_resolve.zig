@@ -230,11 +230,12 @@ const GuiLabelle = struct {
 /// the GUI plugin declares no bridge for) returns null — the caller emits the
 /// "no bridge for backend X" diagnostic.
 fn getBridgeForBackendName(bridges: Bridges, name: []const u8) ?BridgeDef {
-    if (std.mem.eql(u8, name, "raylib")) return bridges.raylib;
-    if (std.mem.eql(u8, name, "sokol")) return bridges.sokol;
-    if (std.mem.eql(u8, name, "sdl")) return bridges.sdl;
-    if (std.mem.eql(u8, name, "bgfx")) return bridges.bgfx;
-    if (std.mem.eql(u8, name, "wgpu")) return bridges.wgpu;
+    // Match the backend name against the `Bridges` field of the same name. Using
+    // reflection (rather than a hardcoded per-backend switch) keeps this in lock-
+    // step with the struct — adding a bridge field needs no change here.
+    inline for (@typeInfo(Bridges).@"struct".fields) |f| {
+        if (std.mem.eql(u8, name, f.name)) return @field(bridges, f.name);
+    }
     return null;
 }
 
