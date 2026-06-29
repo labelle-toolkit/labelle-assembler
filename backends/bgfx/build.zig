@@ -375,6 +375,29 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(astc_run).step);
 
+    // Run the video colour-conversion + plane-prep tests on the host. Both
+    // `video/yuv.zig` (CPU YUV→RGBA, BT.601) and `video/planes.zig` (row-tighten
+    // + NV12 de-interleave for the GPU plane-upload path, perf/gpu-yuv-video) are
+    // pure Zig with no zbgfx/NDK dependency, so they EXECUTE on the host — the
+    // verifiable core of the otherwise device-only video decode path.
+    const yuv_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/video/yuv.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(yuv_run).step);
+
+    const planes_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/video/planes.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(planes_run).step);
+
     // ── Compile-check window.zig (+ input.zig via its import) ───────
     // window.zig does the real comptime dispatch on builtin.target — both
     // the per-OS desktop branches and the Android `is_android` path — so

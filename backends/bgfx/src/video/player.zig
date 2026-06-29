@@ -17,6 +17,16 @@
 const std = @import("std");
 const texture = @import("../gfx/texture.zig");
 const types = @import("../gfx/types.zig");
+const planes = @import("planes.zig");
+
+/// Comptime kill-switch for the GPU-side YUV→RGBA path (perf/gpu-yuv-video).
+/// When true (default) the player uploads raw Y/U/V planes to three R8 textures
+/// and converts them in the `fs_yuv` shader during the draw, removing the CPU
+/// convert + 8.3 MB/frame RGBA upload that spike the render thread on 1080p. The
+/// path is only taken when the decoder exposes `decodeFramePlanes` AND the plane
+/// textures create successfully; otherwise it degrades to the CPU RGBA fallback.
+/// Flip to `false` to force the CPU path everywhere (debug / shader bring-up).
+pub const enable_gpu_yuv = true;
 
 /// Audio lifecycle injected by the game/example so the player can drive an audio
 /// track (started with the video, ticked each frame, stopped on teardown)
@@ -44,9 +54,22 @@ pub fn Player(comptime Decoder: type) type {
     return struct {
         const Self = @This();
 
+        /// GPU-YUV state: the three R8 plane textures + their reusable tight
+        /// upload buffers (Y = w*h, U/V = cw*ch). Present only when the GPU path
+        /// is active; null means the CPU RGBA fallback (`tex` / `pixels`) is used.
+        const GpuState = struct {
+            tex: texture.PlaneTextures,
+            y: []u8,
+            u: []u8,
+            v: []u8,
+        };
+
         decoder: Decoder,
+        // CPU-fallback frame sink (unused when `gpu` is set: `tex.id` is invalid
+        // and `pixels` is empty).
         tex: types.Texture,
         pixels: []u8,
+        gpu: ?GpuState,
         allocator: std.mem.Allocator,
         audio: AudioHooks = .{},
         started: bool = false,
@@ -56,8 +79,56 @@ pub fn Player(comptime Decoder: type) type {
         cur_pts: f64 = -1, // PTS of the frame currently on the texture
         ended: bool = false, // stream drained (set when the decoder reports eof)
 
+        /// Try to stand up the GPU-YUV state (plane textures + tight buffers) for
+        /// a `w`×`h` video. Returns null on ANY failure (texture create or alloc),
+        /// cleaning up whatever was created, so the caller cleanly falls back to
+        /// the CPU path. The buffers are allocated once and reused every frame.
+        fn initGpu(allocator: std.mem.Allocator, w: u32, h: u32) ?GpuState {
+            const pt = texture.createPlaneTextures(w, h) catch return null;
+            const cw = planes.chromaWidth(w);
+            const ch = planes.chromaHeight(h);
+            const y = allocator.alloc(u8, @as(usize, w) * h) catch {
+                texture.unloadPlaneTextures(pt);
+                return null;
+            };
+            const u = allocator.alloc(u8, @as(usize, cw) * ch) catch {
+                allocator.free(y);
+                texture.unloadPlaneTextures(pt);
+                return null;
+            };
+            const v = allocator.alloc(u8, @as(usize, cw) * ch) catch {
+                allocator.free(u);
+                allocator.free(y);
+                texture.unloadPlaneTextures(pt);
+                return null;
+            };
+            return .{ .tex = pt, .y = y, .u = u, .v = v };
+        }
+
+        /// Decode the next frame into the active sink (plane buffers or RGBA),
+        /// WITHOUT uploading. Returns the frame PTS or null (no frame / EOS).
+        fn decodeNext(self: *Self) ?f64 {
+            if (self.gpu) |*g| {
+                if (comptime @hasDecl(Decoder, "decodeFramePlanes")) {
+                    return self.decoder.decodeFramePlanes(g.y, g.u, g.v);
+                }
+            }
+            return self.decoder.decodeFrame(self.pixels);
+        }
+
+        /// Upload the most recently decoded frame to its texture(s).
+        fn uploadCurrent(self: *Self) void {
+            if (self.gpu) |*g| {
+                texture.updatePlaneTextures(g.tex, g.y, g.u, g.v);
+            } else {
+                texture.updateTexture(self.tex, self.pixels);
+            }
+        }
+
         /// Take an already-opened decoder (opening is platform-specific), create
-        /// a dynamic texture sized to it, decode the first frame, and upload it.
+        /// the frame texture(s) sized to it, decode the first frame, and upload
+        /// it. Defaults to the GPU-YUV path, degrading to the CPU RGBA path when
+        /// unavailable (logged either way so on-device fps/visual tests are clear).
         pub fn init(allocator: std.mem.Allocator, decoder: Decoder, fps: f32) !Self {
             _ = fps; // pacing is now driven by frame PTS, not a fixed rate
             var dec = decoder;
@@ -68,14 +139,56 @@ pub fn Player(comptime Decoder: type) type {
             errdefer dec.deinit();
             const w = dec.width();
             const h = dec.height();
-            const tex = try texture.createDynamicTexture(w, h);
-            errdefer texture.unloadTexture(tex);
-            const pixels = try allocator.alloc(u8, @as(usize, w) * h * 4);
 
-            var self: Self = .{ .decoder = dec, .tex = tex, .pixels = pixels, .allocator = allocator };
-            if (self.decoder.decodeFrame(pixels)) |pts| {
+            // Prefer the GPU-YUV path: decoder must expose plane output AND the
+            // plane textures must create. Otherwise fall back to CPU RGBA.
+            var gpu: ?GpuState = if (enable_gpu_yuv and @hasDecl(Decoder, "decodeFramePlanes"))
+                initGpu(allocator, w, h)
+            else
+                null;
+            // The plane textures created, but the GPU draw also needs the
+            // `fs_yuv` shader program. If it can't be created (e.g. it won't
+            // link on this driver), `submitYuvTriangles` would early-return and
+            // draw nothing (black video). Detect that here and release the plane
+            // state so this clip permanently uses the CPU RGBA path below.
+            if (gpu) |g| {
+                if (!texture.yuvProgramReady()) {
+                    std.log.warn("video: GPU-YUV shader program unavailable on this renderer; using CPU YUV->RGBA fallback for this clip", .{});
+                    texture.unloadPlaneTextures(g.tex);
+                    allocator.free(g.y);
+                    allocator.free(g.u);
+                    allocator.free(g.v);
+                    gpu = null;
+                }
+            }
+            errdefer if (gpu) |g| {
+                texture.unloadPlaneTextures(g.tex);
+                allocator.free(g.y);
+                allocator.free(g.u);
+                allocator.free(g.v);
+            };
+
+            var tex: types.Texture = .{ .id = std.math.maxInt(u32), .width = @intCast(w), .height = @intCast(h) };
+            var pixels: []u8 = &.{};
+            if (gpu == null) {
+                tex = try texture.createDynamicTexture(w, h);
+                pixels = try allocator.alloc(u8, @as(usize, w) * h * 4);
+            }
+            errdefer if (gpu == null) {
+                texture.unloadTexture(tex);
+                allocator.free(pixels);
+            };
+
+            if (gpu != null) {
+                std.log.info("video: GPU-YUV path active ({d}x{d}, R8 planes + fs_yuv shader)", .{ w, h });
+            } else {
+                std.log.info("video: CPU YUV→RGBA fallback active ({d}x{d}, full RGBA upload)", .{ w, h });
+            }
+
+            var self: Self = .{ .decoder = dec, .tex = tex, .pixels = pixels, .gpu = gpu, .allocator = allocator };
+            if (self.decodeNext()) |pts| {
                 self.cur_pts = pts;
-                texture.updateTexture(tex, pixels);
+                self.uploadCurrent();
             }
             return self;
         }
@@ -114,7 +227,7 @@ pub fn Player(comptime Decoder: type) type {
             var uploaded = false;
             var caught: u32 = 0;
             while (self.cur_pts < self.play_time and caught < MAX_CATCHUP_FRAMES) : (caught += 1) {
-                const pts = self.decoder.decodeFrame(self.pixels) orelse break;
+                const pts = self.decodeNext() orelse break;
                 self.cur_pts = pts;
                 uploaded = true;
                 // Caught up: this freshly decoded frame's PTS has reached (or
@@ -122,7 +235,7 @@ pub fn Player(comptime Decoder: type) type {
                 // frame) but stop here — don't keep decoding into the future.
                 if (pts >= self.play_time) break;
             }
-            if (uploaded) texture.updateTexture(self.tex, self.pixels);
+            if (uploaded) self.uploadCurrent();
 
             // End-of-stream: the decoder drained (only meaningful for decoders
             // that report it; looping/never-ending sources never set it).
@@ -145,10 +258,18 @@ pub fn Player(comptime Decoder: type) type {
             self.cur_pts = -1;
             self.ended = false;
             self.started = false; // re-arm the audio start on the next update
-            if (self.decoder.decodeFrame(self.pixels)) |pts| {
+            if (self.decodeNext()) |pts| {
                 self.cur_pts = pts;
-                texture.updateTexture(self.tex, self.pixels);
+                self.uploadCurrent();
             }
+        }
+
+        /// Frame dimensions (luma res for the GPU path = the RGBA tex dims).
+        fn frameWidth(self: *const Self) u32 {
+            return if (self.gpu) |g| g.tex.width else @intCast(self.tex.width);
+        }
+        fn frameHeight(self: *const Self) u32 {
+            return if (self.gpu) |g| g.tex.height else @intCast(self.tex.height);
         }
 
         /// Draw the current video frame into `dest` (screen or world space, per
@@ -157,24 +278,36 @@ pub fn Player(comptime Decoder: type) type {
             const src = types.Rectangle{
                 .x = 0,
                 .y = 0,
-                .width = @floatFromInt(self.tex.width),
-                .height = @floatFromInt(self.tex.height),
+                .width = @floatFromInt(self.frameWidth()),
+                .height = @floatFromInt(self.frameHeight()),
             };
-            texture.drawTexturePro(self.tex, src, dest, .{ .x = 0, .y = 0 }, 0, types.white);
+            self.drawRegion(src, dest);
         }
 
-        /// Draw a sub-region `src` (in texture pixels) of the current frame into
-        /// `dest` — the seam for cover/contain fits (center-crop the source, or
-        /// letterbox the dest).
+        /// Draw a sub-region `src` (in luma/frame pixels) of the current frame
+        /// into `dest` — the seam for cover/contain fits (center-crop the source,
+        /// or letterbox the dest). Routes to the YUV plane program when the GPU
+        /// path is active, else the sprite program with the RGBA texture.
         pub fn drawRegion(self: *const Self, src: types.Rectangle, dest: types.Rectangle) void {
-            texture.drawTexturePro(self.tex, src, dest, .{ .x = 0, .y = 0 }, 0, types.white);
+            if (self.gpu) |g| {
+                texture.drawPlanesPro(g.tex, src, dest, .{ .x = 0, .y = 0 }, 0, types.white);
+            } else {
+                texture.drawTexturePro(self.tex, src, dest, .{ .x = 0, .y = 0 }, 0, types.white);
+            }
         }
 
         pub fn deinit(self: *Self) void {
             if (self.audio.stop) |f| f(self.audio.ctx);
             self.decoder.deinit();
-            texture.unloadTexture(self.tex);
-            self.allocator.free(self.pixels);
+            if (self.gpu) |g| {
+                texture.unloadPlaneTextures(g.tex);
+                self.allocator.free(g.y);
+                self.allocator.free(g.u);
+                self.allocator.free(g.v);
+            } else {
+                texture.unloadTexture(self.tex);
+                self.allocator.free(self.pixels);
+            }
         }
     };
 }

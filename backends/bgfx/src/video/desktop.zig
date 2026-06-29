@@ -8,9 +8,15 @@
 //!
 //! ffmpeg runs without `-re` (decodes ahead; the OS pipe provides backpressure),
 //! so the caller paces reads with its own fps timer and the render loop never
-//! blocks on the pipe. ffmpeg also does the YUV→RGBA conversion (`-pix_fmt rgba`).
+//! blocks on the pipe. ffmpeg emits raw **I420** (`-pix_fmt yuv420p`): the GPU
+//! path (`decodeFramePlanes`) uploads those Y/U/V planes straight to the plane
+//! textures (shader does the convert), while the CPU fallback (`decodeFrame`)
+//! converts I420 → RGBA8 via `yuv.zig` — the same colour math the Android path
+//! and the `fs_yuv` shader use, so all three paths match.
 
 const std = @import("std");
+const yuv = @import("yuv.zig");
+const planes = @import("planes.zig");
 
 extern "c" fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern "c" fn pclose(stream: *anyopaque) c_int;
@@ -72,7 +78,12 @@ pub const VideoDecoder = struct {
     stream: *anyopaque, // libc FILE*
     w: u32,
     h: u32,
-    frame_bytes: usize,
+    cw: u32, // chroma plane width  (ceil(w/2))
+    ch: u32, // chroma plane height (ceil(h/2))
+    frame_bytes: usize, // RGBA out size = w*h*4 (decodeFrame guard)
+    frame_bytes_yuv: usize, // I420 frame from ffmpeg = w*h + 2*cw*ch
+    yuv: []u8, // reusable scratch for one raw I420 frame (no per-frame alloc)
+    allocator: std.mem.Allocator,
     fps: f32,
     frame_index: u64 = 0, // for the nominal CFR presentation timestamp
     eof_flag: bool = false, // set once the pipe drains (stream end)
@@ -148,7 +159,23 @@ pub const VideoDecoder = struct {
     /// internally, which would hide the stream end.
     pub fn open(allocator: std.mem.Allocator, path: []const u8, w: u32, h: u32, fps: f32) !VideoDecoder {
         const stream = try spawn(allocator, path, w, h);
-        var dec = VideoDecoder{ .stream = stream, .w = w, .h = h, .frame_bytes = @as(usize, w) * h * 4, .fps = fps };
+        errdefer _ = pclose(stream);
+        const cw = planes.chromaWidth(w);
+        const ch = planes.chromaHeight(h);
+        const frame_bytes_yuv = @as(usize, w) * h + 2 * @as(usize, cw) * ch;
+        const scratch = try allocator.alloc(u8, frame_bytes_yuv);
+        var dec = VideoDecoder{
+            .stream = stream,
+            .w = w,
+            .h = h,
+            .cw = cw,
+            .ch = ch,
+            .frame_bytes = @as(usize, w) * h * 4,
+            .frame_bytes_yuv = frame_bytes_yuv,
+            .yuv = scratch,
+            .allocator = allocator,
+            .fps = fps,
+        };
         const n = @min(path.len, dec.path_buf.len);
         @memcpy(dec.path_buf[0..n], path[0..n]);
         dec.path_len = n;
@@ -158,12 +185,45 @@ pub const VideoDecoder = struct {
     fn spawn(allocator: std.mem.Allocator, path: []const u8, w: u32, h: u32) !*anyopaque {
         const qpath = try shellQuote(allocator, path);
         defer allocator.free(qpath);
+        // Raw I420 (planar YUV 4:2:0): Y plane (w*h) then U then V (each cw*ch).
         const cmd = try std.fmt.allocPrintSentinel(allocator,
             "ffmpeg -hide_banner -loglevel error -i {s} " ++
-            "-f rawvideo -pix_fmt rgba -s {d}x{d} pipe:1",
+            "-f rawvideo -pix_fmt yuv420p -s {d}x{d} pipe:1",
             .{ qpath, w, h }, 0);
         defer allocator.free(cmd);
         return popen(cmd.ptr, "r") orelse error.PopenFailed;
+    }
+
+    /// Read exactly one raw I420 frame into `self.yuv`. Returns false (and sets
+    /// `eof_flag`) when the pipe drains mid/at frame.
+    fn readFrame(self: *VideoDecoder) bool {
+        var off: usize = 0;
+        while (off < self.frame_bytes_yuv) {
+            const n = fread(self.yuv.ptr + off, 1, self.frame_bytes_yuv - off, self.stream);
+            if (n == 0) {
+                self.eof_flag = true;
+                return false;
+            }
+            off += n;
+        }
+        return true;
+    }
+
+    /// Slices of `self.yuv` for the Y, U, and V planes (tightly packed I420).
+    fn planeSlices(self: *VideoDecoder) struct { y: []const u8, u: []const u8, v: []const u8 } {
+        const y_len = @as(usize, self.w) * self.h;
+        const c_len = @as(usize, self.cw) * self.ch;
+        return .{
+            .y = self.yuv[0..y_len],
+            .u = self.yuv[y_len .. y_len + c_len],
+            .v = self.yuv[y_len + c_len .. y_len + 2 * c_len],
+        };
+    }
+
+    fn nextPts(self: *VideoDecoder) f64 {
+        const pts = @as(f64, @floatFromInt(self.frame_index)) / @as(f64, self.fps);
+        self.frame_index += 1;
+        return pts;
     }
 
     pub fn eof(self: *const VideoDecoder) bool {
@@ -186,29 +246,37 @@ pub const VideoDecoder = struct {
         return self.h;
     }
 
-    /// Read one RGBA8 frame into `buf` (width*height*4 bytes). Returns the
-    /// frame's presentation timestamp in seconds (nominal CFR: frame_index/fps),
-    /// or null on stream end. ffmpeg rawvideo carries no timestamps, so for a
-    /// constant-rate clip the index-derived PTS is exact; the A/V sync still
-    /// runs off the audio master clock regardless.
+    /// CPU fallback: read one I420 frame and convert it to RGBA8 into `buf`
+    /// (width*height*4 bytes) via `yuv.i420ToRgba` (the same BT.601 math the
+    /// Android path + `fs_yuv` shader use). Returns the frame's presentation
+    /// timestamp in seconds (nominal CFR: frame_index/fps), or null on stream
+    /// end. The A/V sync runs off the audio master clock regardless.
     pub fn decodeFrame(self: *VideoDecoder, buf: []u8) ?f64 {
         if (buf.len != self.frame_bytes) return null;
-        var off: usize = 0;
-        while (off < buf.len) {
-            const n = fread(buf.ptr + off, 1, buf.len - off, self.stream);
-            if (n == 0) {
-                self.eof_flag = true;
-                return null;
-            }
-            off += n;
-        }
-        const pts = @as(f64, @floatFromInt(self.frame_index)) / @as(f64, self.fps);
-        self.frame_index += 1;
-        return pts;
+        if (!self.readFrame()) return null;
+        const p = self.planeSlices();
+        yuv.i420ToRgba(p.y, p.u, p.v, self.w, self.h, self.w, self.cw, buf);
+        return self.nextPts();
+    }
+
+    /// GPU path: read one I420 frame and copy its Y/U/V planes into the caller's
+    /// tight plane buffers (`y` is w*h, `u`/`v` are cw*ch). ffmpeg's yuv420p is
+    /// already tightly packed, so this is a straight copy — no de-interleave. The
+    /// shader does the YUV→RGB convert.
+    pub fn decodeFramePlanes(self: *VideoDecoder, y: []u8, u: []u8, v: []u8) ?f64 {
+        const c_len = @as(usize, self.cw) * self.ch;
+        if (y.len != @as(usize, self.w) * self.h or u.len != c_len or v.len != c_len) return null;
+        if (!self.readFrame()) return null;
+        const p = self.planeSlices();
+        @memcpy(y, p.y);
+        @memcpy(u, p.u);
+        @memcpy(v, p.v);
+        return self.nextPts();
     }
 
     pub fn deinit(self: *VideoDecoder) void {
         _ = pclose(self.stream);
+        self.allocator.free(self.yuv);
     }
 };
 

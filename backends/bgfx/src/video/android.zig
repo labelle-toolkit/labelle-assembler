@@ -36,6 +36,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const yuv = @import("yuv.zig");
+const planes = @import("planes.zig");
 
 extern fn close(c_int) c_int;
 
@@ -66,6 +67,9 @@ const UnsupportedDecoder = struct {
         return 0;
     }
     pub fn decodeFrame(_: *UnsupportedDecoder, _: []u8) ?f64 {
+        return null;
+    }
+    pub fn decodeFramePlanes(_: *UnsupportedDecoder, _: []u8, _: []u8, _: []u8) ?f64 {
         return null;
     }
     pub fn deinit(_: *UnsupportedDecoder) void {}
@@ -158,6 +162,11 @@ const AndroidVideoDecoder = struct {
     w: u32,
     h: u32,
     input_done: bool,
+    // Output-side end-of-stream: set when AMediaCodec tags an output buffer with
+    // FLAG_EOS (stream fully drained). `eof()` exposes it so the player can mark
+    // a play-once clip finished — mirrors the desktop decoder, which already has
+    // eof(); Android lacked it, so intros never auto-advanced to the next scene.
+    eof_seen: bool,
 
     /// Open a video stream from a file descriptor (the APK asset fd from
     /// `AAsset_openFileDescriptor`, with its offset/length). Selects the first
@@ -232,6 +241,7 @@ const AndroidVideoDecoder = struct {
             .w = @intCast(@max(w, 0)),
             .h = @intCast(@max(h, 0)),
             .input_done = false,
+            .eof_seen = false,
         };
     }
 
@@ -242,13 +252,20 @@ const AndroidVideoDecoder = struct {
         return self.h;
     }
 
-    /// Pump one decode step and, if a frame came out, convert it to RGBA8 into
-    /// `out` (width*height*4 bytes). Returns the frame's presentation timestamp
-    /// in seconds (for A/V sync), or null if no frame was produced this call.
-    /// Feeds at most one input sample per call and drains one output buffer.
-    pub fn decodeFrame(self: *AndroidVideoDecoder, out: []u8) ?f64 {
-        if (out.len != @as(usize, self.w) * self.h * 4) return null;
+    /// True once the decoder has drained the stream (an output buffer carried
+    /// FLAG_EOS). The player reads this via `@hasDecl` to mark a play-once clip
+    /// ended, so the engine emits `engine__video_finished` and the game hands
+    /// off. Without it, Android intros played forever (no auto-advance).
+    pub fn eof(self: *const AndroidVideoDecoder) bool {
+        return self.eof_seen;
+    }
 
+    /// Pump one decode step (feed at most one input sample, drain one output
+    /// buffer) and acquire the most recent rendered frame as a YUV_420_888
+    /// AImage, or null if no frame is ready this call. The caller OWNS the
+    /// returned image and must `AImage_delete` it. Shared by the RGBA
+    /// (`decodeFrame`) and plane (`decodeFramePlanes`) output paths.
+    fn pumpAndAcquire(self: *AndroidVideoDecoder) ?*Image {
         // -- Feed input.
         if (!self.input_done) {
             const in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 2000);
@@ -280,6 +297,10 @@ const AndroidVideoDecoder = struct {
             return null;
         }
         if (out_idx >= 0) {
+            // An output buffer tagged FLAG_EOS means the stream is fully drained
+            // (the input-side FLAG_EOS has propagated all the way through). Record
+            // it so `eof()` reports the clip ended.
+            if (info.flags & FLAG_EOS != 0) self.eof_seen = true;
             // render = true: send the frame to the ImageReader's surface.
             _ = AMediaCodec_releaseOutputBuffer(self.codec, @intCast(out_idx), true);
         }
@@ -289,12 +310,43 @@ const AndroidVideoDecoder = struct {
         // the caller's catch-up loop retries.
         var img_opt: ?*Image = null;
         if (AImageReader_acquireLatestImage(self.reader, &img_opt) != AMEDIA_OK) return null;
-        const img = img_opt orelse return null;
-        defer AImage_delete(img);
-        if (!self.convertImage(img, out)) return null;
+        return img_opt;
+    }
+
+    fn imageTimestamp(img: *Image) f64 {
         var ts_ns: i64 = 0;
         _ = AImage_getTimestamp(img, &ts_ns);
         return @as(f64, @floatFromInt(ts_ns)) / 1_000_000_000.0; // PTS seconds
+    }
+
+    /// Pump one decode step and, if a frame came out, convert it to RGBA8 into
+    /// `out` (width*height*4 bytes) on the CPU (`yuv.zig`). Returns the frame's
+    /// presentation timestamp in seconds (for A/V sync), or null if no frame was
+    /// produced this call. This is the CPU fallback path; `decodeFramePlanes` is
+    /// the default GPU path.
+    pub fn decodeFrame(self: *AndroidVideoDecoder, out: []u8) ?f64 {
+        if (out.len != @as(usize, self.w) * self.h * 4) return null;
+        const img = self.pumpAndAcquire() orelse return null;
+        defer AImage_delete(img);
+        if (!self.convertImage(img, out)) return null;
+        return imageTimestamp(img);
+    }
+
+    /// GPU-YUV path: pump one decode step and, if a frame came out, copy its
+    /// Y/U/V planes (row-tightened, and de-interleaved for semi-planar/NV12) into
+    /// the caller's tight plane buffers — `y` is w*h, `u`/`v` are cw*ch (half-res,
+    /// rounded up). Returns the frame PTS in seconds, or null if no frame this
+    /// call. The shader does the YUV→RGB convert, so this is a chroma-only copy
+    /// (¼ the data) instead of the full RGBA convert in `decodeFrame`.
+    pub fn decodeFramePlanes(self: *AndroidVideoDecoder, y: []u8, u: []u8, v: []u8) ?f64 {
+        const cw = planes.chromaWidth(self.w);
+        const ch = planes.chromaHeight(self.h);
+        if (y.len != @as(usize, self.w) * self.h) return null;
+        if (u.len != @as(usize, cw) * ch or v.len != @as(usize, cw) * ch) return null;
+        const img = self.pumpAndAcquire() orelse return null;
+        defer AImage_delete(img);
+        if (!self.fillPlanes(img, y, u, v)) return null;
+        return imageTimestamp(img);
     }
 
     /// An output-format change is emitted once before the first frame. We
@@ -312,12 +364,27 @@ const AndroidVideoDecoder = struct {
         _ = self;
     }
 
-    /// Convert a YUV_420_888 AImage to RGBA8. The plane row/pixel strides make
-    /// this format-agnostic — planar, semi-planar, and vendor/Flexible layouts
-    /// all read through the same `yuv.yuv420ToRgba`.
-    fn convertImage(self: *AndroidVideoDecoder, img: *Image, out: []u8) bool {
+    /// The three crop-offset, stride-described plane slices of a YUV_420_888
+    /// AImage, ready for either the CPU convert (`yuv.yuv420ToRgba`) or the GPU
+    /// plane tighten (`planes.tightenPlane`). `u`/`v` may alias one interleaved
+    /// buffer (NV12, `uv_pixel_stride == 2`) or be separate (I420, `== 1`).
+    const ImagePlanes = struct {
+        y: []const u8,
+        u: []const u8,
+        v: []const u8,
+        y_row_stride: u32,
+        y_pixel_stride: u32,
+        uv_row_stride: u32,
+        uv_pixel_stride: u32,
+    };
+
+    /// Read the Y/U/V plane pointers, strides, and crop rect from a
+    /// YUV_420_888 AImage. Format-agnostic (planar / semi-planar / vendor
+    /// Flexible all expose the same plane+stride model). Null on any API error
+    /// or out-of-range crop. Shared by `convertImage` (CPU) + `fillPlanes` (GPU).
+    fn readPlanes(img: *const Image) ?ImagePlanes {
         var num: i32 = 0;
-        if (AImage_getNumberOfPlanes(img, &num) != AMEDIA_OK or num < 3) return false;
+        if (AImage_getNumberOfPlanes(img, &num) != AMEDIA_OK or num < 3) return null;
 
         var yd: ?[*]u8 = null;
         var ud: ?[*]u8 = null;
@@ -325,13 +392,13 @@ const AndroidVideoDecoder = struct {
         var yl: i32 = 0;
         var ul: i32 = 0;
         var vl: i32 = 0;
-        if (AImage_getPlaneData(img, 0, &yd, &yl) != AMEDIA_OK) return false;
-        if (AImage_getPlaneData(img, 1, &ud, &ul) != AMEDIA_OK) return false;
-        if (AImage_getPlaneData(img, 2, &vd, &vl) != AMEDIA_OK) return false;
-        const yp = yd orelse return false;
-        const up = ud orelse return false;
-        const vp = vd orelse return false;
-        if (yl <= 0 or ul <= 0 or vl <= 0) return false;
+        if (AImage_getPlaneData(img, 0, &yd, &yl) != AMEDIA_OK) return null;
+        if (AImage_getPlaneData(img, 1, &ud, &ul) != AMEDIA_OK) return null;
+        if (AImage_getPlaneData(img, 2, &vd, &vl) != AMEDIA_OK) return null;
+        const yp = yd orelse return null;
+        const up = ud orelse return null;
+        const vp = vd orelse return null;
+        if (yl <= 0 or ul <= 0 or vl <= 0) return null;
 
         var y_row: i32 = 0;
         var uv_row: i32 = 0;
@@ -358,20 +425,47 @@ const AndroidVideoDecoder = struct {
         const yl_u: usize = @intCast(yl);
         const ul_u: usize = @intCast(ul);
         const vl_u: usize = @intCast(vl);
-        if (y_off >= yl_u or uv_off >= ul_u or uv_off >= vl_u) return false;
+        if (y_off >= yl_u or uv_off >= ul_u or uv_off >= vl_u) return null;
 
+        return .{
+            .y = yp[y_off..yl_u],
+            .u = up[uv_off..ul_u],
+            .v = vp[uv_off..vl_u],
+            .y_row_stride = ys,
+            .y_pixel_stride = yx,
+            .uv_row_stride = us,
+            .uv_pixel_stride = ux,
+        };
+    }
+
+    /// CPU fallback: convert a YUV_420_888 AImage to RGBA8 via `yuv.yuv420ToRgba`.
+    fn convertImage(self: *AndroidVideoDecoder, img: *Image, out: []u8) bool {
+        const p = readPlanes(img) orelse return false;
         yuv.yuv420ToRgba(
-            yp[y_off..yl_u],
-            ys,
-            yx,
-            up[uv_off..ul_u],
-            vp[uv_off..vl_u],
-            us,
-            ux,
+            p.y,
+            p.y_row_stride,
+            p.y_pixel_stride,
+            p.u,
+            p.v,
+            p.uv_row_stride,
+            p.uv_pixel_stride,
             self.w,
             self.h,
             out,
         );
+        return true;
+    }
+
+    /// GPU path: copy the AImage's Y/U/V planes into tight per-plane buffers
+    /// (row-tightening Y; row-tightening AND de-interleaving U/V for the NV12
+    /// `pixel_stride == 2` case) for upload to the three R8 plane textures.
+    fn fillPlanes(self: *AndroidVideoDecoder, img: *Image, y_dst: []u8, u_dst: []u8, v_dst: []u8) bool {
+        const p = readPlanes(img) orelse return false;
+        const cw = planes.chromaWidth(self.w);
+        const ch = planes.chromaHeight(self.h);
+        planes.tightenPlane(p.y, p.y_row_stride, p.y_pixel_stride, self.w, self.h, y_dst);
+        planes.tightenPlane(p.u, p.uv_row_stride, p.uv_pixel_stride, cw, ch, u_dst);
+        planes.tightenPlane(p.v, p.uv_row_stride, p.uv_pixel_stride, cw, ch, v_dst);
         return true;
     }
 

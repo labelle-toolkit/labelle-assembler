@@ -362,25 +362,22 @@ fn makeTexVertex(px: f32, py: f32, u: f32, v: f32, abgr: u32) PosTexColorVertex 
     };
 }
 
-pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, origin: Vector2, rotation: f32, tint: Color) void {
-    if (texture.id >= MAX_TEXTURES) return;
-    const handle = texture_handles[texture.id];
-    if (handle.idx == std.math.maxInt(u16)) return;
-
-    const abgr = tint.toAbgr();
-    const tw: f32 = @floatFromInt(texture.width);
-    const th: f32 = @floatFromInt(texture.height);
+/// Build the 6 vertices (2 triangles) for a textured quad: maps `source` (in
+/// texture pixels, with the labelle-gfx negative-dim flip convention) to `dest`
+/// (screen/world space), applying origin + rotation + camera zoom. `tex_w`/`tex_h`
+/// are the texture's pixel dimensions used to normalize the source rect to UVs.
+/// Shared by `drawTexturePro` (single RGBA texture) and `drawPlanesPro` (three
+/// YUV plane textures): the geometry + UVs are identical, only the submit /
+/// sampler binding differs. For the YUV path the same normalized UVs sample the
+/// full-res Y and the half-res U/V correctly (0..1 spans each plane's extent).
+fn buildQuadVertices(tex_w: u32, tex_h: u32, source: Rectangle, dest: Rectangle, origin: Vector2, rotation: f32, abgr: u32) [6]PosTexColorVertex {
+    const tw: f32 = @floatFromInt(tex_w);
+    const th: f32 = @floatFromInt(tex_h);
 
     // Source rect → UVs. Negative source.width/height are the labelle-gfx
     // convention for flip_x/flip_y (the renderer negates the rect dims when a
-    // sprite is flipped). The atlas frame always lives at
-    // [source.x, source.x + |width|] / [source.y, source.y + |height|], so we
-    // compute the UV bounds from the ABSOLUTE extents and SWAP u0/u1 (v0/v1)
-    // on the flip path. Using `(source.x + source.width)` directly with a
-    // negative width samples LEFT of source.x — into a NEIGHBORING atlas frame
-    // (usually another character's animation on a packed atlas). That's the
-    // "workers wearing each other's frames when they turn around" bug from
-    // flying-platform-labelle. Matches the sokol/raylib backends' fix.
+    // sprite is flipped). See drawTexturePro's original comment for the
+    // absolute-extent + swap rationale (avoids sampling a neighboring frame).
     const sw_abs = @abs(source.width);
     const sh_abs = @abs(source.height);
     const flip_x = source.width < 0;
@@ -394,8 +391,6 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
     const tv0 = if (flip_y) v_bottom else v_top;
     const tv1 = if (flip_y) v_top else v_bottom;
 
-    // Destination quad corners (before rotation)
-    // Scale width, height, and origin by camera zoom for consistent coordinate space
     const zoom = state.cameraZoom();
     const scaled_ox = origin.x * zoom;
     const scaled_oy = origin.y * zoom;
@@ -405,8 +400,7 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
     const dh = dest.height * zoom;
 
     if (rotation == 0.0) {
-        // Fast path: axis-aligned textured quad
-        const vertices = [6]PosTexColorVertex{
+        return .{
             makeTexVertex(dx, dy, uv0, tv0, abgr),
             makeTexVertex(dx + dw, dy, uv1, tv0, abgr),
             makeTexVertex(dx + dw, dy + dh, uv1, tv1, abgr),
@@ -414,44 +408,153 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
             makeTexVertex(dx + dw, dy + dh, uv1, tv1, abgr),
             makeTexVertex(dx, dy + dh, uv0, tv1, abgr),
         };
-        programs.submitTexturedTriangles(&vertices, handle);
-    } else {
-        // Rotated quad: rotate corners around origin point
-        const rad = rotation * (std.math.pi / 180.0);
-        const cos_r = @cos(rad);
-        const sin_r = @sin(rad);
-        const ox = scaled_ox;
-        const oy = scaled_oy;
-
-        const corners = [4][2]f32{
-            .{ 0, 0 },
-            .{ dw, 0 },
-            .{ dw, dh },
-            .{ 0, dh },
-        };
-
-        var rotated: [4][2]f32 = undefined;
-        for (corners, 0..) |corner, i| {
-            const cx = corner[0] - ox;
-            const cy = corner[1] - oy;
-            rotated[i] = .{
-                dx + ox + cx * cos_r - cy * sin_r,
-                dy + oy + cx * sin_r + cy * cos_r,
-            };
-        }
-
-        const uvs = [4][2]f32{ .{ uv0, tv0 }, .{ uv1, tv0 }, .{ uv1, tv1 }, .{ uv0, tv1 } };
-
-        const vertices = [6]PosTexColorVertex{
-            makeTexVertex(rotated[0][0], rotated[0][1], uvs[0][0], uvs[0][1], abgr),
-            makeTexVertex(rotated[1][0], rotated[1][1], uvs[1][0], uvs[1][1], abgr),
-            makeTexVertex(rotated[2][0], rotated[2][1], uvs[2][0], uvs[2][1], abgr),
-            makeTexVertex(rotated[0][0], rotated[0][1], uvs[0][0], uvs[0][1], abgr),
-            makeTexVertex(rotated[2][0], rotated[2][1], uvs[2][0], uvs[2][1], abgr),
-            makeTexVertex(rotated[3][0], rotated[3][1], uvs[3][0], uvs[3][1], abgr),
-        };
-        programs.submitTexturedTriangles(&vertices, handle);
     }
+
+    const rad = rotation * (std.math.pi / 180.0);
+    const cos_r = @cos(rad);
+    const sin_r = @sin(rad);
+    const ox = scaled_ox;
+    const oy = scaled_oy;
+
+    const corners = [4][2]f32{ .{ 0, 0 }, .{ dw, 0 }, .{ dw, dh }, .{ 0, dh } };
+    var rotated: [4][2]f32 = undefined;
+    for (corners, 0..) |corner, i| {
+        const cx = corner[0] - ox;
+        const cy = corner[1] - oy;
+        rotated[i] = .{
+            dx + ox + cx * cos_r - cy * sin_r,
+            dy + oy + cx * sin_r + cy * cos_r,
+        };
+    }
+    const uvs = [4][2]f32{ .{ uv0, tv0 }, .{ uv1, tv0 }, .{ uv1, tv1 }, .{ uv0, tv1 } };
+    return .{
+        makeTexVertex(rotated[0][0], rotated[0][1], uvs[0][0], uvs[0][1], abgr),
+        makeTexVertex(rotated[1][0], rotated[1][1], uvs[1][0], uvs[1][1], abgr),
+        makeTexVertex(rotated[2][0], rotated[2][1], uvs[2][0], uvs[2][1], abgr),
+        makeTexVertex(rotated[0][0], rotated[0][1], uvs[0][0], uvs[0][1], abgr),
+        makeTexVertex(rotated[2][0], rotated[2][1], uvs[2][0], uvs[2][1], abgr),
+        makeTexVertex(rotated[3][0], rotated[3][1], uvs[3][0], uvs[3][1], abgr),
+    };
+}
+
+pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, origin: Vector2, rotation: f32, tint: Color) void {
+    if (texture.id >= MAX_TEXTURES) return;
+    const handle = texture_handles[texture.id];
+    if (handle.idx == std.math.maxInt(u16)) return;
+
+    const vertices = buildQuadVertices(@intCast(texture.width), @intCast(texture.height), source, dest, origin, rotation, tint.toAbgr());
+    programs.submitTexturedTriangles(&vertices, handle);
+}
+
+// ── YUV plane textures (GPU-side video colour conversion) ──────────────────
+// perf/gpu-yuv-video: the in-engine video path uploads raw Y/U/V planes to
+// three single-channel R8 textures (Y full-res, U/V half-res) and converts
+// them to RGB in the `fs_yuv` fragment shader during the draw — replacing the
+// CPU YUV→RGBA convert + 8.3 MB RGBA upload with a ~3 MB plane upload and no CPU
+// convert. The textures are MUTABLE (null initial memory) and re-uploaded each
+// frame via `updatePlaneTextures`, exactly like `createDynamicTexture` /
+// `updateTexture`. R8 is the single-channel 8-bit unorm format bgfx samples as
+// (value, 0, 0, 1); the shader reads `.x`.
+
+/// Three mutable R8 plane textures backing one video frame, plus the video's
+/// luma dimensions (used as the "texture size" when building the draw quad's
+/// UVs — see `buildQuadVertices`). `width`/`height` are the full (luma) frame
+/// size; the U/V textures are half-res but sample with the same normalized UVs.
+pub const PlaneTextures = struct {
+    y: Texture,
+    u: Texture,
+    v: Texture,
+    width: u32,
+    height: u32,
+};
+
+/// True when the GPU-YUV shader program can be created/submitted on this
+/// renderer. The player calls this once when choosing the video path: if it
+/// returns false (e.g. `fs_yuv` won't link), the player permanently uses the
+/// CPU RGBA fallback instead of submitting draws that would no-op (black).
+/// Wraps `programs.ensureYuvProgram` so `player.zig` need not import `programs`.
+pub fn yuvProgramReady() bool {
+    return programs.ensureYuvProgram();
+}
+
+/// Allocate a fresh R8 plane texture of `w`×`h` (mutable, updatable per frame).
+/// Bilinear + clamp sampling like the RGBA dynamic texture. Returns the pool id.
+fn createPlaneR8(w: u32, h: u32) !Texture {
+    const id = findFreeTextureSlot() orelse return error.LoadFailed;
+    const cw: u16 = std.math.cast(u16, w) orelse return error.LoadFailed;
+    const ch: u16 = std.math.cast(u16, h) orelse return error.LoadFailed;
+    const handle = bgfx.createTexture2D(
+        cw,
+        ch,
+        false,
+        1,
+        .R8,
+        bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp,
+        null, // mutable
+        0,
+    );
+    if (handle.idx == std.math.maxInt(u16)) return error.LoadFailed;
+    texture_handles[id] = handle;
+    texture_pixel_data[id] = null;
+    return .{ .id = id, .width = @intCast(w), .height = @intCast(h) };
+}
+
+/// Create the Y (full-res) + U/V (half-res) R8 plane textures for a `width`×
+/// `height` video. On any sub-allocation failure, frees whatever was created so
+/// the caller can cleanly fall back to the CPU RGBA path. Half-res dims round up
+/// (matches `planes.chromaWidth`/`chromaHeight`) so odd frames keep a full edge.
+pub fn createPlaneTextures(width: u32, height: u32) !PlaneTextures {
+    const cw = (width + 1) / 2;
+    const ch = (height + 1) / 2;
+    const y = try createPlaneR8(width, height);
+    errdefer unloadTexture(y);
+    const u = try createPlaneR8(cw, ch);
+    errdefer unloadTexture(u);
+    const v = try createPlaneR8(cw, ch);
+    return .{ .y = y, .u = u, .v = v, .width = width, .height = height };
+}
+
+/// Re-upload tight Y/U/V plane buffers to their textures. Each buffer must be
+/// exactly `plane.width*plane.height` bytes (tightly packed, top-left origin).
+/// No-ops a plane on a size mismatch / dead handle so a malformed frame can't
+/// scribble past a texture (matching `updateTexture`).
+pub fn updatePlaneTextures(pt: PlaneTextures, y_pixels: []const u8, u_pixels: []const u8, v_pixels: []const u8) void {
+    updatePlaneR8(pt.y, y_pixels);
+    updatePlaneR8(pt.u, u_pixels);
+    updatePlaneR8(pt.v, v_pixels);
+}
+
+fn updatePlaneR8(t: Texture, pixels: []const u8) void {
+    if (t.id >= MAX_TEXTURES) return;
+    const handle = texture_handles[t.id];
+    if (handle.idx == std.math.maxInt(u16)) return;
+    const w: u16 = std.math.cast(u16, t.width) orelse return;
+    const h: u16 = std.math.cast(u16, t.height) orelse return;
+    const expected = @as(usize, @intCast(t.width)) * @as(usize, @intCast(t.height));
+    if (pixels.len != expected) return;
+    const mem = bgfx.copy(pixels.ptr, @intCast(pixels.len));
+    bgfx.updateTexture2D(handle, 0, 0, 0, 0, w, h, mem, std.math.maxInt(u16));
+}
+
+/// Destroy the three plane textures (frees their pool slots).
+pub fn unloadPlaneTextures(pt: PlaneTextures) void {
+    unloadTexture(pt.y);
+    unloadTexture(pt.u);
+    unloadTexture(pt.v);
+}
+
+/// Draw the YUV video frame: same quad geometry as `drawTexturePro`, but binds
+/// the three plane textures to the `s_texY/U/V` samplers and submits with the
+/// `yuv_program` (GPU YUV→RGB). `source` is in luma (full-res) pixels.
+pub fn drawPlanesPro(pt: PlaneTextures, source: Rectangle, dest: Rectangle, origin: Vector2, rotation: f32, tint: Color) void {
+    if (pt.y.id >= MAX_TEXTURES or pt.u.id >= MAX_TEXTURES or pt.v.id >= MAX_TEXTURES) return;
+    const yh = texture_handles[pt.y.id];
+    const uh = texture_handles[pt.u.id];
+    const vh = texture_handles[pt.v.id];
+    if (yh.idx == std.math.maxInt(u16) or uh.idx == std.math.maxInt(u16) or vh.idx == std.math.maxInt(u16)) return;
+
+    const vertices = buildQuadVertices(pt.width, pt.height, source, dest, origin, rotation, tint.toAbgr());
+    programs.submitYuvTriangles(&vertices, yh, uh, vh);
 }
 
 // ── Image decoding helpers ─────────────────────────────────────────────
