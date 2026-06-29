@@ -46,7 +46,7 @@ pub fn resolveGuiPlugin(allocator: std.mem.Allocator, cfg: *config.ProjectConfig
             return error.GuiMissingBridges;
         };
 
-        const bridge_def = getBridgeForBackend(bridges, cfg.backend) orelse {
+        const bridge_def = getBridgeForBackendName(bridges, cfg.backendName()) orelse {
             std.debug.print("labelle: GUI plugin '{s}' requires a bridge for backend '{s}', but none is declared in gui.labelle.\n", .{ manifest.name, cfg.backendName() });
             std.debug.print("  available bridges:", .{});
             printAvailableBridges(bridges);
@@ -219,18 +219,23 @@ const GuiLabelle = struct {
     bridges: ?Bridges = null,
 };
 
-fn getBridgeForBackend(bridges: Bridges, backend: config.Backend) ?BridgeDef {
-    return switch (backend) {
-        .raylib => bridges.raylib,
-        .sokol => bridges.sokol,
-        .sdl => bridges.sdl,
-        .bgfx => bridges.bgfx,
-        .wgpu => bridges.wgpu,
-        // Null backend has no GUI surface to bridge to — every GUI plugin
-        // is incompatible by definition. Caller's null-bridge branch already
-        // emits the right "no bridge for backend X" diagnostic.
-        .null => null,
-    };
+/// Select the GUI bridge variant for a backend by its NAME (not the closed
+/// `config.Backend` enum). An EXTERNAL backend leaves `cfg.backend` at its
+/// `.raylib` enum default (the tag is meaningless for a named package, #386),
+/// so keying off the enum would mis-select the raylib bridge for, e.g., an
+/// out-of-tree bgfx — pulling rlImGui + an old raylib-zig into a bgfx game.
+/// Matching on `cfg.backendName()` resolves an external "bgfx" to `bridges.bgfx`
+/// and stays byte-identical for built-ins (their name IS the enum tag). A name
+/// with no matching bridge field (the null backend, or a third-party backend
+/// the GUI plugin declares no bridge for) returns null — the caller emits the
+/// "no bridge for backend X" diagnostic.
+fn getBridgeForBackendName(bridges: Bridges, name: []const u8) ?BridgeDef {
+    if (std.mem.eql(u8, name, "raylib")) return bridges.raylib;
+    if (std.mem.eql(u8, name, "sokol")) return bridges.sokol;
+    if (std.mem.eql(u8, name, "sdl")) return bridges.sdl;
+    if (std.mem.eql(u8, name, "bgfx")) return bridges.bgfx;
+    if (std.mem.eql(u8, name, "wgpu")) return bridges.wgpu;
+    return null;
 }
 
 fn printAvailableBridges(bridges: Bridges) void {
@@ -384,4 +389,27 @@ test "resolveGuiPackage: a release version maps to the packages/plugins cache sl
     // Same layout regular declared plugins use: plugins/{repo}/{version}.
     try std.testing.expect(std.mem.indexOf(u8, dir, "plugins") != null);
     try std.testing.expect(std.mem.endsWith(u8, dir, "github.com/labelle-toolkit/labelle-imgui/0.3.0"));
+}
+
+test "getBridgeForBackendName: external backend selects its bridge by NAME, not the enum default" {
+    // Regression (#386): an external `.backend_package` leaves `cfg.backend` at
+    // its `.raylib` enum default, so selecting the GUI bridge by the enum pulled
+    // the raylib (rlImGui) bridge into a bgfx game — dragging in an old,
+    // Zig-0.16-incompatible raylib-zig. Selecting by `backendName()` resolves an
+    // external "bgfx" to the bgfx bridge. Surfaced by building Flying Platform
+    // (bgfx + imgui) against the out-of-tree labelle-bgfx package.
+    const bridges = Bridges{
+        .raylib = .{ .adapter = "rlimgui", .path = "bridges/raylib" },
+        .bgfx = .{ .adapter = "bgfx_imgui", .path = "bridges/bgfx" },
+    };
+
+    // External bgfx (backendName "bgfx") → the bgfx bridge, NOT raylib.
+    const ext = getBridgeForBackendName(bridges, "bgfx").?;
+    try std.testing.expectEqualStrings("bgfx_imgui", ext.adapter);
+
+    // Built-ins still resolve by their (tag-equal) name — unchanged behavior.
+    try std.testing.expectEqualStrings("rlimgui", getBridgeForBackendName(bridges, "raylib").?.adapter);
+    // A name with no declared bridge (null backend / unknown third-party) → null.
+    try std.testing.expect(getBridgeForBackendName(bridges, "sokol") == null);
+    try std.testing.expect(getBridgeForBackendName(bridges, "somethirdparty") == null);
 }
