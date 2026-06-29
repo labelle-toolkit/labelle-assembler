@@ -486,11 +486,11 @@ jobs:
       # External (out-of-tree) backend wiring — bgfx extracted to its own
       # repo (github.com/labelle-toolkit/labelle-bgfx, #386 Phase 6c). Proves
       # the opt-in `.backend_package` path end-to-end: `install` FETCHES the
-      # backend package from GitHub into the cache, then `generate` stages it
-      # self-contained (vendored sdl_gamepad/android_gamepad come along) and
+      # backend package from GitHub into the cache, then `generate` stages it +
       # codegens against its manifest. We then resolve the FULL generated build
-      # graph (`zig build --help` → fetches zbgfx/zglfw + resolves the vendored
-      # sub-packages + url deps) but do NOT run the heavy bgfx C++ compile — it
+      # graph (`zig build --help` → fetches zbgfx/zglfw + the labelle-sdl-gamepad
+      # / labelle-android-gamepad packages + url core/audio) but do NOT run the
+      # heavy bgfx C++ compile — it
       # is byte-identical to the bundled backend and is covered by the dedicated
       # cached `bgfx-build` job. Bypasses labelle-cli (pinned older release) and
       # drives the assembler binary directly, like the null step below.
@@ -503,12 +503,19 @@ jobs:
           $ASM install --project-root .
           $ASM generate --project-root .
 
-          # The fetched package was staged SELF-CONTAINED (manifest + vendored
-          # gamepad sub-packages), and codegen wired the labelle_bgfx dependency.
+          # The fetched package staged with its manifest, codegen wired the
+          # labelle_bgfx dependency, and (v0.2.0+) the shared gamepad sources are
+          # url+hash PACKAGES — the backend no longer vendors them, so its staged
+          # build.zig.zon references them by url rather than carrying subdirs.
           test -f .labelle/deps/labelle-bgfx/backend.manifest.zon
-          test -d .labelle/deps/labelle-bgfx/sdl_gamepad
-          test -d .labelle/deps/labelle-bgfx/android_gamepad
           grep -qF 'b.dependency("labelle_bgfx"' .labelle/bgfx_desktop/build.zig
+          # The gamepad sources are url+hash PACKAGE deps now (not vendored): match
+          # the actual `.url = "...labelle-*-gamepad...tar.gz"` lines, not a bare
+          # slug that could appear in a comment.
+          grep -qE '\.url = ".*labelle-sdl-gamepad.*\.tar\.gz"' .labelle/deps/labelle-bgfx/build.zig.zon
+          grep -qE '\.url = ".*labelle-android-gamepad.*\.tar\.gz"' .labelle/deps/labelle-bgfx/build.zig.zon
+          ! test -d .labelle/deps/labelle-bgfx/sdl_gamepad   # de-vendored
+          ! test -d .labelle/deps/labelle-bgfx/android_gamepad
 
           cd .labelle/bgfx_desktop
           # Resolve the whole dep graph without the heavy C++ build. Patch the
