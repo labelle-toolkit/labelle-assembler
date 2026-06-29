@@ -468,6 +468,15 @@ pub const PlaneTextures = struct {
     height: u32,
 };
 
+/// True when the GPU-YUV shader program can be created/submitted on this
+/// renderer. The player calls this once when choosing the video path: if it
+/// returns false (e.g. `fs_yuv` won't link), the player permanently uses the
+/// CPU RGBA fallback instead of submitting draws that would no-op (black).
+/// Wraps `programs.ensureYuvProgram` so `player.zig` need not import `programs`.
+pub fn yuvProgramReady() bool {
+    return programs.ensureYuvProgram();
+}
+
 /// Allocate a fresh R8 plane texture of `w`×`h` (mutable, updatable per frame).
 /// Bilinear + clamp sampling like the RGBA dynamic texture. Returns the pool id.
 fn createPlaneR8(w: u32, h: u32) !Texture {

@@ -66,6 +66,12 @@ var s_texY_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var s_texU_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var s_texV_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var yuv_initialized: bool = false;
+/// Set when `initYuvProgram` has tried and failed (e.g. `fs_yuv` won't link on
+/// this driver). Latches the failure so `ensureYuvProgram` gives up after ONE
+/// attempt instead of re-creating + leaking shader handles every frame (which
+/// would exhaust bgfx's handle pool and black-screen the whole game). Cleared
+/// by `shutdownPrograms` so a fresh Android surface gets one more honest try.
+var yuv_failed: bool = false;
 
 /// Returns true if `handle` is a valid bgfx handle (not the sentinel value).
 pub fn isValidHandle(idx: u16) bool {
@@ -167,12 +173,23 @@ fn initYuvProgram() void {
     const fs_handle = bgfx.createShader(bgfx.makeRef(fs_data.ptr, @intCast(fs_data.len)));
     if (!isValidHandle(vs_handle.idx) or !isValidHandle(fs_handle.idx)) {
         std.log.err("bgfx: failed to create YUV video shaders", .{});
+        // Reclaim whichever handle did get created — neither was consumed.
+        if (isValidHandle(vs_handle.idx)) bgfx.destroyShader(vs_handle);
+        if (isValidHandle(fs_handle.idx)) bgfx.destroyShader(fs_handle);
+        yuv_failed = true;
         return;
     }
 
     yuv_program = bgfx.createProgram(vs_handle, fs_handle, true);
     if (!isValidProgram(yuv_program)) {
-        std.log.err("bgfx: failed to create YUV video program", .{});
+        std.log.err("bgfx: failed to create YUV video program (fs_yuv link failed on this renderer); falling back to CPU YUV path", .{});
+        // createProgram does NOT consume the shaders when it fails (the
+        // `destroy_shaders=true` hand-off only happens on success), so we own
+        // them and MUST destroy them here. Leaking ~2 handles every frame
+        // exhausts bgfx's handle pool in seconds and black-screens the game.
+        bgfx.destroyShader(vs_handle);
+        bgfx.destroyShader(fs_handle);
+        yuv_failed = true;
         return;
     }
 
@@ -185,8 +202,14 @@ fn initYuvProgram() void {
 }
 
 /// Ensure the YUV video program is ready. Returns true when it can be submitted.
+/// Tries to create the program at most ONCE: once `yuv_failed` latches we return
+/// false immediately (no per-frame re-create / handle leak). The latch is cleared
+/// by `shutdownPrograms`, so a post-surface-loss re-init gets a fresh attempt.
 pub fn ensureYuvProgram() bool {
-    if (!yuv_initialized) initYuvProgram();
+    if (!yuv_initialized) {
+        if (yuv_failed) return false;
+        initYuvProgram();
+    }
     return yuv_initialized and isValidProgram(yuv_program) and
         isValidHandle(s_texY_uniform.idx) and isValidHandle(s_texU_uniform.idx) and isValidHandle(s_texV_uniform.idx);
 }
@@ -227,6 +250,8 @@ pub fn shutdownPrograms() void {
         s_texV_uniform = .{ .idx = std.math.maxInt(u16) };
     }
     yuv_initialized = false;
+    // Give the program one honest re-create attempt after a surface cycle.
+    yuv_failed = false;
 
     // Hand off to the sibling modules that own their own bgfx
     // handles. Pre-split this loop and the font-atlas teardown lived

@@ -142,10 +142,25 @@ pub fn Player(comptime Decoder: type) type {
 
             // Prefer the GPU-YUV path: decoder must expose plane output AND the
             // plane textures must create. Otherwise fall back to CPU RGBA.
-            const gpu: ?GpuState = if (enable_gpu_yuv and @hasDecl(Decoder, "decodeFramePlanes"))
+            var gpu: ?GpuState = if (enable_gpu_yuv and @hasDecl(Decoder, "decodeFramePlanes"))
                 initGpu(allocator, w, h)
             else
                 null;
+            // The plane textures created, but the GPU draw also needs the
+            // `fs_yuv` shader program. If it can't be created (e.g. it won't
+            // link on this driver), `submitYuvTriangles` would early-return and
+            // draw nothing (black video). Detect that here and release the plane
+            // state so this clip permanently uses the CPU RGBA path below.
+            if (gpu) |g| {
+                if (!texture.yuvProgramReady()) {
+                    std.log.warn("video: GPU-YUV shader program unavailable on this renderer; using CPU YUV->RGBA fallback for this clip", .{});
+                    texture.unloadPlaneTextures(g.tex);
+                    allocator.free(g.y);
+                    allocator.free(g.u);
+                    allocator.free(g.v);
+                    gpu = null;
+                }
+            }
             errdefer if (gpu) |g| {
                 texture.unloadPlaneTextures(g.tex);
                 allocator.free(g.y);
