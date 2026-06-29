@@ -91,11 +91,13 @@ pub fn resolveBackendPackage(
     cfg: config.ProjectConfig,
     project_dir: ?[]const u8,
 ) ![]const u8 {
-    if (cfg.backend_package) |bp| {
+    if (cfg.effectiveBackendPackage()) |bp| {
         // External: reuse the plugin resolver — same `local:`/`@`/fetched-repo
         // handling, no enum, no bundled cache slot. The package follows the
         // `backends/{name}` convention internally but the dir itself is the
-        // plugin checkout root.
+        // plugin checkout root. `effectiveBackendPackage` also covers a built-in
+        // enum tag that has been extracted to a provider (the Phase-5
+        // enum-as-shorthand) — today that's only an explicit `.backend_package`.
         return cache.resolvePlugin(allocator, bp, project_dir);
     }
     const info = try lookup(allocator, cfg.backendName());
@@ -222,6 +224,35 @@ test "open-config: a built-in config is not external and names via the enum" {
     const cfg = config.ProjectConfig{ .name = "g", .backend = .bgfx };
     try std.testing.expect(!cfg.isExternal());
     try std.testing.expectEqualStrings("bgfx", cfg.backendName());
+}
+
+test "enum-as-shorthand: every built-in backend is still BUNDLED (Phase 5 seam is a no-op today)" {
+    // The enum-as-shorthand seam (#386 Phase 5) routes `isExternal`/`backendName`
+    // through `effectiveBackendPackage`. Until a backend is extracted (Phase 6c
+    // adds an entry to `builtinProvider`), every built-in tag must still resolve
+    // bundled: not external, no effective package, named by its enum tag. This
+    // is the behavior-preservation guard — when bgfx (or any tag) is extracted,
+    // THIS test's expectation for that tag flips and the change is visible here.
+    inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
+        const cfg = config.ProjectConfig{ .name = "g", .backend = @field(config.Backend, f.name) };
+        try std.testing.expect(!cfg.isExternal());
+        try std.testing.expect(cfg.effectiveBackendPackage() == null);
+        try std.testing.expectEqualStrings(f.name, cfg.backendName());
+    }
+}
+
+test "enum-as-shorthand: an explicit backend_package still wins (external) over the enum" {
+    // `effectiveBackendPackage` prefers an explicit package; the enum tag is only
+    // a fallback. (Proves the resolution order at the seam.)
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend = .raylib, // the default enum tag, deliberately left set
+        .backend_package = .{ .name = "stubbackend", .repo = "local:../stub" },
+    };
+    try std.testing.expect(cfg.isExternal());
+    try std.testing.expectEqualStrings("stubbackend", cfg.backendName());
+    const eff = cfg.effectiveBackendPackage().?;
+    try std.testing.expectEqualStrings("stubbackend", eff.name);
 }
 
 test "open-config: resolveBackendPackage routes an external backend to its local checkout" {

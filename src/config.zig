@@ -596,31 +596,64 @@ pub const ProjectConfig = struct {
         return self.resolved_gui != null;
     }
 
+    /// Provider package a BUILT-IN `.backend` enum tag resolves to, or `null`
+    /// when that backend still ships **bundled** inside the assembler.
+    ///
+    /// This is the enum-as-shorthand seam (epic #386, Phase 5): the closed
+    /// `Backend` enum stays as the backward-compatible spelling, but a tag is
+    /// just a *shorthand* for a provider. Extracting a built-in backend
+    /// out-of-tree (Phase 6c) is exactly adding its `.{ .name, .repo, .version }`
+    /// entry below — `.backend = .<tag>` then transparently resolves to the
+    /// fetched package (`isExternal()` ⇒ true) with no project-config change.
+    ///
+    /// Every built-in maps to `null` today, so `.backend = .<tag>` behaves
+    /// exactly as before (bundled `backends/<tag>` slot, byte-identical output).
+    fn builtinProvider(backend: Backend) ?PluginDep {
+        return switch (backend) {
+            // No backend has been extracted yet — all ship bundled. Extraction
+            // (Phase 6c) replaces a branch here, e.g.:
+            //   .bgfx => .{ .name = "bgfx",
+            //               .repo = "github.com/labelle-toolkit/labelle-bgfx",
+            //               .version = "X.Y.Z" },
+            .raylib, .sokol, .sdl, .bgfx, .wgpu, .null => null,
+        };
+    }
+
+    /// The provider package this config effectively resolves its backend from,
+    /// or `null` when the backend is bundled. An explicit `.backend_package`
+    /// always wins; otherwise a built-in enum tag may resolve to a provider via
+    /// `builtinProvider` (the enum-as-shorthand). This is the ONE place that
+    /// composes the two, so `backendName()` / `isExternal()` /
+    /// `backend_registry.resolveBackendPackage` all agree on whether a backend
+    /// is external and which package it is.
+    pub fn effectiveBackendPackage(self: ProjectConfig) ?PluginDep {
+        return self.backend_package orelse builtinProvider(self.backend);
+    }
+
     /// The canonical backend NAME as a string (e.g. "bgfx").
     ///
     /// This is the pluggable-backends seam (epic #386, Phase 5): name-layer
     /// code reads `backendName()` instead of `@tagName(self.backend)` directly,
     /// so the package-layout conventions (see `backend_registry`) are derived
-    /// from a string rather than a closed enum tag. Today this is just the
-    /// enum tag — the `Backend` enum remains the backward-compat shorthand and
-    /// `.backend` still parses as an enum value — but routing through this
-    /// method is what lets a future resolver hand the name layer a backend name
-    /// that has no enum tag (the explicit follow-up).
+    /// from a string rather than a closed enum tag. For a bundled built-in this
+    /// is just the enum tag; for an external backend (explicit package OR an
+    /// enum tag that resolves to a provider) it's the provider name.
     pub fn backendName(self: ProjectConfig) []const u8 {
-        if (self.backend_package) |bp| return bp.name;
+        if (self.effectiveBackendPackage()) |bp| return bp.name;
         return @tagName(self.backend);
     }
 
-    /// True when the project declares an EXTERNAL backend (`backend_package`
-    /// set) rather than a built-in `.backend` enum value. The external path is
-    /// purely additive: when this is false the assembler stays on the unchanged
-    /// built-in codepath (byte-identical output). The behavioral
-    /// `switch (cfg.backend)` sites (built-in-specific sub-package staging /
-    /// per-backend build fragments) are gated OFF when this is true — an
-    /// external backend is self-contained (its own staged `build.zig.zon`
+    /// True when the backend resolves from a PACKAGE (external) rather than the
+    /// bundled slot — either an explicit `.backend_package` or a built-in enum
+    /// tag mapped to a provider via `builtinProvider` (the enum-as-shorthand).
+    /// The external path is purely additive: when this is false the assembler
+    /// stays on the unchanged built-in codepath (byte-identical output). The
+    /// behavioral `switch (cfg.backend)` sites (built-in-specific sub-package
+    /// staging / per-backend build fragments) are gated OFF when this is true —
+    /// an external backend is self-contained (its own staged `build.zig.zon`
     /// declares its deps) and generates exclusively through its manifest.
     pub fn isExternal(self: ProjectConfig) bool {
-        return self.backend_package != null;
+        return self.effectiveBackendPackage() != null;
     }
 
     /// The unset-`.y_axis` build guard (RFC-Y-AXIS-CONVENTION Migration §,
