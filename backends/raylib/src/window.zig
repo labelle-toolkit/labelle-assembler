@@ -13,8 +13,8 @@ pub fn setConfigFlags(flags: ConfigFlags) void {
     }
 }
 
-pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
-    rl.initWindow(width, height, title);
+pub fn initWindow(width_px: i32, height_px: i32, title: [:0]const u8) void {
+    rl.initWindow(width_px, height_px, title);
     rl.setExitKey(.escape);
 }
 
@@ -23,7 +23,7 @@ pub fn closeWindow() void {
 }
 
 pub fn windowShouldClose() bool {
-    return rl.windowShouldClose();
+    return quit_requested or rl.windowShouldClose();
 }
 
 /// Query whether the window is currently fullscreen. Mirrors the sokol
@@ -55,6 +55,34 @@ pub fn getScreenWidth() i32 {
 
 pub fn getScreenHeight() i32 {
     return rl.getScreenHeight();
+}
+
+// ── Canonical window contract (labelle-core/src/window_contract.zig) ──────
+// The uniform window surface the pluggable-backends contract standardizes on
+// (labelle-assembler#386). raylib already exposes these values under its legacy
+// `getScreenWidth`-style names (kept — the generated raylib run-loop templates
+// still call them); the decls below are the canonical aliases so raylib
+// satisfies `core.assertWindow`. Renaming the templates to call these instead
+// (so backends can share one run-loop template) is a separate epic slice.
+var quit_requested: bool = false;
+
+/// Current framebuffer width.
+pub fn width() i32 {
+    return rl.getScreenWidth();
+}
+/// Current framebuffer height.
+pub fn height() i32 {
+    return rl.getScreenHeight();
+}
+/// Seconds elapsed for the last frame — the engine's `dt` source.
+pub fn frameDuration() f64 {
+    return @floatCast(rl.getFrameTime());
+}
+/// Ask the window to end the run loop. raylib has no native programmatic close,
+/// so latch a flag that `windowShouldClose` ORs in (no behavior change unless
+/// a script/engine calls this).
+pub fn requestQuit() void {
+    quit_requested = true;
 }
 
 pub fn beginDrawing() void {
