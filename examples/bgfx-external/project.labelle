@@ -1,7 +1,7 @@
 .{
     .name = "example_bgfx_external",
     .title = "LaBelle v2 — bgfx",
-    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.1.0" },
+    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.2.0" },
     .y_axis = .up,
     .ecs = .mock,
     .core_version = "local:../../../labelle-core",
