@@ -16,6 +16,7 @@
 //! output `AMediaFormat` rather than assuming tight packing.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// BT.601 limited-range YUV → RGB, integer math (matches the canonical
 /// fixed-point coefficients). Inputs are the raw plane samples; output is a
@@ -118,12 +119,182 @@ pub fn yuv420ToRgba(
     std.debug.assert(y.len > last_y);
     std.debug.assert(u.len > last_c);
     std.debug.assert(v.len > last_c);
+
+    const args = ConvertArgs{
+        .y = y,
+        .y_row_stride = y_row_stride,
+        .y_pixel_stride = y_pixel_stride,
+        .u = u,
+        .v = v,
+        .uv_row_stride = uv_row_stride,
+        .uv_pixel_stride = uv_pixel_stride,
+        .width = width,
+        .out = out,
+    };
+
+    // Decide whether threading is worth it. yuv.zig is pure-Zig and may be
+    // compiled for non-threaded targets (wasm/single-threaded), so gate on
+    // `builtin.single_threaded`. Below MIN_THREAD_HEIGHT the spawn/join cost
+    // dominates, so just run inline.
+    const MIN_THREAD_HEIGHT = 64;
+    const thread_count: u32 = blk: {
+        if (builtin.single_threaded or height < MIN_THREAD_HEIGHT) break :blk 1;
+        const cpus = std.Thread.getCpuCount() catch 1;
+        break :blk @intCast(@min(cpus, 8));
+    };
+
+    if (thread_count <= 1) {
+        convertRowRange(args, 0, height);
+        return;
+    }
+
+    // Split [0, height) into `thread_count` contiguous chunks. Each chunk owns a
+    // disjoint `out` region (rows never overlap), so workers write lock-free.
+    // Spawn `thread_count-1` workers and run the last chunk on this thread.
+    const base = height / thread_count;
+    const extra = height % thread_count; // first `extra` chunks get one more row
+
+    var threads: [8]?std.Thread = .{null} ** 8;
+    var spawned: u32 = 0;
+    var start: u32 = 0;
+    var t: u32 = 0;
+    while (t < thread_count) : (t += 1) {
+        const rows = base + (if (t < extra) @as(u32, 1) else 0);
+        const end = start + rows;
+        if (rows == 0) {
+            start = end;
+            continue;
+        }
+        if (t == thread_count - 1) {
+            // Run the final chunk inline on the calling thread.
+            convertRowRange(args, start, end);
+        } else {
+            threads[spawned] = std.Thread.spawn(.{}, convertRowRange, .{ args, start, end }) catch {
+                // Spawn failed: fall back to doing this chunk inline.
+                convertRowRange(args, start, end);
+                start = end;
+                continue;
+            };
+            spawned += 1;
+        }
+        start = end;
+    }
+    var j: u32 = 0;
+    while (j < spawned) : (j += 1) {
+        if (threads[j]) |th| th.join();
+    }
+}
+
+/// Bundle of immutable conversion parameters shared by every worker. Carrying
+/// these as one struct keeps the `std.Thread.spawn` arg-tuple small.
+const ConvertArgs = struct {
+    y: []const u8,
+    y_row_stride: u32,
+    y_pixel_stride: u32,
+    u: []const u8,
+    v: []const u8,
+    uv_row_stride: u32,
+    uv_pixel_stride: u32,
+    width: u32,
+    out: []u8,
+};
+
+/// Number of i32 lanes processed per SIMD step.
+const VEC = 8;
+const I32x = @Vector(VEC, i32);
+
+/// Convert the half-open row range `[row_start, row_end)` into the matching
+/// disjoint slice of `out`. This is the per-worker (and single-threaded)
+/// entry point. The inner column loop is SIMD-vectorized with a scalar
+/// remainder; both share `yuvToRgba` so the math is bit-identical everywhere.
+fn convertRowRange(a: ConvertArgs, row_start: u32, row_end: u32) void {
+    const width = a.width;
+    const vec_cols: u32 = if (a.y_pixel_stride == 1) (width / VEC) * VEC else 0;
+
+    var row: u32 = row_start;
+    while (row < row_end) : (row += 1) {
+        const y_base = row * a.y_row_stride;
+        const c_base = (row / 2) * a.uv_row_stride;
+        const o_base = (row * width) * 4;
+
+        var col: u32 = 0;
+        // ── SIMD body: only when luma is tightly packed (the AImageReader
+        // common case). Chroma is gathered scalar — it's 2×2 sub-sampled so it
+        // costs half as many loads, cheap next to the vector arithmetic.
+        while (col < vec_cols) : (col += VEC) {
+            // Load Y lanes (contiguous, pixel_stride == 1).
+            var yv: I32x = undefined;
+            inline for (0..VEC) |k| {
+                yv[k] = a.y[y_base + col + k];
+            }
+            // Build U/V lanes: each chroma sample feeds 2 adjacent columns, so
+            // gather one sample per column index (col+k)/2.
+            var uv: I32x = undefined;
+            var vv: I32x = undefined;
+            inline for (0..VEC) |k| {
+                const ci = c_base + ((col + k) / 2) * a.uv_pixel_stride;
+                uv[k] = a.u[ci];
+                vv[k] = a.v[ci];
+            }
+
+            const c = yv - @as(I32x, @splat(16));
+            const d = uv - @as(I32x, @splat(128));
+            const e = vv - @as(I32x, @splat(128));
+
+            const c298 = @as(I32x, @splat(298)) * c;
+            const rnd = @as(I32x, @splat(128));
+            const r = (c298 + @as(I32x, @splat(409)) * e + rnd) >> @splat(8);
+            const g = (c298 - @as(I32x, @splat(100)) * d - @as(I32x, @splat(208)) * e + rnd) >> @splat(8);
+            const b = (c298 + @as(I32x, @splat(516)) * d + rnd) >> @splat(8);
+
+            const lo: I32x = @splat(0);
+            const hi: I32x = @splat(255);
+            const rc = @min(@max(r, lo), hi);
+            const gc = @min(@max(g, lo), hi);
+            const bc = @min(@max(b, lo), hi);
+
+            // Store: scalar lane extraction (A=255). Avoids fragile interleave
+            // shuffles; the arithmetic above was the hot part.
+            inline for (0..VEC) |k| {
+                const o = o_base + (col + k) * 4;
+                a.out[o + 0] = @intCast(rc[k]);
+                a.out[o + 1] = @intCast(gc[k]);
+                a.out[o + 2] = @intCast(bc[k]);
+                a.out[o + 3] = 255;
+            }
+        }
+
+        // ── Scalar remainder (and the entire row when y_pixel_stride != 1).
+        while (col < width) : (col += 1) {
+            const yi = y_base + col * a.y_pixel_stride;
+            const ci = c_base + (col / 2) * a.uv_pixel_stride;
+            const o = o_base + col * 4;
+            yuvToRgba(a.y[yi], a.u[ci], a.v[ci], a.out[o..][0..4]);
+        }
+    }
+}
+
+/// Reference scalar converter — the original naive double-loop, kept verbatim
+/// as the bit-exact equivalence guard for the SIMD + threaded path. Test-only.
+fn yuv420ToRgbaScalar(
+    y: []const u8,
+    y_row_stride: u32,
+    y_pixel_stride: u32,
+    u: []const u8,
+    v: []const u8,
+    uv_row_stride: u32,
+    uv_pixel_stride: u32,
+    width: u32,
+    height: u32,
+    out: []u8,
+) void {
+    std.debug.assert(out.len == @as(usize, width) * height * 4);
+    if (width == 0 or height == 0) return;
     var row: u32 = 0;
     while (row < height) : (row += 1) {
         var col: u32 = 0;
         while (col < width) : (col += 1) {
             const yi = row * y_row_stride + col * y_pixel_stride;
-            // Chroma is 2×2 sub-sampled: one (U,V) per 2×2 luma block.
             const ci = (row / 2) * uv_row_stride + (col / 2) * uv_pixel_stride;
             const o = (row * width + col) * 4;
             yuvToRgba(y[yi], u[ci], v[ci], out[o..][0..4]);
@@ -214,4 +385,64 @@ test "stride padding is honoured (y_stride > width)" {
     var expect: [4]u8 = undefined;
     yuvToRgba(40, 128, 128, &expect);
     try std.testing.expectEqualSlices(u8, &expect, out[(3) * 4 ..][0..4]);
+}
+
+test "yuv420ToRgba SIMD+threaded path is bit-exact vs scalar reference" {
+    const alloc = std.testing.allocator;
+
+    // (width, height) sizes: 1×1, 2×2, an odd width not a multiple of VEC, a
+    // large multiple, and the deliberately-awkward 258×130 case.
+    const Size = struct { w: u32, h: u32 };
+    const sizes = [_]Size{
+        .{ .w = 1, .h = 1 },
+        .{ .w = 2, .h = 2 },
+        .{ .w = 17, .h = 9 },
+        .{ .w = 256, .h = 256 },
+        .{ .w = 258, .h = 130 },
+    };
+
+    for (sizes) |s| {
+        const w = s.w;
+        const h = s.h;
+        const cw = (w + 1) / 2; // chroma width (half-res, round up)
+        const ch = (h + 1) / 2; // chroma height
+
+        // Both interleaved (uv_pixel_stride=2) and planar (=1) layouts.
+        const uv_pix_strides = [_]u32{ 1, 2 };
+        for (uv_pix_strides) |uv_pix| {
+            // y_row_stride > width to exercise padding.
+            const y_row_stride = w + 7;
+            const uv_row_stride = cw * uv_pix + 5;
+
+            const y = try alloc.alloc(u8, @as(usize, y_row_stride) * h);
+            defer alloc.free(y);
+            // Combined U/V buffer. For planar (uv_pix=1) U and V are distinct
+            // slices; for interleaved (=2) they alias one buffer at +0 and +1.
+            const uv_buf_len: usize = @as(usize, uv_row_stride) * ch + 2;
+            const ubuf = try alloc.alloc(u8, uv_buf_len);
+            defer alloc.free(ubuf);
+            const vbuf = if (uv_pix == 1) try alloc.alloc(u8, uv_buf_len) else ubuf;
+            defer if (uv_pix == 1) alloc.free(vbuf);
+
+            // Varied pattern.
+            for (y, 0..) |*p, i| p.* = @intCast((i * 7) & 0xff);
+            for (ubuf, 0..) |*p, i| p.* = @intCast((i * 11 + 3) & 0xff);
+            if (uv_pix == 1) for (vbuf, 0..) |*p, i| {
+                p.* = @intCast((i * 13 + 7) & 0xff);
+            };
+
+            const u_slice = ubuf[0..];
+            const v_slice = if (uv_pix == 1) vbuf[0..] else ubuf[1..];
+
+            const ref = try alloc.alloc(u8, @as(usize, w) * h * 4);
+            defer alloc.free(ref);
+            const got = try alloc.alloc(u8, @as(usize, w) * h * 4);
+            defer alloc.free(got);
+
+            yuv420ToRgbaScalar(y, y_row_stride, 1, u_slice, v_slice, uv_row_stride, uv_pix, w, h, ref);
+            yuv420ToRgba(y, y_row_stride, 1, u_slice, v_slice, uv_row_stride, uv_pix, w, h, got);
+
+            try std.testing.expectEqualSlices(u8, ref, got);
+        }
+    }
 }
