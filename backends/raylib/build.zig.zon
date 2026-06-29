@@ -32,8 +32,8 @@
         // backend has to dodge does not arise here. Replaces this backend's own
         // dr_wav + stb_vorbis copies.
         .labelle_audio = .{
-            .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.4.1.tar.gz",
-            .hash = "labelle_audio-0.4.1-QQRmYI7UBADw8tnp-pTegdPnZ84eqnnoAxTa486MMYTb",
+            .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.4.2.tar.gz",
+            .hash = "labelle_audio-0.4.2-QQRmYPTbBABcweqfq5lBsZsOS6Z4EnQ0qDXdESuITDrz",
         },
         .emsdk = .{
             .url = "git+https://github.com/emscripten-core/emsdk?ref=4.0.9#3bcf1dcd01f040f370e10fe673a092d9ed79ebb5",
