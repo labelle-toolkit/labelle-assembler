@@ -180,6 +180,20 @@ pub const BUILD_ZIG = struct {
         }, .{}));
     }
 
+    test "tag-matched external backend on a NON-android no-splice target still errors (#386)" {
+        // The enum-path fallthrough is scoped to ANDROID only (the validated,
+        // tag-safe target). A tag-matched external on wasm would otherwise emit
+        // enum backend deps but miss the wasm-specific `wasm_emsdk_*`/`link_*_wasm`
+        // wiring, so it must hard-error and route through the manifest instead.
+        try std.testing.expectError(error.ExternalBackendNeedsManifest, generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .wasm,
+            .backend_package = .{ .name = "sokol", .repo = "local:../sokol" },
+            .ecs = .mock,
+        }, .{}));
+    }
+
     test "links wgpu glfw artifact" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",

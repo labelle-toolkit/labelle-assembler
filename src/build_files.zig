@@ -155,6 +155,20 @@ pub const BuildZigOptions = struct {
     project_dir: ?[]const u8 = null,
 };
 
+/// True when an EXTERNAL backend may safely fall through to the enum
+/// `switch (cfg.backend)` codegen instead of the (desktop-only) manifest splice.
+/// Only the ANDROID path is validated tag-safe: the extracted backend is
+/// selected via `.backend = .<tag>` (the enum-as-shorthand preserves the tag),
+/// the android sections pull it from `b.dependency("labelle_<tag>")` — which
+/// resolves to the fetched package — and they make no staged-sibling
+/// assumptions (#386 Phase 6c, validated on-device). A backend named only by a
+/// string (no matching tag), or any other no-splice target (desktop without a
+/// project_dir, wasm/ios — whose enum sections don't compose with a
+/// self-contained package), is NOT tag-safe and must route through the manifest.
+fn externalUsesEnumPath(cfg: ProjectConfig) bool {
+    return cfg.platform == .android and std.mem.eql(u8, cfg.backendName(), @tagName(cfg.backend));
+}
+
 pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: BuildZigOptions) ![]const u8 {
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer alloc_writer.deinit();
@@ -241,19 +255,11 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Splice: resolve the backend-dep build fragment from the manifest,
         // no `=> .<tag>` branch. Desktop-only (the gate guarantees it).
         try manifest_splice.renderBackendDepSection(allocator, m, cfg, opts.project_dir.?, w);
-    } else if (cfg.isExternal() and !std.mem.eql(u8, cfg.backendName(), @tagName(cfg.backend))) {
-        // External backend whose package name does NOT match any enum tag (named
-        // only by string). The manifest splice is the only valid route for it,
-        // and it didn't run (non-desktop, or no project_dir), so the enum
-        // `switch (cfg.backend)` below would read a MEANINGLESS tag — hard error.
-        //
-        // But an external backend whose name DOES match its enum tag — e.g. the
-        // extracted bgfx selected via `.backend = .bgfx` (#386 Phase 6c), where
-        // the enum-as-shorthand resolves to a package while preserving the tag —
-        // falls through to the switch below intentionally: on a non-desktop
-        // target (where the desktop-only manifest splice doesn't run) the enum
-        // sections are exactly the right codegen, and they pull the backend from
-        // `b.dependency("labelle_<tag>")`, which resolves to the fetched package.
+    } else if (cfg.isExternal() and !externalUsesEnumPath(cfg)) {
+        // External backend with no manifest splice and no safe enum fallback —
+        // the enum `switch (cfg.backend)` below would read a MEANINGLESS tag (for
+        // a string-named backend) or emit sections that don't compose with a
+        // self-contained package (wasm/ios) — hard error.
         return error.ExternalBackendNeedsManifest;
     } else switch (cfg.backend) {
         .raylib => try tpl.renderSection(build_zig_tmpl, "backend_raylib", .{ .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi }, w),
@@ -580,9 +586,13 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
                 // Splice: resolve the link build fragment from the manifest,
                 // no `=> .<tag>` branch.
                 try manifest_splice.renderLinkSection(allocator, m, cfg, opts.project_dir.?, w);
-            } else if (cfg.isExternal()) {
-                // Guard: an external backend never falls into the built-in link
-                // switch (no enum tag). The splice branch above handles it.
+            } else if (cfg.isExternal() and !externalUsesEnumPath(cfg)) {
+                // Same gate as the backend-dep section above: an external backend
+                // with no splice falls into this desktop link switch only when
+                // it's tag-safe (`externalUsesEnumPath`). This switch is the
+                // desktop exe path (android links via its own section), so the
+                // helper is false here and an external backend hard-errors —
+                // kept symmetric with the backend-dep guard so the two can't drift.
                 return error.ExternalBackendNeedsManifest;
             } else switch (cfg.backend) {
                 .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib", w),
