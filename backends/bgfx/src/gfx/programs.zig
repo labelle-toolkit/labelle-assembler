@@ -55,6 +55,18 @@ var white_texture: bgfx.TextureHandle = .{ .idx = std.math.maxInt(u16) };
 /// Whether embedded shaders have been initialized.
 var shaders_initialized: bool = false;
 
+// ── YUV video program (GPU-side YUV→RGBA, perf/gpu-yuv-video) ───────────
+// A second program built from `vs_sprite` + `fs_yuv`: it samples three R8 plane
+// textures (Y full-res, U/V half-res) bound to `s_texY/U/V` and does the BT.601
+// limited-range convert in the fragment stage. Lazy-created like the sprite
+// program (see `ensureYuvProgram`) and torn down in `shutdownPrograms`, so it
+// re-creates cleanly after an Android surface cycle (Phase-4 reset path).
+var yuv_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
+var s_texY_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var s_texU_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var s_texV_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var yuv_initialized: bool = false;
+
 /// Returns true if `handle` is a valid bgfx handle (not the sentinel value).
 pub fn isValidHandle(idx: u16) bool {
     return idx != std.math.maxInt(u16);
@@ -132,6 +144,53 @@ pub fn ensureShadersInitialized() void {
     if (!shaders_initialized) initShaders();
 }
 
+/// Lazily build the YUV video program (`vs_sprite` + `fs_yuv`) and its three
+/// plane samplers, selecting the renderer-appropriate bytecode. Called from
+/// `submitYuvTriangles`; re-runs after `shutdownPrograms` (surface loss) since
+/// it resets `yuv_initialized`. Falls back silently (leaves `yuv_program`
+/// invalid) on failure — the video path then degrades to the CPU RGBA fallback.
+fn initYuvProgram() void {
+    if (yuv_initialized) return;
+
+    const vs_data: []const u8 = switch (bgfx.getRendererType()) {
+        .Metal => &shaders_data.vs_sprite_mtl,
+        .Vulkan => &shaders_data.vs_sprite_spv,
+        else => &shaders_data.vs_sprite_glsl,
+    };
+    const fs_data: []const u8 = switch (bgfx.getRendererType()) {
+        .Metal => &shaders_data.fs_yuv_mtl,
+        .Vulkan => &shaders_data.fs_yuv_spv,
+        else => &shaders_data.fs_yuv_glsl,
+    };
+
+    const vs_handle = bgfx.createShader(bgfx.makeRef(vs_data.ptr, @intCast(vs_data.len)));
+    const fs_handle = bgfx.createShader(bgfx.makeRef(fs_data.ptr, @intCast(fs_data.len)));
+    if (!isValidHandle(vs_handle.idx) or !isValidHandle(fs_handle.idx)) {
+        std.log.err("bgfx: failed to create YUV video shaders", .{});
+        return;
+    }
+
+    yuv_program = bgfx.createProgram(vs_handle, fs_handle, true);
+    if (!isValidProgram(yuv_program)) {
+        std.log.err("bgfx: failed to create YUV video program", .{});
+        return;
+    }
+
+    s_texY_uniform = bgfx.createUniform("s_texY", .Sampler, 1);
+    s_texU_uniform = bgfx.createUniform("s_texU", .Sampler, 1);
+    s_texV_uniform = bgfx.createUniform("s_texV", .Sampler, 1);
+
+    yuv_initialized = true;
+    std.log.info("bgfx: GPU-YUV video program initialized (renderer: {})", .{bgfx.getRendererType()});
+}
+
+/// Ensure the YUV video program is ready. Returns true when it can be submitted.
+pub fn ensureYuvProgram() bool {
+    if (!yuv_initialized) initYuvProgram();
+    return yuv_initialized and isValidProgram(yuv_program) and
+        isValidHandle(s_texY_uniform.idx) and isValidHandle(s_texU_uniform.idx) and isValidHandle(s_texV_uniform.idx);
+}
+
 /// Destroy shader programs, uniforms, and textures, resetting to invalid sentinels.
 pub fn shutdownPrograms() void {
     if (isValidProgram(sprite_program)) {
@@ -148,6 +207,26 @@ pub fn shutdownPrograms() void {
         white_texture = .{ .idx = std.math.maxInt(u16) };
     }
     shaders_initialized = false;
+
+    // YUV video program + its plane samplers participate in the same teardown,
+    // so an Android surface cycle re-creates them lazily on the next video draw.
+    if (isValidProgram(yuv_program)) {
+        bgfx.destroyProgram(yuv_program);
+        yuv_program = .{ .idx = std.math.maxInt(u16) };
+    }
+    if (isValidHandle(s_texY_uniform.idx)) {
+        bgfx.destroyUniform(s_texY_uniform);
+        s_texY_uniform = .{ .idx = std.math.maxInt(u16) };
+    }
+    if (isValidHandle(s_texU_uniform.idx)) {
+        bgfx.destroyUniform(s_texU_uniform);
+        s_texU_uniform = .{ .idx = std.math.maxInt(u16) };
+    }
+    if (isValidHandle(s_texV_uniform.idx)) {
+        bgfx.destroyUniform(s_texV_uniform);
+        s_texV_uniform = .{ .idx = std.math.maxInt(u16) };
+    }
+    yuv_initialized = false;
 
     // Hand off to the sibling modules that own their own bgfx
     // handles. Pre-split this loop and the font-atlas teardown lived
@@ -237,4 +316,40 @@ pub fn submitTexturedTriangles(vertices: []const PosTexColorVertex, texture_hand
     bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
     bgfx.submit(VIEW_ID, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+}
+
+/// Submit a textured quad converted from three YUV plane textures via the
+/// `yuv_program` (GPU YUV→RGBA). Binds Y/U/V to sampler units 0/1/2. Mirrors
+/// `submitTexturedTriangles` but with the video program + three samplers; the
+/// vertices carry the same NDC positions + UVs (`drawPlanesPro` builds them).
+pub fn submitYuvTriangles(
+    vertices: []const PosTexColorVertex,
+    y_handle: bgfx.TextureHandle,
+    u_handle: bgfx.TextureHandle,
+    v_handle: bgfx.TextureHandle,
+) void {
+    if (!ensureYuvProgram()) return;
+    ensureLayouts();
+
+    // Set u_viewProj to identity each frame (bgfx clears uniforms after submit)
+    const identity = [16]f32{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    };
+    bgfx.setViewTransform(VIEW_ID, &identity, &identity);
+
+    const num: u32 = @intCast(vertices.len);
+    var tvb: bgfx.TransientVertexBuffer = undefined;
+    bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);
+    const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
+    @memcpy(dest_ptr[0..vertices.len], vertices);
+
+    bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
+    bgfx.setTexture(0, s_texY_uniform, y_handle, 0);
+    bgfx.setTexture(1, s_texU_uniform, u_handle, 0);
+    bgfx.setTexture(2, s_texV_uniform, v_handle, 0);
+    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
+    bgfx.submit(VIEW_ID, yuv_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 }
