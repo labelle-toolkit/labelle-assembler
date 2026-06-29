@@ -511,7 +511,15 @@ pub fn Mixin(comptime Self: type) type {
                 // already runs through its own callback path. raylib WASM
                 // takes the callback branch above, so this only fires for
                 // raylib desktop.
-                const is_raylib_desktop = cfg.backend == .raylib;
+                // An EXTERNAL backend leaves `cfg.backend` at its `.raylib`
+                // enum default (the tag is meaningless for a named package —
+                // selection comes from the manifest, #386). A bare `== .raylib`
+                // would therefore misfire on every external backend and emit
+                // raylib's PBO async-readback against a window module that has
+                // no `preview_pbo`. External backends take the empty-readback
+                // path the other loop backends (null/sdl/bgfx/wgpu) use until
+                // they declare their own preview support.
+                const is_raylib_desktop = cfg.backend == .raylib and !cfg.isExternal();
                 // Preview mouse-input forwarding is sokol-only: the
                 // `imgui_bridge_mouse_*` externs `PREVIEW_INPUT_DISPATCH`
                 // declares are exported solely by the *sokol* imgui bridge

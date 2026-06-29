@@ -305,6 +305,19 @@ pub fn validateCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) ![
         try missing.append(allocator, try std.fmt.allocPrint(allocator, "assembler {s}", .{asm_ver}));
     }
 
+    // External backend package (#386 Phase 6a). A `backend_package` is a
+    // `PluginDep`, so a remote one is cached on the same `plugins/` path a
+    // plugin uses (`resolvePlugin` → `isPluginCached`). Local (`local:`/`@libs`)
+    // backends always report cached (the early return in `isPluginCached`), so
+    // only a non-local `.repo` ever lands here. Built-in backends have no
+    // `backend_package` and stay accounted for by the assembler-bundled slot
+    // above, so this never touches the byte-identical built-in path.
+    if (cfg.backend_package) |bp| {
+        if (!try isPluginCached(allocator, bp)) {
+            try missing.append(allocator, try std.fmt.allocPrint(allocator, "backend {s} {s}", .{ bp.name, bp.version }));
+        }
+    }
+
     // Plugins
     for (cfg.plugins) |plugin| {
         if (!try isPluginCached(allocator, plugin)) {
@@ -316,6 +329,73 @@ pub fn validateCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) ![
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+/// True if any entry in `missing` starts with `prefix`.
+fn missingHasPrefix(missing: []const []const u8, prefix: []const u8) bool {
+    for (missing) |m| {
+        if (std.mem.startsWith(u8, m, prefix)) return true;
+    }
+    return false;
+}
+
+test "validateCache: a LOCAL external backend is never reported missing" {
+    // A `local:`/`@libs` backend resolves to its checkout in place, so
+    // `isPluginCached` reports it cached unconditionally — it must never appear
+    // in the missing set. All framework/assembler versions are pinned `local:`
+    // here so the probe touches neither the env nor the disk: the only thing
+    // under test is the backend branch.
+    const alloc = std.testing.allocator;
+    const cfg = config.ProjectConfig{
+        .name = "stubgame",
+        .core_version = "local:../labelle-core",
+        .engine_version = "local:../labelle-engine",
+        .gfx_version = "local:../labelle-gfx",
+        .assembler_version = "local:../labelle-assembler",
+        .backend_package = .{ .name = "stubbackend", .repo = "local:../stubbackend" },
+    };
+
+    const missing = try validateCache(alloc, cfg);
+    defer {
+        for (missing) |m| alloc.free(m);
+        alloc.free(missing);
+    }
+
+    try std.testing.expect(!missingHasPrefix(missing, "backend "));
+}
+
+test "validateCache: a remote external backend with no cache entry is reported missing" {
+    // A non-local `.repo` is fetched onto the same `plugins/` cache path a
+    // plugin uses. With every framework/assembler dep pinned `local:`, a
+    // remote backend that was never fetched is the sole missing entry —
+    // reported as `backend <name> <version>` so `ensureCache` knows to fetch it.
+    const alloc = std.testing.allocator;
+    const cfg = config.ProjectConfig{
+        .name = "stubgame",
+        .core_version = "local:../labelle-core",
+        .engine_version = "local:../labelle-engine",
+        .gfx_version = "local:../labelle-gfx",
+        .assembler_version = "local:../labelle-assembler",
+        // A repo string that cannot exist in any real cache.
+        .backend_package = .{
+            .name = "fakebackend",
+            .repo = "github.com/labelle-toolkit-test/labelle-nonexistent-backend-xyz",
+            .version = "9.9.9",
+        },
+    };
+
+    const missing = validateCache(alloc, cfg) catch |err| switch (err) {
+        // No HOME/LABELLE_HOME in the runner env → the cache path can't be
+        // resolved at all. Nothing backend-specific to assert in that case.
+        error.NoHomeDirectory => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        for (missing) |m| alloc.free(m);
+        alloc.free(missing);
+    }
+
+    try std.testing.expect(missingHasPrefix(missing, "backend fakebackend 9.9.9"));
+}
 
 test "resolveProjectRoot: main checkout (.git is a directory) returns project_dir unchanged" {
     const alloc = std.testing.allocator;

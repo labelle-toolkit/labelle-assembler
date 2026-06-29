@@ -334,6 +334,36 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
     }
 
+    test "external backend does not pull in raylib PBO readback (cfg.backend defaults to .raylib)" {
+        // Pluggable-backends regression (#386). An external `backend_package`
+        // leaves `cfg.backend` at its `.raylib` enum DEFAULT — the tag is
+        // meaningless for a named out-of-tree backend; selection comes from the
+        // package manifest. A bare `cfg.backend == .raylib` readback gate would
+        // therefore misfire and splice raylib's PBO async-readback
+        // (`window.preview_pbo.*`, the `_preview_pbo_*` bridges) into a game
+        // whose backend window module has no such surface — the exact compile
+        // failure the headless `nullfixture` external backend hit before the
+        // gate was tightened to `== .raylib and !cfg.isExternal()`. The
+        // control plane (hello/heartbeat/bye) must still be wired, exactly like
+        // the sdl/bgfx/wgpu non-readback loop backends above.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            // backend left at the .raylib default on purpose; the package makes it external.
+            .backend_package = .{ .name = "nullfixture", .repo = "local:../nullfixture" },
+            .ecs = .mock,
+        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // No raylib PBO readback surface — this is what broke the e2e build.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "preview_pbo") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_pbo_begin_bridge") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_read_pixels") == null);
+        // …but the GPU-independent control plane is still wired.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
+    }
+
     // macOS IOSurface gating (labelle-assembler#121, labelle-engine#547).
     // The raylib desktop template emits BOTH the SHM and the IOSurface
     // lifecycle calls; the actual selection happens at comptime via
