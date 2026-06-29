@@ -411,6 +411,37 @@ pub const NULL_BACKEND = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "endFrameStream") == null);
     }
 
+    test "external backend emits the core-contract verification guard (#386 Phase 6b)" {
+        // A fetched out-of-tree backend has no enum-path codegen to vet it, so
+        // generated main.zig asserts its modules satisfy labelle-core's render /
+        // window / input contracts up front — a missing decl then fails with a
+        // decl-naming message at this call site, not deep in engine wiring.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend_package = .{ .name = "nullfixture", .repo = "local:../nf" },
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "assertBackend(@import(\"backend_gfx\"))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "assertWindow(@import(\"backend_window\"))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "assertInput(@import(\"backend_input\"))") != null);
+    }
+
+    test "built-in backend emits NO contract guard (byte-identical to before, #386 Phase 6b)" {
+        // Built-ins are vetted by the enum path; the guard is external-only so
+        // their generated output is unchanged.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "External backend contract verification") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "assertWindow(@import(\"backend_window\"))") == null);
+    }
+
     test "external backend with a callback run-loop is rejected (not yet wired, #386)" {
         // `.platform = .wasm` forces `use_callback_lifecycle = true`; paired with
         // an external `backend_package` this must fail FAST rather than fall

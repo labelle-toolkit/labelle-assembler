@@ -139,6 +139,7 @@ pub const Codegen = struct {
 
     // Import + JSONC-scene blocks (codegen/blocks/imports.zig)
     pub const writeHookImportsBlock = ImportsMixin.writeHookImportsBlock;
+    pub const writeBackendContractCheck = ImportsMixin.writeBackendContractCheck;
     pub const writeEventImportsBlock = ImportsMixin.writeEventImportsBlock;
     pub const writeEnumImportsBlock = ImportsMixin.writeEnumImportsBlock;
     pub const writeJsoncSceneBlock = ImportsMixin.writeJsoncSceneBlock;

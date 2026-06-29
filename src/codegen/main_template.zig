@@ -220,6 +220,9 @@ pub fn generateMainZigFromTemplate(
         const b = try block(allocator, &allocs, struct {
             fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
                 try c.writeHookImportsBlock(w, ib);
+                // External-backend contract guard (#386 Phase 6b) — emitted at
+                // module root alongside the hook imports, no-op for built-ins.
+                try c.writeBackendContractCheck(w);
             }
         }.emit, &ctx, &ident_buf);
         try data.scalars.put("hook_imports_block", b);

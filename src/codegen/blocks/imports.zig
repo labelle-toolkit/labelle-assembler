@@ -50,6 +50,41 @@ pub fn Mixin(comptime Self: type) type {
             }
         }
 
+        /// External-backend contract-verification guard (epic #386 Phase 6b).
+        ///
+        /// Emitted at module root (right after the hook imports) ONLY for an
+        /// external `backend_package`. A fetched out-of-tree backend has no
+        /// enum-path codegen to vet it, so we assert its three modules satisfy
+        /// labelle-core's render / window / input contracts up front. A missing
+        /// required decl then fails with a decl-naming message from
+        /// `core.assert{Backend,Window,Input}` at the very start of the build,
+        /// instead of surfacing as a deep error from inside engine wiring.
+        ///
+        /// Built-in backends emit nothing here — they're vetted by the enum path
+        /// (and their own in-module asserts), so generated output for every
+        /// built-in backend is byte-identical to before.
+        ///
+        /// `backend_gfx` / `backend_window` / `backend_input` and `labelle-core`
+        /// are all root module deps of the generated `main.zig`, so the imports
+        /// resolve without any extra wiring.
+        pub fn writeBackendContractCheck(self: *Self, w: anytype) !void {
+            if (!self.cfg.isExternal()) return;
+            try w.writeAll(
+                \\
+                \\// --- External backend contract verification (labelle-assembler#386 Phase 6b) ---
+                \\// Assert the fetched out-of-tree backend satisfies labelle-core's render /
+                \\// window / input contracts, naming any missing decl HERE rather than deep in
+                \\// engine wiring. Built-in backends skip this (vetted by the enum path).
+                \\comptime {
+                \\    const _backend_contract_core = @import("labelle-core");
+                \\    _backend_contract_core.assertBackend(@import("backend_gfx"));
+                \\    _backend_contract_core.assertWindow(@import("backend_window"));
+                \\    _backend_contract_core.assertInput(@import("backend_input"));
+                \\}
+                \\
+            );
+        }
+
         /// Event imports block.
         ///
         /// Use the file basename (no path escape) as the import alias so
