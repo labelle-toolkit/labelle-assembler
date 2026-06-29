@@ -483,6 +483,49 @@ jobs:
           cd .labelle/wgpu_desktop
           zig build
 
+      # External (out-of-tree) backend wiring — bgfx extracted to its own
+      # repo (github.com/labelle-toolkit/labelle-bgfx, #386 Phase 6c). Proves
+      # the opt-in `.backend_package` path end-to-end: `install` FETCHES the
+      # backend package from GitHub into the cache, then `generate` stages it
+      # self-contained (vendored sdl_gamepad/android_gamepad come along) and
+      # codegens against its manifest. We then resolve the FULL generated build
+      # graph (`zig build --help` → fetches zbgfx/zglfw + resolves the vendored
+      # sub-packages + url deps) but do NOT run the heavy bgfx C++ compile — it
+      # is byte-identical to the bundled backend and is covered by the dedicated
+      # cached `bgfx-build` job. Bypasses labelle-cli (pinned older release) and
+      # drives the assembler binary directly, like the null step below.
+      - name: Verify the external (out-of-tree) bgfx backend wires up
+        run: |
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+          cd labelle-assembler/examples/bgfx-external
+          # `install` fetches the github backend_package into the cache;
+          # `generate` stages it + codegens (the assembler handles backend_package).
+          $ASM install --project-root .
+          $ASM generate --project-root .
+
+          # The fetched package was staged SELF-CONTAINED (manifest + vendored
+          # gamepad sub-packages), and codegen wired the labelle_bgfx dependency.
+          test -f .labelle/deps/labelle-bgfx/backend.manifest.zon
+          test -d .labelle/deps/labelle-bgfx/sdl_gamepad
+          test -d .labelle/deps/labelle-bgfx/android_gamepad
+          grep -qF 'b.dependency("labelle_bgfx"' .labelle/bgfx_desktop/build.zig
+
+          cd .labelle/bgfx_desktop
+          # Resolve the whole dep graph without the heavy C++ build. Patch the
+          # placeholder fingerprint the same way labelle-cli's runner does
+          # (mirrors the null step).
+          set +e
+          ERR=$(zig build --help 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build --help >/dev/null
+          echo "PASS: external bgfx fetched + staged self-contained + codegen + graph resolve OK"
+
       # Hardware-free RUNTIME check of the shared sdl_gamepad source
       # (backends/sdl_gamepad/sim — see its README). Attaches an
       # in-process SDL2 virtual gamecontroller, drives every button and
