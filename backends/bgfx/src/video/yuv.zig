@@ -243,9 +243,9 @@ fn convertRowRange(a: ConvertArgs, row_start: u32, row_end: u32) void {
 
             const c298 = @as(I32x, @splat(298)) * c;
             const rnd = @as(I32x, @splat(128));
-            const r = (c298 + @as(I32x, @splat(409)) * e + rnd) >> @as(I32x, @splat(8));
-            const g = (c298 - @as(I32x, @splat(100)) * d - @as(I32x, @splat(208)) * e + rnd) >> @as(I32x, @splat(8));
-            const b = (c298 + @as(I32x, @splat(516)) * d + rnd) >> @as(I32x, @splat(8));
+            const r = (c298 + @as(I32x, @splat(409)) * e + rnd) >> @splat(8);
+            const g = (c298 - @as(I32x, @splat(100)) * d - @as(I32x, @splat(208)) * e + rnd) >> @splat(8);
+            const b = (c298 + @as(I32x, @splat(516)) * d + rnd) >> @splat(8);
 
             const lo: I32x = @splat(0);
             const hi: I32x = @splat(255);
