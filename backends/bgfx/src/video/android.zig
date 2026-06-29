@@ -162,6 +162,11 @@ const AndroidVideoDecoder = struct {
     w: u32,
     h: u32,
     input_done: bool,
+    // Output-side end-of-stream: set when AMediaCodec tags an output buffer with
+    // FLAG_EOS (stream fully drained). `eof()` exposes it so the player can mark
+    // a play-once clip finished — mirrors the desktop decoder, which already has
+    // eof(); Android lacked it, so intros never auto-advanced to the next scene.
+    eof_seen: bool,
 
     /// Open a video stream from a file descriptor (the APK asset fd from
     /// `AAsset_openFileDescriptor`, with its offset/length). Selects the first
@@ -236,6 +241,7 @@ const AndroidVideoDecoder = struct {
             .w = @intCast(@max(w, 0)),
             .h = @intCast(@max(h, 0)),
             .input_done = false,
+            .eof_seen = false,
         };
     }
 
@@ -244,6 +250,14 @@ const AndroidVideoDecoder = struct {
     }
     pub fn height(self: *const AndroidVideoDecoder) u32 {
         return self.h;
+    }
+
+    /// True once the decoder has drained the stream (an output buffer carried
+    /// FLAG_EOS). The player reads this via `@hasDecl` to mark a play-once clip
+    /// ended, so the engine emits `engine__video_finished` and the game hands
+    /// off. Without it, Android intros played forever (no auto-advance).
+    pub fn eof(self: *const AndroidVideoDecoder) bool {
+        return self.eof_seen;
     }
 
     /// Pump one decode step (feed at most one input sample, drain one output
@@ -283,6 +297,10 @@ const AndroidVideoDecoder = struct {
             return null;
         }
         if (out_idx >= 0) {
+            // An output buffer tagged FLAG_EOS means the stream is fully drained
+            // (the input-side FLAG_EOS has propagated all the way through). Record
+            // it so `eof()` reports the clip ended.
+            if (info.flags & FLAG_EOS != 0) self.eof_seen = true;
             // render = true: send the frame to the ImageReader's surface.
             _ = AMediaCodec_releaseOutputBuffer(self.codec, @intCast(out_idx), true);
         }
