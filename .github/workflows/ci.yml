@@ -509,8 +509,11 @@ jobs:
           # build.zig.zon references them by url rather than carrying subdirs.
           test -f .labelle/deps/labelle-bgfx/backend.manifest.zon
           grep -qF 'b.dependency("labelle_bgfx"' .labelle/bgfx_desktop/build.zig
-          grep -qF 'labelle-sdl-gamepad' .labelle/deps/labelle-bgfx/build.zig.zon
-          grep -qF 'labelle-android-gamepad' .labelle/deps/labelle-bgfx/build.zig.zon
+          # The gamepad sources are url+hash PACKAGE deps now (not vendored): match
+          # the actual `.url = "...labelle-*-gamepad...tar.gz"` lines, not a bare
+          # slug that could appear in a comment.
+          grep -qE '\.url = ".*labelle-sdl-gamepad.*\.tar\.gz"' .labelle/deps/labelle-bgfx/build.zig.zon
+          grep -qE '\.url = ".*labelle-android-gamepad.*\.tar\.gz"' .labelle/deps/labelle-bgfx/build.zig.zon
           ! test -d .labelle/deps/labelle-bgfx/sdl_gamepad   # de-vendored
           ! test -d .labelle/deps/labelle-bgfx/android_gamepad
 
