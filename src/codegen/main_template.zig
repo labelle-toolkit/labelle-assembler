@@ -27,10 +27,9 @@ const config = @import("../config.zig");
 const script_scanner = @import("../script_scanner.zig");
 const scene_manifest = @import("../scene_manifest.zig");
 const scan = @import("scan.zig");
-const idents = @import("idents.zig");
 const validate = @import("validate.zig");
-const preview = @import("preview.zig");
 const context = @import("context.zig");
+const hooks_block = @import("blocks/hooks.zig");
 const manifest_splice = @import("manifest_splice.zig");
 
 /// Manifest-driven run-loop splice (pluggable-backends RFC, assembler#378).
@@ -46,38 +45,16 @@ const manifest_splice = @import("manifest_splice.zig");
 pub threadlocal var loop_style_override: ?manifest_splice.BackendManifest.LoopStyle = null;
 
 const ProjectConfig = config.ProjectConfig;
-const PluginDep = config.PluginDep;
 const LayerDef = config.LayerDef;
 const ResourceDef = config.ResourceDef;
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
 const SceneManifest = scene_manifest.SceneManifest;
 
-// Scan types + helpers
+// Scan types (function-parameter slice element types).
 const PluginEvent = scan.PluginEvent;
 const PluginFlowNode = scan.PluginFlowNode;
 const PluginPinStyle = scan.PluginPinStyle;
 const PluginCoercion = scan.PluginCoercion;
-const dedupePinStyles = scan.dedupePinStyles;
-const pathToIdent = scan.pathToIdent;
-
-/// True iff `ident` (a game script's `pathToIdent(rel_path)`) names a
-/// game-script module that contributed at least one FlowNode and is
-/// therefore promoted to a named build module (labelle-assembler#240
-/// Gap 2). `module_sanitized` of an `is_script` flow node equals
-/// `pathToIdent(rel_path)`, so the comparison is a direct string match.
-/// Used by the `AllScripts` emitter to switch promoted scripts to the
-/// `@import("script__<ident>")` form.
-fn isFlowNodeScript(flow_nodes: []const PluginFlowNode, ident: []const u8) bool {
-    for (flow_nodes) |fn_| {
-        if (!fn_.is_script) continue;
-        if (std.mem.eql(u8, fn_.module_sanitized, ident)) return true;
-    }
-    return false;
-}
-
-// Identifier helpers
-const pathToPascal = idents.pathToPascal;
-const eventVariantName = idents.eventVariantName;
 
 // Validation (pure helpers — not mixin-converted; see codegen/context.zig).
 const checkBasenameCollisions = validate.checkBasenameCollisions;
@@ -86,59 +63,39 @@ const validateResources = validate.validateResources;
 
 const Codegen = context.Codegen;
 
-// Preview-mode templates (extracted to codegen/preview.zig).
-const WASM_PANIC_WORKAROUND = preview.WASM_PANIC_WORKAROUND;
-const PREVIEW_HELPERS = preview.PREVIEW_HELPERS;
-const PREVIEW_READBACK_HELPERS = preview.PREVIEW_READBACK_HELPERS;
-const PREVIEW_LOOP_SETUP = preview.PREVIEW_LOOP_SETUP;
-const PREVIEW_READBACK_SETUP = preview.PREVIEW_READBACK_SETUP;
-const PREVIEW_HEARTBEAT_LOOP = preview.PREVIEW_HEARTBEAT_LOOP;
-const PREVIEW_INPUT_DISPATCH = preview.PREVIEW_INPUT_DISPATCH;
-const PREVIEW_INPUT_DISPATCH_STUB = preview.PREVIEW_INPUT_DISPATCH_STUB;
-const PREVIEW_READBACK_LOOP = preview.PREVIEW_READBACK_LOOP;
-const PREVIEW_INIT_CALLBACK = preview.PREVIEW_INIT_CALLBACK;
-const PREVIEW_CLEANUP_CALLBACK = preview.PREVIEW_CLEANUP_CALLBACK;
-const PREVIEW_HEARTBEAT_CALLBACK = preview.PREVIEW_HEARTBEAT_CALLBACK;
-const PREVIEW_READBACK_HELPERS_SOKOL = preview.PREVIEW_READBACK_HELPERS_SOKOL;
-const PREVIEW_READBACK_INIT_SOKOL = preview.PREVIEW_READBACK_INIT_SOKOL;
-const PREVIEW_READBACK_FRAME_SOKOL = preview.PREVIEW_READBACK_FRAME_SOKOL;
-const PREVIEW_READBACK_CLEANUP_SOKOL = preview.PREVIEW_READBACK_CLEANUP_SOKOL;
-const PREVIEW_READBACK_HELPERS_SOKOL_D3D11 = preview.PREVIEW_READBACK_HELPERS_SOKOL_D3D11;
-const PREVIEW_READBACK_HELPERS_METAL_SOKOL = preview.PREVIEW_READBACK_HELPERS_METAL_SOKOL;
-const PREVIEW_READBACK_INIT_SOKOL_D3D11 = preview.PREVIEW_READBACK_INIT_SOKOL_D3D11;
-const PREVIEW_READBACK_INIT_METAL_SOKOL = preview.PREVIEW_READBACK_INIT_METAL_SOKOL;
-const PREVIEW_READBACK_FRAME_SOKOL_D3D11 = preview.PREVIEW_READBACK_FRAME_SOKOL_D3D11;
-const PREVIEW_PRE_RENDER_METAL_SOKOL = preview.PREVIEW_PRE_RENDER_METAL_SOKOL;
-const PREVIEW_READBACK_FRAME_METAL_SOKOL = preview.PREVIEW_READBACK_FRAME_METAL_SOKOL;
-const PREVIEW_READBACK_CLEANUP_SOKOL_D3D11 = preview.PREVIEW_READBACK_CLEANUP_SOKOL_D3D11;
-const PREVIEW_READBACK_CLEANUP_METAL_SOKOL = preview.PREVIEW_READBACK_CLEANUP_METAL_SOKOL;
+// The per-block builders (imports, hooks, events, registries) and the
+// stateful lifecycle render now live in codegen/blocks/*.zig and
+// codegen/lifecycle/render.zig respectively, dispatched here through the
+// `Codegen` mixin context (`ctx.writeXxxBlock(...)` / `ctx.renderLifecycle`).
+// Preview-mode template literals + the bgfx-Android register snippet moved
+// with the lifecycle render that consumes them.
 
-/// `{{android_backend_register}}` body for the bgfx-Android `android_main`
-/// hole (#310 Stage 4). Registers the bgfx backend's Android JNI seam with
-/// core ONCE at startup — emitted in `android_main` BEFORE `run()`, so it
-/// runs before the event loop starts and therefore before the first
-/// `onWindowFocusChanged` (the immersive re-hide path) AND before the first
-/// gamepad poll. (It previously sat in `gameInit`, which the shell fires on
-/// the first INIT_WINDOW *inside* the loop — that runs after the window's
-/// first focus event, so the launch immersive hide found no context
-/// registered and no-op'd. Moving it ahead of `run` fixes the launch hide.)
-/// Core's gamepad source + the engine's immersive mode then reach the
-/// running ANativeActivity / InputManager through the bgfx adapter's
-/// `AndroidBackendContext` instead of linking any backend symbol directly.
-/// Emitted unconditionally on bgfx-Android (gamepad detection needs it even
-/// when immersive mode is off). Replaces the removed sokol-compat shims.
-const BGFX_ANDROID_BACKEND_REGISTER =
-    \\    // Register the bgfx Android backend seam with core (labelle-core#310):
-    \\    // core's gamepad source and the engine's immersive mode reach the
-    \\    // running ANativeActivity / InputManager JNI glue through this context
-    \\    // instead of linking any backend symbol directly. Runs once at startup,
-    \\    // before the first frame polls the gamepad source. The context comes
-    \\    // from the bgfx backend adapter surfaced as `backend_input.android`;
-    \\    // `engine.core` is labelle-engine's re-export of labelle-core. See
-    \\    // backends/bgfx/src/android.zig.
-    \\    engine.core.registerAndroidBackend(@import("backend_input").android.backendContext());
-    \\
-;
+/// Build one template scalar block: spin up an `Allocating` writer, run
+/// `emitFn(ctx, writer, ident_buf)`, take ownership of the rendered
+/// bytes, register them in `allocs` for cleanup, and return the slice.
+/// Collapses the writer→`toOwnedSlice`→`appendAssumeCapacity` boilerplate
+/// the orchestrator repeated once per block. `allocs` must have reserved
+/// capacity for the append (the orchestrator pre-reserves
+/// `ALLOCS_BLOCK_COUNT`). `emitFn` always takes the shared `ident_buf`;
+/// writers that don't need it simply ignore the param.
+fn block(
+    allocator: std.mem.Allocator,
+    allocs: *std.ArrayList([]const u8),
+    comptime emitFn: anytype,
+    ctx: *Codegen,
+    ident_buf: *[256]u8,
+) ![]const u8 {
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer alloc_writer.deinit();
+    try emitFn(ctx, &alloc_writer.writer, ident_buf);
+    var arr_list = alloc_writer.toArrayList();
+    // `toArrayList` moved the buffer out of `alloc_writer` (its errdefer above is
+    // now a no-op), so guard `arr_list` until `toOwnedSlice` transfers ownership.
+    errdefer arr_list.deinit(allocator);
+    const out = try arr_list.toOwnedSlice(allocator);
+    allocs.appendAssumeCapacity(out);
+    return out;
+}
 
 // ── Template-based generation (engine provides main.zig.template) ────────
 
@@ -255,143 +212,60 @@ pub fn generateMainZigFromTemplate(
     // ── Pre-computed blocks ──
     var ident_buf: [256]u8 = undefined;
 
-    // Hook imports block
-    //
-    // The wasm32-emscripten panic-handler override (labelle-assembler#141)
-    // is emitted at the top of this block so the two `pub const` root
-    // declarations land near `const std = @import("std")` in the
-    // generated `main.zig`. They MUST appear at module root for Zig to
-    // honor them, and this block is rendered right after the stdlib
-    // imports in `labelle-engine/codegen/main.zig.template`.
+    // Import + JSONC-scene blocks (codegen/blocks/imports.zig). Each
+    // writer fills its own `Allocating` block via the `block()` helper,
+    // which owns the writer→owned-slice→cleanup-list dance the orchestrator
+    // used to repeat inline per block.
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        if (cfg.platform == .wasm) {
-            try bw.writeAll(WASM_PANIC_WORKAROUND);
-        }
-        if (hook_names.len > 0) {
-            try bw.writeAll("\n// --- Hook imports ---\n");
-            for (hook_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                try bw.print("const {s} = @import(\"hooks/{s}.zig\");\n", .{ ident, name });
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
+                try c.writeHookImportsBlock(w, ib);
             }
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("hook_imports_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("hook_imports_block", b);
     }
-
-    // Event imports block
-    //
-    // Use the file basename (no path escape) as the import alias so the
-    // alias matches the union variant name below, which in turn matches
-    // the user's handler function name. Plugin events use `pathToIdent`
-    // because plugin-namespaced names (`<plugin>__<event>`) need escapes
-    // for path safety; in-tree game events do not — the basename is
-    // already a valid Zig identifier (the user's handler references it).
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        if (event_names.len > 0) {
-            try bw.writeAll("\n// --- Event imports ---\n");
-            for (event_names) |name| {
-                const ident = eventVariantName(name);
-                try bw.print("const {s} = @import(\"events/{s}.zig\");\n", .{ ident, name });
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                try c.writeEventImportsBlock(w);
             }
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("event_imports_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("event_imports_block", b);
     }
-
-    // Enum imports block
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        if (enum_names.len > 0) {
-            try bw.writeAll("\n// --- Enum imports ---\n");
-            for (enum_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                try bw.print("const {s} = @import(\"enums/{s}.zig\");\n", .{ ident, name });
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
+                try c.writeEnumImportsBlock(w, ib);
             }
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("enum_imports_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("enum_imports_block", b);
     }
-
-    // JSONC scene block
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        if (jsonc_scene_names.len > 0 or prefab_names.len > 0) {
-            try bw.writeAll("\n// --- JSONC scene loaders (embedded) ---\n");
-            if (gizmo_names.len > 0) {
-                try bw.writeAll("const JsoncBridge = engine.JsoncSceneBridgeWithGizmos(AssembledGame, Components, Gizmos);\n");
-            } else {
-                try bw.writeAll("const JsoncBridge = engine.JsoncSceneBridge(AssembledGame, Components);\n");
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
+                try c.writeJsoncSceneBlock(w, ib);
             }
-            for (jsonc_scene_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                try bw.print(
-                    \\const jsonc_{s}_loader = struct {{
-                    \\    const embedded_source = @embedFile("scenes/{s}.jsonc");
-                    \\    fn load(game: *AssembledGame) anyerror!void {{
-                    \\        return JsoncBridge.loadSceneFromSource(game, embedded_source, "prefabs");
-                    \\    }}
-                    \\}}.load;
-                    \\
-                    , .{ ident, name });
-            }
-
-            // ── Scene → assets map (Asset Streaming RFC, ticket #46) ────
-            // Emit a comptime-visible struct that maps each scene's
-            // assembler name to the `assets:` array declared at the top of
-            // its .jsonc file. Empty arrays are emitted explicitly so the
-            // labelle-engine consumer (issue #445) can iterate `entries`
-            // without checking for missing keys. See also the upcoming
-            // labelle-engine SceneEntry.assets field — this block is the
-            // codegen contract that ticket reads.
-            try ctx.writeSceneAssetManifests(bw, &ident_buf);
-
-            // Same pattern for scene-declared `initial_state`
-            // (labelle-engine#500) — emit only the scenes that opted in,
-            // so the generated inline-for is a no-op for back-compat.
-            try ctx.writeSceneInitialStateManifests(bw);
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("jsonc_scene_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("jsonc_scene_block", b);
     }
 
     // Game layers block
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        try generateGameLayers(cfg.layers, bw);
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("game_layers_block", block);
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                try generateGameLayers(c.cfg.layers, w);
+            }
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("game_layers_block", b);
     }
 
-    // Resource registry block
     // Resource registry block — resources are now loaded at runtime via
     // @embedFile + loadAtlasFromMemory, so the comptime registry is empty.
     // The block is kept as an empty string for template compatibility.
     {
-        const block = try allocator.dupe(u8, "");
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("resource_registry_block", block);
+        const empty = try allocator.dupe(u8, "");
+        allocs.appendAssumeCapacity(empty);
+        try data.scalars.put("resource_registry_block", empty);
     }
 
     // AllHookPayloads block — merge engine payloads with game events
@@ -402,995 +276,135 @@ pub fn generateMainZigFromTemplate(
     // game events stay on the same merged `AllHookPayloads` (no parallel
     // dispatcher, per RFC §2 "feed the existing pipeline").
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        // Gate on **discovered** events, not declared plugins — a project
-        // can declare a plugin whose `Events` decl is empty (or absent, e.g.
-        // the plugin-controllers demo plugin), in which case `PluginEvents`
-        // is emitted as `void` and must NOT be folded into `GameEvents`
-        // (`MergeHookPayloads` rejects `void` operands).
-        const has_plugin_events = plugin_events.len > 0;
-        // When plugins declare events, the assembler emits a widened
-        // `GameEvents` that already folds in `PluginEvents` (see the
-        // game_events_block emission below). So `AllHookPayloads` only
-        // needs to merge `GameEvents` once — referencing `PluginEvents`
-        // here too would re-emit every plugin variant twice and trip
-        // `MergeHookPayloads`' duplicate-field check.
-        if (event_names.len == 0 and !has_plugin_events) {
-            try bw.writeAll("const AllHookPayloads = engine.HookPayload(EcsBackend.Entity);\n\n");
-        } else {
-            try bw.writeAll("const AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity)");
-            if (event_names.len > 0 or has_plugin_events) try bw.writeAll(", GameEvents");
-            try bw.writeAll(" });\n\n");
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("all_hook_payloads_block", block);
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                try c.writeAllHookPayloadsBlock(w);
+            }
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("all_hook_payloads_block", b);
     }
 
-    // Count + collect new-form flow handlers (RFC-PLUGIN-EVENTS phase 4,
-    // labelle-assembler#175). flow-codegen emits `pub const FlowEventHandler`
-    // for new-form `OnEvent` flows; flow_scanner flips
-    // `ScriptEntry.has_event_handler` on those. We thread them into the
-    // existing `GameHooks` receiver tuple — by default in the
-    // scanner-sorted order `script_entries` arrives in
-    // (numeric-prefix-then-alphabetical; `flow_scanner.zig:220-232`, O3
-    // in the RFC).
-    //
-    // **Phase 7 layering (RFC-PLUGIN-EVENTS O4 / labelle-core#16).** A
-    // flow listening to a consumable event sets `priority` in its
-    // `.flow.jsonc`; `flow_scanner` lifts that onto
-    // `ScriptEntry.event_priority`. Flows with a priority sort to the
-    // front of the flow tail, priority descending; the rest stay on the
-    // scanner sort. The runtime `MergeHooks.emit`
-    // (`labelle-core/src/dispatcher.zig`) switches to the return-aware
-    // path automatically when the variant's payload declares
-    // `pub const consumable = true`, breaking the loop on the first
-    // handler that returns `true` — so the highest-priority consumer
-    // wins, which is the contract phase 7 promises.
-    //
-    // **Sort scope — whole flow tail, not per-event.** A single flow
-    // handler struct currently subscribes to exactly one event (one
-    // `OnEvent` per `.flow.jsonc`), but the assembler-side sort is
-    // over the **whole flow tail**, not partitioned per event. The
-    // reason: priority is only meaningful for consumable events, and a
-    // notification handler's relative position in the tail doesn't
-    // affect dispatch correctness (every notification listener runs
-    // regardless of order). Front-loading the priority-set flows ahead
-    // of notification flows is the simplest scope that satisfies the
-    // consumable-flavor contract without re-keying the tuple by event
-    // tag. If a future flow listens to multiple events (one consumable,
-    // one notification, with different priorities each), the
-    // single-priority shape no longer fits — that's the day a per-event
-    // sort becomes load-bearing; not now.
-    //
-    // The handler module is referenced via an inline `@import("scripts/<rel_path>")`
-    // because `AllScripts` (which holds these imports under stable
-    // identifiers) is declared *after* `GameHooks` in the template
-    // (`labelle-engine/codegen/main.zig.template:20` vs `:35`), so we
-    // can't borrow the alias. Spelling the import inline keeps the
-    // wiring local to these two blocks without adding a new template
-    // slot ahead of `game_hooks_block`. An ident derived from `rel_path`
-    // names the per-handler `var` declaration in `hooks_init_block`.
-    var flow_handler_count: usize = 0;
-    for (script_entries) |entry| {
-        if (entry.has_event_handler) flow_handler_count += 1;
-    }
-
-    // Priority-aware ordering of the flow tail. The list holds indices
-    // into `script_entries` for every entry with
-    // `has_event_handler == true`, in the order the receiver tuple
-    // must emit them: priority-set entries first (descending), then
-    // the rest in scanner order. A stable sort on (priority bucket,
-    // scanner index) keeps everything deterministic — the input is
-    // already in scanner order, so the tie-breaker is just "preserve
-    // relative position".
-    var flow_order: std.ArrayList(usize) = .empty;
+    // Priority-aware ordering of the flow tail (RFC-PLUGIN-EVENTS phase
+    // 4/7, labelle-assembler#175). `buildFlowOrder` returns indices into
+    // `script_entries` for every `has_event_handler` flow — priority-set
+    // entries first (descending), then the rest in scanner order. Owned
+    // here so its lifetime is visible at the call site; both the
+    // game-hooks and hooks-init writers consume the same slice so the
+    // receiver-type order matches the receiver-pointer order
+    // (`MergeHooks.emit` looks receivers up by tuple position). See
+    // `codegen/blocks/hooks.zig` for the full rationale.
+    var flow_order = try hooks_block.buildFlowOrder(allocator, script_entries);
     defer flow_order.deinit(allocator);
-    try flow_order.ensureTotalCapacity(allocator, flow_handler_count);
-    for (script_entries, 0..) |entry, i| {
-        if (entry.has_event_handler) flow_order.appendAssumeCapacity(i);
-    }
-    const FlowSortCtx = struct {
-        entries: []const ScriptEntry,
-        fn lessThan(self: @This(), a: usize, b: usize) bool {
-            const ea = self.entries[a];
-            const eb = self.entries[b];
-            // Priority-set entries strictly precede priority-null
-            // entries; among priority-set entries, higher value first.
-            if (ea.event_priority != null and eb.event_priority == null) return true;
-            if (ea.event_priority == null and eb.event_priority != null) return false;
-            if (ea.event_priority) |pa| {
-                if (eb.event_priority) |pb| {
-                    if (pa != pb) return pa > pb;
-                }
-            }
-            // Same bucket: preserve the input scanner-sort order.
-            return a < b;
-        }
-    };
-    std.mem.sort(usize, flow_order.items, FlowSortCtx{ .entries = script_entries }, FlowSortCtx.lessThan);
+    ctx.flow_order = flow_order.items;
 
-    // Game hooks block
+    // Game hooks block (codegen/blocks/hooks.zig).
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        if (hook_names.len == 0 and flow_handler_count == 0) {
-            try bw.writeAll("const GameHooks = struct {};\n\n");
-        } else {
-            var pascal_buf: [128]u8 = undefined;
-            try bw.writeAll("const GameHooks = engine.MergeHooks(AllHookPayloads, .{");
-            for (hook_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                const pascal = pathToPascal(name, &pascal_buf);
-                try bw.print(" *{s}.{s},", .{ ident, pascal });
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
+                try c.writeGameHooksBlock(w, ib, c.flow_order);
             }
-            // Flow handler receiver types — appended after hooks so the
-            // scanner sort (flows-among-flows) sits inside a single
-            // tail block, leaving the existing hook order at the head
-            // unchanged. `rel_path` is e.g. `flows/hit_counter.zig`,
-            // matching the on-disk layout the `AllScripts` block already
-            // imports. Iteration order is `flow_order` — priority-set
-            // flows first (desc), then scanner-sorted notification flows.
-            for (flow_order.items) |i| {
-                const entry = script_entries[i];
-                try bw.print(" *@import(\"scripts/{s}\").FlowEventHandler,", .{entry.rel_path});
-            }
-            try bw.writeAll(" });\n\n");
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("game_hooks_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("game_hooks_block", b);
     }
 
-    // Hooks init block — instantiate individual hooks and wire into GameHooks
+    // Hooks init block (codegen/blocks/hooks.zig).
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        if (hook_names.len == 0 and flow_handler_count == 0) {
-            try bw.writeAll("    var hooks = GameHooks{};\n");
-        } else {
-            var pascal_buf: [128]u8 = undefined;
-            for (hook_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                const pascal = pathToPascal(name, &pascal_buf);
-                try bw.print("    var {s}_inst = {s}.{s}{{}};\n", .{ ident, ident, pascal });
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
+                try c.writeHooksInitBlock(w, ib, c.flow_order);
             }
-            // Materialise each flow handler so it has a stable address
-            // the `&` operator can produce a pointer to. `pathToIdent`
-            // makes the `rel_path` injective into the Zig identifier
-            // namespace (issue #173), so multiple flows in subdirs
-            // can't collide on the same `<ident>_flow_handler` name.
-            // `setHooks` walks the receiver tuple and injects
-            // `*AssembledGame` into `game_ptr` for every receiver that
-            // declares such a field (`labelle-engine/src/game.zig:419-429`),
-            // so no extra init step is needed here — the existing walk
-            // reaches these entries the same way it does the hook ones.
-            //
-            // Note: the `var` decls below can be emitted in any order
-            // (each one names a unique identifier) but we follow
-            // `flow_order` for clean diff-readability — the `var`s
-            // appear in the same order their `&` references will inside
-            // the tuple literal.
-            for (flow_order.items) |i| {
-                const entry = script_entries[i];
-                const ident = pathToIdent(entry.rel_path, &ident_buf);
-                try bw.print(
-                    "    var {s}_flow_handler: @import(\"scripts/{s}\").FlowEventHandler = .{{}};\n",
-                    .{ ident, entry.rel_path },
-                );
-            }
-            try bw.writeAll("    var hooks = GameHooks{ .receivers = .{");
-            for (hook_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                try bw.print(" &{s}_inst,", .{ident});
-            }
-            // The tuple-literal order MUST match the receiver-type
-            // order in `GameHooks` above — `MergeHooks.emit` looks each
-            // receiver up by its tuple position. Iterate `flow_order`
-            // identically to the `game_hooks_block` loop.
-            for (flow_order.items) |i| {
-                const entry = script_entries[i];
-                const ident = pathToIdent(entry.rel_path, &ident_buf);
-                try bw.print(" &{s}_flow_handler,", .{ident});
-            }
-            try bw.writeAll(" } };\n");
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("hooks_init_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("hooks_init_block", b);
     }
 
-    // Game events + Plugin events block.
-    //
-    // `GameEvents` is the game-side scan of `events/*.zig`
-    // (labelle-engine#422 — shipped). `PluginEvents` is the
-    // plugin-side discovery added by RFC-PLUGIN-EVENTS phase 1: walks
-    // every plugin module with `@hasDecl(plugin, "Events")` at
-    // comptime — same convention as `Components`/`Systems`/
-    // `GizmoCategories` — and folds each `pub const <name> = struct`
-    // declaration into a single tagged union with plugin-qualified
-    // variant names (`<plugin>__<event>`). `.` is not a valid Zig
-    // identifier character, so the on-disk JSONC dot form
-    // (`box2d.collision_begin`) resolves to the qualified tag
-    // (`box2d__collision_begin`) when flow-codegen consumes this in
-    // phase 3.
-    //
-    // Both decls are `pub` so flow-codegen-emitted hook handler
-    // structs (phase 3) can reference them by name via the existing
-    // module-level import path. The resolver is the comptime
-    // reflection itself (option (a) — generated comptime decl rather
-    // than a JSON sidecar): `@FieldType(PluginEvents, "<tag>")` and
-    // `@typeInfo(...).@"struct".fields` give the payload field list
-    // without a separate registry file to keep in sync.
-    //
-    // **Phase 3 widening:** the engine's `Game.emit(event: GameEvents)`
-    // accepts a single union type, but plugins (RFC-PLUGIN-EVENTS phase
-    // 2, e.g. labelle-box2d 6c44691) now `game.emit(.{ .box2d__... = .{...} })`.
-    // So when plugins declare events, `GameEvents` is **widened** to the
-    // union of the game-side scan and `PluginEvents` — emitted via
-    // `pub const GameEvents = engine.core.MergeHookPayloads(.{ GameEventsRaw, PluginEvents })`
-    // — and `GameConfig(..., GameEvents)` (the existing engine template
-    // slot, unchanged) now sees the merged type. The raw game-side scan
-    // is kept under a private alias `GameEventsRaw` so the merge has a
-    // stable second operand even when `events/*.zig` is empty.
-    //
-    // No engine template change required: the `GameEvents,` token in
-    // `codegen/main.zig.template` keeps its v1 shape; only the
-    // **meaning** of `GameEvents` widens when plugins declare events.
-    // Every project without plugin events keeps the v1 semantics
-    // verbatim — `GameEvents` is either `void` or the events/*.zig
-    // union.
+    // Game events + Plugin events block (codegen/blocks/events.zig).
+    // Composes the game-side `events/*.zig` scan with plugin-side
+    // discovery (events/flow-nodes/pin-styles/coercions); see that file
+    // for the RFC-PLUGIN-EVENTS / RFC-FLOW-VOCABULARY rationale.
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-
-        // Gate on **discovered** plugin events, not declared plugins —
-        // a project can declare a plugin whose `Events` is empty/absent
-        // (e.g. the plugin-controllers demo plugin), and in that case
-        // we want the v1 emission shape verbatim ("no plugin events"),
-        // not a `GameEvents = PluginEvents = void` path that would
-        // confuse downstream consumers.
-        const has_plugin_events_local = plugin_events.len > 0;
-        const has_game_events_local = event_names.len > 0;
-
-        // The raw game-side scan keeps its v1 shape; the alias is what
-        // the merge feeds on when plugins are also in play. For
-        // plugin-less projects with no game events, `GameEventsRaw` is
-        // omitted and `GameEvents = void` is emitted directly (the
-        // pre-RFC shape every shipped game already has).
-        if (has_plugin_events_local) {
-            // Need a name for the raw events to feed into the merge.
-            // Without game events, the alias is `void` and we end up
-            // with `GameEvents = PluginEvents` directly (skipping the
-            // merge — `MergeHookPayloads` rejects `void`).
-            if (has_game_events_local) {
-                try bw.writeAll("pub const GameEventsRaw = union(enum) {\n");
-                var pascal_buf: [128]u8 = undefined;
-                for (event_names) |name| {
-                    const ident = eventVariantName(name);
-                    const pascal = pathToPascal(name, &pascal_buf);
-                    try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
-                }
-                try bw.writeAll("};\n\n");
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                try c.writeGameEventsBlock(w);
             }
-            try ctx.writePluginEventsBlock(bw);
-            if (has_game_events_local) {
-                try bw.writeAll("pub const GameEvents = engine.core.MergeHookPayloads(.{ GameEventsRaw, PluginEvents });\n\n");
-            } else {
-                try bw.writeAll("pub const GameEvents = PluginEvents;\n\n");
-            }
-        } else {
-            // No plugins — the v1 emission verbatim, every shipped
-            // pre-RFC game keeps its exact shape.
-            if (has_game_events_local) {
-                try bw.writeAll("pub const GameEvents = union(enum) {\n");
-                var pascal_buf: [128]u8 = undefined;
-                for (event_names) |name| {
-                    const ident = eventVariantName(name);
-                    const pascal = pathToPascal(name, &pascal_buf);
-                    try bw.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
-                }
-                try bw.writeAll("};\n\n");
-            } else {
-                try bw.writeAll("pub const GameEvents = void;\n\n");
-            }
-        }
-
-        // RFC-FLOW-VOCABULARY phase 2 — emit the PluginFlowNodes and
-        // PluginPinStyles registries inside the same generated block so
-        // the engine template stays unchanged. Both decls are always
-        // emitted (empty `struct {}` when discovery found nothing) so
-        // downstream consumers can do uniform reflection. See the
-        // file header on `writePluginFlowNodesBlock` for the
-        // mechanism + RFC §5 (game-script-as-source) for the scope.
-        try ctx.writePluginFlowNodesBlock(bw);
-        const deduped_styles = try dedupePinStyles(allocator, plugin_pin_styles);
-        defer allocator.free(deduped_styles);
-        try ctx.writePluginPinStylesBlock(bw, deduped_styles);
-        // RFC-FLOW-VOCABULARY §2 / O4 — emit PluginCoercions next to
-        // the other registries. The block carries its own `resolve` +
-        // `findByTypes` helpers so flow-codegen + the editor can do
-        // the wire-fit lookup without re-iterating the decls.
-        try ctx.writePluginCoercionsBlock(bw);
-
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("game_events_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("game_events_block", b);
     }
 
-    // Prefab registry block — JSONC prefabs are loaded at runtime via
-    // addEmbeddedPrefab, so the comptime registry is always empty.
+    // Comptime registry blocks (codegen/blocks/registries.zig).
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        try bw.writeAll("const Prefabs = engine.PrefabRegistry(.{});\n\n");
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("prefab_registry_block", block);
-    }
-
-    // Component registry block
-    {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        const has_plugins = cfg.plugins.len > 0;
-        if (has_plugins) {
-            try bw.writeAll("const Components = engine.ComponentRegistryWithPlugins(.{\n");
-        } else {
-            try bw.writeAll("const Components = engine.ComponentRegistry(.{\n");
-        }
-        // Built-in engine component available to every project's prefabs/scenes
-        // (#549) — a `VideoComponent` can be declared in a prefab/scene `.jsonc`
-        // like any game component (`{ "VideoComponent": { "path": "intro", … } }`)
-        // and the engine's video system plays it at the entity's position.
-        try bw.writeAll("    .VideoComponent = engine.core.VideoComponent,\n");
-        var pascal_buf: [128]u8 = undefined;
-        for (component_names) |name| {
-            const pascal = pathToPascal(name, &pascal_buf);
-            try bw.print("    .{s} = @import(\"components/{s}.zig\").{s},\n", .{ pascal, name, pascal });
-        }
-        if (has_plugins) {
-            try bw.writeAll("}, .{\n");
-            try bw.writeAll("    @import(\"labelle-gfx\"),\n");
-            for (cfg.plugins) |plugin| {
-                try bw.print("    @import(\"{s}\"),\n", .{plugin.name});
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                try c.writePrefabRegistryBlock(w);
             }
-            try bw.writeAll("});\n\n");
-        } else {
-            try bw.writeAll("});\n\n");
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("component_registry_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("prefab_registry_block", b);
     }
-
-    // System registry block + Plugin controllers block (appended into the
-    // same scalar so it slots into existing `{{system_registry_block}}`
-    // placeholder in main.zig.template without needing a template update).
-    //
-    // The Plugin controllers scaffolding discovers `pub const Controller` in
-    // each plugin root module at comptime and emits a `setup` / `deinit`
-    // dispatcher the generated main calls on scene load / unload.
-    // Backward-compatible: plugins without a Controller export are silently
-    // skipped by the `@hasDecl` guard, so no runtime cost and no
-    // generate-time opt-in needed.
-    //
-    // See flying-platform-labelle#208 (RFC: Plugin-Exported Controllers) §1–§2.
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        if (cfg.plugins.len > 0) {
-            try bw.writeAll("const PluginSystems = engine.SystemRegistry(.{\n");
-            try bw.writeAll("    @import(\"labelle-gfx\"),\n");
-            for (cfg.plugins) |plugin| {
-                try bw.print("    @import(\"{s}\"),\n", .{plugin.name});
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                try c.writeComponentRegistryBlock(w);
             }
-            try bw.writeAll("});\n\n");
-            try bw.writeAll("const DiscoveredGizmoCategories = PluginSystems.gizmoCategories();\n\n");
-
-            try ctx.writePluginControllersBlock(bw);
-        } else {
-            try bw.writeAll("const GizmoCatEntry = struct { name: []const u8, id: u8 };\n");
-            try bw.writeAll("const DiscoveredGizmoCategories: []const GizmoCatEntry = &.{};\n\n");
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("system_registry_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("component_registry_block", b);
     }
-
-    // All scripts block
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        try bw.writeAll("const AllScripts = struct {\n");
-        for (script_entries) |entry| {
-            if (std.mem.eql(u8, entry.name, "context")) continue;
-            const ident = pathToIdent(entry.rel_path, &ident_buf);
-            // labelle-assembler#240 Gap 2 — a game script that exports
-            // `pub const FlowNodes` is promoted to a NAMED build module
-            // (it's also reached by the `game` shim's `PluginFlowNodes`).
-            // It MUST be `@import("script__<sanitized>")` here, not
-            // `@import("scripts/<rel>")`, or the file lands in both the
-            // root module (this block) and the `game` module → the
-            // "file exists in modules 'root' and 'game'" error. The
-            // sanitized prefix is byte-identical to `ident` because both
-            // are `pathToIdent(rel_path)`, matching
-            // `scan.promotedScriptModuleName`. Scripts without FlowNodes
-            // keep the path import.
-            const is_promoted = isFlowNodeScript(plugin_flow_nodes, ident);
-            // Buffer the named module name so the import expr below is a
-            // single `{s}` regardless of promotion. `script__` + `ident`.
-            var named_buf: [256 + "script__".len]u8 = undefined;
-            const import_target: []const u8 = if (is_promoted)
-                std.fmt.bufPrint(&named_buf, "script__{s}", .{ident}) catch return error.NameTooLong
-            else
-                entry.rel_path;
-            const import_prefix: []const u8 = if (is_promoted) "" else "scripts/";
-            if (entry.states.len == 0) {
-                try bw.print("    pub const {s} = @import(\"{s}{s}\");\n", .{ ident, import_prefix, import_target });
-            } else {
-                try bw.print("    pub const {s} = struct {{\n", .{ident});
-                try bw.print("        const _inner = @import(\"{s}{s}\");\n", .{ import_prefix, import_target });
-                try bw.writeAll("        pub const game_states = .{\n");
-                for (entry.states) |state| {
-                    try bw.print("            \"{s}\",\n", .{state});
-                }
-                try bw.writeAll("        };\n");
-                const decl_names = [_][]const u8{ "tick", "setup", "drawGui", "State" };
-                for (decl_names) |decl| {
-                    try bw.print("        pub const {s} = if (@hasDecl(_inner, \"{s}\")) _inner.{s} else {{}};\n", .{ decl, decl, decl });
-                }
-                try bw.writeAll("    };\n");
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                try c.writeSystemRegistryBlock(w);
             }
-        }
-        try bw.writeAll("};\n\n");
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("all_scripts_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("system_registry_block", b);
     }
-
-    // View registry block
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        if (view_names.len > 0) {
-            try bw.writeAll("const Views = engine.ViewRegistry(.{\n");
-            for (view_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                try bw.print("    .{s} = @import(\"views/{s}.zon\"),\n", .{ ident, name });
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
+                try c.writeAllScriptsBlock(w, ib);
             }
-            try bw.writeAll("});\n\n");
-        } else {
-            try bw.writeAll("const Views = engine.EmptyViewRegistry;\n\n");
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("view_registry_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("all_scripts_block", b);
     }
-
-    // Gizmo registry block
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        if (gizmo_names.len > 0) {
-            try bw.writeAll("const Gizmos = engine.GizmoRegistry(.{\n");
-            for (gizmo_names) |name| {
-                const ident = pathToIdent(name, &ident_buf);
-                try bw.print("    .{s} = @import(\"gizmos/{s}.zon\"),\n", .{ ident, name });
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
+                try c.writeViewRegistryBlock(w, ib);
             }
-            try bw.writeAll("});\n\n");
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("gizmo_registry_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("view_registry_block", b);
     }
-
-    // Animation registry block
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-        if (animation_names.len > 0) {
-            var anim_pascal_buf: [128]u8 = undefined;
-            for (animation_names) |name| {
-                const pascal = pathToPascal(name, &anim_pascal_buf);
-                try bw.print("const {s}Anim = engine.AnimationDef(@import(\"animations/{s}.zon\"));\n", .{ pascal, name });
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
+                try c.writeGizmoRegistryBlock(w, ib);
             }
-            try bw.writeAll("\n");
-        }
-        var arr_list_b = alloc_writer_b.toArrayList();
-        const block = try arr_list_b.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(block);
-        try data.scalars.put("animation_registry_block", block);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("gizmo_registry_block", b);
+    }
+    {
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                try c.writeAnimationRegistryBlock(w);
+            }
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("animation_registry_block", b);
     }
 
     // ── Lifecycle section (rendered from backend template, same as procedural path) ──
+    // Extracted to codegen/lifecycle/render.zig — the stateful per-backend
+    // dispatch (sokol / raylib-wasm / bgfx-android callback paths + the loop
+    // path for raylib-desktop / sdl / bgfx-desktop / wgpu). `hooks_init` is
+    // the already-rendered `hooks_init_block` scalar the lifecycle templates
+    // re-embed; the manifest-driven `loop_style_override` is read here and
+    // passed by value so the render module stays free of the threadlocal.
     {
-        var alloc_writer_b: std.Io.Writer.Allocating = .init(allocator);
-        errdefer alloc_writer_b.deinit();
-        const bw = &alloc_writer_b.writer;
-
-        const tick_code = if (cfg.plugins.len > 0)
-            "        const scaled_dt = dt * g.time_scale;\n" ++
-            "        if (scaled_dt > 0) {\n" ++
-            "            runner.tick(&g, scaled_dt);\n" ++
-            "            PluginSystems.tick(&g, scaled_dt);\n" ++
-            "            PluginSystems.postTick(&g, scaled_dt);\n" ++
-            "        }\n" ++
-            "        g.dispatchEvents();\n" ++
-            "        // Update profiling pointers (debug only)\n" ++
-            "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
-            "            g.script_profile_ptr = @ptrCast(@alignCast(&runner.profile));\n" ++
-            "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
-            "        }\n" ++
-            "        if (comptime PluginSystems.profiling_enabled) {\n" ++
-            "            g.plugin_profile_ptr = @ptrCast(@alignCast(&PluginSystems.plugin_profile));\n" ++
-            "            g.plugin_profile_count = PluginSystems.plugin_system_count;\n" ++
-            "        }\n"
-        else
-            "        const scaled_dt = dt * g.time_scale;\n" ++
-            "        if (scaled_dt > 0) {\n" ++
-            "            runner.tick(&g, scaled_dt);\n" ++
-            "        }\n" ++
-            "        g.dispatchEvents();\n" ++
-            "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
-            "            g.script_profile_ptr = @ptrCast(@alignCast(&runner.profile));\n" ++
-            "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
-            "        }\n";
-
-        const gui_draw_code = try ctx.buildGuiDrawCode();
-        defer allocator.free(gui_draw_code);
-
-        var w_buf: [16]u8 = undefined;
-        var h_buf: [16]u8 = undefined;
-        var fps_buf: [16]u8 = undefined;
-        const w_str = std.fmt.bufPrint(&w_buf, "{d}", .{cfg.width}) catch unreachable;
-        const h_str = std.fmt.bufPrint(&h_buf, "{d}", .{cfg.height}) catch unreachable;
-        const fps_str = std.fmt.bufPrint(&fps_buf, "{d}", .{cfg.target_fps}) catch unreachable;
-
-        const hidden_setup: []const u8 = if (cfg.hidden)
-            "    window.setConfigFlags(.{ .window_hidden = true });\n"
-        else
-            "";
-
-        const hooks_init = data.scalars.get("hooks_init_block") orelse "    var hooks = GameHooks{};\n";
-
-        // bgfx-on-Android (#303) inverts its desktop loop into the same
-        // init/frame callback shape sokol/wasm use: the NativeActivity
-        // shell (`backends/bgfx/src/android_app.zig`) owns the event+frame
-        // loop and calls back into the game per-frame. So it shares the
-        // callback-lifecycle path (module-scope `g`/`runner`, void-safe
-        // `init_code` via `buildCallbackInitCode`) rather than the
-        // procedural loop path the bgfx DESKTOP template uses.
-        const is_bgfx_android = cfg.backend == .bgfx and cfg.platform == .android;
-        // Manifest-driven run-loop splice (assembler#378): when the backend
-        // manifest supplied a `loop_style`, resolve callback-vs-loop from THAT
-        // (data), not the `cfg.backend == .sokol` enum branch. For
-        // bgfx-desktop the manifest declares `.loop` → callback false (the
-        // desktop `while (!shouldQuit())` path); for sokol-desktop it declares
-        // `.callback` → true. Both match the enum path → byte-identical output.
-        // Null override keeps the enum path verbatim for every other target.
-        const use_callback_lifecycle = if (loop_style_override) |ls|
-            ls == .callback
-        else
-            cfg.backend == .sokol or cfg.platform == .wasm or is_bgfx_android;
-
-        if (use_callback_lifecycle) {
-            // Module-scope `runner` decl — needed by every callback-path
-            // backend whose `init_code` ASSIGNS `runner = Runner.init(...)`
-            // (sokol mobile/desktop and bgfx-android both split init from
-            // the per-frame tick, so the runner can't be an init-scope
-            // local like the loop path). Raylib-wasm takes the `else`
-            // branch below and declares its own runner inside `main()`.
-            const callback_runner: []const u8 = if (cfg.backend == .sokol or is_bgfx_android) "var runner: Runner = undefined;\n" else "";
-            // Sokol-backend builds get ALL THREE readback helper blocks
-            // emitted side-by-side:
-            //   - GL PBO ring (labelle-assembler#122 slice 1, #124) —
-            //     fires on Linux/Android via `_sokol_preview_gl_enabled`.
-            //   - D3D11 staging-texture ring (labelle-assembler#126,
-            //     slice 2 of #122) — fires on Windows via
-            //     `_sokol_preview_d3d11_enabled`.
-            //   - Metal/IOSurface ring (labelle-assembler#125, slice 3
-            //     of #122) — fires on macOS/iOS via
-            //     `_sokol_preview_metal_enabled`.
-            // The three gates are mutually exclusive (Linux vs Windows
-            // vs Darwin), so only one block's runtime code path is
-            // reachable per target. The `else struct {}` branches in
-            // each helper namespace keep unresolved-symbol references
-            // off the link line on the inactive targets.
-            // Emit-unconditional for `cfg.backend == .sokol` keeps the
-            // generated source uniform across desktop / mobile
-            // templates; wasm routes through the raylib branch below
-            // and stays out of all three readback paths for now.
-            const sokol_readback_helpers: []const u8 = if (cfg.backend == .sokol)
-                try std.mem.concat(allocator, u8, &.{
-                    PREVIEW_READBACK_HELPERS_SOKOL,
-                    PREVIEW_READBACK_HELPERS_SOKOL_D3D11,
-                    PREVIEW_READBACK_HELPERS_METAL_SOKOL,
-                })
-            else
-                "";
-            defer if (cfg.backend == .sokol) allocator.free(sokol_readback_helpers);
-            // PREVIEW_INPUT_DISPATCH emits `extern fn imgui_bridge_mouse_*`
-            // symbols, which only exist when the gui plugin is imgui. Gate
-            // narrowly on plugin name — other gui plugins (clay, simple-raylib,
-            // simple-sokol, …) would link-fail on these externs. The stub
-            // variant provides safe no-ops for those projects.
-            const input_dispatch_cb: []const u8 = if (cfg.resolved_gui) |gui|
-                (if (std.mem.eql(u8, gui.name, "imgui")) PREVIEW_INPUT_DISPATCH else PREVIEW_INPUT_DISPATCH_STUB)
-            else
-                PREVIEW_INPUT_DISPATCH_STUB;
-            const module_vars = try std.mem.concat(allocator, u8, &.{ callback_runner, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch_cb });
-            defer allocator.free(module_vars);
-            const init_code = try ctx.buildCallbackInitCode();
-            defer allocator.free(init_code);
-
-            const platform_comment: []const u8 = if (is_bgfx_android)
-                "Android: the bgfx NativeActivity shell (android_app.zig) drives the lifecycle"
-            else switch (cfg.platform) {
-                .ios => "iOS: sokol bindings accessed through engine.sokol (no direct sokol import)",
-                .android => "Android: sokol handles the app lifecycle via NativeActivity",
-                .wasm => "WASM: Emscripten drives the main loop via callbacks",
-                .desktop => "",
-            };
-            const entry_comment: []const u8 = if (is_bgfx_android)
-                "Android entry — the game owns android_main; the bgfx shell runs the loop"
-            else switch (cfg.platform) {
-                .ios => "iOS entry — no main(), sokol handles the app lifecycle",
-                .android => "Android entry — no main(), sokol handles the NativeActivity lifecycle",
-                .wasm => "WASM entry — Emscripten drives the main loop via callbacks",
-                .desktop => "",
-            };
-
-            if (cfg.backend == .sokol) {
-                const cleanup_code = try ctx.buildCallbackCleanupCode();
-                defer allocator.free(cleanup_code);
-                const is_wasm = cfg.platform == .wasm;
-                const allocator_decl: []const u8 = if (is_wasm)
-                    "// Use c_allocator for Emscripten — delegates to emscripten's malloc/free\n// which respects ALLOW_MEMORY_GROWTH. GPA is incompatible with wasm32-emscripten.\nconst allocator = std.heap.c_allocator;"
-                else
-                    "var gpa = std.heap.DebugAllocator(.{}).init;";
-                const allocator_expr: []const u8 = if (is_wasm) "std.heap.c_allocator" else "gpa.allocator()";
-                const allocator_cleanup: []const u8 = if (is_wasm) "" else "    _ = gpa.deinit();\n";
-                // For wasm, `allocator` is already declared at module scope
-                // by `{{allocator_decl}}` above, so re-declaring it inside
-                // `initInner` would trigger Zig's "local constant shadows
-                // declaration" error (labelle-cli#198). For desktop, the
-                // module scope only has `var gpa = ...`, so we still need
-                // the inner alias.
-                const allocator_local_decl: []const u8 = if (is_wasm) "" else "    const allocator = gpa.allocator();\n";
-
-                // Wire the GUI bridge into sokol's event callback so widgets
-                // see mouse / keyboard input. labelle-imgui's sokol bridge
-                // exports `imgui_bridge_handle_event` for exactly this — when
-                // a GUI plugin is configured we forward each event to it.
-                // Without this hook simgui's IO state stays empty and ImGui
-                // buttons/sliders never respond.
-                const gui_event_extern: []const u8 = if (cfg.hasGui())
-                    "extern fn imgui_bridge_handle_event(ev: [*c]const @import(\"backend_input\").Event) bool;\n\n"
-                else
-                    "";
-                const gui_event_forward: []const u8 = if (cfg.hasGui())
-                    "    _ = imgui_bridge_handle_event(ev);\n"
-                else
-                    "";
-
-                // Readback hookups (labelle-assembler#122). Each
-                // lifecycle slot gets ALL THREE backend variants
-                // concatenated (GL slice 1 #124, D3D11 slice 2 #126,
-                // Metal slice 3 #125):
-                //   - init   : stash the allocator into the module-scope
-                //              slot (idempotent across the three gates —
-                //              exactly one branch fires per target)
-                //   - frame  : pre-endFrame slot carries GL + D3D11
-                //              (both rely on a flush-on-read primitive
-                //              that's safe before `sg.commit()`); the
-                //              Metal block runs in the post-endFrame
-                //              slot because Metal needs `sg.commit()`
-                //              to land the swapchain texture before our
-                //              own command buffer can read it.
-                //   - cleanup: endFrameStream + ring teardown for each,
-                //              then the graceful `bye`. Buffer free
-                //              guarded so the inactive blocks are
-                //              no-ops.
-                // The three paths evaporate on the non-matching OS via
-                // their `_sokol_preview_{gl,d3d11,metal}_enabled` flags.
-                //
-                // Wasm-emscripten gate (labelle-assembler#141): preview
-                // mode is useless in a browser tab (no `LABELLE_PREVIEW`
-                // env, no TCP socket out), and `std.Io.Threaded.init` +
-                // `.io()` instantiates the vtable that references
-                // `childWaitPosix` → triggers the Zig 0.16
-                // `Threaded.zig:15315` / `emscripten.zig:215` enum
-                // mismatches. Emit empty strings for the preview slots
-                // on wasm so the generated `main.zig` never references
-                // `std.Io.Threaded`. See ziglang/zig#31849 + PR #31850
-                // for the upstream fix; this is the workaround for now.
-                const preview_setup_sokol = if (is_wasm)
-                    try allocator.dupe(u8, "")
-                else
-                    try std.mem.concat(allocator, u8, &.{
-                        PREVIEW_INIT_CALLBACK,
-                        PREVIEW_READBACK_INIT_SOKOL,
-                        PREVIEW_READBACK_INIT_SOKOL_D3D11,
-                        PREVIEW_READBACK_INIT_METAL_SOKOL,
-                    });
-                defer allocator.free(preview_setup_sokol);
-                // Wasm-emscripten gate (labelle-assembler#141, same
-                // rationale as `preview_setup_sokol` above). Heartbeat
-                // + readback + cleanup all touch `g.preview`'s public
-                // methods, and Zig's lazy compilation may still pull
-                // the `popInputEvent` / `tickHeartbeat` codepaths into
-                // the wasm exe even when `g.preview` is statically
-                // null. Emit empty strings so the generated `main.zig`
-                // never references Preview's IO surface on wasm.
-                const preview_readback_sokol = if (is_wasm)
-                    try allocator.dupe(u8, "")
-                else
-                    try std.mem.concat(allocator, u8, &.{
-                        PREVIEW_READBACK_FRAME_SOKOL,
-                        PREVIEW_READBACK_FRAME_SOKOL_D3D11,
-                        // Path A (#131): the Metal block no longer depends
-                        // on a swapchain drawable, so it can run in the
-                        // pre-endFrame slot alongside GL / D3D11. The
-                        // `{{preview_readback_post}}` template hole gets
-                        // an empty string below — kept in the template so
-                        // existing test scaffolding still expands cleanly,
-                        // but no longer carries any Metal payload.
-                        PREVIEW_READBACK_FRAME_METAL_SOKOL,
-                    });
-                defer allocator.free(preview_readback_sokol);
-                const preview_cleanup_sokol = if (is_wasm)
-                    try allocator.dupe(u8, "")
-                else
-                    try std.mem.concat(allocator, u8, &.{
-                        PREVIEW_READBACK_CLEANUP_SOKOL,
-                        PREVIEW_READBACK_CLEANUP_SOKOL_D3D11,
-                        PREVIEW_READBACK_CLEANUP_METAL_SOKOL,
-                        PREVIEW_CLEANUP_CALLBACK,
-                    });
-                defer allocator.free(preview_cleanup_sokol);
-                const preview_heartbeat_sokol: []const u8 = if (is_wasm) "" else PREVIEW_HEARTBEAT_CALLBACK;
-
-                // `{{immersive_entry}}` — Android immersive-mode call,
-                // emitted into `sokol_main()` (UI thread, pre-callback
-                // registration) so the bars are hidden at launch. Empty
-                // for non-Android / non-immersive projects; the shared
-                // sokol `desktop.txt` has no such hole, so an empty
-                // value there is a harmless no-op.
-                const immersive_entry = try ctx.buildImmersiveEntryCode();
-                defer allocator.free(immersive_entry);
-
-                try tpl.render(lifecycle_tmpl, .{
-                    .module_vars = module_vars,
-                    .width = w_str,
-                    .height = h_str,
-                    .title = cfg.title,
-                    .fps = fps_str,
-                    .init_code = init_code,
-                    .tick_code = tick_code,
-                    .gui_draw_code = gui_draw_code,
-                    .gui_event_extern = gui_event_extern,
-                    .gui_event_forward = gui_event_forward,
-                    .cleanup_code = cleanup_code,
-                    .platform_comment = platform_comment,
-                    .entry_comment = entry_comment,
-                    .hidden_setup = hidden_setup,
-                    .hooks_init_block = hooks_init,
-                    .allocator_decl = allocator_decl,
-                    .allocator_expr = allocator_expr,
-                    .allocator_local_decl = allocator_local_decl,
-                    .allocator_cleanup = allocator_cleanup,
-                    // Preview-mode wiring (labelle-assembler#94,
-                    // labelle-engine#520). `g.preview` is the canonical
-                    // storage; init dials + assigns + seeds the PBO
-                    // allocator, frame heartbeats + reads back pixels,
-                    // cleanup tears down PBO state then emits the
-                    // graceful `bye`, and `g.deinit` owns the socket +
-                    // arena teardown.
-                    .preview_setup = preview_setup_sokol,
-                    .preview_heartbeat = preview_heartbeat_sokol,
-                    // Path A render-target wiring (#133) — fires BEFORE
-                    // `window.beginFrame()` so the swapchain-vs-offscreen
-                    // decision is made before sokol-gfx commits to either.
-                    // Empty under non-Darwin targets (the block is
-                    // comptime-gated on `_sokol_preview_metal_enabled`).
-                    // GL (#124) and D3D11 (#126) keep their existing
-                    // pre-endFrame slot — their readback model is a
-                    // post-commit copy, not a render redirect.
-                    .preview_pre_render = PREVIEW_PRE_RENDER_METAL_SOKOL,
-                    .preview_readback = preview_readback_sokol,
-                    // Path A (#131): the Metal block is part of the
-                    // pre-endFrame readback now, so the post-endFrame
-                    // hole is empty. Kept in the template so the
-                    // placeholder still expands cleanly; retiring it
-                    // entirely is a separate cleanup step.
-                    .preview_readback_post = "",
-                    .preview_cleanup = preview_cleanup_sokol,
-                    .immersive_entry = immersive_entry,
-                }, bw);
-            } else if (is_bgfx_android) {
-                // bgfx-on-Android (#303): the generated game owns
-                // `android_main` and registers an init + frame callback
-                // with the bgfx NativeActivity shell, which drives the
-                // event/frame loop. Holes mirror `backends/bgfx/templates/
-                // android.txt`. `init_code` comes from the callback builder
-                // (void-safe — the shell's callback is `callconv(.c) void`,
-                // no error channel), `tick_code` is the shared engine-tick
-                // block, and the preview-mode readback slots are empty:
-                // bgfx has no on-device preview path yet (its desktop
-                // readback is a separate, unshipped ticket like sdl/wgpu).
-                //
-                // `{{android_backend_register}}` (#310 Stage 4): register the
-                // bgfx backend's Android JNI seam with core at the top of
-                // `gameInit`, before the first frame polls the gamepad source.
-                // Replaces the old sokol-compat shims (now removed from the
-                // template). Emitted UNCONDITIONALLY on bgfx-Android — gamepad
-                // detection needs it even when immersive mode is off — mirroring
-                // the sokol path (`buildImmersiveEntryCode`). `engine.core` is
-                // labelle-engine's re-export of labelle-core; the context comes
-                // from the bgfx backend adapter surfaced as `backend_input.android`.
-                //
-                // Immersive mode (bgfx-immersive). The engine's hook-based
-                // `enableImmersiveMode()` does NOT work on bgfx: native_app_glue
-                // owns `onContentRectChanged`, so the launch hook installs too
-                // late / clobbers the glue and the system-bar hide never fires.
-                // And the hide (`WindowInsetsController.hide()`) MUST run on the
-                // UI thread — the glue runs `gameFrame` on its app thread, so it
-                // can't be driven from the frame loop either (Android throws even
-                // from a JVM-attached app-thread; verified on-device).
-                //
-                // Instead the bgfx shell chains `onWindowFocusChanged` — a
-                // framework callback the OS fires ON THE UI THREAD at launch and
-                // on every focus regain — and invokes a registered callback from
-                // there. We register the engine's UI-thread hide
-                // (`engine.android.applyImmersiveUiThread`) via the shell's
-                // `setImmersiveCallback` in `android_main`, before `run()`. The
-                // generated `main` owns both the shell (`android_app`) and the
-                // engine, satisfying the backend-cannot-depend-on-engine rule.
-                const bgfx_immersive = if (cfg.android) |a| a.immersive_mode else false;
-                const immersive_register: []const u8 = if (bgfx_immersive)
-                    "    // Android immersive mode (project.labelle `.android.immersive_mode`):\n" ++
-                    "    // register the engine's UI-thread system-bar hide with the bgfx shell.\n" ++
-                    "    // The shell chains onWindowFocusChanged (a UI-thread framework callback)\n" ++
-                    "    // and invokes this on launch + every focus regain, so the bars hide at\n" ++
-                    "    // launch and re-hide after a swipe / returning from the shade. The\n" ++
-                    "    // hook-based enableImmersiveMode() can't work under native_app_glue.\n" ++
-                    "    // See labelle-engine src/android.zig (applyImmersiveUiThread) and\n" ++
-                    "    // backends/bgfx/src/android_app.zig (setImmersiveCallback / focusHook).\n" ++
-                    "    android_app.setImmersiveCallback(&engine.android.applyImmersiveUiThread);\n"
-                else
-                    "";
-
-                try tpl.render(lifecycle_tmpl, .{
-                    .module_vars = module_vars,
-                    .width = w_str,
-                    .height = h_str,
-                    .title = cfg.title,
-                    .fps = fps_str,
-                    .init_code = init_code,
-                    .tick_code = tick_code,
-                    .gui_draw_code = gui_draw_code,
-                    .hooks_init_block = hooks_init,
-                    .platform_comment = platform_comment,
-                    .entry_comment = entry_comment,
-                    .preview_setup = "",
-                    .preview_heartbeat = "",
-                    .android_backend_register = BGFX_ANDROID_BACKEND_REGISTER,
-                    .immersive_register = immersive_register,
-                }, bw);
-            } else {
-                // Raylib wasm: emscripten-driven callback loop. Preview
-                // setup runs once in main() before the loop is handed
-                // to emscripten; heartbeats fire inside `gameFrame`.
-                // No cleanup callback — emscripten keeps running after
-                // main returns, and the editor reads EOF on tab close.
-                //
-                // Wasm-emscripten gate (labelle-assembler#141): preview
-                // mode is useless in a browser tab, and the explicit
-                // `std.Io.Threaded.init` in PREVIEW_INIT_CALLBACK pulls
-                // the broken Zig 0.16 posix wrappers into the wasm exe
-                // (Threaded.zig:15315 / emscripten.zig:215). Emit empty
-                // strings on wasm. Both branches of this `if/else` land
-                // on wasm in practice, but keep the gate explicit so
-                // the intent is local.
-                const is_wasm_raylib = cfg.platform == .wasm;
-                try tpl.render(lifecycle_tmpl, .{
-                    .width = w_str,
-                    .height = h_str,
-                    .title = cfg.title,
-                    .fps = fps_str,
-                    .setup_code = init_code,
-                    .tick_code = tick_code,
-                    .gui_draw_code = gui_draw_code,
-                    .hidden_setup = hidden_setup,
-                    .hooks_init_block = hooks_init,
-                    .preview_setup = if (is_wasm_raylib) "" else PREVIEW_INIT_CALLBACK,
-                    .preview_heartbeat = if (is_wasm_raylib) "" else PREVIEW_HEARTBEAT_CALLBACK,
-                }, bw);
+        ctx.lifecycle_tmpl = lifecycle_tmpl;
+        ctx.hooks_init = data.scalars.get("hooks_init_block") orelse "    var hooks = GameHooks{};\n";
+        ctx.loop_style_override = loop_style_override;
+        const b = try block(allocator, &allocs, struct {
+            fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
+                try c.renderLifecycle(w, c.lifecycle_tmpl, c.hooks_init, c.loop_style_override);
             }
-        } else {
-            const setup_code = try ctx.buildSetupCode();
-            defer allocator.free(setup_code);
-
-            // Raylib desktop gets the PBO async-readback block + the GL
-            // externs that drive it (labelle-engine#544). The PoC at
-            // imgui-preview-poc/src/game.zig is the reference shape.
-            // Other loop backends (sdl/bgfx/wgpu) keep an empty readback
-            // slot until their per-backend tickets land — sokol's readback
-            // already runs through its own callback path. raylib WASM
-            // takes the callback branch above, so this only fires for
-            // raylib desktop.
-            const is_raylib_desktop = cfg.backend == .raylib;
-            // Preview mouse-input forwarding is sokol-only: the
-            // `imgui_bridge_mouse_*` externs `PREVIEW_INPUT_DISPATCH`
-            // declares are exported solely by the *sokol* imgui bridge
-            // (`bridges/sokol`). The raylib imgui bridge (`bridges/raylib`,
-            // rlImGui) does NOT export them — rlImGui reads raylib's own
-            // input each frame — so a raylib+imgui build that emitted the
-            // imgui dispatch failed to link with
-            // `undefined symbol: _imgui_bridge_mouse_button`. This loop
-            // lifecycle path is reached by raylib desktop (and other loop
-            // backends), so it must always take the STUB; the imgui
-            // dispatch lives on the sokol-callback site above.
-            const input_dispatch: []const u8 = PREVIEW_INPUT_DISPATCH_STUB;
-            const module_vars_loop = if (is_raylib_desktop)
-                try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, PREVIEW_READBACK_HELPERS, input_dispatch })
-            else
-                try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, input_dispatch });
-            defer allocator.free(module_vars_loop);
-            const preview_setup_loop = if (is_raylib_desktop)
-                try std.mem.concat(allocator, u8, &.{ PREVIEW_LOOP_SETUP, PREVIEW_READBACK_SETUP })
-            else
-                PREVIEW_LOOP_SETUP;
-            defer if (is_raylib_desktop) allocator.free(preview_setup_loop);
-            const readback_block = if (is_raylib_desktop) PREVIEW_READBACK_LOOP else "";
-
-            try tpl.render(lifecycle_tmpl, .{
-                .width = w_str,
-                .height = h_str,
-                .title = cfg.title,
-                .fps = fps_str,
-                .setup_code = setup_code,
-                .tick_code = tick_code,
-                .gui_draw_code = gui_draw_code,
-                .hidden_setup = hidden_setup,
-                .hooks_init_block = hooks_init,
-                .module_vars = module_vars_loop,
-                // Preview-mode wiring (labelle-assembler#94). Always
-                // emitted; runtime parse returns null when the flag is
-                // absent so the block is a no-op for non-preview runs.
-                .preview_setup = preview_setup_loop,
-                .preview_heartbeat = PREVIEW_HEARTBEAT_LOOP,
-                .preview_readback = readback_block,
-            }, bw);
-        }
-
-        var arr_list_l = alloc_writer_b.toArrayList();
-        const lifecycle = try arr_list_l.toOwnedSlice(allocator);
-        allocs.appendAssumeCapacity(lifecycle);
-        try data.scalars.put("lifecycle", lifecycle);
+        }.emit, &ctx, &ident_buf);
+        try data.scalars.put("lifecycle", b);
     }
 
     // ── Render the engine template ──
