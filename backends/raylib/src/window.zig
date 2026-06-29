@@ -14,6 +14,7 @@ pub fn setConfigFlags(flags: ConfigFlags) void {
 }
 
 pub fn initWindow(width_px: i32, height_px: i32, title: [:0]const u8) void {
+    quit_requested = false; // clear any prior latch so a re-init starts fresh
     rl.initWindow(width_px, height_px, title);
     rl.setExitKey(.escape);
 }
