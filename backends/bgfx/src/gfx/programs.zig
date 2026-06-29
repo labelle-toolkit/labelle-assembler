@@ -196,6 +196,24 @@ fn initYuvProgram() void {
     s_texY_uniform = bgfx.createUniform("s_texY", .Sampler, 1);
     s_texU_uniform = bgfx.createUniform("s_texU", .Sampler, 1);
     s_texV_uniform = bgfx.createUniform("s_texV", .Sampler, 1);
+    if (!isValidHandle(s_texY_uniform.idx) or !isValidHandle(s_texU_uniform.idx) or
+        !isValidHandle(s_texV_uniform.idx))
+    {
+        std.log.err("bgfx: failed to create YUV sampler uniforms; falling back to CPU YUV path", .{});
+        // Tear down the whole group so we never cache a half-initialized program
+        // (and never leak the program / the uniforms that DID create). Latch
+        // yuv_failed like the other failure paths so we don't retry every frame.
+        if (isValidProgram(yuv_program)) bgfx.destroyProgram(yuv_program);
+        yuv_program = .{ .idx = std.math.maxInt(u16) };
+        if (isValidHandle(s_texY_uniform.idx)) bgfx.destroyUniform(s_texY_uniform);
+        if (isValidHandle(s_texU_uniform.idx)) bgfx.destroyUniform(s_texU_uniform);
+        if (isValidHandle(s_texV_uniform.idx)) bgfx.destroyUniform(s_texV_uniform);
+        s_texY_uniform = .{ .idx = std.math.maxInt(u16) };
+        s_texU_uniform = .{ .idx = std.math.maxInt(u16) };
+        s_texV_uniform = .{ .idx = std.math.maxInt(u16) };
+        yuv_failed = true;
+        return;
+    }
 
     yuv_initialized = true;
     std.log.info("bgfx: GPU-YUV video program initialized (renderer: {})", .{bgfx.getRendererType()});
