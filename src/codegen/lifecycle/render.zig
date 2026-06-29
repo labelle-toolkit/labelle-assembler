@@ -26,6 +26,7 @@
 //! inline section it replaces.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tpl = @import("../../template.zig");
 const config = @import("../../config.zig");
 const preview = @import("../preview.zig");
@@ -164,6 +165,32 @@ pub fn Mixin(comptime Self: type) type {
                 ls == .callback
             else
                 cfg.backend == .sokol or cfg.platform == .wasm or is_bgfx_android;
+
+            // Phase 6a wires only LOOP-style external backends through codegen.
+            // The callback dispatch below still keys off `cfg.backend` (`== .sokol`
+            // / bgfx-android), which is meaningless for an external backend —
+            // `cfg.backend` sits at its `.raylib` enum DEFAULT — so a callback-style
+            // external would fall through into the raylib-wasm callback branch and
+            // inherit raylib-specific preview wiring. Until that dispatch becomes
+            // manifest/capability-driven (epic #386 follow-up), fail fast with a
+            // clear project-level error rather than silently emitting wrong code.
+            // Built-ins are unaffected (`isExternal()` is false for them).
+            if (use_callback_lifecycle and cfg.isExternal()) {
+                // Silenced under test (the Zig test runner fails any test that
+                // emits a `std.log.err`, even when the error is the asserted
+                // outcome — see env.zig's HOME-missing log for the same gate).
+                // The returned error is the hard signal; this is the human hint.
+                if (!builtin.is_test) {
+                    std.log.err(
+                        "labelle-assembler: external backend '{s}' declares a callback run-loop " ++
+                            "(loop_style = .callback), which codegen does not support yet — only " ++
+                            "loop-style external backends are wired today (epic #386). Use a loop-style " ++
+                            "backend, or follow up on the callback-dispatch externalization.",
+                        .{cfg.backendName()},
+                    );
+                }
+                return error.ExternalCallbackBackendUnsupported;
+            }
 
             if (use_callback_lifecycle) {
                 // Module-scope `runner` decl — needed by every callback-path

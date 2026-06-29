@@ -8,6 +8,7 @@
 /// network fetches live in `fetch.zig`; tests for the resolve-side helpers
 /// are kept here.
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("../config.zig");
 const env = @import("env.zig");
 
@@ -368,6 +369,17 @@ test "validateCache: a remote external backend with no cache entry is reported m
     // plugin uses. With every framework/assembler dep pinned `local:`, a
     // remote backend that was never fetched is the sole missing entry —
     // reported as `backend <name> <version>` so `ensureCache` knows to fetch it.
+    //
+    // Hermetic: point LABELLE_HOME at a guaranteed-absent dir so the cache
+    // probe can't be swayed by whatever lives in the caller's real
+    // ~/.labelle/packages on a dev box or a reused CI home. The construction
+    // is PosixBlock-only, so skip on Windows (a different env-block layout).
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const saved_environ = std.testing.environ;
+    defer std.testing.environ = saved_environ;
+    const envp = [_:null]?[*:0]const u8{"LABELLE_HOME=/nonexistent/labelle-validatecache-test-home"};
+    std.testing.environ = .{ .block = .{ .slice = &envp } };
+
     const alloc = std.testing.allocator;
     const cfg = config.ProjectConfig{
         .name = "stubgame",
@@ -375,7 +387,7 @@ test "validateCache: a remote external backend with no cache entry is reported m
         .engine_version = "local:../labelle-engine",
         .gfx_version = "local:../labelle-gfx",
         .assembler_version = "local:../labelle-assembler",
-        // A repo string that cannot exist in any real cache.
+        // A repo string that cannot exist under the (absent) test cache home.
         .backend_package = .{
             .name = "fakebackend",
             .repo = "github.com/labelle-toolkit-test/labelle-nonexistent-backend-xyz",
@@ -383,17 +395,15 @@ test "validateCache: a remote external backend with no cache entry is reported m
         },
     };
 
-    const missing = validateCache(alloc, cfg) catch |err| switch (err) {
-        // No HOME/LABELLE_HOME in the runner env → the cache path can't be
-        // resolved at all. Nothing backend-specific to assert in that case.
-        error.NoHomeDirectory => return error.SkipZigTest,
-        else => return err,
-    };
+    const missing = try validateCache(alloc, cfg);
     defer {
         for (missing) |m| alloc.free(m);
         alloc.free(missing);
     }
 
+    // Framework/assembler are all `local:` (always cached) and there are no
+    // plugins, so the remote backend is the ONE and only missing entry.
+    try std.testing.expectEqual(@as(usize, 1), missing.len);
     try std.testing.expect(missingHasPrefix(missing, "backend fakebackend 9.9.9"));
 }
 

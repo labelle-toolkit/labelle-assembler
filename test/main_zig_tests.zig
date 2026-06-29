@@ -411,6 +411,21 @@ pub const NULL_BACKEND = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "endFrameStream") == null);
     }
 
+    test "external backend with a callback run-loop is rejected (not yet wired, #386)" {
+        // `.platform = .wasm` forces `use_callback_lifecycle = true`; paired with
+        // an external `backend_package` this must fail FAST rather than fall
+        // through the `cfg.backend == .sokol` checks into the raylib-wasm callback
+        // branch (cfg.backend sits at its `.raylib` default for an external
+        // backend). Callback-style external backends aren't wired through codegen
+        // yet — only loop-style are.
+        try std.testing.expectError(error.ExternalCallbackBackendUnsupported, generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .platform = .wasm,
+            .backend_package = .{ .name = "cbexternal", .repo = "local:../cb" },
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions));
+    }
+
     test "raylib + sokol unchanged — null doesn't leak into other backends" {
         // Regression-lock: the headless main pattern must NOT appear in
         // raylib's or sokol's generated output, and each backend's

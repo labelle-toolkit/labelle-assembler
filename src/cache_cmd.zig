@@ -612,6 +612,20 @@ fn fetchPluginWithFallback(allocator: std.mem.Allocator, plugin: config.PluginDe
 /// surface a clear, backend-named diagnostic in addition to the git-level error
 /// `fetchPlugin` already logs, then re-raise so `ensureCache` aborts.
 fn fetchBackendWithFallback(allocator: std.mem.Allocator, bp: config.PluginDep) !void {
+    // This is only reached for a NON-local backend that isn't cached (local
+    // backends always report cached). A non-local backend with an empty `.repo`
+    // or `.version` is a config error: `resolvePlugin` would probe a bogus
+    // `plugins///` cache slot and the clone would degrade to
+    // `git clone --branch "" https://.git`. Fail with a clear, actionable
+    // message instead of that confusing downstream git error.
+    if (bp.repo.len == 0 or bp.version.len == 0) {
+        std.log.err(
+            "labelle-assembler: external backend '{s}' needs both a '.repo' and a '.version' to fetch " ++
+                "(got repo='{s}', version='{s}'). Add them to '.backend_package', or use a 'local:' repo.",
+            .{ bp.name, bp.repo, bp.version },
+        );
+        return error.InvalidBackendPackage;
+    }
     if (findRepoRoot(allocator)) |repo_root| {
         defer allocator.free(repo_root);
         const dir_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{bp.name});
