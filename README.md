@@ -52,8 +52,9 @@ generated `main()` runs the engine's tick loop for `LABELLE_NULL_FRAMES`
 frames (default 5) and exits cleanly so `defer`-bound teardown actually
 runs. Use `.backend = .null` in `project.labelle` for lifecycle /
 integration / determinism tests that don't exercise rendering — see
-`examples/plugin-controllers/` for a worked example and
-`backends/null/` for the implementation.
+`examples/plugin-controllers/` for a worked example. The null backend is
+extracted out-of-tree (the labelle-null package); `.backend = .null`
+resolves to it automatically.
 
 ### Run tests
 

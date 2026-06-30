@@ -46,7 +46,8 @@ pub fn globalEnviron() std.process.Environ {
 /// (no graphics context, no input, no audio, no window) that drives the
 /// generated `main()` through a fixed-frame tick loop — used for
 /// lifecycle / determinism / integration tests that don't exercise
-/// rendering. See `backends/null/` for the no-op implementations.
+/// rendering. Extracted out-of-tree — see the labelle-null package for the
+/// no-op implementations (resolved via builtinProvider, #386 Phase 6c).
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 pub const Platform = enum { desktop, ios, android, wasm };
 
