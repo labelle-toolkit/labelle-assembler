@@ -1,0 +1,26 @@
+.{
+    // wgpu backend manifest — pluggable-backends epic (labelle-assembler#386).
+    //
+    // Presence of this file opts the wgpu DESKTOP build into the manifest-splice
+    // codegen path (manifest_splice.zig) instead of the enum `switch (cfg.backend)`
+    // sections in src/templates/build_zig.txt. The spliced output is byte-identical
+    // to the enum path (verified against a generated baseline) — this is the step
+    // that lets wgpu move out-of-tree (its build sections travel WITH the package).
+    //
+    // Loop-style (owns `while (!window.shouldQuit())`), desktop-only — wgpu has no
+    // WASM/Android target (the CLI rejects wgpu+wasm). No params: unlike bgfx, the
+    // wgpu fragments take no gamepad/gui toggles, and wgpu pulls no shared gamepad
+    // sub-package (no core-diamond override needed).
+    .dir_name = "wgpu",
+    .dep_name = "labelle_wgpu",
+    .loop_style = .loop,
+    .main_loop_template = "templates/desktop.txt",
+    .build_fragments = .{
+        .backend_dep = "build_fragments/backend_dep.txt",
+        .link = "build_fragments/link.txt",
+    },
+    .params = .{
+        .backend_dep = .{},
+        .link = .{},
+    },
+}

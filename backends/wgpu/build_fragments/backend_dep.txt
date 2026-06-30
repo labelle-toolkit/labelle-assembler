@@ -1,0 +1,7 @@
+    const backend_dep = b.dependency("labelle_wgpu", .{ .target = target, .optimize = optimize });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+    const glfw_artifact = backend_dep.artifact("glfw");
+
