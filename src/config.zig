@@ -597,31 +597,26 @@ pub const ProjectConfig = struct {
         return self.resolved_gui != null;
     }
 
-    /// Provider package a BUILT-IN `.backend` enum tag resolves to, or `null`
-    /// when that backend still ships **bundled** inside the assembler.
+    /// Provider package a BUILT-IN `.backend` enum tag resolves to. As of #386
+    /// Phase 6c ALL six backends are extracted out-of-tree, so every arm returns
+    /// a provider package and production codegen is fully backend-agnostic. The
+    /// return type stays optional for callers, but there are no `null` arms.
     ///
     /// This is the enum-as-shorthand seam (epic #386, Phase 5): the closed
     /// `Backend` enum stays as the backward-compatible spelling, but a tag is
-    /// just a *shorthand* for a provider. Extracting a built-in backend
-    /// out-of-tree (Phase 6c) is exactly adding its `.{ .name, .repo, .version }`
-    /// entry below — `.backend = .<tag>` then transparently resolves to the
-    /// fetched package (`isExternal()` ⇒ true) with no project-config change.
-    ///
-    /// An EXTRACTED backend maps to its provider package; a bundled one maps to
-    /// `null` (resolves to the `backends/<tag>` slot, byte-identical to before).
-    /// Extracting another backend (Phase 6c) = flipping its branch from `null`
-    /// to `.{ .name, .repo, .version }`.
+    /// just a *shorthand* for a provider. `.backend = .<tag>` transparently
+    /// resolves to the fetched package (`isExternal()` ⇒ true) with no
+    /// project-config change.
     fn builtinProvider(backend: Backend) ?PluginDep {
         return switch (backend) {
             // Extracted out-of-tree (#386 Phase 6c) — `.backend = .<tag>` resolves
-            // to the provider package, not the bundled slot.
+            // to the provider package, not a bundled slot.
             .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.2.2" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.1.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.1.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.1.0" },
             .raylib => .{ .name = "raylib", .repo = "github.com/labelle-toolkit/labelle-raylib", .version = "0.1.0" },
-            // Still bundled.
-            .sokol => null,
+            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.1.0" },
         };
     }
 

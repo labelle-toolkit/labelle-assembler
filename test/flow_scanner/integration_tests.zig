@@ -367,11 +367,16 @@ pub const GameModuleBinding = struct {
 
         const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
+            // Post-#386 every built-in backend resolves to an EXTERNAL provider,
+            // so repoint generation at the retained in-tree sokol fixture
+            // (`backends/sokol`, the offline reference manifest) via an explicit
+            // package + project_dir = "." (tests run with the repo root as cwd).
             .backend = .sokol,
+            .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
             .ecs = .mock,
         };
 
-        const build_zig = try generator.generateBuildZig(allocator, cfg, .{});
+        const build_zig = try generator.generateBuildZig(allocator, cfg, .{ .project_dir = "." });
         defer allocator.free(build_zig);
 
         // Module declaration: rooted at `game.zig`, with `labelle-engine`
@@ -544,19 +549,20 @@ pub const GameModuleBinding = struct {
         const allocator = std.testing.allocator;
         const cfg = generator.ProjectConfig{
             .name = "t",
-            // sokol is the last bundled backend; the `.backend` default is now the
-            // external raylib (#386), so set sokol explicitly to keep this
-            // backend-agnostic test resolvable without a package/project_dir.
+            // Post-#386 every built-in resolves to an EXTERNAL provider, so
+            // repoint at the retained in-tree sokol fixture (`backends/sokol`)
+            // via an explicit package + project_dir = "." (repo root = cwd).
             .backend = .sokol,
+            .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
             .ecs = .zig_ecs,
             .plugins = &.{.{ .name = "box2d", .repo = "local:x" }},
         };
 
-        const tests_bz = try generator.generateBuildZig(allocator, cfg, .{ .is_tests_target = true });
+        const tests_bz = try generator.generateBuildZig(allocator, cfg, .{ .is_tests_target = true, .project_dir = "." });
         defer allocator.free(tests_bz);
         try std.testing.expect(std.mem.indexOf(u8, tests_bz, "overrideImport(game_mod, \"ecs_backend\", ecs_mod);") != null);
 
-        const exe_bz = try generator.generateBuildZig(allocator, cfg, .{ .is_tests_target = false });
+        const exe_bz = try generator.generateBuildZig(allocator, cfg, .{ .is_tests_target = false, .project_dir = "." });
         defer allocator.free(exe_bz);
         try std.testing.expect(std.mem.indexOf(u8, exe_bz, "overrideImport(game_mod, \"ecs_backend\", ecs_mod);") == null);
     }
