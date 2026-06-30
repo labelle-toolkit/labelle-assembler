@@ -32,7 +32,7 @@ test {
 
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -52,7 +52,7 @@ pub const BUILD_ZIG = struct {
         // reintroduce a hard build/runtime dependency that defeats core's
         // graceful-degradation design. Runtime device-access setup lives in
         // docs/gamepad-linux.md.
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -168,7 +168,7 @@ pub const BUILD_ZIG = struct {
     // generate + build + RUN a project on the fetched external null backend).
 
     test "deduplicates labelle-core across gfx and engine" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -187,7 +187,7 @@ pub const BUILD_ZIG = struct {
         // tilemap sub-packages pin their OWN labelle-core, so without unifying
         // them onto `core_mod` the two `core.YAxis` enums don't match and the
         // example fails to compile ("expected 'YAxis', found 'YAxis'").
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -218,7 +218,7 @@ pub const BUILD_ZIG = struct {
         // only when the import exists — asserting both halves here keeps the
         // guard from being "simplified" away into a dead-import injection
         // (#258) or dropped entirely (silent core type-split on Linux).
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -229,7 +229,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "resolved_gui wires gui_backend" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -241,7 +241,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "resolved_gui raw_backend wires bridge artifact" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -253,7 +253,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "no gui omits gui_mod" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -263,7 +263,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "emits test step rooted at __tests_root.zig wrapper" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -280,7 +280,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "test step reuses exe module imports" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .zig_ecs,
@@ -299,7 +299,7 @@ pub const BUILD_ZIG = struct {
         // (sokol) so the unit test needs no external resolution. (The real
         // tests-target forces null — now external — which the examples-integration
         // covers end-to-end.)
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -323,7 +323,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "names desktop exe after the sanitized project name (#362)" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "energy flow!",
             .backend = .sokol,
             .ecs = .mock,
@@ -338,7 +338,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "falls back to game when the sanitized exe name is empty (#362)" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "!!!",
             .backend = .sokol,
             .ecs = .mock,
@@ -352,7 +352,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "chains in-project @libs/ plugin test step into test step (issue #82)" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -371,7 +371,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "chains every @libs/ plugin into test step (issue #82)" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -389,7 +389,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "no @libs/ plugins emits no lib test chaining (issue #82)" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -402,7 +402,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "out-of-project local: plugins are not chained as libs (issue #82)" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -420,7 +420,7 @@ pub const BUILD_ZIG = struct {
     test "lib test chaining present in is_tests_target build (issue #82)" {
         // Lib-chaining is backend-agnostic; use a bundled backend (sokol) so the
         // unit test needs no external resolution (null is external post-#386).
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -456,7 +456,7 @@ pub const PLUGINS = struct {
     }
 
     test "no plugins excludes pathfinding/physics from build.zig" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -488,7 +488,7 @@ pub const PLUGINS = struct {
     }
 
     test "plugins enabled includes pathfinding/physics in build.zig" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -506,7 +506,7 @@ pub const PLUGINS = struct {
     }
 
     test "plugins receive all engine subsystem imports" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .zig_ecs,
@@ -532,7 +532,7 @@ pub const PLUGINS = struct {
     }
 
     test "plugins with mock ecs omit ecs_backend import" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -550,7 +550,7 @@ pub const PLUGINS = struct {
     }
 
     test "plugins receive gui_backend when gui is active" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -565,7 +565,7 @@ pub const PLUGINS = struct {
     }
 
     test "plugins omit gui_backend when no gui" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,

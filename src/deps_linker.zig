@@ -818,19 +818,19 @@ test "hardlinkTree: skips zig-pkg/.labelle/.git/.zig-cache/zig-out, stages real 
 
 // ── External-backend gating (open-config, epic #386 Phase 5) ─────────
 
-test "stagesSdlGamepad: BUNDLED sokol with auto stages it" {
-    // sokol is the last still-bundled backend, so with `.gamepad = .auto` it
-    // stages the shared SDL gamepad sub-package; `.none` opts out.
-    try std.testing.expect(stagesSdlGamepad(.{ .name = "g", .backend = .sokol, .gamepad = .auto }));
-    try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .sokol, .gamepad = .none }));
-    // raylib + bgfx are now extracted (external) → self-contained, so they carry
-    // their own gamepad source and the assembler does NOT stage the sibling for
-    // them, even with `.gamepad = .auto`.
-    try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .raylib, .gamepad = .auto }));
-    try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .bgfx, .gamepad = .auto }));
-    // Other external built-ins never stage it.
-    try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .sdl, .gamepad = .auto }));
-    try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .null, .gamepad = .auto }));
+test "stagesSdlGamepad: every built-in is now external → stages NOTHING" {
+    // As of #386 Phase 6c ALL six built-ins (incl. sokol, the last extraction)
+    // resolve to external provider packages, so `isExternal()` is true for every
+    // bare `.backend = .<tag>` config and the behavioral switch is gated OFF: an
+    // external backend is self-contained and carries its own gamepad source, so
+    // the assembler never stages the sibling sub-package — even with
+    // `.gamepad = .auto`. (The `.raylib, .sokol, .bgfx` switch arm is now
+    // defensive dead code, reachable only if a future backend ships bundled.)
+    inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
+        const tag = @field(config.Backend, f.name);
+        try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = tag, .gamepad = .auto }));
+        try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = tag, .gamepad = .none }));
+    }
 }
 
 test "stagesSdlGamepad/AndroidGamepad: an external backend stages NEITHER" {
@@ -847,11 +847,13 @@ test "stagesSdlGamepad/AndroidGamepad: an external backend stages NEITHER" {
     try std.testing.expect(!stagesAndroidGamepad(cfg));
 }
 
-test "stagesAndroidGamepad: bundled sokol stages it; extracted bgfx + others don't" {
-    try std.testing.expect(stagesAndroidGamepad(.{ .name = "g", .backend = .sokol }));
-    // bgfx is now extracted (external) → self-contained, carries its own android
-    // gamepad source, so the assembler does not stage the sibling for it.
-    try std.testing.expect(!stagesAndroidGamepad(.{ .name = "g", .backend = .bgfx }));
-    try std.testing.expect(!stagesAndroidGamepad(.{ .name = "g", .backend = .raylib }));
-    try std.testing.expect(!stagesAndroidGamepad(.{ .name = "g", .backend = .null }));
+test "stagesAndroidGamepad: every built-in is now external → stages NOTHING" {
+    // Same as the SDL case: post-#386 every built-in resolves to an external
+    // provider, so the android-gamepad staging switch is gated OFF for them all
+    // (sokol included). Each external backend carries its own android gamepad
+    // source; the `.sokol, .bgfx` switch arm is now defensive dead code.
+    inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
+        const tag = @field(config.Backend, f.name);
+        try std.testing.expect(!stagesAndroidGamepad(.{ .name = "g", .backend = tag }));
+    }
 }

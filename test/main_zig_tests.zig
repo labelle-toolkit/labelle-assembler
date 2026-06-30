@@ -428,21 +428,13 @@ pub const NULL_BACKEND = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "assertInput(@import(\"backend_input\"))") != null);
     }
 
-    test "built-in backend emits NO contract guard (byte-identical to before, #386 Phase 6b)" {
-        // Built-ins are vetted by the enum path; the guard is external-only so
-        // their generated output is unchanged. sokol is the last still-bundled
-        // backend (raylib is now extracted out-of-tree, #386), so it's the
-        // built-in under test here.
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
-            .name = "test-game",
-            .backend = .sokol,
-            .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
-        defer std.testing.allocator.free(main_zig);
-
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "External backend contract verification") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "assertWindow(@import(\"backend_window\"))") == null);
-    }
+    // NOTE: the companion "built-in backend emits NO contract guard" test was
+    // removed in #386 Phase 6c. The guard is gated on `cfg.isExternal()`, and
+    // post-flip EVERY built-in backend resolves to an external provider package,
+    // so the no-guard branch is no longer reachable from any `.backend = .<tag>`
+    // config — every backend now emits the contract guard (covered by the
+    // external-backend test directly above). The `if (!cfg.isExternal()) return`
+    // in `codegen/blocks/imports.zig` is retained as defensive dead code.
 
     test "external backend with a callback run-loop is rejected (not yet wired, #386)" {
         // `.platform = .wasm` forces `use_callback_lifecycle = true`; paired with

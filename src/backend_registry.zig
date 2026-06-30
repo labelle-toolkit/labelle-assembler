@@ -220,33 +220,28 @@ test "open-config: an external backend config reports isExternal / backendName b
     try std.testing.expectEqualStrings("labelle-stubbackend", info.link_name);
 }
 
-test "open-config: a BUNDLED built-in config is not external and names via the enum" {
-    // sokol is the last still-bundled backend (raylib is now an extracted
-    // provider — see the enum-as-shorthand test below), so it stays on the
-    // non-external enum path.
+test "open-config: the last extracted built-in (sokol) is external and names via its enum tag" {
+    // sokol was the final still-bundled backend; as of #386 Phase 6c it is an
+    // extracted provider too, so EVERY built-in `.backend` tag now resolves to
+    // an external package while keeping its tag-spelled name.
     const cfg = config.ProjectConfig{ .name = "g", .backend = .sokol };
-    try std.testing.expect(!cfg.isExternal());
+    try std.testing.expect(cfg.isExternal());
+    try std.testing.expect(cfg.effectiveBackendPackage() != null);
     try std.testing.expectEqualStrings("sokol", cfg.backendName());
 }
 
-test "enum-as-shorthand: extracted backends resolve to their package; the rest stay bundled" {
+test "enum-as-shorthand: every built-in backend resolves to its provider package" {
     // The enum-as-shorthand seam (#386 Phase 5) routes `isExternal`/`backendName`
-    // through `effectiveBackendPackage`. bgfx + wgpu + null + sdl + raylib are now
-    // EXTRACTED (#386 Phase 6c): `.backend = .<tag>` resolves to the provider
-    // package (external, named by the tag — preserved). sokol still ships bundled
-    // (not external, no effective package, named by its enum tag). When the next
-    // backend is extracted, its tag joins this set.
+    // through `effectiveBackendPackage`. As of #386 Phase 6c ALL six built-ins
+    // (bgfx/wgpu/null/sdl/raylib/sokol) are EXTRACTED: `.backend = .<tag>`
+    // resolves to the provider package (external, named by the preserved tag).
+    // There are no longer any bundled backends, so `builtinProvider` has no
+    // `null` arms and production codegen is fully backend-agnostic.
     inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
         const cfg = config.ProjectConfig{ .name = "g", .backend = @field(config.Backend, f.name) };
-        if (cfg.backend == .bgfx or cfg.backend == .wgpu or cfg.backend == .null or cfg.backend == .sdl or cfg.backend == .raylib) {
-            try std.testing.expect(cfg.isExternal());
-            try std.testing.expect(cfg.effectiveBackendPackage() != null);
-            try std.testing.expectEqualStrings(f.name, cfg.backendName());
-        } else {
-            try std.testing.expect(!cfg.isExternal());
-            try std.testing.expect(cfg.effectiveBackendPackage() == null);
-            try std.testing.expectEqualStrings(f.name, cfg.backendName());
-        }
+        try std.testing.expect(cfg.isExternal());
+        try std.testing.expect(cfg.effectiveBackendPackage() != null);
+        try std.testing.expectEqualStrings(f.name, cfg.backendName());
     }
 }
 

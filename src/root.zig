@@ -70,6 +70,7 @@ pub const resolveGuiPlugin = gui_resolve.resolveGuiPlugin;
 
 pub const generateMainZigFromTemplate = main_zig.generateMainZigFromTemplate;
 pub const generateBuildZig = build_files.generateBuildZig;
+pub const BuildZigOptions = build_files.BuildZigOptions;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
 pub const deps_linker = build_files.deps_linker;
 

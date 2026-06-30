@@ -348,17 +348,19 @@ test "requireManifestIfExternal: external backend WITHOUT a manifest errors" {
     );
 }
 
-test "requireManifestIfExternal: a built-in backend is a no-op even with no manifest" {
+test "requireManifestIfExternal: the retained in-tree sokol fixture ships a manifest (accepted)" {
+    // Post-#386 Phase 6c every built-in (incl. sokol) is external, so there is no
+    // longer any non-external config to exercise the `!isExternal()` early return
+    // (now defensive dead code). What IS still load-bearing: `backends/sokol` is
+    // retained as the offline in-tree fixture and MUST ship a `backend.manifest.zon`
+    // so the generic codegen tests can resolve a real manifest. Selecting it via an
+    // explicit `.backend_package` (the post-flip shape) + the repo root as
+    // project_dir (tests run with the assembler repo root as cwd) must be ACCEPTED.
     const alloc = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "project");
-    const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
-    defer alloc.free(project_abs);
-
-    // Built-in sokol ships no manifest — must NOT error (keeps enum path).
-    // (raylib is now extracted out-of-tree (#386); sokol is the last bundled one.)
-    const cfg = config.ProjectConfig{ .name = "g", .backend = .sokol };
-    try requireManifestIfExternal(alloc, cfg, project_abs);
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend = .sokol,
+        .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
+    };
+    try requireManifestIfExternal(alloc, cfg, ".");
 }

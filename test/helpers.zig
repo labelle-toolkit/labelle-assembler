@@ -325,3 +325,32 @@ pub fn testGuiRawBackend(name: []const u8) generate.ResolvedGui {
         .bridge_dir = "/fake/gui/bridge",
     };
 }
+
+// ── In-tree sokol backend fixture (pluggable-backends epic #386) ──────
+// Post-#386 ALL six built-in backends resolve to EXTERNAL provider packages
+// (`builtinProvider` has no `null` arms), so production codegen is fully
+// backend-agnostic. `backends/sokol` is RETAINED purely as the offline
+// in-tree reference manifest / test fixture: codegen tests that inspect a
+// generated build.zig need *some* real backend manifest readable on disk.
+// Selecting it via an explicit `.backend_package` (instead of the bare
+// `.backend = .sokol` enum tag, which now resolves to the published
+// labelle-sokol package) repoints generation at that fixture; the manifest
+// splice then renders byte-identically to the pre-flip enum path.
+pub const sokol_fixture_package = generate.PluginDep{ .name = "sokol", .repo = "local:backends/sokol" };
+
+/// Generate a build.zig against the retained in-tree sokol fixture. Injects
+/// the fixture `backend_package` + `project_dir = "."` (tests run with the
+/// assembler repo root as cwd) so the desktop manifest splice resolves
+/// `backends/sokol/backend.manifest.zon` offline. Any caller-supplied opts
+/// (e.g. `is_tests_target`) are preserved.
+pub fn genSokolBuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend_package = sokol_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
