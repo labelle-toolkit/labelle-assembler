@@ -367,7 +367,7 @@ pub const GameModuleBinding = struct {
 
         const cfg: generator.ProjectConfig = .{ .y_axis = .up,
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
         };
 
@@ -544,6 +544,10 @@ pub const GameModuleBinding = struct {
         const allocator = std.testing.allocator;
         const cfg = generator.ProjectConfig{
             .name = "t",
+            // sokol is the last bundled backend; the `.backend` default is now the
+            // external raylib (#386), so set sokol explicitly to keep this
+            // backend-agnostic test resolvable without a package/project_dir.
+            .backend = .sokol,
             .ecs = .zig_ecs,
             .plugins = &.{.{ .name = "box2d", .repo = "local:x" }},
         };

@@ -248,6 +248,17 @@ pub const PREVIEW_MODE = struct {
     ;
 
     test "raylib desktop emits PBO readback + publishFrame between render and endDrawing" {
+        // raylib extracted out-of-tree (#386): `.backend = .raylib` now resolves
+        // to the external labelle-raylib package, so `cfg.isExternal()` is true
+        // and the in-tree raylib-desktop PBO readback gate
+        // (`render.zig: cfg.backend == .raylib and !cfg.isExternal()`) is dead —
+        // the readback codegen + `preview_pbo` surface live in labelle-raylib's
+        // own window module/CI now. The external no-PBO behavior is still locked
+        // here by "external backend does not pull in raylib PBO readback". This
+        // emit-side assertion can no longer fire in-tree; skip rather than assert
+        // unreachable output. (generateMainZigFromTemplate has no manifest path,
+        // so a local backend_package can't re-enable it.)
+        if (true) return error.SkipZigTest;
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
@@ -372,6 +383,12 @@ pub const PREVIEW_MODE = struct {
     // branch is exercised when the generated game is compiled for a
     // specific OS, not here.
     test "raylib desktop emits both SHM and IOSurface preview lifecycle calls" {
+        // See sibling "raylib desktop emits PBO readback ..." — raylib is now an
+        // external backend (#386), so the in-tree raylib-desktop readback gate is
+        // dead and the SHM/IOSurface bridge codegen lives in labelle-raylib. Skip
+        // the emit-side assertion; out-of-tree CI + the external no-PBO test cover
+        // the post-flip reality.
+        if (true) return error.SkipZigTest;
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
@@ -667,6 +684,10 @@ pub const PREVIEW_MODE = struct {
         // is untouched. After #140 migration, both backends use the
         // backend-module seam; raylib's bridges + lifecycle hooks
         // appear in main_zig, sokol-specific names must NOT leak.
+        // raylib is now external (#386) — the in-tree raylib-desktop readback gate
+        // is dead and `window.preview_pbo.*` codegen lives in labelle-raylib. Skip
+        // the emit-side assertion (see sibling raylib PBO tests for rationale).
+        if (true) return error.SkipZigTest;
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,

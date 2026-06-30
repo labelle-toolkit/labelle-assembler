@@ -430,12 +430,14 @@ pub const NULL_BACKEND = struct {
 
     test "built-in backend emits NO contract guard (byte-identical to before, #386 Phase 6b)" {
         // Built-ins are vetted by the enum path; the guard is external-only so
-        // their generated output is unchanged.
+        // their generated output is unchanged. sokol is the last still-bundled
+        // backend (raylib is now extracted out-of-tree, #386), so it's the
+        // built-in under test here.
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
-        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
         defer std.testing.allocator.free(main_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "External backend contract verification") == null);

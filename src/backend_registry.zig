@@ -221,23 +221,24 @@ test "open-config: an external backend config reports isExternal / backendName b
 }
 
 test "open-config: a BUNDLED built-in config is not external and names via the enum" {
-    // raylib still ships bundled (bgfx is now an extracted provider — see the
-    // enum-as-shorthand test below), so it stays on the non-external enum path.
-    const cfg = config.ProjectConfig{ .name = "g", .backend = .raylib };
+    // sokol is the last still-bundled backend (raylib is now an extracted
+    // provider — see the enum-as-shorthand test below), so it stays on the
+    // non-external enum path.
+    const cfg = config.ProjectConfig{ .name = "g", .backend = .sokol };
     try std.testing.expect(!cfg.isExternal());
-    try std.testing.expectEqualStrings("raylib", cfg.backendName());
+    try std.testing.expectEqualStrings("sokol", cfg.backendName());
 }
 
 test "enum-as-shorthand: extracted backends resolve to their package; the rest stay bundled" {
     // The enum-as-shorthand seam (#386 Phase 5) routes `isExternal`/`backendName`
-    // through `effectiveBackendPackage`. bgfx + wgpu + null are now EXTRACTED (#386
-    // Phase 6c): `.backend = .<tag>` resolves to the provider package (external,
-    // named by the tag — preserved). The rest still ship bundled (not external, no
-    // effective package, named by its enum tag). When the next backend is
-    // extracted, its tag joins this set.
+    // through `effectiveBackendPackage`. bgfx + wgpu + null + sdl + raylib are now
+    // EXTRACTED (#386 Phase 6c): `.backend = .<tag>` resolves to the provider
+    // package (external, named by the tag — preserved). sokol still ships bundled
+    // (not external, no effective package, named by its enum tag). When the next
+    // backend is extracted, its tag joins this set.
     inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
         const cfg = config.ProjectConfig{ .name = "g", .backend = @field(config.Backend, f.name) };
-        if (cfg.backend == .bgfx or cfg.backend == .wgpu or cfg.backend == .null or cfg.backend == .sdl) {
+        if (cfg.backend == .bgfx or cfg.backend == .wgpu or cfg.backend == .null or cfg.backend == .sdl or cfg.backend == .raylib) {
             try std.testing.expect(cfg.isExternal());
             try std.testing.expect(cfg.effectiveBackendPackage() != null);
             try std.testing.expectEqualStrings(f.name, cfg.backendName());
