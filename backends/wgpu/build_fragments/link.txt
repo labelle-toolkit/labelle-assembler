@@ -1,0 +1,16 @@
+    exe.root_module.linkLibrary(glfw_artifact);
+
+    // wgpu-native's static lib (libwgpu_native.a, embedded in the wgpu
+    // module via addObjectFile) references Apple system frameworks. Upstream
+    // links them per-Compile rather than on the module, so the consuming exe
+    // must link them here or the macOS/iOS link fails with undefined Metal /
+    // Foundation symbols.
+    switch (target.result.os.tag) {
+        .macos, .ios => {
+            exe.root_module.linkFramework("Foundation", .{});
+            exe.root_module.linkFramework("QuartzCore", .{});
+            exe.root_module.linkFramework("Metal", .{});
+        },
+        else => {},
+    }
+
