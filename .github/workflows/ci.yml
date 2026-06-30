@@ -69,8 +69,6 @@ jobs:
       - name: zig-ecs adapter tests
         run: cd ecs/zig-ecs && zig build test
 
-      - name: SDL backend build-helper tests
-        run: cd backends/sdl && zig build test
 
       - name: sokol backend unit tests + audio.zig compile-check
         run: cd backends/sokol && zig build test

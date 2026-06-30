@@ -932,7 +932,6 @@ pub const PREVIEW_MODE = struct {
         const Case = struct { backend: generate.Backend, template: []const u8 };
         const cases = [_]Case{
             .{ .backend = .raylib, .template = "backends/raylib/templates/desktop.txt" },
-            .{ .backend = .sdl, .template = "backends/sdl/templates/desktop.txt" },
             // bgfx + wgpu + null are extracted out-of-tree (labelle-bgfx /
             // labelle-wgpu / labelle-null) — their templates live there + are
             // covered by their own CI, so they're no longer in this in-tree list.
