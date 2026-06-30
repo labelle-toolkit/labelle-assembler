@@ -221,7 +221,7 @@ fn writeCoercionJson(w: *std.Io.Writer, c: CoercionEntry) !void {
 /// subset of bytes JSON requires (`"`, `\`, control chars below 0x20)
 /// and pass-throughs everything else. UTF-8 source bytes ride along
 /// unchanged because JSON is UTF-8 itself.
-fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
     for (s) |c| {
         switch (c) {
@@ -240,7 +240,7 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
 /// Format the current UTC timestamp as `"YYYY-MM-DDTHH:MM:SSZ"`. Pure
 /// epoch arithmetic so we don't depend on system locale settings or a
 /// `strftime`-style call.
-fn formatTimestamp(buf: *[32]u8) []const u8 {
+pub fn formatTimestamp(buf: *[32]u8) []const u8 {
     const epoch_secs: u64 = blk: {
         // `std.time.timestamp` was removed in 0.16; route per-platform:
         //   - Windows: GetSystemTimeAsFileTime → 100-ns intervals since
