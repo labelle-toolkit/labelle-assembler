@@ -228,19 +228,19 @@ test "open-config: a BUNDLED built-in config is not external and names via the e
     try std.testing.expectEqualStrings("raylib", cfg.backendName());
 }
 
-test "enum-as-shorthand: bgfx resolves to its extracted package; the rest stay bundled" {
+test "enum-as-shorthand: extracted backends resolve to their package; the rest stay bundled" {
     // The enum-as-shorthand seam (#386 Phase 5) routes `isExternal`/`backendName`
-    // through `effectiveBackendPackage`. bgfx is now EXTRACTED (#386 Phase 6c):
-    // `.backend = .bgfx` resolves to the labelle-bgfx provider package (external,
-    // named "bgfx" — the tag is preserved). Every other built-in still ships
-    // bundled (not external, no effective package, named by its enum tag). When
-    // the next backend is extracted, its line flips here too.
+    // through `effectiveBackendPackage`. bgfx + wgpu are now EXTRACTED (#386 Phase
+    // 6c): `.backend = .<tag>` resolves to the provider package (external, named by
+    // the tag — preserved). Every other built-in still ships bundled (not external,
+    // no effective package, named by its enum tag). When the next backend is
+    // extracted, its tag joins this set.
     inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
         const cfg = config.ProjectConfig{ .name = "g", .backend = @field(config.Backend, f.name) };
-        if (cfg.backend == .bgfx) {
+        if (cfg.backend == .bgfx or cfg.backend == .wgpu) {
             try std.testing.expect(cfg.isExternal());
             try std.testing.expect(cfg.effectiveBackendPackage() != null);
-            try std.testing.expectEqualStrings("bgfx", cfg.backendName());
+            try std.testing.expectEqualStrings(f.name, cfg.backendName());
         } else {
             try std.testing.expect(!cfg.isExternal());
             try std.testing.expect(cfg.effectiveBackendPackage() == null);

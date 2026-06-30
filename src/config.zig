@@ -612,11 +612,12 @@ pub const ProjectConfig = struct {
     /// to `.{ .name, .repo, .version }`.
     fn builtinProvider(backend: Backend) ?PluginDep {
         return switch (backend) {
-            // bgfx is extracted out-of-tree (#386 Phase 6c) — `.backend = .bgfx`
-            // resolves to the labelle-bgfx provider package, not the bundled slot.
+            // Extracted out-of-tree (#386 Phase 6c) — `.backend = .<tag>` resolves
+            // to the provider package, not the bundled slot.
             .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.2.0" },
+            .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.1.0" },
             // Still bundled.
-            .raylib, .sokol, .sdl, .wgpu, .null => null,
+            .raylib, .sokol, .sdl, .null => null,
         };
     }
 
