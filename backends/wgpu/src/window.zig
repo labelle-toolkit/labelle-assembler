@@ -660,6 +660,7 @@ pub fn initWindow(width_px: i32, height_px: i32, title: [:0]const u8) void {
     // `frameDuration` would be a huge time-since-old-baseline). Mirrors raylib.
     quit_requested = false;
     last_frame_time = 0;
+    gpu_ready = false; // set true by initGpu() below on success; a failed re-init stays not-ready
     screen_w = width_px;
     screen_h = height_px;
 
@@ -733,6 +734,10 @@ pub fn closeWindow() void {
     if (glfw_window) |win| win.destroy();
     glfw.terminate();
     glfw_window = null;
+    // The GPU resources above are released — mark not-ready so a stray
+    // `endDrawing`/`ensureSurface` after close (or before a re-init's `initGpu`)
+    // hits the `if (!gpu_ready) return` guard instead of touching freed handles.
+    gpu_ready = false;
 }
 
 pub fn windowShouldClose() bool {
