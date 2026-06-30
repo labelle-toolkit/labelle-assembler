@@ -237,7 +237,7 @@ test "enum-as-shorthand: extracted backends resolve to their package; the rest s
     // extracted, its tag joins this set.
     inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
         const cfg = config.ProjectConfig{ .name = "g", .backend = @field(config.Backend, f.name) };
-        if (cfg.backend == .bgfx or cfg.backend == .wgpu or cfg.backend == .null) {
+        if (cfg.backend == .bgfx or cfg.backend == .wgpu or cfg.backend == .null or cfg.backend == .sdl) {
             try std.testing.expect(cfg.isExternal());
             try std.testing.expect(cfg.effectiveBackendPackage() != null);
             try std.testing.expectEqualStrings(f.name, cfg.backendName());
