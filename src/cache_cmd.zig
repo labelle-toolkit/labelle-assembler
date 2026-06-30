@@ -537,6 +537,20 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !voi
         }
     }
 
+    // The tests target (#83) ALWAYS forces `.backend = .null` (so `zig build test`
+    // needs no native libs/toolchain, on any host). Once null is an EXTRACTED
+    // external backend (the flip, #386 Phase 6c), it must be in the cache for that
+    // tests-target generate even when the PROJECT's own backend is something else
+    // (raylib/sokol/…). Fetch it here so every project's `install` covers its tests
+    // target. Idempotent + a no-op when null is still bundled (effectivePkg == null)
+    // or the project already IS null (cached above). null is pure-Zig + tiny.
+    const tests_target_cfg = config.ProjectConfig{ .name = cfg.name, .backend = .null };
+    if (tests_target_cfg.effectiveBackendPackage()) |null_bp| {
+        if (!try cache.isPluginCached(allocator, null_bp)) {
+            try fetchBackendWithFallback(allocator, null_bp);
+        }
+    }
+
     for (cfg.plugins) |plugin| {
         if (!try cache.isPluginCached(allocator, plugin)) {
             try fetchPluginWithFallback(allocator, plugin);
