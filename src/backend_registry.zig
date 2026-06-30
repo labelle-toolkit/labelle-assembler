@@ -220,24 +220,32 @@ test "open-config: an external backend config reports isExternal / backendName b
     try std.testing.expectEqualStrings("labelle-stubbackend", info.link_name);
 }
 
-test "open-config: a built-in config is not external and names via the enum" {
-    const cfg = config.ProjectConfig{ .name = "g", .backend = .bgfx };
+test "open-config: a BUNDLED built-in config is not external and names via the enum" {
+    // raylib still ships bundled (bgfx is now an extracted provider — see the
+    // enum-as-shorthand test below), so it stays on the non-external enum path.
+    const cfg = config.ProjectConfig{ .name = "g", .backend = .raylib };
     try std.testing.expect(!cfg.isExternal());
-    try std.testing.expectEqualStrings("bgfx", cfg.backendName());
+    try std.testing.expectEqualStrings("raylib", cfg.backendName());
 }
 
-test "enum-as-shorthand: every built-in backend is still BUNDLED (Phase 5 seam is a no-op today)" {
+test "enum-as-shorthand: bgfx resolves to its extracted package; the rest stay bundled" {
     // The enum-as-shorthand seam (#386 Phase 5) routes `isExternal`/`backendName`
-    // through `effectiveBackendPackage`. Until a backend is extracted (Phase 6c
-    // adds an entry to `builtinProvider`), every built-in tag must still resolve
-    // bundled: not external, no effective package, named by its enum tag. This
-    // is the behavior-preservation guard — when bgfx (or any tag) is extracted,
-    // THIS test's expectation for that tag flips and the change is visible here.
+    // through `effectiveBackendPackage`. bgfx is now EXTRACTED (#386 Phase 6c):
+    // `.backend = .bgfx` resolves to the labelle-bgfx provider package (external,
+    // named "bgfx" — the tag is preserved). Every other built-in still ships
+    // bundled (not external, no effective package, named by its enum tag). When
+    // the next backend is extracted, its line flips here too.
     inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
         const cfg = config.ProjectConfig{ .name = "g", .backend = @field(config.Backend, f.name) };
-        try std.testing.expect(!cfg.isExternal());
-        try std.testing.expect(cfg.effectiveBackendPackage() == null);
-        try std.testing.expectEqualStrings(f.name, cfg.backendName());
+        if (cfg.backend == .bgfx) {
+            try std.testing.expect(cfg.isExternal());
+            try std.testing.expect(cfg.effectiveBackendPackage() != null);
+            try std.testing.expectEqualStrings("bgfx", cfg.backendName());
+        } else {
+            try std.testing.expect(!cfg.isExternal());
+            try std.testing.expect(cfg.effectiveBackendPackage() == null);
+            try std.testing.expectEqualStrings(f.name, cfg.backendName());
+        }
     }
 }
 

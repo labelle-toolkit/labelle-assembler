@@ -615,7 +615,8 @@ pub const ProjectConfig = struct {
             //   .bgfx => .{ .name = "bgfx",
             //               .repo = "github.com/labelle-toolkit/labelle-bgfx",
             //               .version = "X.Y.Z" },
-            .raylib, .sokol, .sdl, .bgfx, .wgpu, .null => null,
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.2.0" },
+            .raylib, .sokol, .sdl, .wgpu, .null => null,
         };
     }
 
