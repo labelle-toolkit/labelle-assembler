@@ -818,16 +818,17 @@ test "hardlinkTree: skips zig-pkg/.labelle/.git/.zig-cache/zig-out, stages real 
 
 // ── External-backend gating (open-config, epic #386 Phase 5) ─────────
 
-test "stagesSdlGamepad: BUNDLED raylib/sokol with auto stages it" {
-    // bgfx is now extracted (external) → self-contained, so it carries its own
-    // gamepad source and the assembler does NOT stage the sibling for it.
-    inline for (.{ config.Backend.raylib, .sokol }) |b| {
-        try std.testing.expect(stagesSdlGamepad(.{ .name = "g", .backend = b, .gamepad = .auto }));
-        try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = b, .gamepad = .none }));
-    }
-    // Extracted bgfx (external) never stages the sibling, regardless of gamepad.
+test "stagesSdlGamepad: BUNDLED sokol with auto stages it" {
+    // sokol is the last still-bundled backend, so with `.gamepad = .auto` it
+    // stages the shared SDL gamepad sub-package; `.none` opts out.
+    try std.testing.expect(stagesSdlGamepad(.{ .name = "g", .backend = .sokol, .gamepad = .auto }));
+    try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .sokol, .gamepad = .none }));
+    // raylib + bgfx are now extracted (external) → self-contained, so they carry
+    // their own gamepad source and the assembler does NOT stage the sibling for
+    // them, even with `.gamepad = .auto`.
+    try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .raylib, .gamepad = .auto }));
     try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .bgfx, .gamepad = .auto }));
-    // Other built-ins never stage it.
+    // Other external built-ins never stage it.
     try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .sdl, .gamepad = .auto }));
     try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .null, .gamepad = .auto }));
 }

@@ -357,7 +357,8 @@ test "requireManifestIfExternal: a built-in backend is a no-op even with no mani
     const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
     defer alloc.free(project_abs);
 
-    // Built-in raylib ships no manifest — must NOT error (keeps enum path).
-    const cfg = config.ProjectConfig{ .name = "g", .backend = .raylib };
+    // Built-in sokol ships no manifest — must NOT error (keeps enum path).
+    // (raylib is now extracted out-of-tree (#386); sokol is the last bundled one.)
+    const cfg = config.ProjectConfig{ .name = "g", .backend = .sokol };
     try requireManifestIfExternal(alloc, cfg, project_abs);
 }

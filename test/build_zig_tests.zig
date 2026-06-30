@@ -35,8 +35,11 @@ pub const BUILD_ZIG = struct {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .raylib,
+            // raylib is now external (#386) — point at the in-tree copy so the
+            // manifest splice resolves; project_dir is the assembler repo root.
+            .backend_package = .{ .name = "raylib", .repo = "local:backends/raylib" },
             .ecs = .mock,
-        }, .{});
+        }, .{ .project_dir = "." });
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkLibrary") != null);
@@ -81,8 +84,11 @@ pub const BUILD_ZIG = struct {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .raylib,
+            // raylib is now external (#386) — point at the in-tree copy so the
+            // manifest splice resolves; project_dir is the assembler repo root.
+            .backend_package = .{ .name = "raylib", .repo = "local:backends/raylib" },
             .ecs = .mock,
-        }, .{});
+        }, .{ .project_dir = "." });
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"udev\"") == null);
@@ -197,7 +203,7 @@ pub const BUILD_ZIG = struct {
     test "deduplicates labelle-core across gfx and engine" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
         }, .{});
         defer std.testing.allocator.free(build_zig);
@@ -216,7 +222,7 @@ pub const BUILD_ZIG = struct {
         // example fails to compile ("expected 'YAxis', found 'YAxis'").
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
         }, .{});
         defer std.testing.allocator.free(build_zig);
@@ -238,8 +244,11 @@ pub const BUILD_ZIG = struct {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .raylib,
+            // raylib is now external (#386) — point at the in-tree copy so the
+            // manifest splice resolves; project_dir is the assembler repo root.
+            .backend_package = .{ .name = "raylib", .repo = "local:backends/raylib" },
             .ecs = .mock,
-        }, .{});
+        }, .{ .project_dir = "." });
         defer std.testing.allocator.free(build_zig);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input, \"labelle-core\", core_mod)") != null);
     }
@@ -273,7 +282,7 @@ pub const BUILD_ZIG = struct {
     test "resolved_gui wires gui_backend" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .resolved_gui = testGuiRenderInterface("clay"),
         }, .{});
@@ -285,7 +294,7 @@ pub const BUILD_ZIG = struct {
     test "resolved_gui raw_backend wires bridge artifact" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .resolved_gui = testGuiRawBackend("imgui"),
         }, .{});
@@ -297,7 +306,7 @@ pub const BUILD_ZIG = struct {
     test "no gui omits gui_mod" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
         }, .{});
         defer std.testing.allocator.free(build_zig);
@@ -307,7 +316,7 @@ pub const BUILD_ZIG = struct {
     test "emits test step rooted at __tests_root.zig wrapper" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
         }, .{});
         defer std.testing.allocator.free(build_zig);
@@ -338,12 +347,12 @@ pub const BUILD_ZIG = struct {
 
     test "is_tests_target trims exe assembly + run step (issue #83)" {
         // The exe-trimming mechanism is backend-agnostic; use a bundled backend
-        // (raylib) so the unit test needs no external resolution. (The real
+        // (sokol) so the unit test needs no external resolution. (The real
         // tests-target forces null — now external — which the examples-integration
         // covers end-to-end.)
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
         }, .{ .is_tests_target = true });
         defer std.testing.allocator.free(build_zig);
@@ -367,7 +376,7 @@ pub const BUILD_ZIG = struct {
     test "names desktop exe after the sanitized project name (#362)" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "energy flow!",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
         }, .{});
         defer std.testing.allocator.free(build_zig);
@@ -382,7 +391,7 @@ pub const BUILD_ZIG = struct {
     test "falls back to game when the sanitized exe name is empty (#362)" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "!!!",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
         }, .{});
         defer std.testing.allocator.free(build_zig);
@@ -396,7 +405,7 @@ pub const BUILD_ZIG = struct {
     test "chains in-project @libs/ plugin test step into test step (issue #82)" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .plugins = &.{
                 .{ .name = "pathfinder", .repo = "@libs/pathfinder" },
@@ -415,7 +424,7 @@ pub const BUILD_ZIG = struct {
     test "chains every @libs/ plugin into test step (issue #82)" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .plugins = &.{
                 .{ .name = "pathfinder", .repo = "@libs/pathfinder" },
@@ -433,7 +442,7 @@ pub const BUILD_ZIG = struct {
     test "no @libs/ plugins emits no lib test chaining (issue #82)" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .plugins = &.{},
         }, .{});
@@ -446,7 +455,7 @@ pub const BUILD_ZIG = struct {
     test "out-of-project local: plugins are not chained as libs (issue #82)" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .plugins = &.{
                 // local: paths can escape the project root — not part of
@@ -460,11 +469,11 @@ pub const BUILD_ZIG = struct {
     }
 
     test "lib test chaining present in is_tests_target build (issue #82)" {
-        // Lib-chaining is backend-agnostic; use a bundled backend (raylib) so the
+        // Lib-chaining is backend-agnostic; use a bundled backend (sokol) so the
         // unit test needs no external resolution (null is external post-#386).
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .plugins = &.{
                 .{ .name = "pathfinder", .repo = "@libs/pathfinder" },
@@ -500,7 +509,7 @@ pub const PLUGINS = struct {
     test "no plugins excludes pathfinding/physics from build.zig" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .plugins = &.{},
         }, .{});
@@ -532,7 +541,7 @@ pub const PLUGINS = struct {
     test "plugins enabled includes pathfinding/physics in build.zig" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .plugins = &.{
                 .{ .name = "pathfinding", .repo = "github.com/labelle-toolkit/labelle-pathfinding", .version = "0.1.0" },
@@ -550,7 +559,7 @@ pub const PLUGINS = struct {
     test "plugins receive all engine subsystem imports" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .zig_ecs,
             .plugins = &.{
                 .{ .name = "physics", .repo = "github.com/labelle-toolkit/labelle-physics", .version = "0.1.0" },
@@ -576,7 +585,7 @@ pub const PLUGINS = struct {
     test "plugins with mock ecs omit ecs_backend import" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .plugins = &.{
                 .{ .name = "physics", .repo = "github.com/labelle-toolkit/labelle-physics", .version = "0.1.0" },
@@ -594,7 +603,7 @@ pub const PLUGINS = struct {
     test "plugins receive gui_backend when gui is active" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .resolved_gui = testGuiRenderInterface("clay"),
             .plugins = &.{
@@ -609,7 +618,7 @@ pub const PLUGINS = struct {
     test "plugins omit gui_backend when no gui" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .raylib,
+            .backend = .sokol,
             .ecs = .mock,
             .plugins = &.{
                 .{ .name = "physics", .repo = "github.com/labelle-toolkit/labelle-physics", .version = "0.1.0" },

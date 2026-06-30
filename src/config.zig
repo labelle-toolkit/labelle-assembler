@@ -619,8 +619,9 @@ pub const ProjectConfig = struct {
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.1.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.1.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.1.0" },
+            .raylib => .{ .name = "raylib", .repo = "github.com/labelle-toolkit/labelle-raylib", .version = "0.1.0" },
             // Still bundled.
-            .raylib, .sokol => null,
+            .sokol => null,
         };
     }
 
