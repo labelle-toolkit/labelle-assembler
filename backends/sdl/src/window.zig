@@ -12,13 +12,17 @@ var sdl_window: ?*c.SDL_Window = null;
 var should_close: bool = false;
 var target_fps_val: i32 = 60;
 var last_frame_time: u64 = 0;
+var frame_dur_last: u64 = 0; // baseline for the canonical frameDuration() dt source
 var window_hidden: bool = false;
 
 pub fn setConfigFlags(flags: ConfigFlags) void {
     window_hidden = flags.window_hidden;
 }
 
-pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
+pub fn initWindow(width_px: i32, height_px: i32, title: [:0]const u8) void {
+    // Clear any latched state so a close→reopen starts clean (the canonical
+    // `requestQuit` and the `SDL_QUIT` event both set `should_close`).
+    should_close = false;
     _ = c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO | c.SDL_INIT_GAMECONTROLLER);
     // Bring up the gamepad subsystem and enumerate already-connected pads.
     input.initGamepads();
@@ -27,16 +31,18 @@ pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
         title.ptr,
         c.SDL_WINDOWPOS_CENTERED,
         c.SDL_WINDOWPOS_CENTERED,
-        width,
-        height,
+        width_px,
+        height_px,
         window_flags,
     );
     if (sdl_window) |win| {
         const renderer = c.SDL_CreateRenderer(win, -1, c.SDL_RENDERER_ACCELERATED | c.SDL_RENDERER_PRESENTVSYNC);
         gfx.sdl_renderer = renderer;
-        gfx.setScreenSize(width, height);
+        gfx.setScreenSize(width_px, height_px);
     }
-    last_frame_time = c.SDL_GetPerformanceCounter();
+    const now = c.SDL_GetPerformanceCounter();
+    last_frame_time = now;
+    frame_dur_last = now; // reset the frameDuration() baseline too
 }
 
 pub fn closeWindow() void {
@@ -52,6 +58,48 @@ pub fn closeWindow() void {
 
 pub fn windowShouldClose() bool {
     return should_close;
+}
+
+// ── Canonical window contract (labelle-core/src/window_contract.zig) ─────
+// The uniform window surface the pluggable-backends contract standardizes on
+// (labelle-assembler#386). SDL already exposes these values under its legacy
+// names (kept — the generated SDL run-loop templates still call them, so
+// generated output stays byte-identical); the decls below are the canonical
+// aliases/wrappers so the SDL backend satisfies `core.assertWindow`. SDL is a
+// *loop-style* backend (it owns `while (!windowShouldClose())`), so it also
+// declares `shouldQuit` — whose presence signals loop-ownership to the splice.
+
+/// Current framebuffer width (physical px).
+pub fn width() i32 {
+    return gfx.getScreenWidth();
+}
+/// Current framebuffer height (physical px).
+pub fn height() i32 {
+    return gfx.getScreenHeight();
+}
+/// Seconds elapsed for the last frame — the engine's `dt` source. SDL has no
+/// stored frame-time (the FPS limiter in `endDrawing` discards its delta and
+/// `last_frame_time` only advances when `target_fps_val > 0`), so track a
+/// dedicated high-resolution baseline here and report the delta since the last
+/// call. The baseline is reset in `initWindow` so a re-open starts clean.
+pub fn frameDuration() f64 {
+    const freq = c.SDL_GetPerformanceFrequency();
+    const now = c.SDL_GetPerformanceCounter();
+    const elapsed = now - frame_dur_last;
+    frame_dur_last = now;
+    if (freq == 0) return 0;
+    return @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(freq));
+}
+/// Ask the run loop to end. Latches the same `should_close` flag the `SDL_QUIT`
+/// event sets, which `windowShouldClose`/`shouldQuit` already report (no
+/// behavior change unless a script/engine calls this).
+pub fn requestQuit() void {
+    should_close = true;
+}
+/// Canonical alias of `windowShouldClose`. Its presence marks SDL as a
+/// loop-model backend (`Window(Impl).ownsLoop()`).
+pub fn shouldQuit() bool {
+    return windowShouldClose();
 }
 
 /// Query whether the window is currently fullscreen. Mirrors the
