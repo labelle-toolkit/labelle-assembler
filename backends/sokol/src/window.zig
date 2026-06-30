@@ -344,10 +344,26 @@ pub fn setVsync(on: bool) void {
     desired_swap_interval = if (on) 1 else 0;
 }
 
+// ── Canonical window contract (labelle-core/src/window_contract.zig) ──────
+// The uniform window surface the pluggable-backends contract standardizes on
+// (labelle-assembler#386, the first step of extracting sokol out-of-tree). The
+// required core is `width`/`height`/`frameDuration`/`requestQuit`; sokol already
+// names them canonically (unlike raylib's legacy `getScreenWidth`-style getters),
+// so `core.assertWindow` is satisfied without aliases. `requestQuit` lives above
+// (next to the other lifecycle calls) and wraps `sapp.requestQuit()`.
+//
+// sokol is a *callback*-model backend: sokol_app's run loop is pumped by the
+// OS (it does NOT own a `while (!shouldQuit())` loop), so we deliberately omit
+// `shouldQuit`. `core.ownsLoop()` reads `shouldQuit`'s presence, so leaving it
+// off correctly classifies sokol as callback-style; the app ends via
+// `requestQuit` driving sokol_app's own pump instead.
+
+/// Current framebuffer width (physical px).
 pub fn width() i32 {
     return if (headless_mode) headless_w else sapp.width();
 }
 
+/// Current framebuffer height (physical px).
 pub fn height() i32 {
     return if (headless_mode) headless_h else sapp.height();
 }
