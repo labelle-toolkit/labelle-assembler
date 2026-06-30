@@ -191,11 +191,19 @@ pub const BUILD_ZIG = struct {
     }
 
     test "links wgpu glfw artifact" {
+        // wgpu is now an extracted (external) backend (#386 Phase 6c). `.backend
+        // = .wgpu` resolves to the labelle-wgpu package; point it at the in-tree
+        // copy via a local path + project_dir so the desktop manifest splice
+        // resolves its backend.manifest.zon (the fragment emits the same
+        // labelle_wgpu / glfw_artifact the old enum `backend_wgpu` section did —
+        // byte-identical, verified in #426). project_dir is the assembler repo
+        // root (the test runner's cwd).
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .wgpu,
+            .backend_package = .{ .name = "wgpu", .repo = "local:backends/wgpu" },
             .ecs = .mock,
-        }, .{});
+        }, .{ .project_dir = "." });
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_wgpu") != null);
@@ -287,12 +295,12 @@ pub const BUILD_ZIG = struct {
     }
 
     test "backends without a core import get no backend_input override" {
-        // null / wgpu backend `input` modules do not import labelle-core, so no
+        // The null backend's `input` module does not import labelle-core, so no
         // `overrideImport(backend_input, ...)` line should be emitted. (raylib
         // and sdl import core unconditionally; sokol imports it on desktop Linux
-        // only — covered below. bgfx is now an extracted external backend, so
-        // it's exercised by the external-backend tests, not this bundled loop.)
-        for ([_]generate.Backend{ .null, .wgpu }) |be| {
+        // only — covered below. bgfx + wgpu are now extracted external backends,
+        // so they're exercised by the external-backend tests, not this bundled loop.)
+        for ([_]generate.Backend{.null}) |be| {
             const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
                 .name = "test-game",
                 .backend = be,
