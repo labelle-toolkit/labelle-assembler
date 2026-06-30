@@ -254,9 +254,9 @@ jobs:
       # bug ship (its lifecycle template lacked the {{module_vars}} slot,
       # so generated mains referenced undeclared `_preview_*` helpers and
       # failed sema — caught only when a real project switched backends).
-      # bgfx isn't built in THIS job — its C++ compile runs tens of
-      # minutes, so it lives in the dedicated cached `bgfx-build` (desktop
-      # Metal) and `bgfx-android-build` (NDK .so cross-build) jobs above.
+      # bgfx isn't built here (or anywhere in this repo) — it's extracted to
+      # labelle-bgfx, which builds + tests it (incl. the android .so) in its
+      # own CI. This job covers the bundled backends' example codegen.
       - name: Generate + build the wgpu example
         env:
           LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
@@ -282,17 +282,14 @@ jobs:
           cd .labelle/wgpu_desktop
           zig build
 
-      # External (out-of-tree) backend wiring — bgfx extracted to its own
-      # repo (github.com/labelle-toolkit/labelle-bgfx, #386 Phase 6c). Proves
-      # the opt-in `.backend_package` path end-to-end: `install` FETCHES the
-      # backend package from GitHub into the cache, then `generate` stages it +
-      # codegens against its manifest. We then resolve the FULL generated build
-      # graph (`zig build --help` → fetches zbgfx/zglfw + the labelle-sdl-gamepad
-      # / labelle-android-gamepad packages + url core/audio) but do NOT run the
-      # heavy bgfx C++ compile — it
-      # is byte-identical to the bundled backend and is covered by the dedicated
-      # cached `bgfx-build` job. Bypasses labelle-cli (pinned older release) and
-      # drives the assembler binary directly, like the null step below.
+      # External (out-of-tree) backend wiring, backend-AGNOSTIC. Proves the
+      # opt-in `.backend_package` path end-to-end: `install` FETCHES the backend
+      # package from GitHub into the cache, then `generate` stages it + codegens
+      # against its manifest. Uses the headless `nullfixture` backend (a real
+      # out-of-tree package with zero native deps) so the whole fetch → stage →
+      # codegen → BUILD pipeline runs cheaply — no heavy native compile. bgfx,
+      # the other external backend, builds + tests in its own repo (labelle-bgfx).
+      # Bypasses labelle-cli and drives the assembler binary directly.
       - name: Verify an external (out-of-tree) backend wires up end-to-end
         run: |
           ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
