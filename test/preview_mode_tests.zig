@@ -933,7 +933,9 @@ pub const PREVIEW_MODE = struct {
         const cases = [_]Case{
             .{ .backend = .raylib, .template = "backends/raylib/templates/desktop.txt" },
             .{ .backend = .sdl, .template = "backends/sdl/templates/desktop.txt" },
-            .{ .backend = .bgfx, .template = "backends/bgfx/templates/desktop.txt" },
+            // bgfx is extracted out-of-tree (labelle-bgfx) — its templates live
+            // there + are covered by its own CI, so it's no longer in this
+            // in-tree-template regression list.
             .{ .backend = .wgpu, .template = "backends/wgpu/templates/desktop.txt" },
             .{ .backend = .sokol, .template = "backends/sokol/templates/desktop.txt" },
             .{ .backend = .null, .template = "backends/null/templates/headless.txt" },

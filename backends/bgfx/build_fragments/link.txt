@@ -1,3 +1,0 @@
-    exe.root_module.linkLibrary(bgfx_artifact);
-    exe.root_module.linkLibrary(glfw_artifact);
-
