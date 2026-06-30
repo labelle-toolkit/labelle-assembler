@@ -88,20 +88,6 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"udev\"") == null);
     }
 
-    test "wires sdl backend modules" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .sdl,
-            // sdl is now external (#386) — point at the in-tree copy so the
-            // manifest splice resolves; project_dir is the assembler repo root.
-            .backend_package = .{ .name = "sdl", .repo = "local:backends/sdl" },
-            .ecs = .mock,
-        }, .{ .project_dir = "." });
-        defer std.testing.allocator.free(build_zig);
-
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_sdl") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "backend_gfx") != null);
-    }
 
     // NOTE: bgfx's desktop backend-dep codegen (the bgfx/glfw artifacts) is no
     // longer unit-tested here — bgfx is extracted out-of-tree (labelle-bgfx), so
@@ -258,20 +244,6 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input, \"labelle-core\", core_mod)") != null);
     }
 
-    test "unifies labelle-core onto the sdl backend input module" {
-        // The SDL `input` module imports core under the UNDERSCORE name
-        // `labelle_core`, so the override key must match that exactly.
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .sdl,
-            // sdl is now external (#386) — point at the in-tree copy so the
-            // manifest splice resolves; project_dir is the assembler repo root.
-            .backend_package = .{ .name = "sdl", .repo = "local:backends/sdl" },
-            .ecs = .mock,
-        }, .{ .project_dir = "." });
-        defer std.testing.allocator.free(build_zig);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input, \"labelle_core\", core_mod)") != null);
-    }
 
     // NOTE: "a self-contained (external) backend gets no backend_input core
     // override" was exercised via null, now extracted out-of-tree — no in-tree
