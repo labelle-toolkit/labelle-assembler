@@ -1,0 +1,25 @@
+.{
+    // null backend manifest — pluggable-backends epic (labelle-assembler#386).
+    //
+    // Presence of this file opts the null DESKTOP build into the manifest-splice
+    // codegen path (manifest_splice.zig) instead of the enum `switch (cfg.backend)`
+    // sections in src/templates/build_zig.txt. Spliced output is byte-identical to
+    // the enum path (verified against a generated baseline) — the step that lets
+    // null move out-of-tree (its build sections travel WITH the package).
+    //
+    // Loop-style (the generated headless main drives a fixed-frame tick loop). No
+    // params: pure-Zig, zero native deps, and the LINK fragment is EMPTY — null has
+    // no artifact to link (the enum path's `.null => {}` emitted nothing).
+    .dir_name = "null",
+    .dep_name = "labelle_null",
+    .loop_style = .loop,
+    .main_loop_template = "templates/headless.txt",
+    .build_fragments = .{
+        .backend_dep = "build_fragments/backend_dep.txt",
+        .link = "build_fragments/link.txt",
+    },
+    .params = .{
+        .backend_dep = .{},
+        .link = .{},
+    },
+}
