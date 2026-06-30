@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x71cf045810176ea4,
     .name = .labelle_assembler,
-    .version = "0.63.0",
+    .version = "0.64.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zspec = .{
