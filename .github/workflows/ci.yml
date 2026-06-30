@@ -112,137 +112,6 @@ jobs:
           ./zig-out/bin/labelle-assembler --protocol-version
           ./zig-out/bin/labelle-assembler --help
 
-  # Android NDK cross-build of the bgfx backend. The bgfx-on-Android
-  # bring-up (#300–#303, phases 1–4 + audio #306) produces a
-  # NativeActivity `libgame.so`, but had NO automated coverage — the
-  # `.so`/APK were verified by hand on a physical tablet only. This job
-  # locks in Milestone A (the `backend_bgfx_android` codegen → `.so` link
-  # path): generate the bgfx-android example and cross-compile
-  # `libgame.so` for `aarch64-linux-android` with the NDK. Build-only —
-  # no device or emulator. APK packaging (needs SDK build-tools +
-  # keytool) and on-device runs stay manual by design.
-  #
-  # Heavy: bgfx/bx/bimg C++ is cross-compiled for Android, so this is a
-  # dedicated pull_request-only job (like docker-build) with the same
-  # zig-cache strategy as bgfx-build. The generated build.zig locates the
-  # NDK sysroot via ANDROID_NDK_HOME (see getAndroidNdkSysroot in
-  # src/templates/build_zig.txt).
-  bgfx-android-build:
-    name: bgfx Android .so cross-build
-    if: ${{ github.event_name == 'pull_request' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-
-    steps:
-      - name: Checkout labelle-assembler
-        uses: actions/checkout@v4
-        with:
-          path: labelle-assembler
-
-      - name: Checkout labelle-gui (flow_codegen)
-        uses: actions/checkout@v4
-        with:
-          repository: labelle-toolkit/labelle-gui
-          ref: main
-          path: labelle-gui
-
-      - uses: actions/checkout@v4
-        with:
-          repository: labelle-toolkit/labelle-cli
-          ref: main
-          path: labelle-cli
-
-      - name: Checkout labelle-gui for the labelle-cli build
-        uses: actions/checkout@v4
-        with:
-          repository: labelle-toolkit/labelle-gui
-          ref: main
-          path: labelle-cli/zig-pkg/labelle-gui
-
-      # Stacked-PR sibling checkout: this PR (FP#549 in-engine video) needs
-      # labelle-core's VideoInterface/VideoComponent and labelle-engine's
-      # VideoImpl slot, which live on the `feat/video-interface` branch of each.
-      # Try that branch first, fall back to the default branch the job otherwise
-      # uses, so this keeps working once the video branches merge/are deleted.
-      - name: Checkout labelle-core (video branch first)
-        run: |
-          git clone --depth 1 --branch feat/video-interface \
-            https://github.com/labelle-toolkit/labelle-core.git labelle-core \
-          || git clone --depth 1 --branch main \
-            https://github.com/labelle-toolkit/labelle-core.git labelle-core
-
-      - name: Checkout labelle-engine (video branch first)
-        run: |
-          git clone --depth 1 --branch feat/video-interface \
-            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine \
-          || git clone --depth 1 --branch main \
-            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine
-
-      - uses: actions/checkout@v4
-        with:
-          repository: labelle-toolkit/labelle-gfx
-          ref: main
-          path: labelle-gfx
-
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      - name: Set up Android NDK
-        id: ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r27c
-
-      # Cache the cross-compiled bgfx/bx/bimg C++ (the expensive part).
-      # The Zig global cache holds the heavy C/C++ objects; the per-project
-      # .zig-cache holds the rest. Keyed on the bgfx .zon so a zbgfx bump
-      # busts it; restore-keys warm-starts from the last good build.
-      - name: Cache Zig bgfx Android build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/zig
-            labelle-assembler/examples/bgfx-android/.labelle/bgfx_android/.zig-cache
-          # bgfx is now fetched (labelle-bgfx, pinned in config.zig builtinProvider),
-          # so key on the example's pins + the assembler config that pins the
-          # backend version. zbgfx itself lives in the fetched package; zig's
-          # content-addressed cache keeps correctness, restore-keys warm-starts.
-          key: bgfx-android-${{ hashFiles('labelle-assembler/examples/bgfx-android/project.labelle', 'labelle-assembler/src/config.zig') }}
-          restore-keys: |
-            bgfx-android-
-
-      - name: Build labelle-assembler
-        run: cd labelle-assembler && zig build
-
-      - name: Build labelle-cli
-        run: cd labelle-cli && zig build
-
-      - name: Generate + cross-build libgame.so (aarch64-linux-android)
-        env:
-          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: |
-          cd labelle-assembler/examples/bgfx-android
-          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate --platform=android
-          cd .labelle/bgfx_android
-          zig build
-
-      # Assert the phase-4 verification criteria, not just "it compiled":
-      # the artifact is an aarch64 ELF shared object exporting the
-      # NativeActivity + android_main entry points.
-      - name: Verify libgame.so
-        run: |
-          set -euo pipefail
-          so=$(find labelle-assembler/examples/bgfx-android/.labelle/bgfx_android -name 'libgame.so' | head -1)
-          if [ -z "$so" ]; then echo "libgame.so not found"; exit 1; fi
-          echo "found: $so"
-          file "$so"
-          file "$so" | grep -q 'ELF 64-bit.*ARM aarch64' || { echo "FAIL: not an aarch64 ELF"; exit 1; }
-          nm -D "$so" | grep -q 'android_main' || { echo "FAIL: android_main not exported"; exit 1; }
-          nm -D "$so" | grep -q 'ANativeActivity_onCreate' || { echo "FAIL: ANativeActivity_onCreate not exported"; exit 1; }
-          echo "libgame.so OK — aarch64 NativeActivity shared object"
-
   # End-to-end usage test: check out every sibling repo the examples
   # need (labelle-cli for the binary, labelle-core/engine/gfx for the
   # runtime packages), then `labelle generate` and `zig build` the
@@ -424,44 +293,28 @@ jobs:
       # is byte-identical to the bundled backend and is covered by the dedicated
       # cached `bgfx-build` job. Bypasses labelle-cli (pinned older release) and
       # drives the assembler binary directly, like the null step below.
-      - name: Verify the external (out-of-tree) bgfx backend wires up
+      - name: Verify an external (out-of-tree) backend wires up end-to-end
         run: |
           ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
-          cd labelle-assembler/examples/bgfx-external
-          # `install` fetches the github backend_package into the cache;
-          # `generate` stages it + codegens (the assembler handles backend_package).
+          # Backend-AGNOSTIC fetch test: the assembler resolves ANY external
+          # backend_package the same way (Phase 6a). bgfx now lives + is tested in
+          # its own repo (labelle-bgfx); here we use the headless `nullfixture`
+          # backend — a real out-of-tree package with zero native deps, so it
+          # exercises the full remote-fetch → stage → codegen → BUILD pipeline cheaply.
+          cd labelle-assembler/examples/external-null
           $ASM install --project-root .
           $ASM generate --project-root .
 
-          # The fetched package staged with its manifest, codegen wired the
-          # labelle_bgfx dependency, and (v0.2.0+) the shared gamepad sources are
-          # url+hash PACKAGES — the backend no longer vendors them, so its staged
-          # build.zig.zon references them by url rather than carrying subdirs.
-          test -f .labelle/deps/labelle-bgfx/backend.manifest.zon
-          grep -qF 'b.dependency("labelle_bgfx"' .labelle/bgfx_desktop/build.zig
-          # The gamepad sources are url+hash PACKAGE deps now (not vendored): match
-          # the actual `.url = "...labelle-*-gamepad...tar.gz"` lines, not a bare
-          # slug that could appear in a comment.
-          grep -qE '\.url = ".*labelle-sdl-gamepad.*\.tar\.gz"' .labelle/deps/labelle-bgfx/build.zig.zon
-          grep -qE '\.url = ".*labelle-android-gamepad.*\.tar\.gz"' .labelle/deps/labelle-bgfx/build.zig.zon
-          ! test -d .labelle/deps/labelle-bgfx/sdl_gamepad   # de-vendored
-          ! test -d .labelle/deps/labelle-bgfx/android_gamepad
+          # The fetched package staged with its manifest, and codegen wired the dep.
+          test -f .labelle/deps/labelle-nullfixture/backend.manifest.zon
+          grep -qF 'b.dependency("labelle_nullfixture"' .labelle/nullfixture_desktop/build.zig
 
-          cd .labelle/bgfx_desktop
-          # Resolve the whole dep graph without the heavy C++ build. Patch the
-          # placeholder fingerprint the same way labelle-cli's runner does
-          # (mirrors the null step).
-          set +e
-          ERR=$(zig build --help 2>&1)
-          set -e
-          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
-          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
-          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
-            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
-            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
-          fi
-          zig build --help >/dev/null
-          echo "PASS: external bgfx fetched + staged self-contained + codegen + graph resolve OK"
+          # Headless backend → a full build is cheap (no native C++), so build the
+          # binary outright rather than only resolving the graph.
+          cd .labelle/nullfixture_desktop
+          zig build
+          test -x zig-out/bin/example_external_null
+          echo "PASS: external backend fetched + staged self-contained + codegen + build OK"
 
       # Hardware-free RUNTIME check of the shared sdl_gamepad source
       # (backends/sdl_gamepad/sim — see its README). Attaches an
