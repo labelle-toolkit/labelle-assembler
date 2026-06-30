@@ -380,7 +380,10 @@ test "validateCache: a LOCAL external backend is never reported missing" {
         alloc.free(missing);
     }
 
-    try std.testing.expect(!missingHasPrefix(missing, "backend "));
+    // The PROJECT's local backend must never be reported. (Post-null-flip the
+    // tests-target's external `null` backend may appear as `backend null …` since
+    // it isn't cached in this probe — that's a separate concern, covered below.)
+    try std.testing.expect(!missingHasPrefix(missing, "backend stubbackend"));
 }
 
 test "validateCache: a remote external backend with no cache entry is reported missing" {
@@ -421,9 +424,13 @@ test "validateCache: a remote external backend with no cache entry is reported m
     }
 
     // Framework/assembler are all `local:` (always cached) and there are no
-    // plugins, so the remote backend is the ONE and only missing entry.
-    try std.testing.expectEqual(@as(usize, 1), missing.len);
+    // plugins. Two backends are reported missing: the project's remote
+    // `fakebackend`, AND the tests-target's external `null` (#386 — every
+    // project's `zig build test` forces null, fetched alongside the project
+    // backend), neither of which exists under the absent test cache home.
     try std.testing.expect(missingHasPrefix(missing, "backend fakebackend 9.9.9"));
+    try std.testing.expect(missingHasPrefix(missing, "backend null"));
+    try std.testing.expectEqual(@as(usize, 2), missing.len);
 }
 
 test "resolveProjectRoot: main checkout (.git is a directory) returns project_dir unchanged" {
