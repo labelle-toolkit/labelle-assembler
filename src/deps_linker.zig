@@ -757,11 +757,15 @@ test "hardlinkTree: errors on missing source" {
 
 // ── External-backend gating (open-config, epic #386 Phase 5) ─────────
 
-test "stagesSdlGamepad: built-in raylib/sokol/bgfx with auto stages it" {
-    inline for (.{ config.Backend.raylib, .sokol, .bgfx }) |b| {
+test "stagesSdlGamepad: BUNDLED raylib/sokol with auto stages it" {
+    // bgfx is now extracted (external) → self-contained, so it carries its own
+    // gamepad source and the assembler does NOT stage the sibling for it.
+    inline for (.{ config.Backend.raylib, .sokol }) |b| {
         try std.testing.expect(stagesSdlGamepad(.{ .name = "g", .backend = b, .gamepad = .auto }));
         try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = b, .gamepad = .none }));
     }
+    // Extracted bgfx (external) never stages the sibling, regardless of gamepad.
+    try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .bgfx, .gamepad = .auto }));
     // Other built-ins never stage it.
     try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .sdl, .gamepad = .auto }));
     try std.testing.expect(!stagesSdlGamepad(.{ .name = "g", .backend = .null, .gamepad = .auto }));
@@ -781,9 +785,11 @@ test "stagesSdlGamepad/AndroidGamepad: an external backend stages NEITHER" {
     try std.testing.expect(!stagesAndroidGamepad(cfg));
 }
 
-test "stagesAndroidGamepad: built-in sokol/bgfx stage it; others don't" {
+test "stagesAndroidGamepad: bundled sokol stages it; extracted bgfx + others don't" {
     try std.testing.expect(stagesAndroidGamepad(.{ .name = "g", .backend = .sokol }));
-    try std.testing.expect(stagesAndroidGamepad(.{ .name = "g", .backend = .bgfx }));
+    // bgfx is now extracted (external) → self-contained, carries its own android
+    // gamepad source, so the assembler does not stage the sibling for it.
+    try std.testing.expect(!stagesAndroidGamepad(.{ .name = "g", .backend = .bgfx }));
     try std.testing.expect(!stagesAndroidGamepad(.{ .name = "g", .backend = .raylib }));
     try std.testing.expect(!stagesAndroidGamepad(.{ .name = "g", .backend = .null }));
 }

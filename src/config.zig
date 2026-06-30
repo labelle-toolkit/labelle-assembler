@@ -606,16 +606,17 @@ pub const ProjectConfig = struct {
     /// entry below — `.backend = .<tag>` then transparently resolves to the
     /// fetched package (`isExternal()` ⇒ true) with no project-config change.
     ///
-    /// Every built-in maps to `null` today, so `.backend = .<tag>` behaves
-    /// exactly as before (bundled `backends/<tag>` slot, byte-identical output).
+    /// An EXTRACTED backend maps to its provider package; a bundled one maps to
+    /// `null` (resolves to the `backends/<tag>` slot, byte-identical to before).
+    /// Extracting another backend (Phase 6c) = flipping its branch from `null`
+    /// to `.{ .name, .repo, .version }`.
     fn builtinProvider(backend: Backend) ?PluginDep {
         return switch (backend) {
-            // No backend has been extracted yet — all ship bundled. Extraction
-            // (Phase 6c) replaces a branch here, e.g.:
-            //   .bgfx => .{ .name = "bgfx",
-            //               .repo = "github.com/labelle-toolkit/labelle-bgfx",
-            //               .version = "X.Y.Z" },
-            .raylib, .sokol, .sdl, .bgfx, .wgpu, .null => null,
+            // bgfx is extracted out-of-tree (#386 Phase 6c) — `.backend = .bgfx`
+            // resolves to the labelle-bgfx provider package, not the bundled slot.
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.2.0" },
+            // Still bundled.
+            .raylib, .sokol, .sdl, .wgpu, .null => null,
         };
     }
 

@@ -310,10 +310,14 @@ pub fn validateCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) ![
     // `PluginDep`, so a remote one is cached on the same `plugins/` path a
     // plugin uses (`resolvePlugin` → `isPluginCached`). Local (`local:`/`@libs`)
     // backends always report cached (the early return in `isPluginCached`), so
-    // only a non-local `.repo` ever lands here. Built-in backends have no
-    // `backend_package` and stay accounted for by the assembler-bundled slot
-    // above, so this never touches the byte-identical built-in path.
-    if (cfg.backend_package) |bp| {
+    // only a non-local `.repo` ever lands here.
+    //
+    // Use `effectiveBackendPackage()`, not the raw `.backend_package` field, so
+    // a built-in tag EXTRACTED to a provider (the enum-as-shorthand flip, e.g.
+    // `.backend = .bgfx`, #386 Phase 6c) is fetched too — its package comes from
+    // `builtinProvider`, not an explicit `.backend_package`. Bundled built-ins
+    // return null here and stay accounted for by the assembler slot above.
+    if (cfg.effectiveBackendPackage()) |bp| {
         if (!try isPluginCached(allocator, bp)) {
             try missing.append(allocator, try std.fmt.allocPrint(allocator, "backend {s} {s}", .{ bp.name, bp.version }));
         }

@@ -527,7 +527,11 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !voi
     // External backend package (#386 Phase 6a): fetch a remote backend into the
     // cache exactly like a plugin. Local (`local:`/`@libs`) backends report
     // cached and are skipped — they already resolve to their checkout in place.
-    if (cfg.backend_package) |bp| {
+    //
+    // `effectiveBackendPackage()` (not the raw `.backend_package` field) so an
+    // EXTRACTED built-in (the enum-as-shorthand flip, e.g. `.backend = .bgfx`,
+    // #386 Phase 6c) is fetched too — its package comes from `builtinProvider`.
+    if (cfg.effectiveBackendPackage()) |bp| {
         if (!try cache.isPluginCached(allocator, bp)) {
             try fetchBackendWithFallback(allocator, bp);
         }
