@@ -100,25 +100,14 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "backend_gfx") != null);
     }
 
-    test "links bgfx and glfw artifacts" {
-        // bgfx is now an extracted (external) backend. `.backend = .bgfx` resolves
-        // to the labelle-bgfx package; override to the in-tree copy via a local
-        // path + project_dir so the desktop manifest splice resolves its
-        // backend.manifest.zon (the fragment emits the same artifacts the old
-        // enum `backend_bgfx` section did — byte-identical per #396). project_dir
-        // is the assembler repo root (the test runner's cwd).
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .bgfx,
-            .backend_package = .{ .name = "bgfx", .repo = "local:backends/bgfx" },
-            .ecs = .mock,
-        }, .{ .project_dir = "." });
-        defer std.testing.allocator.free(build_zig);
-
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_bgfx") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "bgfx_artifact") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "glfw_artifact") != null);
-    }
+    // NOTE: bgfx's desktop backend-dep codegen (the bgfx/glfw artifacts) is no
+    // longer unit-tested here — bgfx is extracted out-of-tree (labelle-bgfx), so
+    // its in-tree `backends/bgfx` is gone and there's no local package for a
+    // unit test to resolve. That coverage now lives in labelle-bgfx's own CI +
+    // the manifest-splice tests + the examples-integration `bgfx-external` step
+    // (which fetches the package). The android codegen is still covered below
+    // (it generates via the enum path on the preserved `.bgfx` tag, no package
+    // resolution needed).
 
     test "bgfx android builds a NativeActivity shared library, not a glfw exe" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
