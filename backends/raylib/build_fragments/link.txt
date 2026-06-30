@@ -1,0 +1,15 @@
+    exe.root_module.linkLibrary(raylib_artifact);
+
+    // OpenGL is needed for the PIE preview's PBO readback path —
+    // the generated `main.zig` references `glReadPixels`, `glGenBuffers`,
+    // `glMapBuffer`, etc. via `@extern` (labelle-engine#544). raylib's
+    // C archive references these too but the upstream raylib build
+    // doesn't propagate the OpenGL framework / linker flag to the
+    // consumer, so we add it here on a per-OS basis.
+    switch (target.result.os.tag) {
+        .macos => exe.root_module.linkFramework("OpenGL", .{}),
+        .linux => exe.root_module.linkSystemLibrary("GL", .{}),
+        .windows => exe.root_module.linkSystemLibrary("opengl32", .{}),
+        else => {},
+    }
+

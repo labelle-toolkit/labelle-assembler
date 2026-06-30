@@ -1,0 +1,24 @@
+.{
+    // raylib backend manifest — pluggable-backends epic (labelle-assembler#386).
+    // Opts the raylib DESKTOP build into the manifest-splice codegen path
+    // (manifest_splice.zig) instead of the enum sections in build_zig.txt.
+    // Byte-identical to the enum path (verified vs a generated baseline). WASM
+    // keeps the enum path (link_raylib_wasm) — the splice is desktop-only.
+    //
+    // Loop-style. Params: gamepad_enabled/gamepad_hidapi (the backend_dep
+    // fragment forwards them to b.dependency, like the enum renderSection did).
+    // The fragment also carries the core-diamond overrides (input + the
+    // transitive sdl_gamepad sub-package), same as the enum section.
+    .dir_name = "raylib",
+    .dep_name = "labelle_raylib",
+    .loop_style = .loop,
+    .main_loop_template = "templates/desktop.txt",
+    .build_fragments = .{
+        .backend_dep = "build_fragments/backend_dep.txt",
+        .link = "build_fragments/link.txt",
+    },
+    .params = .{
+        .backend_dep = .{ "gamepad_enabled", "gamepad_hidapi" },
+        .link = .{},
+    },
+}

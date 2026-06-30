@@ -1,0 +1,32 @@
+    const backend_dep = b.dependency("labelle_raylib", .{ .target = target, .optimize = optimize, .gamepad_enabled = {{gamepad_enabled}}, .gamepad_hidapi = {{gamepad_hidapi}} });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+    const raylib_artifact = backend_dep.artifact("raylib");
+
+    // Unify labelle-core onto the backend modules too. The raylib `input`
+    // module imports labelle-core (for `GamepadEvent` and friends); without
+    // this, it resolves its OWN pinned core tarball — a *different* module
+    // instance than engine/gfx — and core structs that cross the
+    // engine↔backend boundary (e.g. `[]GamepadEvent`) fail to type-check.
+    // Only `input` imports core here; overriding gfx/audio/window (which
+    // don't) would silently add a dead import. See labelle-assembler#258.
+    overrideImport(backend_input, "labelle-core", core_mod);
+
+    // The desktop gamepad source (`backends/sdl_gamepad/`, core#28) is a
+    // TRANSITIVE dep of `input` — it returns `[]GamepadEvent` typed against
+    // the `GamepadEvent` contract it imports under the `labelle_core`
+    // (underscore) key. The sub-package pins its OWN core tarball
+    // (`labelle_core-1.15.0`), and the generated game's zon does NOT declare
+    // `labelle_sdl_gamepad`, so we can't reach it via `b.dependency`. Reach it
+    // through `input`'s import table and unify the app core onto it; otherwise
+    // `input` (app core) and `sdl_gamepad` (v1.15.0 core) carry two distinct
+    // `GamepadEvent` types and the slice crossing the seam fails to type-check
+    // ("`[]gamepad.GamepadEvent` cannot cast into `[]gamepad.GamepadEvent`").
+    // See labelle-assembler#271. `if` guard: the module is only present on
+    // desktop targets that wire sdl_gamepad in.
+    if (backend_input.import_table.get("sdl_gamepad")) |sdl_gp_mod| {
+        overrideImport(sdl_gp_mod, "labelle_core", core_mod);
+    }
+
