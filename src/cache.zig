@@ -7,7 +7,7 @@
 ///     gfx/0.3.0/              (fetched from gfx repo)
 ///     plugins/{repo}/{version}/ (fetched from plugin repos)
 ///     cli/0.3.0/              (populated from CLI companion directory)
-///       backends/raylib/
+///       backends/sokol/
 ///       ecs/zig-ecs/
 ///
 /// Overridable via LABELLE_HOME env var.

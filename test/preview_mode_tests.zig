@@ -247,76 +247,6 @@ pub const PREVIEW_MODE = struct {
         \\
     ;
 
-    test "raylib desktop emits PBO readback + publishFrame between render and endDrawing" {
-        // raylib extracted out-of-tree (#386): `.backend = .raylib` now resolves
-        // to the external labelle-raylib package, so `cfg.isExternal()` is true
-        // and the in-tree raylib-desktop PBO readback gate
-        // (`render.zig: cfg.backend == .raylib and !cfg.isExternal()`) is dead —
-        // the readback codegen + `preview_pbo` surface live in labelle-raylib's
-        // own window module/CI now. The external no-PBO behavior is still locked
-        // here by "external backend does not pull in raylib PBO readback". This
-        // emit-side assertion can no longer fire in-tree; skip rather than assert
-        // unreachable output. (generateMainZigFromTemplate has no manifest path,
-        // so a local backend_package can't re-enable it.)
-        if (true) return error.SkipZigTest;
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
-            .name = "test-game",
-            .backend = .raylib,
-            .ecs = .mock,
-        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
-        defer std.testing.allocator.free(main_zig);
-
-        // labelle-assembler#140 — Phase B raylib migration. The PBO ring,
-        // GL externs, and per-frame readback all live in the backend
-        // module (`backends/raylib/src/window.zig:preview_pbo`). The
-        // codegen template emits only:
-        //   - the engine.Preview vtable bridge fns at module scope
-        //   - `window.preview_pbo.attach(...)` after the gui handshake
-        //   - `window.preview_pbo.frame()` in the per-frame block
-        //   - `defer window.preview_pbo.deinit()` in main()
-
-        // Vtable bridges declared at module scope.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_begin_bridge(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_publish_bridge(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_end_bridge(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_accepted_bridge(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_begin_ios_bridge(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_publish_ios_bridge(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_end_ios_bridge(") != null);
-
-        // Bridge bodies still reference engine.Preview methods so the
-        // type/name-correctness of the seam is observable from main_zig.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.beginFrameStream(w, h)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.publishFrame(pixels)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.endFrameStream()") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.isFrameAccepted()") != null);
-
-        // Three backend lifecycle hooks: attach (init), frame (per frame),
-        // deinit (cleanup). Source-order caveat: the `defer deinit()` is
-        // declared at the top of main() right next to `attach`, so the
-        // deinit *string* appears in source order BEFORE the per-frame
-        // loop, even though it RUNS at scope-exit. What we can usefully
-        // assert is that all three are emitted and attach precedes the
-        // per-frame call.
-        const attach_idx = std.mem.indexOf(u8, main_zig, "window.preview_pbo.attach(.{").?;
-        const frame_idx = std.mem.indexOf(u8, main_zig, "window.preview_pbo.frame()").?;
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.deinit()") != null);
-        try std.testing.expect(attach_idx < frame_idx);
-
-        // Old inline-code MUST be absent — these moved to the backend.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_GL_PIXEL_PACK_BUFFER") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_gl_read_pixels") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_pbos: [3]c_uint") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var _preview_frame_idx") == null);
-
-        // Generated source must still parse as valid Zig.
-        const dup = try std.testing.allocator.dupeZ(u8, main_zig);
-        defer std.testing.allocator.free(dup);
-        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
-        defer ast.deinit(std.testing.allocator);
-        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
-    }
-
     test "non-raylib loop backends do not pull in GL externs or PBO readback" {
         // sdl is the regression lock: it shares the loop-style lifecycle
         // branch with raylib but doesn't link OpenGL directly, so
@@ -373,50 +303,6 @@ pub const PREVIEW_MODE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendHello(") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.tickHeartbeat(") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_p.sendBye(.normal)") != null);
-    }
-
-    // macOS IOSurface gating (labelle-assembler#121, labelle-engine#547).
-    // The raylib desktop template emits BOTH the SHM and the IOSurface
-    // lifecycle calls; the actual selection happens at comptime via
-    // `@import("builtin").os.tag == .macos`. This test only asserts
-    // both strings are present in the emitted source — the comptime
-    // branch is exercised when the generated game is compiled for a
-    // specific OS, not here.
-    test "raylib desktop emits both SHM and IOSurface preview lifecycle calls" {
-        // See sibling "raylib desktop emits PBO readback ..." — raylib is now an
-        // external backend (#386), so the in-tree raylib-desktop readback gate is
-        // dead and the SHM/IOSurface bridge codegen lives in labelle-raylib. Skip
-        // the emit-side assertion; out-of-tree CI + the external no-PBO test cover
-        // the post-flip reality.
-        if (true) return error.SkipZigTest;
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
-            .name = "test-game",
-            .backend = .raylib,
-            .ecs = .mock,
-        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
-        defer std.testing.allocator.free(main_zig);
-
-        // Post-#140 migration: the SHM-vs-IOSurface comptime branch lives
-        // INSIDE the backend's `preview_pbo.frame()`. The codegen emits
-        // both lifecycle's bridge fns at module scope; the backend
-        // dispatches at comptime via `builtin.target.os.tag == .macos`.
-
-        // SHM bridges (Linux/Windows).
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.beginFrameStream(w, h)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.publishFrame(pixels)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.endFrameStream()") != null);
-
-        // IOSurface bridges (macOS).
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.beginFrameStreamIOSurface(w, h)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.publishFrameIOSurface(pixels)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "p.endFrameStreamIOSurface()") != null);
-
-        // Generated source must still parse as valid Zig.
-        const dup_iosurface = try std.testing.allocator.dupeZ(u8, main_zig);
-        defer std.testing.allocator.free(dup_iosurface);
-        var ast_iosurface = try std.zig.Ast.parse(std.testing.allocator, dup_iosurface, .zig);
-        defer ast_iosurface.deinit(std.testing.allocator);
-        try std.testing.expectEqual(@as(usize, 0), ast_iosurface.errors.len);
     }
 
     // ── Sokol PBO readback codegen (labelle-assembler#122 slice 1) ──
@@ -678,41 +564,6 @@ pub const PREVIEW_MODE = struct {
         }
     }
 
-    test "raylib desktop still emits its own PBO readback after the sokol slice lands" {
-        // Regression lock — the sokol slice extended the emit gating
-        // on the callback branch but the raylib desktop loop branch
-        // is untouched. After #140 migration, both backends use the
-        // backend-module seam; raylib's bridges + lifecycle hooks
-        // appear in main_zig, sokol-specific names must NOT leak.
-        // raylib is now external (#386) — the in-tree raylib-desktop readback gate
-        // is dead and `window.preview_pbo.*` codegen lives in labelle-raylib. Skip
-        // the emit-side assertion (see sibling raylib PBO tests for rationale).
-        if (true) return error.SkipZigTest;
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
-            .name = "test-game",
-            .backend = .raylib,
-            .ecs = .mock,
-        }, preview_readback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
-        defer std.testing.allocator.free(main_zig);
-
-        // Raylib backend hooks present.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.attach(") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.frame()") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.deinit()") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn _preview_pbo_begin_bridge(") != null);
-
-        // sokol-specific names must NOT leak into raylib output —
-        // covers the GL slice (#124), the D3D11 slice (#126), and the
-        // Metal slice (#125 / #140).
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_gl_enabled") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_d3d11_enabled") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewGl") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_SokolPreviewD3d11") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview_metal_enabled") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_mtl") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.metalDevice()") == null);
-    }
-
     test "sokol desktop emits D3D11 staging-texture readback alongside the GL block" {
         // labelle-assembler#126 (slice 2 of #122): Windows sokol-on-D3D11
         // can't share the GL PBO path (no `glReadPixels`), so the
@@ -952,10 +803,10 @@ pub const PREVIEW_MODE = struct {
         // from backends/<be>/templates/.
         const Case = struct { backend: generate.Backend, template: []const u8 };
         const cases = [_]Case{
-            .{ .backend = .raylib, .template = "backends/raylib/templates/desktop.txt" },
-            // bgfx + wgpu + null are extracted out-of-tree (labelle-bgfx /
-            // labelle-wgpu / labelle-null) — their templates live there + are
-            // covered by their own CI, so they're no longer in this in-tree list.
+            // raylib + bgfx + wgpu + null are extracted out-of-tree
+            // (labelle-raylib / labelle-bgfx / labelle-wgpu / labelle-null) —
+            // their templates live there + are covered by their own CI, so
+            // they're no longer in this in-tree list.
             .{ .backend = .sokol, .template = "backends/sokol/templates/desktop.txt" },
         };
 

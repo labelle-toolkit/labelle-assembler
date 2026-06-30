@@ -26,7 +26,7 @@ pub fn resolveFrameworkPackage(allocator: std.mem.Allocator, package: []const u8
 }
 
 /// Resolve an assembler-bundled package (backend, ecs adapter, gui) to its cached path.
-/// Returns an absolute path like: ~/.labelle/packages/assembler/0.3.0/backends/raylib
+/// Returns an absolute path like: ~/.labelle/packages/assembler/0.3.0/backends/sokol
 /// `project_dir` is used to resolve `local:` paths relative to the project (not CWD).
 pub fn resolveAssemblerPackage(allocator: std.mem.Allocator, assembler_version: []const u8, project_dir: ?[]const u8, subpath: []const u8) ![]const u8 {
     if (config.isLocalVersion(assembler_version)) {
