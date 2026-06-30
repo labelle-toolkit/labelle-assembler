@@ -616,8 +616,9 @@ pub const ProjectConfig = struct {
             // to the provider package, not the bundled slot.
             .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.2.0" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.1.0" },
+            .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.1.0" },
             // Still bundled.
-            .raylib, .sokol, .sdl, .null => null,
+            .raylib, .sokol, .sdl => null,
         };
     }
 

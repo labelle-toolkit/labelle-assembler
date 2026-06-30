@@ -230,14 +230,14 @@ test "open-config: a BUNDLED built-in config is not external and names via the e
 
 test "enum-as-shorthand: extracted backends resolve to their package; the rest stay bundled" {
     // The enum-as-shorthand seam (#386 Phase 5) routes `isExternal`/`backendName`
-    // through `effectiveBackendPackage`. bgfx + wgpu are now EXTRACTED (#386 Phase
-    // 6c): `.backend = .<tag>` resolves to the provider package (external, named by
-    // the tag — preserved). Every other built-in still ships bundled (not external,
-    // no effective package, named by its enum tag). When the next backend is
+    // through `effectiveBackendPackage`. bgfx + wgpu + null are now EXTRACTED (#386
+    // Phase 6c): `.backend = .<tag>` resolves to the provider package (external,
+    // named by the tag — preserved). The rest still ship bundled (not external, no
+    // effective package, named by its enum tag). When the next backend is
     // extracted, its tag joins this set.
     inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
         const cfg = config.ProjectConfig{ .name = "g", .backend = @field(config.Backend, f.name) };
-        if (cfg.backend == .bgfx or cfg.backend == .wgpu) {
+        if (cfg.backend == .bgfx or cfg.backend == .wgpu or cfg.backend == .null) {
             try std.testing.expect(cfg.isExternal());
             try std.testing.expect(cfg.effectiveBackendPackage() != null);
             try std.testing.expectEqualStrings(f.name, cfg.backendName());
