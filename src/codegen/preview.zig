@@ -117,7 +117,8 @@ pub const PREVIEW_READBACK_HELPERS =
     \\
     \\// ── Preview readback bridges (labelle-assembler#140) ──
     \\// All GL state + PBO ring + per-frame readback machinery now
-    \\// lives in `backends/raylib/src/window.zig:preview_pbo`. The
+    \\// lives in the external labelle-raylib package
+    \\// (`src/window.zig:preview_pbo`). The
     \\// codegen owns only these tiny bridge fns that wrap
     \\// `engine.Preview` methods behind an `*anyopaque` boundary so
     \\// the backend module doesn't need an engine type-import.

@@ -31,21 +31,6 @@ test {
 }
 
 pub const BUILD_ZIG = struct {
-    test "links raylib artifact" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .raylib,
-            // raylib is now external (#386) — point at the in-tree copy so the
-            // manifest splice resolves; project_dir is the assembler repo root.
-            .backend_package = .{ .name = "raylib", .repo = "local:backends/raylib" },
-            .ecs = .mock,
-        }, .{ .project_dir = "." });
-        defer std.testing.allocator.free(build_zig);
-
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkLibrary") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "raylib") != null);
-    }
-
     test "links sokol_clib artifact" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
@@ -76,24 +61,6 @@ pub const BUILD_ZIG = struct {
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"udev\"") == null);
     }
-
-    test "raylib build does not link libudev (#249)" {
-        // No backend should emit a build-time libudev link — libudev is a
-        // runtime dlopen dependency of labelle-core, never a link-time one.
-        // raylib additionally supplies its own gamepad polling.
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .raylib,
-            // raylib is now external (#386) — point at the in-tree copy so the
-            // manifest splice resolves; project_dir is the assembler repo root.
-            .backend_package = .{ .name = "raylib", .repo = "local:backends/raylib" },
-            .ecs = .mock,
-        }, .{ .project_dir = "." });
-        defer std.testing.allocator.free(build_zig);
-
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"udev\"") == null);
-    }
-
 
     // NOTE: bgfx's desktop backend-dep codegen (the bgfx/glfw artifacts) is no
     // longer unit-tested here — bgfx is extracted out-of-tree (labelle-bgfx), so
@@ -235,24 +202,6 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"spatial_grid\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"tilemap\"") != null);
     }
-
-    test "unifies labelle-core onto the raylib backend input module" {
-        // The raylib `input` module imports labelle-core (for GamepadEvent),
-        // so it must be forced onto the project core to avoid a second core
-        // module instance crossing the engine<->backend boundary. The raylib
-        // backend declares the import under the hyphenated name.
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .raylib,
-            // raylib is now external (#386) — point at the in-tree copy so the
-            // manifest splice resolves; project_dir is the assembler repo root.
-            .backend_package = .{ .name = "raylib", .repo = "local:backends/raylib" },
-            .ecs = .mock,
-        }, .{ .project_dir = "." });
-        defer std.testing.allocator.free(build_zig);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input, \"labelle-core\", core_mod)") != null);
-    }
-
 
     // NOTE: "a self-contained (external) backend gets no backend_input core
     // override" was exercised via null, now extracted out-of-tree — no in-tree
