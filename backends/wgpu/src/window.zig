@@ -33,6 +33,11 @@ var screen_h: i32 = 600;
 var glfw_window: ?*glfw.Window = null;
 var target_fps_val: i32 = 60;
 var window_hidden: bool = false;
+/// Latched by `requestQuit()` and OR'd into `windowShouldClose`/`shouldQuit`
+/// (GLFW also has its own close flag; this covers a programmatic engine quit).
+var quit_requested: bool = false;
+/// Previous `glfw.getTime()` reading, for `frameDuration()`.
+var last_frame_time: f64 = 0;
 /// Windowed-mode geometry, captured the moment we go fullscreen so
 /// `setFullscreen(false)` restores the window to the same place + size
 /// (GLFW's `setMonitor` needs explicit windowed coords on the way back).
@@ -646,10 +651,12 @@ fn getOrCreateGpuTexture(id: u32) ?*wgpu.BindGroup {
     return bind_group;
 }
 
-pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
-    // `width`/`height` are the LOGICAL design canvas (project width/height).
-    screen_w = width;
-    screen_h = height;
+pub fn initWindow(width_px: i32, height_px: i32, title: [:0]const u8) void {
+    // `width_px`/`height_px` are the LOGICAL design canvas (project width/height).
+    // (Params suffixed `_px` so they don't shadow the module-level `width()`/
+    // `height()` window-contract decls.)
+    screen_w = width_px;
+    screen_h = height_px;
 
     glfw.init() catch return;
 
@@ -659,8 +666,8 @@ pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
     glfw.windowHint(.client_api, .no_api);
     glfw.windowHint(.visible, !window_hidden);
     glfw_window = glfw.createWindow(
-        @intCast(width),
-        @intCast(height),
+        @intCast(width_px),
+        @intCast(height_px),
         title,
         null,
         null,
@@ -673,7 +680,7 @@ pub fn initWindow(width: i32, height: i32, title: [:0]const u8) void {
     // the design canvas aspect-fits onto it. wgpu has no template
     // `setDesignSize` call (the generated main never invokes it for this
     // backend), so window.zig sets it here. Mirrors the bgfx backend.
-    gfx.setDesignSize(width, height);
+    gfx.setDesignSize(width_px, height_px);
     const fb = framebufferSize();
     screen_w = fb[0];
     screen_h = fb[1];
@@ -724,8 +731,51 @@ pub fn closeWindow() void {
 }
 
 pub fn windowShouldClose() bool {
+    if (quit_requested) return true;
     if (glfw_window) |win| return win.shouldClose();
     return true;
+}
+
+// ── Canonical window contract (labelle-core `assertWindow`) ──────────────
+// Additive aliases so the wgpu backend satisfies the canonical window contract
+// (width/height/frameDuration/requestQuit) ahead of its out-of-tree extraction
+// (#386), mirroring the in-tree raylib/null conformance (#411). The desktop
+// template still calls the legacy names + a fixed 0.016 dt, so generated output
+// is byte-identical; these exist for the contract guard + manifest-driven
+// templates.
+
+/// Current framebuffer width (physical pixels, HiDPI-aware — `screen_w` is
+/// reconciled from `getFramebufferSize()` each frame by `ensureSurface`).
+pub fn width() i32 {
+    return screen_w;
+}
+/// Current framebuffer height (physical pixels).
+pub fn height() i32 {
+    return screen_h;
+}
+/// Seconds elapsed since the previous call — the engine's `dt` source. GLFW's
+/// monotonic clock; the first call seeds the baseline and returns one nominal
+/// 60 Hz step rather than the (large) time-since-glfwInit.
+pub fn frameDuration() f64 {
+    const now = glfw.getTime();
+    if (last_frame_time == 0) {
+        last_frame_time = now;
+        return 1.0 / 60.0;
+    }
+    const dt = now - last_frame_time;
+    last_frame_time = now;
+    return dt;
+}
+/// Ask the window to end the run loop. GLFW has its own close flag too, but a
+/// programmatic engine/script quit latches here; `windowShouldClose`/`shouldQuit`
+/// OR it in (no behavior change unless something calls this).
+pub fn requestQuit() void {
+    quit_requested = true;
+}
+/// Canonical alias of `windowShouldClose` (loop-style backends own the
+/// `while (!shouldQuit())` loop). Presence signals loop-ownership to the contract.
+pub fn shouldQuit() bool {
+    return windowShouldClose();
 }
 
 /// Query whether the window is currently fullscreen. Mirrors the bgfx
