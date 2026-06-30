@@ -13,6 +13,7 @@ var should_close: bool = false;
 var target_fps_val: i32 = 60;
 var last_frame_time: u64 = 0;
 var frame_dur_last: u64 = 0; // baseline for the canonical frameDuration() dt source
+var frame_dur_seconds: f64 = 1.0 / 60.0; // cached per-frame dt; updated once per beginDrawing
 var window_hidden: bool = false;
 
 pub fn setConfigFlags(flags: ConfigFlags) void {
@@ -43,6 +44,7 @@ pub fn initWindow(width_px: i32, height_px: i32, title: [:0]const u8) void {
     const now = c.SDL_GetPerformanceCounter();
     last_frame_time = now;
     frame_dur_last = now; // reset the frameDuration() baseline too
+    frame_dur_seconds = 1.0 / 60.0; // and its cached value, so a re-open starts clean
 }
 
 pub fn closeWindow() void {
@@ -77,18 +79,12 @@ pub fn width() i32 {
 pub fn height() i32 {
     return gfx.getScreenHeight();
 }
-/// Seconds elapsed for the last frame — the engine's `dt` source. SDL has no
-/// stored frame-time (the FPS limiter in `endDrawing` discards its delta and
-/// `last_frame_time` only advances when `target_fps_val > 0`), so track a
-/// dedicated high-resolution baseline here and report the delta since the last
-/// call. The baseline is reset in `initWindow` so a re-open starts clean.
+/// Seconds elapsed for the last frame — the engine's `dt` source. Returns the
+/// value cached by `beginDrawing` (computed once per frame), so this is
+/// idempotent: repeated calls within a frame all report the same dt. Seeded to
+/// 1/60 until the first frame completes; reset in `initWindow`.
 pub fn frameDuration() f64 {
-    const freq = c.SDL_GetPerformanceFrequency();
-    const now = c.SDL_GetPerformanceCounter();
-    const elapsed = now - frame_dur_last;
-    frame_dur_last = now;
-    if (freq == 0) return 0;
-    return @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(freq));
+    return frame_dur_seconds;
 }
 /// Ask the run loop to end. Latches the same `should_close` flag the `SDL_QUIT`
 /// event sets, which `windowShouldClose`/`shouldQuit` already report (no
@@ -134,6 +130,17 @@ pub fn setTargetFPS(fps: i32) void {
 }
 
 pub fn beginDrawing() void {
+    // Compute this frame's dt ONCE here (the per-frame entry) and cache it, so
+    // `frameDuration()` is idempotent — safe to query any number of times per
+    // frame and always returns the same value. (Updating the baseline inside
+    // frameDuration() itself made a 2nd call/frame return ~0.)
+    const freq = c.SDL_GetPerformanceFrequency();
+    const now = c.SDL_GetPerformanceCounter();
+    if (freq != 0 and frame_dur_last != 0) {
+        frame_dur_seconds = @as(f64, @floatFromInt(now - frame_dur_last)) / @as(f64, @floatFromInt(freq));
+    }
+    frame_dur_last = now;
+
     // Clear per-frame keyboard/mouse edges, then pump events (which refreshes
     // SDL's controller state), then snapshot gamepad button edges. Snapshotting
     // after the pump keeps "pressed" detection from lagging a frame.
