@@ -198,32 +198,12 @@ pub const BUILD_ZIG = struct {
     // assembler + asserts the Foundation/QuartzCore/Metal framework links) + the
     // manifest-splice tests + the examples-integration `external-null` step.
 
-    test "null backend wires modules without artifact link" {
-        // null is now an extracted (external) backend (#386 Phase 6c). `.backend
-        // = .null` resolves to the labelle-null package; point it at the in-tree
-        // copy via a local path + project_dir so the manifest splice resolves its
-        // backend.manifest.zon (its link fragment is empty — no artifact).
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .null,
-            .backend_package = .{ .name = "null", .repo = "local:backends/null" },
-            .ecs = .mock,
-        }, .{ .project_dir = "." });
-        defer std.testing.allocator.free(build_zig);
-
-        // Module wiring still happens — the engine's import surface is the
-        // same regardless of backend.
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_null") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "backend_gfx") != null);
-
-        // No native artifact to link — the null backend is pure Zig. The
-        // raylib/sokol/sdl/bgfx/wgpu paths each emit a `linkLibrary(...)`
-        // for their backend artifact; null must not.
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "raylib_artifact") == null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "sokol_clib") == null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "bgfx_artifact") == null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "glfw_artifact") == null);
-    }
+    // NOTE: null's backend-dep codegen (modules wired, no artifact link) is no
+    // longer unit-tested here — null is extracted out-of-tree (labelle-null), so
+    // its in-tree `backends/null` is gone and there's no local package for a unit
+    // test to resolve. That coverage now lives in labelle-null's CI + the
+    // examples-integration null headless + plugin-controllers steps (which
+    // generate + build + RUN a project on the fetched external null backend).
 
     test "deduplicates labelle-core across gfx and engine" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
@@ -287,22 +267,12 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input, \"labelle_core\", core_mod)") != null);
     }
 
-    test "a self-contained backend gets no backend_input core override" {
-        // The null backend's `input` module does not import labelle-core, and null
-        // is now an extracted EXTERNAL backend (#386 Phase 6c) — external backends
-        // are self-contained, so no `overrideImport(backend_input, ...)` is emitted
-        // regardless. (raylib + sdl import core unconditionally; sokol on desktop
-        // Linux only — both covered below.) Resolve null's in-tree copy via a local
-        // path + project_dir so the manifest splice runs.
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .null,
-            .backend_package = .{ .name = "null", .repo = "local:backends/null" },
-            .ecs = .mock,
-        }, .{ .project_dir = "." });
-        defer std.testing.allocator.free(build_zig);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input,") == null);
-    }
+    // NOTE: "a self-contained (external) backend gets no backend_input core
+    // override" was exercised via null, now extracted out-of-tree — no in-tree
+    // package for a unit test to resolve. The self-contained → no-override
+    // behavior is covered by the external-backend tests + the examples-integration
+    // external-null/null steps; the IN-TREE core-import override paths
+    // (raylib/sdl/sokol) are covered by the dedicated tests below.
 
     test "sokol emits a GUARDED backend_input core override (Linux core gamepad route)" {
         // On desktop Linux the sokol input module imports labelle-core
@@ -389,14 +359,15 @@ pub const BUILD_ZIG = struct {
     }
 
     test "is_tests_target trims exe assembly + run step (issue #83)" {
-        // The tests target forces the null backend; null is now external (#386),
-        // so resolve its in-tree copy via a local path + project_dir.
+        // The exe-trimming mechanism is backend-agnostic; use a bundled backend
+        // (raylib) so the unit test needs no external resolution. (The real
+        // tests-target forces null — now external — which the examples-integration
+        // covers end-to-end.)
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .null,
-            .backend_package = .{ .name = "null", .repo = "local:backends/null" },
+            .backend = .raylib,
             .ecs = .mock,
-        }, .{ .is_tests_target = true, .project_dir = "." });
+        }, .{ .is_tests_target = true });
         defer std.testing.allocator.free(build_zig);
 
         // Test step is the only entry point — keep it.
@@ -511,16 +482,16 @@ pub const BUILD_ZIG = struct {
     }
 
     test "lib test chaining present in is_tests_target build (issue #82)" {
+        // Lib-chaining is backend-agnostic; use a bundled backend (raylib) so the
+        // unit test needs no external resolution (null is external post-#386).
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .null,
-            // tests target forces null (now external #386) — resolve in-tree copy.
-            .backend_package = .{ .name = "null", .repo = "local:backends/null" },
+            .backend = .raylib,
             .ecs = .mock,
             .plugins = &.{
                 .{ .name = "pathfinder", .repo = "@libs/pathfinder" },
             },
-        }, .{ .is_tests_target = true, .project_dir = "." });
+        }, .{ .is_tests_target = true });
         defer std.testing.allocator.free(build_zig);
 
         // The tests-only target is the canonical `zig build test` entry

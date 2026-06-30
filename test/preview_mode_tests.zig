@@ -933,11 +933,10 @@ pub const PREVIEW_MODE = struct {
         const cases = [_]Case{
             .{ .backend = .raylib, .template = "backends/raylib/templates/desktop.txt" },
             .{ .backend = .sdl, .template = "backends/sdl/templates/desktop.txt" },
-            // bgfx + wgpu are extracted out-of-tree (labelle-bgfx / labelle-wgpu)
-            // — their templates live there + are covered by their own CI, so
-            // they're no longer in this in-tree-template regression list.
+            // bgfx + wgpu + null are extracted out-of-tree (labelle-bgfx /
+            // labelle-wgpu / labelle-null) — their templates live there + are
+            // covered by their own CI, so they're no longer in this in-tree list.
             .{ .backend = .sokol, .template = "backends/sokol/templates/desktop.txt" },
-            .{ .backend = .null, .template = "backends/null/templates/headless.txt" },
         };
 
         const io = std.testing.io;

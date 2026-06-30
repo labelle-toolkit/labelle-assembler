@@ -83,8 +83,8 @@ only assert at the codegen layer.
 
 ## How this works (null-backend tick loop)
 
-The `.null` backend (`backends/null/`) ships pure-Zig no-op stubs for
-every gfx / input / audio / window symbol the engine expects, plus a
+The `.null` backend (the out-of-tree labelle-null package) ships pure-Zig
+no-op stubs for every gfx / input / audio / window symbol the engine expects, plus a
 `templates/headless.txt` that emits a `main()` shaped like:
 
 ```zig
@@ -159,4 +159,4 @@ placeholder (labelle-cli normally patches it via a post-generate
   — plugin-Controller discovery, plugin-shipped scripts, ship_from_plugin
 - PR [#74](https://github.com/labelle-toolkit/labelle-assembler/pull/74)
   — null backend (this example's runtime)
-- `backends/null/` — the no-op backend's source
+- the labelle-null package — the no-op backend's source (out-of-tree)
