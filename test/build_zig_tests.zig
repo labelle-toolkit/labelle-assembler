@@ -190,25 +190,13 @@ pub const BUILD_ZIG = struct {
         }, .{}));
     }
 
-    test "links wgpu glfw artifact" {
-        // wgpu is now an extracted (external) backend (#386 Phase 6c). `.backend
-        // = .wgpu` resolves to the labelle-wgpu package; point it at the in-tree
-        // copy via a local path + project_dir so the desktop manifest splice
-        // resolves its backend.manifest.zon (the fragment emits the same
-        // labelle_wgpu / glfw_artifact the old enum `backend_wgpu` section did —
-        // byte-identical, verified in #426). project_dir is the assembler repo
-        // root (the test runner's cwd).
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .wgpu,
-            .backend_package = .{ .name = "wgpu", .repo = "local:backends/wgpu" },
-            .ecs = .mock,
-        }, .{ .project_dir = "." });
-        defer std.testing.allocator.free(build_zig);
-
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "labelle_wgpu") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "glfw_artifact") != null);
-    }
+    // NOTE: wgpu's desktop backend-dep codegen (the labelle_wgpu / glfw_artifact
+    // links) is no longer unit-tested here — wgpu is extracted out-of-tree
+    // (labelle-wgpu), so its in-tree `backends/wgpu` is gone and there's no local
+    // package for a unit test to resolve. That coverage now lives in labelle-wgpu's
+    // own CI (its assembler-integration job generates a wgpu project through the
+    // assembler + asserts the Foundation/QuartzCore/Metal framework links) + the
+    // manifest-splice tests + the examples-integration `external-null` step.
 
     test "null backend wires modules without artifact link" {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
