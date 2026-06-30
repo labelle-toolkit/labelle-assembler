@@ -375,9 +375,20 @@ fn hardlinkTree(allocator: std.mem.Allocator, src_path: []const u8, dest_path: [
 
         switch (entry.kind) {
             .directory => {
-                // Skip .zig-cache and zig-out inside packages
+                // Skip build/VCS/generated dirs inside a staged package. Besides
+                // the obvious .zig-cache/zig-out/.git, skip:
+                //   - zig-pkg: the fetched-dependency cache, whose hashed subpaths
+                //     (…/N-V-…/upstream/node_modules/…) blow past the OS path limit
+                //     → copyFile errors with NameTooLong and crashes staging.
+                //   - .labelle: generated output. Critical when a package repo
+                //     ships an example *inside itself* (labelle-bgfx/examples/…):
+                //     staging the package while generating that example would copy
+                //     the example's own .labelle output back into the stage.
+                // None of these are part of the package's importable modules.
                 if (std.mem.eql(u8, entry.name, ".zig-cache") or
                     std.mem.eql(u8, entry.name, "zig-out") or
+                    std.mem.eql(u8, entry.name, "zig-pkg") or
+                    std.mem.eql(u8, entry.name, ".labelle") or
                     std.mem.eql(u8, entry.name, ".git"))
                     continue;
 
@@ -753,6 +764,56 @@ test "hardlinkTree: errors on missing source" {
 
     const result = hardlinkTree(alloc, missing_src, dest);
     try std.testing.expectError(error.FileNotFound, result);
+}
+
+test "hardlinkTree: skips zig-pkg/.labelle/.git/.zig-cache/zig-out, stages real files" {
+    // Regression for the local-backend staging crash: a package repo with a
+    // populated zig-pkg/ (deep hashed dep paths) or an in-repo example's
+    // .labelle/ output used to be copied wholesale → NameTooLong + an invalid
+    // free. These dirs must be skipped; real module files must still stage.
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Source package tree: build/cache/VCS dirs + real module files.
+    for ([_][]const u8{ "pkg/src", "pkg/zig-pkg/deep", "pkg/.labelle/out", "pkg/.git", "pkg/.zig-cache", "pkg/zig-out" }) |d|
+        try tmp.dir.createDirPath(io, d);
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/build.zig", .data = "// build" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/src/root.zig", .data = "pub const x = 1;" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/zig-pkg/deep/huge.txt", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/.labelle/out/main.zig", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/.git/HEAD", .data = "ref" });
+
+    const src = try tmp.dir.realPathFileAlloc(io, "pkg", alloc);
+    defer alloc.free(src);
+    const base = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(base);
+    const dest = try std.fs.path.join(alloc, &.{ base, "staged" });
+    defer alloc.free(dest);
+
+    try hardlinkTree(alloc, src, dest);
+
+    const exists = struct {
+        fn f(c: std.Io.Dir, i: anytype, d: []const u8, sub: []const u8, a: std.mem.Allocator) bool {
+            const p = std.fs.path.join(a, &.{ d, sub }) catch return false;
+            defer a.free(p);
+            c.access(i, p, .{}) catch return false;
+            return true;
+        }
+    }.f;
+
+    // Real files staged.
+    try std.testing.expect(exists(cwd, io, dest, "build.zig", alloc));
+    try std.testing.expect(exists(cwd, io, dest, "src/root.zig", alloc));
+    // Build/cache/VCS/output dirs skipped.
+    try std.testing.expect(!exists(cwd, io, dest, "zig-pkg", alloc));
+    try std.testing.expect(!exists(cwd, io, dest, ".labelle", alloc));
+    try std.testing.expect(!exists(cwd, io, dest, ".git", alloc));
+    try std.testing.expect(!exists(cwd, io, dest, ".zig-cache", alloc));
+    try std.testing.expect(!exists(cwd, io, dest, "zig-out", alloc));
 }
 
 // ── External-backend gating (open-config, epic #386 Phase 5) ─────────
