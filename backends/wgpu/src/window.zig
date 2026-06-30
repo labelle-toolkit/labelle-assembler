@@ -655,6 +655,11 @@ pub fn initWindow(width_px: i32, height_px: i32, title: [:0]const u8) void {
     // `width_px`/`height_px` are the LOGICAL design canvas (project width/height).
     // (Params suffixed `_px` so they don't shadow the module-level `width()`/
     // `height()` window-contract decls.)
+    // Reset per-window contract state so a close→reopen starts clean (else a
+    // prior `requestQuit` would close the new window immediately + the first
+    // `frameDuration` would be a huge time-since-old-baseline). Mirrors raylib.
+    quit_requested = false;
+    last_frame_time = 0;
     screen_w = width_px;
     screen_h = height_px;
 
