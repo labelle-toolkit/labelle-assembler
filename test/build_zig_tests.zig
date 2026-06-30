@@ -199,11 +199,16 @@ pub const BUILD_ZIG = struct {
     // manifest-splice tests + the examples-integration `external-null` step.
 
     test "null backend wires modules without artifact link" {
+        // null is now an extracted (external) backend (#386 Phase 6c). `.backend
+        // = .null` resolves to the labelle-null package; point it at the in-tree
+        // copy via a local path + project_dir so the manifest splice resolves its
+        // backend.manifest.zon (its link fragment is empty — no artifact).
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .null,
+            .backend_package = .{ .name = "null", .repo = "local:backends/null" },
             .ecs = .mock,
-        }, .{});
+        }, .{ .project_dir = "." });
         defer std.testing.allocator.free(build_zig);
 
         // Module wiring still happens — the engine's import surface is the
@@ -282,21 +287,21 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input, \"labelle_core\", core_mod)") != null);
     }
 
-    test "backends without a core import get no backend_input override" {
-        // The null backend's `input` module does not import labelle-core, so no
-        // `overrideImport(backend_input, ...)` line should be emitted. (raylib
-        // and sdl import core unconditionally; sokol imports it on desktop Linux
-        // only — covered below. bgfx + wgpu are now extracted external backends,
-        // so they're exercised by the external-backend tests, not this bundled loop.)
-        for ([_]generate.Backend{.null}) |be| {
-            const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-                .name = "test-game",
-                .backend = be,
-                .ecs = .mock,
-            }, .{});
-            defer std.testing.allocator.free(build_zig);
-            try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input,") == null);
-        }
+    test "a self-contained backend gets no backend_input core override" {
+        // The null backend's `input` module does not import labelle-core, and null
+        // is now an extracted EXTERNAL backend (#386 Phase 6c) — external backends
+        // are self-contained, so no `overrideImport(backend_input, ...)` is emitted
+        // regardless. (raylib + sdl import core unconditionally; sokol on desktop
+        // Linux only — both covered below.) Resolve null's in-tree copy via a local
+        // path + project_dir so the manifest splice runs.
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .null,
+            .backend_package = .{ .name = "null", .repo = "local:backends/null" },
+            .ecs = .mock,
+        }, .{ .project_dir = "." });
+        defer std.testing.allocator.free(build_zig);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "overrideImport(backend_input,") == null);
     }
 
     test "sokol emits a GUARDED backend_input core override (Linux core gamepad route)" {
@@ -384,11 +389,14 @@ pub const BUILD_ZIG = struct {
     }
 
     test "is_tests_target trims exe assembly + run step (issue #83)" {
+        // The tests target forces the null backend; null is now external (#386),
+        // so resolve its in-tree copy via a local path + project_dir.
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .null,
+            .backend_package = .{ .name = "null", .repo = "local:backends/null" },
             .ecs = .mock,
-        }, .{ .is_tests_target = true });
+        }, .{ .is_tests_target = true, .project_dir = "." });
         defer std.testing.allocator.free(build_zig);
 
         // Test step is the only entry point — keep it.
@@ -506,11 +514,13 @@ pub const BUILD_ZIG = struct {
         const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .null,
+            // tests target forces null (now external #386) — resolve in-tree copy.
+            .backend_package = .{ .name = "null", .repo = "local:backends/null" },
             .ecs = .mock,
             .plugins = &.{
                 .{ .name = "pathfinder", .repo = "@libs/pathfinder" },
             },
-        }, .{ .is_tests_target = true });
+        }, .{ .is_tests_target = true, .project_dir = "." });
         defer std.testing.allocator.free(build_zig);
 
         // The tests-only target is the canonical `zig build test` entry
