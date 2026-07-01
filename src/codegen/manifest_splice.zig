@@ -120,9 +120,15 @@ pub const LEGACY_MANIFEST_NAME = "backend.manifest.zon";
 /// no env var. bgfx-desktop ships one (→ manifest path); sokol ships one too
 /// (the POC artifact). raylib/sdl/wgpu/null ship none (→ enum path).
 pub fn manifestPathEnabled(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8, manifest_name: ?[]const u8) bool {
-    // Manifests declare desktop fields only; non-desktop targets (wasm/ios/
-    // android) keep their enum branches (e.g. bgfx-android's NDK ordering).
-    if (cfg.platform != .desktop) return false;
+    // The V1 splice declares desktop fields only, so a null (production) name
+    // keeps non-desktop targets (wasm/ios/android) on their enum branches (e.g.
+    // bgfx-android's NDK ordering). An EXPLICIT `manifest_name` is the manifest-v2
+    // opt-in (epic #453): v2 manifests carry a full per-platform matrix, so the
+    // path is enabled on any platform when the named manifest exists. build_files
+    // routes a v2 manifest to the v2 codegen and IGNORES a v1 manifest on a
+    // non-desktop target (falling back to the enum path), so relaxing the gate
+    // here cannot mis-drive the desktop-only v1 splice on android/ios/wasm.
+    if (cfg.platform != .desktop and manifest_name == null) return false;
     return manifestExists(allocator, cfg, project_dir, manifest_name orelse LEGACY_MANIFEST_NAME);
 }
 

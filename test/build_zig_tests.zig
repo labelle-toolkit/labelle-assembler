@@ -98,6 +98,73 @@ pub const MANIFEST_V2_DESKTOP_ANCHOR = struct {
     }
 };
 
+// ── manifest-v2 sokol-android GOLDEN cell (epic #453 item 3, PR 5, design §7) ──
+// Android is the first HOOK-BEARING conversion. Unlike the desktop byte anchor,
+// this cannot be a 0-diff-vs-enum comparison: the residual (NDK sysroot detection,
+// libc.txt, target resolution) moved into the imported `backend.hook.zig` and the
+// unrolled core-diamond overrides became the generic `unifyCoreDiamond` loop, so
+// the generated text legitimately DIFFERS from the enum `header_android`/
+// `android_deps`/`backend_sokol_android`/`android_link` path. The gate is
+// therefore a committed golden (reviewed by hand against the enum output for
+// graph equivalence) PLUS the hook's own gates: `backend.hook.zig` is compiled as
+// a test target in build.zig (typechecking `resolve_target`/`post_wire` against
+// the real std.Build API) and unit-tests its pure decision helpers (arch select,
+// NDK triple, required-SDK enforcement, libc.txt body). See design §7 for why the
+// text golden alone is blind to the hook body.
+pub const MANIFEST_V2_ANDROID_GOLDEN = struct {
+    const golden = @embedFile("goldens/sokol_android_v2.build.zig");
+
+    fn genAndroidV2() ![]const u8 {
+        return h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .sokol,
+            .platform = .android,
+            .ecs = .mock,
+        }, .{});
+    }
+
+    test "golden: v2 sokol-android build.zig matches the committed golden" {
+        const out = try genAndroidV2();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 sokol-android build.zig is syntactically valid Zig" {
+        const out = try genAndroidV2();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 sokol-android imports the backend hook and calls BOTH phases (§4)" {
+        const out = try genAndroidV2();
+        defer std.testing.allocator.free(out);
+        // resolve_target BEFORE any b.dependency (produces android_target).
+        try std.testing.expect(std.mem.indexOf(u8, out, "@import(\"backend_build_hook.zig\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.resolve_target(b, .{ .platform = .android }).target") != null);
+        // post_wire AFTER wiring, carrying the REQUIRED android_target_sdk (34).
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.post_wire(b, .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".android_target_sdk = 34,") != null);
+        // The generic core-diamond walk (loop form) replaced the unrolled overrides.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyGfxSubpackageCore(gfx_mod, core_mod)") == null);
+        // Declarative graph: artifact link + NDK system libs + pic + link_libc.
+        try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.linkLibrary(sokol_clib)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "sokol_clib.root_module.pic = true;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.linkSystemLibrary(\"GLESv3\", .{})") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.link_libc = true;") != null);
+        // APK packaging delegated to the shared packager (byte-identical section).
+        try std.testing.expect(std.mem.indexOf(u8, out, "Package and sign Android APK") != null);
+        // The enum-path inline NDK detection is GONE from the generated build.zig —
+        // it lives in the hook now (the documented enum-vs-v2 boundary).
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn getAndroidNdkSysroot(") == null);
+    }
+};
+
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
         const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
