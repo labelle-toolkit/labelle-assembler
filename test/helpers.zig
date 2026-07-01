@@ -421,3 +421,11 @@ pub fn genSokolV2OnlyBuildZig(
     opts.backend_manifest_name = "backend.manifest.v2.zon";
     return generate.generateBuildZig(allocator, cfg, opts);
 }
+
+// A BROKEN-v2 backend fixture: `backends/sokol_v2broken` ships a
+// `backend.manifest.v2.zon` whose header parses (manifest_version = 2) but whose
+// body is invalid, so `manifest_v2.loadNamedManifest` fails. Used to prove #468
+// finding 1: a v2 manifest that fails to load must error BOTH the build.zig and
+// build.zig.zon generators (the zon path must not swallow the error with
+// `catch null` and silently fall back to enum output).
+pub const sokol_v2broken_fixture_package = generate.PluginDep{ .name = "sokol_v2broken", .repo = "local:backends/sokol_v2broken" };

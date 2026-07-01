@@ -872,13 +872,17 @@ pub fn emitRootBuildDepsV2(
                 if (!std.mem.eql(u8, dep.name, "emsdk")) return error.UnknownBuiltinRootDep;
                 try w.writeAll(dep_emsdk_section);
             },
+            // url/hash/path are emitted as ZON string literals: escape their
+            // contents (`"` → `\"`, `\` → `\\`) via std.zig.fmtString so a value
+            // containing a quote/backslash can't produce malformed ZON. hash is
+            // hex (low-risk) but escaped for consistency. #468 finding 2.
             .remote => |r| try w.print(
-                "        .{s} = .{{\n            .url = \"{s}\",\n            .hash = \"{s}\",\n        }},\n",
-                .{ dep.name, r.url, r.hash },
+                "        .{s} = .{{\n            .url = \"{f}\",\n            .hash = \"{f}\",\n        }},\n",
+                .{ dep.name, std.zig.fmtString(r.url), std.zig.fmtString(r.hash) },
             ),
             .path => |p| try w.print(
-                "        .{s} = .{{\n            .path = \"{s}\",\n        }},\n",
-                .{ dep.name, p },
+                "        .{s} = .{{\n            .path = \"{f}\",\n        }},\n",
+                .{ dep.name, std.zig.fmtString(p) },
             ),
         }
     }
@@ -991,6 +995,47 @@ test "emitRootBuildDepsV2: builtin emsdk emits the pinned dep_emsdk section" {
         .platforms = .{ .wasm = e(&.{.{ .name = "mystery", .resolution = .builtin }}) },
     };
     try testing.expectError(error.UnknownBuiltinRootDep, emitRootBuildDepsV2(m3, .wasm, "", &aw3.writer));
+}
+
+test "emitRootBuildDepsV2: url/path with quote+backslash are escaped into valid ZON" {
+    const e = struct {
+        fn make(deps: []const BackendManifestV2.RootBuildDep) BackendManifestV2.PlatformEntry {
+            return .{ .entry = "t.txt", .loop_style = .callback, .target = .{ .triple = "wasm32-emscripten" }, .root_build_deps = deps, .package = .{ .web = .{} } };
+        }
+    }.make;
+
+    // remote: a url/hash carrying a `"` and a `\` must be emitted as escaped
+    // ZON string content, not interpolated raw (which would break the literal).
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    const m: BackendManifestV2 = .{
+        .manifest_version = 2,
+        .dir_name = "x",
+        .dep_name = "x",
+        .modules = &.{},
+        .platforms = .{ .wasm = e(&.{.{ .name = "foo", .resolution = .{ .remote = .{ .url = "git+u\"x\\y", .hash = "h\"h" } } }}) },
+    };
+    try emitRootBuildDepsV2(m, .wasm, "", &aw.writer);
+    try testing.expectEqualStrings(
+        "        .foo = .{\n            .url = \"git+u\\\"x\\\\y\",\n            .hash = \"h\\\"h\",\n        },\n",
+        aw.written(),
+    );
+
+    // path: same escaping.
+    var aw2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw2.deinit();
+    const m2: BackendManifestV2 = .{
+        .manifest_version = 2,
+        .dir_name = "x",
+        .dep_name = "x",
+        .modules = &.{},
+        .platforms = .{ .wasm = e(&.{.{ .name = "bar", .resolution = .{ .path = "a\"b\\c" } }}) },
+    };
+    try emitRootBuildDepsV2(m2, .wasm, "", &aw2.writer);
+    try testing.expectEqualStrings(
+        "        .bar = .{\n            .path = \"a\\\"b\\\\c\",\n        },\n",
+        aw2.written(),
+    );
 }
 
 test "emitCoreDiamondWalk emits the PR-2 generic walk source (drift guard)" {

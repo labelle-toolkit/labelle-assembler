@@ -443,6 +443,40 @@ pub const MANIFEST_V2_WASM_GOLDEN = struct {
         defer std.testing.allocator.free(enum_zon);
         try std.testing.expectEqualStrings(enum_zon, v2_zon);
     }
+
+    // ── #468 finding 1: a v2 manifest that fails to load must error the ZON ──
+    // generation, not silently fall back to enum output. The build.zig path
+    // (`generateBuildZig`) already propagates the load error with `try`; the zon
+    // path used to `catch null`, which could pair a build.zig that resolved its
+    // hook deps against a v2 manifest with a build.zig.zon that fell back to enum
+    // output — a divergent (broken) pair. The two generators must now AGREE:
+    // both succeed, or both error, for the same manifest.
+    const broken_cfg: generate.ProjectConfig = .{
+        .name = "anchor-game",
+        .backend = .sokol,
+        .platform = .wasm,
+        .ecs = .mock,
+        .backend_package = h.sokol_v2broken_fixture_package,
+    };
+
+    test "v2 build.zig.zon errors when the v2 manifest fails to load (no enum fallback)" {
+        try std.testing.expectError(error.BackendManifestParseError, generate.generateBuildZigZon(
+            std.testing.allocator,
+            broken_cfg,
+            null,
+            null,
+            ".",
+            .{ .backend_manifest_name = "backend.manifest.v2.zon" },
+        ));
+    }
+
+    test "v2 build.zig ALSO errors on the same broken manifest (both paths agree)" {
+        try std.testing.expectError(error.BackendManifestParseError, generate.generateBuildZig(
+            std.testing.allocator,
+            broken_cfg,
+            .{ .project_dir = ".", .backend_manifest_name = "backend.manifest.v2.zon" },
+        ));
+    }
 };
 
 pub const BUILD_ZIG = struct {

@@ -1000,12 +1000,20 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     // is byte-identical to the enum path. The production/enum path keeps the
     // hardcoded per-platform emsdk emission unchanged.
     var v2_root_deps_emitted = false;
-    if (opts.backend_manifest_name) |name| {
-        if (project_dir) |pd| {
-            const parsed = manifest_v2.loadNamedManifest(allocator, cfg, pd, name) catch null;
-            if (parsed) |p| {
-                defer p.free(allocator);
-                switch (p) {
+    // Mirror `generateBuildZig`'s manifest gate + load so the two generators
+    // agree: gate the load on `manifestPathEnabled` (a missing manifest → enum
+    // fallback in BOTH), and propagate load errors with `try` rather than
+    // swallowing them with `catch null`. A v2 manifest that fails to load must
+    // error in build.zig.zon generation exactly as it does in build.zig
+    // generation — otherwise a build.zig that resolved its hook deps against a
+    // v2 manifest could be paired with a build.zig.zon that silently fell back
+    // to enum output, producing a divergent (and broken) pair. #468 finding 1.
+    if (project_dir) |pd| {
+        if (opts.backend_manifest_name) |name| {
+            if (manifest_splice.manifestPathEnabled(allocator, cfg, pd, name)) {
+                const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, pd, name);
+                defer parsed.free(allocator);
+                switch (parsed) {
                     .v1 => {},
                     .v2 => |m| {
                         const dep_emsdk = tpl.getSection(build_zig_zon_tmpl, "dep_emsdk") orelse "";

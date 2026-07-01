@@ -1,0 +1,17 @@
+.{
+    // ── BROKEN-v2 test fixture (manifest-v2, epic #453 item 3, PR 7, #468 finding 1) ──
+    // A `manifest_version = 2` manifest whose body is INVALID: `.modules` must be a
+    // tuple of module structs, but here it is an integer, so the v2 body parse
+    // (`std.zon.parse.fromSliceAlloc(BackendManifestV2, ...)`) fails with
+    // `error.BackendManifestParseError`. The header still parses cleanly (v = 2), so
+    // dispatch routes to the v2 branch — this is a genuine "v2 manifest fails to load".
+    //
+    // Used to prove #468 finding 1: a v2 `backend_manifest_name` that fails to load
+    // must error BOTH `generateBuildZig` and `generateBuildZigZon` — the zon path
+    // must NOT swallow the error with `catch null` and silently emit enum-fallback
+    // output, or the emitted build.zig / build.zig.zon pair would diverge.
+    .manifest_version = 2,
+    .dir_name = "sokol",
+    .dep_name = "labelle_sokol",
+    .modules = 5,
+}
