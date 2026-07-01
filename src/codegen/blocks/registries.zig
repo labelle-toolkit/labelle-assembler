@@ -134,7 +134,12 @@ pub fn Mixin(comptime Self: type) type {
             const plugin_flow_nodes = self.plugin_flow_nodes;
             try w.writeAll("const AllScripts = struct {\n");
             for (script_entries) |entry| {
-                if (std.mem.eql(u8, entry.name, "context")) continue;
+                // Skip the GAME's own `context` script — it's imported
+                // separately as `GameContext`, not through `AllScripts`. A
+                // pack/plugin-shipped `context` script (`plugin_name != null`)
+                // is an ordinary script and MUST stay in `AllScripts`, or it's
+                // silently dropped (labelle-assembler#496, codex review).
+                if (entry.plugin_name == null and std.mem.eql(u8, entry.name, "context")) continue;
                 const ident = pathToIdent(entry.rel_path, ident_buf);
                 // labelle-assembler#240 Gap 2 — a game script that exports
                 // `pub const FlowNodes` is promoted to a NAMED build module

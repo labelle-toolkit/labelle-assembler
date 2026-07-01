@@ -38,9 +38,17 @@ pub fn checkBasenameCollisions(allocator: std.mem.Allocator, prefab_names: []con
     return null;
 }
 
-/// Check if a script entry with the given name exists.
+/// True iff the GAME ROOT itself ships a `scripts/context.zig` — the sentinel
+/// that makes the generated main import `GameContext` from
+/// `scripts/context.zig`. Pack/plugin-shipped `context` scripts
+/// (`plugin_name != null`) are EXCLUDED: they are ordinary lifecycle scripts
+/// imported through `AllScripts`, not the game context. A pack's
+/// `scripts/context.zig` must NOT flip this on, or the template would emit a
+/// hard-coded `@import("scripts/context.zig")` for a game that has none —
+/// breaking the build (labelle-assembler#496, codex review).
 pub fn hasContextEntry(entries: []const ScriptEntry) bool {
     for (entries) |entry| {
+        if (entry.plugin_name != null) continue;
         if (std.mem.eql(u8, entry.name, "context")) return true;
     }
     return false;
@@ -116,4 +124,43 @@ pub fn validateResources(cfg: ProjectConfig) !void {
             }
         }
     }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "hasContextEntry: a game-root context script is the game context" {
+    const entries = [_]ScriptEntry{
+        .{
+            .name = "context",
+            .filename = "context.zig",
+            .states = &.{},
+            .sort_order = null,
+            .subdir = null,
+            .rel_path = "context.zig",
+        },
+    };
+    try testing.expect(hasContextEntry(&entries));
+}
+
+test "hasContextEntry: a pack's context script is NOT the game context (#496)" {
+    // A pack ships `scripts/context.zig`; the scanner stamps it with a
+    // `plugin_name`. It must not be treated as the game's GameContext sentinel
+    // (which would emit a hard-coded `@import("scripts/context.zig")` for a
+    // game root that has no such file) — codex review of #496.
+    const entries = [_]ScriptEntry{
+        .{
+            .name = "context",
+            .filename = "context.zig",
+            .states = &.{},
+            .sort_order = null,
+            .subdir = null,
+            .rel_path = "packs/media/scripts/context.zig",
+            .plugin_name = "media",
+            .plugin_index = 1,
+            .import_base = "",
+        },
+    };
+    try testing.expect(!hasContextEntry(&entries));
 }
