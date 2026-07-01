@@ -22,6 +22,7 @@ const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
 const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
+pub const pack_validate = @import("pack_validate.zig");
 const gui_resolve = @import("gui_resolve.zig");
 pub const app_icon = @import("app_icon.zig");
 
@@ -29,6 +30,7 @@ pub const app_icon = @import("app_icon.zig");
 // any compiled function path during `addTest` runs.
 test {
     _ = @import("plugin_manifest.zig");
+    _ = @import("pack_validate.zig");
     _ = @import("scene_manifest.zig");
     _ = @import("scene_manifest_test.zig");
     _ = @import("asset_validator.zig");
@@ -1025,6 +1027,44 @@ pub fn generate(
     //   * the per-pack `global ++ own` registry partition / `PackView`
     //     (#652-remainder) — today everything lands in one flat registry.
     //   * `exposes` / `depends_on` DAG + isolation (#440 / §6).
+    // ── Pack dependency validation — the gate (Packs RFC §6, #441) ─────
+    //
+    // Before scanning/copying anything, read every declared pack's
+    // `pack.labelle` and fail generation on a `depends_on` cycle or a
+    // `depends_on` naming an undeclared pack/plugin. Runs first so a bad
+    // graph rejects the build cheaply. This is the "generate-time
+    // validation" gate only — the depends_on ENFORCEMENT (restricted
+    // per-pack module graph / `PackView` partition) is engine-side
+    // #652-remainder, and the one-facet-one-owner check is mooted by
+    // #440's `<pack>__` name prefix (registry names become pack-unique).
+    {
+        var pack_manifests: std.ArrayList(plugin_manifest.PackManifest) = .empty;
+        defer {
+            for (pack_manifests.items) |*m| m.deinit();
+            pack_manifests.deinit(allocator);
+        }
+        for (cfg.plugins) |plugin| {
+            const pm = (try plugin_manifest.loadPackOptional(allocator, plugin, game_dir)) orelse continue;
+            try pack_manifests.append(allocator, pm);
+        }
+
+        var pack_deps: std.ArrayList(pack_validate.PackDep) = .empty;
+        defer pack_deps.deinit(allocator);
+        try pack_deps.ensureTotalCapacity(allocator, pack_manifests.items.len);
+        for (pack_manifests.items) |m| {
+            pack_deps.appendAssumeCapacity(.{ .name = m.name, .depends_on = m.depends_on });
+        }
+
+        // Legal depends_on targets = every plugin/pack declared in
+        // project.labelle (plus the implicit `contracts`, handled inside).
+        var declared_names: std.ArrayList([]const u8) = .empty;
+        defer declared_names.deinit(allocator);
+        try declared_names.ensureTotalCapacity(allocator, cfg.plugins.len);
+        for (cfg.plugins) |plugin| declared_names.appendAssumeCapacity(plugin.name);
+
+        try pack_validate.validate(allocator, pack_deps.items, declared_names.items);
+    }
+
     var pack_scans: std.ArrayList(main_zig.PackScan) = .empty;
     defer {
         for (pack_scans.items) |*p| p.deinit(allocator);

@@ -112,9 +112,14 @@ pub const PluginManifest = struct {
 // custom-scan plugin uses `plugin.labelle`, and both keep their simple
 // typed ZON parse.
 //
-// `exposes` / `depends_on` (the §6 isolation inputs) are accepted but
-// ignored for now — this slice implements the dir-scan + registry
-// unification only; the DAG/visibility work is #440 / #652-remainder.
+// `exposes` / `depends_on` (the §6 isolation inputs) are PARSED here
+// (labelle-assembler#441) and fed to the generate-time validation pass
+// (`pack_validate.zig`) that rejects dependency cycles and unknown deps.
+// This ticket parses the fields + runs that validation only; the
+// depends_on ENFORCEMENT (the restricted per-pack module graph / the
+// `PackView` registry partition, RFC §6.1a/1b) is engine-side
+// #652-remainder, and the one-facet-one-owner duplicate check is mooted
+// by #440's `<pack>__` name prefix — see the PR / RFC §6.
 
 /// Scan mode a `pack.labelle` may declare. Today only the scalar
 /// `copy_and_scan` shorthand exists — "scan every convention dir I own"
@@ -123,28 +128,58 @@ pub const PackConventionMode = enum {
     copy_and_scan,
 };
 
-/// Parsed and validated `pack.labelle`. `name` is a heap dupe owned by
-/// `allocator`; call `deinit` to release it.
+/// The public verb surface a pack exposes to packs that `depends_on` it
+/// (RFC §6). Both lists are names of `pub fn`s in the pack's
+/// `queries.zig` / `commands.zig`; both may be empty or omitted. These
+/// are advisory/self-documenting for now (they feed the §7 manifest and,
+/// later, the enforcement pass) — this ticket does not narrow imports by
+/// them.
+///
+/// NOTE: the RFC also describes a scalar `.exposes = .all` shorthand for
+/// the degenerate `contracts` pack. That form is NOT part of this typed
+/// schema yet: `contracts` is injected implicitly as a dependency (see
+/// `pack_validate.IMPLICIT_DEPS`) and exposes-narrowing is unenforced
+/// this ticket, so packs use the explicit `.{ .queries, .commands }` form
+/// for now. `.all` support lands with the enforcement work (#652).
+pub const PackExposes = struct {
+    queries: []const []const u8 = &.{},
+    commands: []const []const u8 = &.{},
+};
+
+/// Parsed and validated `pack.labelle`. Every string field (`name`, each
+/// `depends_on` entry, and each `exposes` list entry) is a heap dupe
+/// owned by `allocator`; call `deinit` to release them all.
 pub const PackManifest = struct {
     name: []const u8,
     manifest_version: u8,
     convention_dirs: PackConventionMode,
+    /// Public surface (RFC §6). `null` when the manifest omits `exposes`.
+    exposes: ?PackExposes = null,
+    /// Packs this one may query — the downward DAG edges (RFC §6).
+    /// `contracts` is implicit and need not be listed. Empty/absent =
+    /// legacy loose mode (sees the global registry). Feeds the
+    /// generate-time acyclic + unknown-dep checks.
+    depends_on: []const []const u8 = &.{},
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PackManifest) void {
         std.zon.parse.free(self.allocator, self.name);
+        // zon.parse.free walks optionals, slices and structs recursively,
+        // so these free the nested query/command/dep strings too.
+        std.zon.parse.free(self.allocator, self.exposes);
+        std.zon.parse.free(self.allocator, self.depends_on);
     }
 };
 
-// ZON-parseable shape for `pack.labelle`. `exposes` / `depends_on` are
-// deliberately absent from the typed shape and skipped via
-// `ignore_unknown_fields` — they don't affect the dir-scan this ticket
-// implements, and adding them now would bake in a schema before #440/#652
-// pin their form.
+// ZON-parseable shape for `pack.labelle`. `exposes` / `depends_on` mirror
+// the public `PackManifest` fields; `ignore_unknown_fields` stays on for
+// forward-compat with future optional fields.
 const ZonPackManifest = struct {
     name: []const u8,
     manifest_version: u8,
     convention_dirs: PackConventionMode = .copy_and_scan,
+    exposes: ?PackExposes = null,
+    depends_on: []const []const u8 = &.{},
 };
 
 /// Read and parse `pack.labelle` for the given plugin if it exists.
@@ -216,6 +251,8 @@ pub fn loadPackFromDir(
         .name = parsed.name,
         .manifest_version = parsed.manifest_version,
         .convention_dirs = parsed.convention_dirs,
+        .exposes = parsed.exposes,
+        .depends_on = parsed.depends_on,
         .allocator = allocator,
     };
 }
@@ -1016,18 +1053,19 @@ test "loadPackFromDir: convention_dirs defaults to copy_and_scan when omitted" {
     try testing.expectEqual(PackConventionMode.copy_and_scan, manifest.convention_dirs);
 }
 
-test "loadPackFromDir: ignores exposes/depends_on (deferred to #440/#652)" {
+test "loadPackFromDir: parses exposes/depends_on round-trip (#441)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The RFC §4 pack.labelle carries exposes/depends_on; this slice does
-    // not consume them yet, so they must be silently ignored, not rejected.
+    // RFC §4/§6: the pack.labelle carries the public surface (exposes) and
+    // the downward DAG edges (depends_on). #441 parses both into the typed
+    // PackManifest and hands them to the generate-time validation pass.
     try writePackManifestFile(tmp.dir,
         \\.{
         \\    .name = "citizens",
         \\    .manifest_version = 1,
         \\    .convention_dirs = .copy_and_scan,
-        \\    .exposes = .{ .queries = .{ "idleWorkers" }, .commands = .{ "spawnArrival" } },
+        \\    .exposes = .{ .queries = .{ "idleWorkers", "population" }, .commands = .{ "spawnArrival" } },
         \\    .depends_on = .{ "rooms", "pathfinder" },
         \\}
     );
@@ -1040,6 +1078,43 @@ test "loadPackFromDir: ignores exposes/depends_on (deferred to #440/#652)" {
 
     try testing.expectEqualStrings("citizens", manifest.name);
     try testing.expectEqual(PackConventionMode.copy_and_scan, manifest.convention_dirs);
+
+    // exposes round-trips as two name lists.
+    try testing.expect(manifest.exposes != null);
+    try testing.expectEqual(@as(usize, 2), manifest.exposes.?.queries.len);
+    try testing.expectEqualStrings("idleWorkers", manifest.exposes.?.queries[0]);
+    try testing.expectEqualStrings("population", manifest.exposes.?.queries[1]);
+    try testing.expectEqual(@as(usize, 1), manifest.exposes.?.commands.len);
+    try testing.expectEqualStrings("spawnArrival", manifest.exposes.?.commands[0]);
+
+    // depends_on round-trips as a name list.
+    try testing.expectEqual(@as(usize, 2), manifest.depends_on.len);
+    try testing.expectEqualStrings("rooms", manifest.depends_on[0]);
+    try testing.expectEqualStrings("pathfinder", manifest.depends_on[1]);
+}
+
+test "loadPackFromDir: exposes/depends_on absent → null/empty (#441)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Legacy loose mode: a pack that omits both fields still loads; exposes
+    // is null and depends_on is empty.
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .copy_and_scan,
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadPackFromDir(testing.allocator, tmp_path, "citizens")).?;
+    defer manifest.deinit();
+
+    try testing.expect(manifest.exposes == null);
+    try testing.expectEqual(@as(usize, 0), manifest.depends_on.len);
 }
 
 test "loadPackFromDir: errors on name mismatch" {
