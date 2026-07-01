@@ -183,7 +183,7 @@ pub fn loadPackFromDir(
     const parsed = std.zon.parse.fromSliceAlloc(ZonPackManifest, allocator, raw_z, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
-        std.debug.print(
+        std.log.warn(
             "labelle: failed to parse pack.labelle for pack '{s}' at {s}\n  parser error: {any}\n  see docs/RFC-packs.md for the pack manifest schema\n",
             .{ expected_name, manifest_path, err },
         );
@@ -192,7 +192,7 @@ pub fn loadPackFromDir(
     errdefer std.zon.parse.free(allocator, parsed);
 
     if (!std.mem.eql(u8, parsed.name, expected_name)) {
-        std.debug.print(
+        std.log.warn(
             "labelle: pack.labelle name mismatch\n  project.labelle declares '{s}'\n  but its pack.labelle has name = '{s}'\n  at {s}\n",
             .{ expected_name, parsed.name, manifest_path },
         );
@@ -200,7 +200,7 @@ pub fn loadPackFromDir(
     }
 
     if (parsed.manifest_version < 1 or parsed.manifest_version > SUPPORTED_MANIFEST_VERSION) {
-        std.debug.print(
+        std.log.warn(
             "labelle: pack '{s}' has manifest_version {d}\n  but this labelle-cli release supports manifest_version 1..{d}\n",
             .{ expected_name, parsed.manifest_version, SUPPORTED_MANIFEST_VERSION },
         );
