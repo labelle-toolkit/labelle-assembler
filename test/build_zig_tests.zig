@@ -252,6 +252,77 @@ pub const PR466_FINDING3_STAGE_HOOK = struct {
     }
 };
 
+// ── manifest-v2 sokol-ios GOLDEN cell (epic #453 item 3, PR 6, design §7) ──
+// iOS is the second HOOK-BEARING conversion. Like android (and unlike the desktop
+// byte anchor) this cannot be a 0-diff-vs-enum comparison: the residual (xcrun SDK
+// discovery, device/simulator target resolution, `configureSdkPaths`/
+// `addExeSdkPaths`) moved into the imported `backend.hook.zig` and the unrolled
+// core-diamond overrides became the generic `unifyCoreDiamond` loop, so the
+// generated text legitimately DIFFERS from the enum `header_ios`/`ios_deps`/
+// `backend_sokol_ios`/`ios_link` path. The gate is a committed golden (reviewed by
+// hand against the enum output for graph equivalence) PLUS the hook's own gates:
+// `backend.hook.zig` is compiled as a test target in build.zig (typechecking
+// `resolve_target`/`post_wire` against the real std.Build API) and unit-tests its
+// pure decision helpers (SDK-name select, device/simulator target select, required
+// SDK-path enforcement). The iOS `resolve_target` is DISTINCT from android's — it
+// also returns the SDK path plugin b.dependency calls consume (design §4).
+pub const MANIFEST_V2_IOS_GOLDEN = struct {
+    const golden = @embedFile("goldens/sokol_ios_v2.build.zig");
+
+    fn genIosV2() ![]const u8 {
+        return h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .sokol,
+            .platform = .ios,
+            .ecs = .mock,
+        }, .{});
+    }
+
+    test "golden: v2 sokol-ios build.zig matches the committed golden" {
+        const out = try genIosV2();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 sokol-ios build.zig is syntactically valid Zig" {
+        const out = try genIosV2();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 sokol-ios imports the backend hook and calls BOTH phases (§4)" {
+        const out = try genIosV2();
+        defer std.testing.allocator.free(out);
+        // resolve_target BEFORE any b.dependency — and it returns BOTH the ios
+        // target AND the SDK path (plugin b.dependency calls consume it, §4).
+        try std.testing.expect(std.mem.indexOf(u8, out, "@import(\"backend_build_hook.zig\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.resolve_target(b, .{ .platform = .ios })") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "const sdk_path = ios_resolved.ios_sdk_path.?;") != null);
+        // post_wire AFTER wiring, carrying the REQUIRED SDK path (android null).
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.post_wire(b, .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".ios_sdk_path = sdk_path,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".android_target_sdk = null,") != null);
+        // The generic core-diamond walk (loop form) replaced the unrolled overrides.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") != null);
+        // Declarative graph: artifact link + link_libc + the iOS frameworks
+        // (`.frameworks.ios`) — replaces the enum `linkIosFrameworks` helper call.
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkLibrary(sokol_clib)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.link_libc = true;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkFramework(\"Metal\", .{})") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkFramework(\"GameController\", .{})") != null);
+        // The enum-path inline xcrun SDK discovery + framework helper are GONE from
+        // the generated build.zig — they live in the hook now (the enum-vs-v2 boundary).
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn getIosSdkPath(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn linkIosFrameworks(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "configureSdkPaths(") == null);
+    }
+};
+
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
         const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{

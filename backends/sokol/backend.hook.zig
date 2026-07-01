@@ -8,24 +8,33 @@
 //! `@import("std")` (and `@import("builtin")` for the host tag) and take
 //! everything else through the hook context.
 //!
-//! ## PR 5 scope — android is the first HOOK-BEARING conversion
+//! ## PR 5/6 scope — android + ios are the HOOK-BEARING conversions
 //!
 //! DESKTOP has no residual: it is fully declarative and `.target = .native`
 //! resolves without a hook, so the assembler never invokes this hook on a
-//! desktop build. ANDROID (this PR) exercises BOTH hook phases:
+//! desktop build. ANDROID (PR 5) and IOS (PR 6) each exercise BOTH hook phases:
 //!
 //!   * `resolve_target` — runs BEFORE any `b.dependency` and produces the
-//!     android `ResolvedTarget` from `-Demulator`/`-Dandroid_arch` + host arch.
-//!     This reproduces the enum path's `header_android` target-resolution block
-//!     (`build_zig.txt:690`-`719`) exactly.
+//!     platform `ResolvedTarget`. Android: from `-Demulator`/`-Dandroid_arch` +
+//!     host arch, reproducing the enum path's `header_android` target-resolution
+//!     block (`build_zig.txt:690`-`719`). iOS: runs `xcrun` SDK-path discovery +
+//!     device/simulator selection from `-Ddevice` + host arch, reproducing the
+//!     enum path's `header_ios` build-fn head (`build_zig.txt:474`-`498`) — and
+//!     it ALSO returns the iOS SDK path, because plugin `b.dependency` calls
+//!     consume it (`build_files.zig:341`) and it therefore MUST be resolved
+//!     before ANY dependency (design §4 review-correction #6).
 //!   * `post_wire` — runs AFTER the generic module/artifact/system-lib wiring and
 //!     supplements the graph with the residual the manifest cannot express
-//!     statically (design §2 residual (a)): NDK sysroot detection + the
+//!     statically. Android (design §2 residual (a)): NDK sysroot detection + the
 //!     `addSystemIncludePath`/`addLibraryPath` calls that consume it + the
-//!     `libc.txt` generation. Reproduces `build_zig.txt:776`-`777`/`851`/
-//!     `859`-`868`.
+//!     `libc.txt` generation (reproduces `build_zig.txt:776`-`777`/`851`/
+//!     `859`-`868`). iOS (design §2 residual (b)): the `configureSdkPaths` /
+//!     `addExeSdkPaths` calls that consume the SDK path resolved in
+//!     `resolve_target` (reproduces `build_zig.txt:442`-`452`/`548`/`583`). The
+//!     iOS frameworks + `link_libc` are DECLARATIVE (`.frameworks.ios`), emitted
+//!     by the assembler, NOT here.
 //!
-//! ios/wasm are PR-6/7 stubs. The generated v2 build.zig `@import`s this file
+//! wasm is a PR-7 stub. The generated v2 build.zig `@import`s this file
 //! (as a sibling `backend_build_hook.zig`) and calls the two functions; that
 //! import is the design's "assembler imports the hook into the generated root
 //! package" (§3). Because the whole v2 route is gated-dark (opt-in via the
@@ -60,6 +69,11 @@ pub const HookError = error{
     /// `target_sdk_version` (design §4 review-correction #6). So this is a hard
     /// error, never a default.
     AndroidTargetSdkRequired,
+    /// `ctx.ios_sdk_path` was null on an iOS build. `resolve_target` resolves it
+    /// (via xcrun) BEFORE any dependency and the assembler threads it into the
+    /// `post_wire` context, so a null here is an assembler bug — a hard error,
+    /// never a silent skip that would leave the SDK include/lib paths unset.
+    IosSdkPathRequired,
 };
 
 // ── resolve_target (design §4) — runs BEFORE any b.dependency ──────────────
@@ -115,10 +129,77 @@ pub fn ndkArchTriple(arch: std.Target.Cpu.Arch) []const u8 {
     };
 }
 
+// ── iOS target/SDK resolution (design §4) — pure decision helpers ──────────
+
+/// PURE SDK-name selection (`build_zig.txt:476`): `-Ddevice` picks the device
+/// SDK (`iphoneos`), else the simulator SDK (`iphonesimulator`). The value is
+/// passed to `xcrun --sdk <name> --show-sdk-path`.
+pub fn iosSdkName(device_mode: bool) []const u8 {
+    return if (device_mode) "iphoneos" else "iphonesimulator";
+}
+
+/// A resolved iOS target QUERY — the pure decision output of `selectIosTarget`,
+/// turned into a `std.Target.Query` by `resolve_target`. Kept as data (not a live
+/// `ResolvedTarget`) so the device/simulator/host-arch branch is unit-testable
+/// without a `*std.Build`.
+pub const IosTargetSpec = struct {
+    cpu_arch: std.Target.Cpu.Arch,
+    /// `.simulator` for a simulator build; null for a physical device (which
+    /// takes the default iOS abi).
+    abi: ?std.Target.Abi,
+    /// Apple-Silicon simulator needs an explicit `apple_a14` cpu model
+    /// (`build_zig.txt:497`); device + Intel-simulator do not.
+    apple_a14: bool,
+};
+
+/// PURE iOS target selection (`build_zig.txt:481`-`498`). `-Ddevice` →
+/// `aarch64-ios`; simulator on an Intel host → `x86_64-ios-simulator`; simulator
+/// on an Apple-Silicon host → `aarch64-ios-simulator` + `apple_a14`. Names no
+/// backend, so it is the assembler-generic default (design §4).
+pub fn selectIosTarget(device_mode: bool, host_arch: std.Target.Cpu.Arch) IosTargetSpec {
+    if (device_mode) return .{ .cpu_arch = .aarch64, .abi = null, .apple_a14 = false };
+    if (host_arch == .x86_64) return .{ .cpu_arch = .x86_64, .abi = .simulator, .apple_a14 = false };
+    return .{ .cpu_arch = .aarch64, .abi = .simulator, .apple_a14 = true };
+}
+
+/// Get the iOS SDK path via `xcrun`. Copied verbatim from the enum path's
+/// `header_ios` (`build_zig.txt:426`-`439`) so the residual behaves identically.
+/// Runs BEFORE any `b.dependency` (its result feeds plugin dependency calls) and
+/// constructs no graph nodes. Returns null when Xcode/xcrun is unavailable so the
+/// caller can panic with a readable message.
+fn getIosSdkPath(b: *std.Build, sdk_name: []const u8) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = &.{ "xcrun", "--sdk", sdk_name, "--show-sdk-path" },
+    }) catch return null;
+    defer b.allocator.free(result.stdout);
+    defer b.allocator.free(result.stderr);
+    if (result.term == .Exited and result.term.Exited == 0) {
+        const path = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+        if (path.len == 0) return null;
+        return b.allocator.dupe(u8, path) catch null;
+    }
+    return null;
+}
+
 /// Produce the android `ResolvedTarget`. Reproduces `build_zig.txt:690`-`719`.
 /// Runs before any `b.dependency`, so it constructs no graph nodes.
 pub fn resolve_target(b: *std.Build, ctx: ResolveContext) ResolvedTargetInfo {
     switch (ctx.platform) {
+        .ios => {
+            // `xcrun` SDK discovery + device/simulator selection, BEFORE any
+            // b.dependency (the SDK path feeds plugin dependency calls — §4).
+            const device_mode = b.option(bool, "device", "Build for iOS device instead of simulator") orelse false;
+            const sdk_name = iosSdkName(device_mode);
+            const sdk_path = getIosSdkPath(b, sdk_name) orelse
+                @panic("Could not find iOS SDK. Is Xcode installed?");
+
+            const spec = selectIosTarget(device_mode, b.graph.host.result.cpu.arch);
+            var query: std.Target.Query = .{ .cpu_arch = spec.cpu_arch, .os_tag = .ios };
+            if (spec.abi) |abi| query.abi = abi;
+            if (spec.apple_a14) query.cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_a14 };
+            return .{ .target = b.resolveTargetQuery(query), .ios_sdk_path = sdk_path };
+        },
         .android => {
             const emulator_mode = b.option(bool, "emulator", "Build for Android emulator (x86_64 on Intel Mac, arm64 on Apple Silicon)") orelse false;
             const android_arch_opt = b.option([]const u8, "android_arch", "Android target arch (arm64|x86_64). Overrides -Demulator when set.");
@@ -132,9 +213,9 @@ pub fn resolve_target(b: *std.Build, ctx: ResolveContext) ResolvedTargetInfo {
                 .abi = .android,
             }) };
         },
-        // desktop=.native and wasm=.triple resolve without a hook; iOS lands in
-        // PR 6. resolve_target is never called for these in PR 5.
-        else => @panic("resolve_target: only android is implemented (PR 5)"),
+        // desktop=.native and wasm=.triple resolve their target without a hook,
+        // so resolve_target is never called for them.
+        else => @panic("resolve_target: only ios/android use resolved targets"),
     }
 }
 
@@ -160,6 +241,13 @@ pub const HookContext = struct {
 /// error path is unit-testable; `post_wire` turns it into a `@panic`.
 pub fn requireAndroidSdk(ctx: HookContext) HookError!u32 {
     return ctx.android_target_sdk orelse HookError.AndroidTargetSdkRequired;
+}
+
+/// REQUIRED iOS SDK-path accessor — the testable enforcement of "the SDK path
+/// resolved in `resolve_target` is threaded into `post_wire`". Returns an error on
+/// null so the error path is unit-testable; `post_wire` turns it into a `@panic`.
+pub fn requireIosSdk(ctx: HookContext) HookError![]const u8 {
+    return ctx.ios_sdk_path orelse HookError.IosSdkPathRequired;
 }
 
 /// PURE libc.txt body builder (`build_zig.txt:859`-`866`). Zig does not bundle
@@ -292,8 +380,27 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
             const android_libc = b.addWriteFiles();
             ctx.root_artifact.setLibCFile(android_libc.add("android-libc.txt", libc_content));
         },
-        // PR 6: configureSdkPaths / addExeSdkPaths consuming ctx.ios_sdk_path.
-        .ios => {},
+        .ios => {
+            // Consume the SDK path resolved in `resolve_target` (design §2
+            // residual (b)) — the iOS frameworks + `link_libc` are DECLARATIVE
+            // (`.frameworks.ios`), emitted by the assembler, NOT here. REQUIRED:
+            // a null is an assembler bug (resolve_target always resolves it), so
+            // this panics rather than silently skipping the SDK paths.
+            const sdk_path = requireIosSdk(ctx) catch
+                @panic("ios_sdk_path must be populated for iOS builds");
+
+            // C-header compilation on the backend's clib archive
+            // (`configureSdkPaths`, `build_zig.txt:442`-`445`/`548`).
+            const clib = ctx.backend_dep.artifact("sokol_clib");
+            clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/include" }) });
+            clib.root_module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
+            clib.root_module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/SubFrameworks" }) });
+
+            // Exe SDK library + framework search paths (`addExeSdkPaths`,
+            // `build_zig.txt:449`-`451`/`583`).
+            ctx.root_artifact.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib" }) });
+            ctx.root_artifact.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
+        },
         // PR 7: emccStep / emLinkStep on ctx.root_artifact (needs the emsdk root
         // dep declared via .platforms.wasm.root_build_deps).
         .wasm => {},
@@ -378,6 +485,57 @@ test "libcTxt: body points the compiler at the NDK sysroot (matches the enum blo
 
 test "HOOK_ABI_VERSION is 2 (matches manifest_v2)" {
     try testing.expectEqual(@as(u8, 2), HOOK_ABI_VERSION);
+}
+
+test "iosSdkName: -Ddevice picks iphoneos, else iphonesimulator" {
+    try testing.expectEqualStrings("iphoneos", iosSdkName(true));
+    try testing.expectEqualStrings("iphonesimulator", iosSdkName(false));
+}
+
+test "selectIosTarget: device is aarch64-ios (no simulator abi, no apple_a14)" {
+    // -Ddevice → aarch64-ios regardless of host arch.
+    const dev_on_intel = selectIosTarget(true, .x86_64);
+    try testing.expectEqual(std.Target.Cpu.Arch.aarch64, dev_on_intel.cpu_arch);
+    try testing.expectEqual(@as(?std.Target.Abi, null), dev_on_intel.abi);
+    try testing.expectEqual(false, dev_on_intel.apple_a14);
+
+    const dev_on_arm = selectIosTarget(true, .aarch64);
+    try testing.expectEqual(std.Target.Cpu.Arch.aarch64, dev_on_arm.cpu_arch);
+    try testing.expectEqual(@as(?std.Target.Abi, null), dev_on_arm.abi);
+    try testing.expectEqual(false, dev_on_arm.apple_a14);
+}
+
+test "selectIosTarget: simulator arch follows the host (Intel x86_64, Apple-Silicon aarch64+apple_a14)" {
+    // Intel host simulator → x86_64-ios-simulator, no apple_a14.
+    const sim_intel = selectIosTarget(false, .x86_64);
+    try testing.expectEqual(std.Target.Cpu.Arch.x86_64, sim_intel.cpu_arch);
+    try testing.expectEqual(@as(?std.Target.Abi, .simulator), sim_intel.abi);
+    try testing.expectEqual(false, sim_intel.apple_a14);
+
+    // Apple-Silicon host simulator → aarch64-ios-simulator + apple_a14.
+    const sim_arm = selectIosTarget(false, .aarch64);
+    try testing.expectEqual(std.Target.Cpu.Arch.aarch64, sim_arm.cpu_arch);
+    try testing.expectEqual(@as(?std.Target.Abi, .simulator), sim_arm.abi);
+    try testing.expectEqual(true, sim_arm.apple_a14);
+}
+
+test "requireIosSdk: present path is returned; null is a hard error (no silent skip)" {
+    const base: HookContext = .{
+        .manifest_version = HOOK_ABI_VERSION,
+        .backend_dep = undefined,
+        .root_module = undefined,
+        .root_artifact = undefined,
+        .target = undefined,
+        .optimize = .Debug,
+        .platform = .ios,
+        .ios_sdk_path = "/Xcode/iPhoneSimulator.sdk",
+        .android_target_sdk = null,
+    };
+    try testing.expectEqualStrings("/Xcode/iPhoneSimulator.sdk", try requireIosSdk(base));
+
+    var missing = base;
+    missing.ios_sdk_path = null;
+    try testing.expectError(HookError.IosSdkPathRequired, requireIosSdk(missing));
 }
 
 test "selectGreatestValidNdk: a stray dir doesn't shadow a valid older NDK (PR #466 Finding 2)" {
