@@ -21,6 +21,7 @@ const std = @import("std");
 const gen = @import("root.zig");
 const cache_cmd = @import("cache_cmd.zig");
 const init_cmd = @import("init_cmd.zig");
+const add_cmd = @import("add_cmd.zig");
 
 /// Wire protocol version for CLI ↔ assembler subprocess communication.
 /// Bump when the command surface or output format changes in a way the
@@ -34,7 +35,11 @@ const init_cmd = @import("init_cmd.zig");
 /// v3 (#217 phase 3): added the `init` subcommand. The CLI delegates
 /// new-project scaffolding to the binary instead of its in-process
 /// `cmdInit`.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// v4 (Packs #271): added the `add` subcommand (`add pack <name>` /
+/// `add feature <kind> <name>`). The CLI delegates pack/feature-unit
+/// scaffolding to the binary.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 const usage =
     \\labelle-assembler — code generator for the labelle game toolkit
@@ -47,6 +52,8 @@ const usage =
     \\  labelle-assembler clean [--dry-run] [--project-root <path>]
     \\  labelle-assembler upgrade --project-root <path> [pkg [version]]
     \\  labelle-assembler init <name> [dir] [options]
+    \\  labelle-assembler add pack <name>
+    \\  labelle-assembler add feature <kind> <name>
     \\
     \\Subcommands:
     \\  generate    Materialize .labelle/<target>/ from project.labelle
@@ -54,6 +61,7 @@ const usage =
     \\  clean       Prune unused cached package versions
     \\  upgrade     Bump version fields in project.labelle
     \\  init        Scaffold a new project directory
+    \\  add         Scaffold a pack or a feature-unit (need/role/status)
     \\
     \\Generate options:
     \\  --project-root <path>   Path to game project (containing project.labelle)
@@ -121,6 +129,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, first, "init")) {
         try init_cmd.cmdInit(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "add")) {
+        try add_cmd.cmdAdd(allocator, io, &args);
         return;
     }
 
@@ -287,4 +300,5 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
 test {
     std.testing.refAllDecls(@import("init_cmd.zig"));
     std.testing.refAllDecls(@import("cache_cmd.zig"));
+    std.testing.refAllDecls(@import("add_cmd.zig"));
 }
