@@ -428,6 +428,65 @@ pub const NULL_BACKEND = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "assertInput(@import(\"backend_input\"))") != null);
     }
 
+    test "external backend emits directional per-sub-surface contract-version asserts (#453 item 1)" {
+        // Contract versioning (labelle-assembler#453): on top of the shape check
+        // above, each sub-surface gets a `@hasDecl`-guarded DIRECTIONAL version
+        // assert comparing the backend's `targets_<surface>_contract` against
+        // labelle-core's `<SURFACE>_CONTRACT_VERSION`. Both a too-new (`>`,
+        // upgrade core) and a too-old (`<`, upgrade backend) branch are emitted,
+        // so ANY mismatch is a `@compileError` naming which side to bump. The
+        // `@hasDecl` guard is the no-flag-day property: a backend that hasn't
+        // adopted `targets_*` is untouched (guarded body isn't analyzed).
+        //
+        // NOTE: the negative direction (a MISMATCHED `targets_*` -> build fails)
+        // is a Sema-level `@compileError` that requires a full backend+core
+        // compile the assembler's string-golden test harness does not run. It is
+        // covered by inspection here: we assert BOTH the `>`/provides and the
+        // `<`/expects `@compileError` branches are present for every sub-surface,
+        // so the failing comparison provably exists in the generated source.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend_package = .{ .name = "nullfixture", .repo = "local:../nf" },
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // The four backend-sub-surface module bindings the version guards read.
+        // `backend_audio` is newly imported into this comptime block for #453.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _bc_gfx = @import(\"backend_gfx\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _bc_window = @import(\"backend_window\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _bc_input = @import(\"backend_input\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _bc_audio = @import(\"backend_audio\");") != null);
+
+        // Every sub-surface: the `@hasDecl` opt-in guard + BOTH directional
+        // `@compileError` comparisons (`>` provides / `<` expects) against the
+        // matching labelle-core `*_CONTRACT_VERSION` const.
+        const Case = struct { mod: []const u8, decl: []const u8, core: []const u8 };
+        const cases = [_]Case{
+            .{ .mod = "_bc_gfx", .decl = "targets_draw_contract", .core = "DRAW_CONTRACT_VERSION" },
+            .{ .mod = "_bc_gfx", .decl = "targets_loader_contract", .core = "LOADER_CONTRACT_VERSION" },
+            .{ .mod = "_bc_window", .decl = "targets_window_contract", .core = "WINDOW_CONTRACT_VERSION" },
+            .{ .mod = "_bc_input", .decl = "targets_input_contract", .core = "INPUT_CONTRACT_VERSION" },
+            .{ .mod = "_bc_audio", .decl = "targets_audio_playback_contract", .core = "AUDIO_PLAYBACK_CONTRACT_VERSION" },
+            .{ .mod = "_bc_audio", .decl = "targets_audio_loader_contract", .core = "AUDIO_LOADER_CONTRACT_VERSION" },
+        };
+        inline for (cases) |c| {
+            const guard = "@hasDecl(" ++ c.mod ++ ", \"" ++ c.decl ++ "\")";
+            const too_new = "if (" ++ c.mod ++ "." ++ c.decl ++ " > _backend_contract_core." ++ c.core ++ ")";
+            const too_old = "if (" ++ c.mod ++ "." ++ c.decl ++ " < _backend_contract_core." ++ c.core ++ ")";
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, guard) != null);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, too_new) != null);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, too_old) != null);
+        }
+
+        // Both @compileError message directions ("provides" = upgrade core,
+        // "expects" = upgrade backend) are present at least once.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "upgrade labelle-core") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "upgrade the backend") != null);
+        // Messages are built at comptime from the actual version numbers.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.fmt.comptimePrint(") != null);
+    }
+
     // NOTE: the companion "built-in backend emits NO contract guard" test was
     // removed in #386 Phase 6c. The guard is gated on `cfg.isExternal()`, and
     // post-flip EVERY built-in backend resolves to an external provider package,
