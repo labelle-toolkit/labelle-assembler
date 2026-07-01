@@ -107,6 +107,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run game-side tests");
     test_step.dependOn(&b.addRunArtifact(test_root).step);
 
+    test_root.root_module.linkLibrary(glfw);
+
+    switch (target.result.os.tag) {
+        .macos => {
+            test_root.root_module.linkFramework("Foundation", .{});
+            test_root.root_module.linkFramework("QuartzCore", .{});
+            test_root.root_module.linkFramework("Metal", .{});
+        },
+        else => {},
+    }
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

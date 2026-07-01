@@ -598,6 +598,13 @@ pub const MANIFEST_V2_WGPU_GOLDEN = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkFramework(\"Metal\", .{})") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkFramework(\"Foundation\", .{})") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkFramework(\"QuartzCore\", .{})") != null);
+        // The SAME native linkage is mirrored onto `test_root` so `zig build
+        // test` for a wgpu project links glfw + the macOS frameworks too (review
+        // #469). The enum path links only exe; the generic desktop path links both.
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkLibrary(glfw);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkFramework(\"Metal\", .{})") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkFramework(\"Foundation\", .{})") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkFramework(\"QuartzCore\", .{})") != null);
     }
 };
 

@@ -867,6 +867,18 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // `__tests_root.zig` reaches the same named modules.
         try emitPromotedScriptImports(w, "test_root", opts.promoted_scripts);
 
+        // manifest-v2 GENERIC desktop (PR 8): mirror the native linkage
+        // (artifact `linkLibrary` + per-OS framework/syslib switch) onto
+        // `test_root` too. `test_root` imports the backend modules, so a
+        // wgpu-backed project's `zig build test` links against symbols in
+        // `glfw` + the macOS Metal/Foundation/QuartzCore frameworks; the
+        // exe-only link above left the test binary unresolved (review #469
+        // coderabbit). The enum/sokol byte-anchor path links only the exe, so
+        // this is generic-desktop-only. null emits nothing (no artifact/fw).
+        if (desktopUsesGenericV2(v2_manifest, cfg)) {
+            try manifest_v2_splice.renderDesktopTestLinkGenericV2(v2_manifest.?, w);
+        }
+
         // Chain each in-project library's `test` step into the master
         // `test` step (issue #82). An `@libs/<lib>` plugin lives at
         // `libs/<lib>/` under the project root and ships its own
