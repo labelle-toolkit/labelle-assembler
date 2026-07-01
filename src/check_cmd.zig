@@ -17,6 +17,7 @@ const plugin_manifest = @import("plugin_manifest.zig");
 const scan = @import("codegen/scan.zig");
 const idents = @import("codegen/idents.zig");
 const check = @import("check.zig");
+const scene_name_lint = @import("scene_name_lint.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -105,7 +106,52 @@ pub fn runLint(arena: std.mem.Allocator, io: std.Io, root: []const u8) !LintResu
         };
         try check.scanPackDir(arena, io, &findings, pack.dir, ctx);
     }
+
+    // Game-root scene/prefab bare pack-component lint (#490). A game-root
+    // scene must reference a pack component by its namespaced key
+    // (`citizens__Worker`); a bare name (`Worker`) silently no-ops as an
+    // unknown component (RFC #596). Build the pack component set (bare →
+    // namespaced) from the shared owner map, and the game-owned name set
+    // from the game root's own `components/`, then walk `scenes/` +
+    // `prefabs/`.
+    try scanSceneNames(arena, io, root, shared, &findings);
+
     return .{ .findings = try findings.toOwnedSlice(arena), .pack_count = packs.len };
+}
+
+/// Lint the game root's `scenes/` and `prefabs/` for bare pack-component
+/// references (#490). See `scene_name_lint.zig`.
+fn scanSceneNames(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    shared: Shared,
+    findings: *std.ArrayList(check.Finding),
+) !void {
+    // Pack components: bare un-prefixed Pascal → namespaced registry key.
+    var pack_components: std.ArrayList(scene_name_lint.PackComponent) = .empty;
+    for (shared.components) |c| {
+        const namespaced = try std.fmt.allocPrint(arena, "{s}__{s}", .{ c.owner_prefix, c.pascal });
+        try pack_components.append(arena, .{ .bare = c.pascal, .namespaced = namespaced });
+    }
+    // No pack components → nothing a bare name could collide with.
+    if (pack_components.items.len == 0) return;
+
+    // Game-owned bare component names: the game root's own `components/*.zig`
+    // (registered under their bare Pascal name, so a bare reference to one is
+    // legitimate). Engine builtins never collide with a pack's un-prefixed
+    // name in practice, so they need no enumeration here.
+    var game_owned: std.ArrayList([]const u8) = .empty;
+    const own_stems = try collectStems(arena, io, root, "components");
+    for (own_stems) |stem| {
+        var pb: [128]u8 = undefined;
+        try game_owned.append(arena, try arena.dupe(u8, idents.pathToPascal(stem, &pb)));
+    }
+
+    inline for (.{ "scenes", "prefabs" }) |subdir| {
+        const dir = try std.fs.path.join(arena, &.{ root, subdir });
+        try scene_name_lint.scanScenesDir(arena, io, findings, dir, pack_components.items, game_owned.items);
+    }
 }
 
 // ── Discovery ────────────────────────────────────────────────────────────
@@ -435,6 +481,7 @@ test "runLint: a fixture violating all three rules is flagged" {
         .cross_pack_registry_access => saw_reg = true,
         .raw_global_facet_write => saw_facet = true,
         .event_direction_inversion => saw_evt = true,
+        .scene_bare_pack_component => {},
     };
     try testing.expect(saw_reg);
     try testing.expect(saw_facet);
@@ -474,4 +521,66 @@ test "runLint: a clean fixture passes" {
 
     try testing.expectEqual(@as(usize, 3), result.pack_count);
     try testing.expectEqual(@as(usize, 0), result.findings.len);
+}
+
+test "runLint: a game-root scene using a bare pack-component name is flagged (#490)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try scaffoldFixture(io, tmp.dir);
+
+    // Clean pack sources so the only finding is the scene one.
+    try writeFile(io, tmp.dir, "packs/production/scripts/00_work.zig",
+        \\pub fn work() void {}
+    );
+
+    // A game-root scene references citizens' `Worker` by its BARE name —
+    // the trap. citizens registers it only as `citizens__Worker`.
+    try writeFile(io, tmp.dir, "scenes/main.jsonc",
+        \\{ "components": { "Worker": { "hunger": 0 } } }
+    );
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const result = try runLint(arena, io, root);
+
+    try testing.expectEqual(@as(usize, 3), result.pack_count);
+    var saw_scene = false;
+    for (result.findings) |f| {
+        if (f.rule == .scene_bare_pack_component) {
+            saw_scene = true;
+            try testing.expect(std.mem.indexOf(u8, f.message, "citizens__Worker") != null);
+            try testing.expect(std.mem.endsWith(u8, f.file, "main.jsonc"));
+        }
+    }
+    try testing.expect(saw_scene);
+}
+
+test "runLint: a game-root scene using the namespaced key is silent (#490)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try scaffoldFixture(io, tmp.dir);
+
+    try writeFile(io, tmp.dir, "packs/production/scripts/00_work.zig",
+        \\pub fn work() void {}
+    );
+    // Correct namespaced key → no scene finding.
+    try writeFile(io, tmp.dir, "scenes/main.jsonc",
+        \\{ "components": { "citizens__Worker": { "hunger": 0 } } }
+    );
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const result = try runLint(arena, io, root);
+
+    for (result.findings) |f| {
+        try testing.expect(f.rule != .scene_bare_pack_component);
+    }
 }
