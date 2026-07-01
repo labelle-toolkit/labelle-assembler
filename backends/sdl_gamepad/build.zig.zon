@@ -10,8 +10,8 @@
         // own unified core onto this module so the event types unify across
         // the engine↔backend boundary. The contract landed in v1.15.0.
         .labelle_core = .{
-            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.15.0.tar.gz",
-            .hash = "labelle_core-1.15.0-OauRcIDMAwCys-pGbaVktdIZZk65hbXkrzzqd0Jk_XjY",
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.22.0.tar.gz",
+            .hash = "labelle_core-1.22.0-OauRcMkFBgCFj-reWQnyVqtZBYsfbSFQkHY971oQduWl",
         },
     },
     .paths = .{
