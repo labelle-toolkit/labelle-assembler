@@ -22,6 +22,7 @@ const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
 const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
+pub const pack_validate = @import("pack_validate.zig");
 const gui_resolve = @import("gui_resolve.zig");
 pub const app_icon = @import("app_icon.zig");
 
@@ -29,6 +30,7 @@ pub const app_icon = @import("app_icon.zig");
 // any compiled function path during `addTest` runs.
 test {
     _ = @import("plugin_manifest.zig");
+    _ = @import("pack_validate.zig");
     _ = @import("scene_manifest.zig");
     _ = @import("scene_manifest_test.zig");
     _ = @import("asset_validator.zig");
@@ -727,6 +729,59 @@ pub fn generate(
     defer allocator.free(target_name);
     const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
     defer allocator.free(target_dir);
+
+    // ── Pack manifest load + dependency-validation gate (Packs RFC §6, #441) ─
+    //
+    // Read every declared pack's `pack.labelle` ONCE here — BEFORE the target
+    // dir is created or any project folder / plugin script is copied below —
+    // then run the dependency gate: fail generation on a `depends_on` cycle or
+    // a `depends_on` naming an undeclared pack/plugin. Running this early means
+    // a bad graph rejects the build cheaply, without first mutating
+    // `.labelle/<target>` and leaving stale output (chatgpt-codex review, #441).
+    // The parsed manifests (with their owning PluginDep) stay alive for the
+    // whole function via the defer below and are REUSED by the pack-scan loop
+    // far down in `generate()` rather than re-read from disk. This is the
+    // "generate-time validation" gate only — the depends_on ENFORCEMENT
+    // (restricted per-pack module graph / `PackView` partition) is engine-side
+    // #652-remainder, and the one-facet-one-owner check is mooted by #440's
+    // `<pack>__` name prefix (registry names become pack-unique).
+    const PackEntry = struct {
+        plugin: config.PluginDep,
+        manifest: plugin_manifest.PackManifest,
+    };
+    var pack_entries: std.ArrayList(PackEntry) = .empty;
+    defer {
+        for (pack_entries.items) |*e| e.manifest.deinit();
+        pack_entries.deinit(allocator);
+    }
+    // Reserve one slot per declared plugin (upper bound — non-pack plugins are
+    // skipped) so the append below cannot fail. This closes the window where a
+    // parsed PackManifest is owned but not yet in `pack_entries`, so a mid-loop
+    // OutOfMemory would leak it past the cleanup defer (Gemini review, #441).
+    try pack_entries.ensureTotalCapacity(allocator, cfg.plugins.len);
+    for (cfg.plugins) |plugin| {
+        const pm = (try plugin_manifest.loadPackOptional(allocator, plugin, game_dir)) orelse continue;
+        pack_entries.appendAssumeCapacity(.{ .plugin = plugin, .manifest = pm });
+    }
+
+    {
+        var pack_deps: std.ArrayList(pack_validate.PackDep) = .empty;
+        defer pack_deps.deinit(allocator);
+        try pack_deps.ensureTotalCapacity(allocator, pack_entries.items.len);
+        for (pack_entries.items) |e| {
+            pack_deps.appendAssumeCapacity(.{ .name = e.manifest.name, .depends_on = e.manifest.depends_on });
+        }
+
+        // Legal depends_on targets = every plugin/pack declared in
+        // project.labelle (plus the implicit `contracts`, handled inside).
+        var declared_names: std.ArrayList([]const u8) = .empty;
+        defer declared_names.deinit(allocator);
+        try declared_names.ensureTotalCapacity(allocator, cfg.plugins.len);
+        for (cfg.plugins) |plugin| declared_names.appendAssumeCapacity(plugin.name);
+
+        try pack_validate.validate(allocator, pack_deps.items, declared_names.items);
+    }
+
     try cwd.createDirPath(io, target_dir);
 
     // Copy game folders into target dir and scan file stems in one pass.
@@ -1025,23 +1080,26 @@ pub fn generate(
     //   * the per-pack `global ++ own` registry partition / `PackView`
     //     (#652-remainder) — today everything lands in one flat registry.
     //   * `exposes` / `depends_on` DAG + isolation (#440 / §6).
+    //
+    // The pack manifests reused below were parsed ONCE near the top of
+    // `generate()` (`pack_entries`), where the dependency-validation gate also
+    // runs — a bad `depends_on` graph rejects the build before any target
+    // writes, rather than re-reading `pack.labelle` here.
     var pack_scans: std.ArrayList(main_zig.PackScan) = .empty;
     defer {
         for (pack_scans.items) |*p| p.deinit(allocator);
         pack_scans.deinit(allocator);
     }
-    try pack_scans.ensureTotalCapacity(allocator, cfg.plugins.len);
-    for (cfg.plugins) |plugin| {
-        var pm = (try plugin_manifest.loadPackOptional(allocator, plugin, game_dir)) orelse continue;
-        defer pm.deinit();
-
-        const pack_src_dir = try cache.resolvePlugin(allocator, plugin, game_dir);
+    try pack_scans.ensureTotalCapacity(allocator, pack_entries.items.len);
+    for (pack_entries.items) |e| {
+        // Reuse the manifest parsed above; only the source dir is resolved here.
+        const pack_src_dir = try cache.resolvePlugin(allocator, e.plugin, game_dir);
         defer allocator.free(pack_src_dir);
 
-        // ensureTotalCapacity above reserved cfg.plugins.len slots, so this
+        // ensureTotalCapacity above reserved pack_entries.len slots, so this
         // append cannot fail — no window where a scanned pack is owned but
         // outside the cleanup list's reach.
-        const scanned = try scanPack(allocator, pack_src_dir, target_dir, plugin.name);
+        const scanned = try scanPack(allocator, pack_src_dir, target_dir, e.plugin.name);
         pack_scans.appendAssumeCapacity(scanned);
     }
 
