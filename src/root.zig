@@ -748,7 +748,10 @@ fn rewritePackHookHandlers(
         };
         defer allocator.free(src);
 
-        const rewritten = try scan.rewritePackHookHandlerNames(allocator, src, event_names, prefix);
+        // `name` is the hook file stem (`overlay` / `combat/overlay`); the
+        // rewrite scopes the rename to that file's receiver container
+        // (`pathToPascal(name)`), so unrelated helpers are never touched.
+        const rewritten = try scan.rewritePackHookHandlerNames(allocator, src, event_names, prefix, name);
         defer allocator.free(rewritten);
 
         if (std.mem.eql(u8, rewritten, src)) continue;
@@ -1253,6 +1256,21 @@ pub fn generate(
         const scanned = try scanPack(allocator, pack_src_dir, target_dir, e.plugin.name);
         pack_scans.appendAssumeCapacity(scanned);
     }
+
+    // Injectivity gate (#440 / chatgpt-codex events L164): the `<pack>__<name>`
+    // scheme is not injective on its own — two distinct (pack, name) pairs can
+    // fold to the same emitted symbol (e.g. pack `a` + `b__hit` and pack `a__b`
+    // + `hit` both emit `a__b__hit`), which the sanitized-prefix gate above
+    // can't see. Validate the fully-qualified component/event/prefab names the
+    // block-writers will emit — over BOTH the game root and every pack — and
+    // fail before any main.zig is written.
+    try pack_validate.checkEmittedNameCollisions(
+        allocator,
+        component_names,
+        event_names,
+        prefab_names,
+        pack_scans.items,
+    );
 
     // ── Flow-node discovery (RFC-FLOW-VOCABULARY phase 2) ──────────────
     //
