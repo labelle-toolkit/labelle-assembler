@@ -270,12 +270,21 @@ pub const wasm_min_webgl_arg = "-sMIN_WEBGL_VERSION=2";
 pub const wasm_max_webgl_arg = "-sMAX_WEBGL_VERSION=2";
 pub const wasm_gl_get_proc_address_arg = "-sGL_ENABLE_GET_PROC_ADDRESS=1";
 
-/// Options for `emLinkStep`. Uses only `std.Build`/`std.builtin` types so the hook
-/// stays provider-free.
+/// Options for `emLinkStep` — the subset of emcc options the wasm residual sets.
+/// Uses only `std.Build`/`std.builtin` types so the hook stays provider-free.
 pub const EmLinkOptions = struct {
     optimize: std.builtin.OptimizeMode,
+    /// The Zig code compiled to a static lib that emcc links into the module.
+    /// `emLinkStep` walks its transitive compile-dependency set (element 0 IS
+    /// `lib_main`) so emcc also receives bgfx/bx/bimg AND any sibling archives
+    /// in the game's link graph — the GUI bridge (bgfx_imgui_bridge + cimgui_clib)
+    /// and plugin C libs — not just bgfx's own subtree.
     lib_main: *std.Build.Step.Compile,
+    /// The bgfx C++ archive (`backend_dep.artifact("bgfx")`, compiled for
+    /// wasm32-emscripten by the apotema/zbgfx fork). Retained for callers/context;
+    /// its subtree is already covered by walking `lib_main`'s graph.
     lib_backend: *std.Build.Step.Compile,
+    /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`.
     emsdk: *std.Build.Dependency,
 };
 
@@ -284,8 +293,10 @@ fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Bui
 }
 
 /// Reconstruction of the emcc link step using only `std.Build` + the emsdk
-/// dependency. Walks the bgfx artifact's transitive compile deps so emcc receives
-/// bgfx + bx + bimg. Returns the install step for the caller to wire in.
+/// dependency (mirrors raylib's hook). Builds the `emcc` shell-out that links
+/// `lib_main` + the `bgfx` archive into the `.html`/`.wasm`/`.js` module and
+/// installs them under `web/`. Returns the install step so the caller can wire it
+/// into `b.getInstallStep()` + the run step.
 pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.InstallDir {
     const emcc = std.Build.Step.Run.create(b, "emcc");
     emcc.addFileArg(emTool(b, options.emsdk, "emcc"));
@@ -308,8 +319,12 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     emcc.addArg(wasm_gl_get_proc_address_arg);
     emcc.addArg(wasm_allow_memory_growth_arg);
     emcc.addArg(wasm_stack_size_arg);
-    emcc.addArtifactArg(options.lib_main);
-    for (options.lib_backend.getCompileDependencies(false)) |dep| {
+    // EVERY static lib reachable from the game's link graph (element 0 IS lib_main
+    // itself): the game, bgfx/bx/bimg, AND any GUI bridge (bgfx_imgui_bridge +
+    // its cimgui_clib) or plugin C libs the game links. Walking lib_backend would
+    // catch only bgfx's subtree and leave siblings (e.g. the imgui bridge)
+    // undefined at link. Mirrors the sokol backend's emLinkStep.
+    for (options.lib_main.getCompileDependencies(false)) |dep| {
         if (dep.kind == .lib) emcc.addArtifactArg(dep);
     }
     emcc.addArg("-o");
@@ -362,8 +377,11 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
             // The Emscripten emcc link step + install/run wiring. emsdk is resolved
             // via `b.dependency` — declared as a root build dep by the manifest's
             // `.root_build_deps`. The declarative `linkLibrary(bgfx)` is emitted by
-            // the assembler BEFORE this call; `emLinkStep` walks the bgfx artifact's
-            // transitive libs (bgfx+bx+bimg) and hands them all to emcc.
+            // the assembler BEFORE this call, so the bgfx archive (compiled for
+            // wasm32-emscripten by the apotema/zbgfx fork) is reachable via the
+            // backend dep. `emLinkStep` walks the GAME's transitive libs
+            // (lib_main + bgfx+bx+bimg + any GUI bridge / plugin C archives) and
+            // hands them all to emcc.
             const emsdk = b.dependency("emsdk", .{});
             const bgfx_artifact = ctx.backend_dep.artifact("bgfx");
             const install = emLinkStep(b, .{
