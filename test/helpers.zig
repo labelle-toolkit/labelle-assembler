@@ -378,3 +378,21 @@ pub fn genSokolBuildZig(
     opts.project_dir = ".";
     return generate.generateBuildZig(allocator, cfg, opts);
 }
+
+/// Generate a build.zig against the retained sokol fixture's SCHEMA-v2 manifest
+/// (`backend.manifest.v2.zon`) — the manifest-v2 desktop codegen path (epic #453
+/// item 3, PR 3). Identical wiring to `genSokolBuildZig` but points codegen at the
+/// v2 manifest via `backend_manifest_name`, so the byte-anchor test (§7) can drive
+/// the v2 path WITHOUT touching the v1 `backend.manifest.zon` other tests use.
+pub fn genSokolBuildZigV2(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend_package = sokol_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}

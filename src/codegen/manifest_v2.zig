@@ -21,6 +21,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const splice = @import("manifest_splice.zig");
+const backend_registry = @import("../backend_registry.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -386,6 +387,33 @@ pub fn parseManifest(allocator: std.mem.Allocator, raw_z: [:0]const u8) !ParsedM
         .ignore_unknown_fields = true,
     }) catch return error.BackendManifestParseError;
     return .{ .v2 = m };
+}
+
+/// Load + header-first parse a NAMED manifest file from the resolved backend
+/// package (design §6 step 1 dispatch). `filename` is relative to the backend
+/// package root — `"backend.manifest.zon"` for the production v1 file, or a v2
+/// fixture like `"backend.manifest.v2.zon"` for the byte-anchor test. Routed
+/// through `backend_registry.resolveBackendPackage` exactly as the v1
+/// `manifest_splice.loadManifest` locates the package. Caller frees via
+/// `ParsedManifest.free`.
+pub fn loadNamedManifest(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    project_dir: []const u8,
+    filename: []const u8,
+) !ParsedManifest {
+    const pkg_dir = try backend_registry.resolveBackendPackage(allocator, cfg, project_dir);
+    defer allocator.free(pkg_dir);
+
+    const manifest_path = try std.fs.path.join(allocator, &.{ pkg_dir, filename });
+    defer allocator.free(manifest_path);
+
+    const raw = try std.Io.Dir.cwd().readFileAlloc(config.globalIo(), manifest_path, allocator, .limited(64 * 1024));
+    defer allocator.free(raw);
+    const raw_z = try allocator.dupeZ(u8, raw);
+    defer allocator.free(raw_z);
+
+    return parseManifest(allocator, raw_z);
 }
 
 // ============================================================================

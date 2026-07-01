@@ -30,6 +30,44 @@ test {
     zspec.runAll(@This());
 }
 
+// ── manifest-v2 desktop byte anchor (epic #453 item 3, PR 3, design §7) ──
+// The critical proof-of-concept: the v2 desktop codegen path
+// (`backend.manifest.v2.zon` → `manifest_v2_splice`) must generate a build.zig
+// BYTE-IDENTICAL to the enum/v1-splice path for sokol-desktop. sokol-desktop is
+// the one cell where the v1 splice already ships byte-identical to the enum path,
+// so a 0-diff here proves the v2 machinery reproduces the established baseline.
+// Varies the exact cfg inputs the declarative `dep_options` ValueSource predicates
+// branch on (gamepad auto/off, hidapi on/off), each of which must stay 0-diff.
+pub const MANIFEST_V2_DESKTOP_ANCHOR = struct {
+    fn expectV2MatchesEnum(cfg: generate.ProjectConfig) !void {
+        const enum_baseline = try h.genSokolBuildZig(std.testing.allocator, cfg, .{});
+        defer std.testing.allocator.free(enum_baseline);
+        const v2_out = try h.genSokolBuildZigV2(std.testing.allocator, cfg, .{});
+        defer std.testing.allocator.free(v2_out);
+        // Byte anchor: 0 diff. `expectEqualStrings` prints the first divergence,
+        // so a regression in the v2 model surfaces as a readable line delta.
+        try std.testing.expectEqualStrings(enum_baseline, v2_out);
+    }
+
+    test "byte anchor: v2 desktop == enum/v1, default cfg (gamepad auto, no gui)" {
+        try expectV2MatchesEnum(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock });
+    }
+
+    test "byte anchor: v2 desktop == enum/v1, gamepad off" {
+        try expectV2MatchesEnum(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock, .gamepad = .none });
+    }
+
+    test "byte anchor: v2 desktop == enum/v1, gamepad hidapi on" {
+        try expectV2MatchesEnum(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock, .gamepad_hidapi = true });
+    }
+
+    test "byte anchor: v2 desktop == enum/v1, with plugins + zig_ecs (shared regions unaffected)" {
+        // The backend-dep + link regions are the only v2-touched cells; wiring
+        // plugins/ecs exercises that everything AROUND them stays identical too.
+        try expectV2MatchesEnum(.{ .name = "anchor-game", .backend = .sokol, .ecs = .zig_ecs });
+    }
+};
+
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
         const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{

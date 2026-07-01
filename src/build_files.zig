@@ -6,6 +6,8 @@ const cache = @import("cache.zig");
 const backend_registry = @import("backend_registry.zig");
 const scan = @import("codegen/scan.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
+const manifest_v2 = @import("codegen/manifest_v2.zig");
+const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
 pub const deps_linker = @import("deps_linker.zig");
 
 const ProjectConfig = config.ProjectConfig;
@@ -153,6 +155,18 @@ pub const BuildZigOptions = struct {
     /// enum path. Only consulted when `manifest_splice.manifestPathEnabled`
     /// returns true (desktop target + a backend that ships a manifest).
     project_dir: ?[]const u8 = null,
+    /// Which backend manifest file to load, relative to the resolved backend
+    /// package root (manifest-v2, epic #453 item 3, PR 3). Null (default) keeps
+    /// the PRODUCTION path 100% unchanged: `manifest_splice.loadManifest` reads
+    /// `backend.manifest.zon` (v1) and the enum/v1 splice runs byte-for-byte as
+    /// before. When set, the named manifest is header-first parsed
+    /// (`manifest_v2.parseManifest`) and dispatched: a v1/field-less manifest
+    /// still routes to the v1 splice; a `manifest_version >= 2` manifest routes to
+    /// the v2 desktop codegen (`manifest_v2_splice`). The byte-anchor test (§7)
+    /// sets this to `"backend.manifest.v2.zon"` to drive the v2 path against the
+    /// retained sokol fixture WITHOUT touching the v1 `backend.manifest.zon` other
+    /// tests depend on.
+    backend_manifest_name: ?[]const u8 = null,
 };
 
 /// True when an EXTERNAL backend may safely fall through to the enum
@@ -267,12 +281,33 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         manifest_splice.manifestPathEnabled(allocator, cfg, opts.project_dir.?);
     var splice_manifest: ?manifest_splice.BackendManifest = null;
     defer if (splice_manifest) |m| manifest_splice.freeManifest(allocator, m);
+    // manifest-v2 (epic #453 item 3, PR 3): only set when a `manifest_version >= 2`
+    // manifest is loaded via the opt-in `backend_manifest_name`. Null in production.
+    var v2_manifest: ?manifest_v2.BackendManifestV2 = null;
+    defer if (v2_manifest) |m| std.zon.parse.free(allocator, m);
     if (use_manifest) {
-        splice_manifest = try manifest_splice.loadManifest(allocator, cfg, opts.project_dir.?);
+        if (opts.backend_manifest_name) |name| {
+            // Header-first parse + dispatch (design §6): a v1/field-less manifest
+            // still routes to the v1 splice below; a v2 manifest routes to the v2
+            // desktop codegen. `>` SUPPORTED is rejected by `parseManifest`.
+            const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, opts.project_dir.?, name);
+            switch (parsed) {
+                .v1 => |m| splice_manifest = m,
+                .v2 => |m| v2_manifest = m,
+            }
+        } else {
+            // PRODUCTION path — unchanged: read `backend.manifest.zon` (v1) directly.
+            splice_manifest = try manifest_splice.loadManifest(allocator, cfg, opts.project_dir.?);
+        }
     }
 
     // Backend dep — always the standard backend (never a merged GUI+backend package)
-    if (splice_manifest) |m| {
+    if (v2_manifest) |m| {
+        // manifest-v2 desktop codegen (design §3/§5/§7): render the b.dependency
+        // literal + modules + artifact from typed manifest data. Desktop-only in
+        // PR 3 (the gate is desktop-only). Byte-anchored against the v1/enum path.
+        try manifest_v2_splice.renderBackendDepSectionV2(allocator, m, cfg, w);
+    } else if (splice_manifest) |m| {
         // Splice: resolve the backend-dep build fragment from the manifest,
         // no `=> .<tag>` branch. Desktop-only (the gate guarantees it).
         try manifest_splice.renderBackendDepSection(allocator, m, cfg, opts.project_dir.?, w);
@@ -606,7 +641,11 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
 
             // Link backend artifact
-            if (splice_manifest) |m| {
+            if (v2_manifest) |m| {
+                // manifest-v2 desktop codegen: linkLibrary from manifest artifacts
+                // + the per-OS framework wiring. Byte-anchored against v1/enum.
+                try manifest_v2_splice.renderLinkSectionV2(allocator, m, cfg, w);
+            } else if (splice_manifest) |m| {
                 // Splice: resolve the link build fragment from the manifest,
                 // no `=> .<tag>` branch.
                 try manifest_splice.renderLinkSection(allocator, m, cfg, opts.project_dir.?, w);
