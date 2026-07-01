@@ -597,3 +597,60 @@ pub fn genBgfxV2BuildZig(
 // build.zig.zon generators (the zon path must not swallow the error with
 // `catch null` and silently fall back to enum output).
 pub const sokol_v2broken_fixture_package = generate.PluginDep{ .name = "sokol_v2broken", .repo = "local:backends/sokol_v2broken" };
+
+// A V1-ONLY backend fixture: `backends/sokol_v1only` ships ONLY the legacy
+// `backend.manifest.zon` (+ its desktop build fragments) — NO
+// `backend.manifest.v2.zon` sibling. The mirror of `sokol_v2only`. Used to prove
+// the manifest-v2 PRODUCTION CUTOVER (#453/#472 P2) is a no-op for a v1 backend:
+// the real `generate` entry probe finds no v2 manifest, so it stays on the v1/enum
+// splice path — the generated build.zig must NOT carry the v2 generic markers.
+pub const sokol_v1only_fixture_package = generate.PluginDep{ .name = "sokol_v1only", .repo = "local:backends/sokol_v1only" };
+
+// A V1-CONTENT-UNDER-V2-FILENAME backend fixture: `backends/sokol_v1inv2` ships
+// ONLY `backend.manifest.v2.zon` (NO canonical `backend.manifest.zon` sibling),
+// but that file's CONTENT is v1 — no `manifest_version` field, so `parseManifest`
+// defaults it to 1 and returns the `.v1` union tag. `detectV2ManifestName` keys
+// off file existence, so `generate` threads `backend.manifest.v2.zon` as the
+// detected name. Used to prove the #473 Major edge case: the loop_style + template
+// seams must resolve from THIS detected-but-v1 file (`loop_style = .loop`,
+// `main_loop_template = templates/desktop.txt`), NOT retry the canonical (null)
+// name — which would probe the absent `backend.manifest.zon` and silently drop
+// the backend into enum behavior.
+pub const sokol_v1inv2_fixture_package = generate.PluginDep{ .name = "sokol_v1inv2", .repo = "local:backends/sokol_v1inv2" };
+
+/// Drive the REAL `generate` entry point (the production codepath — NOT the
+/// `generateBuildZig` unit helper, which takes `backend_manifest_name` explicitly)
+/// against an in-tree backend fixture, and return the generated `build.zig` read
+/// back from disk. This is the proof for the manifest-v2 PRODUCTION CUTOVER
+/// (#453 / #472 P2): `generate` itself must AUTO-DETECT a `backend.manifest.v2.zon`
+/// in the resolved backend package and drive the v2 codegen WITHOUT any caller
+/// passing `backend_manifest_name` — `GenerateOptions` has no such field, so the
+/// only way a v2 build.zig can come out is `generate`'s own probe.
+///
+/// `is_tests_target = true` trims main.zig (so the test needs no cached engine
+/// template) while still emitting the FULL backend-dep/link build.zig — the exact
+/// sections the v2 cutover routes. `game_dir` is the repo root (".") so the
+/// fixture's `local:backends/<name>` repo resolves offline, exactly as the other
+/// v2 helpers do; the output lands in a throwaway tmp dir.
+pub fn generateAndReadBuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    backend_package: generate.PluginDep,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend_package = backend_package;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(out_abs);
+
+    try generate.generate(allocator, cfg, out_abs, ".", .{ .is_tests_target = true });
+
+    // generate writes to `<output_dir>/<backendName>_<platform>/build.zig`.
+    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ cfg.backendName(), @tagName(cfg.platform) });
+    defer allocator.free(target_name);
+    const build_zig_rel = try std.fs.path.join(allocator, &.{ target_name, "build.zig" });
+    defer allocator.free(build_zig_rel);
+    return tmp.dir.readFileAlloc(std.testing.io, build_zig_rel, allocator, .limited(1 << 20));
+}

@@ -701,6 +701,284 @@ pub const MANIFEST_V2_THIRD_PARTY_OPEN_CONFIG = struct {
     }
 };
 
+// ── manifest-v2 PRODUCTION CUTOVER via the real `generate` (#453, closes #472 P2) ──
+// The prior tests all drive the `generateBuildZig` UNIT helper, which takes
+// `backend_manifest_name` EXPLICITLY — so they prove the v2 CODEGEN works when the
+// caller opts in, but NOT that the production `generate` entry point auto-detects a
+// v2 manifest on its own. This struct closes that gap: it drives the REAL `generate`
+// (via `h.generateAndReadBuildZig`, which passes NO `backend_manifest_name` — that
+// field doesn't exist on `GenerateOptions`) and asserts `generate` probed the
+// resolved backend package, found `backend.manifest.v2.zon`, and drove the v2 path.
+pub const MANIFEST_V2_GENERATE_CUTOVER = struct {
+    test "generate AUTO-DETECTS a v2 backend and emits v2 build.zig (no caller opt-in)" {
+        // acme_foo ships ONLY `backend.manifest.v2.zon` and has NO enum tag. Before
+        // the cutover, `generate` passed a null manifest name → `requireManifestIf-
+        // External` probed the absent legacy `backend.manifest.zon` and hard-errored
+        // `ExternalBackendNeedsManifest`, never reaching v2 codegen. After the
+        // cutover, `generate`'s probe finds the v2 manifest, threads its name through
+        // every site, and emits the generic v2 desktop build.zig.
+        const cfg = generate.ProjectConfig{ .name = "cutover-game", .ecs = .mock };
+        const out = try h.generateAndReadBuildZig(std.testing.allocator, cfg, h.acme_foo_fixture_package);
+        defer std.testing.allocator.free(out);
+
+        // v2 output, generated from the manifest data — NOT the enum raylib default.
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"acme_foo\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"labelle_raylib\"") == null);
+        // The v2 generic (loop-form) core-diamond walk — the unambiguous v2 marker.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") != null);
+        // Sanity: the auto-detected v2 build.zig is syntactically valid Zig.
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "generate on a v1-only backend stays on the v1/enum path (no regression, no v2 markers)" {
+        // sokol_v1only ships ONLY the legacy `backend.manifest.zon` (no v2 sibling),
+        // so `generate`'s v2 probe returns null and generation stays on the v1 splice
+        // path — the generic v2 markers must be ABSENT. Proves the cutover is inert
+        // for a backend that ships no v2 manifest.
+        const cfg = generate.ProjectConfig{ .name = "v1-game", .backend = .sokol, .ecs = .mock };
+        const out = try h.generateAndReadBuildZig(std.testing.allocator, cfg, h.sokol_v1only_fixture_package);
+        defer std.testing.allocator.free(out);
+
+        // v1 sokol splice output — the unrolled core-diamond residual, NOT the
+        // generic loop-form v2 walk.
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyGfxSubpackageCore(gfx_mod, core_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") == null);
+        // No hook import — the v1 path never stages a backend build hook.
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook") == null);
+    }
+
+    test "PRODUCTION NO-OP: a dual-manifest backend's auto-detected v2 output == the v1/enum baseline" {
+        // sokol ships BOTH v1 and v2 manifests; its v2 desktop cell is the byte
+        // anchor (§7), so `generate` auto-detecting v2 must be BYTE-IDENTICAL to the
+        // v1/enum splice. This is the production-no-op guarantee: even where a v2
+        // manifest IS present, the emitted build.zig does not change.
+        const cfg = generate.ProjectConfig{ .name = "noop-game", .backend = .sokol, .ecs = .mock };
+        const v2_auto = try h.generateAndReadBuildZig(std.testing.allocator, cfg, h.sokol_fixture_package);
+        defer std.testing.allocator.free(v2_auto);
+        // The v1/enum baseline for the SAME desktop build (the unit helper, v1 path).
+        const v1_baseline = try h.genSokolBuildZig(std.testing.allocator, cfg, .{ .is_tests_target = true });
+        defer std.testing.allocator.free(v1_baseline);
+        try std.testing.expectEqualStrings(v1_baseline, v2_auto);
+    }
+
+    test "generate CATCHES a capability mismatch on the auto-detected v2 manifest (#473 finding 2)" {
+        // acme_foo advertises ONLY `.headless` in its v2 manifest and ships NO
+        // legacy `backend.manifest.zon`. Before the finding-2 fix the resolve-time
+        // `validateProviderContracts` read only the (absent) v1 provider manifest,
+        // so the v2 `.capabilities` were ignored. A project requiring a capability
+        // the v2 backend does NOT declare must now fail the REAL `generate` with the
+        // readable project-level `error.UnsupportedCapability`.
+        const cfg = generate.ProjectConfig{
+            .name = "cutover-cap-game",
+            .ecs = .mock,
+            .requires = &.{.screenshots},
+        };
+        try std.testing.expectError(
+            error.UnsupportedCapability,
+            h.generateAndReadBuildZig(std.testing.allocator, cfg, h.acme_foo_fixture_package),
+        );
+    }
+};
+
+// ── manifest-v2 cutover: `loadBackendTemplate` + `validateProviderContracts`
+// honor the auto-detected `backend_manifest_name` (#473 findings 1 + 2). These
+// drive the two internal seams `generate` threads the detected v2 name into
+// DIRECTLY, proving each honors a v2 manifest without needing the full main.zig
+// generation (which would require a cached engine template). `game_dir = "."`
+// (repo root) so the `local:backends/<name>` fixtures resolve offline.
+pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
+    // ── Finding 1: main-template loading resolves the v2 `.platforms[<p>].entry` ──
+
+    test "loadBackendTemplate: a v2-only backend resolves its template from the v2 entry" {
+        // sokol_v2only ships ONLY `backend.manifest.v2.zon` (no legacy manifest) +
+        // its `templates/desktop.txt`. With the detected v2 name, loadBackendTemplate
+        // must route to `.platforms.desktop.entry` and read that template — NOT fail
+        // for lack of a legacy manifest / enum-path template.
+        const cfg = generate.ProjectConfig{
+            .name = "tmpl-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v2only_fixture_package,
+        };
+        const tmpl = try generate.loadBackendTemplate(std.testing.allocator, ".", cfg, "backend.manifest.v2.zon");
+        defer std.testing.allocator.free(tmpl);
+        // The desktop lifecycle template was found + read (non-empty content).
+        try std.testing.expect(tmpl.len > 0);
+    }
+
+    test "loadBackendTemplate: the SAME v2-only backend errors WITHOUT the detected name (proves the v2 path is load-bearing)" {
+        // The distinguishing proof for finding 1: a v2-only external backend passed a
+        // null manifest name falls to the legacy requirement, which probes the absent
+        // `backend.manifest.zon` and hard-errors `ExternalBackendNeedsManifest`. Only
+        // threading the detected v2 name makes template loading succeed (test above).
+        const cfg = generate.ProjectConfig{
+            .name = "tmpl-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v2only_fixture_package,
+        };
+        try std.testing.expectError(
+            error.ExternalBackendNeedsManifest,
+            generate.loadBackendTemplate(std.testing.allocator, ".", cfg, null),
+        );
+    }
+
+    // ── Finding 2: provider-contract validation reads the v2 `.id`/`.capabilities` ──
+
+    test "validateProviderContracts: reads the v2 capabilities — a missing requirement errors" {
+        // acme_foo's v2 manifest declares ONLY `.headless`. Requiring `.screenshots`
+        // must fail via the v2 `.capabilities` (acme_foo ships no legacy manifest, so
+        // the check keys off the v2 name it is passed).
+        const cfg = generate.ProjectConfig{
+            .name = "contract-game",
+            .ecs = .mock,
+            .requires = &.{.screenshots},
+            .backend_package = h.acme_foo_fixture_package,
+        };
+        try std.testing.expectError(
+            error.UnsupportedCapability,
+            generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon"),
+        );
+    }
+
+    test "validateProviderContracts: a satisfied v2 requirement (the declared .headless) passes" {
+        // The complement — requiring exactly what the v2 manifest declares proves the
+        // gate fires on the MISSING capability, not on enforcement being on at all.
+        const cfg = generate.ProjectConfig{
+            .name = "contract-game",
+            .ecs = .mock,
+            .requires = &.{.headless},
+            .backend_package = h.acme_foo_fixture_package,
+        };
+        try generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon");
+    }
+
+    test "validateProviderContracts: WITHOUT the detected v2 name the v2 capabilities are NOT enforced (proves the name is load-bearing)" {
+        // The distinguishing proof for finding 2: passing null (the pre-fix behavior)
+        // reads the absent legacy provider manifest → an empty declared set → the
+        // back-compat gate leaves enforcement OFF, so the SAME `.screenshots`
+        // requirement does NOT error. Only threading the detected v2 name enforces the
+        // v2 `.capabilities` (test above).
+        const cfg = generate.ProjectConfig{
+            .name = "contract-game",
+            .ecs = .mock,
+            .requires = &.{.screenshots},
+            .backend_package = h.acme_foo_fixture_package,
+        };
+        try generate.validateProviderContracts(std.testing.allocator, cfg, ".", null);
+    }
+
+    // ── Major (#473): the legacy loop_style path must run for a v1-by-name file ──
+
+    test "resolveLoopStyleOverride: a named manifest that parses as v1 STILL resolves its legacy loop_style (#473 Major)" {
+        // The Major: when `backend_manifest_name` is non-null but the named file
+        // parses as v1 (union tag `.v1`), the v2 arm no-ops. Before the fix the
+        // legacy loop_style path was chained with `else if (name == null)` and was
+        // therefore SKIPPED whenever a name was present — silently leaving
+        // `loop_style_override` null and dropping the v1 backend's loop_style.
+        // sokol_v1only ships a v1 `backend.manifest.zon` (`loop_style = .callback`);
+        // passing its name here exercises the EXACT `.v1`-from-named-file condition
+        // (production detects `backend.manifest.v2.zon`, but the load returns the
+        // SAME `.v1` union tag, so this reproduces the code path faithfully). The
+        // legacy pass must still run and resolve `.callback` — NOT null.
+        const cfg = generate.ProjectConfig{
+            .name = "loop-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v1only_fixture_package,
+        };
+        const override = try generate.resolveLoopStyleOverride(std.testing.allocator, cfg, ".", "backend.manifest.zon");
+        try std.testing.expect(override != null); // NOT left unset (the bug)
+        try std.testing.expect(override.? == .callback); // resolved from the v1 manifest
+    }
+
+    test "resolveLoopStyleOverride: a v2-only backend resolves loop_style from its per-platform matrix (not the absent legacy manifest)" {
+        // Distinguishing complement: sokol_v2only ships NO legacy
+        // `backend.manifest.zon`, so had the code fallen to the legacy pass here
+        // (`manifestPathEnabled` → absent file) the override would be null. Getting
+        // a concrete `.callback` proves the `.v2` arm resolved it from the
+        // per-platform matrix and `v2_resolved` correctly suppressed the legacy pass.
+        const cfg = generate.ProjectConfig{
+            .name = "loop-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v2only_fixture_package,
+        };
+        const override = try generate.resolveLoopStyleOverride(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon");
+        try std.testing.expect(override != null);
+        try std.testing.expect(override.? == .callback); // sokol desktop entry = .callback
+    }
+
+    // ── Major (#473) edge case: a v2-NAMED file whose CONTENT is v1, with NO
+    // canonical `backend.manifest.zon` sibling. `detectV2ManifestName` finds the
+    // v2 filename (existence-based), the load returns the `.v1` union tag, and the
+    // seams must resolve loop_style + template from THAT file — not retry the
+    // canonical (null) name (an absent file → dropped override / enum fall-through).
+
+    test "resolveLoopStyleOverride: a v2-NAMED-but-v1-CONTENT backend (no canonical sibling) resolves loop_style from THAT file (#473 Major)" {
+        // sokol_v1inv2 ships ONLY `backend.manifest.v2.zon` whose content is v1
+        // (`loop_style = .loop`, no `manifest_version`). Passing the DETECTED v2
+        // name reproduces production (`detectV2ManifestName` returns it): the load
+        // returns `.v1`, and the fix resolves loop_style straight from the parsed
+        // v1 manifest. Before the fix the legacy pass retried with the canonical
+        // (null) name, `manifestPathEnabled` probed the absent `backend.manifest.zon`
+        // → false → override left null (the bug). `.loop` (NOT sokol's `.callback`)
+        // proves it came from THIS file, not a stray canonical fallback.
+        const cfg = generate.ProjectConfig{
+            .name = "loop-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v1inv2_fixture_package,
+        };
+        const override = try generate.resolveLoopStyleOverride(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon");
+        try std.testing.expect(override != null); // NOT dropped to null (the bug)
+        try std.testing.expect(override.? == .loop); // resolved from the v1-content v2-named file
+    }
+
+    test "loadBackendTemplate: a v2-NAMED-but-v1-CONTENT backend (no canonical sibling) resolves its template from THAT file's main_loop_template (#473 Major)" {
+        // The template-site half of the Major. sokol_v1inv2 has no canonical
+        // `backend.manifest.zon`, so before the fix the `.v1` arm freed + fell
+        // through to the legacy `manifestPathEnabled(.., null)` pass, which probed
+        // the absent canonical file → false → fell to the enum path (reading the
+        // closed `cfg.backend` for a backend with no tag → mis-generated). The fix
+        // resolves `.main_loop_template` from the parsed v1 manifest and reads that
+        // template (must succeed, non-empty), NOT error on a missing canonical.
+        const cfg = generate.ProjectConfig{
+            .name = "tmpl-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v1inv2_fixture_package,
+        };
+        const tmpl = try generate.loadBackendTemplate(std.testing.allocator, ".", cfg, "backend.manifest.v2.zon");
+        defer std.testing.allocator.free(tmpl);
+        try std.testing.expect(tmpl.len > 0);
+    }
+
+    test "resolveLoopStyleOverride: reads the PER-PLATFORM v2 loop_style — bgfx desktop is .loop, android .callback" {
+        // The reason loop_style MUST be per-platform, exercised end-to-end: the
+        // SAME bgfx v2 manifest yields `.loop` on desktop (generated main drives
+        // `while (!quit)`) and `.callback` on android (NativeActivity owns the loop).
+        const desktop_cfg = generate.ProjectConfig{
+            .name = "loop-game",
+            .ecs = .mock,
+            .backend = .bgfx,
+            .platform = .desktop,
+            .backend_package = h.bgfx_v2_fixture_package,
+        };
+        const desktop = try generate.resolveLoopStyleOverride(std.testing.allocator, desktop_cfg, ".", "backend.manifest.v2.zon");
+        try std.testing.expect(desktop.? == .loop);
+
+        const android_cfg = generate.ProjectConfig{
+            .name = "loop-game",
+            .ecs = .mock,
+            .backend = .bgfx,
+            .platform = .android,
+            .backend_package = h.bgfx_v2_fixture_package,
+        };
+        const android = try generate.resolveLoopStyleOverride(std.testing.allocator, android_cfg, ".", "backend.manifest.v2.zon");
+        try std.testing.expect(android.? == .callback);
+    }
+};
+
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
         const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
