@@ -165,4 +165,21 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(hook_tests).step);
+
+    // manifest-v2 raylib backend HOOK (epic #453 item 3, PR 9). raylib's dedicated
+    // hook (`backends/raylib_v2/backend.hook.zig`) is a std-only file the generated
+    // v2 WASM build.zig `@import`s and calls (`post_wire`, design §4 residual (c)).
+    // Compiling it as its own test target is the design §7 "run the hook in the
+    // gate": it typechecks the emcc `emLinkStep` reconstruction against the real
+    // `std.Build` API (addSystemCommand/addArtifactArg/addInstallDirectory must
+    // stay valid) AND runs the hook's pure decision tests (the raylib web emcc
+    // args). Like sokol's hook it takes NO generator/zspec imports (§3).
+    const raylib_hook_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("backends/raylib_v2/backend.hook.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(raylib_hook_tests).step);
 }

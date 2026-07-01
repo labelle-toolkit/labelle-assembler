@@ -1219,3 +1219,271 @@ pub const PLUGINS = struct {
         try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_physics") == null);
     }
 };
+
+// ── manifest-v2 sdl + raylib GOLDEN cells (epic #453 item 3, PR 9, design §7) ──
+// sdl and raylib are converted to v2 here. Both reuse the GENERIC declarative
+// desktop path (loop-form `unifyCoreDiamond` walk) landed in PR 8; raylib adds a
+// WASM cell (the emcc residual in a std-only hook, mirroring PR 7's sokol wasm).
+//
+//   - sdl_v2 (desktop): HOOKLESS, fully declarative, NO artifact / NO system_lib —
+//     SDL2 is linked inside the backend package's own window module, so the v1
+//     `link.txt` is EMPTY (design §2 classifies `.link_sdl` as "empty → nothing").
+//   - raylib_v2 desktop: HOOKLESS, links the `raylib` artifact + the per-OS OpenGL
+//     framework/syslib switch (macOS `OpenGL` framework, Linux `GL`, Windows
+//     `opengl32`), mirrored onto `test_root` (PR-8 test_root fix, review #469).
+//   - raylib_v2 wasm: imports the backend hook + calls `post_wire` for the emcc
+//     link residual; the manifest's `.root_build_deps = emsdk` puts emsdk in the
+//     generated build.zig.zon so the hook's `b.dependency("emsdk", .{})` resolves.
+//
+// The core-diamond covers raylib's transitive `sdl_gamepad` sub-package generically
+// (design §5): the `unifyCoreDiamond` walk rooted at `backend_input` overrides its
+// direct `labelle-core` (hyphen) onto `core_mod`, then recurses into the
+// `sdl_gamepad` sub-import and overrides its `labelle_core` (underscore) too — the
+// two hand-written overrides in raylib's `backend_dep.txt`, without a per-backend
+// site. sdl's single underscore override is handled the same way.
+pub const MANIFEST_V2_SDL_GOLDEN = struct {
+    const golden = @embedFile("goldens/sdl_v2.build.zig");
+
+    fn genSdlV2() ![]const u8 {
+        return h.genSdlV2BuildZig(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .sdl,
+            .ecs = .mock,
+        }, .{});
+    }
+
+    test "golden: v2 sdl build.zig matches the committed golden" {
+        const out = try genSdlV2();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 sdl build.zig is syntactically valid Zig" {
+        const out = try genSdlV2();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 sdl is HOOKLESS and fully declarative (no hook / no artifact / no syslib)" {
+        const out = try genSdlV2();
+        defer std.testing.allocator.free(out);
+        // Hookless: NO backend hook import, NO resolve_target / post_wire calls.
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "resolve_target") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "post_wire") == null);
+        // Declarative backend dep (no gamepad/gui toggles) + the four modules.
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"labelle_sdl\", .{ .target = target, .optimize = optimize });") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "const backend_gfx = backend_dep.module(\"gfx\");") != null);
+        // The generic core-diamond walk (loop form) replaced the underscore override.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, backend_input, core_mod, gfx_mod,") != null);
+        // NO artifact, NO link, NO framework — SDL2 is linked by the backend package.
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_dep.artifact(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "linkLibrary") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "linkSystemLibrary") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "linkFramework") == null);
+    }
+};
+
+pub const MANIFEST_V2_RAYLIB_DESKTOP_GOLDEN = struct {
+    const golden = @embedFile("goldens/raylib_v2_desktop.build.zig");
+
+    fn genRaylibV2Desktop() ![]const u8 {
+        return h.genRaylibV2BuildZig(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, .{});
+    }
+
+    test "golden: v2 raylib-desktop build.zig matches the committed golden" {
+        const out = try genRaylibV2Desktop();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 raylib-desktop build.zig is syntactically valid Zig" {
+        const out = try genRaylibV2Desktop();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 raylib-desktop is HOOKLESS, links raylib + per-OS OpenGL on exe AND test_root" {
+        const out = try genRaylibV2Desktop();
+        defer std.testing.allocator.free(out);
+        // Hookless desktop: NO hook import / phases.
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "resolve_target") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "post_wire") == null);
+        // Declarative backend dep forwards the gamepad flags (default cfg: auto → true).
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"labelle_raylib\", .{ .target = target, .optimize = optimize, .gamepad_enabled = true, .gamepad_hidapi = false });") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "const raylib = backend_dep.artifact(\"raylib\");") != null);
+        // Generic core-diamond walk (covers the transitive sdl_gamepad at build time).
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, backend_input, core_mod, gfx_mod,") != null);
+        // exe: link raylib + the per-OS OpenGL switch.
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkLibrary(raylib);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkFramework(\"OpenGL\", .{});") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkSystemLibrary(\"GL\", .{});") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkSystemLibrary(\"opengl32\", .{});") != null);
+        // test_root: the SAME native linkage (PR-8 test_root fix, review #469).
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkLibrary(raylib);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkFramework(\"OpenGL\", .{});") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkSystemLibrary(\"GL\", .{});") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkSystemLibrary(\"opengl32\", .{});") != null);
+    }
+};
+
+pub const MANIFEST_V2_RAYLIB_WASM_GOLDEN = struct {
+    const golden = @embedFile("goldens/raylib_v2_wasm.build.zig");
+
+    const wasm_cfg: generate.ProjectConfig = .{
+        .name = "anchor-game",
+        .backend = .raylib,
+        .platform = .wasm,
+        .ecs = .mock,
+    };
+
+    // The build.zig helper pins the v2 fixture internally (backend_package +
+    // project_dir + manifest name). The ZON tests call `generateBuildZigZon`
+    // directly, so they must pin `backend_package` to the raylib_v2 fixture
+    // themselves — a bare cfg would resolve through the enum/provider `.raylib`
+    // path (backends/raylib_v2/backend.manifest.v2.zon is never consulted),
+    // making the emsdk root-build-dep coverage a false positive (PR #470
+    // coderabbit finding). With the fixture pinned the emsdk emission is
+    // genuinely the v2 manifest's `.platforms.wasm.root_build_deps` behavior.
+    const wasm_v2_cfg: generate.ProjectConfig = blk: {
+        var c = wasm_cfg;
+        c.backend_package = h.raylib_v2_fixture_package;
+        break :blk c;
+    };
+
+    fn genRaylibV2Wasm() ![]const u8 {
+        return h.genRaylibV2BuildZig(std.testing.allocator, wasm_cfg, .{});
+    }
+
+    test "golden: v2 raylib-wasm build.zig matches the committed golden" {
+        const out = try genRaylibV2Wasm();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 raylib-wasm build.zig is syntactically valid Zig" {
+        const out = try genRaylibV2Wasm();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 raylib-wasm imports the hook; post_wire does the emcc step (§2 (c))" {
+        const out = try genRaylibV2Wasm();
+        defer std.testing.allocator.free(out);
+        // The hook is imported and post_wire is called for wasm — the emcc link
+        // residual lives IN the hook (std-only reconstruction), not inline.
+        try std.testing.expect(std.mem.indexOf(u8, out, "@import(\"backend_build_hook.zig\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.post_wire(b, .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".platform = .wasm,") != null);
+        // NO inline emcc / provider import — the enum `@import("labelle_raylib")` +
+        // `emsdk.emccStep(...)`/`emcc_step` are GONE (the enum-vs-v2 boundary).
+        try std.testing.expect(std.mem.indexOf(u8, out, "emccStep") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "emcc_step") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "@import(\"labelle_raylib\")") == null);
+        // wasm has NO resolve_target CALL (static triple) — resolves inline.
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.resolve_target(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".cpu_arch = .wasm32,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.resolveTargetQuery(.{") != null);
+        // Declarative graph: the raylib archive is linked into the wasm lib.
+        try std.testing.expect(std.mem.indexOf(u8, out, "wasm.root_module.linkLibrary(raylib);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+    }
+
+    test "v2 raylib-wasm build.zig.zon carries the emsdk root build dep (§3 RootBuildDep)" {
+        const zon = try generate.generateBuildZigZon(
+            std.testing.allocator,
+            wasm_v2_cfg,
+            null,
+            null,
+            ".",
+            .{ .backend_manifest_name = "backend.manifest.v2.zon" },
+        );
+        defer std.testing.allocator.free(zon);
+        try std.testing.expect(std.mem.indexOf(u8, zon, ".emsdk = .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, zon, "git+https://github.com/emscripten-core/emsdk#4.0.9") != null);
+    }
+
+    test "v2 raylib-wasm zon emsdk is byte-identical to the enum-path zon" {
+        // `.builtin` reuses the enum path's pinned `dep_emsdk` section (design §3).
+        // Both sides pin the raylib_v2 fixture so the ONLY axis under test is the
+        // manifest-v2 opt-in (v2 side sets `.backend_manifest_name`, enum side
+        // does not): the v2 manifest's `.root_build_deps` emsdk emission must be
+        // byte-identical to the enum-fallback `dep_emsdk` section (PR #470
+        // coderabbit finding — a bare cfg made the v2 side fall to the enum path
+        // too, comparing enum-vs-enum).
+        const v2_zon = try generate.generateBuildZigZon(
+            std.testing.allocator,
+            wasm_v2_cfg,
+            null,
+            null,
+            ".",
+            .{ .backend_manifest_name = "backend.manifest.v2.zon" },
+        );
+        defer std.testing.allocator.free(v2_zon);
+        const enum_zon = try generate.generateBuildZigZon(
+            std.testing.allocator,
+            wasm_v2_cfg,
+            null,
+            null,
+            ".",
+            .{},
+        );
+        defer std.testing.allocator.free(enum_zon);
+        try std.testing.expectEqualStrings(enum_zon, v2_zon);
+    }
+};
+
+// ── PR 9: the raylib v2 backend build hook is staged as a sibling ──
+// The generated v2 raylib-wasm build.zig `@import`s `backend_build_hook.zig`; the
+// generator must copy the raylib_v2 manifest's `build_hook` to that sibling name.
+pub const PR9_STAGE_RAYLIB_HOOK = struct {
+    test "stages raylib_v2 build_hook next to build.zig as backend_build_hook.zig" {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const target_dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(target_dir);
+
+        var cfg: generate.ProjectConfig = .{
+            .name = "anchor-game",
+            .backend = .raylib,
+            .platform = .wasm,
+            .ecs = .mock,
+        };
+        cfg.backend_package = h.raylib_v2_fixture_package;
+
+        const staged = try generate.stageBackendBuildHook(
+            std.testing.allocator,
+            cfg,
+            ".",
+            "backend.manifest.v2.zon",
+            target_dir,
+        );
+        try std.testing.expect(staged);
+
+        const got = try tmp.dir.readFileAlloc(io, generate.backend_build_hook_name, std.testing.allocator, .limited(256 * 1024));
+        defer std.testing.allocator.free(got);
+        const want = try std.Io.Dir.cwd().readFileAlloc(io, "backends/raylib_v2/backend.hook.zig", std.testing.allocator, .limited(256 * 1024));
+        defer std.testing.allocator.free(want);
+        try std.testing.expectEqualStrings(want, got);
+    }
+};
