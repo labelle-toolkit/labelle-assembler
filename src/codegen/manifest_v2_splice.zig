@@ -132,7 +132,7 @@ pub fn renderBackendDepSectionV2(
         .desktop => try renderDesktopBackendDepV2(allocator, m, cfg, w),
         .android => try renderAndroidBackendDepV2(allocator, m, cfg, w),
         .ios => try renderIosBackendDepV2(allocator, m, cfg, w),
-        else => return error.V2PlatformUnsupported,
+        .wasm => try renderWasmBackendDepV2(allocator, m, cfg, w),
     }
 }
 
@@ -549,9 +549,173 @@ fn renderIosLinkV2(m: BackendManifestV2, w: anytype) !void {
     , .{manifest_v2.HOOK_ABI_VERSION});
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// WASM v2 emitters (PR 7, golden cell). wasm is the emcc residual (design §2
+// (c)). Unlike ios/android it has NO `resolve_target`: its target is the STATIC
+// `.triple` "wasm32-emscripten" (design §3), resolved directly in the generated
+// build.zig. Its `post_wire` supplies residual (c) — the emcc `emLinkStep`,
+// reconstructed std-only in the hook — AND the install/run wiring (the enum
+// `emcc_step` local cannot escape a void hook to a packager footer). So the wasm
+// v2 path does NOT route packaging through `renderPackageV2(.web)`; post_wire
+// owns it. The manifest declares `.root_build_deps = emsdk`, which the assembler
+// emits into the generated build.zig.zon so the hook's `b.dependency("emsdk", .{})`
+// resolves (design §3 `RootBuildDep`, review #459 finding 2). Like android/ios
+// this is a GOLDEN cell (§7): the residual moved into the imported hook and the
+// unrolled core-diamond overrides became the generic `unifyCoreDiamond` loop, so
+// the text legitimately DIFFERS from the enum `header_wasm`/`backend_sokol_wasm`/
+// `link_sokol_wasm`/`wasm_footer` path.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// v2 wasm HEADER — replaces the enum `header_wasm` + `wasm_target` blocks.
+/// Imports the backend hook and resolves the STATIC wasm32-emscripten target
+/// inline (no `resolve_target` hook — the triple is fixed, design §3). The build
+/// fn is `void` (not the enum `!void`): the emcc `try` moved into the hook's
+/// `post_wire`, which panics on failure.
+pub fn renderWasmHeaderV2(m: BackendManifestV2, w: anytype) !void {
+    _ = m.platforms.wasm orelse return error.V2PlatformUnsupported;
+    try w.print(
+        \\const std = @import("std");
+        \\
+        \\const backend_build_hook = @import("{s}");
+        \\
+        \\pub fn build(b: *std.Build) void {{
+        \\    const optimize = b.standardOptimizeOption(.{{}});
+        \\
+        \\    // WASM/Emscripten: a STATIC wasm32-emscripten target (design §3 — a
+        \\    // fixed .triple, so NO resolve_target hook; the target resolves here).
+        \\    const target = b.resolveTargetQuery(.{{
+        \\        .cpu_arch = .wasm32,
+        \\        .os_tag = .emscripten,
+        \\    }});
+        \\
+        \\
+    , .{hook_import_name});
+}
+
+/// v2 wasm core/gfx/engine dep decls — the declarative half of the enum `deps`
+/// section, WITHOUT the unrolled `overrideImport` diamond + `unifyGfxSubpackageCore`
+/// (those are replaced by the generic `unifyCoreDiamond` walk emitted after the
+/// backend-dep section, design §5). Uses the plain `target` alias (wasm resolves
+/// its target directly, like desktop).
+pub fn renderWasmDepsDeclsV2(w: anytype) !void {
+    try w.writeAll(
+        \\    const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
+        \\    const core_mod = core_dep.module("labelle-core");
+        \\
+        \\    const gfx_dep = b.dependency("labelle_gfx", .{ .target = target, .optimize = optimize });
+        \\    const gfx_mod = gfx_dep.module("labelle-gfx");
+        \\
+        \\    const engine_dep = b.dependency("engine", .{ .target = target, .optimize = optimize });
+        \\    const engine_mod = engine_dep.module("engine");
+        \\
+        \\
+    );
+}
+
+/// v2 wasm backend-dep — the generic `b.dependency` literal (`.target = target`) +
+/// `.module(...)` decls (honoring `root_alias`) + `.artifact` decls. Then the
+/// generic core-diamond walk CALLS (design §5) rooted at gfx/engine + each backend
+/// module — replacing the enum `deps` unrolled overrides. The emcc residual is NOT
+/// here; it is `post_wire`'s job (emitted in the link section).
+fn renderWasmBackendDepV2(
+    allocator: std.mem.Allocator,
+    m: BackendManifestV2,
+    cfg: ProjectConfig,
+    w: anytype,
+) !void {
+    const wasm = m.platforms.wasm orelse return error.V2PlatformUnsupported;
+
+    // GENERATED: `const backend_dep = b.dependency("<dep_name>", .{ .target =
+    // target, .optimize = optimize, <merged dep_options> });` — wasm's empty
+    // per-platform list inherits only the base `with_imgui` (design §3).
+    const opts = try mergeDepOptions(allocator, m.dep_options, wasm.dep_options);
+    defer allocator.free(opts);
+    try w.print("    const backend_dep = b.dependency(\"{s}\", .{{ .target = target, .optimize = optimize", .{m.dep_name});
+    for (opts) |opt| {
+        try w.print(", .{s} = {s}", .{ opt.name, depOptionValue(opt.value, cfg) });
+    }
+    try w.writeAll(" });\n");
+
+    // GENERATED: provider module decls under their root alias.
+    for (m.modules) |mod| {
+        const alias = try moduleAlias(allocator, mod);
+        defer allocator.free(alias);
+        try w.print("    const {s} = backend_dep.module(\"{s}\");\n", .{ alias, mod.name });
+    }
+
+    // GENERATED: artifact decls (wasm has no `.pic`).
+    for (wasm.artifacts) |art| {
+        try w.print("    const {s} = backend_dep.artifact(\"{s}\");\n", .{ art.name, art.name });
+        if (art.pic) try w.print("    {s}.root_module.pic = true;\n", .{art.name});
+    }
+
+    // GENERATED: the generic core+gfx-diamond walk CALLS (design §5).
+    try w.writeAll(
+        \\
+        \\    // Generic core+gfx-diamond unification (design §5) — the loop form of
+        \\    // the per-site overrideImport diamond (golden cell, not the desktop
+        \\    // byte-anchor's unrolled form). Rooted at each imported provider.
+        \\    var core_diamond_visited: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+        \\    unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod, &core_diamond_visited);
+        \\    unifyCoreDiamond(b.allocator, engine_mod, core_mod, gfx_mod, &core_diamond_visited);
+        \\
+    );
+    for (m.modules) |mod| {
+        const alias = try moduleAlias(allocator, mod);
+        defer allocator.free(alias);
+        try w.print("    unifyCoreDiamond(b.allocator, {s}, core_mod, gfx_mod, &core_diamond_visited);\n", .{alias});
+    }
+}
+
+/// v2 wasm LINK — the DECLARATIVE link graph (design §2: **D**): link each
+/// platform artifact into the `wasm` lib — plus the `post_wire` hook CALL for the
+/// residual (**H-post**, design §2 (c)): the emcc `emLinkStep` + install/run
+/// wiring. The wasm root artifact is `wasm` (a static lib emcc links). NO
+/// `resolve_target` (static triple); NO `renderPackageV2(.web)` (post_wire owns
+/// packaging — see the section note).
+fn renderWasmLinkV2(m: BackendManifestV2, w: anytype) !void {
+    const wasm = m.platforms.wasm orelse return error.V2PlatformUnsupported;
+
+    // GENERATED (D): link the platform artifact(s) into the wasm lib. emcc scans
+    // the lib's transitive static deps, so this must run BEFORE post_wire.
+    for (wasm.artifacts) |art| {
+        try w.print("    wasm.root_module.linkLibrary({s});\n", .{art.name});
+    }
+
+    // GENERATED (H-post): the emcc residual (design §2 (c)) — delegated to the
+    // backend hook's `post_wire`. wasm carries no SDK context (`ios_sdk_path` /
+    // `android_target_sdk` are null); the hook resolves emsdk via
+    // `b.dependency("emsdk", .{})`, declared by the manifest's `.root_build_deps`.
+    try w.print(
+        \\
+        \\    // post_wire (design §4) — emcc link residual (c) + web install/run.
+        \\    backend_build_hook.post_wire(b, .{{
+        \\        .manifest_version = {d},
+        \\        .backend_dep = backend_dep,
+        \\        .root_module = wasm.root_module,
+        \\        .root_artifact = wasm,
+        \\        .target = target,
+        \\        .optimize = optimize,
+        \\        .platform = .wasm,
+        \\        .ios_sdk_path = null,
+        \\        .android_target_sdk = null,
+        \\    }});
+        \\
+    , .{manifest_v2.HOOK_ABI_VERSION});
+}
+
+/// v2 wasm FOOTER — the build-fn close + the `overrideImport`/`unifyGfxSubpackageCore`
+/// helper defs (byte-identical to the enum `wasm_footer`/`android_footer` tails),
+/// WITHOUT the enum `wasm_footer`'s install/run block (post_wire owns install/run
+/// on the wasm v2 path). The generic `unifyCoreDiamond` def is appended after this
+/// by `emitCoreDiamondWalk`, exactly as on the android/ios paths.
+pub fn renderWasmFooterV2(w: anytype) !void {
+    try w.writeAll(wasm_footer_helpers);
+}
+
 /// v2 replacement for the link enum branch (`writeSection(.., "link_<tag>")`) / the
 /// v1 `renderLinkSection`. Dispatches on the target platform: DESKTOP (PR 3 byte
-/// anchor) and ANDROID (PR 5 golden cell).
+/// anchor), ANDROID (PR 5), IOS (PR 6), WASM (PR 7) golden cells.
 pub fn renderLinkSectionV2(
     allocator: std.mem.Allocator,
     m: BackendManifestV2,
@@ -562,7 +726,7 @@ pub fn renderLinkSectionV2(
         .desktop => try renderDesktopLinkV2(m, w),
         .android => try renderAndroidLinkV2(m, cfg, w),
         .ios => try renderIosLinkV2(m, w),
-        else => return error.V2PlatformUnsupported,
+        .wasm => try renderWasmLinkV2(m, w),
     }
     _ = allocator;
 }
@@ -637,6 +801,89 @@ const anchor_tail_overrides =
 const anchor_link_body =
     "\n    // IOSurface + CoreFoundation are needed for the macOS preview-mode\n    // IOSurface producer (labelle-assembler#121 + #125, labelle-\n    // engine#547). The engine references `IOSurfaceCreate`,\n    // `IOSurfaceLock`, `CFNumberCreate`, etc. via `@extern \"c\"` —\n    // these symbols live in IOSurface.framework + CoreFoundation\n    // .framework, and sokol's upstream linker line does not propagate\n    // them. Same on iOS (the framework path is identical). Linux /\n    // Windows / web have no macOS-specific symbols to resolve here,\n    // so the framework links are gated on the Darwin target tags.\n    switch (target.result.os.tag) {\n        .macos, .ios => {\n            exe.root_module.linkFramework(\"IOSurface\", .{});\n            exe.root_module.linkFramework(\"CoreFoundation\", .{});\n        },\n        // NOTE: labelle-core's Linux gamepad-detection source\n        // (gamepad_source/linux.zig, labelle-assembler#249) does NOT need a\n        // build-time libudev link. As of labelle-core#20 it loads libudev at\n        // RUNTIME via std.DynLib (dlopen of `libudev.so.1`) and degrades\n        // gracefully when the library is absent — so the generated build must\n        // not link `-ludev`, which would reintroduce a hard build/runtime\n        // dependency. Runtime device-access setup (input group / udev\n        // `uaccess` rule, Flatpak `--device=input`) is in docs/gamepad-linux.md.\n        else => {},\n    }\n\n";
 
+// ──────────────────────────────────────────────────────────────────────────
+// wasm v2 footer helpers (PR 7). The build-fn close + the `overrideImport` /
+// `unifyGfxSubpackageCore` helper defs — byte-identical to the enum
+// `wasm_footer`/`android_footer` tails, but WITHOUT the install/run block (the
+// wasm v2 path's `post_wire` owns install/run; the enum `wasm_footer`'s
+// `emcc_step` local cannot escape a void hook). Ends with a trailing blank line
+// so the appended `emitCoreDiamondWalk` sits two blank lines below, matching the
+// android/ios footer→walk spacing. The drift-guard test below locks this to the
+// live `android_footer` section (its tail) so an edit to one representation but
+// not the other fails loudly. Deleted with the enum sections in PR 12.
+// ──────────────────────────────────────────────────────────────────────────
+const wasm_footer_helpers =
+    \\}
+    \\
+    \\/// Override a module import without leaking memory.
+    \\/// NOTE: Duplicated from .footer — each generated build.zig is standalone and
+    \\/// needs its own copy of this helper.
+    \\fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
+    \\    const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
+    \\    if (!gop.found_existing) {
+    \\        gop.key_ptr.* = name;
+    \\    }
+    \\    gop.value_ptr.* = module;
+    \\}
+    \\
+    \\/// Unify `labelle-core` onto gfx's sub-packages (`camera`, `spatial_grid`,
+    \\/// `tilemap`) so a `core.YAxis` (and any other core type) produced inside the
+    \\/// `labelle-gfx` module unifies with the type the sub-package expects. gfx#276
+    \\/// crosses this boundary by passing the project `y_axis` into
+    \\/// `camera.CameraWith(...)`. Only override sub-packages that actually import
+    \\/// core (a no-op otherwise — keeps this resilient if gfx restructures).
+    \\fn unifyGfxSubpackageCore(gfx_mod: *std.Build.Module, core_mod: *std.Build.Module) void {
+    \\    const sub_names = [_][]const u8{ "camera", "spatial_grid", "tilemap" };
+    \\    for (sub_names) |sub_name| {
+    \\        const sub = gfx_mod.import_table.get(sub_name) orelse continue;
+    \\        if (sub.import_table.get("labelle-core") != null) {
+    \\            overrideImport(sub, "labelle-core", core_mod);
+    \\        }
+    \\    }
+    \\}
+    \\
+    \\
+;
+
+/// Emit a v2 manifest's `.platforms[p].root_build_deps` as generated
+/// `build.zig.zon` dependency entries (design §3 `RootBuildDep`, review #459
+/// finding 2). A hook's build-time `b.dependency(name, .{})` (e.g. the wasm
+/// emcc residual's `b.dependency("emsdk", .{})`) only resolves if the root zon
+/// declares that dep — the v2 manifest otherwise describes only build.zig wiring.
+/// Each entry carries its own resolution because the emitter cannot synthesize a
+/// url+hash from a bare name:
+///   - `.builtin` → a resolution the assembler already knows how to emit. emsdk
+///     is the only builtin today; it reuses the pinned `dep_emsdk` section so the
+///     v2 zon stays byte-identical to the enum path (`build_zig_zon.txt:71`).
+///   - `.remote`  → the given url+hash, emitted verbatim.
+///   - `.path`    → a relative/absolute path dependency.
+/// `dep_emsdk_section` is the caller-supplied pinned emsdk zon text (from
+/// `build_zig_zon.txt`) so this module needn't embed that template.
+pub fn emitRootBuildDepsV2(
+    m: BackendManifestV2,
+    platform: config.Platform,
+    dep_emsdk_section: []const u8,
+    w: anytype,
+) !void {
+    const entry = platformEntry(m, platform) orelse return;
+    for (entry.root_build_deps) |dep| {
+        switch (dep.resolution) {
+            .builtin => {
+                if (!std.mem.eql(u8, dep.name, "emsdk")) return error.UnknownBuiltinRootDep;
+                try w.writeAll(dep_emsdk_section);
+            },
+            .remote => |r| try w.print(
+                "        .{s} = .{{\n            .url = \"{s}\",\n            .hash = \"{s}\",\n        }},\n",
+                .{ dep.name, r.url, r.hash },
+            ),
+            .path => |p| try w.print(
+                "        .{s} = .{{\n            .path = \"{s}\",\n        }},\n",
+                .{ dep.name, p },
+            ),
+        }
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -684,6 +931,66 @@ test "moduleAlias: default is backend_<name>, explicit alias preserved" {
     const b = try moduleAlias(testing.allocator, .{ .name = "android_app", .root_alias = "backend_app", .source = "x" });
     defer testing.allocator.free(b);
     try testing.expectEqualStrings("backend_app", b);
+}
+
+test "wasm_footer_helpers is the android_footer tail (drift guard)" {
+    // The wasm v2 footer reuses the enum footer's build-fn close + helper defs but
+    // drops the install/run block (post_wire owns install/run on wasm). Lock it to
+    // the live `android_footer` section tail so an edit to one representation but
+    // not the other fails loudly.
+    const tpl = @import("../template.zig");
+    const build_zig_tmpl = @embedFile("../templates/build_zig.txt");
+    const android_footer = tpl.getSection(build_zig_tmpl, "android_footer").?;
+    // Everything from the build-fn-closing `}` (col 0) onward is the shared tail.
+    const close = std.mem.indexOf(u8, android_footer, "\n}\n").?;
+    try testing.expectEqualStrings(android_footer[close + 1 ..], wasm_footer_helpers);
+}
+
+test "emitRootBuildDepsV2: builtin emsdk emits the pinned dep_emsdk section" {
+    const e = struct {
+        fn make(deps: []const BackendManifestV2.RootBuildDep) BackendManifestV2.PlatformEntry {
+            return .{ .entry = "t.txt", .loop_style = .callback, .target = .{ .triple = "wasm32-emscripten" }, .root_build_deps = deps, .package = .{ .web = .{} } };
+        }
+    }.make;
+    const m: BackendManifestV2 = .{
+        .manifest_version = 2,
+        .dir_name = "sokol",
+        .dep_name = "labelle_sokol",
+        .modules = &.{},
+        .platforms = .{ .wasm = e(&.{.{ .name = "emsdk", .resolution = .builtin }}) },
+    };
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try emitRootBuildDepsV2(m, .wasm, "PINNED_EMSDK\n", &aw.writer);
+    try testing.expectEqualStrings("PINNED_EMSDK\n", aw.written());
+
+    // remote resolution emits url+hash verbatim.
+    var aw2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw2.deinit();
+    const m2: BackendManifestV2 = .{
+        .manifest_version = 2,
+        .dir_name = "x",
+        .dep_name = "x",
+        .modules = &.{},
+        .platforms = .{ .wasm = e(&.{.{ .name = "foo", .resolution = .{ .remote = .{ .url = "git+u", .hash = "hh" } } }}) },
+    };
+    try emitRootBuildDepsV2(m2, .wasm, "", &aw2.writer);
+    try testing.expectEqualStrings(
+        "        .foo = .{\n            .url = \"git+u\",\n            .hash = \"hh\",\n        },\n",
+        aw2.written(),
+    );
+
+    // an unknown builtin name is a hard error (no url to synthesize).
+    var aw3: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw3.deinit();
+    const m3: BackendManifestV2 = .{
+        .manifest_version = 2,
+        .dir_name = "x",
+        .dep_name = "x",
+        .modules = &.{},
+        .platforms = .{ .wasm = e(&.{.{ .name = "mystery", .resolution = .builtin }}) },
+    };
+    try testing.expectError(error.UnknownBuiltinRootDep, emitRootBuildDepsV2(m3, .wasm, "", &aw3.writer));
 }
 
 test "emitCoreDiamondWalk emits the PR-2 generic walk source (drift guard)" {

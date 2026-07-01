@@ -34,13 +34,31 @@
 //!     iOS frameworks + `link_libc` are DECLARATIVE (`.frameworks.ios`), emitted
 //!     by the assembler, NOT here.
 //!
-//! wasm is a PR-7 stub. The generated v2 build.zig `@import`s this file
-//! (as a sibling `backend_build_hook.zig`) and calls the two functions; that
-//! import is the design's "assembler imports the hook into the generated root
-//! package" (§3). Because the whole v2 route is gated-dark (opt-in via the
-//! assembler's `backend_manifest_name`, never set on the production `generate`
-//! path — §6), PR 5 exercises it only through the golden-cell + hook gates, not
-//! a production android build.
+//! ## PR 7 scope — wasm is the emcc residual (design §2 (c))
+//!
+//! wasm has NO `resolve_target` (its target is the STATIC `.triple`
+//! "wasm32-emscripten", design §3, resolved directly in the generated build.zig).
+//! Its `post_wire` .wasm arm supplies design §2 residual (c): the Emscripten
+//! `emcc` link step (`.link_sokol_wasm`, `build_zig.txt:311`-`332`) plus the
+//! `wasm_footer` install/run wiring (`build_zig.txt:334`-`337`). The enum path
+//! reaches emcc via `@import("labelle_sokol").emLinkStep` — but the hook is
+//! std-only and CANNOT import the provider package, so `emLinkStep` is
+//! reconstructed here (`emLinkStep` below) from ONLY `std.Build` + the emsdk
+//! dependency, which the hook resolves via `b.dependency("emsdk", .{})`. That
+//! call is why the manifest declares `.platforms.wasm.root_build_deps = emsdk`
+//! and the assembler emits emsdk into the generated `build.zig.zon` (design §3
+//! `RootBuildDep`, review #459 finding 2). Because `post_wire` returns `void` it
+//! also owns the install/run wiring (the enum `emcc_step` local cannot escape a
+//! void hook back to the build fn), so the v2 wasm path does NOT emit the
+//! `.wasm_footer`/packager `.web` block — see `manifest_v2_splice`'s wasm notes.
+//!
+//! The generated v2 build.zig `@import`s this file (as a sibling
+//! `backend_build_hook.zig`) and calls the two functions; that import is the
+//! design's "assembler imports the hook into the generated root package" (§3).
+//! Because the whole v2 route is gated-dark (opt-in via the assembler's
+//! `backend_manifest_name`, never set on the production `generate` path — §6),
+//! PR 5/6/7 exercise it only through the golden-cell + hook gates, not a
+//! production android/ios/wasm build.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -345,6 +363,93 @@ fn ndkHostTag() []const u8 {
     };
 }
 
+// ── wasm emcc residual (design §2 (c)) — the emLinkStep reconstruction ──────
+//
+// The enum path links wasm via `@import("labelle_sokol").emLinkStep`
+// (`build_zig.txt:313`), which re-exports sokol-zig's `emLinkStep`. The hook is
+// std-only and cannot import the provider package, so the step is reconstructed
+// here from ONLY `std.Build` + the emsdk dependency. This is a faithful port of
+// sokol-zig's `emLinkStep` (which is itself pure `std.Build` — it locates `emcc`
+// through `emsdk.path(...)` and shells out), so the emitted emcc command line
+// matches the enum path. The emsdk dependency is resolved by `b.dependency`
+// (declared as a root build dep via the manifest's `.root_build_deps`).
+
+/// The C-stack bump the sokol wasm build needs — Emscripten defaults to a 64 KB
+/// stack, which the engine's scene-load + atlas-decode path overflows into the
+/// WASM `.data` segment (labelle-cli#201). Mirrors the enum
+/// `.link_sokol_wasm` `extra_args` (`build_zig.txt:330`). Kept a named constant
+/// so the residual decision is unit-testable without a live `*std.Build`.
+pub const wasm_stack_size_arg = "-sSTACK_SIZE=512KB";
+
+/// Options for `emLinkStep` — the subset of sokol-zig's `EmLinkOptions` the wasm
+/// residual sets (`build_zig.txt:313`-`331`). Uses only `std.Build`/`std.builtin`
+/// types so the hook stays provider-import-free.
+pub const EmLinkOptions = struct {
+    optimize: std.builtin.OptimizeMode,
+    /// The Zig code compiled to a static lib that emcc links into the module.
+    lib_main: *std.Build.Step.Compile,
+    /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`.
+    emsdk: *std.Build.Dependency,
+    release_use_closure: bool = true,
+    release_use_lto: bool = true,
+    use_webgl2: bool = false,
+    use_filesystem: bool = true,
+    shell_file_path: ?std.Build.LazyPath = null,
+    extra_args: []const []const u8 = &.{},
+};
+
+/// Path to an emscripten tool (e.g. `emcc`) inside the resolved emsdk dependency.
+/// Mirrors sokol-zig's `emTool`/`emSdkLazyPath`.
+fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Build.LazyPath {
+    return emsdk.path(b.pathJoin(&.{ "upstream", "emscripten", tool }));
+}
+
+/// Reconstruction of sokol-zig's `emLinkStep` using only `std.Build` + the emsdk
+/// dependency. Builds the `emcc` shell-out that links `lib_main` (and its
+/// transitive static libs, e.g. `sokol_clib`) into the `.html`/`.wasm`/`.js`
+/// module and installs them under `web/`. Returns the install step so the caller
+/// can wire it into `b.getInstallStep()` + the run step.
+pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.InstallDir {
+    const emcc_path = emTool(b, options.emsdk, "emcc").getPath(b);
+    const emcc = b.addSystemCommand(&.{emcc_path});
+    emcc.setName("emcc"); // hide the resolved emcc path in the build log
+    if (options.optimize == .Debug) {
+        emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
+    } else {
+        emcc.addArg("-sASSERTIONS=0");
+        if (options.optimize == .ReleaseSmall) {
+            emcc.addArg("-Oz");
+        } else {
+            emcc.addArg("-O3");
+        }
+        if (options.release_use_lto) emcc.addArg("-flto");
+        if (options.release_use_closure) emcc.addArgs(&.{ "--closure", "1" });
+    }
+    if (options.use_webgl2) emcc.addArg("-sUSE_WEBGL2=1");
+    if (!options.use_filesystem) emcc.addArg("-sNO_FILESYSTEM=1");
+    if (options.shell_file_path) |shell_file_path| {
+        emcc.addPrefixedFileArg("--shell-file=", shell_file_path);
+    }
+    for (options.extra_args) |arg| emcc.addArg(arg);
+
+    // The main lib, then every static-lib dependency (e.g. sokol_clib).
+    emcc.addArtifactArg(options.lib_main);
+    for (options.lib_main.getCompileDependencies(false)) |item| {
+        if (item.kind == .lib) emcc.addArtifactArg(item);
+    }
+    emcc.addArg("-o");
+    const out_file = emcc.addOutputFileArg(b.fmt("{s}.html", .{options.lib_main.name}));
+
+    // emcc emits 3 files (.html/.wasm/.js) into out_file's dir → install to web/.
+    const install = b.addInstallDirectory(.{
+        .source_dir = out_file.dirname(),
+        .install_dir = .prefix,
+        .install_subdir = "web",
+    });
+    install.step.dependOn(&emcc.step);
+    return install;
+}
+
 /// Runs AFTER the generic module/artifact/system-lib/framework wiring, to
 /// supplement the graph with the residual the manifest cannot express statically
 /// (design §2 residual (a)). DESKTOP is empty (no residual). ANDROID does the NDK
@@ -401,9 +506,31 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
             ctx.root_artifact.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib" }) });
             ctx.root_artifact.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
         },
-        // PR 7: emccStep / emLinkStep on ctx.root_artifact (needs the emsdk root
-        // dep declared via .platforms.wasm.root_build_deps).
-        .wasm => {},
+        .wasm => {
+            // Residual (c): the Emscripten emcc link step + install/run wiring
+            // (enum `.link_sokol_wasm` + `.wasm_footer`). emsdk is resolved via
+            // `b.dependency` — declared as a root build dep by the manifest's
+            // `.root_build_deps` and emitted into the generated build.zig.zon.
+            // The declarative `linkLibrary(sokol_clib)` is emitted by the
+            // assembler BEFORE this call; emcc scans the lib's transitive static
+            // deps, so `sokol_clib` lands on the emcc command line here.
+            const emsdk = b.dependency("emsdk", .{});
+            const install = emLinkStep(b, .{
+                .optimize = ctx.optimize,
+                .lib_main = ctx.root_artifact,
+                .emsdk = emsdk,
+                .shell_file_path = null,
+                .use_webgl2 = true,
+                .release_use_closure = false,
+                .extra_args = &.{wasm_stack_size_arg},
+            });
+            // `post_wire` is void, so the enum `emcc_step` local cannot escape to
+            // the build fn for a packager footer — the hook wires install/run
+            // itself (enum `.wasm_footer`, `build_zig.txt:335`-`337`).
+            b.getInstallStep().dependOn(&install.step);
+            const run_step = b.step("run", "Serve WASM build");
+            run_step.dependOn(&install.step);
+        },
     }
 }
 
@@ -485,6 +612,15 @@ test "libcTxt: body points the compiler at the NDK sysroot (matches the enum blo
 
 test "HOOK_ABI_VERSION is 2 (matches manifest_v2)" {
     try testing.expectEqual(@as(u8, 2), HOOK_ABI_VERSION);
+}
+
+test "wasm_stack_size_arg matches the enum .link_sokol_wasm 512 KB stack bump" {
+    // The wasm emcc residual (design §2 (c)) must reproduce the enum path's
+    // `-sSTACK_SIZE=512KB` (build_zig.txt:330) or the engine's atlas-decode path
+    // corrupts the WASM `.data` segment (labelle-cli#201). The `emLinkStep`
+    // reconstruction itself is typechecked against std.Build by compiling this
+    // file as a test target; this pins the one pure decision it carries.
+    try testing.expectEqualStrings("-sSTACK_SIZE=512KB", wasm_stack_size_arg);
 }
 
 test "iosSdkName: -Ddevice picks iphoneos, else iphonesimulator" {
