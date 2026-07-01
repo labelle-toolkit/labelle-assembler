@@ -1215,6 +1215,20 @@ pub fn generate(
     // Both `copyAndScanAbs` and `scanPluginDir` silently no-op on a
     // missing source dir, so no explicit probe is needed here.
     for (cfg.plugins) |plugin| {
+        // A *light pack* is also a `.plugins` entry, but its scripts flow
+        // through the pack dir-scan below (`scanPackScriptsDir`), landing
+        // under `packs/<name>/scripts/` so their own `../components` relative
+        // imports resolve — NOT under `scripts/.plugin_<name>/`. Skip packs
+        // here so a pack that ships a `scripts/` dir isn't scanned twice
+        // (labelle-assembler#487).
+        const is_pack = blk: {
+            for (pack_entries.items) |e| {
+                if (std.mem.eql(u8, e.plugin.name, plugin.name)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (is_pack) continue;
+
         // Plugin was already resolved during the manifest-loading loop
         // above; re-resolving here is infallible in practice. Use `try`
         // to match the manifest-load contract — a failure here is a
@@ -1296,6 +1310,39 @@ pub fn generate(
         // outside the cleanup list's reach.
         const scanned = try scanPack(allocator, pack_src_dir, target_dir, e.plugin.name);
         pack_scans.appendAssumeCapacity(scanned);
+
+        // ── Pack scripts (labelle-assembler#487) ───────────────────────
+        //
+        // A pack's per-frame SYSTEM lives INSIDE the pack, at
+        // `<pack>/scripts/<state>/*.zig`, so it can react to the pack's own
+        // components. Copy that subtree into `<target>/packs/<name>/scripts/`
+        // — UNDER the pack dir, beside the `components/`, `events/`, … that
+        // `scanPack` just copied — so a pack script's own
+        // `@import("../components/foo.zig")` resolves exactly as it did in
+        // the pack source. (Placing it under `scripts/.plugin_<name>/`, the
+        // decl-module-plugin layout, would break those relative imports.)
+        //
+        // Then register the copied scripts into the SAME `ScriptScanner`
+        // (`script_scan`) that feeds the game-root + plugin script dispatch,
+        // scoped under the pack name (`scanPackScriptsDir`) so numeric
+        // prefixes order deterministically and each pack is its own
+        // duplicate-order namespace. A pack script's `pub fn tick(game, dt)`
+        // then runs in its declared state alongside the game's own scripts.
+        const pack_scripts_src = try std.fs.path.join(allocator, &.{ pack_src_dir, "scripts" });
+        defer allocator.free(pack_scripts_src);
+        const pack_scripts_dst = try std.fs.path.join(allocator, &.{ target_dir, "packs", e.plugin.name, "scripts" });
+        defer allocator.free(pack_scripts_dst);
+        // copyAndScanAbs recursively copies the subtree (and no-ops on a
+        // missing source dir — a pack without a `scripts/` contributes
+        // nothing). Discard the flat stem list; the ScriptScanner does the
+        // richer state/prefix walk below.
+        const pack_script_names = try scanner.copyAndScanAbs(allocator, pack_scripts_src, pack_scripts_dst, ".zig");
+        scanner.freeNames(allocator, pack_script_names);
+        // The generated `@import` base is the target-relative dir, mirroring
+        // `PackScan.import_prefix` (`packs/<name>`) plus `/scripts`.
+        const pack_scripts_import_prefix = try std.fmt.allocPrint(allocator, "packs/{s}/scripts", .{e.plugin.name});
+        defer allocator.free(pack_scripts_import_prefix);
+        try script_scan.scanPackScriptsDir(pack_scripts_dst, pack_scripts_import_prefix, e.plugin.name);
     }
 
     // Injectivity gate (#440 / chatgpt-codex events L164): the `<pack>__<name>`

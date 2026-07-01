@@ -565,3 +565,172 @@ pub const LIGHT_PACK_BUILDS_END_TO_END = struct {
         try std.testing.expect(!contains(build_zig, "plugin_citizens_mod"));
     }
 };
+
+// ── #487: a pack's per-frame SYSTEM lives inside the pack ────────────────
+//
+// Before #487 a pack scanned components/events/prefabs/hooks but NOT
+// scripts/, so a pack's per-frame system had to leak into the game root.
+// Now the pack's `scripts/<state>/*.zig` is copied UNDER the pack dir
+// (`packs/<name>/scripts/…`, beside its copied components/) and registered
+// into the SAME per-state dispatch as game-root + plugin scripts. The
+// under-the-pack placement is load-bearing: it preserves the script's own
+// `../components/foo.zig` relative import, exactly as a game-root script
+// reaches `components/` today.
+
+pub const PACK_SCRIPTS = struct {
+    test "scanPackScriptsDir registers a pack script into the per-state dispatch" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        // A pack shipping a component + a state-scoped script that reaches the
+        // component by the SAME relative path a game-root script uses.
+        try tmp.dir.createDirPath(io, "src/citizens");
+        var pack_src = try tmp.dir.openDir(io, "src/citizens", .{});
+        defer pack_src.close(io);
+        try writeFileIn(pack_src, "components/Worker.zig", "pub const Worker = struct { hp: u8 };\n");
+        try writeFileIn(pack_src, "scripts/playing/10_worker_tick.zig",
+            \\const Worker = @import("../../components/Worker.zig").Worker;
+            \\pub fn tick(game: anytype, dt: f32) void {
+            \\    _ = game;
+            \\    _ = dt;
+            \\    _ = Worker;
+            \\}
+        );
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", alloc);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+
+        // scanPack copies the convention dirs (components/) under packs/.
+        var scan = try generate.scanPack(alloc, pack_src_path, target_path, "citizens");
+        defer scan.deinit(alloc);
+
+        // The scripts subtree is copied under the pack dir — same path root.zig
+        // lays down before calling scanPackScriptsDir.
+        const scripts_src = try std.fs.path.join(alloc, &.{ pack_src_path, "scripts" });
+        const scripts_dst = try std.fs.path.join(alloc, &.{ target_path, "packs", "citizens", "scripts" });
+        const copied = try generate.scanner.copyAndScanAbs(alloc, scripts_src, scripts_dst, ".zig");
+        _ = copied;
+
+        // Layout invariant: the script and its `../../components/Worker.zig`
+        // import target both exist at the offsets the source used.
+        try tmp.dir.access(io, "packs/citizens/scripts/playing/10_worker_tick.zig", .{});
+        try tmp.dir.access(io, "packs/citizens/components/Worker.zig", .{});
+
+        // Register into the shared ScriptScanner under the pack namespace.
+        const states = [_][]const u8{"playing"};
+        var scanner = generate.script_scanner.ScriptScanner.init(alloc, &states);
+        try scanner.scanPackScriptsDir(scripts_dst, "packs/citizens/scripts", "citizens");
+
+        const entries = scanner.getEntries();
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        const e = entries[0];
+        try std.testing.expectEqualStrings("worker_tick", e.name);
+        try std.testing.expectEqual(@as(?u32, 10), e.sort_order);
+        try std.testing.expectEqualStrings("citizens", e.plugin_name.?);
+        try std.testing.expectEqual(@as(usize, 1), e.states.len);
+        try std.testing.expectEqualStrings("playing", e.states[0]);
+        // Full target-relative rel_path + empty import_base → imported verbatim.
+        try std.testing.expectEqualStrings("packs/citizens/scripts/playing/10_worker_tick.zig", e.rel_path);
+        try std.testing.expectEqualStrings("", e.import_base);
+    }
+
+    test "scanPackScriptsDir no-ops on a pack with no scripts/ dir" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const states = [_][]const u8{"playing"};
+        var scanner = generate.script_scanner.ScriptScanner.init(alloc, &states);
+        // A path that doesn't exist — tolerated, contributes nothing.
+        try scanner.scanPackScriptsDir("packs/does_not_exist/scripts", "packs/does_not_exist/scripts", "ghost");
+        try std.testing.expectEqual(@as(usize, 0), scanner.getEntries().len);
+    }
+
+    test "AllScripts imports a pack script from packs/<name>/scripts, state-scoped" {
+        const pack_entry: generate.script_scanner.ScriptScanner.ScriptEntry = .{
+            .name = "worker_tick",
+            .filename = "10_worker_tick.zig",
+            .states = &.{"playing"},
+            .sort_order = 10,
+            .subdir = "playing",
+            .rel_path = "packs/citizens/scripts/playing/10_worker_tick.zig",
+            .plugin_name = "citizens",
+            .plugin_index = 1,
+            .import_base = "",
+        };
+        const entries: []const generate.script_scanner.ScriptScanner.ScriptEntry = &.{pack_entry};
+
+        const main_zig = try generate.generateMainZigFromTemplate(
+            std.testing.allocator,
+            engine_template,
+            .{ .y_axis = .up, .name = "test-game", .backend = .raylib, .ecs = .mock },
+            raylib_lifecycle,
+            entries,
+            empty_names,
+            empty_names,
+            empty_scene_manifests,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_plugin_events,
+            empty_plugin_flow_nodes,
+            empty_plugin_pin_styles,
+            empty_plugin_coercions,
+        );
+        defer std.testing.allocator.free(main_zig);
+
+        // Imported verbatim from the copied pack subtree — NOT re-prefixed with
+        // `scripts/`, so the pack script's own ../components imports resolve.
+        try std.testing.expect(contains(main_zig, "@import(\"packs/citizens/scripts/playing/10_worker_tick.zig\")"));
+        try std.testing.expect(!contains(main_zig, "@import(\"scripts/packs/citizens"));
+        // State-scoped: the wrapper carries the pack's declared game_states.
+        try std.testing.expect(contains(main_zig, "pub const game_states = .{"));
+        try std.testing.expect(contains(main_zig, "\"playing\","));
+    }
+
+    test "game-root script import prefix is unchanged (regression guard)" {
+        // A plain game-root entry keeps the default import_base ("scripts/").
+        const game_entry: generate.script_scanner.ScriptScanner.ScriptEntry = .{
+            .name = "hits",
+            .filename = "hits.zig",
+            .states = &.{},
+            .sort_order = null,
+            .subdir = null,
+            .rel_path = "hits.zig",
+        };
+        const entries: []const generate.script_scanner.ScriptScanner.ScriptEntry = &.{game_entry};
+
+        const main_zig = try generate.generateMainZigFromTemplate(
+            std.testing.allocator,
+            engine_template,
+            .{ .y_axis = .up, .name = "test-game", .backend = .raylib, .ecs = .mock },
+            raylib_lifecycle,
+            entries,
+            empty_names,
+            empty_names,
+            empty_scene_manifests,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_plugin_events,
+            empty_plugin_flow_nodes,
+            empty_plugin_pin_styles,
+            empty_plugin_coercions,
+        );
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(contains(main_zig, "@import(\"scripts/hits.zig\")"));
+    }
+};

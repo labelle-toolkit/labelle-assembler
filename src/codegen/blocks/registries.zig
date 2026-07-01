@@ -155,7 +155,14 @@ pub fn Mixin(comptime Self: type) type {
                     std.fmt.bufPrint(&named_buf, "script__{s}", .{ident}) catch return error.NameTooLong
                 else
                     entry.rel_path;
-                const import_prefix: []const u8 = if (is_promoted) "" else "scripts/";
+                // `entry.import_base` is `"scripts/"` for game + plugin
+                // scripts (rel_path relative to the generated scripts/ dir)
+                // and `""` for pack scripts, whose rel_path is already a full
+                // `packs/<name>/scripts/...` target-relative path
+                // (labelle-assembler#487). A FlowNode-promoted game script
+                // still imports through its named module, so it overrides
+                // both to `""`.
+                const import_prefix: []const u8 = if (is_promoted) "" else entry.import_base;
                 if (entry.states.len == 0) {
                     try w.print("    pub const {s} = @import(\"{s}{s}\");\n", .{ ident, import_prefix, import_target });
                 } else {
