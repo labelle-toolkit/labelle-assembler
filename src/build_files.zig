@@ -1048,6 +1048,11 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
         }
     else
         null;
+    // Free `resolved_deps` on every subsequent error path. This defer must be
+    // installed here — immediately after assignment — because fallible calls
+    // below (e.g. `v2BackendDepName`) can return before the
+    // `if (resolved_deps) |deps|` block, leaking the entries otherwise.
+    defer if (resolved_deps) |deps| deps_linker.freeDepEntries(allocator, deps);
 
     // Zig 0.16 validates `build.zig.zon` fingerprints with the formula
     // `(fingerprint >> 32) == std.hash.Crc32.hash(name)` where `name`
@@ -1093,7 +1098,8 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     defer if (v2_backend_dep_name) |n| allocator.free(n);
 
     if (resolved_deps) |deps| {
-        defer deps_linker.freeDepEntries(allocator, deps);
+        // Freed by the `defer` installed right after `resolved_deps` is
+        // assigned (above), so it also covers the fallible calls in between.
         // Deps are at .labelle/deps/, zon is at .labelle/<target>/
         const prefix = if (output_dir != null and target_dir != null) "../deps" else "deps";
         // The deps-linker names the backend entry by the `labelle_<name>`
