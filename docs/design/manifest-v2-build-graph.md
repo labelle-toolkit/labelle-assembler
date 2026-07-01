@@ -209,8 +209,8 @@ Two clarifications that the raw prediction glossed:
    the root module), NOT in a hook. This matches the RFC's `.pic` field
    (line 1424).
 
-2. **Per-OS system-lib/framework gating is declarative.** The `switch
-   (target.result.os.tag)` blocks in `.link_raylib` (OpenGL), `.link_sokol`
+2. **Per-OS system-lib/framework gating is declarative.** The
+   `switch (target.result.os.tag)` blocks in `.link_raylib` (OpenGL), `.link_sokol`
    (IOSurface/CoreFoundation), and `.link_wgpu` (Metal/Foundation/QuartzCore) look
    like code but are pure data: "on macos link X, on linux link Y." They move into
    `.system_libs`/`.frameworks` keyed **per-OS** (`.desktop.macos`, `.desktop.linux`,
@@ -277,9 +277,13 @@ pub const BackendManifestV2 = struct {
     /// declared under `.platforms.<p>.extra_modules`.
     modules: []const ModuleDecl,
 
-    /// b.dependency options common to every platform, name-declared here so the
-    /// name is comptime-known in generated source; value from a closed predicate
-    /// set (§4). Per-platform additions/overrides live in `PlatformEntry.dep_options`.
+    /// BASE b.dependency options — the set applied to EVERY platform. Names are
+    /// declared here so they are comptime-known in generated source; values come
+    /// from a closed predicate set (§4). Per-platform `PlatformEntry.dep_options`
+    /// override-by-name and append to this base; the precise merge contract is
+    /// documented on that field. Only options common to ALL supported platforms
+    /// belong here — an option some platform must NOT pass is a per-platform
+    /// append, never a base entry (there is no subtractive form).
     dep_options: []const DepOption = &.{},
 
     /// Per-platform, per-OS system libraries → `linkSystemLibrary`.
@@ -380,9 +384,29 @@ pub const BackendManifestV2 = struct {
         /// list would over/under-link, so artifacts (and their `.pic`) live here.
         artifacts: []const ArtifactDecl = &.{},
 
-        /// Per-platform b.dependency option additions/overrides (iOS adds
-        /// `dont_link_system_libs`; wasm passes only `with_imgui`). Merged over
-        /// the top-level `dep_options` by name.
+        /// Per-platform b.dependency option additions/overrides, merged over the
+        /// top-level (base) `dep_options` to form the FINAL option set for THIS
+        /// platform's generated `b.dependency` literal. The merge is a COMPTIME
+        /// set operation keyed by `name`, with a fixed precedence and NO runtime
+        /// removal (each platform's literal is generated independently, so it gets
+        /// its own field set — §4):
+        ///   1. Start from the base `dep_options` (applies to all platforms).
+        ///   2. A per-platform entry whose `name` matches a base entry OVERRIDES
+        ///      that entry's `value` for this platform (same name → one field, the
+        ///      per-platform `value` wins).
+        ///   3. A per-platform entry with a `name` not in the base is APPENDED.
+        ///   4. There is NO subtractive form. An empty per-platform list (`.{}`)
+        ///      inherits the base UNCHANGED — it can add or override, never drop.
+        ///      So an option that must NOT reach a given platform simply does not
+        ///      belong in the base; it lives on the per-platform lists that need
+        ///      it (sokol's `gamepad_*` is desktop-only, so it is a desktop append,
+        ///      not a base option — build_zig.txt:94 has it, :124 (wasm) does not).
+        ///   5. Duplicate names within a SINGLE scope (the base list, or one
+        ///      platform's list) are a manifest error — the `b.dependency` literal
+        ///      cannot carry two fields of the same name.
+        /// Examples (§3): iOS/Android append `dont_link_system_libs`; desktop
+        /// appends `gamepad_enabled`/`gamepad_hidapi`; wasm appends nothing and so
+        /// forwards only the base `with_imgui`.
         dep_options: []const DepOption = &.{},
 
         /// Extra platform-only modules (bgfx-Android `android_app`).
@@ -453,12 +477,15 @@ the hook (§4).
         .{ .name = "window", .source = "src/window.zig" },
     },
 
-    // Common option NAMES are declarative (comptime-known in the generated
-    // b.dependency literal); VALUES come from the closed predicate set (§4).
+    // BASE dep_options: ONLY options common to every platform (see the merge
+    // contract on PlatformEntry.dep_options). Option NAMES are declarative
+    // (comptime-known in the generated b.dependency literal); VALUES come from the
+    // closed predicate set (§4). `with_imgui` is the only sokol flag all four
+    // platforms pass (build_zig.txt:94/:124/:535/:763); `gamepad_*` is desktop-only
+    // and `dont_link_system_libs` is mobile-only, so both are per-platform appends
+    // below rather than base entries.
     .dep_options = .{
-        .{ .name = "with_imgui",      .value = .gui_is_imgui },
-        .{ .name = "gamepad_enabled", .value = .gamepad_enabled },
-        .{ .name = "gamepad_hidapi",  .value = .gamepad_hidapi },
+        .{ .name = "with_imgui", .value = .gui_is_imgui },
     },
 
     .system_libs = .{
@@ -477,6 +504,12 @@ the hook (§4).
             .loop_style = .callback,
             .target = .native,
             .artifacts = .{ .{ .name = "sokol_clib" } },
+            // gamepad_* is desktop-only (build_zig.txt:94) — APPENDED to the base
+            // `with_imgui`, so desktop's literal forwards all three flags.
+            .dep_options = .{
+                .{ .name = "gamepad_enabled", .value = .gamepad_enabled },
+                .{ .name = "gamepad_hidapi",  .value = .gamepad_hidapi },
+            },
             .package = .binary,
         },
         .ios = .{
@@ -485,7 +518,9 @@ the hook (§4).
             .target = .resolved, // device vs simulator + host arch — resolve_target (§4)
             .link_libc = true,   // ios_link:582
             .artifacts = .{ .{ .name = "sokol_clib" } },
-            // iOS links system libs manually → dont_link_system_libs (build_zig.txt:538)
+            // iOS links system libs manually → dont_link_system_libs
+            // (build_zig.txt:538), APPENDED to base with_imgui → {with_imgui,
+            // dont_link_system_libs}.
             .dep_options = .{ .{ .name = "dont_link_system_libs", .value = .true_literal } },
             .package = .binary,
         },
@@ -496,6 +531,9 @@ the hook (§4).
             .pic = true,         // android_exe_start root module pic (build_zig.txt:824)
             .link_libc = true,   // android_link:850
             .artifacts = .{ .{ .name = "sokol_clib", .pic = true } }, // build_zig.txt:783
+            // Android also links system libs manually → dont_link_system_libs
+            // (build_zig.txt:766), APPENDED to base with_imgui like iOS.
+            .dep_options = .{ .{ .name = "dont_link_system_libs", .value = .true_literal } },
             .package = .{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } },
         },
         .wasm = .{
@@ -503,7 +541,7 @@ the hook (§4).
             .loop_style = .callback,
             .target = .{ .triple = "wasm32-emscripten" }, // static (build_zig.txt:194)
             .artifacts = .{ .{ .name = "sokol_clib" } },
-            .dep_options = .{}, // wasm passes only with_imgui — see note below
+            .dep_options = .{}, // empty → inherits base UNCHANGED = only with_imgui (build_zig.txt:124); see note below
             .root_build_deps = .{ .{ .name = "emsdk" } }, // hook calls b.dependency("emsdk")
             .package = .{ .web = .{ .shell = null } },
         },
@@ -516,9 +554,12 @@ the hook (§4).
 }
 ```
 
-(wasm's `dep_options = .{}` means the assembler still passes the top-level
-`with_imgui` but not the desktop `gamepad_*` — the per-platform list *replaces* the
-gamepad entries rather than adding to them, matching `build_zig.txt:124`.)
+(wasm's `dep_options = .{}` inherits the base unchanged, so the assembler passes
+only `with_imgui`, matching `build_zig.txt:124`. It reaches that with_imgui-only set
+NOT by *dropping* `gamepad_*` — the merge has no subtractive form — but because
+those flags were never in the base: `gamepad_*` is a desktop-only append (above), so
+a platform that appends nothing never sees them. See the merge contract on
+`PlatformEntry.dep_options` in §3.)
 
 What the assembler now does generically for this manifest: run the hook's
 `resolve_target` phase to pin the `ResolvedTarget` (and, for iOS, the SDK path
@@ -565,8 +606,23 @@ split as **typed data**:
   today (`gui_is_imgui`, `gamepad_enabled`, `gamepad_hidapi`, or the `true/false`
   literals mobile needs), then emits the literal `true`/`false` into source.
 
-So the sokol `.dep_options` in §3 generate, verbatim and byte-for-byte with the
-enum path:
+This makes the base↔per-platform merge (§3) a purely comptime operation on the set
+of NAMES, mirroring how the v1 splice already works: `param_names` is just a list,
+and `renderFragmentWithParams` (`manifest_splice.zig:295`–`312`) puts exactly one
+scalar per name into the template map — the fragment forwards precisely the options
+it lists and no more. v2 replaces that single per-backend name list with a base list
+plus a per-platform list resolved at codegen: for each platform the assembler folds
+the per-platform entries over the base by `name` (override on collision, append
+otherwise) to get that platform's name set, then renders one `DepOption` field per
+name with its `ValueSource`-computed literal. Because the literal is emitted
+per-platform, a name absent from a platform's folded set is simply never written for
+that platform — which is why the merge needs no subtractive form, and why an option
+that must skip a platform (sokol's `gamepad_*` on wasm) belongs on the per-platform
+appends, not the base.
+
+So the sokol dep_options in §3 — the base `with_imgui` merged with the desktop
+platform's `gamepad_*` appends — generate the desktop cell verbatim and
+byte-for-byte with the enum path:
 
 ```zig
 const backend_dep = b.dependency("labelle_sokol", .{
@@ -828,12 +884,13 @@ backend × one platform at a time.
    `BackendManifestV2` would fail before any `>= 2` gate could run. Instead:
    - Parse the tiny `ManifestHeader { manifest_version: u8 = 1 }` first (defaulted,
      `ignore_unknown_fields`), so a v1/field-less manifest reads as `1`.
-   - Dispatch on a **bounded range**, mirroring `plugin_manifest.zig:208` (`< 1 or
-     > SUPPORTED`): `v <= 1` → v1 splice + enum path; `2 <= v <=
-     SUPPORTED_MANIFEST_VERSION` → re-parse into the full `BackendManifestV2`; `v >
-     SUPPORTED` → **reject** with a readable error (an older assembler must NOT
-     silently accept a future v3 manifest and skip its unknown fields — that would
-     generate an incomplete build graph for a hookless future manifest).
+   - Dispatch on a **bounded range**, mirroring `plugin_manifest.zig:208`
+     (`< 1 or > SUPPORTED`): `v <= 1` → v1 splice + enum path;
+     `2 <= v <= SUPPORTED_MANIFEST_VERSION` → re-parse into the full
+     `BackendManifestV2`; `v > SUPPORTED` → **reject** with a readable error (an
+     older assembler must NOT silently accept a future v3 manifest and skip its
+     unknown fields — that would generate an incomplete build graph for a hookless
+     future manifest).
    - A backend with no manifest keeps the enum path. **Zero behavior change** here.
 
 2. **Convert the sokol in-tree fixture to v2, desktop only.** `backends/sokol` is
@@ -1001,7 +1058,12 @@ them. Each was re-verified against the real code before being accepted.
    `b.dependency` options literal needs comptime-known field names, so a runtime
    hook return cannot expand into it. Redesigned: option *names* are declarative
    (`DepOption.name`), *values* come from a closed `ValueSource` predicate set;
-   `pre_wire`/`DependencyOptions` deleted (§3, §4).
+   `pre_wire`/`DependencyOptions` deleted (§3, §4). *Follow-up (PR #459):* the
+   base↔per-platform merge is now specified exactly — a comptime, name-keyed
+   override-plus-append with **no subtractive form** (an empty per-platform list
+   inherits the base unchanged). The sokol example was corrected accordingly so
+   `gamepad_*` is a desktop-only append (not a base entry that wasm has to "drop"),
+   which is why an empty wasm list correctly forwards only `with_imgui` (§3).
 4. **Core-diamond walk must keep the engine→gfx override** (P1). The rev-1
    `unifyCoreDiamond` only rewrote core spellings, dropping `engine_mod←gfx`
    (`build_zig.txt:29`–`30`) and leaving two gfx instances. The walk now carries a
