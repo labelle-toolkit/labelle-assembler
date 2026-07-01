@@ -773,14 +773,27 @@ pub const MANIFEST_V2_GENERATE_CUTOVER = struct {
         // so the v2 `.capabilities` were ignored. A project requiring a capability
         // the v2 backend does NOT declare must now fail the REAL `generate` with the
         // readable project-level `error.UnsupportedCapability`.
+        //
+        // NOTE (issue #83): this drives the REAL exe target (`is_tests_target =
+        // false`) — the tests target deliberately skips the capability gate (both
+        // the root-level `validateProviderContracts` and `generateBuildZig`'s own
+        // v2 check), so it can never surface a capability mismatch. The finding-2
+        // catch is a resolve-time (`validateProviderContracts`) concern, which
+        // fires BEFORE any main.zig/engine-template work, so the exe path errors
+        // without needing a cached engine template.
         const cfg = generate.ProjectConfig{
             .name = "cutover-cap-game",
+            .backend_package = h.acme_foo_fixture_package,
             .ecs = .mock,
             .requires = &.{.screenshots},
         };
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const out_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(out_abs);
         try std.testing.expectError(
             error.UnsupportedCapability,
-            h.generateAndReadBuildZig(std.testing.allocator, cfg, h.acme_foo_fixture_package),
+            generate.generate(std.testing.allocator, cfg, out_abs, ".", .{ .is_tests_target = false }),
         );
     }
 };
@@ -840,7 +853,7 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
         };
         try std.testing.expectError(
             error.UnsupportedCapability,
-            generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon"),
+            generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon", false),
         );
     }
 
@@ -853,7 +866,7 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
             .requires = &.{.headless},
             .backend_package = h.acme_foo_fixture_package,
         };
-        try generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon");
+        try generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon", false);
     }
 
     test "validateProviderContracts: WITHOUT the detected v2 name the v2 capabilities are NOT enforced (proves the name is load-bearing)" {
@@ -868,7 +881,86 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
             .requires = &.{.screenshots},
             .backend_package = h.acme_foo_fixture_package,
         };
-        try generate.validateProviderContracts(std.testing.allocator, cfg, ".", null);
+        try generate.validateProviderContracts(std.testing.allocator, cfg, ".", null, false);
+    }
+
+    // ── Tests-target forced-null must NOT be capability-gated (issue #83) ──
+
+    test "validateProviderContracts: the tests-target forced-null (null-v2) is NOT capability-gated even though the project derives .raw_gui_adapter" {
+        // Reproduces the #83 CI break surfaced by the null→v2 flip: the tests
+        // target force-substitutes `cfg.backend = .null` (a headless harness)
+        // while KEEPING the project's `resolved_gui = imgui` (raw_backend), so
+        // `requiredCapabilities(cfg)` still derives `.raw_gui_adapter`. null-v2
+        // declares ONLY `.headless`. Before the fix the opted-in gate hard-failed
+        // `error.UnsupportedCapability` for every GUI project's `zig build test`.
+        //
+        // Direction 1 (must PASS): is_tests_target = true skips the capability
+        // requirement — the forced-null harness never builds the real GUI.
+        const cfg = generate.ProjectConfig{
+            .name = "gui-tests-game",
+            .ecs = .mock,
+            .resolved_gui = testGuiRawBackend("imgui"), // derives .raw_gui_adapter
+            .backend_package = h.null_v2_fixture_package, // declares only .headless
+        };
+        try generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon", true);
+    }
+
+    test "validateProviderContracts: the SAME GUI project's EXE target STILL fails when its backend lacks .raw_gui_adapter (issue #83)" {
+        // Direction 2 (must FAIL): the exact same config validated as the REAL exe
+        // target (is_tests_target = false) must still hard-error — a GUI project
+        // whose chosen backend declares only `.headless` genuinely cannot satisfy
+        // `.raw_gui_adapter`. This proves the tests-target skip did NOT weaken the
+        // gate for the real backend selection.
+        const cfg = generate.ProjectConfig{
+            .name = "gui-tests-game",
+            .ecs = .mock,
+            .resolved_gui = testGuiRawBackend("imgui"), // derives .raw_gui_adapter
+            .backend_package = h.null_v2_fixture_package, // declares only .headless
+        };
+        try std.testing.expectError(
+            error.UnsupportedCapability,
+            generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon", false),
+        );
+    }
+
+    // ── The SECOND gate: generateBuildZig's own v2 capability check (issue #83) ──
+    // build_files.generateBuildZig runs its OWN v2 capability validation (added
+    // in the #472 open-config PR), independent of the root-level
+    // validateProviderContracts skip above. The tests target calls
+    // generateBuildZig directly (via generateTestsTarget), so this gate must ALSO
+    // skip the capability REQUIREMENT for the forced-null harness — otherwise
+    // #474's gamepad example tests-target generate fails with UnsupportedCapability
+    // even after the root-level fix. These drive generateBuildZig DIRECTLY (not
+    // just validateProviderContracts) to lock the second skip.
+
+    test "generateBuildZig: the tests-target forced-null (null-v2) is NOT capability-gated even though the project derives .raw_gui_adapter" {
+        // Direction 1 (must PASS): is_tests_target = true skips generateBuildZig's
+        // own capability requirement — the forced-null harness never builds the
+        // real GUI. Mirrors the #474 gamepad example's tests-target generate.
+        const cfg = generate.ProjectConfig{
+            .name = "gui-tests-game",
+            .ecs = .mock,
+            .resolved_gui = testGuiRawBackend("imgui"), // derives .raw_gui_adapter
+        };
+        const build_zig = try h.genNullV2BuildZig(std.testing.allocator, cfg, .{ .is_tests_target = true });
+        std.testing.allocator.free(build_zig);
+    }
+
+    test "generateBuildZig: the SAME GUI project's EXE target STILL fails when its backend lacks .raw_gui_adapter (issue #83)" {
+        // Direction 2 (must FAIL): the exact same config generated as the REAL exe
+        // target (is_tests_target = false) must still hard-error in generateBuildZig
+        // — null-v2 declares only `.headless` and genuinely cannot satisfy
+        // `.raw_gui_adapter`. Proves the second skip did NOT weaken the gate for the
+        // real backend selection.
+        const cfg = generate.ProjectConfig{
+            .name = "gui-tests-game",
+            .ecs = .mock,
+            .resolved_gui = testGuiRawBackend("imgui"), // derives .raw_gui_adapter
+        };
+        try std.testing.expectError(
+            error.UnsupportedCapability,
+            h.genNullV2BuildZig(std.testing.allocator, cfg, .{ .is_tests_target = false }),
+        );
     }
 
     // ── Major (#473): the legacy loop_style path must run for a v1-by-name file ──

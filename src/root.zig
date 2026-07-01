@@ -366,11 +366,24 @@ pub const GenerateOptions = struct {
 /// checks apply on every target (android/wasm/ios included). A provider that
 /// ships no manifest yields a null slice: identity is derived, capabilities are
 /// un-enforced (the back-compat path).
+/// `is_tests_target` scopes the CAPABILITY gate OUT for the tests target
+/// (issue #83): that target force-substitutes `cfg.backend = .null` as a
+/// headless test HARNESS while keeping the rest of the project config (e.g.
+/// `resolved_gui = imgui`), so `requiredCapabilities(cfg)` still derives the
+/// REAL backend's needs (`.raw_gui_adapter`, …). The forced-null harness never
+/// builds the real GUI/gamepad, so requiring it to satisfy those capabilities
+/// is wrong — and now that null ships a v2 manifest declaring only `.headless`,
+/// the opted-in gate would hard-fail `zig build test` for any GUI/gamepad
+/// project. Identity + id-collision checks stay ON for the tests target (cheap
+/// and still valid); only the capability REQUIREMENT check is skipped. The real
+/// exe target (`is_tests_target = false`) is unaffected — a GUI project whose
+/// chosen backend lacks `.raw_gui_adapter` must still fail.
 pub fn validateProviderContracts(
     allocator: std.mem.Allocator,
     cfg: ProjectConfig,
     game_dir: []const u8,
     backend_manifest_name: ?[]const u8,
+    is_tests_target: bool,
 ) !void {
     // ── manifest-v2 cutover (epic #453, closes #472 P2 finding 2) ──────
     // When `generate` auto-detected a v2 manifest, the provider identity +
@@ -384,7 +397,7 @@ pub fn validateProviderContracts(
         switch (parsed) {
             .v2 => |m| {
                 defer parsed.free(allocator);
-                return validateProviderContractsInner(allocator, cfg, m.id, m.capabilities);
+                return validateProviderContractsInner(allocator, cfg, m.id, m.capabilities, is_tests_target);
             },
             .v1 => parsed.free(allocator), // not actually a v2 manifest — fall through
         }
@@ -395,7 +408,7 @@ pub fn validateProviderContracts(
     const declared: []const config.Capability = if (maybe_pm) |pm| pm.capabilities else &.{};
     defer if (maybe_pm) |pm| manifest_splice.freeProviderManifest(allocator, pm);
 
-    return validateProviderContractsInner(allocator, cfg, manifest_id, declared);
+    return validateProviderContractsInner(allocator, cfg, manifest_id, declared, is_tests_target);
 }
 
 /// The identity + capability contract checks, factored out so BOTH the legacy
@@ -407,6 +420,7 @@ fn validateProviderContractsInner(
     cfg: ProjectConfig,
     manifest_id: ?[]const u8,
     declared: []const config.Capability,
+    is_tests_target: bool,
 ) !void {
     // Provider identity: reserved-namespace + enum-shorthand drift.
     try backend_registry.validateProviderIdentity(cfg, manifest_id);
@@ -422,6 +436,14 @@ fn validateProviderContractsInner(
     // Capability negotiation. Enforcement is OPT-IN: a provider declaring a
     // non-empty `.capabilities` set has missing requirements fail hard; a
     // provider declaring none is only warned (back-compat gate in `validate`).
+    //
+    // SKIPPED for the tests target (issue #83): its `cfg.backend` was
+    // force-substituted to `.null` (a headless test harness) while the rest of
+    // the config still describes the REAL backend's needs, so validating the
+    // null harness against the project's real-backend capabilities is wrong.
+    // Identity + collision checks above stay ON (cheap + still valid). The real
+    // exe target still enforces the gate.
+    if (is_tests_target) return;
     const required = try capabilities.requiredCapabilities(allocator, cfg);
     defer allocator.free(required);
     const provider_id = manifest_id orelse cfg.backendName();
@@ -567,7 +589,7 @@ pub fn generate(
     // rejected as manifest-less (the requirement keys off THIS name).
     const backend_manifest_name = detectV2ManifestName(allocator, cfg, game_dir);
     try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, backend_manifest_name);
-    try validateProviderContracts(allocator, cfg, game_dir, backend_manifest_name);
+    try validateProviderContracts(allocator, cfg, game_dir, backend_manifest_name, is_tests_target);
 
     // Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
     // target platform opts into ASTC (`asset_compression`) and `labelle astc`

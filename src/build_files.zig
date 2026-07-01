@@ -312,10 +312,23 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // opts into a v2 manifest), so the enum/v1 path is byte-unchanged.
     if (v2_manifest) |m| {
         try backend_registry.validateProviderIdentity(cfg, m.id);
-        const required = try capabilities.requiredCapabilities(allocator, cfg);
-        defer allocator.free(required);
-        const provider_id = m.id orelse cfg.backendName();
-        try capabilities.validate(required, m.capabilities, provider_id);
+        // SKIPPED for the tests target (issue #83), consistent with the
+        // root-level `validateProviderContracts` skip: that target
+        // force-substitutes `cfg.backend = .null` (a headless test HARNESS)
+        // while keeping the rest of the config describing the REAL backend's
+        // needs, so `requiredCapabilities(cfg)` still derives e.g.
+        // `.raw_gui_adapter`. The forced-null harness never builds the real
+        // GUI/gamepad, and null-v2 declares only `.headless`, so requiring the
+        // gate here would hard-fail `zig build test` for every GUI/gamepad
+        // project. Identity check above stays ON (cheap + still valid); only
+        // the capability REQUIREMENT is skipped. The real exe target
+        // (`is_tests_target = false`) still enforces the gate.
+        if (!opts.is_tests_target) {
+            const required = try capabilities.requiredCapabilities(allocator, cfg);
+            defer allocator.free(required);
+            const provider_id = m.id orelse cfg.backendName();
+            try capabilities.validate(required, m.capabilities, provider_id);
+        }
     }
 
     if (cfg.platform == .wasm) {
