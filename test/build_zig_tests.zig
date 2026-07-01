@@ -1487,3 +1487,153 @@ pub const PR9_STAGE_RAYLIB_HOOK = struct {
         try std.testing.expectEqualStrings(want, got);
     }
 };
+
+
+// ── manifest-v2 bgfx GOLDEN cells (epic #453 item 3, PR 10, design §7) ──
+// bgfx is the LAST + HARDEST backend converted to v2 — the first needing BOTH
+// per-platform `loop_style` (desktop `.loop`, android `.callback`) AND a
+// platform-only `extra_modules` with a non-default `root_alias` (android's
+// `android_app` → `backend_app`), both from ONE manifest. Two golden cells:
+//
+//   - bgfx_v2 DESKTOP: HOOKLESS, generic declarative path — the `bgfx` + `glfw`
+//     artifacts linked onto exe AND test_root, the base `gui_enabled` + desktop
+//     `gamepad_*` dep_options, the generic `unifyCoreDiamond` walk (which covers the
+//     transitive `sdl_gamepad` sub-package at build time — the enum
+//     `backend_bgfx` :162 override, without a per-backend site).
+//   - bgfx_v2 ANDROID: HOOK-BEARING — `resolve_target` (ABI) BEFORE any
+//     b.dependency + `post_wire` (the bgfx-Android NDK residual: addLibraryPath +
+//     libc.txt). The `android_app` extra module is pulled and aliased to
+//     `backend_app` (the load-bearing correctness bit, design §3 review-correction
+//     #3 — a wrong alias breaks the generated main's `@import("backend_app")`
+//     NativeActivity shell import). Declarative NDK system libs + link_libc, apk
+//     packaging via the shared packager. Core-diamond covers android's direct
+//     `labelle-core` (#310 vtable) import on `backend_input` generically.
+//
+// Like every hook-bearing/generic v2 cell this is a committed golden (reviewed by
+// hand against the enum `backend_bgfx`/`link_bgfx`/`backend_bgfx_android`/
+// `android_link_bgfx` output for graph equivalence) PLUS the hook's own gates:
+// `backends/bgfx_v2/backend.hook.zig` is compiled as a test target in build.zig
+// (typechecking `resolve_target`/`post_wire` against std.Build) and unit-tests its
+// pure decision helpers. See design §7 for why the text golden alone is blind to
+// the hook body.
+pub const MANIFEST_V2_BGFX_DESKTOP_GOLDEN = struct {
+    const golden = @embedFile("goldens/bgfx_v2_desktop.build.zig");
+
+    fn genBgfxV2Desktop() ![]const u8 {
+        return h.genBgfxV2BuildZig(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .bgfx,
+            .ecs = .mock,
+        }, .{});
+    }
+
+    test "golden: v2 bgfx-desktop build.zig matches the committed golden" {
+        const out = try genBgfxV2Desktop();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 bgfx-desktop build.zig is syntactically valid Zig" {
+        const out = try genBgfxV2Desktop();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 bgfx-desktop is HOOKLESS, links bgfx+glfw on exe AND test_root, generic diamond" {
+        const out = try genBgfxV2Desktop();
+        defer std.testing.allocator.free(out);
+        // Hookless desktop: NO hook import / phases (desktop `.loop`, `.native`).
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "resolve_target") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "post_wire") == null);
+        // Declarative backend dep forwards gui_enabled (base) + gamepad_* (desktop
+        // append; default cfg: gamepad auto → true, hidapi false).
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"labelle_bgfx\", .{ .target = target, .optimize = optimize, .gui_enabled = false, .gamepad_enabled = true, .gamepad_hidapi = false });") != null);
+        // BOTH artifacts declared.
+        try std.testing.expect(std.mem.indexOf(u8, out, "const bgfx = backend_dep.artifact(\"bgfx\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "const glfw = backend_dep.artifact(\"glfw\");") != null);
+        // Generic core-diamond walk (loop form) — covers the transitive sdl_gamepad.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, backend_input, core_mod, gfx_mod,") != null);
+        // exe + test_root: link BOTH bgfx and glfw (no glfw-only, no frameworks).
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkLibrary(bgfx);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkLibrary(glfw);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkLibrary(bgfx);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkLibrary(glfw);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "linkFramework") == null);
+    }
+};
+
+pub const MANIFEST_V2_BGFX_ANDROID_GOLDEN = struct {
+    const golden = @embedFile("goldens/bgfx_v2_android.build.zig");
+
+    fn genBgfxV2Android() ![]const u8 {
+        return h.genBgfxV2BuildZig(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .ecs = .mock,
+        }, .{});
+    }
+
+    test "golden: v2 bgfx-android build.zig matches the committed golden" {
+        const out = try genBgfxV2Android();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 bgfx-android build.zig is syntactically valid Zig" {
+        const out = try genBgfxV2Android();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 bgfx-android: android_app aliased to backend_app (the load-bearing bit, §3)" {
+        const out = try genBgfxV2Android();
+        defer std.testing.allocator.free(out);
+        // The extra module is pulled as `android_app` and published under the
+        // alias `backend_app` — the DEFAULT alias would be `backend_android_app`,
+        // which breaks the generated main's `@import("backend_app")` shell import.
+        try std.testing.expect(std.mem.indexOf(u8, out, "const backend_app = backend_dep.module(\"android_app\");") != null);
+        // …and it is imported into the .so root module under that exact alias.
+        try std.testing.expect(std.mem.indexOf(u8, out, ".{ .name = \"backend_app\", .module = backend_app },") != null);
+        // The wrong (default) alias never appears.
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_android_app") == null);
+        // The extra module is walked by the generic core-diamond too (design §5).
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, backend_app, core_mod, gfx_mod,") != null);
+    }
+
+    test "v2 bgfx-android imports the backend hook and calls BOTH phases (§4)" {
+        const out = try genBgfxV2Android();
+        defer std.testing.allocator.free(out);
+        // resolve_target BEFORE any b.dependency (produces android_target).
+        try std.testing.expect(std.mem.indexOf(u8, out, "@import(\"backend_build_hook.zig\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.resolve_target(b, .{ .platform = .android }).target") != null);
+        // post_wire AFTER wiring, carrying the REQUIRED android_target_sdk (34).
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.post_wire(b, .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".android_target_sdk = 34,") != null);
+        // Generic core-diamond walk (loop form) replaced the unrolled #310 override.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, backend_input, core_mod, gfx_mod,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyGfxSubpackageCore(gfx_mod, core_mod)") == null);
+        // Declarative graph: bgfx artifact link + NDK system libs + link_libc.
+        try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.linkLibrary(bgfx)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.link_libc = true;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.linkSystemLibrary(\"mediandk\", .{})") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.linkSystemLibrary(\"aaudio\", .{})") != null);
+        // NO glfw on android (zglfw is desktop-only, #303).
+        try std.testing.expect(std.mem.indexOf(u8, out, "artifact(\"glfw\")") == null);
+        // APK packaging delegated to the shared packager (byte-identical section).
+        try std.testing.expect(std.mem.indexOf(u8, out, "Package and sign Android APK") != null);
+        // The enum-path inline NDK detection is GONE — it lives in the hook now.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn getAndroidNdkSysroot(") == null);
+    }
+};

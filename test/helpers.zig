@@ -512,6 +512,39 @@ pub fn genRaylibV2BuildZig(
     return generate.generateBuildZig(allocator, cfg, opts);
 }
 
+// ── bgfx v2 GOLDEN fixture (manifest-v2, epic #453 item 3, PR 10) ──
+// bgfx is the LAST + HARDEST backend converted to v2 — the first needing BOTH
+// per-platform `loop_style` (desktop `.loop`, android `.callback`) AND a
+// platform-only `extra_modules` with a non-default `root_alias` (android's
+// `android_app` → `backend_app`). The fixture ships this v2 manifest + the
+// dedicated `backend.hook.zig` (the android NDK residual), no build.zig/package —
+// codegen reads them offline.
+//   - DESKTOP: HOOKLESS, generic declarative path — the `bgfx` + `glfw` artifacts,
+//     the base `gui_enabled` + desktop `gamepad_*` dep_options, the generic
+//     `unifyCoreDiamond` walk (covers the transitive sdl_gamepad at build time).
+//   - ANDROID: HOOK-BEARING — `resolve_target` (ABI) + `post_wire` (NDK
+//     addLibraryPath + libc.txt), the `android_app` extra module aliased to
+//     `backend_app`, declarative NDK system libs, apk packaging via the packager.
+pub const bgfx_v2_fixture_package = generate.PluginDep{ .name = "bgfx_v2", .repo = "local:backends/bgfx_v2" };
+
+/// Generate a build.zig against the bgfx v2 fixture — DESKTOP (declarative
+/// `bgfx`+`glfw` artifacts, hookless) unless the caller sets `cfg.platform =
+/// .android`, which drives the hook path (`resolve_target`/`post_wire`) + the
+/// `android_app` extra module aliased to `backend_app` (design §7 golden cell).
+pub fn genBgfxV2BuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend = .bgfx;
+    cfg.backend_package = bgfx_v2_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
 // A BROKEN-v2 backend fixture: `backends/sokol_v2broken` ships a
 // `backend.manifest.v2.zon` whose header parses (manifest_version = 2) but whose
 // body is invalid, so `manifest_v2.loadNamedManifest` fails. Used to prove #468

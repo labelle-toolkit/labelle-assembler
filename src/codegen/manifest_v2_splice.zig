@@ -436,6 +436,21 @@ fn renderAndroidBackendDepV2(
         try w.print("    const {s} = backend_dep.module(\"{s}\");\n", .{ alias, mod.name });
     }
 
+    // GENERATED: platform-only EXTRA module decls under their root alias (design §3
+    // `PlatformEntry.extra_modules`). bgfx-Android's NativeActivity shell
+    // `android_app` is pulled as `backend_dep.module("android_app")` and published
+    // to the generated root under the alias `backend_app` (its declared
+    // `root_alias`) — the generated `main.zig` imports it as `@import("backend_app")`
+    // (enum `backend_bgfx_android` :799 / `android_exe_app_import` :871). The default
+    // `backend_<name>` alias would be `backend_android_app` and break that import, so
+    // the manifest declares the explicit alias (design §3 review-correction #3).
+    // sokol android has no extra modules, so this is a no-op there.
+    for (android.extra_modules) |mod| {
+        const alias = try moduleAlias(allocator, mod);
+        defer allocator.free(alias);
+        try w.print("    const {s} = backend_dep.module(\"{s}\");\n", .{ alias, mod.name });
+    }
+
     // GENERATED: artifact decls + declarative `.pic` (design §2 note 1).
     for (android.artifacts) |art| {
         try w.print("    const {s} = backend_dep.artifact(\"{s}\");\n", .{ art.name, art.name });
@@ -445,9 +460,12 @@ fn renderAndroidBackendDepV2(
     // GENERATED: the generic core+gfx-diamond walk CALLS (design §5). Rooted at
     // gfx/engine (the fixed diamond) + each backend module (a no-op for sokol
     // android, whose modules do not import core — but design-faithful and
-    // resilient). Replaces the enum `android_deps` unrolled overrides +
-    // `unifyGfxSubpackageCore`. The `unifyCoreDiamond` def itself is emitted as a
-    // top-level helper after the build fn (see `emitCoreDiamondWalk`).
+    // resilient). For bgfx-Android the walk over `backend_input` covers the direct
+    // `labelle-core` import (the #310 vtable override) generically, and the walk
+    // over `backend_app` covers the NativeActivity shell. Replaces the enum
+    // `android_deps` unrolled overrides + `unifyGfxSubpackageCore`. The
+    // `unifyCoreDiamond` def itself is emitted as a top-level helper after the build
+    // fn (see `emitCoreDiamondWalk`).
     try w.writeAll(
         \\
         \\    // Generic core+gfx-diamond unification (design §5) — the loop form of
@@ -459,6 +477,13 @@ fn renderAndroidBackendDepV2(
         \\
     );
     for (m.modules) |mod| {
+        const alias = try moduleAlias(allocator, mod);
+        defer allocator.free(alias);
+        try w.print("    unifyCoreDiamond(b.allocator, {s}, core_mod, gfx_mod, &core_diamond_visited);\n", .{alias});
+    }
+    // The platform-only extra modules are walked too (design §5 lists android_app
+    // among the walked providers).
+    for (android.extra_modules) |mod| {
         const alias = try moduleAlias(allocator, mod);
         defer allocator.free(alias);
         try w.print("    unifyCoreDiamond(b.allocator, {s}, core_mod, gfx_mod, &core_diamond_visited);\n", .{alias});
