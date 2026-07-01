@@ -1352,6 +1352,20 @@ pub const MANIFEST_V2_RAYLIB_WASM_GOLDEN = struct {
         .ecs = .mock,
     };
 
+    // The build.zig helper pins the v2 fixture internally (backend_package +
+    // project_dir + manifest name). The ZON tests call `generateBuildZigZon`
+    // directly, so they must pin `backend_package` to the raylib_v2 fixture
+    // themselves — a bare cfg would resolve through the enum/provider `.raylib`
+    // path (backends/raylib_v2/backend.manifest.v2.zon is never consulted),
+    // making the emsdk root-build-dep coverage a false positive (PR #470
+    // coderabbit finding). With the fixture pinned the emsdk emission is
+    // genuinely the v2 manifest's `.platforms.wasm.root_build_deps` behavior.
+    const wasm_v2_cfg: generate.ProjectConfig = blk: {
+        var c = wasm_cfg;
+        c.backend_package = h.raylib_v2_fixture_package;
+        break :blk c;
+    };
+
     fn genRaylibV2Wasm() ![]const u8 {
         return h.genRaylibV2BuildZig(std.testing.allocator, wasm_cfg, .{});
     }
@@ -1397,7 +1411,7 @@ pub const MANIFEST_V2_RAYLIB_WASM_GOLDEN = struct {
     test "v2 raylib-wasm build.zig.zon carries the emsdk root build dep (§3 RootBuildDep)" {
         const zon = try generate.generateBuildZigZon(
             std.testing.allocator,
-            wasm_cfg,
+            wasm_v2_cfg,
             null,
             null,
             ".",
@@ -1410,9 +1424,15 @@ pub const MANIFEST_V2_RAYLIB_WASM_GOLDEN = struct {
 
     test "v2 raylib-wasm zon emsdk is byte-identical to the enum-path zon" {
         // `.builtin` reuses the enum path's pinned `dep_emsdk` section (design §3).
+        // Both sides pin the raylib_v2 fixture so the ONLY axis under test is the
+        // manifest-v2 opt-in (v2 side sets `.backend_manifest_name`, enum side
+        // does not): the v2 manifest's `.root_build_deps` emsdk emission must be
+        // byte-identical to the enum-fallback `dep_emsdk` section (PR #470
+        // coderabbit finding — a bare cfg made the v2 side fall to the enum path
+        // too, comparing enum-vs-enum).
         const v2_zon = try generate.generateBuildZigZon(
             std.testing.allocator,
-            wasm_cfg,
+            wasm_v2_cfg,
             null,
             null,
             ".",
@@ -1421,7 +1441,7 @@ pub const MANIFEST_V2_RAYLIB_WASM_GOLDEN = struct {
         defer std.testing.allocator.free(v2_zon);
         const enum_zon = try generate.generateBuildZigZon(
             std.testing.allocator,
-            wasm_cfg,
+            wasm_v2_cfg,
             null,
             null,
             ".",

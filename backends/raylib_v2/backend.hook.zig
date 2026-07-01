@@ -117,9 +117,13 @@ fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Bui
 /// under `web/`. Returns the install step so the caller can wire it into
 /// `b.getInstallStep()` + the run step.
 pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.InstallDir {
-    const emcc_path = emTool(b, options.emsdk, "emcc").getPath(b);
-    const emcc = b.addSystemCommand(&.{emcc_path});
-    emcc.setName("emcc"); // hide the resolved emcc path in the build log
+    // Pass emcc as a LazyPath via addFileArg so the emsdk path resolves lazily at
+    // step-execution time — NOT eagerly at build-configuration time. Calling
+    // `.getPath(b)` here would force resolution during configure and break lazy
+    // evaluation (PR #470 gemini finding). `Run.create` + `addFileArg` is the
+    // lazy-safe form; the step name "emcc" also hides the resolved path in the log.
+    const emcc = std.Build.Step.Run.create(b, "emcc");
+    emcc.addFileArg(emTool(b, options.emsdk, "emcc"));
     if (options.optimize == .Debug) {
         emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
     } else {
