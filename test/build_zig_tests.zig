@@ -30,6 +30,74 @@ test {
     zspec.runAll(@This());
 }
 
+// ── manifest-v2 desktop byte anchor (epic #453 item 3, PR 3, design §7) ──
+// The critical proof-of-concept: the v2 desktop codegen path
+// (`backend.manifest.v2.zon` → `manifest_v2_splice`) must generate a build.zig
+// BYTE-IDENTICAL to the enum/v1-splice path for sokol-desktop. sokol-desktop is
+// the one cell where the v1 splice already ships byte-identical to the enum path,
+// so a 0-diff here proves the v2 machinery reproduces the established baseline.
+// Varies the exact cfg inputs the declarative `dep_options` ValueSource predicates
+// branch on (gamepad auto/off, hidapi on/off), each of which must stay 0-diff.
+pub const MANIFEST_V2_DESKTOP_ANCHOR = struct {
+    fn expectV2MatchesEnum(cfg: generate.ProjectConfig) !void {
+        const enum_baseline = try h.genSokolBuildZig(std.testing.allocator, cfg, .{});
+        defer std.testing.allocator.free(enum_baseline);
+        const v2_out = try h.genSokolBuildZigV2(std.testing.allocator, cfg, .{});
+        defer std.testing.allocator.free(v2_out);
+        // Byte anchor: 0 diff. `expectEqualStrings` prints the first divergence,
+        // so a regression in the v2 model surfaces as a readable line delta.
+        try std.testing.expectEqualStrings(enum_baseline, v2_out);
+    }
+
+    test "byte anchor: v2 desktop == enum/v1, default cfg (gamepad auto, no gui)" {
+        try expectV2MatchesEnum(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock });
+    }
+
+    test "byte anchor: v2 desktop == enum/v1, gamepad off" {
+        try expectV2MatchesEnum(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock, .gamepad = .none });
+    }
+
+    test "byte anchor: v2 desktop == enum/v1, gamepad hidapi on" {
+        try expectV2MatchesEnum(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock, .gamepad_hidapi = true });
+    }
+
+    test "byte anchor: v2 desktop == enum/v1, with plugins + zig_ecs (shared regions unaffected)" {
+        // The backend-dep + link regions are the only v2-touched cells; wiring
+        // plugins/ecs exercises that everything AROUND them stays identical too.
+        // A REAL plugin entry is load-bearing here: plugin modules flow through
+        // the core-diamond `overrideImport` region, so the byte anchor only
+        // exercises the plugin-wiring path if a plugin is actually present. The
+        // plugin need not resolve on disk — `generateBuildZig` emits the plugin
+        // dep/module decls from the config alone (only build.zig.zon resolution
+        // touches disk), so a plausible labelle-toolkit slug is enough.
+        try expectV2MatchesEnum(.{
+            .name = "anchor-game",
+            .backend = .sokol,
+            .ecs = .zig_ecs,
+            .plugins = &.{
+                .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "2.6.0" },
+            },
+        });
+    }
+
+    test "byte anchor: v2-only backend (no legacy manifest) reaches v2 == dual-manifest v2 (#453)" {
+        // Regression proof for the manifest-v2 gate fix: `backends/sokol_v2only`
+        // ships ONLY `backend.manifest.v2.zon` (no `backend.manifest.zon`). Before
+        // the fix, the external-manifest requirement + desktop gate keyed off the
+        // hardcoded legacy name, so this package hard-errored ExternalBackendNeeds-
+        // Manifest and never reached `loadNamedManifest`. Keying off the requested
+        // name lets it through the v2 path — and because the v2 manifest is a byte
+        // copy of sokol's, the generated build.zig is IDENTICAL to the dual-manifest
+        // sokol fixture's v2 output. (Also implicitly a 0-diff vs the enum baseline.)
+        const cfg: generate.ProjectConfig = .{ .name = "anchor-game", .backend = .sokol, .ecs = .mock };
+        const v2_dual = try h.genSokolBuildZigV2(std.testing.allocator, cfg, .{});
+        defer std.testing.allocator.free(v2_dual);
+        const v2_only = try h.genSokolV2OnlyBuildZig(std.testing.allocator, cfg, .{});
+        defer std.testing.allocator.free(v2_only);
+        try std.testing.expectEqualStrings(v2_dual, v2_only);
+    }
+};
+
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
         const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{

@@ -38,6 +38,7 @@ test {
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/manifest_splice.zig");
     _ = @import("codegen/manifest_v2.zig");
+    _ = @import("codegen/manifest_v2_splice.zig");
     _ = @import("codegen/core_diamond.zig");
     _ = @import("capabilities.zig");
 }
@@ -411,7 +412,7 @@ pub fn generate(
     // from generated code. Runs after `requireManifestIfExternal` (a manifest-
     // less external still errors first, with its clearer message) and before
     // `deps_linker.createDepsLinks` / build.zig emission below.
-    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir);
+    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, null);
     try validateProviderContracts(allocator, cfg, game_dir);
 
     // Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
@@ -942,7 +943,7 @@ pub fn generate(
         // reads it — instead of the `cfg.backend == .sokol` enum branch inside
         // that function. Scoped to this one call; cleared right after. Null
         // override = enum path (bgfx-android, sokol-wasm, etc. unchanged).
-        if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir)) {
+        if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir, null)) {
             const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
             defer manifest_splice.freeManifest(allocator, m);
             main_zig.main_template.loop_style_override = manifest_splice.loopStyle(m);
@@ -1062,7 +1063,7 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     // External backends generate EXCLUSIVELY via their manifest — fail loudly if
     // one ships none rather than falling through to the enum path below (which
     // reads `cfg.backend ==`, meaningless for an external backend with no tag).
-    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir);
+    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, null);
 
     // ── Manifest-driven main-loop template path (assembler#378) ─────────
     // When the manifest path is enabled (desktop + a backend that ships a
@@ -1071,7 +1072,7 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     // below. For bgfx-desktop this lands on the SAME `templates/desktop.txt`
     // the enum path would have selected — the difference is the SELECTION is
     // data (manifest), not an enum branch.
-    if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir)) {
+    if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir, null)) {
         const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
         defer manifest_splice.freeManifest(allocator, m);
         // Package dir via the location seam: built-in → `backends/{name}` bundled
