@@ -706,6 +706,25 @@ pub const ProjectConfig = struct {
         return self.effectiveBackendPackage() != null;
     }
 
+    /// True when this backend is a built-in identified by the closed `Backend`
+    /// enum tag — i.e. the resolved backend NAME equals the current enum tag's
+    /// spelling. This is the enum-as-shorthand identity check (epic #386 Phase 5,
+    /// #453 PR 11): it covers both a plain `.backend = .<tag>` shorthand and an
+    /// explicit `.backend_package` that is a local dev-override of a built-in
+    /// (e.g. `.backend = .bgfx` + `.backend_package = .{ .name = "bgfx", .. }`),
+    /// because both resolve `backendName()` back to the tag spelling.
+    ///
+    /// It returns FALSE for a genuine THIRD-PARTY backend named only by string
+    /// (`.backend_package = .{ .name = "acme_foo", .. }`), whose `cfg.backend`
+    /// sits at the meaningless `.raylib` default. Such a backend must therefore
+    /// route ENTIRELY through `backend_registry` + its (v2) manifest and MUST
+    /// NOT reach the enum `switch (cfg.backend)` codegen — which would mis-emit
+    /// raylib-shaped wiring. This is the ONE remaining place the enum tag is read
+    /// as an *identity*; a non-enum name never consults it.
+    pub fn isEnumTagBacked(self: ProjectConfig) bool {
+        return std.mem.eql(u8, self.backendName(), @tagName(self.backend));
+    }
+
     /// The unset-`.y_axis` build guard (RFC-Y-AXIS-CONVENTION Migration §,
     /// epic labelle-engine#640). During the transition release an *absent*
     /// `.y_axis` is a hard error naming BOTH choices, so no existing game
