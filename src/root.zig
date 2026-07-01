@@ -34,6 +34,7 @@ test {
     _ = @import("plugin_manifest.zig");
     _ = @import("pack_validate.zig");
     _ = @import("check.zig");
+    _ = @import("scene_name_lint.zig");
     _ = @import("scene_manifest.zig");
     _ = @import("scene_manifest_test.zig");
     _ = @import("asset_validator.zig");

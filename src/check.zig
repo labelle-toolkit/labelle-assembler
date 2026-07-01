@@ -61,6 +61,12 @@ pub const Rule = enum {
     cross_pack_registry_access,
     raw_global_facet_write,
     event_direction_inversion,
+    /// A game-root scene/prefab references a pack component by its BARE
+    /// name (`Worker`) instead of its namespaced registry key
+    /// (`citizens__Worker`). A bare name silently no-ops as an unknown
+    /// component (RFC #596) — the entity loads with the component missing
+    /// and no error. Reported by `scene_name_lint.zig`; see labelle-assembler#490.
+    scene_bare_pack_component,
 
     /// Stable, human/CI-readable rule slug printed in the report.
     pub fn slug(self: Rule) []const u8 {
@@ -68,6 +74,7 @@ pub const Rule = enum {
             .cross_pack_registry_access => "cross-pack-registry-access",
             .raw_global_facet_write => "raw-global-facet-write",
             .event_direction_inversion => "event-direction-inversion",
+            .scene_bare_pack_component => "scene-bare-pack-component",
         };
     }
 };
