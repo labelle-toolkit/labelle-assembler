@@ -765,6 +765,36 @@ pub const PACK_SCRIPTS = struct {
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "packs/citizens/scripts", .{}));
     }
 
+    test "scanPackScriptsAt propagates a non-FileNotFound probe error and does NOT prune (#500 codex)" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        // The pack's `scripts` path exists but is a FILE, not a directory —
+        // `openDir` yields `error.NotDir`. That must PROPAGATE (mirroring
+        // `copyAndScanAbs`, which tolerates only `FileNotFound`), NOT be
+        // swallowed as "no scripts" + a prune of the generated copy.
+        try writeFileIn(tmp.dir, "src/citizens/scripts", "this is a file, not a scripts/ dir\n");
+        // A pre-existing generated copy that must survive (proving no prune).
+        try writeFileIn(tmp.dir, "packs/citizens/scripts/playing/00_keep.zig", "pub fn tick(_: anytype, _: f32) void {}\n");
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", alloc);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+
+        const states = [_][]const u8{"playing"};
+        var scanner = generate.script_scanner.ScriptScanner.init(alloc, &states);
+
+        try std.testing.expectError(
+            error.NotDir,
+            generate.scanPackScriptsAt(alloc, &scanner, pack_src_path, target_path, "citizens"),
+        );
+        // The error propagated BEFORE any prune — the generated copy is intact.
+        try tmp.dir.access(io, "packs/citizens/scripts/playing/00_keep.zig", .{});
+    }
+
     test "scanPackScriptsAt registers a present pack script and returns true" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();

@@ -669,16 +669,22 @@ pub fn scanPackScriptsAt(
     const pack_scripts_dst = try std.fs.path.join(allocator, &.{ target_dir, "packs", pack_name, "scripts" });
     defer allocator.free(pack_scripts_dst);
 
-    const scripts_src_exists = blk: {
-        var d = cwd.openDir(io, pack_scripts_src, .{}) catch break :blk false;
-        d.close(io);
-        break :blk true;
+    // Probe the pack's source `scripts/` dir. Mirror `copyAndScanAbs`'s
+    // source-root open EXACTLY (scanner.copyAndScanRecursive): tolerate ONLY
+    // `error.FileNotFound` — the absent-directory case — and PROPAGATE every
+    // other `openDir` failure. Swallowing e.g. `AccessDenied` (broken mount /
+    // permissions) or `NotDir` (`scripts` is a file) as "no scripts" would
+    // prune the generated copy and silently produce an incomplete build
+    // instead of surfacing the real error (codex P2 on #500).
+    var probe = cwd.openDir(io, pack_scripts_src, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            // No `scripts/` source → prune any stale dest a prior generate copied.
+            cwd.deleteTree(io, pack_scripts_dst) catch {};
+            return false;
+        },
+        else => return err,
     };
-    if (!scripts_src_exists) {
-        // Best-effort prune of the stale dest; ignore a missing dest.
-        cwd.deleteTree(io, pack_scripts_dst) catch {};
-        return false;
-    }
+    probe.close(io);
 
     const names = try scanner.copyAndScanAbs(allocator, pack_scripts_src, pack_scripts_dst, ".zig");
     scanner.freeNames(allocator, names);
