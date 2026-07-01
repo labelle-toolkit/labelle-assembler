@@ -111,32 +111,92 @@ pub fn packNamespacePrefix(pack_name: []const u8, buf: *[128]u8) []const u8 {
     return sanitizePluginIdent(pack_name, buf);
 }
 
-/// Rewrite a pack's own prefab/scene JSONC so references to the pack's OWN
-/// components resolve in the unified registry (Packs RFC §4, #440). A pack
-/// author writes local component names (`"Worker": { ... }`); this rewrites
-/// each JSON *object key* whose content exactly equals one of `local_keys`
-/// to the prefixed form (`"citizens__Worker"`), byte-matching the
-/// `<pack>__<Name>` field the component registry emits. This is what keeps
-/// the prefix invisible — the author never types it.
-///
-/// Only string literals immediately followed by `:` (i.e. keys) are
-/// considered, and only when the key EXACTLY equals a pack-owned component
-/// name. Engine / built-in component names (`Position`, `Sprite`, …) are
-/// never in `local_keys`, so they pass through untouched (the "leave
-/// built-ins alone" rule from the ticket). String *values* and JSONC
-/// comment text are skipped so a `"Worker"` appearing as a value or inside a
-/// `//` comment is never rewritten.
-///
-/// Returns an allocator-owned buffer. When nothing matches it is still a
-/// fresh dupe of the input, so the caller frees unconditionally.
+/// Back-compat shim (#440). Rewrites only pack-owned component KEYS —
+/// delegates to `rewritePackLocalRefs` with an empty prefab-name set so no
+/// `"prefab"` values are touched. Kept because the unit tests below (and any
+/// external caller) reference this narrower entry point directly. New call
+/// sites should prefer `rewritePackLocalRefs`, which also rewrites pack-local
+/// prefab references (chatgpt-codex finding #1).
 pub fn rewritePackComponentKeys(
     allocator: std.mem.Allocator,
     src: []const u8,
     local_keys: []const []const u8,
     prefix: []const u8,
 ) ![]u8 {
+    return rewritePackLocalRefs(allocator, src, local_keys, &.{}, prefix);
+}
+
+/// Rewrite a pack's own prefab/scene JSONC so **local references to the
+/// pack's OWN components and prefabs** resolve in the unified registry
+/// (Packs RFC §4, #440). Two kinds of reference are rewritten, both keeping
+/// the `<pack>__` prefix invisible to the author:
+///
+///   1. **Component keys** — a component-declaration key whose content
+///      exactly equals one of `component_keys` becomes `<prefix>__<Name>`
+///      (`"Worker"` → `"citizens__Worker"`), byte-matching the field the
+///      component registry emits.
+///   2. **Prefab references** — a `"prefab"` string *value* whose content
+///      exactly equals one of `prefab_names` becomes `<prefix>__<name>`
+///      (`"prefab": "worker"` → `"prefab": "citizens__worker"`), matching the
+///      `addEmbeddedPrefab(&g, "citizens__worker", …)` registration key. A
+///      composing prefab (`{ "prefab": "worker" }`) would otherwise reference
+///      the bare `worker`, which is never registered (chatgpt-codex #1).
+///
+/// **Context-awareness (chatgpt-codex #2).** Component-key rewriting is scoped
+/// to genuine component-declaration positions — a key is only rewritten when
+/// it is a direct member of an object reached through a `"components"` or
+/// `"overrides"` key (the wrapped shape the engine's `entityPatch` /
+/// `prefabComponents` treat as the component map). A key of the SAME text that
+/// appears as *payload data* nested inside a component's value (e.g.
+/// `{ "Spawner": { "counts": { "Worker": 3 } } }`) is left untouched, so the
+/// payload never gets corrupted before deserialization.
+///
+/// Prefab-reference rewriting is scoped to the *value* of a `"prefab"` key,
+/// and only when that value names one of the pack's OWN prefabs — a reference
+/// to a non-pack (game-root / built-in) prefab is left alone.
+///
+/// **Boundary (documented):** the engine also accepts a *flat* shape (RFC
+/// #596) where PascalCase component keys sit directly on an entity object with
+/// no `"components"`/`"overrides"` wrapper. Detecting that shape reliably at
+/// the byte level requires full structural entity-vs-payload disambiguation;
+/// the pack authoring convention (and every pack fixture) uses the wrapped
+/// shape, so flat-form component keys are intentionally NOT rewritten here.
+/// This is the conservative-but-correct scope the ticket calls for: it never
+/// corrupts payload data, at the cost of not namespacing the flat shape.
+///
+/// String *values* (other than `"prefab"`) and JSONC comment text are never
+/// rewritten. Returns an allocator-owned buffer; when nothing matches it is
+/// still a fresh dupe of the input, so the caller frees unconditionally.
+pub fn rewritePackLocalRefs(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    component_keys: []const []const u8,
+    prefab_names: []const []const u8,
+    prefix: []const u8,
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
+
+    // Object-nesting context. `component_map_stack` records, per open `{`,
+    // whether that object is a component map (its direct keys are component
+    // names) — true only when the object is the value of a `"components"` or
+    // `"overrides"` key. Array frames push `false` (an array is never a
+    // component map, and objects nested in an array — entity list entries —
+    // start a fresh non-component-map scope).
+    var component_map_stack: std.ArrayList(bool) = .empty;
+    defer component_map_stack.deinit(allocator);
+
+    // The most-recent object key at the current level, awaiting its value.
+    // Drives both "is the next `{` a component map?" and "is this string the
+    // value of a `prefab` key?". Reset whenever the pending key's value is
+    // consumed (a value string, a container open/close, or a `,`).
+    var pending_key: ?[]const u8 = null;
+
+    const in_component_map = struct {
+        fn f(stack: []const bool) bool {
+            return stack.len > 0 and stack[stack.len - 1];
+        }
+    }.f;
 
     var i: usize = 0;
     while (i < src.len) {
@@ -157,8 +217,42 @@ pub fn rewritePackComponentKeys(
             i = end;
             continue;
         }
-        // String literal — capture its inner content, then decide whether
-        // it is an object key that names a pack-owned component.
+        // Container open — the object/array is the value of `pending_key`.
+        if (c == '{') {
+            const is_comp_map = if (pending_key) |k|
+                (std.mem.eql(u8, k, "components") or std.mem.eql(u8, k, "overrides"))
+            else
+                false;
+            try component_map_stack.append(allocator, is_comp_map);
+            pending_key = null;
+            try out.append(allocator, c);
+            i += 1;
+            continue;
+        }
+        if (c == '[') {
+            try component_map_stack.append(allocator, false);
+            pending_key = null;
+            try out.append(allocator, c);
+            i += 1;
+            continue;
+        }
+        if (c == '}' or c == ']') {
+            if (component_map_stack.items.len > 0) _ = component_map_stack.pop();
+            pending_key = null;
+            try out.append(allocator, c);
+            i += 1;
+            continue;
+        }
+        // A comma ends the current key/value pair — clear any pending key so
+        // a primitive value (number/bool/null) can't leak into the next pair.
+        if (c == ',') {
+            pending_key = null;
+            try out.append(allocator, c);
+            i += 1;
+            continue;
+        }
+        // String literal — capture its inner content, then decide whether it
+        // is a component-declaration key, a `"prefab"` value, or neither.
         if (c == '"') {
             const content_start = i + 1;
             var j = content_start;
@@ -178,7 +272,26 @@ pub fn rewritePackComponentKeys(
             }
             const content = src[content_start..j];
             const is_key = nextSignificantIsColon(src, j + 1);
-            if (is_key and containsKey(local_keys, content)) {
+
+            var rewrite = false;
+            if (is_key) {
+                // Component-declaration key: only inside a component map.
+                if (in_component_map(component_map_stack.items) and
+                    containsKey(component_keys, content))
+                {
+                    rewrite = true;
+                }
+            } else {
+                // Value position: rewrite a pack-owned prefab reference
+                // (`"prefab": "worker"` → `"prefab": "citizens__worker"`).
+                if (pending_key) |k| {
+                    if (std.mem.eql(u8, k, "prefab") and containsKey(prefab_names, content)) {
+                        rewrite = true;
+                    }
+                }
+            }
+
+            if (rewrite) {
                 try out.append(allocator, '"');
                 try out.appendSlice(allocator, prefix);
                 try out.appendSlice(allocator, "__");
@@ -186,6 +299,14 @@ pub fn rewritePackComponentKeys(
                 try out.append(allocator, '"');
             } else {
                 try out.appendSlice(allocator, src[i .. j + 1]);
+            }
+
+            // Track the pending key for the container-type / prefab-value
+            // lookups above; a value string closes the pending pair.
+            if (is_key) {
+                pending_key = content;
+            } else {
+                pending_key = null;
             }
             i = j + 1;
             continue;
@@ -228,6 +349,117 @@ fn containsKey(keys: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, k, needle)) return true;
     }
     return false;
+}
+
+/// Rewrite a pack's copied `hooks/*.zig` source so a handler written with the
+/// pack's BARE local event name receives its `<pack>__`-prefixed event
+/// (chatgpt-codex finding #3).
+///
+/// The engine's hook dispatcher (`labelle-core/src/dispatcher.zig`) matches a
+/// receiver's handler-fn NAME against the `GameEvents` variant tag. Pack
+/// events are folded into `GameEvents` under the invisible `<pack>__<event>`
+/// tag, so a pack hook's natural `pub fn worker_died(self, data)` would (a)
+/// never receive `citizens__worker_died`, and worse (b) trip the dispatcher's
+/// comptime guard — a 2-param handler whose name matches no variant is a hard
+/// `@compileError`. To keep the prefix invisible, this renames each qualifying
+/// handler's DECL to the prefixed tag (`worker_died` → `citizens__worker_died`)
+/// in the copied source, exactly mirroring the JSONC key/prefab rewrite.
+///
+/// A handler qualifies only when it is a `pub fn`, takes exactly two
+/// parameters (the `(self, data)` shape the dispatcher treats as a handler),
+/// and its name EXACTLY equals one of the pack's own `event_names`. Handlers
+/// for engine / plugin / game events (bare names that are already valid
+/// variant tags — e.g. `tick`, `game_init`) are left untouched, so a pack
+/// hook keeps receiving those. Only the declaration site is renamed; a pack
+/// that also calls its handler internally by the bare name would surface a
+/// clean compile error rather than a silent mis-dispatch.
+///
+/// Returns an allocator-owned buffer; a content-preserving dupe when nothing
+/// matches, so the caller frees unconditionally.
+pub fn rewritePackHookHandlerNames(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    event_names: []const []const u8,
+    prefix: []const u8,
+) ![]u8 {
+    if (event_names.len == 0) return allocator.dupe(u8, src);
+
+    const src_z = try allocator.dupeZ(u8, src);
+    defer allocator.free(src_z);
+
+    var ast = try std.zig.Ast.parse(allocator, src_z, .zig);
+    defer ast.deinit(allocator);
+
+    // Collect the byte offsets of every handler-fn name token to rename.
+    var sites: std.ArrayList(usize) = .empty;
+    defer sites.deinit(allocator);
+    try collectHookHandlerNameOffsets(allocator, &ast, ast.rootDecls(), event_names, &sites);
+
+    if (sites.items.len == 0) return allocator.dupe(u8, src);
+    std.mem.sort(usize, sites.items, {}, std.sort.asc(usize));
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var cursor: usize = 0;
+    for (sites.items) |off| {
+        // Each recorded offset is the start of a bare event-name token. Emit
+        // everything up to it, then the `<prefix>__` insertion; the original
+        // name bytes follow untouched (cursor advances past the prefix only).
+        try out.appendSlice(allocator, src[cursor..off]);
+        try out.appendSlice(allocator, prefix);
+        try out.appendSlice(allocator, "__");
+        cursor = off;
+    }
+    try out.appendSlice(allocator, src[cursor..]);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Walk `members` (a decl list) for `pub fn <event>` handlers, recording the
+/// source byte offset of each qualifying name token into `sites`, and recurse
+/// into nested container decls (the `pub const Overlay = struct { … }` that
+/// holds the handlers). See `rewritePackHookHandlerNames` for the match rule.
+fn collectHookHandlerNameOffsets(
+    allocator: std.mem.Allocator,
+    ast: *std.zig.Ast,
+    members: []const std.zig.Ast.Node.Index,
+    event_names: []const []const u8,
+    sites: *std.ArrayList(usize),
+) !void {
+    for (members) |m| {
+        // Handler fn? (pub, 2 params, name matches a pack event.)
+        var fn_buf: [1]std.zig.Ast.Node.Index = undefined;
+        if (ast.fullFnProto(&fn_buf, m)) |fp| {
+            if (fp.visib_token != null) {
+                if (fp.name_token) |nt| {
+                    const name = ast.tokenSlice(nt);
+                    if (containsKey(event_names, name) and fnProtoParamCount(ast, fp) == 2) {
+                        // `tokenSlice` returns a sub-slice of `ast.source`;
+                        // its pointer offset is the byte position we splice at.
+                        const off = @intFromPtr(name.ptr) - @intFromPtr(ast.source.ptr);
+                        try sites.append(allocator, off);
+                    }
+                }
+            }
+        }
+        // Recurse into a `const X = struct/union/enum { … }` member so nested
+        // handler methods (the common `pub const Hook = struct { … }` shape)
+        // are reached.
+        if (ast.fullVarDecl(m)) |vd| {
+            if (vd.ast.init_node.unwrap()) |init_node| {
+                var buf: [2]std.zig.Ast.Node.Index = undefined;
+                if (ast.fullContainerDecl(&buf, init_node)) |container| {
+                    try collectHookHandlerNameOffsets(allocator, ast, container.ast.members, event_names, sites);
+                }
+            }
+        }
+    }
+}
+
+fn fnProtoParamCount(ast: *std.zig.Ast, fp: std.zig.Ast.full.FnProto) usize {
+    var count: usize = 0;
+    var it = fp.iterate(ast);
+    while (it.next()) |_| count += 1;
+    return count;
 }
 
 /// A single discovered `pub const <event_name> = struct {...}` declaration
@@ -1281,6 +1513,114 @@ test "rewritePackComponentKeys: no matches yields a content-preserving dupe" {
     const allocator = std.testing.allocator;
     const src = "{ \"Position\": { \"x\": 0 } }";
     const out = try rewritePackComponentKeys(allocator, src, &.{"Worker"}, "citizens");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "rewritePackLocalRefs: payload data key matching a component name is NOT rewritten (chatgpt-codex #2)" {
+    const allocator = std.testing.allocator;
+    // `Worker` is a pack-owned component. It appears BOTH as a real component
+    // declaration key (must be rewritten) AND as a nested payload-data key
+    // inside `Spawner.counts` (must be left alone — rewriting it corrupts the
+    // payload before deserialization).
+    const src =
+        \\{
+        \\    "components": {
+        \\        "Worker": { "hp": 3 },
+        \\        "Spawner": { "counts": { "Worker": 3 } }
+        \\    }
+        \\}
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"Worker"}, &.{}, "citizens");
+    defer allocator.free(out);
+
+    // The real component-declaration key IS rewritten …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"citizens__Worker\": { \"hp\": 3 }") != null);
+    // … the `Spawner` declaration key is also under `components` (not a pack
+    // component, so untouched) …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"Spawner\":") != null);
+    // … but the nested payload key `"Worker"` inside `counts` is NOT rewritten.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"counts\": { \"Worker\": 3 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__Worker\": 3") == null);
+}
+
+test "rewritePackLocalRefs: keys inside an overrides wrapper are rewritten" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{ "prefab": "base", "overrides": { "Worker": { "hp": 9 } } }
+    ;
+    // `base` is not a pack prefab here, so the ref is left alone; the override
+    // component key IS a pack component, so it is namespaced.
+    const out = try rewritePackLocalRefs(allocator, src, &.{"Worker"}, &.{}, "citizens");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"base\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"citizens__Worker\":") != null);
+}
+
+test "rewritePackLocalRefs: a pack-local prefab reference value is rewritten (chatgpt-codex #1)" {
+    const allocator = std.testing.allocator;
+    // A pack prefab composing another SAME-pack prefab by local name. The
+    // `"prefab"` value must resolve to the namespaced registration key.
+    const src =
+        \\{
+        \\    "children": [
+        \\        { "prefab": "worker", "components": { "Position": { "x": 1 } } },
+        \\        { "prefab": "external" }
+        \\    ]
+        \\}
+    ;
+    // `worker` is pack-owned; `external` is NOT (a game-root/foreign prefab).
+    const out = try rewritePackLocalRefs(allocator, src, &.{}, &.{"worker"}, "citizens");
+    defer allocator.free(out);
+
+    // The same-pack reference is namespaced …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"citizens__worker\"") != null);
+    // … the foreign reference is left bare …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"external\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__external") == null);
+    // … and `Position` (built-in, not pack-owned) is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"Position\":") != null);
+}
+
+test "rewritePackHookHandlerNames: bare pack-event handler is renamed to the prefixed tag (chatgpt-codex #3)" {
+    const allocator = std.testing.allocator;
+    // A pack hook: a handler for the pack's OWN event (`worker_died`, bare),
+    // plus a handler for a built-in engine event (`tick`, must stay bare so it
+    // keeps matching the un-prefixed engine variant), plus a private helper
+    // that happens to share the event name (must NOT be renamed).
+    const src =
+        \\const std = @import("std");
+        \\pub const Overlay = struct {
+        \\    pub fn worker_died(self: *Overlay, data: anytype) void {
+        \\        _ = self;
+        \\        _ = data;
+        \\    }
+        \\    pub fn tick(self: *Overlay, data: anytype) void {
+        \\        _ = self;
+        \\        _ = data;
+        \\    }
+        \\    fn helper(self: *Overlay) void {
+        \\        _ = self;
+        \\    }
+        \\};
+    ;
+    const out = try rewritePackHookHandlerNames(allocator, src, &.{"worker_died"}, "citizens");
+    defer allocator.free(out);
+
+    // The pack-event handler DECL is renamed to the prefixed tag …
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn citizens__worker_died(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn worker_died(") == null);
+    // … the engine-event handler keeps its bare name …
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn tick(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__tick") == null);
+    // … the private helper (not a pack event) is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, out, "fn helper(") != null);
+}
+
+test "rewritePackHookHandlerNames: no pack events is a content-preserving dupe" {
+    const allocator = std.testing.allocator;
+    const src = "pub const H = struct { pub fn tick(self: *H, d: anytype) void { _ = self; _ = d; } };";
+    const out = try rewritePackHookHandlerNames(allocator, src, &.{}, "citizens");
     defer allocator.free(out);
     try std.testing.expectEqualStrings(src, out);
 }

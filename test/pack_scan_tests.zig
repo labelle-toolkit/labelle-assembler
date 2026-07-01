@@ -139,6 +139,91 @@ pub const SCAN_PACK = struct {
         try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"packs/citizens/components/Worker.zig\").Worker,"));
     }
 
+    test "rewrites a pack prefab's same-pack prefab reference to the <pack>__ form (chatgpt-codex #1)" {
+        const allocator = std.testing.allocator;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "src/citizens");
+        var pack_src = try tmp.dir.openDir(io, "src/citizens", .{});
+        defer pack_src.close(io);
+        // Two same-pack prefabs: `squad` composes `worker` by local name.
+        try writeFileIn(pack_src, "prefabs/worker.jsonc", "{ \"components\": {} }\n");
+        try writeFileIn(pack_src, "prefabs/squad.jsonc",
+            \\{
+            \\    "children": [
+            \\        { "prefab": "worker" },
+            \\        { "prefab": "external" }
+            \\    ]
+            \\}
+        );
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", allocator);
+        defer allocator.free(pack_src_path);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(target_path);
+
+        var scan = try generate.scanPack(allocator, pack_src_path, target_path, "citizens");
+        defer scan.deinit(allocator);
+
+        const rewritten = try tmp.dir.readFileAlloc(io, "packs/citizens/prefabs/squad.jsonc", allocator, .limited(64 * 1024));
+        defer allocator.free(rewritten);
+
+        // The same-pack reference now resolves to the namespaced registration
+        // key `addEmbeddedPrefab(&g, "citizens__worker", …)` uses …
+        try std.testing.expect(contains(rewritten, "\"prefab\": \"citizens__worker\""));
+        // … while a reference to a non-pack prefab is left bare.
+        try std.testing.expect(contains(rewritten, "\"prefab\": \"external\""));
+        try std.testing.expect(!contains(rewritten, "citizens__external"));
+    }
+
+    test "rewrites a pack hook's bare local event handler to the prefixed tag (chatgpt-codex #3)" {
+        const allocator = std.testing.allocator;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "src/citizens");
+        var pack_src = try tmp.dir.openDir(io, "src/citizens", .{});
+        defer pack_src.close(io);
+        // The pack owns event `worker_died`; the hook reacts to it with the
+        // BARE local name, plus a built-in engine event (`tick`) that must
+        // keep its bare name so it still matches the un-prefixed variant.
+        try writeFileIn(pack_src, "events/worker_died.zig", "pub const WorkerDied = struct { id: u64 };\n");
+        try writeFileIn(pack_src, "hooks/overlay.zig",
+            \\pub const Overlay = struct {
+            \\    pub fn worker_died(self: *Overlay, data: anytype) void {
+            \\        _ = self;
+            \\        _ = data;
+            \\    }
+            \\    pub fn tick(self: *Overlay, data: anytype) void {
+            \\        _ = self;
+            \\        _ = data;
+            \\    }
+            \\};
+        );
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", allocator);
+        defer allocator.free(pack_src_path);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(target_path);
+
+        var scan = try generate.scanPack(allocator, pack_src_path, target_path, "citizens");
+        defer scan.deinit(allocator);
+
+        const rewritten = try tmp.dir.readFileAlloc(io, "packs/citizens/hooks/overlay.zig", allocator, .limited(64 * 1024));
+        defer allocator.free(rewritten);
+
+        // The pack-event handler is renamed to the prefixed variant tag so the
+        // engine dispatcher matches it against `citizens__worker_died` …
+        try std.testing.expect(contains(rewritten, "pub fn citizens__worker_died("));
+        try std.testing.expect(!contains(rewritten, "pub fn worker_died("));
+        // … the engine-event handler keeps its bare name (still matches `tick`).
+        try std.testing.expect(contains(rewritten, "pub fn tick("));
+        try std.testing.expect(!contains(rewritten, "citizens__tick"));
+    }
+
     test "tolerates a pack that ships only some convention dirs" {
         const allocator = std.testing.allocator;
 

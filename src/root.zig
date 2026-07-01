@@ -621,10 +621,15 @@ pub fn scanPack(
     errdefer scanner.freeNames(allocator, hook_names);
 
     // Local→prefixed ref rewrite (#440): rewrite the copied prefab JSONC so a
-    // pack's own component references (`"Worker"`) become the namespaced key
-    // (`"citizens__Worker"`). Done against the copied (destination) files so
-    // the source pack tree is never mutated.
+    // pack's own component references (`"Worker"`) and prefab compositions
+    // (`{ "prefab": "worker" }`) become the namespaced forms
+    // (`"citizens__Worker"` / `"citizens__worker"`). Done against the copied
+    // (destination) files so the source pack tree is never mutated.
     try rewritePackPrefabRefs(allocator, dst_base, pack_name, component_names, prefab_names);
+    // …and rewrite the copied hook sources so a handler written with the pack's
+    // bare local event name receives its `<pack>__`-prefixed event (chatgpt-codex
+    // #3). Same "mutate the copy, never the source" discipline.
+    try rewritePackHookHandlers(allocator, dst_base, pack_name, event_names, hook_names);
 
     return .{
         .name = name_owned,
@@ -636,12 +641,20 @@ pub fn scanPack(
     };
 }
 
-/// Rewrite every copied pack prefab JSONC in place so its local component
-/// keys become the invisible `<pack>__<Name>` form (#440). The rewrite target
-/// keys are the Pascal forms of the pack's scanned component stems — the same
-/// spelling authors write in JSONC and the component registry emits as a
-/// field. A prefab that references none of the pack's own components (or a
-/// pack with no components) is a no-op rewrite (content-preserving dupe).
+/// Rewrite every copied pack prefab JSONC in place so its local references
+/// become the invisible `<pack>__…` form (#440). Two reference kinds are
+/// rewritten (see `scan.rewritePackLocalRefs`):
+///
+///   - **Component keys** — Pascal forms of the pack's scanned component
+///     stems, only in genuine component-declaration positions (context-aware,
+///     chatgpt-codex #2). Payload-data keys that happen to share a component's
+///     spelling are left alone.
+///   - **Prefab references** — a `"prefab": "worker"` value naming one of the
+///     pack's OWN prefabs becomes `"prefab": "citizens__worker"`, matching the
+///     namespaced registration key so a same-pack prefab composition resolves
+///     (chatgpt-codex #1). A pack with prefabs that reference each other but
+///     ships no components is still rewritten (the guard is on prefab count,
+///     not component count).
 fn rewritePackPrefabRefs(
     allocator: std.mem.Allocator,
     dst_base: []const u8,
@@ -649,7 +662,10 @@ fn rewritePackPrefabRefs(
     component_names: []const []const u8,
     prefab_names: []const []const u8,
 ) !void {
-    if (component_names.len == 0 or prefab_names.len == 0) return;
+    // Nothing to walk without prefab files. Note the guard is intentionally
+    // NOT gated on `component_names` — a component-less pack can still have
+    // prefab-to-prefab references that need namespacing (chatgpt-codex #1).
+    if (prefab_names.len == 0) return;
 
     var prefix_buf: [128]u8 = undefined;
     const prefix = scan.packNamespacePrefix(pack_name, &prefix_buf);
@@ -685,11 +701,56 @@ fn rewritePackPrefabRefs(
         };
         defer allocator.free(src);
 
-        const rewritten = try scan.rewritePackComponentKeys(allocator, src, keys.items, prefix);
+        const rewritten = try scan.rewritePackLocalRefs(allocator, src, keys.items, prefab_names, prefix);
         defer allocator.free(rewritten);
 
         // Only rewrite the file when the content actually changed — avoids
         // churning mtimes (and the build cache) on prefabs with no local refs.
+        if (std.mem.eql(u8, rewritten, src)) continue;
+        var f = try cwd.createFile(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, rewritten);
+    }
+}
+
+/// Rewrite every copied pack `hooks/*.zig` in place so a handler written with
+/// the pack's BARE local event name receives its `<pack>__`-prefixed event
+/// (chatgpt-codex #3). Mirrors `rewritePackPrefabRefs` but over the hook
+/// sources and the pack's own event names — see
+/// `scan.rewritePackHookHandlerNames` for the match rule. A pack with no
+/// events (nothing to prefix) or no hooks is a no-op.
+fn rewritePackHookHandlers(
+    allocator: std.mem.Allocator,
+    dst_base: []const u8,
+    pack_name: []const u8,
+    event_names: []const []const u8,
+    hook_names: []const []const u8,
+) !void {
+    if (event_names.len == 0 or hook_names.len == 0) return;
+
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = scan.packNamespacePrefix(pack_name, &prefix_buf);
+
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const hooks_dir = try std.fs.path.join(allocator, &.{ dst_base, "hooks" });
+    defer allocator.free(hooks_dir);
+
+    for (hook_names) |name| {
+        const rel = try std.fmt.allocPrint(allocator, "{s}.zig", .{name});
+        defer allocator.free(rel);
+        const path = try std.fs.path.join(allocator, &.{ hooks_dir, rel });
+        defer allocator.free(path);
+
+        const src = cwd.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer allocator.free(src);
+
+        const rewritten = try scan.rewritePackHookHandlerNames(allocator, src, event_names, prefix);
+        defer allocator.free(rewritten);
+
         if (std.mem.eql(u8, rewritten, src)) continue;
         var f = try cwd.createFile(io, path, .{});
         defer f.close(io);
