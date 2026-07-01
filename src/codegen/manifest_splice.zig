@@ -96,19 +96,34 @@ pub const BackendManifest = struct {
     };
 };
 
+/// The production (v1) manifest filename. Used whenever `manifest_name` is null,
+/// so the enum/v1 splice + every root.zig generator keeps reading
+/// `backend.manifest.zon` byte-for-byte as before. manifest-v2 (epic #453 item 3)
+/// opts a backend onto a DIFFERENT filename (`backend.manifest.v2.zon`), and the
+/// gate + external-manifest requirement below must key off THAT requested name —
+/// otherwise a backend shipping ONLY the v2 manifest is wrongly treated as
+/// manifest-less and never reaches the v2 codegen path.
+pub const LEGACY_MANIFEST_NAME = "backend.manifest.zon";
+
 /// True when the manifest path should be taken for this generation: the target
 /// is a DESKTOP build (the only target manifests cover) AND the resolved
-/// backend package ships a `backend.manifest.zon`. Everything else — non-desktop
-/// targets, and backends with no manifest — stays on the enum path.
+/// backend package ships the requested manifest file. Everything else —
+/// non-desktop targets, and backends with no matching manifest — stays on the
+/// enum path.
+///
+/// `manifest_name` is the filename to probe, relative to the backend package
+/// root. Null selects the production `backend.manifest.zon` (v1). manifest-v2
+/// passes the v2 filename so a v2-only backend (no legacy sibling) still enables
+/// the manifest path.
 ///
 /// This is the productionized gate: a backend opts in by SHIPPING A MANIFEST,
 /// no env var. bgfx-desktop ships one (→ manifest path); sokol ships one too
 /// (the POC artifact). raylib/sdl/wgpu/null ship none (→ enum path).
-pub fn manifestPathEnabled(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) bool {
+pub fn manifestPathEnabled(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8, manifest_name: ?[]const u8) bool {
     // Manifests declare desktop fields only; non-desktop targets (wasm/ios/
     // android) keep their enum branches (e.g. bgfx-android's NDK ordering).
     if (cfg.platform != .desktop) return false;
-    return manifestExists(allocator, cfg, project_dir);
+    return manifestExists(allocator, cfg, project_dir, manifest_name orelse LEGACY_MANIFEST_NAME);
 }
 
 /// Validate that an EXTERNAL backend actually ships a `backend.manifest.zon`.
@@ -123,8 +138,16 @@ pub fn manifestPathEnabled(allocator: std.mem.Allocator, cfg: ProjectConfig, pro
 /// No-op for built-ins (`!cfg.isExternal()`), which keep their enum-path
 /// fallback when they ship no manifest (raylib/sdl/wgpu/null). Call before the
 /// manifest-path decision in the generators.
-pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) !void {
+///
+/// `manifest_name` is the required filename, relative to the backend package
+/// root. Null selects the production `backend.manifest.zon` (v1); manifest-v2
+/// passes the v2 filename so the requirement is keyed off the SAME manifest the
+/// gate/loader will read (a v2-only external must not be flagged manifest-less
+/// just because it ships no legacy sibling).
+pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8, manifest_name: ?[]const u8) !void {
     if (!cfg.isExternal()) return;
+
+    const name = manifest_name orelse LEGACY_MANIFEST_NAME;
 
     // Probe the manifest DIRECTLY (don't reuse `manifestExists`, which swallows
     // every error for built-in fallback probing). For external backends a broken
@@ -133,7 +156,7 @@ pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfi
     // maps to `ExternalBackendNeedsManifest`.
     const pkg_dir = try backendPackageDir(allocator, cfg, project_dir);
     defer allocator.free(pkg_dir);
-    const manifest_path = try std.fs.path.join(allocator, &.{ pkg_dir, "backend.manifest.zon" });
+    const manifest_path = try std.fs.path.join(allocator, &.{ pkg_dir, name });
     defer allocator.free(manifest_path);
 
     std.Io.Dir.cwd().access(config.globalIo(), manifest_path, .{}) catch |err| switch (err) {
@@ -141,9 +164,9 @@ pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfi
             // `warn`, not `err`: the hard failure is the returned error; this is
             // the human-readable hint. Matches `loadManifest`'s warn-on-failure.
             std.log.warn(
-                "labelle-assembler: external backend '{s}' (backend_package) ships no backend.manifest.zon — " ++
+                "labelle-assembler: external backend '{s}' (backend_package) ships no {s} — " ++
                     "an external backend must declare its codegen via a manifest (the enum-path fallback does not apply to external backends).",
-                .{cfg.backendName()},
+                .{ cfg.backendName(), name },
             );
             return error.ExternalBackendNeedsManifest;
         },
@@ -151,12 +174,12 @@ pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfi
     };
 }
 
-/// Does the resolved backend package contain a `backend.manifest.zon`?
+/// Does the resolved backend package contain the named manifest file?
 /// Resolution failures / a missing file both mean "no manifest" → enum path.
-fn manifestExists(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) bool {
+fn manifestExists(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8, manifest_name: []const u8) bool {
     const pkg_dir = backendPackageDir(allocator, cfg, project_dir) catch return false;
     defer allocator.free(pkg_dir);
-    const manifest_path = std.fs.path.join(allocator, &.{ pkg_dir, "backend.manifest.zon" }) catch return false;
+    const manifest_path = std.fs.path.join(allocator, &.{ pkg_dir, manifest_name }) catch return false;
     defer allocator.free(manifest_path);
     std.Io.Dir.cwd().access(config.globalIo(), manifest_path, .{}) catch return false;
     return true;
@@ -385,7 +408,7 @@ test "requireManifestIfExternal: external backend WITH a manifest is accepted" {
         .backend_package = .{ .name = "stubbackend", .repo = "local:../stubbackend" },
     };
 
-    try requireManifestIfExternal(alloc, cfg, project_abs);
+    try requireManifestIfExternal(alloc, cfg, project_abs, null);
 }
 
 test "requireManifestIfExternal: external backend WITHOUT a manifest errors" {
@@ -408,7 +431,43 @@ test "requireManifestIfExternal: external backend WITHOUT a manifest errors" {
 
     try std.testing.expectError(
         error.ExternalBackendNeedsManifest,
-        requireManifestIfExternal(alloc, cfg, project_abs),
+        requireManifestIfExternal(alloc, cfg, project_abs, null),
+    );
+}
+
+test "requireManifestIfExternal: a v2-only backend (no legacy sibling) is keyed off the requested name" {
+    // manifest-v2 regression (#453): a backend shipping ONLY `backend.manifest.v2.zon`
+    // — no legacy `backend.manifest.zon` — must be ACCEPTED when the requested name
+    // is the v2 file, and still REJECTED when the (absent) legacy name is requested.
+    // Proves the requirement gate keys off `manifest_name`, not the hardcoded legacy.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.createDirPath(std.testing.io, "stubbackend");
+    {
+        // v2 manifest present; NO legacy `backend.manifest.zon`.
+        const f = try tmp.dir.createFile(std.testing.io, "stubbackend/backend.manifest.v2.zon", .{});
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io, ".{ .manifest_version = 2 }\n");
+    }
+
+    const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
+    defer alloc.free(project_abs);
+
+    const cfg = config.ProjectConfig{
+        .name = "stubgame",
+        .backend_package = .{ .name = "stubbackend", .repo = "local:../stubbackend" },
+    };
+
+    // Requesting the v2 name → accepted (the file exists).
+    try requireManifestIfExternal(alloc, cfg, project_abs, "backend.manifest.v2.zon");
+    // Requesting the legacy name (or null) → still errors, since it is absent.
+    try std.testing.expectError(
+        error.ExternalBackendNeedsManifest,
+        requireManifestIfExternal(alloc, cfg, project_abs, null),
     );
 }
 
@@ -426,7 +485,7 @@ test "requireManifestIfExternal: the retained in-tree sokol fixture ships a mani
         .backend = .sokol,
         .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
     };
-    try requireManifestIfExternal(alloc, cfg, ".");
+    try requireManifestIfExternal(alloc, cfg, ".", null);
 }
 
 // ── Tests: provider identity + capability slice (#453) ────────────────────

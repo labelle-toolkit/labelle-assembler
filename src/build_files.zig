@@ -275,10 +275,15 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // External backends generate exclusively via the manifest splice; a
     // manifest-less external package is a hard error here (the enum `switch`es
     // below read `cfg.backend`, meaningless for an external backend with no tag).
-    if (opts.project_dir) |pd| try manifest_splice.requireManifestIfExternal(allocator, cfg, pd);
+    // Key BOTH the external-manifest requirement and the desktop gate off the
+    // REQUESTED filename (`opts.backend_manifest_name`, null → the legacy v1
+    // name): a backend shipping ONLY `backend.manifest.v2.zon` must still reach
+    // the v2 loader below rather than be treated as manifest-less because the
+    // hardcoded legacy `backend.manifest.zon` is absent (manifest-v2, #453).
+    if (opts.project_dir) |pd| try manifest_splice.requireManifestIfExternal(allocator, cfg, pd, opts.backend_manifest_name);
 
     const use_manifest = opts.project_dir != null and
-        manifest_splice.manifestPathEnabled(allocator, cfg, opts.project_dir.?);
+        manifest_splice.manifestPathEnabled(allocator, cfg, opts.project_dir.?, opts.backend_manifest_name);
     var splice_manifest: ?manifest_splice.BackendManifest = null;
     defer if (splice_manifest) |m| manifest_splice.freeManifest(allocator, m);
     // manifest-v2 (epic #453 item 3, PR 3): only set when a `manifest_version >= 2`
