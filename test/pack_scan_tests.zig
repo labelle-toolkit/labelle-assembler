@@ -61,8 +61,8 @@ pub const SCAN_PACK = struct {
         try writeFileIn(pack_src, "components/Worker.zig", "pub const Worker = struct { hp: u8 };\n");
         try writeFileIn(pack_src, "events/worker_died.zig", "pub const WorkerDied = struct { id: u64 };\n");
         try writeFileIn(pack_src, "prefabs/worker.jsonc", "{ \"children\": [] }\n");
-        // A hooks/ dir is present but NOT scanned by this slice — assert it's
-        // ignored (deferred to #440) rather than silently miscounted.
+        // hooks/ is now scanned too (#440) — the same copy/scan as the other
+        // convention dirs, registered under the `<pack>__` ident prefix.
         try writeFileIn(pack_src, "hooks/overlay.zig", "pub const Overlay = struct {};\n");
 
         const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", allocator);
@@ -81,11 +81,62 @@ pub const SCAN_PACK = struct {
         try std.testing.expectEqualStrings("worker_died", scan.event_names[0]);
         try std.testing.expectEqual(@as(usize, 1), scan.prefab_names.len);
         try std.testing.expectEqualStrings("worker", scan.prefab_names[0]);
+        try std.testing.expectEqual(@as(usize, 1), scan.hook_names.len);
+        try std.testing.expectEqualStrings("overlay", scan.hook_names[0]);
 
         // The files were physically copied under packs/citizens/ in the target.
         try tmp.dir.access(io, "packs/citizens/components/Worker.zig", .{});
         try tmp.dir.access(io, "packs/citizens/events/worker_died.zig", .{});
         try tmp.dir.access(io, "packs/citizens/prefabs/worker.jsonc", .{});
+        try tmp.dir.access(io, "packs/citizens/hooks/overlay.zig", .{});
+    }
+
+    test "rewrites a pack prefab's local component refs to the <pack>__ form" {
+        const allocator = std.testing.allocator;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "src/citizens");
+        var pack_src = try tmp.dir.openDir(io, "src/citizens", .{});
+        defer pack_src.close(io);
+        try writeFileIn(pack_src, "components/Worker.zig", "pub const Worker = struct { hp: u8 };\n");
+        // The prefab references the pack's OWN `Worker` by local name, plus a
+        // built-in engine component (`Position`) that must be left ALONE, and
+        // a string VALUE `"Worker"` that must NOT be rewritten (only keys are).
+        try writeFileIn(pack_src, "prefabs/worker.jsonc",
+            \\{
+            \\    "components": {
+            \\        "Worker": { "hp": 3, "label": "Worker" },
+            \\        "Position": { "x": 0, "y": 0 }
+            \\    }
+            \\}
+        );
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", allocator);
+        defer allocator.free(pack_src_path);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(target_path);
+
+        var scan = try generate.scanPack(allocator, pack_src_path, target_path, "citizens");
+        defer scan.deinit(allocator);
+
+        const rewritten = try tmp.dir.readFileAlloc(io, "packs/citizens/prefabs/worker.jsonc", allocator, .limited(64 * 1024));
+        defer allocator.free(rewritten);
+
+        // The pack's own component KEY was rewritten to the prefixed form …
+        try std.testing.expect(contains(rewritten, "\"citizens__Worker\":"));
+        // … the built-in `Position` was left untouched …
+        try std.testing.expect(contains(rewritten, "\"Position\":"));
+        try std.testing.expect(!contains(rewritten, "citizens__Position"));
+        // … and the string VALUE `"Worker"` was NOT rewritten (keys only).
+        try std.testing.expect(contains(rewritten, "\"label\": \"Worker\""));
+
+        // End-to-end (#440): the SAME pack drives the component registry to the
+        // prefixed field, so the rewritten JSONC key resolves against it.
+        const main_zig = try genWithPack(component_tmpl, cfg_with_pack, scan);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"packs/citizens/components/Worker.zig\").Worker,"));
     }
 
     test "tolerates a pack that ships only some convention dirs" {
@@ -135,6 +186,7 @@ const cfg_with_pack: generate.ProjectConfig = .{
 const component_tmpl = "{{component_registry_block}}\n{{lifecycle}}";
 const events_tmpl = "{{event_imports_block}}\n{{game_events_block}}\n{{lifecycle}}";
 const prefab_tmpl = "{{jsonc_scene_block}}\n{{lifecycle}}";
+const hooks_tmpl = "{{hook_imports_block}}\n{{game_hooks_block}}\n{{hooks_init_block}}\n{{lifecycle}}";
 
 fn genWithPack(tmpl: []const u8, cfg: generate.ProjectConfig, pack: generate.PackScan) ![]const u8 {
     generate.main_template.pack_scans = &.{pack};
@@ -176,9 +228,13 @@ pub const PACK_EMISSION = struct {
         defer std.testing.allocator.free(main_zig);
 
         // The unified registry is emitted (plugin present) and the pack's
-        // component is a field in it, imported through the pack prefix.
+        // component is a field in it under the invisible `<pack>__<Name>`
+        // prefix (#440) — imported through the pack prefix, but the DECL
+        // access stays bare (the component type's own `pub const Worker`).
         try std.testing.expect(contains(main_zig, "engine.ComponentRegistryWithPlugins(.{"));
-        try std.testing.expect(contains(main_zig, ".Worker = @import(\"packs/citizens/components/Worker.zig\").Worker,"));
+        try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"packs/citizens/components/Worker.zig\").Worker,"));
+        // The bare (un-prefixed) field must NOT be emitted.
+        try std.testing.expect(!contains(main_zig, ".Worker = @import(\"packs/citizens"));
     }
 
     test "pack event widens GameEvents and is imported through the pack prefix" {
@@ -192,10 +248,11 @@ pub const PACK_EMISSION = struct {
         const main_zig = try genWithPack(events_tmpl, cfg_with_pack, pack);
         defer std.testing.allocator.free(main_zig);
 
-        // Imported through the pack prefix …
-        try std.testing.expect(contains(main_zig, "const worker_died = @import(\"packs/citizens/events/worker_died.zig\");"));
-        // … and folded into the GameEvents union as a variant.
-        try std.testing.expect(contains(main_zig, "worker_died: worker_died.WorkerDied,"));
+        // Imported through the pack prefix, aliased under `<pack>__` (#440) …
+        try std.testing.expect(contains(main_zig, "const citizens__worker_died = @import(\"packs/citizens/events/worker_died.zig\");"));
+        // … and folded into the GameEvents union as a prefixed variant, whose
+        // type reference uses the same prefixed alias.
+        try std.testing.expect(contains(main_zig, "citizens__worker_died: citizens__worker_died.WorkerDied,"));
     }
 
     test "pack prefab is embedded and registered from the pack prefix" {
@@ -227,6 +284,31 @@ pub const PACK_EMISSION = struct {
             main_zig,
             "@embedFile(\"packs/citizens/prefabs/worker.jsonc\"), \"prefabs\"",
         ));
+
+        // The prefab is REGISTERED under the invisible `<pack>__<name>` key
+        // (#440) so a pack + game root that both ship `worker` don't collide.
+        try std.testing.expect(contains(main_zig, "addEmbeddedPrefab(&g, \"citizens__worker\","));
+    }
+
+    test "pack hook is imported, added to GameHooks, and instantiated under the <pack>__ prefix" {
+        const pack: generate.PackScan = .{
+            .name = "citizens",
+            .import_prefix = "packs/citizens",
+            .component_names = &.{},
+            .event_names = &.{},
+            .prefab_names = &.{},
+            .hook_names = &.{"overlay"},
+        };
+        const main_zig = try genWithPack(hooks_tmpl, cfg_with_pack, pack);
+        defer std.testing.allocator.free(main_zig);
+
+        // Imported through the pack prefix, aliased under `<pack>__` (#440).
+        try std.testing.expect(contains(main_zig, "const citizens__overlay = @import(\"packs/citizens/hooks/overlay.zig\");"));
+        // Wired into the GameHooks receiver-type tuple …
+        try std.testing.expect(contains(main_zig, "*citizens__overlay.Overlay,"));
+        // … and instantiated + referenced in the receivers tuple (same order).
+        try std.testing.expect(contains(main_zig, "var citizens__overlay_inst = citizens__overlay.Overlay{};"));
+        try std.testing.expect(contains(main_zig, "&citizens__overlay_inst,"));
     }
 
     test "no packs → component registry emission is unchanged (empty pack_scans is a no-op)" {

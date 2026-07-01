@@ -41,11 +41,24 @@ pub fn Mixin(comptime Self: type) type {
             if (cfg.platform == .wasm) {
                 try w.writeAll(@import("../preview.zig").WASM_PANIC_WORKAROUND);
             }
-            if (hook_names.len > 0) {
+            if (hook_names.len > 0 or self.hasPackHooks()) {
                 try w.writeAll("\n// --- Hook imports ---\n");
                 for (hook_names) |name| {
                     const ident = pathToIdent(name, ident_buf);
                     try w.print("const {s} = @import(\"hooks/{s}.zig\");\n", .{ ident, name });
+                }
+                // Pack hooks (Packs RFC §4, #440): imported through the pack's
+                // `import_prefix` and aliased `<pack>__<ident>` so two packs
+                // shipping `overlay.zig` don't collide on the alias. The alias
+                // MUST match the receiver-type + instance idents the hook
+                // blocks emit.
+                var pack_prefix_buf: [128]u8 = undefined;
+                for (self.pack_scans) |pack| {
+                    const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
+                    for (pack.hook_names) |name| {
+                        const ident = pathToIdent(name, ident_buf);
+                        try w.print("const {s}__{s} = @import(\"{s}/hooks/{s}.zig\");\n", .{ prefix, ident, pack.import_prefix, name });
+                    }
                 }
             }
         }
@@ -165,13 +178,16 @@ pub fn Mixin(comptime Self: type) type {
                 }
                 // Pack events (Packs RFC §4, #439). Same alias = variant-name
                 // convention as game events, but imported through the pack's
-                // `import_prefix` (e.g. `packs/citizens/events/...`). Alias is
-                // bare `eventVariantName` today — the `<pack>__` prefix that
-                // avoids cross-realm alias collisions is #440.
+                // `import_prefix` (e.g. `packs/citizens/events/...`) and under
+                // the invisible `<pack>__` prefix (#440) so two packs shipping
+                // `hit.zig` don't collide on the import alias. The alias here
+                // MUST match the variant type reference in `writePackEventVariants`.
+                var pack_prefix_buf: [128]u8 = undefined;
                 for (self.pack_scans) |pack| {
+                    const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
                     for (pack.event_names) |name| {
                         const ident = eventVariantName(name);
-                        try w.print("const {s} = @import(\"{s}/events/{s}.zig\");\n", .{ ident, pack.import_prefix, name });
+                        try w.print("const {s}__{s} = @import(\"{s}/events/{s}.zig\");\n", .{ prefix, ident, pack.import_prefix, name });
                     }
                 }
             }

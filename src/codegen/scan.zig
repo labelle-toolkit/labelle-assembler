@@ -56,22 +56,27 @@ fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
 /// e.g. `"packs/citizens"` — files live at
 /// `<import_prefix>/{components,events,prefabs}/<name>.<ext>`.
 ///
-/// Namespacing NOTE (deferred to #440): the registered identifiers are the
-/// pack's *bare* stems (`.Worker`, not `.citizens__Worker`). The physical
-/// path is already pack-namespaced (files never collide on disk), but the
-/// *registry field / event-variant* names are bare, so a pack and the game
-/// root that both define `Worker` would collide at the registry. The
-/// invisible `<pack>__` prefix that closes this is a separate ticket; this
-/// slice only unblocks the discarded-names gap.
+/// Namespacing (#440): a pack's contributed component / prefab / pack-local
+/// event names are registered in the generated global registry under the
+/// invisible `<pack>__<Name>` prefix (see `packNamespacePrefix`) — authors
+/// write local names (`.Worker`) and the assembler namespaces them so a pack
+/// and the game root that both define `Worker` never collide. The physical
+/// path is already pack-namespaced (`import_prefix`), so files never collide
+/// on disk either.
 ///
 /// Owned by `deinit` — `name`, `import_prefix`, and every string in the
-/// three name slices are heap dupes made by the scan/copy pass.
+/// four name slices are heap dupes made by the scan/copy pass.
 pub const PackScan = struct {
     name: []const u8,
     import_prefix: []const u8,
     component_names: []const []const u8,
     event_names: []const []const u8,
     prefab_names: []const []const u8,
+    /// Pack `hooks/*.zig` stems (#440). Registered into the SAME `GameHooks`
+    /// receiver tuple as the game root's `hooks/`, under the `<pack>__` ident
+    /// prefix so two packs shipping `overlay.zig` don't collide on the import
+    /// alias / receiver-instance identifier.
+    hook_names: []const []const u8 = &.{},
 
     pub fn deinit(self: *PackScan, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -79,6 +84,7 @@ pub const PackScan = struct {
         freeNameSlice(allocator, self.component_names);
         freeNameSlice(allocator, self.event_names);
         freeNameSlice(allocator, self.prefab_names);
+        freeNameSlice(allocator, self.hook_names);
     }
 
     fn freeNameSlice(allocator: std.mem.Allocator, names: []const []const u8) void {
@@ -86,6 +92,143 @@ pub const PackScan = struct {
         allocator.free(names);
     }
 };
+
+/// Derive a pack's invisible namespace ident from its manifest `name`
+/// (Packs RFC §4, #440). Every registry ident a pack contributes — the
+/// component registry field (`<pfx>__<Pascal>`), the pack-local event
+/// variant + its import alias, the prefab registration key, and the hook
+/// import alias / receiver-instance ident — is prefixed `<pfx>__`, mirroring
+/// the existing `<plugin>__<event>` convention (`plugin_registries.zig`).
+/// The name is sanitized to a valid Zig identifier fragment the same way
+/// plugin idents are, so a pack named `my-pack` namespaces as `my_pack__…`.
+///
+/// SAVE-STABILITY: the prefixed component name is the on-disk save key
+/// (`serde.componentName`, engine-side), so a pack's `name` is **save-stable**
+/// — renaming a shipped pack changes every component's save key and is
+/// therefore a save migration, not a cosmetic rename. Treat a pack `name`
+/// like a serialized schema field once the pack has shipped.
+pub fn packNamespacePrefix(pack_name: []const u8, buf: *[128]u8) []const u8 {
+    return sanitizePluginIdent(pack_name, buf);
+}
+
+/// Rewrite a pack's own prefab/scene JSONC so references to the pack's OWN
+/// components resolve in the unified registry (Packs RFC §4, #440). A pack
+/// author writes local component names (`"Worker": { ... }`); this rewrites
+/// each JSON *object key* whose content exactly equals one of `local_keys`
+/// to the prefixed form (`"citizens__Worker"`), byte-matching the
+/// `<pack>__<Name>` field the component registry emits. This is what keeps
+/// the prefix invisible — the author never types it.
+///
+/// Only string literals immediately followed by `:` (i.e. keys) are
+/// considered, and only when the key EXACTLY equals a pack-owned component
+/// name. Engine / built-in component names (`Position`, `Sprite`, …) are
+/// never in `local_keys`, so they pass through untouched (the "leave
+/// built-ins alone" rule from the ticket). String *values* and JSONC
+/// comment text are skipped so a `"Worker"` appearing as a value or inside a
+/// `//` comment is never rewritten.
+///
+/// Returns an allocator-owned buffer. When nothing matches it is still a
+/// fresh dupe of the input, so the caller frees unconditionally.
+pub fn rewritePackComponentKeys(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    local_keys: []const []const u8,
+    prefix: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+
+        // JSONC line comment — copy verbatim to end of line.
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            const nl = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+            try out.appendSlice(allocator, src[i..nl]);
+            i = nl;
+            continue;
+        }
+        // JSONC block comment — copy verbatim to the closing `*/`.
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+            const close = std.mem.indexOfPos(u8, src, i + 2, "*/");
+            const end = if (close) |p| p + 2 else src.len;
+            try out.appendSlice(allocator, src[i..end]);
+            i = end;
+            continue;
+        }
+        // String literal — capture its inner content, then decide whether
+        // it is an object key that names a pack-owned component.
+        if (c == '"') {
+            const content_start = i + 1;
+            var j = content_start;
+            while (j < src.len) : (j += 1) {
+                if (src[j] == '\\' and j + 1 < src.len) {
+                    j += 1; // skip the escaped char
+                    continue;
+                }
+                if (src[j] == '"') break;
+            }
+            // `j` is the closing quote (or src.len for an unterminated
+            // string — pass it through untouched rather than guessing).
+            if (j >= src.len) {
+                try out.appendSlice(allocator, src[i..]);
+                i = src.len;
+                continue;
+            }
+            const content = src[content_start..j];
+            const is_key = nextSignificantIsColon(src, j + 1);
+            if (is_key and containsKey(local_keys, content)) {
+                try out.append(allocator, '"');
+                try out.appendSlice(allocator, prefix);
+                try out.appendSlice(allocator, "__");
+                try out.appendSlice(allocator, content);
+                try out.append(allocator, '"');
+            } else {
+                try out.appendSlice(allocator, src[i .. j + 1]);
+            }
+            i = j + 1;
+            continue;
+        }
+
+        try out.append(allocator, c);
+        i += 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// True iff the next significant byte at/after `from` (skipping whitespace
+/// and JSONC comments) is a `:` — i.e. the preceding string literal was an
+/// object key rather than a value. Pure lookahead; consumes nothing.
+fn nextSignificantIsColon(src: []const u8, from: usize) bool {
+    var i = from;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            i = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+            const close = std.mem.indexOfPos(u8, src, i + 2, "*/");
+            i = if (close) |p| p + 2 else src.len;
+            continue;
+        }
+        return c == ':';
+    }
+    return false;
+}
+
+fn containsKey(keys: []const []const u8, needle: []const u8) bool {
+    for (keys) |k| {
+        if (std.mem.eql(u8, k, needle)) return true;
+    }
+    return false;
+}
 
 /// A single discovered `pub const <event_name> = struct {...}` declaration
 /// inside a plugin's `pub const Events = struct { ... }`. Owned by
@@ -1087,6 +1230,60 @@ pub fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
 }
 
 // ── Tests (moved verbatim from main_zig.zig) ─────────────────────────
+
+test "packNamespacePrefix: sanitizes the pack name into a Zig ident fragment" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("citizens", packNamespacePrefix("citizens", &buf));
+    // Non-identifier bytes collapse to `_`, same as plugin idents.
+    try std.testing.expectEqualStrings("my_pack", packNamespacePrefix("my-pack", &buf));
+}
+
+test "rewritePackComponentKeys: rewrites only pack-owned component KEYS" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{
+        \\    "components": {
+        \\        "Worker": { "hp": 3, "label": "Worker" },
+        \\        "Position": { "x": 0 }
+        \\    }
+        \\}
+    ;
+    const out = try rewritePackComponentKeys(allocator, src, &.{"Worker"}, "citizens");
+    defer allocator.free(out);
+
+    // Pack-owned key rewritten …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"citizens__Worker\":") != null);
+    // … built-in `Position` untouched …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"Position\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__Position") == null);
+    // … and the VALUE `"Worker"` (not a key) left alone.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"label\": \"Worker\"") != null);
+}
+
+test "rewritePackComponentKeys: leaves a matching name in a comment alone" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{
+        \\    // "Worker": legacy note, not a real key
+        \\    "components": { "Worker": {} }
+        \\}
+    ;
+    const out = try rewritePackComponentKeys(allocator, src, &.{"Worker"}, "citizens");
+    defer allocator.free(out);
+
+    // The real key was rewritten …
+    try std.testing.expect(std.mem.indexOf(u8, out, "{ \"citizens__Worker\": {} }") != null);
+    // … but the comment text is preserved verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, out, "// \"Worker\": legacy note") != null);
+}
+
+test "rewritePackComponentKeys: no matches yields a content-preserving dupe" {
+    const allocator = std.testing.allocator;
+    const src = "{ \"Position\": { \"x\": 0 } }";
+    const out = try rewritePackComponentKeys(allocator, src, &.{"Worker"}, "citizens");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
 
 test "pathToIdent: plain name is unchanged" {
     var buf: [256]u8 = undefined;
