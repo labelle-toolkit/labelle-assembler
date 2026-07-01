@@ -40,11 +40,11 @@ const add_usage =
     \\  labelle-assembler add feature <kind> <name>
     \\
     \\`add pack <name>` creates packs/<name>/ with the convention subdirs
-    \\(components/ events/ scripts/ prefabs/ hooks/) and a pack.labelle.
+    \\(components/ events/ prefabs/ hooks/) and a pack.labelle.
     \\Refuses to overwrite an existing packs/<name>/.
     \\
     \\`add feature <kind> <name>` scaffolds a feature-unit in the game root:
-    \\a components/<name>.zig plus a scripts/playing/xx_<name>.zig stub.
+    \\a components/<name>.zig plus a scripts/running/xx_<name>.zig stub.
     \\  <kind> is one of: need, role, status
     \\  <name> must be a lowercase identifier (a-z, 0-9, _), e.g. boredom
     \\
@@ -88,6 +88,7 @@ pub fn cmdAdd(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.
                 "labelle-assembler add feature: unknown kind '{s}' — valid kinds are: need, role, status",
                 .{kind_str},
             );
+            writeStderr(io, "\n" ++ add_usage);
             std.process.exit(2);
         };
         const name = args.next() orelse {
@@ -146,6 +147,13 @@ fn validateName(io: std.Io, name: []const u8, ctx: []const u8) void {
 pub fn toTypeName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
+    // Zig identifiers can't start with a digit. `isValidName` already
+    // rejects a digit-leading feature name, but `toTypeName` is public and
+    // reused elsewhere, so guard here too: prefix `_` so the result is a
+    // legal identifier regardless of caller (Gemini review).
+    if (name.len > 0 and name[0] >= '0' and name[0] <= '9') {
+        try out.append(allocator, '_');
+    }
     var at_word_start = true;
     for (name) |c| {
         if (c == '_') {
@@ -164,7 +172,13 @@ pub fn toTypeName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
 
 // ─── pack ──────────────────────────────────────────────────────────────
 
-const pack_convention_dirs = [_][]const u8{ "components", "events", "scripts", "prefabs", "hooks" };
+// Only the convention subdirs the generator's `scanPack` actually copies +
+// scans today (`src/root.zig` scans components/events/prefabs/hooks). A
+// `scripts/` dir is deliberately NOT scaffolded: light-pack scripts are not
+// yet scanned by generate, so a scaffolded `packs/<name>/scripts/` would be
+// silently ignored (chatgpt-codex review). Add it back here once pack-script
+// scanning lands (follow-up ticket).
+const pack_convention_dirs = [_][]const u8{ "components", "events", "prefabs", "hooks" };
 
 /// Materialize `<root>/packs/<name>/` with the convention subdirs and a
 /// `pack.labelle`. Refuses if the directory already exists. `root` is the
@@ -199,7 +213,7 @@ pub fn scaffoldPack(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
         };
         const keep_path = try std.fs.path.join(allocator, &.{ sub_path, ".gitkeep" });
         defer allocator.free(keep_path);
-        writeExclusive(io, cwd, keep_path, "");
+        writeExclusiveData(io, cwd, keep_path, "") catch std.process.exit(1);
     }
 
     // The manifest. Scalar `.convention_dirs = .copy_and_scan` is the pack
@@ -219,11 +233,100 @@ pub fn scaffoldPack(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
 
         const manifest_path = try std.fs.path.join(allocator, &.{ pack_dir, "pack.labelle" });
         defer allocator.free(manifest_path);
-        writeExclusiveData(io, cwd, manifest_path, aw.written());
+        writeExclusiveData(io, cwd, manifest_path, aw.written()) catch std.process.exit(1);
     }
 
     std.log.info("labelle-assembler: scaffolded pack '{s}' in {s}/", .{ name, pack_dir });
+
+    // A light pack only participates in generation when `project.labelle`
+    // declares it in `.plugins` (`generate()` discovers packs by iterating
+    // `cfg.plugins`). Register it automatically when we can do so safely,
+    // otherwise print the exact next step so the pack isn't left dead
+    // (chatgpt-codex review).
+    try registerPackInProject(allocator, io, cwd, root, name);
+
     std.log.info("  add features with: labelle add feature <kind> <name>", .{});
+}
+
+/// Add `.{ .name = "<name>", .repo = "@packs/<name>" }` to the project's
+/// `.plugins` tuple so `generate()` picks the freshly-scaffolded pack up.
+///
+/// A pack is an in-project local plugin, referenced by the `@`-path form the
+/// resolver understands: `@packs/<name>` → `packs/<name>` (see
+/// `config.PluginDep.localPath`, same shape as `@libs/...`).
+///
+/// ZON has no round-trip editor here, so this only rewrites in the cases it
+/// can do safely by string surgery — insert the entry right after the
+/// `.plugins = .{` opener (works for both an empty `.{}` and a populated
+/// tuple). If `project.labelle` is absent, unreadable, has no `.plugins`
+/// field, or already references this pack, it prints the manual next step
+/// instead of guessing. Never leaves the pack unregistered *and* silent.
+fn registerPackInProject(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    root: []const u8,
+    name: []const u8,
+) !void {
+    const proj_path = try std.fs.path.join(allocator, &.{ root, "project.labelle" });
+    defer allocator.free(proj_path);
+
+    const src = cwd.readFileAlloc(io, proj_path, allocator, .limited(1 << 20)) catch |err| {
+        // No project.labelle (scaffolding a pack outside a project), or it
+        // couldn't be read — fall back to the printed instruction.
+        if (err != error.FileNotFound) {
+            std.log.warn("labelle-assembler add pack: could not read '{s}': {s}", .{ proj_path, @errorName(err) });
+        }
+        printRegisterHint(name);
+        return;
+    };
+    defer allocator.free(src);
+
+    const repo_ref = try std.fmt.allocPrint(allocator, "\"@packs/{s}\"", .{name});
+    defer allocator.free(repo_ref);
+
+    // Already registered? Leave the file untouched.
+    if (std.mem.indexOf(u8, src, repo_ref) != null) {
+        std.log.info("  pack '{s}' is already registered in project.labelle .plugins", .{name});
+        return;
+    }
+
+    // Find the `.plugins = .{` opener and insert right after the `{`.
+    const plugins_at = std.mem.indexOf(u8, src, ".plugins") orelse {
+        printRegisterHint(name);
+        return;
+    };
+    const brace_rel = std.mem.indexOf(u8, src[plugins_at..], ".{") orelse {
+        printRegisterHint(name);
+        return;
+    };
+    const insert_at = plugins_at + brace_rel + ".{".len;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, src[0..insert_at]);
+    try out.appendSlice(allocator, "\n        .{ .name = \"");
+    try out.appendSlice(allocator, name);
+    try out.appendSlice(allocator, "\", .repo = \"@packs/");
+    try out.appendSlice(allocator, name);
+    try out.appendSlice(allocator, "\" },");
+    try out.appendSlice(allocator, src[insert_at..]);
+
+    cwd.writeFile(io, .{ .sub_path = proj_path, .data = out.items }) catch |err| {
+        std.log.warn("labelle-assembler add pack: could not update '{s}': {s}", .{ proj_path, @errorName(err) });
+        printRegisterHint(name);
+        return;
+    };
+    std.log.info("  registered pack '{s}' in project.labelle .plugins", .{name});
+}
+
+/// Print the manual step to register a pack in `project.labelle` when we
+/// can't (or shouldn't) edit it automatically.
+fn printRegisterHint(name: []const u8) void {
+    std.log.info(
+        "  next: add .{{ .name = \"{s}\", .repo = \"@packs/{s}\" }} to project.labelle .plugins so generate picks it up",
+        .{ name, name },
+    );
 }
 
 // ─── feature ─────────────────────────────────────────────────────────────
@@ -239,41 +342,88 @@ pub fn scaffoldFeature(allocator: std.mem.Allocator, io: std.Io, root: []const u
 
     const components_dir = try std.fs.path.join(allocator, &.{ root, "components" });
     defer allocator.free(components_dir);
-    cwd.createDirPath(io, components_dir) catch {};
-    const playing_dir = try std.fs.path.join(allocator, &.{ root, "scripts", "playing" });
-    defer allocator.free(playing_dir);
-    cwd.createDirPath(io, playing_dir) catch {};
+    // Feature scripts live under the project's active game state. Projects
+    // scaffolded by `init` default `ProjectConfig.states` to `"running"`, and
+    // `ScriptScanner.scanDir` silently ignores first-level script dirs that
+    // aren't a declared state — so a script under `scripts/playing/` would
+    // never run in a default project (chatgpt-codex review). Target
+    // `scripts/running/` so the scaffolded script is picked up out of the box.
+    const script_dir = try std.fs.path.join(allocator, &.{ root, "scripts", "running" });
+    defer allocator.free(script_dir);
+
+    const comp_file = try std.fmt.allocPrint(allocator, "{s}.zig", .{name});
+    defer allocator.free(comp_file);
+    const comp_path = try std.fs.path.join(allocator, &.{ components_dir, comp_file });
+    defer allocator.free(comp_path);
+
+    const script_file = try std.fmt.allocPrint(allocator, "xx_{s}.zig", .{name});
+    defer allocator.free(script_file);
+    const script_path = try std.fs.path.join(allocator, &.{ script_dir, script_file });
+    defer allocator.free(script_path);
+
+    // Preflight BOTH targets before writing either, so the documented refusal
+    // to overwrite is all-or-nothing: `add feature` never leaves a
+    // half-created scaffold when one file exists and the other doesn't
+    // (chatgpt-codex review). `access` on the file path works whether or not
+    // the parent dir exists yet.
+    preflightAbsent(io, cwd, comp_path) catch std.process.exit(1);
+    preflightAbsent(io, cwd, script_path) catch std.process.exit(1);
+
+    // Report dir-creation failures instead of swallowing them — a silent
+    // `catch {}` would let a real error (permission denied, a path component
+    // that's a file, disk full) surface later as a confusing write failure
+    // (CodeRabbit review). Matches `scaffoldPack`'s handling.
+    cwd.createDirPath(io, components_dir) catch |err| {
+        std.log.err("labelle-assembler add feature: could not create '{s}': {s}", .{ components_dir, @errorName(err) });
+        std.process.exit(1);
+    };
+    cwd.createDirPath(io, script_dir) catch |err| {
+        std.log.err("labelle-assembler add feature: could not create '{s}': {s}", .{ script_dir, @errorName(err) });
+        std.process.exit(1);
+    };
 
     // components/<name>.zig
     {
         var aw = std.Io.Writer.Allocating.init(allocator);
         defer aw.deinit();
         try writeComponentTemplate(&aw.writer, kind, name, type_name);
-
-        const file = try std.fmt.allocPrint(allocator, "{s}.zig", .{name});
-        defer allocator.free(file);
-        const path = try std.fs.path.join(allocator, &.{ components_dir, file });
-        defer allocator.free(path);
-        writeExclusiveData(io, cwd, path, aw.written());
+        writeExclusiveData(io, cwd, comp_path, aw.written()) catch std.process.exit(1);
     }
 
-    // scripts/playing/xx_<name>.zig
+    // scripts/running/xx_<name>.zig
     {
         var aw = std.Io.Writer.Allocating.init(allocator);
         defer aw.deinit();
         try writeScriptTemplate(&aw.writer, kind, name, type_name);
-
-        const file = try std.fmt.allocPrint(allocator, "xx_{s}.zig", .{name});
-        defer allocator.free(file);
-        const path = try std.fs.path.join(allocator, &.{ playing_dir, file });
-        defer allocator.free(path);
-        writeExclusiveData(io, cwd, path, aw.written());
+        writeExclusiveData(io, cwd, script_path, aw.written()) catch std.process.exit(1);
     }
 
     std.log.info("labelle-assembler: scaffolded {s} feature '{s}'", .{ @tagName(kind), name });
     std.log.info("  components/{s}.zig", .{name});
-    std.log.info("  scripts/playing/xx_{s}.zig", .{name});
+    std.log.info("  scripts/running/xx_{s}.zig", .{name});
     std.log.info("  next: attach `{s}` to the prefab whose entities this feature acts on", .{type_name});
+}
+
+/// Preflight guard: error with a clear diagnostic if `path` already exists, so
+/// a multi-file scaffold can check every target up front and stay atomic.
+/// A `FileNotFound` (the wanted case) passes; any other stat error also errors
+/// rather than risk clobbering. Returns the error to the caller (rather than
+/// exiting) so it stays unit-testable — the caller maps it to an exit code.
+fn preflightAbsent(io: std.Io, cwd: std.Io.Dir, path: []const u8) !void {
+    if (cwd.access(io, path, .{})) |_| {
+        // Straight to stderr (not `std.log.err`) so the negative-path unit
+        // tests don't fail on a logged error (repo convention).
+        writeStderr3(io, "labelle-assembler add: '", path, "' already exists — refusing to overwrite\n");
+        return error.PathAlreadyExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            writeStderr3(io, "labelle-assembler add: could not check '", path, "': ");
+            writeStderr(io, @errorName(err));
+            writeStderr(io, "\n");
+            return err;
+        },
+    }
 }
 
 fn writeComponentTemplate(w: *std.Io.Writer, kind: FeatureKind, name: []const u8, type_name: []const u8) !void {
@@ -284,7 +434,7 @@ fn writeComponentTemplate(w: *std.Io.Writer, kind: FeatureKind, name: []const u8
             \\//! Scaffolded by `labelle add feature need {s}` (RFC-packs §3). A need is
             \\//! a self-contained feature that integrates purely via events: this
             \\//! component holds the durable value, the colocated
-            \\//! `scripts/playing/xx_{s}.zig` decays it and emits the standard
+            \\//! `scripts/running/xx_{s}.zig` decays it and emits the standard
             \\//! `need_threshold_crossed` event, and consumers (overlay, satisfaction)
             \\//! subscribe to that event — nothing existing is edited.
             \\//!
@@ -306,7 +456,7 @@ fn writeComponentTemplate(w: *std.Io.Writer, kind: FeatureKind, name: []const u8
             \\//!
             \\//! Scaffolded by `labelle add feature role {s}` (RFC-packs §3). A role is
             \\//! a self-contained feature: attach this component to give an entity the
-            \\//! role, and the colocated `scripts/playing/xx_{s}.zig` drives its
+            \\//! role, and the colocated `scripts/running/xx_{s}.zig` drives its
             \\//! per-frame behavior. Consumers react via events, not by reading this
             \\//! component — so adding a role edits nothing existing.
             \\//!
@@ -326,7 +476,7 @@ fn writeComponentTemplate(w: *std.Io.Writer, kind: FeatureKind, name: []const u8
             \\//! `{s}` — a transient status flag, shown as an overlay.
             \\//!
             \\//! Scaffolded by `labelle add feature status {s}` (RFC-packs §3). A status
-            \\//! is a self-contained feature: `scripts/playing/xx_{s}.zig` derives
+            \\//! is a self-contained feature: `scripts/running/xx_{s}.zig` derives
             \\//! whether it is active (typically by subscribing to an event), and an
             \\//! overlay prefab renders it. The state is re-derived each frame, so it is
             \\//! `.transient` — stripped on load rather than serialized.
@@ -372,7 +522,7 @@ fn writeScriptTemplate(w: *std.Io.Writer, kind: FeatureKind, name: []const u8, t
             \\    defer view.deinit();
             \\
             \\    while (view.next()) |entity| {{
-            \\        const need = game.getComponent(entity, {s}) orelse continue;
+            \\        const need = game.ecs_backend.getComponent(entity, {s}) orelse continue;
             \\        const before = need.value;
             \\        need.value = std.math.clamp(before - decay_per_second * dt, 0.0, 1.0);
             \\
@@ -416,7 +566,7 @@ fn writeScriptTemplate(w: *std.Io.Writer, kind: FeatureKind, name: []const u8, t
             \\    defer view.deinit();
             \\
             \\    while (view.next()) |entity| {{
-            \\        const role = game.getComponent(entity, {s}) orelse continue;
+            \\        const role = game.ecs_backend.getComponent(entity, {s}) orelse continue;
             \\        if (!role.active) continue;
             \\
             \\        // TODO(behavior): drive the role for `entity` here (move, work,
@@ -448,7 +598,7 @@ fn writeScriptTemplate(w: *std.Io.Writer, kind: FeatureKind, name: []const u8, t
             \\    defer view.deinit();
             \\
             \\    while (view.next()) |entity| {{
-            \\        const status = game.getComponent(entity, {s}) orelse continue;
+            \\        const status = game.ecs_backend.getComponent(entity, {s}) orelse continue;
             \\
             \\        // TODO(condition): compute whether the status is active this frame.
             \\        // Typically driven by an event subscriber (a hook) rather than a
@@ -463,28 +613,41 @@ fn writeScriptTemplate(w: *std.Io.Writer, kind: FeatureKind, name: []const u8, t
 
 // ─── file helpers ──────────────────────────────────────────────────────
 
-/// Exclusive write of a string literal; exits non-zero if the file exists.
-fn writeExclusive(io: std.Io, cwd: std.Io.Dir, path: []const u8, data: []const u8) void {
-    writeExclusiveData(io, cwd, path, data);
-}
-
 /// Exclusive write; refuses to overwrite (error.PathAlreadyExists) with a
-/// clear diagnostic, and exits non-zero on any other filesystem failure.
-fn writeExclusiveData(io: std.Io, cwd: std.Io.Dir, path: []const u8, data: []const u8) void {
+/// clear diagnostic and reports any other filesystem failure. Returns the
+/// error to the caller rather than exiting itself so the helper stays
+/// reusable and unit-testable (Gemini review) — the caller decides the exit
+/// code. The diagnostic is emitted here so every call site logs uniformly.
+fn writeExclusiveData(io: std.Io, cwd: std.Io.Dir, path: []const u8, data: []const u8) !void {
     cwd.writeFile(io, .{
         .sub_path = path,
         .data = data,
         .flags = .{ .exclusive = true },
     }) catch |err| switch (err) {
         error.PathAlreadyExists => {
-            std.log.err("labelle-assembler add: '{s}' already exists — refusing to overwrite", .{path});
-            std.process.exit(1);
+            // Diagnostics go straight to stderr (not `std.log.err`) so the
+            // negative-path unit tests here don't fail on a logged error —
+            // the repo-wide convention for testable error-returning helpers
+            // (see `flow_scanner`, `scene_manifest`).
+            writeStderr3(io, "labelle-assembler add: '", path, "' already exists — refusing to overwrite\n");
+            return err;
         },
         else => {
-            std.log.err("labelle-assembler add: could not write '{s}': {s}", .{ path, @errorName(err) });
-            std.process.exit(1);
+            writeStderr3(io, "labelle-assembler add: could not write '", path, "': ");
+            writeStderr(io, @errorName(err));
+            writeStderr(io, "\n");
+            return err;
         },
     };
+}
+
+/// Write three segments to stderr in one logical line. Keeps the
+/// error-returning helpers allocation-free while formatting a path into a
+/// message (paths are unbounded, so a stack `bufPrint` isn't safe).
+fn writeStderr3(io: std.Io, a: []const u8, b: []const u8, c: []const u8) void {
+    writeStderr(io, a);
+    writeStderr(io, b);
+    writeStderr(io, c);
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -520,6 +683,18 @@ test "toTypeName produces PascalCase" {
     try testing.expectEqualStrings("X1Y2", c);
 }
 
+test "toTypeName prefixes _ when the name starts with a digit" {
+    // `isValidName` rejects digit-leading feature names, but `toTypeName` is
+    // public/reused, so it must still emit a legal Zig identifier (Gemini).
+    const a = try toTypeName(testing.allocator, "1up");
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("_1up", a);
+
+    const b = try toTypeName(testing.allocator, "3d_view");
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("_3dView", b);
+}
+
 test "scaffoldPack creates the convention tree and a parseable pack.labelle" {
     const alloc = testing.allocator;
     const io = config.globalIo();
@@ -534,11 +709,15 @@ test "scaffoldPack creates the convention tree and a parseable pack.labelle" {
 
     try scaffoldPack(alloc, io, tmp_abs, "citizens");
 
-    // Each convention subdir exists with a .gitkeep.
-    inline for (.{ "components", "events", "scripts", "prefabs", "hooks" }) |sub| {
+    // Each convention subdir the generator actually scans exists with a
+    // .gitkeep. `scripts/` is intentionally NOT scaffolded (pack scripts are
+    // not scanned yet — see `pack_convention_dirs`).
+    inline for (.{ "components", "events", "prefabs", "hooks" }) |sub| {
         try tmp.dir.access(io, "packs/citizens/" ++ sub, .{});
         try tmp.dir.access(io, "packs/citizens/" ++ sub ++ "/.gitkeep", .{});
     }
+    // No `scripts/` dir — it would be silently ignored by generate today.
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "packs/citizens/scripts", .{}));
 
     // pack.labelle carries the exact fields and parses as the pack manifest.
     const manifest = try tmp.dir.readFileAlloc(io, "packs/citizens/pack.labelle", alloc, .limited(4096));
@@ -575,11 +754,14 @@ test "scaffoldFeature need creates a component and a playing script" {
     try testing.expect(std.mem.indexOf(u8, comp, "pub const Boredom = struct") != null);
     try testing.expect(std.mem.indexOf(u8, comp, "core.Saveable(.saveable") != null);
 
-    const script = try tmp.dir.readFileAlloc(io, "scripts/playing/xx_boredom.zig", alloc, .limited(8192));
+    // Script lands under the default `running` state so it's actually scanned.
+    const script = try tmp.dir.readFileAlloc(io, "scripts/running/xx_boredom.zig", alloc, .limited(8192));
     defer alloc.free(script);
     try testing.expect(std.mem.indexOf(u8, script, "pub fn tick(game: anytype, dt: f32) void") != null);
     try testing.expect(std.mem.indexOf(u8, script, "../../components/boredom.zig") != null);
     try testing.expect(std.mem.indexOf(u8, script, "need_threshold_crossed") != null);
+    // Component lookup goes through the ECS backend, matching the view call.
+    try testing.expect(std.mem.indexOf(u8, script, "game.ecs_backend.getComponent(entity, Boredom)") != null);
 }
 
 test "scaffoldFeature status uses a transient save policy" {
@@ -618,4 +800,134 @@ test "scaffoldFeature refuses to overwrite an existing component" {
         .flags = .{ .exclusive = true },
     });
     try testing.expectError(error.PathAlreadyExists, result);
+}
+
+test "preflightAbsent errors on an existing path, passes on an absent one" {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const alloc = testing.allocator;
+    const tmp_abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(tmp_abs);
+
+    // Absent → passes (this is what lets a fresh scaffold proceed).
+    const absent = try std.fs.path.join(alloc, &.{ tmp_abs, "not_there.zig" });
+    defer alloc.free(absent);
+    try preflightAbsent(io, cwd, absent);
+
+    // Existing → refuses. This is the guard that makes `add feature`
+    // all-or-nothing: if EITHER target exists it's rejected before any write.
+    try tmp.dir.writeFile(io, .{ .sub_path = "there.zig", .data = "x\n" });
+    const existing = try std.fs.path.join(alloc, &.{ tmp_abs, "there.zig" });
+    defer alloc.free(existing);
+    try testing.expectError(error.PathAlreadyExists, preflightAbsent(io, cwd, existing));
+}
+
+test "writeExclusiveData returns error.PathAlreadyExists instead of exiting" {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const alloc = testing.allocator;
+    const tmp_abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(tmp_abs);
+    const path = try std.fs.path.join(alloc, &.{ tmp_abs, "f.zig" });
+    defer alloc.free(path);
+
+    // First write succeeds; the second is refused via a returned error (the
+    // helper no longer calls std.process.exit — Gemini review).
+    try writeExclusiveData(io, cwd, path, "a\n");
+    try testing.expectError(error.PathAlreadyExists, writeExclusiveData(io, cwd, path, "b\n"));
+}
+
+test "scaffoldPack auto-registers the pack in an existing project.labelle" {
+    const alloc = testing.allocator;
+    const io = config.globalIo();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(tmp_abs);
+
+    // A minimal project.labelle with an EMPTY .plugins tuple.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project.labelle",
+        .data =
+        \\.{
+        \\    .name = "demo",
+        \\    .plugins = .{},
+        \\}
+        \\
+        ,
+    });
+
+    try scaffoldPack(alloc, io, tmp_abs, "citizens");
+
+    const proj = try tmp.dir.readFileAlloc(io, "project.labelle", alloc, .limited(8192));
+    defer alloc.free(proj);
+    // The pack is now declared with the in-project `@packs/<name>` repo form
+    // the resolver understands (same shape as `@libs/...`).
+    try testing.expect(std.mem.indexOf(u8, proj, ".name = \"citizens\"") != null);
+    try testing.expect(std.mem.indexOf(u8, proj, ".repo = \"@packs/citizens\"") != null);
+    // …and the rewritten file still parses as a ProjectConfig with the pack
+    // in .plugins.
+    const src = try alloc.dupeZ(u8, proj);
+    defer alloc.free(src);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
+    var found = false;
+    for (cfg.plugins) |p| {
+        if (std.mem.eql(u8, p.name, "citizens") and std.mem.eql(u8, p.repo, "@packs/citizens")) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "scaffoldPack registers into a populated .plugins tuple" {
+    const alloc = testing.allocator;
+    const io = config.globalIo();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(tmp_abs);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "project.labelle",
+        .data =
+        \\.{
+        \\    .name = "demo",
+        \\    .plugins = .{
+        \\        .{ .name = "existing", .repo = "@libs/existing" },
+        \\    },
+        \\}
+        \\
+        ,
+    });
+
+    try scaffoldPack(alloc, io, tmp_abs, "citizens");
+
+    const proj = try tmp.dir.readFileAlloc(io, "project.labelle", alloc, .limited(8192));
+    defer alloc.free(proj);
+    const src = try alloc.dupeZ(u8, proj);
+    defer alloc.free(src);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, arena.allocator(), src, null, .{});
+    var has_existing = false;
+    var has_citizens = false;
+    for (cfg.plugins) |p| {
+        if (std.mem.eql(u8, p.name, "existing")) has_existing = true;
+        if (std.mem.eql(u8, p.name, "citizens") and std.mem.eql(u8, p.repo, "@packs/citizens")) has_citizens = true;
+    }
+    // The pre-existing plugin is preserved AND the new pack is appended.
+    try testing.expect(has_existing);
+    try testing.expect(has_citizens);
 }
