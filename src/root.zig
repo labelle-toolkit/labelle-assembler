@@ -38,6 +38,7 @@ test {
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/manifest_splice.zig");
     _ = @import("codegen/manifest_v2.zig");
+    _ = @import("codegen/core_diamond.zig");
     _ = @import("capabilities.zig");
 }
 
