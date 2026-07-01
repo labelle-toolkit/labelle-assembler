@@ -473,6 +473,32 @@ pub const NULL_BACKEND = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn android_main(") != null);
     }
 
+    test "external sokol-desktop is NOT rejected — it has a real callback dispatch path (#454)" {
+        // Regression-lock for the #454 re-check: sokol is now a fully EXTERNAL
+        // backend (`builtinProvider(.sokol)` resolves to labelle-sokol), and it
+        // declares a `.callback` run-loop. The callback-external guard must NOT
+        // reject it — the enum-as-shorthand preserves `cfg.backend == .sokol`, so
+        // `callback_dispatch_handled` is true and the sokol callback dispatch has
+        // a real branch. This must generate the sokol callback main (export
+        // init/frame/cleanup), not `error.ExternalCallbackBackendUnsupported`.
+        // (Setting both `.backend = .sokol` and `.backend_package` models the
+        // post-flip state: external resolution + preserved enum tag. If someone
+        // ever drops `cfg.backend == .sokol` from `callback_dispatch_handled`,
+        // this test fails instead of production silently breaking sokol-desktop.)
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .desktop,
+            .backend_package = .{ .name = "sokol", .repo = "local:../sokol" },
+            .ecs = .mock,
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // Took the sokol callback path (exported init/frame/cleanup callbacks),
+        // not the error and not the raylib-wasm fallback.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn frame() callconv(.c) void") != null);
+    }
+
     test "raylib + sokol unchanged — null doesn't leak into other backends" {
         // Regression-lock: the headless main pattern must NOT appear in
         // raylib's or sokol's generated output, and each backend's
