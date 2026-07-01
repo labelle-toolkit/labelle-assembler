@@ -323,6 +323,162 @@ pub const MANIFEST_V2_IOS_GOLDEN = struct {
     }
 };
 
+// ── manifest-v2 sokol-wasm GOLDEN cell (epic #453 item 3, PR 7, design §7) ──
+// wasm is the emcc residual (design §2 (c)) and the LAST sokol platform. Like
+// android/ios (and unlike the desktop byte anchor) this cannot be a 0-diff-vs-enum
+// comparison: the emcc `emLinkStep` (enum `.link_sokol_wasm`, which reaches emcc
+// via `@import("labelle_sokol").emLinkStep`) moved into the imported std-only
+// `backend.hook.zig` — reconstructed there from only `std.Build` + the emsdk
+// dependency — and the unrolled core-diamond overrides became the generic
+// `unifyCoreDiamond` loop. wasm has NO `resolve_target` (its target is the STATIC
+// `.triple` "wasm32-emscripten", resolved inline). Because `post_wire` returns
+// void it also owns the install/run wiring the enum `.wasm_footer` did (the enum
+// `emcc_step` local cannot escape a void hook), so the wasm v2 path does NOT emit
+// the `.wasm_footer`/packager `.web` block — the documented enum-vs-v2 boundary.
+// The gate is a committed golden (reviewed by hand against the enum output for
+// graph equivalence) PLUS the hook's own gates: `backend.hook.zig` is compiled as
+// a test target in build.zig (typechecking `emLinkStep`/`post_wire` against the
+// real std.Build API) and unit-tests its pure decision (the 512 KB stack arg). It
+// ALSO asserts the generated build.zig.zon carries the emsdk root build dep
+// (design §3 `RootBuildDep`, review #459 finding 2) — the hook's
+// `b.dependency("emsdk", .{})` only resolves if the root zon declares it.
+pub const MANIFEST_V2_WASM_GOLDEN = struct {
+    const golden = @embedFile("goldens/sokol_wasm_v2.build.zig");
+
+    const wasm_cfg: generate.ProjectConfig = .{
+        .name = "anchor-game",
+        .backend = .sokol,
+        .platform = .wasm,
+        .ecs = .mock,
+    };
+
+    fn genWasmV2() ![]const u8 {
+        return h.genSokolBuildZigV2(std.testing.allocator, wasm_cfg, .{});
+    }
+
+    test "golden: v2 sokol-wasm build.zig matches the committed golden" {
+        const out = try genWasmV2();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 sokol-wasm build.zig is syntactically valid Zig" {
+        const out = try genWasmV2();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 sokol-wasm imports the hook; post_wire does the emcc step (§2 (c))" {
+        const out = try genWasmV2();
+        defer std.testing.allocator.free(out);
+        // The hook is imported and post_wire is called for wasm — the emcc
+        // link residual lives IN the hook, not inline in build.zig.
+        try std.testing.expect(std.mem.indexOf(u8, out, "@import(\"backend_build_hook.zig\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.post_wire(b, .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".platform = .wasm,") != null);
+        // NO inline emLinkStep / provider import in the generated build.zig — the
+        // std-only hook reconstructs emcc; the enum `@import("labelle_sokol")` +
+        // `sokol_em.emLinkStep(...)` are GONE (the enum-vs-v2 boundary).
+        try std.testing.expect(std.mem.indexOf(u8, out, "emLinkStep") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "@import(\"labelle_sokol\")") == null);
+        // wasm has NO resolve_target CALL (static triple) — the target resolves
+        // inline via resolveTargetQuery (the header comment mentions the phase name).
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.resolve_target(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".cpu_arch = .wasm32,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.resolveTargetQuery(.{") != null);
+        // The generic core-diamond walk (loop form) replaced the unrolled overrides.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") != null);
+        // Declarative graph: the sokol_clib artifact is linked into the wasm lib
+        // (emcc scans it as a transitive static dep in post_wire).
+        try std.testing.expect(std.mem.indexOf(u8, out, "wasm.root_module.linkLibrary(sokol_clib)") != null);
+        // post_wire owns install/run, so NO packager `.web` footer is emitted —
+        // the enum `emcc_step` local is absent from the generated build.zig.
+        try std.testing.expect(std.mem.indexOf(u8, out, "emcc_step") == null);
+    }
+
+    test "v2 sokol-wasm build.zig.zon carries the emsdk root build dep (§3 RootBuildDep)" {
+        // The hook's `b.dependency("emsdk", .{})` only resolves if the generated
+        // root zon declares emsdk. The manifest's `.platforms.wasm.root_build_deps`
+        // = `.{ .name = "emsdk", .resolution = .builtin }` drives this; `.builtin`
+        // reuses the pinned `dep_emsdk` section, so the emitted url is byte-identical
+        // to the enum path.
+        const zon = try generate.generateBuildZigZon(
+            std.testing.allocator,
+            wasm_cfg,
+            null,
+            null,
+            ".",
+            .{ .backend_manifest_name = "backend.manifest.v2.zon" },
+        );
+        defer std.testing.allocator.free(zon);
+        try std.testing.expect(std.mem.indexOf(u8, zon, ".emsdk = .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, zon, "git+https://github.com/emscripten-core/emsdk#4.0.9") != null);
+    }
+
+    test "v2 sokol-wasm zon emsdk is byte-identical to the enum-path zon" {
+        // `.builtin` reuses the enum path's pinned `dep_emsdk` section, so a v2 wasm
+        // zon and the enum wasm zon agree on the emsdk entry (design §3).
+        const v2_zon = try generate.generateBuildZigZon(
+            std.testing.allocator,
+            wasm_cfg,
+            null,
+            null,
+            ".",
+            .{ .backend_manifest_name = "backend.manifest.v2.zon" },
+        );
+        defer std.testing.allocator.free(v2_zon);
+        const enum_zon = try generate.generateBuildZigZon(
+            std.testing.allocator,
+            wasm_cfg,
+            null,
+            null,
+            ".",
+            .{},
+        );
+        defer std.testing.allocator.free(enum_zon);
+        try std.testing.expectEqualStrings(enum_zon, v2_zon);
+    }
+
+    // ── #468 finding 1: a v2 manifest that fails to load must error the ZON ──
+    // generation, not silently fall back to enum output. The build.zig path
+    // (`generateBuildZig`) already propagates the load error with `try`; the zon
+    // path used to `catch null`, which could pair a build.zig that resolved its
+    // hook deps against a v2 manifest with a build.zig.zon that fell back to enum
+    // output — a divergent (broken) pair. The two generators must now AGREE:
+    // both succeed, or both error, for the same manifest.
+    const broken_cfg: generate.ProjectConfig = .{
+        .name = "anchor-game",
+        .backend = .sokol,
+        .platform = .wasm,
+        .ecs = .mock,
+        .backend_package = h.sokol_v2broken_fixture_package,
+    };
+
+    test "v2 build.zig.zon errors when the v2 manifest fails to load (no enum fallback)" {
+        try std.testing.expectError(error.BackendManifestParseError, generate.generateBuildZigZon(
+            std.testing.allocator,
+            broken_cfg,
+            null,
+            null,
+            ".",
+            .{ .backend_manifest_name = "backend.manifest.v2.zon" },
+        ));
+    }
+
+    test "v2 build.zig ALSO errors on the same broken manifest (both paths agree)" {
+        try std.testing.expectError(error.BackendManifestParseError, generate.generateBuildZig(
+            std.testing.allocator,
+            broken_cfg,
+            .{ .project_dir = ".", .backend_manifest_name = "backend.manifest.v2.zon" },
+        ));
+    }
+};
+
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
         const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{

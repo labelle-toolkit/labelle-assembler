@@ -280,8 +280,16 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     }
 
     if (cfg.platform == .wasm) {
-        try tpl.writeSection(build_zig_tmpl, "header_wasm", w);
-        try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
+        if (v2_manifest) |m| {
+            // manifest-v2 wasm (PR 7): the header imports the backend hook and
+            // resolves the STATIC wasm32-emscripten target inline (design §3 — a
+            // fixed .triple, so NO resolve_target hook). Replaces the enum
+            // `header_wasm` + `wasm_target` blocks.
+            try manifest_v2_splice.renderWasmHeaderV2(m, w);
+        } else {
+            try tpl.writeSection(build_zig_tmpl, "header_wasm", w);
+            try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
+        }
     } else if (cfg.platform == .ios) {
         if (v2_manifest) |m| {
             // manifest-v2 ios (PR 6): the header imports the backend hook and
@@ -341,6 +349,13 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             try tpl.writeSection(build_zig_tmpl, "android_deps", w);
         }
         try tpl.writeSection(build_zig_tmpl, "game_mod_decl_android", w);
+    } else if (cfg.platform == .wasm and v2_manifest != null) {
+        // manifest-v2 wasm (PR 7): emit the core/gfx/engine dep decls WITHOUT the
+        // unrolled overrideImport diamond — the generic `unifyCoreDiamond` walk
+        // (emitted after the backend-dep section) replaces it (design §5). Uses the
+        // plain `target` alias the v2 wasm header declares.
+        try manifest_v2_splice.renderWasmDepsDeclsV2(w);
+        try tpl.writeSection(build_zig_tmpl, "game_mod_decl", w);
     } else {
         try tpl.writeSection(build_zig_tmpl, "deps", w);
         // Bind the `game` module right after deps so the exe/tests
@@ -529,7 +544,11 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // built-in AND for a tag-matched external on wasm (both route through
         // the enum path — see `externalUsesEnumPath`); a non-tag-matched
         // external is self-contained and declares its own wasm wiring.
-        if (usesEnumBackendPath(cfg)) switch (cfg.backend) {
+        // manifest-v2 (PR 7) skips this: the emcc residual moved into the
+        // backend hook's `post_wire`, which resolves emsdk itself via
+        // `b.dependency("emsdk", .{})` — no `@import("labelle_sokol")` in the
+        // generated build.zig (design §2 (c)).
+        if (v2_manifest == null and usesEnumBackendPath(cfg)) switch (cfg.backend) {
             .raylib => try tpl.writeSection(build_zig_tmpl, "wasm_emsdk_raylib", w),
             .sokol => try tpl.writeSection(build_zig_tmpl, "wasm_emsdk_sokol", w),
             else => {},
@@ -571,15 +590,33 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         }
 
-        // WASM link step; emitted on the enum path (bundled built-in or a
-        // tag-matched external on wasm), skipped for a self-contained external.
-        if (usesEnumBackendPath(cfg)) switch (cfg.backend) {
+        // WASM link step.
+        if (v2_manifest) |m| {
+            // manifest-v2 wasm (PR 7): the generic link (linkLibrary the wasm lib's
+            // artifact) plus the `post_wire` hook call for the emcc `emLinkStep`
+            // residual + install/run wiring (design §2 (c) / §4). No enum
+            // `link_sokol_wasm`/`wasm_footer` sections — the hook owns the emcc
+            // step AND (being void) the install/run the enum `emcc_step` local fed.
+            try manifest_v2_splice.renderLinkSectionV2(allocator, m, cfg, w);
+        } else if (usesEnumBackendPath(cfg)) switch (cfg.backend) {
+            // Enum path (bundled built-in or a tag-matched external on wasm),
+            // skipped for a self-contained external.
             .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib_wasm", w),
             .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol_wasm", w),
             else => {},
         };
 
-        try tpl.writeSection(build_zig_tmpl, "wasm_footer", w);
+        if (v2_manifest != null) {
+            // manifest-v2 wasm footer (PR 7): the build-fn close + helper defs
+            // WITHOUT the enum `wasm_footer`'s install/run block (post_wire owns
+            // install/run), then the generic `unifyCoreDiamond` walk (design §5)
+            // as a top-level helper — same footer→walk shape as android/ios.
+            try manifest_v2_splice.renderWasmFooterV2(w);
+            try w.writeByte('\n');
+            try manifest_v2_splice.emitCoreDiamondWalk(w);
+        } else {
+            try tpl.writeSection(build_zig_tmpl, "wasm_footer", w);
+        }
     } else if (cfg.platform == .ios) {
         // iOS: build executable for simulator, link frameworks manually
         try tpl.writeSection(build_zig_tmpl, "ios_exe_start", w);
@@ -861,6 +898,16 @@ pub const BuildZigZonOptions = struct {
     /// the second-pass generation merges its null-backend dep into the
     /// existing dir without orphaning the exe target's chosen-backend dep.
     recreate_deps: bool = true,
+    /// Which backend manifest file to load, relative to the resolved backend
+    /// package root (manifest-v2, epic #453 item 3, PR 7). Null (default) keeps
+    /// the PRODUCTION path 100% unchanged: emsdk is emitted for any wasm build
+    /// via the hardcoded `dep_emsdk` section. When set AND the named manifest is
+    /// `manifest_version >= 2`, the wasm emsdk dependency is instead driven by the
+    /// manifest's `.platforms.wasm.root_build_deps` (design §3 `RootBuildDep`,
+    /// review #459 finding 2) — a `.builtin` emsdk resolves to that same pinned
+    /// section, so the emitted zon stays byte-identical. Mirrors
+    /// `BuildZigOptions.backend_manifest_name`.
+    backend_manifest_name: ?[]const u8 = null,
 };
 
 pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, output_dir: ?[]const u8, project_dir: ?[]const u8, opts: BuildZigZonOptions) ![]const u8 {
@@ -946,7 +993,38 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
         try generateZonPathsFallback(allocator, cfg, target_dir, project_dir, w);
     }
 
-    if (cfg.platform == .wasm) {
+    // Root build-time deps a backend hook resolves via `b.dependency` at consumer
+    // build time (design §3 `RootBuildDep`). On the manifest-v2 path (PR 7) the
+    // wasm emsdk dep is driven by the manifest's `.platforms.wasm.root_build_deps`;
+    // a `.builtin` emsdk reuses the pinned `dep_emsdk` section so the emitted zon
+    // is byte-identical to the enum path. The production/enum path keeps the
+    // hardcoded per-platform emsdk emission unchanged.
+    var v2_root_deps_emitted = false;
+    // Mirror `generateBuildZig`'s manifest gate + load so the two generators
+    // agree: gate the load on `manifestPathEnabled` (a missing manifest → enum
+    // fallback in BOTH), and propagate load errors with `try` rather than
+    // swallowing them with `catch null`. A v2 manifest that fails to load must
+    // error in build.zig.zon generation exactly as it does in build.zig
+    // generation — otherwise a build.zig that resolved its hook deps against a
+    // v2 manifest could be paired with a build.zig.zon that silently fell back
+    // to enum output, producing a divergent (and broken) pair. #468 finding 1.
+    if (project_dir) |pd| {
+        if (opts.backend_manifest_name) |name| {
+            if (manifest_splice.manifestPathEnabled(allocator, cfg, pd, name)) {
+                const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, pd, name);
+                defer parsed.free(allocator);
+                switch (parsed) {
+                    .v1 => {},
+                    .v2 => |m| {
+                        const dep_emsdk = tpl.getSection(build_zig_zon_tmpl, "dep_emsdk") orelse "";
+                        try manifest_v2_splice.emitRootBuildDepsV2(m, cfg.platform, dep_emsdk, w);
+                        v2_root_deps_emitted = true;
+                    },
+                }
+            }
+        }
+    }
+    if (!v2_root_deps_emitted and cfg.platform == .wasm) {
         try tpl.writeSection(build_zig_zon_tmpl, "dep_emsdk", w);
     }
 
