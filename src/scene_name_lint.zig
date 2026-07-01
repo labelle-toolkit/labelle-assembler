@@ -50,6 +50,20 @@ pub const PackComponent = struct {
     namespaced: []const u8,
 };
 
+/// Engine/gfx built-in component names that the assembler's codegen ALWAYS
+/// registers into every project's component registry
+/// (`writeComponentRegistryBlock` in `codegen/blocks/registries.zig`),
+/// independent of the game's own `components/` and of any pack. A game
+/// scene/prefab may reference one of these by its bare name legitimately, so
+/// they are exempt from this lint even when a pack happens to ship a
+/// same-named component (labelle-assembler#494, codex review). Keep in sync
+/// with the hard-coded `engine.core.*` registrations in
+/// `writeComponentRegistryBlock`.
+pub const builtin_component_names = [_][]const u8{
+    // #549 — `{ "VideoComponent": { "path": "intro", … } }` in any scene/prefab.
+    "VideoComponent",
+};
+
 // ── Component-reference collection ─────────────────────────────────────────
 
 /// One component-declaration reference found in a scene/prefab source: the
@@ -286,11 +300,14 @@ fn containsStr(haystack: []const []const u8, needle: []const u8) bool {
 /// on `arena`.
 ///
 /// A reference is flagged iff ALL of:
-///   1. it is NOT already namespaced or otherwise game-owned — i.e. the
-///      game root does not itself register a component of that bare name
-///      (`game_owned` covers scanned `components/*.zig` names; engine
-///      builtins never collide with a pack's un-prefixed name in practice,
-///      so they are safe without enumeration); and
+///   1. it is NOT already namespaced or otherwise game-owned — i.e. neither
+///      the game root's own scanned `components/*.zig` names (`game_owned`)
+///      NOR an engine/gfx built-in the codegen always registers
+///      (`builtin_component_names`, e.g. `VideoComponent`) claims that bare
+///      name. A built-in must be exempt even when a pack ships a same-named
+///      component, or a legitimate `{ "VideoComponent": … }` is falsely
+///      flagged + mis-suggested to `pack__VideoComponent`
+///      (labelle-assembler#494, codex review); and
 ///   2. some pack DOES contribute a component whose un-prefixed name equals
 ///      the bare reference — that pack component is only reachable via its
 ///      `<pack>__<Name>` key, so the bare form is the trap.
@@ -308,6 +325,10 @@ pub fn lintSource(
     for (refs) |ref| {
         // A name the game root itself owns is a legitimate bare reference.
         if (containsStr(game_owned, ref.name)) continue;
+        // An engine/gfx built-in the codegen always registers (e.g.
+        // `VideoComponent`) is likewise legitimate by its bare name — even
+        // when a pack ships a same-named component (labelle-assembler#494).
+        if (containsStr(&builtin_component_names, ref.name)) continue;
 
         // Gather the namespaced candidates whose un-prefixed name matches.
         var candidates: std.ArrayList([]const u8) = .empty;
@@ -502,6 +523,23 @@ test "lint: a game-owned component of the same name is not flagged" {
     ,
         &.{.{ .bare = "Worker", .namespaced = "citizens__Worker" }},
         &.{"Worker"},
+    );
+    try testing.expectEqual(@as(usize, 0), f.len);
+}
+
+test "lint: a built-in component name is not flagged even if a pack ships one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // `VideoComponent` is an engine built-in the codegen always registers, so
+    // a bare scene reference is legitimate — even though a pack here also
+    // defines a `VideoComponent` (labelle-assembler#494, codex review). It
+    // must NOT be flagged / mis-suggested to `media__VideoComponent`.
+    const f = try lintOne(
+        arena.allocator(),
+        \\{ "components": { "VideoComponent": { "path": "intro" } } }
+    ,
+        &.{.{ .bare = "VideoComponent", .namespaced = "media__VideoComponent" }},
+        &.{},
     );
     try testing.expectEqual(@as(usize, 0), f.len);
 }

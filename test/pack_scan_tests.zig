@@ -733,4 +733,141 @@ pub const PACK_SCRIPTS = struct {
 
         try std.testing.expect(contains(main_zig, "@import(\"scripts/hits.zig\")"));
     }
+
+    test "scanPackScriptsAt prunes a stale dest and registers nothing when the pack has no scripts/ (#496)" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        // A pack that ships components/ but NO scripts/ (upstream removed the
+        // scripts/ it once had).
+        try writeFileIn(tmp.dir, "src/citizens/components/Worker.zig", "pub const Worker = struct {};\n");
+
+        // A STALE destination a PRIOR `generate` copied, back when the pack DID
+        // ship scripts/. `copyAndScanAbs` no-ops on the missing source and never
+        // touches this, so without the prune the scan would register it.
+        try writeFileIn(tmp.dir, "packs/citizens/scripts/playing/00_stale.zig", "pub fn tick(_: anytype, _: f32) void {}\n");
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", alloc);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+
+        const states = [_][]const u8{"playing"};
+        var scanner = generate.script_scanner.ScriptScanner.init(alloc, &states);
+
+        const registered = try generate.scanPackScriptsAt(alloc, &scanner, pack_src_path, target_path, "citizens");
+
+        // No source scripts/ → nothing registered, and the stale dest is gone.
+        try std.testing.expect(!registered);
+        try std.testing.expectEqual(@as(usize, 0), scanner.getEntries().len);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "packs/citizens/scripts", .{}));
+    }
+
+    test "scanPackScriptsAt propagates a non-FileNotFound probe error and does NOT prune (#500 codex)" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        // The pack's `scripts` path exists but is a FILE, not a directory —
+        // `openDir` yields `error.NotDir`. That must PROPAGATE (mirroring
+        // `copyAndScanAbs`, which tolerates only `FileNotFound`), NOT be
+        // swallowed as "no scripts" + a prune of the generated copy.
+        try writeFileIn(tmp.dir, "src/citizens/scripts", "this is a file, not a scripts/ dir\n");
+        // A pre-existing generated copy that must survive (proving no prune).
+        try writeFileIn(tmp.dir, "packs/citizens/scripts/playing/00_keep.zig", "pub fn tick(_: anytype, _: f32) void {}\n");
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", alloc);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+
+        const states = [_][]const u8{"playing"};
+        var scanner = generate.script_scanner.ScriptScanner.init(alloc, &states);
+
+        try std.testing.expectError(
+            error.NotDir,
+            generate.scanPackScriptsAt(alloc, &scanner, pack_src_path, target_path, "citizens"),
+        );
+        // The error propagated BEFORE any prune — the generated copy is intact.
+        try tmp.dir.access(io, "packs/citizens/scripts/playing/00_keep.zig", .{});
+    }
+
+    test "scanPackScriptsAt registers a present pack script and returns true" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try writeFileIn(tmp.dir, "src/citizens/scripts/playing/10_worker_tick.zig",
+            \\pub fn tick(_: anytype, _: f32) void {}
+        );
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", alloc);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+
+        const states = [_][]const u8{"playing"};
+        var scanner = generate.script_scanner.ScriptScanner.init(alloc, &states);
+
+        const registered = try generate.scanPackScriptsAt(alloc, &scanner, pack_src_path, target_path, "citizens");
+
+        try std.testing.expect(registered);
+        const entries = scanner.getEntries();
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expectEqualStrings("citizens", entries[0].plugin_name.?);
+        try std.testing.expectEqualStrings("packs/citizens/scripts/playing/10_worker_tick.zig", entries[0].rel_path);
+    }
+
+    test "a pack context.zig is imported via AllScripts and does NOT become the game context (#496)" {
+        // A pack ships scripts/context.zig. It must be treated as an ordinary
+        // pack script (imported through AllScripts, verbatim from the pack
+        // subtree), NOT as the game's GameContext — otherwise the template
+        // would emit @import("scripts/context.zig") for a game root that has
+        // no such file, breaking the build.
+        const pack_context: generate.script_scanner.ScriptScanner.ScriptEntry = .{
+            .name = "context",
+            .filename = "context.zig",
+            .states = &.{},
+            .sort_order = null,
+            .subdir = null,
+            .rel_path = "packs/media/scripts/context.zig",
+            .plugin_name = "media",
+            .plugin_index = 1,
+            .import_base = "",
+        };
+        const entries: []const generate.script_scanner.ScriptScanner.ScriptEntry = &.{pack_context};
+
+        const main_zig = try generate.generateMainZigFromTemplate(
+            std.testing.allocator,
+            engine_template,
+            .{ .y_axis = .up, .name = "test-game", .backend = .raylib, .ecs = .mock },
+            raylib_lifecycle,
+            entries,
+            empty_names,
+            empty_names,
+            empty_scene_manifests,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_plugin_events,
+            empty_plugin_flow_nodes,
+            empty_plugin_pin_styles,
+            empty_plugin_coercions,
+        );
+        defer std.testing.allocator.free(main_zig);
+
+        // Imported through AllScripts, verbatim from the copied pack subtree.
+        try std.testing.expect(contains(main_zig, "@import(\"packs/media/scripts/context.zig\")"));
+        // …but NOT wired as the game GameContext (the game root has none).
+        try std.testing.expect(contains(main_zig, "const GameContext = struct {};"));
+        try std.testing.expect(!contains(main_zig, "@import(\"scripts/context.zig\")"));
+    }
 };

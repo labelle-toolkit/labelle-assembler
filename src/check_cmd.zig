@@ -139,8 +139,10 @@ fn scanSceneNames(
 
     // Game-owned bare component names: the game root's own `components/*.zig`
     // (registered under their bare Pascal name, so a bare reference to one is
-    // legitimate). Engine builtins never collide with a pack's un-prefixed
-    // name in practice, so they need no enumeration here.
+    // legitimate). Engine/gfx built-ins (e.g. `VideoComponent`) the codegen
+    // always registers are exempted inside `lintSource` itself via
+    // `scene_name_lint.builtin_component_names`, so they need no enumeration
+    // here (labelle-assembler#494, codex review).
     var game_owned: std.ArrayList([]const u8) = .empty;
     const own_stems = try collectStems(arena, io, root, "components");
     for (own_stems) |stem| {

@@ -519,6 +519,48 @@ pub const PluginBlockOrdering = struct {
         try std.testing.expectEqualStrings("pathfinder", entries[1].plugin_name.?);
     }
 
+    test "a pack declared before a plugin sorts before it (#494 declaration order)" {
+        // A pack and a plugin both ship a `scripts/playing/` script. When the
+        // pack is declared FIRST in project.labelle, root.zig scans it first
+        // (interleaved with plugins), so `scanPackScriptsDir` runs before
+        // `scanPluginDir` — the pack's script must sort ahead of the plugin's
+        // (its lower `plugin_index`). This locks the ordering contract the
+        // #494 codex fix restores in `generate()`.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+
+        try tmp_dir.dir.createDirPath(std.testing.io, "scripts");
+
+        // packA: `<pack>/scripts/playing/01_a.zig`
+        try tmp_dir.dir.createDirPath(std.testing.io, "packA/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "packA/playing/01_a.zig", .data = "" });
+
+        // pluginB: `<plugin>/scripts/playing/01_b.zig`
+        try tmp_dir.dir.createDirPath(std.testing.io, "pluginB/playing");
+        try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "pluginB/playing/01_b.zig", .data = "" });
+
+        const scripts_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "scripts", alloc);
+        const packA_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "packA", alloc);
+        const pluginB_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "pluginB", alloc);
+
+        const states_list = [_][]const u8{"playing"};
+        var scanner = ScriptScanner.init(alloc, &states_list);
+        try scanner.scanDir(scripts_path);
+        // packA declared before pluginB → scanned first (interleaved order).
+        try scanner.scanPackScriptsDir(packA_path, "packs/packA/scripts", "packA");
+        try scanner.scanPluginDir(pluginB_path, "pluginB");
+
+        const entries = scanner.getEntries();
+        try expect.equal(entries.len, @as(usize, 2));
+        try std.testing.expectEqualStrings("packA", entries[0].plugin_name.?);
+        try std.testing.expectEqualStrings("pluginB", entries[1].plugin_name.?);
+        try std.testing.expect(entries[0].plugin_index < entries[1].plugin_index);
+    }
+
     test "same numeric prefix across two plugins is ok (separate namespaces)" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
