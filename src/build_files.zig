@@ -725,6 +725,15 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }, w);
         }
 
+        // manifest-v2 packaging seam (epic #453 item 3, PR 4): delegate this
+        // platform's packaging to the shared packager off the typed
+        // `PlatformEntry.package` recipe. Desktop's `.binary` is a NO-OP, so this
+        // does not disturb the PR-3 desktop byte anchor; the apk/web recipes
+        // (Android/wasm, PRs 5/7) emit their packaging block here.
+        if (v2_manifest) |m| {
+            try manifest_v2_splice.renderPackageV2(m, cfg.platform, w);
+        }
+
         // Test-only target (issue #83): close the build function without
         // installing/running the exe. Otherwise emit the regular footer
         // that wires `b.installArtifact(exe)` and the `run` step.
