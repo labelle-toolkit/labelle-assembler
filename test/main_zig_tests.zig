@@ -485,6 +485,15 @@ pub const NULL_BACKEND = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "upgrade the backend") != null);
         // Messages are built at comptime from the actual version numbers.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.fmt.comptimePrint(") != null);
+
+        // ORDER (#453 finding): the directional VERSION asserts must be emitted
+        // BEFORE the shape (`assertBackend`/`assertWindow`/`assertInput`) asserts.
+        // Otherwise a shape assert can `@compileError` first on a decl the newer
+        // contract renamed/added, and the intended directional "upgrade the
+        // backend / labelle-core" message never fires.
+        const first_version_guard = std.mem.indexOf(u8, main_zig, "@hasDecl(_bc_gfx, \"targets_draw_contract\")").?;
+        const first_shape_assert = std.mem.indexOf(u8, main_zig, "assertBackend(@import(\"backend_gfx\"))").?;
+        try std.testing.expect(first_version_guard < first_shape_assert);
     }
 
     // NOTE: the companion "built-in backend emits NO contract guard" test was
@@ -556,6 +565,46 @@ pub const NULL_BACKEND = struct {
         // Took the sokol callback path (exported init/frame/cleanup callbacks),
         // not the error and not the raylib-wasm fallback.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn frame() callconv(.c) void") != null);
+    }
+
+    test "raylib desktop (external-by-default) STILL emits the PBO preview readback (#386 flip regression)" {
+        // Post-#386 flip `.backend = .raylib` resolves to labelle-raylib, so
+        // `cfg.isExternal()` is now true even for the DEFAULT raylib. The render
+        // gate must key off the RESOLVED backend NAME ("raylib"), not
+        // `!isExternal()` — otherwise the `{{preview_setup}}`/`{{preview_readback}}`
+        // holes (labelle-raylib's desktop template still carries them) fill EMPTY
+        // and the editor preview connects but publishes no frames.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .platform = .desktop,
+            .ecs = .mock,
+        }, h.raylib_desktop_preview_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // PBO readback setup (attach) + per-frame readback + the publish bridge
+        // must all be present — the async-readback path that publishes frames.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.attach(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.frame();") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_pbo_publish_bridge") != null);
+    }
+
+    test "a non-raylib external backend does NOT get raylib's PBO readback (#409 intent preserved)" {
+        // The gate must still EXCLUDE other/third-party external backends: their
+        // window module has no `preview_pbo`, so emitting raylib's readback would
+        // fail to compile. A backend whose resolved NAME is not "raylib" (here the
+        // `nullfixture` package, `cfg.backend` at its `.raylib` enum default) keeps
+        // the empty-readback path — same as null/sdl/bgfx/wgpu.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .platform = .desktop,
+            .backend_package = .{ .name = "nullfixture", .repo = "local:../nf" },
+            .ecs = .mock,
+        }, h.raylib_desktop_preview_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.attach(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.frame();") == null);
     }
 
     test "raylib + sokol unchanged — null doesn't leak into other backends" {

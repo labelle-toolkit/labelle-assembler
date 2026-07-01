@@ -157,16 +157,37 @@ pub const BuildZigOptions = struct {
 
 /// True when an EXTERNAL backend may safely fall through to the enum
 /// `switch (cfg.backend)` codegen instead of the (desktop-only) manifest splice.
-/// Only the ANDROID path is validated tag-safe: the extracted backend is
-/// selected via `.backend = .<tag>` (the enum-as-shorthand preserves the tag),
-/// the android sections pull it from `b.dependency("labelle_<tag>")` — which
-/// resolves to the fetched package — and they make no staged-sibling
-/// assumptions (#386 Phase 6c, validated on-device). A backend named only by a
-/// string (no matching tag), or any other no-splice target (desktop without a
-/// project_dir, wasm/ios — whose enum sections don't compose with a
-/// self-contained package), is NOT tag-safe and must route through the manifest.
+/// The android/wasm/ios cross-compile targets are validated tag-safe: the
+/// extracted backend is selected via `.backend = .<tag>` (the enum-as-shorthand
+/// preserves the tag), and those platforms' enum sections pull the backend from
+/// `b.dependency("labelle_<tag>")` — which resolves to the fetched package —
+/// while making no staged-sibling assumptions (#386 Phase 6c, validated
+/// on-device for android). None of these three cross-compile targets have a
+/// manifest splice (that's desktop-only), but each DOES have platform-specific
+/// enum sections (`.backend_sokol_wasm`/`.backend_sokol_ios`, the
+/// `wasm_emsdk_*`/`link_*_wasm` wiring), so the default raylib/sokol backends
+/// must reach them via the enum path rather than hard-erroring — otherwise the
+/// post-flip external default breaks the existing raylib web + sokol web/iOS
+/// builds. Desktop, by contrast, routes an external backend exclusively through
+/// its manifest splice, so it stays OFF this path (a desktop external without a
+/// project_dir/manifest is a hard error). A backend named only by a string (no
+/// matching tag) is NOT tag-safe on any target and must route through the
+/// manifest — the enum `switch` would emit the wrong (raylib-default) codegen.
 fn externalUsesEnumPath(cfg: ProjectConfig) bool {
-    return cfg.platform == .android and std.mem.eql(u8, cfg.backendName(), @tagName(cfg.backend));
+    if (!std.mem.eql(u8, cfg.backendName(), @tagName(cfg.backend))) return false;
+    return switch (cfg.platform) {
+        .android, .wasm, .ios => true,
+        .desktop => false,
+    };
+}
+
+/// True when codegen should route the backend through the embedded enum
+/// `switch (cfg.backend)` sections (and their platform-specific companions like
+/// `wasm_emsdk_*`) rather than the manifest splice / hard error. A bundled
+/// built-in always uses the enum path; a tag-matched external uses it on the
+/// no-manifest cross-compile targets (see `externalUsesEnumPath`).
+fn usesEnumBackendPath(cfg: ProjectConfig) bool {
+    return !cfg.isExternal() or externalUsesEnumPath(cfg);
 }
 
 pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: BuildZigOptions) ![]const u8 {
@@ -409,9 +430,11 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     try emitPromotedScriptModules(w, cfg, opts.promoted_scripts);
 
     if (cfg.platform == .wasm) {
-        // WASM: import emsdk helpers from backend. Built-in-specific; skipped
-        // for an external backend (self-contained; declares its own wasm wiring).
-        if (!cfg.isExternal()) switch (cfg.backend) {
+        // WASM: import emsdk helpers from backend. Emitted for a bundled
+        // built-in AND for a tag-matched external on wasm (both route through
+        // the enum path — see `externalUsesEnumPath`); a non-tag-matched
+        // external is self-contained and declares its own wasm wiring.
+        if (usesEnumBackendPath(cfg)) switch (cfg.backend) {
             .raylib => try tpl.writeSection(build_zig_tmpl, "wasm_emsdk_raylib", w),
             .sokol => try tpl.writeSection(build_zig_tmpl, "wasm_emsdk_sokol", w),
             else => {},
@@ -453,8 +476,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         }
 
-        // Built-in-specific wasm link; skipped for an external backend.
-        if (!cfg.isExternal()) switch (cfg.backend) {
+        // WASM link step; emitted on the enum path (bundled built-in or a
+        // tag-matched external on wasm), skipped for a self-contained external.
+        if (usesEnumBackendPath(cfg)) switch (cfg.backend) {
             .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib_wasm", w),
             .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol_wasm", w),
             else => {},

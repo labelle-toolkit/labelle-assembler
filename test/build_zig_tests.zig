@@ -138,16 +138,64 @@ pub const BUILD_ZIG = struct {
         }, .{}));
     }
 
-    test "tag-matched external backend on a NON-android no-splice target still errors (#386)" {
-        // The enum-path fallthrough is scoped to ANDROID only (the validated,
-        // tag-safe target). A tag-matched external on wasm would otherwise emit
-        // enum backend deps but miss the wasm-specific `wasm_emsdk_*`/`link_*_wasm`
-        // wiring, so it must hard-error and route through the manifest instead.
-        try std.testing.expectError(error.ExternalBackendNeedsManifest, generate.generateBuildZig(std.testing.allocator, .{
+    test "tag-matched external raylib on wasm uses the enum path — emits emsdk + emcc link (#386 regression)" {
+        // Post-flip, `.backend = .raylib` resolves to labelle-raylib (external
+        // by default), so on wasm the old `if (!cfg.isExternal())` gates skipped
+        // the raylib emsdk/link sections AND the backend-dep switch hard-errored
+        // with ExternalBackendNeedsManifest — breaking the existing raylib web
+        // build. A tag-matched external on wasm must instead fall through to the
+        // enum path (no manifest splice on wasm) and emit the wasm sections.
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .raylib,
+            .platform = .wasm,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        // emsdk helper import + the emcc link step must both be present.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "@import(\"labelle_raylib\").emsdk") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "emsdk.emccStep(b, raylib_artifact, wasm") != null);
+    }
+
+    test "tag-matched external sokol on wasm uses the enum path — emits sokol wasm dep + emLinkStep (#386 regression)" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .platform = .wasm,
-            .backend_package = .{ .name = "sokol", .repo = "local:../sokol" },
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        // Wasm-specific sokol backend dep + the emcc emLinkStep wiring.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.dependency(\"labelle_sokol\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "sokol_em.emLinkStep(b, .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "wasm.root_module.linkLibrary(backend_dep.artifact(\"sokol_clib\"))") != null);
+    }
+
+    test "tag-matched external sokol on ios uses the enum path — emits sokol ios dep + framework link (#386 regression)" {
+        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .ios,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        // iOS sokol backend dep (dont_link_system_libs) + the manual framework link.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.dependency(\"labelle_sokol\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, ".dont_link_system_libs = true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkIosFrameworks(exe)") != null);
+    }
+
+    test "non-tag-matched external on wasm still needs a manifest (#386)" {
+        // A genuine third-party backend whose package name has no matching enum
+        // tag cannot use the enum path on wasm — the `switch (cfg.backend)` would
+        // emit raylib-default codegen. With no manifest splice it must hard-error.
+        try std.testing.expectError(error.ExternalBackendNeedsManifest, generate.generateBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .platform = .wasm,
+            .backend_package = .{ .name = "thirdparty", .repo = "local:../tp" },
             .ecs = .mock,
         }, .{}));
     }
