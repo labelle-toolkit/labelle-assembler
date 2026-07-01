@@ -401,7 +401,7 @@ pub const EmLinkOptions = struct {
 /// Path to an emscripten tool (e.g. `emcc`) inside the resolved emsdk dependency.
 /// Mirrors sokol-zig's `emTool`/`emSdkLazyPath`.
 fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Build.LazyPath {
-    return emsdk.path(b.pathJoin(&.{ "upstream", "emscripten", tool }));
+    return emsdk.path(b.fmt("upstream/emscripten/{s}", .{tool}));
 }
 
 /// Reconstruction of sokol-zig's `emLinkStep` using only `std.Build` + the emsdk
@@ -421,7 +421,16 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     if (options.optimize == .Debug) {
         emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
     } else {
-        emcc.addArg("-sASSERTIONS=0");
+        // Non-Debug: optimize. Emscripten DEFAULTS assertions off (ASSERTIONS=0)
+        // in optimized (-O1+) builds, so keeping them for ReleaseSafe (a safety
+        // build) requires setting -sASSERTIONS=1 EXPLICITLY — merely omitting
+        // -sASSERTIONS=0 would still leave them off. ReleaseFast/ReleaseSmall
+        // disable them for the fastest/smallest builds.
+        if (options.optimize == .ReleaseSafe) {
+            emcc.addArg("-sASSERTIONS=1");
+        } else {
+            emcc.addArg("-sASSERTIONS=0");
+        }
         if (options.optimize == .ReleaseSmall) {
             emcc.addArg("-Oz");
         } else {
