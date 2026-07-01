@@ -454,6 +454,62 @@ fn detectV2ManifestName(allocator: std.mem.Allocator, cfg: ProjectConfig, projec
     return manifest_v2.V2_MANIFEST_NAME;
 }
 
+/// Resolve the run-loop-style override for `main.zig` codegen from whichever
+/// backend manifest applies (`null` → the enum path in
+/// `generateMainZigFromTemplate`, unchanged for bgfx-android / sokol-wasm / …).
+///
+/// manifest-v2 cutover (epic #453): a v2-detected backend reads the PER-PLATFORM
+/// `.platforms[<platform>].loop_style` (bgfx-desktop is `.loop`, bgfx-android
+/// `.callback` — the style MUST be per-platform); the legacy path reads the
+/// top-level `loop_style`. Both map onto the same override enum.
+///
+/// Mirrors the `.v2`-handles / `.v1`-falls-through shape of `loadBackendTemplate`
+/// + `validateProviderContracts`:
+///   (1) a REAL v2 manifest (union tag `.v2`) resolves loop_style from its
+///       per-platform matrix; `v2_resolved` records that it did.
+///   (2) OTHERWISE — `backend_manifest_name` null, a `backend.manifest.v2.zon`-
+///       named file that actually parses as v1 (`manifest_version <= 1`), or a
+///       v2 load error — fall through to the legacy `manifestPathEnabled`-gated
+///       top-level `loop_style`.
+///
+/// The legacy branch is a SECOND guarded pass, NOT an `else if` chained off the
+/// name being present (PR #473 Major): chaining it would skip it whenever a name
+/// was detected but the file turned out to be v1, silently leaving that v1
+/// backend's loop_style unset. A v2 load ERROR is swallowed (`catch break`) so it
+/// too falls through to the legacy pass, matching the surrounding manifest
+/// probing's swallow-and-fall-back discipline; a legacy load error propagates.
+pub fn resolveLoopStyleOverride(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    game_dir: []const u8,
+    backend_manifest_name: ?[]const u8,
+) !?manifest_splice.BackendManifest.LoopStyle {
+    var v2_resolved = false;
+    var override: ?manifest_splice.BackendManifest.LoopStyle = null;
+    if (backend_manifest_name) |name| v2blk: {
+        const parsed = manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name) catch break :v2blk;
+        defer parsed.free(allocator);
+        switch (parsed) {
+            .v2 => |m| {
+                v2_resolved = true;
+                if (manifest_v2_splice.platformEntry(m, cfg.platform)) |entry| {
+                    override = switch (entry.loop_style) {
+                        .callback => .callback,
+                        .loop => .loop,
+                    };
+                }
+            },
+            .v1 => {}, // not actually a v2 manifest — legacy pass below handles it
+        }
+    }
+    if (!v2_resolved and manifest_splice.manifestPathEnabled(allocator, cfg, game_dir, null)) {
+        const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
+        defer manifest_splice.freeManifest(allocator, m);
+        override = manifest_splice.loopStyle(m);
+    }
+    return override;
+}
+
 pub fn generate(
     allocator: std.mem.Allocator,
     cfg_in: ProjectConfig,
@@ -1048,25 +1104,7 @@ pub fn generate(
         // bgfx-android `.callback` — the style MUST be per-platform); the v1 path
         // reads the top-level `loop_style`. Both map onto the same override enum.
         defer main_zig.main_template.loop_style_override = null;
-        if (backend_manifest_name) |name| v2blk: {
-            const parsed = manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name) catch break :v2blk;
-            defer parsed.free(allocator);
-            switch (parsed) {
-                .v2 => |m| {
-                    if (manifest_v2_splice.platformEntry(m, cfg.platform)) |entry| {
-                        main_zig.main_template.loop_style_override = switch (entry.loop_style) {
-                            .callback => .callback,
-                            .loop => .loop,
-                        };
-                    }
-                },
-                .v1 => {}, // not actually a v2 manifest — v1 handling below on a later pass
-            }
-        } else if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir, null)) {
-            const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
-            defer manifest_splice.freeManifest(allocator, m);
-            main_zig.main_template.loop_style_override = manifest_splice.loopStyle(m);
-        }
+        main_zig.main_template.loop_style_override = try resolveLoopStyleOverride(allocator, cfg, game_dir, backend_manifest_name);
 
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,

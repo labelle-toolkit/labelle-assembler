@@ -870,6 +870,70 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
         };
         try generate.validateProviderContracts(std.testing.allocator, cfg, ".", null);
     }
+
+    // ── Major (#473): the legacy loop_style path must run for a v1-by-name file ──
+
+    test "resolveLoopStyleOverride: a named manifest that parses as v1 STILL resolves its legacy loop_style (#473 Major)" {
+        // The Major: when `backend_manifest_name` is non-null but the named file
+        // parses as v1 (union tag `.v1`), the v2 arm no-ops. Before the fix the
+        // legacy loop_style path was chained with `else if (name == null)` and was
+        // therefore SKIPPED whenever a name was present — silently leaving
+        // `loop_style_override` null and dropping the v1 backend's loop_style.
+        // sokol_v1only ships a v1 `backend.manifest.zon` (`loop_style = .callback`);
+        // passing its name here exercises the EXACT `.v1`-from-named-file condition
+        // (production detects `backend.manifest.v2.zon`, but the load returns the
+        // SAME `.v1` union tag, so this reproduces the code path faithfully). The
+        // legacy pass must still run and resolve `.callback` — NOT null.
+        const cfg = generate.ProjectConfig{
+            .name = "loop-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v1only_fixture_package,
+        };
+        const override = try generate.resolveLoopStyleOverride(std.testing.allocator, cfg, ".", "backend.manifest.zon");
+        try std.testing.expect(override != null); // NOT left unset (the bug)
+        try std.testing.expect(override.? == .callback); // resolved from the v1 manifest
+    }
+
+    test "resolveLoopStyleOverride: a v2-only backend resolves loop_style from its per-platform matrix (not the absent legacy manifest)" {
+        // Distinguishing complement: sokol_v2only ships NO legacy
+        // `backend.manifest.zon`, so had the code fallen to the legacy pass here
+        // (`manifestPathEnabled` → absent file) the override would be null. Getting
+        // a concrete `.callback` proves the `.v2` arm resolved it from the
+        // per-platform matrix and `v2_resolved` correctly suppressed the legacy pass.
+        const cfg = generate.ProjectConfig{
+            .name = "loop-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v2only_fixture_package,
+        };
+        const override = try generate.resolveLoopStyleOverride(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon");
+        try std.testing.expect(override != null);
+        try std.testing.expect(override.? == .callback); // sokol desktop entry = .callback
+    }
+
+    test "resolveLoopStyleOverride: reads the PER-PLATFORM v2 loop_style — bgfx desktop is .loop, android .callback" {
+        // The reason loop_style MUST be per-platform, exercised end-to-end: the
+        // SAME bgfx v2 manifest yields `.loop` on desktop (generated main drives
+        // `while (!quit)`) and `.callback` on android (NativeActivity owns the loop).
+        const desktop_cfg = generate.ProjectConfig{
+            .name = "loop-game",
+            .ecs = .mock,
+            .backend = .bgfx,
+            .platform = .desktop,
+            .backend_package = h.bgfx_v2_fixture_package,
+        };
+        const desktop = try generate.resolveLoopStyleOverride(std.testing.allocator, desktop_cfg, ".", "backend.manifest.v2.zon");
+        try std.testing.expect(desktop.? == .loop);
+
+        const android_cfg = generate.ProjectConfig{
+            .name = "loop-game",
+            .ecs = .mock,
+            .backend = .bgfx,
+            .platform = .android,
+            .backend_package = h.bgfx_v2_fixture_package,
+        };
+        const android = try generate.resolveLoopStyleOverride(std.testing.allocator, android_cfg, ".", "backend.manifest.v2.zon");
+        try std.testing.expect(android.? == .callback);
+    }
 };
 
 pub const BUILD_ZIG = struct {
