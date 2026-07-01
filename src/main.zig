@@ -21,6 +21,7 @@ const std = @import("std");
 const gen = @import("root.zig");
 const cache_cmd = @import("cache_cmd.zig");
 const init_cmd = @import("init_cmd.zig");
+const check_cmd = @import("check_cmd.zig");
 const add_cmd = @import("add_cmd.zig");
 
 /// Wire protocol version for CLI ↔ assembler subprocess communication.
@@ -36,10 +37,14 @@ const add_cmd = @import("add_cmd.zig");
 /// new-project scaffolding to the binary instead of its in-process
 /// `cmdInit`.
 ///
+/// v5 (labelle-cli#270): added the `check` subcommand — the Packs
+/// enforcement lint (RFC §6). Additive; the CLI's `labelle check` delegates
+/// to it. The CLI still only *requires* protocol >= 3 (older binaries just
+/// lack `check`), so this bump is informational.
 /// v4 (Packs #271): added the `add` subcommand (`add pack <name>` /
 /// `add feature <kind> <name>`). The CLI delegates pack/feature-unit
 /// scaffolding to the binary.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 const usage =
     \\labelle-assembler — code generator for the labelle game toolkit
@@ -52,6 +57,7 @@ const usage =
     \\  labelle-assembler clean [--dry-run] [--project-root <path>]
     \\  labelle-assembler upgrade --project-root <path> [pkg [version]]
     \\  labelle-assembler init <name> [dir] [options]
+    \\  labelle-assembler check --project-root <path>
     \\  labelle-assembler add pack <name>
     \\  labelle-assembler add feature <kind> <name>
     \\
@@ -61,6 +67,7 @@ const usage =
     \\  clean       Prune unused cached package versions
     \\  upgrade     Bump version fields in project.labelle
     \\  init        Scaffold a new project directory
+    \\  check       Lint packs for §6 convention violations (Packs RFC)
     \\  add         Scaffold a pack or a feature-unit (need/role/status)
     \\
     \\Generate options:
@@ -129,6 +136,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, first, "init")) {
         try init_cmd.cmdInit(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "check")) {
+        try check_cmd.cmdCheck(allocator, io, &args);
         return;
     }
 
@@ -300,5 +312,6 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
 test {
     std.testing.refAllDecls(@import("init_cmd.zig"));
     std.testing.refAllDecls(@import("cache_cmd.zig"));
+    std.testing.refAllDecls(@import("check_cmd.zig"));
     std.testing.refAllDecls(@import("add_cmd.zig"));
 }
