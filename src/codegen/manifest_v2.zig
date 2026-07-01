@@ -33,6 +33,15 @@ const ProjectConfig = config.ProjectConfig;
 /// Mirrors `plugin_manifest.zig`'s `SUPPORTED_MANIFEST_VERSION` gate.
 pub const SUPPORTED_MANIFEST_VERSION: u8 = 2;
 
+/// Canonical filename of the build-graph manifest **v2** (epic #453 item 3). A
+/// backend opts into the v2 codegen path by SHIPPING this file next to (or
+/// instead of) the legacy v1 `backend.manifest.zon`. `generate` auto-detects it
+/// by probing the resolved backend package for this name (the production cutover,
+/// #472 P2) and threads it through as `backend_manifest_name`. Kept here — beside
+/// `SUPPORTED_MANIFEST_VERSION` and the parse/dispatch — so the probe, the codegen
+/// gate, and the fixtures agree on ONE spelling.
+pub const V2_MANIFEST_NAME = "backend.manifest.v2.zon";
+
 /// Parsed FIRST, before the full schema (design §3). Defaulted so a v1 manifest
 /// (no `manifest_version` field) reads as version 1 instead of failing to parse,
 /// and `ignore_unknown_fields` makes it tolerate every OTHER field the real

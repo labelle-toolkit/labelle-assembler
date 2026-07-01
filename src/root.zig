@@ -16,6 +16,7 @@ pub const flow_scanner = @import("flow_scanner.zig");
 pub const flow_catalog = @import("flow_catalog.zig");
 const build_files = @import("build_files.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
+const manifest_v2 = @import("codegen/manifest_v2.zig");
 const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
 const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
@@ -393,6 +394,34 @@ fn validateProviderContracts(
     try capabilities.validate(required, declared, provider_id);
 }
 
+/// Auto-detect whether the resolved backend package ships a v2 build-graph
+/// manifest (`backend.manifest.v2.zon`) and, if so, return its canonical
+/// filename so `generate` drives the manifest-v2 codegen path (epic #453,
+/// closing the #472 P2 gap). Returns `V2_MANIFEST_NAME` (a static string, so no
+/// allocation to free) when the package ships one, else `null` → the v1/enum
+/// path, unchanged.
+///
+/// PRODUCTION NO-OP TODAY: no fetched external backend repo ships a v2 manifest
+/// yet (they ship the v1 `backend.manifest.zon`), so this returns null on every
+/// real `generate`, and generation stays byte-identical. It flips to the v2 path
+/// only once a backend actually ships the file (a later per-repo step) — or for
+/// the in-tree v2 fixtures a test selects via `backend_package`.
+///
+/// GRACEFUL DEGRADATION: any probe I/O error (package resolution failure, a
+/// missing dir, an access error, OOM building the path) falls back to null (the
+/// v1/enum path) rather than crashing — mirroring the swallow-and-fall-back
+/// discipline the rest of `generate`'s manifest probing uses
+/// (`manifest_splice.manifestExists`). A genuine external-backend
+/// misconfiguration is still surfaced separately by `requireManifestIfExternal`.
+fn detectV2ManifestName(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) ?[]const u8 {
+    const pkg_dir = backend_registry.resolveBackendPackage(allocator, cfg, project_dir) catch return null;
+    defer allocator.free(pkg_dir);
+    const manifest_path = std.fs.path.join(allocator, &.{ pkg_dir, manifest_v2.V2_MANIFEST_NAME }) catch return null;
+    defer allocator.free(manifest_path);
+    std.Io.Dir.cwd().access(config.globalIo(), manifest_path, .{}) catch return null;
+    return manifest_v2.V2_MANIFEST_NAME;
+}
+
 pub fn generate(
     allocator: std.mem.Allocator,
     cfg_in: ProjectConfig,
@@ -420,7 +449,20 @@ pub fn generate(
     // from generated code. Runs after `requireManifestIfExternal` (a manifest-
     // less external still errors first, with its clearer message) and before
     // `deps_linker.createDepsLinks` / build.zig emission below.
-    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, null);
+    //
+    // ── manifest-v2 production cutover (epic #453, closes #472 P2) ──────
+    // Auto-detect a `backend.manifest.v2.zon` in the resolved backend package
+    // ONCE here and thread the result through every downstream site
+    // (`requireManifestIfExternal`, `generateBuildZigZon`, `generateBuildZig`,
+    // `stageBackendBuildHook`) so a v2-shipping backend drives the v2 codegen
+    // WITHOUT the caller passing `backend_manifest_name`. `null` → the v1/enum
+    // path, unchanged. Production no-op today (no fetched backend ships a v2
+    // manifest yet); the in-tree v2 FIXTURES are reached only via `backend_package`.
+    // Passing the detected name to `requireManifestIfExternal` is load-bearing: a
+    // v2-ONLY external backend (no legacy `backend.manifest.zon`) must not be
+    // rejected as manifest-less (the requirement keys off THIS name).
+    const backend_manifest_name = detectV2ManifestName(allocator, cfg, game_dir);
+    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, backend_manifest_name);
     try validateProviderContracts(allocator, cfg, game_dir);
 
     // Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
@@ -820,6 +862,10 @@ pub fn generate(
         // The tests target runs second — additive merge so the exe
         // target's deps (chosen-backend, plugins) survive. Issue #83.
         .recreate_deps = !is_tests_target,
+        // manifest-v2 cutover: when the backend ships a v2 manifest, key the
+        // backend dep entry off its `dep_name` + drive its `root_build_deps`
+        // (design §3). Null → v1/enum, byte-unchanged.
+        .backend_manifest_name = backend_manifest_name,
     });
     defer allocator.free(zon);
     try scanner.writeFile(target_dir, "build.zig.zon", zon);
@@ -840,9 +886,22 @@ pub fn generate(
         // root so the splice can locate `backend.manifest.zon` + fragments.
         // Only consulted when the gate (desktop + manifest present) fires.
         .project_dir = game_dir,
+        // manifest-v2 cutover: the auto-detected v2 manifest name (null → v1/enum,
+        // byte-unchanged). When a v2 manifest is present this routes the
+        // backend-dep + link sections to the v2 codegen (`manifest_v2_splice`).
+        .backend_manifest_name = backend_manifest_name,
     });
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
+
+    // manifest-v2 (PR #466 Finding 3): a v2 backend whose manifest declares a
+    // `build_hook` needs that hook staged next to the generated build.zig as
+    // `backend_build_hook.zig`, so the generated `@import("backend_build_hook.zig")`
+    // resolves in the real output dir. No-op (returns false) for the v1/enum path
+    // (backend_manifest_name null), a v1 manifest, or a hookless v2 manifest.
+    if (backend_manifest_name) |name| {
+        _ = try manifest_v2_splice.stageBackendBuildHook(allocator, cfg, game_dir, name, target_dir);
+    }
 
     // Discover each plugin's `pub const Events` decls at assembler time
     // by AST-walking `<plugin>/src/root.zig`. The shim + main.zig

@@ -701,6 +701,72 @@ pub const MANIFEST_V2_THIRD_PARTY_OPEN_CONFIG = struct {
     }
 };
 
+// ── manifest-v2 PRODUCTION CUTOVER via the real `generate` (#453, closes #472 P2) ──
+// The prior tests all drive the `generateBuildZig` UNIT helper, which takes
+// `backend_manifest_name` EXPLICITLY — so they prove the v2 CODEGEN works when the
+// caller opts in, but NOT that the production `generate` entry point auto-detects a
+// v2 manifest on its own. This struct closes that gap: it drives the REAL `generate`
+// (via `h.generateAndReadBuildZig`, which passes NO `backend_manifest_name` — that
+// field doesn't exist on `GenerateOptions`) and asserts `generate` probed the
+// resolved backend package, found `backend.manifest.v2.zon`, and drove the v2 path.
+pub const MANIFEST_V2_GENERATE_CUTOVER = struct {
+    test "generate AUTO-DETECTS a v2 backend and emits v2 build.zig (no caller opt-in)" {
+        // acme_foo ships ONLY `backend.manifest.v2.zon` and has NO enum tag. Before
+        // the cutover, `generate` passed a null manifest name → `requireManifestIf-
+        // External` probed the absent legacy `backend.manifest.zon` and hard-errored
+        // `ExternalBackendNeedsManifest`, never reaching v2 codegen. After the
+        // cutover, `generate`'s probe finds the v2 manifest, threads its name through
+        // every site, and emits the generic v2 desktop build.zig.
+        const cfg = generate.ProjectConfig{ .name = "cutover-game", .ecs = .mock };
+        const out = try h.generateAndReadBuildZig(std.testing.allocator, cfg, h.acme_foo_fixture_package);
+        defer std.testing.allocator.free(out);
+
+        // v2 output, generated from the manifest data — NOT the enum raylib default.
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"acme_foo\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"labelle_raylib\"") == null);
+        // The v2 generic (loop-form) core-diamond walk — the unambiguous v2 marker.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") != null);
+        // Sanity: the auto-detected v2 build.zig is syntactically valid Zig.
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "generate on a v1-only backend stays on the v1/enum path (no regression, no v2 markers)" {
+        // sokol_v1only ships ONLY the legacy `backend.manifest.zon` (no v2 sibling),
+        // so `generate`'s v2 probe returns null and generation stays on the v1 splice
+        // path — the generic v2 markers must be ABSENT. Proves the cutover is inert
+        // for a backend that ships no v2 manifest.
+        const cfg = generate.ProjectConfig{ .name = "v1-game", .backend = .sokol, .ecs = .mock };
+        const out = try h.generateAndReadBuildZig(std.testing.allocator, cfg, h.sokol_v1only_fixture_package);
+        defer std.testing.allocator.free(out);
+
+        // v1 sokol splice output — the unrolled core-diamond residual, NOT the
+        // generic loop-form v2 walk.
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyGfxSubpackageCore(gfx_mod, core_mod)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") == null);
+        // No hook import — the v1 path never stages a backend build hook.
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook") == null);
+    }
+
+    test "PRODUCTION NO-OP: a dual-manifest backend's auto-detected v2 output == the v1/enum baseline" {
+        // sokol ships BOTH v1 and v2 manifests; its v2 desktop cell is the byte
+        // anchor (§7), so `generate` auto-detecting v2 must be BYTE-IDENTICAL to the
+        // v1/enum splice. This is the production-no-op guarantee: even where a v2
+        // manifest IS present, the emitted build.zig does not change.
+        const cfg = generate.ProjectConfig{ .name = "noop-game", .backend = .sokol, .ecs = .mock };
+        const v2_auto = try h.generateAndReadBuildZig(std.testing.allocator, cfg, h.sokol_fixture_package);
+        defer std.testing.allocator.free(v2_auto);
+        // The v1/enum baseline for the SAME desktop build (the unit helper, v1 path).
+        const v1_baseline = try h.genSokolBuildZig(std.testing.allocator, cfg, .{ .is_tests_target = true });
+        defer std.testing.allocator.free(v1_baseline);
+        try std.testing.expectEqualStrings(v1_baseline, v2_auto);
+    }
+};
+
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
         const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
