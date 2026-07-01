@@ -46,6 +46,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const manifest_v2 = @import("manifest_v2.zig");
 const core_diamond = @import("core_diamond.zig");
+const packager = @import("packager.zig");
 
 const BackendManifestV2 = manifest_v2.BackendManifestV2;
 const DepOption = BackendManifestV2.DepOption;
@@ -186,6 +187,39 @@ pub fn renderLinkSectionV2(
     try w.writeAll(anchor_link_body);
 }
 
+/// Look up the `PlatformEntry` for a `config.Platform` on a v2 manifest. Absent
+/// platform = unsupported by this backend.
+pub fn platformEntry(
+    m: BackendManifestV2,
+    platform: config.Platform,
+) ?BackendManifestV2.PlatformEntry {
+    return switch (platform) {
+        .desktop => m.platforms.desktop,
+        .android => m.platforms.android,
+        .ios => m.platforms.ios,
+        .wasm => m.platforms.wasm,
+    };
+}
+
+/// v2 packaging seam (design §3/§6): delegate a platform's packaging to the
+/// shared packager, driven by the typed `PlatformEntry.package` recipe. The v2
+/// codegen has no `switch (cfg.platform)` — it drives packaging off manifest
+/// data — so this is the single entry point every v2 platform path calls.
+///
+/// Desktop's `.binary` recipe is a NO-OP, so this is safe to call
+/// unconditionally on the PR-3 desktop path without disturbing its byte anchor.
+/// Android/wasm entries (PRs 5/7) carry `.apk`/`.web` recipes that emit the
+/// apk-staging / emcc packaging block here, byte-identical to the enum path's
+/// `.android_package` / `.wasm_footer` sections (design §7).
+pub fn renderPackageV2(
+    m: BackendManifestV2,
+    platform: config.Platform,
+    w: anytype,
+) !void {
+    const entry = platformEntry(m, platform) orelse return error.V2PlatformUnsupported;
+    try packager.emitPackage(entry.package, w);
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // sokol-desktop byte-anchor VERBATIM RESIDUAL (§7).
 //
@@ -265,4 +299,59 @@ test "emitCoreDiamondWalk emits the PR-2 generic walk source (drift guard)" {
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
     try testing.expect(std.mem.indexOf(u8, out, "labelle-gfx") != null);
+}
+
+// A minimal v2 manifest exercising all four platform packaging recipes: desktop
+// `.binary` (no-op), android `.apk`, wasm `.web`; ios absent (unsupported).
+fn packagingManifest() BackendManifestV2 {
+    const entry = struct {
+        fn e(pkg: BackendManifestV2.Package) BackendManifestV2.PlatformEntry {
+            return .{ .entry = "t.txt", .loop_style = .callback, .target = .native, .package = pkg };
+        }
+    }.e;
+    return .{
+        .manifest_version = 2,
+        .dir_name = "sokol",
+        .dep_name = "labelle_sokol",
+        .modules = &.{},
+        .platforms = .{
+            .desktop = entry(.binary),
+            .android = entry(.{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } }),
+            .wasm = entry(.{ .web = .{ .shell = null } }),
+        },
+    };
+}
+
+fn renderPackageToOwned(m: BackendManifestV2, platform: config.Platform) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer aw.deinit();
+    try renderPackageV2(m, platform, &aw.writer);
+    return aw.toOwnedSlice();
+}
+
+test "renderPackageV2: desktop .binary is a no-op (preserves the byte anchor)" {
+    const out = try renderPackageToOwned(packagingManifest(), .desktop);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "renderPackageV2: android delegates to the packager apk recipe" {
+    const out = try renderPackageToOwned(packagingManifest(), .android);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(packager.apk_package_zig, out);
+}
+
+test "renderPackageV2: wasm delegates to the packager web recipe" {
+    const out = try renderPackageToOwned(packagingManifest(), .wasm);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(packager.web_package_zig, out);
+}
+
+test "renderPackageV2: an absent platform is unsupported" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try testing.expectError(
+        error.V2PlatformUnsupported,
+        renderPackageV2(packagingManifest(), .ios, &aw.writer),
+    );
 }
