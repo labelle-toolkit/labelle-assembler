@@ -111,6 +111,20 @@ pub const Codegen = struct {
     hooks_init: []const u8 = "",
     loop_style_override: ?manifest_splice.BackendManifest.LoopStyle = null,
 
+    // wasm-only: true when the backend's `templates/wasm.txt` ships its OWN
+    // `pub const panic` (and typically `std_options`) — e.g. bgfx routes panics
+    // to the browser console via `emscripten_console_log`. The assembler emits a
+    // stopgap `WASM_PANIC_WORKAROUND` (`std_options_debug_io` + `panic =
+    // no_panic`) at the top of every wasm main to dodge the Zig 0.16
+    // std.Io.Threaded emscripten regression (labelle-assembler#141), but that
+    // collides with a template that already declares `pub const panic` (a
+    // duplicate root decl → compile error). When this is set the assembler skips
+    // its shim and lets the backend template own both decls. Backend-agnostic:
+    // computed by scanning the loaded backend template, not a per-backend switch.
+    // Raylib's wasm template ships no panic decl, so this stays false and the
+    // shim is emitted exactly as before.
+    wasm_template_provides_panic: bool = false,
+
     // ── Mixin types ──────────────────────────────────────────────────
     const AssetWiringMixin = asset_wiring.Mixin(Self);
     const SceneManifestsMixin = scene_manifests_block.Mixin(Self);

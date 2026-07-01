@@ -78,6 +78,28 @@ pub const WASM_PANIC_WORKAROUND =
     \\
 ;
 
+/// Reduced form of `WASM_PANIC_WORKAROUND` for backends whose `templates/wasm.txt`
+/// ALREADY declares its own `pub const panic` (e.g. bgfx's browser-console
+/// handler). Emitting the full workaround's `panic = no_panic` there is a
+/// duplicate root decl, but the `std_options_debug_io` override is STILL required
+/// and is INDEPENDENT of `panic`: `std.Options.debug_io` (std/std.zig) resolves to
+/// the `std.Io.Threaded`-backed `debug_threaded_io` UNLESS root declares
+/// `std_options_debug_io` — and that Threaded path is what fails to compile for
+/// wasm32-emscripten on Zig 0.16 (labelle-assembler#141). So emit ONLY the
+/// debug-io override here; the backend template owns `panic` (+ typically
+/// `std_options`). Dropped once labelle-toolkit moves off Zig 0.16.x (PR #31850).
+pub const WASM_DEBUG_IO_WORKAROUND =
+    \\
+    \\// Zig 0.16.0 wasm32-emscripten: override the default debug IO so the
+    \\// std.Io.Threaded path (broken posix wrappers on emscripten) is never
+    \\// instantiated. The backend's wasm template supplies its own `pub const
+    \\// panic`, so only this half of the labelle-assembler#141 workaround is
+    \\// emitted here. Fixed upstream in 0.17.0-dev (PR #31850).
+    \\// https://ziggit.dev/t/0-16-0-wasm32-emscripten-fails-to-build-because-of-default-panic-handler-recommended-workaround/15052
+    \\pub const std_options_debug_io = std.Io.failing;
+    \\
+;
+
 /// Module-scope helpers the preview blocks rely on. `getenv` and
 /// `clock_gettime` are at module scope because `extern "c" fn`
 /// must be; both names are unique within the generated main.zig.

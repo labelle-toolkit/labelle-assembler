@@ -196,6 +196,13 @@ pub fn generateMainZigFromTemplate(
         // root.zig. Defaults to empty so every existing call site (tests,
         // preview) keeps its exact pre-pack emission.
         .pack_scans = pack_scans,
+        // wasm-only: does the backend's lifecycle (wasm) template ship its own
+        // `pub const panic`? If so, the assembler must NOT also emit its
+        // stopgap panic shim (they would duplicate the root decl). Scanned from
+        // the template text, so it's backend-agnostic (bgfx ships one, raylib
+        // does not). Only consulted on wasm.
+        .wasm_template_provides_panic = cfg.platform == .wasm and
+            std.mem.indexOf(u8, lifecycle_tmpl, "pub const panic") != null,
     };
 
     var data = tpl.TemplateData{

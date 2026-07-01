@@ -58,6 +58,9 @@
         .screenshots,
         .gamepad_polling,
         .raw_gui_adapter,
+        // WASM/Emscripten (bgfx-wasm epic labelle-bgfx#8): the web PlatformEntry +
+        // emcc hook arm mirror the proven sokol/raylib wasm pattern.
+        .wasm,
     },
 
     // root_alias defaults to `backend_<name>`, so the generated root imports these
@@ -151,7 +154,25 @@
             .dep_options = .{},
             .package = .{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } },
         },
-        // No ios/wasm — bgfx ships no iOS/wasm templates (mobile is Android-only).
+        // WASM/Emscripten (bgfx-wasm epic labelle-bgfx#8) — mirrors the proven
+        // raylib wasm PlatformEntry: a `.callback` loop driven by
+        // `emscripten_set_main_loop`, the static `wasm32-emscripten` triple, the
+        // emcc `post_wire` residual, `.web` package, and the emsdk root build dep.
+        // No per-platform `dep_options` → inherits the base `gui_enabled`
+        // UNCHANGED (merge contract). Only the `bgfx` artifact (no glfw — zglfw is
+        // desktop-only, like android).
+        .wasm = .{
+            .entry = "templates/wasm.txt",
+            .loop_style = .callback,
+            .target = .{ .triple = "wasm32-emscripten" }, // static
+            .artifacts = .{ .{ .name = "bgfx" } },
+            .dep_options = .{},
+            // The hook's wasm `post_wire` resolves emcc via `b.dependency("emsdk",
+            // .{})`; `.builtin` reuses the assembler's pinned emsdk section.
+            .root_build_deps = .{ .{ .name = "emsdk", .resolution = .builtin } },
+            .package = .{ .web = .{ .shell = null } },
+        },
+        // No ios — bgfx ships no iOS template (mobile is Android-only).
     },
 
     // Dedicated hook file (NOT bgfx's own build.zig, which carries package-local

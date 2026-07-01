@@ -2119,3 +2119,66 @@ pub const MANIFEST_V2_BGFX_ANDROID_GOLDEN = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "fn getAndroidNdkSysroot(") == null);
     }
 };
+
+
+
+// ── manifest-v2 bgfx WASM GOLDEN cell (bgfx-wasm epic labelle-bgfx#8) ──
+// The THIRD bgfx platform (after desktop PR 10 + android). wasm is the emcc
+// residual (design §2 (c)): `post_wire`'s `.wasm` arm reconstructs the emcc
+// `emLinkStep` (walking bgfx+bx+bimg) + owns the web install/run wiring, so the
+// v2 wasm path emits NO packager `.web` footer. It has NO `resolve_target` — the
+// target is the STATIC `.triple` "wasm32-emscripten", resolved inline. The
+// declarative half (module/artifact decls + generic `unifyCoreDiamond` walk +
+// `linkLibrary(bgfx)`) is emitted from the manifest; the emcc step is the hook's.
+// Regression-locks the assembler-side fixes that made a first-party external
+// CALLBACK backend buildable on wasm (the callback-lifecycle gate + the
+// `{{module_vars}}` runner injection + the panic-shim de-dup live in the
+// main.zig path; this golden pins the build.zig graph).
+pub const MANIFEST_V2_BGFX_WASM_GOLDEN = struct {
+    const golden = @embedFile("goldens/bgfx_v2_wasm.build.zig");
+
+    fn genBgfxV2Wasm() ![]const u8 {
+        return h.genBgfxV2BuildZig(std.testing.allocator, .{
+            .name = "bgfxgame",
+            .backend = .bgfx,
+            .platform = .wasm,
+        }, .{});
+    }
+
+    test "golden: v2 bgfx-wasm build.zig matches the committed golden" {
+        const out = try genBgfxV2Wasm();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 bgfx-wasm build.zig is syntactically valid Zig" {
+        const out = try genBgfxV2Wasm();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 bgfx-wasm: static wasm32 target, imports hook, post_wire does the emcc step" {
+        const out = try genBgfxV2Wasm();
+        defer std.testing.allocator.free(out);
+        // STATIC triple resolved inline — NO resolve_target hook (design §3).
+        try std.testing.expect(std.mem.indexOf(u8, out, ".cpu_arch = .wasm32,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".os_tag = .emscripten,") != null);
+        // No `resolve_target` CALL (the static triple resolves inline; the phrase
+        // appears only in the explanatory comment).
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook.resolve_target(") == null);
+        // Backend hook imported + post_wire called for wasm (owns the emcc link).
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook = @import(\"backend_build_hook.zig\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".platform = .wasm,") != null);
+        // Declarative graph: the bgfx artifact is linked into the wasm lib (emcc
+        // walks its transitive bgfx+bx+bimg deps in the hook).
+        try std.testing.expect(std.mem.indexOf(u8, out, "wasm.root_module.linkLibrary(bgfx)") != null);
+        // NO glfw on wasm (zglfw is desktop-only, like android).
+        try std.testing.expect(std.mem.indexOf(u8, out, "artifact(\"glfw\")") == null);
+        // Not the android residual — no NDK detection leaks here.
+        try std.testing.expect(std.mem.indexOf(u8, out, "getAndroidNdkSysroot(") == null);
+    }
+};
