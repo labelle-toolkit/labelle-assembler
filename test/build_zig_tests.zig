@@ -910,6 +910,49 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
         try std.testing.expect(override.? == .callback); // sokol desktop entry = .callback
     }
 
+    // ── Major (#473) edge case: a v2-NAMED file whose CONTENT is v1, with NO
+    // canonical `backend.manifest.zon` sibling. `detectV2ManifestName` finds the
+    // v2 filename (existence-based), the load returns the `.v1` union tag, and the
+    // seams must resolve loop_style + template from THAT file — not retry the
+    // canonical (null) name (an absent file → dropped override / enum fall-through).
+
+    test "resolveLoopStyleOverride: a v2-NAMED-but-v1-CONTENT backend (no canonical sibling) resolves loop_style from THAT file (#473 Major)" {
+        // sokol_v1inv2 ships ONLY `backend.manifest.v2.zon` whose content is v1
+        // (`loop_style = .loop`, no `manifest_version`). Passing the DETECTED v2
+        // name reproduces production (`detectV2ManifestName` returns it): the load
+        // returns `.v1`, and the fix resolves loop_style straight from the parsed
+        // v1 manifest. Before the fix the legacy pass retried with the canonical
+        // (null) name, `manifestPathEnabled` probed the absent `backend.manifest.zon`
+        // → false → override left null (the bug). `.loop` (NOT sokol's `.callback`)
+        // proves it came from THIS file, not a stray canonical fallback.
+        const cfg = generate.ProjectConfig{
+            .name = "loop-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v1inv2_fixture_package,
+        };
+        const override = try generate.resolveLoopStyleOverride(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon");
+        try std.testing.expect(override != null); // NOT dropped to null (the bug)
+        try std.testing.expect(override.? == .loop); // resolved from the v1-content v2-named file
+    }
+
+    test "loadBackendTemplate: a v2-NAMED-but-v1-CONTENT backend (no canonical sibling) resolves its template from THAT file's main_loop_template (#473 Major)" {
+        // The template-site half of the Major. sokol_v1inv2 has no canonical
+        // `backend.manifest.zon`, so before the fix the `.v1` arm freed + fell
+        // through to the legacy `manifestPathEnabled(.., null)` pass, which probed
+        // the absent canonical file → false → fell to the enum path (reading the
+        // closed `cfg.backend` for a backend with no tag → mis-generated). The fix
+        // resolves `.main_loop_template` from the parsed v1 manifest and reads that
+        // template (must succeed, non-empty), NOT error on a missing canonical.
+        const cfg = generate.ProjectConfig{
+            .name = "tmpl-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v1inv2_fixture_package,
+        };
+        const tmpl = try generate.loadBackendTemplate(std.testing.allocator, ".", cfg, "backend.manifest.v2.zon");
+        defer std.testing.allocator.free(tmpl);
+        try std.testing.expect(tmpl.len > 0);
+    }
+
     test "resolveLoopStyleOverride: reads the PER-PLATFORM v2 loop_style — bgfx desktop is .loop, android .callback" {
         // The reason loop_style MUST be per-platform, exercised end-to-end: the
         // SAME bgfx v2 manifest yields `.loop` on desktop (generated main drives

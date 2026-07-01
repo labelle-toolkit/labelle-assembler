@@ -606,6 +606,18 @@ pub const sokol_v2broken_fixture_package = generate.PluginDep{ .name = "sokol_v2
 // splice path — the generated build.zig must NOT carry the v2 generic markers.
 pub const sokol_v1only_fixture_package = generate.PluginDep{ .name = "sokol_v1only", .repo = "local:backends/sokol_v1only" };
 
+// A V1-CONTENT-UNDER-V2-FILENAME backend fixture: `backends/sokol_v1inv2` ships
+// ONLY `backend.manifest.v2.zon` (NO canonical `backend.manifest.zon` sibling),
+// but that file's CONTENT is v1 — no `manifest_version` field, so `parseManifest`
+// defaults it to 1 and returns the `.v1` union tag. `detectV2ManifestName` keys
+// off file existence, so `generate` threads `backend.manifest.v2.zon` as the
+// detected name. Used to prove the #473 Major edge case: the loop_style + template
+// seams must resolve from THIS detected-but-v1 file (`loop_style = .loop`,
+// `main_loop_template = templates/desktop.txt`), NOT retry the canonical (null)
+// name — which would probe the absent `backend.manifest.zon` and silently drop
+// the backend into enum behavior.
+pub const sokol_v1inv2_fixture_package = generate.PluginDep{ .name = "sokol_v1inv2", .repo = "local:backends/sokol_v1inv2" };
+
 /// Drive the REAL `generate` entry point (the production codepath — NOT the
 /// `generateBuildZig` unit helper, which takes `backend_manifest_name` explicitly)
 /// against an in-tree backend fixture, and return the generated `build.zig` read

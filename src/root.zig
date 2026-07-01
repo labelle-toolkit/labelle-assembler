@@ -464,34 +464,41 @@ fn detectV2ManifestName(allocator: std.mem.Allocator, cfg: ProjectConfig, projec
 /// top-level `loop_style`. Both map onto the same override enum.
 ///
 /// Mirrors the `.v2`-handles / `.v1`-falls-through shape of `loadBackendTemplate`
-/// + `validateProviderContracts`:
+/// + `validateProviderContracts`. THREE ordered cases (PR #473 Major):
 ///   (1) a REAL v2 manifest (union tag `.v2`) resolves loop_style from its
-///       per-platform matrix; `v2_resolved` records that it did.
-///   (2) OTHERWISE — `backend_manifest_name` null, a `backend.manifest.v2.zon`-
-///       named file that actually parses as v1 (`manifest_version <= 1`), or a
-///       v2 load error — fall through to the legacy `manifestPathEnabled`-gated
-///       top-level `loop_style`.
+///       per-platform matrix; `handled` records that it did.
+///   (2) a DETECTED named manifest that actually parses as v1 (its
+///       `manifest_version` is 1/omitted → union tag `.v1`) resolves loop_style
+///       straight from THAT parsed manifest and marks `handled`. This is
+///       load-bearing for a v2-ONLY backend (ships only `backend.manifest.v2.zon`,
+///       NO canonical `backend.manifest.zon` sibling) whose CONTENT is v1: it
+///       passed the external-manifest gate on the detected name, so we must keep
+///       ITS loop_style rather than retrying with the canonical (null) name —
+///       which would probe an absent file, leave the override null, and silently
+///       drop the backend into enum behavior.
+///   (3) OTHERWISE — `backend_manifest_name` null (production: straight to the
+///       canonical file), or a named-manifest LOAD ERROR (swallowed via
+///       `catch break`, matching the surrounding probing's swallow-and-fall-back
+///       discipline) — fall through to the legacy `manifestPathEnabled`-gated
+///       top-level `loop_style` on the canonical `backend.manifest.zon`.
 ///
 /// The legacy branch is a SECOND guarded pass, NOT an `else if` chained off the
-/// name being present (PR #473 Major): chaining it would skip it whenever a name
-/// was detected but the file turned out to be v1, silently leaving that v1
-/// backend's loop_style unset. A v2 load ERROR is swallowed (`catch break`) so it
-/// too falls through to the legacy pass, matching the surrounding manifest
-/// probing's swallow-and-fall-back discipline; a legacy load error propagates.
+/// name being present: chaining it would skip it whenever a name was detected but
+/// the file turned out to be v1. A legacy load error propagates.
 pub fn resolveLoopStyleOverride(
     allocator: std.mem.Allocator,
     cfg: ProjectConfig,
     game_dir: []const u8,
     backend_manifest_name: ?[]const u8,
 ) !?manifest_splice.BackendManifest.LoopStyle {
-    var v2_resolved = false;
+    var handled = false;
     var override: ?manifest_splice.BackendManifest.LoopStyle = null;
-    if (backend_manifest_name) |name| v2blk: {
-        const parsed = manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name) catch break :v2blk;
+    if (backend_manifest_name) |name| namedblk: {
+        const parsed = manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name) catch break :namedblk;
         defer parsed.free(allocator);
         switch (parsed) {
             .v2 => |m| {
-                v2_resolved = true;
+                handled = true;
                 if (manifest_v2_splice.platformEntry(m, cfg.platform)) |entry| {
                     override = switch (entry.loop_style) {
                         .callback => .callback,
@@ -499,10 +506,17 @@ pub fn resolveLoopStyleOverride(
                     };
                 }
             },
-            .v1 => {}, // not actually a v2 manifest — legacy pass below handles it
+            .v1 => |m| {
+                // The detected named file parses as v1: resolve loop_style from
+                // THIS manifest (case 2 above), not the canonical-name legacy pass
+                // below — a v2-only-but-v1-content backend has no canonical sibling
+                // to fall back to.
+                handled = true;
+                override = manifest_splice.loopStyle(m);
+            },
         }
     }
-    if (!v2_resolved and manifest_splice.manifestPathEnabled(allocator, cfg, game_dir, null)) {
+    if (!handled and manifest_splice.manifestPathEnabled(allocator, cfg, game_dir, null)) {
         const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
         defer manifest_splice.freeManifest(allocator, m);
         override = manifest_splice.loopStyle(m);
@@ -1233,12 +1247,13 @@ pub fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, c
     // When `generate` auto-detected a v2 manifest, resolve the entry-point template
     // from the v2 `.platforms[<platform>].entry` (the per-platform matrix), NOT the
     // v1 `main_loop_template` / enum→`<platform>.txt` mappings below. If the named
-    // file parses as v1 (not v2) we fall through to the v1/enum handling.
+    // file parses as v1 we resolve its `main_loop_template` from THAT manifest (see
+    // the `.v1` arm) instead of falling to the canonical-name legacy pass below.
     if (backend_manifest_name) |name| {
         const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name);
+        defer parsed.free(allocator);
         switch (parsed) {
             .v2 => |m| {
-                defer parsed.free(allocator);
                 const entry = manifest_v2_splice.platformEntry(m, cfg.platform) orelse {
                     std.log.warn(
                         "labelle: v2 backend '{s}' declares no `.platforms.{s}` entry — the platform is unsupported by this backend.",
@@ -1255,7 +1270,25 @@ pub fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, c
                     return error.TemplateNotFound;
                 };
             },
-            .v1 => parsed.free(allocator), // not actually a v2 manifest — fall through
+            .v1 => |m| {
+                // The detected named file parses as v1 (its `manifest_version` is
+                // 1/omitted). A v2-ONLY backend (no canonical `backend.manifest.zon`
+                // sibling) whose CONTENT is v1 passed the external-manifest gate on
+                // THIS detected name, so it must keep the `main_loop_template` from
+                // the file that was actually found. Retrying with the canonical
+                // (null) name at the legacy pass below would probe an absent file,
+                // fall through to the enum path, and mis-generate — reading the
+                // closed `cfg.backend` for a backend that has no enum tag (PR #473
+                // Major). Resolve the main-loop template straight from THIS manifest.
+                const backend_path = try backend_registry.resolveBackendPackage(allocator, cfg, game_dir);
+                defer allocator.free(backend_path);
+                const tmpl_path = try std.fs.path.join(allocator, &.{ backend_path, manifest_splice.mainLoopTemplateRel(m) });
+                defer allocator.free(tmpl_path);
+                return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), tmpl_path, allocator, .limited(64 * 1024)) catch |err| {
+                    std.log.warn("labelle: could not read v1 (named) main-loop template '{s}': {any}", .{ tmpl_path, err });
+                    return error.TemplateNotFound;
+                };
+            },
         }
     }
 
