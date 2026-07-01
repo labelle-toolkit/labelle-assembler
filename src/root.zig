@@ -1027,32 +1027,39 @@ pub fn generate(
     //   * the per-pack `global ++ own` registry partition / `PackView`
     //     (#652-remainder) — today everything lands in one flat registry.
     //   * `exposes` / `depends_on` DAG + isolation (#440 / §6).
-    // ── Pack dependency validation — the gate (Packs RFC §6, #441) ─────
+    // ── Pack manifest load + dependency-validation gate (Packs RFC §6, #441) ─
     //
-    // Before scanning/copying anything, read every declared pack's
-    // `pack.labelle` and fail generation on a `depends_on` cycle or a
-    // `depends_on` naming an undeclared pack/plugin. Runs first so a bad
-    // graph rejects the build cheaply. This is the "generate-time
-    // validation" gate only — the depends_on ENFORCEMENT (restricted
-    // per-pack module graph / `PackView` partition) is engine-side
-    // #652-remainder, and the one-facet-one-owner check is mooted by
-    // #440's `<pack>__` name prefix (registry names become pack-unique).
-    {
-        var pack_manifests: std.ArrayList(plugin_manifest.PackManifest) = .empty;
-        defer {
-            for (pack_manifests.items) |*m| m.deinit();
-            pack_manifests.deinit(allocator);
-        }
-        for (cfg.plugins) |plugin| {
-            const pm = (try plugin_manifest.loadPackOptional(allocator, plugin, game_dir)) orelse continue;
-            try pack_manifests.append(allocator, pm);
-        }
+    // Read every declared pack's `pack.labelle` ONCE here, then run the
+    // dependency gate: fail generation on a `depends_on` cycle or a
+    // `depends_on` naming an undeclared pack/plugin, so a bad graph rejects
+    // the build cheaply. The parsed manifests (with their owning PluginDep)
+    // are reused by the pack-scan loop below rather than re-read from disk.
+    // (Game/plugin convention dirs + scripts have already been copied above;
+    // this gate runs before the pack scan specifically.) This is the
+    // "generate-time validation" gate only — the depends_on ENFORCEMENT
+    // (restricted per-pack module graph / `PackView` partition) is engine-side
+    // #652-remainder, and the one-facet-one-owner check is mooted by #440's
+    // `<pack>__` name prefix (registry names become pack-unique).
+    const PackEntry = struct {
+        plugin: config.PluginDep,
+        manifest: plugin_manifest.PackManifest,
+    };
+    var pack_entries: std.ArrayList(PackEntry) = .empty;
+    defer {
+        for (pack_entries.items) |*e| e.manifest.deinit();
+        pack_entries.deinit(allocator);
+    }
+    for (cfg.plugins) |plugin| {
+        const pm = (try plugin_manifest.loadPackOptional(allocator, plugin, game_dir)) orelse continue;
+        try pack_entries.append(allocator, .{ .plugin = plugin, .manifest = pm });
+    }
 
+    {
         var pack_deps: std.ArrayList(pack_validate.PackDep) = .empty;
         defer pack_deps.deinit(allocator);
-        try pack_deps.ensureTotalCapacity(allocator, pack_manifests.items.len);
-        for (pack_manifests.items) |m| {
-            pack_deps.appendAssumeCapacity(.{ .name = m.name, .depends_on = m.depends_on });
+        try pack_deps.ensureTotalCapacity(allocator, pack_entries.items.len);
+        for (pack_entries.items) |e| {
+            pack_deps.appendAssumeCapacity(.{ .name = e.manifest.name, .depends_on = e.manifest.depends_on });
         }
 
         // Legal depends_on targets = every plugin/pack declared in
@@ -1070,18 +1077,16 @@ pub fn generate(
         for (pack_scans.items) |*p| p.deinit(allocator);
         pack_scans.deinit(allocator);
     }
-    try pack_scans.ensureTotalCapacity(allocator, cfg.plugins.len);
-    for (cfg.plugins) |plugin| {
-        var pm = (try plugin_manifest.loadPackOptional(allocator, plugin, game_dir)) orelse continue;
-        defer pm.deinit();
-
-        const pack_src_dir = try cache.resolvePlugin(allocator, plugin, game_dir);
+    try pack_scans.ensureTotalCapacity(allocator, pack_entries.items.len);
+    for (pack_entries.items) |e| {
+        // Reuse the manifest parsed above; only the source dir is resolved here.
+        const pack_src_dir = try cache.resolvePlugin(allocator, e.plugin, game_dir);
         defer allocator.free(pack_src_dir);
 
-        // ensureTotalCapacity above reserved cfg.plugins.len slots, so this
+        // ensureTotalCapacity above reserved pack_entries.len slots, so this
         // append cannot fail — no window where a scanned pack is owned but
         // outside the cleanup list's reach.
-        const scanned = try scanPack(allocator, pack_src_dir, target_dir, plugin.name);
+        const scanned = try scanPack(allocator, pack_src_dir, target_dir, e.plugin.name);
         pack_scans.appendAssumeCapacity(scanned);
     }
 
