@@ -430,3 +430,138 @@ pub const PACK_EMISSION = struct {
         try std.testing.expect(!contains(main_zig, "packs/"));
     }
 };
+
+// ── #481: a light pack builds end-to-end (module-less, dir-scan only) ────
+//
+// A light pack is declared in `project.labelle` `.plugins` just like a real
+// plugin, but it ships NO Zig module — only convention dirs. `generate()`
+// therefore splits the declared `.plugins` list into decl-module plugins
+// (which get `@import("<name>")` + a `b.dependency("labelle_<name>", …)`) and
+// light packs (which contribute ONLY the already-scanned `pack_scans` registry
+// entries). The split is `root.declModulePlugins`; these tests exercise that
+// selection AND prove the two emission consequences: the pack is never
+// imported / never a build dep, yet its items ARE registered.
+
+pub const LIGHT_PACK_MODULE_FILTER = struct {
+    test "declModulePlugins drops light packs and keeps decl-module plugins, order preserved" {
+        const plugins = [_]generate.PluginDep{
+            .{ .name = "physics", .repo = "github:x/physics" },
+            .{ .name = "citizens", .repo = "@packs/citizens" }, // light pack
+            .{ .name = "combat", .repo = "@libs/combat" },
+            .{ .name = "biomes", .repo = "@packs/biomes" }, // light pack
+        };
+        const pack_names = [_][]const u8{ "citizens", "biomes" };
+
+        const kept = try generate.declModulePlugins(std.testing.allocator, &plugins, &pack_names);
+        defer std.testing.allocator.free(kept);
+
+        try std.testing.expectEqual(@as(usize, 2), kept.len);
+        try std.testing.expectEqualStrings("physics", kept[0].name);
+        try std.testing.expectEqualStrings("combat", kept[1].name);
+    }
+
+    test "declModulePlugins is a no-op when there are no packs" {
+        const plugins = [_]generate.PluginDep{
+            .{ .name = "physics", .repo = "github:x/physics" },
+        };
+        const kept = try generate.declModulePlugins(std.testing.allocator, &plugins, &.{});
+        defer std.testing.allocator.free(kept);
+        try std.testing.expectEqual(@as(usize, 1), kept.len);
+        try std.testing.expectEqualStrings("physics", kept[0].name);
+    }
+
+    test "declModulePlugins drops a game whose ONLY plugin is a light pack" {
+        const plugins = [_]generate.PluginDep{
+            .{ .name = "citizens", .repo = "@packs/citizens" },
+        };
+        const pack_names = [_][]const u8{"citizens"};
+        const kept = try generate.declModulePlugins(std.testing.allocator, &plugins, &pack_names);
+        defer std.testing.allocator.free(kept);
+        try std.testing.expectEqual(@as(usize, 0), kept.len);
+    }
+};
+
+pub const LIGHT_PACK_BUILDS_END_TO_END = struct {
+    // A game declaring a decl-module plugin (`physics`) AND a light pack
+    // (`citizens`). This mirrors the `project.labelle` `.plugins` list that
+    // reaches `generate()`.
+    const declared_plugins = [_]generate.PluginDep{
+        .{ .name = "physics", .repo = "github:x/physics" },
+        .{ .name = "citizens", .repo = "@packs/citizens" },
+    };
+    const pack_names = [_][]const u8{"citizens"};
+
+    // The pack's scanned contribution (what #439/#440 produced from its
+    // convention dirs). This is what a light pack adds to the build INSTEAD of
+    // a module.
+    const citizens_scan: generate.PackScan = .{
+        .name = "citizens",
+        .import_prefix = "packs/citizens",
+        .component_names = &.{"Worker"},
+        .event_names = &.{"worker_died"},
+        .prefab_names = &.{"worker"},
+        .hook_names = &.{},
+    };
+
+    // A main.zig template that emits every site that either (a) iterates the
+    // plugin list to write `@import("<plugin>")` — the
+    // ComponentRegistryWithPlugins / SystemRegistry args AND the
+    // plugin-controllers `_plugin_mods` tuple — or (b) registers a pack's
+    // scanned items (component registry field, event import, prefab embed).
+    const registries_tmpl =
+        "{{component_registry_block}}\n{{system_registry_block}}\n{{event_imports_block}}\n{{jsonc_scene_block}}\n{{lifecycle}}";
+
+    test "main.zig imports the decl-module plugin but NOT the light pack, yet registers the pack's items" {
+        // Run the SAME split `generate()` runs: declared `.plugins` → the
+        // decl-module subset.
+        const module_plugins = try generate.declModulePlugins(std.testing.allocator, &declared_plugins, &pack_names);
+        defer std.testing.allocator.free(module_plugins);
+
+        const cfg: generate.ProjectConfig = .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = module_plugins, // light pack already filtered out
+        };
+
+        const main_zig = try genWithPack(registries_tmpl, cfg, citizens_scan);
+        defer std.testing.allocator.free(main_zig);
+
+        // The decl-module plugin IS imported (registry args + controllers).
+        try std.testing.expect(contains(main_zig, "@import(\"physics\")"));
+
+        // The light pack is NEVER imported — a module-less pack has nothing to
+        // `@import`. This is the core #481 fix: emitting `@import("citizens")`
+        // here is exactly what broke `labelle build`.
+        try std.testing.expect(!contains(main_zig, "@import(\"citizens\")"));
+
+        // …yet the pack's component/event/prefab ARE compiled in, via the
+        // dir-scan `pack_scans` path, under the invisible `<pack>__` namespace.
+        try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"packs/citizens/components/Worker.zig\").Worker,"));
+        try std.testing.expect(contains(main_zig, "@import(\"packs/citizens/events/worker_died.zig\")"));
+        try std.testing.expect(contains(main_zig, "@embedFile(\"packs/citizens/prefabs/worker.jsonc\")"));
+    }
+
+    test "build.zig wires a module dep for the decl-module plugin but NOT the light pack" {
+        const module_plugins = try generate.declModulePlugins(std.testing.allocator, &declared_plugins, &pack_names);
+        defer std.testing.allocator.free(module_plugins);
+
+        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = module_plugins, // light pack already filtered out
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        // The decl-module plugin gets its `b.dependency` + module decl…
+        try std.testing.expect(contains(build_zig, "b.dependency(\"labelle_physics\""));
+        try std.testing.expect(contains(build_zig, "plugin_physics_mod"));
+
+        // …while the light pack has NO build dep / module wiring — a
+        // module-less pack ships no `build.zig` for `b.dependency` to point at.
+        try std.testing.expect(!contains(build_zig, "labelle_citizens"));
+        try std.testing.expect(!contains(build_zig, "plugin_citizens_mod"));
+    }
+};

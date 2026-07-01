@@ -247,6 +247,41 @@ pub fn loadPackFromDir(
         return error.PackManifestUnknownVersion;
     }
 
+    // ── Mutual-exclusivity guard: pack XOR decl-module plugin (CodeRabbit, #481) ─
+    //
+    // A `pack.labelle` marks a *light pack*: a module-less, directory-scanned
+    // convention bundle whose entire contribution is its scanned/namespaced
+    // registry entries. A *decl-module plugin* is the opposite: a real Zig
+    // package that the generated build wires in as a module and `main.zig`
+    // reaches via `@import("<name>")`. The `declModulePlugins` filter in
+    // root.zig treats "carries pack.labelle" as the sole light-pack predicate
+    // and DROPS every such plugin from the module wiring. If a plugin
+    // erroneously carried BOTH a `pack.labelle` AND decl-module content, it
+    // would be silently stripped of its module wiring — a confusing failure.
+    //
+    // The two forms are mutually exclusive by design (a pack is module-less),
+    // so reject the conflict here, at load time, before `pack_entries` is even
+    // built — that keeps `declModulePlugins` fed a clean either/or split.
+    //
+    // Detection basis: presence of ANY decl-module signal in the same dir —
+    //   - `plugin.labelle` — the decl-module plugin manifest (the clearest
+    //     signal; the two manifests must never coexist), OR
+    //   - `build.zig`      — a decl-module plugin ships a build script; a light
+    //     pack ships none, OR
+    //   - `src/root.zig`   — the importable module's exports.
+    // Any one is sufficient; a clean light pack has none of them.
+    if (try packDirHasDeclModuleContent(allocator, pack_dir)) {
+        std.log.warn(
+            "labelle: pack '{s}' at {s} carries a pack.labelle but ALSO ships decl-module content\n" ++
+                "  (a plugin.labelle, a build.zig, or a src/root.zig).\n" ++
+                "  A light pack (pack.labelle) and a decl-module plugin are mutually exclusive:\n" ++
+                "  a pack is module-less and contributes only its scanned convention dirs.\n" ++
+                "  Use ONE form — either a pack.labelle OR a decl-module plugin, not both.\n",
+            .{ expected_name, pack_dir },
+        );
+        return error.PackAndPluginManifestConflict;
+    }
+
     return PackManifest{
         .name = parsed.name,
         .manifest_version = parsed.manifest_version,
@@ -269,6 +304,10 @@ pub fn loadPackFromDir(
 //   error.PluginManifestUnsafeDirName      — convention_dir name is not a safe relative segment
 //   error.PluginManifestMissingExtension   — copy_and_scan entry omitted its required extension
 //   error.PluginManifestUnknownVersion     — manifest_version is < 1 or > what we support
+//
+// The pack-manifest path (`loadPackFromDir`) additionally raises:
+//   error.PackAndPluginManifestConflict    — a pack.labelle dir ALSO ships
+//                                             decl-module content (mutually exclusive)
 
 /// Read and parse `plugin.labelle` for the given plugin if it exists.
 ///
@@ -430,6 +469,40 @@ pub fn loadFromDir(
         .convention_dirs = parsed.convention_dirs,
         .allocator = allocator,
     };
+}
+
+/// Returns true iff `pack_dir` contains any decl-module-plugin signal,
+/// i.e. content that only a real Zig-package plugin (not a light pack)
+/// would ship. Used by the pack/plugin mutual-exclusivity guard.
+///
+/// Signals (any one is sufficient):
+///   - `plugin.labelle` — the decl-module plugin manifest
+///   - `build.zig`      — a plugin's build script
+///   - `src/root.zig`   — the importable module's exports
+///
+/// A clean light pack has none of these; it ships only convention dirs
+/// (`components/ events/ prefabs/ hooks/`) and its `pack.labelle`.
+pub fn packDirHasDeclModuleContent(allocator: std.mem.Allocator, pack_dir: []const u8) !bool {
+    const cwd = std.Io.Dir.cwd();
+    const io = config.globalIo();
+    const signals = [_][]const u8{
+        "plugin.labelle",
+        "build.zig",
+        "src" ++ std.fs.path.sep_str ++ "root.zig",
+    };
+    for (signals) |rel| {
+        const path = try std.fs.path.join(allocator, &.{ pack_dir, rel });
+        defer allocator.free(path);
+        if (cwd.access(io, path, .{})) |_| {
+            return true;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            // Any other access error (permissions, etc.) is treated as
+            // "no reliable signal" rather than failing the whole generate.
+            else => {},
+        }
+    }
+    return false;
 }
 
 pub fn isReservedDirName(name: []const u8) bool {
@@ -1153,4 +1226,132 @@ test "loadPackFromDir: errors on unsupported manifest_version" {
 
     const result = loadPackFromDir(testing.allocator, tmp_path, "citizens");
     try testing.expectError(error.PackManifestUnknownVersion, result);
+}
+
+// ── pack XOR decl-module plugin mutual-exclusivity guard (#481) ─────
+
+fn writeFileIn(tmp_dir: std.Io.Dir, name: []const u8, body: []const u8) !void {
+    var f = try tmp_dir.createFile(testing.io, name, .{});
+    defer f.close(testing.io);
+    try f.writeStreamingAll(testing.io, body);
+}
+
+test "loadPackFromDir: rejects a pack.labelle dir that also has plugin.labelle" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .copy_and_scan,
+        \\}
+    );
+    // Decl-module signal: a plugin.labelle alongside the pack.labelle.
+    try writeFileIn(tmp.dir, "plugin.labelle",
+        \\.{ .name = "citizens", .manifest_version = 1 }
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadPackFromDir(testing.allocator, tmp_path, "citizens");
+    try testing.expectError(error.PackAndPluginManifestConflict, result);
+}
+
+test "loadPackFromDir: rejects a pack.labelle dir that also has build.zig" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .copy_and_scan,
+        \\}
+    );
+    // Decl-module signal: a build.zig means a real Zig package, not a pack.
+    try writeFileIn(tmp.dir, "build.zig",
+        \\pub fn build(b: *@import("std").Build) void { _ = b; }
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadPackFromDir(testing.allocator, tmp_path, "citizens");
+    try testing.expectError(error.PackAndPluginManifestConflict, result);
+}
+
+test "loadPackFromDir: rejects a pack.labelle dir that also has src/root.zig" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .copy_and_scan,
+        \\}
+    );
+    // Decl-module signal: an importable src/root.zig.
+    try tmp.dir.createDirPath(testing.io, "src");
+    var src_dir = try tmp.dir.openDir(testing.io, "src", .{});
+    defer src_dir.close(testing.io);
+    try writeFileIn(src_dir, "root.zig",
+        \\pub const marker = 1;
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadPackFromDir(testing.allocator, tmp_path, "citizens");
+    try testing.expectError(error.PackAndPluginManifestConflict, result);
+}
+
+test "loadPackFromDir: a clean light pack (no decl-module content) still loads" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Only a pack.labelle + a convention dir — the genuine light-pack shape.
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .copy_and_scan,
+        \\}
+    );
+    try tmp.dir.createDirPath(testing.io, "components");
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadPackFromDir(testing.allocator, tmp_path, "citizens")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqualStrings("citizens", manifest.name);
+}
+
+test "loadFromDir: a clean decl-module plugin (no pack.labelle) still loads" {
+    // The mutual-exclusivity guard lives on the pack path; a decl-module
+    // plugin with a build.zig + src/root.zig but NO pack.labelle loads fine
+    // through the plugin.labelle path.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{ .name = "fsm", .manifest_version = 1 }
+    );
+    try writeFileIn(tmp.dir, "build.zig",
+        \\pub fn build(b: *@import("std").Build) void { _ = b; }
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "fsm")).?;
+    defer manifest.deinit();
+    try testing.expectEqualStrings("fsm", manifest.name);
+
+    // And it must NOT parse as a pack (no pack.labelle present).
+    try testing.expect((try loadPackFromDir(testing.allocator, tmp_path, "fsm")) == null);
 }

@@ -579,6 +579,46 @@ fn scanPackSubdir(
     return scanner.copyAndScanAbs(allocator, src, dst, ext);
 }
 
+/// Select the decl-module subset of `plugins` (labelle-assembler#481).
+///
+/// A game's `.plugins` list mixes two kinds of dependency:
+///
+///   - **decl-module plugins** — a real Zig package (`plugin.labelle` +
+///     `src/root.zig` exports) that the generated build wires in as a module
+///     and the generated `main.zig` reaches via `@import("<name>")`.
+///   - **light packs** — module-less, directory-scanned convention bundles
+///     (they carry `pack.labelle`, so their name appears in `pack_names`).
+///     A light pack has NO `build.zig` and NO importable module; its entire
+///     contribution is the already-scanned + `<pack>__`-namespaced registry
+///     entries (#439/#440). Emitting `@import("<pack>")` or a
+///     `b.dependency("labelle_<pack>", …)` for one fails to resolve and breaks
+///     `labelle build` — the gap this ticket closes.
+///
+/// Returns the subset of `plugins` whose name is NOT in `pack_names`, i.e. the
+/// plugins that DO ship an importable module. The order of `plugins` is
+/// preserved. The returned slice is caller-owned (`allocator.free`); the
+/// `PluginDep` elements are shallow copies that alias the input's strings.
+pub fn declModulePlugins(
+    allocator: std.mem.Allocator,
+    plugins: []const config.PluginDep,
+    pack_names: []const []const u8,
+) ![]config.PluginDep {
+    var out: std.ArrayList(config.PluginDep) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, plugins.len);
+    for (plugins) |plugin| {
+        var is_light_pack = false;
+        for (pack_names) |pack_name| {
+            if (std.mem.eql(u8, pack_name, plugin.name)) {
+                is_light_pack = true;
+                break;
+            }
+        }
+        if (!is_light_pack) out.appendAssumeCapacity(plugin);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Scan a pack's convention subdirs (Packs RFC §4, labelle-assembler#439).
 ///
 /// Copies `<pack_src_dir>/{components,events,prefabs,hooks}/` into
@@ -1272,6 +1312,42 @@ pub fn generate(
         pack_scans.items,
     );
 
+    // ── Module-plugin filter — light packs are dir-scan-only (#481) ────
+    //
+    // A *light pack* (module-less, carrying `pack.labelle`) contributes to
+    // the build ONLY via the dir-scan registry entries collected above
+    // (`pack_scans`): its components/events/prefabs/hooks are already
+    // copied, `<pack>__`-namespaced (#440), validated (#441), and wired
+    // into the SAME unified registries the game root feeds (#439). It ships
+    // NO importable Zig module and has NO `build.zig`, so it must NOT appear
+    // in any codegen/build site that emits `@import("<name>")` or a
+    // `b.dependency("labelle_<name>", …)` — the ComponentRegistryWithPlugins
+    // / SystemRegistry args, plugin controllers/events, the build.zig module
+    // graph, and the build.zig.zon deps. Emitting either for a module-less
+    // pack fails to resolve and breaks `labelle build` (the #481 gap).
+    //
+    // Only genuine decl-module plugins (a `plugin.labelle` with `src/root.zig`
+    // exports) get the module import + build dep. Every light pack carries a
+    // `pack.labelle` and therefore appears in `pack_entries` (parsed near the
+    // top of `generate()`), so membership there IS the light-pack predicate.
+    //
+    // Build a filtered plugin list and run the module-emitting phase against
+    // a `cfg` copy whose `.plugins` excludes light packs (`cfg_modules`). The
+    // scan/copy loops that need the FULL declared list already ran above, and
+    // the project-description sidecars (flow catalog, feature manifest) keep
+    // the original `cfg` so they still describe every declared plugin/pack.
+    var pack_names_for_filter: std.ArrayList([]const u8) = .empty;
+    defer pack_names_for_filter.deinit(allocator);
+    try pack_names_for_filter.ensureTotalCapacity(allocator, pack_entries.items.len);
+    for (pack_entries.items) |e| pack_names_for_filter.appendAssumeCapacity(e.plugin.name);
+
+    const module_plugins = try declModulePlugins(allocator, cfg.plugins, pack_names_for_filter.items);
+    defer allocator.free(module_plugins);
+    // A `cfg` view whose `.plugins` is the decl-module subset. Passed to every
+    // site that emits a Zig-module import or a build-file module dependency.
+    var cfg_modules = cfg;
+    cfg_modules.plugins = module_plugins;
+
     // ── Flow-node discovery (RFC-FLOW-VOCABULARY phase 2) ──────────────
     //
     // Discover `pub const FlowNodes` + `pub const PinStyles` +
@@ -1301,7 +1377,9 @@ pub fn generate(
     defer allocator.free(scripts_target_for_flow);
     var plugin_flow_decls = try main_zig.discoverPluginFlowDecls(
         allocator,
-        cfg,
+        // Light packs contribute no decl-module `FlowNodes` (they have no
+        // `src/root.zig`); walk only the decl-module plugins (#481).
+        cfg_modules,
         game_dir,
         scripts_target_for_flow,
         script_scan.getEntries(),
@@ -1327,7 +1405,9 @@ pub fn generate(
     defer flow_result.deinit();
 
     // Generate build.zig.zon
-    const zon = try build_files.generateBuildZigZon(allocator, cfg, target_dir, output_dir, game_dir, .{
+    // `cfg_modules` (not `cfg`): a light pack has no `build.zig`/module, so it
+    // must not become a `.labelle_<name> = .{ .path }` dep (#481).
+    const zon = try build_files.generateBuildZigZon(allocator, cfg_modules, target_dir, output_dir, game_dir, .{
         // The tests target runs second — additive merge so the exe
         // target's deps (chosen-backend, plugins) survive. Issue #83.
         .recreate_deps = !is_tests_target,
@@ -1348,7 +1428,10 @@ pub fn generate(
     defer main_zig.freePromotedScripts(allocator, promoted_scripts);
 
     // Generate build.zig
-    const build_zig = try build_files.generateBuildZig(allocator, cfg, .{
+    // `cfg_modules` (not `cfg`): light packs get no `b.dependency` /
+    // `overrideImport` module wiring — their contribution is dir-scan
+    // registry entries, not an importable module (#481).
+    const build_zig = try build_files.generateBuildZig(allocator, cfg_modules, .{
         .is_tests_target = is_tests_target,
         .promoted_scripts = promoted_scripts,
         // Manifest-driven backend splice (assembler#378): pass the project
@@ -1379,7 +1462,11 @@ pub fn generate(
     // the file header on `main_zig.writePluginEventsBlock` for why the
     // builtin `@Union(.auto, …)` path was retired (zero-field result is
     // uninstantiable, breaks the plugin-controllers example).
-    var plugin_events = try main_zig.discoverPluginEvents(allocator, cfg, game_dir);
+    // `cfg_modules`: only decl-module plugins have a `src/root.zig` with an
+    // `Events` block; a light pack's events arrive via `pack_scans`, already
+    // namespaced, so it contributes nothing here and must not be resolved as a
+    // module (#481).
+    var plugin_events = try main_zig.discoverPluginEvents(allocator, cfg_modules, game_dir);
     defer plugin_events.deinit();
 
     // Emit the `game.zig` shim — a tiny re-export module that surfaces
@@ -1524,7 +1611,11 @@ pub fn generate(
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,
             engine_template,
-            cfg,
+            // `cfg_modules`: the plugin `@import` sites inside main.zig
+            // (ComponentRegistryWithPlugins / SystemRegistry / plugin
+            // controllers) must skip light packs — their items are wired in
+            // via `main_template.pack_scans` above, not a module import (#481).
+            cfg_modules,
             backend_tmpl,
             merged_entries,
             prefab_names,
