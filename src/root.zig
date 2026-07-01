@@ -896,7 +896,7 @@ pub fn generate(
             plugin_flow_decls.flow_nodes,
             plugin_events.entries,
         ) catch |err| {
-            std.debug.print("labelle-assembler: manifest sidecar emission failed: {s}\n", .{@errorName(err)});
+            std.log.warn("labelle-assembler: manifest sidecar emission failed: {s}", .{@errorName(err)});
         };
 
         // Backend lifecycle template — only the exe target needs it.

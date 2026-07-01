@@ -88,6 +88,7 @@ const config = @import("config.zig");
 const script_scanner = @import("script_scanner.zig");
 const scan = @import("codegen/scan.zig");
 const jw = @import("flow_catalog/json_writer.zig");
+const idents = @import("codegen/idents.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
@@ -178,9 +179,22 @@ pub fn emitManifestSidecar(
 // ── Game-realm struct parsing (components + events) ──────────────────────
 
 /// Parse every `<game_dir>/<folder>/<name>.zig` file (one struct per
-/// file by convention) into `StructDecl`s. Unreadable / unparsable files
-/// degrade to an empty result for that file rather than failing the whole
-/// manifest — same graceful-degradation contract `flow_catalog` follows.
+/// file by convention) into `StructDecl`s.
+///
+/// The decl the assembler actually registers is the *file-stem Pascal*
+/// decl (`components/<name>.zig` → `pub const <pathToPascal(name)> =
+/// struct {...}`), so this emits exactly that one decl per file — a
+/// component/event file may also declare helper containers (a private
+/// `const Options = struct {}` / `pub const Clip = enum {}`), and those
+/// must NOT leak into the manifest as phantom components/events.
+///
+/// Read / parse failures degrade to a **name-only** `StructDecl` (the
+/// file-stem Pascal name, empty fields) rather than dropping the entry:
+/// the generated registries still import that file-stem decl from
+/// `component_names` / `event_names`, so omitting it would wrongly report
+/// an existing component/event as absent. `OutOfMemory` is the one error
+/// that propagates — a real allocation failure must not masquerade as
+/// graceful degradation.
 fn parseStructDir(
     aa: std.mem.Allocator,
     game_dir: []const u8,
@@ -190,13 +204,48 @@ fn parseStructDir(
     const io = config.globalIo();
     var list: std.ArrayList(StructDecl) = .empty;
     for (names) |name| {
+        // The registry-visible decl name, matching how `blocks/registries`
+        // names components (`velocity` → `Velocity`).
+        var pascal_buf: [128]u8 = undefined;
+        const decl_name = idents.pathToPascal(name, &pascal_buf);
+
         const rel = try std.fmt.allocPrint(aa, "{s}.zig", .{name});
         const path = try std.fs.path.join(aa, &.{ game_dir, folder, rel });
-        const src = std.Io.Dir.cwd().readFileAlloc(io, path, aa, .limited(2 * 1024 * 1024)) catch continue;
-        const decls = parseStructFile(aa, src) catch continue;
-        for (decls) |d| try list.append(aa, d);
+
+        const src = std.Io.Dir.cwd().readFileAlloc(io, path, aa, .limited(2 * 1024 * 1024)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try list.append(aa, try nameOnlyDecl(aa, decl_name));
+                continue;
+            },
+        };
+        // `parseStructFile` only fails with `OutOfMemory` — `std.zig.Ast`
+        // captures syntax errors in the tree rather than returning them,
+        // so a garbled file parses to an AST with no matching decl and is
+        // handled by the name-only fallback below, not by a caught error.
+        const decls = try parseStructFile(aa, src);
+
+        // Emit only the file-stem decl; ignore any helper containers.
+        var matched = false;
+        for (decls) |d| {
+            if (std.mem.eql(u8, d.name, decl_name)) {
+                try list.append(aa, d);
+                matched = true;
+                break;
+            }
+        }
+        // No decl matched the file stem (empty / garbled source, or an
+        // unconventional decl name) — degrade to name-only so the manifest
+        // still lists what the registry imports.
+        if (!matched) try list.append(aa, try nameOnlyDecl(aa, decl_name));
     }
     return list.toOwnedSlice(aa);
+}
+
+/// A `StructDecl` carrying only the registry name — the graceful-degradation
+/// stand-in for a component/event file the AST pass couldn't read or match.
+fn nameOnlyDecl(aa: std.mem.Allocator, name: []const u8) !StructDecl {
+    return .{ .name = try aa.dupe(u8, name), .save = null, .fields = &.{} };
 }
 
 /// AST-walk one source buffer for top-level `pub const <Name> = struct
@@ -205,6 +254,7 @@ fn parseStructDir(
 fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDecl {
     const src_z = try aa.dupeZ(u8, src);
     var ast = try std.zig.Ast.parse(aa, src_z, .zig);
+    defer ast.deinit(aa);
 
     var decls: std.ArrayList(StructDecl) = .empty;
     for (ast.rootDecls()) |decl_idx| {
@@ -236,7 +286,11 @@ fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDecl {
                 if (ast.fullVarDecl(m)) |member_vd| {
                     const mname = ast.tokenSlice(member_vd.ast.mut_token + 1);
                     if (std.mem.eql(u8, mname, "save")) {
-                        save = extractSavePolicy(aa, ast.getNodeSource(m)) catch null;
+                        // `try` (not `catch null`): a null return means "no
+                        // policy literal found" and is expected, but an
+                        // `OutOfMemory` must propagate rather than be
+                        // silently collapsed to "no save policy".
+                        save = try extractSavePolicy(aa, ast.getNodeSource(m));
                     }
                 }
             }
@@ -315,21 +369,33 @@ fn writeIndex(w: *std.Io.Writer, d: ManifestData) !void {
     try writeStringArray(w, d.enum_names);
     try w.writeAll(",\n      \"registries\": []\n    },\n");
 
-    // realms — the realm map.
+    // realms — the realm map. Game first, then the engine realm (only
+    // when engine lifecycle events were discovered — otherwise the
+    // `engine.<event>` contract entries would reference a realm that
+    // never appears here), then the declared plugins. A leading comma
+    // before each subsequent realm keeps the separator logic uniform.
     try w.writeAll("    \"realms\": [\n");
 
-    // Game realm first.
     try writeGameIndexRealm(w, d);
-    if (d.cfg.plugins.len > 0) try w.writeAll(",");
-    try w.writeAll("\n");
-
-    for (d.cfg.plugins, 0..) |plugin, pi| {
-        try writePluginIndexRealm(w, d, plugin.name, plugin.version);
-        if (pi + 1 < d.cfg.plugins.len) try w.writeAll(",");
-        try w.writeAll("\n");
+    if (hasEngineEvents(d)) {
+        try w.writeAll(",\n");
+        try writeNonGameIndexRealm(w, d, ENGINE_REALM, "engine", null);
     }
+    for (d.cfg.plugins) |plugin| {
+        try w.writeAll(",\n");
+        try writeNonGameIndexRealm(w, d, plugin.name, "plugin", plugin.version);
+    }
+    try w.writeAll("\n    ]\n  }");
+}
 
-    try w.writeAll("    ]\n  }");
+/// True when `discoverPluginEvents` surfaced any engine lifecycle event
+/// (stored under the literal `engine` realm label). Gates emission of the
+/// dedicated engine realm so its `contracts.events` entries resolve.
+fn hasEngineEvents(d: ManifestData) bool {
+    for (d.plugin_events) |e| {
+        if (std.mem.eql(u8, e.plugin_import_name, ENGINE_REALM)) return true;
+    }
+    return false;
 }
 
 fn writeGameIndexRealm(w: *std.Io.Writer, d: ManifestData) !void {
@@ -355,11 +421,25 @@ fn writeGameIndexRealm(w: *std.Io.Writer, d: ManifestData) !void {
     try w.writeAll(",\n        \"recipes\": []\n      }");
 }
 
-fn writePluginIndexRealm(w: *std.Io.Writer, d: ManifestData, name: []const u8, version: []const u8) !void {
+/// Index entry for a non-game realm — a plugin (`tier = "plugin"`, with a
+/// `version`) or the engine peer (`tier = "engine"`, no version). Both
+/// own only events + flow_nodes and expose the same verb surface, so they
+/// share this writer.
+fn writeNonGameIndexRealm(
+    w: *std.Io.Writer,
+    d: ManifestData,
+    name: []const u8,
+    tier: []const u8,
+    version: ?[]const u8,
+) !void {
     try w.writeAll("      {\n        \"name\": ");
     try jw.writeJsonString(w, name);
-    try w.writeAll(",\n        \"tier\": \"plugin\",\n        \"version\": ");
-    try jw.writeJsonString(w, version);
+    try w.writeAll(",\n        \"tier\": ");
+    try jw.writeJsonString(w, tier);
+    if (version) |v| {
+        try w.writeAll(",\n        \"version\": ");
+        try jw.writeJsonString(w, v);
+    }
     try w.writeAll(",\n        \"owns\": {\n          \"events\": ");
     try writePluginEventNameArray(w, d.plugin_events, name);
     try w.writeAll(",\n          \"flow_nodes\": ");
@@ -394,7 +474,16 @@ fn writeExposeKind(
         // command == void impl; query == reporter (non-void).
         if (n.is_void != commands) continue;
         if (!first) try w.writeAll(", ");
-        try jw.writeJsonString(w, n.node_name);
+        if (is_game) {
+            // The game realm aggregates every game script, so a bare
+            // `spawn` from two scripts would collide. Qualify with the
+            // script module label (part of the public registry name).
+            try writeScriptQualifiedJsonString(w, n.module_import_path, n.node_name);
+        } else {
+            // A plugin realm scopes its own nodes; `owns.flow_nodes` lists
+            // them bare too, and node names are unique within a plugin.
+            try jw.writeJsonString(w, n.node_name);
+        }
         first = false;
     }
     try w.writeAll("]");
@@ -411,17 +500,18 @@ fn nodeBelongsToRealm(n: PluginFlowNode, realm: []const u8, is_game: bool) bool 
 fn writeRealmDetail(w: *std.Io.Writer, d: ManifestData) !void {
     try w.writeAll("  \"realms\": [\n");
 
+    // Same realm ordering as the index: game, engine (when it has
+    // events), then plugins.
     try writeGameRealmDetail(w, d);
-    if (d.cfg.plugins.len > 0) try w.writeAll(",");
-    try w.writeAll("\n");
-
-    for (d.cfg.plugins, 0..) |plugin, pi| {
-        try writePluginRealmDetail(w, d, plugin.name);
-        if (pi + 1 < d.cfg.plugins.len) try w.writeAll(",");
-        try w.writeAll("\n");
+    if (hasEngineEvents(d)) {
+        try w.writeAll(",\n");
+        try writeNonGameRealmDetail(w, d, ENGINE_REALM, "engine");
     }
-
-    try w.writeAll("  ]");
+    for (d.cfg.plugins) |plugin| {
+        try w.writeAll(",\n");
+        try writeNonGameRealmDetail(w, d, plugin.name, "plugin");
+    }
+    try w.writeAll("\n  ]");
 }
 
 fn writeGameRealmDetail(w: *std.Io.Writer, d: ManifestData) !void {
@@ -494,10 +584,15 @@ fn writeGameRealmDetail(w: *std.Io.Writer, d: ManifestData) !void {
     try w.writeAll(",\n      \"recipes\": []\n    }");
 }
 
-fn writePluginRealmDetail(w: *std.Io.Writer, d: ManifestData, name: []const u8) !void {
+/// Per-realm detail for a non-game realm (plugin or engine peer). Events
+/// are names-only (payloads live in `flow_catalog.json` per module);
+/// flow_nodes carry their command/query kind.
+fn writeNonGameRealmDetail(w: *std.Io.Writer, d: ManifestData, name: []const u8, tier: []const u8) !void {
     try w.writeAll("    {\n      \"name\": ");
     try jw.writeJsonString(w, name);
-    try w.writeAll(",\n      \"tier\": \"plugin\",\n");
+    try w.writeAll(",\n      \"tier\": ");
+    try jw.writeJsonString(w, tier);
+    try w.writeAll(",\n");
 
     // events — names only; payloads live in flow_catalog.json per-plugin.
     try w.writeAll("      \"events\": [");
@@ -592,22 +687,82 @@ fn writeFlowNodeNameArray(w: *std.Io.Writer, nodes: []const PluginFlowNode, plug
     try w.writeAll("]");
 }
 
-/// Every game event name plus engine/plugin event names — the shared
-/// event vocabulary an agent can subscribe to across realms.
+/// Every game event plus engine/plugin events — the shared event
+/// vocabulary an agent can subscribe to across realms. Each entry is
+/// **realm-qualified** in the dotted `<realm>.<event>` form the rest of
+/// the toolchain uses (`engine.tick`, `box2d.collision_begin`; see the
+/// flow catalog's `qualified` field). Without the realm prefix two realms
+/// exposing the same bare event name (`engine.tick` vs a plugin `tick`,
+/// or two plugins' `collision_begin`) would collide into one ambiguous
+/// entry.
 fn writeContractEvents(w: *std.Io.Writer, d: ManifestData) !void {
     try w.writeAll("[");
     var first = true;
     for (d.game_events) |e| {
         if (!first) try w.writeAll(", ");
-        try jw.writeJsonString(w, e.name);
+        try writeQualifiedJsonString(w, GAME_REALM, e.name);
         first = false;
     }
     for (d.plugin_events) |e| {
         if (!first) try w.writeAll(", ");
-        try jw.writeJsonString(w, e.event_name);
+        // `plugin_import_name` is the realm label — the plugin's
+        // `project.labelle` name, or the literal `engine` for engine
+        // lifecycle events (`discoverPluginEvents`).
+        try writeQualifiedJsonString(w, e.plugin_import_name, e.event_name);
         first = false;
     }
     try w.writeAll("]");
+}
+
+/// Write a `"<realm>.<name>"` JSON string — the dotted realm-qualified
+/// form — without allocating an intermediate join. Both halves are
+/// escaped identically to `jw.writeJsonString`.
+fn writeQualifiedJsonString(w: *std.Io.Writer, realm: []const u8, name: []const u8) !void {
+    try w.writeByte('"');
+    try writeJsonStringBody(w, realm);
+    try w.writeByte('.');
+    try writeJsonStringBody(w, name);
+    try w.writeByte('"');
+}
+
+/// Write a script FlowNode's qualified `"<module_label>.<node>"` name,
+/// where `<module_label>` is the script `rel_path` with its `.zig`
+/// stripped and path separators mapped to dots (`flows/hit_counter.zig`
+/// → `flows.hit_counter`) — the same dotted module label the flow
+/// catalog builds via `scriptModuleLabel`. The script module path is
+/// part of the public registry name, so two scripts both exposing
+/// `spawn` stay distinct (`flows.hit_counter.spawn` vs `combat.spawn`).
+fn writeScriptQualifiedJsonString(w: *std.Io.Writer, rel_path: []const u8, node: []const u8) !void {
+    const stem = if (std.mem.endsWith(u8, rel_path, ".zig"))
+        rel_path[0 .. rel_path.len - ".zig".len]
+    else
+        rel_path;
+    try w.writeByte('"');
+    for (stem) |c| {
+        try writeJsonStringChar(w, if (c == '/' or c == '\\') '.' else c);
+    }
+    try w.writeByte('.');
+    try writeJsonStringBody(w, node);
+    try w.writeByte('"');
+}
+
+/// Escape+emit a string's *body* (no surrounding quotes) — the shared
+/// inner loop of `jw.writeJsonString`, reused so qualified names build
+/// one JSON string from several pieces.
+fn writeJsonStringBody(w: *std.Io.Writer, s: []const u8) !void {
+    for (s) |c| try writeJsonStringChar(w, c);
+}
+
+fn writeJsonStringChar(w: *std.Io.Writer, c: u8) !void {
+    switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => try w.print("\\u{x:0>4}", .{c}),
+        else => try w.writeByte(c),
+    }
 }
 
 /// `{ "field": "Type", ... }` — a flat field/type map.
@@ -795,4 +950,133 @@ test "emitManifestSidecar: writes a parseable sidecar for an empty project" {
     try std.testing.expect(root.contains("index"));
     try std.testing.expect(root.contains("realms"));
     try std.testing.expectEqual(@as(usize, 1), root.get("realms").?.array.items.len); // game only
+}
+
+/// Find the realm object named `name` in a `[{ "name": ... }, ...]` array.
+fn findRealm(arr: std.json.Array, name: []const u8) ?std.json.ObjectMap {
+    for (arr.items) |item| {
+        const obj = item.object;
+        if (std.mem.eql(u8, obj.get("name").?.string, name)) return obj;
+    }
+    return null;
+}
+
+/// True when `arr` (a JSON string array) contains `needle`.
+fn jsonArrayHas(arr: std.json.Array, needle: []const u8) bool {
+    for (arr.items) |item| {
+        if (std.mem.eql(u8, item.string, needle)) return true;
+    }
+    return false;
+}
+
+test "parseStructDir: name-only fallback for a missing file, helper decls excluded" {
+    const aa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = config.globalIo();
+
+    // `components/velocity.zig` declares the file-stem decl `Velocity`
+    // plus a helper container that must NOT surface as its own component.
+    try tmp.dir.createDirPath(io, "components");
+    {
+        var cdir = try tmp.dir.openDir(io, "components", .{});
+        defer cdir.close(io);
+        var f = try cdir.createFile(io, "velocity.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\pub const Velocity = struct {
+            \\    dx: f32 = 0,
+            \\    dy: f32 = 0,
+            \\};
+            \\pub const Helper = struct { z: u8 = 0 };
+            \\
+        );
+    }
+
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", aa);
+    defer aa.free(dir);
+
+    var arena = std.heap.ArenaAllocator.init(aa);
+    defer arena.deinit();
+
+    // `missing` has no backing file → name-only fallback (`Missing`).
+    const decls = try parseStructDir(arena.allocator(), dir, "components", &.{ "velocity", "missing" });
+
+    // Exactly two decls: the file-stem `Velocity` and the fallback
+    // `Missing` — the `Helper` container is dropped.
+    try std.testing.expectEqual(@as(usize, 2), decls.len);
+    try std.testing.expectEqualStrings("Velocity", decls[0].name);
+    try std.testing.expectEqual(@as(usize, 2), decls[0].fields.len);
+    try std.testing.expectEqualStrings("dx", decls[0].fields[0].name);
+    // Name-only fallback: registry name present, empty field set.
+    try std.testing.expectEqualStrings("Missing", decls[1].name);
+    try std.testing.expectEqual(@as(usize, 0), decls[1].fields.len);
+    try std.testing.expect(decls[1].save == null);
+}
+
+test "writeManifestJson: engine realm emitted + realm-qualified contracts + script-qualified exposes" {
+    const aa = std.testing.allocator;
+
+    // One game-script FlowNode (command) + engine & plugin events.
+    const flow_nodes = [_]PluginFlowNode{
+        .{ .module_import_path = "flows/hit_counter.zig", .module_sanitized = "flows_s_hit_u_counter", .node_name = "spawn", .is_script = true, .is_void = true },
+        .{ .module_import_path = "box2d", .module_sanitized = "box2d", .node_name = "apply_impulse", .is_script = false, .is_void = true },
+    };
+    const plugin_events = [_]PluginEvent{
+        .{ .plugin_import_name = "engine", .plugin_sanitized = "engine", .event_name = "tick" },
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
+    };
+    const game_events = [_]StructDecl{.{ .name = "WorkerSleepStart", .save = null, .fields = &.{} }};
+
+    const cfg = ProjectConfig{
+        .name = "demo",
+        .plugins = &.{.{ .name = "box2d", .version = "1.2.3" }},
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(aa);
+    defer aw.deinit();
+    try writeManifestJson(&aw.writer, .{
+        .cfg = cfg,
+        .components = &.{},
+        .prefab_names = &.{},
+        .enum_names = &.{},
+        .hook_names = &.{},
+        .game_events = &game_events,
+        .game_scripts = &.{},
+        .flow_nodes = &flow_nodes,
+        .plugin_events = &plugin_events,
+    });
+    const out = aw.writer.buffer[0..aw.writer.end];
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, out, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    // contracts.events — realm-qualified, no bare collisions.
+    const index = root.get("index").?.object;
+    const contract_events = index.get("contracts").?.object.get("events").?.array;
+    try std.testing.expect(jsonArrayHas(contract_events, "game.WorkerSleepStart"));
+    try std.testing.expect(jsonArrayHas(contract_events, "engine.tick"));
+    try std.testing.expect(jsonArrayHas(contract_events, "box2d.collision_begin"));
+
+    // index.realms — game + engine + box2d, all reachable by name.
+    const realms_idx = index.get("realms").?.array;
+    try std.testing.expectEqual(@as(usize, 3), realms_idx.items.len);
+    const game_idx = findRealm(realms_idx, "game").?;
+    // Game exposes are script-qualified so two scripts' `spawn` stay apart.
+    const game_cmds = game_idx.get("exposes").?.object.get("commands").?.array;
+    try std.testing.expect(jsonArrayHas(game_cmds, "flows.hit_counter.spawn"));
+
+    // Engine realm exists, tier "engine", owns `tick`, and carries no version.
+    const engine_idx = findRealm(realms_idx, "engine").?;
+    try std.testing.expectEqualStrings("engine", engine_idx.get("tier").?.string);
+    try std.testing.expect(!engine_idx.contains("version"));
+    try std.testing.expect(jsonArrayHas(engine_idx.get("owns").?.object.get("events").?.array, "tick"));
+
+    // detail — engine realm present with its event list.
+    const realms = root.get("realms").?.array;
+    try std.testing.expectEqual(@as(usize, 3), realms.items.len);
+    const engine_detail = findRealm(realms, "engine").?;
+    try std.testing.expectEqualStrings("engine", engine_detail.get("tier").?.string);
+    try std.testing.expectEqualStrings("tick", engine_detail.get("events").?.array.items[0].object.get("name").?.string);
 }
