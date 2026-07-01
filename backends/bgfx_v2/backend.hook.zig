@@ -257,6 +257,72 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
     return null;
 }
 
+// ── wasm emcc residual — the emLinkStep reconstruction (labelle-bgfx#8) ─────
+// The hook is std-only and cannot import the provider package, so the emcc link
+// step is reconstructed from ONLY `std.Build` + the emsdk dependency (resolved
+// via `b.dependency("emsdk", .{})`). bgfx creates its own WebGL2 context (no GLFW
+// emulation, no asyncify), so the flag set is WebGL2 + the GL proc-address helper
+// + memory-growth/stack.
+
+pub const wasm_stack_size_arg = "-sSTACK_SIZE=524288";
+pub const wasm_allow_memory_growth_arg = "-sALLOW_MEMORY_GROWTH=1";
+pub const wasm_min_webgl_arg = "-sMIN_WEBGL_VERSION=2";
+pub const wasm_max_webgl_arg = "-sMAX_WEBGL_VERSION=2";
+pub const wasm_gl_get_proc_address_arg = "-sGL_ENABLE_GET_PROC_ADDRESS=1";
+
+/// Options for `emLinkStep`. Uses only `std.Build`/`std.builtin` types so the hook
+/// stays provider-free.
+pub const EmLinkOptions = struct {
+    optimize: std.builtin.OptimizeMode,
+    lib_main: *std.Build.Step.Compile,
+    lib_backend: *std.Build.Step.Compile,
+    emsdk: *std.Build.Dependency,
+};
+
+fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Build.LazyPath {
+    return emsdk.path(b.fmt("upstream/emscripten/{s}", .{tool}));
+}
+
+/// Reconstruction of the emcc link step using only `std.Build` + the emsdk
+/// dependency. Walks the bgfx artifact's transitive compile deps so emcc receives
+/// bgfx + bx + bimg. Returns the install step for the caller to wire in.
+pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.InstallDir {
+    const emcc = std.Build.Step.Run.create(b, "emcc");
+    emcc.addFileArg(emTool(b, options.emsdk, "emcc"));
+    if (options.optimize == .Debug) {
+        emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
+    } else {
+        if (options.optimize == .ReleaseSafe) {
+            emcc.addArg("-sASSERTIONS=1");
+        } else {
+            emcc.addArg("-sASSERTIONS=0");
+        }
+        if (options.optimize == .ReleaseSmall) {
+            emcc.addArg("-Oz");
+        } else {
+            emcc.addArg("-O3");
+        }
+    }
+    emcc.addArg(wasm_min_webgl_arg);
+    emcc.addArg(wasm_max_webgl_arg);
+    emcc.addArg(wasm_gl_get_proc_address_arg);
+    emcc.addArg(wasm_allow_memory_growth_arg);
+    emcc.addArg(wasm_stack_size_arg);
+    emcc.addArtifactArg(options.lib_main);
+    for (options.lib_backend.getCompileDependencies(false)) |dep| {
+        if (dep.kind == .lib) emcc.addArtifactArg(dep);
+    }
+    emcc.addArg("-o");
+    const out_file = emcc.addOutputFileArg(b.fmt("{s}.html", .{options.lib_main.name}));
+    const install = b.addInstallDirectory(.{
+        .source_dir = out_file.dirname(),
+        .install_dir = .prefix,
+        .install_subdir = "web",
+    });
+    install.step.dependOn(&emcc.step);
+    return install;
+}
+
 /// Runs AFTER the generic module/artifact/system-lib wiring, to supply the residual
 /// the manifest cannot express statically (design §2 residual (a) — the bgfx-Android
 /// NDK ordering). DESKTOP is empty (fully declarative — no residual). ANDROID adds
@@ -264,8 +330,9 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
 /// `linkLibrary`, `linkSystemLibrary`, `link_libc`, root `.pic` — are emitted
 /// declaratively by the assembler from the manifest, NOT here). Unlike sokol there
 /// is NO `addSystemIncludePath` on the artifact: the bgfx/bx/bimg C++ TUs are
-/// NDK-sysroot-wired by the backend's own build.zig. bgfx has no ios/wasm platform,
-/// so those arms are unreachable.
+/// NDK-sysroot-wired by the backend's own build.zig. WASM does the Emscripten emcc
+/// link step + install/run wiring (labelle-bgfx#8). bgfx has no ios platform, so
+/// that arm is unreachable.
 pub fn post_wire(b: *std.Build, ctx: HookContext) void {
     switch (ctx.platform) {
         .desktop => {}, // fully declarative — no residual
@@ -291,7 +358,25 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
             const android_libc = b.addWriteFiles();
             ctx.root_artifact.setLibCFile(android_libc.add("android-libc.txt", libc_content));
         },
-        .ios, .wasm => @panic("bgfx backend has no ios/wasm platform"),
+        .wasm => {
+            // The Emscripten emcc link step + install/run wiring. emsdk is resolved
+            // via `b.dependency` — declared as a root build dep by the manifest's
+            // `.root_build_deps`. The declarative `linkLibrary(bgfx)` is emitted by
+            // the assembler BEFORE this call; `emLinkStep` walks the bgfx artifact's
+            // transitive libs (bgfx+bx+bimg) and hands them all to emcc.
+            const emsdk = b.dependency("emsdk", .{});
+            const bgfx_artifact = ctx.backend_dep.artifact("bgfx");
+            const install = emLinkStep(b, .{
+                .optimize = ctx.optimize,
+                .lib_main = ctx.root_artifact,
+                .lib_backend = bgfx_artifact,
+                .emsdk = emsdk,
+            });
+            b.getInstallStep().dependOn(&install.step);
+            const run_step = b.step("run", "Serve WASM build");
+            run_step.dependOn(&install.step);
+        },
+        .ios => @panic("bgfx backend has no ios platform"),
     }
 }
 
