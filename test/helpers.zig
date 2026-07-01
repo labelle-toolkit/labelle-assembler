@@ -465,6 +465,53 @@ pub fn genWgpuV2BuildZig(
     return generate.generateBuildZig(allocator, cfg, opts);
 }
 
+// ── sdl + raylib v2 GOLDEN fixtures (manifest-v2, epic #453 item 3, PR 9) ──
+// sdl and raylib are the next backends converted to v2. Each ships a
+// `backend.manifest.v2.zon` (mirroring `backends/null_v2`/`backends/wgpu_v2`);
+// raylib_v2 ALSO ships the dedicated `backend.hook.zig` (the wasm emcc residual).
+// Codegen reads them offline.
+//   - sdl_v2: DESKTOP-ONLY, HOOKLESS, fully declarative — no artifacts / no
+//     system_libs (SDL2 is linked inside the backend package's window module, so
+//     the v1 `link.txt` is empty); uses the generic `unifyCoreDiamond` walk.
+//   - raylib_v2: DESKTOP (declarative — the `raylib` artifact + per-OS OpenGL
+//     framework/syslib switch) + WASM (the emcc residual in the std-only hook).
+pub const sdl_v2_fixture_package = generate.PluginDep{ .name = "sdl_v2", .repo = "local:backends/sdl_v2" };
+pub const raylib_v2_fixture_package = generate.PluginDep{ .name = "raylib_v2", .repo = "local:backends/raylib_v2" };
+
+/// Generate a build.zig against the sdl v2 fixture — the hookless, fully
+/// declarative desktop path (design §7 golden cell). SDL2 is linked by the backend
+/// package, so no artifact/system_lib is emitted here.
+pub fn genSdlV2BuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend = .sdl;
+    cfg.backend_package = sdl_v2_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+/// Generate a build.zig against the raylib v2 fixture — DESKTOP (declarative
+/// `raylib` artifact + per-OS OpenGL framework/syslib switch) unless the caller
+/// sets `cfg.platform = .wasm`, which drives the emcc hook path (design §7).
+pub fn genRaylibV2BuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend = .raylib;
+    cfg.backend_package = raylib_v2_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
 // A BROKEN-v2 backend fixture: `backends/sokol_v2broken` ships a
 // `backend.manifest.v2.zon` whose header parses (manifest_version = 2) but whose
 // body is invalid, so `manifest_v2.loadNamedManifest` fails. Used to prove #468

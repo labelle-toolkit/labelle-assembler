@@ -1,0 +1,129 @@
+.{
+    // ── raylib backend manifest, SCHEMA v2 (build-graph manifest, epic #453 item
+    // 3, PR 9) — a faithful translation of the real `labelle-raylib` v1
+    // `backend.manifest.zon` + `build_fragments/{backend_dep,link}.txt` + the enum
+    // `link_raylib_wasm`/`wasm_footer` wasm wiring + `templates/{desktop,wasm}.txt`.
+    // See docs/design/manifest-v2-build-graph.md §3.
+    //
+    // raylib is a DESKTOP + WASM backend (no android/ios — sokol is the only mobile
+    // path). It exercises TWO v2 codegen paths:
+    //   - DESKTOP: the fully-DECLARATIVE generic path (design §7 golden cell, NOT
+    //     the sokol byte anchor). HOOKLESS on desktop: the raylib `link.txt` links
+    //     the `raylib` artifact + a per-OS OpenGL switch (macOS `OpenGL` framework,
+    //     Linux `GL`, Windows `opengl32`) — all pure declarative graph data.
+    //   - WASM: the emcc residual (design §2 (c)). Its target is the STATIC
+    //     `.triple` "wasm32-emscripten" (no `resolve_target`), and its `post_wire`
+    //     runs the Emscripten `emcc` link step (the enum `link_raylib_wasm`, which
+    //     reaches emcc via `@import("labelle_raylib").emsdk.emccStep`). The hook is
+    //     std-only and cannot import the provider package, so the step is
+    //     reconstructed in `backend.hook.zig` from ONLY `std.Build` + the emsdk
+    //     dependency, which it resolves via `b.dependency("emsdk", .{})` — declared
+    //     by `.platforms.wasm.root_build_deps` (design §3 `RootBuildDep`).
+    //
+    // Core-diamond: raylib's `input` module imports `labelle-core` (HYPHEN key) and
+    // transitively pulls the desktop `sdl_gamepad` sub-package, which imports
+    // `labelle_core` (UNDERSCORE key). Both are handled generically by the
+    // `unifyCoreDiamond` walk (design §5): rooted at `backend_input`, it overrides
+    // the direct `labelle-core` onto the app `core_mod`, then recurses into the
+    // `sdl_gamepad` sub-import (not a core/gfx key) and overrides its `labelle_core`
+    // too — reproducing the two hand-written overrides in `backend_dep.txt` without
+    // any per-backend override site.
+    //
+    // This is a TEST FIXTURE dir: it ships this v2 manifest + the dedicated
+    // `backend.hook.zig` (the wasm emcc residual), no build.zig/package — codegen
+    // reads them offline.
+    .manifest_version = 2,
+    .dir_name = "raylib",
+    .dep_name = "labelle_raylib",
+    .id = "labelle.raylib",
+
+    // Carried forward UNCHANGED from the v1 manifest — what raylib ACTUALLY
+    // supports (screenshots, ASTC upload, font atlas, gamepad polling, a wasm
+    // build, OGG audio decode). A non-empty set opts into resolve-time capability
+    // enforcement (design §3 review-correction #8); v2 must not drop it.
+    .capabilities = .{
+        .screenshots,
+        .compressed_textures,
+        .fonts,
+        .gamepad_polling,
+        .wasm,
+        .audio_ogg,
+    },
+
+    // root_alias defaults to `backend_<name>`, so the generated root imports these
+    // as `backend_gfx`/`backend_input`/… exactly as the enum path does.
+    .modules = .{
+        .{ .name = "gfx", .source = "src/gfx.zig" },
+        .{ .name = "input", .source = "src/input.zig" },
+        .{ .name = "audio", .source = "src/audio.zig" },
+        .{ .name = "window", .source = "src/window.zig" },
+    },
+
+    // BASE dep_options: `gamepad_enabled`/`gamepad_hidapi` are forwarded to
+    // `b.dependency("labelle_raylib", …)` on BOTH desktop AND wasm — the enum path
+    // reuses the single `.backend_raylib` section for both platforms
+    // (build_files.zig:417 has no per-platform raylib branch), so both literals
+    // carry the two flags. They therefore belong in the base, not a per-platform
+    // append. Option NAMES are declarative; VALUES come from the closed predicate
+    // set (design §4).
+    .dep_options = .{
+        .{ .name = "gamepad_enabled", .value = .gamepad_enabled },
+        .{ .name = "gamepad_hidapi", .value = .gamepad_hidapi },
+    },
+
+    .system_libs = .{
+        // Per-OS OpenGL for the PIE preview's PBO readback path (glReadPixels/
+        // glGenBuffers/glMapBuffer via @extern, labelle-engine#544) — replaces the
+        // v1 link.txt `switch (target.result.os.tag)` block. macOS uses the OpenGL
+        // FRAMEWORK (see .frameworks.desktop below); Linux/Windows use system libs.
+        .desktop = .{
+            .linux = .{"GL"},
+            .windows = .{"opengl32"},
+        },
+    },
+    .frameworks = .{
+        // macOS links OpenGL as a framework (v1 link.txt `.macos` arm). raylib is
+        // desktop+wasm only, so only the desktop-macos framework set is declared.
+        .desktop = .{ .macos = .{"OpenGL"} },
+    },
+
+    .platforms = .{
+        .desktop = .{
+            .entry = "templates/desktop.txt",
+            .loop_style = .loop,
+            .target = .native,
+            // The raylib C archive (v1 `backend_dep.txt`
+            // `backend_dep.artifact("raylib")`), linked into the exe + test_root.
+            .artifacts = .{.{ .name = "raylib" }},
+            .package = .binary,
+        },
+        .wasm = .{
+            .entry = "templates/wasm.txt",
+            // raylib's web target drives the loop via emscripten_set_main_loop
+            // (templates/wasm.txt), a callback — NOT a generated `while`.
+            .loop_style = .callback,
+            .target = .{ .triple = "wasm32-emscripten" }, // static (design §3)
+            // The raylib C archive is linked into the `wasm` lib; emcc scans it as
+            // a transitive static dep in the hook's post_wire emcc step.
+            .artifacts = .{.{ .name = "raylib" }},
+            // Empty per-platform list → inherits the base gamepad_* options
+            // UNCHANGED (design §3 merge contract) — matching the enum path, which
+            // forwards them to the raylib backend-dep on wasm too (harmless: raylib
+            // only wires sdl_gamepad on desktop).
+            .dep_options = .{},
+            // The hook's `b.dependency("emsdk", .{})` only resolves if the root
+            // build.zig.zon declares emsdk — `.builtin` reuses the assembler's
+            // pinned `dep_emsdk` section (design §3 `RootBuildDep`).
+            .root_build_deps = .{.{ .name = "emsdk", .resolution = .builtin }},
+            .package = .{ .web = .{ .shell = null } },
+        },
+        // No android/ios — raylib ships no mobile templates.
+    },
+
+    // Dedicated hook file (NOT raylib's own build.zig, which re-exports
+    // `pub const emsdk = @import("raylib-zig").emsdk;` at top level — a name absent
+    // from the generated root package). Desktop is fully declarative and never
+    // invokes the hook; the hook exists ONLY for the wasm emcc residual (design
+    // §2 (c) / §4) — its `post_wire` .wasm arm reconstructs the emcc link step.
+    .build_hook = "backend.hook.zig",
+}
