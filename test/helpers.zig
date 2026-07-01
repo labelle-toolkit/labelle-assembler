@@ -350,6 +350,21 @@ pub fn testGuiRawBackend(name: []const u8) generate.ResolvedGui {
     };
 }
 
+/// A `raw_backend` GUI rendered by the backend's OWN in-backend imgui adapter
+/// — NO separate GUI-bridge plugin is resolved for the backend, so `bridge_dir`
+/// is null (sokol/bgfx). This is the shape that derives `.raw_gui_adapter` in
+/// `requiredCapabilities`; the bridge-backed shape above (raylib/rlImGui,
+/// `bridge_dir != null`) does NOT. See src/capabilities.zig.
+pub fn testGuiRawBackendNoBridge(name: []const u8) generate.ResolvedGui {
+    return .{
+        .name = name,
+        .rendering = .raw_backend,
+        .lifecycle = .{ .init = true, .shutdown = true },
+        .plugin_dir = "/fake/gui/plugin",
+        .bridge_dir = null, // in-backend adapter — no bridge for this backend
+    };
+}
+
 // ── In-tree sokol backend fixture (pluggable-backends epic #386) ──────
 // Post-#386 ALL six built-in backends resolve to EXTERNAL provider packages
 // (`builtinProvider` has no `null` arms), so production codegen is fully
