@@ -283,7 +283,15 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         try tpl.writeSection(build_zig_tmpl, "header_wasm", w);
         try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
     } else if (cfg.platform == .ios) {
-        try tpl.writeSection(build_zig_tmpl, "header_ios", w);
+        if (v2_manifest) |m| {
+            // manifest-v2 ios (PR 6): the header imports the backend hook and
+            // resolves BOTH the ios target and the SDK path via `resolve_target`
+            // (design §4) instead of the enum `header_ios`'s inline xcrun/target
+            // block + helper fns.
+            try manifest_v2_splice.renderIosHeaderV2(m, w);
+        } else {
+            try tpl.writeSection(build_zig_tmpl, "header_ios", w);
+        }
     } else if (cfg.platform == .android) {
         if (v2_manifest) |m| {
             // manifest-v2 android (PR 5): the header imports the backend hook and
@@ -305,7 +313,14 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
             try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
         }
-        try tpl.writeSection(build_zig_tmpl, "ios_deps", w);
+        if (v2_manifest != null) {
+            // manifest-v2 ios (PR 6): emit the core/gfx/engine dep decls WITHOUT
+            // the unrolled overrideImport diamond — the generic `unifyCoreDiamond`
+            // walk (emitted after the backend-dep section) replaces it (design §5).
+            try manifest_v2_splice.renderIosDepsDeclsV2(w);
+        } else {
+            try tpl.writeSection(build_zig_tmpl, "ios_deps", w);
+        }
         try tpl.writeSection(build_zig_tmpl, "game_mod_decl_ios", w);
     } else if (cfg.platform == .android) {
         // `target` (the alias for `android_target`) is consumed by the deps/plugin
@@ -586,7 +601,15 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → iOS exe root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
 
-        try tpl.writeSection(build_zig_tmpl, "ios_link", w);
+        if (v2_manifest) |m| {
+            // manifest-v2 ios (PR 6): the generic link (linkLibrary + link_libc +
+            // linkFramework from `.frameworks.ios`) plus the `post_wire` hook call
+            // for the SDK include/lib/framework paths residual (design §4). No enum
+            // `ios_link` section.
+            try manifest_v2_splice.renderLinkSectionV2(allocator, m, cfg, w);
+        } else {
+            try tpl.writeSection(build_zig_tmpl, "ios_link", w);
+        }
 
         // Bridge artifact (raw_backend GUIs)
         if (cfg.resolved_gui) |gui| {
@@ -596,7 +619,23 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         }
 
+        // manifest-v2 packaging seam (design §3/§6): ios ships `.binary` (a NO-OP),
+        // so this emits nothing and does not disturb the golden — but it keeps every
+        // v2 platform path routing packaging through the shared packager off the
+        // typed `PlatformEntry.package` recipe.
+        if (v2_manifest) |m| {
+            try manifest_v2_splice.renderPackageV2(m, cfg.platform, w);
+        }
+
         try tpl.writeSection(build_zig_tmpl, "ios_footer", w);
+
+        // manifest-v2 ios emits the generic `unifyCoreDiamond` walk (design §5) as
+        // a top-level helper AFTER the build fn + the footer's `overrideImport` def
+        // it calls. The enum path unrolls the overrides, so this is v2-only.
+        if (v2_manifest != null) {
+            try w.writeByte('\n');
+            try manifest_v2_splice.emitCoreDiamondWalk(w);
+        }
     } else if (cfg.platform == .android) {
         // Android: build shared library for NativeActivity, link NDK libs
         try tpl.writeSection(build_zig_tmpl, "android_exe_start", w);
