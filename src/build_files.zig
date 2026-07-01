@@ -980,6 +980,41 @@ pub const BuildZigZonOptions = struct {
     backend_manifest_name: ?[]const u8 = null,
 };
 
+/// The `build.zig.zon` dependency KEY for the backend on the manifest-v2 path.
+///
+/// A v2 backend's generated `build.zig` resolves its provider modules via
+/// `b.dependency(m.dep_name, ..)` (e.g. `b.dependency("acme_foo", ..)` for a
+/// third-party backend), so the `build.zig.zon` dependency entry MUST be keyed
+/// by `m.dep_name` — NOT the `labelle_<name>` derivation the zon generator /
+/// deps-linker otherwise uses. The two diverge for a third-party backend whose
+/// package name is not `labelle_*` (acme_foo → dep key `labelle_acme_foo` in the
+/// zon vs `b.dependency("acme_foo")` in build.zig), so Zig can't resolve the
+/// backend dependency. For a BUILT-IN v2 backend `m.dep_name` already equals the
+/// `labelle_<name>` derivation (sokol → `labelle_sokol`), so the emitted key is
+/// byte-unchanged.
+///
+/// Returns null — meaning "keep the `labelle_<name>` derivation" — for the
+/// v1/enum path, when no manifest is requested, or when the requested manifest
+/// isn't enabled for this target. Allocator-owned; caller frees. Errors
+/// propagate exactly as the root-build-deps load does (a broken v2 manifest
+/// fails zon generation, matching the build.zig generator — #468 finding 1).
+fn v2BackendDepName(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    project_dir: ?[]const u8,
+    backend_manifest_name: ?[]const u8,
+) !?[]const u8 {
+    const pd = project_dir orelse return null;
+    const name = backend_manifest_name orelse return null;
+    if (!manifest_splice.manifestPathEnabled(allocator, cfg, pd, name)) return null;
+    const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, pd, name);
+    defer parsed.free(allocator);
+    return switch (parsed) {
+        .v1 => null,
+        .v2 => |m| try allocator.dupe(u8, m.dep_name),
+    };
+}
+
 pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, output_dir: ?[]const u8, project_dir: ?[]const u8, opts: BuildZigZonOptions) ![]const u8 {
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer alloc_writer.deinit();
@@ -1049,18 +1084,35 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
 
     try tpl.renderSection(build_zig_zon_tmpl, "header", .{ .hash = hash_str, .version = cfg.version }, w);
 
+    // Manifest-v2 backend dep key: the generated build.zig calls
+    // `b.dependency(m.dep_name, ..)`, so the zon backend entry must be keyed by
+    // `m.dep_name` (see `v2BackendDepName`). Null → keep the `labelle_<name>`
+    // derivation (v1/enum path, byte-unchanged; also unchanged for a built-in v2
+    // backend whose `dep_name` already equals the derivation).
+    const v2_backend_dep_name = try v2BackendDepName(allocator, cfg, project_dir, opts.backend_manifest_name);
+    defer if (v2_backend_dep_name) |n| allocator.free(n);
+
     if (resolved_deps) |deps| {
         defer deps_linker.freeDepEntries(allocator, deps);
         // Deps are at .labelle/deps/, zon is at .labelle/<target>/
         const prefix = if (output_dir != null and target_dir != null) "../deps" else "deps";
+        // The deps-linker names the backend entry by the `labelle_<name>`
+        // convention; on the v2 path that entry (and ONLY it) is re-keyed to
+        // `m.dep_name` so build.zig and build.zig.zon agree on the backend dep.
+        const derived_backend_zon = try std.fmt.allocPrint(allocator, "labelle_{s}", .{cfg.backendName()});
+        defer allocator.free(derived_backend_zon);
         for (deps) |dep| {
-            try w.print("        .{s} = .{{\n", .{dep.zon_name});
+            const zon_name = if (v2_backend_dep_name) |dn|
+                (if (std.mem.eql(u8, dep.zon_name, derived_backend_zon)) dn else dep.zon_name)
+            else
+                dep.zon_name;
+            try w.print("        .{s} = .{{\n", .{zon_name});
             try w.print("            .path = \"{s}/{s}\",\n", .{ prefix, dep.link_name });
             try w.writeAll("        },\n");
         }
     } else {
         // Fallback: relative paths (for tests without target_dir)
-        try generateZonPathsFallback(allocator, cfg, target_dir, project_dir, w);
+        try generateZonPathsFallback(allocator, cfg, target_dir, project_dir, v2_backend_dep_name, w);
     }
 
     // Root build-time deps a backend hook resolves via `b.dependency` at consumer
@@ -1105,7 +1157,10 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
 }
 
 /// Fallback: compute relative paths when deps/ symlinks aren't available.
-fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, project_dir: ?[]const u8, w: anytype) !void {
+/// `v2_backend_dep_name` (see `v2BackendDepName`) re-keys the backend dep entry
+/// on the manifest-v2 path so it matches `b.dependency(m.dep_name, ..)` in the
+/// generated build.zig; null keeps the `labelle_<name>` derivation.
+fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, project_dir: ?[]const u8, v2_backend_dep_name: ?[]const u8, w: anytype) !void {
     const abs_target: ?[]const u8 = if (target_dir) |td|
         std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), td, allocator) catch null
     else
@@ -1146,7 +1201,14 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
             // External backends have no per-name `dep_<name>_path` template
             // section — emit the dep inline (same shape as the plugin loop and
             // the built-in template sections: `.labelle_<name> = .{ .path }`).
-            try w.print("        .labelle_{s} = .{{ .path = \"{s}\" }},\n", .{ bn, bp });
+            // On the v2 path the entry is keyed by `m.dep_name` so it matches
+            // `b.dependency(m.dep_name, ..)` in the generated build.zig; the
+            // v1/enum path keeps the `labelle_<name>` derivation.
+            if (v2_backend_dep_name) |dn| {
+                try w.print("        .{s} = .{{ .path = \"{s}\" }},\n", .{ dn, bp });
+            } else {
+                try w.print("        .labelle_{s} = .{{ .path = \"{s}\" }},\n", .{ bn, bp });
+            }
         } else {
             // Built-in: keep the embedded per-name template section so the
             // generated zon stays byte-identical to before this change.

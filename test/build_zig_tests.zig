@@ -682,6 +682,23 @@ pub const MANIFEST_V2_THIRD_PARTY_OPEN_CONFIG = struct {
         defer std.testing.allocator.free(out);
         try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"acme_foo\"") != null);
     }
+
+    test "open config: build.zig.zon keys the backend dep by the manifest dep_name, matching build.zig (#472 P1)" {
+        // Regression proof for #472 P1: the generated build.zig calls
+        // `b.dependency("acme_foo", ..)` (the v2 manifest's `dep_name`), but the
+        // zon generator used to derive the backend dependency key as
+        // `labelle_<name>` → `.labelle_acme_foo`. build.zig and build.zig.zon then
+        // disagreed and Zig could not resolve the backend dependency. The zon MUST
+        // key the backend entry by `dep_name` (`acme_foo`) so the two files agree.
+        const cfg = generate.ProjectConfig{ .name = "acme-game", .ecs = .mock };
+        const zon = try h.genAcmeFooBuildZigZon(std.testing.allocator, cfg);
+        defer std.testing.allocator.free(zon);
+
+        // The backend dep is keyed exactly as `b.dependency("acme_foo")` expects.
+        try std.testing.expect(std.mem.indexOf(u8, zon, ".acme_foo = .{") != null);
+        // The stale `labelle_`-prefixed derivation must NOT appear.
+        try std.testing.expect(std.mem.indexOf(u8, zon, "labelle_acme_foo") == null);
+    }
 };
 
 pub const BUILD_ZIG = struct {
@@ -1506,6 +1523,15 @@ pub const MANIFEST_V2_RAYLIB_WASM_GOLDEN = struct {
         // byte-identical to the enum-fallback `dep_emsdk` section (PR #470
         // coderabbit finding — a bare cfg made the v2 side fall to the enum path
         // too, comparing enum-vs-enum).
+        //
+        // #472 P1: the emsdk section is this test's subject. The BACKEND dep key,
+        // however, now legitimately differs between the two zons: the raylib_v2
+        // FIXTURE's package name ("raylib_v2") differs from its manifest
+        // `dep_name` ("labelle_raylib"), and the v2 build.zig resolves the backend
+        // via `b.dependency("labelle_raylib", ..)`. The v2 zon therefore CORRECTLY
+        // keys the backend dep `labelle_raylib` (matching build.zig), while the
+        // enum-path zon still derives it from the package name. The emsdk block is
+        // emitted after all path-deps and is unaffected — compare from there.
         const v2_zon = try generate.generateBuildZigZon(
             std.testing.allocator,
             wasm_v2_cfg,
@@ -1524,7 +1550,16 @@ pub const MANIFEST_V2_RAYLIB_WASM_GOLDEN = struct {
             .{},
         );
         defer std.testing.allocator.free(enum_zon);
-        try std.testing.expectEqualStrings(enum_zon, v2_zon);
+
+        const v2_emsdk = v2_zon[std.mem.indexOf(u8, v2_zon, ".emsdk = .{").?..];
+        const enum_emsdk = enum_zon[std.mem.indexOf(u8, enum_zon, ".emsdk = .{").?..];
+        try std.testing.expectEqualStrings(enum_emsdk, v2_emsdk);
+
+        // Lock in the P1 fix: the v2 zon keys the backend dep by `dep_name`
+        // (`labelle_raylib`, matching `b.dependency("labelle_raylib")` in the v2
+        // build.zig), NOT the package-name derivation (`labelle_raylib_v2`).
+        try std.testing.expect(std.mem.indexOf(u8, v2_zon, ".labelle_raylib = .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, v2_zon, "labelle_raylib_v2") == null);
     }
 };
 

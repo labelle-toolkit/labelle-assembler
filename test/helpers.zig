@@ -492,6 +492,24 @@ pub fn genAcmeFooBuildZig(
     return generate.generateBuildZig(allocator, cfg, opts);
 }
 
+/// Generate a build.zig.zon against the third-party `acme_foo` v2 fixture. Like
+/// `genAcmeFooBuildZig` this leaves `cfg.backend` at its `.raylib` default and
+/// selects the backend purely by `backend_package` + the v2 manifest, so the
+/// emitted zon must key the backend dep by the manifest's `dep_name` (`acme_foo`)
+/// — matching `b.dependency("acme_foo", ..)` in the generated build.zig. Uses the
+/// relative-path fallback (no target_dir/output_dir), read offline.
+pub fn genAcmeFooBuildZigZon(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+) ![]const u8 {
+    var cfg = cfg_in;
+    // Deliberately NOT setting cfg.backend — it stays at the meaningless default.
+    cfg.backend_package = acme_foo_fixture_package;
+    return generate.generateBuildZigZon(allocator, cfg, null, null, ".", .{
+        .backend_manifest_name = "backend.manifest.v2.zon",
+    });
+}
+
 // ── sdl + raylib v2 GOLDEN fixtures (manifest-v2, epic #453 item 3, PR 9) ──
 // sdl and raylib are the next backends converted to v2. Each ships a
 // `backend.manifest.v2.zon` (mirroring `backends/null_v2`/`backends/wgpu_v2`);
