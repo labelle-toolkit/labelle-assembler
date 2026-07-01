@@ -25,6 +25,8 @@
 //! `PackDep` view from the loaded `PackManifest`s and calls it.
 
 const std = @import("std");
+const scan = @import("codegen/scan.zig");
+const idents = @import("codegen/idents.zig");
 
 /// The dependency view of one pack: its name and the pack names it
 /// declares depending on. Borrows its strings from the caller (typically
@@ -71,6 +73,147 @@ pub fn validate(
 ) !void {
     try checkUnknownDeps(packs, declared_names);
     try checkAcyclic(allocator, packs);
+}
+
+// ── Sanitized-prefix collision check (#440 / CodeRabbit) ───────────
+
+/// Reject two packs whose `name` sanitizes to the SAME `<pack>__` namespace
+/// prefix. A pack's `name` feeds `scan.packNamespacePrefix` (codegen), which
+/// sanitizes it into a Zig-ident fragment — so `my-pack` and `my_pack` both
+/// namespace to `my_pack__…`. Left unchecked, two such packs would emit
+/// duplicate `<pack>__…` symbols and break the generated imports, registries,
+/// and hook tuples. This gate runs at generate time, before any target is
+/// written, so a collision fails cheaply with a clear diagnostic.
+///
+/// `names` is the set of pack names AS FED TO `scanPack` (i.e. the pack's
+/// plugin name in `project.labelle`, which becomes `PackScan.name` and drives
+/// the codegen prefix) — pass the same value here so the check matches the
+/// symbols actually emitted. Pure (data in, error out); the O(n²) compare is
+/// fine for the handful of packs a project declares.
+///
+/// Returns `error.PackNamePrefixCollision` naming both offending packs.
+pub fn checkPrefixCollisions(names: []const []const u8) !void {
+    var buf_a: [128]u8 = undefined;
+    var buf_b: [128]u8 = undefined;
+    for (names, 0..) |name_a, i| {
+        const prefix_a = scan.packNamespacePrefix(name_a, &buf_a);
+        for (names[i + 1 ..]) |name_b| {
+            const prefix_b = scan.packNamespacePrefix(name_b, &buf_b);
+            if (std.mem.eql(u8, prefix_a, prefix_b)) {
+                std.log.warn(
+                    "labelle: pack name collision: '{s}' and '{s}' both namespace to '{s}__'.\n" ++
+                        "  each pack's name must sanitize to a UNIQUE Zig-ident prefix — two packs\n" ++
+                        "  sharing a prefix emit duplicate `<pack>__…` symbols and break the\n" ++
+                        "  generated imports/registries/hook tuples. rename one of the packs.\n",
+                    .{ name_a, name_b, prefix_a },
+                );
+                return error.PackNamePrefixCollision;
+            }
+        }
+    }
+}
+
+// ── Emitted-name injectivity check (#440 / chatgpt-codex events L164) ──
+
+/// One emitted registry identifier plus a human-readable origin, used by
+/// `checkEmittedNameCollisions` to report which two sources collide.
+const EmittedItem = struct { emitted: []const u8, origin: []const u8 };
+
+/// Reject any two sources that fold to the SAME emitted registry identifier
+/// after pack namespacing (#440). The `<pack>__<name>` scheme is not injective
+/// on its own — pack `a` shipping `events/b__hit.zig` and pack `a__b` shipping
+/// `events/hit.zig` both emit the event tag `a__b__hit`, and the
+/// sanitized-prefix gate (`checkPrefixCollisions`) misses it because `a` and
+/// `a__b` are distinct prefixes. Rather than escape the `__` delimiter (which
+/// would change every on-disk save key and every emitted symbol), this validates
+/// the FULLY-QUALIFIED emitted names directly — the most maintainable option,
+/// and it also catches pack-internal basename clashes for subdir prefabs
+/// (`enemies/goblin` + `allies/goblin` → `<pack>__goblin` twice).
+///
+/// Checks three independent registry namespaces (component fields, event
+/// variant tags, prefab registration keys), each exactly as the block-writers
+/// emit them. Runs at generate time, before any target is written. Returns
+/// `error.PackEmittedNameCollision` naming both offending sources.
+///
+/// Plugin-declared events (`<plugin>__<event>`) are not folded in here — a
+/// pack/plugin name overlap surfaces at compile time via `MergeHookPayloads`'
+/// duplicate-field check; this gate covers the game-root + pack sources whose
+/// collisions would otherwise slip past the prefix gate.
+pub fn checkEmittedNameCollisions(
+    gpa: std.mem.Allocator,
+    component_names: []const []const u8,
+    event_names: []const []const u8,
+    prefab_names: []const []const u8,
+    pack_scans: []const scan.PackScan,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var comps: std.ArrayList(EmittedItem) = .empty;
+    var events: std.ArrayList(EmittedItem) = .empty;
+    var prefabs: std.ArrayList(EmittedItem) = .empty;
+
+    var pascal_buf: [128]u8 = undefined;
+    var prefix_buf: [128]u8 = undefined;
+
+    // Game-root sources — emitted bare (component `<Pascal>`, event
+    // `<variant>`, prefab `<basename>`), matching the block-writers.
+    for (component_names) |name| {
+        const pascal = idents.pathToPascal(name, &pascal_buf);
+        try comps.append(a, .{ .emitted = try a.dupe(u8, pascal), .origin = name });
+    }
+    for (event_names) |name| {
+        try events.append(a, .{ .emitted = try a.dupe(u8, idents.eventVariantName(name)), .origin = name });
+    }
+    for (prefab_names) |name| {
+        try prefabs.append(a, .{ .emitted = try a.dupe(u8, std.fs.path.basename(name)), .origin = name });
+    }
+
+    // Pack sources — emitted under the invisible `<prefix>__` namespace.
+    for (pack_scans) |pack| {
+        const prefix = scan.packNamespacePrefix(pack.name, &prefix_buf);
+        for (pack.component_names) |name| {
+            const pascal = idents.pathToPascal(name, &pascal_buf);
+            try comps.append(a, .{
+                .emitted = try std.fmt.allocPrint(a, "{s}__{s}", .{ prefix, pascal }),
+                .origin = try std.fmt.allocPrint(a, "pack '{s}' component '{s}'", .{ pack.name, name }),
+            });
+        }
+        for (pack.event_names) |name| {
+            try events.append(a, .{
+                .emitted = try std.fmt.allocPrint(a, "{s}__{s}", .{ prefix, idents.eventVariantName(name) }),
+                .origin = try std.fmt.allocPrint(a, "pack '{s}' event '{s}'", .{ pack.name, name }),
+            });
+        }
+        for (pack.prefab_names) |name| {
+            try prefabs.append(a, .{
+                .emitted = try std.fmt.allocPrint(a, "{s}__{s}", .{ prefix, std.fs.path.basename(name) }),
+                .origin = try std.fmt.allocPrint(a, "pack '{s}' prefab '{s}'", .{ pack.name, name }),
+            });
+        }
+    }
+
+    try reportEmittedDup("component", comps.items);
+    try reportEmittedDup("event", events.items);
+    try reportEmittedDup("prefab", prefabs.items);
+}
+
+fn reportEmittedDup(comptime kind: []const u8, items: []const EmittedItem) !void {
+    for (items, 0..) |x, i| {
+        for (items[i + 1 ..]) |y| {
+            if (std.mem.eql(u8, x.emitted, y.emitted)) {
+                std.log.warn(
+                    "labelle: duplicate emitted " ++ kind ++ " identifier '{s}':\n" ++
+                        "  {s}\n  {s}\n" ++
+                        "  pack namespacing folds these to the SAME generated symbol, which would\n" ++
+                        "  emit duplicate " ++ kind ++ "s in main.zig. rename one source (or its pack).\n",
+                    .{ x.emitted, x.origin, y.origin },
+                );
+                return error.PackEmittedNameCollision;
+            }
+        }
+    }
 }
 
 // ── Unknown-dependency check ───────────────────────────────────────
@@ -266,6 +409,61 @@ test "validate: empty pack list is trivially valid" {
     const packs = [_]PackDep{};
     const declared = [_][]const u8{};
     try validate(testing.allocator, &packs, &declared);
+}
+
+test "checkPrefixCollisions: rejects names that sanitize to the same prefix" {
+    // `my-pack` and `my_pack` both sanitize to the Zig-ident `my_pack`.
+    const names = [_][]const u8{ "my-pack", "my_pack" };
+    try testing.expectError(error.PackNamePrefixCollision, checkPrefixCollisions(&names));
+}
+
+test "checkPrefixCollisions: rejects exact duplicate names" {
+    const names = [_][]const u8{ "citizens", "rooms", "citizens" };
+    try testing.expectError(error.PackNamePrefixCollision, checkPrefixCollisions(&names));
+}
+
+test "checkPrefixCollisions: accepts distinct sanitized prefixes" {
+    const names = [_][]const u8{ "citizens", "rooms", "production" };
+    try checkPrefixCollisions(&names);
+}
+
+test "checkPrefixCollisions: empty and single sets are trivially valid" {
+    try checkPrefixCollisions(&[_][]const u8{});
+    try checkPrefixCollisions(&[_][]const u8{"solo"});
+}
+
+test "checkEmittedNameCollisions: pack 'a'+'b__hit' and pack 'a__b'+'hit' both fold to 'a__b__hit'" {
+    // The delimiter is not injective on its own: distinct (pack, event) pairs
+    // fold to the same emitted tag, which the prefix gate ('a' ≠ 'a__b') misses.
+    const packs = [_]scan.PackScan{
+        .{ .name = "a", .import_prefix = "packs/a", .component_names = &.{}, .event_names = &.{"b__hit"}, .prefab_names = &.{}, .hook_names = &.{} },
+        .{ .name = "a__b", .import_prefix = "packs/a__b", .component_names = &.{}, .event_names = &.{"hit"}, .prefab_names = &.{}, .hook_names = &.{} },
+    };
+    try testing.expectError(
+        error.PackEmittedNameCollision,
+        checkEmittedNameCollisions(testing.allocator, &.{}, &.{}, &.{}, &packs),
+    );
+}
+
+test "checkEmittedNameCollisions: two subdir pack prefabs sharing a basename collide" {
+    // `enemies/goblin` and `allies/goblin` both register as `pack__goblin`.
+    const packs = [_]scan.PackScan{
+        .{ .name = "pack", .import_prefix = "packs/pack", .component_names = &.{}, .event_names = &.{}, .prefab_names = &.{ "enemies/goblin", "allies/goblin" }, .hook_names = &.{} },
+    };
+    try testing.expectError(
+        error.PackEmittedNameCollision,
+        checkEmittedNameCollisions(testing.allocator, &.{}, &.{}, &.{}, &packs),
+    );
+}
+
+test "checkEmittedNameCollisions: distinct emitted names pass" {
+    const packs = [_]scan.PackScan{
+        .{ .name = "a", .import_prefix = "packs/a", .component_names = &.{"worker"}, .event_names = &.{"hit"}, .prefab_names = &.{"boss"}, .hook_names = &.{} },
+        .{ .name = "b", .import_prefix = "packs/b", .component_names = &.{"worker"}, .event_names = &.{"hit"}, .prefab_names = &.{"boss"}, .hook_names = &.{} },
+    };
+    // Game root also defines a `hit` event + `Worker` component — bare vs
+    // `<pack>__`-prefixed, so no clash.
+    try checkEmittedNameCollisions(testing.allocator, &.{"worker"}, &.{"hit"}, &.{"level"}, &packs);
 }
 
 test "validate: diamond DAG (shared lower dep) is acyclic" {

@@ -147,18 +147,21 @@ pub fn Mixin(comptime Self: type) type {
             try self.writePluginCoercionsBlock(w);
         }
 
-        /// Emit `<ident>: <ident>.<Pascal>,` union variants for every pack
-        /// event (Packs RFC §4, #439), matching the game-root event loop's
-        /// shape. The `<ident>` alias is defined by `writeEventImportsBlock`
-        /// as `@import("<pack.import_prefix>/events/<name>.zig")`. Bare
-        /// `eventVariantName` today (namespacing is #440); a pack and the game
-        /// root that both name `hit.zig` would collide on `hit` here.
+        /// Emit `<pfx>__<ident>: <pfx>__<ident>.<Pascal>,` union variants for
+        /// every pack event (Packs RFC §4, #439), matching the game-root event
+        /// loop's shape but under the invisible `<pack>__` prefix (#440). The
+        /// `<pfx>__<ident>` alias is defined by `writeEventImportsBlock` as
+        /// `@import("<pack.import_prefix>/events/<name>.zig")`; the variant tag
+        /// and the type reference both use it, so a pack and the game root that
+        /// both name `hit.zig` no longer collide on the bare `hit`.
         fn writePackEventVariants(self: *Self, w: anytype, pascal_buf: *[128]u8) !void {
+            var pack_prefix_buf: [128]u8 = undefined;
             for (self.pack_scans) |pack| {
+                const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
                 for (pack.event_names) |name| {
                     const ident = eventVariantName(name);
                     const pascal = pathToPascal(name, pascal_buf);
-                    try w.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
+                    try w.print("    {s}__{s}: {s}__{s}.{s},\n", .{ prefix, ident, prefix, ident, pascal });
                 }
             }
         }

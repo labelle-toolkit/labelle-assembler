@@ -133,10 +133,15 @@ pub fn Mixin(comptime Self: type) type {
                 // prefab root is the pack's own `<import_prefix>/prefabs` so a
                 // pack prefab's `"include"` / source-relative lookups resolve
                 // against the copied pack dir, not the game's (chatgpt-codex, #478).
+                // The registration KEY is the invisible `<pack>__<display>`
+                // (#440) so a pack and the game root that both ship `worker`
+                // don't collide in the runtime name→source registry.
+                var pack_prefix_buf: [128]u8 = undefined;
                 for (self.pack_scans) |pack| {
+                    const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
                     for (pack.prefab_names) |name| {
                         const display = std.fs.path.basename(name);
-                        try w.print("    JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"{s}/prefabs/{s}.jsonc\"), \"{s}/prefabs\") catch @panic(\"failed to load prefab\");\n", .{ display, pack.import_prefix, name, pack.import_prefix });
+                        try w.print("    JsoncBridge.addEmbeddedPrefab(&g, \"{s}__{s}\", @embedFile(\"{s}/prefabs/{s}.jsonc\"), \"{s}/prefabs\") catch @panic(\"failed to load prefab\");\n", .{ prefix, display, pack.import_prefix, name, pack.import_prefix });
                     }
                 }
                 try w.writeByte('\n');

@@ -25,6 +25,8 @@ pub const plugin_manifest = @import("plugin_manifest.zig");
 pub const pack_validate = @import("pack_validate.zig");
 const gui_resolve = @import("gui_resolve.zig");
 pub const app_icon = @import("app_icon.zig");
+const scan = @import("codegen/scan.zig");
+const idents = @import("codegen/idents.zig");
 
 // Force test discovery for files that aren't transitively reached by
 // any compiled function path during `addTest` runs.
@@ -579,14 +581,17 @@ fn scanPackSubdir(
 
 /// Scan a pack's convention subdirs (Packs RFC §4, labelle-assembler#439).
 ///
-/// Copies `<pack_src_dir>/{components,events,prefabs}/` into
+/// Copies `<pack_src_dir>/{components,events,prefabs,hooks}/` into
 /// `<target_dir>/packs/<pack_name>/{...}/` and collects the scanned stems
 /// into a `PackScan` whose `import_prefix` is `packs/<pack_name>` — the path
 /// the generated `main.zig` imports through. The returned `PackScan` owns
 /// every string; the caller must `deinit` it.
 ///
-/// `hooks/` is intentionally not scanned yet — see the deferred list at the
-/// pack-scan loop in `generate`.
+/// After copying the pack's `prefabs/`, this rewrites each copied prefab's
+/// local component references to the invisible `<pack>__<Name>` form (#440,
+/// see `scan.rewritePackComponentKeys`) so a pack author's `.Worker` resolves
+/// against the namespaced field the component registry emits. Only the pack's
+/// OWN scanned components are rewritten; built-in/engine names are left alone.
 ///
 /// Exposed publicly so tests can exercise the copy/scan without the full
 /// cache-resolution + codegen pipeline.
@@ -610,6 +615,21 @@ pub fn scanPack(
     errdefer scanner.freeNames(allocator, event_names);
     const prefab_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "prefabs", ".jsonc");
     errdefer scanner.freeNames(allocator, prefab_names);
+    // hooks/ (#440): scanned + registered into the game-root hook pipeline
+    // under the `<pack>__` ident prefix (see the hook block-writers).
+    const hook_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "hooks", ".zig");
+    errdefer scanner.freeNames(allocator, hook_names);
+
+    // Local→prefixed ref rewrite (#440): rewrite the copied prefab JSONC so a
+    // pack's own component references (`"Worker"`) and prefab compositions
+    // (`{ "prefab": "worker" }`) become the namespaced forms
+    // (`"citizens__Worker"` / `"citizens__worker"`). Done against the copied
+    // (destination) files so the source pack tree is never mutated.
+    try rewritePackPrefabRefs(allocator, dst_base, pack_name, component_names, prefab_names);
+    // …and rewrite the copied hook sources so a handler written with the pack's
+    // bare local event name receives its `<pack>__`-prefixed event (chatgpt-codex
+    // #3). Same "mutate the copy, never the source" discipline.
+    try rewritePackHookHandlers(allocator, dst_base, pack_name, event_names, hook_names);
 
     return .{
         .name = name_owned,
@@ -617,7 +637,128 @@ pub fn scanPack(
         .component_names = component_names,
         .event_names = event_names,
         .prefab_names = prefab_names,
+        .hook_names = hook_names,
     };
+}
+
+/// Rewrite every copied pack prefab JSONC in place so its local references
+/// become the invisible `<pack>__…` form (#440). Two reference kinds are
+/// rewritten (see `scan.rewritePackLocalRefs`):
+///
+///   - **Component keys** — Pascal forms of the pack's scanned component
+///     stems, only in genuine component-declaration positions (context-aware,
+///     chatgpt-codex #2). Payload-data keys that happen to share a component's
+///     spelling are left alone.
+///   - **Prefab references** — a `"prefab": "worker"` value naming one of the
+///     pack's OWN prefabs becomes `"prefab": "citizens__worker"`, matching the
+///     namespaced registration key so a same-pack prefab composition resolves
+///     (chatgpt-codex #1). A pack with prefabs that reference each other but
+///     ships no components is still rewritten (the guard is on prefab count,
+///     not component count).
+fn rewritePackPrefabRefs(
+    allocator: std.mem.Allocator,
+    dst_base: []const u8,
+    pack_name: []const u8,
+    component_names: []const []const u8,
+    prefab_names: []const []const u8,
+) !void {
+    // Nothing to walk without prefab files. Note the guard is intentionally
+    // NOT gated on `component_names` — a component-less pack can still have
+    // prefab-to-prefab references that need namespacing (chatgpt-codex #1).
+    if (prefab_names.len == 0) return;
+
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = scan.packNamespacePrefix(pack_name, &prefix_buf);
+
+    // Build the Pascal-form key set once — this is the exact string a JSONC
+    // component key uses and the exact field the registry emits.
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit(allocator);
+    }
+    try keys.ensureTotalCapacity(allocator, component_names.len);
+    for (component_names) |stem| {
+        var pascal_buf: [128]u8 = undefined;
+        const pascal = idents.pathToPascal(stem, &pascal_buf);
+        keys.appendAssumeCapacity(try allocator.dupe(u8, pascal));
+    }
+
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const prefabs_dir = try std.fs.path.join(allocator, &.{ dst_base, "prefabs" });
+    defer allocator.free(prefabs_dir);
+
+    for (prefab_names) |name| {
+        const rel = try std.fmt.allocPrint(allocator, "{s}.jsonc", .{name});
+        defer allocator.free(rel);
+        const path = try std.fs.path.join(allocator, &.{ prefabs_dir, rel });
+        defer allocator.free(path);
+
+        const src = cwd.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer allocator.free(src);
+
+        const rewritten = try scan.rewritePackLocalRefs(allocator, src, keys.items, prefab_names, prefix);
+        defer allocator.free(rewritten);
+
+        // Only rewrite the file when the content actually changed — avoids
+        // churning mtimes (and the build cache) on prefabs with no local refs.
+        if (std.mem.eql(u8, rewritten, src)) continue;
+        var f = try cwd.createFile(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, rewritten);
+    }
+}
+
+/// Rewrite every copied pack `hooks/*.zig` in place so a handler written with
+/// the pack's BARE local event name receives its `<pack>__`-prefixed event
+/// (chatgpt-codex #3). Mirrors `rewritePackPrefabRefs` but over the hook
+/// sources and the pack's own event names — see
+/// `scan.rewritePackHookHandlerNames` for the match rule. A pack with no
+/// events (nothing to prefix) or no hooks is a no-op.
+fn rewritePackHookHandlers(
+    allocator: std.mem.Allocator,
+    dst_base: []const u8,
+    pack_name: []const u8,
+    event_names: []const []const u8,
+    hook_names: []const []const u8,
+) !void {
+    if (event_names.len == 0 or hook_names.len == 0) return;
+
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = scan.packNamespacePrefix(pack_name, &prefix_buf);
+
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const hooks_dir = try std.fs.path.join(allocator, &.{ dst_base, "hooks" });
+    defer allocator.free(hooks_dir);
+
+    for (hook_names) |name| {
+        const rel = try std.fmt.allocPrint(allocator, "{s}.zig", .{name});
+        defer allocator.free(rel);
+        const path = try std.fs.path.join(allocator, &.{ hooks_dir, rel });
+        defer allocator.free(path);
+
+        const src = cwd.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer allocator.free(src);
+
+        // `name` is the hook file stem (`overlay` / `combat/overlay`); the
+        // rewrite scopes the rename to that file's receiver container
+        // (`pathToPascal(name)`), so unrelated helpers are never touched.
+        const rewritten = try scan.rewritePackHookHandlerNames(allocator, src, event_names, prefix, name);
+        defer allocator.free(rewritten);
+
+        if (std.mem.eql(u8, rewritten, src)) continue;
+        var f = try cwd.createFile(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, rewritten);
+    }
 }
 
 pub fn generate(
@@ -780,6 +921,20 @@ pub fn generate(
         for (cfg.plugins) |plugin| declared_names.appendAssumeCapacity(plugin.name);
 
         try pack_validate.validate(allocator, pack_deps.items, declared_names.items);
+
+        // Prefix-collision gate (#440 / CodeRabbit): a pack's name feeds
+        // `scan.packNamespacePrefix` (codegen). Two packs whose names sanitize
+        // to the same `<pack>__` prefix (e.g. `my-pack` and `my_pack`) would
+        // emit duplicate namespaced symbols and break the generated
+        // imports/registries/hook tuples. Check over the SAME name the pack-scan
+        // loop feeds `scanPack` (`plugin.name` → `PackScan.name` → prefix), so
+        // the gate matches the symbols actually emitted. Fails before any target
+        // is written.
+        var pack_names: std.ArrayList([]const u8) = .empty;
+        defer pack_names.deinit(allocator);
+        try pack_names.ensureTotalCapacity(allocator, pack_entries.items.len);
+        for (pack_entries.items) |e| pack_names.appendAssumeCapacity(e.plugin.name);
+        try pack_validate.checkPrefixCollisions(pack_names.items);
     }
 
     try cwd.createDirPath(io, target_dir);
@@ -1069,22 +1224,21 @@ pub fn generate(
     // `main_template.pack_scans`. Plugins WITHOUT a `pack.labelle` (every
     // decl-module plugin today) are skipped, so this is fully back-compat.
     //
-    // Scope of this slice (#439): components + events + prefabs are scanned
-    // and registered. DEFERRED with clean seams:
-    //   * `hooks/` scanning — the game-root hook pipeline is a three-block
-    //     coordination (import + GameHooks type + per-instance init) that
-    //     needs the `<pack>__` ident-namespacing to avoid collisions; folded
-    //     in once #440 lands the prefix.
-    //   * the invisible `<pack>__<Name>` prefix + `.jsonc` local→prefixed ref
-    //     rewrite (#440) — today registered names are BARE.
+    // Scope (#439 + #440): components + events + prefabs + hooks are scanned
+    // and registered under the invisible `<pack>__<Name>` prefix (§4), and a
+    // pack's own prefab JSONC has its local component refs rewritten to the
+    // prefixed form (`scanPack` → `rewritePackPrefabRefs`). DEFERRED with
+    // clean seams:
     //   * the per-pack `global ++ own` registry partition / `PackView`
     //     (#652-remainder) — today everything lands in one flat registry.
     //   * `exposes` / `depends_on` DAG + isolation (#440 / §6).
     //
     // The pack manifests reused below were parsed ONCE near the top of
-    // `generate()` (`pack_entries`), where the dependency-validation gate also
-    // runs — a bad `depends_on` graph rejects the build before any target
-    // writes, rather than re-reading `pack.labelle` here.
+    // `generate()` (`pack_entries`), where the dependency-validation gate AND
+    // the sanitized-prefix collision gate both run — a bad `depends_on` graph
+    // or two packs whose names sanitize to the same `<pack>__` prefix reject
+    // the build before any target writes, rather than re-reading `pack.labelle`
+    // here.
     var pack_scans: std.ArrayList(main_zig.PackScan) = .empty;
     defer {
         for (pack_scans.items) |*p| p.deinit(allocator);
@@ -1102,6 +1256,21 @@ pub fn generate(
         const scanned = try scanPack(allocator, pack_src_dir, target_dir, e.plugin.name);
         pack_scans.appendAssumeCapacity(scanned);
     }
+
+    // Injectivity gate (#440 / chatgpt-codex events L164): the `<pack>__<name>`
+    // scheme is not injective on its own — two distinct (pack, name) pairs can
+    // fold to the same emitted symbol (e.g. pack `a` + `b__hit` and pack `a__b`
+    // + `hit` both emit `a__b__hit`), which the sanitized-prefix gate above
+    // can't see. Validate the fully-qualified component/event/prefab names the
+    // block-writers will emit — over BOTH the game root and every pack — and
+    // fail before any main.zig is written.
+    try pack_validate.checkEmittedNameCollisions(
+        allocator,
+        component_names,
+        event_names,
+        prefab_names,
+        pack_scans.items,
+    );
 
     // ── Flow-node discovery (RFC-FLOW-VOCABULARY phase 2) ──────────────
     //

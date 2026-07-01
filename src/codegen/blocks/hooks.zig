@@ -118,7 +118,7 @@ pub fn Mixin(comptime Self: type) type {
         pub fn writeGameHooksBlock(self: *Self, w: anytype, ident_buf: *[256]u8, flow_order: []const usize) !void {
             const hook_names = self.hook_names;
             const script_entries = self.script_entries;
-            if (hook_names.len == 0 and flow_order.len == 0) {
+            if (hook_names.len == 0 and flow_order.len == 0 and !self.hasPackHooks()) {
                 try w.writeAll("const GameHooks = struct {};\n\n");
             } else {
                 var pascal_buf: [128]u8 = undefined;
@@ -127,6 +127,19 @@ pub fn Mixin(comptime Self: type) type {
                     const ident = pathToIdent(name, ident_buf);
                     const pascal = pathToPascal(name, &pascal_buf);
                     try w.print(" *{s}.{s},", .{ ident, pascal });
+                }
+                // Pack hooks (#440) — receiver types after the game-root hooks,
+                // before the flow-handler tail. Prefixed `<pack>__<ident>` to
+                // match the import alias + `hooks_init` instance idents. The
+                // ordering here MUST mirror `writeHooksInitBlock`'s tuple order.
+                var pack_prefix_buf: [128]u8 = undefined;
+                for (self.pack_scans) |pack| {
+                    const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
+                    for (pack.hook_names) |name| {
+                        const ident = pathToIdent(name, ident_buf);
+                        const pascal = pathToPascal(name, &pascal_buf);
+                        try w.print(" *{s}__{s}.{s},", .{ prefix, ident, pascal });
+                    }
                 }
                 // Flow handler receiver types — appended after hooks so the
                 // scanner sort (flows-among-flows) sits inside a single
@@ -149,7 +162,7 @@ pub fn Mixin(comptime Self: type) type {
         pub fn writeHooksInitBlock(self: *Self, w: anytype, ident_buf: *[256]u8, flow_order: []const usize) !void {
             const hook_names = self.hook_names;
             const script_entries = self.script_entries;
-            if (hook_names.len == 0 and flow_order.len == 0) {
+            if (hook_names.len == 0 and flow_order.len == 0 and !self.hasPackHooks()) {
                 try w.writeAll("    var hooks = GameHooks{};\n");
             } else {
                 var pascal_buf: [128]u8 = undefined;
@@ -157,6 +170,19 @@ pub fn Mixin(comptime Self: type) type {
                     const ident = pathToIdent(name, ident_buf);
                     const pascal = pathToPascal(name, &pascal_buf);
                     try w.print("    var {s}_inst = {s}.{s}{{}};\n", .{ ident, ident, pascal });
+                }
+                // Pack-hook instances (#440) — `<pack>__<ident>_inst`,
+                // materialised after the game-root hooks and before the flow
+                // handlers so the `.receivers` tuple below matches the
+                // `GameHooks` receiver-type order exactly.
+                var pack_prefix_buf: [128]u8 = undefined;
+                for (self.pack_scans) |pack| {
+                    const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
+                    for (pack.hook_names) |name| {
+                        const ident = pathToIdent(name, ident_buf);
+                        const pascal = pathToPascal(name, &pascal_buf);
+                        try w.print("    var {s}__{s}_inst = {s}__{s}.{s}{{}};\n", .{ prefix, ident, prefix, ident, pascal });
+                    }
                 }
                 // Materialise each flow handler so it has a stable address
                 // the `&` operator can produce a pointer to. `pathToIdent`
@@ -186,6 +212,14 @@ pub fn Mixin(comptime Self: type) type {
                 for (hook_names) |name| {
                     const ident = pathToIdent(name, ident_buf);
                     try w.print(" &{s}_inst,", .{ident});
+                }
+                // Pack-hook receiver pointers — same order as the type tuple.
+                for (self.pack_scans) |pack| {
+                    const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
+                    for (pack.hook_names) |name| {
+                        const ident = pathToIdent(name, ident_buf);
+                        try w.print(" &{s}__{s}_inst,", .{ prefix, ident });
+                    }
                 }
                 // The tuple-literal order MUST match the receiver-type
                 // order in `GameHooks` above — `MergeHooks.emit` looks each

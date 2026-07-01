@@ -139,9 +139,12 @@ pub fn Mixin(comptime Self: type) type {
                     try w.print("    try JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"prefabs/{s}.jsonc\"), \"prefabs\");\n", .{ display, name });
                 }
                 // Pack prefabs (Packs RFC §4, #439): embedded from the pack's
-                // `import_prefix`, registered by bare basename (namespacing is
-                // #440). No comptime PrefabRegistry entry — JSONC prefabs are a
-                // runtime name→source registry, so a pack just registers more.
+                // `import_prefix`, registered under the invisible
+                // `<pack>__<basename>` key (#440) so a pack and the game root
+                // that both ship `worker` don't collide in the runtime
+                // name→source registry. No comptime PrefabRegistry entry —
+                // JSONC prefabs are a runtime name→source registry, so a pack
+                // just registers more.
                 //
                 // The prefab root MUST be the pack's own `<import_prefix>/prefabs`
                 // (e.g. `packs/citizens/prefabs`), NOT the bare `"prefabs"` root:
@@ -150,10 +153,12 @@ pub fn Mixin(comptime Self: type) type {
                 // lookups resolve against. Registering a pack prefab under the
                 // game's `"prefabs"` would make its includes resolve against the
                 // game tree instead of the copied pack dir (chatgpt-codex, #478).
+                var pack_prefix_buf: [128]u8 = undefined;
                 for (self.pack_scans) |pack| {
+                    const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
                     for (pack.prefab_names) |name| {
                         const display = std.fs.path.basename(name);
-                        try w.print("    try JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"{s}/prefabs/{s}.jsonc\"), \"{s}/prefabs\");\n", .{ display, pack.import_prefix, name, pack.import_prefix });
+                        try w.print("    try JsoncBridge.addEmbeddedPrefab(&g, \"{s}__{s}\", @embedFile(\"{s}/prefabs/{s}.jsonc\"), \"{s}/prefabs\");\n", .{ prefix, display, pack.import_prefix, name, pack.import_prefix });
                     }
                 }
                 try w.writeByte('\n');

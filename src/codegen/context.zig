@@ -202,4 +202,14 @@ pub const Codegen = struct {
         }
         return false;
     }
+
+    /// True iff any pack contributed at least one `hooks/*.zig` (#440). Gates
+    /// the hook-imports / `GameHooks` receiver-tuple / `hooks_init` blocks so
+    /// a pack can register hooks even when the game root declares none.
+    pub fn hasPackHooks(self: *const Self) bool {
+        for (self.pack_scans) |p| {
+            if (p.hook_names.len > 0) return true;
+        }
+        return false;
+    }
 };

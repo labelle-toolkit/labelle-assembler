@@ -69,14 +69,18 @@ pub fn Mixin(comptime Self: type) type {
             // field-set as the game root — the "unified set" (§6-1b): they're
             // stored + serialized identically, no separate registry. Files
             // live under the pack's `import_prefix` (e.g. `packs/citizens`),
-            // scanned/copied by `root.zig`. NOTE (#440): the field name is the
-            // pack's *bare* `Pascal` (no `<pack>__` prefix yet) — a pack and
-            // the game root that both define `Worker` collide here; the
-            // invisible prefix that closes that is deferred.
+            // scanned/copied by `root.zig`. #440: the registry FIELD is the
+            // invisible `<pack>__<Pascal>` (e.g. `.citizens__Worker`) so a pack
+            // and the game root that both define `Worker` never collide — the
+            // author still writes the bare local name in JSONC (rewritten by
+            // `scanPack`). The imported DECL name stays bare — it's the
+            // component type's own `pub const Worker` inside the pack file.
+            var pack_prefix_buf: [128]u8 = undefined;
             for (self.pack_scans) |pack| {
+                const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
                 for (pack.component_names) |name| {
                     const pascal = pathToPascal(name, &pascal_buf);
-                    try w.print("    .{s} = @import(\"{s}/components/{s}.zig\").{s},\n", .{ pascal, pack.import_prefix, name, pascal });
+                    try w.print("    .{s}__{s} = @import(\"{s}/components/{s}.zig\").{s},\n", .{ prefix, pascal, pack.import_prefix, name, pascal });
                 }
             }
             if (has_plugins) {

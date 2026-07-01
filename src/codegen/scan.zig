@@ -20,6 +20,7 @@ const config = @import("../config.zig");
 const cache = @import("../cache.zig");
 const script_scanner = @import("../script_scanner.zig");
 const scanners = @import("../flow_catalog/scanners.zig");
+const idents = @import("idents.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
@@ -56,22 +57,27 @@ fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
 /// e.g. `"packs/citizens"` — files live at
 /// `<import_prefix>/{components,events,prefabs}/<name>.<ext>`.
 ///
-/// Namespacing NOTE (deferred to #440): the registered identifiers are the
-/// pack's *bare* stems (`.Worker`, not `.citizens__Worker`). The physical
-/// path is already pack-namespaced (files never collide on disk), but the
-/// *registry field / event-variant* names are bare, so a pack and the game
-/// root that both define `Worker` would collide at the registry. The
-/// invisible `<pack>__` prefix that closes this is a separate ticket; this
-/// slice only unblocks the discarded-names gap.
+/// Namespacing (#440): a pack's contributed component / prefab / pack-local
+/// event names are registered in the generated global registry under the
+/// invisible `<pack>__<Name>` prefix (see `packNamespacePrefix`) — authors
+/// write local names (`.Worker`) and the assembler namespaces them so a pack
+/// and the game root that both define `Worker` never collide. The physical
+/// path is already pack-namespaced (`import_prefix`), so files never collide
+/// on disk either.
 ///
 /// Owned by `deinit` — `name`, `import_prefix`, and every string in the
-/// three name slices are heap dupes made by the scan/copy pass.
+/// four name slices are heap dupes made by the scan/copy pass.
 pub const PackScan = struct {
     name: []const u8,
     import_prefix: []const u8,
     component_names: []const []const u8,
     event_names: []const []const u8,
     prefab_names: []const []const u8,
+    /// Pack `hooks/*.zig` stems (#440). Registered into the SAME `GameHooks`
+    /// receiver tuple as the game root's `hooks/`, under the `<pack>__` ident
+    /// prefix so two packs shipping `overlay.zig` don't collide on the import
+    /// alias / receiver-instance identifier.
+    hook_names: []const []const u8 = &.{},
 
     pub fn deinit(self: *PackScan, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -79,6 +85,7 @@ pub const PackScan = struct {
         freeNameSlice(allocator, self.component_names);
         freeNameSlice(allocator, self.event_names);
         freeNameSlice(allocator, self.prefab_names);
+        freeNameSlice(allocator, self.hook_names);
     }
 
     fn freeNameSlice(allocator: std.mem.Allocator, names: []const []const u8) void {
@@ -86,6 +93,498 @@ pub const PackScan = struct {
         allocator.free(names);
     }
 };
+
+/// Derive a pack's invisible namespace ident from its manifest `name`
+/// (Packs RFC §4, #440). Every registry ident a pack contributes — the
+/// component registry field (`<pfx>__<Pascal>`), the pack-local event
+/// variant + its import alias, the prefab registration key, and the hook
+/// import alias / receiver-instance ident — is prefixed `<pfx>__`, mirroring
+/// the existing `<plugin>__<event>` convention (`plugin_registries.zig`).
+/// The name is sanitized to a valid Zig identifier fragment the same way
+/// plugin idents are, so a pack named `my-pack` namespaces as `my_pack__…`.
+///
+/// SAVE-STABILITY: the prefixed component name is the on-disk save key
+/// (`serde.componentName`, engine-side), so a pack's `name` is **save-stable**
+/// — renaming a shipped pack changes every component's save key and is
+/// therefore a save migration, not a cosmetic rename. Treat a pack `name`
+/// like a serialized schema field once the pack has shipped.
+pub fn packNamespacePrefix(pack_name: []const u8, buf: *[128]u8) []const u8 {
+    return sanitizePluginIdent(pack_name, buf);
+}
+
+/// Back-compat shim (#440). Rewrites only pack-owned component KEYS —
+/// delegates to `rewritePackLocalRefs` with an empty prefab-name set so no
+/// `"prefab"` values are touched. Kept because the unit tests below (and any
+/// external caller) reference this narrower entry point directly. New call
+/// sites should prefer `rewritePackLocalRefs`, which also rewrites pack-local
+/// prefab references (chatgpt-codex finding #1).
+pub fn rewritePackComponentKeys(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    local_keys: []const []const u8,
+    prefix: []const u8,
+) ![]u8 {
+    return rewritePackLocalRefs(allocator, src, local_keys, &.{}, prefix);
+}
+
+/// Rewrite a pack's own prefab/scene JSONC so **local references to the
+/// pack's OWN components and prefabs** resolve in the unified registry
+/// (Packs RFC §4, #440). Two kinds of reference are rewritten, both keeping
+/// the `<pack>__` prefix invisible to the author:
+///
+///   1. **Component keys** — a component-declaration key whose content
+///      exactly equals one of `component_keys` becomes `<prefix>__<Name>`
+///      (`"Worker"` → `"citizens__Worker"`), byte-matching the field the
+///      component registry emits.
+///   2. **Prefab references** — a `"prefab"` string *value* whose **basename**
+///      matches one of `prefab_names` becomes `<prefix>__<basename>`
+///      (`"prefab": "worker"` → `"prefab": "citizens__worker"`), matching the
+///      `addEmbeddedPrefab(&g, "citizens__worker", …)` registration key. A
+///      composing prefab (`{ "prefab": "worker" }`) would otherwise reference
+///      the bare `worker`, which is never registered (chatgpt-codex #1).
+///      Subdirectory prefabs are keyed by BASENAME at registration
+///      (`addEmbeddedPrefab` uses `std.fs.path.basename`), so both a bare
+///      `"worker"` and a path `"enemies/goblin"` reference resolve to the same
+///      basename-prefixed key (`citizens__goblin`) (chatgpt-codex L704).
+///
+/// **Context-awareness (chatgpt-codex #2).** Both rewrites are gated on the
+/// current object *scope*, tracked precisely as we descend. A `"components"` /
+/// `"overrides"` object is treated as a component map ONLY when its parent is
+/// an ENTITY / prefab-patch scope (the wrapped shape the engine's `entityPatch`
+/// / `prefabComponents` treat as the component map); a `"components"` /
+/// `"overrides"` key nested inside a component's *value* (payload) is opaque
+/// data and opens no component map. So a key of the SAME text as a pack
+/// component appearing as payload — e.g.
+/// `{ "Spawner": { "overrides": { "Worker": 3 } } }` — is left untouched, and
+/// the payload never gets corrupted before deserialization.
+///
+/// Prefab-reference rewriting is likewise scoped to the *value* of a `"prefab"`
+/// key that sits directly on an ENTITY scope — a `"prefab"` field appearing as
+/// payload data inside a component's value (e.g.
+/// `{ "Spawner": { "prefab": "worker" } }`) is component data, not an entity
+/// reference, and is left alone (chatgpt-codex L288). Only pack-OWN prefabs are
+/// rewritten — a reference to a non-pack (game-root / built-in) prefab is left
+/// bare.
+///
+/// **Boundary (documented):** the engine also accepts a *flat* shape (RFC
+/// #596) where PascalCase component keys sit directly on an entity object with
+/// no `"components"`/`"overrides"` wrapper. Detecting that shape reliably at
+/// the byte level requires full structural entity-vs-payload disambiguation;
+/// the pack authoring convention (and every pack fixture) uses the wrapped
+/// shape, so flat-form component keys are intentionally NOT rewritten here.
+/// This is the conservative-but-correct scope the ticket calls for: it never
+/// corrupts payload data, at the cost of not namespacing the flat shape.
+///
+/// String *values* (other than `"prefab"`) and JSONC comment text are never
+/// rewritten. Returns an allocator-owned buffer; when nothing matches it is
+/// still a fresh dupe of the input, so the caller frees unconditionally.
+pub fn rewritePackLocalRefs(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    component_keys: []const []const u8,
+    prefab_names: []const []const u8,
+    prefix: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    // Object-nesting context. Each open `{`/`[` pushes the *scope* of the
+    // container it introduces so we can tell an entity/prefab-patch object
+    // (where `components`/`overrides`/`prefab` are meaningful) apart from a
+    // component *payload* (opaque data that must never be rewritten). See
+    // `Scope` for the frame kinds and `childScope`/`childArrayScope` for the
+    // transitions.
+    var scope_stack: std.ArrayList(Scope) = .empty;
+    defer scope_stack.deinit(allocator);
+
+    // The most-recent object key at the current level, awaiting its value.
+    // Drives both "is the next `{` a component map?" and "is this string the
+    // value of a `prefab` key?". Reset whenever the pending key's value is
+    // consumed (a value string, a container open/close, or a `,`).
+    var pending_key: ?[]const u8 = null;
+
+    const topScope = struct {
+        fn f(stack: []const Scope) ?Scope {
+            return if (stack.len > 0) stack[stack.len - 1] else null;
+        }
+    }.f;
+
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+
+        // JSONC line comment — copy verbatim to end of line.
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            const nl = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+            try out.appendSlice(allocator, src[i..nl]);
+            i = nl;
+            continue;
+        }
+        // JSONC block comment — copy verbatim to the closing `*/`.
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+            const close = std.mem.indexOfPos(u8, src, i + 2, "*/");
+            const end = if (close) |p| p + 2 else src.len;
+            try out.appendSlice(allocator, src[i..end]);
+            i = end;
+            continue;
+        }
+        // Container open — the object/array is the value of `pending_key`.
+        if (c == '{') {
+            try scope_stack.append(allocator, childScope(topScope(scope_stack.items), pending_key));
+            pending_key = null;
+            try out.append(allocator, c);
+            i += 1;
+            continue;
+        }
+        if (c == '[') {
+            try scope_stack.append(allocator, childArrayScope(topScope(scope_stack.items), pending_key));
+            pending_key = null;
+            try out.append(allocator, c);
+            i += 1;
+            continue;
+        }
+        if (c == '}' or c == ']') {
+            if (scope_stack.items.len > 0) _ = scope_stack.pop();
+            pending_key = null;
+            try out.append(allocator, c);
+            i += 1;
+            continue;
+        }
+        // A comma ends the current key/value pair — clear any pending key so
+        // a primitive value (number/bool/null) can't leak into the next pair.
+        if (c == ',') {
+            pending_key = null;
+            try out.append(allocator, c);
+            i += 1;
+            continue;
+        }
+        // String literal — capture its inner content, then decide whether it
+        // is a component-declaration key, a `"prefab"` value, or neither.
+        if (c == '"') {
+            const content_start = i + 1;
+            var j = content_start;
+            while (j < src.len) : (j += 1) {
+                if (src[j] == '\\' and j + 1 < src.len) {
+                    j += 1; // skip the escaped char
+                    continue;
+                }
+                if (src[j] == '"') break;
+            }
+            // `j` is the closing quote (or src.len for an unterminated
+            // string — pass it through untouched rather than guessing).
+            if (j >= src.len) {
+                try out.appendSlice(allocator, src[i..]);
+                i = src.len;
+                continue;
+            }
+            const content = src[content_start..j];
+            const is_key = nextSignificantIsColon(src, j + 1);
+
+            // The text emitted after `<prefix>__`, or null to pass the literal
+            // through untouched. Component keys keep their exact spelling; a
+            // prefab value is namespaced by its BASENAME so a subdir prefab
+            // reference lands on the same registered key.
+            var rewrite_to: ?[]const u8 = null;
+            if (is_key) {
+                // Component-declaration key: only when the enclosing object is
+                // a genuine component map (parent scope is an entity/patch).
+                if (topScope(scope_stack.items) == .component_map and
+                    containsKey(component_keys, content))
+                {
+                    rewrite_to = content;
+                }
+            } else {
+                // Value position: rewrite a pack-owned prefab reference, but
+                // only when the `"prefab"` key sits directly on an ENTITY scope
+                // (not a component payload field named `prefab`).
+                if (pending_key) |k| {
+                    if (std.mem.eql(u8, k, "prefab") and
+                        topScope(scope_stack.items) == .entity)
+                    {
+                        rewrite_to = prefabBasenameMatch(prefab_names, content);
+                    }
+                }
+            }
+
+            if (rewrite_to) |txt| {
+                try out.append(allocator, '"');
+                try out.appendSlice(allocator, prefix);
+                try out.appendSlice(allocator, "__");
+                try out.appendSlice(allocator, txt);
+                try out.append(allocator, '"');
+            } else {
+                try out.appendSlice(allocator, src[i .. j + 1]);
+            }
+
+            // Track the pending key for the container-type / prefab-value
+            // lookups above; a value string closes the pending pair.
+            if (is_key) {
+                pending_key = content;
+            } else {
+                pending_key = null;
+            }
+            i = j + 1;
+            continue;
+        }
+
+        try out.append(allocator, c);
+        i += 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Object/array scope kinds tracked while walking pack JSONC in
+/// `rewritePackLocalRefs`. The distinction that matters is ENTITY (where
+/// `components`/`overrides`/`prefab` carry engine meaning) vs PAYLOAD (opaque
+/// component data that must never be rewritten). See the engine's
+/// `labelle-engine/src/jsonc/unified_format.zig` for the authoritative shape.
+const Scope = enum {
+    /// An entity / prefab-patch object. `components`/`overrides` open a
+    /// component map here; a `prefab` string value is an entity reference.
+    entity,
+    /// The value of a `components`/`overrides` key sitting on an entity — its
+    /// direct keys are component names.
+    component_map,
+    /// A component's value, or anything nested below it: opaque payload data.
+    /// Never opens a component map and never treats `prefab` as a reference.
+    payload,
+    /// An array whose elements are entities (a `children`/`entities` list).
+    array_entities,
+    /// Any other array — payload arrays, unknown lists. Elements are opaque.
+    array_other,
+};
+
+/// Scope of the object introduced by a `{`, given its parent's scope and the
+/// key it is the value of. The document root (parent == null) is an entity
+/// (prefab-root / entity object). See `Scope`.
+fn childScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
+    const p = parent orelse return .entity;
+    return switch (p) {
+        .array_entities => .entity,
+        .entity => blk: {
+            if (pending_key) |k| {
+                if (std.mem.eql(u8, k, "components") or std.mem.eql(u8, k, "overrides")) {
+                    break :blk .component_map;
+                }
+            }
+            // Any other object field on an entity (`meta`, etc.) is opaque.
+            break :blk .payload;
+        },
+        // A component's value, or anything already inside payload, stays opaque.
+        .component_map, .payload, .array_other => .payload,
+    };
+}
+
+/// Scope of the array introduced by a `[`. Only a `children`/`entities` list
+/// directly on an entity carries entity elements; every other array is opaque.
+fn childArrayScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
+    if (parent) |p| {
+        if (p == .entity) {
+            if (pending_key) |k| {
+                if (std.mem.eql(u8, k, "children") or std.mem.eql(u8, k, "entities")) {
+                    return .array_entities;
+                }
+            }
+        }
+    }
+    return .array_other;
+}
+
+/// If `content` (the value of a `"prefab"` key) names one of the pack's OWN
+/// prefabs by BASENAME, return that basename — the text `addEmbeddedPrefab`
+/// registers under `<prefix>__<basename>`. Both a bare `"worker"` and a subdir
+/// path `"enemies/goblin"` map to their basename, matching the registration
+/// key that `std.fs.path.basename` produces (chatgpt-codex L704). Returns null
+/// for a foreign/game-root prefab reference.
+fn prefabBasenameMatch(prefab_names: []const []const u8, content: []const u8) ?[]const u8 {
+    const content_base = std.fs.path.basename(content);
+    for (prefab_names) |p| {
+        if (std.mem.eql(u8, std.fs.path.basename(p), content_base)) return content_base;
+    }
+    return null;
+}
+
+/// True iff the next significant byte at/after `from` (skipping whitespace
+/// and JSONC comments) is a `:` — i.e. the preceding string literal was an
+/// object key rather than a value. Pure lookahead; consumes nothing.
+fn nextSignificantIsColon(src: []const u8, from: usize) bool {
+    var i = from;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            i = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+            const close = std.mem.indexOfPos(u8, src, i + 2, "*/");
+            i = if (close) |p| p + 2 else src.len;
+            continue;
+        }
+        return c == ':';
+    }
+    return false;
+}
+
+fn containsKey(keys: []const []const u8, needle: []const u8) bool {
+    for (keys) |k| {
+        if (std.mem.eql(u8, k, needle)) return true;
+    }
+    return false;
+}
+
+/// Rewrite a pack's copied `hooks/*.zig` source so a handler written with the
+/// pack's BARE local event name receives its `<pack>__`-prefixed event
+/// (chatgpt-codex finding #3).
+///
+/// The engine's hook dispatcher (`labelle-core/src/dispatcher.zig`) matches a
+/// receiver's handler-fn NAME against the `GameEvents` variant tag. Pack
+/// events are folded into `GameEvents` under the invisible `<pack>__<event>`
+/// tag, so a pack hook's natural `pub fn worker_died(self, data)` would (a)
+/// never receive `citizens__worker_died`, and worse (b) trip the dispatcher's
+/// comptime guard — a 2-param handler whose name matches no variant is a hard
+/// `@compileError`. To keep the prefix invisible, this renames each qualifying
+/// handler's DECL to the prefixed tag (`worker_died` → `citizens__worker_died`)
+/// in the copied source, exactly mirroring the JSONC key/prefab rewrite.
+///
+/// A handler qualifies only when it is a `pub fn`, takes exactly two
+/// parameters (the `(self, data)` shape the dispatcher treats as a handler),
+/// and its name equals the BASENAME/variant of one of the pack's own
+/// `event_names` (`eventVariantName` — so a subdir event `combat/worker_died`
+/// still matches a `pub fn worker_died`, since the emitted tag is
+/// `<pack>__worker_died`) (chatgpt-codex L435). Handlers for engine / plugin /
+/// game events (bare names that are already valid variant tags — e.g. `tick`,
+/// `game_init`) are left untouched, so a pack hook keeps receiving those. Only
+/// the declaration site is renamed; a pack that also calls its handler
+/// internally by the bare name would surface a clean compile error rather than
+/// a silent mis-dispatch.
+///
+/// **Receiver-scoped (CodeRabbit L435).** The rename is confined to the DIRECT
+/// members of the hook file's receiver container — the `pub const <Pascal> =
+/// struct { … }` whose name is `pathToPascal(hook_stem)` (the exact type the
+/// generated `GameHooks` tuple references). Top-level `pub fn`s and unrelated
+/// helper structs elsewhere in the file are never touched, so a helper API that
+/// happens to share an event name (and arity) keeps its name and any internal
+/// callers stay valid.
+///
+/// Returns an allocator-owned buffer; a content-preserving dupe when nothing
+/// matches, so the caller frees unconditionally.
+pub fn rewritePackHookHandlerNames(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    event_names: []const []const u8,
+    prefix: []const u8,
+    hook_stem: []const u8,
+) ![]u8 {
+    if (event_names.len == 0) return allocator.dupe(u8, src);
+
+    var receiver_buf: [128]u8 = undefined;
+    const receiver = idents.pathToPascal(hook_stem, &receiver_buf);
+
+    const src_z = try allocator.dupeZ(u8, src);
+    defer allocator.free(src_z);
+
+    var ast = try std.zig.Ast.parse(allocator, src_z, .zig);
+    defer ast.deinit(allocator);
+
+    // Collect the byte offsets of every handler-fn name token to rename —
+    // scoped to the receiver container so unrelated decls are never renamed.
+    var sites: std.ArrayList(usize) = .empty;
+    defer sites.deinit(allocator);
+    try collectReceiverHandlerNameOffsets(allocator, &ast, ast.rootDecls(), receiver, event_names, &sites);
+
+    if (sites.items.len == 0) return allocator.dupe(u8, src);
+    std.mem.sort(usize, sites.items, {}, std.sort.asc(usize));
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var cursor: usize = 0;
+    for (sites.items) |off| {
+        // Each recorded offset is the start of a bare event-name token. Emit
+        // everything up to it, then the `<prefix>__` insertion; the original
+        // name bytes follow untouched (cursor advances past the prefix only).
+        try out.appendSlice(allocator, src[cursor..off]);
+        try out.appendSlice(allocator, prefix);
+        try out.appendSlice(allocator, "__");
+        cursor = off;
+    }
+    try out.appendSlice(allocator, src[cursor..]);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Find the hook file's receiver container — the root-level
+/// `const <receiver> = struct/union/enum { … }` whose name is the Pascal form
+/// of the hook stem — and collect the byte offsets of its DIRECT handler-fn
+/// name tokens into `sites`. Only that one container is walked, and its members
+/// are NOT recursed into, so top-level helpers and unrelated helper structs are
+/// never renamed (CodeRabbit L435). See `rewritePackHookHandlerNames`.
+fn collectReceiverHandlerNameOffsets(
+    allocator: std.mem.Allocator,
+    ast: *std.zig.Ast,
+    root_decls: []const std.zig.Ast.Node.Index,
+    receiver: []const u8,
+    event_names: []const []const u8,
+    sites: *std.ArrayList(usize),
+) !void {
+    for (root_decls) |decl| {
+        const vd = ast.fullVarDecl(decl) orelse continue;
+        const name_tok = vd.ast.mut_token + 1;
+        if (!std.mem.eql(u8, ast.tokenSlice(name_tok), receiver)) continue;
+        const init_node = vd.ast.init_node.unwrap() orelse continue;
+        var buf: [2]std.zig.Ast.Node.Index = undefined;
+        const container = ast.fullContainerDecl(&buf, init_node) orelse continue;
+        collectDirectHandlerNameOffsets(allocator, ast, container.ast.members, event_names, sites) catch |e| return e;
+        // Exactly one receiver container matters; stop after the first match.
+        return;
+    }
+}
+
+/// Record the source byte offset of each qualifying `pub fn <event>(self, data)`
+/// name token among `members` (the receiver's DIRECT members — no recursion).
+/// A handler matches when its name equals the basename/variant of a pack event.
+fn collectDirectHandlerNameOffsets(
+    allocator: std.mem.Allocator,
+    ast: *std.zig.Ast,
+    members: []const std.zig.Ast.Node.Index,
+    event_names: []const []const u8,
+    sites: *std.ArrayList(usize),
+) !void {
+    for (members) |m| {
+        var fn_buf: [1]std.zig.Ast.Node.Index = undefined;
+        const fp = ast.fullFnProto(&fn_buf, m) orelse continue;
+        if (fp.visib_token == null) continue;
+        const nt = fp.name_token orelse continue;
+        const name = ast.tokenSlice(nt);
+        if (matchesEventBasename(event_names, name) and fnProtoParamCount(ast, fp) == 2) {
+            // `tokenSlice` returns a sub-slice of `ast.source`; its pointer
+            // offset is the byte position we splice at.
+            const off = @intFromPtr(name.ptr) - @intFromPtr(ast.source.ptr);
+            try sites.append(allocator, off);
+        }
+    }
+}
+
+/// True iff `handler_name` equals the emitted variant BASENAME of one of the
+/// pack's `event_names` (`eventVariantName` strips any subdir + `.zig`), so a
+/// handler `pub fn worker_died` matches a pack event scanned as
+/// `combat/worker_died` (chatgpt-codex L435).
+fn matchesEventBasename(event_names: []const []const u8, handler_name: []const u8) bool {
+    for (event_names) |e| {
+        if (std.mem.eql(u8, idents.eventVariantName(e), handler_name)) return true;
+    }
+    return false;
+}
+
+fn fnProtoParamCount(ast: *std.zig.Ast, fp: std.zig.Ast.full.FnProto) usize {
+    var count: usize = 0;
+    var it = fp.iterate(ast);
+    while (it.next()) |_| count += 1;
+    return count;
+}
 
 /// A single discovered `pub const <event_name> = struct {...}` declaration
 /// inside a plugin's `pub const Events = struct { ... }`. Owned by
@@ -1088,6 +1587,271 @@ pub fn pathToIdent(name: []const u8, buf: *[256]u8) []const u8 {
 
 // ── Tests (moved verbatim from main_zig.zig) ─────────────────────────
 
+test "packNamespacePrefix: sanitizes the pack name into a Zig ident fragment" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("citizens", packNamespacePrefix("citizens", &buf));
+    // Non-identifier bytes collapse to `_`, same as plugin idents.
+    try std.testing.expectEqualStrings("my_pack", packNamespacePrefix("my-pack", &buf));
+}
+
+test "rewritePackComponentKeys: rewrites only pack-owned component KEYS" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{
+        \\    "components": {
+        \\        "Worker": { "hp": 3, "label": "Worker" },
+        \\        "Position": { "x": 0 }
+        \\    }
+        \\}
+    ;
+    const out = try rewritePackComponentKeys(allocator, src, &.{"Worker"}, "citizens");
+    defer allocator.free(out);
+
+    // Pack-owned key rewritten …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"citizens__Worker\":") != null);
+    // … built-in `Position` untouched …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"Position\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__Position") == null);
+    // … and the VALUE `"Worker"` (not a key) left alone.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"label\": \"Worker\"") != null);
+}
+
+test "rewritePackComponentKeys: leaves a matching name in a comment alone" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{
+        \\    // "Worker": legacy note, not a real key
+        \\    "components": { "Worker": {} }
+        \\}
+    ;
+    const out = try rewritePackComponentKeys(allocator, src, &.{"Worker"}, "citizens");
+    defer allocator.free(out);
+
+    // The real key was rewritten …
+    try std.testing.expect(std.mem.indexOf(u8, out, "{ \"citizens__Worker\": {} }") != null);
+    // … but the comment text is preserved verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, out, "// \"Worker\": legacy note") != null);
+}
+
+test "rewritePackComponentKeys: no matches yields a content-preserving dupe" {
+    const allocator = std.testing.allocator;
+    const src = "{ \"Position\": { \"x\": 0 } }";
+    const out = try rewritePackComponentKeys(allocator, src, &.{"Worker"}, "citizens");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "rewritePackLocalRefs: payload data key matching a component name is NOT rewritten (chatgpt-codex #2)" {
+    const allocator = std.testing.allocator;
+    // `Worker` is a pack-owned component. It appears BOTH as a real component
+    // declaration key (must be rewritten) AND as a nested payload-data key
+    // inside `Spawner.counts` (must be left alone — rewriting it corrupts the
+    // payload before deserialization).
+    const src =
+        \\{
+        \\    "components": {
+        \\        "Worker": { "hp": 3 },
+        \\        "Spawner": { "counts": { "Worker": 3 } }
+        \\    }
+        \\}
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"Worker"}, &.{}, "citizens");
+    defer allocator.free(out);
+
+    // The real component-declaration key IS rewritten …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"citizens__Worker\": { \"hp\": 3 }") != null);
+    // … the `Spawner` declaration key is also under `components` (not a pack
+    // component, so untouched) …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"Spawner\":") != null);
+    // … but the nested payload key `"Worker"` inside `counts` is NOT rewritten.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"counts\": { \"Worker\": 3 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__Worker\": 3") == null);
+}
+
+test "rewritePackLocalRefs: keys inside an overrides wrapper are rewritten" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{ "prefab": "base", "overrides": { "Worker": { "hp": 9 } } }
+    ;
+    // `base` is not a pack prefab here, so the ref is left alone; the override
+    // component key IS a pack component, so it is namespaced.
+    const out = try rewritePackLocalRefs(allocator, src, &.{"Worker"}, &.{}, "citizens");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"base\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"citizens__Worker\":") != null);
+}
+
+test "rewritePackLocalRefs: a pack-local prefab reference value is rewritten (chatgpt-codex #1)" {
+    const allocator = std.testing.allocator;
+    // A pack prefab composing another SAME-pack prefab by local name. The
+    // `"prefab"` value must resolve to the namespaced registration key.
+    const src =
+        \\{
+        \\    "children": [
+        \\        { "prefab": "worker", "components": { "Position": { "x": 1 } } },
+        \\        { "prefab": "external" }
+        \\    ]
+        \\}
+    ;
+    // `worker` is pack-owned; `external` is NOT (a game-root/foreign prefab).
+    const out = try rewritePackLocalRefs(allocator, src, &.{}, &.{"worker"}, "citizens");
+    defer allocator.free(out);
+
+    // The same-pack reference is namespaced …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"citizens__worker\"") != null);
+    // … the foreign reference is left bare …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"external\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__external") == null);
+    // … and `Position` (built-in, not pack-owned) is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"Position\":") != null);
+}
+
+test "rewritePackHookHandlerNames: bare pack-event handler is renamed to the prefixed tag (chatgpt-codex #3)" {
+    const allocator = std.testing.allocator;
+    // A pack hook: a handler for the pack's OWN event (`worker_died`, bare),
+    // plus a handler for a built-in engine event (`tick`, must stay bare so it
+    // keeps matching the un-prefixed engine variant), plus a private helper
+    // that happens to share the event name (must NOT be renamed).
+    const src =
+        \\const std = @import("std");
+        \\pub const Overlay = struct {
+        \\    pub fn worker_died(self: *Overlay, data: anytype) void {
+        \\        _ = self;
+        \\        _ = data;
+        \\    }
+        \\    pub fn tick(self: *Overlay, data: anytype) void {
+        \\        _ = self;
+        \\        _ = data;
+        \\    }
+        \\    fn helper(self: *Overlay) void {
+        \\        _ = self;
+        \\    }
+        \\};
+    ;
+    const out = try rewritePackHookHandlerNames(allocator, src, &.{"worker_died"}, "citizens", "overlay");
+    defer allocator.free(out);
+
+    // The pack-event handler DECL is renamed to the prefixed tag …
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn citizens__worker_died(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn worker_died(") == null);
+    // … the engine-event handler keeps its bare name …
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn tick(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__tick") == null);
+    // … the private helper (not a pack event) is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, out, "fn helper(") != null);
+}
+
+test "rewritePackLocalRefs: nested overrides inside a component payload is NOT a component map (CR L224)" {
+    const allocator = std.testing.allocator;
+    // `Worker` is a pack component. It appears as a real declaration key AND
+    // deep inside `Spawner`'s payload under a nested `overrides` object. The
+    // nested `overrides` must NOT open a component map — it's payload data.
+    const src =
+        \\{
+        \\    "components": {
+        \\        "Worker": { "hp": 3 },
+        \\        "Spawner": { "overrides": { "Worker": 3 } }
+        \\    }
+        \\}
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"Worker"}, &.{}, "citizens");
+    defer allocator.free(out);
+
+    // The real component key IS namespaced …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"citizens__Worker\": { \"hp\": 3 }") != null);
+    // … but the payload `Worker` under the nested `overrides` is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"overrides\": { \"Worker\": 3 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__Worker\": 3") == null);
+}
+
+test "rewritePackLocalRefs: a payload field named prefab is NOT rewritten (codex L288)" {
+    const allocator = std.testing.allocator;
+    // `worker` is a pack prefab. The `prefab` key here is a component-payload
+    // field (inside `Spawner`'s value), not an entity reference — leave it bare.
+    const src =
+        \\{ "components": { "Spawner": { "prefab": "worker" } } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{}, &.{"worker"}, "citizens");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"worker\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__worker") == null);
+}
+
+test "rewritePackLocalRefs: subdir pack prefab ref resolves to the basename-prefixed key (codex L704)" {
+    const allocator = std.testing.allocator;
+    // Pack prefab scanned as `enemies/goblin`; `addEmbeddedPrefab` registers it
+    // as `citizens__goblin` (basename). Both a bare and a path-spelled ref must
+    // land on that same key.
+    const src =
+        \\{
+        \\    "children": [
+        \\        { "prefab": "goblin" },
+        \\        { "prefab": "enemies/goblin" }
+        \\    ]
+        \\}
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{}, &.{"enemies/goblin"}, "citizens");
+    defer allocator.free(out);
+    // Both references collapse to the basename-prefixed registration key.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"citizens__goblin\"") != null);
+    // …and neither retains the raw subdir spelling.
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__enemies/goblin") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"goblin\"") == null);
+}
+
+test "rewritePackHookHandlerNames: subdir pack event matches a bare handler (codex L435)" {
+    const allocator = std.testing.allocator;
+    // Pack event scanned as `combat/worker_died`; the emitted tag is
+    // `citizens__worker_died`, so a `pub fn worker_died` must be renamed.
+    const src =
+        \\pub const Overlay = struct {
+        \\    pub fn worker_died(self: *Overlay, data: anytype) void {
+        \\        _ = self;
+        \\        _ = data;
+        \\    }
+        \\};
+    ;
+    const out = try rewritePackHookHandlerNames(allocator, src, &.{"combat/worker_died"}, "citizens", "overlay");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn citizens__worker_died(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn worker_died(") == null);
+}
+
+test "rewritePackHookHandlerNames: a top-level helper fn is NOT renamed (CR L435)" {
+    const allocator = std.testing.allocator;
+    // A top-level `pub fn worker_died(_, _)` helper (2 params, name matches the
+    // event) sits OUTSIDE the receiver container — it must be left alone. Only
+    // the same-named method INSIDE the `Overlay` receiver is renamed.
+    const src =
+        \\pub fn worker_died(a: u32, b: u32) u32 {
+        \\    return a + b;
+        \\}
+        \\pub const Overlay = struct {
+        \\    pub fn worker_died(self: *Overlay, data: anytype) void {
+        \\        _ = self;
+        \\        _ = worker_died(1, 2);
+        \\        _ = data;
+        \\    }
+        \\};
+    ;
+    const out = try rewritePackHookHandlerNames(allocator, src, &.{"worker_died"}, "citizens", "overlay");
+    defer allocator.free(out);
+    // The top-level helper decl keeps its bare name …
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn worker_died(a: u32, b: u32) u32") != null);
+    // … the receiver method is renamed …
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn citizens__worker_died(self: *Overlay") != null);
+    // … and the internal call to the helper still resolves (unchanged).
+    try std.testing.expect(std.mem.indexOf(u8, out, "_ = worker_died(1, 2);") != null);
+}
+
+test "rewritePackHookHandlerNames: no pack events is a content-preserving dupe" {
+    const allocator = std.testing.allocator;
+    const src = "pub const H = struct { pub fn tick(self: *H, d: anytype) void { _ = self; _ = d; } };";
+    const out = try rewritePackHookHandlerNames(allocator, src, &.{}, "citizens", "h");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
 test "pathToIdent: plain name is unchanged" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("health", pathToIdent("health", &buf));
@@ -1160,10 +1924,10 @@ test "pathToIdent: every distinct path yields a distinct identifier" {
         "plugin_core/script",
     };
     var bufs: [cases.len][256]u8 = undefined;
-    var idents: [cases.len][]const u8 = undefined;
-    for (cases, 0..) |c, i| idents[i] = pathToIdent(c, &bufs[i]);
-    for (idents, 0..) |x, i| {
-        for (idents[i + 1 ..]) |y| {
+    var id_list: [cases.len][]const u8 = undefined;
+    for (cases, 0..) |c, i| id_list[i] = pathToIdent(c, &bufs[i]);
+    for (id_list, 0..) |x, i| {
+        for (id_list[i + 1 ..]) |y| {
             try std.testing.expect(!std.mem.eql(u8, x, y));
         }
     }
