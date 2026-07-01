@@ -14,6 +14,7 @@ pub const main_zig = @import("main_zig.zig");
 pub const script_scanner = @import("script_scanner.zig");
 pub const flow_scanner = @import("flow_scanner.zig");
 pub const flow_catalog = @import("flow_catalog.zig");
+pub const pack_manifest = @import("manifest.zig");
 const build_files = @import("build_files.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 const manifest_v2 = @import("codegen/manifest_v2.zig");
@@ -37,6 +38,7 @@ test {
     _ = @import("backend_registry.zig");
     _ = @import("app_icon.zig");
     _ = @import("flow_catalog.zig");
+    _ = @import("manifest.zig");
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/manifest_splice.zig");
     _ = @import("codegen/manifest_v2.zig");
@@ -1093,6 +1095,33 @@ pub fn generate(
             // additive. Log it and move on; the gui's static fallback
             // covers the editor regardless.
             std.debug.print("labelle-assembler: flow_catalog sidecar emission failed: {s}\n", .{@errorName(err)});
+        };
+
+        // Pack/feature manifest sidecar (#442, Packs RFC §7). Sits next to
+        // `flow_catalog.json` and answers the "I'm adding a feature — which
+        // realm owns this, what shapes do I touch, what already exists, what
+        // may I call cross-pack" questions for an agent or a human. Built
+        // from the same scanned data the codegen already has (component /
+        // prefab / event / enum / hook names + script entries + discovered
+        // FlowNodes + plugin events), plus a light AST pass over the game
+        // root's `components/` + `events/` for field schemas. Additive and
+        // best-effort — a failure here is logged, never fatal, exactly like
+        // the flow catalog above.
+        pack_manifest.emitManifestSidecar(
+            allocator,
+            cfg,
+            game_dir,
+            labelle_dir,
+            component_names,
+            prefab_names,
+            enum_names,
+            event_names,
+            hook_names,
+            merged_entries,
+            plugin_flow_decls.flow_nodes,
+            plugin_events.entries,
+        ) catch |err| {
+            std.log.warn("labelle-assembler: manifest sidecar emission failed: {s}", .{@errorName(err)});
         };
 
         // Backend lifecycle template — only the exe target needs it.
