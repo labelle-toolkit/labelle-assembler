@@ -298,13 +298,23 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     }
 
     if (cfg.platform == .ios) {
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
+        // `target` (the alias for `ios_target`) is consumed by the deps/plugin
+        // decls AND by `emitPromotedScriptModules` (`.target = target`). Emit the
+        // alias whenever ANY consumer needs it — including promoted scripts on an
+        // otherwise plugin/ECS/GUI-free game (PR #466 Finding 1).
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
             try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
         }
         try tpl.writeSection(build_zig_tmpl, "ios_deps", w);
         try tpl.writeSection(build_zig_tmpl, "game_mod_decl_ios", w);
     } else if (cfg.platform == .android) {
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
+        // `target` (the alias for `android_target`) is consumed by the deps/plugin
+        // decls AND by `emitPromotedScriptModules` (`.target = target`). This guard
+        // is shared by BOTH the v2 and enum android routes, so include the promoted-
+        // scripts condition so `target` is defined whenever any consumer needs it —
+        // a promoted-scripts + no-plugin/ECS/GUI android game previously emitted an
+        // undefined `target` (PR #466 Finding 1, applies to v2 AND enum).
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
             try tpl.writeSection(build_zig_tmpl, "android_target_alias", w);
         }
         if (v2_manifest != null) {

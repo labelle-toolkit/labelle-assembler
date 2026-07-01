@@ -165,6 +165,93 @@ pub const MANIFEST_V2_ANDROID_GOLDEN = struct {
     }
 };
 
+// ── PR #466 Finding 1: promoted scripts must not leave `target` undefined ──
+// The `android_target_alias`/`ios_target_alias` section (`const target =
+// <platform>_target;`) was emitted only under `plugins|ecs|gui`, but
+// `emitPromotedScriptModules` unconditionally emits `.target = target,`. A game
+// with promoted (FlowNodes-bearing) scripts and NO plugins/ECS/GUI therefore
+// referenced an UNDEFINED `target`. The guard now also fires on promoted scripts.
+// This shared guard covers BOTH the v2 and enum android routes.
+pub const PR466_FINDING1_TARGET_ALIAS = struct {
+    const promoted = [_]generate.PromotedScript{
+        .{ .module_name = "script__demo", .rel_path = "demo.zig" },
+    };
+
+    fn expectDefinesTarget(out: []const u8) !void {
+        // The promoted-script module decl references `target`…
+        try std.testing.expect(std.mem.indexOf(u8, out, ".target = target,") != null);
+        // …and the alias that DEFINES it must now be present.
+        try std.testing.expect(std.mem.indexOf(u8, out, "const target = android_target;") != null);
+        // Sanity: the generated build.zig still parses.
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "enum android: promoted scripts + no plugins/ecs/gui still defines `target`" {
+        const out = try generate.generateBuildZig(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .sokol,
+            .platform = .android,
+            .ecs = .mock,
+        }, .{ .promoted_scripts = &promoted });
+        defer std.testing.allocator.free(out);
+        try expectDefinesTarget(out);
+    }
+
+    test "v2 android: promoted scripts + no plugins/ecs/gui still defines `target`" {
+        const out = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .sokol,
+            .platform = .android,
+            .ecs = .mock,
+        }, .{ .promoted_scripts = &promoted });
+        defer std.testing.allocator.free(out);
+        try expectDefinesTarget(out);
+    }
+};
+
+// ── PR #466 Finding 3: the v2 backend build hook is staged as a sibling ──
+// The generated v2 android build.zig `@import`s `backend_build_hook.zig`; the
+// generator must copy the manifest's `build_hook` file to that sibling name or a
+// real build fails at import resolution.
+pub const PR466_FINDING3_STAGE_HOOK = struct {
+    test "stages manifest build_hook next to build.zig as backend_build_hook.zig" {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const target_dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(target_dir);
+
+        var cfg: generate.ProjectConfig = .{
+            .name = "anchor-game",
+            .backend = .sokol,
+            .platform = .android,
+            .ecs = .mock,
+        };
+        cfg.backend_package = h.sokol_fixture_package;
+
+        const staged = try generate.stageBackendBuildHook(
+            std.testing.allocator,
+            cfg,
+            ".",
+            "backend.manifest.v2.zon",
+            target_dir,
+        );
+        try std.testing.expect(staged);
+
+        // The sibling exists under the exact name the generated build.zig imports,
+        // with the fixture hook's byte content.
+        const got = try tmp.dir.readFileAlloc(io, generate.backend_build_hook_name, std.testing.allocator, .limited(256 * 1024));
+        defer std.testing.allocator.free(got);
+        const want = try std.Io.Dir.cwd().readFileAlloc(io, "backends/sokol/backend.hook.zig", std.testing.allocator, .limited(256 * 1024));
+        defer std.testing.allocator.free(want);
+        try std.testing.expectEqualStrings(want, got);
+    }
+};
+
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
         const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{

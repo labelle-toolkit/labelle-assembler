@@ -47,6 +47,7 @@ const config = @import("../config.zig");
 const manifest_v2 = @import("manifest_v2.zig");
 const core_diamond = @import("core_diamond.zig");
 const packager = @import("packager.zig");
+const backend_registry = @import("../backend_registry.zig");
 
 const BackendManifestV2 = manifest_v2.BackendManifestV2;
 const DepOption = BackendManifestV2.DepOption;
@@ -192,10 +193,54 @@ fn renderDesktopBackendDepV2(
 // ──────────────────────────────────────────────────────────────────────────
 
 /// The root-import alias the generated build.zig references the backend hook by.
-/// The assembler stages `backend.hook.zig` next to the generated `build.zig` under
-/// this name (deferred until the v2 route is promoted to production `generate` —
-/// the whole route is gated-dark today, §6).
-const hook_import_name = "backend_build_hook.zig";
+/// The assembler stages the manifest's `build_hook` file next to the generated
+/// `build.zig` under this name (see `stageBackendBuildHook`) so the generated
+/// `@import("backend_build_hook.zig")` resolves at build time.
+pub const hook_import_name = "backend_build_hook.zig";
+
+/// Stage (copy) the backend package's `build_hook` file next to the generated
+/// build.zig, under `hook_import_name`. The generated v2 (android, PR 5) build.zig
+/// `@import`s the hook by that sibling name and calls `resolve_target`/`post_wire`;
+/// without this copy a real v2 build fails at import resolution (PR #466 Finding 3).
+/// Mirrors how the orchestrator writes the other generated siblings (build.zig,
+/// game.zig, main.zig) into `target_dir`.
+///
+/// No-op (returns false) when the named manifest is v1 or carries no `build_hook`;
+/// returns true when a hook was staged. `backend_manifest_name` is the SAME name the
+/// caller passed to `generateBuildZig` (null there ⇒ the enum path, so the caller
+/// should not invoke this).
+pub fn stageBackendBuildHook(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    project_dir: []const u8,
+    backend_manifest_name: []const u8,
+    target_dir: []const u8,
+) !bool {
+    const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, project_dir, backend_manifest_name);
+    defer parsed.free(allocator);
+    const m = switch (parsed) {
+        .v1 => return false,
+        .v2 => |v| v,
+    };
+    const hook_rel = m.build_hook orelse return false;
+
+    const pkg_dir = try backend_registry.resolveBackendPackage(allocator, cfg, project_dir);
+    defer allocator.free(pkg_dir);
+    const src_path = try std.fs.path.join(allocator, &.{ pkg_dir, hook_rel });
+    defer allocator.free(src_path);
+
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const content = try cwd.readFileAlloc(io, src_path, allocator, .limited(256 * 1024));
+    defer allocator.free(content);
+
+    var dir = try cwd.openDir(io, target_dir, .{});
+    defer dir.close(io);
+    const file = try dir.createFile(io, hook_import_name, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, content);
+    return true;
+}
 
 /// v2 android HEADER — replaces the enum `header_android` block. Instead of
 /// inlining `getAndroidNdkSysroot`/`ndkHostTag` + the target-resolution block, it

@@ -199,29 +199,53 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
         const ndk_dir = b.pathJoin(&.{ home, "ndk" });
         var dir = std.Io.Dir.cwd().openDir(io, ndk_dir, .{ .iterate = true }) catch return null;
         defer dir.close(io);
-        var latest: ?[]const u8 = null;
+        // Collect every version dir together with WHETHER it actually has a
+        // usable sysroot, then pick the greatest VALID one. A stray/partial NDK
+        // install (or a lexicographically-greater dir with no sysroot) must NOT
+        // shadow an older, valid NDK — checking validity only AFTER picking the
+        // greatest dir made us miss it and panic (PR #466 Finding 2).
+        var candidates: std.ArrayList(NdkCandidate) = .empty;
+        defer {
+            for (candidates.items) |c| b.allocator.free(c.name);
+            candidates.deinit(b.allocator);
+        }
         var iter = dir.iterate();
         while (iter.next(io) catch null) |entry| {
-            if (entry.kind == .directory) {
-                if (latest) |prev| {
-                    if (std.mem.order(u8, entry.name, prev) == .gt) {
-                        b.allocator.free(prev);
-                        latest = b.allocator.dupe(u8, entry.name) catch null;
-                    }
-                } else {
-                    latest = b.allocator.dupe(u8, entry.name) catch null;
-                }
-            }
+            if (entry.kind != .directory) continue;
+            const name = b.allocator.dupe(u8, entry.name) catch continue;
+            const sysroot = b.pathJoin(&.{ ndk_dir, name, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
+            const has_sysroot = if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| true else |_| false;
+            candidates.append(b.allocator, .{ .name = name, .has_sysroot = has_sysroot }) catch {
+                b.allocator.free(name);
+                continue;
+            };
         }
-        if (latest) |version| {
-            defer b.allocator.free(version);
-            const sysroot = b.pathJoin(&.{ ndk_dir, version, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
-            if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| {
-                return sysroot;
-            } else |_| {}
+        if (selectGreatestValidNdk(candidates.items)) |version| {
+            return b.pathJoin(&.{ ndk_dir, version, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
         }
     }
     return null;
+}
+
+/// A candidate `$ANDROID_HOME/ndk/<name>` dir paired with whether its
+/// `toolchains/llvm/prebuilt/<host>/sysroot` actually exists.
+const NdkCandidate = struct { name: []const u8, has_sysroot: bool };
+
+/// Pick the lexicographically-greatest NDK version dir that HAS a valid sysroot.
+/// Validity is part of the selection (not an after-the-fact check on the greatest
+/// dir), so a stray/partial install can't shadow an older valid NDK (PR #466
+/// Finding 2). Returns a borrowed slice from `candidates` or null when none valid.
+fn selectGreatestValidNdk(candidates: []const NdkCandidate) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    for (candidates) |c| {
+        if (!c.has_sysroot) continue;
+        if (best) |prev| {
+            if (std.mem.order(u8, c.name, prev) == .gt) best = c.name;
+        } else {
+            best = c.name;
+        }
+    }
+    return best;
 }
 
 fn ndkHostTag() []const u8 {
@@ -354,4 +378,32 @@ test "libcTxt: body points the compiler at the NDK sysroot (matches the enum blo
 
 test "HOOK_ABI_VERSION is 2 (matches manifest_v2)" {
     try testing.expectEqual(@as(u8, 2), HOOK_ABI_VERSION);
+}
+
+test "selectGreatestValidNdk: a stray dir doesn't shadow a valid older NDK (PR #466 Finding 2)" {
+    // "27.0.0" sorts greatest but has NO sysroot (stray/partial install); the
+    // greatest VALID dir is "26.1.10909125" — the old "greatest dir then check"
+    // logic would have picked 27 and missed it.
+    const c1 = [_]NdkCandidate{
+        .{ .name = "25.2.9519653", .has_sysroot = true },
+        .{ .name = "26.1.10909125", .has_sysroot = true },
+        .{ .name = "27.0.0", .has_sysroot = false },
+    };
+    try testing.expectEqualStrings("26.1.10909125", selectGreatestValidNdk(&c1).?);
+
+    // All valid → the greatest is chosen.
+    const c2 = [_]NdkCandidate{
+        .{ .name = "25.2.9519653", .has_sysroot = true },
+        .{ .name = "26.1.10909125", .has_sysroot = true },
+    };
+    try testing.expectEqualStrings("26.1.10909125", selectGreatestValidNdk(&c2).?);
+
+    // No valid candidate → null (caller then falls through / panics upstream).
+    const c3 = [_]NdkCandidate{
+        .{ .name = "27.0.0", .has_sysroot = false },
+    };
+    try testing.expectEqual(@as(?[]const u8, null), selectGreatestValidNdk(&c3));
+
+    // Empty set → null.
+    try testing.expectEqual(@as(?[]const u8, null), selectGreatestValidNdk(&.{}));
 }

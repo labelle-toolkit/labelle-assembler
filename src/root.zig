@@ -16,6 +16,7 @@ pub const flow_scanner = @import("flow_scanner.zig");
 pub const flow_catalog = @import("flow_catalog.zig");
 const build_files = @import("build_files.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
+const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
 const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
@@ -79,6 +80,12 @@ pub const generateBuildZig = build_files.generateBuildZig;
 pub const BuildZigOptions = build_files.BuildZigOptions;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
 pub const deps_linker = build_files.deps_linker;
+// Stages the v2 backend build hook next to the generated build.zig
+// (`backend_build_hook.zig`) so the generated `@import` resolves — see the fn
+// docs (PR #466 Finding 3).
+pub const stageBackendBuildHook = manifest_v2_splice.stageBackendBuildHook;
+pub const backend_build_hook_name = manifest_v2_splice.hook_import_name;
+pub const PromotedScript = @import("codegen/scan.zig").PromotedScript;
 
 pub const validateCache = cache.validateCache;
 pub const getCacheRoot = cache.getCacheRoot;
