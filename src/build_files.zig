@@ -4,6 +4,7 @@ const tpl = @import("template.zig");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
 const backend_registry = @import("backend_registry.zig");
+const capabilities = @import("capabilities.zig");
 const scan = @import("codegen/scan.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 const manifest_v2 = @import("codegen/manifest_v2.zig");
@@ -187,8 +188,14 @@ pub const BuildZigOptions = struct {
 /// project_dir/manifest is a hard error). A backend named only by a string (no
 /// matching tag) is NOT tag-safe on any target and must route through the
 /// manifest — the enum `switch` would emit the wrong (raylib-default) codegen.
+///
+/// The tag-safe discriminator is `cfg.isEnumTagBacked()` (config.zig): a genuine
+/// THIRD-PARTY backend named only by string is never enum-tag-backed, so it can
+/// never take the enum path on ANY target and instead routes entirely through
+/// `backend_registry` + its (v2) manifest (#453 PR 11 — the enum tag is no longer
+/// read as an identity here; the check moved onto the documented config predicate).
 fn externalUsesEnumPath(cfg: ProjectConfig) bool {
-    if (!std.mem.eql(u8, cfg.backendName(), @tagName(cfg.backend))) return false;
+    if (!cfg.isEnumTagBacked()) return false;
     return switch (cfg.platform) {
         .android, .wasm, .ios => true,
         .desktop => false,
@@ -289,6 +296,26 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // PRODUCTION path — unchanged: read `backend.manifest.zon` (v1) directly.
             splice_manifest = try manifest_splice.loadManifest(allocator, cfg, opts.project_dir.?);
         }
+    }
+
+    // ── Capability negotiation on the v2 path (RFC step 1, epic #453 PR 11) ──
+    // The v2 manifest carries its OWN `.id` + `.capabilities`; the resolve-time
+    // `validateProviderContracts` (root.zig) reads only the v1 `backend.manifest.zon`
+    // via `loadProviderManifest`, so a v2-only third-party backend (no legacy
+    // sibling) would bypass BOTH identity and capability checks. Run them HERE,
+    // against the v2 manifest, BEFORE any build-graph text is emitted — so a
+    // project requiring a capability the backend does not declare fails with the
+    // readable project-level `error.UnsupportedCapability` (capabilities.validate)
+    // rather than a deep codegen/compile error, and a third party claiming the
+    // reserved `labelle.*` namespace is still rejected (validateProviderIdentity).
+    // No-op in production (v2_manifest is null unless `backend_manifest_name`
+    // opts into a v2 manifest), so the enum/v1 path is byte-unchanged.
+    if (v2_manifest) |m| {
+        try backend_registry.validateProviderIdentity(cfg, m.id);
+        const required = try capabilities.requiredCapabilities(allocator, cfg);
+        defer allocator.free(required);
+        const provider_id = m.id orelse cfg.backendName();
+        try capabilities.validate(required, m.capabilities, provider_id);
     }
 
     if (cfg.platform == .wasm) {

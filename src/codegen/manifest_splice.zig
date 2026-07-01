@@ -31,13 +31,15 @@
 //!   - root.zig `loadBackendTemplate` backend→desktop.txt mapping
 //!       → `mainLoopTemplateRel(manifest)` (reads manifest `main_loop_template`)
 //!
-//! None of the above names a backend enum tag. The ONLY place the splice
-//! still touches the enum is `backendPackageDir`, which uses
-//! `@tagName(cfg.backend)` to LOCATE the package so it can read the manifest.
-//! That `@tagName` is the documented future seam: Phase 5 replaces it with a
-//! backend *name string* → package registry (the manifest already carries
-//! `dir_name`/`dep_name` as data so nothing downstream depends on the tag).
-//! Building that registry is out of scope here — this lands the splice.
+//! None of the above names a backend enum tag. Package LOCATION
+//! (`backendPackageDir`) is likewise enum-free: it routes through
+//! `backend_registry.resolveBackendPackage`, keyed by `cfg.backendName()` (a
+//! STRING), so a third-party backend named only by `.backend_package` — with no
+//! matching `Backend` enum tag — resolves + generates through this same registry
+//! + its (v2) manifest, never through `@tagName(cfg.backend)` (open-config, #453
+//! PR 11). The enum survives only as a shorthand for the 6 built-ins; the one
+//! remaining enum-as-identity read is `cfg.isEnumTagBacked()` (config.zig), which
+//! a name-only backend never satisfies.
 
 const std = @import("std");
 const tpl = @import("../template.zig");

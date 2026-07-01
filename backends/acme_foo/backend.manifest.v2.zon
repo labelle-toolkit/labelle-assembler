@@ -1,0 +1,56 @@
+.{
+    // ── THIRD-PARTY backend manifest, SCHEMA v2 (open-config, epic #453 PR 11) ──
+    // A HYPOTHETICAL third-party backend proving the pluggable-backends end goal:
+    // it is selected purely by NAME + package (`.backend_package = .{ .name =
+    // "acme_foo", .. }`) with NO matching `Backend` enum tag, and it declares a
+    // NON-`labelle.` canonical id (`acme.foo`). It must resolve + generate a valid
+    // build.zig entirely through `backend_registry` + THIS v2 manifest — never
+    // touching the closed `Backend` enum (whose `cfg.backend` sits at its
+    // meaningless `.raylib` default for a name-only backend).
+    //
+    // Modeled on `backends/null_v2`: the SIMPLEST v2 shape — fully declarative,
+    // HOOKLESS, headless desktop-only, pure-Zig with zero native deps. This is a
+    // TEST FIXTURE dir: it ships ONLY this v2 manifest, no build.zig/package —
+    // codegen reads the manifest offline.
+    .manifest_version = 2,
+    .dir_name = "acme_foo",
+    // A third party names its own dependency however it likes — NOT the
+    // `labelle_*` convention. Emitted verbatim into `b.dependency("acme_foo", ..)`.
+    .dep_name = "acme_foo",
+    // NON-`labelle.` vendor namespace. The reserved `labelle.*` namespace is
+    // rejected for a third party resolving from a non-official repo
+    // (backend_registry.validateProviderIdentity); a genuine third party uses
+    // `<vendor>.<name>`.
+    .id = "acme.foo",
+
+    // A NON-EMPTY capability set opts INTO resolve-time capability enforcement
+    // (design §3 review-correction #8): a project requiring a capability NOT in
+    // this set fails with the readable project-level `error.UnsupportedCapability`
+    // BEFORE any build-graph is emitted. This backend advertises only `.headless`.
+    .capabilities = .{.headless},
+
+    // root_alias defaults to `backend_<name>`, so the generated root imports these
+    // as `backend_gfx`/`backend_input`/… exactly as every other backend does.
+    .modules = .{
+        .{ .name = "gfx", .source = "src/gfx.zig" },
+        .{ .name = "input", .source = "src/input.zig" },
+        .{ .name = "audio", .source = "src/audio.zig" },
+        .{ .name = "window", .source = "src/window.zig" },
+    },
+
+    // No dep_options / system_libs / frameworks: pure Zig, nothing native to link.
+
+    .platforms = .{
+        // Desktop-only, headless. Generic declarative desktop path (loop-form
+        // `unifyCoreDiamond` walk); no artifacts, no packaging beyond the binary.
+        .desktop = .{
+            .entry = "templates/headless.txt",
+            .loop_style = .loop,
+            .target = .native,
+            .package = .binary,
+        },
+        // No android/ios/wasm — desktop only.
+    },
+
+    // No build_hook — a fully declarative, HOOKLESS backend.
+}

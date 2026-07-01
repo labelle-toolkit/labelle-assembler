@@ -608,6 +608,82 @@ pub const MANIFEST_V2_WGPU_GOLDEN = struct {
     }
 };
 
+// ── open config: a THIRD-PARTY backend, name+package only (epic #453 PR 11) ──
+// The capstone of the pluggable-backends epic. `backends/acme_foo` is a
+// HYPOTHETICAL third-party backend selected purely by NAME + package with NO
+// matching `Backend` enum tag (its `cfg.backend` sits at the `.raylib` default)
+// and a NON-`labelle.` canonical id (`acme.foo`). It must resolve + generate a
+// valid build.zig entirely through `backend_registry` + its v2 manifest, never
+// through the enum `switch (cfg.backend)`. PLUS: capability validation runs on
+// the v2 path BEFORE any build-graph is emitted, so a project requiring a
+// capability the backend does not declare fails with the readable project-level
+// `error.UnsupportedCapability` — not a deep codegen/compile error.
+pub const MANIFEST_V2_THIRD_PARTY_OPEN_CONFIG = struct {
+    fn genAcmeFoo(cfg: generate.ProjectConfig) ![]const u8 {
+        return h.genAcmeFooBuildZig(std.testing.allocator, cfg, .{});
+    }
+
+    test "open config: a name-only third-party backend (no enum tag) generates a valid build.zig via its v2 manifest" {
+        // `cfg.backend` is left at its `.raylib` default — the ONLY selector is
+        // `backend_package`. If routing leaked to the enum path this would emit
+        // raylib-shaped wiring; instead it must emit the acme_foo dep from the
+        // manifest and the generic loop-form core-diamond walk.
+        const cfg = generate.ProjectConfig{ .name = "acme-game", .ecs = .mock };
+        const out = try genAcmeFoo(cfg);
+        defer std.testing.allocator.free(out);
+
+        // Generated from the v2 manifest data — NOT the enum's raylib default.
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"acme_foo\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"labelle_raylib\"") == null);
+        // Provider modules under their default `backend_<name>` aliases.
+        try std.testing.expect(std.mem.indexOf(u8, out, "const backend_gfx = backend_dep.module(\"gfx\");") != null);
+        // The generic (loop-form) core-diamond walk replaced the unrolled overrides.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") != null);
+        // Hookless + no native deps (headless, pure Zig).
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_dep.artifact(") == null);
+    }
+
+    test "open config: the name-only third-party build.zig is syntactically valid Zig" {
+        const cfg = generate.ProjectConfig{ .name = "acme-game", .ecs = .mock };
+        const out = try genAcmeFoo(cfg);
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "capability gate: a required capability the third-party backend does not declare errors BEFORE wiring" {
+        // acme_foo advertises only `.headless`. A project explicitly requiring
+        // `.screenshots` must fail at generation time with the project-level
+        // `error.UnsupportedCapability` (capabilities.validate on the v2 path),
+        // BEFORE any build-graph text is emitted — not a deep compile error.
+        const cfg = generate.ProjectConfig{
+            .name = "acme-game",
+            .ecs = .mock,
+            .requires = &.{.screenshots},
+        };
+        try std.testing.expectError(error.UnsupportedCapability, genAcmeFoo(cfg));
+    }
+
+    test "capability gate: a satisfied requirement (the declared .headless) generates fine" {
+        // The complement of the gate: requiring exactly what the backend declares
+        // must pass and produce a valid build.zig — proving the gate fires on the
+        // MISSING capability, not on capability enforcement being on at all.
+        const cfg = generate.ProjectConfig{
+            .name = "acme-game",
+            .ecs = .mock,
+            .requires = &.{.headless},
+        };
+        const out = try genAcmeFoo(cfg);
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"acme_foo\"") != null);
+    }
+};
+
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
         const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
