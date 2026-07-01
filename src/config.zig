@@ -51,6 +51,46 @@ pub fn globalEnviron() std.process.Environ {
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 pub const Platform = enum { desktop, ios, android, wasm };
 
+/// A capability a backend provider may declare it supports (and a project may
+/// require). This is the DECLARATIVE MIRROR of the `@hasDecl`-gated optional
+/// backend decls (RFC "Opening the ecosystem — Capability negotiation",
+/// §1645-1683): the optional decl is the *mechanism*, the capability flag is
+/// the *advertisement* the resolver reads WITHOUT compiling the provider, so a
+/// missing capability surfaces as an early project-level error instead of a
+/// deep `@compileError` in generated `main.zig`.
+///
+/// The set is the RFC's core seven (§1656-1665) EXTENDED with the platform
+/// capabilities the codegen already branches on (`cfg.platform`) and the
+/// OGG-decode backend seam:
+///   - `screenshots`         — `takeScreenshot()` (headless CI, preview).
+///   - `compressed_textures` — ASTC/KTX2 GPU-native upload path.
+///   - `fonts`               — `decodeFont` / `uploadFontAtlas`.
+///   - `gamepad_polling`     — the input source provides gamepad state.
+///   - `raw_gui_adapter`     — in-backend imgui adapter (not just the C++ bridge).
+///   - `headless`            — can run with no window surface.
+///   - `surface_loss`        — implements `surfaceLost` / `surfaceRestored` (mobile).
+///   - `wasm` / `android` / `ios` — the provider supports building for that platform.
+///   - `audio_ogg`           — the provider decodes OGG/Vorbis audio.
+///
+/// Shared by the manifest parser (`BackendManifest.capabilities`) and the
+/// project-side requirement derivation (`capabilities.requiredCapabilities`),
+/// so a declared capability and a required capability are the SAME nominal type
+/// — no string matching, and adding a variant is caught by the exhaustiveness
+/// checker on both sides.
+pub const Capability = enum {
+    screenshots,
+    compressed_textures,
+    fonts,
+    gamepad_polling,
+    raw_gui_adapter,
+    headless,
+    surface_loss,
+    wasm,
+    android,
+    ios,
+    audio_ogg,
+};
+
 /// Project logical Y-axis convention (RFC-Y-AXIS-CONVENTION, epic
 /// labelle-engine#640). Parsed from `project.labelle`'s `.y_axis` key and
 /// emitted onto the generated game's `engine.GameConfigWithYAxis(..., .up|.down)`
@@ -478,6 +518,15 @@ pub const ProjectConfig = struct {
     /// and MUST ship a `backend.manifest.zon` — the manifest splice is its only
     /// codegen route (see `isExternal` / `backend_registry.resolveBackendPackage`).
     backend_package: ?PluginDep = null,
+    /// Capabilities the project EXPLICITLY requires of its resolved backend
+    /// provider (RFC "Capability negotiation", §1668). This is the explicit
+    /// half of the required set; the other half is DERIVED by the assembler
+    /// from the platform / GUI / asset-compression selection (see
+    /// `capabilities.requiredCapabilities`). A CI screenshot target, whose
+    /// need isn't derivable from a `project.labelle` field, declares
+    /// `.requires = &.{ .screenshots }` here. Defaults empty — an ordinary
+    /// desktop project derives everything and lists nothing.
+    requires: []const Capability = &.{},
     platform: Platform = .desktop,
     /// Logical Y-axis convention (RFC-Y-AXIS-CONVENTION / epic
     /// labelle-engine#640). Emitted onto the generated game's

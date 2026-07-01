@@ -16,6 +16,7 @@ pub const flow_scanner = @import("flow_scanner.zig");
 pub const flow_catalog = @import("flow_catalog.zig");
 const build_files = @import("build_files.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
+const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
 const gui_resolve = @import("gui_resolve.zig");
@@ -36,6 +37,7 @@ test {
     _ = @import("flow_catalog.zig");
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/manifest_splice.zig");
+    _ = @import("capabilities.zig");
 }
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
@@ -340,6 +342,46 @@ pub const GenerateOptions = struct {
     is_tests_target: bool = false,
 };
 
+/// Resolve-time provider-contract checks (RFC "Opening the ecosystem",
+/// §1616-1683): canonical provider identity, cross-provider id collision, and
+/// capability negotiation, all read from the resolved backend's
+/// `backend.manifest.zon` BEFORE the build graph is emitted.
+///
+/// Reads the identity/capability slice via `loadProviderManifest`, which is
+/// DECOUPLED from the desktop-only splice gate (`manifestPathEnabled`) — these
+/// checks apply on every target (android/wasm/ios included). A provider that
+/// ships no manifest yields a null slice: identity is derived, capabilities are
+/// un-enforced (the back-compat path).
+fn validateProviderContracts(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    game_dir: []const u8,
+) !void {
+    const maybe_pm = try manifest_splice.loadProviderManifest(allocator, cfg, game_dir);
+    const manifest_id: ?[]const u8 = if (maybe_pm) |pm| pm.id else null;
+    const declared: []const config.Capability = if (maybe_pm) |pm| pm.capabilities else &.{};
+    defer if (maybe_pm) |pm| manifest_splice.freeProviderManifest(allocator, pm);
+
+    // Provider identity: reserved-namespace + enum-shorthand drift.
+    try backend_registry.validateProviderIdentity(cfg, manifest_id);
+
+    // Cross-provider id collision over the full resolved provider set. Today
+    // that set is the single render backend, so this is future-proofing (the
+    // one place the whole set is cross-checked); plugins/audio providers join
+    // it once they carry identities.
+    if (manifest_id) |id| {
+        try backend_registry.checkProviderIdCollisions(&.{id});
+    }
+
+    // Capability negotiation. Enforcement is OPT-IN: a provider declaring a
+    // non-empty `.capabilities` set has missing requirements fail hard; a
+    // provider declaring none is only warned (back-compat gate in `validate`).
+    const required = try capabilities.requiredCapabilities(allocator, cfg);
+    defer allocator.free(required);
+    const provider_id = manifest_id orelse cfg.backendName();
+    try capabilities.validate(required, declared, provider_id);
+}
+
 pub fn generate(
     allocator: std.mem.Allocator,
     cfg_in: ProjectConfig,
@@ -359,6 +401,16 @@ pub fn generate(
     cfg.resources = mutable_resources;
 
     const io = config.globalIo();
+
+    // ── Provider identity + capability negotiation (RFC "Opening the
+    // ecosystem", §1616-1683; ecosystem-hardening #453) ──────────────
+    // Resolve-time contract checks that produce EARLY, project-level errors —
+    // before any build graph is emitted — instead of a deep `@compileError`
+    // from generated code. Runs after `requireManifestIfExternal` (a manifest-
+    // less external still errors first, with its clearer message) and before
+    // `deps_linker.createDepsLinks` / build.zig emission below.
+    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir);
+    try validateProviderContracts(allocator, cfg, game_dir);
 
     // Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
     // target platform opts into ASTC (`asset_compression`) and `labelle astc`
