@@ -79,7 +79,10 @@ pub fn Mixin(comptime Self: type) type {
             // not a `GameEvents = PluginEvents = void` path that would
             // confuse downstream consumers.
             const has_plugin_events_local = self.plugin_events.len > 0;
-            const has_game_events_local = event_names.len > 0;
+            // Pack events (Packs RFC §4, #439) are dir-scanned `events/*.zig`
+            // exactly like the game root's, so they count as game events: they
+            // widen `GameEvents` and fold into `AllHookPayloads` the same way.
+            const has_game_events_local = event_names.len > 0 or self.hasPackEvents();
 
             // The raw game-side scan keeps its v1 shape; the alias is what
             // the merge feeds on when plugins are also in play. For
@@ -99,6 +102,7 @@ pub fn Mixin(comptime Self: type) type {
                         const pascal = pathToPascal(name, &pascal_buf);
                         try w.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
                     }
+                    try writePackEventVariants(self, w, &pascal_buf);
                     try w.writeAll("};\n\n");
                 }
                 try self.writePluginEventsBlock(w);
@@ -118,6 +122,7 @@ pub fn Mixin(comptime Self: type) type {
                         const pascal = pathToPascal(name, &pascal_buf);
                         try w.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
                     }
+                    try writePackEventVariants(self, w, &pascal_buf);
                     try w.writeAll("};\n\n");
                 } else {
                     try w.writeAll("pub const GameEvents = void;\n\n");
@@ -140,6 +145,22 @@ pub fn Mixin(comptime Self: type) type {
             // `findByTypes` helpers so flow-codegen + the editor can do
             // the wire-fit lookup without re-iterating the decls.
             try self.writePluginCoercionsBlock(w);
+        }
+
+        /// Emit `<ident>: <ident>.<Pascal>,` union variants for every pack
+        /// event (Packs RFC §4, #439), matching the game-root event loop's
+        /// shape. The `<ident>` alias is defined by `writeEventImportsBlock`
+        /// as `@import("<pack.import_prefix>/events/<name>.zig")`. Bare
+        /// `eventVariantName` today (namespacing is #440); a pack and the game
+        /// root that both name `hit.zig` would collide on `hit` here.
+        fn writePackEventVariants(self: *Self, w: anytype, pascal_buf: *[128]u8) !void {
+            for (self.pack_scans) |pack| {
+                for (pack.event_names) |name| {
+                    const ident = eventVariantName(name);
+                    const pascal = pathToPascal(name, pascal_buf);
+                    try w.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
+                }
+            }
         }
     };
 }

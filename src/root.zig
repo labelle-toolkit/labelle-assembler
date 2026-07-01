@@ -79,6 +79,13 @@ pub const initGlobalIo = config.initGlobalIo;
 pub const resolveGuiPlugin = gui_resolve.resolveGuiPlugin;
 
 pub const generateMainZigFromTemplate = main_zig.generateMainZigFromTemplate;
+/// Codegen orchestrator module — exposed so callers/tests can set the
+/// module-level `pack_scans` (Packs RFC §4, #439) / `loop_style_override`
+/// vars that thread into `generateMainZigFromTemplate`.
+pub const main_template = main_zig.main_template;
+/// Pack dir-scan result (Packs RFC §4, #439). Re-exported so tests can build
+/// one directly and callers can name the `scanPack` return type.
+pub const PackScan = main_zig.PackScan;
 pub const generateBuildZig = build_files.generateBuildZig;
 pub const BuildZigOptions = build_files.BuildZigOptions;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
@@ -548,6 +555,69 @@ pub fn resolveLoopStyleOverride(
     return override;
 }
 
+/// Copy + scan one convention subdir of a pack into the generated target,
+/// returning the sorted file stems. Source is `<pack_src_dir>/<subdir>`;
+/// destination is `<dst_base>/<subdir>` (a generator-owned dir under
+/// `<target>/packs/<name>/`). A missing source subdir is tolerated —
+/// `copyAndScanAbs` returns an empty list — so a pack can ship, say,
+/// `components/` + `events/` without a `prefabs/` and not error.
+fn scanPackSubdir(
+    allocator: std.mem.Allocator,
+    pack_src_dir: []const u8,
+    dst_base: []const u8,
+    subdir: []const u8,
+    ext: []const u8,
+) ![][]const u8 {
+    const src = try std.fs.path.join(allocator, &.{ pack_src_dir, subdir });
+    defer allocator.free(src);
+    const dst = try std.fs.path.join(allocator, &.{ dst_base, subdir });
+    defer allocator.free(dst);
+    return scanner.copyAndScanAbs(allocator, src, dst, ext);
+}
+
+/// Scan a pack's convention subdirs (Packs RFC §4, labelle-assembler#439).
+///
+/// Copies `<pack_src_dir>/{components,events,prefabs}/` into
+/// `<target_dir>/packs/<pack_name>/{...}/` and collects the scanned stems
+/// into a `PackScan` whose `import_prefix` is `packs/<pack_name>` — the path
+/// the generated `main.zig` imports through. The returned `PackScan` owns
+/// every string; the caller must `deinit` it.
+///
+/// `hooks/` is intentionally not scanned yet — see the deferred list at the
+/// pack-scan loop in `generate`.
+///
+/// Exposed publicly so tests can exercise the copy/scan without the full
+/// cache-resolution + codegen pipeline.
+pub fn scanPack(
+    allocator: std.mem.Allocator,
+    pack_src_dir: []const u8,
+    target_dir: []const u8,
+    pack_name: []const u8,
+) !main_zig.PackScan {
+    const import_prefix = try std.fmt.allocPrint(allocator, "packs/{s}", .{pack_name});
+    errdefer allocator.free(import_prefix);
+    const name_owned = try allocator.dupe(u8, pack_name);
+    errdefer allocator.free(name_owned);
+
+    const dst_base = try std.fs.path.join(allocator, &.{ target_dir, "packs", pack_name });
+    defer allocator.free(dst_base);
+
+    const component_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "components", ".zig");
+    errdefer scanner.freeNames(allocator, component_names);
+    const event_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "events", ".zig");
+    errdefer scanner.freeNames(allocator, event_names);
+    const prefab_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "prefabs", ".jsonc");
+    errdefer scanner.freeNames(allocator, prefab_names);
+
+    return .{
+        .name = name_owned,
+        .import_prefix = import_prefix,
+        .component_names = component_names,
+        .event_names = event_names,
+        .prefab_names = prefab_names,
+    };
+}
+
 pub fn generate(
     allocator: std.mem.Allocator,
     cfg_in: ProjectConfig,
@@ -929,6 +999,52 @@ pub fn generate(
         try script_scan.scanPluginDir(plugin_scripts_dst, plugin.name);
     }
 
+    // ── Pack dir-scan (Packs RFC §4, labelle-assembler#439) ────────────
+    //
+    // A *pack* is the light, directory-scanned form of a plugin: instead of
+    // contributing components/events/prefabs via decl-modules, it drops
+    // game-convention files into `components/ events/ prefabs/ hooks/` and
+    // ships a thin `pack.labelle` whose scalar `.convention_dirs =
+    // .copy_and_scan` says "scan all my convention dirs like the game root".
+    //
+    // For every plugin that carries a `pack.labelle`, copy its convention
+    // subdirs into `<target>/packs/<name>/<subdir>/` and record the scanned
+    // stems. The codegen block-writers then register those stems into the
+    // SAME registries the game root feeds (the unified set) — see
+    // `main_template.pack_scans`. Plugins WITHOUT a `pack.labelle` (every
+    // decl-module plugin today) are skipped, so this is fully back-compat.
+    //
+    // Scope of this slice (#439): components + events + prefabs are scanned
+    // and registered. DEFERRED with clean seams:
+    //   * `hooks/` scanning — the game-root hook pipeline is a three-block
+    //     coordination (import + GameHooks type + per-instance init) that
+    //     needs the `<pack>__` ident-namespacing to avoid collisions; folded
+    //     in once #440 lands the prefix.
+    //   * the invisible `<pack>__<Name>` prefix + `.jsonc` local→prefixed ref
+    //     rewrite (#440) — today registered names are BARE.
+    //   * the per-pack `global ++ own` registry partition / `PackView`
+    //     (#652-remainder) — today everything lands in one flat registry.
+    //   * `exposes` / `depends_on` DAG + isolation (#440 / §6).
+    var pack_scans: std.ArrayList(main_zig.PackScan) = .empty;
+    defer {
+        for (pack_scans.items) |*p| p.deinit(allocator);
+        pack_scans.deinit(allocator);
+    }
+    try pack_scans.ensureTotalCapacity(allocator, cfg.plugins.len);
+    for (cfg.plugins) |plugin| {
+        var pm = (try plugin_manifest.loadPackOptional(allocator, plugin, game_dir)) orelse continue;
+        defer pm.deinit();
+
+        const pack_src_dir = try cache.resolvePlugin(allocator, plugin, game_dir);
+        defer allocator.free(pack_src_dir);
+
+        // ensureTotalCapacity above reserved cfg.plugins.len slots, so this
+        // append cannot fail — no window where a scanned pack is owned but
+        // outside the cleanup list's reach.
+        const scanned = try scanPack(allocator, pack_src_dir, target_dir, plugin.name);
+        pack_scans.appendAssumeCapacity(scanned);
+    }
+
     // ── Flow-node discovery (RFC-FLOW-VOCABULARY phase 2) ──────────────
     //
     // Discover `pub const FlowNodes` + `pub const PinStyles` +
@@ -1170,6 +1286,13 @@ pub fn generate(
         // reads the top-level `loop_style`. Both map onto the same override enum.
         defer main_zig.main_template.loop_style_override = null;
         main_zig.main_template.loop_style_override = try resolveLoopStyleOverride(allocator, cfg, game_dir, backend_manifest_name);
+
+        // Pack dir-scan results (Packs RFC §4, #439) — same module-level-var
+        // pattern as loop_style_override, so the ~19-arg generator signature
+        // (100+ call sites) stays untouched. Scoped to this one generation;
+        // cleared right after. Empty when the project declares no packs.
+        defer main_zig.main_template.pack_scans = &.{};
+        main_zig.main_template.pack_scans = pack_scans.items;
 
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,

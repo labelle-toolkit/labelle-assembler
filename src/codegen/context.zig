@@ -85,6 +85,13 @@ pub const Codegen = struct {
     plugin_pin_styles: []const PluginPinStyle,
     plugin_coercions: []const PluginCoercion,
 
+    // Pack dir-scan results (Packs RFC §4, labelle-assembler#439). Borrowed;
+    // owned by `root.zig`. Empty by default so every caller that never sets
+    // it (tests, preview) keeps its exact pre-pack registry emission. The
+    // registry/import/prefab block-writers iterate this AFTER the game-root
+    // loops to register pack items into the SAME (unified) registries.
+    pack_scans: []const scan.PackScan = &.{},
+
     // Priority-aware flow-handler ordering (indices into `script_entries`),
     // built by `blocks/hooks.zig:buildFlowOrder`. Borrowed: the
     // orchestrator owns the backing `ArrayList`. Shared between the
@@ -170,4 +177,29 @@ pub const Codegen = struct {
 
     // Lifecycle section render (codegen/lifecycle/render.zig)
     pub const renderLifecycle = LifecycleRenderMixin.renderLifecycle;
+
+    // ── Pack helpers (Packs RFC §4, #439) ────────────────────────────
+    // Shared gating predicates so the event-union / AllHookPayloads / prefab
+    // / JsoncBridge blocks all treat "pack items exist" identically to their
+    // game-root counterparts.
+
+    /// True iff any pack contributed at least one `events/*.zig`. Folded
+    /// into the same gate as game `event_names` so pack events widen
+    /// `GameEvents` and get merged into `AllHookPayloads`.
+    pub fn hasPackEvents(self: *const Self) bool {
+        for (self.pack_scans) |p| {
+            if (p.event_names.len > 0) return true;
+        }
+        return false;
+    }
+
+    /// True iff any pack contributed at least one `prefabs/*.jsonc`. Gates
+    /// the `JsoncBridge` decl + the embedded-prefab registration so a pack
+    /// can ship prefabs even when the game root declares none.
+    pub fn hasPackPrefabs(self: *const Self) bool {
+        for (self.pack_scans) |p| {
+            if (p.prefab_names.len > 0) return true;
+        }
+        return false;
+    }
 };

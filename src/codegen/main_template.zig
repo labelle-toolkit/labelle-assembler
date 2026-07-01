@@ -44,6 +44,17 @@ const manifest_splice = @import("manifest_splice.zig");
 /// `use_callback_lifecycle` is false — identical to the enum path.
 pub threadlocal var loop_style_override: ?manifest_splice.BackendManifest.LoopStyle = null;
 
+/// Pack dir-scan results (Packs RFC §4, labelle-assembler#439). Each entry
+/// carries one pack's scanned component/event/prefab stems + its
+/// `import_prefix`, so the registry block-writers can register them into the
+/// SAME registries the game root feeds (the unified set). `root.zig` sets
+/// this immediately before the `generateMainZigFromTemplate` call and clears
+/// it after — same module-level-var pattern as `loop_style_override`, chosen
+/// to keep this diff off the generator's ~19 positional-arg signature (which
+/// has 100+ call sites in the test suite). Empty (the default) → no packs,
+/// every registry block emits its exact pre-pack shape.
+pub threadlocal var pack_scans: []const scan.PackScan = &.{};
+
 const ProjectConfig = config.ProjectConfig;
 const LayerDef = config.LayerDef;
 const ResourceDef = config.ResourceDef;
@@ -181,6 +192,10 @@ pub fn generateMainZigFromTemplate(
         .plugin_flow_nodes = plugin_flow_nodes,
         .plugin_pin_styles = plugin_pin_styles,
         .plugin_coercions = plugin_coercions,
+        // Packs (RFC §4, #439) — read from the module-level var set by
+        // root.zig. Defaults to empty so every existing call site (tests,
+        // preview) keeps its exact pre-pack emission.
+        .pack_scans = pack_scans,
     };
 
     var data = tpl.TemplateData{

@@ -132,11 +132,29 @@ pub fn Mixin(comptime Self: type) type {
             }
 
             // Pre-load embedded prefabs (must happen before scene loading)
-            if (prefab_names.len > 0) {
+            if (prefab_names.len > 0 or self.hasPackPrefabs()) {
                 try w.writeAll("    // Embedded prefabs (via @embedFile)\n");
                 for (prefab_names) |name| {
                     const display = std.fs.path.basename(name);
                     try w.print("    try JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"prefabs/{s}.jsonc\"), \"prefabs\");\n", .{ display, name });
+                }
+                // Pack prefabs (Packs RFC §4, #439): embedded from the pack's
+                // `import_prefix`, registered by bare basename (namespacing is
+                // #440). No comptime PrefabRegistry entry — JSONC prefabs are a
+                // runtime name→source registry, so a pack just registers more.
+                //
+                // The prefab root MUST be the pack's own `<import_prefix>/prefabs`
+                // (e.g. `packs/citizens/prefabs`), NOT the bare `"prefabs"` root:
+                // the engine stores this as the cache's `prefab_dir`, which is the
+                // base directory a prefab's JSONC `"include"` / source-relative
+                // lookups resolve against. Registering a pack prefab under the
+                // game's `"prefabs"` would make its includes resolve against the
+                // game tree instead of the copied pack dir (chatgpt-codex, #478).
+                for (self.pack_scans) |pack| {
+                    for (pack.prefab_names) |name| {
+                        const display = std.fs.path.basename(name);
+                        try w.print("    try JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"{s}/prefabs/{s}.jsonc\"), \"{s}/prefabs\");\n", .{ display, pack.import_prefix, name, pack.import_prefix });
+                    }
                 }
                 try w.writeByte('\n');
             }

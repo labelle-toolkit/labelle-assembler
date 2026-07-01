@@ -23,6 +23,11 @@ pub const RESERVED_DIR_NAMES = [_][]const u8{
     "events",
     "gizmos",
     "hooks",
+    // `packs` is owned by the pack-scan layout (Packs RFC §4, #439): the
+    // generator copies each scanned pack into `<target>/packs/<name>/`, so a
+    // plugin must not claim `packs` as a convention dir and write into that
+    // same tree (CodeRabbit, #478).
+    "packs",
     "prefabs",
     "scenes",
     "scripts",
@@ -91,6 +96,129 @@ pub const PluginManifest = struct {
         std.zon.parse.free(self.allocator, self.convention_dirs);
     }
 };
+
+// ── Pack manifest (`pack.labelle`) ─────────────────────────────────
+//
+// A *pack* (Packs RFC §4, labelle-assembler#439) is the author-facing,
+// light form of a plugin: a namespaced directory of game-convention files
+// (`components/ events/ prefabs/ hooks/`) scanned the same way the game
+// root is, rather than a decl-module plugin. It carries its own thin
+// descriptor, `pack.labelle`, whose distinguishing feature is a **scalar**
+// `.convention_dirs = .copy_and_scan` shorthand meaning "scan all my
+// convention dirs like the game root" (RFC §10 Q3). This is kept as a
+// SEPARATE file + schema from `plugin.labelle` (whose `convention_dirs` is
+// an array of per-dir `.{}` entries) so neither parser has to disambiguate
+// scalar-vs-array in one field — a pack uses `pack.labelle`, a
+// custom-scan plugin uses `plugin.labelle`, and both keep their simple
+// typed ZON parse.
+//
+// `exposes` / `depends_on` (the §6 isolation inputs) are accepted but
+// ignored for now — this slice implements the dir-scan + registry
+// unification only; the DAG/visibility work is #440 / #652-remainder.
+
+/// Scan mode a `pack.labelle` may declare. Today only the scalar
+/// `copy_and_scan` shorthand exists — "scan every convention dir I own"
+/// (`components/ events/ prefabs/ hooks/`).
+pub const PackConventionMode = enum {
+    copy_and_scan,
+};
+
+/// Parsed and validated `pack.labelle`. `name` is a heap dupe owned by
+/// `allocator`; call `deinit` to release it.
+pub const PackManifest = struct {
+    name: []const u8,
+    manifest_version: u8,
+    convention_dirs: PackConventionMode,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *PackManifest) void {
+        std.zon.parse.free(self.allocator, self.name);
+    }
+};
+
+// ZON-parseable shape for `pack.labelle`. `exposes` / `depends_on` are
+// deliberately absent from the typed shape and skipped via
+// `ignore_unknown_fields` — they don't affect the dir-scan this ticket
+// implements, and adding them now would bake in a schema before #440/#652
+// pin their form.
+const ZonPackManifest = struct {
+    name: []const u8,
+    manifest_version: u8,
+    convention_dirs: PackConventionMode = .copy_and_scan,
+};
+
+/// Read and parse `pack.labelle` for the given plugin if it exists.
+/// Returns `null` when the plugin ships no `pack.labelle` (the common
+/// case — most plugins are decl-module plugins, not packs).
+pub fn loadPackOptional(
+    allocator: std.mem.Allocator,
+    plugin: config.PluginDep,
+    project_dir: []const u8,
+) !?PackManifest {
+    const plugin_dir = try cache.resolvePlugin(allocator, plugin, project_dir);
+    defer allocator.free(plugin_dir);
+    return loadPackFromDir(allocator, plugin_dir, plugin.name);
+}
+
+/// Lower-level entry point: read + parse `pack.labelle` from a known pack
+/// directory. `expected_name` is the `.plugins` entry name; the manifest's
+/// `name` must match it (same contract as `plugin.labelle`).
+///
+/// Returns `null` if there is no `pack.labelle`. Errors on parse failure
+/// (`PackManifestParseError`), name mismatch (`PackManifestNameMismatch`),
+/// or an unsupported `manifest_version` (`PackManifestUnknownVersion`).
+pub fn loadPackFromDir(
+    allocator: std.mem.Allocator,
+    pack_dir: []const u8,
+    expected_name: []const u8,
+) !?PackManifest {
+    const manifest_path = try std.fs.path.join(allocator, &.{ pack_dir, "pack.labelle" });
+    defer allocator.free(manifest_path);
+
+    const cwd = std.Io.Dir.cwd();
+    const raw_bytes = cwd.readFileAlloc(config.globalIo(), manifest_path, allocator, .limited(64 * 1024)) catch |err| {
+        if (err == error.FileNotFound) return null;
+        return err;
+    };
+    defer allocator.free(raw_bytes);
+
+    const raw_z = try allocator.dupeZ(u8, raw_bytes);
+    defer allocator.free(raw_z);
+
+    const parsed = std.zon.parse.fromSliceAlloc(ZonPackManifest, allocator, raw_z, null, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        std.log.warn(
+            "labelle: failed to parse pack.labelle for pack '{s}' at {s}\n  parser error: {any}\n  see docs/RFC-packs.md for the pack manifest schema\n",
+            .{ expected_name, manifest_path, err },
+        );
+        return error.PackManifestParseError;
+    };
+    errdefer std.zon.parse.free(allocator, parsed);
+
+    if (!std.mem.eql(u8, parsed.name, expected_name)) {
+        std.log.warn(
+            "labelle: pack.labelle name mismatch\n  project.labelle declares '{s}'\n  but its pack.labelle has name = '{s}'\n  at {s}\n",
+            .{ expected_name, parsed.name, manifest_path },
+        );
+        return error.PackManifestNameMismatch;
+    }
+
+    if (parsed.manifest_version < 1 or parsed.manifest_version > SUPPORTED_MANIFEST_VERSION) {
+        std.log.warn(
+            "labelle: pack '{s}' has manifest_version {d}\n  but this labelle-cli release supports manifest_version 1..{d}\n",
+            .{ expected_name, parsed.manifest_version, SUPPORTED_MANIFEST_VERSION },
+        );
+        return error.PackManifestUnknownVersion;
+    }
+
+    return PackManifest{
+        .name = parsed.name,
+        .manifest_version = parsed.manifest_version,
+        .convention_dirs = parsed.convention_dirs,
+        .allocator = allocator,
+    };
+}
 
 // ── Errors ─────────────────────────────────────────────────────────
 //
@@ -315,8 +443,9 @@ const testing = std.testing;
 
 test "isReservedDirName: matches every hardcoded name" {
     inline for (.{
-        "assets", "components", "enums", "events", "gizmos",
-        "hooks",  "prefabs",    "scenes", "scripts", "views",
+        "assets", "components", "enums",  "events",  "gizmos",
+        "hooks",  "packs",      "prefabs", "scenes",  "scripts",
+        "views",
     }) |name| {
         try testing.expect(isReservedDirName(name));
     }
@@ -631,6 +760,33 @@ test "loadFromDir: errors when plugin tries to declare a reserved name" {
     try testing.expectError(error.PluginManifestReservedDirName, result);
 }
 
+test "loadFromDir: errors when plugin tries to declare the packs reserved name" {
+    // `packs` is reserved for the pack-scan layout (#439) — a plugin must not
+    // claim it and write into `<target>/packs/`, colliding with scanned packs.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "fsm",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .{
+        \\        .{
+        \\            .name = "packs",
+        \\            .extension = ".zig",
+        \\            .mode = .copy_and_scan,
+        \\        },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadFromDir(testing.allocator, tmp_path, "fsm");
+    try testing.expectError(error.PluginManifestReservedDirName, result);
+}
+
 test "loadFromDir: errors on malformed ZON" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -796,4 +952,130 @@ test "loadFromDir: ignore_unknown_fields allows forward-compat manifests" {
 
     try testing.expectEqualStrings("fsm", manifest.name);
     try testing.expectEqual(@as(usize, 1), manifest.convention_dirs.len);
+}
+
+// ── Pack manifest (`pack.labelle`) tests ───────────────────────────
+
+fn writePackManifestFile(tmp_dir: std.Io.Dir, body: []const u8) !void {
+    var f = try tmp_dir.createFile(testing.io, "pack.labelle", .{});
+    defer f.close(testing.io);
+    try f.writeStreamingAll(testing.io, body);
+}
+
+test "loadPackFromDir: returns null when pack.labelle is missing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = try loadPackFromDir(testing.allocator, tmp_path, "citizens");
+    try testing.expect(result == null);
+}
+
+test "loadPackFromDir: parses the scalar copy_and_scan shorthand" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .copy_and_scan,
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadPackFromDir(testing.allocator, tmp_path, "citizens")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqualStrings("citizens", manifest.name);
+    try testing.expectEqual(@as(u8, 1), manifest.manifest_version);
+    try testing.expectEqual(PackConventionMode.copy_and_scan, manifest.convention_dirs);
+}
+
+test "loadPackFromDir: convention_dirs defaults to copy_and_scan when omitted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 1,
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadPackFromDir(testing.allocator, tmp_path, "citizens")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqual(PackConventionMode.copy_and_scan, manifest.convention_dirs);
+}
+
+test "loadPackFromDir: ignores exposes/depends_on (deferred to #440/#652)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The RFC §4 pack.labelle carries exposes/depends_on; this slice does
+    // not consume them yet, so they must be silently ignored, not rejected.
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .copy_and_scan,
+        \\    .exposes = .{ .queries = .{ "idleWorkers" }, .commands = .{ "spawnArrival" } },
+        \\    .depends_on = .{ "rooms", "pathfinder" },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadPackFromDir(testing.allocator, tmp_path, "citizens")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqualStrings("citizens", manifest.name);
+    try testing.expectEqual(PackConventionMode.copy_and_scan, manifest.convention_dirs);
+}
+
+test "loadPackFromDir: errors on name mismatch" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .copy_and_scan,
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadPackFromDir(testing.allocator, tmp_path, "different");
+    try testing.expectError(error.PackManifestNameMismatch, result);
+}
+
+test "loadPackFromDir: errors on unsupported manifest_version" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 99,
+        \\    .convention_dirs = .copy_and_scan,
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadPackFromDir(testing.allocator, tmp_path, "citizens");
+    try testing.expectError(error.PackManifestUnknownVersion, result);
 }

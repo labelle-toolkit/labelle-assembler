@@ -65,6 +65,20 @@ pub fn Mixin(comptime Self: type) type {
                 const pascal = pathToPascal(name, &pascal_buf);
                 try w.print("    .{s} = @import(\"components/{s}.zig\").{s},\n", .{ pascal, name, pascal });
             }
+            // Pack components (Packs RFC §4, #439) land in the SAME registry
+            // field-set as the game root — the "unified set" (§6-1b): they're
+            // stored + serialized identically, no separate registry. Files
+            // live under the pack's `import_prefix` (e.g. `packs/citizens`),
+            // scanned/copied by `root.zig`. NOTE (#440): the field name is the
+            // pack's *bare* `Pascal` (no `<pack>__` prefix yet) — a pack and
+            // the game root that both define `Worker` collide here; the
+            // invisible prefix that closes that is deferred.
+            for (self.pack_scans) |pack| {
+                for (pack.component_names) |name| {
+                    const pascal = pathToPascal(name, &pascal_buf);
+                    try w.print("    .{s} = @import(\"{s}/components/{s}.zig\").{s},\n", .{ pascal, pack.import_prefix, name, pascal });
+                }
+            }
             if (has_plugins) {
                 try w.writeAll("}, .{\n");
                 try w.writeAll("    @import(\"labelle-gfx\"),\n");

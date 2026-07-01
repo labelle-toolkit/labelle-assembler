@@ -42,6 +42,51 @@ fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
     std.Io.File.stderr().writeStreamingAll(config.globalIo(), msg) catch {};
 }
 
+/// Scan result for one **pack** (Packs RFC §4, labelle-assembler#439).
+///
+/// A *pack* is a light, directory-scanned plugin: instead of contributing
+/// components/events/prefabs through decl-modules (`pub const Components`),
+/// it drops game-convention files into `components/ events/ prefabs/ hooks/`
+/// subdirs — scanned the same way the game root is. `generate` copies each
+/// subdir into `<target>/packs/<name>/<subdir>/` and records the scanned
+/// stems here so the codegen block-writers can register them into the SAME
+/// registries the game root feeds (the "unified set", RFC §4 / §6-1b).
+///
+/// `import_prefix` is the path the generated `main.zig` imports through,
+/// e.g. `"packs/citizens"` — files live at
+/// `<import_prefix>/{components,events,prefabs}/<name>.<ext>`.
+///
+/// Namespacing NOTE (deferred to #440): the registered identifiers are the
+/// pack's *bare* stems (`.Worker`, not `.citizens__Worker`). The physical
+/// path is already pack-namespaced (files never collide on disk), but the
+/// *registry field / event-variant* names are bare, so a pack and the game
+/// root that both define `Worker` would collide at the registry. The
+/// invisible `<pack>__` prefix that closes this is a separate ticket; this
+/// slice only unblocks the discarded-names gap.
+///
+/// Owned by `deinit` — `name`, `import_prefix`, and every string in the
+/// three name slices are heap dupes made by the scan/copy pass.
+pub const PackScan = struct {
+    name: []const u8,
+    import_prefix: []const u8,
+    component_names: []const []const u8,
+    event_names: []const []const u8,
+    prefab_names: []const []const u8,
+
+    pub fn deinit(self: *PackScan, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.import_prefix);
+        freeNameSlice(allocator, self.component_names);
+        freeNameSlice(allocator, self.event_names);
+        freeNameSlice(allocator, self.prefab_names);
+    }
+
+    fn freeNameSlice(allocator: std.mem.Allocator, names: []const []const u8) void {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+};
+
 /// A single discovered `pub const <event_name> = struct {...}` declaration
 /// inside a plugin's `pub const Events = struct { ... }`. Owned by
 /// `PluginEvents.deinit` — all three strings (`plugin_import_name`,
