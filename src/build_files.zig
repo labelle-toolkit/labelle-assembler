@@ -209,48 +209,6 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     errdefer alloc_writer.deinit();
     const w = &alloc_writer.writer;
 
-    if (cfg.platform == .wasm) {
-        try tpl.writeSection(build_zig_tmpl, "header_wasm", w);
-        try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
-    } else if (cfg.platform == .ios) {
-        try tpl.writeSection(build_zig_tmpl, "header_ios", w);
-    } else if (cfg.platform == .android) {
-        try tpl.writeSection(build_zig_tmpl, "header_android", w);
-    } else {
-        try tpl.writeSection(build_zig_tmpl, "header", w);
-    }
-
-    if (cfg.platform == .ios) {
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
-            try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
-        }
-        try tpl.writeSection(build_zig_tmpl, "ios_deps", w);
-        try tpl.writeSection(build_zig_tmpl, "game_mod_decl_ios", w);
-    } else if (cfg.platform == .android) {
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui()) {
-            try tpl.writeSection(build_zig_tmpl, "android_target_alias", w);
-        }
-        try tpl.writeSection(build_zig_tmpl, "android_deps", w);
-        try tpl.writeSection(build_zig_tmpl, "game_mod_decl_android", w);
-    } else {
-        try tpl.writeSection(build_zig_tmpl, "deps", w);
-        // Bind the `game` module right after deps so the exe/tests
-        // module imports below can reference `game_mod`. See
-        // labelle-assembler#116.
-        try tpl.writeSection(build_zig_tmpl, "game_mod_decl", w);
-    }
-
-    // Plugin dep/module declarations (for all declared plugins)
-    for (cfg.plugins) |plugin| {
-        if (cfg.platform == .ios) {
-            // Pass iOS SDK path to plugins so C dependencies can find system headers
-            try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize, .ios_sdk_path = @as(?[]const u8, sdk_path) }});\n", .{ plugin.name, plugin.name });
-        } else {
-            try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize }});\n", .{ plugin.name, plugin.name });
-        }
-        try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle_{s}\");\n", .{ plugin.name, plugin.name, plugin.name });
-    }
-
     // `gamepad_enabled` flips the shared SDL desktop gamepad source on
     // (core#28 slice 5). When `.auto`, the backend's build.zig wires
     // `sdl_gamepad` + links SDL2 on desktop and routes through it; when
@@ -280,13 +238,18 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // name): a backend shipping ONLY `backend.manifest.v2.zon` must still reach
     // the v2 loader below rather than be treated as manifest-less because the
     // hardcoded legacy `backend.manifest.zon` is absent (manifest-v2, #453).
+    //
+    // Loaded UP HERE (before the header/deps emission) because a v2 android build
+    // emits a different header (hook-imported `resolve_target`) than the enum
+    // `header_android`, so the platform-scaffold emission below must know whether
+    // this is a v2 manifest (manifest-v2 PR 5, #453).
     if (opts.project_dir) |pd| try manifest_splice.requireManifestIfExternal(allocator, cfg, pd, opts.backend_manifest_name);
 
     const use_manifest = opts.project_dir != null and
         manifest_splice.manifestPathEnabled(allocator, cfg, opts.project_dir.?, opts.backend_manifest_name);
     var splice_manifest: ?manifest_splice.BackendManifest = null;
     defer if (splice_manifest) |m| manifest_splice.freeManifest(allocator, m);
-    // manifest-v2 (epic #453 item 3, PR 3): only set when a `manifest_version >= 2`
+    // manifest-v2 (epic #453 item 3, PR 3/5): only set when a `manifest_version >= 2`
     // manifest is loaded via the opt-in `backend_manifest_name`. Null in production.
     var v2_manifest: ?manifest_v2.BackendManifestV2 = null;
     defer if (v2_manifest) |m| std.zon.parse.free(allocator, m);
@@ -294,10 +257,20 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         if (opts.backend_manifest_name) |name| {
             // Header-first parse + dispatch (design §6): a v1/field-less manifest
             // still routes to the v1 splice below; a v2 manifest routes to the v2
-            // desktop codegen. `>` SUPPORTED is rejected by `parseManifest`.
+            // codegen. `>` SUPPORTED is rejected by `parseManifest`.
             const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, opts.project_dir.?, name);
             switch (parsed) {
-                .v1 => |m| splice_manifest = m,
+                .v1 => |m| {
+                    // The V1 splice covers desktop only. On a non-desktop target the
+                    // relaxed gate (manifest-v2 opt-in) let us load the manifest, but
+                    // a v1 one there must fall back to the enum path — free it and
+                    // leave `splice_manifest` null.
+                    if (cfg.platform == .desktop) {
+                        splice_manifest = m;
+                    } else {
+                        manifest_splice.freeManifest(allocator, m);
+                    }
+                },
                 .v2 => |m| v2_manifest = m,
             }
         } else {
@@ -306,11 +279,78 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         }
     }
 
+    if (cfg.platform == .wasm) {
+        try tpl.writeSection(build_zig_tmpl, "header_wasm", w);
+        try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
+    } else if (cfg.platform == .ios) {
+        try tpl.writeSection(build_zig_tmpl, "header_ios", w);
+    } else if (cfg.platform == .android) {
+        if (v2_manifest) |m| {
+            // manifest-v2 android (PR 5): the header imports the backend hook and
+            // resolves the android target via `resolve_target` (design §4) instead
+            // of the enum `header_android`'s inline NDK/target block.
+            try manifest_v2_splice.renderAndroidHeaderV2(m, w);
+        } else {
+            try tpl.writeSection(build_zig_tmpl, "header_android", w);
+        }
+    } else {
+        try tpl.writeSection(build_zig_tmpl, "header", w);
+    }
+
+    if (cfg.platform == .ios) {
+        // `target` (the alias for `ios_target`) is consumed by the deps/plugin
+        // decls AND by `emitPromotedScriptModules` (`.target = target`). Emit the
+        // alias whenever ANY consumer needs it — including promoted scripts on an
+        // otherwise plugin/ECS/GUI-free game (PR #466 Finding 1).
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
+            try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
+        }
+        try tpl.writeSection(build_zig_tmpl, "ios_deps", w);
+        try tpl.writeSection(build_zig_tmpl, "game_mod_decl_ios", w);
+    } else if (cfg.platform == .android) {
+        // `target` (the alias for `android_target`) is consumed by the deps/plugin
+        // decls AND by `emitPromotedScriptModules` (`.target = target`). This guard
+        // is shared by BOTH the v2 and enum android routes, so include the promoted-
+        // scripts condition so `target` is defined whenever any consumer needs it —
+        // a promoted-scripts + no-plugin/ECS/GUI android game previously emitted an
+        // undefined `target` (PR #466 Finding 1, applies to v2 AND enum).
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
+            try tpl.writeSection(build_zig_tmpl, "android_target_alias", w);
+        }
+        if (v2_manifest != null) {
+            // manifest-v2 android (PR 5): emit the core/gfx/engine dep decls WITHOUT
+            // the unrolled overrideImport diamond — the generic `unifyCoreDiamond`
+            // walk (emitted after the backend-dep section) replaces it (design §5).
+            try manifest_v2_splice.renderAndroidDepsDeclsV2(w);
+        } else {
+            try tpl.writeSection(build_zig_tmpl, "android_deps", w);
+        }
+        try tpl.writeSection(build_zig_tmpl, "game_mod_decl_android", w);
+    } else {
+        try tpl.writeSection(build_zig_tmpl, "deps", w);
+        // Bind the `game` module right after deps so the exe/tests
+        // module imports below can reference `game_mod`. See
+        // labelle-assembler#116.
+        try tpl.writeSection(build_zig_tmpl, "game_mod_decl", w);
+    }
+
+    // Plugin dep/module declarations (for all declared plugins)
+    for (cfg.plugins) |plugin| {
+        if (cfg.platform == .ios) {
+            // Pass iOS SDK path to plugins so C dependencies can find system headers
+            try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize, .ios_sdk_path = @as(?[]const u8, sdk_path) }});\n", .{ plugin.name, plugin.name });
+        } else {
+            try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize }});\n", .{ plugin.name, plugin.name });
+        }
+        try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle_{s}\");\n", .{ plugin.name, plugin.name, plugin.name });
+    }
+
     // Backend dep — always the standard backend (never a merged GUI+backend package)
     if (v2_manifest) |m| {
-        // manifest-v2 desktop codegen (design §3/§5/§7): render the b.dependency
-        // literal + modules + artifact from typed manifest data. Desktop-only in
-        // PR 3 (the gate is desktop-only). Byte-anchored against the v1/enum path.
+        // manifest-v2 codegen (design §3/§5/§7): render the b.dependency literal +
+        // modules + artifacts from typed manifest data. Desktop (PR 3) is
+        // byte-anchored against v1/enum; android (PR 5) is a golden cell — its
+        // backend-dep emitter also appends the generic core-diamond walk calls.
         try manifest_v2_splice.renderBackendDepSectionV2(allocator, m, cfg, w);
     } else if (splice_manifest) |m| {
         // Splice: resolve the backend-dep build fragment from the manifest,
@@ -587,18 +627,26 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → Android lib root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "lib", opts.promoted_scripts);
 
-        // Pass target_sdk_version from AndroidConfig (default 34) for NDK library path
-        const android_cfg = cfg.android orelse config.AndroidConfig{};
-        var sdk_buf: [10]u8 = undefined;
-        const sdk_version_str = std.fmt.bufPrint(&sdk_buf, "{d}", .{android_cfg.target_sdk_version}) catch "34";
-        // Backend-specific NDK link line: sokol consumes its `sokol_clib`
-        // static archive into the .so + links GLESv3/EGL; bgfx consumes
-        // the `bgfx` artifact + the `android_app` glue module and links
-        // GLESv3/EGL/android/log itself (#303).
-        if (cfg.backend == .bgfx) {
-            try tpl.renderSection(build_zig_tmpl, "android_link_bgfx", .{ .target_sdk_version = sdk_version_str }, w);
+        if (v2_manifest) |m| {
+            // manifest-v2 android (PR 5): the generic link (linkLibrary +
+            // linkSystemLibrary from `.system_libs.android` + `link_libc`) plus the
+            // `post_wire` hook call for the NDK-sysroot / addLibraryPath / libc.txt
+            // residual (design §4). No enum `android_link` section.
+            try manifest_v2_splice.renderLinkSectionV2(allocator, m, cfg, w);
         } else {
-            try tpl.renderSection(build_zig_tmpl, "android_link", .{ .target_sdk_version = sdk_version_str }, w);
+            // Pass target_sdk_version from AndroidConfig (default 34) for NDK library path
+            const android_cfg = cfg.android orelse config.AndroidConfig{};
+            var sdk_buf: [10]u8 = undefined;
+            const sdk_version_str = std.fmt.bufPrint(&sdk_buf, "{d}", .{android_cfg.target_sdk_version}) catch "34";
+            // Backend-specific NDK link line: sokol consumes its `sokol_clib`
+            // static archive into the .so + links GLESv3/EGL; bgfx consumes
+            // the `bgfx` artifact + the `android_app` glue module and links
+            // GLESv3/EGL/android/log itself (#303).
+            if (cfg.backend == .bgfx) {
+                try tpl.renderSection(build_zig_tmpl, "android_link_bgfx", .{ .target_sdk_version = sdk_version_str }, w);
+            } else {
+                try tpl.renderSection(build_zig_tmpl, "android_link", .{ .target_sdk_version = sdk_version_str }, w);
+            }
         }
 
         if (cfg.resolved_gui) |gui| {
@@ -608,8 +656,24 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         }
 
-        try tpl.writeSection(build_zig_tmpl, "android_package", w);
+        // Packaging: v2 delegates the `.apk` recipe to the shared packager
+        // (byte-identical to `.android_package`, design §7); the enum path emits
+        // the section directly.
+        if (v2_manifest) |m| {
+            try manifest_v2_splice.renderPackageV2(m, cfg.platform, w);
+        } else {
+            try tpl.writeSection(build_zig_tmpl, "android_package", w);
+        }
         try tpl.writeSection(build_zig_tmpl, "android_footer", w);
+
+        // manifest-v2 android emits the generic `unifyCoreDiamond` walk (design §5)
+        // as a top-level helper AFTER the build fn + the footer's `overrideImport`
+        // def it calls. Desktop keeps the unrolled overrides (byte anchor), so this
+        // is android-only.
+        if (v2_manifest != null) {
+            try w.writeByte('\n');
+            try manifest_v2_splice.emitCoreDiamondWalk(w);
+        }
     } else {
         // Desktop: build as executable, link natively. Test-only targets
         // (issue #83) skip the exe assembly + backend artifact link + bridge
