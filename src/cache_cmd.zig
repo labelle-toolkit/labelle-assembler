@@ -542,8 +542,13 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !voi
     // external backend (the flip, #386 Phase 6c), it must be in the cache for that
     // tests-target generate even when the PROJECT's own backend is something else
     // (raylib/sokol/…). Fetch it here so every project's `install` covers its tests
-    // target. Idempotent + a no-op when null is still bundled (effectivePkg == null)
-    // or the project already IS null (cached above). null is pure-Zig + tiny.
+    // target. null is now an EXTRACTED external backend (#386 Phase 6c) —
+    // `builtinProvider(.null)` returns the labelle-null package and no
+    // `builtinProvider` arm returns null anymore, so `effectiveBackendPackage()`
+    // here always resolves (the `orelse null` bundled path is gone). The no-op is
+    // therefore the `isPluginCached` guard, not a null effective package: when the
+    // project already IS null the fetch above (line ~534) already cached it, so
+    // this skips. Idempotent regardless. null is pure-Zig + tiny.
     const tests_target_cfg = config.ProjectConfig{ .name = cfg.name, .backend = .null };
     if (tests_target_cfg.effectiveBackendPackage()) |null_bp| {
         if (!try cache.isPluginCached(allocator, null_bp)) {

@@ -428,19 +428,81 @@ pub const NULL_BACKEND = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "assertInput(@import(\"backend_input\"))") != null);
     }
 
-    test "built-in backend emits NO contract guard (byte-identical to before, #386 Phase 6b)" {
-        // Built-ins are vetted by the enum path; the guard is external-only so
-        // their generated output is unchanged.
+    test "external backend emits directional per-sub-surface contract-version asserts (#453 item 1)" {
+        // Contract versioning (labelle-assembler#453): on top of the shape check
+        // above, each sub-surface gets a `@hasDecl`-guarded DIRECTIONAL version
+        // assert comparing the backend's `targets_<surface>_contract` against
+        // labelle-core's `<SURFACE>_CONTRACT_VERSION`. Both a too-new (`>`,
+        // upgrade core) and a too-old (`<`, upgrade backend) branch are emitted,
+        // so ANY mismatch is a `@compileError` naming which side to bump. The
+        // `@hasDecl` guard is the no-flag-day property: a backend that hasn't
+        // adopted `targets_*` is untouched (guarded body isn't analyzed).
+        //
+        // NOTE: the negative direction (a MISMATCHED `targets_*` -> build fails)
+        // is a Sema-level `@compileError` that requires a full backend+core
+        // compile the assembler's string-golden test harness does not run. It is
+        // covered by inspection here: we assert BOTH the `>`/provides and the
+        // `<`/expects `@compileError` branches are present for every sub-surface,
+        // so the failing comparison provably exists in the generated source.
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
-            .backend = .raylib,
+            .backend_package = .{ .name = "nullfixture", .repo = "local:../nf" },
             .ecs = .mock,
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
         defer std.testing.allocator.free(main_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "External backend contract verification") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "assertWindow(@import(\"backend_window\"))") == null);
+        // The four backend-sub-surface module bindings the version guards read.
+        // `backend_audio` is newly imported into this comptime block for #453.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _bc_gfx = @import(\"backend_gfx\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _bc_window = @import(\"backend_window\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _bc_input = @import(\"backend_input\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const _bc_audio = @import(\"backend_audio\");") != null);
+
+        // Every sub-surface: the `@hasDecl` opt-in guard + BOTH directional
+        // `@compileError` comparisons (`>` provides / `<` expects) against the
+        // matching labelle-core `*_CONTRACT_VERSION` const.
+        const Case = struct { mod: []const u8, decl: []const u8, core: []const u8 };
+        const cases = [_]Case{
+            .{ .mod = "_bc_gfx", .decl = "targets_draw_contract", .core = "DRAW_CONTRACT_VERSION" },
+            .{ .mod = "_bc_gfx", .decl = "targets_loader_contract", .core = "LOADER_CONTRACT_VERSION" },
+            .{ .mod = "_bc_window", .decl = "targets_window_contract", .core = "WINDOW_CONTRACT_VERSION" },
+            .{ .mod = "_bc_input", .decl = "targets_input_contract", .core = "INPUT_CONTRACT_VERSION" },
+            .{ .mod = "_bc_audio", .decl = "targets_audio_playback_contract", .core = "AUDIO_PLAYBACK_CONTRACT_VERSION" },
+            .{ .mod = "_bc_audio", .decl = "targets_audio_loader_contract", .core = "AUDIO_LOADER_CONTRACT_VERSION" },
+        };
+        inline for (cases) |c| {
+            const guard = "@hasDecl(" ++ c.mod ++ ", \"" ++ c.decl ++ "\")";
+            const too_new = "if (" ++ c.mod ++ "." ++ c.decl ++ " > _backend_contract_core." ++ c.core ++ ")";
+            const too_old = "if (" ++ c.mod ++ "." ++ c.decl ++ " < _backend_contract_core." ++ c.core ++ ")";
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, guard) != null);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, too_new) != null);
+            try std.testing.expect(std.mem.indexOf(u8, main_zig, too_old) != null);
+        }
+
+        // Both @compileError message directions ("provides" = upgrade core,
+        // "expects" = upgrade backend) are present at least once.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "upgrade labelle-core") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "upgrade the backend") != null);
+        // Messages are built at comptime from the actual version numbers.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "std.fmt.comptimePrint(") != null);
+
+        // ORDER (#453 finding): the directional VERSION asserts must be emitted
+        // BEFORE the shape (`assertBackend`/`assertWindow`/`assertInput`) asserts.
+        // Otherwise a shape assert can `@compileError` first on a decl the newer
+        // contract renamed/added, and the intended directional "upgrade the
+        // backend / labelle-core" message never fires.
+        const first_version_guard = std.mem.indexOf(u8, main_zig, "@hasDecl(_bc_gfx, \"targets_draw_contract\")").?;
+        const first_shape_assert = std.mem.indexOf(u8, main_zig, "assertBackend(@import(\"backend_gfx\"))").?;
+        try std.testing.expect(first_version_guard < first_shape_assert);
     }
+
+    // NOTE: the companion "built-in backend emits NO contract guard" test was
+    // removed in #386 Phase 6c. The guard is gated on `cfg.isExternal()`, and
+    // post-flip EVERY built-in backend resolves to an external provider package,
+    // so the no-guard branch is no longer reachable from any `.backend = .<tag>`
+    // config — every backend now emits the contract guard (covered by the
+    // external-backend test directly above). The `if (!cfg.isExternal()) return`
+    // in `codegen/blocks/imports.zig` is retained as defensive dead code.
 
     test "external backend with a callback run-loop is rejected (not yet wired, #386)" {
         // `.platform = .wasm` forces `use_callback_lifecycle = true`; paired with
@@ -477,6 +539,72 @@ pub const NULL_BACKEND = struct {
         // Took the bgfx-android callback path (owns android_main), not the error
         // and not the raylib-wasm fallback.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn android_main(") != null);
+    }
+
+    test "external sokol-desktop is NOT rejected — it has a real callback dispatch path (#454)" {
+        // Regression-lock for the #454 re-check: sokol is now a fully EXTERNAL
+        // backend (`builtinProvider(.sokol)` resolves to labelle-sokol), and it
+        // declares a `.callback` run-loop. The callback-external guard must NOT
+        // reject it — the enum-as-shorthand preserves `cfg.backend == .sokol`, so
+        // `callback_dispatch_handled` is true and the sokol callback dispatch has
+        // a real branch. This must generate the sokol callback main (export
+        // init/frame/cleanup), not `error.ExternalCallbackBackendUnsupported`.
+        // (Setting both `.backend = .sokol` and `.backend_package` models the
+        // post-flip state: external resolution + preserved enum tag. If someone
+        // ever drops `cfg.backend == .sokol` from `callback_dispatch_handled`,
+        // this test fails instead of production silently breaking sokol-desktop.)
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .platform = .desktop,
+            .backend_package = .{ .name = "sokol", .repo = "local:../sokol" },
+            .ecs = .mock,
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // Took the sokol callback path (exported init/frame/cleanup callbacks),
+        // not the error and not the raylib-wasm fallback.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn frame() callconv(.c) void") != null);
+    }
+
+    test "raylib desktop (external-by-default) STILL emits the PBO preview readback (#386 flip regression)" {
+        // Post-#386 flip `.backend = .raylib` resolves to labelle-raylib, so
+        // `cfg.isExternal()` is now true even for the DEFAULT raylib. The render
+        // gate must key off the RESOLVED backend NAME ("raylib"), not
+        // `!isExternal()` — otherwise the `{{preview_setup}}`/`{{preview_readback}}`
+        // holes (labelle-raylib's desktop template still carries them) fill EMPTY
+        // and the editor preview connects but publishes no frames.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .platform = .desktop,
+            .ecs = .mock,
+        }, h.raylib_desktop_preview_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // PBO readback setup (attach) + per-frame readback + the publish bridge
+        // must all be present — the async-readback path that publishes frames.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.attach(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.frame();") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_preview_pbo_publish_bridge") != null);
+    }
+
+    test "a non-raylib external backend does NOT get raylib's PBO readback (#409 intent preserved)" {
+        // The gate must still EXCLUDE other/third-party external backends: their
+        // window module has no `preview_pbo`, so emitting raylib's readback would
+        // fail to compile. A backend whose resolved NAME is not "raylib" (here the
+        // `nullfixture` package, `cfg.backend` at its `.raylib` enum default) keeps
+        // the empty-readback path — same as null/sdl/bgfx/wgpu.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .platform = .desktop,
+            .backend_package = .{ .name = "nullfixture", .repo = "local:../nf" },
+            .ecs = .mock,
+        }, h.raylib_desktop_preview_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.attach(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.preview_pbo.frame();") == null);
     }
 
     test "raylib + sokol unchanged — null doesn't leak into other backends" {

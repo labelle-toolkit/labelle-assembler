@@ -51,6 +51,46 @@ pub fn globalEnviron() std.process.Environ {
 pub const Backend = enum { raylib, sokol, sdl, bgfx, wgpu, null };
 pub const Platform = enum { desktop, ios, android, wasm };
 
+/// A capability a backend provider may declare it supports (and a project may
+/// require). This is the DECLARATIVE MIRROR of the `@hasDecl`-gated optional
+/// backend decls (RFC "Opening the ecosystem — Capability negotiation",
+/// §1645-1683): the optional decl is the *mechanism*, the capability flag is
+/// the *advertisement* the resolver reads WITHOUT compiling the provider, so a
+/// missing capability surfaces as an early project-level error instead of a
+/// deep `@compileError` in generated `main.zig`.
+///
+/// The set is the RFC's core seven (§1656-1665) EXTENDED with the platform
+/// capabilities the codegen already branches on (`cfg.platform`) and the
+/// OGG-decode backend seam:
+///   - `screenshots`         — `takeScreenshot()` (headless CI, preview).
+///   - `compressed_textures` — ASTC/KTX2 GPU-native upload path.
+///   - `fonts`               — `decodeFont` / `uploadFontAtlas`.
+///   - `gamepad_polling`     — the input source provides gamepad state.
+///   - `raw_gui_adapter`     — in-backend imgui adapter (not just the C++ bridge).
+///   - `headless`            — can run with no window surface.
+///   - `surface_loss`        — implements `surfaceLost` / `surfaceRestored` (mobile).
+///   - `wasm` / `android` / `ios` — the provider supports building for that platform.
+///   - `audio_ogg`           — the provider decodes OGG/Vorbis audio.
+///
+/// Shared by the manifest parser (`BackendManifest.capabilities`) and the
+/// project-side requirement derivation (`capabilities.requiredCapabilities`),
+/// so a declared capability and a required capability are the SAME nominal type
+/// — no string matching, and adding a variant is caught by the exhaustiveness
+/// checker on both sides.
+pub const Capability = enum {
+    screenshots,
+    compressed_textures,
+    fonts,
+    gamepad_polling,
+    raw_gui_adapter,
+    headless,
+    surface_loss,
+    wasm,
+    android,
+    ios,
+    audio_ogg,
+};
+
 /// Project logical Y-axis convention (RFC-Y-AXIS-CONVENTION, epic
 /// labelle-engine#640). Parsed from `project.labelle`'s `.y_axis` key and
 /// emitted onto the generated game's `engine.GameConfigWithYAxis(..., .up|.down)`
@@ -478,6 +518,15 @@ pub const ProjectConfig = struct {
     /// and MUST ship a `backend.manifest.zon` — the manifest splice is its only
     /// codegen route (see `isExternal` / `backend_registry.resolveBackendPackage`).
     backend_package: ?PluginDep = null,
+    /// Capabilities the project EXPLICITLY requires of its resolved backend
+    /// provider (RFC "Capability negotiation", §1668). This is the explicit
+    /// half of the required set; the other half is DERIVED by the assembler
+    /// from the platform / GUI / asset-compression selection (see
+    /// `capabilities.requiredCapabilities`). A CI screenshot target, whose
+    /// need isn't derivable from a `project.labelle` field, declares
+    /// `.requires = &.{ .screenshots }` here. Defaults empty — an ordinary
+    /// desktop project derives everything and lists nothing.
+    requires: []const Capability = &.{},
     platform: Platform = .desktop,
     /// Logical Y-axis convention (RFC-Y-AXIS-CONVENTION / epic
     /// labelle-engine#640). Emitted onto the generated game's
@@ -597,29 +646,26 @@ pub const ProjectConfig = struct {
         return self.resolved_gui != null;
     }
 
-    /// Provider package a BUILT-IN `.backend` enum tag resolves to, or `null`
-    /// when that backend still ships **bundled** inside the assembler.
+    /// Provider package a BUILT-IN `.backend` enum tag resolves to. As of #386
+    /// Phase 6c ALL six backends are extracted out-of-tree, so every arm returns
+    /// a provider package and production codegen is fully backend-agnostic. The
+    /// return type stays optional for callers, but there are no `null` arms.
     ///
     /// This is the enum-as-shorthand seam (epic #386, Phase 5): the closed
     /// `Backend` enum stays as the backward-compatible spelling, but a tag is
-    /// just a *shorthand* for a provider. Extracting a built-in backend
-    /// out-of-tree (Phase 6c) is exactly adding its `.{ .name, .repo, .version }`
-    /// entry below — `.backend = .<tag>` then transparently resolves to the
-    /// fetched package (`isExternal()` ⇒ true) with no project-config change.
-    ///
-    /// An EXTRACTED backend maps to its provider package; a bundled one maps to
-    /// `null` (resolves to the `backends/<tag>` slot, byte-identical to before).
-    /// Extracting another backend (Phase 6c) = flipping its branch from `null`
-    /// to `.{ .name, .repo, .version }`.
+    /// just a *shorthand* for a provider. `.backend = .<tag>` transparently
+    /// resolves to the fetched package (`isExternal()` ⇒ true) with no
+    /// project-config change.
     fn builtinProvider(backend: Backend) ?PluginDep {
         return switch (backend) {
             // Extracted out-of-tree (#386 Phase 6c) — `.backend = .<tag>` resolves
-            // to the provider package, not the bundled slot.
+            // to the provider package, not a bundled slot.
             .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.2.2" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.1.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.1.0" },
-            // Still bundled.
-            .raylib, .sokol, .sdl => null,
+            .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.1.0" },
+            .raylib => .{ .name = "raylib", .repo = "github.com/labelle-toolkit/labelle-raylib", .version = "0.1.0" },
+            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.1.0" },
         };
     }
 
@@ -658,6 +704,25 @@ pub const ProjectConfig = struct {
     /// declares its deps) and generates exclusively through its manifest.
     pub fn isExternal(self: ProjectConfig) bool {
         return self.effectiveBackendPackage() != null;
+    }
+
+    /// True when this backend is a built-in identified by the closed `Backend`
+    /// enum tag — i.e. the resolved backend NAME equals the current enum tag's
+    /// spelling. This is the enum-as-shorthand identity check (epic #386 Phase 5,
+    /// #453 PR 11): it covers both a plain `.backend = .<tag>` shorthand and an
+    /// explicit `.backend_package` that is a local dev-override of a built-in
+    /// (e.g. `.backend = .bgfx` + `.backend_package = .{ .name = "bgfx", .. }`),
+    /// because both resolve `backendName()` back to the tag spelling.
+    ///
+    /// It returns FALSE for a genuine THIRD-PARTY backend named only by string
+    /// (`.backend_package = .{ .name = "acme_foo", .. }`), whose `cfg.backend`
+    /// sits at the meaningless `.raylib` default. Such a backend must therefore
+    /// route ENTIRELY through `backend_registry` + its (v2) manifest and MUST
+    /// NOT reach the enum `switch (cfg.backend)` codegen — which would mis-emit
+    /// raylib-shaped wiring. This is the ONE remaining place the enum tag is read
+    /// as an *identity*; a non-enum name never consults it.
+    pub fn isEnumTagBacked(self: ProjectConfig) bool {
+        return std.mem.eql(u8, self.backendName(), @tagName(self.backend));
     }
 
     /// The unset-`.y_axis` build guard (RFC-Y-AXIS-CONVENTION Migration §,

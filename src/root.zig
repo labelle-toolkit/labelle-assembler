@@ -17,6 +17,9 @@ pub const flow_catalog = @import("flow_catalog.zig");
 pub const pack_manifest = @import("manifest.zig");
 const build_files = @import("build_files.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
+const manifest_v2 = @import("codegen/manifest_v2.zig");
+const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
+const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
 const gui_resolve = @import("gui_resolve.zig");
@@ -38,6 +41,11 @@ test {
     _ = @import("manifest.zig");
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/manifest_splice.zig");
+    _ = @import("codegen/manifest_v2.zig");
+    _ = @import("codegen/manifest_v2_splice.zig");
+    _ = @import("codegen/packager.zig");
+    _ = @import("codegen/core_diamond.zig");
+    _ = @import("capabilities.zig");
 }
 
 // ── Re-exports (preserve public API for tests and consumers) ──────────
@@ -72,8 +80,15 @@ pub const resolveGuiPlugin = gui_resolve.resolveGuiPlugin;
 
 pub const generateMainZigFromTemplate = main_zig.generateMainZigFromTemplate;
 pub const generateBuildZig = build_files.generateBuildZig;
+pub const BuildZigOptions = build_files.BuildZigOptions;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
 pub const deps_linker = build_files.deps_linker;
+// Stages the v2 backend build hook next to the generated build.zig
+// (`backend_build_hook.zig`) so the generated `@import` resolves — see the fn
+// docs (PR #466 Finding 3).
+pub const stageBackendBuildHook = manifest_v2_splice.stageBackendBuildHook;
+pub const backend_build_hook_name = manifest_v2_splice.hook_import_name;
+pub const PromotedScript = @import("codegen/scan.zig").PromotedScript;
 
 pub const validateCache = cache.validateCache;
 pub const getCacheRoot = cache.getCacheRoot;
@@ -341,6 +356,176 @@ pub const GenerateOptions = struct {
     is_tests_target: bool = false,
 };
 
+/// Resolve-time provider-contract checks (RFC "Opening the ecosystem",
+/// §1616-1683): canonical provider identity, cross-provider id collision, and
+/// capability negotiation, all read from the resolved backend's
+/// `backend.manifest.zon` BEFORE the build graph is emitted.
+///
+/// Reads the identity/capability slice via `loadProviderManifest`, which is
+/// DECOUPLED from the desktop-only splice gate (`manifestPathEnabled`) — these
+/// checks apply on every target (android/wasm/ios included). A provider that
+/// ships no manifest yields a null slice: identity is derived, capabilities are
+/// un-enforced (the back-compat path).
+pub fn validateProviderContracts(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    game_dir: []const u8,
+    backend_manifest_name: ?[]const u8,
+) !void {
+    // ── manifest-v2 cutover (epic #453, closes #472 P2 finding 2) ──────
+    // When `generate` auto-detected a v2 manifest, the provider identity +
+    // capabilities live in the v2 `.id`/`.capabilities` (a v2-only backend
+    // ships NO legacy `backend.manifest.zon` for `loadProviderManifest` to
+    // read, so the checks below would silently no-op / read the wrong file).
+    // Read them off the v2 manifest and run the SAME contract checks. If the
+    // named file parses as v1 (not v2) we fall through to the legacy path.
+    if (backend_manifest_name) |name| {
+        const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name);
+        switch (parsed) {
+            .v2 => |m| {
+                defer parsed.free(allocator);
+                return validateProviderContractsInner(allocator, cfg, m.id, m.capabilities);
+            },
+            .v1 => parsed.free(allocator), // not actually a v2 manifest — fall through
+        }
+    }
+
+    const maybe_pm = try manifest_splice.loadProviderManifest(allocator, cfg, game_dir);
+    const manifest_id: ?[]const u8 = if (maybe_pm) |pm| pm.id else null;
+    const declared: []const config.Capability = if (maybe_pm) |pm| pm.capabilities else &.{};
+    defer if (maybe_pm) |pm| manifest_splice.freeProviderManifest(allocator, pm);
+
+    return validateProviderContractsInner(allocator, cfg, manifest_id, declared);
+}
+
+/// The identity + capability contract checks, factored out so BOTH the legacy
+/// (v1 provider manifest) and the v2 (auto-detected build-graph manifest) paths
+/// run the exact same negotiation against whichever `.id`/`.capabilities` the
+/// resolved manifest carries.
+fn validateProviderContractsInner(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    manifest_id: ?[]const u8,
+    declared: []const config.Capability,
+) !void {
+    // Provider identity: reserved-namespace + enum-shorthand drift.
+    try backend_registry.validateProviderIdentity(cfg, manifest_id);
+
+    // Cross-provider id collision over the full resolved provider set. Today
+    // that set is the single render backend, so this is future-proofing (the
+    // one place the whole set is cross-checked); plugins/audio providers join
+    // it once they carry identities.
+    if (manifest_id) |id| {
+        try backend_registry.checkProviderIdCollisions(&.{id});
+    }
+
+    // Capability negotiation. Enforcement is OPT-IN: a provider declaring a
+    // non-empty `.capabilities` set has missing requirements fail hard; a
+    // provider declaring none is only warned (back-compat gate in `validate`).
+    const required = try capabilities.requiredCapabilities(allocator, cfg);
+    defer allocator.free(required);
+    const provider_id = manifest_id orelse cfg.backendName();
+    try capabilities.validate(required, declared, provider_id);
+}
+
+/// Auto-detect whether the resolved backend package ships a v2 build-graph
+/// manifest (`backend.manifest.v2.zon`) and, if so, return its canonical
+/// filename so `generate` drives the manifest-v2 codegen path (epic #453,
+/// closing the #472 P2 gap). Returns `V2_MANIFEST_NAME` (a static string, so no
+/// allocation to free) when the package ships one, else `null` → the v1/enum
+/// path, unchanged.
+///
+/// PRODUCTION NO-OP TODAY: no fetched external backend repo ships a v2 manifest
+/// yet (they ship the v1 `backend.manifest.zon`), so this returns null on every
+/// real `generate`, and generation stays byte-identical. It flips to the v2 path
+/// only once a backend actually ships the file (a later per-repo step) — or for
+/// the in-tree v2 fixtures a test selects via `backend_package`.
+///
+/// GRACEFUL DEGRADATION: any probe I/O error (package resolution failure, a
+/// missing dir, an access error, OOM building the path) falls back to null (the
+/// v1/enum path) rather than crashing — mirroring the swallow-and-fall-back
+/// discipline the rest of `generate`'s manifest probing uses
+/// (`manifest_splice.manifestExists`). A genuine external-backend
+/// misconfiguration is still surfaced separately by `requireManifestIfExternal`.
+fn detectV2ManifestName(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) ?[]const u8 {
+    const pkg_dir = backend_registry.resolveBackendPackage(allocator, cfg, project_dir) catch return null;
+    defer allocator.free(pkg_dir);
+    const manifest_path = std.fs.path.join(allocator, &.{ pkg_dir, manifest_v2.V2_MANIFEST_NAME }) catch return null;
+    defer allocator.free(manifest_path);
+    std.Io.Dir.cwd().access(config.globalIo(), manifest_path, .{}) catch return null;
+    return manifest_v2.V2_MANIFEST_NAME;
+}
+
+/// Resolve the run-loop-style override for `main.zig` codegen from whichever
+/// backend manifest applies (`null` → the enum path in
+/// `generateMainZigFromTemplate`, unchanged for bgfx-android / sokol-wasm / …).
+///
+/// manifest-v2 cutover (epic #453): a v2-detected backend reads the PER-PLATFORM
+/// `.platforms[<platform>].loop_style` (bgfx-desktop is `.loop`, bgfx-android
+/// `.callback` — the style MUST be per-platform); the legacy path reads the
+/// top-level `loop_style`. Both map onto the same override enum.
+///
+/// Mirrors the `.v2`-handles / `.v1`-falls-through shape of `loadBackendTemplate`
+/// + `validateProviderContracts`. THREE ordered cases (PR #473 Major):
+///   (1) a REAL v2 manifest (union tag `.v2`) resolves loop_style from its
+///       per-platform matrix; `handled` records that it did.
+///   (2) a DETECTED named manifest that actually parses as v1 (its
+///       `manifest_version` is 1/omitted → union tag `.v1`) resolves loop_style
+///       straight from THAT parsed manifest and marks `handled`. This is
+///       load-bearing for a v2-ONLY backend (ships only `backend.manifest.v2.zon`,
+///       NO canonical `backend.manifest.zon` sibling) whose CONTENT is v1: it
+///       passed the external-manifest gate on the detected name, so we must keep
+///       ITS loop_style rather than retrying with the canonical (null) name —
+///       which would probe an absent file, leave the override null, and silently
+///       drop the backend into enum behavior.
+///   (3) OTHERWISE — `backend_manifest_name` null (production: straight to the
+///       canonical file), or a named-manifest LOAD ERROR (swallowed via
+///       `catch break`, matching the surrounding probing's swallow-and-fall-back
+///       discipline) — fall through to the legacy `manifestPathEnabled`-gated
+///       top-level `loop_style` on the canonical `backend.manifest.zon`.
+///
+/// The legacy branch is a SECOND guarded pass, NOT an `else if` chained off the
+/// name being present: chaining it would skip it whenever a name was detected but
+/// the file turned out to be v1. A legacy load error propagates.
+pub fn resolveLoopStyleOverride(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    game_dir: []const u8,
+    backend_manifest_name: ?[]const u8,
+) !?manifest_splice.BackendManifest.LoopStyle {
+    var handled = false;
+    var override: ?manifest_splice.BackendManifest.LoopStyle = null;
+    if (backend_manifest_name) |name| namedblk: {
+        const parsed = manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name) catch break :namedblk;
+        defer parsed.free(allocator);
+        switch (parsed) {
+            .v2 => |m| {
+                handled = true;
+                if (manifest_v2_splice.platformEntry(m, cfg.platform)) |entry| {
+                    override = switch (entry.loop_style) {
+                        .callback => .callback,
+                        .loop => .loop,
+                    };
+                }
+            },
+            .v1 => |m| {
+                // The detected named file parses as v1: resolve loop_style from
+                // THIS manifest (case 2 above), not the canonical-name legacy pass
+                // below — a v2-only-but-v1-content backend has no canonical sibling
+                // to fall back to.
+                handled = true;
+                override = manifest_splice.loopStyle(m);
+            },
+        }
+    }
+    if (!handled and manifest_splice.manifestPathEnabled(allocator, cfg, game_dir, null)) {
+        const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
+        defer manifest_splice.freeManifest(allocator, m);
+        override = manifest_splice.loopStyle(m);
+    }
+    return override;
+}
+
 pub fn generate(
     allocator: std.mem.Allocator,
     cfg_in: ProjectConfig,
@@ -360,6 +545,29 @@ pub fn generate(
     cfg.resources = mutable_resources;
 
     const io = config.globalIo();
+
+    // ── Provider identity + capability negotiation (RFC "Opening the
+    // ecosystem", §1616-1683; ecosystem-hardening #453) ──────────────
+    // Resolve-time contract checks that produce EARLY, project-level errors —
+    // before any build graph is emitted — instead of a deep `@compileError`
+    // from generated code. Runs after `requireManifestIfExternal` (a manifest-
+    // less external still errors first, with its clearer message) and before
+    // `deps_linker.createDepsLinks` / build.zig emission below.
+    //
+    // ── manifest-v2 production cutover (epic #453, closes #472 P2) ──────
+    // Auto-detect a `backend.manifest.v2.zon` in the resolved backend package
+    // ONCE here and thread the result through every downstream site
+    // (`requireManifestIfExternal`, `generateBuildZigZon`, `generateBuildZig`,
+    // `stageBackendBuildHook`) so a v2-shipping backend drives the v2 codegen
+    // WITHOUT the caller passing `backend_manifest_name`. `null` → the v1/enum
+    // path, unchanged. Production no-op today (no fetched backend ships a v2
+    // manifest yet); the in-tree v2 FIXTURES are reached only via `backend_package`.
+    // Passing the detected name to `requireManifestIfExternal` is load-bearing: a
+    // v2-ONLY external backend (no legacy `backend.manifest.zon`) must not be
+    // rejected as manifest-less (the requirement keys off THIS name).
+    const backend_manifest_name = detectV2ManifestName(allocator, cfg, game_dir);
+    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, backend_manifest_name);
+    try validateProviderContracts(allocator, cfg, game_dir, backend_manifest_name);
 
     // Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
     // target platform opts into ASTC (`asset_compression`) and `labelle astc`
@@ -758,6 +966,10 @@ pub fn generate(
         // The tests target runs second — additive merge so the exe
         // target's deps (chosen-backend, plugins) survive. Issue #83.
         .recreate_deps = !is_tests_target,
+        // manifest-v2 cutover: when the backend ships a v2 manifest, key the
+        // backend dep entry off its `dep_name` + drive its `root_build_deps`
+        // (design §3). Null → v1/enum, byte-unchanged.
+        .backend_manifest_name = backend_manifest_name,
     });
     defer allocator.free(zon);
     try scanner.writeFile(target_dir, "build.zig.zon", zon);
@@ -778,9 +990,22 @@ pub fn generate(
         // root so the splice can locate `backend.manifest.zon` + fragments.
         // Only consulted when the gate (desktop + manifest present) fires.
         .project_dir = game_dir,
+        // manifest-v2 cutover: the auto-detected v2 manifest name (null → v1/enum,
+        // byte-unchanged). When a v2 manifest is present this routes the
+        // backend-dep + link sections to the v2 codegen (`manifest_v2_splice`).
+        .backend_manifest_name = backend_manifest_name,
     });
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
+
+    // manifest-v2 (PR #466 Finding 3): a v2 backend whose manifest declares a
+    // `build_hook` needs that hook staged next to the generated build.zig as
+    // `backend_build_hook.zig`, so the generated `@import("backend_build_hook.zig")`
+    // resolves in the real output dir. No-op (returns false) for the v1/enum path
+    // (backend_manifest_name null), a v1 manifest, or a hookless v2 manifest.
+    if (backend_manifest_name) |name| {
+        _ = try manifest_v2_splice.stageBackendBuildHook(allocator, cfg, game_dir, name, target_dir);
+    }
 
     // Discover each plugin's `pub const Events` decls at assembler time
     // by AST-walking `<plugin>/src/root.zig`. The shim + main.zig
@@ -904,24 +1129,25 @@ pub fn generate(
         // null backend's `desktop.txt` is missing from the cache, since
         // the tests target never emits main.zig and therefore never uses
         // the template anyway.
-        const backend_tmpl = try loadBackendTemplate(allocator, game_dir, cfg);
+        const backend_tmpl = try loadBackendTemplate(allocator, game_dir, cfg, backend_manifest_name);
         defer allocator.free(backend_tmpl);
         const engine_template = try loadEngineTemplate(allocator, game_dir, cfg);
         defer allocator.free(engine_template);
 
         // Manifest-driven run-loop splice (assembler#378): when the manifest
         // path is enabled (desktop + a backend that ships a manifest), resolve
-        // the lifecycle style (callback vs loop) from the backend manifest's
-        // `loop_style` field and stash it where `generateMainZigFromTemplate`
-        // reads it — instead of the `cfg.backend == .sokol` enum branch inside
-        // that function. Scoped to this one call; cleared right after. Null
-        // override = enum path (bgfx-android, sokol-wasm, etc. unchanged).
-        if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir)) {
-            const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
-            defer manifest_splice.freeManifest(allocator, m);
-            main_zig.main_template.loop_style_override = manifest_splice.loopStyle(m);
-        }
+        // the lifecycle style (callback vs loop) from the backend manifest and
+        // stash it where `generateMainZigFromTemplate` reads it — instead of the
+        // `cfg.backend == .sokol` enum branch inside that function. Scoped to this
+        // one call; cleared right after. Null override = enum path (bgfx-android,
+        // sokol-wasm, etc. unchanged).
+        //
+        // manifest-v2 cutover (epic #453): a v2-detected backend reads the
+        // PER-PLATFORM `.platforms[<platform>].loop_style` (bgfx-desktop is `.loop`,
+        // bgfx-android `.callback` — the style MUST be per-platform); the v1 path
+        // reads the top-level `loop_style`. Both map onto the same override enum.
         defer main_zig.main_template.loop_style_override = null;
+        main_zig.main_template.loop_style_override = try resolveLoopStyleOverride(allocator, cfg, game_dir, backend_manifest_name);
 
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,
@@ -1032,11 +1258,68 @@ fn loadEngineTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: P
 }
 
 /// Load the backend+platform lifecycle template from the CLI cache.
-fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: ProjectConfig) ![]const u8 {
+///
+/// `backend_manifest_name` is the v2 manifest filename `generate` auto-detected
+/// (null → v1/enum path, unchanged). When a v2 manifest is present the entry-point
+/// template is resolved from its `.platforms[<platform>].entry` (design §3) — a
+/// v2-ONLY backend ships no legacy `backend.manifest.zon`, so the v1 splice / enum
+/// mappings below would fail to find a template for it.
+pub fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: ProjectConfig, backend_manifest_name: ?[]const u8) ![]const u8 {
     // External backends generate EXCLUSIVELY via their manifest — fail loudly if
     // one ships none rather than falling through to the enum path below (which
     // reads `cfg.backend ==`, meaningless for an external backend with no tag).
-    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir);
+    // Key off the SAME detected name so a v2-only external (no legacy sibling)
+    // is not rejected as manifest-less.
+    try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, backend_manifest_name);
+
+    // ── manifest-v2 entry-point template path (epic #453, closes #472 P2 finding 1) ──
+    // When `generate` auto-detected a v2 manifest, resolve the entry-point template
+    // from the v2 `.platforms[<platform>].entry` (the per-platform matrix), NOT the
+    // v1 `main_loop_template` / enum→`<platform>.txt` mappings below. If the named
+    // file parses as v1 we resolve its `main_loop_template` from THAT manifest (see
+    // the `.v1` arm) instead of falling to the canonical-name legacy pass below.
+    if (backend_manifest_name) |name| {
+        const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name);
+        defer parsed.free(allocator);
+        switch (parsed) {
+            .v2 => |m| {
+                const entry = manifest_v2_splice.platformEntry(m, cfg.platform) orelse {
+                    std.log.warn(
+                        "labelle: v2 backend '{s}' declares no `.platforms.{s}` entry — the platform is unsupported by this backend.",
+                        .{ cfg.backendName(), @tagName(cfg.platform) },
+                    );
+                    return error.V2PlatformUnsupported;
+                };
+                const backend_path = try backend_registry.resolveBackendPackage(allocator, cfg, game_dir);
+                defer allocator.free(backend_path);
+                const tmpl_path = try std.fs.path.join(allocator, &.{ backend_path, entry.entry });
+                defer allocator.free(tmpl_path);
+                return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), tmpl_path, allocator, .limited(64 * 1024)) catch |err| {
+                    std.log.warn("labelle: could not read v2 entry template '{s}': {any}", .{ tmpl_path, err });
+                    return error.TemplateNotFound;
+                };
+            },
+            .v1 => |m| {
+                // The detected named file parses as v1 (its `manifest_version` is
+                // 1/omitted). A v2-ONLY backend (no canonical `backend.manifest.zon`
+                // sibling) whose CONTENT is v1 passed the external-manifest gate on
+                // THIS detected name, so it must keep the `main_loop_template` from
+                // the file that was actually found. Retrying with the canonical
+                // (null) name at the legacy pass below would probe an absent file,
+                // fall through to the enum path, and mis-generate — reading the
+                // closed `cfg.backend` for a backend that has no enum tag (PR #473
+                // Major). Resolve the main-loop template straight from THIS manifest.
+                const backend_path = try backend_registry.resolveBackendPackage(allocator, cfg, game_dir);
+                defer allocator.free(backend_path);
+                const tmpl_path = try std.fs.path.join(allocator, &.{ backend_path, manifest_splice.mainLoopTemplateRel(m) });
+                defer allocator.free(tmpl_path);
+                return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), tmpl_path, allocator, .limited(64 * 1024)) catch |err| {
+                    std.log.warn("labelle: could not read v1 (named) main-loop template '{s}': {any}", .{ tmpl_path, err });
+                    return error.TemplateNotFound;
+                };
+            },
+        }
+    }
 
     // ── Manifest-driven main-loop template path (assembler#378) ─────────
     // When the manifest path is enabled (desktop + a backend that ships a
@@ -1045,7 +1328,7 @@ fn loadBackendTemplate(allocator: std.mem.Allocator, game_dir: []const u8, cfg: 
     // below. For bgfx-desktop this lands on the SAME `templates/desktop.txt`
     // the enum path would have selected — the difference is the SELECTION is
     // data (manifest), not an enum branch.
-    if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir)) {
+    if (manifest_splice.manifestPathEnabled(allocator, cfg, game_dir, null)) {
         const m = try manifest_splice.loadManifest(allocator, cfg, game_dir);
         defer manifest_splice.freeManifest(allocator, m);
         // Package dir via the location seam: built-in → `backends/{name}` bundled

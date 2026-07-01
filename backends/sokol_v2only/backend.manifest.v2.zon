@@ -1,0 +1,124 @@
+.{
+    // ── V2-ONLY test fixture (manifest-v2, epic #453 item 3, PR 3) ──────────
+    // A byte-for-byte copy of `backends/sokol/backend.manifest.v2.zon`, kept in a
+    // directory that ships NO legacy `backend.manifest.zon`. This is the offline
+    // fixture for the regression that a backend shipping ONLY the v2 manifest must
+    // still reach the v2 desktop codegen: the external-manifest requirement + the
+    // desktop gate now key off the REQUESTED filename, so this v2-only package is
+    // NOT treated as manifest-less. Its generated build.zig is byte-anchored equal
+    // to the retained dual-manifest sokol fixture's v2 output (test/build_zig_tests).
+    //
+    // ── sokol backend manifest, SCHEMA v2 (build-graph manifest, epic #453
+    // item 3, PR 3) — see docs/design/manifest-v2-build-graph.md §3 (the WORKED
+    // sokol example this file is a faithful translation of).
+    //
+    // This is a SEPARATE fixture from the retained v1 `backend.manifest.zon`:
+    // the v1 file has NO `manifest_version` field and stays on the enum/splice
+    // path (byte-unchanged), while THIS file (`manifest_version = 2`) drives the
+    // v2 desktop codegen path and the byte-anchor differential test (§7). Keeping
+    // them as two files means converting sokol to v2 does not disturb the existing
+    // v1-fixture tests other code depends on. Do NOT bump the v1 file to v2.
+    //
+    // PR 3 wires only the DESKTOP entry; the android/ios/wasm entries are authored
+    // here (faithful to §3) so the fixture is complete, but they are exercised in
+    // later PRs (5/6/7) once the shared packager + hook phases land.
+    .manifest_version = 2,
+    .dir_name = "sokol",
+    .dep_name = "labelle_sokol",
+    .id = "labelle.sokol",
+
+    // Carried forward from the v1 manifest UNCHANGED (same list sokol ships today,
+    // backends/sokol/backend.manifest.zon) — v2 must not drop capability
+    // negotiation (design §3 review-correction #8).
+    .capabilities = .{
+        .screenshots,
+        .compressed_textures,
+        .fonts,
+        .gamepad_polling,
+        .raw_gui_adapter,
+        .surface_loss,
+        .wasm,
+        .android,
+        .ios,
+        .audio_ogg,
+    },
+
+    // root_alias defaults to `backend_<name>`, so the generated root imports
+    // these as `backend_gfx`/`backend_input`/… exactly as the enum path does.
+    .modules = .{
+        .{ .name = "gfx", .source = "src/gfx.zig" },
+        .{ .name = "input", .source = "src/input.zig" },
+        .{ .name = "audio", .source = "src/audio.zig" },
+        .{ .name = "window", .source = "src/window.zig" },
+    },
+
+    // BASE dep_options: ONLY options common to EVERY platform (design §3 merge
+    // contract). `with_imgui` is the only sokol flag all four platforms pass;
+    // `gamepad_*` is desktop-only and `dont_link_system_libs` is mobile-only, so
+    // both are per-platform appends below, never base entries.
+    .dep_options = .{
+        .{ .name = "with_imgui", .value = .gui_is_imgui },
+    },
+
+    .system_libs = .{
+        // .android_link:850-855 — sokol links these NDK libs manually on Android.
+        .android = .{ "android", "log", "GLESv3", "EGL" },
+        // desktop/ios system libs: none — sokol links via frameworks.
+    },
+    .frameworks = .{
+        // IOSurface/CoreFoundation on Darwin — replaces link.txt:12-16 switch.
+        .desktop = .{ .macos = .{ "IOSurface", "CoreFoundation" } },
+        .ios = .{ "Foundation", "UIKit", "Metal", "MetalKit", "AudioToolbox", "AVFoundation", "QuartzCore", "GameController" },
+    },
+
+    .platforms = .{
+        .desktop = .{
+            .entry = "templates/desktop.txt",
+            .loop_style = .callback,
+            .target = .native,
+            .artifacts = .{ .{ .name = "sokol_clib" } },
+            // gamepad_* is desktop-only (build_zig.txt:94) — APPENDED to the base
+            // `with_imgui`, so desktop's literal forwards all three flags.
+            .dep_options = .{
+                .{ .name = "gamepad_enabled", .value = .gamepad_enabled },
+                .{ .name = "gamepad_hidapi", .value = .gamepad_hidapi },
+            },
+            .package = .binary,
+        },
+        .ios = .{
+            .entry = "templates/mobile.txt",
+            .loop_style = .callback,
+            .target = .resolved,
+            .link_libc = true,
+            .artifacts = .{ .{ .name = "sokol_clib" } },
+            .dep_options = .{ .{ .name = "dont_link_system_libs", .value = .true_literal } },
+            .package = .binary,
+        },
+        .android = .{
+            .entry = "templates/mobile.txt",
+            .loop_style = .callback,
+            .target = .resolved,
+            .pic = true,
+            .link_libc = true,
+            .artifacts = .{ .{ .name = "sokol_clib", .pic = true } },
+            .dep_options = .{ .{ .name = "dont_link_system_libs", .value = .true_literal } },
+            .package = .{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } },
+        },
+        .wasm = .{
+            .entry = "templates/wasm.txt",
+            .loop_style = .callback,
+            .target = .{ .triple = "wasm32-emscripten" },
+            .artifacts = .{ .{ .name = "sokol_clib" } },
+            .dep_options = .{},
+            .root_build_deps = .{ .{ .name = "emsdk", .resolution = .builtin } },
+            .package = .{ .web = .{ .shell = null } },
+        },
+    },
+
+    // Dedicated hook file (NOT sokol's own build.zig, which re-exports
+    // `@import("sokol")` at top level — a name absent from the generated root
+    // package). Desktop has an EMPTY post_wire and uses the built-in target
+    // resolver, so PR 3 never invokes the hook; it exists for the android/ios/wasm
+    // residual wired in later PRs (design §3/§4).
+    .build_hook = "backend.hook.zig",
+}

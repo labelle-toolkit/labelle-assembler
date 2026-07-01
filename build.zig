@@ -145,4 +145,58 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+
+    // manifest-v2 sokol backend HOOK (epic #453 item 3, PR 5 android + PR 6 ios).
+    // The dedicated hook (`backends/sokol/backend.hook.zig`) is a std-only file the
+    // generated v2 android/ios build.zig `@import`s and calls
+    // (`resolve_target`/`post_wire`, design §4). Compiling it as its own test target
+    // is the design §7 "run the hook in the gate" gate: it typechecks the residual
+    // against the real `std.Build` API (addLibraryPath/setLibCFile/linkSystemLibrary/
+    // addSystemFrameworkPath/resolveTargetQuery must stay valid) AND runs the hook's
+    // pure-helper unit tests (android arch selection, NDK triple, required-SDK
+    // enforcement, libc.txt body; ios SDK-name/target selection, required SDK-path
+    // enforcement). It takes NO generator/zspec imports — a hook must make no
+    // package-local import assumptions (§3).
+    const hook_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("backends/sokol/backend.hook.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(hook_tests).step);
+
+    // manifest-v2 raylib backend HOOK (epic #453 item 3, PR 9). raylib's dedicated
+    // hook (`backends/raylib_v2/backend.hook.zig`) is a std-only file the generated
+    // v2 WASM build.zig `@import`s and calls (`post_wire`, design §4 residual (c)).
+    // Compiling it as its own test target is the design §7 "run the hook in the
+    // gate": it typechecks the emcc `emLinkStep` reconstruction against the real
+    // `std.Build` API (addSystemCommand/addArtifactArg/addInstallDirectory must
+    // stay valid) AND runs the hook's pure decision tests (the raylib web emcc
+    // args). Like sokol's hook it takes NO generator/zspec imports (§3).
+    const raylib_hook_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("backends/raylib_v2/backend.hook.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(raylib_hook_tests).step);
+
+    // manifest-v2 bgfx backend HOOK (epic #453 item 3, PR 10). bgfx's dedicated
+    // hook (`backends/bgfx_v2/backend.hook.zig`) is a std-only file the generated v2
+    // ANDROID build.zig `@import`s and calls (`resolve_target`/`post_wire`, design
+    // §4). Compiling it as its own test target is the design §7 "run the hook in the
+    // gate": it typechecks the android residual (addLibraryPath/setLibCFile/
+    // resolveTargetQuery) against the real `std.Build` API AND runs the hook's pure
+    // decision tests (arch selection, NDK triple, required-SDK enforcement, libc.txt
+    // body). Like sokol/raylib's hooks it takes NO generator/zspec imports (§3).
+    const bgfx_hook_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("backends/bgfx_v2/backend.hook.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(bgfx_hook_tests).step);
 }

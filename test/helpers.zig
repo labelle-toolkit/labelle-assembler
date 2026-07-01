@@ -79,6 +79,30 @@ pub const raylib_lifecycle =
     \\
 ;
 
+// Mirror of `labelle-raylib/templates/desktop.txt` — the raylib DESKTOP
+// lifecycle template AFTER the backend was extracted out-of-tree (#386).
+// Unlike `raylib_lifecycle` above (trimmed), this keeps the preview-mode
+// holes (`{{module_vars}}`/`{{preview_setup}}`/`{{preview_readback}}`/
+// `{{preview_heartbeat}}`) the loop path fills, so a test can assert the
+// PBO async-readback IS emitted for raylib desktop even though `.backend =
+// .raylib` now resolves to an EXTERNAL package (the #386-flip regression).
+pub const raylib_desktop_preview_lifecycle =
+    \\{{module_vars}}pub fn main() !void {
+    \\    var gpa = std.heap.DebugAllocator(.{}).init;
+    \\    const allocator = gpa.allocator();
+    \\    var g = AssembledGame.init(allocator);
+    \\    g.setHooks(&hooks);
+    \\{{preview_setup}}{{setup_code}}
+    \\    while (!window.windowShouldClose()) {
+    \\        const dt: f32 = 0.016;
+    \\{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
+    \\        g.render();
+    \\{{preview_readback}}        window.endDrawing();
+    \\{{gui_draw_code}}    }
+    \\}
+    \\
+;
+
 pub const sokol_lifecycle =
     \\var g: AssembledGame = undefined;
     \\var hooks: GameHooks = .{};
@@ -324,4 +348,309 @@ pub fn testGuiRawBackend(name: []const u8) generate.ResolvedGui {
         .plugin_dir = "/fake/gui/plugin",
         .bridge_dir = "/fake/gui/bridge",
     };
+}
+
+// ── In-tree sokol backend fixture (pluggable-backends epic #386) ──────
+// Post-#386 ALL six built-in backends resolve to EXTERNAL provider packages
+// (`builtinProvider` has no `null` arms), so production codegen is fully
+// backend-agnostic. `backends/sokol` is RETAINED purely as the offline
+// in-tree reference manifest / test fixture: codegen tests that inspect a
+// generated build.zig need *some* real backend manifest readable on disk.
+// Selecting it via an explicit `.backend_package` (instead of the bare
+// `.backend = .sokol` enum tag, which now resolves to the published
+// labelle-sokol package) repoints generation at that fixture; the manifest
+// splice then renders byte-identically to the pre-flip enum path.
+pub const sokol_fixture_package = generate.PluginDep{ .name = "sokol", .repo = "local:backends/sokol" };
+
+/// Generate a build.zig against the retained in-tree sokol fixture. Injects
+/// the fixture `backend_package` + `project_dir = "."` (tests run with the
+/// assembler repo root as cwd) so the desktop manifest splice resolves
+/// `backends/sokol/backend.manifest.zon` offline. Any caller-supplied opts
+/// (e.g. `is_tests_target`) are preserved.
+pub fn genSokolBuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend_package = sokol_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+/// Generate a build.zig against the retained sokol fixture's SCHEMA-v2 manifest
+/// (`backend.manifest.v2.zon`) — the manifest-v2 desktop codegen path (epic #453
+/// item 3, PR 3). Identical wiring to `genSokolBuildZig` but points codegen at the
+/// v2 manifest via `backend_manifest_name`, so the byte-anchor test (§7) can drive
+/// the v2 path WITHOUT touching the v1 `backend.manifest.zon` other tests use.
+pub fn genSokolBuildZigV2(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend_package = sokol_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+// A V2-ONLY backend fixture: `backends/sokol_v2only` ships ONLY
+// `backend.manifest.v2.zon` — NO legacy `backend.manifest.zon` sibling. Used to
+// prove the manifest-v2 regression fix (#453): the external-manifest requirement
+// + the desktop gate key off the REQUESTED manifest name, so a v2-only backend
+// still reaches the v2 codegen path instead of being treated as manifest-less.
+pub const sokol_v2only_fixture_package = generate.PluginDep{ .name = "sokol_v2only", .repo = "local:backends/sokol_v2only" };
+
+/// Generate a build.zig against the V2-ONLY fixture (no legacy manifest present).
+/// Identical wiring to `genSokolBuildZigV2` but repoints at `sokol_v2only`, whose
+/// package dir has NO `backend.manifest.zon` — so this ONLY generates if the gate
+/// keys off the requested `backend.manifest.v2.zon`. The v2 manifest content is a
+/// byte copy of sokol's, so the output byte-anchors equal to `genSokolBuildZigV2`.
+pub fn genSokolV2OnlyBuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend_package = sokol_v2only_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+// ── null + wgpu v2 GOLDEN fixtures (manifest-v2, epic #453 item 3, PR 8) ──
+// null and wgpu are the first FULLY-DECLARATIVE, HOOKLESS desktop backends
+// converted to v2. Each ships ONLY a `backend.manifest.v2.zon` (mirroring
+// `backends/sokol_v2only` — no build.zig/package), so codegen reads the manifest
+// offline. Unlike the sokol byte anchor these use the GENERIC declarative desktop
+// path (loop-form `unifyCoreDiamond` walk, no sokol residual), gated as reviewed
+// goldens (design §7): null exercises the no-artifact/no-framework path, wgpu the
+// per-OS `.frameworks.desktop.macos` (Metal/Foundation/QuartzCore) emission.
+pub const null_v2_fixture_package = generate.PluginDep{ .name = "null_v2", .repo = "local:backends/null_v2" };
+pub const wgpu_v2_fixture_package = generate.PluginDep{ .name = "wgpu_v2", .repo = "local:backends/wgpu_v2" };
+
+/// Generate a build.zig against the null v2 fixture — the hookless, fully
+/// declarative desktop path (design §7 golden cell).
+pub fn genNullV2BuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend = .null;
+    cfg.backend_package = null_v2_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+/// Generate a build.zig against the wgpu v2 fixture — the hookless, declarative
+/// desktop path WITH per-OS framework emission (design §7 golden cell).
+pub fn genWgpuV2BuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend = .wgpu;
+    cfg.backend_package = wgpu_v2_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+// ── THIRD-PARTY (open-config) v2 fixture (manifest-v2, epic #453 PR 11) ──
+// `backends/acme_foo` is a HYPOTHETICAL third-party backend: selected purely by
+// NAME + package with NO matching `Backend` enum tag, declaring a NON-`labelle.`
+// canonical id (`acme.foo`). It proves the pluggable-backends end goal — a
+// name-only backend resolves + generates entirely through `backend_registry` +
+// its v2 manifest, never touching the closed enum. Mirrors `backends/null_v2`:
+// ships ONLY a `backend.manifest.v2.zon`, hookless + declarative, read offline.
+pub const acme_foo_fixture_package = generate.PluginDep{ .name = "acme_foo", .repo = "local:backends/acme_foo" };
+
+/// Generate a build.zig against the third-party `acme_foo` v2 fixture. CRUCIALLY
+/// this leaves `cfg.backend` at its `.raylib` default (a name-only backend has NO
+/// enum tag): the only selector is `backend_package`, so codegen must route
+/// through the registry + v2 manifest, NOT the enum `switch (cfg.backend)`.
+pub fn genAcmeFooBuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    // Deliberately NOT setting cfg.backend — it stays at the meaningless default.
+    cfg.backend_package = acme_foo_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+/// Generate a build.zig.zon against the third-party `acme_foo` v2 fixture. Like
+/// `genAcmeFooBuildZig` this leaves `cfg.backend` at its `.raylib` default and
+/// selects the backend purely by `backend_package` + the v2 manifest, so the
+/// emitted zon must key the backend dep by the manifest's `dep_name` (`acme_foo`)
+/// — matching `b.dependency("acme_foo", ..)` in the generated build.zig. Uses the
+/// relative-path fallback (no target_dir/output_dir), read offline.
+pub fn genAcmeFooBuildZigZon(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+) ![]const u8 {
+    var cfg = cfg_in;
+    // Deliberately NOT setting cfg.backend — it stays at the meaningless default.
+    cfg.backend_package = acme_foo_fixture_package;
+    return generate.generateBuildZigZon(allocator, cfg, null, null, ".", .{
+        .backend_manifest_name = "backend.manifest.v2.zon",
+    });
+}
+
+// ── sdl + raylib v2 GOLDEN fixtures (manifest-v2, epic #453 item 3, PR 9) ──
+// sdl and raylib are the next backends converted to v2. Each ships a
+// `backend.manifest.v2.zon` (mirroring `backends/null_v2`/`backends/wgpu_v2`);
+// raylib_v2 ALSO ships the dedicated `backend.hook.zig` (the wasm emcc residual).
+// Codegen reads them offline.
+//   - sdl_v2: DESKTOP-ONLY, HOOKLESS, fully declarative — no artifacts / no
+//     system_libs (SDL2 is linked inside the backend package's window module, so
+//     the v1 `link.txt` is empty); uses the generic `unifyCoreDiamond` walk.
+//   - raylib_v2: DESKTOP (declarative — the `raylib` artifact + per-OS OpenGL
+//     framework/syslib switch) + WASM (the emcc residual in the std-only hook).
+pub const sdl_v2_fixture_package = generate.PluginDep{ .name = "sdl_v2", .repo = "local:backends/sdl_v2" };
+pub const raylib_v2_fixture_package = generate.PluginDep{ .name = "raylib_v2", .repo = "local:backends/raylib_v2" };
+
+/// Generate a build.zig against the sdl v2 fixture — the hookless, fully
+/// declarative desktop path (design §7 golden cell). SDL2 is linked by the backend
+/// package, so no artifact/system_lib is emitted here.
+pub fn genSdlV2BuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend = .sdl;
+    cfg.backend_package = sdl_v2_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+/// Generate a build.zig against the raylib v2 fixture — DESKTOP (declarative
+/// `raylib` artifact + per-OS OpenGL framework/syslib switch) unless the caller
+/// sets `cfg.platform = .wasm`, which drives the emcc hook path (design §7).
+pub fn genRaylibV2BuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend = .raylib;
+    cfg.backend_package = raylib_v2_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+// ── bgfx v2 GOLDEN fixture (manifest-v2, epic #453 item 3, PR 10) ──
+// bgfx is the LAST + HARDEST backend converted to v2 — the first needing BOTH
+// per-platform `loop_style` (desktop `.loop`, android `.callback`) AND a
+// platform-only `extra_modules` with a non-default `root_alias` (android's
+// `android_app` → `backend_app`). The fixture ships this v2 manifest + the
+// dedicated `backend.hook.zig` (the android NDK residual), no build.zig/package —
+// codegen reads them offline.
+//   - DESKTOP: HOOKLESS, generic declarative path — the `bgfx` + `glfw` artifacts,
+//     the base `gui_enabled` + desktop `gamepad_*` dep_options, the generic
+//     `unifyCoreDiamond` walk (covers the transitive sdl_gamepad at build time).
+//   - ANDROID: HOOK-BEARING — `resolve_target` (ABI) + `post_wire` (NDK
+//     addLibraryPath + libc.txt), the `android_app` extra module aliased to
+//     `backend_app`, declarative NDK system libs, apk packaging via the packager.
+pub const bgfx_v2_fixture_package = generate.PluginDep{ .name = "bgfx_v2", .repo = "local:backends/bgfx_v2" };
+
+/// Generate a build.zig against the bgfx v2 fixture — DESKTOP (declarative
+/// `bgfx`+`glfw` artifacts, hookless) unless the caller sets `cfg.platform =
+/// .android`, which drives the hook path (`resolve_target`/`post_wire`) + the
+/// `android_app` extra module aliased to `backend_app` (design §7 golden cell).
+pub fn genBgfxV2BuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend = .bgfx;
+    cfg.backend_package = bgfx_v2_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+// A BROKEN-v2 backend fixture: `backends/sokol_v2broken` ships a
+// `backend.manifest.v2.zon` whose header parses (manifest_version = 2) but whose
+// body is invalid, so `manifest_v2.loadNamedManifest` fails. Used to prove #468
+// finding 1: a v2 manifest that fails to load must error BOTH the build.zig and
+// build.zig.zon generators (the zon path must not swallow the error with
+// `catch null` and silently fall back to enum output).
+pub const sokol_v2broken_fixture_package = generate.PluginDep{ .name = "sokol_v2broken", .repo = "local:backends/sokol_v2broken" };
+
+// A V1-ONLY backend fixture: `backends/sokol_v1only` ships ONLY the legacy
+// `backend.manifest.zon` (+ its desktop build fragments) — NO
+// `backend.manifest.v2.zon` sibling. The mirror of `sokol_v2only`. Used to prove
+// the manifest-v2 PRODUCTION CUTOVER (#453/#472 P2) is a no-op for a v1 backend:
+// the real `generate` entry probe finds no v2 manifest, so it stays on the v1/enum
+// splice path — the generated build.zig must NOT carry the v2 generic markers.
+pub const sokol_v1only_fixture_package = generate.PluginDep{ .name = "sokol_v1only", .repo = "local:backends/sokol_v1only" };
+
+// A V1-CONTENT-UNDER-V2-FILENAME backend fixture: `backends/sokol_v1inv2` ships
+// ONLY `backend.manifest.v2.zon` (NO canonical `backend.manifest.zon` sibling),
+// but that file's CONTENT is v1 — no `manifest_version` field, so `parseManifest`
+// defaults it to 1 and returns the `.v1` union tag. `detectV2ManifestName` keys
+// off file existence, so `generate` threads `backend.manifest.v2.zon` as the
+// detected name. Used to prove the #473 Major edge case: the loop_style + template
+// seams must resolve from THIS detected-but-v1 file (`loop_style = .loop`,
+// `main_loop_template = templates/desktop.txt`), NOT retry the canonical (null)
+// name — which would probe the absent `backend.manifest.zon` and silently drop
+// the backend into enum behavior.
+pub const sokol_v1inv2_fixture_package = generate.PluginDep{ .name = "sokol_v1inv2", .repo = "local:backends/sokol_v1inv2" };
+
+/// Drive the REAL `generate` entry point (the production codepath — NOT the
+/// `generateBuildZig` unit helper, which takes `backend_manifest_name` explicitly)
+/// against an in-tree backend fixture, and return the generated `build.zig` read
+/// back from disk. This is the proof for the manifest-v2 PRODUCTION CUTOVER
+/// (#453 / #472 P2): `generate` itself must AUTO-DETECT a `backend.manifest.v2.zon`
+/// in the resolved backend package and drive the v2 codegen WITHOUT any caller
+/// passing `backend_manifest_name` — `GenerateOptions` has no such field, so the
+/// only way a v2 build.zig can come out is `generate`'s own probe.
+///
+/// `is_tests_target = true` trims main.zig (so the test needs no cached engine
+/// template) while still emitting the FULL backend-dep/link build.zig — the exact
+/// sections the v2 cutover routes. `game_dir` is the repo root (".") so the
+/// fixture's `local:backends/<name>` repo resolves offline, exactly as the other
+/// v2 helpers do; the output lands in a throwaway tmp dir.
+pub fn generateAndReadBuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    backend_package: generate.PluginDep,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend_package = backend_package;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(out_abs);
+
+    try generate.generate(allocator, cfg, out_abs, ".", .{ .is_tests_target = true });
+
+    // generate writes to `<output_dir>/<backendName>_<platform>/build.zig`.
+    const target_name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ cfg.backendName(), @tagName(cfg.platform) });
+    defer allocator.free(target_name);
+    const build_zig_rel = try std.fs.path.join(allocator, &.{ target_name, "build.zig" });
+    defer allocator.free(build_zig_rel);
+    return tmp.dir.readFileAlloc(std.testing.io, build_zig_rel, allocator, .limited(1 << 20));
 }

@@ -1,0 +1,57 @@
+.{
+    // ── null backend manifest, SCHEMA v2 (build-graph manifest, epic #453 item 3,
+    // PR 8) — a faithful translation of the real `labelle-null` v1
+    // `backend.manifest.zon` + `build_fragments/{backend_dep,link}.txt` +
+    // `templates/headless.txt`. See docs/design/manifest-v2-build-graph.md §3.
+    //
+    // null is the SIMPLEST possible v2 backend: pure-Zig, zero native deps,
+    // headless, desktop-only. It exercises the v2 codegen's FULLY-DECLARATIVE
+    // desktop path (design §7 golden cell, NOT the sokol byte anchor):
+    //   - NO `build_hook` — hookless, so the generated build.zig imports no
+    //     `backend_build_hook.zig` and calls no `resolve_target`/`post_wire`.
+    //   - NO artifacts — the enum path's `.null => {}` link arm emitted nothing;
+    //     every backend module is a no-op Zig stub, so there is no library to link.
+    //   - NO frameworks, NO system libs, NO dep_options.
+    // The only genuine capability is `.headless` (runs with no window surface).
+    //
+    // This is a TEST FIXTURE dir (mirrors `backends/sokol_v2only`): it ships ONLY
+    // this v2 manifest, no build.zig/package — codegen reads the manifest offline.
+    .manifest_version = 2,
+    .dir_name = "null",
+    .dep_name = "labelle_null",
+    .id = "labelle.null",
+
+    // Carried forward UNCHANGED from the v1 manifest — null's ONE defining
+    // capability. A non-empty set opts into resolve-time capability enforcement
+    // (design §3 review-correction #8); v2 must not drop capability negotiation.
+    .capabilities = .{.headless},
+
+    // root_alias defaults to `backend_<name>`, so the generated root imports
+    // these as `backend_gfx`/`backend_input`/… exactly as the enum path does.
+    .modules = .{
+        .{ .name = "gfx", .source = "src/gfx.zig" },
+        .{ .name = "input", .source = "src/input.zig" },
+        .{ .name = "audio", .source = "src/audio.zig" },
+        .{ .name = "window", .source = "src/window.zig" },
+    },
+
+    // No dep_options: the null backend-dep takes no gamepad/gui/imgui toggles.
+    // No system_libs / frameworks: null links nothing native.
+
+    .platforms = .{
+        // Desktop-only, headless (`templates/headless.txt`). The generated main
+        // drives a fixed-frame tick `while (frame < max_frames)` loop, so this is
+        // `.loop`, matching the v1 manifest's `loop_style = .loop`.
+        .desktop = .{
+            .entry = "templates/headless.txt",
+            .loop_style = .loop,
+            .target = .native,
+            // No artifacts — pure Zig, nothing to link (v1 link fragment is EMPTY).
+            .package = .binary,
+        },
+        // No android/ios/wasm — null is headless desktop only.
+    },
+
+    // No build_hook — a fully declarative, HOOKLESS backend (design §3): the
+    // generated build.zig has no hook import and no resolve_target/post_wire call.
+}

@@ -1,0 +1,30 @@
+.{
+    // ── V1-CONTENT-UNDER-V2-FILENAME test fixture (#473 Major) ──────────────
+    // This backend ships ONLY `backend.manifest.v2.zon` — there is NO canonical
+    // `backend.manifest.zon` sibling — yet the file's CONTENT is v1: it has no
+    // `manifest_version` field, so `parseManifest` defaults it to 1 and dispatches
+    // to the v1 `BackendManifest` (union tag `.v1`), NOT the v2 build-graph shape.
+    //
+    // `generate`'s `detectV2ManifestName` keys off file EXISTENCE, so it returns
+    // `backend.manifest.v2.zon` here; the external-manifest gate + provider-contract
+    // checks pass on that detected name. The bug this fixture pins: the loop_style /
+    // template seams used to retry the legacy pass with the canonical (null) name,
+    // which probes the ABSENT `backend.manifest.zon`, drops the override to null /
+    // falls to the enum path, and silently loses this backend's loop_style +
+    // main-loop template. The fix resolves BOTH from THIS file (the one actually
+    // found). `loop_style = .loop` (distinct from sokol's `.callback`) proves the
+    // value came from here, not from a stray canonical fallback.
+    .dir_name = "sokol",
+    .dep_name = "labelle_sokol",
+    .loop_style = .loop,
+    .main_loop_template = "templates/desktop.txt",
+    .build_fragments = .{ .backend_dep = "build_fragments/backend_dep.txt", .link = "build_fragments/link.txt" },
+    .params = .{ .backend_dep = .{}, .link = .{} },
+
+    .id = "labelle.sokol",
+    .capabilities = .{
+        .screenshots,
+        .raw_gui_adapter,
+        .audio_ogg,
+    },
+}

@@ -69,21 +69,9 @@ jobs:
       - name: zig-ecs adapter tests
         run: cd ecs/zig-ecs && zig build test
 
-      - name: SDL backend build-helper tests
-        run: cd backends/sdl && zig build test
 
       - name: sokol backend unit tests + audio.zig compile-check
         run: cd backends/sokol && zig build test
-
-      # Linux-only: raylib-zig transitively pulls hexops/xcode-frameworks
-      # via `git+https://`, which Zig's git fetcher can't resolve on the
-      # macos-latest runner ("unable to discover remote git server
-      # capabilities: ProtocolError"). The slot_alloc tests are pure Zig
-      # with no platform-specific behaviour, so running them on the
-      # ubuntu runner alone is enough.
-      - name: raylib backend slot-allocator tests
-        if: runner.os == 'Linux'
-        run: cd backends/raylib && zig build test
 
       - name: plugins/debug tests
         run: cd plugins/debug && zig build test

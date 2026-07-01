@@ -50,23 +50,40 @@ pub fn Mixin(comptime Self: type) type {
             }
         }
 
-        /// External-backend contract-verification guard (epic #386 Phase 6b).
+        /// External-backend contract-verification guard (epic #386 Phase 6b)
+        /// plus per-sub-surface contract-VERSION asserts (contract versioning,
+        /// labelle-assembler#453 item 1).
         ///
         /// Emitted at module root (right after the hook imports) ONLY for an
         /// external `backend_package`. A fetched out-of-tree backend has no
-        /// enum-path codegen to vet it, so we assert its three modules satisfy
+        /// enum-path codegen to vet it, so we assert its modules satisfy
         /// labelle-core's render / window / input contracts up front. A missing
         /// required decl then fails with a decl-naming message from
         /// `core.assert{Backend,Window,Input}` at the very start of the build,
         /// instead of surfacing as a deep error from inside engine wiring.
         ///
-        /// Built-in backends emit nothing here — they're vetted by the enum path
-        /// (and their own in-module asserts), so generated output for every
-        /// built-in backend is byte-identical to before.
+        /// On top of the shape check, each sub-surface gets a DIRECTIONAL
+        /// version assert: a backend may publish `targets_<surface>_contract`
+        /// (a `u32`) declaring which revision of that contract it was built
+        /// against. We compare it to labelle-core's `<SURFACE>_CONTRACT_VERSION`
+        /// and `@compileError` on ANY mismatch, naming which side to upgrade:
+        ///   * backend N  >  core M  -> the backend was built against a newer
+        ///     contract than this labelle-core provides -> upgrade labelle-core.
+        ///   * backend N  <  core M  -> a breaking contract change landed in
+        ///     labelle-core the backend hasn't adopted -> upgrade the backend.
+        /// Both checks are wrapped in `@hasDecl(...)`, so a backend that hasn't
+        /// adopted `targets_*` yet is completely unaffected -- the guarded body
+        /// is not analyzed when the guard is comptime-false. This is the
+        /// no-flag-day property: opting in is per-backend, per-surface.
         ///
-        /// `backend_gfx` / `backend_window` / `backend_input` and `labelle-core`
-        /// are all root module deps of the generated `main.zig`, so the imports
-        /// resolve without any extra wiring.
+        /// Built-in backends emit nothing here -- they're vetted by the enum path
+        /// (and their own in-module asserts). (Post-#386 every backend resolves
+        /// to an external provider package, so this branch always runs; the
+        /// `isExternal()` gate is retained as defensive dead code.)
+        ///
+        /// `backend_gfx` / `backend_window` / `backend_input` / `backend_audio`
+        /// and `labelle-core` are all root module deps of the generated
+        /// `main.zig`, so the imports resolve without any extra wiring.
         pub fn writeBackendContractCheck(self: *Self, w: anytype) !void {
             if (!self.cfg.isExternal()) return;
             try w.writeAll(
@@ -77,6 +94,50 @@ pub fn Mixin(comptime Self: type) type {
                 \\// engine wiring. Built-in backends skip this (vetted by the enum path).
                 \\comptime {
                 \\    const _backend_contract_core = @import("labelle-core");
+                \\
+                \\    // --- Directional per-sub-surface contract-VERSION asserts (labelle-assembler#453) ---
+                \\    // Emitted BEFORE the shape asserts below: a `targets_<surface>_contract`
+                \\    // mismatch must report the DIRECTIONAL "upgrade labelle-core / upgrade the
+                \\    // backend" message FIRST -- if a shape assert @compileError'd first (a
+                \\    // decl the newer contract renamed/added), that directional guidance would
+                \\    // never fire. Each surface is checked only when the backend opts in by
+                \\    // declaring `targets_<surface>_contract` (@hasDecl guard = no flag day).
+                \\    const _bc_gfx = @import("backend_gfx");
+                \\    const _bc_window = @import("backend_window");
+                \\    const _bc_input = @import("backend_input");
+                \\    const _bc_audio = @import("backend_audio");
+                \\
+            );
+            const Surface = struct {
+                mod: []const u8,
+                decl: []const u8,
+                core: []const u8,
+                human: []const u8,
+            };
+            const surfaces = [_]Surface{
+                .{ .mod = "_bc_gfx", .decl = "targets_draw_contract", .core = "DRAW_CONTRACT_VERSION", .human = "draw" },
+                .{ .mod = "_bc_gfx", .decl = "targets_loader_contract", .core = "LOADER_CONTRACT_VERSION", .human = "loader" },
+                .{ .mod = "_bc_window", .decl = "targets_window_contract", .core = "WINDOW_CONTRACT_VERSION", .human = "window" },
+                .{ .mod = "_bc_input", .decl = "targets_input_contract", .core = "INPUT_CONTRACT_VERSION", .human = "input" },
+                .{ .mod = "_bc_audio", .decl = "targets_audio_playback_contract", .core = "AUDIO_PLAYBACK_CONTRACT_VERSION", .human = "audio-playback" },
+                .{ .mod = "_bc_audio", .decl = "targets_audio_loader_contract", .core = "AUDIO_LOADER_CONTRACT_VERSION", .human = "audio-loader" },
+            };
+            for (surfaces) |s| {
+                try w.print(
+                    \\    if (@hasDecl({[mod]s}, "{[decl]s}")) {{
+                    \\        if ({[mod]s}.{[decl]s} > _backend_contract_core.{[core]s})
+                    \\            @compileError(std.fmt.comptimePrint("backend targets {[human]s}-contract v{{d}} but this labelle-core provides v{{d}} -- upgrade labelle-core", .{{ {[mod]s}.{[decl]s}, _backend_contract_core.{[core]s} }}));
+                    \\        if ({[mod]s}.{[decl]s} < _backend_contract_core.{[core]s})
+                    \\            @compileError(std.fmt.comptimePrint("backend targets {[human]s}-contract v{{d}} but this labelle-core expects v{{d}} -- a breaking {[human]s}-contract change landed; upgrade the backend", .{{ {[mod]s}.{[decl]s}, _backend_contract_core.{[core]s} }}));
+                    \\    }}
+                    \\
+                , .{ .mod = s.mod, .decl = s.decl, .core = s.core, .human = s.human });
+            }
+            try w.writeAll(
+                \\
+                \\    // Shape asserts run AFTER the version asserts above (see note there):
+                \\    // the backend must satisfy labelle-core's render / window / input contract
+                \\    // SURFACE (every required decl present) once its version is known-compatible.
                 \\    _backend_contract_core.assertBackend(@import("backend_gfx"));
                 \\    _backend_contract_core.assertWindow(@import("backend_window"));
                 \\    _backend_contract_core.assertInput(@import("backend_input"));

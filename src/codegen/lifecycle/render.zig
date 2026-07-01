@@ -541,15 +541,23 @@ pub fn Mixin(comptime Self: type) type {
                 // already runs through its own callback path. raylib WASM
                 // takes the callback branch above, so this only fires for
                 // raylib desktop.
-                // An EXTERNAL backend leaves `cfg.backend` at its `.raylib`
-                // enum default (the tag is meaningless for a named package —
-                // selection comes from the manifest, #386). A bare `== .raylib`
-                // would therefore misfire on every external backend and emit
-                // raylib's PBO async-readback against a window module that has
-                // no `preview_pbo`. External backends take the empty-readback
-                // path the other loop backends (null/sdl/bgfx/wgpu) use until
-                // they declare their own preview support.
-                const is_raylib_desktop = cfg.backend == .raylib and !cfg.isExternal();
+                // Match on the RESOLVED backend NAME, not `!isExternal()`.
+                // Post-#386 flip, `.backend = .raylib` resolves to the external
+                // labelle-raylib package (`isExternal()` is now true even for the
+                // default raylib), yet labelle-raylib's desktop template STILL
+                // carries the `{{preview_setup}}`/`{{preview_readback}}` holes this
+                // block fills — so a `!isExternal()` gate emits them EMPTY and the
+                // editor preview connects but publishes no frames (the #409 gate,
+                // written while raylib was still bundled, over-fired after the
+                // flip). `backendName()` is "raylib" for both the (former) bundled
+                // build and the tag-matched external default, so the PBO readback
+                // fires for raylib desktop either way. A THIRD-PARTY external
+                // backend leaves `cfg.backend` at its `.raylib` enum default but
+                // resolves a differently-NAMED package, so `backendName()` is NOT
+                // "raylib" — it correctly stays on the empty-readback path (the
+                // #409 intent: don't emit raylib's PBO readback against a window
+                // module with no `preview_pbo`), same as null/sdl/bgfx/wgpu.
+                const is_raylib_desktop = std.mem.eql(u8, cfg.backendName(), "raylib");
                 // Preview mouse-input forwarding is sokol-only: the
                 // `imgui_bridge_mouse_*` externs `PREVIEW_INPUT_DISPATCH`
                 // declares are exported solely by the *sokol* imgui bridge

@@ -31,13 +31,15 @@
 //!   - root.zig `loadBackendTemplate` backend→desktop.txt mapping
 //!       → `mainLoopTemplateRel(manifest)` (reads manifest `main_loop_template`)
 //!
-//! None of the above names a backend enum tag. The ONLY place the splice
-//! still touches the enum is `backendPackageDir`, which uses
-//! `@tagName(cfg.backend)` to LOCATE the package so it can read the manifest.
-//! That `@tagName` is the documented future seam: Phase 5 replaces it with a
-//! backend *name string* → package registry (the manifest already carries
-//! `dir_name`/`dep_name` as data so nothing downstream depends on the tag).
-//! Building that registry is out of scope here — this lands the splice.
+//! None of the above names a backend enum tag. Package LOCATION
+//! (`backendPackageDir`) is likewise enum-free: it routes through
+//! `backend_registry.resolveBackendPackage`, keyed by `cfg.backendName()` (a
+//! STRING), so a third-party backend named only by `.backend_package` — with no
+//! matching `Backend` enum tag — resolves + generates through this same registry
+//! + its (v2) manifest, never through `@tagName(cfg.backend)` (open-config, #453
+//! PR 11). The enum survives only as a shorthand for the 6 built-ins; the one
+//! remaining enum-as-identity read is `cfg.isEnumTagBacked()` (config.zig), which
+//! a name-only backend never satisfies.
 
 const std = @import("std");
 const tpl = @import("../template.zig");
@@ -56,6 +58,22 @@ pub const BackendManifest = struct {
     main_loop_template: []const u8,
     build_fragments: BuildFragments,
     params: Params,
+
+    /// Canonical provider identity — a reverse-namespaced `<namespace>.<name>`
+    /// (RFC "Provider identity & collision rules", §1616). Official providers
+    /// live under the reserved `labelle.` namespace (`labelle.sokol`); a third
+    /// party uses `<vendor>.<name>`. Optional for back-compat: an absent `.id`
+    /// on a built-in is DERIVED as `labelle.<name>` (no error); on an external
+    /// provider it warns (required-id is enforced in a later release). See
+    /// `backend_registry.validateProviderIdentity`.
+    id: ?[]const u8 = null,
+
+    /// Capabilities this provider advertises (RFC "Capability negotiation",
+    /// §1652). Defaults empty so pre-capability manifests keep parsing under
+    /// `ignore_unknown_fields`; a non-empty set OPTS IN to enforcement
+    /// (`capabilities.validate` fails on a missing required capability; an
+    /// empty declared set only warns — the back-compat gate).
+    capabilities: []const config.Capability = &.{},
 
     /// `.callback` → the windowing runtime owns the loop and the generated
     /// `main` registers init/frame/cleanup callbacks (sokol, bgfx-android,
@@ -80,19 +98,40 @@ pub const BackendManifest = struct {
     };
 };
 
+/// The production (v1) manifest filename. Used whenever `manifest_name` is null,
+/// so the enum/v1 splice + every root.zig generator keeps reading
+/// `backend.manifest.zon` byte-for-byte as before. manifest-v2 (epic #453 item 3)
+/// opts a backend onto a DIFFERENT filename (`backend.manifest.v2.zon`), and the
+/// gate + external-manifest requirement below must key off THAT requested name —
+/// otherwise a backend shipping ONLY the v2 manifest is wrongly treated as
+/// manifest-less and never reaches the v2 codegen path.
+pub const LEGACY_MANIFEST_NAME = "backend.manifest.zon";
+
 /// True when the manifest path should be taken for this generation: the target
 /// is a DESKTOP build (the only target manifests cover) AND the resolved
-/// backend package ships a `backend.manifest.zon`. Everything else — non-desktop
-/// targets, and backends with no manifest — stays on the enum path.
+/// backend package ships the requested manifest file. Everything else —
+/// non-desktop targets, and backends with no matching manifest — stays on the
+/// enum path.
+///
+/// `manifest_name` is the filename to probe, relative to the backend package
+/// root. Null selects the production `backend.manifest.zon` (v1). manifest-v2
+/// passes the v2 filename so a v2-only backend (no legacy sibling) still enables
+/// the manifest path.
 ///
 /// This is the productionized gate: a backend opts in by SHIPPING A MANIFEST,
 /// no env var. bgfx-desktop ships one (→ manifest path); sokol ships one too
 /// (the POC artifact). raylib/sdl/wgpu/null ship none (→ enum path).
-pub fn manifestPathEnabled(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) bool {
-    // Manifests declare desktop fields only; non-desktop targets (wasm/ios/
-    // android) keep their enum branches (e.g. bgfx-android's NDK ordering).
-    if (cfg.platform != .desktop) return false;
-    return manifestExists(allocator, cfg, project_dir);
+pub fn manifestPathEnabled(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8, manifest_name: ?[]const u8) bool {
+    // The V1 splice declares desktop fields only, so a null (production) name
+    // keeps non-desktop targets (wasm/ios/android) on their enum branches (e.g.
+    // bgfx-android's NDK ordering). An EXPLICIT `manifest_name` is the manifest-v2
+    // opt-in (epic #453): v2 manifests carry a full per-platform matrix, so the
+    // path is enabled on any platform when the named manifest exists. build_files
+    // routes a v2 manifest to the v2 codegen and IGNORES a v1 manifest on a
+    // non-desktop target (falling back to the enum path), so relaxing the gate
+    // here cannot mis-drive the desktop-only v1 splice on android/ios/wasm.
+    if (cfg.platform != .desktop and manifest_name == null) return false;
+    return manifestExists(allocator, cfg, project_dir, manifest_name orelse LEGACY_MANIFEST_NAME);
 }
 
 /// Validate that an EXTERNAL backend actually ships a `backend.manifest.zon`.
@@ -107,8 +146,16 @@ pub fn manifestPathEnabled(allocator: std.mem.Allocator, cfg: ProjectConfig, pro
 /// No-op for built-ins (`!cfg.isExternal()`), which keep their enum-path
 /// fallback when they ship no manifest (raylib/sdl/wgpu/null). Call before the
 /// manifest-path decision in the generators.
-pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) !void {
+///
+/// `manifest_name` is the required filename, relative to the backend package
+/// root. Null selects the production `backend.manifest.zon` (v1); manifest-v2
+/// passes the v2 filename so the requirement is keyed off the SAME manifest the
+/// gate/loader will read (a v2-only external must not be flagged manifest-less
+/// just because it ships no legacy sibling).
+pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8, manifest_name: ?[]const u8) !void {
     if (!cfg.isExternal()) return;
+
+    const name = manifest_name orelse LEGACY_MANIFEST_NAME;
 
     // Probe the manifest DIRECTLY (don't reuse `manifestExists`, which swallows
     // every error for built-in fallback probing). For external backends a broken
@@ -117,7 +164,7 @@ pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfi
     // maps to `ExternalBackendNeedsManifest`.
     const pkg_dir = try backendPackageDir(allocator, cfg, project_dir);
     defer allocator.free(pkg_dir);
-    const manifest_path = try std.fs.path.join(allocator, &.{ pkg_dir, "backend.manifest.zon" });
+    const manifest_path = try std.fs.path.join(allocator, &.{ pkg_dir, name });
     defer allocator.free(manifest_path);
 
     std.Io.Dir.cwd().access(config.globalIo(), manifest_path, .{}) catch |err| switch (err) {
@@ -125,9 +172,9 @@ pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfi
             // `warn`, not `err`: the hard failure is the returned error; this is
             // the human-readable hint. Matches `loadManifest`'s warn-on-failure.
             std.log.warn(
-                "labelle-assembler: external backend '{s}' (backend_package) ships no backend.manifest.zon — " ++
+                "labelle-assembler: external backend '{s}' (backend_package) ships no {s} — " ++
                     "an external backend must declare its codegen via a manifest (the enum-path fallback does not apply to external backends).",
-                .{cfg.backendName()},
+                .{ cfg.backendName(), name },
             );
             return error.ExternalBackendNeedsManifest;
         },
@@ -135,12 +182,12 @@ pub fn requireManifestIfExternal(allocator: std.mem.Allocator, cfg: ProjectConfi
     };
 }
 
-/// Does the resolved backend package contain a `backend.manifest.zon`?
+/// Does the resolved backend package contain the named manifest file?
 /// Resolution failures / a missing file both mean "no manifest" → enum path.
-fn manifestExists(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) bool {
+fn manifestExists(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8, manifest_name: []const u8) bool {
     const pkg_dir = backendPackageDir(allocator, cfg, project_dir) catch return false;
     defer allocator.free(pkg_dir);
-    const manifest_path = std.fs.path.join(allocator, &.{ pkg_dir, "backend.manifest.zon" }) catch return false;
+    const manifest_path = std.fs.path.join(allocator, &.{ pkg_dir, manifest_name }) catch return false;
     defer allocator.free(manifest_path);
     std.Io.Dir.cwd().access(config.globalIo(), manifest_path, .{}) catch return false;
     return true;
@@ -188,6 +235,54 @@ pub fn loadManifest(allocator: std.mem.Allocator, cfg: ProjectConfig, project_di
 }
 
 pub fn freeManifest(allocator: std.mem.Allocator, m: BackendManifest) void {
+    std.zon.parse.free(allocator, m);
+}
+
+/// The RESOLVE-TIME slice of a backend manifest: provider identity + declared
+/// capabilities ONLY. Parsed with `ignore_unknown_fields`, so it reads the same
+/// `backend.manifest.zon` the full `BackendManifest` does but ignores the
+/// desktop-only splice fields (`dir_name`/`loop_style`/`build_fragments`/…).
+///
+/// This is deliberately DECOUPLED from `manifestPathEnabled` (which is
+/// desktop-only, because the splice fragments it drives only cover desktop):
+/// identity + capability negotiation happen at resolve time on EVERY target
+/// (android/wasm/ios included), so they must not be gated behind the
+/// desktop-only splice. A provider ships one manifest; this reads the
+/// platform-independent half of it.
+pub const ProviderManifest = struct {
+    id: ?[]const u8 = null,
+    capabilities: []const config.Capability = &.{},
+};
+
+/// Load the provider-identity / capability slice of `backend.manifest.zon`,
+/// regardless of target platform. Returns `null` when the resolved backend
+/// package ships NO manifest (a built-in with no manifest → identity derived,
+/// capabilities un-enforced). Errors only on a genuine parse failure. Caller
+/// frees the result with `freeProviderManifest`.
+pub fn loadProviderManifest(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) !?ProviderManifest {
+    const pkg_dir = backendPackageDir(allocator, cfg, project_dir) catch return null;
+    defer allocator.free(pkg_dir);
+
+    const manifest_path = try std.fs.path.join(allocator, &.{ pkg_dir, "backend.manifest.zon" });
+    defer allocator.free(manifest_path);
+
+    const raw = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), manifest_path, allocator, .limited(64 * 1024)) catch |err| {
+        if (err == error.FileNotFound) return null;
+        return err;
+    };
+    defer allocator.free(raw);
+    const raw_z = try allocator.dupeZ(u8, raw);
+    defer allocator.free(raw_z);
+
+    return std.zon.parse.fromSliceAlloc(ProviderManifest, allocator, raw_z, null, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        std.log.warn("labelle-assembler: failed to parse backend.manifest.zon (identity/capabilities) at {s}: {any}", .{ manifest_path, err });
+        return error.BackendManifestParseError;
+    };
+}
+
+pub fn freeProviderManifest(allocator: std.mem.Allocator, m: ProviderManifest) void {
     std.zon.parse.free(allocator, m);
 }
 
@@ -321,7 +416,7 @@ test "requireManifestIfExternal: external backend WITH a manifest is accepted" {
         .backend_package = .{ .name = "stubbackend", .repo = "local:../stubbackend" },
     };
 
-    try requireManifestIfExternal(alloc, cfg, project_abs);
+    try requireManifestIfExternal(alloc, cfg, project_abs, null);
 }
 
 test "requireManifestIfExternal: external backend WITHOUT a manifest errors" {
@@ -344,20 +439,130 @@ test "requireManifestIfExternal: external backend WITHOUT a manifest errors" {
 
     try std.testing.expectError(
         error.ExternalBackendNeedsManifest,
-        requireManifestIfExternal(alloc, cfg, project_abs),
+        requireManifestIfExternal(alloc, cfg, project_abs, null),
     );
 }
 
-test "requireManifestIfExternal: a built-in backend is a no-op even with no manifest" {
+test "requireManifestIfExternal: a v2-only backend (no legacy sibling) is keyed off the requested name" {
+    // manifest-v2 regression (#453): a backend shipping ONLY `backend.manifest.v2.zon`
+    // — no legacy `backend.manifest.zon` — must be ACCEPTED when the requested name
+    // is the v2 file, and still REJECTED when the (absent) legacy name is requested.
+    // Proves the requirement gate keys off `manifest_name`, not the hardcoded legacy.
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
     try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.createDirPath(std.testing.io, "stubbackend");
+    {
+        // v2 manifest present; NO legacy `backend.manifest.zon`.
+        const f = try tmp.dir.createFile(std.testing.io, "stubbackend/backend.manifest.v2.zon", .{});
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io, ".{ .manifest_version = 2 }\n");
+    }
+
     const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
     defer alloc.free(project_abs);
 
-    // Built-in raylib ships no manifest — must NOT error (keeps enum path).
-    const cfg = config.ProjectConfig{ .name = "g", .backend = .raylib };
-    try requireManifestIfExternal(alloc, cfg, project_abs);
+    const cfg = config.ProjectConfig{
+        .name = "stubgame",
+        .backend_package = .{ .name = "stubbackend", .repo = "local:../stubbackend" },
+    };
+
+    // Requesting the v2 name → accepted (the file exists).
+    try requireManifestIfExternal(alloc, cfg, project_abs, "backend.manifest.v2.zon");
+    // Requesting the legacy name (or null) → still errors, since it is absent.
+    try std.testing.expectError(
+        error.ExternalBackendNeedsManifest,
+        requireManifestIfExternal(alloc, cfg, project_abs, null),
+    );
+}
+
+test "requireManifestIfExternal: the retained in-tree sokol fixture ships a manifest (accepted)" {
+    // Post-#386 Phase 6c every built-in (incl. sokol) is external, so there is no
+    // longer any non-external config to exercise the `!isExternal()` early return
+    // (now defensive dead code). What IS still load-bearing: `backends/sokol` is
+    // retained as the offline in-tree fixture and MUST ship a `backend.manifest.zon`
+    // so the generic codegen tests can resolve a real manifest. Selecting it via an
+    // explicit `.backend_package` (the post-flip shape) + the repo root as
+    // project_dir (tests run with the assembler repo root as cwd) must be ACCEPTED.
+    const alloc = std.testing.allocator;
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend = .sokol,
+        .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
+    };
+    try requireManifestIfExternal(alloc, cfg, ".", null);
+}
+
+// ── Tests: provider identity + capability slice (#453) ────────────────────
+
+test "BackendManifest: an OLD manifest with no .id/.capabilities still parses" {
+    // Back-compat: a pre-#453 manifest (no identity, no capabilities) must
+    // still parse under `ignore_unknown_fields`; the new fields default (null /
+    // empty). Byte-identical generation for such built-ins is unaffected.
+    const alloc = std.testing.allocator;
+    const src =
+        \\.{
+        \\    .dir_name = "legacy",
+        \\    .dep_name = "labelle_legacy",
+        \\    .loop_style = .loop,
+        \\    .main_loop_template = "templates/desktop.txt",
+        \\    .build_fragments = .{ .backend_dep = "a.txt", .link = "b.txt" },
+        \\    .params = .{ .backend_dep = .{}, .link = .{} },
+        \\}
+    ;
+    const src_z = try alloc.dupeZ(u8, src);
+    defer alloc.free(src_z);
+
+    const m = try std.zon.parse.fromSliceAlloc(BackendManifest, alloc, src_z, null, .{ .ignore_unknown_fields = true });
+    defer std.zon.parse.free(alloc, m);
+
+    try std.testing.expect(m.id == null);
+    try std.testing.expectEqual(@as(usize, 0), m.capabilities.len);
+}
+
+test "ProviderManifest: parses the id + capability slice, ignoring splice fields" {
+    // The decoupled resolve-time slice reads the SAME file the full manifest
+    // does but only cares about `.id` / `.capabilities`; the desktop-only
+    // splice fields are ignored (ignore_unknown_fields).
+    const alloc = std.testing.allocator;
+    const src =
+        \\.{
+        \\    .dir_name = "sokol",
+        \\    .dep_name = "labelle_sokol",
+        \\    .loop_style = .callback,
+        \\    .main_loop_template = "templates/desktop.txt",
+        \\    .build_fragments = .{ .backend_dep = "a.txt", .link = "b.txt" },
+        \\    .params = .{ .backend_dep = .{}, .link = .{} },
+        \\    .id = "labelle.sokol",
+        \\    .capabilities = .{ .screenshots, .raw_gui_adapter, .audio_ogg },
+        \\}
+    ;
+    const src_z = try alloc.dupeZ(u8, src);
+    defer alloc.free(src_z);
+
+    const pm = try std.zon.parse.fromSliceAlloc(ProviderManifest, alloc, src_z, null, .{ .ignore_unknown_fields = true });
+    defer std.zon.parse.free(alloc, pm);
+
+    try std.testing.expectEqualStrings("labelle.sokol", pm.id.?);
+    try std.testing.expectEqual(@as(usize, 3), pm.capabilities.len);
+    try std.testing.expectEqual(config.Capability.screenshots, pm.capabilities[0]);
+}
+
+test "loadProviderManifest: reads the retained sokol fixture's id + capabilities" {
+    // The in-tree sokol fixture is the reference manifest; it must expose the
+    // canonical id and a non-empty capability set through the decoupled loader.
+    const alloc = std.testing.allocator;
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend = .sokol,
+        .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
+    };
+    const pm = (try loadProviderManifest(alloc, cfg, ".")).?;
+    defer freeProviderManifest(alloc, pm);
+
+    try std.testing.expectEqualStrings("labelle.sokol", pm.id.?);
+    try std.testing.expect(pm.capabilities.len > 0);
 }
