@@ -271,6 +271,18 @@ pub const BackendManifestV2 = struct {
     dep_name: []const u8,
     id: []const u8, // e.g. "labelle.sokol"
 
+    /// Capabilities this provider advertises — CARRIED FORWARD FROM v1, not
+    /// dropped. The v1 `BackendManifest.capabilities` (`manifest_splice.zig:73`)
+    /// feeds `capabilities.validate` (`src/capabilities.zig:94`), the resolve-time
+    /// negotiation seam that hard-errors when a project requires a capability the
+    /// provider does not declare (RFC "Capability negotiation"). Dropping it from
+    /// v2 would let a backend opt into v2 and thereby bypass the check third-party
+    /// providers are gated on. Same nominal type as v1 (`config.Capability`), same
+    /// back-compat rule: an empty set only warns; a non-empty set opts into
+    /// enforcement. Defaulted so a v2 manifest that predates a given capability
+    /// still parses.
+    capabilities: []const config.Capability = &.{},
+
     /// Named modules the provider exposes. Replaces the four hand-written
     /// `.module("gfx"/"input"/"audio"/"window")` lines in every fragment.
     /// Optional platform-scoped modules (bgfx-Android's `android_app`) are
@@ -298,6 +310,19 @@ pub const BackendManifestV2 = struct {
 
     /// OPTIONAL. Relative path to the provider's build hook (§4). Absent =
     /// fully declarative backend, no hook compiled/called.
+    ///
+    /// This MUST point at a DEDICATED hook file (convention `backend.hook.zig`),
+    /// NOT the provider's own `build.zig`. The provider `build.zig` is compiled in
+    /// the `labelle_<name>` package's build context and carries top-level imports
+    /// resolvable only there — e.g. `backends/sokol/build.zig:49`-`50` does
+    /// `pub const emLinkStep = @import("sokol").emLinkStep;`, and `"sokol"` is a
+    /// name in labelle_sokol's build namespace, absent from the generated ROOT
+    /// package. The assembler imports the hook into the generated root package, so
+    /// a hook that carried those package-local imports would fail to compile before
+    /// any `post_wire`/`resolve_target` runs. The dedicated hook file must therefore
+    /// make no package-local import assumptions (it may `@import("std")` and the
+    /// hook-context type only); anything it needs from the provider package it takes
+    /// through `HookContext.backend_dep` (§4).
     build_hook: ?[]const u8 = null,
 
     pub const ModuleDecl = struct {
@@ -409,16 +434,25 @@ pub const BackendManifestV2 = struct {
         /// forwards only the base `with_imgui`.
         dep_options: []const DepOption = &.{},
 
-        /// Extra platform-only modules (bgfx-Android `android_app`).
+        /// Extra platform-only modules (bgfx-Android `android_app`). These MUST set
+        /// an explicit `root_alias` when the generated root imports them under a
+        /// name that is not `backend_<module_name>`: bgfx-Android's `android_app`
+        /// module is pulled as `backend_dep.module("android_app")` and published to
+        /// the root under the alias `backend_app` (`build_zig.txt:799`,`:871`), and
+        /// generated `main.zig` does `@import("backend_app")` for the NativeActivity
+        /// shell. The default alias would be `backend_android_app`, which breaks that
+        /// import — so the bgfx-android manifest declares
+        /// `.{ .name = "android_app", .root_alias = "backend_app", … }` (§8 PR 10).
         extra_modules: []const ModuleDecl = &.{},
 
         /// Root `build.zig.zon` build-time dependencies the hook needs to resolve
         /// via `b.dependency` at consumer build time — e.g. sokol/raylib wasm
         /// hooks call `b.dependency("emsdk", .{})` (build_zig.txt:253), which only
-        /// works if the generated root build.zig.zon declares emsdk
-        /// (build_files.zig:770 `dep_emsdk`). The v2 manifest otherwise describes
-        /// only build.zig wiring, so the hook would generate fine then fail at
-        /// `zig build`. The assembler emits a `build.zig.zon` entry per name.
+        /// works if the generated root build.zig.zon declares emsdk. The v2 manifest
+        /// otherwise describes only build.zig wiring, so the hook would generate fine
+        /// then fail at `zig build`. The assembler emits a `build.zig.zon` entry per
+        /// entry — and each entry MUST carry its own resolution (§4, `RootBuildDep`),
+        /// because the emitter has no way to synthesize a url+hash from a bare name.
         root_build_deps: []const RootBuildDep = &.{},
 
         /// Packaging recipe handed to the shared platform-packager.
@@ -433,8 +467,29 @@ pub const BackendManifestV2 = struct {
 
     pub const RootBuildDep = struct {
         name: []const u8, // build.zig.zon key, e.g. "emsdk"
-        // resolution (url+hash / path) is handled by the existing deps machinery;
-        // this only declares that the hook REQUIRES the dep to exist at the root.
+
+        /// How the emitted `build.zig.zon` entry resolves. REQUIRED — a bare key
+        /// name is not enough. Today emsdk is NOT name-synthesized: it is a
+        /// hand-authored template section with the url pinned inline
+        /// (`build_zig_zon.txt:72`-`73`, `.url = "git+…/emsdk#4.0.9"`), emitted by a
+        /// hardcoded `writeSection(…, "dep_emsdk", …)` (`build_files.zig:770`).
+        /// `b.dependency(name, .{})` cannot invent a url+hash from an arbitrary
+        /// name, so a third-party `root_build_deps` name with no resolution would
+        /// emit an unresolvable zon entry (or none). Every entry therefore either
+        /// carries its resolution here, mirroring how plugin/backend deps are
+        /// pinned, or names one of a closed set of assembler-provided built-ins.
+        resolution: Resolution,
+
+        pub const Resolution = union(enum) {
+            /// url+hash, emitted verbatim into build.zig.zon (as `dep_emsdk` does).
+            remote: struct { url: []const u8, hash: []const u8 },
+            /// relative/absolute path dependency.
+            path: []const u8,
+            /// A resolution the assembler already knows how to emit (emsdk is the
+            /// only one today — keeps the current pinned-url behavior for built-in
+            /// backends without duplicating the url in every wasm manifest).
+            builtin,
+        };
     };
 
     pub const Target = union(enum) {
@@ -467,6 +522,12 @@ the hook (§4).
     .dir_name = "sokol",
     .dep_name = "labelle_sokol",
     .id = "labelle.sokol",
+    // Carried forward from the v1 manifest UNCHANGED (same list sokol ships today,
+    // backends/sokol/backend.manifest.zon) — v2 must not drop capability negotiation.
+    .capabilities = .{
+        .screenshots, .compressed_textures, .fonts, .gamepad_polling,
+        .raw_gui_adapter, .surface_loss, .wasm, .android, .ios, .audio_ogg,
+    },
 
     .modules = .{
         // root_alias defaults to `backend_<name>`, so the generated root imports
@@ -542,15 +603,22 @@ the hook (§4).
             .target = .{ .triple = "wasm32-emscripten" }, // static (build_zig.txt:194)
             .artifacts = .{ .{ .name = "sokol_clib" } },
             .dep_options = .{}, // empty → inherits base UNCHANGED = only with_imgui (build_zig.txt:124); see note below
-            .root_build_deps = .{ .{ .name = "emsdk" } }, // hook calls b.dependency("emsdk")
+            // hook calls b.dependency("emsdk"); the entry carries its resolution —
+            // `.builtin` reuses the assembler's pinned emsdk url (build_zig_zon.txt:72),
+            // so this desktop-authored line needn't repeat the url+hash.
+            .root_build_deps = .{ .{ .name = "emsdk", .resolution = .builtin } },
             .package = .{ .web = .{ .shell = null } },
         },
     },
-    // sokol needs a hook for: resolve_target (iOS device/sim + SDK, Android ABI),
-    // and post_wire residual (a) NDK sysroot+libc.txt, (b) iOS SDK path plumbing,
-    // (c) emcc emLinkStep. The b.dependency option flags are NO LONGER a hook
-    // concern — they are declarative `dep_options` above. See §4.
-    .build_hook = "build.zig",
+    // sokol needs a hook for: post_wire residual (a) NDK sysroot+libc.txt,
+    // (b) iOS SDK path plumbing, (c) emcc emLinkStep. (Target/SDK resolution can
+    // use the assembler's built-in resolver — §4 — so the hook only overrides it if
+    // sokol needs something unusual, which it does not.) It is a DEDICATED hook
+    // file, NOT sokol's own build.zig: that build.zig re-exports `@import("sokol")`
+    // at top level (build.zig:49-50), a name absent from the generated root package.
+    // The b.dependency option flags are NO LONGER a hook concern — they are
+    // declarative `dep_options` above. See §4.
+    .build_hook = "backend.hook.zig",
 }
 ```
 
@@ -675,6 +743,23 @@ as the current generator does — the residual iOS SDK *consumption*
 *path itself is resolved here*, before plugins. Desktop (`.native`) and wasm
 (fixed `.triple`) resolve their target without calling this hook.
 
+**A hookless mobile backend uses the assembler's built-in default resolver.** A
+manifest may omit `build_hook` (a "fully declarative backend"), yet its iOS/Android
+platform entries still set `.target = .resolved`, which needs a `ResolvedTarget`
+before any `b.dependency`. This is not a contradiction, because the resolution logic
+above is **backend-agnostic**: `resolveIosTarget`/`resolveAndroidTarget` and
+`getIosSdkPath` read `-Ddevice`/`-Demulator`/`-Dandroid_arch` + host arch + xcrun and
+name no backend (build_zig.txt:474-498, :690-726) — nothing in them is sokol- or
+bgfx-specific. The assembler therefore **owns a built-in default `resolve_target`**
+for `.resolved` iOS/Android, and a hook's `resolve_target` is an OPTIONAL OVERRIDE
+for a backend with unusual target needs. A hookless mobile backend gets correct
+device/simulator/ABI/SDK resolution from the default; declaring `.target = .resolved`
+does NOT force a hook. (Contrast `post_wire`'s NDK/emcc residual, which the default
+cannot supply — a backend needing that still ships a hook, but for `post_wire`, not
+for target resolution.) The `resolve_target` in the snippet above is thus the
+assembler's default body; a provider overrides it only by shipping a hook that
+exports its own `resolve_target`.
+
 ### The `post_wire` phase (after generic wiring)
 
 ```zig
@@ -705,6 +790,16 @@ pub const HookContext = struct {
     /// sourced from cfg.android.target_sdk_version, config.zig:214, default 34).
     /// Without it the hook cannot build the correct API-level lib path and v2
     /// would drift from the enum path for any non-default target SDK.
+    ///
+    /// REQUIRED for Android — the assembler MUST populate it (from
+    /// `cfg.android.target_sdk_version`, which `AndroidConfig` always defaults to a
+    /// concrete 34, config.zig:214) before calling `post_wire` on an Android build.
+    /// It is `?u32` only because `HookContext` is shared with the non-Android
+    /// platforms (where it is meaningfully null); the Android arm of `post_wire`
+    /// must NOT paper over an unpopulated value with a default. A silent
+    /// `orelse 34` would produce a wrong `usr/lib/<triple>/34` path and libc.txt
+    /// while appearing to honor the user's `target_sdk_version`, so the hook
+    /// PANICS if it is null on Android instead of falling back (see post_wire).
     android_target_sdk: ?u32,
 };
 
@@ -714,7 +809,11 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
     switch (ctx.platform) {
         .android => {
             const sysroot = getAndroidNdkSysroot(b) orelse @panic("NDK not found");
-            const api = ctx.android_target_sdk orelse 34;
+            // REQUIRED — no `orelse 34` fallback: a null here is an assembler bug
+            // (AndroidConfig.target_sdk_version always has a concrete value), and a
+            // silent default would emit a wrong usr/lib/<triple>/<api> path.
+            const api = ctx.android_target_sdk orelse
+                @panic("android_target_sdk must be populated for Android builds");
             // addSystemIncludePath / addLibraryPath(.../<triple>/<api>) /
             // setLibCFile(libc.txt built with <api>) …
         },
@@ -896,10 +995,11 @@ backend × one platform at a time.
 2. **Convert the sokol in-tree fixture to v2, desktop only.** `backends/sokol` is
    the retained offline fixture the codegen tests resolve against
    (`manifest_splice.zig:415`–`430`). Bump its manifest to v2 with the desktop
-   platform entry (declarative `dep_options` for with_imgui/gamepad) + a `build.zig`
-   hook with an empty desktop `post_wire` (desktop has no residual and `.native`
-   needs no `resolve_target`). The differential test (§7) gates this: v2 output for
-   sokol-desktop must match the enum baseline.
+   platform entry (declarative `dep_options` for with_imgui/gamepad) + a dedicated
+   `backend.hook.zig` (NOT sokol's own `build.zig`, §3/§4) with an empty desktop
+   `post_wire` (desktop has no residual and `.native` uses the built-in target
+   resolver, so no hook `resolve_target`). The differential test (§7) gates this:
+   v2 output for sokol-desktop must match the enum baseline.
 
 3. **Add platforms to sokol one at a time**, each gated by its own differential
    test: **desktop → android → ios → wasm.** Android brings residual (a) into the
@@ -969,10 +1069,32 @@ on/off; plus, for mobile, `-Ddevice`/`-Demulator` and a non-default
 `target_sdk_version` so the `resolve_target`/`android_target_sdk` paths are
 exercised.
 
+### Converted cells: the text golden is blind to the hook body
+
+Once Android/iOS/wasm residuals move into imported hook functions (§4), a
+generated-`build.zig` text golden only sees the `post_wire`/`resolve_target` **call
+site** — it does not change when the hook stops adding the NDK library path, skips
+`setLibCFile`, or changes the emcc flags. So for the converted (hook-bearing) cells
+the text snapshot no longer catches the "v2 wired a different graph than the enum
+path" regression it exists to guard. Those cells need a stronger gate:
+
+- **Snapshot the hook source alongside the golden `build.zig`.** The hook file
+  (`backend.hook.zig`) is committed with the fixture, so a golden test also asserts
+  the hook bytes against a committed copy. A change to the residual then fails as a
+  reviewable diff of the hook, not silently.
+- **Or run the hook in the gate.** The strongest form executes the hook against a
+  fixture `*std.Build` and asserts the resulting build graph / emitted flags (the
+  NDK lib path is added, `link_libc`/`setLibCFile` set, emcc flags present) — a
+  build-graph smoke check that actually exercises the residual. This is the
+  hook-side analogue of the normalized-graph comparison below and is the intended
+  gate for the mobile/wasm cells; the source snapshot is the pragmatic minimum until
+  it lands.
+
 ### Scope + limits
 
 - The test compares **generated text**, not build behavior — it is fast (no
-  `zig build`) and runs in the ordinary `zig build test` suite.
+  `zig build`) and runs in the ordinary `zig build test` suite. For hook-bearing
+  cells this is why the text golden alone is insufficient (see above).
 - It does **not** replace CI cross-compile smoke builds — those still catch
   toolchain/SDK issues the text diff can't (a wrong NDK path that is *spelled*
   identically but points nowhere). A **normalized-graph** comparison (parse both
@@ -1003,7 +1125,7 @@ sections, defeating the conversion.
 | **7** | sokol **wasm** (residual c: emcc `emLinkStep`; `.root_build_deps = emsdk` emitted into build.zig.zon); golden cell. | Med | M |
 | **8** | Convert **null** + **wgpu** (pure declarative + frameworks); golden each. | Low | S |
 | **9** | Convert **raylib** (emsdk wasm hook) + **sdl**; golden each. | Med | M |
-| **10** | Convert **bgfx** all platforms (most artifacts, per-platform `loop_style` desktop `.loop`/Android `.callback`, Android `android_app` extra module + bgfx-Android NDK ordering — the piece `manifest_splice.zig:17`–`19` flagged as non-declarative); golden. | High | L |
+| **10** | Convert **bgfx** all platforms (most artifacts, per-platform `loop_style` desktop `.loop`/Android `.callback`, Android `android_app` extra module — declared with `root_alias = "backend_app"` so generated `main.zig`'s `@import("backend_app")` still resolves (§3, build_zig.txt:799/:871) — + bgfx-Android NDK ordering, the piece `manifest_splice.zig:17`–`19` flagged as non-declarative); golden. | High | L |
 | **11** | Open config to name+package third-party backends (remove the residual `@tagName` coupling noted at `manifest_splice.zig:34`–`39`); capability validation before wiring (RFC step 1). | Med | M |
 | **12** | Delete enum-path sections + v1 splice (§6 step 5); convert the desktop anchor to a golden snapshot. | Low (mechanical, but large diff) | M |
 
@@ -1029,8 +1151,10 @@ same gated pattern.
   `:208`) reused for the header-first `manifest_version` gate and `HOOK_ABI_VERSION`.
 - `src/config.zig` — `AndroidConfig.target_sdk_version` (`:214`, default 34) feeds
   `ctx.android_target_sdk` (§4); `build_files.zig:526`–`537` renders it today.
-- `backends/<dir>/backend.manifest.zon` + `backends/<dir>/build.zig` — each backend
-  ships a v2 manifest + optional hook; sokol fixture converts first.
+- `backends/<dir>/backend.manifest.zon` + `backends/<dir>/backend.hook.zig` — each
+  backend ships a v2 manifest + an OPTIONAL DEDICATED hook file (NOT the provider's
+  own `build.zig`, whose package-local `@import`s don't resolve in the generated root
+  package — §3/§4); sokol fixture converts first.
 - `backends/<dir>/build_fragments/*.txt` — v1 raw-text fragments; deleted per
   backend as it converts to v2.
 
@@ -1114,3 +1238,75 @@ post-wire context fields"*: it is a real hazard in the rev-1 shape, but the
 `DependencyOptions` correction (deleting `pre_wire` entirely) dissolves it rather
 than requiring separate pre/post context types — so it is resolved indirectly, not
 ignored.
+
+---
+
+## PR #459 corrections
+
+A second bot-review pass (chatgpt-codex) on PR #459 raised 8 findings the PR #456
+round did not cover. Each was re-verified against the current doc and the real code
+(`manifest_splice.zig`, `build_files.zig`, `build_zig.txt`, `build_zig_zon.txt`, the
+sokol fixture, `config.zig`, `backends/sokol/build.zig`) before disposition.
+
+1. **Define dep-option removal semantics** (P2) — **already resolved; no change.**
+   Commit `ea24373` reworked the schema and the sokol example so the base
+   `dep_options` carries only universally-shared options and every platform-specific
+   option is a per-platform APPEND, with an explicit merge contract that states there
+   is **no subtractive form** (§3 `dep_options` / `PlatformEntry.dep_options`). sokol's
+   `gamepad_*` is a desktop append and `dont_link_system_libs` a mobile append, so
+   wasm's empty list forwards only the base `with_imgui` (build_zig.txt:124) without
+   ever needing to "drop" anything. The doc is internally consistent on this; the
+   finding's premise (base leaking desktop-only options to wasm/mobile) no longer
+   holds. Recorded, not re-edited.
+
+2. **`root_build_deps` need resolution data** (P2) — **folded in.** A bare zon key is
+   not resolvable: emsdk is not name-synthesized but a hand-authored template section
+   with the url pinned inline (`build_zig_zon.txt:72`-`73`, emitted by the hardcoded
+   `dep_emsdk` writeSection, `build_files.zig:770`), and `b.dependency(name, .{})`
+   cannot invent a url+hash from an arbitrary name. `RootBuildDep` now carries a
+   required `resolution: union(enum) { remote{url,hash}, path, builtin }`; the sokol
+   wasm entry uses `.builtin` to reuse the pinned emsdk url (§3).
+
+3. **Preserve the bgfx `android_app` alias** (P2) — **folded in.** Generated
+   `main.zig` imports the NativeActivity shell as `@import("backend_app")`, wired from
+   `backend_dep.module("android_app")` aliased to `backend_app`
+   (`build_zig.txt:799`,`:871`); the default `backend_<name>` alias would publish it as
+   `backend_android_app` and break the import. The `extra_modules` doc and §8 PR 10 now
+   require `.root_alias = "backend_app"` for that module (§3).
+
+4. **Resolver for hookless mobile targets** (P2) — **folded in.** A fully declarative
+   backend may omit `build_hook` yet still set `.target = .resolved` for iOS/Android.
+   Reconciled by making the assembler OWN a built-in default `resolve_target` (the
+   resolution logic — device/simulator, NDK ABI, xcrun SDK — names no backend, so it
+   is assembler-generic), with a hook's `resolve_target` an optional override.
+   `.resolved` therefore does NOT force a hook (§4).
+
+5. **Don't import the provider `build.zig` as the hook** (P1) — **folded in.**
+   `backends/sokol/build.zig:49`-`50` re-exports `@import("sokol")` at top level, a
+   name resolvable only in the labelle_sokol package build context, not the generated
+   root package the assembler imports the hook into — so using it as the hook path
+   fails to compile before any `post_wire` runs. The `build_hook` must be a DEDICATED
+   file (`backend.hook.zig`) with no package-local import assumptions; the schema
+   field, the sokol example (`.build_hook = "backend.hook.zig"`), §6 step 2, and the
+   appendix were all fixed (§3/§4).
+
+6. **Don't default a missing Android SDK in the hook** (P2) — **folded in.** The
+   `orelse 34` fallback silently masks an unpopulated `ctx.android_target_sdk`,
+   emitting a wrong `usr/lib/<triple>/34` path while appearing to honor the user's
+   `target_sdk_version`. Since `AndroidConfig.target_sdk_version` always has a concrete
+   value (`config.zig:214`), the Android `post_wire` arm now PANICS on null instead of
+   defaulting, and the field is documented as assembler-required for Android (§4).
+
+7. **Golden gate blind to hook code** (P2) — **folded in.** A generated-`build.zig`
+   text golden only sees the `post_wire`/`resolve_target` call, not its behavior, so it
+   can't catch a hook that stops adding the NDK lib path, skips `setLibCFile`, or
+   changes emcc flags. §7 now requires hook-bearing cells to additionally snapshot the
+   hook source (committed alongside the golden) and/or run the hook against a fixture
+   `*std.Build` asserting the resulting graph/flags (§7).
+
+8. **Keep `capabilities` (and `.id`) in the v2 schema** (P2) — **folded in.** `.id`
+   was already present; `.capabilities` (v1 `manifest_splice.zig:73`, feeding
+   `capabilities.validate`, `src/capabilities.zig:94`) was dropped by v2, which would
+   let a backend opt into v2 and bypass capability negotiation. Added
+   `BackendManifestV2.capabilities: []const config.Capability` (same nominal type and
+   back-compat rule as v1) and carried the list into the sokol example (§3).
