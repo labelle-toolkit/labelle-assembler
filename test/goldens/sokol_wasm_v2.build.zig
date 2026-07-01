@@ -71,6 +71,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    ensureEmsdkActivated(b);
     wasm.root_module.linkLibrary(sokol_clib);
 
     // post_wire (design §4) — emcc link residual (c) + web install/run.
@@ -143,4 +144,32 @@ fn unifyCoreDiamond(
             unifyCoreDiamond(gpa, entry.value_ptr.*, core_mod, gfx_mod, visited);
         }
     }
+}
+
+/// Preflight (labelle-assembler#492): fail early with an actionable message if
+/// the emsdk package's Emscripten toolchain has not been activated.
+///
+/// `b.dependency("emsdk", .{})` only fetches the emsdk *launcher* repo; `emcc`
+/// under `upstream/emscripten/` does not exist until the toolchain is installed
+/// and activated. Without this check the wasm build fails with an opaque
+/// `...upstream/emscripten/emcc file_hash FileNotFound`.
+fn ensureEmsdkActivated(b: *std.Build) void {
+    const io = b.graph.io;
+    const emsdk_dep = b.dependency("emsdk", .{});
+    const root = emsdk_dep.builder.build_root.path orelse return;
+    const emcc_path = b.pathJoin(&.{ root, "upstream", "emscripten", "emcc" });
+    std.Io.Dir.cwd().access(io, emcc_path, .{}) catch {
+        std.debug.print(
+            \\
+            \\[labelle] Emscripten (emsdk) is fetched but not activated — the wasm
+            \\build cannot find `emcc`. Download + activate the pinned toolchain once:
+            \\
+            \\    cd "{s}" && ./emsdk install latest && ./emsdk activate latest
+            \\
+            \\then re-run your `zig build` command. (labelle-assembler#492)
+            \\
+            \\
+        , .{root});
+        std.process.exit(1);
+    };
 }

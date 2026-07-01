@@ -9,6 +9,7 @@ const scan = @import("codegen/scan.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 const manifest_v2 = @import("codegen/manifest_v2.zig");
 const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
+const emsdk_preflight = @import("codegen/emsdk_preflight.zig");
 pub const deps_linker = @import("deps_linker.zig");
 
 const ProjectConfig = config.ProjectConfig;
@@ -651,6 +652,16 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         }
 
+        // emsdk activation preflight (labelle-assembler#492). Emitted for the
+        // paths whose emcc wiring WE own (manifest-v2 `post_wire` + the enum
+        // `emccStep`/`emLinkStep`); a self-contained external declares its own
+        // wasm wiring and may not use the emsdk package at all. Runs at configure
+        // time, before the emcc link step, turning the opaque
+        // `.../upstream/emscripten/emcc file_hash FileNotFound` into an actionable
+        // "run ./emsdk install/activate" message.
+        const emits_emcc_wiring = v2_manifest != null or usesEnumBackendPath(cfg);
+        if (emits_emcc_wiring) try emsdk_preflight.emitCheckCall(w);
+
         // WASM link step.
         if (v2_manifest) |m| {
             // manifest-v2 wasm (PR 7): the generic link (linkLibrary the wasm lib's
@@ -678,6 +689,11 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         } else {
             try tpl.writeSection(build_zig_tmpl, "wasm_footer", w);
         }
+
+        // The `ensureEmsdkActivated` helper the guard call above invokes — a
+        // top-level fn appended after the footer, same footer→helper shape as the
+        // core-diamond walk (labelle-assembler#492).
+        if (emits_emcc_wiring) try emsdk_preflight.emitHelperFn(w);
     } else if (cfg.platform == .ios) {
         // iOS: build executable for simulator, link frameworks manually
         try tpl.writeSection(build_zig_tmpl, "ios_exe_start", w);

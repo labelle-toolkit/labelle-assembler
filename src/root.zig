@@ -50,6 +50,7 @@ test {
     _ = @import("codegen/manifest_v2_splice.zig");
     _ = @import("codegen/packager.zig");
     _ = @import("codegen/core_diamond.zig");
+    _ = @import("codegen/emsdk_preflight.zig");
     _ = @import("capabilities.zig");
 }
 
