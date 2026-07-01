@@ -94,14 +94,14 @@ pub fn Mixin(comptime Self: type) type {
                 \\// engine wiring. Built-in backends skip this (vetted by the enum path).
                 \\comptime {
                 \\    const _backend_contract_core = @import("labelle-core");
-                \\    _backend_contract_core.assertBackend(@import("backend_gfx"));
-                \\    _backend_contract_core.assertWindow(@import("backend_window"));
-                \\    _backend_contract_core.assertInput(@import("backend_input"));
                 \\
                 \\    // --- Directional per-sub-surface contract-VERSION asserts (labelle-assembler#453) ---
-                \\    // Each surface is checked only when the backend opts in by declaring
-                \\    // `targets_<surface>_contract` (@hasDecl guard = no flag day). A mismatch in
-                \\    // either direction @compileError's, naming which side to upgrade.
+                \\    // Emitted BEFORE the shape asserts below: a `targets_<surface>_contract`
+                \\    // mismatch must report the DIRECTIONAL "upgrade labelle-core / upgrade the
+                \\    // backend" message FIRST -- if a shape assert @compileError'd first (a
+                \\    // decl the newer contract renamed/added), that directional guidance would
+                \\    // never fire. Each surface is checked only when the backend opts in by
+                \\    // declaring `targets_<surface>_contract` (@hasDecl guard = no flag day).
                 \\    const _bc_gfx = @import("backend_gfx");
                 \\    const _bc_window = @import("backend_window");
                 \\    const _bc_input = @import("backend_input");
@@ -134,6 +134,13 @@ pub fn Mixin(comptime Self: type) type {
                 , .{ .mod = s.mod, .decl = s.decl, .core = s.core, .human = s.human });
             }
             try w.writeAll(
+                \\
+                \\    // Shape asserts run AFTER the version asserts above (see note there):
+                \\    // the backend must satisfy labelle-core's render / window / input contract
+                \\    // SURFACE (every required decl present) once its version is known-compatible.
+                \\    _backend_contract_core.assertBackend(@import("backend_gfx"));
+                \\    _backend_contract_core.assertWindow(@import("backend_window"));
+                \\    _backend_contract_core.assertInput(@import("backend_input"));
                 \\}
                 \\
             );

@@ -79,6 +79,30 @@ pub const raylib_lifecycle =
     \\
 ;
 
+// Mirror of `labelle-raylib/templates/desktop.txt` — the raylib DESKTOP
+// lifecycle template AFTER the backend was extracted out-of-tree (#386).
+// Unlike `raylib_lifecycle` above (trimmed), this keeps the preview-mode
+// holes (`{{module_vars}}`/`{{preview_setup}}`/`{{preview_readback}}`/
+// `{{preview_heartbeat}}`) the loop path fills, so a test can assert the
+// PBO async-readback IS emitted for raylib desktop even though `.backend =
+// .raylib` now resolves to an EXTERNAL package (the #386-flip regression).
+pub const raylib_desktop_preview_lifecycle =
+    \\{{module_vars}}pub fn main() !void {
+    \\    var gpa = std.heap.DebugAllocator(.{}).init;
+    \\    const allocator = gpa.allocator();
+    \\    var g = AssembledGame.init(allocator);
+    \\    g.setHooks(&hooks);
+    \\{{preview_setup}}{{setup_code}}
+    \\    while (!window.windowShouldClose()) {
+    \\        const dt: f32 = 0.016;
+    \\{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
+    \\        g.render();
+    \\{{preview_readback}}        window.endDrawing();
+    \\{{gui_draw_code}}    }
+    \\}
+    \\
+;
+
 pub const sokol_lifecycle =
     \\var g: AssembledGame = undefined;
     \\var hooks: GameHooks = .{};

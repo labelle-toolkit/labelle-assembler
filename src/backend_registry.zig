@@ -159,7 +159,23 @@ pub fn isBuiltin(name: []const u8) bool {
 /// is under the `labelle-toolkit/` org.
 fn repoIsOfficialOrLocal(repo: []const u8) bool {
     if (config.PluginDep.isLocal(.{ .name = "", .repo = repo })) return true;
-    return std.mem.indexOf(u8, repo, "labelle-toolkit/") != null;
+    // A remote repo is official iff it is OWNED by the `labelle-toolkit` org —
+    // i.e. its URL STARTS with one of the supported owner-prefixed forms. A bare
+    // `indexOf("labelle-toolkit/")` was too loose: it also matched a hostile URL
+    // that merely CONTAINS that path segment (e.g.
+    // `https://evil.com/labelle-toolkit/x`), letting any repo claim the reserved
+    // `labelle.*` namespace. Anchoring on the host+owner prefix closes that.
+    const official_prefixes = [_][]const u8{
+        "https://github.com/labelle-toolkit/",
+        "git@github.com:labelle-toolkit/",
+        "github:labelle-toolkit/",
+        // Scheme-less form used by the enum-shorthand `builtinProvider` defaults.
+        "github.com/labelle-toolkit/",
+    };
+    for (official_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, repo, prefix)) return true;
+    }
+    return false;
 }
 
 /// Validate the resolved backend provider's identity against `manifest_id`
@@ -201,6 +217,16 @@ pub fn validateProviderIdentity(cfg: config.ProjectConfig, manifest_id: ?[]const
         );
         return error.MalformedProviderId;
     };
+    // A dot alone isn't enough: `.sokol` (empty namespace, dot == 0) and
+    // `labelle.` (empty name, dot is the last byte) are BOTH malformed —
+    // `<namespace>.<name>` requires a non-empty half on each side.
+    if (dot == 0 or dot + 1 == id.len) {
+        std.debug.print(
+            "labelle-assembler: backend provider id '{s}' is not a canonical '<namespace>.<name>' — both the namespace and the name must be non-empty (e.g. 'labelle.sokol').\n",
+            .{id},
+        );
+        return error.MalformedProviderId;
+    }
     const namespace = id[0..dot];
 
     if (std.mem.eql(u8, namespace, "labelle") and !repoIsOfficialOrLocal(bp.repo)) {
@@ -467,6 +493,59 @@ test "identity: a malformed id (no namespace) errors" {
     try std.testing.expectError(
         error.MalformedProviderId,
         validateProviderIdentity(cfg, "sokolonly"),
+    );
+}
+
+test "identity: a spoof repo merely CONTAINING labelle-toolkit/ is rejected (#453 security)" {
+    // `https://evil.com/labelle-toolkit/x` is NOT owned by the labelle-toolkit
+    // org — it just embeds that path segment. It must not be able to claim the
+    // reserved `labelle.*` namespace (the old `indexOf` let it through).
+    const spoofs = [_][]const u8{
+        "https://evil.com/labelle-toolkit/vulkan",
+        "git@evil.com:labelle-toolkit/vulkan",
+        "https://gitlab.com/notlabelle-toolkit/x", // owner isn't labelle-toolkit
+    };
+    inline for (spoofs) |repo| {
+        const cfg = config.ProjectConfig{
+            .name = "g",
+            .backend_package = .{ .name = "vulkan", .repo = repo },
+        };
+        try std.testing.expectError(
+            error.ReservedProviderNamespace,
+            validateProviderIdentity(cfg, "labelle.vulkan"),
+        );
+    }
+}
+
+test "identity: the real labelle-toolkit owner forms may claim labelle.* (#453 security)" {
+    // Every supported OWNER-prefixed remote form is accepted (so the official
+    // providers and the scheme-less enum-shorthand defaults still pass).
+    const official = [_][]const u8{
+        "https://github.com/labelle-toolkit/labelle-vulkan",
+        "git@github.com:labelle-toolkit/labelle-vulkan",
+        "github:labelle-toolkit/labelle-vulkan",
+        "github.com/labelle-toolkit/labelle-vulkan",
+    };
+    inline for (official) |repo| {
+        const cfg = config.ProjectConfig{
+            .name = "g",
+            .backend_package = .{ .name = "vulkan", .repo = repo },
+        };
+        try validateProviderIdentity(cfg, "labelle.vulkan");
+    }
+}
+
+test "identity: an id with an empty namespace or name is malformed (#453)" {
+    const cfg = config.ProjectConfig{ .name = "g", .backend = .sokol };
+    // Empty namespace (`.sokol`, dot == 0) and empty name (`labelle.`, dot is
+    // the last byte) are both rejected — a lone dot is not `<ns>.<name>`.
+    try std.testing.expectError(
+        error.MalformedProviderId,
+        validateProviderIdentity(cfg, ".sokol"),
+    );
+    try std.testing.expectError(
+        error.MalformedProviderId,
+        validateProviderIdentity(cfg, "labelle."),
     );
 }
 
