@@ -765,6 +765,111 @@ pub const MANIFEST_V2_GENERATE_CUTOVER = struct {
         defer std.testing.allocator.free(v1_baseline);
         try std.testing.expectEqualStrings(v1_baseline, v2_auto);
     }
+
+    test "generate CATCHES a capability mismatch on the auto-detected v2 manifest (#473 finding 2)" {
+        // acme_foo advertises ONLY `.headless` in its v2 manifest and ships NO
+        // legacy `backend.manifest.zon`. Before the finding-2 fix the resolve-time
+        // `validateProviderContracts` read only the (absent) v1 provider manifest,
+        // so the v2 `.capabilities` were ignored. A project requiring a capability
+        // the v2 backend does NOT declare must now fail the REAL `generate` with the
+        // readable project-level `error.UnsupportedCapability`.
+        const cfg = generate.ProjectConfig{
+            .name = "cutover-cap-game",
+            .ecs = .mock,
+            .requires = &.{.screenshots},
+        };
+        try std.testing.expectError(
+            error.UnsupportedCapability,
+            h.generateAndReadBuildZig(std.testing.allocator, cfg, h.acme_foo_fixture_package),
+        );
+    }
+};
+
+// ── manifest-v2 cutover: `loadBackendTemplate` + `validateProviderContracts`
+// honor the auto-detected `backend_manifest_name` (#473 findings 1 + 2). These
+// drive the two internal seams `generate` threads the detected v2 name into
+// DIRECTLY, proving each honors a v2 manifest without needing the full main.zig
+// generation (which would require a cached engine template). `game_dir = "."`
+// (repo root) so the `local:backends/<name>` fixtures resolve offline.
+pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
+    // ── Finding 1: main-template loading resolves the v2 `.platforms[<p>].entry` ──
+
+    test "loadBackendTemplate: a v2-only backend resolves its template from the v2 entry" {
+        // sokol_v2only ships ONLY `backend.manifest.v2.zon` (no legacy manifest) +
+        // its `templates/desktop.txt`. With the detected v2 name, loadBackendTemplate
+        // must route to `.platforms.desktop.entry` and read that template — NOT fail
+        // for lack of a legacy manifest / enum-path template.
+        const cfg = generate.ProjectConfig{
+            .name = "tmpl-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v2only_fixture_package,
+        };
+        const tmpl = try generate.loadBackendTemplate(std.testing.allocator, ".", cfg, "backend.manifest.v2.zon");
+        defer std.testing.allocator.free(tmpl);
+        // The desktop lifecycle template was found + read (non-empty content).
+        try std.testing.expect(tmpl.len > 0);
+    }
+
+    test "loadBackendTemplate: the SAME v2-only backend errors WITHOUT the detected name (proves the v2 path is load-bearing)" {
+        // The distinguishing proof for finding 1: a v2-only external backend passed a
+        // null manifest name falls to the legacy requirement, which probes the absent
+        // `backend.manifest.zon` and hard-errors `ExternalBackendNeedsManifest`. Only
+        // threading the detected v2 name makes template loading succeed (test above).
+        const cfg = generate.ProjectConfig{
+            .name = "tmpl-game",
+            .ecs = .mock,
+            .backend_package = h.sokol_v2only_fixture_package,
+        };
+        try std.testing.expectError(
+            error.ExternalBackendNeedsManifest,
+            generate.loadBackendTemplate(std.testing.allocator, ".", cfg, null),
+        );
+    }
+
+    // ── Finding 2: provider-contract validation reads the v2 `.id`/`.capabilities` ──
+
+    test "validateProviderContracts: reads the v2 capabilities — a missing requirement errors" {
+        // acme_foo's v2 manifest declares ONLY `.headless`. Requiring `.screenshots`
+        // must fail via the v2 `.capabilities` (acme_foo ships no legacy manifest, so
+        // the check keys off the v2 name it is passed).
+        const cfg = generate.ProjectConfig{
+            .name = "contract-game",
+            .ecs = .mock,
+            .requires = &.{.screenshots},
+            .backend_package = h.acme_foo_fixture_package,
+        };
+        try std.testing.expectError(
+            error.UnsupportedCapability,
+            generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon"),
+        );
+    }
+
+    test "validateProviderContracts: a satisfied v2 requirement (the declared .headless) passes" {
+        // The complement — requiring exactly what the v2 manifest declares proves the
+        // gate fires on the MISSING capability, not on enforcement being on at all.
+        const cfg = generate.ProjectConfig{
+            .name = "contract-game",
+            .ecs = .mock,
+            .requires = &.{.headless},
+            .backend_package = h.acme_foo_fixture_package,
+        };
+        try generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon");
+    }
+
+    test "validateProviderContracts: WITHOUT the detected v2 name the v2 capabilities are NOT enforced (proves the name is load-bearing)" {
+        // The distinguishing proof for finding 2: passing null (the pre-fix behavior)
+        // reads the absent legacy provider manifest → an empty declared set → the
+        // back-compat gate leaves enforcement OFF, so the SAME `.screenshots`
+        // requirement does NOT error. Only threading the detected v2 name enforces the
+        // v2 `.capabilities` (test above).
+        const cfg = generate.ProjectConfig{
+            .name = "contract-game",
+            .ecs = .mock,
+            .requires = &.{.screenshots},
+            .backend_package = h.acme_foo_fixture_package,
+        };
+        try generate.validateProviderContracts(std.testing.allocator, cfg, ".", null);
+    }
 };
 
 pub const BUILD_ZIG = struct {
