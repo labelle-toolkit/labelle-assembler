@@ -171,13 +171,24 @@ pub fn Mixin(comptime Self: type) type {
             // `cfg.backend`, which the enum-as-shorthand PRESERVES even when the
             // backend resolves to a package (#386): `.backend = .bgfx` stays
             // `.bgfx`, so `is_bgfx_android` and the `== .sokol` branch still fire
-            // for an extracted bgfx/sokol. What has NO branch is a callback
-            // external that falls through to the raylib-wasm fallback (e.g. a
-            // third-party backend, whose `cfg.backend` sits at the `.raylib`
-            // default, or any external on wasm) — that would inherit
-            // raylib-specific wiring, so fail fast there. Built-ins are
-            // unaffected (`isExternal()` is false).
-            const callback_dispatch_handled = is_bgfx_android or cfg.backend == .sokol;
+            // for an extracted bgfx/sokol.
+            //
+            // WASM (bgfx-wasm epic labelle-bgfx#8): the callback `else` branch
+            // below is the GENERIC emscripten `emscripten_set_main_loop` path —
+            // it fills only backend-agnostic template holes, and the wasm shape
+            // (loop callback, `g.tick`, no module-scope runner) is shipped by the
+            // backend's OWN `templates/wasm.txt`. So any FIRST-PARTY (enum-tag-
+            // backed) external backend on wasm — raylib, sokol, bgfx — is safe
+            // through it. Post-#386 raylib/bgfx are external too, so keying only
+            // off `== .sokol` left every other first-party wasm backend wrongly
+            // rejected (the else branch went unreachable at the flip). What stays
+            // rejected is a genuine THIRD-PARTY callback backend named only by
+            // string (`cfg.backend` at its `.raylib` default, `backendName()` !=
+            // the tag): `isEnumTagBacked()` is false for it, so it never inherits
+            // the raylib-shaped wasm wiring against an unvalidated template.
+            // Built-ins are unaffected (`isExternal()` is false).
+            const callback_dispatch_handled = is_bgfx_android or cfg.backend == .sokol or
+                (cfg.platform == .wasm and cfg.isEnumTagBacked());
             if (use_callback_lifecycle and cfg.isExternal() and !callback_dispatch_handled) {
                 // Silenced under test (the Zig test runner fails any test that
                 // emits a `std.log.err`, even when the error is the asserted
@@ -515,11 +526,31 @@ pub fn Mixin(comptime Self: type) type {
                     // on wasm in practice, but keep the gate explicit so
                     // the intent is local.
                     const is_wasm_raylib = cfg.platform == .wasm;
+                    // `{{module_vars}}` hole: raylib's `templates/wasm.txt` has
+                    // none (this key is then harmlessly ignored), but bgfx's
+                    // `templates/wasm.txt` DOES carry it (mirroring bgfx's
+                    // desktop/android templates), so it must be filled or the
+                    // literal `{{module_vars}}` would land in the generated
+                    // main.zig. Emit the same helper block the bgfx desktop/
+                    // sokol-wasm paths do (PREVIEW_HELPERS is just extern
+                    // getenv/clock_gettime decls — proven wasm-safe by the
+                    // sokol-wasm path — plus the no-op input-dispatch stub). No
+                    // module-scope runner: the shared callback `tick_code`
+                    // references `runner.tick(...)` and `init_code` assigns
+                    // `runner = Runner.init(...)`, so `runner` MUST be declared at
+                    // module scope. Raylib's `templates/wasm.txt` hardcodes its own
+                    // `var runner` (so its (absent) module_vars hole carries none),
+                    // but bgfx's template injects it through `{{module_vars}}` —
+                    // mirroring the sokol/bgfx-android callback paths. Include it
+                    // here; raylib ignores the key (no hole), bgfx fills it.
+                    const module_vars_wasm = try std.mem.concat(allocator, u8, &.{ "var runner: Runner = undefined;\n", PREVIEW_HELPERS, PREVIEW_INPUT_DISPATCH_STUB });
+                    defer allocator.free(module_vars_wasm);
                     try tpl.render(lifecycle_tmpl, .{
                         .width = w_str,
                         .height = h_str,
                         .title = cfg.title,
                         .fps = fps_str,
+                        .module_vars = module_vars_wasm,
                         .setup_code = init_code,
                         .tick_code = tick_code,
                         .gui_draw_code = gui_draw_code,
