@@ -422,6 +422,49 @@ pub fn genSokolV2OnlyBuildZig(
     return generate.generateBuildZig(allocator, cfg, opts);
 }
 
+// ── null + wgpu v2 GOLDEN fixtures (manifest-v2, epic #453 item 3, PR 8) ──
+// null and wgpu are the first FULLY-DECLARATIVE, HOOKLESS desktop backends
+// converted to v2. Each ships ONLY a `backend.manifest.v2.zon` (mirroring
+// `backends/sokol_v2only` — no build.zig/package), so codegen reads the manifest
+// offline. Unlike the sokol byte anchor these use the GENERIC declarative desktop
+// path (loop-form `unifyCoreDiamond` walk, no sokol residual), gated as reviewed
+// goldens (design §7): null exercises the no-artifact/no-framework path, wgpu the
+// per-OS `.frameworks.desktop.macos` (Metal/Foundation/QuartzCore) emission.
+pub const null_v2_fixture_package = generate.PluginDep{ .name = "null_v2", .repo = "local:backends/null_v2" };
+pub const wgpu_v2_fixture_package = generate.PluginDep{ .name = "wgpu_v2", .repo = "local:backends/wgpu_v2" };
+
+/// Generate a build.zig against the null v2 fixture — the hookless, fully
+/// declarative desktop path (design §7 golden cell).
+pub fn genNullV2BuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend = .null;
+    cfg.backend_package = null_v2_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
+/// Generate a build.zig against the wgpu v2 fixture — the hookless, declarative
+/// desktop path WITH per-OS framework emission (design §7 golden cell).
+pub fn genWgpuV2BuildZig(
+    allocator: std.mem.Allocator,
+    cfg_in: generate.ProjectConfig,
+    opts_in: generate.BuildZigOptions,
+) ![]const u8 {
+    var cfg = cfg_in;
+    cfg.backend = .wgpu;
+    cfg.backend_package = wgpu_v2_fixture_package;
+    var opts = opts_in;
+    opts.project_dir = ".";
+    opts.backend_manifest_name = "backend.manifest.v2.zon";
+    return generate.generateBuildZig(allocator, cfg, opts);
+}
+
 // A BROKEN-v2 backend fixture: `backends/sokol_v2broken` ships a
 // `backend.manifest.v2.zon` whose header parses (manifest_version = 2) but whose
 // body is invalid, so `manifest_v2.loadNamedManifest` fails. Used to prove #468
