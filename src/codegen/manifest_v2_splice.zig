@@ -48,6 +48,7 @@ const manifest_v2 = @import("manifest_v2.zig");
 const core_diamond = @import("core_diamond.zig");
 const packager = @import("packager.zig");
 const backend_registry = @import("../backend_registry.zig");
+const scan = @import("scan.zig");
 
 const BackendManifestV2 = manifest_v2.BackendManifestV2;
 const DepOption = BackendManifestV2.DepOption;
@@ -129,10 +130,129 @@ pub fn renderBackendDepSectionV2(
     w: anytype,
 ) !void {
     switch (cfg.platform) {
-        .desktop => try renderDesktopBackendDepV2(allocator, m, cfg, w),
+        // Desktop has TWO shapes: the sokol byte anchor (unrolled sokol residual,
+        // §7) vs the fully-declarative generic path (loop-form walk, golden cells
+        // like null/wgpu, PR 8). See `isDesktopByteAnchor`.
+        .desktop => if (isDesktopByteAnchor(m))
+            try renderDesktopBackendDepV2(allocator, m, cfg, w)
+        else
+            try renderDesktopBackendDepGenericV2(allocator, m, cfg, w),
         .android => try renderAndroidBackendDepV2(allocator, m, cfg, w),
         .ios => try renderIosBackendDepV2(allocator, m, cfg, w),
         .wasm => try renderWasmBackendDepV2(allocator, m, cfg, w),
+    }
+}
+
+/// Whether a v2 manifest's DESKTOP cell is emitted in the sokol BYTE-ANCHOR form
+/// (design §7): its output is unrolled to hit a 0-diff against the enum/v1 path,
+/// keeping the backend-specific prose + the hand-written core-diamond
+/// `overrideImport` `if`-blocks. EVERY OTHER v2 backend's desktop cell uses the
+/// GENERIC declarative path (loop-form `unifyCoreDiamond` walk + manifest-driven
+/// artifact/framework link), gated as a reviewed golden — because a loop emits
+/// different source than the unrolled form (§7 tier-1).
+///
+/// Keyed on the retained sokol fixture's `dep_name`: the anchor residual constants
+/// (`anchor_head_comment`/`anchor_tail_overrides`/`anchor_link_body`) are literally
+/// sokol's own fragments, so only the sokol byte-anchor backend can use them. This
+/// discriminator (and the anchor residual it selects) is deleted with the enum path
+/// in PR 12, at which point the sokol-desktop cell becomes a golden snapshot too.
+pub fn isDesktopByteAnchor(m: BackendManifestV2) bool {
+    return std.mem.eql(u8, m.dep_name, "labelle_sokol");
+}
+
+/// v2 GENERIC desktop core/gfx/engine dep decls (design §7 golden path) — the
+/// declarative half of the enum `deps` section, WITHOUT the unrolled
+/// `overrideImport` diamond + `unifyGfxSubpackageCore` (those are replaced by the
+/// generic `unifyCoreDiamond` walk emitted after the backend-dep section, §5).
+/// Uses the plain `target` alias the desktop `header` declares.
+pub fn renderDesktopDepsDeclsV2(w: anytype) !void {
+    try w.writeAll(
+        \\    const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
+        \\    const core_mod = core_dep.module("labelle-core");
+        \\
+        \\    const gfx_dep = b.dependency("labelle_gfx", .{ .target = target, .optimize = optimize });
+        \\    const gfx_mod = gfx_dep.module("labelle-gfx");
+        \\
+        \\    const engine_dep = b.dependency("engine", .{ .target = target, .optimize = optimize });
+        \\    const engine_mod = engine_dep.module("engine");
+        \\
+        \\
+    );
+}
+
+/// Sanitize a manifest artifact NAME into a valid Zig identifier for use as the
+/// generated variable name. Manifest artifact names are free-form strings, but
+/// they are emitted BOTH as a `const <id> = backend_dep.artifact("<raw>")` decl
+/// and referenced at the link site (`<target>.root_module.linkLibrary(<id>)`),
+/// so an artifact named `glfw-native` (hyphen) or `123lib` (leading digit) would
+/// emit invalid Zig unless both sites sanitize to the SAME identifier. Reuses the
+/// repo's `scan.sanitizePluginIdent` (invalid bytes → `_`, leading digit → `_`
+/// prefix); the raw name is still used verbatim inside the `artifact("...")`
+/// string literal. Review #469 findings 1+2.
+fn artifactIdent(name: []const u8, buf: *[128]u8) []const u8 {
+    return scan.sanitizePluginIdent(name, buf);
+}
+
+/// v2 GENERIC desktop backend-dep (design §7 golden path, e.g. null/wgpu, PR 8) —
+/// the generic `b.dependency` literal (`.target = target`) + `.module(...)` decls
+/// (honoring `root_alias`) + `.artifact` decls, then the generic core-diamond walk
+/// CALLS (§5) rooted at gfx/engine + each backend module. This is the desktop
+/// analogue of the android/ios/wasm generic backend-dep emitters — fully
+/// declarative, NO backend-specific prose and NO hardcoded `overrideImport`
+/// `if`-blocks (that is the sokol byte-anchor path only, `renderDesktopBackendDepV2`).
+fn renderDesktopBackendDepGenericV2(
+    allocator: std.mem.Allocator,
+    m: BackendManifestV2,
+    cfg: ProjectConfig,
+    w: anytype,
+) !void {
+    const desktop = m.platforms.desktop orelse return error.V2PlatformUnsupported;
+
+    // GENERATED: `const backend_dep = b.dependency("<dep_name>", .{ .target =
+    // target, .optimize = optimize, <merged dep_options> });`
+    const opts = try mergeDepOptions(allocator, m.dep_options, desktop.dep_options);
+    defer allocator.free(opts);
+    try w.print("    const backend_dep = b.dependency(\"{s}\", .{{ .target = target, .optimize = optimize", .{m.dep_name});
+    for (opts) |opt| {
+        try w.print(", .{s} = {s}", .{ opt.name, depOptionValue(opt.value, cfg) });
+    }
+    try w.writeAll(" });\n");
+
+    // GENERATED: provider module decls under their root alias.
+    for (m.modules) |mod| {
+        const alias = try moduleAlias(allocator, mod);
+        defer allocator.free(alias);
+        try w.print("    const {s} = backend_dep.module(\"{s}\");\n", .{ alias, mod.name });
+    }
+
+    // GENERATED: artifact decls for this platform (the var name is the SANITIZED
+    // artifact name — the raw name stays inside the `artifact("...")` string).
+    // null has none; wgpu has `glfw`. See `artifactIdent` (review #469 f1+2).
+    for (desktop.artifacts) |art| {
+        var ident_buf: [128]u8 = undefined;
+        const ident = artifactIdent(art.name, &ident_buf);
+        try w.print("    const {s} = backend_dep.artifact(\"{s}\");\n", .{ ident, art.name });
+        if (art.pic) try w.print("    {s}.root_module.pic = true;\n", .{ident});
+    }
+
+    // GENERATED: the generic core+gfx-diamond walk CALLS (design §5) — the loop
+    // form of the per-site overrideImport diamond, replacing the enum `deps`
+    // unrolled overrides + `unifyGfxSubpackageCore`. The `unifyCoreDiamond` def is
+    // emitted as a top-level helper after the build fn (see `emitCoreDiamondWalk`).
+    try w.writeAll(
+        \\
+        \\    // Generic core+gfx-diamond unification (design §5) — the loop form of
+        \\    // the per-site overrideImport diamond (golden cell, not the desktop
+        \\    // byte-anchor's unrolled form). Rooted at each imported provider.
+        \\    var core_diamond_visited: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+        \\    unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod, &core_diamond_visited);
+        \\    unifyCoreDiamond(b.allocator, engine_mod, core_mod, gfx_mod, &core_diamond_visited);
+        \\
+    );
+    for (m.modules) |mod| {
+        const alias = try moduleAlias(allocator, mod);
+        defer allocator.free(alias);
+        try w.print("    unifyCoreDiamond(b.allocator, {s}, core_mod, gfx_mod, &core_diamond_visited);\n", .{alias});
     }
 }
 
@@ -723,12 +843,101 @@ pub fn renderLinkSectionV2(
     w: anytype,
 ) !void {
     switch (cfg.platform) {
-        .desktop => try renderDesktopLinkV2(m, w),
+        // Desktop: the sokol byte anchor (unrolled residual) vs the generic
+        // declarative link (manifest-driven artifact + per-OS framework/syslib).
+        .desktop => if (isDesktopByteAnchor(m))
+            try renderDesktopLinkV2(m, w)
+        else
+            try renderDesktopLinkGenericV2(m, w),
         .android => try renderAndroidLinkV2(m, cfg, w),
         .ios => try renderIosLinkV2(m, w),
         .wasm => try renderWasmLinkV2(m, w),
     }
     _ = allocator;
+}
+
+/// v2 GENERIC desktop link (design §7 golden path, e.g. null/wgpu, PR 8) — the
+/// fully DECLARATIVE link graph (design §2 **D**): link each platform artifact,
+/// `link_libc` if set, and the per-OS `.system_libs.desktop`/`.frameworks.desktop`
+/// entries as a `switch (target.result.os.tag)` block. NO `post_wire` (hookless),
+/// NO backend-specific prose (that is the sokol byte-anchor path only). null emits
+/// nothing (no artifact, no frameworks); wgpu links `glfw` + the macOS Metal/
+/// Foundation/QuartzCore frameworks.
+fn renderDesktopLinkGenericV2(m: BackendManifestV2, w: anytype) !void {
+    try emitDesktopLinkForTarget(m, w, "exe");
+}
+
+/// v2 GENERIC desktop link mirrored onto `test_root` (review #469, coderabbit).
+/// `test_root` imports the backend modules (backend_gfx/input/audio/window), so a
+/// wgpu-backed project's `zig build test` links against symbols in `glfw` + the
+/// macOS Metal/Foundation/QuartzCore frameworks. The exe-only link left `test_root`
+/// unresolved → link failure. The enum path already links only `exe`; the generic
+/// desktop path attaches the SAME native linkage to `test_root` too. Emitted AFTER
+/// the test step declares `test_root` (see `build_files.zig`). null has no artifact
+/// and no frameworks, so this emits nothing for the null backend.
+pub fn renderDesktopTestLinkGenericV2(m: BackendManifestV2, w: anytype) !void {
+    try emitDesktopLinkForTarget(m, w, "test_root");
+}
+
+/// Emit the generic desktop native linkage (artifact `linkLibrary` + optional
+/// `link_libc` + the per-OS system-lib/framework switch) onto a given target
+/// module variable (`exe` or `test_root`). Factored out so the exe and the test
+/// root receive byte-identical linkage.
+fn emitDesktopLinkForTarget(m: BackendManifestV2, w: anytype, target_var: []const u8) !void {
+    const desktop = m.platforms.desktop orelse return error.V2PlatformUnsupported;
+
+    // GENERATED (D): link each platform artifact (var name is the SANITIZED
+    // ident, matching the decl site — review #469 findings 1+2).
+    for (desktop.artifacts) |art| {
+        var ident_buf: [128]u8 = undefined;
+        const ident = artifactIdent(art.name, &ident_buf);
+        try w.print("    {s}.root_module.linkLibrary({s});\n", .{ target_var, ident });
+    }
+    // GENERATED (D): libc, if the platform entry requests it (desktop usually not).
+    if (desktop.link_libc) try w.print("    {s}.root_module.link_libc = true;\n", .{target_var});
+
+    // GENERATED (D): the per-OS system-lib/framework switch (`.system_libs.desktop`
+    // + `.frameworks.desktop`) — replaces the enum `switch (target.result.os.tag)`
+    // block. Emitted only when at least one OS has an entry (null → nothing).
+    try emitDesktopOsLinks(m, w, target_var);
+}
+
+/// Emit the desktop per-OS `switch (target.result.os.tag)` link block from
+/// `.system_libs.desktop` (`linkSystemLibrary`) + `.frameworks.desktop`
+/// (`linkFramework`). An OS arm is emitted only when that OS has ≥1 entry; the
+/// whole switch is omitted when every OS is empty (design §2 note 2: per-OS gating
+/// is declarative). Order: system libs before frameworks, macos → linux → windows,
+/// then `else => {}`.
+fn emitDesktopOsLinks(m: BackendManifestV2, w: anytype, target_var: []const u8) !void {
+    const sl = m.system_libs.desktop;
+    const fw = m.frameworks.desktop;
+    const any = sl.macos.len + sl.linux.len + sl.windows.len +
+        fw.macos.len + fw.linux.len + fw.windows.len > 0;
+    if (!any) return;
+
+    try w.writeAll("\n    switch (target.result.os.tag) {\n");
+    try emitDesktopOsArm(w, target_var, "macos", sl.macos, fw.macos);
+    try emitDesktopOsArm(w, target_var, "linux", sl.linux, fw.linux);
+    try emitDesktopOsArm(w, target_var, "windows", sl.windows, fw.windows);
+    try w.writeAll("        else => {},\n    }\n");
+}
+
+fn emitDesktopOsArm(
+    w: anytype,
+    target_var: []const u8,
+    os_tag: []const u8,
+    libs: []const []const u8,
+    fws: []const []const u8,
+) !void {
+    if (libs.len == 0 and fws.len == 0) return;
+    try w.print("        .{s} => {{\n", .{os_tag});
+    for (libs) |lib_name| {
+        try w.print("            {s}.root_module.linkSystemLibrary(\"{s}\", .{{}});\n", .{ target_var, lib_name });
+    }
+    for (fws) |fw_name| {
+        try w.print("            {s}.root_module.linkFramework(\"{s}\", .{{}});\n", .{ target_var, fw_name });
+    }
+    try w.writeAll("        },\n");
 }
 
 /// DESKTOP link (PR 3 byte anchor). Generated from the manifest: the
@@ -893,6 +1102,136 @@ pub fn emitRootBuildDepsV2(
 // ============================================================================
 
 const testing = std.testing;
+
+test "isDesktopByteAnchor: only the sokol fixture uses the unrolled anchor path" {
+    const mk = struct {
+        fn m(dep_name: []const u8) BackendManifestV2 {
+            return .{ .manifest_version = 2, .dir_name = "x", .dep_name = dep_name, .modules = &.{}, .platforms = .{} };
+        }
+    }.m;
+    try testing.expect(isDesktopByteAnchor(mk("labelle_sokol")));
+    try testing.expect(!isDesktopByteAnchor(mk("labelle_null")));
+    try testing.expect(!isDesktopByteAnchor(mk("labelle_wgpu")));
+}
+
+test "emitDesktopOsLinks: per-OS frameworks + syslibs, omitted when all empty" {
+    // wgpu-shape: macOS frameworks only → one .macos arm + else, no linux/windows.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    const m: BackendManifestV2 = .{
+        .manifest_version = 2,
+        .dir_name = "wgpu",
+        .dep_name = "labelle_wgpu",
+        .modules = &.{},
+        .frameworks = .{ .desktop = .{ .macos = &.{ "Foundation", "Metal" } } },
+        .platforms = .{},
+    };
+    try emitDesktopOsLinks(m, &aw.writer, "exe");
+    try testing.expectEqualStrings(
+        "\n    switch (target.result.os.tag) {\n" ++
+            "        .macos => {\n" ++
+            "            exe.root_module.linkFramework(\"Foundation\", .{});\n" ++
+            "            exe.root_module.linkFramework(\"Metal\", .{});\n" ++
+            "        },\n" ++
+            "        else => {},\n    }\n",
+        aw.written(),
+    );
+
+    // Same switch, mirrored onto `test_root` (review #469): identical block with
+    // the target variable swapped.
+    var aw_test: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw_test.deinit();
+    try emitDesktopOsLinks(m, &aw_test.writer, "test_root");
+    try testing.expectEqualStrings(
+        "\n    switch (target.result.os.tag) {\n" ++
+            "        .macos => {\n" ++
+            "            test_root.root_module.linkFramework(\"Foundation\", .{});\n" ++
+            "            test_root.root_module.linkFramework(\"Metal\", .{});\n" ++
+            "        },\n" ++
+            "        else => {},\n    }\n",
+        aw_test.written(),
+    );
+
+    // null-shape: nothing declared → no switch emitted at all.
+    var aw2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw2.deinit();
+    const empty: BackendManifestV2 = .{ .manifest_version = 2, .dir_name = "null", .dep_name = "labelle_null", .modules = &.{}, .platforms = .{} };
+    try emitDesktopOsLinks(empty, &aw2.writer, "exe");
+    try testing.expectEqual(@as(usize, 0), aw2.written().len);
+}
+
+test "artifactIdent: sanitizes decl + link sites to matching valid Zig identifiers" {
+    // A manifest artifact name is free-form; `glfw-native` (hyphen) and `123lib`
+    // (leading digit) are NOT valid Zig identifiers, so the emitted variable name
+    // must be sanitized — and the decl site + every link site must agree on it,
+    // or the generated build.zig won't compile (review #469 findings 1+2).
+    const cases = [_]struct { raw: []const u8, ident: []const u8 }{
+        .{ .raw = "glfw-native", .ident = "glfw_native" },
+        .{ .raw = "123lib", .ident = "_123lib" },
+    };
+    const cfg = ProjectConfig{ .name = "g" };
+
+    for (cases) |c| {
+        const artifacts = [_]BackendManifestV2.ArtifactDecl{.{ .name = c.raw }};
+        const m: BackendManifestV2 = .{
+            .manifest_version = 2,
+            .dir_name = "x",
+            .dep_name = "labelle_x",
+            .modules = &.{},
+            .platforms = .{ .desktop = .{
+                .entry = "main.zig",
+                .loop_style = .loop,
+                .target = .native,
+                .artifacts = &artifacts,
+                .package = .binary,
+            } },
+        };
+
+        // Decl site: `const <ident> = backend_dep.artifact("<raw>");`
+        var decl: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer decl.deinit();
+        try renderDesktopBackendDepGenericV2(testing.allocator, m, cfg, &decl.writer);
+        const decl_line = try std.fmt.allocPrint(
+            testing.allocator,
+            "    const {s} = backend_dep.artifact(\"{s}\");\n",
+            .{ c.ident, c.raw },
+        );
+        defer testing.allocator.free(decl_line);
+        try testing.expect(std.mem.indexOf(u8, decl.written(), decl_line) != null);
+
+        // Link site (exe): must reference the SAME sanitized identifier.
+        var link_exe: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer link_exe.deinit();
+        try renderDesktopLinkGenericV2(m, &link_exe.writer);
+        const exe_line = try std.fmt.allocPrint(
+            testing.allocator,
+            "    exe.root_module.linkLibrary({s});\n",
+            .{c.ident},
+        );
+        defer testing.allocator.free(exe_line);
+        try testing.expectEqualStrings(exe_line, link_exe.written());
+
+        // Link site (test_root): identical linkage mirrored onto the test root.
+        var link_test: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer link_test.deinit();
+        try renderDesktopTestLinkGenericV2(m, &link_test.writer);
+        const test_line = try std.fmt.allocPrint(
+            testing.allocator,
+            "    test_root.root_module.linkLibrary({s});\n",
+            .{c.ident},
+        );
+        defer testing.allocator.free(test_line);
+        try testing.expectEqualStrings(test_line, link_test.written());
+
+        // The sanitized identifier is a VALID Zig identifier (no invalid bytes,
+        // no leading digit) — the whole point of the sanitizer.
+        try testing.expect(c.ident.len > 0);
+        try testing.expect(!std.ascii.isDigit(c.ident[0]));
+        for (c.ident) |ch| {
+            try testing.expect(std.ascii.isAlphanumeric(ch) or ch == '_');
+        }
+    }
+}
 
 test "mergeDepOptions: base first, then per-platform appends (sokol desktop order)" {
     const base = [_]DepOption{.{ .name = "with_imgui", .value = .gui_is_imgui }};

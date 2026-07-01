@@ -479,6 +479,135 @@ pub const MANIFEST_V2_WASM_GOLDEN = struct {
     }
 };
 
+// ── manifest-v2 null GOLDEN cell (epic #453 item 3, PR 8, design §7) ──
+// null is the FIRST fully-declarative, HOOKLESS backend converted to v2, and the
+// simplest possible v2 cell: pure-Zig, zero native deps, headless, desktop-only.
+// Unlike the sokol DESKTOP byte anchor (0-diff vs enum/v1 by unrolling the walk +
+// keeping the sokol residual prose), null uses the GENERIC declarative desktop
+// path — the loop-form `unifyCoreDiamond` walk replaces the enum `deps` unrolled
+// overrides — so the generated text legitimately DIFFERS from the enum
+// `deps`/`backend_null` path. The gate is a committed golden reviewed by hand
+// against the enum output for graph equivalence (§7 tier-1: a loop emits different
+// source than the unrolled form). NOTE: null's `.backend_null` enum section still
+// exists in build_zig.txt, but a byte-anchor is NOT the gate here — the v2 path
+// deliberately uses the generic loop form (not the enum's unrolled overrides), so
+// the reviewed golden is the correct gate (see design §7). null is HOOKLESS: NO
+// `backend_build_hook.zig` import, NO `resolve_target`/`post_wire` call.
+pub const MANIFEST_V2_NULL_GOLDEN = struct {
+    const golden = @embedFile("goldens/null_v2.build.zig");
+
+    fn genNullV2() ![]const u8 {
+        return h.genNullV2BuildZig(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .null,
+            .ecs = .mock,
+        }, .{});
+    }
+
+    test "golden: v2 null build.zig matches the committed golden" {
+        const out = try genNullV2();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 null build.zig is syntactically valid Zig" {
+        const out = try genNullV2();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 null is HOOKLESS and fully declarative (no hook import / phases)" {
+        const out = try genNullV2();
+        defer std.testing.allocator.free(out);
+        // Hookless: NO backend hook import, NO resolve_target / post_wire calls.
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "resolve_target") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "post_wire") == null);
+        // Declarative backend dep + the four provider modules under their aliases.
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"labelle_null\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "const backend_gfx = backend_dep.module(\"gfx\");") != null);
+        // The generic core-diamond walk (loop form) replaced the unrolled overrides.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") != null);
+        // No native artifact + no framework links (headless, pure Zig).
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_dep.artifact(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "linkLibrary") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "linkFramework") == null);
+    }
+};
+
+// ── manifest-v2 wgpu GOLDEN cell (epic #453 item 3, PR 8, design §7) ──
+// wgpu is the second HOOKLESS desktop backend, exercising the GENERIC declarative
+// desktop path PLUS per-OS framework emission: it links the `glfw` artifact and
+// the macOS Metal/Foundation/QuartzCore frameworks (`.frameworks.desktop.macos`),
+// the data form of the enum `link_wgpu`'s `switch (target.result.os.tag)` block.
+// Like null (and unlike the sokol byte anchor) this uses the loop-form
+// `unifyCoreDiamond` walk, so the text DIFFERS from the enum `deps`/`backend_wgpu`/
+// `link_wgpu` path — the gate is a committed golden reviewed for graph equivalence
+// (§7). wgpu's `.backend_wgpu`/`.link_wgpu` enum sections still exist in
+// build_zig.txt, but a byte-anchor is NOT the gate (the v2 path uses the generic
+// loop, not the enum unroll). wgpu is HOOKLESS: NO hook import / phases.
+pub const MANIFEST_V2_WGPU_GOLDEN = struct {
+    const golden = @embedFile("goldens/wgpu_v2.build.zig");
+
+    fn genWgpuV2() ![]const u8 {
+        return h.genWgpuV2BuildZig(std.testing.allocator, .{
+            .name = "anchor-game",
+            .backend = .wgpu,
+            .ecs = .mock,
+        }, .{});
+    }
+
+    test "golden: v2 wgpu build.zig matches the committed golden" {
+        const out = try genWgpuV2();
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(golden, out);
+    }
+
+    test "golden: v2 wgpu build.zig is syntactically valid Zig" {
+        const out = try genWgpuV2();
+        defer std.testing.allocator.free(out);
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "v2 wgpu is HOOKLESS, links glfw + the macOS frameworks (declarative)" {
+        const out = try genWgpuV2();
+        defer std.testing.allocator.free(out);
+        // Hookless: NO backend hook import, NO resolve_target / post_wire calls.
+        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "resolve_target") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "post_wire") == null);
+        // Declarative backend dep + the glfw artifact + its link.
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"labelle_wgpu\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "const glfw = backend_dep.artifact(\"glfw\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkLibrary(glfw);") != null);
+        // The generic core-diamond walk (loop form) replaced the unrolled overrides.
+        try std.testing.expect(std.mem.indexOf(u8, out, "fn unifyCoreDiamond(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") != null);
+        // Per-OS framework block: the macOS Metal/Foundation/QuartzCore links.
+        try std.testing.expect(std.mem.indexOf(u8, out, "switch (target.result.os.tag) {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".macos => {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkFramework(\"Metal\", .{})") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkFramework(\"Foundation\", .{})") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "exe.root_module.linkFramework(\"QuartzCore\", .{})") != null);
+        // The SAME native linkage is mirrored onto `test_root` so `zig build
+        // test` for a wgpu project links glfw + the macOS frameworks too (review
+        // #469). The enum path links only exe; the generic desktop path links both.
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkLibrary(glfw);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkFramework(\"Metal\", .{})") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkFramework(\"Foundation\", .{})") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.linkFramework(\"QuartzCore\", .{})") != null);
+    }
+};
+
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
         const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{

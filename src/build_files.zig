@@ -204,6 +204,18 @@ fn usesEnumBackendPath(cfg: ProjectConfig) bool {
     return !cfg.isExternal() or externalUsesEnumPath(cfg);
 }
 
+/// True when the DESKTOP build should take the manifest-v2 GENERIC declarative
+/// path (loop-form `unifyCoreDiamond` walk + manifest-driven artifact/framework
+/// link, design §7 golden cells like null/wgpu) rather than the sokol byte-anchor
+/// unroll. Only fires for a v2 desktop build whose backend is NOT the sokol
+/// byte-anchor fixture (`manifest_v2_splice.isDesktopByteAnchor`), so the
+/// sokol-desktop 0-diff anchor is untouched (epic #453 item 3, PR 8).
+fn desktopUsesGenericV2(v2_manifest: ?manifest_v2.BackendManifestV2, cfg: ProjectConfig) bool {
+    if (cfg.platform != .desktop) return false;
+    const m = v2_manifest orelse return false;
+    return !manifest_v2_splice.isDesktopByteAnchor(m);
+}
+
 pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: BuildZigOptions) ![]const u8 {
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer alloc_writer.deinit();
@@ -357,7 +369,16 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         try manifest_v2_splice.renderWasmDepsDeclsV2(w);
         try tpl.writeSection(build_zig_tmpl, "game_mod_decl", w);
     } else {
-        try tpl.writeSection(build_zig_tmpl, "deps", w);
+        // manifest-v2 GENERIC desktop (PR 8, e.g. null/wgpu): emit the core/gfx/
+        // engine dep decls WITHOUT the unrolled overrideImport diamond — the
+        // generic `unifyCoreDiamond` walk (emitted after the backend-dep section)
+        // replaces it (design §5/§7). The sokol byte-anchor desktop cell keeps the
+        // enum `deps` (unrolled) so its 0-diff holds — hence the anchor guard.
+        if (desktopUsesGenericV2(v2_manifest, cfg)) {
+            try manifest_v2_splice.renderDesktopDepsDeclsV2(w);
+        } else {
+            try tpl.writeSection(build_zig_tmpl, "deps", w);
+        }
         // Bind the `game` module right after deps so the exe/tests
         // module imports below can reference `game_mod`. See
         // labelle-assembler#116.
@@ -846,6 +867,18 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // `__tests_root.zig` reaches the same named modules.
         try emitPromotedScriptImports(w, "test_root", opts.promoted_scripts);
 
+        // manifest-v2 GENERIC desktop (PR 8): mirror the native linkage
+        // (artifact `linkLibrary` + per-OS framework/syslib switch) onto
+        // `test_root` too. `test_root` imports the backend modules, so a
+        // wgpu-backed project's `zig build test` links against symbols in
+        // `glfw` + the macOS Metal/Foundation/QuartzCore frameworks; the
+        // exe-only link above left the test binary unresolved (review #469
+        // coderabbit). The enum/sokol byte-anchor path links only the exe, so
+        // this is generic-desktop-only. null emits nothing (no artifact/fw).
+        if (desktopUsesGenericV2(v2_manifest, cfg)) {
+            try manifest_v2_splice.renderDesktopTestLinkGenericV2(v2_manifest.?, w);
+        }
+
         // Chain each in-project library's `test` step into the master
         // `test` step (issue #82). An `@libs/<lib>` plugin lives at
         // `libs/<lib>/` under the project root and ships its own
@@ -881,6 +914,16 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             try tpl.writeSection(build_zig_tmpl, "tests_only_footer", w);
         } else {
             try tpl.writeSection(build_zig_tmpl, "footer", w);
+        }
+
+        // manifest-v2 GENERIC desktop (PR 8) emits the generic `unifyCoreDiamond`
+        // walk (design §5) as a top-level helper AFTER the build fn + the footer's
+        // `overrideImport` def it calls — same footer→walk shape as android/ios.
+        // The sokol byte-anchor desktop cell unrolls the overrides instead, so this
+        // is generic-desktop-only (guarded by `desktopUsesGenericV2`).
+        if (desktopUsesGenericV2(v2_manifest, cfg)) {
+            try w.writeByte('\n');
+            try manifest_v2_splice.emitCoreDiamondWalk(w);
         }
     }
 
