@@ -57,6 +57,22 @@ pub const BackendManifest = struct {
     build_fragments: BuildFragments,
     params: Params,
 
+    /// Canonical provider identity — a reverse-namespaced `<namespace>.<name>`
+    /// (RFC "Provider identity & collision rules", §1616). Official providers
+    /// live under the reserved `labelle.` namespace (`labelle.sokol`); a third
+    /// party uses `<vendor>.<name>`. Optional for back-compat: an absent `.id`
+    /// on a built-in is DERIVED as `labelle.<name>` (no error); on an external
+    /// provider it warns (required-id is enforced in a later release). See
+    /// `backend_registry.validateProviderIdentity`.
+    id: ?[]const u8 = null,
+
+    /// Capabilities this provider advertises (RFC "Capability negotiation",
+    /// §1652). Defaults empty so pre-capability manifests keep parsing under
+    /// `ignore_unknown_fields`; a non-empty set OPTS IN to enforcement
+    /// (`capabilities.validate` fails on a missing required capability; an
+    /// empty declared set only warns — the back-compat gate).
+    capabilities: []const config.Capability = &.{},
+
     /// `.callback` → the windowing runtime owns the loop and the generated
     /// `main` registers init/frame/cleanup callbacks (sokol, bgfx-android,
     /// wasm). `.loop` → the generated `main` drives a `while (!shouldQuit())`
@@ -188,6 +204,54 @@ pub fn loadManifest(allocator: std.mem.Allocator, cfg: ProjectConfig, project_di
 }
 
 pub fn freeManifest(allocator: std.mem.Allocator, m: BackendManifest) void {
+    std.zon.parse.free(allocator, m);
+}
+
+/// The RESOLVE-TIME slice of a backend manifest: provider identity + declared
+/// capabilities ONLY. Parsed with `ignore_unknown_fields`, so it reads the same
+/// `backend.manifest.zon` the full `BackendManifest` does but ignores the
+/// desktop-only splice fields (`dir_name`/`loop_style`/`build_fragments`/…).
+///
+/// This is deliberately DECOUPLED from `manifestPathEnabled` (which is
+/// desktop-only, because the splice fragments it drives only cover desktop):
+/// identity + capability negotiation happen at resolve time on EVERY target
+/// (android/wasm/ios included), so they must not be gated behind the
+/// desktop-only splice. A provider ships one manifest; this reads the
+/// platform-independent half of it.
+pub const ProviderManifest = struct {
+    id: ?[]const u8 = null,
+    capabilities: []const config.Capability = &.{},
+};
+
+/// Load the provider-identity / capability slice of `backend.manifest.zon`,
+/// regardless of target platform. Returns `null` when the resolved backend
+/// package ships NO manifest (a built-in with no manifest → identity derived,
+/// capabilities un-enforced). Errors only on a genuine parse failure. Caller
+/// frees the result with `freeProviderManifest`.
+pub fn loadProviderManifest(allocator: std.mem.Allocator, cfg: ProjectConfig, project_dir: []const u8) !?ProviderManifest {
+    const pkg_dir = backendPackageDir(allocator, cfg, project_dir) catch return null;
+    defer allocator.free(pkg_dir);
+
+    const manifest_path = try std.fs.path.join(allocator, &.{ pkg_dir, "backend.manifest.zon" });
+    defer allocator.free(manifest_path);
+
+    const raw = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), manifest_path, allocator, .limited(64 * 1024)) catch |err| {
+        if (err == error.FileNotFound) return null;
+        return err;
+    };
+    defer allocator.free(raw);
+    const raw_z = try allocator.dupeZ(u8, raw);
+    defer allocator.free(raw_z);
+
+    return std.zon.parse.fromSliceAlloc(ProviderManifest, allocator, raw_z, null, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        std.log.warn("labelle-assembler: failed to parse backend.manifest.zon (identity/capabilities) at {s}: {any}", .{ manifest_path, err });
+        return error.BackendManifestParseError;
+    };
+}
+
+pub fn freeProviderManifest(allocator: std.mem.Allocator, m: ProviderManifest) void {
     std.zon.parse.free(allocator, m);
 }
 
@@ -363,4 +427,75 @@ test "requireManifestIfExternal: the retained in-tree sokol fixture ships a mani
         .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
     };
     try requireManifestIfExternal(alloc, cfg, ".");
+}
+
+// ── Tests: provider identity + capability slice (#453) ────────────────────
+
+test "BackendManifest: an OLD manifest with no .id/.capabilities still parses" {
+    // Back-compat: a pre-#453 manifest (no identity, no capabilities) must
+    // still parse under `ignore_unknown_fields`; the new fields default (null /
+    // empty). Byte-identical generation for such built-ins is unaffected.
+    const alloc = std.testing.allocator;
+    const src =
+        \\.{
+        \\    .dir_name = "legacy",
+        \\    .dep_name = "labelle_legacy",
+        \\    .loop_style = .loop,
+        \\    .main_loop_template = "templates/desktop.txt",
+        \\    .build_fragments = .{ .backend_dep = "a.txt", .link = "b.txt" },
+        \\    .params = .{ .backend_dep = .{}, .link = .{} },
+        \\}
+    ;
+    const src_z = try alloc.dupeZ(u8, src);
+    defer alloc.free(src_z);
+
+    const m = try std.zon.parse.fromSliceAlloc(BackendManifest, alloc, src_z, null, .{ .ignore_unknown_fields = true });
+    defer std.zon.parse.free(alloc, m);
+
+    try std.testing.expect(m.id == null);
+    try std.testing.expectEqual(@as(usize, 0), m.capabilities.len);
+}
+
+test "ProviderManifest: parses the id + capability slice, ignoring splice fields" {
+    // The decoupled resolve-time slice reads the SAME file the full manifest
+    // does but only cares about `.id` / `.capabilities`; the desktop-only
+    // splice fields are ignored (ignore_unknown_fields).
+    const alloc = std.testing.allocator;
+    const src =
+        \\.{
+        \\    .dir_name = "sokol",
+        \\    .dep_name = "labelle_sokol",
+        \\    .loop_style = .callback,
+        \\    .main_loop_template = "templates/desktop.txt",
+        \\    .build_fragments = .{ .backend_dep = "a.txt", .link = "b.txt" },
+        \\    .params = .{ .backend_dep = .{}, .link = .{} },
+        \\    .id = "labelle.sokol",
+        \\    .capabilities = .{ .screenshots, .raw_gui_adapter, .audio_ogg },
+        \\}
+    ;
+    const src_z = try alloc.dupeZ(u8, src);
+    defer alloc.free(src_z);
+
+    const pm = try std.zon.parse.fromSliceAlloc(ProviderManifest, alloc, src_z, null, .{ .ignore_unknown_fields = true });
+    defer std.zon.parse.free(alloc, pm);
+
+    try std.testing.expectEqualStrings("labelle.sokol", pm.id.?);
+    try std.testing.expectEqual(@as(usize, 3), pm.capabilities.len);
+    try std.testing.expectEqual(config.Capability.screenshots, pm.capabilities[0]);
+}
+
+test "loadProviderManifest: reads the retained sokol fixture's id + capabilities" {
+    // The in-tree sokol fixture is the reference manifest; it must expose the
+    // canonical id and a non-empty capability set through the decoupled loader.
+    const alloc = std.testing.allocator;
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend = .sokol,
+        .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
+    };
+    const pm = (try loadProviderManifest(alloc, cfg, ".")).?;
+    defer freeProviderManifest(alloc, pm);
+
+    try std.testing.expectEqualStrings("labelle.sokol", pm.id.?);
+    try std.testing.expect(pm.capabilities.len > 0);
 }

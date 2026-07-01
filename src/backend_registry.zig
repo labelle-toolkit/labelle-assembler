@@ -131,6 +131,122 @@ pub fn isBuiltin(name: []const u8) bool {
     return false;
 }
 
+// ── Provider identity & collision (RFC §1616, ecosystem-hardening #453) ──
+//
+// Once `.backend_package = .{ .repo = "github:someone/labelle-vulkan" }` is
+// legal, bare backend names collide across vendors. Each provider declares a
+// canonical `<namespace>.<name>` ID in its manifest; the reserved `labelle.`
+// namespace is the official-provider marker (the `labelle-toolkit` org owns
+// it). These checks make that identity explicit and namespaced instead of
+// assuming a closed enum — the provider-graph analog of the core-diamond
+// unification check.
+//
+// The identity errors:
+//   error.ReservedProviderNamespace — a third party claims a `labelle.*` ID
+//                                       (namespace `labelle`, repo NOT under
+//                                       github.com/labelle-toolkit/ and not a
+//                                       trusted local dev checkout).
+//   error.ProviderIdDrift           — a BUILT-IN enum-shorthand tag whose
+//                                       manifest `.id` ≠ `labelle.<tag>`
+//                                       (mirrors the `builtin_names` drift guard).
+//   error.MalformedProviderId       — an `.id` with no `.` (not `<ns>.<name>`).
+//   error.ProviderIdCollision       — two resolved providers share one ID.
+
+/// True when a repo string denotes an OFFICIAL (labelle-toolkit-owned) source
+/// or a trusted LOCAL dev checkout. Local (`local:` / `@`) repos are exempt
+/// from the reserved-namespace rule so a `local:backends/sokol` dev override
+/// can legitimately be `labelle.sokol`. A remote repo is official iff its URL
+/// is under the `labelle-toolkit/` org.
+fn repoIsOfficialOrLocal(repo: []const u8) bool {
+    if (config.PluginDep.isLocal(.{ .name = "", .repo = repo })) return true;
+    return std.mem.indexOf(u8, repo, "labelle-toolkit/") != null;
+}
+
+/// Validate the resolved backend provider's identity against `manifest_id`
+/// (the `.id` from its `backend.manifest.zon`, or null when it ships none).
+///
+/// Rules (RFC §1629-1637):
+///   - a third party claiming `labelle.*` → `error.ReservedProviderNamespace`.
+///   - a built-in enum-shorthand tag (`.backend = .<tag>`, no explicit
+///     `.backend_package`) whose `.id` ≠ `labelle.<tag>` → `error.ProviderIdDrift`.
+///   - an `.id` that isn't `<namespace>.<name>` → `error.MalformedProviderId`.
+///
+/// Back-compat: `manifest_id == null` is NOT an error. A built-in derives
+/// `labelle.<name>` silently; an external provider is WARNED (required-`.id`
+/// enforcement lands in a later release). No-op for a bundled backend (no
+/// provider package — none exist today).
+pub fn validateProviderIdentity(cfg: config.ProjectConfig, manifest_id: ?[]const u8) !void {
+    const bp = cfg.effectiveBackendPackage() orelse return; // bundled: no identity
+    const name = cfg.backendName();
+    // `.backend = .<tag>` with no explicit `.backend_package` is the enum
+    // shorthand — the ONLY case the drift guard applies to (the tag pins the
+    // expected `labelle.<tag>` ID).
+    const is_enum_shorthand = cfg.backend_package == null;
+
+    const id = manifest_id orelse {
+        if (!is_enum_shorthand) {
+            std.log.warn(
+                "labelle-assembler: external backend '{s}' (backend_package) ships no `.id` in its backend.manifest.zon; deriving '{s}' for now (a future release will require an explicit canonical `<namespace>.<name>` id).",
+                .{ name, name },
+            );
+        }
+        // Built-in with no id → derive `labelle.<name>`, no error.
+        return;
+    };
+
+    const dot = std.mem.indexOfScalar(u8, id, '.') orelse {
+        std.debug.print(
+            "labelle-assembler: backend provider id '{s}' is not a canonical '<namespace>.<name>' (e.g. 'labelle.sokol', 'acme.vulkan').\n",
+            .{id},
+        );
+        return error.MalformedProviderId;
+    };
+    const namespace = id[0..dot];
+
+    if (std.mem.eql(u8, namespace, "labelle") and !repoIsOfficialOrLocal(bp.repo)) {
+        std.debug.print(
+            "labelle-assembler: backend provider '{s}' claims the reserved 'labelle.*' namespace but resolves from '{s}',\n  which is not an official labelle-toolkit repo. The 'labelle.' namespace is reserved for official\n  providers; use a '<vendor>.<name>' id instead.\n",
+            .{ id, bp.repo },
+        );
+        return error.ReservedProviderNamespace;
+    }
+
+    if (is_enum_shorthand) {
+        // The enum tag is a shorthand for `labelle.<tag>` ONLY; a built-in
+        // manifest whose id disagrees has drifted from its tag.
+        const prefix = "labelle.";
+        const matches = std.mem.startsWith(u8, id, prefix) and
+            std.mem.eql(u8, id[prefix.len..], name);
+        if (!matches) {
+            std.debug.print(
+                "labelle-assembler: built-in backend '{s}' (selected by enum tag) declares id '{s}',\n  but the tag is a shorthand for 'labelle.{s}'. Fix the provider's backend.manifest.zon `.id`.\n",
+                .{ name, id, name },
+            );
+            return error.ProviderIdDrift;
+        }
+    }
+}
+
+/// Detect a canonical-ID collision across the full resolved provider set
+/// (RFC §1634): two providers claiming the same `<namespace>.<name>` is a hard
+/// error, not a silent last-wins. Today the provider set is effectively the
+/// single render backend, so this is future-proofing for when plugins/audio
+/// providers also carry identities — but it is the one place the whole set is
+/// cross-checked, mirroring the core-diamond unification check.
+pub fn checkProviderIdCollisions(ids: []const []const u8) !void {
+    for (ids, 0..) |a, i| {
+        for (ids[i + 1 ..]) |b| {
+            if (std.mem.eql(u8, a, b)) {
+                std.debug.print(
+                    "labelle-assembler: two resolved providers claim the same canonical id '{s}'. Provider ids must be globally unique.\n",
+                    .{a},
+                );
+                return error.ProviderIdCollision;
+            }
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 test "lookup derives the package convention for a built-in name" {
@@ -288,4 +404,92 @@ test "open-config: resolveBackendPackage routes an external backend to its local
     // `backends/` cache slot — so it lands on the sibling checkout.
     try std.testing.expectEqualStrings(stub_abs, resolved);
     try std.testing.expect(std.mem.indexOf(u8, resolved, "/backends/") == null);
+}
+
+// ── Provider identity & collision tests (RFC §1616, #453) ────────────
+
+test "identity: a third party claiming labelle.* is rejected" {
+    // External backend_package resolving from a NON-labelle-toolkit remote repo
+    // may not claim the reserved `labelle.` namespace.
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend_package = .{ .name = "vulkan", .repo = "github:someone/labelle-vulkan" },
+    };
+    try std.testing.expectError(
+        error.ReservedProviderNamespace,
+        validateProviderIdentity(cfg, "labelle.vulkan"),
+    );
+}
+
+test "identity: a local dev checkout may legitimately be labelle.*" {
+    // The retained in-tree sokol fixture (`local:backends/sokol`) is
+    // labelle.sokol — local repos are trusted dev overrides, exempt from the
+    // reserved-namespace rule.
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend = .sokol,
+        .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
+    };
+    try validateProviderIdentity(cfg, "labelle.sokol");
+}
+
+test "identity: a third-party vendor namespace is accepted" {
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend_package = .{ .name = "vulkan", .repo = "github:someone/labelle-vulkan" },
+    };
+    try validateProviderIdentity(cfg, "someone.vulkan");
+}
+
+test "identity: an enum-shorthand built-in whose id drifts from its tag errors" {
+    // `.backend = .sokol` is a shorthand for `labelle.sokol`; a manifest id of
+    // `labelle.bgfx` has drifted from the tag.
+    const cfg = config.ProjectConfig{ .name = "g", .backend = .sokol };
+    try std.testing.expectError(
+        error.ProviderIdDrift,
+        validateProviderIdentity(cfg, "labelle.bgfx"),
+    );
+}
+
+test "identity: an enum-shorthand built-in with the matching id is accepted" {
+    const cfg = config.ProjectConfig{ .name = "g", .backend = .sokol };
+    try validateProviderIdentity(cfg, "labelle.sokol");
+    // And every built-in tag agrees with its `labelle.<tag>` shorthand.
+    inline for (@typeInfo(config.Backend).@"enum".fields) |f| {
+        const c = config.ProjectConfig{ .name = "g", .backend = @field(config.Backend, f.name) };
+        const expected = "labelle." ++ f.name;
+        try validateProviderIdentity(c, expected);
+    }
+}
+
+test "identity: a malformed id (no namespace) errors" {
+    const cfg = config.ProjectConfig{ .name = "g", .backend = .sokol };
+    try std.testing.expectError(
+        error.MalformedProviderId,
+        validateProviderIdentity(cfg, "sokolonly"),
+    );
+}
+
+test "identity: back-compat — a built-in with no id derives silently (no error)" {
+    const cfg = config.ProjectConfig{ .name = "g", .backend = .sokol };
+    try validateProviderIdentity(cfg, null);
+}
+
+test "identity: back-compat — an external with no id warns but does not error" {
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend_package = .{ .name = "vulkan", .repo = "github:someone/labelle-vulkan" },
+    };
+    try validateProviderIdentity(cfg, null);
+}
+
+test "collision: duplicate provider ids are a hard error, unique ids pass" {
+    try checkProviderIdCollisions(&.{ "labelle.sokol", "labelle.miniaudio" });
+    try std.testing.expectError(
+        error.ProviderIdCollision,
+        checkProviderIdCollisions(&.{ "labelle.sokol", "acme.thing", "labelle.sokol" }),
+    );
+    // Empty / single sets never collide.
+    try checkProviderIdCollisions(&.{});
+    try checkProviderIdCollisions(&.{"labelle.sokol"});
 }
