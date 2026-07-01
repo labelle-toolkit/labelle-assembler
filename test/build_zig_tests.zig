@@ -25,6 +25,7 @@ const GlobalEntries = h.GlobalEntries;
 const globalEntries = h.globalEntries;
 const testGuiRenderInterface = h.testGuiRenderInterface;
 const testGuiRawBackend = h.testGuiRawBackend;
+const testGuiRawBackendNoBridge = h.testGuiRawBackendNoBridge;
 
 test {
     zspec.runAll(@This());
@@ -899,7 +900,7 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
         const cfg = generate.ProjectConfig{
             .name = "gui-tests-game",
             .ecs = .mock,
-            .resolved_gui = testGuiRawBackend("imgui"), // derives .raw_gui_adapter
+            .resolved_gui = testGuiRawBackendNoBridge("imgui"), // in-backend adapter → derives .raw_gui_adapter
             .backend_package = h.null_v2_fixture_package, // declares only .headless
         };
         try generate.validateProviderContracts(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon", true);
@@ -914,7 +915,7 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
         const cfg = generate.ProjectConfig{
             .name = "gui-tests-game",
             .ecs = .mock,
-            .resolved_gui = testGuiRawBackend("imgui"), // derives .raw_gui_adapter
+            .resolved_gui = testGuiRawBackendNoBridge("imgui"), // in-backend adapter → derives .raw_gui_adapter
             .backend_package = h.null_v2_fixture_package, // declares only .headless
         };
         try std.testing.expectError(
@@ -940,7 +941,7 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
         const cfg = generate.ProjectConfig{
             .name = "gui-tests-game",
             .ecs = .mock,
-            .resolved_gui = testGuiRawBackend("imgui"), // derives .raw_gui_adapter
+            .resolved_gui = testGuiRawBackendNoBridge("imgui"), // in-backend adapter → derives .raw_gui_adapter
         };
         const build_zig = try h.genNullV2BuildZig(std.testing.allocator, cfg, .{ .is_tests_target = true });
         std.testing.allocator.free(build_zig);
@@ -955,7 +956,7 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
         const cfg = generate.ProjectConfig{
             .name = "gui-tests-game",
             .ecs = .mock,
-            .resolved_gui = testGuiRawBackend("imgui"), // derives .raw_gui_adapter
+            .resolved_gui = testGuiRawBackendNoBridge("imgui"), // in-backend adapter → derives .raw_gui_adapter
         };
         try std.testing.expectError(
             error.UnsupportedCapability,

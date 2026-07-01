@@ -37,8 +37,14 @@ const ProjectConfig = config.ProjectConfig;
 ///   - `.platform = .ios`     ⇒ `.ios`.
 ///   - ASTC selected for the target platform (`asset_compression`) ⇒
 ///     `.compressed_textures` (the GPU-native upload path — #340).
-///   - a resolved GUI plugin rendering in `raw_backend` mode ⇒
-///     `.raw_gui_adapter` (the in-backend imgui adapter, RFC Q#6).
+///   - a resolved GUI plugin rendering in `raw_backend` mode AND satisfied by
+///     the backend's OWN in-backend imgui adapter (no GUI bridge resolved for
+///     this backend — `bridge_dir == null`) ⇒ `.raw_gui_adapter` (RFC Q#6). A
+///     `raw_backend` GUI that a separate GUI-bridge plugin renders for this
+///     backend (raylib → rlImGui; `bridge_dir != null`) does NOT require it —
+///     the bridge, not the backend, supplies the adapter. This mirrors the
+///     bridge-vs-in-backend split the codegen already makes in `build_files`
+///     (`rendering == .raw_backend and bridge_dir != null` ⇒ wire the bridge).
 ///   - every capability in `cfg.requires` (the explicit half).
 ///
 /// NOTE (deferred): a `--screenshot` run requires `.screenshots` (RFC §1671),
@@ -75,7 +81,17 @@ pub fn requiredCapabilities(allocator: std.mem.Allocator, cfg: ProjectConfig) ![
     }
 
     if (cfg.resolved_gui) |gui| {
-        if (gui.rendering == .raw_backend) try add(allocator, &set, .raw_gui_adapter);
+        // Only the IN-BACKEND-adapter path requires the backend to declare
+        // `.raw_gui_adapter`. A `raw_backend` GUI whose rendering is handled by
+        // a resolved GUI-bridge plugin for this backend (raylib → rlImGui;
+        // `bridge_dir != null`) is satisfied by the BRIDGE, not the backend, so
+        // it must NOT require the capability — otherwise raylib (which has no
+        // in-backend adapter and correctly omits `.raw_gui_adapter`) fails the
+        // gate for every imgui project. `bridge_dir == null` on a `raw_backend`
+        // GUI means no bridge was resolved for this backend, i.e. the backend's
+        // own in-backend adapter renders it (sokol/bgfx) — that DOES require it.
+        if (gui.rendering == .raw_backend and gui.bridge_dir == null)
+            try add(allocator, &set, .raw_gui_adapter);
     }
 
     for (cfg.requires) |cap| try add(allocator, &set, cap);
@@ -190,18 +206,106 @@ test "requiredCapabilities: ASTC selection derives .compressed_textures" {
     try testing.expect(hasCap(req, .compressed_textures));
 }
 
-test "requiredCapabilities: a raw_backend GUI derives .raw_gui_adapter" {
+test "requiredCapabilities: a raw_backend GUI on the in-backend adapter (no bridge) derives .raw_gui_adapter" {
+    // sokol/bgfx render imgui through their OWN in-backend adapter — no
+    // GUI-bridge plugin is resolved for the backend, so `bridge_dir == null`.
+    // That path DOES require the backend to declare `.raw_gui_adapter`.
     const cfg = ProjectConfig{
         .name = "g",
+        .backend = .sokol,
         .resolved_gui = .{
             .name = "imgui",
             .rendering = .raw_backend,
             .plugin_dir = "x",
+            .bridge_dir = null, // in-backend adapter — no separate bridge plugin
         },
     };
     const req = try requiredCapabilities(testing.allocator, cfg);
     defer testing.allocator.free(req);
     try testing.expect(hasCap(req, .raw_gui_adapter));
+}
+
+test "requiredCapabilities: a raw_backend GUI rendered by a bridge (raylib/rlImGui) does NOT derive .raw_gui_adapter" {
+    // Regression for the raylib→v2 cutover gamepad failure (#477): raylib
+    // renders imgui via the rlImGui BRIDGE (a separate plugin the assembler
+    // wires — `bridge_dir` is set), NOT an in-backend raw adapter. raylib
+    // legitimately omits `.raw_gui_adapter`, so deriving it here made every
+    // raylib+imgui project fail the capability gate with UnsupportedCapability.
+    const cfg = ProjectConfig{
+        .name = "g",
+        .backend = .raylib,
+        .resolved_gui = .{
+            .name = "imgui",
+            .rendering = .raw_backend,
+            .plugin_dir = "x",
+            .bridge_dir = "/abs/plugins/imgui/bridges/raylib", // bridge resolved
+            .bridge_artifact = "rlimgui_bridge",
+        },
+    };
+    const req = try requiredCapabilities(testing.allocator, cfg);
+    defer testing.allocator.free(req);
+    // The bridge supplies the adapter — the backend must NOT be required to.
+    try testing.expect(!hasCap(req, .raw_gui_adapter));
+}
+
+test "capability gate end-to-end: raylib+imgui (bridge) generates; sokol/bgfx+imgui (in-backend) still gated" {
+    // Prove BOTH directions against the real backend-manifest capability sets:
+    //   raylib_v2 declares NO `.raw_gui_adapter` (bridge case) — must pass.
+    //   sokol/bgfx declare it (in-backend case) — the requirement is derived,
+    //   and a manifest that omitted it would fail.
+    const raylib_declared: []const Capability = &.{
+        .screenshots, .compressed_textures, .fonts, .gamepad_polling, .wasm, .audio_ogg,
+    };
+    const in_backend_declared: []const Capability = &.{
+        .screenshots, .compressed_textures, .fonts, .gamepad_polling, .raw_gui_adapter, .surface_loss,
+    };
+
+    // raylib + imgui via the rlImGui bridge — this is the #477 gamepad scenario
+    // (raylib backend + imgui GUI, exe target). Must NOT require .raw_gui_adapter
+    // and must validate cleanly against raylib's (adapter-less) declared set.
+    {
+        const cfg = ProjectConfig{
+            .name = "example_gamepad",
+            .backend = .raylib,
+            .resolved_gui = .{
+                .name = "imgui",
+                .rendering = .raw_backend,
+                .plugin_dir = "x",
+                .bridge_dir = "/abs/plugins/imgui/bridges/raylib",
+                .bridge_artifact = "rlimgui_bridge",
+            },
+        };
+        const req = try requiredCapabilities(testing.allocator, cfg);
+        defer testing.allocator.free(req);
+        try testing.expect(!hasCap(req, .raw_gui_adapter));
+        // No UnsupportedCapability against the real raylib manifest.
+        try validate(req, raylib_declared, "labelle.raylib");
+    }
+
+    // sokol/bgfx + imgui via the in-backend adapter (no bridge) — STILL requires
+    // .raw_gui_adapter; passes when the manifest declares it, fails when omitted.
+    {
+        const cfg = ProjectConfig{
+            .name = "example_sokol_imgui",
+            .backend = .sokol,
+            .resolved_gui = .{
+                .name = "imgui",
+                .rendering = .raw_backend,
+                .plugin_dir = "x",
+                .bridge_dir = null,
+            },
+        };
+        const req = try requiredCapabilities(testing.allocator, cfg);
+        defer testing.allocator.free(req);
+        try testing.expect(hasCap(req, .raw_gui_adapter));
+        // Declared → validates. Omitted → hard UnsupportedCapability.
+        try validate(req, in_backend_declared, "labelle.sokol");
+        try testing.expectError(error.UnsupportedCapability, validate(
+            req,
+            &.{ .screenshots, .gamepad_polling }, // opted-in but omits .raw_gui_adapter
+            "labelle.sokol",
+        ));
+    }
 }
 
 test "requiredCapabilities: explicit .requires are unioned in and de-duped" {
