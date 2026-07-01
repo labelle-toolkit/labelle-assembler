@@ -213,6 +213,20 @@ pub const PACK_EMISSION = struct {
         // and the pack prefab is embedded from its prefixed path.
         try std.testing.expect(contains(main_zig, "JsoncBridge"));
         try std.testing.expect(contains(main_zig, "@embedFile(\"packs/citizens/prefabs/worker.jsonc\")"));
+
+        // The prefab MUST be registered with the pack's own prefab root
+        // (`packs/citizens/prefabs`), NOT the game's bare `"prefabs"` — the
+        // engine uses this as the base dir for the prefab's JSONC `"include"`
+        // / source-relative lookups, so a pack prefab has to resolve against
+        // the copied pack dir (chatgpt-codex, #478).
+        try std.testing.expect(contains(
+            main_zig,
+            "@embedFile(\"packs/citizens/prefabs/worker.jsonc\"), \"packs/citizens/prefabs\"",
+        ));
+        try std.testing.expect(!contains(
+            main_zig,
+            "@embedFile(\"packs/citizens/prefabs/worker.jsonc\"), \"prefabs\"",
+        ));
     }
 
     test "no packs → component registry emission is unchanged (empty pack_scans is a no-op)" {

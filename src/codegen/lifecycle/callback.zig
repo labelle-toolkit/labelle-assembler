@@ -129,11 +129,14 @@ pub fn Mixin(comptime Self: type) type {
                 }
                 // Pack prefabs (Packs RFC §4, #439) — see the loop-lifecycle
                 // sibling for rationale. Embedded from the pack's prefix; the
-                // callback host has no error channel, so panic-on-failure.
+                // callback host has no error channel, so panic-on-failure. The
+                // prefab root is the pack's own `<import_prefix>/prefabs` so a
+                // pack prefab's `"include"` / source-relative lookups resolve
+                // against the copied pack dir, not the game's (chatgpt-codex, #478).
                 for (self.pack_scans) |pack| {
                     for (pack.prefab_names) |name| {
                         const display = std.fs.path.basename(name);
-                        try w.print("    JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"{s}/prefabs/{s}.jsonc\"), \"prefabs\") catch @panic(\"failed to load prefab\");\n", .{ display, pack.import_prefix, name });
+                        try w.print("    JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"{s}/prefabs/{s}.jsonc\"), \"{s}/prefabs\") catch @panic(\"failed to load prefab\");\n", .{ display, pack.import_prefix, name, pack.import_prefix });
                     }
                 }
                 try w.writeByte('\n');

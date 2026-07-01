@@ -23,6 +23,11 @@ pub const RESERVED_DIR_NAMES = [_][]const u8{
     "events",
     "gizmos",
     "hooks",
+    // `packs` is owned by the pack-scan layout (Packs RFC §4, #439): the
+    // generator copies each scanned pack into `<target>/packs/<name>/`, so a
+    // plugin must not claim `packs` as a convention dir and write into that
+    // same tree (CodeRabbit, #478).
+    "packs",
     "prefabs",
     "scenes",
     "scripts",
@@ -438,8 +443,9 @@ const testing = std.testing;
 
 test "isReservedDirName: matches every hardcoded name" {
     inline for (.{
-        "assets", "components", "enums", "events", "gizmos",
-        "hooks",  "prefabs",    "scenes", "scripts", "views",
+        "assets", "components", "enums",  "events",  "gizmos",
+        "hooks",  "packs",      "prefabs", "scenes",  "scripts",
+        "views",
     }) |name| {
         try testing.expect(isReservedDirName(name));
     }
@@ -740,6 +746,33 @@ test "loadFromDir: errors when plugin tries to declare a reserved name" {
         \\    .convention_dirs = .{
         \\        .{
         \\            .name = "components",
+        \\            .extension = ".zig",
+        \\            .mode = .copy_and_scan,
+        \\        },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadFromDir(testing.allocator, tmp_path, "fsm");
+    try testing.expectError(error.PluginManifestReservedDirName, result);
+}
+
+test "loadFromDir: errors when plugin tries to declare the packs reserved name" {
+    // `packs` is reserved for the pack-scan layout (#439) — a plugin must not
+    // claim it and write into `<target>/packs/`, colliding with scanned packs.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "fsm",
+        \\    .manifest_version = 1,
+        \\    .convention_dirs = .{
+        \\        .{
+        \\            .name = "packs",
         \\            .extension = ".zig",
         \\            .mode = .copy_and_scan,
         \\        },
