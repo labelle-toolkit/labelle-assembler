@@ -52,6 +52,10 @@ pub const PluginPinStyle = scan.PluginPinStyle;
 pub const PluginCoercion = scan.PluginCoercion;
 pub const PluginFlowDecls = scan.PluginFlowDecls;
 pub const PromotedScript = scan.PromotedScript;
+/// Pack dir-scan result (Packs RFC §4, #439). Threaded into codegen via
+/// `main_template.pack_scans` so the registry block-writers can register a
+/// pack's components/events/prefabs into the unified game-root registries.
+pub const PackScan = scan.PackScan;
 pub const discoverPluginEvents = scan.discoverPluginEvents;
 pub const discoverPluginFlowDecls = scan.discoverPluginFlowDecls;
 pub const collectPromotedScripts = scan.collectPromotedScripts;

@@ -132,11 +132,21 @@ pub fn Mixin(comptime Self: type) type {
             }
 
             // Pre-load embedded prefabs (must happen before scene loading)
-            if (prefab_names.len > 0) {
+            if (prefab_names.len > 0 or self.hasPackPrefabs()) {
                 try w.writeAll("    // Embedded prefabs (via @embedFile)\n");
                 for (prefab_names) |name| {
                     const display = std.fs.path.basename(name);
                     try w.print("    try JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"prefabs/{s}.jsonc\"), \"prefabs\");\n", .{ display, name });
+                }
+                // Pack prefabs (Packs RFC §4, #439): embedded from the pack's
+                // `import_prefix`, registered by bare basename (namespacing is
+                // #440). No comptime PrefabRegistry entry — JSONC prefabs are a
+                // runtime name→source registry, so a pack just registers more.
+                for (self.pack_scans) |pack| {
+                    for (pack.prefab_names) |name| {
+                        const display = std.fs.path.basename(name);
+                        try w.print("    try JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"{s}/prefabs/{s}.jsonc\"), \"prefabs\");\n", .{ display, pack.import_prefix, name });
+                    }
                 }
                 try w.writeByte('\n');
             }

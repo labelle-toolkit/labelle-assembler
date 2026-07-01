@@ -121,11 +121,20 @@ pub fn Mixin(comptime Self: type) type {
             }
 
             // Pre-load embedded prefabs
-            if (prefab_names.len > 0) {
+            if (prefab_names.len > 0 or self.hasPackPrefabs()) {
                 try w.writeAll("    // Embedded prefabs (via @embedFile)\n");
                 for (prefab_names) |name| {
                     const display = std.fs.path.basename(name);
                     try w.print("    JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"prefabs/{s}.jsonc\"), \"prefabs\") catch @panic(\"failed to load prefab\");\n", .{ display, name });
+                }
+                // Pack prefabs (Packs RFC §4, #439) — see the loop-lifecycle
+                // sibling for rationale. Embedded from the pack's prefix; the
+                // callback host has no error channel, so panic-on-failure.
+                for (self.pack_scans) |pack| {
+                    for (pack.prefab_names) |name| {
+                        const display = std.fs.path.basename(name);
+                        try w.print("    JsoncBridge.addEmbeddedPrefab(&g, \"{s}\", @embedFile(\"{s}/prefabs/{s}.jsonc\"), \"prefabs\") catch @panic(\"failed to load prefab\");\n", .{ display, pack.import_prefix, name });
+                    }
                 }
                 try w.writeByte('\n');
             }

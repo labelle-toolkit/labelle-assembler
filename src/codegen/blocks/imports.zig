@@ -157,11 +157,22 @@ pub fn Mixin(comptime Self: type) type {
         /// identifier (the user's handler references it).
         pub fn writeEventImportsBlock(self: *Self, w: anytype) !void {
             const event_names = self.event_names;
-            if (event_names.len > 0) {
+            if (event_names.len > 0 or self.hasPackEvents()) {
                 try w.writeAll("\n// --- Event imports ---\n");
                 for (event_names) |name| {
                     const ident = eventVariantName(name);
                     try w.print("const {s} = @import(\"events/{s}.zig\");\n", .{ ident, name });
+                }
+                // Pack events (Packs RFC §4, #439). Same alias = variant-name
+                // convention as game events, but imported through the pack's
+                // `import_prefix` (e.g. `packs/citizens/events/...`). Alias is
+                // bare `eventVariantName` today — the `<pack>__` prefix that
+                // avoids cross-realm alias collisions is #440.
+                for (self.pack_scans) |pack| {
+                    for (pack.event_names) |name| {
+                        const ident = eventVariantName(name);
+                        try w.print("const {s} = @import(\"{s}/events/{s}.zig\");\n", .{ ident, pack.import_prefix, name });
+                    }
                 }
             }
         }
@@ -184,7 +195,10 @@ pub fn Mixin(comptime Self: type) type {
             const jsonc_scene_names = self.jsonc_scene_names;
             const prefab_names = self.prefab_names;
             const gizmo_names = self.gizmo_names;
-            if (jsonc_scene_names.len > 0 or prefab_names.len > 0) {
+            // A pack that ships prefabs (Packs RFC §4, #439) needs `JsoncBridge`
+            // declared even when the game root has no scenes/prefabs — the
+            // embedded-prefab registration in the lifecycle block calls it.
+            if (jsonc_scene_names.len > 0 or prefab_names.len > 0 or self.hasPackPrefabs()) {
                 try w.writeAll("\n// --- JSONC scene loaders (embedded) ---\n");
                 if (gizmo_names.len > 0) {
                     try w.writeAll("const JsoncBridge = engine.JsoncSceneBridgeWithGizmos(AssembledGame, Components, Gizmos);\n");

@@ -87,7 +87,10 @@ pub fn Mixin(comptime Self: type) type {
         /// `AllHookPayloads` (no parallel dispatcher, per RFC §2 "feed the
         /// existing pipeline").
         pub fn writeAllHookPayloadsBlock(self: *Self, w: anytype) !void {
-            const event_names = self.event_names;
+            // Pack events (Packs RFC §4, #439) are dir-scanned like the game
+            // root's, so they widen `GameEvents` — fold `GameEvents` into
+            // `AllHookPayloads` even when a pack is the ONLY source of events.
+            const has_game_events = self.event_names.len > 0 or self.hasPackEvents();
             // Gate on **discovered** events, not declared plugins — a project
             // can declare a plugin whose `Events` decl is empty (or absent, e.g.
             // the plugin-controllers demo plugin), in which case `PluginEvents`
@@ -100,11 +103,11 @@ pub fn Mixin(comptime Self: type) type {
             // needs to merge `GameEvents` once — referencing `PluginEvents`
             // here too would re-emit every plugin variant twice and trip
             // `MergeHookPayloads`' duplicate-field check.
-            if (event_names.len == 0 and !has_plugin_events) {
+            if (!has_game_events and !has_plugin_events) {
                 try w.writeAll("const AllHookPayloads = engine.HookPayload(EcsBackend.Entity);\n\n");
             } else {
                 try w.writeAll("const AllHookPayloads = engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity)");
-                if (event_names.len > 0 or has_plugin_events) try w.writeAll(", GameEvents");
+                if (has_game_events or has_plugin_events) try w.writeAll(", GameEvents");
                 try w.writeAll(" });\n\n");
             }
         }
