@@ -40,7 +40,7 @@ const add_usage =
     \\  labelle-assembler add feature <kind> <name>
     \\
     \\`add pack <name>` creates packs/<name>/ with the convention subdirs
-    \\(components/ events/ prefabs/ hooks/) and a pack.labelle.
+    \\(components/ events/ prefabs/ hooks/ scripts/) and a pack.labelle.
     \\Refuses to overwrite an existing packs/<name>/.
     \\
     \\`add feature <kind> <name>` scaffolds a feature-unit in the game root:
@@ -172,13 +172,12 @@ pub fn toTypeName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
 
 // ─── pack ──────────────────────────────────────────────────────────────
 
-// Only the convention subdirs the generator's `scanPack` actually copies +
-// scans today (`src/root.zig` scans components/events/prefabs/hooks). A
-// `scripts/` dir is deliberately NOT scaffolded: light-pack scripts are not
-// yet scanned by generate, so a scaffolded `packs/<name>/scripts/` would be
-// silently ignored (chatgpt-codex review). Add it back here once pack-script
-// scanning lands (follow-up ticket).
-const pack_convention_dirs = [_][]const u8{ "components", "events", "prefabs", "hooks" };
+// The convention subdirs the generator's `scanPack` copies + scans
+// (`src/root.zig`): components/events/prefabs/hooks, plus `scripts/`
+// (labelle-assembler#487 — a pack's per-frame system now lives inside the
+// pack at `scripts/<state>/*.zig`, copied to `packs/<name>/scripts/` and
+// registered into the same per-state dispatch as the game root).
+const pack_convention_dirs = [_][]const u8{ "components", "events", "prefabs", "hooks", "scripts" };
 
 /// Materialize `<root>/packs/<name>/` with the convention subdirs and a
 /// `pack.labelle`. Refuses if the directory already exists. `root` is the
@@ -709,15 +708,13 @@ test "scaffoldPack creates the convention tree and a parseable pack.labelle" {
 
     try scaffoldPack(alloc, io, tmp_abs, "citizens");
 
-    // Each convention subdir the generator actually scans exists with a
-    // .gitkeep. `scripts/` is intentionally NOT scaffolded (pack scripts are
-    // not scanned yet — see `pack_convention_dirs`).
-    inline for (.{ "components", "events", "prefabs", "hooks" }) |sub| {
+    // Each convention subdir the generator scans exists with a .gitkeep —
+    // including `scripts/` now that light-pack scripts are scanned
+    // (labelle-assembler#487).
+    inline for (.{ "components", "events", "prefabs", "hooks", "scripts" }) |sub| {
         try tmp.dir.access(io, "packs/citizens/" ++ sub, .{});
         try tmp.dir.access(io, "packs/citizens/" ++ sub ++ "/.gitkeep", .{});
     }
-    // No `scripts/` dir — it would be silently ignored by generate today.
-    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "packs/citizens/scripts", .{}));
 
     // pack.labelle carries the exact fields and parses as the pack manifest.
     const manifest = try tmp.dir.readFileAlloc(io, "packs/citizens/pack.labelle", alloc, .limited(4096));

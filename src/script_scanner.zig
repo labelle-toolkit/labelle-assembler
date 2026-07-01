@@ -42,6 +42,12 @@ pub const ScriptScanner = struct {
     /// subsequent game scans remain plugin-free.
     current_plugin_name: ?[]const u8 = null,
     current_plugin_index: u32 = 0,
+    /// Scratch slot stamped onto every entry's `import_base` as it's
+    /// added. `"scripts/"` for the game + plugin scans; set to `""` by
+    /// `scanPackScriptsDir` so pack entries (whose `rel_path` is already a
+    /// full `packs/<name>/scripts/...` target-relative path) import
+    /// verbatim (labelle-assembler#487). Restored after each pack scan.
+    current_import_base: []const u8 = "scripts/",
 
     pub const ScriptEntry = struct {
         /// Script name (prefix stripped, .zig stripped).
@@ -92,6 +98,21 @@ pub const ScriptScanner = struct {
         /// on the scanner sort — the contract for notification events
         /// (O3). Set only by `flow_scanner.zig`.
         event_priority: ?i32 = null,
+        /// Path prefix the `AllScripts` codegen prepends (verbatim, no
+        /// extra separator) to `rel_path` when it emits `@import(...)`.
+        ///
+        /// Game scripts and plugin scripts leave this at the default
+        /// `"scripts/"` — their `rel_path` is relative to the generated
+        /// `scripts/` dir (`hits.zig`, `.plugin_foo/playing/01_x.zig`).
+        ///
+        /// Pack scripts (labelle-assembler#487) instead carry a full
+        /// target-relative `rel_path` (`packs/<name>/scripts/<sub>`) and
+        /// set this to `""`, so the generated import resolves against the
+        /// copied pack subtree. That placement — under the pack dir rather
+        /// than `scripts/.plugin_<name>/` — is what lets a pack script's
+        /// own `../components/foo.zig` relative import keep resolving
+        /// against the pack's copied `components/`.
+        import_base: []const u8 = "scripts/",
     };
 
     /// Errors `scanDir` / `scanPluginDir` / `scanZigFilesRecursive` can
@@ -307,6 +328,99 @@ pub const ScriptScanner = struct {
         try self.validateNoDuplicateOrders();
     }
 
+    /// Scan a *light pack's* copied scripts directory (Packs RFC §4,
+    /// labelle-assembler#487). Unlike a decl-module plugin — which imports
+    /// its own code through its Zig module — a pack ships no module, so its
+    /// per-frame system lives in `scripts/<state>/*.zig` and reaches its own
+    /// pack-local files (`../components/foo.zig`) by relative import.
+    ///
+    /// The pack subtree is therefore copied UNDER the pack dir
+    /// (`<target>/packs/<name>/scripts/...`, not `scripts/.plugin_<name>/`),
+    /// preserving the pack's on-disk shape so those relative imports resolve
+    /// against the pack's copied `components/`, `events/`, etc.
+    /// `pack_scripts_dir` is that copied on-disk directory; `import_prefix`
+    /// is its target-relative form (`packs/<name>/scripts`) that the
+    /// generated `@import` uses.
+    ///
+    /// Every entry is stamped with the pack name as its `plugin_name`, so:
+    ///   * it forms its OWN numeric-prefix scope (the duplicate-order
+    ///     validator treats each pack independently — same as plugins);
+    ///   * it sorts into the plugin block, AFTER game scripts, ordered by
+    ///     declaration position (`plugin_index`);
+    ///   * the game-script FlowNode walk skips it (pack scripts are
+    ///     lifecycle scripts: `tick`/`setup`/`State`/`drawGui`).
+    ///
+    /// Entries carry `import_base = ""` and a full target-relative
+    /// `rel_path`, so the `AllScripts` emitter imports them verbatim.
+    /// A missing/absent scripts dir is a no-op (same tolerance as
+    /// `scanDir`/`scanPluginDir`).
+    pub fn scanPackScriptsDir(self: *ScriptScanner, pack_scripts_dir: []const u8, import_prefix: []const u8, pack_name: []const u8) ScanError!void {
+        const io = config.globalIo();
+        var dir = std.Io.Dir.cwd().openDir(io, pack_scripts_dir, .{ .iterate = true }) catch return;
+        defer dir.close(io);
+
+        // Reserve before duping so the append is infallible (issue #75).
+        try self.shared_plugin_names.ensureUnusedCapacity(self.allocator, 1);
+        const name_dup = try self.allocator.dupe(u8, pack_name);
+        self.shared_plugin_names.appendAssumeCapacity(name_dup);
+
+        // Same declaration-order namespacing as plugins — increment first so
+        // indices start at 1 (0 stays the "game script" sentinel).
+        self.next_plugin_index += 1;
+        self.current_plugin_name = name_dup;
+        self.current_plugin_index = self.next_plugin_index;
+        // Pack entries store a full target-relative rel_path already, so the
+        // AllScripts emitter must NOT re-prepend `scripts/`.
+        self.current_import_base = "";
+        defer {
+            self.current_plugin_name = null;
+            self.current_plugin_index = 0;
+            self.current_import_base = "scripts/";
+        }
+
+        var iter = dir.iterate();
+        while (try iter.next(io)) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zig")) {
+                const name_copy = try self.allocator.dupe(u8, entry.name);
+                errdefer self.allocator.free(name_copy);
+                const rel_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ import_prefix, entry.name });
+                errdefer self.allocator.free(rel_path);
+                try self.addEntryWithPath(name_copy, null, &.{}, rel_path);
+            } else if (entry.kind == .directory) {
+                const dir_states = try self.parseDirStates(entry.name);
+                if (dir_states.len == 0) continue;
+                var transferred = false;
+                errdefer if (!transferred) {
+                    for (dir_states) |s| self.allocator.free(s);
+                    self.allocator.free(dir_states);
+                };
+
+                const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ pack_scripts_dir, entry.name });
+                defer self.allocator.free(subdir_path);
+
+                try self.shared_subdirs.ensureUnusedCapacity(self.allocator, 1);
+                try self.shared_states.ensureUnusedCapacity(self.allocator, 1);
+
+                const subdir_name = try self.allocator.dupe(u8, entry.name);
+                errdefer if (!transferred) self.allocator.free(subdir_name);
+                self.shared_subdirs.appendAssumeCapacity(subdir_name);
+                self.shared_states.appendAssumeCapacity(dir_states);
+                transferred = true;
+                // Thread the target-relative rel prefix through recursion so
+                // nested organizational dirs end up as
+                // `packs/<name>/scripts/<state>/<sub>/...`.
+                const rel_prefix_with_state = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ import_prefix, entry.name });
+                defer self.allocator.free(rel_prefix_with_state);
+                try self.scanZigFilesRecursive(subdir_path, subdir_name, dir_states, rel_prefix_with_state);
+            }
+        }
+
+        // Sort + revalidate so the pack's block stays consistent with the
+        // game + plugin blocks. See `scanPluginDir`.
+        self.sortEntries();
+        try self.validateNoDuplicateOrders();
+    }
+
     /// Add an entry manually (for testing without filesystem).
     pub fn addEntry(self: *ScriptScanner, filename: []const u8, subdir: ?[]const u8, states: []const []const u8) !void {
         const name = stripPrefixAndExtension(filename);
@@ -321,6 +435,7 @@ pub const ScriptScanner = struct {
             .rel_path = filename,
             .plugin_name = self.current_plugin_name,
             .plugin_index = self.current_plugin_index,
+            .import_base = self.current_import_base,
         });
     }
 
@@ -338,6 +453,7 @@ pub const ScriptScanner = struct {
             .rel_path = rel_path,
             .plugin_name = self.current_plugin_name,
             .plugin_index = self.current_plugin_index,
+            .import_base = self.current_import_base,
         });
     }
 
