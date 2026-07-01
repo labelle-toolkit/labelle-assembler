@@ -37,6 +37,7 @@ test {
     _ = @import("flow_catalog.zig");
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/manifest_splice.zig");
+    _ = @import("codegen/manifest_v2.zig");
     _ = @import("capabilities.zig");
 }
 
