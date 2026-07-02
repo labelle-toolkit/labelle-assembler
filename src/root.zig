@@ -1391,11 +1391,20 @@ pub fn generate(
     // Scope (#439 + #440): components + events + prefabs + hooks are scanned
     // and registered under the invisible `<pack>__<Name>` prefix (§4), and a
     // pack's own prefab JSONC has its local component refs rewritten to the
-    // prefixed form (`scanPack` → `rewritePackPrefabRefs`). DEFERRED with
+    // prefixed form (`scanPack` → `rewritePackPrefabRefs`).
+    //
+    // The per-pack `PackView` registry partition (#498, "wire the wall") is now
+    // GENERATED assembler-side: the component-registry block emits a
+    // `<pack>_pack_view = engine.PackView(Components, &.{…})` name-lens over the
+    // single full registry for every pack (see `writePackViewsBlock`).
+    // `Components` stays one flat registry (it feeds the serializer / bridge);
+    // the view is the pack's sanctioned string-keyed surface. STILL DEFERRED with
     // clean seams:
-    //   * the per-pack `global ++ own` registry partition / `PackView`
-    //     (#652-remainder) — today everything lands in one flat registry.
-    //   * `exposes` / `depends_on` DAG + isolation (#440 / §6).
+    //   * the per-pack Zig MODULE graph + the `@import("root")` bridge that wires
+    //     pack code to its view (so a foreign name is a compile error, not a
+    //     lint) — assembler#498 PRs 2–3.
+    //   * `exposes` surface module / `depends_on` import narrowing (#440 / §6) —
+    //     assembler#498 PR 4.
     //
     // The pack manifests reused below were parsed ONCE near the top of
     // `generate()` (`pack_entries`), where the dependency-validation gate AND

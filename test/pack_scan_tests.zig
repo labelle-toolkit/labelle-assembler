@@ -396,6 +396,67 @@ pub const PACK_EMISSION = struct {
         try std.testing.expect(contains(main_zig, "&citizens__overlay_inst,"));
     }
 
+    test "pack emits a PackView registry partition over its own component field names (#498)" {
+        const pack: generate.PackScan = .{
+            .name = "citizens",
+            .import_prefix = "packs/citizens",
+            .component_names = &.{ "Worker", "Home" },
+            .event_names = &.{},
+            .prefab_names = &.{},
+        };
+        const main_zig = try genWithPack(component_tmpl, cfg_with_pack, pack);
+        defer std.testing.allocator.free(main_zig);
+
+        // The per-pack partition is generated as a `PackView` over the single
+        // full `Components` registry (a name lens, not a second registry) …
+        try std.testing.expect(contains(main_zig, "pub const citizens_pack_view = engine.PackView(Components, &.{"));
+        // … whose allow-list is EXACTLY the namespaced registry field names the
+        // component block emitted (the serde/save keys), both entries present.
+        try std.testing.expect(contains(main_zig, "    \"citizens__Worker\",\n"));
+        try std.testing.expect(contains(main_zig, "    \"citizens__Home\",\n"));
+    }
+
+    test "pack view uses the sanitized <pack>__ prefix for a hyphenated pack name (#498)" {
+        const pack: generate.PackScan = .{
+            .name = "my-pack",
+            .import_prefix = "packs/my-pack",
+            .component_names = &.{"Worker"},
+            .event_names = &.{},
+            .prefab_names = &.{},
+        };
+        // A pack name is consumed as a plugin; declare the matching plugin so the
+        // unified-registry path is taken (mirrors `cfg_with_pack`).
+        const cfg: generate.ProjectConfig = .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "my-pack", .repo = "@packs/my-pack" }},
+        };
+        const main_zig = try genWithPack(component_tmpl, cfg, pack);
+        defer std.testing.allocator.free(main_zig);
+
+        // The view decl name + its allow-list entry both use the sanitized
+        // `my_pack__` prefix — byte-identical to the emitted registry field.
+        try std.testing.expect(contains(main_zig, "pub const my_pack_pack_view = engine.PackView(Components, &.{"));
+        try std.testing.expect(contains(main_zig, "    \"my_pack__Worker\",\n"));
+    }
+
+    test "a component-less pack emits no PackView (nothing to partition) (#498)" {
+        const pack: generate.PackScan = .{
+            .name = "citizens",
+            .import_prefix = "packs/citizens",
+            .component_names = &.{},
+            .event_names = &.{"worker_died"},
+            .prefab_names = &.{},
+        };
+        const main_zig = try genWithPack(events_tmpl, cfg_with_pack, pack);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(!contains(main_zig, "_pack_view"));
+        try std.testing.expect(!contains(main_zig, "engine.PackView("));
+    }
+
     test "no packs → component registry emission is unchanged (empty pack_scans is a no-op)" {
         const empty_pack_scans: []const generate.PackScan = &.{};
         generate.main_template.pack_scans = empty_pack_scans;
@@ -425,9 +486,10 @@ pub const PACK_EMISSION = struct {
         defer std.testing.allocator.free(main_zig);
 
         // Plugin-less, pack-less project keeps the plain ComponentRegistry and
-        // never references a packs/ path.
+        // never references a packs/ path — and emits no per-pack partition (#498).
         try std.testing.expect(contains(main_zig, "engine.ComponentRegistry(.{"));
         try std.testing.expect(!contains(main_zig, "packs/"));
+        try std.testing.expect(!contains(main_zig, "_pack_view"));
     }
 };
 
