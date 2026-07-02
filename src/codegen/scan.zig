@@ -484,14 +484,17 @@ fn isPascalCase(name: []const u8) bool {
 ///   - An entity with no pack-local flat key is left byte-identical — flat
 ///     engine-only entities load fine as-is (flat is RFC #596's recommended
 ///     shape), so everything the bug can't affect stays minimal-diff.
-///   - A mixed entity (explicit wrapper AND flat Pascal keys) is left
-///     alone: the engine drops the flat keys ("wrapper wins", warn-once),
-///     and preserving the bytes preserves that diagnostic — the pack copy
-///     must not silently behave differently from the same file at game
-///     root. For a reference, `"overrides"` OR `"components"` counts as the
-///     wrapper; for an inline entity only `"components"` does (an
-///     `"overrides"` key on an inline entity is a dead structural key the
-///     engine ignores, so it does not block the wrap).
+///   - A HYBRID entity — a `"components"` or `"overrides"` wrapper key AND
+///     flat Pascal keys COEXISTING in the author's text — is left
+///     byte-verbatim, whether inline or reference. That mix is rejected as
+///     `error.HybridForm` by this repo's scene validator
+///     (`scene_manifest.zig`, RFC #596 axis 2 — deliberately no reference
+///     check there) and gated the same way engine-side (#597, "wrapper
+///     wins" warn-once at load); the copy must keep tripping those
+///     diagnostics on the author's own bytes instead of masking the error
+///     with a second wrapper. Pure flat — Pascal keys with NO wrapper key
+///     anywhere on the entity — is never hybrid; that is exactly the shape
+///     this pass converts.
 ///   - Component payloads: a Pascal key INSIDE a moved value — the decoy,
 ///     `{ "Spawner": { "SkyBody": 3 } }` — is payload, copied verbatim.
 ///   - JSONC comments ride along verbatim with the pair they precede.
@@ -615,22 +618,26 @@ const FlatWrap = struct {
         const obj = try self.parseObject(allocator, at);
         defer allocator.free(obj.pairs);
 
-        // Entity classification — mirrors the engine's `entityPatch`
-        // (`unified_format.zig`): a string-valued `prefab` key makes this a
-        // reference (its patch map is spelled `overrides`); an explicit
-        // wrapper key suppresses the flat shape ("wrapper wins").
+        // Entity classification. `is_reference` (string-valued `prefab`,
+        // mirroring the engine's `entityPatch`) picks the wrapper SPELLING
+        // only. ANY pre-existing wrapper key — `components` OR `overrides`,
+        // reference or not — blocks the wrap entirely: a wrapper key
+        // coexisting with flat Pascal keys is the RFC #596 HYBRID form,
+        // rejected as `error.HybridForm` by this repo's scene validator
+        // (`scene_manifest.zig`, which deliberately has no reference check
+        // either) and gated the same way engine-side (#597). The author's
+        // text must keep tripping that diagnostic — synthesizing a second
+        // wrapper next to the existing one would mask the error (codex P2
+        // on #515).
         var is_reference = false;
-        var has_components = false;
-        var has_overrides = false;
+        var has_wrapper = false;
         var has_local_flat = false;
         for (obj.pairs) |p| {
             if (std.mem.eql(u8, p.key, "prefab") and s[p.value_start] == '"') is_reference = true;
-            if (std.mem.eql(u8, p.key, "components")) has_components = true;
-            if (std.mem.eql(u8, p.key, "overrides")) has_overrides = true;
+            if (std.mem.eql(u8, p.key, "components") or std.mem.eql(u8, p.key, "overrides")) has_wrapper = true;
             if (containsKey(self.component_keys, p.key)) has_local_flat = true;
         }
-        const wrapper_present = has_components or (is_reference and has_overrides);
-        const wrap = has_local_flat and !wrapper_present;
+        const wrap = has_local_flat and !has_wrapper;
 
         try out.append(allocator, '{');
         var emitted_any = false;
@@ -2404,7 +2411,10 @@ test "rewritePackLocalRefs: flat prefab reference wraps its patch as overrides, 
     // `"overrides"` — the engine's `entityPatch` treats `"components"` on a
     // prefab reference as a warned legacy synonym (RFC #560), while
     // `"overrides"` is the warning-free patch-map spelling. Inline entities
-    // (no `prefab`) wrap into `"components"` instead.
+    // (no `prefab`) wrap into `"components"` instead. Note this entity is
+    // PURE flat (no wrapper key anywhere), so it is NOT the HybridForm mix
+    // — a pre-existing `overrides`/`components` key would block the wrap
+    // entirely (see the hybrid tests below).
     const src =
         \\{ "prefab": "base", "Position": { "x": 5 }, "SkyBody": { "role": "moon" } }
     ;
@@ -2443,11 +2453,13 @@ test "rewritePackLocalRefs: flat root and flat child both wrap (#513)" {
 
 test "rewritePackLocalRefs: entity mixing wrapper and flat keys is left for the engine warn (#513)" {
     const allocator = std.testing.allocator;
-    // The engine's rule for a wrapper+flat mix is "wrapper wins, warn once,
-    // flat keys dropped" (`entityPatch`, RFC #596). The copy must not
-    // silently behave differently from the same file at game root, so the
-    // flat key stays byte-verbatim (still triggering the engine's
-    // mixed-shape warn) and only the wrapper's contents are namespaced.
+    // A wrapper key coexisting with flat Pascal keys is the RFC #596
+    // HYBRID form: this repo's scene validator hard-rejects it
+    // (`error.HybridForm`, `scene_manifest.zig`) and the engine gates it
+    // at load ("wrapper wins" warn-once, #597). The copy must not behave
+    // differently from the same file at game root, so the flat key stays
+    // byte-verbatim (keeping those diagnostics alive) and only the
+    // wrapper's contents are namespaced.
     const src =
         \\{ "components": { "SkyBody": { "role": "sun" } }, "CloudDrift": { "v": 1 } }
     ;
@@ -2460,27 +2472,24 @@ test "rewritePackLocalRefs: entity mixing wrapper and flat keys is left for the 
     try std.testing.expect(std.mem.indexOf(u8, out, "sky__CloudDrift") == null);
 }
 
-test "rewritePackLocalRefs: inline entity with a dead overrides key still wraps flat keys as components (#513)" {
+test "rewritePackLocalRefs: inline entity mixing overrides with flat keys is left for the HybridForm diagnostic (#513)" {
     const allocator = std.testing.allocator;
-    // On an INLINE entity (no `prefab`) the engine treats only
-    // `"components"` as the wrapper — an `"overrides"` key is a dead
-    // structural key it ignores (`entityPatch` consults `overrides` on
-    // references only). So it must NOT block the wrap: the flat pack key
-    // still moves into a synthesized `"components"` map, and the dead
-    // `"overrides"` stays at entity scope byte-verbatim. Exercises the
-    // `has_overrides=true, is_reference=false` → `wrapper_present=false`
-    // branch (CodeRabbit on #515).
+    // An `overrides` key coexisting with flat Pascal keys is the RFC #596
+    // HYBRID form on ANY entity — inline included: the repo's scene
+    // validator rejects it as `error.HybridForm` with deliberately no
+    // reference check (`scene_manifest.zig`), and engine #597 gates the
+    // same mix at every entity site. Wrapping the flat key into a second
+    // (`components`) wrapper here would mask the author's error, so the
+    // entity must come back byte-identical (codex P2 on #515 — this
+    // REVERSES the expectation CodeRabbit's round-1 sketch suggested).
+    // Hybrid = wrapper key AND flat Pascal keys COEXIST; pure flat (no
+    // wrapper key at all) still wraps — see the flat-reference test above.
     const src =
         \\{ "overrides": { "unused": 1 }, "SkyBody": { "role": "sun" } }
     ;
     const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
     defer allocator.free(out);
-
-    // The flat pack key wrapped into `components` and was namespaced …
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"components\": { \"sky__SkyBody\"") != null);
-    // … while the dead `overrides` map is untouched at entity scope.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"overrides\": { \"unused\": 1 }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"SkyBody\":") == null);
+    try std.testing.expectEqualStrings(src, out);
 }
 
 test "rewritePackLocalRefs: JSONC comments survive the flat wrap verbatim (#513)" {
