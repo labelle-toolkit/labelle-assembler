@@ -472,11 +472,15 @@ fn validateProviderContractsInner(
 /// allocation to free) when the package ships one, else `null` → the v1/enum
 /// path, unchanged.
 ///
-/// PRODUCTION NO-OP TODAY: no fetched external backend repo ships a v2 manifest
-/// yet (they ship the v1 `backend.manifest.zon`), so this returns null on every
-/// real `generate`, and generation stays byte-identical. It flips to the v2 path
-/// only once a backend actually ships the file (a later per-repo step) — or for
-/// the in-tree v2 fixtures a test selects via `backend_package`.
+/// LIVE AUTO-DETECTION (the #472 P2 cutover shipped): whether this fires on a
+/// real `generate` depends ONLY on the resolved backend package shipping the
+/// file — no caller opt-in. The in-tree sokol package (`local:backends/sokol`)
+/// and the v2 fixtures ship one; a fetched provider repo opts in per-repo by
+/// adding the file. When it fires, the detected name is threaded through every
+/// downstream site (template selection, loop-style, build.zig/zon, hook staging)
+/// — see test/build_zig_tests.zig `MANIFEST_V2_GENERATE_CUTOVER`. For a
+/// dual-manifest backend the v2 DESKTOP build.zig stays byte-identical to the
+/// v1/enum splice (the §7 anchor test).
 ///
 /// GRACEFUL DEGRADATION: any probe I/O error (package resolution failure, a
 /// missing dir, an access error, OOM building the path) falls back to null (the
@@ -897,8 +901,10 @@ pub fn generate(
     // (`requireManifestIfExternal`, `generateBuildZigZon`, `generateBuildZig`,
     // `stageBackendBuildHook`) so a v2-shipping backend drives the v2 codegen
     // WITHOUT the caller passing `backend_manifest_name`. `null` → the v1/enum
-    // path, unchanged. Production no-op today (no fetched backend ships a v2
-    // manifest yet); the in-tree v2 FIXTURES are reached only via `backend_package`.
+    // path, unchanged. Detection is LIVE: any resolved package shipping
+    // `backend.manifest.v2.zon` — the in-tree fixtures via `backend_package`, or
+    // a fetched provider repo that has added the file — drives the v2 path; a
+    // dual-manifest backend's desktop output stays byte-identical (§7 anchor).
     // Passing the detected name to `requireManifestIfExternal` is load-bearing: a
     // v2-ONLY external backend (no legacy `backend.manifest.zon`) must not be
     // rejected as manifest-less (the requirement keys off THIS name).
