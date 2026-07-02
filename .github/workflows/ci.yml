@@ -200,13 +200,24 @@ jobs:
       - name: Generate + build + run the asset-streaming-smoke example
         run: |
           cd labelle-assembler/examples/asset-streaming-smoke
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          # `.null` is an EXTRACTED external backend (#386 Phase 6c) — it
+          # resolves to the `labelle-null` package, not a bundled slot, so
+          # its `backend.manifest.zon` must be in the package cache before
+          # `generate` can splice the codegen. `install` populates that
+          # cache (remote-fetches `labelle-null`). Do it explicitly per
+          # step so this fixture is self-sufficient and order-independent
+          # rather than piggy-backing on another example's `labelle generate`
+          # → `ensureCache`. Mirrors the external-backend step's `$ASM install`.
+          $ASM install --project-root .
 
           # Invoke the assembler binary directly — labelle-cli's bundled
           # generator is pinned to an older release that predates the
           # `.null` Backend variant, so `labelle generate` would fail at
           # the project.labelle parse step. Same recipe as the null /
           # flows-smoke / plugin-controllers steps below.
-          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+          $ASM generate --project-root .
 
           # Codegen assertions — fail loudly if lazy-inference regresses
           # and the atlases stop deferring their PNG decode.
@@ -381,7 +392,17 @@ jobs:
       - name: Generate + build the flows-smoke example
         run: |
           cd labelle-assembler/examples/flows-smoke
-          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          # `.null` is an EXTRACTED external backend (#386 Phase 6c): its
+          # `backend.manifest.zon` must be in the package cache before
+          # `generate` can splice the codegen. Populate it explicitly so
+          # this fixture is self-sufficient / order-independent instead of
+          # relying on an earlier example's `ensureCache`. (See the
+          # asset-streaming-smoke step above for the full rationale.)
+          $ASM install --project-root .
+
+          $ASM generate --project-root .
 
           # Asserted output of the flow_scanner pass — fails loudly here
           # if a regression silently disables the scanner.

@@ -75,6 +75,7 @@ with no display / GPU. To see the sprites actually render, point
 
 ```sh
 cd examples/asset-streaming-smoke
+labelle-assembler install  --project-root .   # cache the labelle-null backend package (extracted external backend)
 labelle-assembler generate --project-root .
 cd .labelle/null_desktop
 zig build
