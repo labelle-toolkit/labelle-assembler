@@ -600,6 +600,47 @@ fn bundleHeaderOpen(src: []const u8) ?usize {
     return if (isOnlyMetaHeaderObject(src, first)) first else null;
 }
 
+/// Offset (key content start, for line/col reporting) of a legacy
+/// `"entities"` key inside an RFC #596 bundle's file-header element, or
+/// null when the file is not a bundle, has no header, or the header
+/// carries no such key (#521 codex P2).
+///
+/// PARITY NOTE — `entities` is deliberately NOT a header disqualifier:
+/// the engine's `isFileHeader` (v1.66.0) tolerates every lowercase key
+/// except `prefab`/`children`/`components`/`overrides`/`ref`, so
+/// `{ "meta": …, "entities": […] }` IS a header to the engine, and
+/// `classifyTopLevel` extracts only its `meta` — the `entities` list is
+/// dead data the loader never reads. The rewrite therefore keeps skipping
+/// the element byte-verbatim (rewriting inside it would mutate bytes the
+/// engine consumes as metadata); this probe exists solely so `generate`
+/// can surface the dead list as a warning — a bundle header carrying a
+/// legacy entity list is almost certainly an authoring mistake.
+pub fn bundleHeaderLegacyEntitiesOffset(src: []const u8) ?usize {
+    const header = bundleHeaderOpen(src) orelse return null;
+    const probe = FlatWrap{ .src = src, .component_keys = &.{} };
+    var i = header + 1;
+    while (true) {
+        i = probe.skipTrivia(i);
+        if (i >= src.len) return null;
+        if (src[i] == '}') return null;
+        if (src[i] != '"') return null;
+        const key_start = i + 1;
+        const key_end = probe.scanString(i) catch return null;
+        if (std.mem.eql(u8, src[key_start .. key_end - 1], "entities")) return key_start;
+        i = probe.skipTrivia(key_end);
+        if (i >= src.len or src[i] != ':') return null;
+        i = probe.skipTrivia(i + 1);
+        const value_end = probe.scanValue(i) catch return null;
+        i = probe.skipTrivia(value_end);
+        if (i >= src.len) return null;
+        if (src[i] == ',') {
+            i += 1;
+            continue;
+        }
+        return null;
+    }
+}
+
 /// Offset of the `{` opening the root-wrapper's entity value, or null when
 /// the file is not the legacy v1.0 — v1.x root-wrapper shape (#516).
 /// Mirrors the engine's `rootObject` (`file_obj.getObject("root") orelse
@@ -3091,6 +3132,36 @@ test "rewritePackLocalRefs: engine-only bundle and root-wrapper round-trip byte-
     const w_out = try rewritePackLocalRefs(allocator, wrapper, &.{"SkyBody"}, &.{"sun"}, "sky");
     defer allocator.free(w_out);
     try std.testing.expectEqualStrings(wrapper, w_out);
+}
+
+test "bundleHeaderLegacyEntitiesOffset: dead entities on a header are flagged, not rewritten (#521 codex)" {
+    const allocator = std.testing.allocator;
+    // Engine parity (v1.66.0 `isFileHeader`): `entities` does NOT
+    // disqualify a header — the engine still consumes the element as file
+    // metadata and extracts only `meta`, so the list inside is dead data it
+    // never loads. The rewrite must keep the element byte-verbatim
+    // (mutating it would rewrite engine-metadata bytes); this probe is what
+    // lets `generate` warn about the probable authoring mistake instead.
+    const src =
+        \\[
+        \\    { "meta": { "v": 1 }, "entities": [ { "SkyBody": { "role": "dead" } } ] },
+        \\    { "SkyBody": { "role": "sun" } }
+        \\]
+    ;
+    // The probe points at the header's `entities` key …
+    const off = bundleHeaderLegacyEntitiesOffset(src);
+    try std.testing.expect(off != null);
+    try std.testing.expect(std.mem.startsWith(u8, src[off.?..], "entities"));
+    // … an entity-first bundle (no header) and a clean header report nothing …
+    try std.testing.expect(bundleHeaderLegacyEntitiesOffset("[ { \"Position\": {} } ]") == null);
+    try std.testing.expect(bundleHeaderLegacyEntitiesOffset("[ { \"meta\": {} } ]") == null);
+    // … and the rewrite still skips the whole header verbatim: the dead
+    // pack key inside it stays bare while the live sibling namespaces.
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"entities\": [ { \"SkyBody\": { \"role\": \"dead\" } } ]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"components\": { \"sky__SkyBody\": { \"role\": \"sun\" }") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "sky__SkyBody"));
 }
 
 test "rewritePackHookHandlerNames: subdir pack event matches a bare handler (codex L435)" {

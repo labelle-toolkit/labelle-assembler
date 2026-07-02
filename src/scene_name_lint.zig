@@ -274,8 +274,10 @@ pub fn collectComponentRefs(arena: std.mem.Allocator, src: []const u8) ![]CompRe
 
 // ── Lint ────────────────────────────────────────────────────────────────
 
-/// 1-based line/column of a byte offset in `src`.
-fn locOf(src: []const u8, offset: usize) struct { line: usize, col: usize } {
+/// 1-based line/column of a byte offset in `src`. Public because the #516
+/// generate-time net driver (root.zig) also positions its bundle-header
+/// warning with it (#521).
+pub fn locOf(src: []const u8, offset: usize) struct { line: usize, col: usize } {
     var line: usize = 1;
     var col: usize = 1;
     const end = @min(offset, src.len);

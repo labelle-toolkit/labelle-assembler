@@ -865,15 +865,28 @@ fn rewritePackPrefabRefs(
 /// Log the #516 generate-time net findings for one rewritten pack-prefab
 /// copy: every component declaration still using one of the pack's own bare
 /// Pascal names after `scan.rewritePackLocalRefs` (see
-/// `scene_name_lint.findBareLocalRefs` for what a survivor means). Never
-/// fails the build — the net is a diagnostic, not a gate (mirrors
-/// `scanScenesDir`'s posture); allocation failure just drops the warning.
+/// `scene_name_lint.findBareLocalRefs` for what a survivor means), plus a
+/// bundle file-header that carries a legacy `"entities"` list (#521 codex
+/// P2) — the engine consumes a header as metadata and extracts only its
+/// `meta`, so such a list is dead data that never loads; the rewrite
+/// correctly skips it verbatim (engine parity, see
+/// `scan.bundleHeaderLegacyEntitiesOffset`), and this warning is what
+/// surfaces the probable authoring mistake. Never fails the build — the
+/// net is a diagnostic, not a gate (mirrors `scanScenesDir`'s posture);
+/// allocation failure just drops the warning.
 fn warnLeftoverBareKeys(
     allocator: std.mem.Allocator,
     path: []const u8,
     rewritten: []const u8,
     local_keys: []const []const u8,
 ) void {
+    if (scan.bundleHeaderLegacyEntitiesOffset(rewritten)) |off| {
+        const loc = scene_name_lint.locOf(rewritten, off);
+        std.log.warn(
+            "labelle-assembler: pack prefab copy '{s}':{d}:{d} — the bundle's file-header element carries a legacy \"entities\" list. The engine reads only `meta` from a bundle header (RFC #596), so those entities are dead data that never loads; move them out of the header into top-level bundle elements (ref labelle-assembler#521).",
+            .{ path, loc.line, loc.col },
+        );
+    }
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const refs = scene_name_lint.findBareLocalRefs(arena_state.allocator(), rewritten, local_keys) catch return;
