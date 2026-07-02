@@ -215,7 +215,7 @@ pub const PREVIEW_MODE = struct {
     // PBO async-readback codegen for the raylib desktop loop
     // (labelle-engine#544). Mirrors `backends/raylib/templates/desktop.txt`
     // placement: the `{{preview_readback}}` block sits between
-    // `g.renderGizmos()` / GUI draw and `window.endDrawing()`, so the
+    // `g.renderGizmos()` / GUI draw and `window.endFrame()`, so the
     // glReadPixels DMA hits the still-bound back buffer before raylib
     // swaps. The test uses a stripped-down lifecycle that mirrors the
     // real shape — full template assertions live in the smoke run
@@ -235,13 +235,13 @@ pub const PREVIEW_MODE = struct {
         \\    defer g.deinit();
         \\    g.setHooks(&hooks);
         \\{{preview_setup}}{{setup_code}}
-        \\    while (!window.windowShouldClose()) {
+        \\    while (!window.shouldQuit()) {
         \\        const dt: f32 = 0.016;
         \\{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
-        \\        window.beginDrawing();
+        \\        window.beginFrame();
         \\        g.render();
         \\        g.renderGizmos();
-        \\{{gui_draw_code}}{{preview_readback}}        window.endDrawing();
+        \\{{gui_draw_code}}{{preview_readback}}        window.endFrame();
         \\    }
         \\}
         \\

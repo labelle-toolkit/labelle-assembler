@@ -305,7 +305,7 @@ pub const PREVIEW_INPUT_DISPATCH_STUB =
 ;
 
 /// PBO-based async GPU→CPU readback that runs inside the raylib desktop
-/// frame loop, between `g.render*` and `window.endDrawing()`
+/// frame loop, between `g.render*` and `window.endFrame()`
 /// (labelle-engine#544).
 ///
 /// Translates the imgui-preview PoC's 3-deep PBO ring into the
@@ -320,7 +320,7 @@ pub const PREVIEW_INPUT_DISPATCH_STUB =
 /// 2 onwards we always have a mature PBO to map.
 ///
 /// Resize handling: the screen dims are read every frame from
-/// `window.getScreenWidth/Height`. When they differ from the last
+/// `window.width()`/`window.height()`. When they differ from the last
 /// published dims we tear the PBO ring + CPU buffer down, re-issue
 /// `Preview.beginFrameStream(w,h)` (idempotent — internally re-offers
 /// + frees the prior SHM ring), and reset the priming counter. The
@@ -557,7 +557,7 @@ pub const PREVIEW_READBACK_INIT_SOKOL =
 /// `sg.endPass(); sg.commit();`. We inject the readback BEFORE
 /// `window.endFrame()` so glReadPixels still hits the swapchain
 /// framebuffer (FBO 0 / GL_BACK) before the swap. Same shape as
-/// raylib's pre-`endDrawing()` placement.
+/// raylib's pre-`endFrame()` placement.
 pub const PREVIEW_READBACK_FRAME_SOKOL =
     \\        if (comptime _sokol_preview_gl_enabled) {
     \\            if (g.preview) |*_p| _readback: {
