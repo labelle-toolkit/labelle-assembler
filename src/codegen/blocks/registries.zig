@@ -93,6 +93,63 @@ pub fn Mixin(comptime Self: type) type {
             } else {
                 try w.writeAll("});\n\n");
             }
+
+            // Per-pack registry partition (labelle-engine#652, assembler#498).
+            // Appended into the SAME `{{component_registry_block}}` scalar right
+            // after `Components` — no new template placeholder — so the view
+            // aliases sit beside the full registry they partition.
+            try writePackViewsBlock(self, w);
+        }
+
+        /// Per-pack `PackView` partition aliases (Packs "wire the wall",
+        /// labelle-assembler#498 / labelle-engine#652).
+        ///
+        /// For every pack with at least one component, emit
+        ///
+        /// ```zig
+        /// pub const <pack>_pack_view = engine.PackView(Components, &.{
+        ///     "<pack>__<Pascal>",
+        ///     …
+        /// });
+        /// ```
+        ///
+        /// `Components` stays the SINGLE full registry (it feeds
+        /// `GameConfigWithYAxis`, `JsoncBridge`, and the serializer); the view
+        /// is a NAME LENS onto it — the pack's sanctioned string-keyed surface.
+        /// `own_names` are the pack's **namespaced registry field names**
+        /// (`<prefix>__<Pascal>`), byte-identical to the strings
+        /// `writeComponentRegistryBlock` emitted as `Components` fields — which
+        /// are also the serde/save keys, so the allow-list must match them
+        /// exactly. The engine's `ComponentView` `@compileError`s on any
+        /// foreign-private name resolved through the view.
+        ///
+        /// The `<pack>_pack_view` decl name mirrors the guide/ticket
+        /// (`citizens_pack_view`). Pack code reaches its view via
+        /// `@import("root").<pack>_pack_view` — the `@import("root")` bridge +
+        /// self-import land with the per-pack module (assembler#498 PRs 2–3), so
+        /// today these aliases are generated but not yet referenced by pack code
+        /// (they compile: `engine` is imported and `Components` is in scope).
+        ///
+        /// Gated on pack presence AND per-pack on the pack owning ≥1 component:
+        /// a pack-less project (or a component-less pack) emits nothing, keeping
+        /// generation byte-identical for every project that isn't using packs.
+        pub fn writePackViewsBlock(self: *Self, w: anytype) !void {
+            if (self.pack_scans.len == 0) return;
+            var pack_prefix_buf: [128]u8 = undefined;
+            var pascal_buf: [128]u8 = undefined;
+            for (self.pack_scans) |pack| {
+                if (pack.component_names.len == 0) continue;
+                const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
+                try w.print(
+                    "// Per-pack registry partition (labelle-engine#652).\npub const {s}_pack_view = engine.PackView(Components, &.{{\n",
+                    .{prefix},
+                );
+                for (pack.component_names) |name| {
+                    const pascal = pathToPascal(name, &pascal_buf);
+                    try w.print("    \"{s}__{s}\",\n", .{ prefix, pascal });
+                }
+                try w.writeAll("});\n\n");
+            }
         }
 
         /// System registry block + Plugin controllers block (appended into
