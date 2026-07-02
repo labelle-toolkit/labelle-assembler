@@ -1,1 +1,0 @@
-pub const CoinMarker = struct {};
