@@ -245,22 +245,6 @@ jobs:
           LABELLE_NULL_FRAMES=10 ./zig-out/bin/asset_streaming_smoke
           echo "PASS: asset-streaming-smoke generated + built + ran headless on null"
 
-      # Gamepad input demo (raylib + imgui). Build-only, same recipe as the
-      # raylib example. Exercises the engine input-mixin gamepad forwarders
-      # (`isGamepad*` / `getGamepadAxisValue`) plus the raylib+imgui GUI path
-      # (rlImGui bridge). STACKED on the engine input-mixin PR: the example
-      # pins `engine_version` at that PR's branch. Once it merges, repin to
-      # `local:../../../labelle-engine` (the `main` checkout this job uses) and
-      # this step builds against the sibling engine checkout like the others.
-      - name: Generate + build the gamepad example
-        env:
-          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
-        run: |
-          cd labelle-assembler/examples/gamepad
-          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
-          cd .labelle/raylib_desktop
-          zig build
-
       # External (out-of-tree) backend wiring, backend-AGNOSTIC. Proves the
       # opt-in `.backend_package` path end-to-end: `install` FETCHES the backend
       # package from GitHub into the cache, then `generate` stages it + codegens
@@ -296,8 +280,9 @@ jobs:
       # (backends/sdl_gamepad/sim — see its README). Attaches an
       # in-process SDL2 virtual gamecontroller, drives every button and
       # axis, and asserts the toolkit Source reports each one back with
-      # the correct canonical mapping. The gamepad example step above
-      # only proves the source COMPILES; this proves connect detection,
+      # the correct canonical mapping. The gamepad example (now in
+      # labelle-raylib) only proves the source COMPILES; this proves
+      # connect detection,
       # button routing, axis scaling/sign, and the synthesized
       # analog-trigger button actually behave — headless, no window, no
       # input devices on the runner needed.
