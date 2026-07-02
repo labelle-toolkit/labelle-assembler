@@ -788,7 +788,10 @@ pub fn scanPack(
 ///     declares pack-local components is converted to the wrapped shape in
 ///     the copy, because a namespaced (lowercase-starting) key would be
 ///     silently dropped by the engine's case-based flat-key classification
-///     (see `scan.wrapFlatEntityComponents`).
+///     (see `scan.wrapFlatEntityComponents`). All three engine-accepted
+///     top-level FILE shapes are walked (#516): the plain entity object,
+///     RFC #596 file-as-array bundles (only-`meta` header skipped), and
+///     legacy `"root"`-wrapper files.
 ///   - **Prefab references** — a `"prefab": "worker"` value naming one of the
 ///     pack's OWN prefabs becomes `"prefab": "citizens__worker"`, matching the
 ///     namespaced registration key so a same-pack prefab composition resolves
