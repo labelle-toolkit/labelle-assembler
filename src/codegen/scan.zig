@@ -2460,6 +2460,29 @@ test "rewritePackLocalRefs: entity mixing wrapper and flat keys is left for the 
     try std.testing.expect(std.mem.indexOf(u8, out, "sky__CloudDrift") == null);
 }
 
+test "rewritePackLocalRefs: inline entity with a dead overrides key still wraps flat keys as components (#513)" {
+    const allocator = std.testing.allocator;
+    // On an INLINE entity (no `prefab`) the engine treats only
+    // `"components"` as the wrapper — an `"overrides"` key is a dead
+    // structural key it ignores (`entityPatch` consults `overrides` on
+    // references only). So it must NOT block the wrap: the flat pack key
+    // still moves into a synthesized `"components"` map, and the dead
+    // `"overrides"` stays at entity scope byte-verbatim. Exercises the
+    // `has_overrides=true, is_reference=false` → `wrapper_present=false`
+    // branch (CodeRabbit on #515).
+    const src =
+        \\{ "overrides": { "unused": 1 }, "SkyBody": { "role": "sun" } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(out);
+
+    // The flat pack key wrapped into `components` and was namespaced …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"components\": { \"sky__SkyBody\"") != null);
+    // … while the dead `overrides` map is untouched at entity scope.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"overrides\": { \"unused\": 1 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"SkyBody\":") == null);
+}
+
 test "rewritePackLocalRefs: JSONC comments survive the flat wrap verbatim (#513)" {
     const allocator = std.testing.allocator;
     // Line comment leading a moved pair, block comment inside a moved
