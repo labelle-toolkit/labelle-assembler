@@ -1,0 +1,64 @@
+.{
+    // ── THIRD-PARTY CALLBACK backend manifest, SCHEMA v2 (assembler#501) ──────
+    // A HYPOTHETICAL third-party backend that declares a CALLBACK run-loop
+    // (`loop_style = .callback`) — the windowing runtime owns the loop and calls
+    // back into the generated game per frame — with NO matching `Backend` enum
+    // tag. It is selected purely by NAME + package (`.backend_package = .{ .name
+    // = "acme_callback", .. }`), and it declares which callback-lifecycle blocks
+    // its entry template consumes via `.platforms.desktop.lifecycle`.
+    //
+    // Before assembler#501, codegen rejected ANY string-named callback backend
+    // at generate time (`error.ExternalCallbackBackendUnsupported`) — only the
+    // enum-tag-backed sokol/bgfx and loop-style externals were wired. The
+    // `.lifecycle` declaration below lifts that rejection: it names the CLOSED,
+    // assembler-known block set (flags only, never Zig source) the entry
+    // template's holes consume, and the assembler owns the block bodies.
+    //
+    // Modeled on `backends/acme_foo` (name-only, hookless, headless, desktop-
+    // only, pure-Zig, zero native deps): a TEST FIXTURE dir shipping ONLY this
+    // manifest + one entry template — codegen reads them offline.
+    .manifest_version = 2,
+    .dir_name = "acme_callback",
+    // A third party names its own dependency however it likes — NOT the
+    // `labelle_*` convention. Emitted verbatim into `b.dependency("acme_callback", ..)`.
+    .dep_name = "acme_callback",
+    // NON-`labelle.` vendor namespace (the reserved `labelle.*` namespace is
+    // rejected for a third party); a genuine third party uses `<vendor>.<name>`.
+    .id = "acme.callback",
+
+    // Advertises only `.headless` — a project requiring any other capability
+    // fails the resolve-time capability check before any build-graph is emitted.
+    .capabilities = .{.headless},
+
+    // root_alias defaults to `backend_<name>`, so the generated root imports these
+    // as `backend_gfx`/`backend_input`/… exactly as every other backend does.
+    .modules = .{
+        .{ .name = "gfx", .source = "src/gfx.zig" },
+        .{ .name = "input", .source = "src/input.zig" },
+        .{ .name = "audio", .source = "src/audio.zig" },
+        .{ .name = "window", .source = "src/window.zig" },
+    },
+
+    // No dep_options / system_libs / frameworks: pure Zig, nothing native to link.
+
+    .platforms = .{
+        // Desktop-only, headless, CALLBACK-driven. The runtime owns the loop and
+        // invokes the exported init/frame/cleanup callbacks; the generated game
+        // declares a module-scope `runner` and a `cleanup` teardown callback, so
+        // it declares exactly those two lifecycle blocks. The sokol readback,
+        // imgui-bridge externs, and bgfx shell registration are NOT declarable
+        // (they reference backend-private symbols), so preview/allocator/gui_event
+        // stay off — a third-party callback backend gets PREVIEW_HELPERS + the
+        // input-dispatch stub in `{{module_vars}}` and empty preview holes.
+        .desktop = .{
+            .entry = "templates/desktop.txt",
+            .loop_style = .callback,
+            .lifecycle = .{ .runner_module_var = true, .cleanup_callback = true },
+            .target = .native,
+            .package = .binary,
+        },
+        // No android/ios/wasm — desktop only.
+    },
+
+    // No build_hook — a fully declarative, HOOKLESS backend.
+}

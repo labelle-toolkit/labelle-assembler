@@ -17,7 +17,7 @@ pub const flow_catalog = @import("flow_catalog.zig");
 pub const pack_manifest = @import("manifest.zig");
 const build_files = @import("build_files.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
-const manifest_v2 = @import("codegen/manifest_v2.zig");
+pub const manifest_v2 = @import("codegen/manifest_v2.zig");
 const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
 const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
@@ -565,6 +565,34 @@ pub fn resolveLoopStyleOverride(
         override = manifest_splice.loopStyle(m);
     }
     return override;
+}
+
+/// Resolve the callback-lifecycle-blocks declaration for `main.zig` codegen from
+/// the v2 backend manifest's `.platforms[<platform>].lifecycle` (assembler#501).
+/// `null` → no declaration (built-ins keep the enum-predicate shape; an
+/// UNDECLARED callback external is still rejected in `lifecycle/render.zig`).
+///
+/// Lifecycle blocks are a v2-ONLY concept — the v1 splice has no such field — so
+/// this only inspects the detected named v2 manifest. Mirrors the `.v2` case of
+/// `resolveLoopStyleOverride`; a load error is swallowed (fall back to null, same
+/// probing discipline). The returned `Lifecycle` is a copy of trivial bool
+/// flags, so it stays valid after the parsed manifest is freed.
+pub fn resolveLifecycleOverride(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    game_dir: []const u8,
+    backend_manifest_name: ?[]const u8,
+) !?manifest_v2.BackendManifestV2.PlatformEntry.Lifecycle {
+    const name = backend_manifest_name orelse return null;
+    const parsed = manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name) catch return null;
+    defer parsed.free(allocator);
+    switch (parsed) {
+        .v2 => |m| {
+            const entry = manifest_v2_splice.platformEntry(m, cfg.platform) orelse return null;
+            return entry.lifecycle;
+        },
+        .v1 => return null,
+    }
 }
 
 /// Copy + scan one convention subdir of a pack into the generated target,
@@ -1725,6 +1753,14 @@ pub fn generate(
         // reads the top-level `loop_style`. Both map onto the same override enum.
         defer main_zig.main_template.loop_style_override = null;
         main_zig.main_template.loop_style_override = try resolveLoopStyleOverride(allocator, cfg, game_dir, backend_manifest_name);
+
+        // Callback-lifecycle-blocks declaration (assembler#501) — resolved from
+        // the SAME v2 manifest's `.platforms.<platform>.lifecycle`. Non-null
+        // lifts the callback-external rejection AND drives the render shape for
+        // a declared third-party callback backend. Same scoped-threadlocal
+        // pattern; null keeps the built-in enum-predicate shape.
+        defer main_zig.main_template.lifecycle_override = null;
+        main_zig.main_template.lifecycle_override = try resolveLifecycleOverride(allocator, cfg, game_dir, backend_manifest_name);
 
         // Pack dir-scan results (Packs RFC §4, #439) — same module-level-var
         // pattern as loop_style_override, so the ~19-arg generator signature

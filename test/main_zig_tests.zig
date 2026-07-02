@@ -567,6 +567,82 @@ pub const NULL_BACKEND = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn frame() callconv(.c) void") != null);
     }
 
+    test "third-party callback backend with a declared lifecycle GENERATES (assembler#501)" {
+        // The end goal: a STRING-NAMED callback backend (no enum tag, `cfg.backend`
+        // at its `.raylib` default) that declares its callback-lifecycle blocks in
+        // its v2 manifest generates a valid callback main — no
+        // `error.ExternalCallbackBackendUnsupported`. The manifest declaration is
+        // threaded via the `lifecycle_override` threadlocal (production resolves the
+        // SAME value from `.platforms.desktop.lifecycle` via
+        // `resolveLifecycleOverride`); `loop_style_override = .callback` mirrors the
+        // manifest's `loop_style` so `use_callback_lifecycle` fires without an enum tag.
+        generate.main_template.loop_style_override = .callback;
+        defer generate.main_template.loop_style_override = null;
+        generate.main_template.lifecycle_override = h.acme_callback_lifecycle_decl;
+        defer generate.main_template.lifecycle_override = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .platform = .desktop,
+            .backend_package = h.acme_callback_fixture_package,
+            .ecs = .mock,
+        }, h.acme_callback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // Callback shape: exported C callbacks + the module-scope runner the
+        // declared `runner_module_var` block emits (via `{{module_vars}}`), plus
+        // the `cleanup_callback` teardown (`runner.deinit();`).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn init() callconv(.c) void") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn frame() callconv(.c) void") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn cleanup() callconv(.c) void") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var runner: Runner = undefined;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "runner.deinit();") != null);
+        // NOT the loop shape — no `while (!windowShouldClose())` marker.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "windowShouldClose") == null);
+        // NO backend-private holes leaked in: no sokol readback, no imgui bridge.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "imgui_bridge_handle_event") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview") == null);
+    }
+
+    test "third-party callback main.zig matches its reviewed golden (assembler#501)" {
+        // First main.zig GOLDEN (deliberate: this third-party callback cell has no
+        // enum baseline to byte-anchor against, so a reviewed golden is the gate).
+        // Regenerate with `zig build` + capture on an intentional change.
+        generate.main_template.loop_style_override = .callback;
+        defer generate.main_template.loop_style_override = null;
+        generate.main_template.lifecycle_override = h.acme_callback_lifecycle_decl;
+        defer generate.main_template.lifecycle_override = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .platform = .desktop,
+            .backend_package = h.acme_callback_fixture_package,
+            .ecs = .mock,
+        }, h.acme_callback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        const golden = @embedFile("goldens/acme_callback_main.zig");
+        try std.testing.expectEqualStrings(golden, main_zig);
+    }
+
+    test "a v2 callback entry WITHOUT a lifecycle declaration is STILL rejected (assembler#501)" {
+        // Negative B: relaxing the gate must NOT drop the fail-fast for an
+        // UNDECLARED callback external. `loop_style_override = .callback` forces
+        // `use_callback_lifecycle`, the backend is external + non-enum-tag-backed,
+        // and `lifecycle_override` stays null (no `.lifecycle` in the manifest) —
+        // so the reworded `error.ExternalCallbackBackendUnsupported` must fire.
+        generate.main_template.loop_style_override = .callback;
+        defer generate.main_template.loop_style_override = null;
+        // lifecycle_override deliberately left at its null default.
+
+        try std.testing.expectError(error.ExternalCallbackBackendUnsupported, generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .platform = .desktop,
+            .backend_package = .{ .name = "undeclaredcb", .repo = "local:../ucb" },
+            .ecs = .mock,
+        }, h.acme_callback_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions));
+    }
+
     test "raylib desktop (external-by-default) STILL emits the PBO preview readback (#386 flip regression)" {
         // Post-#386 flip `.backend = .raylib` resolves to labelle-raylib, so
         // `cfg.isExternal()` is now true even for the DEFAULT raylib. The render

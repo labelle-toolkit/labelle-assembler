@@ -36,6 +36,7 @@ const script_scanner = @import("../script_scanner.zig");
 const scene_manifest = @import("../scene_manifest.zig");
 const scan = @import("scan.zig");
 const manifest_splice = @import("manifest_splice.zig");
+const manifest_v2 = @import("manifest_v2.zig");
 
 const asset_wiring = @import("blocks/asset_wiring.zig");
 const scene_manifests_block = @import("blocks/scene_manifests.zig");
@@ -110,6 +111,11 @@ pub const Codegen = struct {
     lifecycle_tmpl: []const u8 = "",
     hooks_init: []const u8 = "",
     loop_style_override: ?manifest_splice.BackendManifest.LoopStyle = null,
+    // Manifest-declared callback-lifecycle blocks (assembler#501). Non-null
+    // lifts the callback-external rejection AND drives the render shape for a
+    // declared third-party callback backend. Same borrowed-by-value discipline
+    // as `loop_style_override`. Null keeps the enum-predicate shape.
+    lifecycle_override: ?manifest_v2.BackendManifestV2.PlatformEntry.Lifecycle = null,
 
     // wasm-only: true when the backend's `templates/wasm.txt` ships its OWN
     // `pub const panic` (and typically `std_options`) — e.g. bgfx routes panics

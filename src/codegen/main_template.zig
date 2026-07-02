@@ -31,6 +31,7 @@ const validate = @import("validate.zig");
 const context = @import("context.zig");
 const hooks_block = @import("blocks/hooks.zig");
 const manifest_splice = @import("manifest_splice.zig");
+const manifest_v2 = @import("manifest_v2.zig");
 
 /// Manifest-driven run-loop splice (pluggable-backends RFC, assembler#378).
 /// When non-null, the run-loop style was resolved from the backend manifest's
@@ -43,6 +44,15 @@ const manifest_splice = @import("manifest_splice.zig");
 /// verbatim. For bgfx-desktop the manifest declares `.loop`, so the resolved
 /// `use_callback_lifecycle` is false — identical to the enum path.
 pub threadlocal var loop_style_override: ?manifest_splice.BackendManifest.LoopStyle = null;
+
+/// Manifest-declared callback-lifecycle blocks (assembler#501). Set by
+/// `root.zig` from the v2 manifest's `.platforms.<platform>.lifecycle` right
+/// before the `generateMainZigFromTemplate` call and cleared after — the same
+/// scoped-threadlocal pattern as `loop_style_override` (kept off the ~19-arg
+/// generator signature). Non-null both lifts the callback-external rejection
+/// AND drives the render shape for a declared third-party callback backend.
+/// Null keeps the enum-predicate shape verbatim for every built-in.
+pub threadlocal var lifecycle_override: ?manifest_v2.BackendManifestV2.PlatformEntry.Lifecycle = null;
 
 /// Pack dir-scan results (Packs RFC §4, labelle-assembler#439). Each entry
 /// carries one pack's scanned component/event/prefab stems + its
@@ -424,9 +434,10 @@ pub fn generateMainZigFromTemplate(
         ctx.lifecycle_tmpl = lifecycle_tmpl;
         ctx.hooks_init = data.scalars.get("hooks_init_block") orelse "    var hooks = GameHooks{};\n";
         ctx.loop_style_override = loop_style_override;
+        ctx.lifecycle_override = lifecycle_override;
         const b = try block(allocator, &allocs, struct {
             fn emit(c: *Codegen, w: anytype, _: *[256]u8) !void {
-                try c.renderLifecycle(w, c.lifecycle_tmpl, c.hooks_init, c.loop_style_override);
+                try c.renderLifecycle(w, c.lifecycle_tmpl, c.hooks_init, c.loop_style_override, c.lifecycle_override);
             }
         }.emit, &ctx, &ident_buf);
         try data.scalars.put("lifecycle", b);
