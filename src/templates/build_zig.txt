@@ -782,6 +782,23 @@ pub fn build(b: *std.Build) void {
     // relocations. See labelle-assembler#147.
     sokol_clib.root_module.pic = true;
 
+    // Unify the app's core onto the sokol `input` module (labelle-core#310).
+    // The sokol Android seam adapter (`backends/sokol/src/android.zig`, reached
+    // via `backend_input.android`) imports labelle-core for the
+    // `AndroidBackendContext` vtable the generated main hands to
+    // `engine.core.registerAndroidBackend(...)`. Without this override `input`
+    // resolves its OWN pinned core tarball — a DIFFERENT module instance than
+    // engine/gfx — so the registered context's type would not match the
+    // engine's `engine.core.AndroidBackendContext` and the call fails to
+    // type-check. On Android the sokol input module registers this import under
+    // `labelle-core` (build.zig, the `is_android` branch), so the guarded
+    // override lands only there. Mirror of `.backend_bgfx_android` below; this
+    // is the first consumer of the sokol-Android manifest-splice path
+    // (labelle-assembler#520), which is why the gap surfaced now.
+    if (backend_input.import_table.get("labelle-core")) |_| {
+        overrideImport(backend_input, "labelle-core", core_mod);
+    }
+
 .backend_bgfx_android
     // bgfx Android backend (#303). The backend's build.zig detects the
     // Android ABI from the resolved target and: builds gfx/input/audio/
