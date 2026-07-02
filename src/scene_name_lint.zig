@@ -440,6 +440,10 @@ pub fn findBareLocalRefs(
 ) ![]BareLocalRef {
     const refs = try collectComponentRefs(arena, src);
     var out: std.ArrayList(BareLocalRef) = .empty;
+    // No-op under the documented arena contract, but keeps the growth path
+    // leak-free if a future caller passes a general-purpose allocator
+    // (Gemini on #521).
+    errdefer out.deinit(arena);
     for (refs) |ref| {
         if (!containsStr(local_keys, ref.name)) continue;
         const loc = locOf(src, ref.offset);
