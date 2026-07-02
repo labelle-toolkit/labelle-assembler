@@ -23,6 +23,7 @@ const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
 pub const pack_validate = @import("pack_validate.zig");
+const scene_name_lint = @import("scene_name_lint.zig");
 const gui_resolve = @import("gui_resolve.zig");
 pub const app_icon = @import("app_icon.zig");
 const scan = @import("codegen/scan.zig");
@@ -788,7 +789,10 @@ pub fn scanPack(
 ///     declares pack-local components is converted to the wrapped shape in
 ///     the copy, because a namespaced (lowercase-starting) key would be
 ///     silently dropped by the engine's case-based flat-key classification
-///     (see `scan.wrapFlatEntityComponents`).
+///     (see `scan.wrapFlatEntityComponents`). All three engine-accepted
+///     top-level FILE shapes are walked (#516): the plain entity object,
+///     RFC #596 file-as-array bundles (only-`meta` header skipped), and
+///     legacy `"root"`-wrapper files.
 ///   - **Prefab references** — a `"prefab": "worker"` value naming one of the
 ///     pack's OWN prefabs becomes `"prefab": "citizens__worker"`, matching the
 ///     namespaced registration key so a same-pack prefab composition resolves
@@ -844,12 +848,53 @@ fn rewritePackPrefabRefs(
         const rewritten = try scan.rewritePackLocalRefs(allocator, src, keys.items, prefab_names, prefix);
         defer allocator.free(rewritten);
 
+        // Generate-time net (#516): a component-declaration position that
+        // still uses one of the pack's own BARE names after the rewrite will
+        // NOT attach at load — warn now instead of failing silently there.
+        warnLeftoverBareKeys(allocator, path, rewritten, keys.items);
+
         // Only rewrite the file when the content actually changed — avoids
         // churning mtimes (and the build cache) on prefabs with no local refs.
         if (std.mem.eql(u8, rewritten, src)) continue;
         var f = try cwd.createFile(io, path, .{});
         defer f.close(io);
         try f.writeStreamingAll(io, rewritten);
+    }
+}
+
+/// Log the #516 generate-time net findings for one rewritten pack-prefab
+/// copy: every component declaration still using one of the pack's own bare
+/// Pascal names after `scan.rewritePackLocalRefs` (see
+/// `scene_name_lint.findBareLocalRefs` for what a survivor means), plus a
+/// bundle file-header that carries a legacy `"entities"` list (#521 codex
+/// P2) — the engine consumes a header as metadata and extracts only its
+/// `meta`, so such a list is dead data that never loads; the rewrite
+/// correctly skips it verbatim (engine parity, see
+/// `scan.bundleHeaderLegacyEntitiesOffset`), and this warning is what
+/// surfaces the probable authoring mistake. Never fails the build — the
+/// net is a diagnostic, not a gate (mirrors `scanScenesDir`'s posture);
+/// allocation failure just drops the warning.
+fn warnLeftoverBareKeys(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    rewritten: []const u8,
+    local_keys: []const []const u8,
+) void {
+    if (scan.bundleHeaderLegacyEntitiesOffset(rewritten)) |off| {
+        const loc = scene_name_lint.locOf(rewritten, off);
+        std.log.warn(
+            "labelle-assembler: pack prefab copy '{s}':{d}:{d} — the bundle's file-header element carries a legacy \"entities\" list. The engine reads only `meta` from a bundle header (RFC #596), so those entities are dead data that never loads; move them out of the header into top-level bundle elements (ref labelle-assembler#521).",
+            .{ path, loc.line, loc.col },
+        );
+    }
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const refs = scene_name_lint.findBareLocalRefs(arena_state.allocator(), rewritten, local_keys) catch return;
+    for (refs) |ref| {
+        std.log.warn(
+            "labelle-assembler: pack prefab copy '{s}':{d}:{d} still declares component '{s}' by its bare local name after the pack rewrite — it will NOT attach at load. Either the entity mixes a components/overrides wrapper with flat keys (RFC #596 hybrid — pick one shape), or the key sits where the engine never reads it, or the file's shape escaped the rewriter (ref labelle-assembler#516).",
+            .{ path, ref.line, ref.col, ref.name },
+        );
     }
 }
 
