@@ -96,6 +96,7 @@ pub fn runLint(arena: std.mem.Allocator, io: std.Io, root: []const u8) !LintResu
 
     var findings: std.ArrayList(check.Finding) = .empty;
     for (packs, 0..) |pack, i| {
+        const foreign = try foreignPacksFor(arena, packs, i);
         const ctx = check.Context{
             .current_prefix = pack.prefix,
             .pack_prefixes = shared.pack_prefixes,
@@ -103,6 +104,8 @@ pub fn runLint(arena: std.mem.Allocator, io: std.Io, root: []const u8) !LintResu
             .events = shared.events,
             .global_facets = shared.global_facets,
             .dependents_of_current = shared.dependents[i],
+            .current_pack_dir = pack.dir,
+            .foreign_packs = foreign,
         };
         try check.scanPackDir(arena, io, &findings, pack.dir, ctx);
     }
@@ -243,6 +246,30 @@ fn collectStemsRec(
             else => {},
         }
     }
+}
+
+/// Build the `ForeignPack` view for the pack at `current_idx`: every OTHER
+/// discovered pack, tagged `allowed` when the current pack declares it in
+/// `depends_on` (or it is the implicit `contracts` root). Drives the
+/// cross-pack-import rule (rule 4) — an import into an `allowed == false`
+/// pack's tree is the flagged reach-around.
+fn foreignPacksFor(arena: std.mem.Allocator, packs: []const Pack, current_idx: usize) ![]const check.ForeignPack {
+    const cur = packs[current_idx];
+    var list: std.ArrayList(check.ForeignPack) = .empty;
+    for (packs, 0..) |other, j| {
+        if (j == current_idx) continue;
+        const allowed = std.mem.eql(u8, other.name, "contracts") or
+            containsStr(cur.depends_on, other.name);
+        try list.append(arena, .{ .name = other.name, .dir = other.dir, .allowed = allowed });
+    }
+    return list.toOwnedSlice(arena);
+}
+
+fn containsStr(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |h| {
+        if (std.mem.eql(u8, h, needle)) return true;
+    }
+    return false;
 }
 
 // ── Shared context (owner maps + DAG) ────────────────────────────────────
@@ -484,6 +511,7 @@ test "runLint: a fixture violating all three rules is flagged" {
         .raw_global_facet_write => saw_facet = true,
         .event_direction_inversion => saw_evt = true,
         .scene_bare_pack_component => {},
+        .cross_pack_import => {},
     };
     try testing.expect(saw_reg);
     try testing.expect(saw_facet);
@@ -523,6 +551,70 @@ test "runLint: a clean fixture passes" {
 
     try testing.expectEqual(@as(usize, 3), result.pack_count);
     try testing.expectEqual(@as(usize, 0), result.findings.len);
+}
+
+test "runLint: a pack @importing a non-dependency pack's file is flagged (rule 4)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try scaffoldFixture(io, tmp.dir);
+
+    // citizens depends_on {contracts} only — it does NOT declare production.
+    // Reaching into production's source tree by file import is the #656
+    // reach-around: caught textually even though no registry/view is used.
+    try writeFile(io, tmp.dir, "packs/citizens/scripts/00_peek.zig",
+        \\const Produced = @import("../../production/events/item_produced.zig").ItemProduced;
+        \\pub fn tick() void { _ = Produced; }
+    );
+    // A clean production file (imports only its declared contracts dep — allowed).
+    try writeFile(io, tmp.dir, "packs/production/scripts/00_work.zig",
+        \\const Locked = @import("../../contracts/components/locked.zig").Locked;
+        \\pub fn work() void { _ = Locked; }
+    );
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const result = try runLint(arena, io, root);
+
+    try testing.expectEqual(@as(usize, 3), result.pack_count);
+    var saw_import = false;
+    for (result.findings) |f| {
+        if (f.rule == .cross_pack_import) {
+            saw_import = true;
+            try testing.expect(std.mem.indexOf(u8, f.message, "production") != null);
+            try testing.expect(std.mem.endsWith(u8, f.file, "00_peek.zig"));
+        }
+    }
+    try testing.expect(saw_import);
+}
+
+test "runLint: a pack @importing its DECLARED dependency's file is clean (rule 4)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try scaffoldFixture(io, tmp.dir);
+
+    // production depends_on {citizens, contracts}; importing citizens' and
+    // contracts' files is permitted (no module wall yet, RFC §6).
+    try writeFile(io, tmp.dir, "packs/production/scripts/00_work.zig",
+        \\const Worker = @import("../../citizens/components/worker.zig").Worker;
+        \\const Locked = @import("../../contracts/components/locked.zig").Locked;
+        \\pub fn work() void { _ = Worker; _ = Locked; }
+    );
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const result = try runLint(arena, io, root);
+
+    for (result.findings) |f| {
+        try testing.expect(f.rule != .cross_pack_import);
+    }
 }
 
 test "runLint: a game-root scene using a bare pack-component name is flagged (#490)" {

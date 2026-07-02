@@ -43,6 +43,22 @@
 //!    scanner can't trace); the *compile-time* direction wall is future
 //!    work.
 //!
+//! 4. **cross-pack file imports** (`cross_pack_import`). A pack `@import`s a
+//!    source file that lives inside ANOTHER pack's directory without
+//!    declaring that pack in `depends_on`. This is the direct-TYPE-import
+//!    reach-around engine #656 identified as the real ACL escape: instead of
+//!    recovering a foreign type through the registry (rule 1) it imports the
+//!    foreign component/type file outright. Detected TEXTUALLY — a literal
+//!    relative-path `@import("../../other/x.zig")` whose resolved path is under a
+//!    foreign pack's on-disk directory. This closes the *blatant* literal
+//!    case; it deliberately does NOT chase semantic routes (a re-export
+//!    chain, a type reached through a value, or an import via a named
+//!    module) — those need Zig call-graph/semantic analysis the assembler
+//!    does not do (engine #656). An import of a DECLARED dependency's file is
+//!    allowed (the packs share a copied tree with no module wall yet, RFC §6
+//!    "isolation is future work"); only imports into a NON-dependency pack
+//!    are flagged.
+//!
 //! The token scan is deliberately anchored on high-confidence syntactic
 //! shapes (a qualified `<pack>__` name, a `Facet{` construction) rather
 //! than broad heuristics — a lint with false positives is worthless, so
@@ -68,6 +84,17 @@ pub const Rule = enum {
     /// and no error. Reported by `scene_name_lint.zig`; see labelle-assembler#490.
     scene_bare_pack_component,
 
+    /// A pack's source `@import`s a file that lives INSIDE another pack's
+    /// directory without declaring that pack in `depends_on`
+    /// (`@import("../../other/components/foo.zig")`). This is the blatant
+    /// "reach around the ACL by importing a foreign file" escape flagged by
+    /// engine #656 — a TYPE recovered by direct file import, sidestepping
+    /// both module isolation and the string-keyed registry (RFC §6). Caught
+    /// TEXTUALLY (a literal relative-path `@import` that resolves under a
+    /// foreign pack's dir); the compiler-level "only calls exposed fns" wall
+    /// stays out of the assembler's reach (see the module header note).
+    cross_pack_import,
+
     /// Stable, human/CI-readable rule slug printed in the report.
     pub fn slug(self: Rule) []const u8 {
         return switch (self) {
@@ -75,6 +102,7 @@ pub const Rule = enum {
             .raw_global_facet_write => "raw-global-facet-write",
             .event_direction_inversion => "event-direction-inversion",
             .scene_bare_pack_component => "scene-bare-pack-component",
+            .cross_pack_import => "cross-pack-import",
         };
     }
 };
@@ -119,6 +147,18 @@ pub const EventOwner = struct {
     owner_prefix: []const u8,
 };
 
+/// One OTHER pack, as the cross-pack-import rule (rule 4) sees it: its raw
+/// manifest `name` (for the diagnostic), its canonical on-disk `dir` (used
+/// for path-containment), and whether the current pack is ALLOWED to reach
+/// it — true when the current pack declares it in `depends_on` or it is the
+/// implicit `contracts` root. Only imports into a pack with `allowed == false`
+/// are flagged. Populated by `check_cmd.zig` per (current-pack) scan.
+pub const ForeignPack = struct {
+    name: []const u8,
+    dir: []const u8,
+    allowed: bool,
+};
+
 /// Everything the per-source scan needs about the surrounding project.
 /// Every slice is borrowed for the duration of the scan call.
 pub const Context = struct {
@@ -136,6 +176,14 @@ pub const Context = struct {
     /// current pack — i.e. the packs *higher* than it in the DAG. Used by
     /// rule 3: a reference to one of these packs' events is an inversion.
     dependents_of_current: []const []const u8 = &.{},
+    /// Canonical on-disk directory of the pack being scanned. Rule 4 resolves
+    /// each relative `@import` against the importing file's dir and compares
+    /// the result to the foreign pack dirs. Empty (`""`, the default) DISABLES
+    /// rule 4 — so the pure per-source unit tests, which pass synthetic file
+    /// paths and no pack dirs, never trip it.
+    current_pack_dir: []const u8 = "",
+    /// Every OTHER pack's dir + allow-status, for rule 4. See `ForeignPack`.
+    foreign_packs: []const ForeignPack = &.{},
 };
 
 // ── Accessor name sets ───────────────────────────────────────────────────
@@ -279,6 +327,15 @@ pub fn scanSource(
     var i: usize = 0;
     while (i < toks.len) : (i += 1) {
         const tk = toks[i];
+
+        // Rule 4 — cross-pack file import `@import("…")`. A builtin token,
+        // so handled before the identifier gate below.
+        if (tk.tag == .builtin and std.mem.eql(u8, src[tk.start..tk.end], "@import") and
+            i + 2 < toks.len and toks[i + 1].tag == .l_paren and toks[i + 2].tag == .string_literal)
+        {
+            try checkCrossPackImport(arena, findings, src, file, ctx, toks[i + 2]);
+        }
+
         if (tk.tag != .identifier) continue;
         const name = src[tk.start..tk.end];
 
@@ -405,6 +462,60 @@ fn checkEventDirection(
             );
             try emit(arena, findings, .event_direction_inversion, src, file, tk.start, msg);
         }
+        return;
+    }
+}
+
+/// True when path `p` equals `base` or sits beneath it (`base/…`). Both are
+/// canonical lexical paths (already `..`-resolved); this is a plain prefix
+/// test guarded on a `/` boundary so `…/citizens` doesn't match `…/citizens2`.
+fn pathUnder(p: []const u8, base: []const u8) bool {
+    if (base.len == 0) return false;
+    if (!std.mem.startsWith(u8, p, base)) return false;
+    return p.len == base.len or p[base.len] == '/' or p[base.len] == '\\';
+}
+
+/// Rule 4 — a relative-path `@import` that resolves into a foreign pack dir.
+/// `path_tok` is the string-literal argument. Silent unless `ctx.current_pack_dir`
+/// is set (so the pure per-source tests, which don't populate pack dirs, are
+/// unaffected). Only literal, relative, `.zig` file imports are considered —
+/// module imports (`@import("std")`, `@import("game")`) never end in `.zig` and
+/// can't textually name a foreign source file.
+fn checkCrossPackImport(
+    arena: std.mem.Allocator,
+    findings: *std.ArrayList(Finding),
+    src: []const u8,
+    file: []const u8,
+    ctx: Context,
+    path_tok: Tok,
+) !void {
+    if (ctx.current_pack_dir.len == 0) return; // rule disabled (unit-test path)
+    if (ctx.foreign_packs.len == 0) return; // nothing foreign to reach
+
+    const path = decodeStringLiteral(src[path_tok.start..path_tok.end]) orelse return;
+    // Only a relative FILE import can escape into another pack's tree. A bare
+    // module name has no `.zig` suffix; a package/module import never does.
+    if (!std.mem.endsWith(u8, path, ".zig")) return;
+
+    // Resolve the import against the importing file's directory, lexically
+    // collapsing `..`/`.`. `file` is the canonical pack-dir-joined path the
+    // walker produced, so the result shares a canonical base with the foreign
+    // pack dirs (both come from the same `resolvePlugin` realpath pass).
+    const dir = std.fs.path.dirname(file) orelse ".";
+    const resolved = std.fs.path.resolve(arena, &.{ dir, path }) catch return;
+
+    // Staying inside the current pack is always fine.
+    if (pathUnder(resolved, ctx.current_pack_dir)) return;
+
+    for (ctx.foreign_packs) |fp| {
+        if (!pathUnder(resolved, fp.dir)) continue;
+        if (fp.allowed) return; // declared dependency (or contracts) — permitted
+        const msg = try std.fmt.allocPrint(
+            arena,
+            "pack '{s}' @imports \"{s}\", a source file inside pack '{s}' — which it does not declare in depends_on; a pack may not reach around the ACL by importing another pack's files directly (add '{s}' to depends_on and go through its published surface, or drop the import). RFC §6 / engine #656",
+            .{ ctx.current_prefix, path, fp.name, fp.name },
+        );
+        try emit(arena, findings, .cross_pack_import, src, file, path_tok.start, msg);
         return;
     }
 }
@@ -696,6 +807,118 @@ test "rule 3: a higher pack referencing a lower pack's event is clean" {
         \\const tag = GameEvents.citizens__worker_died;
     , ctx);
     try testing.expectEqual(@as(usize, 0), f.len);
+}
+
+test "rule 4: importing a non-dependency pack's file is flagged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context{
+        .current_prefix = "production",
+        .pack_prefixes = &.{ "production", "citizens" },
+        .current_pack_dir = "/proj/packs/production",
+        .foreign_packs = &.{
+            .{ .name = "citizens", .dir = "/proj/packs/citizens", .allowed = false },
+        },
+    };
+    var findings: std.ArrayList(Finding) = .empty;
+    try scanSource(arena.allocator(), &findings,
+        \\const Worker = @import("../../citizens/components/worker.zig").Worker;
+    , "/proj/packs/production/scripts/00_work.zig", ctx);
+    try testing.expectEqual(@as(usize, 1), findings.items.len);
+    try testing.expectEqual(Rule.cross_pack_import, findings.items[0].rule);
+    try testing.expect(std.mem.indexOf(u8, findings.items[0].message, "citizens") != null);
+}
+
+test "rule 4: importing a DECLARED-dependency pack's file is allowed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Same import, but citizens is a declared dependency (allowed = true).
+    const ctx = Context{
+        .current_prefix = "production",
+        .pack_prefixes = &.{ "production", "citizens" },
+        .current_pack_dir = "/proj/packs/production",
+        .foreign_packs = &.{
+            .{ .name = "citizens", .dir = "/proj/packs/citizens", .allowed = true },
+        },
+    };
+    var findings: std.ArrayList(Finding) = .empty;
+    try scanSource(arena.allocator(), &findings,
+        \\const Worker = @import("../../citizens/components/worker.zig").Worker;
+    , "/proj/packs/production/scripts/00_work.zig", ctx);
+    try testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "rule 4: a pack importing its OWN file is clean" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context{
+        .current_prefix = "production",
+        .pack_prefixes = &.{ "production", "citizens" },
+        .current_pack_dir = "/proj/packs/production",
+        .foreign_packs = &.{
+            .{ .name = "citizens", .dir = "/proj/packs/citizens", .allowed = false },
+        },
+    };
+    var findings: std.ArrayList(Finding) = .empty;
+    try scanSource(arena.allocator(), &findings,
+        \\const Local = @import("../components/thing.zig").Thing;
+    , "/proj/packs/production/scripts/00_work.zig", ctx);
+    try testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "rule 4: a module import (no .zig) is never a cross-pack import" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context{
+        .current_prefix = "production",
+        .pack_prefixes = &.{ "production", "citizens" },
+        .current_pack_dir = "/proj/packs/production",
+        .foreign_packs = &.{
+            .{ .name = "citizens", .dir = "/proj/packs/citizens", .allowed = false },
+        },
+    };
+    var findings: std.ArrayList(Finding) = .empty;
+    try scanSource(arena.allocator(), &findings,
+        \\const std = @import("std");
+        \\const game = @import("game");
+    , "/proj/packs/production/scripts/00_work.zig", ctx);
+    try testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "rule 4: disabled (no current_pack_dir) never fires" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Default Context (current_pack_dir == "") — the pure unit-test shape.
+    const ctx = Context{
+        .current_prefix = "production",
+        .pack_prefixes = &.{ "production", "citizens" },
+    };
+    var findings: std.ArrayList(Finding) = .empty;
+    try scanSource(arena.allocator(), &findings,
+        \\const W = @import("../../citizens/components/worker.zig").Worker;
+    , "test.zig", ctx);
+    try testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "rule 4: a sibling-prefix dir does not false-match (citizens vs citizens2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Import resolves under /proj/packs/citizens2, which is a declared dep;
+    // the /proj/packs/citizens boundary must not swallow it.
+    const ctx = Context{
+        .current_prefix = "production",
+        .pack_prefixes = &.{ "production", "citizens", "citizens2" },
+        .current_pack_dir = "/proj/packs/production",
+        .foreign_packs = &.{
+            .{ .name = "citizens", .dir = "/proj/packs/citizens", .allowed = false },
+            .{ .name = "citizens2", .dir = "/proj/packs/citizens2", .allowed = true },
+        },
+    };
+    var findings: std.ArrayList(Finding) = .empty;
+    try scanSource(arena.allocator(), &findings,
+        \\const W = @import("../../citizens2/components/worker.zig").Worker;
+    , "/proj/packs/production/scripts/00_work.zig", ctx);
+    try testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
 test "clean pack source produces no findings" {
