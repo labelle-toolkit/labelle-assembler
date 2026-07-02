@@ -1665,11 +1665,29 @@ pub fn generate(
         // root's `components/` + `events/` for field schemas. Additive and
         // best-effort — a failure here is logged, never fatal, exactly like
         // the flow catalog above.
+        // Zip the pack scans (`pack_scans`, name + staged import prefix +
+        // scanned stems) with the already-parsed `pack.labelle` surfaces
+        // (`pack_entries`, `exposes` + `depends_on`) into the manifest input.
+        // Both lists are appended once per iteration of the SAME pack loop
+        // above, so `pack_scans.items[i]` ↔ `pack_entries.items[i]`. Borrows
+        // both lists — valid only for the synchronous call below.
+        std.debug.assert(pack_scans.items.len == pack_entries.items.len);
+        const manifest_packs = try allocator.alloc(pack_manifest.PackInput, pack_scans.items.len);
+        defer allocator.free(manifest_packs);
+        for (pack_scans.items, pack_entries.items, 0..) |*ps, pe, i| {
+            manifest_packs[i] = .{
+                .scan = ps,
+                .exposes = pe.manifest.exposes,
+                .depends_on = pe.manifest.depends_on,
+            };
+        }
+
         pack_manifest.emitManifestSidecar(
             allocator,
             cfg,
             game_dir,
             labelle_dir,
+            target_dir,
             component_names,
             prefab_names,
             enum_names,
@@ -1678,6 +1696,7 @@ pub fn generate(
             merged_entries,
             plugin_flow_decls.flow_nodes,
             plugin_events.entries,
+            manifest_packs,
         ) catch |err| {
             std.log.warn("labelle-assembler: manifest sidecar emission failed: {s}", .{@errorName(err)});
         };
