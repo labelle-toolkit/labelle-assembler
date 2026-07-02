@@ -70,7 +70,7 @@ pub const raylib_lifecycle =
     \\    g.setHooks(&hooks);
     \\    g.renderer.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
     \\{{setup_code}}
-    \\    while (!window.windowShouldClose()) {
+    \\    while (!window.shouldQuit()) {
     \\        const dt: f32 = 0.016;
     \\{{tick_code}}        g.tick(dt);
     \\        g.render();
@@ -93,11 +93,11 @@ pub const raylib_desktop_preview_lifecycle =
     \\    var g = AssembledGame.init(allocator);
     \\    g.setHooks(&hooks);
     \\{{preview_setup}}{{setup_code}}
-    \\    while (!window.windowShouldClose()) {
+    \\    while (!window.shouldQuit()) {
     \\        const dt: f32 = 0.016;
     \\{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
     \\        g.render();
-    \\{{preview_readback}}        window.endDrawing();
+    \\{{preview_readback}}        window.endFrame();
     \\{{gui_draw_code}}    }
     \\}
     \\

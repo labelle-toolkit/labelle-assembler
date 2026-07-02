@@ -183,14 +183,14 @@ pub const MAIN_ZIG = struct {
         // bgfx-android (#303) takes the CALLBACK path, not the desktop loop:
         // the game exports `android_main`, opts the shell out of its own
         // export, and registers init + tick callbacks. No `pub fn main()`
-        // and no `windowShouldClose` loop.
+        // and no `shouldQuit` loop.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn android_main(") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const labelle_provides_android_main = true;") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "android_app.setInitCallback(&gameInit)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "android_app.setTickCallback(&gameFrame)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "android_app.run(app)") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn main()") == null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "windowShouldClose") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "shouldQuit") == null);
         // Module-scope runner (assigned in gameInit), not an init-scope local.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var runner: Runner = undefined;") != null);
     }
@@ -369,9 +369,9 @@ pub const NULL_BACKEND = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn init() callconv(.c) void") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "sapp_run") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "window.run(.{") == null);
-        // Frame-counter loop, not a windowShouldClose loop.
+        // Frame-counter loop, not a shouldQuit loop.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "while (frame < max_frames)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "windowShouldClose") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "shouldQuit") == null);
     }
 
     test "null backend wires LABELLE_PREVIEW env-var (control plane works)" {
@@ -597,8 +597,8 @@ pub const NULL_BACKEND = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn cleanup() callconv(.c) void") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var runner: Runner = undefined;") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "runner.deinit();") != null);
-        // NOT the loop shape — no `while (!windowShouldClose())` marker.
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "windowShouldClose") == null);
+        // NOT the loop shape — no `while (!shouldQuit())` marker.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "shouldQuit") == null);
         // NO backend-private holes leaked in: no sokol readback, no imgui bridge.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "imgui_bridge_handle_event") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview") == null);
@@ -694,9 +694,9 @@ pub const NULL_BACKEND = struct {
         }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
         defer std.testing.allocator.free(raylib_main);
 
-        // Frame-counter loop is null-only; raylib uses windowShouldClose.
+        // Frame-counter loop is null-only; raylib uses shouldQuit.
         try std.testing.expect(std.mem.indexOf(u8, raylib_main, "while (frame < max_frames)") == null);
-        try std.testing.expect(std.mem.indexOf(u8, raylib_main, "windowShouldClose") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raylib_main, "shouldQuit") != null);
         // Rendering path intact.
         try std.testing.expect(std.mem.indexOf(u8, raylib_main, "g.render()") != null);
 
