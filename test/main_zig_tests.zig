@@ -759,6 +759,27 @@ pub const PLUGIN_CONTROLLERS = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "defer PluginControllers.deinit(&g);") != null);
     }
 
+    test "plugins present wires PluginSystems.renderMeshes into the render sequence (gfx#290)" {
+        // engine#660 added `SystemRegistry.renderMeshes(game)` — the render-phase
+        // sibling of `drawGui`. The generated render loop must fire it after
+        // `g.render()` so a plugin's `renderMeshes` system actually runs. Unlike
+        // `drawGui` it is NOT nested in the imgui `guiBegin`/`guiEnd` pass and is
+        // independent of `hasGui()` — this project has no GUI, yet the call is
+        // still emitted (Spine world meshes must render without imgui).
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = plugins_two,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        const rm_idx = std.mem.indexOf(u8, main_zig, "PluginSystems.renderMeshes(&g);") orelse return error.NotFound;
+        const render_idx = std.mem.indexOf(u8, main_zig, "g.render()") orelse return error.NotFound;
+        // Fires in the render phase, after the scene render flushes sprites.
+        try std.testing.expect(render_idx < rm_idx);
+    }
+
     test "plugins present wires controllers into init/cleanup (sokol callback backend)" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
