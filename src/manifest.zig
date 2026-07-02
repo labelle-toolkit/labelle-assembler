@@ -79,14 +79,44 @@
 //!   empty arrays. The AST emit/subscribe extraction across every script
 //!   is a larger pass (the scanner doesn't track call sites yet); the
 //!   shape is in place so a follow-up can fill it without a schema bump.
-//! - **`visibility`** (pack vs public) — comes from `pack.labelle`,
-//!   which doesn't exist until the pack-convention ticket lands; omitted
-//!   for now rather than guessed.
+//!
+//! ## Packs (#499 — the realm designed for LLM authors)
+//!
+//! A declared plugin that carries a `pack.labelle` (a *pack*) gets a
+//! `tier: "pack"` realm with the SAME full detail the game root gets —
+//! AST-parsed component field schemas + save policy + `visibility`
+//! (`global`|`pack`, default `pack`), AST-parsed event payloads, prefabs,
+//! hooks, and scripts — plus the pack-only bits: the invisible
+//! `namespace_prefix` (`<pfx>__`), the registry `emitted_name` /
+//! `emitted_tag` each contribution lands under, and the `exposes`
+//! (`commands`/`queries`) + `depends_on` DAG surface read from
+//! `pack.labelle`. Pack components/events are parsed from the STAGED copies
+//! under `<target>/packs/<name>/` and pack events are added to
+//! `contracts.events` realm-qualified (`citizens.Hit`). Emitted names are
+//! derived through the SAME helpers codegen uses (`scan.packNamespacePrefix`,
+//! `idents.pathToPascal`, `idents.eventVariantName`, `path.basename`) so the
+//! manifest never drifts from the generated registry symbols.
+//!
+//! ```jsonc
+//!   { "name": "citizens", "tier": "pack", "namespace_prefix": "citizens",
+//!     "components": [ { "name": "Worker", "emitted_name": "citizens__Worker",
+//!                       "save": "saveable", "visibility": "pack",
+//!                       "fields": { "hunger": "f32" } } ],
+//!     "events": [ { "name": "Hit", "emitted_tag": "citizens__hit",
+//!                   "payload": { "attacker": "u64" },
+//!                   "emitted_by": [], "subscribed_by": [] } ],
+//!     "prefabs": [ { "name": "worker", "emitted_name": "citizens__worker" } ],
+//!     "hooks": ["overlay"], "scripts": [ ... ],
+//!     "depends_on": ["contracts"],
+//!     "exposes": { "commands": ["assign_home"], "queries": ["worker_count"] },
+//!     "recipes": [] }
+//! ```
 
 const std = @import("std");
 const config = @import("config.zig");
 const script_scanner = @import("script_scanner.zig");
 const scan = @import("codegen/scan.zig");
+const plugin_manifest = @import("plugin_manifest.zig");
 const jw = @import("flow_catalog/json_writer.zig");
 const idents = @import("codegen/idents.zig");
 
@@ -117,7 +147,24 @@ const Field = struct {
 const StructDecl = struct {
     name: []const u8,
     save: ?[]const u8,
+    /// The declared `pub const visibility = .<v>` enum literal (`global` /
+    /// `pack`), or null when the struct declares none. Resolved to the
+    /// engine default (`pack`) in the writer, not here — the parser reports
+    /// only what the source declared (labelle-engine `scene/src/component.zig`).
+    visibility: ?[]const u8,
     fields: []const Field,
+};
+
+/// One declared pack, threaded from the generate-time scan (#499). `scan`
+/// points into the caller's `pack_scans` list (name + import prefix + the
+/// scanned component/event/prefab/hook stems); `exposes` / `depends_on` come
+/// from the already-parsed `pack.labelle` (`pack_entries`). All three borrow
+/// the caller's memory — valid only for the synchronous `emitManifestSidecar`
+/// call, never stored past it.
+pub const PackInput = struct {
+    scan: *const scan.PackScan,
+    exposes: ?plugin_manifest.PackExposes,
+    depends_on: []const []const u8,
 };
 
 /// Public entry point: build the pack/feature manifest from the data the
@@ -132,6 +179,7 @@ pub fn emitManifestSidecar(
     cfg: ProjectConfig,
     game_dir: []const u8,
     labelle_dir: []const u8,
+    target_dir: []const u8,
     component_names: []const []const u8,
     prefab_names: []const []const u8,
     enum_names: []const []const u8,
@@ -140,6 +188,7 @@ pub fn emitManifestSidecar(
     script_entries: []const ScriptEntry,
     flow_nodes: []const PluginFlowNode,
     plugin_events: []const PluginEvent,
+    packs: []const PackInput,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -156,6 +205,44 @@ pub fn emitManifestSidecar(
         try game_scripts.append(aa, e);
     }
 
+    // ── Pack realms (#499): full detail, AST-parsed from the STAGED copies
+    // under `<target>/packs/<name>/`. Same graceful degradation as the game
+    // realm — an unreadable pack file becomes a name-only decl, never fatal.
+    var pack_realms: std.ArrayList(PackRealm) = .empty;
+    for (packs) |p| {
+        const pack_root = try std.fs.path.join(aa, &.{ target_dir, p.scan.import_prefix });
+        const pack_components = try parseStructDir(aa, pack_root, "components", p.scan.component_names);
+        const pack_events = try parseStructDir(aa, pack_root, "events", p.scan.event_names);
+
+        // The invisible `<pfx>__` namespace — the SINGLE source of truth
+        // (`scan.packNamespacePrefix`) codegen registers under. It writes into
+        // a stack buffer, so dupe into the arena before storing.
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try aa.dupe(u8, scan.packNamespacePrefix(p.scan.name, &prefix_buf));
+
+        // This pack's scripts — already in `script_entries` tagged with the
+        // pack name (`script_scanner` sets `plugin_name` = pack name).
+        var pack_scripts: std.ArrayList(ScriptEntry) = .empty;
+        for (script_entries) |e| {
+            const pn = e.plugin_name orelse continue;
+            if (std.mem.eql(u8, pn, p.scan.name)) try pack_scripts.append(aa, e);
+        }
+
+        try pack_realms.append(aa, .{
+            .name = p.scan.name,
+            .prefix = prefix,
+            .components = pack_components,
+            .component_stems = p.scan.component_names,
+            .events = pack_events,
+            .event_stems = p.scan.event_names,
+            .prefab_names = p.scan.prefab_names,
+            .hook_names = p.scan.hook_names,
+            .scripts = try pack_scripts.toOwnedSlice(aa),
+            .depends_on = p.depends_on,
+            .exposes = p.exposes,
+        });
+    }
+
     // ── Build the JSON in `allocator` so it survives arena teardown ──
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -169,6 +256,7 @@ pub fn emitManifestSidecar(
         .game_scripts = game_scripts.items,
         .flow_nodes = flow_nodes,
         .plugin_events = plugin_events,
+        .packs = pack_realms.items,
     });
     const json_bytes = try aw.toOwnedSlice();
     defer allocator.free(json_bytes);
@@ -245,7 +333,7 @@ fn parseStructDir(
 /// A `StructDecl` carrying only the registry name — the graceful-degradation
 /// stand-in for a component/event file the AST pass couldn't read or match.
 fn nameOnlyDecl(aa: std.mem.Allocator, name: []const u8) !StructDecl {
-    return .{ .name = try aa.dupe(u8, name), .save = null, .fields = &.{} };
+    return .{ .name = try aa.dupe(u8, name), .save = null, .visibility = null, .fields = &.{} };
 }
 
 /// AST-walk one source buffer for top-level `pub const <Name> = struct
@@ -269,6 +357,7 @@ fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDecl {
 
         var fields: std.ArrayList(Field) = .empty;
         var save: ?[]const u8 = null;
+        var visibility: ?[]const u8 = null;
         for (container.ast.members) |m| {
             if (ast.fullContainerField(m)) |fd| {
                 const fname = ast.tokenSlice(fd.ast.main_token);
@@ -281,17 +370,19 @@ fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDecl {
                 continue;
             }
             // Not a field — look for the `pub const save = ...Saveable(.x, ...)`
-            // decl so the manifest can surface the save policy.
-            if (save == null) {
-                if (ast.fullVarDecl(m)) |member_vd| {
-                    const mname = ast.tokenSlice(member_vd.ast.mut_token + 1);
-                    if (std.mem.eql(u8, mname, "save")) {
-                        // `try` (not `catch null`): a null return means "no
-                        // policy literal found" and is expected, but an
-                        // `OutOfMemory` must propagate rather than be
-                        // silently collapsed to "no save policy".
-                        save = try extractSavePolicy(aa, ast.getNodeSource(m));
-                    }
+            // and `pub const visibility = .<v>` decls the manifest surfaces.
+            // `try` (not `catch null`): a null return means "no literal found"
+            // and is expected, but an `OutOfMemory` must propagate rather than
+            // be silently collapsed to "no policy / no visibility".
+            if (ast.fullVarDecl(m)) |member_vd| {
+                const mname = ast.tokenSlice(member_vd.ast.mut_token + 1);
+                if (save == null and std.mem.eql(u8, mname, "save")) {
+                    save = try extractSavePolicy(aa, ast.getNodeSource(m));
+                } else if (visibility == null and std.mem.eql(u8, mname, "visibility")) {
+                    // Handles both `pub const visibility = .pack;` and the
+                    // typed `pub const visibility: Visibility = .pack;` — the
+                    // `: Visibility` annotation sits before the `=`.
+                    visibility = try extractEnumLiteralAfterEq(aa, ast.getNodeSource(m));
                 }
             }
         }
@@ -299,6 +390,7 @@ fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDecl {
         try decls.append(aa, .{
             .name = try aa.dupe(u8, name),
             .save = save,
+            .visibility = visibility,
             .fields = try fields.toOwnedSlice(aa),
         });
     }
@@ -321,7 +413,45 @@ fn extractSavePolicy(aa: std.mem.Allocator, decl_src: []const u8) !?[]const u8 {
     return try aa.dupe(u8, decl_src[start..i]);
 }
 
+/// Pull the enum-literal RHS out of a simple `pub const <name> = .<lit>;`
+/// (or the typed `pub const <name>: <T> = .<lit>;`) decl source — used for
+/// `visibility`. The `: <T>` annotation, when present, precedes the `=`, so
+/// splitting on the first `=` handles both forms. Returns null when no
+/// `= .<ident>` follows (a non-literal RHS, or no assignment at all).
+fn extractEnumLiteralAfterEq(aa: std.mem.Allocator, decl_src: []const u8) !?[]const u8 {
+    const eq = std.mem.indexOfScalar(u8, decl_src, '=') orelse return null;
+    var i = eq + 1;
+    while (i < decl_src.len and (decl_src[i] == ' ' or decl_src[i] == '\t' or decl_src[i] == '\n' or decl_src[i] == '\r')) i += 1;
+    if (i >= decl_src.len or decl_src[i] != '.') return null;
+    i += 1;
+    const start = i;
+    while (i < decl_src.len and (std.ascii.isAlphanumeric(decl_src[i]) or decl_src[i] == '_')) i += 1;
+    if (i == start) return null;
+    return try aa.dupe(u8, decl_src[start..i]);
+}
+
 // ── JSON emission ────────────────────────────────────────────────────────
+
+/// A fully pre-parsed pack realm — everything `writeManifestJson` needs to
+/// emit a `tier:"pack"` realm without touching the filesystem, so the writer
+/// stays a pure function over data (the round-trip tests build these as
+/// literals). `component_stems` / `event_stems` are the raw file stems, kept
+/// index-aligned with `components` / `events` (guaranteed by `parseStructDir`,
+/// which emits one decl per stem in order) so the writer can derive each
+/// `emitted_name` / `emitted_tag` through the same helpers codegen uses.
+const PackRealm = struct {
+    name: []const u8,
+    prefix: []const u8,
+    components: []const StructDecl,
+    component_stems: []const []const u8,
+    events: []const StructDecl,
+    event_stems: []const []const u8,
+    prefab_names: []const []const u8,
+    hook_names: []const []const u8,
+    scripts: []const ScriptEntry,
+    depends_on: []const []const u8,
+    exposes: ?plugin_manifest.PackExposes,
+};
 
 const ManifestData = struct {
     cfg: ProjectConfig,
@@ -333,6 +463,7 @@ const ManifestData = struct {
     game_scripts: []const ScriptEntry,
     flow_nodes: []const PluginFlowNode,
     plugin_events: []const PluginEvent,
+    packs: []const PackRealm = &.{},
 };
 
 /// The sentinel game-realm name. Plugin realms use their `project.labelle`
@@ -383,9 +514,25 @@ fn writeIndex(w: *std.Io.Writer, d: ManifestData) !void {
     }
     for (d.cfg.plugins) |plugin| {
         try w.writeAll(",\n");
-        try writeNonGameIndexRealm(w, d, plugin.name, "plugin", plugin.version);
+        // A declared plugin that carries a `pack.labelle` is a pack realm
+        // (`tier:"pack"`, full owns + exposes); every other plugin keeps the
+        // byte-identical names-only plugin entry.
+        if (findPack(d, plugin.name)) |pack| {
+            try writePackIndexRealm(w, pack);
+        } else {
+            try writeNonGameIndexRealm(w, d, plugin.name, "plugin", plugin.version);
+        }
     }
     try w.writeAll("\n    ]\n  }");
+}
+
+/// The pack realm declared under `name`, or null when `name` is a plain
+/// decl-module plugin. Packs are a subset of `cfg.plugins`.
+fn findPack(d: ManifestData, name: []const u8) ?PackRealm {
+    for (d.packs) |p| {
+        if (std.mem.eql(u8, p.name, name)) return p;
+    }
+    return null;
 }
 
 /// True when `discoverPluginEvents` surfaced any engine lifecycle event
@@ -509,7 +656,11 @@ fn writeRealmDetail(w: *std.Io.Writer, d: ManifestData) !void {
     }
     for (d.cfg.plugins) |plugin| {
         try w.writeAll(",\n");
-        try writeNonGameRealmDetail(w, d, plugin.name, "plugin");
+        if (findPack(d, plugin.name)) |pack| {
+            try writePackRealmDetail(w, pack);
+        } else {
+            try writeNonGameRealmDetail(w, d, plugin.name, "plugin");
+        }
     }
     try w.writeAll("\n  ]");
 }
@@ -528,6 +679,8 @@ fn writeGameRealmDetail(w: *std.Io.Writer, d: ManifestData) !void {
             try jw.writeJsonString(w, c.name);
             try w.writeAll(", \"save\": ");
             if (c.save) |s| try jw.writeJsonString(w, s) else try w.writeAll("null");
+            try w.writeAll(", \"visibility\": ");
+            try jw.writeJsonString(w, c.visibility orelse "pack");
             try w.writeAll(", \"fields\": ");
             try writeFieldObject(w, c.fields);
             try w.writeAll(" }");
@@ -625,6 +778,170 @@ fn writeNonGameRealmDetail(w: *std.Io.Writer, d: ManifestData, name: []const u8,
     try w.writeAll("      \"recipes\": []\n    }");
 }
 
+// ── pack realms (#499) ───────────────────────────────────────────────────
+
+/// Index entry for a pack realm — mirrors the game realm's `owns` (five
+/// local-name lists) plus the pack `depends_on` + `exposes` surface.
+fn writePackIndexRealm(w: *std.Io.Writer, pack: PackRealm) !void {
+    try w.writeAll("      {\n        \"name\": ");
+    try jw.writeJsonString(w, pack.name);
+    try w.writeAll(",\n        \"tier\": \"pack\",\n        \"namespace_prefix\": ");
+    try jw.writeJsonString(w, pack.prefix);
+    try w.writeAll(",\n        \"owns\": {\n          \"components\": ");
+    try writeStructNameArray(w, pack.components);
+    try w.writeAll(",\n          \"prefabs\": ");
+    try writeStringArray(w, pack.prefab_names);
+    try w.writeAll(",\n          \"scripts\": ");
+    try writeScriptNameArray(w, pack.scripts);
+    try w.writeAll(",\n          \"events\": ");
+    try writeStructNameArray(w, pack.events);
+    try w.writeAll(",\n          \"hooks\": ");
+    try writeStringArray(w, pack.hook_names);
+    try w.writeAll("\n        },\n        \"depends_on\": ");
+    try writeStringArray(w, pack.depends_on);
+    try w.writeAll(",\n");
+    try writePackExposes(w, pack.exposes, "        ");
+    try w.writeAll(",\n        \"recipes\": []\n      }");
+}
+
+/// Per-realm detail for a pack — the SAME full shape the game root gets
+/// (component field schemas + save + visibility, event payloads, prefabs,
+/// hooks, scripts), plus the pack-only `namespace_prefix` / `emitted_*` /
+/// `exposes` / `depends_on`.
+fn writePackRealmDetail(w: *std.Io.Writer, pack: PackRealm) !void {
+    try w.writeAll("    {\n      \"name\": ");
+    try jw.writeJsonString(w, pack.name);
+    try w.writeAll(",\n      \"tier\": \"pack\",\n      \"namespace_prefix\": ");
+    try jw.writeJsonString(w, pack.prefix);
+    try w.writeAll(",\n");
+
+    // components — name + emitted registry name + save + visibility + fields.
+    try w.writeAll("      \"components\": [");
+    if (pack.components.len == 0) {
+        try w.writeAll("],\n");
+    } else {
+        try w.writeAll("\n");
+        for (pack.components, pack.component_stems, 0..) |c, stem, ci| {
+            var pascal_buf: [128]u8 = undefined;
+            try w.writeAll("        { \"name\": ");
+            try jw.writeJsonString(w, c.name);
+            try w.writeAll(", \"emitted_name\": ");
+            try writeEmittedName(w, pack.prefix, idents.pathToPascal(stem, &pascal_buf));
+            try w.writeAll(", \"save\": ");
+            if (c.save) |s| try jw.writeJsonString(w, s) else try w.writeAll("null");
+            try w.writeAll(", \"visibility\": ");
+            try jw.writeJsonString(w, c.visibility orelse "pack");
+            try w.writeAll(", \"fields\": ");
+            try writeFieldObject(w, c.fields);
+            try w.writeAll(" }");
+            if (ci + 1 < pack.components.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("      ],\n");
+    }
+
+    // events — name + emitted registry tag + payload + (deferred) cross-refs.
+    try w.writeAll("      \"events\": [");
+    if (pack.events.len == 0) {
+        try w.writeAll("],\n");
+    } else {
+        try w.writeAll("\n");
+        for (pack.events, pack.event_stems, 0..) |e, stem, ei| {
+            try w.writeAll("        { \"name\": ");
+            try jw.writeJsonString(w, e.name);
+            try w.writeAll(", \"emitted_tag\": ");
+            try writeEmittedName(w, pack.prefix, idents.eventVariantName(stem));
+            try w.writeAll(", \"payload\": ");
+            try writeFieldObject(w, e.fields);
+            try w.writeAll(", \"emitted_by\": [], \"subscribed_by\": [] }");
+            if (ei + 1 < pack.events.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("      ],\n");
+    }
+
+    // prefabs — local name + emitted registration key.
+    try w.writeAll("      \"prefabs\": [");
+    if (pack.prefab_names.len == 0) {
+        try w.writeAll("],\n");
+    } else {
+        try w.writeAll("\n");
+        for (pack.prefab_names, 0..) |name, pi| {
+            try w.writeAll("        { \"name\": ");
+            try jw.writeJsonString(w, name);
+            try w.writeAll(", \"emitted_name\": ");
+            try writeEmittedName(w, pack.prefix, std.fs.path.basename(name));
+            try w.writeAll(" }");
+            if (pi + 1 < pack.prefab_names.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("      ],\n");
+    }
+
+    // hooks — local stems (registered under `<pfx>__` idents).
+    try w.writeAll("      \"hooks\": ");
+    try writeStringArray(w, pack.hook_names);
+    try w.writeAll(",\n");
+
+    // scripts — same shape as the game realm.
+    try w.writeAll("      \"scripts\": [");
+    if (pack.scripts.len == 0) {
+        try w.writeAll("],\n");
+    } else {
+        try w.writeAll("\n");
+        for (pack.scripts, 0..) |s, si| {
+            try w.writeAll("        { \"name\": ");
+            try jw.writeJsonString(w, s.name);
+            try w.writeAll(", \"rel_path\": ");
+            try jw.writeJsonString(w, s.rel_path);
+            try w.writeAll(", \"order\": ");
+            if (s.sort_order) |o| try w.print("{d}", .{o}) else try w.writeAll("null");
+            try w.writeAll(", \"states\": ");
+            try writeStringArray(w, s.states);
+            try w.writeAll(" }");
+            if (si + 1 < pack.scripts.len) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("      ],\n");
+    }
+
+    try w.writeAll("      \"depends_on\": ");
+    try writeStringArray(w, pack.depends_on);
+    try w.writeAll(",\n");
+    try writePackExposes(w, pack.exposes, "      ");
+    try w.writeAll(",\n      \"recipes\": []\n    }");
+}
+
+/// `exposes` split into `commands`/`queries` — sourced from `pack.labelle`
+/// (`PackExposes`), not FlowNodes (packs ship none). `indent` is the base
+/// indent of the `"exposes"` key so both the 8-space index entry and the
+/// 6-space detail entry reuse one writer.
+fn writePackExposes(w: *std.Io.Writer, exposes: ?plugin_manifest.PackExposes, indent: []const u8) !void {
+    try w.writeAll(indent);
+    try w.writeAll("\"exposes\": {\n");
+    try w.writeAll(indent);
+    try w.writeAll("  \"commands\": ");
+    try writeStringArray(w, if (exposes) |e| e.commands else &.{});
+    try w.writeAll(",\n");
+    try w.writeAll(indent);
+    try w.writeAll("  \"queries\": ");
+    try writeStringArray(w, if (exposes) |e| e.queries else &.{});
+    try w.writeAll("\n");
+    try w.writeAll(indent);
+    try w.writeAll("}");
+}
+
+/// Write a `"<prefix>__<local>"` JSON string — the registry-emitted form —
+/// without allocating the join. `local` is the already-derived local part
+/// (Pascal decl name, event variant, or prefab basename).
+fn writeEmittedName(w: *std.Io.Writer, prefix: []const u8, local: []const u8) !void {
+    try w.writeByte('"');
+    try writeJsonStringBody(w, prefix);
+    try w.writeAll("__");
+    try writeJsonStringBody(w, local);
+    try w.writeByte('"');
+}
+
 // ── small array / object writers ─────────────────────────────────────────
 
 fn writeStringArray(w: *std.Io.Writer, items: []const []const u8) !void {
@@ -710,6 +1027,16 @@ fn writeContractEvents(w: *std.Io.Writer, d: ManifestData) !void {
         // lifecycle events (`discoverPluginEvents`).
         try writeQualifiedJsonString(w, e.plugin_import_name, e.event_name);
         first = false;
+    }
+    // Pack events are AST-parsed (packs have no flow-catalog module entry),
+    // so they're added here rather than via `plugin_events` — realm-qualified
+    // by the pack name (`citizens.Hit`) like every other contract event.
+    for (d.packs) |pack| {
+        for (pack.events) |e| {
+            if (!first) try w.writeAll(", ");
+            try writeQualifiedJsonString(w, pack.name, e.name);
+            first = false;
+        }
     }
     try w.writeAll("]");
 }
@@ -856,11 +1183,11 @@ test "writeManifestJson: round-trips through std.json with index + realms" {
 
     var comp_fields: std.ArrayList(Field) = .empty;
     try comp_fields.append(ag, .{ .name = "sleeper", .zig_type = "?u64" });
-    const components = [_]StructDecl{.{ .name = "Bed", .save = "saveable", .fields = comp_fields.items }};
+    const components = [_]StructDecl{.{ .name = "Bed", .save = "saveable", .visibility = null, .fields = comp_fields.items }};
 
     var ev_fields: std.ArrayList(Field) = .empty;
     try ev_fields.append(ag, .{ .name = "worker_id", .zig_type = "u64" });
-    const events = [_]StructDecl{.{ .name = "WorkerSleepStart", .save = null, .fields = ev_fields.items }};
+    const events = [_]StructDecl{.{ .name = "WorkerSleepStart", .save = null, .visibility = null, .fields = ev_fields.items }};
 
     const flow_nodes = [_]PluginFlowNode{
         .{ .module_import_path = "box2d", .module_sanitized = "box2d", .node_name = "apply_impulse", .is_script = false, .is_void = true },
@@ -937,7 +1264,7 @@ test "emitManifestSidecar: writes a parseable sidecar for an empty project" {
     defer aa.free(dir);
 
     const cfg = ProjectConfig{ .name = "tmp" };
-    try emitManifestSidecar(aa, cfg, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{});
+    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{});
 
     const path = try std.fs.path.join(aa, &.{ dir, MANIFEST_FILENAME });
     defer aa.free(path);
@@ -1026,7 +1353,7 @@ test "writeManifestJson: engine realm emitted + realm-qualified contracts + scri
         .{ .plugin_import_name = "engine", .plugin_sanitized = "engine", .event_name = "tick" },
         .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
     };
-    const game_events = [_]StructDecl{.{ .name = "WorkerSleepStart", .save = null, .fields = &.{} }};
+    const game_events = [_]StructDecl{.{ .name = "WorkerSleepStart", .save = null, .visibility = null, .fields = &.{} }};
 
     const cfg = ProjectConfig{
         .name = "demo",
@@ -1079,4 +1406,207 @@ test "writeManifestJson: engine realm emitted + realm-qualified contracts + scri
     const engine_detail = findRealm(realms, "engine").?;
     try std.testing.expectEqualStrings("engine", engine_detail.get("tier").?.string);
     try std.testing.expectEqualStrings("tick", engine_detail.get("events").?.array.items[0].object.get("name").?.string);
+}
+
+test "parseStructFile: visibility (bare, typed, absent)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ag = arena.allocator();
+
+    // Bare `pub const visibility = .global;`.
+    {
+        const decls = try parseStructFile(ag,
+            \\pub const Worker = struct {
+            \\    pub const visibility = .global;
+            \\    hunger: f32 = 0,
+            \\};
+            \\
+        );
+        try std.testing.expectEqual(@as(usize, 1), decls.len);
+        try std.testing.expectEqualStrings("global", decls[0].visibility.?);
+    }
+    // Typed `pub const visibility: Visibility = .pack;` — the annotation
+    // precedes the `=`, so the extractor still lands on `.pack`.
+    {
+        const decls = try parseStructFile(ag,
+            \\pub const Worker = struct {
+            \\    pub const visibility: Visibility = .pack;
+            \\    hunger: f32 = 0,
+            \\};
+            \\
+        );
+        try std.testing.expectEqual(@as(usize, 1), decls.len);
+        try std.testing.expectEqualStrings("pack", decls[0].visibility.?);
+    }
+    // Absent → null (resolved to the `pack` default in the writer, not here).
+    {
+        const decls = try parseStructFile(ag,
+            \\pub const Worker = struct { hunger: f32 = 0 };
+            \\
+        );
+        try std.testing.expectEqual(@as(usize, 1), decls.len);
+        try std.testing.expect(decls[0].visibility == null);
+    }
+}
+
+test "writeManifestJson: pack realm — tier, emitted names, visibility, exposes, contracts" {
+    const aa = std.testing.allocator;
+
+    const worker_fields = [_]Field{.{ .name = "hunger", .zig_type = "f32" }};
+    const pack_components = [_]StructDecl{.{ .name = "Worker", .save = "saveable", .visibility = "pack", .fields = &worker_fields }};
+    const hit_fields = [_]Field{.{ .name = "attacker", .zig_type = "u64" }};
+    const pack_events = [_]StructDecl{.{ .name = "Hit", .save = null, .visibility = null, .fields = &hit_fields }};
+
+    const pack = PackRealm{
+        .name = "citizens",
+        .prefix = "citizens",
+        .components = &pack_components,
+        .component_stems = &.{"worker"},
+        .events = &pack_events,
+        .event_stems = &.{"hit"},
+        .prefab_names = &.{"worker"},
+        .hook_names = &.{"overlay"},
+        .scripts = &.{},
+        .depends_on = &.{"contracts"},
+        .exposes = .{ .queries = &.{"worker_count"}, .commands = &.{"assign_home"} },
+    };
+
+    // A plain decl-module plugin alongside the pack — regression that plugin
+    // realms keep their old names-only shape when packs are present.
+    const flow_nodes = [_]PluginFlowNode{
+        .{ .module_import_path = "box2d", .module_sanitized = "box2d", .node_name = "apply_impulse", .is_script = false, .is_void = true },
+    };
+    const plugin_events = [_]PluginEvent{
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
+    };
+
+    const cfg = ProjectConfig{
+        .name = "demo",
+        .plugins = &.{
+            .{ .name = "citizens", .version = "0.1.0" },
+            .{ .name = "box2d", .version = "1.2.3" },
+        },
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(aa);
+    defer aw.deinit();
+    try writeManifestJson(&aw.writer, .{
+        .cfg = cfg,
+        .components = &.{},
+        .prefab_names = &.{},
+        .enum_names = &.{},
+        .hook_names = &.{},
+        .game_events = &.{},
+        .game_scripts = &.{},
+        .flow_nodes = &flow_nodes,
+        .plugin_events = &plugin_events,
+        .packs = &.{pack},
+    });
+    const out = aw.writer.buffer[0..aw.writer.end];
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, out, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    // contracts.events — pack event realm-qualified by pack name.
+    const contract_events = root.get("index").?.object.get("contracts").?.object.get("events").?.array;
+    try std.testing.expect(jsonArrayHas(contract_events, "citizens.Hit"));
+
+    // index realm: game + citizens (pack) + box2d (plugin).
+    const realms_idx = root.get("index").?.object.get("realms").?.array;
+    try std.testing.expectEqual(@as(usize, 3), realms_idx.items.len);
+    const citizens_idx = findRealm(realms_idx, "citizens").?;
+    try std.testing.expectEqualStrings("pack", citizens_idx.get("tier").?.string);
+    try std.testing.expectEqualStrings("citizens", citizens_idx.get("namespace_prefix").?.string);
+    try std.testing.expect(jsonArrayHas(citizens_idx.get("owns").?.object.get("components").?.array, "Worker"));
+    try std.testing.expect(jsonArrayHas(citizens_idx.get("depends_on").?.array, "contracts"));
+    try std.testing.expect(jsonArrayHas(citizens_idx.get("exposes").?.object.get("commands").?.array, "assign_home"));
+    try std.testing.expect(jsonArrayHas(citizens_idx.get("exposes").?.object.get("queries").?.array, "worker_count"));
+    // Plain plugin realm untouched.
+    const box2d_idx = findRealm(realms_idx, "box2d").?;
+    try std.testing.expectEqualStrings("plugin", box2d_idx.get("tier").?.string);
+
+    // detail realm: pack carries full component/event/prefab detail.
+    const realms = root.get("realms").?.array;
+    const citizens = findRealm(realms, "citizens").?;
+    try std.testing.expectEqualStrings("pack", citizens.get("tier").?.string);
+    const comp0 = citizens.get("components").?.array.items[0].object;
+    try std.testing.expectEqualStrings("Worker", comp0.get("name").?.string);
+    try std.testing.expectEqualStrings("citizens__Worker", comp0.get("emitted_name").?.string);
+    try std.testing.expectEqualStrings("saveable", comp0.get("save").?.string);
+    try std.testing.expectEqualStrings("pack", comp0.get("visibility").?.string);
+    try std.testing.expectEqualStrings("f32", comp0.get("fields").?.object.get("hunger").?.string);
+    const ev0 = citizens.get("events").?.array.items[0].object;
+    try std.testing.expectEqualStrings("Hit", ev0.get("name").?.string);
+    try std.testing.expectEqualStrings("citizens__hit", ev0.get("emitted_tag").?.string);
+    try std.testing.expectEqualStrings("u64", ev0.get("payload").?.object.get("attacker").?.string);
+    const pf0 = citizens.get("prefabs").?.array.items[0].object;
+    try std.testing.expectEqualStrings("worker", pf0.get("name").?.string);
+    try std.testing.expectEqualStrings("citizens__worker", pf0.get("emitted_name").?.string);
+    try std.testing.expect(jsonArrayHas(citizens.get("hooks").?.array, "overlay"));
+
+    // Regression: game realm still present with its old keys; plain plugin too.
+    try std.testing.expect(findRealm(realms, "game") != null);
+    const box2d = findRealm(realms, "box2d").?;
+    try std.testing.expectEqualStrings("plugin", box2d.get("tier").?.string);
+    try std.testing.expectEqualStrings("collision_begin", box2d.get("events").?.array.items[0].object.get("name").?.string);
+}
+
+test "emitManifestSidecar: AST-parses a staged pack's components" {
+    const aa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = config.globalIo();
+
+    // Stage `packs/citizens/components/worker.zig` under the target dir —
+    // the same layout `scanPack` writes before the manifest runs.
+    try tmp.dir.createDirPath(io, "packs/citizens/components");
+    {
+        var cdir = try tmp.dir.openDir(io, "packs/citizens/components", .{});
+        defer cdir.close(io);
+        var f = try cdir.createFile(io, "worker.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\pub const Worker = struct {
+            \\    pub const visibility = .pack;
+            \\    hunger: f32 = 0,
+            \\    home: ?u64 = null,
+            \\};
+            \\
+        );
+    }
+
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", aa);
+    defer aa.free(dir);
+
+    var pack_scan = scan.PackScan{
+        .name = "citizens",
+        .import_prefix = "packs/citizens",
+        .component_names = &.{"worker"},
+        .event_names = &.{},
+        .prefab_names = &.{},
+        .hook_names = &.{},
+    };
+    const packs = [_]PackInput{.{ .scan = &pack_scan, .exposes = null, .depends_on = &.{} }};
+
+    const cfg = ProjectConfig{ .name = "tmp", .plugins = &.{.{ .name = "citizens" }} };
+    // game_dir and target_dir both point at the tmp dir; the pack files live
+    // under `<target>/packs/citizens/`.
+    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &packs);
+
+    const path = try std.fs.path.join(aa, &.{ dir, MANIFEST_FILENAME });
+    defer aa.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, aa, .limited(1 << 20));
+    defer aa.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, bytes, .{});
+    defer parsed.deinit();
+    const realms = parsed.value.object.get("realms").?.array;
+    const citizens = findRealm(realms, "citizens").?;
+    try std.testing.expectEqualStrings("pack", citizens.get("tier").?.string);
+    const comp0 = citizens.get("components").?.array.items[0].object;
+    try std.testing.expectEqualStrings("Worker", comp0.get("name").?.string);
+    try std.testing.expectEqualStrings("citizens__Worker", comp0.get("emitted_name").?.string);
+    try std.testing.expectEqualStrings("pack", comp0.get("visibility").?.string);
+    try std.testing.expectEqualStrings("?u64", comp0.get("fields").?.object.get("home").?.string);
 }
