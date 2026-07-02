@@ -161,6 +161,63 @@ pub fn validate(
     return error.UnsupportedCapability;
 }
 
+/// Assert a resolved provider's DECLARED `.surface_loss` capability agrees with
+/// whether its window backend ACTUALLY implements the surface-loss hooks. This
+/// is the manifest<->decl consistency half that `validate` (required-vs-
+/// declared) does NOT cover.
+///
+/// The `.surface_loss` manifest bit is the DECLARATIVE MIRROR of the
+/// `@hasDecl`-gated `surfaceLost`/`surfaceRestored` window-contract hooks (see
+/// labelle-core `window_contract.supportsSurfaceLoss` — "declares BOTH hooks",
+/// #53). `supports` is that probe: pass the backend's
+/// `core.Window(WindowImpl).supportsSurfaceLoss()` (equivalently
+/// `@hasDecl(WindowImpl, "surfaceLost") and @hasDecl(WindowImpl,
+/// "surfaceRestored")`). A drifted mirror silently mis-routes the resolve-time
+/// gate, so — mirroring the way labelle-core's conformance suite asserts
+/// probe-truthfulness on the backend side — this asserts it on the ASSEMBLER
+/// side against the manifest.
+///
+/// DIRECTIONAL, both ways (the "and vice-versa"):
+///   - declares `.surface_loss` but the hooks are ABSENT → the manifest
+///     advertises a capability the backend can't back. An android project's
+///     derived `.surface_loss` requirement would `validate` cleanly against
+///     this manifest, then the backend no-ops the surface at runtime — a black
+///     screen after resume, NOT a build-time error.
+///   - hooks PRESENT but `.surface_loss` OMITTED → under-advertised. An android
+///     project's derived `.surface_loss` requirement spuriously fails the
+///     `validate` gate against a backend that actually supports surface loss.
+///
+/// Back-compat: a provider that declares NO capabilities at all
+/// (`declared.len == 0`, a pre-capability manifest) is exempt — same opt-in
+/// gate as `validate`; we only cross-check a provider that has OPTED IN to the
+/// capability vocabulary. `supports` is comptime-known at the call site (it is
+/// `@hasDecl`-derived), so this reads as a directional assert; the diagnostic
+/// mirrors `validate`'s `std.debug.print` (not `std.log.err`) so the intentional
+/// error-path test does not read as a runner failure.
+pub fn validateSurfaceLossConsistency(
+    supports_surface_loss: bool,
+    declared: []const Capability,
+    provider_id: []const u8,
+) error{SurfaceLossManifestMismatch}!void {
+    if (declared.len == 0) return; // opted out of the capability vocabulary — see validate.
+
+    const declares_cap = declares(declared, .surface_loss);
+    if (declares_cap == supports_surface_loss) return; // mirror agrees with the hooks.
+
+    if (declares_cap) {
+        std.debug.print(
+            "labelle-assembler: backend provider '{s}' declares the '.surface_loss' capability but its window backend does not implement the surfaceLost/surfaceRestored hooks.\n  Either implement both hooks (labelle-core window contract) or drop '.surface_loss' from the provider's backend.manifest.zon `.capabilities`.\n",
+            .{provider_id},
+        );
+    } else {
+        std.debug.print(
+            "labelle-assembler: backend provider '{s}' implements the surfaceLost/surfaceRestored hooks but its manifest omits the '.surface_loss' capability.\n  Add '.surface_loss' to the provider's backend.manifest.zon `.capabilities` so the resolve-time gate can advertise it.\n",
+            .{provider_id},
+        );
+    }
+    return error.SurfaceLossManifestMismatch;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -350,6 +407,58 @@ test "validate: back-compat — a provider declaring NO capabilities only warns"
 
 test "validate: no requirements is trivially ok even with no declarations" {
     try validate(&.{}, &.{}, "labelle.whatever");
+}
+
+test "validateSurfaceLossConsistency: manifest bit and hooks agree (both present)" {
+    // A backend that implements the hooks (supports == true) AND advertises
+    // `.surface_loss` is consistent — e.g. the bgfx/sokol mobile backends.
+    try validateSurfaceLossConsistency(
+        true,
+        &.{ .surface_loss, .screenshots },
+        "labelle.bgfx",
+    );
+}
+
+test "validateSurfaceLossConsistency: manifest bit and hooks agree (both absent)" {
+    // A desktop-only backend implements NO hooks (supports == false) and omits
+    // `.surface_loss` — also consistent (the both-or-neither shape).
+    try validateSurfaceLossConsistency(
+        false,
+        &.{ .screenshots, .fonts },
+        "labelle.raylib",
+    );
+}
+
+test "validateSurfaceLossConsistency: over-advertised — manifest declares .surface_loss but no hooks errors" {
+    // Directional half 1: the manifest is a lie the resolver would trust — an
+    // android project's derived `.surface_loss` requirement would `validate`
+    // cleanly, then the backend no-ops the surface at runtime. Hard error.
+    // (The `std.debug.print` diagnostic here is the intentional negative-test
+    // log, not a runner failure — same discipline as the `validate` tests.)
+    try testing.expectError(error.SurfaceLossManifestMismatch, validateSurfaceLossConsistency(
+        false,
+        &.{ .surface_loss, .screenshots },
+        "labelle.bgfx",
+    ));
+}
+
+test "validateSurfaceLossConsistency: under-advertised — hooks present but manifest omits .surface_loss errors" {
+    // Directional half 2 (the "and vice-versa"): a backend that implements the
+    // hooks but forgets the bit under-advertises, so an android project's
+    // derived requirement spuriously fails the gate. Hard error.
+    try testing.expectError(error.SurfaceLossManifestMismatch, validateSurfaceLossConsistency(
+        true,
+        &.{ .screenshots, .fonts },
+        "labelle.sokol",
+    ));
+}
+
+test "validateSurfaceLossConsistency: back-compat — a provider declaring NO capabilities is exempt" {
+    // declared.len == 0 ⇒ pre-capability manifest / no-manifest built-in. Same
+    // opt-in gate as `validate`: we only cross-check an opted-in provider, so a
+    // hooks-implementing backend with an empty manifest must NOT error.
+    try validateSurfaceLossConsistency(true, &.{}, "labelle.legacy");
+    try validateSurfaceLossConsistency(false, &.{}, "labelle.legacy");
 }
 
 fn hasCap(caps: []const Capability, cap: Capability) bool {
