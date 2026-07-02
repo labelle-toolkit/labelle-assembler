@@ -84,9 +84,16 @@ jobs:
   # End-to-end usage test: check out every sibling repo the examples
   # need (labelle-cli for the binary, labelle-core/engine/gfx for the
   # runtime packages), then `labelle generate` and `zig build` the
-  # raylib example. Validates that the assembler + backends +
+  # in-tree examples. Validates that the assembler + backends +
   # zig-ecs + deps_linker pipeline produces a project that actually
   # compiles, not just resolves paths.
+  #
+  # The pure-raylib and pure-sokol examples were migrated into their
+  # backend packages (labelle-raylib#7 / labelle-sokol#5), which now
+  # own their own generate+build CI, so the assembler no longer owns
+  # them. The assembler tests its generate→build path against the
+  # backend-AGNOSTIC null backend (the `null` / `plugin-controllers`
+  # steps below) plus the still-in-tree feature smokes.
   #
   # Linux only for now — raylib-zig's transitive hexops/xcode-frameworks
   # dep doesn't fetch cleanly from the macos GitHub runner (see the
@@ -178,15 +185,6 @@ jobs:
 
       - name: Build labelle-cli
         run: cd labelle-cli && zig build
-
-      - name: Generate + build the raylib example
-        env:
-          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
-        run: |
-          cd labelle-assembler/examples/raylib
-          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
-          cd .labelle/raylib_desktop
-          zig build
 
       # Smoke test for the Asset Streaming RFC (labelle-assembler#55,
       # labelle-engine#437). Same recipe as the raylib example above —

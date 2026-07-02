@@ -19,7 +19,7 @@ game-script **CustomNode** (labelle-assembler#240): it calls
 `AllScripts`) and the `game` module (via the shim) at once (Gap 2).
 
 CI builds this fixture but does not run the resulting binary (raylib
-needs a display); the build-only depth matches `examples/raylib` and
+needs a display); the build-only depth matches
 `examples/asset-streaming-smoke`.
 
 > **Note:** Only *discovery* keys on the `.flow.jsonc` extension today
