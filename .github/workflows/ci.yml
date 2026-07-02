@@ -187,18 +187,63 @@ jobs:
         run: cd labelle-cli && zig build
 
       # Smoke test for the Asset Streaming RFC (labelle-assembler#55,
-      # labelle-engine#437). Same recipe as the raylib example above —
-      # build-only, not a headless runtime check. Runtime exercise
-      # requires a display (raylib creates its GL context at init);
-      # local `labelle run --timeout=Ns` covers the render path.
-      - name: Generate + build the asset-streaming-smoke example
-        env:
-          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
+      # labelle-engine#437). This fixture tests the assembler's
+      # asset-streaming CODEGEN — lazy-inference flipping the two atlases
+      # to `registerAtlasFromMemory` (parse JSON, defer PNG decode) plus
+      # the emitted `SceneAssetManifests.entries` / `setSceneAssets` loop.
+      # That pipeline is backend-AGNOSTIC, so the fixture now targets the
+      # headless `.null` backend (labelle-assembler#520): generate + build
+      # need no display / GL context, and the generated streaming main
+      # loop + ImageBackendAdapter also RUN headless (frame-capped, clean
+      # exit). Real GPU texture upload / on-screen render stays a local
+      # `labelle run --timeout=Ns` check — null has no GPU to upload to.
+      - name: Generate + build + run the asset-streaming-smoke example
         run: |
           cd labelle-assembler/examples/asset-streaming-smoke
-          $GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle generate
-          cd .labelle/raylib_desktop
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          # `.null` is an EXTRACTED external backend (#386 Phase 6c) — it
+          # resolves to the `labelle-null` package, not a bundled slot, so
+          # its `backend.manifest.zon` must be in the package cache before
+          # `generate` can splice the codegen. `install` populates that
+          # cache (remote-fetches `labelle-null`). Do it explicitly per
+          # step so this fixture is self-sufficient and order-independent
+          # rather than piggy-backing on another example's `labelle generate`
+          # → `ensureCache`. Mirrors the external-backend step's `$ASM install`.
+          $ASM install --project-root .
+
+          # Invoke the assembler binary directly — labelle-cli's bundled
+          # generator is pinned to an older release that predates the
+          # `.null` Backend variant, so `labelle generate` would fail at
+          # the project.labelle parse step. Same recipe as the null /
+          # flows-smoke / plugin-controllers steps below.
+          $ASM generate --project-root .
+
+          # Codegen assertions — fail loudly if lazy-inference regresses
+          # and the atlases stop deferring their PNG decode.
+          grep -q 'registerAtlasFromMemory' .labelle/null_desktop/main.zig
+          grep -q 'SceneAssetManifests' .labelle/null_desktop/main.zig
+
+          cd .labelle/null_desktop
+
+          # labelle-cli-equivalent fixFingerprint dance (see the null step
+          # below) — the assembler emits a placeholder fingerprint.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
           zig build
+
+          # Null backend has no window / GL context — the generated
+          # streaming main loop + ImageBackendAdapter run for
+          # LABELLE_NULL_FRAMES frames and exit cleanly (rc=0) or crash.
+          LABELLE_NULL_FRAMES=10 ./zig-out/bin/asset_streaming_smoke
+          echo "PASS: asset-streaming-smoke generated + built + ran headless on null"
 
       # Gamepad input demo (raylib + imgui). Build-only, same recipe as the
       # raylib example. Exercises the engine input-mixin gamepad forwarders
@@ -333,17 +378,36 @@ jobs:
       # Invokes the assembler binary directly (same recipe as the null
       # step above) — labelle-cli's bundled generator module is pinned
       # to an older release and routing through `labelle generate` is
-      # unnecessary friction here. Build-only: same depth as the other
-      # examples, raylib still needs a display to run.
+      # unnecessary friction here.
+      #
+      # Backend: `.null` (labelle-assembler#520). This fixture tests FLOW
+      # CODEGEN, not rendering, so it targets the backend-agnostic
+      # headless backend — generate + build need no display / GL context.
+      # Build-only (no headless run): the generated flow event-handler's
+      # `tick` graph does a runtime `game.getComponent` on the
+      # entity_created payload, which currently faults inside labelle-core's
+      # ecs (`alive.contains`) — a pre-existing, backend-INDEPENDENT runtime
+      # gap this fixture never surfaced while it was raylib build-only. The
+      # codegen contract under test is fully asserted by generate + build.
       - name: Generate + build the flows-smoke example
         run: |
           cd labelle-assembler/examples/flows-smoke
-          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          # `.null` is an EXTRACTED external backend (#386 Phase 6c): its
+          # `backend.manifest.zon` must be in the package cache before
+          # `generate` can splice the codegen. Populate it explicitly so
+          # this fixture is self-sufficient / order-independent instead of
+          # relying on an earlier example's `ensureCache`. (See the
+          # asset-streaming-smoke step above for the full rationale.)
+          $ASM install --project-root .
+
+          $ASM generate --project-root .
 
           # Asserted output of the flow_scanner pass — fails loudly here
           # if a regression silently disables the scanner.
           test -f scripts/flows/tick.zig
-          test -f .labelle/raylib_desktop/scripts/flows/tick.zig
+          test -f .labelle/null_desktop/scripts/flows/tick.zig
 
           # Game-script CustomNode (labelle-assembler#240) — the
           # `custom.flow.jsonc` references `logger.log_i32`, a FlowNode
@@ -351,18 +415,18 @@ jobs:
           # that the named-module promotion (#240 Gap 2) + shim
           # `PluginFlowNodes` (#240 Gap 1) landed in the generated build.
           test -f scripts/flows/custom.zig
-          test -f .labelle/raylib_desktop/scripts/flows/custom.zig
+          test -f .labelle/null_desktop/scripts/flows/custom.zig
           # Call reaches `impl` through `@TypeOf(...)` so Zig doesn't UFCS-bind
           # the FlowNode value as impl's first arg (flow-codegen#28).
-          grep -qF "@TypeOf(game_mod.PluginFlowNodes.logger__log_i32).impl(game" .labelle/raylib_desktop/scripts/flows/custom.zig
+          grep -qF "@TypeOf(game_mod.PluginFlowNodes.logger__log_i32).impl(game" .labelle/null_desktop/scripts/flows/custom.zig
           # Shim exposes PluginFlowNodes via the NAMED module (Gap 1+2).
-          grep -q 'pub const PluginFlowNodes = struct' .labelle/raylib_desktop/game.zig
-          grep -q 'logger__log_i32 = @import("script__logger")' .labelle/raylib_desktop/game.zig
+          grep -q 'pub const PluginFlowNodes = struct' .labelle/null_desktop/game.zig
+          grep -q 'logger__log_i32 = @import("script__logger")' .labelle/null_desktop/game.zig
           # build.zig declares + wires the named module.
-          grep -q 'const script__logger_mod = b.createModule' .labelle/raylib_desktop/build.zig
-          grep -q 'overrideImport(game_mod, "script__logger"' .labelle/raylib_desktop/build.zig
+          grep -q 'const script__logger_mod = b.createModule' .labelle/null_desktop/build.zig
+          grep -q 'overrideImport(game_mod, "script__logger"' .labelle/null_desktop/build.zig
 
-          cd .labelle/raylib_desktop
+          cd .labelle/null_desktop
 
           # Same labelle-cli-equivalent fixFingerprint dance as the
           # null step above — the assembler emits a placeholder

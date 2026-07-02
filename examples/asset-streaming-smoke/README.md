@@ -62,37 +62,38 @@ form without changing `project.labelle`, `scenes/main.jsonc`, or
 `SceneAssetManifests` — the codegen contract this example exercises
 is identical to what the async path will consume.
 
-## Running locally
+## Backend: `.null` (headless)
+
+This fixture tests the assembler's asset-streaming **codegen**
+(lazy-inference → `registerAtlasFromMemory`, `SceneAssetManifests`), not
+rendering, so it targets the backend-agnostic headless `.null` backend
+(labelle-assembler#520). Generate + build + a frame-capped run all work
+with no display / GPU. To see the sprites actually render, point
+`project.labelle` at a windowed backend (`.raylib`) and run locally.
+
+## Running locally (headless, null)
 
 ```sh
 cd examples/asset-streaming-smoke
-labelle generate        # or: labelle-assembler generate
-cd .labelle/raylib_desktop
+labelle-assembler install  --project-root .   # cache the labelle-null backend package (extracted external backend)
+labelle-assembler generate --project-root .
+cd .labelle/null_desktop
 zig build
-./zig-out/bin/asset_streaming_smoke
+LABELLE_NULL_FRAMES=10 ./zig-out/bin/asset_streaming_smoke   # runs N frames, exits rc=0
 ```
 
-Expected behaviour:
-
-- Window opens showing an empty 800×600 frame.
-- A green progress bar fills across two ticks (one per atlas).
-- The progress bar disappears; two sprites (a blue player face and
-  a small jumper figure) render in the **top-right quadrant** of the
-  window — at world (550, 450) and (650, 450). That position is
-  intentional: it's the simplest unambiguous "the JSON-declared
-  coordinates ended up where the JSON said they would" check;
-  anything in any other quadrant means the streaming pipeline
-  mangled the position somewhere.
-- After 30 frames the playing-state script saves
-  `smoke-test.png` to the run directory and quits, so a CI runner
-  gets a reproducible image without needing a window manager.
-- Escape quits early.
+The null backend has no GPU to upload textures to, so it exercises the
+generated streaming main loop + `ImageBackendAdapter` wiring headless
+rather than actually drawing the sprites. For the visual round-trip
+(progress bar → two sprites in the top-right quadrant → `smoke-test.png`)
+switch the backend to `.raylib` and run with a display.
 
 ## CI integration
 
-Added to the `Examples integration test` matrix alongside the
-existing raylib example. The step runs
-`labelle generate` + `cd .labelle/raylib_desktop && zig build` —
-build-only, no headless runtime. A headless run would require a
-display (raylib's window/context is mandatory at init), so runtime
-validation stays local.
+Runs in the `Examples integration test` job. The step invokes the
+assembler binary directly (labelle-cli is pinned to a release that
+predates `.null`), asserts the streaming codegen is emitted
+(`registerAtlasFromMemory` / `SceneAssetManifests`), builds
+`.labelle/null_desktop`, and runs the binary frame-capped for a clean
+headless exit — no display required. Real GPU texture upload / on-screen
+render stays a local `.raylib` check.
