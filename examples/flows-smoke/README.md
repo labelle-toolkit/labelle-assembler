@@ -18,8 +18,8 @@ game-script **CustomNode** (labelle-assembler#240): it calls
 (`script__logger`) so it isn't a member of both the root module (via
 `AllScripts`) and the `game` module (via the shim) at once (Gap 2).
 
-This fixture targets the headless `.null` backend (labelle-assembler
-#520) — it tests flow *codegen*, not rendering, so it needs no display /
+This fixture targets the headless `.null` backend (labelle-assembler #520)
+— it tests flow *codegen*, not rendering, so it needs no display /
 GPU to generate or build. CI builds it but does not run the resulting
 binary: the generated `tick` flow-handler does a runtime
 `game.getComponent` on the `entity_created` payload that currently faults
