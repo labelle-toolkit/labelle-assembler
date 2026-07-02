@@ -266,6 +266,18 @@ pub fn Mixin(comptime Self: type) type {
             errdefer alloc_writer.deinit();
             const w = &alloc_writer.writer;
 
+            // Render-phase plugin mesh callback (engine#660 / labelle-gfx#290
+            // Spine Stage 4b). Sibling of `PluginSystems.drawGui` below, but
+            // emitted OUTSIDE the `guiBegin`/`guiEnd` (imgui) pass and
+            // independent of `hasGui()`: `renderMeshes` draws world-space
+            // meshes (e.g. Spine skeletons) straight through the gfx backend,
+            // so it must fire right after `g.render()` even in a game with no
+            // imgui GUI. Gated only on plugins, mirroring the `plugins.len > 0`
+            // gate the `drawGui` call below carries.
+            if (cfg.plugins.len > 0) {
+                try w.writeAll("        PluginSystems.renderMeshes(&g);\n");
+            }
+
             if (cfg.hasGui()) {
                 try w.writeAll("        g.guiBegin();\n");
                 if (view_names.len > 0) {
