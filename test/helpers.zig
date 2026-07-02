@@ -525,6 +525,80 @@ pub fn genAcmeFooBuildZigZon(
     });
 }
 
+// ── THIRD-PARTY CALLBACK backend fixture (assembler#501) ──────────────────
+// `backends/acme_callback` is a HYPOTHETICAL third-party backend that declares a
+// CALLBACK run-loop (`loop_style = .callback`) with NO matching `Backend` enum
+// tag. Before #501 codegen rejected any string-named callback backend at
+// generate time (`error.ExternalCallbackBackendUnsupported`); its manifest
+// `.platforms.desktop.lifecycle` declaration lifts that rejection by naming the
+// closed, assembler-known callback-block set its entry template consumes. Ships
+// ONLY the v2 manifest + one entry template — read offline.
+pub const acme_callback_fixture_package = generate.PluginDep{ .name = "acme_callback", .repo = "local:backends/acme_callback" };
+
+// The `.lifecycle` declaration `backends/acme_callback/backend.manifest.v2.zon`
+// carries for its desktop callback entry: a module-scope runner + a teardown
+// cleanup callback, nothing backend-private. The tests set this on the
+// `lifecycle_override` threadlocal (production resolves the SAME value from the
+// manifest via `resolveLifecycleOverride`).
+pub const acme_callback_lifecycle_decl = generate.manifest_v2.BackendManifestV2.PlatformEntry.Lifecycle{
+    .runner_module_var = true,
+    .cleanup_callback = true,
+};
+
+// Byte-copy MIRROR of `backends/acme_callback/templates/desktop.txt` — the
+// third-party callback entry template. Inlined so the codegen unit + golden
+// tests run offline against exactly the fixture the production path loads from
+// disk. A minimal headless callback shape: module-scope `g`/`runner` (via
+// `{{module_vars}}`), exported init/frame/cleanup embedding the declared holes.
+pub const acme_callback_lifecycle =
+    \\// acme_callback DESKTOP entry — a minimal CALLBACK-shaped `main.zig`
+    \\// (assembler#501 fixture). The acme windowing runtime owns the loop and invokes
+    \\// the exported init/frame/cleanup callbacks; the generated game splits init from
+    \\// the per-frame tick, so `runner` lives at module scope (declared through the
+    \\// module_vars hole) and the teardown runs in the exported `cleanup` callback
+    \\// (the cleanup_code hole). Restricted to the fixed, declared hole set — no sokol
+    \\// readback / imgui-bridge / bgfx-shell holes (those are backend-private and stay
+    \\// keyed to the built-in branches).
+    \\var g: AssembledGame = undefined;
+    \\{{hooks_init_block}}
+    \\var gpa = std.heap.DebugAllocator(.{}).init;
+    \\{{module_vars}}
+    \\const screen_w: u32 = {{width}};
+    \\const screen_h: u32 = {{height}};
+    \\const screen_title = "{{title}}";
+    \\const target_fps: u32 = {{fps}};
+    \\
+    \\export fn init() callconv(.c) void {
+    \\    const allocator = gpa.allocator();
+    \\    g = AssembledGame.init(allocator);
+    \\    g.setHooks(&hooks);
+    \\    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    \\{{init_code}}}
+    \\
+    \\export fn frame() callconv(.c) void {
+    \\    const dt: f32 = 1.0 / @as(f32, @floatFromInt(@max(target_fps, 1)));
+    \\{{tick_code}}    g.tick(dt);
+    \\    g.render();
+    \\{{gui_draw_code}}}
+    \\
+    \\export fn cleanup() callconv(.c) void {
+    \\{{cleanup_code}}    g.deinit();
+    \\    _ = gpa.deinit();
+    \\}
+    \\
+    \\pub fn main() void {
+    \\    window.run(.{
+    \\        .init_cb = &init,
+    \\        .frame_cb = &frame,
+    \\        .cleanup_cb = &cleanup,
+    \\        .w = screen_w,
+    \\        .h = screen_h,
+    \\        .title = screen_title,
+    \\    });
+    \\}
+    \\
+;
+
 // ── sdl + raylib v2 GOLDEN fixtures (manifest-v2, epic #453 item 3, PR 9) ──
 // sdl and raylib are the next backends converted to v2. Each ships a
 // `backend.manifest.v2.zon` (mirroring `backends/null_v2`/`backends/wgpu_v2`);

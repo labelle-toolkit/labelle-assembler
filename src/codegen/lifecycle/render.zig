@@ -31,6 +31,44 @@ const tpl = @import("../../template.zig");
 const config = @import("../../config.zig");
 const preview = @import("../preview.zig");
 const manifest_splice = @import("../manifest_splice.zig");
+const manifest_v2 = @import("../manifest_v2.zig");
+
+/// Which preview-mode wiring a callback lifecycle emits (assembler#501). The
+/// three callback branches used to hard-code this; it is now a computed value.
+///   - `sokol_readback`: sokol's full GL/D3D11/Metal readback superset (#122).
+///   - `callback_basic`: the generic emscripten INIT/HEARTBEAT callbacks the
+///     raylib/bgfx wasm else-path fills (backend-agnostic).
+///   - `none`: no preview wiring (bgfx-android, declared third-party callback).
+const CallbackPreview = enum { none, sokol_readback, callback_basic };
+
+/// Which Android registration seam a callback lifecycle wires (assembler#501).
+///   - `bgfx_shell`: the bgfx NativeActivity shell register + immersive hook.
+///   - `none`: no Android registration (sokol routes its own via
+///     `immersive_entry`; third-party desktop callbacks have none).
+const AndroidRegister = enum { none, bgfx_shell };
+
+/// The fixed, assembler-computed shape of a callback lifecycle (assembler#501).
+/// For the six built-ins it is derived from the existing enum predicates
+/// (byte-identical behavior); for a declared third-party callback backend it is
+/// computed from the manifest `.platforms.<p>.lifecycle` declaration. Every
+/// callback template hole is then a value keyed on this shape, rendered through
+/// ONE `tpl.render` call (the superset-hole collapse of the former three).
+const LifecycleShape = struct {
+    /// Emit `var runner: Runner = undefined;` at module scope.
+    runner: bool,
+    /// Emit the `{{cleanup_code}}` callback body (`buildCallbackCleanupCode`).
+    cleanup: bool,
+    /// Emit the `{{allocator_decl/expr/local_decl/cleanup}}` holes (sokol).
+    allocator: bool,
+    /// Emit the imgui `{{gui_event_extern}}`/`{{gui_event_forward}}` holes.
+    gui_event: bool,
+    /// `{{module_vars}}` input dispatch is the imgui-conditional variant
+    /// (else the safe no-op stub). sokol/bgfx-android use the conditional
+    /// variant; wasm/third-party use the stub.
+    imgui_dispatch: bool,
+    preview: CallbackPreview,
+    android: AndroidRegister,
+};
 
 const PREVIEW_HELPERS = preview.PREVIEW_HELPERS;
 const PREVIEW_READBACK_HELPERS = preview.PREVIEW_READBACK_HELPERS;
@@ -98,6 +136,12 @@ pub fn Mixin(comptime Self: type) type {
             lifecycle_tmpl: []const u8,
             hooks_init: []const u8,
             loop_style_ovr: ?manifest_splice.BackendManifest.LoopStyle,
+            /// Manifest-declared callback-lifecycle blocks (assembler#501).
+            /// Non-null lifts the callback-external rejection AND drives the
+            /// shape for a genuine third-party (non-enum-tag) callback backend.
+            /// Passed by value (like `loop_style_ovr`) so this module stays
+            /// decoupled from the orchestrator's `threadlocal`.
+            lifecycle_ovr: ?manifest_v2.BackendManifestV2.PlatformEntry.Lifecycle,
         ) !void {
             const allocator = self.allocator;
             const cfg = self.cfg;
@@ -187,8 +231,14 @@ pub fn Mixin(comptime Self: type) type {
             // the tag): `isEnumTagBacked()` is false for it, so it never inherits
             // the raylib-shaped wasm wiring against an unvalidated template.
             // Built-ins are unaffected (`isExternal()` is false).
+            //
+            // A DECLARED callback backend (assembler#501) is also handled: its
+            // manifest `.platforms.<p>.lifecycle` names the assembler-known
+            // blocks its entry template consumes, so the third-party dispatch
+            // branch below has a real shape to render. An UNDECLARED callback
+            // external stays rejected — the fail-fast is the safety property.
             const callback_dispatch_handled = is_bgfx_android or cfg.backend == .sokol or
-                (cfg.platform == .wasm and cfg.isEnumTagBacked());
+                (cfg.platform == .wasm and cfg.isEnumTagBacked()) or lifecycle_ovr != null;
             if (use_callback_lifecycle and cfg.isExternal() and !callback_dispatch_handled) {
                 // Silenced under test (the Zig test runner fails any test that
                 // emits a `std.log.err`, even when the error is the asserted
@@ -197,9 +247,10 @@ pub fn Mixin(comptime Self: type) type {
                 if (!builtin.is_test) {
                     std.log.err(
                         "labelle-assembler: external backend '{s}' declares a callback run-loop " ++
-                            "(loop_style = .callback), which codegen does not support yet — only " ++
-                            "loop-style external backends are wired today (epic #386). Use a loop-style " ++
-                            "backend, or follow up on the callback-dispatch externalization.",
+                            "(loop_style = .callback) but does NOT declare its lifecycle blocks — " ++
+                            "add `.platforms.<platform>.lifecycle` to its backend.manifest.v2.zon so " ++
+                            "codegen knows which callback blocks its entry template consumes " ++
+                            "(assembler#501). Loop-style external backends need no such declaration.",
                         .{cfg.backendName()},
                     );
                 }
@@ -207,13 +258,39 @@ pub fn Mixin(comptime Self: type) type {
             }
 
             if (use_callback_lifecycle) {
+                // The fixed shape of this callback lifecycle (assembler#501).
+                // For the six built-ins it is derived from the SAME enum
+                // predicates as before (byte-identical output); for a declared
+                // third-party callback backend it comes from the manifest
+                // `.lifecycle`. Sokol/bgfx-android are matched FIRST, so the
+                // declared branch only ever covers a genuine non-enum-tag
+                // callback backend (the wasm else-shape is the remaining
+                // first-party fall-through). Every callback hole below is a
+                // value keyed on this shape, rendered through ONE `tpl.render`.
+                const shape: LifecycleShape = if (cfg.backend == .sokol)
+                    .{ .runner = true, .cleanup = true, .allocator = true, .gui_event = true, .imgui_dispatch = true, .preview = .sokol_readback, .android = .none }
+                else if (is_bgfx_android)
+                    .{ .runner = true, .cleanup = false, .allocator = false, .gui_event = false, .imgui_dispatch = true, .preview = .none, .android = .bgfx_shell }
+                else if (lifecycle_ovr) |decl|
+                    // Declared third-party callback backend: only the fixed
+                    // engine-facing blocks are declarable — the sokol readback,
+                    // imgui-bridge externs, and bgfx shell reference backend-
+                    // private symbols and stay keyed to the built-in branches.
+                    .{ .runner = decl.runner_module_var, .cleanup = decl.cleanup_callback, .allocator = decl.allocator_holes, .gui_event = decl.gui_events, .imgui_dispatch = false, .preview = .none, .android = .none }
+                else
+                    // Raylib/bgfx wasm (first-party): the generic emscripten
+                    // callback else-path — module-scope runner, INIT/HEARTBEAT
+                    // preview callbacks, no backend-specific holes.
+                    .{ .runner = true, .cleanup = false, .allocator = false, .gui_event = false, .imgui_dispatch = false, .preview = .callback_basic, .android = .none };
+
+                const is_wasm = cfg.platform == .wasm;
+
                 // Module-scope `runner` decl — needed by every callback-path
                 // backend whose `init_code` ASSIGNS `runner = Runner.init(...)`
                 // (sokol mobile/desktop and bgfx-android both split init from
                 // the per-frame tick, so the runner can't be an init-scope
-                // local like the loop path). Raylib-wasm takes the `else`
-                // branch below and declares its own runner inside `main()`.
-                const callback_runner: []const u8 = if (cfg.backend == .sokol or is_bgfx_android) "var runner: Runner = undefined;\n" else "";
+                // local like the loop path).
+                const runner_decl: []const u8 = if (shape.runner) "var runner: Runner = undefined;\n" else "";
                 // Sokol-backend builds get ALL THREE readback helper blocks
                 // emitted side-by-side:
                 //   - GL PBO ring (labelle-assembler#122 slice 1, #124) —
@@ -229,11 +306,7 @@ pub fn Mixin(comptime Self: type) type {
                 // reachable per target. The `else struct {}` branches in
                 // each helper namespace keep unresolved-symbol references
                 // off the link line on the inactive targets.
-                // Emit-unconditional for `cfg.backend == .sokol` keeps the
-                // generated source uniform across desktop / mobile
-                // templates; wasm routes through the raylib branch below
-                // and stays out of all three readback paths for now.
-                const sokol_readback_helpers: []const u8 = if (cfg.backend == .sokol)
+                const sokol_readback_helpers: []const u8 = if (shape.preview == .sokol_readback)
                     try std.mem.concat(allocator, u8, &.{
                         PREVIEW_READBACK_HELPERS_SOKOL,
                         PREVIEW_READBACK_HELPERS_SOKOL_D3D11,
@@ -241,17 +314,20 @@ pub fn Mixin(comptime Self: type) type {
                     })
                 else
                     "";
-                defer if (cfg.backend == .sokol) allocator.free(sokol_readback_helpers);
+                defer if (shape.preview == .sokol_readback) allocator.free(sokol_readback_helpers);
                 // PREVIEW_INPUT_DISPATCH emits `extern fn imgui_bridge_mouse_*`
                 // symbols, which only exist when the gui plugin is imgui. Gate
                 // narrowly on plugin name — other gui plugins (clay, simple-raylib,
                 // simple-sokol, …) would link-fail on these externs. The stub
-                // variant provides safe no-ops for those projects.
+                // variant provides safe no-ops for those projects. Only the
+                // sokol/bgfx-android shapes take the imgui-conditional dispatch;
+                // wasm/third-party always take the safe stub.
                 const input_dispatch_cb: []const u8 = if (cfg.resolved_gui) |gui|
                     (if (std.mem.eql(u8, gui.name, "imgui")) PREVIEW_INPUT_DISPATCH else PREVIEW_INPUT_DISPATCH_STUB)
                 else
                     PREVIEW_INPUT_DISPATCH_STUB;
-                const module_vars = try std.mem.concat(allocator, u8, &.{ callback_runner, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch_cb });
+                const input_dispatch: []const u8 = if (shape.imgui_dispatch) input_dispatch_cb else PREVIEW_INPUT_DISPATCH_STUB;
+                const module_vars = try std.mem.concat(allocator, u8, &.{ runner_decl, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch });
                 defer allocator.free(module_vars);
                 const init_code = try self.buildCallbackInitCode();
                 defer allocator.free(init_code);
@@ -273,293 +349,165 @@ pub fn Mixin(comptime Self: type) type {
                     .desktop => "",
                 };
 
-                if (cfg.backend == .sokol) {
-                    const cleanup_code = try self.buildCallbackCleanupCode();
-                    defer allocator.free(cleanup_code);
-                    const is_wasm = cfg.platform == .wasm;
-                    const allocator_decl: []const u8 = if (is_wasm)
-                        "// Use c_allocator for Emscripten — delegates to emscripten's malloc/free\n// which respects ALLOW_MEMORY_GROWTH. GPA is incompatible with wasm32-emscripten.\nconst allocator = std.heap.c_allocator;"
-                    else
-                        "var gpa = std.heap.DebugAllocator(.{}).init;";
-                    const allocator_expr: []const u8 = if (is_wasm) "std.heap.c_allocator" else "gpa.allocator()";
-                    const allocator_cleanup: []const u8 = if (is_wasm) "" else "    _ = gpa.deinit();\n";
-                    // For wasm, `allocator` is already declared at module scope
-                    // by `{{allocator_decl}}` above, so re-declaring it inside
-                    // `initInner` would trigger Zig's "local constant shadows
-                    // declaration" error (labelle-cli#198). For desktop, the
-                    // module scope only has `var gpa = ...`, so we still need
-                    // the inner alias.
-                    const allocator_local_decl: []const u8 = if (is_wasm) "" else "    const allocator = gpa.allocator();\n";
+                // ── Callback lifecycle holes (assembler#501) ──────────────
+                // Every hole is a value keyed on `shape`; the superset is
+                // rendered through ONE `tpl.render`. Holes a given entry
+                // template does not declare are harmlessly ignored (unknown
+                // struct keys); a shape must fill every hole its template DOES
+                // declare (`tpl.render` leaves truly-absent holes verbatim).
 
-                    // Wire the GUI bridge into sokol's event callback so widgets
-                    // see mouse / keyboard input. labelle-imgui's sokol bridge
-                    // exports `imgui_bridge_handle_event` for exactly this — when
-                    // a GUI plugin is configured we forward each event to it.
-                    // Without this hook simgui's IO state stays empty and ImGui
-                    // buttons/sliders never respond.
-                    const gui_event_extern: []const u8 = if (cfg.hasGui())
-                        "extern fn imgui_bridge_handle_event(ev: [*c]const @import(\"backend_input\").Event) bool;\n\n"
-                    else
-                        "";
-                    const gui_event_forward: []const u8 = if (cfg.hasGui())
-                        "    _ = imgui_bridge_handle_event(ev);\n"
-                    else
-                        "";
+                const cleanup_code: []const u8 = if (shape.cleanup) try self.buildCallbackCleanupCode() else "";
+                defer if (shape.cleanup) allocator.free(cleanup_code);
 
-                    // Readback hookups (labelle-assembler#122). Each
-                    // lifecycle slot gets ALL THREE backend variants
-                    // concatenated (GL slice 1 #124, D3D11 slice 2 #126,
-                    // Metal slice 3 #125):
-                    //   - init   : stash the allocator into the module-scope
-                    //              slot (idempotent across the three gates —
-                    //              exactly one branch fires per target)
-                    //   - frame  : pre-endFrame slot carries GL + D3D11
-                    //              (both rely on a flush-on-read primitive
-                    //              that's safe before `sg.commit()`); the
-                    //              Metal block runs in the post-endFrame
-                    //              slot because Metal needs `sg.commit()`
-                    //              to land the swapchain texture before our
-                    //              own command buffer can read it.
-                    //   - cleanup: endFrameStream + ring teardown for each,
-                    //              then the graceful `bye`. Buffer free
-                    //              guarded so the inactive blocks are
-                    //              no-ops.
-                    // The three paths evaporate on the non-matching OS via
-                    // their `_sokol_preview_{gl,d3d11,metal}_enabled` flags.
-                    //
-                    // Wasm-emscripten gate (labelle-assembler#141): preview
-                    // mode is useless in a browser tab (no `LABELLE_PREVIEW`
-                    // env, no TCP socket out), and `std.Io.Threaded.init` +
-                    // `.io()` instantiates the vtable that references
-                    // `childWaitPosix` → triggers the Zig 0.16
-                    // `Threaded.zig:15315` / `emscripten.zig:215` enum
-                    // mismatches. Emit empty strings for the preview slots
-                    // on wasm so the generated `main.zig` never references
-                    // `std.Io.Threaded`. See ziglang/zig#31849 + PR #31850
-                    // for the upstream fix; this is the workaround for now.
-                    const preview_setup_sokol = if (is_wasm)
-                        try allocator.dupe(u8, "")
-                    else
-                        try std.mem.concat(allocator, u8, &.{
-                            PREVIEW_INIT_CALLBACK,
-                            PREVIEW_READBACK_INIT_SOKOL,
-                            PREVIEW_READBACK_INIT_SOKOL_D3D11,
-                            PREVIEW_READBACK_INIT_METAL_SOKOL,
-                        });
-                    defer allocator.free(preview_setup_sokol);
-                    // Wasm-emscripten gate (labelle-assembler#141, same
-                    // rationale as `preview_setup_sokol` above). Heartbeat
-                    // + readback + cleanup all touch `g.preview`'s public
-                    // methods, and Zig's lazy compilation may still pull
-                    // the `popInputEvent` / `tickHeartbeat` codepaths into
-                    // the wasm exe even when `g.preview` is statically
-                    // null. Emit empty strings so the generated `main.zig`
-                    // never references Preview's IO surface on wasm.
-                    const preview_readback_sokol = if (is_wasm)
-                        try allocator.dupe(u8, "")
-                    else
-                        try std.mem.concat(allocator, u8, &.{
-                            PREVIEW_READBACK_FRAME_SOKOL,
-                            PREVIEW_READBACK_FRAME_SOKOL_D3D11,
-                            // Path A (#131): the Metal block no longer depends
-                            // on a swapchain drawable, so it can run in the
-                            // pre-endFrame slot alongside GL / D3D11. The
-                            // `{{preview_readback_post}}` template hole gets
-                            // an empty string below — kept in the template so
-                            // existing test scaffolding still expands cleanly,
-                            // but no longer carries any Metal payload.
-                            PREVIEW_READBACK_FRAME_METAL_SOKOL,
-                        });
-                    defer allocator.free(preview_readback_sokol);
-                    const preview_cleanup_sokol = if (is_wasm)
-                        try allocator.dupe(u8, "")
-                    else
-                        try std.mem.concat(allocator, u8, &.{
-                            PREVIEW_READBACK_CLEANUP_SOKOL,
-                            PREVIEW_READBACK_CLEANUP_SOKOL_D3D11,
-                            PREVIEW_READBACK_CLEANUP_METAL_SOKOL,
-                            PREVIEW_CLEANUP_CALLBACK,
-                        });
-                    defer allocator.free(preview_cleanup_sokol);
-                    const preview_heartbeat_sokol: []const u8 = if (is_wasm) "" else PREVIEW_HEARTBEAT_CALLBACK;
+                // Allocator holes (sokol shape): module-scope decl + inner
+                // alias + init expr + cleanup. wasm uses c_allocator (GPA is
+                // incompatible with wasm32-emscripten); the inner alias is empty
+                // on wasm to avoid shadowing the module-scope decl
+                // (labelle-cli#198). Empty for every non-allocator shape.
+                const allocator_decl: []const u8 = if (!shape.allocator)
+                    ""
+                else if (is_wasm)
+                    "// Use c_allocator for Emscripten — delegates to emscripten's malloc/free\n// which respects ALLOW_MEMORY_GROWTH. GPA is incompatible with wasm32-emscripten.\nconst allocator = std.heap.c_allocator;"
+                else
+                    "var gpa = std.heap.DebugAllocator(.{}).init;";
+                const allocator_expr: []const u8 = if (!shape.allocator) "" else if (is_wasm) "std.heap.c_allocator" else "gpa.allocator()";
+                const allocator_cleanup: []const u8 = if (!shape.allocator) "" else if (is_wasm) "" else "    _ = gpa.deinit();\n";
+                const allocator_local_decl: []const u8 = if (!shape.allocator) "" else if (is_wasm) "" else "    const allocator = gpa.allocator();\n";
 
-                    // `{{immersive_entry}}` — Android immersive-mode call,
-                    // emitted into `sokol_main()` (UI thread, pre-callback
-                    // registration) so the bars are hidden at launch. Empty
-                    // for non-Android / non-immersive projects; the shared
-                    // sokol `desktop.txt` has no such hole, so an empty
-                    // value there is a harmless no-op.
-                    const immersive_entry = try self.buildImmersiveEntryCode();
-                    defer allocator.free(immersive_entry);
+                // Wire the GUI bridge into sokol's event callback so widgets see
+                // mouse / keyboard input. labelle-imgui's sokol bridge exports
+                // `imgui_bridge_handle_event`; only the sokol shape declares the
+                // holes, and only when a GUI plugin is configured.
+                const gui_event_extern: []const u8 = if (shape.gui_event and cfg.hasGui())
+                    "extern fn imgui_bridge_handle_event(ev: [*c]const @import(\"backend_input\").Event) bool;\n\n"
+                else
+                    "";
+                const gui_event_forward: []const u8 = if (shape.gui_event and cfg.hasGui())
+                    "    _ = imgui_bridge_handle_event(ev);\n"
+                else
+                    "";
 
-                    try tpl.render(lifecycle_tmpl, .{
-                        .module_vars = module_vars,
-                        .width = w_str,
-                        .height = h_str,
-                        .title = cfg.title,
-                        .fps = fps_str,
-                        .init_code = init_code,
-                        .tick_code = tick_code,
-                        .gui_draw_code = gui_draw_code,
-                        .gui_event_extern = gui_event_extern,
-                        .gui_event_forward = gui_event_forward,
-                        .cleanup_code = cleanup_code,
-                        .platform_comment = platform_comment,
-                        .entry_comment = entry_comment,
-                        .hidden_setup = hidden_setup,
-                        .hooks_init_block = hooks_init,
-                        .allocator_decl = allocator_decl,
-                        .allocator_expr = allocator_expr,
-                        .allocator_local_decl = allocator_local_decl,
-                        .allocator_cleanup = allocator_cleanup,
-                        // Preview-mode wiring (labelle-assembler#94,
-                        // labelle-engine#520). `g.preview` is the canonical
-                        // storage; init dials + assigns + seeds the PBO
-                        // allocator, frame heartbeats + reads back pixels,
-                        // cleanup tears down PBO state then emits the
-                        // graceful `bye`, and `g.deinit` owns the socket +
-                        // arena teardown.
-                        .preview_setup = preview_setup_sokol,
-                        .preview_heartbeat = preview_heartbeat_sokol,
-                        // Path A render-target wiring (#133) — fires BEFORE
-                        // `window.beginFrame()` so the swapchain-vs-offscreen
-                        // decision is made before sokol-gfx commits to either.
-                        // Empty under non-Darwin targets (the block is
-                        // comptime-gated on `_sokol_preview_metal_enabled`).
-                        // GL (#124) and D3D11 (#126) keep their existing
-                        // pre-endFrame slot — their readback model is a
-                        // post-commit copy, not a render redirect.
-                        .preview_pre_render = PREVIEW_PRE_RENDER_METAL_SOKOL,
-                        .preview_readback = preview_readback_sokol,
-                        // Path A (#131): the Metal block is part of the
-                        // pre-endFrame readback now, so the post-endFrame
-                        // hole is empty. Kept in the template so the
-                        // placeholder still expands cleanly; retiring it
-                        // entirely is a separate cleanup step.
-                        .preview_readback_post = "",
-                        .preview_cleanup = preview_cleanup_sokol,
-                        .immersive_entry = immersive_entry,
-                    }, bw);
-                } else if (is_bgfx_android) {
-                    // bgfx-on-Android (#303): the generated game owns
-                    // `android_main` and registers an init + frame callback
-                    // with the bgfx NativeActivity shell, which drives the
-                    // event/frame loop. Holes mirror `backends/bgfx/templates/
-                    // android.txt`. `init_code` comes from the callback builder
-                    // (void-safe — the shell's callback is `callconv(.c) void`,
-                    // no error channel), `tick_code` is the shared engine-tick
-                    // block, and the preview-mode readback slots are empty:
-                    // bgfx has no on-device preview path yet (its desktop
-                    // readback is a separate, unshipped ticket like sdl/wgpu).
-                    //
-                    // `{{android_backend_register}}` (#310 Stage 4): register the
-                    // bgfx backend's Android JNI seam with core at the top of
-                    // `gameInit`, before the first frame polls the gamepad source.
-                    // Replaces the old sokol-compat shims (now removed from the
-                    // template). Emitted UNCONDITIONALLY on bgfx-Android — gamepad
-                    // detection needs it even when immersive mode is off — mirroring
-                    // the sokol path (`buildImmersiveEntryCode`). `engine.core` is
-                    // labelle-engine's re-export of labelle-core; the context comes
-                    // from the bgfx backend adapter surfaced as `backend_input.android`.
-                    //
-                    // Immersive mode (bgfx-immersive). The engine's hook-based
-                    // `enableImmersiveMode()` does NOT work on bgfx: native_app_glue
-                    // owns `onContentRectChanged`, so the launch hook installs too
-                    // late / clobbers the glue and the system-bar hide never fires.
-                    // And the hide (`WindowInsetsController.hide()`) MUST run on the
-                    // UI thread — the glue runs `gameFrame` on its app thread, so it
-                    // can't be driven from the frame loop either (Android throws even
-                    // from a JVM-attached app-thread; verified on-device).
-                    //
-                    // Instead the bgfx shell chains `onWindowFocusChanged` — a
-                    // framework callback the OS fires ON THE UI THREAD at launch and
-                    // on every focus regain — and invokes a registered callback from
-                    // there. We register the engine's UI-thread hide
-                    // (`engine.android.applyImmersiveUiThread`) via the shell's
-                    // `setImmersiveCallback` in `android_main`, before `run()`. The
-                    // generated `main` owns both the shell (`android_app`) and the
-                    // engine, satisfying the backend-cannot-depend-on-engine rule.
-                    const bgfx_immersive = if (cfg.android) |a| a.immersive_mode else false;
-                    const immersive_register: []const u8 = if (bgfx_immersive)
-                        "    // Android immersive mode (project.labelle `.android.immersive_mode`):\n" ++
-                        "    // register the engine's UI-thread system-bar hide with the bgfx shell.\n" ++
-                        "    // The shell chains onWindowFocusChanged (a UI-thread framework callback)\n" ++
-                        "    // and invokes this on launch + every focus regain, so the bars hide at\n" ++
-                        "    // launch and re-hide after a swipe / returning from the shade. The\n" ++
-                        "    // hook-based enableImmersiveMode() can't work under native_app_glue.\n" ++
-                        "    // See labelle-engine src/android.zig (applyImmersiveUiThread) and\n" ++
-                        "    // backends/bgfx/src/android_app.zig (setImmersiveCallback / focusHook).\n" ++
-                        "    android_app.setImmersiveCallback(&engine.android.applyImmersiveUiThread);\n"
-                    else
-                        "";
+                // Preview-mode wiring. The sokol shape emits ALL THREE readback
+                // helper slots (GL slice 1 #124, D3D11 slice 2 #126, Metal slice
+                // 3 #125), each keyed on `_sokol_preview_{gl,d3d11,metal}_enabled`
+                // so exactly one path is live per target. The wasm callback-basic
+                // shape emits only the generic emscripten INIT/HEARTBEAT
+                // callbacks; every other shape emits nothing.
+                //
+                // Wasm-emscripten gate (labelle-assembler#141): sokol's preview
+                // slots reference `std.Io.Threaded` (broken under wasm32-
+                // emscripten, Threaded.zig:15315 / emscripten.zig:215), so they
+                // go empty on wasm. See ziglang/zig#31849 + PR #31850.
+                const sokol_preview = shape.preview == .sokol_readback;
+                const preview_setup: []const u8 = blk: {
+                    if (sokol_preview) break :blk if (is_wasm) "" else try std.mem.concat(allocator, u8, &.{
+                        PREVIEW_INIT_CALLBACK,
+                        PREVIEW_READBACK_INIT_SOKOL,
+                        PREVIEW_READBACK_INIT_SOKOL_D3D11,
+                        PREVIEW_READBACK_INIT_METAL_SOKOL,
+                    });
+                    if (shape.preview == .callback_basic) break :blk if (is_wasm) "" else PREVIEW_INIT_CALLBACK;
+                    break :blk "";
+                };
+                defer if (sokol_preview and !is_wasm) allocator.free(preview_setup);
+                const preview_readback: []const u8 = blk: {
+                    if (sokol_preview) break :blk if (is_wasm) "" else try std.mem.concat(allocator, u8, &.{
+                        PREVIEW_READBACK_FRAME_SOKOL,
+                        PREVIEW_READBACK_FRAME_SOKOL_D3D11,
+                        // Path A (#131): the Metal block runs in the pre-endFrame
+                        // slot alongside GL / D3D11; the `{{preview_readback_post}}`
+                        // hole below is empty (kept so scaffolding expands cleanly).
+                        PREVIEW_READBACK_FRAME_METAL_SOKOL,
+                    });
+                    break :blk "";
+                };
+                defer if (sokol_preview and !is_wasm) allocator.free(preview_readback);
+                const preview_cleanup: []const u8 = blk: {
+                    if (sokol_preview) break :blk if (is_wasm) "" else try std.mem.concat(allocator, u8, &.{
+                        PREVIEW_READBACK_CLEANUP_SOKOL,
+                        PREVIEW_READBACK_CLEANUP_SOKOL_D3D11,
+                        PREVIEW_READBACK_CLEANUP_METAL_SOKOL,
+                        PREVIEW_CLEANUP_CALLBACK,
+                    });
+                    break :blk "";
+                };
+                defer if (sokol_preview and !is_wasm) allocator.free(preview_cleanup);
+                const preview_heartbeat: []const u8 = switch (shape.preview) {
+                    .sokol_readback, .callback_basic => if (is_wasm) "" else PREVIEW_HEARTBEAT_CALLBACK,
+                    .none => "",
+                };
+                // Path A render-target wiring (#133) — sokol only, comptime-gated
+                // on `_sokol_preview_metal_enabled` (empty on non-Darwin targets).
+                const preview_pre_render: []const u8 = if (sokol_preview) PREVIEW_PRE_RENDER_METAL_SOKOL else "";
+                // Path A (#131): the Metal readback moved to the pre-endFrame
+                // slot, so this hole is always empty.
+                const preview_readback_post: []const u8 = "";
 
-                    try tpl.render(lifecycle_tmpl, .{
-                        .module_vars = module_vars,
-                        .width = w_str,
-                        .height = h_str,
-                        .title = cfg.title,
-                        .fps = fps_str,
-                        .init_code = init_code,
-                        .tick_code = tick_code,
-                        .gui_draw_code = gui_draw_code,
-                        .hooks_init_block = hooks_init,
-                        .platform_comment = platform_comment,
-                        .entry_comment = entry_comment,
-                        .preview_setup = "",
-                        .preview_heartbeat = "",
-                        .android_backend_register = BGFX_ANDROID_BACKEND_REGISTER,
-                        .immersive_register = immersive_register,
-                    }, bw);
-                } else {
-                    // Raylib wasm: emscripten-driven callback loop. Preview
-                    // setup runs once in main() before the loop is handed
-                    // to emscripten; heartbeats fire inside `gameFrame`.
-                    // No cleanup callback — emscripten keeps running after
-                    // main returns, and the editor reads EOF on tab close.
-                    //
-                    // Wasm-emscripten gate (labelle-assembler#141): preview
-                    // mode is useless in a browser tab, and the explicit
-                    // `std.Io.Threaded.init` in PREVIEW_INIT_CALLBACK pulls
-                    // the broken Zig 0.16 posix wrappers into the wasm exe
-                    // (Threaded.zig:15315 / emscripten.zig:215). Emit empty
-                    // strings on wasm. Both branches of this `if/else` land
-                    // on wasm in practice, but keep the gate explicit so
-                    // the intent is local.
-                    const is_wasm_raylib = cfg.platform == .wasm;
-                    // `{{module_vars}}` hole: raylib's `templates/wasm.txt` has
-                    // none (this key is then harmlessly ignored), but bgfx's
-                    // `templates/wasm.txt` DOES carry it (mirroring bgfx's
-                    // desktop/android templates), so it must be filled or the
-                    // literal `{{module_vars}}` would land in the generated
-                    // main.zig. Emit the same helper block the bgfx desktop/
-                    // sokol-wasm paths do (PREVIEW_HELPERS is just extern
-                    // getenv/clock_gettime decls — proven wasm-safe by the
-                    // sokol-wasm path — plus the no-op input-dispatch stub). No
-                    // module-scope runner: the shared callback `tick_code`
-                    // references `runner.tick(...)` and `init_code` assigns
-                    // `runner = Runner.init(...)`, so `runner` MUST be declared at
-                    // module scope. Raylib's `templates/wasm.txt` hardcodes its own
-                    // `var runner` (so its (absent) module_vars hole carries none),
-                    // but bgfx's template injects it through `{{module_vars}}` —
-                    // mirroring the sokol/bgfx-android callback paths. Include it
-                    // here; raylib ignores the key (no hole), bgfx fills it.
-                    const module_vars_wasm = try std.mem.concat(allocator, u8, &.{ "var runner: Runner = undefined;\n", PREVIEW_HELPERS, PREVIEW_INPUT_DISPATCH_STUB });
-                    defer allocator.free(module_vars_wasm);
-                    try tpl.render(lifecycle_tmpl, .{
-                        .width = w_str,
-                        .height = h_str,
-                        .title = cfg.title,
-                        .fps = fps_str,
-                        .module_vars = module_vars_wasm,
-                        .setup_code = init_code,
-                        .tick_code = tick_code,
-                        .gui_draw_code = gui_draw_code,
-                        .hidden_setup = hidden_setup,
-                        .hooks_init_block = hooks_init,
-                        .preview_setup = if (is_wasm_raylib) "" else PREVIEW_INIT_CALLBACK,
-                        .preview_heartbeat = if (is_wasm_raylib) "" else PREVIEW_HEARTBEAT_CALLBACK,
-                    }, bw);
-                }
+                // `{{immersive_entry}}` — sokol Android immersive-mode call +
+                // backend-context registration, emitted into `sokol_main()`
+                // (UI thread, pre-callback registration). Empty (but allocated)
+                // off Android; only the sokol shape emits it.
+                const immersive_entry: []const u8 = if (sokol_preview) try self.buildImmersiveEntryCode() else "";
+                defer if (sokol_preview) allocator.free(immersive_entry);
+
+                // bgfx-on-Android registration seam (#310 Stage 4) + immersive
+                // hook — only the bgfx_shell android shape emits them. The bgfx
+                // shell chains `onWindowFocusChanged` (a UI-thread framework
+                // callback) and invokes the engine's UI-thread system-bar hide;
+                // the hook-based `enableImmersiveMode()` can't work under
+                // native_app_glue. See backends/bgfx/src/android_app.zig.
+                const android_backend_register: []const u8 = if (shape.android == .bgfx_shell) BGFX_ANDROID_BACKEND_REGISTER else "";
+                const immersive_register: []const u8 = if (shape.android == .bgfx_shell and (if (cfg.android) |a| a.immersive_mode else false))
+                    "    // Android immersive mode (project.labelle `.android.immersive_mode`):\n" ++
+                    "    // register the engine's UI-thread system-bar hide with the bgfx shell.\n" ++
+                    "    // The shell chains onWindowFocusChanged (a UI-thread framework callback)\n" ++
+                    "    // and invokes this on launch + every focus regain, so the bars hide at\n" ++
+                    "    // launch and re-hide after a swipe / returning from the shade. The\n" ++
+                    "    // hook-based enableImmersiveMode() can't work under native_app_glue.\n" ++
+                    "    // See labelle-engine src/android.zig (applyImmersiveUiThread) and\n" ++
+                    "    // backends/bgfx/src/android_app.zig (setImmersiveCallback / focusHook).\n" ++
+                    "    android_app.setImmersiveCallback(&engine.android.applyImmersiveUiThread);\n"
+                else
+                    "";
+
+                // ONE render for every callback shape — the superset-hole
+                // collapse of the former three per-branch `tpl.render` calls
+                // (assembler#501). `init_code` doubles as `setup_code` (the wasm
+                // else-path's hole spelling); each template consumes only the
+                // holes it declares. `g.preview` is the canonical preview
+                // storage — init dials/assigns/seeds the PBO allocator, frame
+                // heartbeats + reads back pixels, cleanup tears it down.
+                try tpl.render(lifecycle_tmpl, .{
+                    .module_vars = module_vars,
+                    .width = w_str,
+                    .height = h_str,
+                    .title = cfg.title,
+                    .fps = fps_str,
+                    .init_code = init_code,
+                    .setup_code = init_code,
+                    .tick_code = tick_code,
+                    .gui_draw_code = gui_draw_code,
+                    .gui_event_extern = gui_event_extern,
+                    .gui_event_forward = gui_event_forward,
+                    .cleanup_code = cleanup_code,
+                    .platform_comment = platform_comment,
+                    .entry_comment = entry_comment,
+                    .hidden_setup = hidden_setup,
+                    .hooks_init_block = hooks_init,
+                    .allocator_decl = allocator_decl,
+                    .allocator_expr = allocator_expr,
+                    .allocator_local_decl = allocator_local_decl,
+                    .allocator_cleanup = allocator_cleanup,
+                    .preview_setup = preview_setup,
+                    .preview_heartbeat = preview_heartbeat,
+                    .preview_pre_render = preview_pre_render,
+                    .preview_readback = preview_readback,
+                    .preview_readback_post = preview_readback_post,
+                    .preview_cleanup = preview_cleanup,
+                    .immersive_entry = immersive_entry,
+                    .android_backend_register = android_backend_register,
+                    .immersive_register = immersive_register,
+                }, bw);
             } else {
                 const setup_code = try self.buildSetupCode();
                 defer allocator.free(setup_code);

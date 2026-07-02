@@ -272,7 +272,43 @@ pub const BackendManifestV2 = struct {
         /// Packaging recipe handed to the shared platform-packager.
         package: Package,
 
+        /// Which callback-lifecycle blocks this entry template's holes consume
+        /// (assembler#501). Names a CLOSED, assembler-known block library —
+        /// never raw Zig source (the v1 fragment mistake, see the
+        /// `BackendManifestV2` doc). `null` on a `.callback` entry means
+        /// "undeclared": codegen still REJECTS a non-enum-tag callback backend
+        /// (the fail-fast safety property at `lifecycle/render.zig`). Only a
+        /// declaration lifts that rejection. Irrelevant on a `.loop` entry (the
+        /// loop path emits no callback blocks). Additive + defaulted so every
+        /// existing v2 manifest keeps parsing unchanged.
+        lifecycle: ?Lifecycle = null,
+
         pub const LoopStyle = enum { callback, loop };
+
+        /// The declarable callback-lifecycle block set (assembler#501). Flags
+        /// only — each names a fixed block whose BODY lives in the assembler
+        /// (`lifecycle/render.zig`), not the manifest. The sokol readback, the
+        /// imgui-bridge externs, and the bgfx shell registration are NOT
+        /// declarable here: they reference backend-private symbols and stay
+        /// keyed to the built-in enum branches. A third-party callback backend
+        /// gets `PREVIEW_HELPERS` + the input-dispatch stub in `module_vars`,
+        /// empty preview holes, and no Android registers.
+        pub const Lifecycle = struct {
+            /// Emit `var runner: Runner = undefined;` at module scope (the
+            /// callback `init_code` assigns it; the per-frame `tick_code` reads
+            /// it — so it can't be an init-scope local).
+            runner_module_var: bool = true,
+            /// Emit the `{{cleanup_code}}` callback body (runner/plugin/GUI
+            /// teardown) — callback backends have no `defer` scope to hang it on.
+            cleanup_callback: bool = false,
+            /// Emit the `{{allocator_decl/expr/local_decl/cleanup}}` holes (a
+            /// module-scope allocator the split init/frame/cleanup callbacks
+            /// share).
+            allocator_holes: bool = false,
+            /// Emit the imgui `{{gui_event_extern}}`/`{{gui_event_forward}}`
+            /// holes (only meaningful with a configured imgui GUI plugin).
+            gui_events: bool = false,
+        };
     };
 
     pub const Platforms = struct {
@@ -461,6 +497,7 @@ const synthetic_v2 =
     \\        .desktop = .{
     \\            .entry = "templates/desktop.txt",
     \\            .loop_style = .callback,
+    \\            .lifecycle = .{ .runner_module_var = true, .cleanup_callback = true, .allocator_holes = true, .gui_events = true },
     \\            .target = .native,
     \\            .artifacts = .{ .{ .name = "sokol_clib" } },
     \\            .dep_options = .{
@@ -556,8 +593,19 @@ test "BackendManifestV2: a synthetic v2 manifest parses with the right fields" {
     try testing.expectEqual(BackendManifestV2.DepOption.ValueSource.gamepad_hidapi, desktop.dep_options[1].value);
     try testing.expect(desktop.package == .binary);
 
+    // desktop `.lifecycle` declaration parses (assembler#501): the callback
+    // blocks the desktop entry template consumes.
+    const desktop_lifecycle = desktop.lifecycle.?;
+    try testing.expect(desktop_lifecycle.runner_module_var);
+    try testing.expect(desktop_lifecycle.cleanup_callback);
+    try testing.expect(desktop_lifecycle.allocator_holes);
+    try testing.expect(desktop_lifecycle.gui_events);
+
     // android platform entry: resolved target, pic + link_libc, apk package
     const android = m.platforms.android.?;
+    // `.lifecycle` is ABSENT on the android entry → null (additive default,
+    // assembler#501): codegen keeps rejecting an undeclared callback external.
+    try testing.expect(android.lifecycle == null);
     try testing.expectEqual(BackendManifestV2.Target.resolved, android.target);
     try testing.expect(android.pic);
     try testing.expect(android.link_libc);
