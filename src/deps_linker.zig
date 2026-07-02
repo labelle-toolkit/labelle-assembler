@@ -24,6 +24,13 @@ pub const DepEntry = struct {
 /// gate is OFF regardless of the enum. This is the exact predicate the
 /// `if (!cfg.isExternal()) switch (cfg.backend)` site below uses, factored out
 /// so it's unit-testable without disk I/O.
+///
+/// DEFENSIVE DEAD CODE (post-#386 Phase 6c): every `Backend` tag now resolves to
+/// an external provider via `builtinProvider`, so `isExternal()` is true for
+/// EVERY config and the `.raylib, .sokol, .bgfx` arm below is unreachable —
+/// pinned by the "stagesSdlGamepad: every built-in is now external" test. Kept
+/// (not deleted) for a future bundled backend; do NOT add new tags here
+/// (assembler#501 forbids enum growth).
 pub fn stagesSdlGamepad(cfg: ProjectConfig) bool {
     if (cfg.isExternal()) return false;
     return switch (cfg.backend) {
@@ -35,6 +42,13 @@ pub fn stagesSdlGamepad(cfg: ProjectConfig) bool {
 /// Whether the shared Android gamepad sub-package (`backends/android_gamepad`)
 /// is staged for `cfg`. Built-in-specific: sokol/bgfx. OFF for an external
 /// backend (self-contained). Mirrors the gated `switch (cfg.backend)` site below.
+///
+/// DEFENSIVE DEAD CODE (post-#386 Phase 6c): every `Backend` tag now resolves to
+/// an external provider via `builtinProvider`, so `isExternal()` is true for
+/// EVERY config and the `.sokol, .bgfx` arm below is unreachable — pinned by the
+/// "stagesAndroidGamepad: every built-in is now external" test. Kept (not
+/// deleted) for a future bundled backend; do NOT add new tags here
+/// (assembler#501 forbids enum growth).
 pub fn stagesAndroidGamepad(cfg: ProjectConfig) bool {
     if (cfg.isExternal()) return false;
     return switch (cfg.backend) {

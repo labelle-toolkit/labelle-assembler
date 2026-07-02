@@ -178,25 +178,16 @@ pub fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
 /// (imported here as `BackendAudio` — see
 /// `labelle-engine/codegen/main.zig.template`).
 ///
-/// SCAFFOLDING (Phase 4, #447): this helper is currently defined but
-/// NOT yet called from `buildSetupCode` / `buildCallbackInitCode`. The
-/// missing pieces before it can be wired in:
-///   1. `engine.AudioLoader` must be re-exported from
-///      `labelle-engine/src/root.zig` (mirror of `ImageLoader` at the
-///      bottom of that file).
-///   2. `ProjectConfig.resources` (in `src/config.zig`) must grow a
-///      resource shape for audio (`.wav`/`.ogg` instead of the
-///      atlas-shaped `.json` + `.texture`), and the assembler must
-///      dispatch on extension to choose between `registerAtlasFromMemory`
-///      and `registerSoundFromMemory` (or equivalent).
-///   3. At least one concrete backend (`labelle-raylib-audio` or
-///      `labelle-sokol-audio`) must implement `decodeAudio` etc. on its
-///      audio module. Until then, calling this helper would generate
-///      code that fails to compile.
-///
-/// This PR lands the codegen skeleton + unit tests so the function is
-/// reviewed in isolation; follow-up PRs add the three pieces above and
-/// the call sites.
+/// WIRED (Phase 4 complete — #447 landed via #104): called from BOTH lifecycle
+/// builders — `buildSetupCode` (codegen/lifecycle/loop.zig:107) and
+/// `buildCallbackInitCode` (codegen/lifecycle/callback.zig:95) — GATED on the
+/// project declaring at least one resource whose `kind()` is `.sound`. The gate
+/// is load-bearing: the emitted adapter references `BackendAudio.decodeAudio` /
+/// `uploadSound` / `unloadSound`, which only audio-capable backends implement,
+/// so a project with no sound resources must never see those references in its
+/// generated main.zig (full rationale at codegen/lifecycle/loop.zig:75-97). A
+/// project WITH sound resources on a backend without audio support gets a clean
+/// compile error pointing at `BackendAudio.decodeAudio`.
 ///
 /// Ticket: labelle-engine#447 (audio loader tracking)
 /// Sibling: `writeImageBackendWiring` (already wired)
@@ -293,28 +284,17 @@ pub fn writeAudioBackendWiring(w: anytype, indent: []const u8) !void {
 /// returns `error.FontBackendNotImplemented` from `decode`/`upload`
 /// and silently no-ops on `unload`.
 ///
-/// SCAFFOLDING (Phase 4, #448): this helper is currently defined but
-/// NOT yet called from `buildSetupCode` / `buildCallbackInitCode`. The
-/// missing pieces before it can be wired in:
-///   1. `engine.FontLoader` must be re-exported from
-///      `labelle-engine/src/root.zig` (sibling PR in flight — mirrors
-///      the `ImageLoader` / `AudioLoader` re-exports).
-///   2. `ProjectConfig.resources` (in `src/config.zig`) must grow a
-///      font-shaped resource entry (`.ttf` / `.otf` + a
-///      `FontBakeParams` payload: pixel sizes, atlas dimensions,
-///      codepoint ranges) and the assembler must dispatch on extension
-///      to choose between `registerAtlasFromMemory`,
-///      `registerSoundFromMemory`, and `registerFontFromMemory`.
-///   3. At least one graphics backend (`labelle-raylib` first, per
-///      labelle-gfx#258) must implement `decodeFont` /
-///      `uploadFontAtlas` / `unloadFontAtlas` on its `gfx.zig`. Until
-///      then, calling this helper unconditionally would generate code
-///      that fails to compile on the non-opted-in backends — hence the
-///      `@hasDecl` guard.
-///
-/// This PR lands the codegen skeleton + unit tests so the function is
-/// reviewed in isolation; follow-up PRs add the three pieces above and
-/// the call sites.
+/// WIRED (Phase 4 complete — #448 landed via #104): called from BOTH lifecycle
+/// builders — `buildSetupCode` (codegen/lifecycle/loop.zig:108) and
+/// `buildCallbackInitCode` (codegen/lifecycle/callback.zig:96) — GATED on the
+/// project declaring at least one resource whose `kind()` is `.font`. The gate
+/// is load-bearing: the emitted adapter references `BackendGfx.decodeFont` /
+/// `uploadFontAtlas` / `unloadFontAtlas`, which only font-capable backends
+/// implement, so a project with no font resources must never see those
+/// references in its generated main.zig (full rationale at
+/// codegen/lifecycle/loop.zig:75-97). A project WITH font resources on a backend
+/// without font support gets a clean compile error pointing at
+/// `BackendGfx.decodeFont`.
 ///
 /// Ticket: labelle-engine#448 (font loader tracking)
 /// Sibling: `writeAudioBackendWiring` (audio scaffolding, #447)
