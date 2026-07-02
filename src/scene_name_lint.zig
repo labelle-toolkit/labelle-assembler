@@ -33,6 +33,10 @@
 //! is unit-testable with in-memory sources; `check_cmd.zig` builds the pack
 //! component set + game-owned name set from the discovered packs and game
 //! root, and drives the directory walk.
+//!
+//! The same reference walk also backs the #516 generate-time net over a
+//! pack's COPIED prefabs (`findBareLocalRefs`, driven from root.zig after
+//! the pack-local rewrite) — see that function for the survivor semantics.
 
 const std = @import("std");
 const check = @import("check.zig");
@@ -402,6 +406,48 @@ pub fn scanScenesDir(
     }
 }
 
+// ── Post-rewrite net for pack copies (#516) ───────────────────────────────
+
+/// A bare pack-LOCAL component reference that survived the pack-copy
+/// rewrite: its name plus 1-based line/col in the rewritten source.
+pub const BareLocalRef = struct {
+    name: []const u8,
+    line: usize,
+    col: usize,
+};
+
+/// Generate-time net over a pack's COPIED prefabs (#516). After
+/// `scan.rewritePackLocalRefs` runs, NO component-declaration reference in
+/// the copy should still equal one of the pack's OWN bare component names
+/// (`local_keys`, Pascal forms) — the rewrite namespaces every declaration
+/// position it understands. A survivor means the component will NOT attach
+/// at load: either the file's shape escaped the rewrite walkers (the #516
+/// failure class), or it is the deliberately-untouched RFC #596 HYBRID
+/// form (wrapper + flat keys mixed — an authoring error the engine
+/// warn-drops), or the key is dead data the engine never reads (e.g. a
+/// flat key beside a `"root"` wrapper). All of those deserve a loud
+/// generate-time warning instead of a silent no-op.
+///
+/// Pure over its inputs (arena-owned result) so it is unit-testable with
+/// in-memory sources; `rewritePackPrefabRefs` (root.zig) drives it over
+/// each rewritten copy and logs. Reuses `collectComponentRefs` — the same
+/// recall-oriented walk the game-root lint trusts, which already covers
+/// the bundle and root-wrapper container shapes.
+pub fn findBareLocalRefs(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    local_keys: []const []const u8,
+) ![]BareLocalRef {
+    const refs = try collectComponentRefs(arena, src);
+    var out: std.ArrayList(BareLocalRef) = .empty;
+    for (refs) |ref| {
+        if (!containsStr(local_keys, ref.name)) continue;
+        const loc = locOf(src, ref.offset);
+        try out.append(arena, .{ .name = ref.name, .line = loc.line, .col = loc.col });
+    }
+    return out.toOwnedSlice(arena);
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════
@@ -612,4 +658,50 @@ test "scanScenesDir: walks a temp scenes tree and reports a bare reference" {
     try testing.expectEqual(@as(usize, 1), findings.items.len);
     try testing.expectEqual(check.Rule.scene_bare_pack_component, findings.items[0].rule);
     try testing.expect(std.mem.endsWith(u8, findings.items[0].file, "main.jsonc"));
+}
+
+test "findBareLocalRefs: leftover bare pack key in a hybrid entity is reported with line/col (#516)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The RFC #596 HYBRID form is left byte-verbatim by the pack rewrite
+    // (scan.zig, codex P2 on #515), so its flat `CloudDrift` stays bare —
+    // exactly the survivor the net must surface. The namespaced sibling
+    // and the non-pack `Position` are silent.
+    const refs = try findBareLocalRefs(arena.allocator(),
+        \\{
+        \\    "components": { "sky__SkyBody": {}, "Position": { "x": 1 } },
+        \\    "CloudDrift": { "v": 1 }
+        \\}
+    , &.{ "SkyBody", "CloudDrift" });
+    try testing.expectEqual(@as(usize, 1), refs.len);
+    try testing.expectEqualStrings("CloudDrift", refs[0].name);
+    try testing.expectEqual(@as(usize, 3), refs[0].line);
+    try testing.expectEqual(@as(usize, 6), refs[0].col);
+}
+
+test "findBareLocalRefs: a correctly rewritten copy is silent, payload decoys included (#516)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // What a copy looks like after a correct rewrite: every declaration is
+    // namespaced; the pack name surviving inside a payload (`Spawner`'s
+    // value) is opaque data, not a declaration.
+    const refs = try findBareLocalRefs(arena.allocator(),
+        \\{ "components": { "sky__SkyBody": {}, "Spawner": { "SkyBody": 3 } } }
+    , &.{"SkyBody"});
+    try testing.expectEqual(@as(usize, 0), refs.len);
+}
+
+test "findBareLocalRefs: covers bundle and root-wrapper containers (#516)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // A survivor inside a bundle element…
+    const bundle_refs = try findBareLocalRefs(arena.allocator(),
+        \\[ { "meta": {} }, { "components": { "SkyBody": {} } } ]
+    , &.{"SkyBody"});
+    try testing.expectEqual(@as(usize, 1), bundle_refs.len);
+    // …and inside a root-wrapper's entity are both reachable by the walk.
+    const wrapper_refs = try findBareLocalRefs(arena.allocator(),
+        \\{ "root": { "SkyBody": {} } }
+    , &.{"SkyBody"});
+    try testing.expectEqual(@as(usize, 1), wrapper_refs.len);
 }
