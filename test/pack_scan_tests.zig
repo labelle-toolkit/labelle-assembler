@@ -139,6 +139,65 @@ pub const SCAN_PACK = struct {
         try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"packs/citizens/components/Worker.zig\").Worker,"));
     }
 
+    test "rewrites a FLAT-shape pack prefab into the wrapped namespaced form (#513)" {
+        const allocator = std.testing.allocator;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "src/citizens");
+        var pack_src = try tmp.dir.openDir(io, "src/citizens", .{});
+        defer pack_src.close(io);
+        try writeFileIn(pack_src, "components/Worker.zig", "pub const Worker = struct { hp: u8 };\n");
+        // RFC #596 FLAT shape (the engine's recommended one): PascalCase
+        // component keys directly at entity scope, no wrapper — the exact
+        // shape the FP pilot shipped (flying-platform-labelle#573). The copy
+        // must come out WRAPPED: a namespaced flat key would start lowercase
+        // and be silently dropped by the engine's case-based classification.
+        try writeFileIn(pack_src, "prefabs/worker.jsonc",
+            \\{
+            \\    "Worker": { "hp": 3 },
+            \\    "Position": { "x": 0, "y": 0 }
+            \\}
+        );
+        // A composing prefab whose child is a flat prefab REFERENCE carrying
+        // a pack component as its patch — the patch must wrap as `overrides`
+        // (the engine's warning-free spelling for reference patches).
+        try writeFileIn(pack_src, "prefabs/squad.jsonc",
+            \\{
+            \\    "children": [
+            \\        { "prefab": "worker", "Worker": { "hp": 1 } }
+            \\    ]
+            \\}
+        );
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", allocator);
+        defer allocator.free(pack_src_path);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(target_path);
+
+        var scan = try generate.scanPack(allocator, pack_src_path, target_path, "citizens");
+        defer scan.deinit(allocator);
+
+        const worker = try tmp.dir.readFileAlloc(io, "packs/citizens/prefabs/worker.jsonc", allocator, .limited(64 * 1024));
+        defer allocator.free(worker);
+        // The inline flat entity was wrapped, the pack key namespaced, the
+        // engine key moved in untouched, and no bare flat key survived.
+        try std.testing.expect(contains(worker, "\"components\": {"));
+        try std.testing.expect(contains(worker, "\"citizens__Worker\": { \"hp\": 3 }"));
+        try std.testing.expect(contains(worker, "\"Position\": { \"x\": 0, \"y\": 0 }"));
+        try std.testing.expect(!contains(worker, "citizens__Position"));
+        try std.testing.expect(!contains(worker, "\"Worker\":"));
+
+        const squad = try tmp.dir.readFileAlloc(io, "packs/citizens/prefabs/squad.jsonc", allocator, .limited(64 * 1024));
+        defer allocator.free(squad);
+        // The flat reference child: prefab VALUE namespaced, patch wrapped
+        // as `overrides` (not `components`), pack key namespaced inside.
+        try std.testing.expect(contains(squad, "\"prefab\": \"citizens__worker\""));
+        try std.testing.expect(contains(squad, "\"overrides\": { \"citizens__Worker\": { \"hp\": 1 }"));
+        try std.testing.expect(!contains(squad, "\"components\""));
+    }
+
     test "rewrites a pack prefab's same-pack prefab reference to the <pack>__ form (chatgpt-codex #1)" {
         const allocator = std.testing.allocator;
 

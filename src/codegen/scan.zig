@@ -166,19 +166,51 @@ pub fn rewritePackComponentKeys(
 /// rewritten — a reference to a non-pack (game-root / built-in) prefab is left
 /// bare.
 ///
-/// **Boundary (documented):** the engine also accepts a *flat* shape (RFC
-/// #596) where PascalCase component keys sit directly on an entity object with
-/// no `"components"`/`"overrides"` wrapper. Detecting that shape reliably at
-/// the byte level requires full structural entity-vs-payload disambiguation;
-/// the pack authoring convention (and every pack fixture) uses the wrapped
-/// shape, so flat-form component keys are intentionally NOT rewritten here.
-/// This is the conservative-but-correct scope the ticket calls for: it never
-/// corrupts payload data, at the cost of not namespacing the flat shape.
+/// **Flat shape (#513, engine RFC #596).** The engine also accepts a *flat*
+/// shape where PascalCase component keys sit directly on the entity object
+/// with no `"components"`/`"overrides"` wrapper — and RFC #596 makes it the
+/// recommended authoring shape, so real pack prefabs use it. Bare pack-local
+/// keys there have the exact same collision problem, but an in-place key
+/// rewrite is NOT viable: the engine's flat loader classifies entity-scope
+/// keys by CASE (`unified_format.zig` `isPascalCase`), so a namespaced
+/// `<pack>__Pascal` key (lowercase first byte) would demote to a structural
+/// key and be dropped silently — with zero log signal, because the RFC #596
+/// unknown-component warn-once only covers Pascal-cased unknowns (observed
+/// as a runtime regression on the FP pilot, flying-platform-labelle#573).
+/// Instead, a normalization pre-pass (`wrapFlatEntityComponents`) converts
+/// any flat entity that declares pack-local components into the WRAPPED
+/// shape — collecting ALL its PascalCase keys into a synthesized
+/// `"components"` map (`"overrides"` for prefab references) — and the walk
+/// below then namespaces the pack-local keys through the same
+/// component-map scope rule it always used. See that function for the full
+/// shape rules (mixed wrapper+flat entities, payload decoys, malformed-
+/// input fallback).
 ///
 /// String *values* (other than `"prefab"`) and JSONC comment text are never
 /// rewritten. Returns an allocator-owned buffer; when nothing matches it is
 /// still a fresh dupe of the input, so the caller frees unconditionally.
 pub fn rewritePackLocalRefs(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    component_keys: []const []const u8,
+    prefab_names: []const []const u8,
+    prefix: []const u8,
+) ![]u8 {
+    // Pass 1 (#513): flat-shape entities that declare pack-local components
+    // are normalized into the wrapped shape, so pass 2's component-map scope
+    // rule sees (and namespaces) their keys. A no-op for files with nothing
+    // to wrap — those come back byte-identical.
+    const normalized = try wrapFlatEntityComponents(allocator, src, component_keys);
+    defer allocator.free(normalized);
+    return rewriteWrappedShapeRefs(allocator, normalized, component_keys, prefab_names, prefix);
+}
+
+/// Pass 2 of `rewritePackLocalRefs`: the scope-tracked streaming walk over
+/// wrapped-shape JSONC. On its own it rewrites component keys only inside
+/// genuine `"components"`/`"overrides"` maps (and `"prefab"` values on
+/// entity scopes) — flat-shape component keys are invisible to it, which is
+/// why `wrapFlatEntityComponents` must run first (#513).
+fn rewriteWrappedShapeRefs(
     allocator: std.mem.Allocator,
     src: []const u8,
     component_keys: []const []const u8,
@@ -382,14 +414,498 @@ fn childArrayScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
     if (parent) |p| {
         if (p == .entity) {
             if (pending_key) |k| {
-                if (std.mem.eql(u8, k, "children") or std.mem.eql(u8, k, "entities")) {
-                    return .array_entities;
-                }
+                if (isEntityListKey(k)) return .array_entities;
             }
         }
     }
     return .array_other;
 }
+
+/// The two array-valued entity-list keys the engine walks (`children` on any
+/// entity scope, legacy `entities` at file level). Shared between pass 2's
+/// `childArrayScope` and pass 1's flat-wrap recursion so the two walks can
+/// never disagree about where entities live.
+fn isEntityListKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "children") or std.mem.eql(u8, key, "entities");
+}
+
+/// Byte-parity twin of the engine's `unified_format.zig` `isPascalCase`
+/// (RFC #596): an entity-scope key is a flat component declaration iff its
+/// first byte is an ASCII uppercase letter; everything else (lowercase
+/// structural keys like `prefab`/`children`/`meta`/`ref`, empty, non-ASCII
+/// start) is structural. The flat-wrap transform must classify keys EXACTLY
+/// like the engine's flat loader, or the copy's shape drifts from what the
+/// author's file would have meant at game root.
+fn isPascalCase(name: []const u8) bool {
+    if (name.len == 0) return false;
+    return name[0] >= 'A' and name[0] <= 'Z';
+}
+
+/// Pass 1 of `rewritePackLocalRefs` (#513): normalize FLAT-shape entities
+/// (engine RFC #596) into the WRAPPED shape wherever they declare one of the
+/// pack's own components, so pass 2's wrapped-shape walk can namespace them.
+///
+/// **Why a shape conversion instead of prefixing the flat key in place?**
+/// The engine's flat loader classifies entity-scope keys by case: PascalCase
+/// keys are component declarations, lowercase keys are structural
+/// (`unified_format.zig` `isPascalCase`). A namespaced key
+/// (`citizens__Worker`) starts lowercase, so an in-place rewrite would
+/// demote the component to a silently-dropped structural key — and the
+/// RFC #596 unknown-component warn-once would not fire either, since it only
+/// covers Pascal-cased unknowns. Observed as a zero-signal runtime
+/// regression on the FP pilot (flying-platform-labelle#573). The wrapped
+/// shape has no case rule — `"components"`/`"overrides"` map keys are
+/// component names verbatim — so it is the only shape in which a `<pack>__`
+/// key can attach today, and converting to it is self-contained in the
+/// assembler (no engine release required). If/when the engine's flat loader
+/// learns to accept `<pack>__Pascal` keys (they are the documented
+/// global-registry key format — a prerequisite for engine v2.0, which drops
+/// the wrapper entirely), this pass can flip to an in-place key rewrite.
+///
+/// **What is transformed.** For each entity object (file root, or an element
+/// of a `children`/`entities` array — the same entity scopes pass 2 walks)
+/// whose top-level keys include at least one of the pack's own component
+/// names (`component_keys`, Pascal forms) and which carries no explicit
+/// wrapper yet: ALL PascalCase keys — engine components like `Position` AND
+/// the pack-local ones — move, values byte-verbatim, into one synthesized
+/// wrapper map inserted at the first moved key's position, relative order
+/// kept. Lowercase structural keys (`prefab`, `children`, `meta`, `ref`, …)
+/// stay at entity scope in their original order. Moving ALL Pascal keys
+/// together is load-bearing: the engine's "wrapper wins" rule DROPS any key
+/// left flat beside a wrapper, so a partial move would lose components.
+///
+/// **Wrapper spelling.** `"overrides"` when the entity is a prefab
+/// reference (string-valued `"prefab"` key — mirrors `entityPatch`'s
+/// `is_reference`), `"components"` otherwise. The engine does accept
+/// `"components"` on a reference, but warns it as a legacy spelling
+/// (RFC #560); `"overrides"` is the warning-free patch-map form.
+///
+/// **What is NOT transformed.**
+///   - An entity with no pack-local flat key is left byte-identical — flat
+///     engine-only entities load fine as-is (flat is RFC #596's recommended
+///     shape), so everything the bug can't affect stays minimal-diff.
+///   - A HYBRID entity — a `"components"` or `"overrides"` wrapper key AND
+///     flat Pascal keys COEXISTING in the author's text — is left
+///     byte-verbatim, whether inline or reference. That mix is rejected as
+///     `error.HybridForm` by this repo's scene validator
+///     (`scene_manifest.zig`, RFC #596 axis 2 — deliberately no reference
+///     check there) and gated the same way engine-side (#597, "wrapper
+///     wins" warn-once at load); the copy must keep tripping those
+///     diagnostics on the author's own bytes instead of masking the error
+///     with a second wrapper. Pure flat — Pascal keys with NO wrapper key
+///     anywhere on the entity — is never hybrid; that is exactly the shape
+///     this pass converts.
+///   - Component payloads: a Pascal key INSIDE a moved value — the decoy,
+///     `{ "Spawner": { "SkyBody": 3 } }` — is payload, copied verbatim.
+///   - JSONC comments ride along verbatim with the pair they precede.
+///
+/// **Safety valve.** The transform re-emits parsed pieces, so it only runs
+/// when it can account for the whole file structurally; on any surprise
+/// (unbalanced containers, missing colon, non-object root — e.g. an
+/// RFC #596 file-as-array bundle, which this pass does not walk — or
+/// pathological nesting) it returns the input untouched and pass 2 proceeds
+/// exactly as before. Same conservative posture as the original #440
+/// boundary: never guess on bytes we would rewrite. A file where no entity
+/// qualifies is returned byte-identical (trailing commas and all), so no-op
+/// inputs round-trip exactly.
+///
+/// Returns an allocator-owned buffer; a content-preserving dupe when
+/// nothing qualifies, so the caller frees unconditionally.
+fn wrapFlatEntityComponents(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    component_keys: []const []const u8,
+) ![]u8 {
+    // A pack with no components has no key that could qualify an entity.
+    if (component_keys.len == 0) return allocator.dupe(u8, src);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var walker = FlatWrap{ .src = src, .component_keys = component_keys };
+    const parsed = blk: {
+        walker.emitRoot(allocator, &out) catch |err| switch (err) {
+            error.Malformed => break :blk false,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        break :blk true;
+    };
+    if (!parsed or !walker.wrapped_any) return allocator.dupe(u8, src);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Recursive-descent walker for `wrapFlatEntityComponents` (#513). Parses
+/// just enough JSONC structure — strings, comments, strictly-balanced
+/// containers — to re-emit entity objects with their flat component keys
+/// collected into a wrapper; every value span is copied byte-verbatim.
+/// Errors with `Malformed` on anything it cannot fully account for, and the
+/// caller then keeps the input untouched.
+const FlatWrap = struct {
+    src: []const u8,
+    component_keys: []const []const u8,
+    /// Set when at least one wrapper was synthesized. When it stays false
+    /// the caller returns the INPUT verbatim, so byte fidelity of no-op
+    /// files (their trailing commas, exact separators) holds by
+    /// construction rather than by emitter carefulness.
+    wrapped_any: bool = false,
+
+    const Error = error{ Malformed, OutOfMemory };
+
+    /// Nesting cap for both the recursion and the balanced-span scanner.
+    /// Anything legitimately deeper than this is not a scene/prefab file;
+    /// bail to the untouched-input path instead of trusting the process
+    /// stack to an adversarial input.
+    const max_depth: usize = 128;
+
+    /// One parsed `"key": value` pair at an object's top level. All fields
+    /// are byte offsets into `src`; spans are emitted verbatim so trivia
+    /// (whitespace + comments) rides along with its pair.
+    const Pair = struct {
+        /// Start of the pair's leading trivia (right after `{`, or after
+        /// the previous pair's `,`).
+        lead_start: usize,
+        /// Opening `"` of the key literal.
+        key_start: usize,
+        /// Key content (between the quotes, escapes unprocessed).
+        key: []const u8,
+        /// First byte of the value (past `:` and any trivia).
+        value_start: usize,
+        /// One past the last byte of the value.
+        value_end: usize,
+        /// One past the pair's trailing trivia (between the value and its
+        /// `,` / the enclosing `}`) — stays attached to the pair if moved.
+        post_end: usize,
+    };
+
+    const ParsedObject = struct {
+        pairs: []Pair,
+        /// Start of the trivia between the last separator and `}`. Equals
+        /// `close_brace` when the last pair's own `post` span already
+        /// carried that trivia (the no-trailing-comma case).
+        close_trivia_start: usize,
+        close_brace: usize,
+        /// One past `}`.
+        end: usize,
+    };
+
+    /// Emit the whole document: leading trivia, the root entity object,
+    /// trailing trivia. Only object-rooted documents are walked — an
+    /// array-rooted file (RFC #596 bundle) or a scalar root falls back to
+    /// the untouched-input path via `Malformed`.
+    fn emitRoot(self: *FlatWrap, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) Error!void {
+        const s = self.src;
+        const start = self.skipTrivia(0);
+        try out.appendSlice(allocator, s[0..start]);
+        if (start >= s.len) return; // comment/whitespace-only file
+        if (s[start] != '{') return error.Malformed;
+        const end = try self.emitEntityObject(allocator, out, start, 0);
+        try out.appendSlice(allocator, s[end..]);
+    }
+
+    /// Emit one entity object, wrapping its flat component keys when it
+    /// qualifies (see `wrapFlatEntityComponents` doc for the rules), and
+    /// recursing into its `children`/`entities` arrays either way. Returns
+    /// the index one past the object's `}`.
+    fn emitEntityObject(
+        self: *FlatWrap,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        at: usize,
+        depth: usize,
+    ) Error!usize {
+        if (depth > max_depth) return error.Malformed;
+        const s = self.src;
+        const obj = try self.parseObject(allocator, at);
+        defer allocator.free(obj.pairs);
+
+        // Entity classification. `is_reference` (string-valued `prefab`,
+        // mirroring the engine's `entityPatch`) picks the wrapper SPELLING
+        // only. ANY pre-existing wrapper key — `components` OR `overrides`,
+        // reference or not — blocks the wrap entirely: a wrapper key
+        // coexisting with flat Pascal keys is the RFC #596 HYBRID form,
+        // rejected as `error.HybridForm` by this repo's scene validator
+        // (`scene_manifest.zig`, which deliberately has no reference check
+        // either) and gated the same way engine-side (#597). The author's
+        // text must keep tripping that diagnostic — synthesizing a second
+        // wrapper next to the existing one would mask the error (codex P2
+        // on #515).
+        var is_reference = false;
+        var has_wrapper = false;
+        var has_local_flat = false;
+        for (obj.pairs) |p| {
+            if (std.mem.eql(u8, p.key, "prefab") and s[p.value_start] == '"') is_reference = true;
+            if (std.mem.eql(u8, p.key, "components") or std.mem.eql(u8, p.key, "overrides")) has_wrapper = true;
+            if (containsKey(self.component_keys, p.key)) has_local_flat = true;
+        }
+        const wrap = has_local_flat and !has_wrapper;
+
+        try out.append(allocator, '{');
+        var emitted_any = false;
+        var wrapper_done = false;
+        for (obj.pairs) |p| {
+            if (wrap and isPascalCase(p.key)) {
+                // Every Pascal pair moves into the single wrapper, emitted
+                // at the FIRST Pascal pair's position (with its leading
+                // trivia); later Pascal pairs were already emitted inside.
+                if (wrapper_done) continue;
+                if (emitted_any) try out.append(allocator, ',');
+                try out.appendSlice(allocator, s[p.lead_start..p.key_start]);
+                try out.appendSlice(allocator, if (is_reference) "\"overrides\": {" else "\"components\": {");
+                var first = true;
+                for (obj.pairs) |q| {
+                    if (!isPascalCase(q.key)) continue;
+                    if (!first) try out.append(allocator, ',');
+                    if (first) {
+                        // Its original lead was spent on the wrapper key.
+                        try out.append(allocator, ' ');
+                        try out.appendSlice(allocator, s[q.key_start..q.value_end]);
+                    } else {
+                        try out.appendSlice(allocator, s[q.lead_start..q.value_end]);
+                    }
+                    try out.appendSlice(allocator, s[q.value_end..q.post_end]);
+                    first = false;
+                }
+                try out.appendSlice(allocator, " }");
+                wrapper_done = true;
+                emitted_any = true;
+                self.wrapped_any = true;
+                continue;
+            }
+            // Structural pair (or an untransformed entity's pair): verbatim,
+            // except that entity-list arrays recurse so nested flat entities
+            // are reached. Payload values (`meta`, component values, …) are
+            // copied as-is — the decoy guarantee.
+            if (emitted_any) try out.append(allocator, ',');
+            try out.appendSlice(allocator, s[p.lead_start..p.value_start]);
+            if (s[p.value_start] == '[' and isEntityListKey(p.key)) {
+                _ = try self.emitEntityArray(allocator, out, p.value_start, depth + 1);
+            } else {
+                try out.appendSlice(allocator, s[p.value_start..p.value_end]);
+            }
+            try out.appendSlice(allocator, s[p.value_end..p.post_end]);
+            emitted_any = true;
+        }
+        try out.appendSlice(allocator, s[obj.close_trivia_start..obj.close_brace]);
+        try out.append(allocator, '}');
+        return obj.end;
+    }
+
+    /// Emit an entity-list array: object elements recurse as entities,
+    /// anything else is copied verbatim. Returns one past the `]`.
+    fn emitEntityArray(
+        self: *FlatWrap,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        at: usize,
+        depth: usize,
+    ) Error!usize {
+        if (depth > max_depth) return error.Malformed;
+        const s = self.src;
+        try out.append(allocator, '[');
+        var i = at + 1;
+        var lead_start = i;
+        var emitted_any = false;
+        while (true) {
+            i = self.skipTrivia(i);
+            if (i >= s.len) return error.Malformed;
+            if (s[i] == ']') {
+                // Empty array, or trivia after a trailing comma.
+                try out.appendSlice(allocator, s[lead_start..i]);
+                try out.append(allocator, ']');
+                return i + 1;
+            }
+            if (emitted_any) try out.append(allocator, ',');
+            try out.appendSlice(allocator, s[lead_start..i]);
+            if (s[i] == '{') {
+                i = try self.emitEntityObject(allocator, out, i, depth + 1);
+            } else {
+                const vend = try self.scanValue(i);
+                try out.appendSlice(allocator, s[i..vend]);
+                i = vend;
+            }
+            emitted_any = true;
+            const post = self.skipTrivia(i);
+            try out.appendSlice(allocator, s[i..post]);
+            i = post;
+            if (i >= s.len) return error.Malformed;
+            if (s[i] == ',') {
+                i += 1;
+                lead_start = i;
+                continue;
+            }
+            if (s[i] == ']') {
+                try out.append(allocator, ']');
+                return i + 1;
+            }
+            return error.Malformed;
+        }
+    }
+
+    /// Parse the top-level `"key": value` pairs of the object opening at
+    /// `at`. Records byte spans only — nothing is emitted here — so the
+    /// caller can classify the pairs before deciding on a layout.
+    fn parseObject(self: *const FlatWrap, allocator: std.mem.Allocator, at: usize) Error!ParsedObject {
+        const s = self.src;
+        if (at >= s.len or s[at] != '{') return error.Malformed;
+        var pairs: std.ArrayList(Pair) = .empty;
+        errdefer pairs.deinit(allocator);
+        var i = at + 1;
+        var lead_start = i;
+        while (true) {
+            i = self.skipTrivia(i);
+            if (i >= s.len) return error.Malformed;
+            if (s[i] == '}') {
+                // Empty object, or trivia after a trailing comma.
+                return .{
+                    .pairs = try pairs.toOwnedSlice(allocator),
+                    .close_trivia_start = lead_start,
+                    .close_brace = i,
+                    .end = i + 1,
+                };
+            }
+            if (s[i] != '"') return error.Malformed;
+            const key_start = i;
+            const key_end = try self.scanString(i);
+            i = self.skipTrivia(key_end);
+            if (i >= s.len or s[i] != ':') return error.Malformed;
+            i = self.skipTrivia(i + 1);
+            if (i >= s.len) return error.Malformed;
+            const value_start = i;
+            const value_end = try self.scanValue(i);
+            const post_end = self.skipTrivia(value_end);
+            try pairs.append(allocator, .{
+                .lead_start = lead_start,
+                .key_start = key_start,
+                .key = s[key_start + 1 .. key_end - 1],
+                .value_start = value_start,
+                .value_end = value_end,
+                .post_end = post_end,
+            });
+            i = post_end;
+            if (i >= s.len) return error.Malformed;
+            if (s[i] == ',') {
+                i += 1;
+                lead_start = i;
+                continue;
+            }
+            if (s[i] == '}') {
+                return .{
+                    .pairs = try pairs.toOwnedSlice(allocator),
+                    .close_trivia_start = i,
+                    .close_brace = i,
+                    .end = i + 1,
+                };
+            }
+            return error.Malformed;
+        }
+    }
+
+    /// Skip whitespace and JSONC line/block comments starting at `from`;
+    /// returns the index of the next significant byte (or `src.len`).
+    fn skipTrivia(self: *const FlatWrap, from: usize) usize {
+        const s = self.src;
+        var i = from;
+        while (i < s.len) {
+            const c = s[i];
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+                i += 1;
+                continue;
+            }
+            if (c == '/' and i + 1 < s.len and s[i + 1] == '/') {
+                i = std.mem.indexOfScalarPos(u8, s, i, '\n') orelse s.len;
+                continue;
+            }
+            if (c == '/' and i + 1 < s.len and s[i + 1] == '*') {
+                const close = std.mem.indexOfPos(u8, s, i + 2, "*/");
+                i = if (close) |p| p + 2 else s.len;
+                continue;
+            }
+            break;
+        }
+        return i;
+    }
+
+    /// Scan a string literal starting at the opening `"`; returns one past
+    /// the closing quote. Backslash escapes are honored the same way pass 2
+    /// honors them (skip the escaped byte).
+    fn scanString(self: *const FlatWrap, at: usize) Error!usize {
+        const s = self.src;
+        var j = at + 1;
+        while (j < s.len) : (j += 1) {
+            if (s[j] == '\\' and j + 1 < s.len) {
+                j += 1;
+                continue;
+            }
+            if (s[j] == '"') return j + 1;
+        }
+        return error.Malformed;
+    }
+
+    /// Scan one JSON value starting at `at`; returns one past its end.
+    /// Containers are scanned with strict `{`/`[` matching, primitives run
+    /// to the next delimiter.
+    fn scanValue(self: *const FlatWrap, at: usize) Error!usize {
+        const s = self.src;
+        if (at >= s.len) return error.Malformed;
+        switch (s[at]) {
+            '"' => return self.scanString(at),
+            '{', '[' => return self.scanBalanced(at),
+            else => {
+                // number / true / false / null.
+                var j = at;
+                while (j < s.len) : (j += 1) {
+                    const c = s[j];
+                    if (c == ',' or c == '}' or c == ']' or c == ' ' or
+                        c == '\t' or c == '\r' or c == '\n' or c == '/')
+                    {
+                        break;
+                    }
+                }
+                if (j == at) return error.Malformed;
+                return j;
+            },
+        }
+    }
+
+    /// Scan past a balanced container starting at `at` (`{` or `[`),
+    /// string- and comment-aware, with STRICT bracket matching — a `]`
+    /// closing a `{` (or any mismatch) is `Malformed`, never a wrong span.
+    /// Wrong spans are the one failure mode that could corrupt output, so
+    /// this scanner refuses rather than guesses.
+    fn scanBalanced(self: *const FlatWrap, at: usize) Error!usize {
+        const s = self.src;
+        var expected: [max_depth]u8 = undefined;
+        var sp: usize = 0;
+        var i = at;
+        while (i < s.len) {
+            const c = s[i];
+            if (c == '"') {
+                i = try self.scanString(i);
+                continue;
+            }
+            if (c == '/' and i + 1 < s.len and s[i + 1] == '/') {
+                i = std.mem.indexOfScalarPos(u8, s, i, '\n') orelse s.len;
+                continue;
+            }
+            if (c == '/' and i + 1 < s.len and s[i + 1] == '*') {
+                const close = std.mem.indexOfPos(u8, s, i + 2, "*/");
+                i = if (close) |p| p + 2 else s.len;
+                continue;
+            }
+            if (c == '{' or c == '[') {
+                if (sp >= max_depth) return error.Malformed;
+                expected[sp] = if (c == '{') '}' else ']';
+                sp += 1;
+            } else if (c == '}' or c == ']') {
+                if (sp == 0 or expected[sp - 1] != c) return error.Malformed;
+                sp -= 1;
+                if (sp == 0) return i + 1;
+            }
+            i += 1;
+        }
+        return error.Malformed;
+    }
+};
 
 /// If `content` (the value of a `"prefab"` key) names one of the pack's OWN
 /// prefabs by BASENAME, return that basename — the text `addEmbeddedPrefab`
@@ -1797,6 +2313,237 @@ test "rewritePackLocalRefs: subdir pack prefab ref resolves to the basename-pref
     // …and neither retains the raw subdir spelling.
     try std.testing.expect(std.mem.indexOf(u8, out, "citizens__enemies/goblin") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"goblin\"") == null);
+}
+
+test "rewritePackLocalRefs: flat-shape entity is wrapped and pack keys namespaced (#513)" {
+    const allocator = std.testing.allocator;
+    // RFC #596 flat shape: PascalCase component keys directly at entity
+    // scope. `SkyBody` is pack-owned (must be namespaced); `Position` is an
+    // engine component (spelling untouched) — but BOTH must move into the
+    // wrapper, because the engine's "wrapper wins" rule drops any key left
+    // flat beside a wrapper.
+    const src =
+        \\{
+        \\    "SkyBody": { "role": "sun" },
+        \\    "Position": { "x": 0 }
+        \\}
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(out);
+
+    // An inline entity (no `prefab`) wraps into `"components"` …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"components\": {") != null);
+    // … the pack key is namespaced, payload verbatim …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sky__SkyBody\": { \"role\": \"sun\" }") != null);
+    // … the engine key moved in untouched …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"Position\": { \"x\": 0 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "sky__Position") == null);
+    // … and no bare flat key survived at entity scope.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"SkyBody\":") == null);
+}
+
+test "rewritePackLocalRefs: flat decoy payload sharing a pack component spelling is NOT touched (#513)" {
+    const allocator = std.testing.allocator;
+    // `SkyBody` is pack-owned. It appears as a real flat declaration AND as
+    // payload data inside `Spawner`'s value. `Spawner` (Pascal → a component
+    // declaration by the engine's own case rule) moves into the wrapper as a
+    // unit with its payload byte-verbatim — the inner `SkyBody` stays bare.
+    const src =
+        \\{ "SkyBody": { "role": "sun" }, "Spawner": { "SkyBody": 3 } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sky__SkyBody\": { \"role\": \"sun\" }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"Spawner\": { \"SkyBody\": 3 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "sky__SkyBody\": 3") == null);
+}
+
+test "rewritePackLocalRefs: flat entity with no pack-local key is left byte-identical (#513)" {
+    const allocator = std.testing.allocator;
+    // Engine-only flat entity — loads fine as-is (flat is RFC #596's
+    // recommended shape), so the copy stays minimal-diff. Includes the
+    // ticket's decoy spelling: a payload key matching the pack component
+    // under a non-pack Pascal key must not qualify the entity for wrapping
+    // (it is not at entity scope).
+    const src =
+        \\{ "Position": { "x": 0 }, "Spawner": { "SkyBody": 3 } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "rewritePackLocalRefs: mixed-shape file rewrites wrapped sibling and LAST flat child (#513)" {
+    const allocator = std.testing.allocator;
+    // Regression shape from the FP pilot (flying-platform-labelle#573): a
+    // children list whose first element is already wrapped and whose LAST
+    // element — no trailing comma after it — is flat; the hand-conversion
+    // missed exactly that last element. Pack-local prefab VALUES must keep
+    // rewriting in both shapes.
+    const src =
+        \\{
+        \\    "children": [
+        \\        { "prefab": "cloud", "overrides": { "SkyBody": { "role": "cloud" } } },
+        \\        // the sun rides last
+        \\        { "prefab": "sun", "SkyBody": { "role": "sun" } }
+        \\    ]
+        \\}
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{ "cloud", "sun" }, "sky");
+    defer allocator.free(out);
+
+    // Wrapped sibling: byte-stable except the key/value namespacing.
+    try std.testing.expect(std.mem.indexOf(u8, out, "{ \"prefab\": \"sky__cloud\", \"overrides\": { \"sky__SkyBody\": { \"role\": \"cloud\" } } }") != null);
+    // The comment between array elements rides along verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, out, "// the sun rides last") != null);
+    // Flat LAST child: normalized into the wrapped shape and namespaced.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"sky__sun\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"overrides\": { \"SkyBody\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"overrides\": { \"sky__SkyBody\": { \"role\": \"sun\" }") != null);
+    // No bare pack key survived anywhere.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"SkyBody\"") == null);
+}
+
+test "rewritePackLocalRefs: flat prefab reference wraps its patch as overrides, not components (#513)" {
+    const allocator = std.testing.allocator;
+    // Decision (#513): a flat REFERENCE entity's Pascal keys wrap into
+    // `"overrides"` — the engine's `entityPatch` treats `"components"` on a
+    // prefab reference as a warned legacy synonym (RFC #560), while
+    // `"overrides"` is the warning-free patch-map spelling. Inline entities
+    // (no `prefab`) wrap into `"components"` instead. Note this entity is
+    // PURE flat (no wrapper key anywhere), so it is NOT the HybridForm mix
+    // — a pre-existing `overrides`/`components` key would block the wrap
+    // entirely (see the hybrid tests below).
+    const src =
+        \\{ "prefab": "base", "Position": { "x": 5 }, "SkyBody": { "role": "moon" } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"overrides\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"components\"") == null);
+    // Engine keys ride into the patch untouched; pack keys namespaced; the
+    // foreign prefab VALUE stays bare.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"Position\": { \"x\": 5 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sky__SkyBody\": { \"role\": \"moon\" }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"base\"") != null);
+}
+
+test "rewritePackLocalRefs: flat root and flat child both wrap (#513)" {
+    const allocator = std.testing.allocator;
+    // The wrap must recurse through `children` exactly like pass 2's scope
+    // walk — a flat prefab-root entity AND a flat child entity each get
+    // their own wrapper.
+    const src =
+        \\{
+        \\    "SkyBody": { "role": "root" },
+        \\    "children": [
+        \\        { "CloudDrift": { "v": 2 } }
+        \\    ]
+        \\}
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{ "SkyBody", "CloudDrift" }, &.{}, "sky");
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sky__SkyBody\": { \"role\": \"root\" }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sky__CloudDrift\": { \"v\": 2 }") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "\"components\": {"));
+}
+
+test "rewritePackLocalRefs: entity mixing wrapper and flat keys is left for the engine warn (#513)" {
+    const allocator = std.testing.allocator;
+    // A wrapper key coexisting with flat Pascal keys is the RFC #596
+    // HYBRID form: this repo's scene validator hard-rejects it
+    // (`error.HybridForm`, `scene_manifest.zig`) and the engine gates it
+    // at load ("wrapper wins" warn-once, #597). The copy must not behave
+    // differently from the same file at game root, so the flat key stays
+    // byte-verbatim (keeping those diagnostics alive) and only the
+    // wrapper's contents are namespaced.
+    const src =
+        \\{ "components": { "SkyBody": { "role": "sun" } }, "CloudDrift": { "v": 1 } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{ "SkyBody", "CloudDrift" }, &.{}, "sky");
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sky__SkyBody\":") != null);
+    // The flat key beside the wrapper is neither moved nor namespaced.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"CloudDrift\": { \"v\": 1 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "sky__CloudDrift") == null);
+}
+
+test "rewritePackLocalRefs: inline entity mixing overrides with flat keys is left for the HybridForm diagnostic (#513)" {
+    const allocator = std.testing.allocator;
+    // An `overrides` key coexisting with flat Pascal keys is the RFC #596
+    // HYBRID form on ANY entity — inline included: the repo's scene
+    // validator rejects it as `error.HybridForm` with deliberately no
+    // reference check (`scene_manifest.zig`), and engine #597 gates the
+    // same mix at every entity site. Wrapping the flat key into a second
+    // (`components`) wrapper here would mask the author's error, so the
+    // entity must come back byte-identical (codex P2 on #515 — this
+    // REVERSES the expectation CodeRabbit's round-1 sketch suggested).
+    // Hybrid = wrapper key AND flat Pascal keys COEXIST; pure flat (no
+    // wrapper key at all) still wraps — see the flat-reference test above.
+    const src =
+        \\{ "overrides": { "unused": 1 }, "SkyBody": { "role": "sun" } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "rewritePackLocalRefs: JSONC comments survive the flat wrap verbatim (#513)" {
+    const allocator = std.testing.allocator;
+    // Line comment leading a moved pair, block comment inside a moved
+    // payload, block comment trailing a structural pair — all must come out
+    // byte-verbatim (comments travel with the pair they precede).
+    const src =
+        \\{
+        \\    // the sun body
+        \\    "SkyBody": { /* payload note */ "role": "sun" },
+        \\    "prefab": "base" /* keep me */
+        \\}
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "// the sun body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "/* payload note */") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "/* keep me */") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"sky__SkyBody\":") != null);
+}
+
+test "rewritePackLocalRefs: flat wrap is idempotent across a second run (#513)" {
+    const allocator = std.testing.allocator;
+    // `generate` re-copies sources every run, but the rewrite must also be
+    // stable if it ever sees its own output: the namespaced keys no longer
+    // match the local key set, and the synthesized wrapper suppresses any
+    // further flat detection.
+    const src =
+        \\{ "prefab": "sun", "SkyBody": { "role": "sun" } }
+    ;
+    const once = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{"sun"}, "sky");
+    defer allocator.free(once);
+    const twice = try rewritePackLocalRefs(allocator, once, &.{"SkyBody"}, &.{"sun"}, "sky");
+    defer allocator.free(twice);
+
+    try std.testing.expect(std.mem.indexOf(u8, once, "\"prefab\": \"sky__sun\"") != null);
+    try std.testing.expectEqualStrings(once, twice);
+}
+
+test "rewritePackLocalRefs: wrapped file with trailing comma round-trips byte-identically (#513)" {
+    const allocator = std.testing.allocator;
+    // The wrap pass re-emits parsed pieces, so guarantee the no-op path
+    // returns the INPUT bytes exactly — a JSONC trailing comma is the
+    // canonical detail a re-emitter would otherwise normalize away.
+    const src =
+        \\{
+        \\    "components": { "Position": { "x": 0 } },
+        \\}
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
 }
 
 test "rewritePackHookHandlerNames: subdir pack event matches a bare handler (codex L435)" {

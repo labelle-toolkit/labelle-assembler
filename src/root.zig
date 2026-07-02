@@ -782,7 +782,13 @@ pub fn scanPack(
 ///   - **Component keys** — Pascal forms of the pack's scanned component
 ///     stems, only in genuine component-declaration positions (context-aware,
 ///     chatgpt-codex #2). Payload-data keys that happen to share a component's
-///     spelling are left alone.
+///     spelling are left alone. This covers BOTH authoring shapes (#513): the
+///     wrapped `"components"`/`"overrides"` maps directly, and the flat
+///     RFC #596 shape via a normalization pre-pass — a flat entity that
+///     declares pack-local components is converted to the wrapped shape in
+///     the copy, because a namespaced (lowercase-starting) key would be
+///     silently dropped by the engine's case-based flat-key classification
+///     (see `scan.wrapFlatEntityComponents`).
 ///   - **Prefab references** — a `"prefab": "worker"` value naming one of the
 ///     pack's OWN prefabs becomes `"prefab": "citizens__worker"`, matching the
 ///     namespaced registration key so a same-pack prefab composition resolves
