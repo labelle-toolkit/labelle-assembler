@@ -4,7 +4,13 @@
     .width = 800,
     .height = 600,
     .target_fps = 60,
-    .backend = .raylib,
+    // Headless null backend: this fixture tests assembler FLOW CODEGEN
+    // (.flow.jsonc → flow_scanner → flow_codegen → generated scripts),
+    // not rendering, so the backend-agnostic headless path is correct.
+    // No window / GPU / display server needed to build OR run it. ecs
+    // stays zig_ecs because the tick flow does a real GetComponent /
+    // SetField round-trip on the entity's Position.
+    .backend = .null,
     .y_axis = .up,
     .ecs = .zig_ecs,
     .initial_prefab = "main",

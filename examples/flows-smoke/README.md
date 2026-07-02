@@ -18,9 +18,14 @@ game-script **CustomNode** (labelle-assembler#240): it calls
 (`script__logger`) so it isn't a member of both the root module (via
 `AllScripts`) and the `game` module (via the shim) at once (Gap 2).
 
-CI builds this fixture but does not run the resulting binary (raylib
-needs a display); the build-only depth matches
-`examples/asset-streaming-smoke`.
+This fixture targets the headless `.null` backend (labelle-assembler
+#520) — it tests flow *codegen*, not rendering, so it needs no display /
+GPU to generate or build. CI builds it but does not run the resulting
+binary: the generated `tick` flow-handler does a runtime
+`game.getComponent` on the `entity_created` payload that currently faults
+inside labelle-core's ecs — a pre-existing, backend-independent runtime
+gap unrelated to flow codegen. The codegen contract this fixture exists
+to prove is fully asserted at generate + build time.
 
 > **Note:** Only *discovery* keys on the `.flow.jsonc` extension today
 > (RFC FLOWS-JSONC §5). The file *body* is still ZON — flow-codegen

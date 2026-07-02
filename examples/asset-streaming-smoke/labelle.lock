@@ -7,7 +7,7 @@
         .engine = .{ .version = "local:../../../labelle-engine" },
         .gfx = .{ .version = "local:../../../labelle-gfx" },
         .labelle = .{ .version = "local:../../../labelle-cli" },
-        .backend = .{ .name = "raylib", .platform = "desktop" },
+        .backend = .{ .name = "null", .platform = "desktop" },
         .ecs = .{ .name = "zig_ecs" },
     },
 }
