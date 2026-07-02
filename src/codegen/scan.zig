@@ -203,7 +203,9 @@ pub fn rewritePackComponentKeys(
 ///      entities / payload (see `isOnlyMetaHeaderObject`).
 ///   3. **Legacy `"root"`-wrapper** — `{ "root": { …entity… } }`
 ///      (v1.0 — v1.x, still dual-accepted): the document object is a
-///      CONTAINER; its object-valued `"root"` member is the entity. Other
+///      CONTAINER; the FIRST `"root"` member's object value is the entity
+///      (engine `Object.get` is first-match — a duplicate later `"root"`
+///      member is dead data, left verbatim; CodeRabbit on #521). Other
 ///      container members (`name`, dead flat keys the engine never reads)
 ///      are left verbatim — except `children`/`entities` arrays, which stay
 ///      live entity lists (the engine's `fileChildren` keeps consulting
@@ -241,10 +243,12 @@ pub fn rewritePackLocalRefs(
 /// The document's top-level container shape is classified ONCE before the
 /// walk descends (#516), mirroring the engine's `unified_format.zig`: a
 /// root Array is an RFC #596 bundle (elements are entities; an only-`meta`
-/// header element walks as opaque `.payload`), and a root object carrying
-/// an object-valued `"root"` key is the legacy wrapper (the document object
-/// walks as `.file_container`, its `"root"` value as the entity). The
-/// per-entity scope rules below are unchanged.
+/// header element walks as opaque `.payload`), and a root object whose
+/// FIRST `"root"` entry is object-valued is the legacy wrapper (the
+/// document object walks as `.file_container`, that first entry's value as
+/// the entity — a duplicate later `"root"` member is dead data and stays
+/// opaque, CodeRabbit on #521). The per-entity scope rules below are
+/// unchanged.
 fn rewriteWrappedShapeRefs(
     allocator: std.mem.Allocator,
     src: []const u8,
@@ -260,7 +264,7 @@ fn rewriteWrappedShapeRefs(
     // pass's input (pass 1 may have shifted byte offsets), and cheap: each
     // is a single bounded scan of the document head.
     const header_open = bundleHeaderOpen(src);
-    const root_wrapped = isRootWrapperFile(src);
+    const root_open = rootWrapperValueOpen(src);
 
     // Object-nesting context. Each open `{`/`[` pushes the *scope* of the
     // container it introduces so we can tell an entity/prefab-patch object
@@ -311,9 +315,18 @@ fn rewriteWrappedShapeRefs(
                 if (header_open) |ho| {
                     if (i == ho) break :blk .payload;
                 }
-                // A root-wrapper file's document object is a container; only
-                // its `"root"` value is entity content (engine `rootObject`).
-                if (scope_stack.items.len == 0 and root_wrapped) break :blk .file_container;
+                if (root_open) |ro| {
+                    // THE root binding — the FIRST `"root"` entry's object
+                    // value (engine `Object.get` is first-match). Routed by
+                    // byte offset so a duplicate later `"root"` member does
+                    // NOT ride this path: it is dead data the engine never
+                    // reads and falls through to `.payload` via
+                    // `childScope(.file_container, …)` (CodeRabbit on #521).
+                    if (i == ro) break :blk .entity;
+                    // The document object of a root-wrapper file is a
+                    // container; every member but that one value is opaque.
+                    if (scope_stack.items.len == 0) break :blk .file_container;
+                }
                 break :blk childScope(topScope(scope_stack.items), pending_key);
             };
             try scope_stack.append(allocator, sc);
@@ -441,12 +454,15 @@ const Scope = enum {
     /// Any other array — payload arrays, unknown lists. Elements are opaque.
     array_other,
     /// The document-root object of a legacy `"root"`-wrapper file
-    /// (v1.0 — v1.x, #516): a pure CONTAINER, not an entity. Its
-    /// object-valued `"root"` member is the entity (engine `rootObject`);
-    /// its `children`/`entities` arrays stay live entity lists (the
-    /// engine's `fileChildren` keeps consulting them as the
-    /// partial-migration fallback, labelle-engine#573); every other member
-    /// — file metadata like `"name"`, dead flat keys — is opaque.
+    /// (v1.0 — v1.x, #516): a pure CONTAINER, not an entity. Its FIRST
+    /// `"root"` member's object value is the entity (engine `rootObject` /
+    /// first-match `Object.get`; routed by byte offset in
+    /// `rewriteWrappedShapeRefs`, so a duplicate later `"root"` member is
+    /// dead data and stays opaque — CodeRabbit on #521); its
+    /// `children`/`entities` arrays stay live entity lists (the engine's
+    /// `fileChildren` keeps consulting them as the partial-migration
+    /// fallback, labelle-engine#573); every other member — file metadata
+    /// like `"name"`, dead flat keys — is opaque.
     file_container,
 };
 
@@ -468,17 +484,13 @@ fn childScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
             // Any other object field on an entity (`meta`, etc.) is opaque.
             break :blk .payload;
         },
-        .file_container => blk: {
-            // Only an OBJECT-valued `"root"` can land here (childScope is
-            // consulted for `{` opens only), matching the engine's
-            // `getObject("root")` — an array/scalar `"root"` never becomes
-            // the entity. A `"root"` key on a NESTED entity stays payload:
-            // the engine unwraps the wrapper at file level only.
-            if (pending_key) |k| {
-                if (std.mem.eql(u8, k, "root")) break :blk .entity;
-            }
-            break :blk .payload;
-        },
+        // A root-wrapper container's object members are all opaque: the ONE
+        // live `"root"` value (FIRST entry — engine `Object.get` is
+        // first-match) is routed to `.entity` by byte offset in
+        // `rewriteWrappedShapeRefs` BEFORE childScope is consulted, so a
+        // duplicate later `"root"` member lands here and stays dead-data
+        // verbatim (CodeRabbit on #521).
+        .file_container => .payload,
         // A component's value, or anything already inside payload, stays opaque.
         .component_map, .payload, .array_other => .payload,
     };
@@ -588,40 +600,42 @@ fn bundleHeaderOpen(src: []const u8) ?usize {
     return if (isOnlyMetaHeaderObject(src, first)) first else null;
 }
 
-/// True iff the file's top-level value is an object carrying an
-/// object-valued `"root"` key — the legacy v1.0 — v1.x root-wrapper shape,
-/// still dual-accepted by the engine (#516). Mirrors the engine's
-/// `rootObject` (`file_obj.getObject("root") orelse file_obj`): the FIRST
-/// `"root"` entry decides (the engine's `Object.get` returns the first
-/// match), and a non-object `"root"` value means the file object itself is
-/// the entity. A document head this scanner cannot account for is treated
-/// as not-a-wrapper, keeping today's plain-shape behavior for malformed
-/// input.
-fn isRootWrapperFile(src: []const u8) bool {
+/// Offset of the `{` opening the root-wrapper's entity value, or null when
+/// the file is not the legacy v1.0 — v1.x root-wrapper shape (#516).
+/// Mirrors the engine's `rootObject` (`file_obj.getObject("root") orelse
+/// file_obj`): the FIRST `"root"` entry decides (the engine's `Object.get`
+/// returns the first match) — a non-object first `"root"` value means the
+/// file object itself is the entity, and a duplicate LATER `"root"` member
+/// is dead data the engine never reads. Returning the byte offset rather
+/// than a bool is what lets both passes route exactly ONE member to the
+/// entity path, so that duplicate stays verbatim (CodeRabbit on #521). A
+/// document head this scanner cannot account for is treated as
+/// not-a-wrapper, keeping today's plain-shape behavior for malformed input.
+fn rootWrapperValueOpen(src: []const u8) ?usize {
     const probe = FlatWrap{ .src = src, .component_keys = &.{} };
     var i = probe.skipTrivia(0);
-    if (i >= src.len or src[i] != '{') return false;
+    if (i >= src.len or src[i] != '{') return null;
     i += 1;
     while (true) {
         i = probe.skipTrivia(i);
-        if (i >= src.len) return false;
-        if (src[i] == '}') return false; // no "root" key — plain shape
-        if (src[i] != '"') return false;
-        const key_end = probe.scanString(i) catch return false;
+        if (i >= src.len) return null;
+        if (src[i] == '}') return null; // no "root" key — plain shape
+        if (src[i] != '"') return null;
+        const key_end = probe.scanString(i) catch return null;
         const key = src[i + 1 .. key_end - 1];
         i = probe.skipTrivia(key_end);
-        if (i >= src.len or src[i] != ':') return false;
+        if (i >= src.len or src[i] != ':') return null;
         i = probe.skipTrivia(i + 1);
-        if (i >= src.len) return false;
-        if (std.mem.eql(u8, key, "root")) return src[i] == '{';
-        const value_end = probe.scanValue(i) catch return false;
+        if (i >= src.len) return null;
+        if (std.mem.eql(u8, key, "root")) return if (src[i] == '{') i else null;
+        const value_end = probe.scanValue(i) catch return null;
         i = probe.skipTrivia(value_end);
-        if (i >= src.len) return false;
+        if (i >= src.len) return null;
         if (src[i] == ',') {
             i += 1;
             continue;
         }
-        return false;
+        return null;
     }
 }
 
@@ -794,8 +808,8 @@ const FlatWrap = struct {
         if (start >= s.len) return; // comment/whitespace-only file
         const end = switch (s[start]) {
             '[' => try self.emitBundle(allocator, out, start),
-            '{' => if (isRootWrapperFile(s))
-                try self.emitFileContainer(allocator, out, start)
+            '{' => if (rootWrapperValueOpen(s)) |root_open|
+                try self.emitFileContainer(allocator, out, start, root_open)
             else
                 try self.emitEntityObject(allocator, out, start, 0),
             else => return error.Malformed,
@@ -1002,18 +1016,22 @@ const FlatWrap = struct {
 
     /// Emit a legacy `"root"`-wrapper file (#516; v1.0 — v1.x, engine
     /// `rootObject`): the document object is a CONTAINER, not an entity.
-    /// Its object-valued `"root"` member descends as the entity;
-    /// `children`/`entities` arrays at container level stay live entity
-    /// lists (the engine's `fileChildren` keeps consulting them as the
-    /// partial-migration fallback, labelle-engine#573); every other member
-    /// — file metadata like `"name"`, dead flat keys the engine never
-    /// reads — is copied verbatim and never wrapped. Returns one past the
-    /// container's `}`.
+    /// The pair whose value opens at `root_open` — the FIRST `"root"`
+    /// member, per `rootWrapperValueOpen` / the engine's first-match
+    /// `Object.get` — descends as the entity; a duplicate later `"root"`
+    /// member is dead data the engine never reads and is copied verbatim
+    /// (CodeRabbit on #521). `children`/`entities` arrays at container
+    /// level stay live entity lists (the engine's `fileChildren` keeps
+    /// consulting them as the partial-migration fallback,
+    /// labelle-engine#573); every other member — file metadata like
+    /// `"name"`, dead flat keys the engine never reads — is copied verbatim
+    /// and never wrapped. Returns one past the container's `}`.
     fn emitFileContainer(
         self: *FlatWrap,
         allocator: std.mem.Allocator,
         out: *std.ArrayList(u8),
         at: usize,
+        root_open: usize,
     ) Error!usize {
         const s = self.src;
         const obj = try self.parseObject(allocator, at);
@@ -1024,7 +1042,7 @@ const FlatWrap = struct {
         for (obj.pairs) |p| {
             if (emitted_any) try out.append(allocator, ',');
             try out.appendSlice(allocator, s[p.lead_start..p.value_start]);
-            if (std.mem.eql(u8, p.key, "root") and s[p.value_start] == '{') {
+            if (p.value_start == root_open) {
                 _ = try self.emitEntityObject(allocator, out, p.value_start, 1);
             } else if (s[p.value_start] == '[' and isEntityListKey(p.key)) {
                 _ = try self.emitEntityArray(allocator, out, p.value_start, 1);
@@ -2962,6 +2980,34 @@ test "rewritePackLocalRefs: root-wrapper children and pack prefab refs are names
     try std.testing.expect(std.mem.indexOf(u8, out, "\"prefab\": \"sky__cloud\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"overrides\": { \"sky__CloudDrift\": { \"v\": 2 } }") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"components\": { \"sky__CloudDrift\": { \"v\": 3 }") != null);
+}
+
+test "rewritePackLocalRefs: only the FIRST root member is the entity — a duplicate is dead data (#516, CodeRabbit #521)" {
+    const allocator = std.testing.allocator;
+    // Engine `Object.get` is first-match: the first `"root"` entry is THE
+    // root binding, and a duplicated later `"root"` member is dead data the
+    // engine never reads — it must stay byte-verbatim (bare keys and all)
+    // through BOTH passes, not get rewritten as a second entity.
+    const src =
+        \\{
+        \\    "root": { "SkyBody": { "role": "sun" } },
+        \\    "root": { "components": { "SkyBody": { "role": "dead" } } }
+        \\}
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(out);
+
+    // First root: wrapped + namespaced …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"components\": { \"sky__SkyBody\": { \"role\": \"sun\" }") != null);
+    // … the duplicate stays byte-verbatim, its bare key included …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"root\": { \"components\": { \"SkyBody\": { \"role\": \"dead\" } } }") != null);
+    // … so exactly one namespacing happened in the whole file.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "sky__SkyBody"));
+
+    // Idempotency holds across the duplicate too.
+    const twice = try rewritePackLocalRefs(allocator, out, &.{"SkyBody"}, &.{}, "sky");
+    defer allocator.free(twice);
+    try std.testing.expectEqualStrings(out, twice);
 }
 
 test "rewritePackLocalRefs: meta on an entity-shaped element is NOT a bundle header (#516)" {
