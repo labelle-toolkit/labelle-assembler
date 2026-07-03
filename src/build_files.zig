@@ -151,66 +151,21 @@ pub const BuildZigOptions = struct {
     /// empty — projects with no FlowNodes-bearing scripts (the common
     /// case) emit nothing here and keep their byte-identical build.zig.
     promoted_scripts: []const scan.PromotedScript = &.{},
-    /// Project root, used by the manifest-driven splice (pluggable-backends
-    /// RFC, assembler#378) to locate the backend package's
-    /// `backend.manifest.zon` + build fragments. Null (default) keeps the
-    /// enum path. Only consulted when `manifest_splice.manifestPathEnabled`
-    /// returns true (desktop target + a backend that ships a manifest).
+    /// Project root, used to locate the resolved backend package's
+    /// `backend.manifest.v2.zon` (pluggable-backends RFC, assembler#453/#461).
+    /// Null (default) means no manifest can be loaded, so codegen hard-errors —
+    /// the enum/v1 fallback is gone. Only consulted when
+    /// `manifest_splice.manifestPathEnabled` returns true.
     project_dir: ?[]const u8 = null,
     /// Which backend manifest file to load, relative to the resolved backend
-    /// package root (manifest-v2, epic #453 item 3, PR 3). Null (default) keeps
-    /// the PRODUCTION path 100% unchanged: `manifest_splice.loadManifest` reads
-    /// `backend.manifest.zon` (v1) and the enum/v1 splice runs byte-for-byte as
-    /// before. When set, the named manifest is header-first parsed
-    /// (`manifest_v2.parseManifest`) and dispatched: a v1/field-less manifest
-    /// still routes to the v1 splice; a `manifest_version >= 2` manifest routes to
-    /// the v2 desktop codegen (`manifest_v2_splice`). The byte-anchor test (§7)
-    /// sets this to `"backend.manifest.v2.zon"` to drive the v2 path against the
-    /// retained sokol fixture WITHOUT touching the v1 `backend.manifest.zon` other
-    /// tests depend on.
+    /// package root (manifest-v2, epic #453 item 3). `generate` auto-detects
+    /// `backend.manifest.v2.zon` and threads its name here. The named manifest is
+    /// header-first parsed (`manifest_v2.parseManifest`) into a `BackendManifestV2`;
+    /// a v1/field-less manifest is REJECTED (the v1/enum codegen path was removed in
+    /// #461). Null means no v2 manifest → codegen hard-errors. Tests pass
+    /// `"backend.manifest.v2.zon"` explicitly to drive the v2 path against a fixture.
     backend_manifest_name: ?[]const u8 = null,
 };
-
-/// True when an EXTERNAL backend may safely fall through to the enum
-/// `switch (cfg.backend)` codegen instead of the (desktop-only) manifest splice.
-/// The android/wasm/ios cross-compile targets are validated tag-safe: the
-/// extracted backend is selected via `.backend = .<tag>` (the enum-as-shorthand
-/// preserves the tag), and those platforms' enum sections pull the backend from
-/// `b.dependency("labelle_<tag>")` — which resolves to the fetched package —
-/// while making no staged-sibling assumptions (#386 Phase 6c, validated
-/// on-device for android). None of these three cross-compile targets have a
-/// manifest splice (that's desktop-only), but each DOES have platform-specific
-/// enum sections (`.backend_sokol_wasm`/`.backend_sokol_ios`, the
-/// `wasm_emsdk_*`/`link_*_wasm` wiring), so the default raylib/sokol backends
-/// must reach them via the enum path rather than hard-erroring — otherwise the
-/// post-flip external default breaks the existing raylib web + sokol web/iOS
-/// builds. Desktop, by contrast, routes an external backend exclusively through
-/// its manifest splice, so it stays OFF this path (a desktop external without a
-/// project_dir/manifest is a hard error). A backend named only by a string (no
-/// matching tag) is NOT tag-safe on any target and must route through the
-/// manifest — the enum `switch` would emit the wrong (raylib-default) codegen.
-///
-/// The tag-safe discriminator is `cfg.isEnumTagBacked()` (config.zig): a genuine
-/// THIRD-PARTY backend named only by string is never enum-tag-backed, so it can
-/// never take the enum path on ANY target and instead routes entirely through
-/// `backend_registry` + its (v2) manifest (#453 PR 11 — the enum tag is no longer
-/// read as an identity here; the check moved onto the documented config predicate).
-fn externalUsesEnumPath(cfg: ProjectConfig) bool {
-    if (!cfg.isEnumTagBacked()) return false;
-    return switch (cfg.platform) {
-        .android, .wasm, .ios => true,
-        .desktop => false,
-    };
-}
-
-/// True when codegen should route the backend through the embedded enum
-/// `switch (cfg.backend)` sections (and their platform-specific companions like
-/// `wasm_emsdk_*`) rather than the manifest splice / hard error. A bundled
-/// built-in always uses the enum path; a tag-matched external uses it on the
-/// no-manifest cross-compile targets (see `externalUsesEnumPath`).
-fn usesEnumBackendPath(cfg: ProjectConfig) bool {
-    return !cfg.isExternal() or externalUsesEnumPath(cfg);
-}
 
 /// True when the DESKTOP build should take the manifest-v2 GENERIC declarative
 /// path (loop-form `unifyCoreDiamond` walk + manifest-driven artifact/framework
@@ -229,43 +184,32 @@ fn desktopUsesGenericV2(v2_manifest: ?manifest_v2.BackendManifestV2, cfg: Projec
 /// `android_main` entry and needs the shell to register its init/tick callbacks
 /// + drive `run`; sokol's C runtime provides the entry and needs no such import.
 ///
-/// Manifest-driven on the v2 path (assembler#461): the bgfx-Android platform
-/// entry declares the shell as an `extra_module` aliased to `backend_app`
+/// Manifest-driven (assembler#461): the bgfx-Android platform entry declares the
+/// shell as an `extra_module` aliased to `backend_app`
 /// (`.{ .name = "android_app", .root_alias = "backend_app" }`), so this keys off
-/// THAT declaration instead of the `cfg.backend == .bgfx` enum. Any v2 backend
-/// (including a name-only third party) that declares such an extra module gets
-/// the import; one that does not (sokol-Android) does not.
-///
-/// The v1 / no-manifest legacy Android path has no such declaration to read, so
-/// it retains the enum fallback — byte-identical to the pre-#461 output. That
-/// fallback is the SAME closed enum residual as the `android_link_bgfx` link
-/// site, and is removed together with it by the separate device-gated enum-path
-/// deletion; production bgfx (v2 manifest) never reaches it.
-fn androidNeedsAppImport(allocator: std.mem.Allocator, v2_manifest: ?manifest_v2.BackendManifestV2, cfg: ProjectConfig) !bool {
-    if (v2_manifest) |m| {
-        const entry = manifest_v2_splice.platformEntry(m, cfg.platform) orelse return false;
-        for (entry.extra_modules) |mod| {
-            // Compute the module's EFFECTIVE root alias EXACTLY as
-            // `manifest_v2_splice.moduleAlias` emits it — `root_alias` if
-            // declared, else the default `backend_<name>` — and match on THAT.
-            // Matching on `mod.name` (or `mod.root_alias orelse mod.name`) is the
-            // bug the reviewers caught: a `.name = "android_app"` module with no
-            // `root_alias` is emitted as `backend_android_app`, so keying the
-            // import off the bare name would emit `.module = backend_app` for a
-            // module that was never declared under that alias → an undefined
-            // reference in the generated build.zig. bgfx sets
-            // `.root_alias = "backend_app"` explicitly, so it still matches; a
-            // name-only `android_app` (→ `backend_android_app`) correctly does not.
-            const alias = if (mod.root_alias) |a|
-                try allocator.dupe(u8, a)
-            else
-                try std.fmt.allocPrint(allocator, "backend_{s}", .{mod.name});
-            defer allocator.free(alias);
-            if (std.mem.eql(u8, alias, "backend_app")) return true;
+/// THAT declaration. Any v2 backend (including a name-only third party) that
+/// declares such an extra module gets the import; one that does not (sokol-Android)
+/// does not. Takes the resolved v2 manifest directly — the enum/v1 path is gone,
+/// so an Android build always carries one.
+fn androidNeedsAppImport(m: manifest_v2.BackendManifestV2, cfg: ProjectConfig) bool {
+    const entry = manifest_v2_splice.platformEntry(m, cfg.platform) orelse return false;
+    for (entry.extra_modules) |mod| {
+        // Match the module's EFFECTIVE root alias as `manifest_v2_splice.moduleAlias`
+        // emits it — `root_alias` if declared, else the default `backend_<name>`.
+        // That equals `backend_app` iff the declared `root_alias` is `backend_app`,
+        // OR (no `root_alias`) the name is `app` — so no allocation is needed. A
+        // `.name = "android_app"` module with no `root_alias` is emitted as
+        // `backend_android_app`, so keying off the bare name would emit
+        // `.module = backend_app` for a module never declared under that alias → an
+        // undefined reference. bgfx sets `.root_alias = "backend_app"` explicitly, so
+        // it matches; a name-only `android_app` correctly does not.
+        if (mod.root_alias) |a| {
+            if (std.mem.eql(u8, a, "backend_app")) return true;
+        } else if (std.mem.eql(u8, mod.name, "app")) {
+            return true;
         }
-        return false;
     }
-    return cfg.backend == .bgfx;
+    return false;
 }
 
 pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: BuildZigOptions) ![]const u8 {
@@ -273,73 +217,27 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     errdefer alloc_writer.deinit();
     const w = &alloc_writer.writer;
 
-    // `gamepad_enabled` flips the shared SDL desktop gamepad source on
-    // (core#28 slice 5). When `.auto`, the backend's build.zig wires
-    // `sdl_gamepad` + links SDL2 on desktop and routes through it; when
-    // `.none` (opt-out), the backend omits the import and links no SDL, and
-    // the input module's gamepad queries resolve to the truly-disabled path.
-    // Computed + substituted exactly like `with_imgui`.
-    const gamepad_enabled: []const u8 = if (cfg.gamepad == .auto) "true" else "false";
-
-    // `gamepad_hidapi` opts the SDL desktop source into HIDAPI raw-HID decode
-    // (Switch/8BitDo). OFF by default: HIDAPI's per-connect device init stalls
-    // the render thread for seconds on some platforms. Substituted exactly like
-    // `gamepad_enabled`; forwarded to the backend's `input` build_options.
-    const gamepad_hidapi: []const u8 = if (cfg.gamepad_hidapi) "true" else "false";
-
-    // ── Manifest-driven backend splice (pluggable-backends RFC, #378) ────
-    // When the resolved backend ships a `backend.manifest.zon` AND the target
-    // is desktop, load it ONCE here; the backend-dep and link sections below
-    // dispatch to the manifest fragments instead of the embedded
-    // `backend_<tag>` / `link_<tag>` template sections. Every other backend ×
-    // platform (no manifest, or non-desktop) falls through the enum `switch`
-    // unchanged. bgfx-desktop opts in by shipping a manifest.
-    // External backends generate exclusively via the manifest splice; a
-    // manifest-less external package is a hard error here (the enum `switch`es
-    // below read `cfg.backend`, meaningless for an external backend with no tag).
-    // Key BOTH the external-manifest requirement and the desktop gate off the
-    // REQUESTED filename (`opts.backend_manifest_name`, null → the legacy v1
-    // name): a backend shipping ONLY `backend.manifest.v2.zon` must still reach
-    // the v2 loader below rather than be treated as manifest-less because the
-    // hardcoded legacy `backend.manifest.zon` is absent (manifest-v2, #453).
+    // ── Manifest-v2 backend codegen (pluggable-backends RFC, #453/#461) ────
+    // The enum/v1 build-graph splice is gone (#461); every backend generates its
+    // build.zig from a typed v2 `backend.manifest.v2.zon`. `generate` auto-detects
+    // that file and threads its name through as `opts.backend_manifest_name`.
     //
     // Loaded UP HERE (before the header/deps emission) because a v2 android build
-    // emits a different header (hook-imported `resolve_target`) than the enum
-    // `header_android`, so the platform-scaffold emission below must know whether
-    // this is a v2 manifest (manifest-v2 PR 5, #453).
+    // emits a hook-imported `resolve_target` header, so the platform-scaffold
+    // emission below must have the manifest in hand.
     if (opts.project_dir) |pd| try manifest_splice.requireManifestIfExternal(allocator, cfg, pd, opts.backend_manifest_name);
 
     const use_manifest = opts.project_dir != null and
         manifest_splice.manifestPathEnabled(allocator, cfg, opts.project_dir.?, opts.backend_manifest_name);
-    var splice_manifest: ?manifest_splice.BackendManifest = null;
-    defer if (splice_manifest) |m| manifest_splice.freeManifest(allocator, m);
-    // manifest-v2 (epic #453 item 3, PR 3/5): only set when a `manifest_version >= 2`
-    // manifest is loaded via the opt-in `backend_manifest_name`. Null in production.
+    // The v2 build-graph manifest is now the ONLY codegen input (#461 removed the
+    // enum/v1 splice). It is loaded via the auto-detected `backend_manifest_name`
+    // (`generate` probes for `backend.manifest.v2.zon`). A build that resolves no v2
+    // manifest cannot be wired and errors below.
     var v2_manifest: ?manifest_v2.BackendManifestV2 = null;
     defer if (v2_manifest) |m| std.zon.parse.free(allocator, m);
     if (use_manifest) {
         if (opts.backend_manifest_name) |name| {
-            // Header-first parse + dispatch (design §6): a v1/field-less manifest
-            // still routes to the v1 splice below; a v2 manifest routes to the v2
-            // codegen. `>` SUPPORTED is rejected by `parseManifest`.
-            const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, opts.project_dir.?, name);
-            switch (parsed) {
-                .v1 => |m| {
-                    // The V1 splice covers desktop only. On a non-desktop target the
-                    // relaxed gate (manifest-v2 opt-in) let us load the manifest, but
-                    // a v1 one there must fall back to the enum path — free it and
-                    // leave `splice_manifest` null.
-                    if (cfg.platform == .desktop) {
-                        splice_manifest = m;
-                    } else {
-                        manifest_splice.freeManifest(allocator, m);
-                    }
-                },
-                .v2 => |m| v2_manifest = m,
-            }
-        } else {
-            // PRODUCTION path — unchanged: read `backend.manifest.zon` (v1) directly.
-            splice_manifest = try manifest_splice.loadManifest(allocator, cfg, opts.project_dir.?);
+            v2_manifest = try manifest_v2.loadNamedManifest(allocator, cfg, opts.project_dir.?, name);
         }
     }
 
@@ -376,36 +274,26 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         }
     }
 
+    // #461: the enum/v1 codegen path is deleted, so a v2 build-graph manifest is
+    // now MANDATORY. A build that reaches here without one (no `project_dir`, or a
+    // backend that ships no `backend.manifest.v2.zon`) cannot be wired — fail loudly
+    // rather than emit a broken build.zig. Every emission below can therefore unwrap
+    // `v2_manifest` unconditionally.
+    const manifest = v2_manifest orelse return error.ExternalBackendNeedsManifest;
+
     if (cfg.platform == .wasm) {
-        if (v2_manifest) |m| {
-            // manifest-v2 wasm (PR 7): the header imports the backend hook and
-            // resolves the STATIC wasm32-emscripten target inline (design §3 — a
-            // fixed .triple, so NO resolve_target hook). Replaces the enum
-            // `header_wasm` + `wasm_target` blocks.
-            try manifest_v2_splice.renderWasmHeaderV2(m, w);
-        } else {
-            try tpl.writeSection(build_zig_tmpl, "header_wasm", w);
-            try tpl.writeSection(build_zig_tmpl, "wasm_target", w);
-        }
+        // manifest-v2 wasm: the header imports the backend hook and resolves the
+        // STATIC wasm32-emscripten target inline (design §3 — a fixed .triple, so NO
+        // resolve_target hook).
+        try manifest_v2_splice.renderWasmHeaderV2(manifest, w);
     } else if (cfg.platform == .ios) {
-        if (v2_manifest) |m| {
-            // manifest-v2 ios (PR 6): the header imports the backend hook and
-            // resolves BOTH the ios target and the SDK path via `resolve_target`
-            // (design §4) instead of the enum `header_ios`'s inline xcrun/target
-            // block + helper fns.
-            try manifest_v2_splice.renderIosHeaderV2(m, w);
-        } else {
-            try tpl.writeSection(build_zig_tmpl, "header_ios", w);
-        }
+        // manifest-v2 ios: the header imports the backend hook and resolves BOTH the
+        // ios target and the SDK path via `resolve_target` (design §4).
+        try manifest_v2_splice.renderIosHeaderV2(manifest, w);
     } else if (cfg.platform == .android) {
-        if (v2_manifest) |m| {
-            // manifest-v2 android (PR 5): the header imports the backend hook and
-            // resolves the android target via `resolve_target` (design §4) instead
-            // of the enum `header_android`'s inline NDK/target block.
-            try manifest_v2_splice.renderAndroidHeaderV2(m, w);
-        } else {
-            try tpl.writeSection(build_zig_tmpl, "header_android", w);
-        }
+        // manifest-v2 android: the header imports the backend hook and resolves the
+        // android target via `resolve_target` (design §4).
+        try manifest_v2_splice.renderAndroidHeaderV2(manifest, w);
     } else {
         try tpl.writeSection(build_zig_tmpl, "header", w);
     }
@@ -418,39 +306,29 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
             try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
         }
-        if (v2_manifest != null) {
-            // manifest-v2 ios (PR 6): emit the core/gfx/engine dep decls WITHOUT
-            // the unrolled overrideImport diamond — the generic `unifyCoreDiamond`
-            // walk (emitted after the backend-dep section) replaces it (design §5).
-            try manifest_v2_splice.renderIosDepsDeclsV2(w);
-        } else {
-            try tpl.writeSection(build_zig_tmpl, "ios_deps", w);
-        }
+        // manifest-v2 ios: emit the core/gfx/engine dep decls WITHOUT the unrolled
+        // overrideImport diamond — the generic `unifyCoreDiamond` walk (emitted after
+        // the backend-dep section) replaces it (design §5).
+        try manifest_v2_splice.renderIosDepsDeclsV2(w);
         try tpl.writeSection(build_zig_tmpl, "game_mod_decl_ios", w);
     } else if (cfg.platform == .android) {
         // `target` (the alias for `android_target`) is consumed by the deps/plugin
-        // decls AND by `emitPromotedScriptModules` (`.target = target`). This guard
-        // is shared by BOTH the v2 and enum android routes, so include the promoted-
-        // scripts condition so `target` is defined whenever any consumer needs it —
-        // a promoted-scripts + no-plugin/ECS/GUI android game previously emitted an
-        // undefined `target` (PR #466 Finding 1, applies to v2 AND enum).
+        // decls AND by `emitPromotedScriptModules` (`.target = target`). Include the
+        // promoted-scripts condition so `target` is defined whenever any consumer
+        // needs it — a promoted-scripts + no-plugin/ECS/GUI android game previously
+        // emitted an undefined `target` (PR #466 Finding 1).
         if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
             try tpl.writeSection(build_zig_tmpl, "android_target_alias", w);
         }
-        if (v2_manifest != null) {
-            // manifest-v2 android (PR 5): emit the core/gfx/engine dep decls WITHOUT
-            // the unrolled overrideImport diamond — the generic `unifyCoreDiamond`
-            // walk (emitted after the backend-dep section) replaces it (design §5).
-            try manifest_v2_splice.renderAndroidDepsDeclsV2(w);
-        } else {
-            try tpl.writeSection(build_zig_tmpl, "android_deps", w);
-        }
-        try tpl.writeSection(build_zig_tmpl, "game_mod_decl_android", w);
-    } else if (cfg.platform == .wasm and v2_manifest != null) {
-        // manifest-v2 wasm (PR 7): emit the core/gfx/engine dep decls WITHOUT the
+        // manifest-v2 android: emit the core/gfx/engine dep decls WITHOUT the
         // unrolled overrideImport diamond — the generic `unifyCoreDiamond` walk
-        // (emitted after the backend-dep section) replaces it (design §5). Uses the
-        // plain `target` alias the v2 wasm header declares.
+        // replaces it (design §5).
+        try manifest_v2_splice.renderAndroidDepsDeclsV2(w);
+        try tpl.writeSection(build_zig_tmpl, "game_mod_decl_android", w);
+    } else if (cfg.platform == .wasm) {
+        // manifest-v2 wasm: emit the core/gfx/engine dep decls WITHOUT the unrolled
+        // overrideImport diamond — the generic `unifyCoreDiamond` walk replaces it
+        // (design §5). Uses the plain `target` alias the v2 wasm header declares.
         try manifest_v2_splice.renderWasmDepsDeclsV2(w);
         try tpl.writeSection(build_zig_tmpl, "game_mod_decl", w);
     } else {
@@ -481,81 +359,12 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle_{s}\");\n", .{ plugin.name, plugin.name, plugin.name });
     }
 
-    // Backend dep — always the standard backend (never a merged GUI+backend package)
-    if (v2_manifest) |m| {
-        // manifest-v2 codegen (design §3/§5/§7): render the b.dependency literal +
-        // modules + artifacts from typed manifest data. Desktop (PR 3) is
-        // byte-anchored against v1/enum; android (PR 5) is a golden cell — its
-        // backend-dep emitter also appends the generic core-diamond walk calls.
-        try manifest_v2_splice.renderBackendDepSectionV2(allocator, m, cfg, w);
-    } else if (splice_manifest) |m| {
-        // Splice: resolve the backend-dep build fragment from the manifest,
-        // no `=> .<tag>` branch. Desktop-only (the gate guarantees it).
-        try manifest_splice.renderBackendDepSection(allocator, m, cfg, opts.project_dir.?, w);
-    } else if (cfg.isExternal() and !externalUsesEnumPath(cfg)) {
-        // External backend with no manifest splice and no safe enum fallback —
-        // the enum `switch (cfg.backend)` below would read a MEANINGLESS tag (for
-        // a string-named backend) or emit sections that don't compose with a
-        // self-contained package (wasm/ios) — hard error.
-        return error.ExternalBackendNeedsManifest;
-    } else switch (cfg.backend) {
-        .raylib => try tpl.renderSection(build_zig_tmpl, "backend_raylib", .{ .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi }, w),
-        .sokol => {
-            // `with_imgui` must be true ONLY when the project's gui plugin
-            // is imgui — sokol_imgui.c needs cimgui.h on its include path,
-            // which only the imgui bridge provides. When imgui IS in the
-            // dep graph, the option set here MUST match
-            // `labelle-imgui/bridges/sokol/build.zig` exactly so Zig
-            // resolves a single `sokol_clib` artifact (and a single `_sg`
-            // static state) — see labelle-assembler#140.
-            const with_imgui: []const u8 = if (cfg.resolved_gui) |gui|
-                if (std.mem.eql(u8, gui.name, "imgui")) "true" else "false"
-            else
-                "false";
-            if (cfg.platform == .wasm) {
-                try tpl.renderSection(build_zig_tmpl, "backend_sokol_wasm", .{ .with_imgui = with_imgui }, w);
-            } else if (cfg.platform == .ios) {
-                try tpl.renderSection(build_zig_tmpl, "backend_sokol_ios", .{ .with_imgui = with_imgui }, w);
-            } else if (cfg.platform == .android) {
-                try tpl.renderSection(build_zig_tmpl, "backend_sokol_android", .{ .with_imgui = with_imgui }, w);
-            } else {
-                try tpl.renderSection(build_zig_tmpl, "backend_sokol", .{ .with_imgui = with_imgui, .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi }, w);
-            }
-        },
-        .sdl => try tpl.writeSection(build_zig_tmpl, "backend_sdl", w),
-        .bgfx => {
-            // bgfx has an Android path (#303): the backend builds
-            // gfx/input/audio/window for `aarch64-linux-android` plus the
-            // `android_app` NativeActivity-glue module, and zglfw (desktop
-            // window toolkit) is omitted from the Android graph. Desktop
-            // keeps the GLFW-based `backend_bgfx` section.
-            // `gui_enabled` for the bgfx backend's imgui input forwarding —
-            // only when the project's gui plugin is imgui (the bridge defining
-            // the `imgui_bridge_mouse_*` externs `input.zig` references). Same
-            // imgui-only predicate as sokol's `with_imgui`.
-            const bgfx_gui_enabled: []const u8 = if (cfg.resolved_gui) |gui|
-                if (std.mem.eql(u8, gui.name, "imgui")) "true" else "false"
-            else
-                "false";
-            if (cfg.platform == .android) {
-                try tpl.renderSection(build_zig_tmpl, "backend_bgfx_android", .{ .gui_enabled = bgfx_gui_enabled }, w);
-            } else {
-                // Desktop bgfx forwards `gamepad_enabled` like raylib/sokol so
-                // the backend wires the shared SDL desktop gamepad source
-                // (`.gamepad = .auto`) or falls back to its GLFW path
-                // (`.gamepad = .none`). See backends/bgfx/src/input.zig.
-                //
-                // `gui_enabled` flips the backend's mouse/touch → imgui-bridge
-                // input forwarding on. TRUE only when the gui plugin is imgui:
-                // the `imgui_bridge_mouse_*` externs `input.zig` then references
-                // are defined solely by the linked imgui bridge artifact, so a
-                // non-imgui build must keep this false or it fails to link.
-                try tpl.renderSection(build_zig_tmpl, "backend_bgfx", .{ .gamepad_enabled = gamepad_enabled, .gamepad_hidapi = gamepad_hidapi, .gui_enabled = bgfx_gui_enabled }, w);
-            }
-        },
-        .wgpu => try tpl.writeSection(build_zig_tmpl, "backend_wgpu", w),
-        .null => try tpl.writeSection(build_zig_tmpl, "backend_null", w),
-    }
+    // Backend dep — always the standard backend (never a merged GUI+backend
+    // package). manifest-v2 codegen (design §3/§5/§7): render the b.dependency
+    // literal + modules + artifacts from typed manifest data. Desktop is the sokol
+    // byte-anchor / generic-declarative golden; android/ios/wasm are golden cells —
+    // the backend-dep emitter also appends the generic core-diamond walk calls.
+    try manifest_v2_splice.renderBackendDepSectionV2(allocator, manifest, cfg, w);
 
     switch (cfg.ecs) {
         .mock => {},
@@ -646,19 +455,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     try emitPromotedScriptModules(w, cfg, opts.promoted_scripts);
 
     if (cfg.platform == .wasm) {
-        // WASM: import emsdk helpers from backend. Emitted for a bundled
-        // built-in AND for a tag-matched external on wasm (both route through
-        // the enum path — see `externalUsesEnumPath`); a non-tag-matched
-        // external is self-contained and declares its own wasm wiring.
-        // manifest-v2 (PR 7) skips this: the emcc residual moved into the
-        // backend hook's `post_wire`, which resolves emsdk itself via
-        // `b.dependency("emsdk", .{})` — no `@import("labelle_sokol")` in the
-        // generated build.zig (design §2 (c)).
-        if (v2_manifest == null and usesEnumBackendPath(cfg)) switch (cfg.backend) {
-            .raylib => try tpl.writeSection(build_zig_tmpl, "wasm_emsdk_raylib", w),
-            .sokol => try tpl.writeSection(build_zig_tmpl, "wasm_emsdk_sokol", w),
-            else => {},
-        };
+        // manifest-v2 wasm: no emsdk-helper import in the generated build.zig — the
+        // emcc residual moved into the backend hook's `post_wire`, which resolves
+        // emsdk itself via `b.dependency("emsdk", .{})` (design §2 (c)).
 
         // WASM: build as library, link via emcc
         try tpl.writeSection(build_zig_tmpl, "wasm_exe_start", w);
@@ -696,48 +495,30 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         }
 
-        // emsdk activation preflight (labelle-assembler#492). Emitted for the
-        // paths whose emcc wiring WE own (manifest-v2 `post_wire` + the enum
-        // `emccStep`/`emLinkStep`); a self-contained external declares its own
-        // wasm wiring and may not use the emsdk package at all. Runs at configure
-        // time, before the emcc link step, turning the opaque
+        // emsdk activation preflight (labelle-assembler#492). The manifest-v2
+        // `post_wire` owns the emcc wiring, so every wasm build emits this guard.
+        // Runs at configure time, before the emcc link step, turning the opaque
         // `.../upstream/emscripten/emcc file_hash FileNotFound` into an actionable
         // "run ./emsdk install/activate" message.
-        const emits_emcc_wiring = v2_manifest != null or usesEnumBackendPath(cfg);
-        if (emits_emcc_wiring) try emsdk_preflight.emitCheckCall(w);
+        try emsdk_preflight.emitCheckCall(w);
 
-        // WASM link step.
-        if (v2_manifest) |m| {
-            // manifest-v2 wasm (PR 7): the generic link (linkLibrary the wasm lib's
-            // artifact) plus the `post_wire` hook call for the emcc `emLinkStep`
-            // residual + install/run wiring (design §2 (c) / §4). No enum
-            // `link_sokol_wasm`/`wasm_footer` sections — the hook owns the emcc
-            // step AND (being void) the install/run the enum `emcc_step` local fed.
-            try manifest_v2_splice.renderLinkSectionV2(allocator, m, cfg, w);
-        } else if (usesEnumBackendPath(cfg)) switch (cfg.backend) {
-            // Enum path (bundled built-in or a tag-matched external on wasm),
-            // skipped for a self-contained external.
-            .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib_wasm", w),
-            .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol_wasm", w),
-            else => {},
-        };
+        // WASM link step. manifest-v2 wasm: the generic link (linkLibrary the wasm
+        // lib's artifact) plus the `post_wire` hook call for the emcc `emLinkStep`
+        // residual + install/run wiring (design §2 (c) / §4). The hook owns the emcc
+        // step AND (being void) the install/run wiring.
+        try manifest_v2_splice.renderLinkSectionV2(allocator, manifest, cfg, w);
 
-        if (v2_manifest != null) {
-            // manifest-v2 wasm footer (PR 7): the build-fn close + helper defs
-            // WITHOUT the enum `wasm_footer`'s install/run block (post_wire owns
-            // install/run), then the generic `unifyCoreDiamond` walk (design §5)
-            // as a top-level helper — same footer→walk shape as android/ios.
-            try manifest_v2_splice.renderWasmFooterV2(w);
-            try w.writeByte('\n');
-            try manifest_v2_splice.emitCoreDiamondWalk(w);
-        } else {
-            try tpl.writeSection(build_zig_tmpl, "wasm_footer", w);
-        }
+        // manifest-v2 wasm footer: the build-fn close + helper defs (post_wire owns
+        // install/run), then the generic `unifyCoreDiamond` walk (design §5) as a
+        // top-level helper — same footer→walk shape as android/ios.
+        try manifest_v2_splice.renderWasmFooterV2(w);
+        try w.writeByte('\n');
+        try manifest_v2_splice.emitCoreDiamondWalk(w);
 
         // The `ensureEmsdkActivated` helper the guard call above invokes — a
         // top-level fn appended after the footer, same footer→helper shape as the
         // core-diamond walk (labelle-assembler#492).
-        if (emits_emcc_wiring) try emsdk_preflight.emitHelperFn(w);
+        try emsdk_preflight.emitHelperFn(w);
     } else if (cfg.platform == .ios) {
         // iOS: build executable for simulator, link frameworks manually
         try tpl.writeSection(build_zig_tmpl, "ios_exe_start", w);
@@ -759,15 +540,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → iOS exe root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
 
-        if (v2_manifest) |m| {
-            // manifest-v2 ios (PR 6): the generic link (linkLibrary + link_libc +
-            // linkFramework from `.frameworks.ios`) plus the `post_wire` hook call
-            // for the SDK include/lib/framework paths residual (design §4). No enum
-            // `ios_link` section.
-            try manifest_v2_splice.renderLinkSectionV2(allocator, m, cfg, w);
-        } else {
-            try tpl.writeSection(build_zig_tmpl, "ios_link", w);
-        }
+        // manifest-v2 ios: the generic link (linkLibrary + link_libc + linkFramework
+        // from `.frameworks.ios`) plus the `post_wire` hook call for the SDK
+        // include/lib/framework paths residual (design §4).
+        try manifest_v2_splice.renderLinkSectionV2(allocator, manifest, cfg, w);
 
         // Bridge artifact (raw_backend GUIs)
         if (cfg.resolved_gui) |gui| {
@@ -778,22 +554,18 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         }
 
         // manifest-v2 packaging seam (design §3/§6): ios ships `.binary` (a NO-OP),
-        // so this emits nothing and does not disturb the golden — but it keeps every
-        // v2 platform path routing packaging through the shared packager off the
-        // typed `PlatformEntry.package` recipe.
-        if (v2_manifest) |m| {
-            try manifest_v2_splice.renderPackageV2(m, cfg.platform, w);
-        }
+        // so this emits nothing — but it keeps every v2 platform path routing
+        // packaging through the shared packager off the typed `PlatformEntry.package`
+        // recipe.
+        try manifest_v2_splice.renderPackageV2(manifest, cfg.platform, w);
 
         try tpl.writeSection(build_zig_tmpl, "ios_footer", w);
 
-        // manifest-v2 ios emits the generic `unifyCoreDiamond` walk (design §5) as
-        // a top-level helper AFTER the build fn + the footer's `overrideImport` def
-        // it calls. The enum path unrolls the overrides, so this is v2-only.
-        if (v2_manifest != null) {
-            try w.writeByte('\n');
-            try manifest_v2_splice.emitCoreDiamondWalk(w);
-        }
+        // manifest-v2 ios emits the generic `unifyCoreDiamond` walk (design §5) as a
+        // top-level helper AFTER the build fn + the footer's `overrideImport` def it
+        // calls.
+        try w.writeByte('\n');
+        try manifest_v2_splice.emitCoreDiamondWalk(w);
     } else if (cfg.platform == .android) {
         // Android: build shared library for NativeActivity, link NDK libs
         try tpl.writeSection(build_zig_tmpl, "android_exe_start", w);
@@ -816,7 +588,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // sokol Android path has no such import — sokol's C runtime
         // provides the entry. Keyed off the v2 manifest's `backend_app`
         // extra-module declaration (assembler#461), not the backend enum.
-        if (try androidNeedsAppImport(allocator, v2_manifest, cfg)) {
+        if (androidNeedsAppImport(manifest, cfg)) {
             try tpl.writeSection(build_zig_tmpl, "android_exe_app_import", w);
         }
 
@@ -825,27 +597,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → Android lib root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "lib", opts.promoted_scripts);
 
-        if (v2_manifest) |m| {
-            // manifest-v2 android (PR 5): the generic link (linkLibrary +
-            // linkSystemLibrary from `.system_libs.android` + `link_libc`) plus the
-            // `post_wire` hook call for the NDK-sysroot / addLibraryPath / libc.txt
-            // residual (design §4). No enum `android_link` section.
-            try manifest_v2_splice.renderLinkSectionV2(allocator, m, cfg, w);
-        } else {
-            // Pass target_sdk_version from AndroidConfig (default 34) for NDK library path
-            const android_cfg = cfg.android orelse config.AndroidConfig{};
-            var sdk_buf: [10]u8 = undefined;
-            const sdk_version_str = std.fmt.bufPrint(&sdk_buf, "{d}", .{android_cfg.target_sdk_version}) catch "34";
-            // Backend-specific NDK link line: sokol consumes its `sokol_clib`
-            // static archive into the .so + links GLESv3/EGL; bgfx consumes
-            // the `bgfx` artifact + the `android_app` glue module and links
-            // GLESv3/EGL/android/log itself (#303).
-            if (cfg.backend == .bgfx) {
-                try tpl.renderSection(build_zig_tmpl, "android_link_bgfx", .{ .target_sdk_version = sdk_version_str }, w);
-            } else {
-                try tpl.renderSection(build_zig_tmpl, "android_link", .{ .target_sdk_version = sdk_version_str }, w);
-            }
-        }
+        // manifest-v2 android: the generic link (linkLibrary + linkSystemLibrary from
+        // `.system_libs.android` + `link_libc`) plus the `post_wire` hook call for the
+        // NDK-sysroot / addLibraryPath / libc.txt residual (design §4).
+        try manifest_v2_splice.renderLinkSectionV2(allocator, manifest, cfg, w);
 
         if (cfg.resolved_gui) |gui| {
             if (gui.rendering == .raw_backend and gui.bridge_dir != null) {
@@ -854,24 +609,15 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             }
         }
 
-        // Packaging: v2 delegates the `.apk` recipe to the shared packager
-        // (byte-identical to `.android_package`, design §7); the enum path emits
-        // the section directly.
-        if (v2_manifest) |m| {
-            try manifest_v2_splice.renderPackageV2(m, cfg.platform, w);
-        } else {
-            try tpl.writeSection(build_zig_tmpl, "android_package", w);
-        }
+        // Packaging: v2 delegates the `.apk` recipe to the shared packager.
+        try manifest_v2_splice.renderPackageV2(manifest, cfg.platform, w);
         try tpl.writeSection(build_zig_tmpl, "android_footer", w);
 
         // manifest-v2 android emits the generic `unifyCoreDiamond` walk (design §5)
         // as a top-level helper AFTER the build fn + the footer's `overrideImport`
-        // def it calls. Desktop keeps the unrolled overrides (byte anchor), so this
-        // is android-only.
-        if (v2_manifest != null) {
-            try w.writeByte('\n');
-            try manifest_v2_splice.emitCoreDiamondWalk(w);
-        }
+        // def it calls.
+        try w.writeByte('\n');
+        try manifest_v2_splice.emitCoreDiamondWalk(w);
     } else {
         // Desktop: build as executable, link natively. Test-only targets
         // (issue #83) skip the exe assembly + backend artifact link + bridge
@@ -907,33 +653,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // `@import("<named>")` (labelle-assembler#240 Gap 2).
             try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
 
-            // Link backend artifact
-            if (v2_manifest) |m| {
-                // manifest-v2 desktop codegen: linkLibrary from manifest artifacts
-                // + the per-OS framework wiring. Byte-anchored against v1/enum.
-                try manifest_v2_splice.renderLinkSectionV2(allocator, m, cfg, w);
-            } else if (splice_manifest) |m| {
-                // Splice: resolve the link build fragment from the manifest,
-                // no `=> .<tag>` branch.
-                try manifest_splice.renderLinkSection(allocator, m, cfg, opts.project_dir.?, w);
-            } else if (cfg.isExternal() and !externalUsesEnumPath(cfg)) {
-                // Same gate as the backend-dep section above: an external backend
-                // with no splice falls into this desktop link switch only when
-                // it's tag-safe (`externalUsesEnumPath`). This switch is the
-                // desktop exe path (android links via its own section), so the
-                // helper is false here and an external backend hard-errors —
-                // kept symmetric with the backend-dep guard so the two can't drift.
-                return error.ExternalBackendNeedsManifest;
-            } else switch (cfg.backend) {
-                .raylib => try tpl.writeSection(build_zig_tmpl, "link_raylib", w),
-                .sokol => try tpl.writeSection(build_zig_tmpl, "link_sokol", w),
-                .sdl => try tpl.writeSection(build_zig_tmpl, "link_sdl", w),
-                .bgfx => try tpl.writeSection(build_zig_tmpl, "link_bgfx", w),
-                .wgpu => try tpl.writeSection(build_zig_tmpl, "link_wgpu", w),
-                // Null backend has no native artifact — every backend module is
-                // pure Zig, no library to link.
-                .null => {},
-            }
+            // Link backend artifact. manifest-v2 desktop codegen: linkLibrary from
+            // manifest artifacts + the per-OS framework/system-lib wiring (design
+            // §3/§5/§7). null emits nothing (no artifact); sokol is the byte anchor.
+            try manifest_v2_splice.renderLinkSectionV2(allocator, manifest, cfg, w);
 
             // Bridge artifact (raw_backend GUIs) — declare + link
             if (cfg.resolved_gui) |gui| {
@@ -1081,12 +804,9 @@ fn v2BackendDepName(
     const pd = project_dir orelse return null;
     const name = backend_manifest_name orelse return null;
     if (!manifest_splice.manifestPathEnabled(allocator, cfg, pd, name)) return null;
-    const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, pd, name);
-    defer parsed.free(allocator);
-    return switch (parsed) {
-        .v1 => null,
-        .v2 => |m| try allocator.dupe(u8, m.dep_name),
-    };
+    const m = try manifest_v2.loadNamedManifest(allocator, cfg, pd, name);
+    defer std.zon.parse.free(allocator, m);
+    return try allocator.dupe(u8, m.dep_name);
 }
 
 pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, target_dir: ?[]const u8, output_dir: ?[]const u8, project_dir: ?[]const u8, opts: BuildZigZonOptions) ![]const u8 {
@@ -1213,16 +933,11 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     if (project_dir) |pd| {
         if (opts.backend_manifest_name) |name| {
             if (manifest_splice.manifestPathEnabled(allocator, cfg, pd, name)) {
-                const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, pd, name);
-                defer parsed.free(allocator);
-                switch (parsed) {
-                    .v1 => {},
-                    .v2 => |m| {
-                        const dep_emsdk = tpl.getSection(build_zig_zon_tmpl, "dep_emsdk") orelse "";
-                        try manifest_v2_splice.emitRootBuildDepsV2(m, cfg.platform, dep_emsdk, w);
-                        v2_root_deps_emitted = true;
-                    },
-                }
+                const m = try manifest_v2.loadNamedManifest(allocator, cfg, pd, name);
+                defer std.zon.parse.free(allocator, m);
+                const dep_emsdk = tpl.getSection(build_zig_zon_tmpl, "dep_emsdk") orelse "";
+                try manifest_v2_splice.emitRootBuildDepsV2(m, cfg.platform, dep_emsdk, w);
+                v2_root_deps_emitted = true;
             }
         }
     }

@@ -5,13 +5,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-.header_wasm
-const std = @import("std");
-
-pub fn build(b: *std.Build) !void {
-    var target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
 .deps
     const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
     const core_mod = core_dep.module("labelle-core");
@@ -53,133 +46,6 @@ pub fn build(b: *std.Build) !void {
         },
     });
 
-.backend_raylib
-    const backend_dep = b.dependency("labelle_raylib", .{ .target = target, .optimize = optimize, .gamepad_enabled = {{gamepad_enabled}}, .gamepad_hidapi = {{gamepad_hidapi}} });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-    const raylib_artifact = backend_dep.artifact("raylib");
-
-    // Unify labelle-core onto the backend modules too. The raylib `input`
-    // module imports labelle-core (for `GamepadEvent` and friends); without
-    // this, it resolves its OWN pinned core tarball — a *different* module
-    // instance than engine/gfx — and core structs that cross the
-    // engine↔backend boundary (e.g. `[]GamepadEvent`) fail to type-check.
-    // Only `input` imports core here; overriding gfx/audio/window (which
-    // don't) would silently add a dead import. See labelle-assembler#258.
-    overrideImport(backend_input, "labelle-core", core_mod);
-
-    // The desktop gamepad source (`backends/sdl_gamepad/`, core#28) is a
-    // TRANSITIVE dep of `input` — it returns `[]GamepadEvent` typed against
-    // the `GamepadEvent` contract it imports under the `labelle_core`
-    // (underscore) key. The sub-package pins its OWN core tarball
-    // (`labelle_core-1.15.0`), and the generated game's zon does NOT declare
-    // `labelle_sdl_gamepad`, so we can't reach it via `b.dependency`. Reach it
-    // through `input`'s import table and unify the app core onto it; otherwise
-    // `input` (app core) and `sdl_gamepad` (v1.15.0 core) carry two distinct
-    // `GamepadEvent` types and the slice crossing the seam fails to type-check
-    // ("`[]gamepad.GamepadEvent` cannot cast into `[]gamepad.GamepadEvent`").
-    // See labelle-assembler#271. `if` guard: the module is only present on
-    // desktop targets that wire sdl_gamepad in.
-    if (backend_input.import_table.get("sdl_gamepad")) |sdl_gp_mod| {
-        overrideImport(sdl_gp_mod, "labelle_core", core_mod);
-    }
-
-.backend_sokol
-    // `with_imgui` flips sokol_imgui.c compilation on. MUST match the
-    // imgui bridge's option set when the project includes imgui, or
-    // Zig caches two `sokol_clib` artifacts (and two `_sg` states) —
-    // see comment in `backends/sokol/build.zig` (labelle-assembler#140).
-    const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize, .with_imgui = {{with_imgui}}, .gamepad_enabled = {{gamepad_enabled}}, .gamepad_hidapi = {{gamepad_hidapi}} });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-    const sokol_clib = backend_dep.artifact("sokol_clib");
-
-    // Unify the app core onto the transitive `sdl_gamepad` desktop gamepad
-    // source — same diamond as `.backend_raylib` (see the note there). The
-    // sokol `input` module reaches `GamepadEvent` through `sdl_gamepad`
-    // (imported under the `labelle_core` underscore key) rather than a direct
-    // core import, so the override target is the sdl_gamepad module, not
-    // `input`. `if` guard: only desktop sokol wires sdl_gamepad in (Android/iOS
-    // use their own gamepad paths; wasm has none). See labelle-assembler#271.
-    if (backend_input.import_table.get("sdl_gamepad")) |sdl_gp_mod| {
-        overrideImport(sdl_gp_mod, "labelle_core", core_mod);
-    }
-
-    // Linux desktop core gamepad route (core#33 scope 2): there the sokol
-    // backend wires a DIRECT `labelle-core` import on `input` (reaching the
-    // udev/evdev gamepad source) instead of `sdl_gamepad`. Unify the app
-    // core onto it so gamepad state/event types match the engine's. `if`
-    // guard: the import only exists on Linux desktop builds — adding the
-    // override unconditionally would inject a dead import elsewhere (#258).
-    if (backend_input.import_table.get("labelle-core")) |_| {
-        overrideImport(backend_input, "labelle-core", core_mod);
-    }
-
-.backend_sokol_wasm
-    // See `.backend_sokol` for why `with_imgui` must match the bridge.
-    const backend_dep = b.dependency("labelle_sokol", .{ .target = target, .optimize = optimize, .with_imgui = {{with_imgui}} });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-
-.backend_sdl
-    const backend_dep = b.dependency("labelle_sdl", .{ .target = target, .optimize = optimize });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-
-    // Unify labelle-core onto the backend `input` module — see the note in
-    // `.backend_raylib`. NOTE: the SDL backend declares this import under the
-    // underscore name `"labelle_core"` (not the hyphenated `"labelle-core"`),
-    // so the override key must match. See labelle-assembler#258.
-    overrideImport(backend_input, "labelle_core", core_mod);
-
-.backend_bgfx
-    const backend_dep = b.dependency("labelle_bgfx", .{ .target = target, .optimize = optimize, .gamepad_enabled = {{gamepad_enabled}}, .gamepad_hidapi = {{gamepad_hidapi}}, .gui_enabled = {{gui_enabled}} });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-    const bgfx_artifact = backend_dep.artifact("bgfx");
-    const glfw_artifact = backend_dep.artifact("glfw");
-
-    // Unify the app core onto the transitive `sdl_gamepad` desktop gamepad
-    // source — same diamond as `.backend_raylib`/`.backend_sokol` (see the note
-    // there). bgfx desktop reads gamepads through GLFW by default (#315), but
-    // when sdl_gamepad is wired in (`.gamepad = .auto`) the `input` module
-    // routes the desktop gamepad getters through the SDL HIDAPI source (so
-    // Switch-mode pads read). The bgfx `input` module reaches `GamepadEvent`
-    // through `sdl_gamepad` (imported under the `labelle_core` underscore key)
-    // rather than a direct core import, so the override target is the
-    // sdl_gamepad module, not `input`. `if` guard: only desktop bgfx wires
-    // sdl_gamepad in (Android uses android_gamepad). See labelle-assembler#271.
-    if (backend_input.import_table.get("sdl_gamepad")) |sdl_gp_mod| {
-        overrideImport(sdl_gp_mod, "labelle_core", core_mod);
-    }
-
-.backend_wgpu
-    const backend_dep = b.dependency("labelle_wgpu", .{ .target = target, .optimize = optimize });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-    const glfw_artifact = backend_dep.artifact("glfw");
-
-.backend_null
-    // Null backend — pure Zig, no native artifact. Every backend module is
-    // a no-op stub; the generated main() drives a fixed-frame tick loop.
-    const backend_dep = b.dependency("labelle_null", .{ .target = target, .optimize = optimize });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-
 .ecs_adapter
     const ecs_dep = b.dependency("{{ecs_dep_name}}", .{ .target = target, .optimize = optimize });
     const ecs_mod = ecs_dep.module("ecs");
@@ -191,13 +57,6 @@ pub fn build(b: *std.Build) !void {
 .gui_bridge
     const bridge_dep = b.dependency("gui_bridge", .{ .target = target, .optimize = optimize });
     const gui_bridge_artifact = bridge_dep.artifact("{{bridge_artifact_name}}");
-
-.wasm_target
-    // WASM/Emscripten: override target so all dependencies build for wasm32-emscripten.
-    target = b.resolveTargetQuery(.{
-        .cpu_arch = .wasm32,
-        .os_tag = .emscripten,
-    });
 
 .exe_start
     const exe = b.addExecutable(.{
@@ -229,29 +88,6 @@ pub fn build(b: *std.Build) !void {
         }),
     });
 
-.link_raylib
-    exe.root_module.linkLibrary(raylib_artifact);
-
-    // OpenGL is needed for the PIE preview's PBO readback path —
-    // the generated `main.zig` references `glReadPixels`, `glGenBuffers`,
-    // `glMapBuffer`, etc. via `@extern` (labelle-engine#544). raylib's
-    // C archive references these too but the upstream raylib build
-    // doesn't propagate the OpenGL framework / linker flag to the
-    // consumer, so we add it here on a per-OS basis.
-    switch (target.result.os.tag) {
-        .macos => exe.root_module.linkFramework("OpenGL", .{}),
-        .linux => exe.root_module.linkSystemLibrary("GL", .{}),
-        .windows => exe.root_module.linkSystemLibrary("opengl32", .{}),
-        else => {},
-    }
-
-.wasm_emsdk_raylib
-    const emsdk = @import("labelle_raylib").emsdk;
-
-.wasm_emsdk_sokol
-    const sokol_em = @import("labelle_sokol");
-    const emsdk_dep = b.dependency("emsdk", .{});
-
 .wasm_exe_start
     const wasm = b.addLibrary(.{
         .name = "game",
@@ -282,241 +118,14 @@ pub fn build(b: *std.Build) !void {
         }),
     });
 
-.link_raylib_wasm
-    const emcc_flags = emsdk.emccDefaultFlags(b.allocator, .{
-        .optimize = optimize,
-        .asyncify = true,
-    });
-    var emcc_settings = emsdk.emccDefaultSettings(b.allocator, .{
-        .optimize = optimize,
-    });
-    emcc_settings.put("ALLOW_MEMORY_GROWTH", "1") catch unreachable;
-    // Match the sokol-wasm 512 KB stack (default is 64 KB and the
-    // engine's scene-load + atlas-decode path is documented to
-    // overflow it into the WASM `.data` segment — concrete cause and
-    // fix in labelle-toolkit/labelle-cli#201 / labelle-toolkit/
-    // labelle-assembler#100). Apply to raylib_wasm too: raylib's
-    // current example happens to fit under 64 KB only because it
-    // ships a single small atlas; a deeper scene would hit the
-    // same corruption.
-    emcc_settings.put("STACK_SIZE", "524288") catch unreachable;
-    const install_dir: std.Build.InstallDir = .{ .custom = "web" };
-    const emcc_step = emsdk.emccStep(b, raylib_artifact, wasm, .{
-        .optimize = optimize,
-        .flags = emcc_flags,
-        .settings = emcc_settings,
-        .install_dir = install_dir,
-    });
-
-.link_sokol_wasm
-    wasm.root_module.linkLibrary(backend_dep.artifact("sokol_clib"));
-    const link_step = try sokol_em.emLinkStep(b, .{
-        .target = target,
-        .optimize = optimize,
-        .lib_main = wasm,
-        .emsdk = emsdk_dep,
-        .shell_file_path = null,
-        .use_webgl2 = true,
-        .release_use_closure = false,
-        // Emscripten defaults to a 64 KB C stack, which the engine's
-        // scene-load + atlas-decode path overflows into the WASM
-        // `.data` segment under sokol. Concrete symptom: the
-        // module-level `var backend: ?ImageBackend` in the engine's
-        // image loader gets clobbered to zero between the first
-        // atlas's `upload` and the second atlas's `decode`, surfacing
-        // as `error.ImageBackendNotInitialized`. sokol-zig's own
-        // example bumps the stack to 512 KB; we follow that here.
-        // See labelle-toolkit/labelle-cli#201.
-        .extra_args = &.{"-sSTACK_SIZE=512KB"},
-    });
-    const emcc_step = &link_step.step;
-
-.wasm_footer
-    b.getInstallStep().dependOn(emcc_step);
-    const run_step = b.step("run", "Serve WASM build");
-    run_step.dependOn(emcc_step);
-}
-
-/// Override a module import without leaking memory.
-fn overrideImport(m: *std.Build.Module, name: []const u8, module: *std.Build.Module) void {
-    const gop = m.import_table.getOrPut(m.owner.allocator, name) catch @panic("OOM");
-    if (!gop.found_existing) {
-        gop.key_ptr.* = name;
-    }
-    gop.value_ptr.* = module;
-}
-
-/// Unify `labelle-core` onto gfx's sub-packages (`camera`, `spatial_grid`,
-/// `tilemap`) so a `core.YAxis` (and any other core type) produced inside the
-/// `labelle-gfx` module unifies with the type the sub-package expects. gfx#276
-/// crosses this boundary by passing the project `y_axis` into
-/// `camera.CameraWith(...)`. Only override sub-packages that actually import
-/// core (a no-op otherwise — keeps this resilient if gfx restructures).
-fn unifyGfxSubpackageCore(gfx_mod: *std.Build.Module, core_mod: *std.Build.Module) void {
-    const sub_names = [_][]const u8{ "camera", "spatial_grid", "tilemap" };
-    for (sub_names) |sub_name| {
-        const sub = gfx_mod.import_table.get(sub_name) orelse continue;
-        if (sub.import_table.get("labelle-core") != null) {
-            overrideImport(sub, "labelle-core", core_mod);
-        }
-    }
-}
-
-.link_sokol
-    exe.root_module.linkLibrary(sokol_clib);
-
-    // IOSurface + CoreFoundation are needed for the macOS preview-mode
-    // IOSurface producer (labelle-assembler#121 + #125, labelle-
-    // engine#547). The engine references `IOSurfaceCreate`,
-    // `IOSurfaceLock`, `CFNumberCreate`, etc. via `@extern "c"` —
-    // these symbols live in IOSurface.framework + CoreFoundation
-    // .framework, and sokol's upstream linker line does not propagate
-    // them. Same on iOS (the framework path is identical). Linux /
-    // Windows / web have no macOS-specific symbols to resolve here,
-    // so the framework links are gated on the Darwin target tags.
-    switch (target.result.os.tag) {
-        .macos, .ios => {
-            exe.root_module.linkFramework("IOSurface", .{});
-            exe.root_module.linkFramework("CoreFoundation", .{});
-        },
-        // NOTE: labelle-core's Linux gamepad-detection source
-        // (gamepad_source/linux.zig, labelle-assembler#249) does NOT need a
-        // build-time libudev link. As of labelle-core#20 it loads libudev at
-        // RUNTIME via std.DynLib (dlopen of `libudev.so.1`) and degrades
-        // gracefully when the library is absent — so the generated build must
-        // not link `-ludev`, which would reintroduce a hard build/runtime
-        // dependency. Runtime device-access setup (input group / udev
-        // `uaccess` rule, Flatpak `--device=input`) is in docs/gamepad-linux.md.
-        else => {},
-    }
-
-.link_sdl
-
-.link_bgfx
-    exe.root_module.linkLibrary(bgfx_artifact);
-    exe.root_module.linkLibrary(glfw_artifact);
-
-.link_wgpu
-    exe.root_module.linkLibrary(glfw_artifact);
-
-    // wgpu-native's static lib (libwgpu_native.a, embedded in the wgpu
-    // module via addObjectFile) references Apple system frameworks. Upstream
-    // links them per-Compile rather than on the module, so the consuming exe
-    // must link them here or the macOS/iOS link fails with undefined Metal /
-    // Foundation symbols.
-    switch (target.result.os.tag) {
-        .macos, .ios => {
-            exe.root_module.linkFramework("Foundation", .{});
-            exe.root_module.linkFramework("QuartzCore", .{});
-            exe.root_module.linkFramework("Metal", .{});
-        },
-        else => {},
-    }
-
 .link_gui_bridge
     exe.root_module.linkLibrary(gui_bridge_artifact);
 
 .link_gui_bridge_wasm
     wasm.root_module.linkLibrary(gui_bridge_artifact);
 
-.header_ios
-const std = @import("std");
-
-/// Get iOS SDK path using xcrun
-fn getIosSdkPath(b: *std.Build, sdk_name: []const u8) ?[]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = b.allocator,
-        .argv = &.{ "xcrun", "--sdk", sdk_name, "--show-sdk-path" },
-    }) catch return null;
-    defer b.allocator.free(result.stdout);
-    defer b.allocator.free(result.stderr);
-    if (result.term == .Exited and result.term.Exited == 0) {
-        const path = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
-        if (path.len == 0) return null;
-        return b.allocator.dupe(u8, path) catch null;
-    }
-    return null;
-}
-
-/// Configure SDK paths for a compile artifact (sokol_clib)
-fn configureSdkPaths(b: *std.Build, artifact: *std.Build.Step.Compile, sdk_path: []const u8) void {
-    artifact.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/include" }) });
-    artifact.root_module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
-    artifact.root_module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/SubFrameworks" }) });
-}
-
-/// Add SDK library and framework paths to an executable
-fn addExeSdkPaths(b: *std.Build, exe: *std.Build.Step.Compile, sdk_path: []const u8) void {
-    exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib" }) });
-    exe.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
-}
-
-/// Link iOS system frameworks on an executable
-fn linkIosFrameworks(exe: *std.Build.Step.Compile) void {
-    exe.root_module.linkFramework("Foundation", .{});
-    exe.root_module.linkFramework("UIKit", .{});
-    exe.root_module.linkFramework("Metal", .{});
-    exe.root_module.linkFramework("MetalKit", .{});
-    exe.root_module.linkFramework("AudioToolbox", .{});
-    exe.root_module.linkFramework("AVFoundation", .{});
-    exe.root_module.linkFramework("QuartzCore", .{});
-    // GameController.framework — backs the ios/tvos gamepad bridge in
-    // labelle-core (`src/gamepad_source/ios.zig`). That file `@export`s the
-    // `labelle_gc_*` C symbols the sokol input backend consumes; the objc
-    // selectors it sends (`+[GCController controllers]`, `-extendedGamepad`,
-    // etc.) resolve against this framework. Without it the link fails with
-    // undefined `_OBJC_CLASS_$_GCController` (labelle-assembler#251).
-    exe.root_module.linkFramework("GameController", .{});
-}
-
-pub fn build(b: *std.Build) void {
-    const optimize = b.standardOptimizeOption(.{});
-    const device_mode = b.option(bool, "device", "Build for iOS device instead of simulator") orelse false;
-
-    const sdk_name: []const u8 = if (device_mode) "iphoneos" else "iphonesimulator";
-    const sdk_path = getIosSdkPath(b, sdk_name) orelse
-        @panic("Could not find iOS SDK. Is Xcode installed?");
-
-    const host_arch = b.graph.host.result.cpu.arch;
-    const ios_target = if (device_mode)
-        b.resolveTargetQuery(.{
-            .cpu_arch = .aarch64,
-            .os_tag = .ios,
-        })
-    else if (host_arch == .x86_64)
-        b.resolveTargetQuery(.{
-            .cpu_arch = .x86_64,
-            .os_tag = .ios,
-            .abi = .simulator,
-        })
-    else
-        b.resolveTargetQuery(.{
-            .cpu_arch = .aarch64,
-            .os_tag = .ios,
-            .abi = .simulator,
-            .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_a14 },
-        });
-
 .ios_target_alias
     const target = ios_target;
-
-.ios_deps
-    const core_dep = b.dependency("labelle_core", .{ .target = ios_target, .optimize = optimize });
-    const core_mod = core_dep.module("labelle-core");
-
-    const gfx_dep = b.dependency("labelle_gfx", .{ .target = ios_target, .optimize = optimize });
-    const gfx_mod = gfx_dep.module("labelle-gfx");
-
-    const engine_dep = b.dependency("engine", .{ .target = ios_target, .optimize = optimize });
-    const engine_mod = engine_dep.module("engine");
-
-    overrideImport(gfx_mod, "labelle-core", core_mod);
-    overrideImport(engine_mod, "labelle-core", core_mod);
-    overrideImport(engine_mod, "labelle-gfx", gfx_mod);
-
-    // gfx#276: unify core onto gfx's sub-packages (camera/spatial_grid/tilemap)
-    // so the renderer's `core.YAxis` unifies with `camera.CameraWith`'s.
-    unifyGfxSubpackageCore(gfx_mod, core_mod);
 
 .game_mod_decl_ios
     // `game` module — see labelle-assembler#116. iOS-targeted variant.
@@ -528,24 +137,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "labelle-engine", .module = engine_mod },
         },
     });
-
-.backend_sokol_ios
-    // sokol with dont_link_system_libs — we link iOS frameworks manually.
-    // See `.backend_sokol` for why `with_imgui` must match the bridge.
-    const backend_dep = b.dependency("labelle_sokol", .{
-        .target = ios_target,
-        .optimize = optimize,
-        .dont_link_system_libs = true,
-        .with_imgui = {{with_imgui}},
-    });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-    const sokol_clib = backend_dep.artifact("sokol_clib");
-
-    // Configure SDK paths on sokol_clib for C header compilation
-    configureSdkPaths(b, sokol_clib, sdk_path);
 
 .ios_exe_start
     const exe = b.addExecutable(.{
@@ -576,12 +167,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-
-.ios_link
-    exe.root_module.linkLibrary(sokol_clib);
-    exe.root_module.link_libc = true;
-    addExeSdkPaths(b, exe, sdk_path);
-    linkIosFrameworks(exe);
 
 .ios_link_gui_bridge
     exe.root_module.linkLibrary(gui_bridge_artifact);
@@ -620,131 +205,8 @@ fn unifyGfxSubpackageCore(gfx_mod: *std.Build.Module, core_mod: *std.Build.Modul
     }
 }
 
-.header_android
-const std = @import("std");
-
-/// Detect Android NDK sysroot path.
-///
-/// Env lookups go through `b.graph.environ_map.get` and filesystem
-/// checks go through `std.Io.Dir.cwd().access(io, ...)` — Zig 0.16
-/// removed `std.process.getEnvVarOwned`, `std.posix.getenv`, and
-/// `std.fs.cwd()`. See labelle-assembler#144.
-fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
-    const io = b.graph.io;
-    // 1. ANDROID_NDK_HOME env var
-    if (b.graph.environ_map.get("ANDROID_NDK_HOME")) |ndk_home| {
-        const sysroot = b.pathJoin(&.{ ndk_home, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
-        if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| {
-            return sysroot;
-        } else |_| {}
-    }
-    // 2. ANDROID_HOME/ndk/<latest>/
-    if (b.graph.environ_map.get("ANDROID_HOME")) |home| {
-        const ndk_dir = b.pathJoin(&.{ home, "ndk" });
-        var dir = std.Io.Dir.cwd().openDir(io, ndk_dir, .{ .iterate = true }) catch return null;
-        defer dir.close(io);
-        var latest: ?[]const u8 = null;
-        var iter = dir.iterate();
-        // `iter.next(io)` returns `!?Entry`. We deliberately swallow
-        // I/O errors per-entry (treat as end-of-iteration) so a single
-        // unreadable subdir doesn't abort NDK detection — the next
-        // pass through `getAndroidNdkSysroot` still has `ANDROID_NDK_HOME`
-        // as a fallback, and any genuine misconfiguration surfaces via
-        // the explicit `@panic` at the call site below.
-        while (iter.next(io) catch null) |entry| {
-            if (entry.kind == .directory) {
-                // Pick the highest version by lexicographic comparison
-                if (latest) |prev| {
-                    if (std.mem.order(u8, entry.name, prev) == .gt) {
-                        b.allocator.free(prev);
-                        latest = b.allocator.dupe(u8, entry.name) catch null;
-                    }
-                } else {
-                    latest = b.allocator.dupe(u8, entry.name) catch null;
-                }
-            }
-        }
-        if (latest) |version| {
-            defer b.allocator.free(version);
-            const sysroot = b.pathJoin(&.{ ndk_dir, version, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
-            if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| {
-                return sysroot;
-            } else |_| {}
-        }
-    }
-    return null;
-}
-
-fn ndkHostTag() []const u8 {
-    const builtin = @import("builtin");
-    return switch (builtin.os.tag) {
-        .linux => "linux-x86_64",
-        .macos => "darwin-x86_64",
-        .windows => "windows-x86_64",
-        else => "linux-x86_64",
-    };
-}
-
-pub fn build(b: *std.Build) void {
-    const optimize = b.standardOptimizeOption(.{});
-    const emulator_mode = b.option(bool, "emulator", "Build for Android emulator (x86_64 on Intel Mac, arm64 on Apple Silicon)") orelse false;
-    // `-Dandroid_arch=arm64|x86_64` is the explicit selector used by
-    // `labelle android --all-abis` to produce a fat APK from a single
-    // host machine. When unset, we fall back to the legacy behavior
-    // (emulator picks the host-matching arch, otherwise arm64) so
-    // existing `zig build -Demulator=true` invocations keep working.
-    const android_arch_opt = b.option([]const u8, "android_arch", "Android target arch (arm64|x86_64). Overrides -Demulator when set.");
-
-    const ndk_sysroot = getAndroidNdkSysroot(b) orelse
-        @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
-
-    // On Apple Silicon the Android emulator runs ARM64 images; on Intel Macs
-    // it runs x86_64. Use the host arch to select the right ABI automatically.
-    const emulator_arch: std.Target.Cpu.Arch = switch (b.graph.host.result.cpu.arch) {
-        .aarch64 => .aarch64,
-        else => .x86_64,
-    };
-
-    const android_arch: std.Target.Cpu.Arch = if (android_arch_opt) |name| blk: {
-        if (std.mem.eql(u8, name, "arm64") or std.mem.eql(u8, name, "aarch64")) break :blk .aarch64;
-        if (std.mem.eql(u8, name, "x86_64") or std.mem.eql(u8, name, "x64")) break :blk .x86_64;
-        std.debug.print("build.zig: unknown -Dandroid_arch value '{s}' (expected arm64 or x86_64)\n", .{name});
-        @panic("invalid android_arch");
-    } else if (emulator_mode) emulator_arch else .aarch64;
-
-    const android_target = b.resolveTargetQuery(.{
-        .cpu_arch = android_arch,
-        .os_tag = .linux,
-        .abi = .android,
-    });
-
-    // Architecture-specific triple for NDK include/library paths
-    const ndk_arch_triple: []const u8 = switch (android_arch) {
-        .aarch64 => "aarch64-linux-android",
-        .x86_64 => "x86_64-linux-android",
-        else => unreachable, // android_arch is pinned to one of the two above
-    };
-
 .android_target_alias
     const target = android_target;
-
-.android_deps
-    const core_dep = b.dependency("labelle_core", .{ .target = android_target, .optimize = optimize });
-    const core_mod = core_dep.module("labelle-core");
-
-    const gfx_dep = b.dependency("labelle_gfx", .{ .target = android_target, .optimize = optimize });
-    const gfx_mod = gfx_dep.module("labelle-gfx");
-
-    const engine_dep = b.dependency("engine", .{ .target = android_target, .optimize = optimize });
-    const engine_mod = engine_dep.module("engine");
-
-    overrideImport(gfx_mod, "labelle-core", core_mod);
-    overrideImport(engine_mod, "labelle-core", core_mod);
-    overrideImport(engine_mod, "labelle-gfx", gfx_mod);
-
-    // gfx#276: unify core onto gfx's sub-packages (camera/spatial_grid/tilemap)
-    // so the renderer's `core.YAxis` unifies with `camera.CameraWith`'s.
-    unifyGfxSubpackageCore(gfx_mod, core_mod);
 
 .game_mod_decl_android
     // `game` module — see labelle-assembler#116. Android-targeted variant.
@@ -756,79 +218,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "labelle-engine", .module = engine_mod },
         },
     });
-
-.backend_sokol_android
-    // sokol with dont_link_system_libs — we link Android libs manually.
-    // See `.backend_sokol` for why `with_imgui` must match the bridge.
-    const backend_dep = b.dependency("labelle_sokol", .{
-        .target = android_target,
-        .optimize = optimize,
-        .dont_link_system_libs = true,
-        .with_imgui = {{with_imgui}},
-    });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-    const sokol_clib = backend_dep.artifact("sokol_clib");
-
-    // Configure NDK sysroot paths on sokol_clib for C header compilation
-    sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include" }) });
-    sokol_clib.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }) });
-    // Android shared libs (libgame.so) must be position-independent.
-    // Static archives like libsokol_clib.a are consumed into the .so,
-    // so every .o inside them needs `-fPIC` too — otherwise ld.lld
-    // refuses the AArch64 R_AARCH64_ABS64 / R_AARCH64_ADR_PREL_PG_HI21
-    // relocations. See labelle-assembler#147.
-    sokol_clib.root_module.pic = true;
-
-    // Unify the app's core onto the sokol `input` module (labelle-core#310).
-    // The sokol Android seam adapter (`backends/sokol/src/android.zig`, reached
-    // via `backend_input.android`) imports labelle-core for the
-    // `AndroidBackendContext` vtable the generated main hands to
-    // `engine.core.registerAndroidBackend(...)`. Without this override `input`
-    // resolves its OWN pinned core tarball — a DIFFERENT module instance than
-    // engine/gfx — so the registered context's type would not match the
-    // engine's `engine.core.AndroidBackendContext` and the call fails to
-    // type-check. On Android the sokol input module registers this import under
-    // `labelle-core` (build.zig, the `is_android` branch), so the guarded
-    // override lands only there. Mirror of `.backend_bgfx_android` below; this
-    // is the first consumer of the sokol-Android manifest-splice path
-    // (labelle-assembler#520), which is why the gap surfaced now.
-    if (backend_input.import_table.get("labelle-core")) |_| {
-        overrideImport(backend_input, "labelle-core", core_mod);
-    }
-
-.backend_bgfx_android
-    // bgfx Android backend (#303). The backend's build.zig detects the
-    // Android ABI from the resolved target and: builds gfx/input/audio/
-    // window for `aarch64-linux-android` (zglfw omitted — desktop-only),
-    // applies the NDK sysroot include/lib paths + `-fPIC` to the bgfx /
-    // bx / bimg C++ TUs, and exposes the `android_app` NativeActivity-glue
-    // module (which compiles the NDK's `android_native_app_glue.c` and
-    // exports the per-frame/init callback registration the generated
-    // `main.zig` drives). No glfw artifact exists on this path.
-    const backend_dep = b.dependency("labelle_bgfx", .{ .target = android_target, .optimize = optimize, .gui_enabled = {{gui_enabled}} });
-    const backend_gfx = backend_dep.module("gfx");
-    const backend_input = backend_dep.module("input");
-    const backend_audio = backend_dep.module("audio");
-    const backend_window = backend_dep.module("window");
-    const backend_app = backend_dep.module("android_app");
-    const bgfx_artifact = backend_dep.artifact("bgfx");
-
-    // Unify the app's core onto the bgfx `input` module (#310 Stage 4). The
-    // bgfx Android backend adapter (`backends/bgfx/src/android.zig`, surfaced
-    // as `backend_input.android`) imports labelle-core for
-    // `AndroidBackendContext` — the vtable the generated main hands to
-    // `engine.core.registerAndroidBackend(...)`. Without this override `input`
-    // resolves its OWN pinned core tarball — a DIFFERENT module instance than
-    // engine/gfx — so the registered context's type would not match the
-    // engine's `engine.core.AndroidBackendContext` and the call fails to
-    // type-check. On Android the bgfx backend declares this import (`if` guard:
-    // it only exists on the Android build), so the override lands only there.
-    if (backend_input.import_table.get("labelle-core")) |_| {
-        overrideImport(backend_input, "labelle-core", core_mod);
-    }
 
 .android_exe_start
     const lib = b.addLibrary(.{
@@ -862,138 +251,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-.android_link
-    lib.root_module.linkLibrary(sokol_clib);
-    lib.root_module.link_libc = true;
-    lib.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }) });
-    lib.root_module.linkSystemLibrary("android", .{});
-    lib.root_module.linkSystemLibrary("log", .{});
-    lib.root_module.linkSystemLibrary("GLESv3", .{});
-    lib.root_module.linkSystemLibrary("EGL", .{});
-
-    // Zig does not bundle Android libc — provide a libc.txt that points the
-    // compiler at the NDK sysroot so Zig can resolve <stdio.h> and friends.
-    const libc_content = std.mem.concat(b.allocator, u8, &.{
-        "include_dir=",     b.pathJoin(&.{ ndk_sysroot, "usr/include" }),                               "\n",
-        "sys_include_dir=", b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }),              "\n",
-        "crt_dir=",         b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }), "\n",
-        "msvc_lib_dir=\n",
-        "kernel32_lib_dir=\n",
-        "gcc_dir=\n",
-    }) catch @panic("OOM");
-    const android_libc = b.addWriteFiles();
-    lib.setLibCFile(android_libc.add("android-libc.txt", libc_content));
-
 .android_exe_app_import
                 .{ .name = "backend_app", .module = backend_app },
-
-.android_link_bgfx
-    // bgfx Android link (#303). The `bgfx` artifact (with bx/bimg consumed
-    // as link objects) carries its NDK-sysroot-wired C++ TUs from the
-    // backend's build.zig; we link it into the .so. The `android_app`
-    // module — the NativeActivity glue + `android_native_app_glue.c` — is
-    // imported into the root module above; linking the bgfx artifact and
-    // declaring the Android system libs here completes the shell.
-    lib.root_module.linkLibrary(bgfx_artifact);
-    lib.root_module.link_libc = true;
-    lib.root_module.pic = true;
-    lib.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }) });
-    // NativeActivity shell + bgfx GLES/Vulkan renderer system libs.
-    // `android`/`log` back the glue + `__android_log_*`; `EGL`/`GLESv3`
-    // back bgfx's GLES renderer; `m`/`dl` are pulled by Bionic. The C++
-    // runtime is provided by Zig's own `-lc++` (bgfx/bx/bimg are consumed
-    // as STATIC archives into the .so), so we do NOT link the NDK's
-    // `libc++_shared.so` — it lives outside the per-API sysroot lib dir
-    // and would be a redundant second STL.
-    lib.root_module.linkSystemLibrary("android", .{});
-    lib.root_module.linkSystemLibrary("log", .{});
-    lib.root_module.linkSystemLibrary("EGL", .{});
-    lib.root_module.linkSystemLibrary("GLESv3", .{});
-    lib.root_module.linkSystemLibrary("m", .{});
-    lib.root_module.linkSystemLibrary("dl", .{});
-    // In-engine video (#549): the bgfx VideoBackend's Android decoder calls
-    // AMediaCodec/AMediaExtractor/AImageReader (libmediandk). Without it the app
-    // fails to dlopen at launch ("cannot locate symbol
-    // AMediaCodec_dequeueOutputBuffer"). `aaudio` backs the AAudio output
-    // device (#306). `android` (above) carries AAssetManager_* for name lookup.
-    lib.root_module.linkSystemLibrary("mediandk", .{});
-    lib.root_module.linkSystemLibrary("aaudio", .{});
-
-    // Zig does not bundle Android libc — provide a libc.txt that points the
-    // compiler at the NDK sysroot so Zig can resolve <stdio.h> and friends.
-    const libc_content = std.mem.concat(b.allocator, u8, &.{
-        "include_dir=",     b.pathJoin(&.{ ndk_sysroot, "usr/include" }),                               "\n",
-        "sys_include_dir=", b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }),              "\n",
-        "crt_dir=",         b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, "{{target_sdk_version}}" }), "\n",
-        "msvc_lib_dir=\n",
-        "kernel32_lib_dir=\n",
-        "gcc_dir=\n",
-    }) catch @panic("OOM");
-    const android_libc = b.addWriteFiles();
-    lib.setLibCFile(android_libc.add("android-libc.txt", libc_content));
 
 .android_link_gui_bridge
     // Same -fPIC requirement as sokol_clib — see labelle-assembler#147.
     gui_bridge_artifact.root_module.pic = true;
     lib.root_module.linkLibrary(gui_bridge_artifact);
-
-.android_package
-    // ── APK packaging step ──────────────────────────────────────────────
-    // Copies the freshly built libgame.so into apk-staging and re-signs the APK.
-    // Requires ANDROID_HOME and ~/.labelle/android-debug.keystore.
-    {
-        const io = b.graph.io;
-        // ANDROID_HOME is read lazily — a missing value only fails when `zig build package` runs.
-        const android_home = b.graph.environ_map.get("ANDROID_HOME") orelse "";
-        const home = b.graph.environ_map.get("HOME") orelse
-            b.graph.environ_map.get("USERPROFILE") orelse "";
-        const keystore = b.pathJoin(&.{ if (home.len > 0) home else "/tmp", ".labelle", "android-debug.keystore" });
-
-        // Find build-tools: prefer newest, then fall back
-        const build_tools_dir = blk: {
-            for (&[_][]const u8{ "36.0.0", "35.0.1", "35.0.0", "34.0.0" }) |ver| {
-                const p = b.pathJoin(&.{ android_home, "build-tools", ver });
-                if (std.Io.Dir.cwd().access(io, p, .{})) |_| break :blk p else |_| {}
-            }
-            break :blk b.pathJoin(&.{ android_home, "build-tools", "35.0.0" });
-        };
-        const apksigner = b.pathJoin(&.{ build_tools_dir, "apksigner" });
-
-        // Derive ABI directory from the actual build target so emulator (x86_64) and device (arm64) both work.
-        const abi_dir: []const u8 = switch (android_target.result.cpu.arch) {
-            .aarch64 => "arm64-v8a",
-            .x86_64  => "x86_64",
-            .arm     => "armeabi-v7a",
-            .x86     => "x86",
-            else     => "arm64-v8a",
-        };
-        // "../apk-staging/..." installs relative to zig-out/, resolving to {project_root}/apk-staging/.
-        const stage_lib = b.addInstallFile(lib.getEmittedBin(), b.fmt("../apk-staging/lib/{s}/libgame.so", .{abi_dir}));
-        stage_lib.step.dependOn(&lib.step);
-
-        // Repack APK from staging dir
-        const pack = b.addSystemCommand(&.{ "sh", "-c",
-            "cd \"$0\" && zip -r \"$1\" . -x '*.idsig'",
-            b.pathFromRoot("apk-staging"),
-            b.pathFromRoot("game_unsigned.apk"),
-        });
-        pack.step.dependOn(&stage_lib.step);
-
-        // Sign
-        const sign = b.addSystemCommand(&.{
-            apksigner,        "sign",
-            "--ks",           keystore,
-            "--ks-pass",      "pass:android",
-            "--key-pass",     "pass:android",
-            "--min-sdk-version", "26",
-            "--out",          b.pathFromRoot("game.apk"),
-            b.pathFromRoot("game_unsigned.apk"),
-        });
-        sign.step.dependOn(&pack.step);
-
-        const package_step = b.step("package", "Package and sign Android APK");
-        package_step.dependOn(&sign.step);
-    }
 
 .android_footer
     b.installArtifact(lib);

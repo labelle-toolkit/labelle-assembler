@@ -30,7 +30,6 @@ const scan = @import("scan.zig");
 const validate = @import("validate.zig");
 const context = @import("context.zig");
 const hooks_block = @import("blocks/hooks.zig");
-const manifest_splice = @import("manifest_splice.zig");
 const manifest_v2 = @import("manifest_v2.zig");
 
 /// Manifest-driven run-loop splice (pluggable-backends RFC, assembler#378).
@@ -43,7 +42,7 @@ const manifest_v2 = @import("manifest_v2.zig");
 /// refactor can thread it as a proper argument. Null keeps the enum path
 /// verbatim. For bgfx-desktop the manifest declares `.loop`, so the resolved
 /// `use_callback_lifecycle` is false — identical to the enum path.
-pub threadlocal var loop_style_override: ?manifest_splice.BackendManifest.LoopStyle = null;
+pub threadlocal var loop_style_override: ?manifest_v2.BackendManifestV2.PlatformEntry.LoopStyle = null;
 
 /// Manifest-declared callback-lifecycle blocks (assembler#501). Set by
 /// `root.zig` from the v2 manifest's `.platforms.<platform>.lifecycle` right

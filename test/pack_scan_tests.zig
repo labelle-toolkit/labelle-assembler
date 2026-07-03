@@ -668,7 +668,7 @@ pub const LIGHT_PACK_BUILDS_END_TO_END = struct {
         const module_plugins = try generate.declModulePlugins(std.testing.allocator, &declared_plugins, &pack_names);
         defer std.testing.allocator.free(module_plugins);
 
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
