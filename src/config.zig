@@ -698,14 +698,20 @@ pub const ProjectConfig = struct {
             // (labelle-bgfx#25, comment fix in 0.6.2) — paired with this
             // assembler's LABELLE_EDITOR_PREVIEW support so a preview build
             // resolves a hole-bearing backend. 0.6.3 grows the emcc export
-            // list with `_editor_set_state` (editor contract v1.1). The
-            // hole-bearing wasm template requires assembler ≥ 0.74.0.
-            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.6.3" },
+            // list with `_editor_set_state` (editor contract v1.1). 0.6.4
+            // declares the bgfx-Android callback lifecycle SHAPE in its v2
+            // manifest (#461), so the assembler selects it from data instead of
+            // the `is_bgfx_android` enum branch. The hole-bearing wasm template
+            // requires assembler ≥ 0.74.0.
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.6.4" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.3.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.3.1" },
             .raylib => .{ .name = "raylib", .repo = "github.com/labelle-toolkit/labelle-raylib", .version = "0.3.0" },
-            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.2.0" },
+            // 0.2.1 declares the sokol callback lifecycle SHAPE in its v2
+            // manifest (#461) — the assembler selects it from data instead of
+            // the `cfg.backend == .sokol` enum branch.
+            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.2.1" },
         };
     }
 
