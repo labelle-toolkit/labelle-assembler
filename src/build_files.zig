@@ -241,12 +241,27 @@ fn desktopUsesGenericV2(v2_manifest: ?manifest_v2.BackendManifestV2, cfg: Projec
 /// fallback is the SAME closed enum residual as the `android_link_bgfx` link
 /// site, and is removed together with it by the separate device-gated enum-path
 /// deletion; production bgfx (v2 manifest) never reaches it.
-fn androidNeedsAppImport(v2_manifest: ?manifest_v2.BackendManifestV2, cfg: ProjectConfig) bool {
+fn androidNeedsAppImport(allocator: std.mem.Allocator, v2_manifest: ?manifest_v2.BackendManifestV2, cfg: ProjectConfig) !bool {
     if (v2_manifest) |m| {
         const entry = manifest_v2_splice.platformEntry(m, cfg.platform) orelse return false;
         for (entry.extra_modules) |mod| {
-            const alias = mod.root_alias orelse mod.name;
-            if (std.mem.eql(u8, alias, "backend_app") or std.mem.eql(u8, mod.name, "android_app")) return true;
+            // Compute the module's EFFECTIVE root alias EXACTLY as
+            // `manifest_v2_splice.moduleAlias` emits it — `root_alias` if
+            // declared, else the default `backend_<name>` — and match on THAT.
+            // Matching on `mod.name` (or `mod.root_alias orelse mod.name`) is the
+            // bug the reviewers caught: a `.name = "android_app"` module with no
+            // `root_alias` is emitted as `backend_android_app`, so keying the
+            // import off the bare name would emit `.module = backend_app` for a
+            // module that was never declared under that alias → an undefined
+            // reference in the generated build.zig. bgfx sets
+            // `.root_alias = "backend_app"` explicitly, so it still matches; a
+            // name-only `android_app` (→ `backend_android_app`) correctly does not.
+            const alias = if (mod.root_alias) |a|
+                try allocator.dupe(u8, a)
+            else
+                try std.fmt.allocPrint(allocator, "backend_{s}", .{mod.name});
+            defer allocator.free(alias);
+            if (std.mem.eql(u8, alias, "backend_app")) return true;
         }
         return false;
     }
@@ -801,7 +816,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // sokol Android path has no such import — sokol's C runtime
         // provides the entry. Keyed off the v2 manifest's `backend_app`
         // extra-module declaration (assembler#461), not the backend enum.
-        if (androidNeedsAppImport(v2_manifest, cfg)) {
+        if (try androidNeedsAppImport(allocator, v2_manifest, cfg)) {
             try tpl.writeSection(build_zig_tmpl, "android_exe_app_import", w);
         }
 
