@@ -1190,37 +1190,72 @@ pub const EDITOR_PREVIEW = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "editor_api") == null);
     }
 
-    test "editor preview against a wasm template WITHOUT the holes is a hard error" {
-        // A backend whose wasm template predates the editor holes cannot
-        // produce a drivable Play-mode build — silently emitting a non-editor
-        // main would leave the studio connecting to a game it cannot drive.
-        // The template below is the PRE-0.6.1 bgfx wasm shape (no holes).
-        const holeless_wasm_lifecycle =
-            \\{{module_vars}}var g: AssembledGame = undefined;
-            \\{{hooks_init_block}}
-            \\fn gameFrame() callconv(.c) void {
-            \\    const dt: f32 = 0.016;
-            \\{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
-            \\
-            \\    window.beginFrame();
-            \\    window.endFrame();
-            \\}
-            \\pub fn main() !void {
-            \\    const allocator = std.heap.c_allocator;
-            \\    g = AssembledGame.init(allocator);
-            \\    g.setHooks(&hooks);
-            \\{{preview_setup}}{{setup_code}}    emscripten_set_main_loop(&gameFrame, 0, 1);
-            \\}
-            \\
-        ;
-        try std.testing.expectError(error.EditorPreviewUnsupportedByBackend, generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+    /// Minimal wasm-shaped lifecycle with each editor hole individually
+    /// toggleable — the partial-hole matrix for the all-or-nothing check
+    /// (#526 review, CodeRabbit Major + codex P2). With all three toggled
+    /// off this is the PRE-0.6.1 bgfx wasm shape (no holes at all).
+    fn wasmTmpl(comptime bind: bool, comptime sim_open: bool, comptime sim_close: bool) []const u8 {
+        return "{{module_vars}}var g: AssembledGame = undefined;\n" ++
+            "{{hooks_init_block}}\n" ++
+            "fn gameFrame() callconv(.c) void {\n" ++
+            "    const dt: f32 = 0.016;\n" ++
+            "{{preview_heartbeat}}" ++ (if (sim_open) "{{editor_sim_open}}" else "") ++ "{{tick_code}}    g.tick(dt);\n" ++
+            (if (sim_close) "{{editor_sim_close}}" else "") ++ "\n" ++
+            "    window.beginFrame();\n" ++
+            "    window.endFrame();\n" ++
+            "}\n" ++
+            "pub fn main() !void {\n" ++
+            "    const allocator = std.heap.c_allocator;\n" ++
+            "    g = AssembledGame.init(allocator);\n" ++
+            "    g.setHooks(&hooks);\n" ++
+            "{{preview_setup}}{{setup_code}}" ++ (if (bind) "{{editor_bind}}" else "") ++ "    emscripten_set_main_loop(&gameFrame, 0, 1);\n" ++
+            "}\n";
+    }
+
+    fn genPreviewWith(comptime tmpl: []const u8) ![]const u8 {
+        return generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
             .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
             .platform = .wasm,
             .editor_preview = true,
             .ecs = .mock,
-        }, holeless_wasm_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions));
+        }, tmpl, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+    }
+
+    test "editor preview against a wasm template WITHOUT the holes is a hard error" {
+        // A backend whose wasm template predates the editor holes cannot
+        // produce a drivable Play-mode build — silently emitting a non-editor
+        // main would leave the studio connecting to a game it cannot drive.
+        try std.testing.expectError(error.EditorPreviewUnsupportedByBackend, genPreviewWith(comptime wasmTmpl(false, false, false)));
+    }
+
+    test "editor preview: a PARTIAL hole set is rejected, never partially spliced" {
+        // All-or-nothing (#526 review, CodeRabbit Major + codex P2):
+        // `tpl.render` silently drops values for undeclared holes, so a
+        // partial set would generate a syntactically broken main.zig (sim
+        // gate opened but never closed) or a silently un-gated one (bind
+        // without shouldTick/frame). Each hole individually missing must be
+        // the SAME hard error the hole-less template gets.
+        // missing {{editor_bind}} only:
+        try std.testing.expectError(error.EditorPreviewUnsupportedByBackend, genPreviewWith(comptime wasmTmpl(false, true, true)));
+        // missing {{editor_sim_open}} only:
+        try std.testing.expectError(error.EditorPreviewUnsupportedByBackend, genPreviewWith(comptime wasmTmpl(true, false, true)));
+        // missing {{editor_sim_close}} only:
+        try std.testing.expectError(error.EditorPreviewUnsupportedByBackend, genPreviewWith(comptime wasmTmpl(true, true, false)));
+    }
+
+    test "editor preview: the SAME minimal template with all three holes generates the full splice" {
+        // Positive control for the matrix above: the all-holes variant of the
+        // exact template the partial cases reject must generate — with all
+        // three splice points present (bind + gate + frame sync) and no
+        // leaked `{{editor_*}}` placeholder.
+        const main_zig = try genPreviewWith(comptime wasmTmpl(true, true, true));
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.editor_api.bind(&g, &runner);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (engine.editor_api.shouldTick()) {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.editor_api.frame(&g);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "{{editor_") == null);
     }
 
     test "editor-preview main.zig is syntactically valid Zig" {

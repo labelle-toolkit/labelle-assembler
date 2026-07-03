@@ -151,26 +151,40 @@ pub fn Mixin(comptime Self: type) type {
             // When the assembler ran an editor-preview generation
             // (LABELLE_EDITOR_PREVIEW=1 / --editor-preview; `generate`
             // normalizes it off for every non-wasm platform), the backend's
-            // wasm template must declare the three editor holes so the
-            // generated main binds `engine.editor_api` and gates the sim.
-            // A template WITHOUT the holes gets a hard, actionable error —
-            // silently emitting a non-editor build would leave the studio's
-            // Play mode connecting to a game it cannot drive. Non-preview
-            // generations fill the holes EMPTY, which reproduces the
-            // pre-preview bytes exactly (hole placement in the template is
-            // chosen for that; goldens lock it).
+            // wasm template must declare ALL THREE editor holes so the
+            // generated main binds `engine.editor_api` AND gates the sim AND
+            // runs the per-frame sync. All-or-nothing (#526 review,
+            // CodeRabbit Major + codex P2): `tpl.render` silently drops
+            // values for holes a template doesn't declare, so a PARTIAL hole
+            // set would generate a syntactically broken main.zig (sim gate
+            // opened but never closed) or a silently un-gated one (bind
+            // without the sim gate / frame sync) — the error names exactly
+            // which hole(s) are missing. Templates with NO holes get the
+            // same upgrade-hint error: silently emitting a non-editor build
+            // would leave the studio's Play mode connecting to a game it
+            // cannot drive. Non-preview generations fill the holes EMPTY,
+            // which reproduces the pre-preview bytes exactly (hole placement
+            // in the template is chosen for that; goldens lock it).
             const editor_preview_on = cfg.editor_preview and cfg.platform == .wasm;
-            if (editor_preview_on and std.mem.indexOf(u8, lifecycle_tmpl, "{{editor_bind}}") == null) {
+            const has_editor_bind = std.mem.indexOf(u8, lifecycle_tmpl, "{{editor_bind}}") != null;
+            const has_editor_sim_open = std.mem.indexOf(u8, lifecycle_tmpl, "{{editor_sim_open}}") != null;
+            const has_editor_sim_close = std.mem.indexOf(u8, lifecycle_tmpl, "{{editor_sim_close}}") != null;
+            if (editor_preview_on and !(has_editor_bind and has_editor_sim_open and has_editor_sim_close)) {
                 // Silenced under test — the Zig test runner fails any test
                 // emitting `std.log.err`, even when the error is the asserted
                 // outcome (same gate as the callback-external rejection below).
                 if (!builtin.is_test) {
                     std.log.err(
                         "labelle-assembler: editor-preview build requested (LABELLE_EDITOR_PREVIEW) but " ++
-                            "backend '{s}' ships a wasm template without the editor holes " ++
-                            "({{{{editor_bind}}}}/{{{{editor_sim_open}}}}/{{{{editor_sim_close}}}}) — upgrade the backend " ++
-                            "package (labelle-bgfx >= 0.6.1) or build without editor preview",
-                        .{cfg.backendName()},
+                            "backend '{s}' ships a wasm template missing editor hole(s):{s}{s}{s} — all three " ++
+                            "are required (a partial set would generate a broken or un-gated main.zig). " ++
+                            "Upgrade the backend package (labelle-bgfx >= 0.6.1) or build without editor preview",
+                        .{
+                            cfg.backendName(),
+                            if (has_editor_bind) "" else " {{editor_bind}}",
+                            if (has_editor_sim_open) "" else " {{editor_sim_open}}",
+                            if (has_editor_sim_close) "" else " {{editor_sim_close}}",
+                        },
                     );
                 }
                 return error.EditorPreviewUnsupportedByBackend;
