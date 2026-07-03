@@ -236,32 +236,43 @@ pub fn Mixin(comptime Self: type) type {
             else
                 "";
 
+            // Manifest-driven run-loop splice (assembler#378, #461): callback-vs-
+            // loop is resolved from the backend manifest's `loop_style` (DATA), not
+            // a `cfg.backend` enum branch. For bgfx-desktop the manifest declares
+            // `.loop` → callback false (the desktop `while (!shouldQuit())` path);
+            // for sokol-desktop / bgfx-android it declares `.callback` → true.
+            // WASM is the one platform that ALWAYS forces the callback lifecycle
+            // (Emscripten owns the main loop), independent of any backend: it is
+            // the fall-through when no manifest `loop_style` is supplied.
+            //
             // bgfx-on-Android (#303) inverts its desktop loop into the same
-            // init/frame callback shape sokol/wasm use: the NativeActivity
-            // shell (`backends/bgfx/src/android_app.zig`) owns the event+frame
-            // loop and calls back into the game per-frame. So it shares the
-            // callback-lifecycle path (module-scope `g`/`runner`, void-safe
-            // `init_code` via `buildCallbackInitCode`) rather than the
-            // procedural loop path the bgfx DESKTOP template uses.
+            // init/frame callback shape sokol/wasm use — its NativeActivity shell
+            // (`backends/bgfx/src/android_app.zig`) owns the event+frame loop and
+            // calls back into the game per-frame — so its manifest declares
+            // `.callback`; the resulting callback shape uses a module-scope
+            // `g`/`runner` + void-safe `init_code` via `buildCallbackInitCode`
+            // rather than the procedural loop path the bgfx DESKTOP template uses.
+            //
+            // V1/LEGACY RESIDUAL (#461 flag-day net): `is_bgfx_android` /
+            // `cfg.backend == .sokol` are the pre-manifest enum fallback, consulted
+            // ONLY in the `else` arm — i.e. when NO manifest `loop_style` was
+            // resolved (`loop_style_ovr == null`). Production sokol/bgfx ship v2
+            // manifests, so `loop_style_ovr` is always non-null there and this arm
+            // is never reached; the fallback covers a tag-matched built-in that
+            // resolves ONLY a v1 `backend.manifest.zon` (or none) on a NON-desktop
+            // target, where `manifestPathEnabled` doesn't read the v1 manifest so
+            // `loop_style_ovr` stays null (`resolveLoopStyleOverride` / #473). Same
+            // closed-enum residual as `build_files.androidNeedsAppImport`'s v1
+            // fallback and the untouched `android_link_bgfx` link site — all three
+            // are removed together by the separate device-gated enum-path deletion.
             const is_bgfx_android = cfg.backend == .bgfx and cfg.platform == .android;
-            // Manifest-driven run-loop splice (assembler#378): when the backend
-            // manifest supplied a `loop_style`, resolve callback-vs-loop from THAT
-            // (data), not the `cfg.backend == .sokol` enum branch. For
-            // bgfx-desktop the manifest declares `.loop` → callback false (the
-            // desktop `while (!shouldQuit())` path); for sokol-desktop it declares
-            // `.callback` → true. Both match the enum path → byte-identical output.
-            // Null override keeps the enum path verbatim for every other target.
             const use_callback_lifecycle = if (loop_style_ovr) |ls|
                 ls == .callback
             else
                 cfg.backend == .sokol or cfg.platform == .wasm or is_bgfx_android;
 
             // A callback-style EXTERNAL backend is only safe where the callback
-            // dispatch below has a real branch for it. That dispatch keys off
-            // `cfg.backend`, which the enum-as-shorthand PRESERVES even when the
-            // backend resolves to a package (#386): `.backend = .bgfx` stays
-            // `.bgfx`, so `is_bgfx_android` and the `== .sokol` branch still fire
-            // for an extracted bgfx/sokol.
+            // dispatch below has a real shape for it. Two data signals supply one:
             //
             // WASM (bgfx-wasm epic labelle-bgfx#8): the callback `else` branch
             // below is the GENERIC emscripten `emscripten_set_main_loop` path —
@@ -269,22 +280,33 @@ pub fn Mixin(comptime Self: type) type {
             // (loop callback, `g.tick`, no module-scope runner) is shipped by the
             // backend's OWN `templates/wasm.txt`. So any FIRST-PARTY (enum-tag-
             // backed) external backend on wasm — raylib, sokol, bgfx — is safe
-            // through it. Post-#386 raylib/bgfx are external too, so keying only
-            // off `== .sokol` left every other first-party wasm backend wrongly
-            // rejected (the else branch went unreachable at the flip). What stays
-            // rejected is a genuine THIRD-PARTY callback backend named only by
-            // string (`cfg.backend` at its `.raylib` default, `backendName()` !=
-            // the tag): `isEnumTagBacked()` is false for it, so it never inherits
-            // the raylib-shaped wasm wiring against an unvalidated template.
-            // Built-ins are unaffected (`isExternal()` is false).
+            // through it. What stays rejected is a genuine THIRD-PARTY callback
+            // backend named only by string (`cfg.backend` at its `.raylib`
+            // default, `backendName()` != the tag): `isEnumTagBacked()` is false
+            // for it, so it never inherits the raylib-shaped wasm wiring against
+            // an unvalidated template.
             //
-            // A DECLARED callback backend (assembler#501) is also handled: its
-            // manifest `.platforms.<p>.lifecycle` names the assembler-known
-            // blocks its entry template consumes, so the third-party dispatch
-            // branch below has a real shape to render. An UNDECLARED callback
-            // external stays rejected — the fail-fast is the safety property.
-            const callback_dispatch_handled = is_bgfx_android or cfg.backend == .sokol or
-                (cfg.platform == .wasm and cfg.isEnumTagBacked()) or lifecycle_ovr != null;
+            // A DECLARED callback backend (assembler#501/#461) is handled by the
+            // manifest signal: its `.platforms.<p>.lifecycle` (surfaced as
+            // `lifecycle_ovr`) names the assembler-known blocks its entry template
+            // consumes, so the shape below has a real value to render. This is the
+            // primary signal for a built-in callback backend too, now that
+            // production sokol/bgfx declare their shape in their v2 manifests.
+            // An UNDECLARED callback external stays rejected — the fail-fast is the
+            // safety property.
+            //
+            // V1/LEGACY RESIDUAL (#461 flag-day net): `is_bgfx_android` /
+            // `cfg.backend == .sokol` are the pre-manifest enum fallback. They are
+            // ordered AFTER the manifest signal, so `or` short-circuits past them
+            // whenever `lifecycle_ovr != null` — production v2 never consults them.
+            // They only decide the gate for a tag-matched built-in that resolves no
+            // v2 lifecycle (v1-only / no manifest), whose real callback dispatch is
+            // supplied by the restored enum shape fallback below. Removed together
+            // with the other enum residuals by the separate device-gated deletion.
+            const callback_dispatch_handled =
+                lifecycle_ovr != null or
+                (cfg.platform == .wasm and cfg.isEnumTagBacked()) or
+                is_bgfx_android or cfg.backend == .sokol;
             if (use_callback_lifecycle and cfg.isExternal() and !callback_dispatch_handled) {
                 // Silenced under test (the Zig test runner fails any test that
                 // emits a `std.log.err`, even when the error is the asserted
@@ -304,27 +326,23 @@ pub fn Mixin(comptime Self: type) type {
             }
 
             if (use_callback_lifecycle) {
-                // The fixed shape of this callback lifecycle (assembler#501).
-                // For the six built-ins it is derived from the SAME enum
-                // predicates as before (byte-identical output); for a declared
-                // third-party callback backend it comes from the manifest
-                // `.lifecycle`. Sokol/bgfx-android are matched FIRST, so the
-                // declared branch only ever covers a genuine non-enum-tag
-                // callback backend (the wasm else-shape is the remaining
-                // first-party fall-through). Every callback hole below is a
-                // value keyed on this shape, rendered through ONE `tpl.render`.
+                // The fixed shape of this callback lifecycle (assembler#501/#461).
+                // For production the shape is selected by DATA — the manifest
+                // `.platforms.<p>.lifecycle` declaration (`lifecycle_ovr`): a
+                // built-in sokol/bgfx v2 manifest declares its FULL shape (including
+                // the privileged `preview = .sokol_readback` / `android_register =
+                // .bgfx_shell`), and an unprivileged third-party callback backend
+                // declares only the safe flags (its preview/android default to
+                // none). The privileged values are namespace-gated at manifest
+                // validation (`backend_registry.assertLifecyclePrivilege`), so a
+                // non-`labelle.*` provider can never reach the backend-private
+                // readback/shell blocks here. The first-party WASM fall-through (no
+                // manifest `.lifecycle` — the generic emscripten
+                // `emscripten_set_main_loop` else-path) has a hard-coded shape:
+                // module-scope runner, INIT/HEARTBEAT preview callbacks, no
+                // backend-specific holes. Every callback hole below is a value keyed
+                // on this shape, rendered through ONE `tpl.render`.
                 const shape: LifecycleShape = if (lifecycle_ovr) |decl|
-                    // Manifest-declared callback shape (#461). Every callback
-                    // block is now selected by DATA, not a `cfg.backend` enum
-                    // branch: a built-in sokol/bgfx manifest declares its FULL
-                    // shape (including the privileged `preview = .sokol_readback`
-                    // / `android_register = .bgfx_shell`), and an unprivileged
-                    // third-party callback backend declares only the safe flags
-                    // (its preview/android default to none). The privileged
-                    // values are namespace-gated at manifest validation
-                    // (`backend_registry.assertLifecyclePrivilege`), so a
-                    // non-`labelle.*` provider can never reach the backend-
-                    // private readback/shell blocks here.
                     .{
                         .runner = decl.runner_module_var,
                         .cleanup = decl.cleanup_callback,
@@ -341,11 +359,18 @@ pub fn Mixin(comptime Self: type) type {
                             .bgfx_shell => .bgfx_shell,
                         },
                     }
+                    // V1/LEGACY RESIDUAL (#461 flag-day net): reached ONLY when no
+                    // v2 lifecycle was resolved (`lifecycle_ovr == null`) for a
+                    // tag-matched built-in that ships only a v1 manifest / none.
+                    // Byte-identical to the manifest-declared shape production
+                    // resolves — without it a v1-only sokol/bgfx-android callback
+                    // build would fall to the wasm `callback_basic` literal below
+                    // (no readback / no shell register = wrong shape). Production
+                    // (v2) sets `lifecycle_ovr`, so it never takes these arms. Same
+                    // closed-enum residual as `androidNeedsAppImport` / the
+                    // `android_link_bgfx` link site — removed together by the
+                    // separate device-gated enum-path deletion.
                 else if (cfg.backend == .sokol)
-                    // Fallback for a built-in whose (older) manifest predates the
-                    // #461 lifecycle-shape fields — byte-identical to the
-                    // manifest-declared shape above. Deleted once every built-in
-                    // manifest declares its shape (#461 step 12).
                     .{ .runner = true, .cleanup = true, .allocator = true, .gui_event = true, .imgui_dispatch = true, .preview = .sokol_readback, .android = .none }
                 else if (is_bgfx_android)
                     .{ .runner = true, .cleanup = false, .allocator = false, .gui_event = false, .imgui_dispatch = true, .preview = .none, .android = .bgfx_shell }
@@ -354,6 +379,12 @@ pub fn Mixin(comptime Self: type) type {
                     // callback else-path — module-scope runner, INIT/HEARTBEAT
                     // preview callbacks, no backend-specific holes.
                     .{ .runner = true, .cleanup = false, .allocator = false, .gui_event = false, .imgui_dispatch = false, .preview = .callback_basic, .android = .none };
+
+                // The bgfx-Android NativeActivity shell shape (formerly a
+                // per-backend enum predicate): now a fact of the resolved shape
+                // (`android_register = .bgfx_shell`), used below to pick the shell
+                // platform/entry comments.
+                const is_bgfx_shell = shape.android == .bgfx_shell;
 
                 const is_wasm = cfg.platform == .wasm;
 
@@ -404,7 +435,7 @@ pub fn Mixin(comptime Self: type) type {
                 const init_code = try self.buildCallbackInitCode();
                 defer allocator.free(init_code);
 
-                const platform_comment: []const u8 = if (is_bgfx_android)
+                const platform_comment: []const u8 = if (is_bgfx_shell)
                     "Android: the bgfx NativeActivity shell (android_app.zig) drives the lifecycle"
                 else switch (cfg.platform) {
                     .ios => "iOS: sokol bindings accessed through engine.sokol (no direct sokol import)",
@@ -412,7 +443,7 @@ pub fn Mixin(comptime Self: type) type {
                     .wasm => "WASM: Emscripten drives the main loop via callbacks",
                     .desktop => "",
                 };
-                const entry_comment: []const u8 = if (is_bgfx_android)
+                const entry_comment: []const u8 = if (is_bgfx_shell)
                     "Android entry — the game owns android_main; the bgfx shell runs the loop"
                 else switch (cfg.platform) {
                     .ios => "iOS entry — no main(), sokol handles the app lifecycle",

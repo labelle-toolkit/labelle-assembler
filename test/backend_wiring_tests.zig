@@ -79,6 +79,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "buildCallbackInitCode emits setBackend + adapters (sokol)" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -156,6 +158,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "setBackend runs before any registerScene / atlas registration (sokol)" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const jsonc_scenes = &[_][]const u8{"menu"};
         const manifests = [_]SceneManifest{
             .{ .name = "menu", .assets = &[_][]const u8{} },
