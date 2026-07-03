@@ -75,6 +75,9 @@ const usage =
     \\  --scene <name>          Override the initial prefab from project.labelle
     \\  --platform <name>       Override target platform (desktop, wasm, ios, android)
     \\  --backend <name>        Override graphics backend (raylib, sokol, sdl, bgfx, wgpu)
+    \\  --editor-preview        Editor-preview wasm build (labelle-studio Play mode);
+    \\                          equivalent to LABELLE_EDITOR_PREVIEW=1. Wasm-only —
+    \\                          ignored on every other platform.
     \\
     \\Notes:
     \\  `generate` reads the local package cache; run `install` first (or
@@ -166,6 +169,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
     var scene_override: ?[]const u8 = null;
     var platform_override: ?gen.Platform = null;
     var backend_override: ?gen.Backend = null;
+    var editor_preview = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--project-root")) {
@@ -198,6 +202,13 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
             backend_override = parseBackend(val) orelse std.process.exit(2);
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
             backend_override = parseBackend(arg["--backend=".len..]) orelse std.process.exit(2);
+        } else if (std.mem.eql(u8, arg, "--editor-preview")) {
+            // Editor-preview wasm build (labelle-studio Play mode). The
+            // required activation path is the LABELLE_EDITOR_PREVIEW env var
+            // (read inside `gen.generate` so it also covers library callers);
+            // this flag is the direct spelling for local testing. `generate`
+            // normalizes it off for non-wasm platforms.
+            editor_preview = true;
         } else {
             std.log.err("labelle-assembler generate: unknown flag '{s}'", .{arg});
             std.process.exit(2);
@@ -222,6 +233,7 @@ fn cmdGenerate(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
     if (scene_override) |s| cfg.initial_prefab = s;
     if (platform_override) |p| cfg.platform = p;
     if (backend_override) |b| cfg.backend = b;
+    if (editor_preview) cfg.editor_preview = true;
 
     // Resolve GUI plugin (reads gui.labelle manifest from plugin directory)
     // and populates cfg.resolved_gui. Must run before gen.generate so the

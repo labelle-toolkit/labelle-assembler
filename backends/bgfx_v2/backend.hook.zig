@@ -158,6 +158,12 @@ pub const HookContext = struct {
     platform: Platform,
     ios_sdk_path: ?[]const u8,
     android_target_sdk: ?u32,
+    /// Editor-preview build (labelle-studio Play mode, wasm only): the wasm
+    /// arm keeps the `editor_*` exports alive in the emcc link. DEFAULTED so
+    /// generated build.zigs that omit the field (every non-preview build)
+    /// keep compiling; the assembler emits `.editor_preview = true` only on
+    /// an editor-preview generation. Mirrors `manifest_v2.HookContext`.
+    editor_preview: bool = false,
 };
 
 /// REQUIRED android SDK accessor — the testable enforcement of "no silent 34
@@ -270,6 +276,22 @@ pub const wasm_min_webgl_arg = "-sMIN_WEBGL_VERSION=2";
 pub const wasm_max_webgl_arg = "-sMAX_WEBGL_VERSION=2";
 pub const wasm_gl_get_proc_address_arg = "-sGL_ENABLE_GET_PROC_ADDRESS=1";
 
+/// Editor-preview exports (labelle-studio Play mode). `-sEXPORTED_FUNCTIONS`
+/// REPLACES emcc's default export list, so `_main` MUST be first — dropping it
+/// leaves the module without an entry point. `HEAPU8` in the runtime methods is
+/// required with ALLOW_MEMORY_GROWTH on emcc 4.x (the view is re-created after
+/// growth; without exporting it the editor's JS reads a detached buffer). Added
+/// ONLY when `editor_preview` is set: emcc hard-errors on exported symbols that
+/// don't exist ("wasm-ld: error: symbol exported via --export not found",
+/// verified on emcc 4.0.x), and the `editor_*` symbols only exist when the
+/// generated main binds `engine.editor_api`.
+pub const wasm_editor_exported_functions_arg =
+    "-sEXPORTED_FUNCTIONS=_main,_editor_alloc,_editor_free,_editor_pause,_editor_step," ++
+    "_editor_set_scene,_editor_load_scene,_editor_set_entity_position,_editor_pick," ++
+    "_editor_scene_digest,_editor_set_camera,_editor_release_camera";
+pub const wasm_editor_exported_runtime_methods_arg =
+    "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8";
+
 /// Options for `emLinkStep` — the subset of emcc options the wasm residual sets.
 /// Uses only `std.Build`/`std.builtin` types so the hook stays provider-free.
 pub const EmLinkOptions = struct {
@@ -286,6 +308,10 @@ pub const EmLinkOptions = struct {
     lib_backend: *std.Build.Step.Compile,
     /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`.
     emsdk: *std.Build.Dependency,
+    /// Editor-preview build: add the `editor_*` export args (see
+    /// `wasm_editor_exported_functions_arg`). Threaded from
+    /// `HookContext.editor_preview` by `post_wire`.
+    editor_preview: bool = false,
 };
 
 fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Build.LazyPath {
@@ -319,6 +345,14 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     emcc.addArg(wasm_gl_get_proc_address_arg);
     emcc.addArg(wasm_allow_memory_growth_arg);
     emcc.addArg(wasm_stack_size_arg);
+    // Editor preview (labelle-studio Play mode): keep the `editor_*` exports
+    // + the ccall/cwrap/HEAPU8 runtime methods alive so the browser editor
+    // can drive the running game. Conditional — see the arg docs above for
+    // why unconditional emission would hard-fail every non-preview link.
+    if (options.editor_preview) {
+        emcc.addArg(wasm_editor_exported_functions_arg);
+        emcc.addArg(wasm_editor_exported_runtime_methods_arg);
+    }
     // EVERY static lib reachable from the game's link graph (element 0 IS lib_main
     // itself): the game, bgfx/bx/bimg, AND any GUI bridge (bgfx_imgui_bridge +
     // its cimgui_clib) or plugin C libs the game links. Walking lib_backend would
@@ -389,6 +423,7 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
                 .lib_main = ctx.root_artifact,
                 .lib_backend = bgfx_artifact,
                 .emsdk = emsdk,
+                .editor_preview = ctx.editor_preview,
             });
             b.getInstallStep().dependOn(&install.step);
             const run_step = b.step("run", "Serve WASM build");
@@ -474,6 +509,58 @@ test "libcTxt: body points the compiler at the NDK sysroot (matches the enum blo
             "gcc_dir=\n",
         out,
     );
+}
+
+test "editor-preview exports: _main first (the flag REPLACES the default export list)" {
+    // Spike-proven: -sEXPORTED_FUNCTIONS replaces emcc's default exports, so a
+    // list without _main strips the entry point from the module.
+    try testing.expect(std.mem.startsWith(u8, wasm_editor_exported_functions_arg, "-sEXPORTED_FUNCTIONS=_main,"));
+}
+
+test "editor-preview exports: every editor_* contract symbol is in the list" {
+    const contract = [_][]const u8{
+        "_editor_alloc",        "_editor_free",
+        "_editor_pause",        "_editor_step",
+        "_editor_set_scene",    "_editor_load_scene",
+        "_editor_set_entity_position", "_editor_pick",
+        "_editor_scene_digest", "_editor_set_camera",
+        "_editor_release_camera",
+    };
+    for (contract) |sym| {
+        try testing.expect(std.mem.indexOf(u8, wasm_editor_exported_functions_arg, sym) != null);
+    }
+    // ccall/cwrap for the JS driver; HEAPU8 required with ALLOW_MEMORY_GROWTH
+    // on emcc 4.x (view re-created after growth).
+    try testing.expectEqualStrings(
+        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8",
+        wasm_editor_exported_runtime_methods_arg,
+    );
+}
+
+test "editor-preview defaults OFF: a pre-preview HookContext/EmLinkOptions literal still coerces" {
+    // Back-compat gate: generated build.zigs that predate the field (every
+    // non-preview build) omit `.editor_preview` — the default must be false
+    // in BOTH structs so those literals keep compiling and the exports stay
+    // off the link line (emcc errors on missing exported symbols otherwise).
+    const ctx: HookContext = .{
+        .manifest_version = HOOK_ABI_VERSION,
+        .backend_dep = undefined,
+        .root_module = undefined,
+        .root_artifact = undefined,
+        .target = undefined,
+        .optimize = .Debug,
+        .platform = .wasm,
+        .ios_sdk_path = null,
+        .android_target_sdk = null,
+    };
+    try testing.expect(!ctx.editor_preview);
+    const opts: EmLinkOptions = .{
+        .optimize = .Debug,
+        .lib_main = undefined,
+        .lib_backend = undefined,
+        .emsdk = undefined,
+    };
+    try testing.expect(!opts.editor_preview);
 }
 
 test "selectGreatestValidNdk: a stray dir doesn't shadow a valid older NDK" {

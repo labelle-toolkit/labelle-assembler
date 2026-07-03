@@ -2181,4 +2181,43 @@ pub const MANIFEST_V2_BGFX_WASM_GOLDEN = struct {
         // Not the android residual — no NDK detection leaks here.
         try std.testing.expect(std.mem.indexOf(u8, out, "getAndroidNdkSysroot(") == null);
     }
+
+    test "v2 bgfx-wasm: a NON-preview build.zig carries NO editor_preview field" {
+        // Back-compat property (editor preview, labelle-studio Play mode):
+        // normal builds must keep compiling against hooks that predate the
+        // `editor_preview` HookContext field, so the generated post_wire
+        // call omits it entirely. (Byte-locked by the golden above too —
+        // this pins the WHY.)
+        const out = try genBgfxV2Wasm();
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "editor_preview") == null);
+    }
+
+    test "v2 bgfx-wasm: editor preview threads .editor_preview = true into post_wire" {
+        // Editor-preview generation (LABELLE_EDITOR_PREVIEW=1 →
+        // cfg.editor_preview): the emcc hook arm must learn preview is on so
+        // it keeps the `_editor_*` exports alive (-sEXPORTED_FUNCTIONS
+        // replaces the default list AND emcc hard-errors on missing exported
+        // symbols, so the exports can only be added when the generated main
+        // actually binds engine.editor_api).
+        const out = try h.genBgfxV2BuildZig(std.testing.allocator, .{
+            .name = "bgfxgame",
+            .backend = .bgfx,
+            .platform = .wasm,
+            .editor_preview = true,
+        }, .{});
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".editor_preview = true,") != null);
+        // Threaded into the post_wire context literal (inside the call).
+        const post_wire_at = std.mem.indexOf(u8, out, "backend_build_hook.post_wire(b, .{").?;
+        const field_at = std.mem.indexOf(u8, out, ".editor_preview = true,").?;
+        try std.testing.expect(post_wire_at < field_at);
+
+        // Still syntactically valid Zig.
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
 };

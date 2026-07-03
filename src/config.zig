@@ -42,6 +42,26 @@ pub fn globalEnviron() std.process.Environ {
     return _global_environ;
 }
 
+/// Interpret the `LABELLE_EDITOR_PREVIEW` env-var value (labelle-studio Play
+/// mode). Documented spelling is `LABELLE_EDITOR_PREVIEW=1`; `true` is
+/// accepted as a courtesy alias. Anything else — including `0`, `false`, and
+/// the empty string — is OFF, so `LABELLE_EDITOR_PREVIEW=0` explicitly
+/// disables preview even when a wrapper exported the var. Pure so the parsing
+/// rule is unit-testable without touching the process environment.
+pub fn editorPreviewEnvEnabled(value: []const u8) bool {
+    return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
+}
+
+test "editorPreviewEnvEnabled: '1'/'true' enable; '0'/'false'/empty/garbage don't" {
+    try std.testing.expect(editorPreviewEnvEnabled("1"));
+    try std.testing.expect(editorPreviewEnvEnabled("true"));
+    try std.testing.expect(!editorPreviewEnvEnabled("0"));
+    try std.testing.expect(!editorPreviewEnvEnabled("false"));
+    try std.testing.expect(!editorPreviewEnvEnabled(""));
+    try std.testing.expect(!editorPreviewEnvEnabled("yes"));
+    try std.testing.expect(!editorPreviewEnvEnabled("TRUE"));
+}
+
 /// Graphics / windowing backend selection. `null` is a headless backend
 /// (no graphics context, no input, no audio, no window) that drives the
 /// generated `main()` through a fixed-frame tick loop — used for
@@ -624,6 +644,20 @@ pub const ProjectConfig = struct {
     /// Resolved GUI plugin — populated by the CLI after reading gui.labelle manifest.
     /// NOT parsed from ZON. Generators check this field, not `gui`.
     resolved_gui: ?ResolvedGui = null,
+
+    /// Editor-preview build (labelle-studio Play mode, wasm only). Not meant
+    /// to be set in `project.labelle` — activated per-generation by the
+    /// `LABELLE_EDITOR_PREVIEW=1` env var (read in `generate`; the studio
+    /// spawns `labelle build --platform=wasm` with it set and the env
+    /// propagates through the CLI into the assembler child) or by the
+    /// assembler's own `--editor-preview` flag. When true AND the platform is
+    /// wasm, the generated wasm main.zig binds the engine's `editor_api`
+    /// (bind / shouldTick sim gate / per-frame editor sync) and the generated
+    /// build.zig threads `.editor_preview = true` into the backend hook's
+    /// `post_wire` so the emcc link keeps the `editor_*` exports alive.
+    /// `generate` normalizes this OFF for every non-wasm platform, so a
+    /// stray env var can never perturb a desktop/android/ios build.
+    editor_preview: bool = false,
 
     /// Check if a plugin is enabled by name.
     pub fn hasPlugin(self: ProjectConfig, name: []const u8) bool {
