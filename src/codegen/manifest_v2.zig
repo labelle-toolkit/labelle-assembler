@@ -285,14 +285,23 @@ pub const BackendManifestV2 = struct {
 
         pub const LoopStyle = enum { callback, loop };
 
-        /// The declarable callback-lifecycle block set (assembler#501). Flags
-        /// only — each names a fixed block whose BODY lives in the assembler
-        /// (`lifecycle/render.zig`), not the manifest. The sokol readback, the
-        /// imgui-bridge externs, and the bgfx shell registration are NOT
-        /// declarable here: they reference backend-private symbols and stay
-        /// keyed to the built-in enum branches. A third-party callback backend
-        /// gets `PREVIEW_HELPERS` + the input-dispatch stub in `module_vars`,
-        /// empty preview holes, and no Android registers.
+        /// The declarable callback-lifecycle block set (assembler#501, extended
+        /// #461). Flags/enums only — each names a fixed block whose BODY lives in
+        /// the assembler (`lifecycle/render.zig`), not the manifest. Selecting a
+        /// block is data; its Zig source is assembler-owned.
+        ///
+        /// Two of the controls are PRIVILEGED — `preview = .sokol_readback` and
+        /// `android_register = .bgfx_shell` emit blocks that reference
+        /// backend-private symbols (sokol's GL/D3D11/Metal readback externs; the
+        /// bgfx NativeActivity-shell register). A backend outside the reserved
+        /// `labelle.*` namespace that declares either is rejected at manifest
+        /// validation (`assertLifecyclePrivilege`), preserving the third-party
+        /// foot-gun protection from the original #501 design while letting the
+        /// built-in sokol/bgfx backends express their shape as DATA instead of a
+        /// `cfg.backend` enum branch (#461). An unprivileged callback backend
+        /// still gets `PREVIEW_HELPERS` + the input-dispatch stub in
+        /// `module_vars`, empty preview holes, and no Android registers (the
+        /// enum-, imgui-, readback-, shell-free defaults below).
         pub const Lifecycle = struct {
             /// Emit `var runner: Runner = undefined;` at module scope (the
             /// callback `init_code` assigns it; the per-frame `tick_code` reads
@@ -308,6 +317,25 @@ pub const BackendManifestV2 = struct {
             /// Emit the imgui `{{gui_event_extern}}`/`{{gui_event_forward}}`
             /// holes (only meaningful with a configured imgui GUI plugin).
             gui_events: bool = false,
+            /// Use the imgui-conditional input-dispatch variant in
+            /// `{{module_vars}}` (sokol / bgfx-android) rather than the safe
+            /// no-op stub (wasm / unprivileged third-party). #461.
+            imgui_dispatch: bool = false,
+            /// Which preview-readback block set the lifecycle wires.
+            /// `sokol_readback` is PRIVILEGED (`labelle.*` only). #461.
+            preview: Preview = .none,
+            /// Which Android registration seam the lifecycle wires. `bgfx_shell`
+            /// is PRIVILEGED (`labelle.*` only). #461.
+            android_register: AndroidRegister = .none,
+
+            /// Preview-readback wiring, mirrors `lifecycle/render.zig`'s
+            /// `CallbackPreview`. `callback_basic` is the generic emscripten
+            /// INIT/HEARTBEAT pair (any first-party wasm callback); only
+            /// `sokol_readback` is privileged.
+            pub const Preview = enum { none, callback_basic, sokol_readback };
+            /// Android registration seam, mirrors `lifecycle/render.zig`'s
+            /// `AndroidRegister`. `bgfx_shell` is privileged.
+            pub const AndroidRegister = enum { none, bgfx_shell };
         };
     };
 
@@ -317,6 +345,25 @@ pub const BackendManifestV2 = struct {
         ios: ?PlatformEntry = null,
         wasm: ?PlatformEntry = null,
     };
+
+    /// True if ANY platform's `.lifecycle` selects a PRIVILEGED block — the
+    /// sokol GL/D3D11/Metal readback (`preview = .sokol_readback`) or the bgfx
+    /// NativeActivity-shell register (`android_register = .bgfx_shell`). These
+    /// emit backend-private Zig, so only a reserved `labelle.*` provider may
+    /// declare them (`backend_registry.assertLifecyclePrivilege`, #461).
+    pub fn declaresPrivilegedLifecycle(self: BackendManifestV2) bool {
+        for ([_]?PlatformEntry{
+            self.platforms.desktop,
+            self.platforms.android,
+            self.platforms.ios,
+            self.platforms.wasm,
+        }) |maybe_p| {
+            const p = maybe_p orelse continue;
+            const lc = p.lifecycle orelse continue;
+            if (lc.preview == .sokol_readback or lc.android_register == .bgfx_shell) return true;
+        }
+        return false;
+    }
 };
 
 // ── Build hook ABI (types only — NOT invoked here) ───────────────────────

@@ -259,6 +259,50 @@ pub fn validateProviderIdentity(cfg: config.ProjectConfig, manifest_id: ?[]const
 /// single render backend, so this is future-proofing for when plugins/audio
 /// providers also carry identities — but it is the one place the whole set is
 /// cross-checked, mirroring the core-diamond unification check.
+/// Gate the PRIVILEGED callback-lifecycle blocks (#461). `preview =
+/// .sokol_readback` and `android_register = .bgfx_shell` emit assembler-owned
+/// Zig that references backend-PRIVATE symbols (sokol's GL/D3D11/Metal readback
+/// externs; the bgfx NativeActivity-shell register). Selecting them moved from
+/// the `cfg.backend` enum to manifest data (#461), so this restores the safety
+/// the enum implicitly provided: only a reserved `labelle.*` provider may
+/// declare them. `validateProviderIdentity` separately enforces `labelle.*` ⟹
+/// official/local repo, so a namespace check here suffices — a hostile
+/// `labelle.evil` from a non-official repo is rejected there, an `acme.*`
+/// declaring a privileged block is rejected here. An unprivileged third-party
+/// callback backend keeps the empty-preview / no-register / stub-dispatch
+/// defaults and never trips this.
+pub fn assertLifecyclePrivilege(
+    cfg: config.ProjectConfig,
+    declares_privileged: bool,
+    manifest_id: ?[]const u8,
+) !void {
+    if (!declares_privileged) return;
+    // Bundled built-in (no provider package): in-tree/trusted. None exist today,
+    // but keep the shape parallel to validateProviderIdentity's early return.
+    _ = cfg.effectiveBackendPackage() orelse return;
+    const id = manifest_id orelse {
+        std.debug.print(
+            "labelle-assembler: a backend provider declares a PRIVILEGED lifecycle block " ++
+                "(sokol readback / bgfx shell) but ships no canonical `.id`. Those blocks emit " ++
+                "backend-private Zig and are reserved to the official `labelle.*` namespace.\n",
+            .{},
+        );
+        return error.PrivilegedLifecycleRequiresReservedNamespace;
+    };
+    const dot = std.mem.indexOfScalar(u8, id, '.') orelse id.len;
+    if (!std.mem.eql(u8, id[0..dot], "labelle")) {
+        std.debug.print(
+            "labelle-assembler: backend provider '{s}' declares a PRIVILEGED lifecycle block " ++
+                "(`preview = .sokol_readback` or `android_register = .bgfx_shell`), but those emit " ++
+                "backend-private Zig and are reserved to the official `labelle.*` namespace. A " ++
+                "third-party callback backend uses the unprivileged defaults (empty preview, no " ++
+                "Android register, input-dispatch stub).\n",
+            .{id},
+        );
+        return error.PrivilegedLifecycleRequiresReservedNamespace;
+    }
+}
+
 pub fn checkProviderIdCollisions(ids: []const []const u8) !void {
     for (ids, 0..) |a, i| {
         for (ids[i + 1 ..]) |b| {
@@ -494,6 +538,38 @@ test "identity: a malformed id (no namespace) errors" {
         error.MalformedProviderId,
         validateProviderIdentity(cfg, "sokolonly"),
     );
+}
+
+test "privilege: a third-party declaring a privileged lifecycle block is rejected (#461)" {
+    // A non-`labelle.*` backend that declares `preview = .sokol_readback` or
+    // `android_register = .bgfx_shell` (declares_privileged = true) would emit
+    // backend-private Zig it can't satisfy — rejected at validation.
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend_package = .{ .name = "vulkan", .repo = "github:someone/labelle-vulkan" },
+    };
+    try std.testing.expectError(
+        error.PrivilegedLifecycleRequiresReservedNamespace,
+        assertLifecyclePrivilege(cfg, true, "someone.vulkan"),
+    );
+    // ...and a privileged declaration with NO canonical id can't prove entitlement.
+    try std.testing.expectError(
+        error.PrivilegedLifecycleRequiresReservedNamespace,
+        assertLifecyclePrivilege(cfg, true, null),
+    );
+    // An UNprivileged callback backend (declares_privileged = false) is always fine.
+    try assertLifecyclePrivilege(cfg, false, "someone.vulkan");
+}
+
+test "privilege: a labelle.* provider may declare the privileged blocks (#461)" {
+    // The built-in sokol/bgfx path: a reserved-namespace id (validated official/
+    // local by `validateProviderIdentity`) is entitled to the privileged blocks.
+    const cfg = config.ProjectConfig{
+        .name = "g",
+        .backend = .sokol,
+        .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
+    };
+    try assertLifecyclePrivilege(cfg, true, "labelle.sokol");
 }
 
 test "identity: a spoof repo merely CONTAINING labelle-toolkit/ is rejected (#453 security)" {
