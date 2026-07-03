@@ -694,7 +694,13 @@ pub const ProjectConfig = struct {
         return switch (backend) {
             // Extracted out-of-tree (#386 Phase 6c) — `.backend = .<tag>` resolves
             // to the provider package, not a bundled slot.
-            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.5.2" },
+            // 0.6.1 ships the editor-preview wasm template holes + hook field
+            // (labelle-bgfx#25) — paired with this assembler's
+            // LABELLE_EDITOR_PREVIEW support so a preview build resolves a
+            // hole-bearing backend instead of fail-fasting on 0.5.2. (The
+            // 0.6.1 wasm template requires assembler ≥ 0.74.0; this pin ships
+            // inside 0.74.0, so the pairing is self-consistent.)
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.6.1" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.3.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.3.1" },
