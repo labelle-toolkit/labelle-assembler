@@ -1092,3 +1092,179 @@ pub const GAME_EVENT_VARIANT_NAMES = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "fight_u_started") == null);
     }
 };
+
+// ── Editor-preview wasm splice (labelle-studio Play mode, Phase 3) ──────────
+// The assembler side of the studio's Play mode: an editor-preview generation
+// (`cfg.editor_preview`, activated by LABELLE_EDITOR_PREVIEW=1 /
+// --editor-preview, wasm-only) fills the `{{editor_bind}}` /
+// `{{editor_sim_open}}` / `{{editor_sim_close}}` holes a backend's wasm
+// template declares (labelle-bgfx ≥ 0.6.1 first) so the generated main binds
+// `engine.editor_api` and gates the sim; a non-preview generation fills them
+// EMPTY and must reproduce the pre-preview bytes exactly.
+pub const EDITOR_PREVIEW = struct {
+    fn genBgfxWasm(editor_preview: bool) ![]const u8 {
+        return generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .wasm,
+            .editor_preview = editor_preview,
+            .ecs = .mock,
+        }, h.bgfx_wasm_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+    }
+
+    test "editor-preview bgfx-wasm main.zig matches its reviewed golden" {
+        // Golden for the three splice points (same discipline as
+        // `acme_callback_main.zig`, #501): bind / sim gate / frame sync in
+        // the bgfx wasm callback shape. Regenerate + re-review on an
+        // intentional change.
+        const main_zig = try genBgfxWasm(true);
+        defer std.testing.allocator.free(main_zig);
+
+        const golden = @embedFile("goldens/bgfx_wasm_editor_preview_main.zig");
+        try std.testing.expectEqualStrings(golden, main_zig);
+    }
+
+    test "editor-preview splice: bind before the main loop, sim gated, frame after sim" {
+        const main_zig = try genBgfxWasm(true);
+        defer std.testing.allocator.free(main_zig);
+
+        // (1) bind — once at startup, after setup (runner.setup is the tail
+        // of {{setup_code}}), BEFORE emscripten_set_main_loop.
+        const bind_at = std.mem.indexOf(u8, main_zig, "engine.editor_api.bind(&g, &runner);").?;
+        const setup_at = std.mem.indexOf(u8, main_zig, "runner.setup(&g);").?;
+        const loop_at = std.mem.indexOf(u8, main_zig, "emscripten_set_main_loop(&gameFrame").?;
+        try std.testing.expect(setup_at < bind_at);
+        try std.testing.expect(bind_at < loop_at);
+
+        // (2) sim gate — shouldTick opens BEFORE the tick block; the close
+        // brace + frame(&g) land AFTER g.tick(dt) and BEFORE the render half.
+        const gate_at = std.mem.indexOf(u8, main_zig, "if (engine.editor_api.shouldTick()) {").?;
+        const tick_at = std.mem.indexOf(u8, main_zig, "runner.tick(&g, scaled_dt);").?;
+        const gtick_at = std.mem.indexOf(u8, main_zig, "g.tick(dt);").?;
+        const frame_at = std.mem.indexOf(u8, main_zig, "engine.editor_api.frame(&g);").?;
+        const render_at = std.mem.indexOf(u8, main_zig, "window.beginFrame();").?;
+        try std.testing.expect(gate_at < tick_at);
+        try std.testing.expect(tick_at < gtick_at);
+        try std.testing.expect(gtick_at < frame_at);
+        try std.testing.expect(frame_at < render_at);
+
+        // (3) stale-engine guard — a pin without editor_api fails with the
+        // actionable @compileError, not a bare missing-member error.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@hasDecl(engine, \"editor_api\")") != null);
+
+        // No template hole leaked through unfilled.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "{{editor_") == null);
+    }
+
+    test "NON-preview generation against the hole-bearing template emits NO editor code" {
+        // The byte-identity property: the SAME (hole-bearing) wasm template,
+        // preview off → no editor_api anywhere, no leaked `{{editor_*}}`
+        // placeholder, and the splice lines collapse to the pre-preview
+        // shape (`g.tick(dt);` followed by a blank line, `{{setup_code}}`
+        // directly followed by the emscripten_set_main_loop call).
+        const main_zig = try genBgfxWasm(false);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "editor_api") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "{{editor_") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "    g.tick(dt);\n\n    window.beginFrame();") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "    emscripten_set_main_loop(&gameFrame, 0, 1);") != null);
+    }
+
+    test "editor_preview is inert off wasm (the wasm-only rule at the codegen layer)" {
+        // `generate` normalizes the flag off for non-wasm platforms, but the
+        // codegen layer must ALSO ignore a stray flag: a desktop generation
+        // with editor_preview set emits no editor code (its template has no
+        // holes and the splice is wasm-gated).
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .platform = .desktop,
+            .editor_preview = true,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "editor_api") == null);
+    }
+
+    /// Minimal wasm-shaped lifecycle with each editor hole individually
+    /// toggleable — the partial-hole matrix for the all-or-nothing check
+    /// (#526 review, CodeRabbit Major + codex P2). With all three toggled
+    /// off this is the PRE-0.6.1 bgfx wasm shape (no holes at all).
+    fn wasmTmpl(comptime bind: bool, comptime sim_open: bool, comptime sim_close: bool) []const u8 {
+        return "{{module_vars}}var g: AssembledGame = undefined;\n" ++
+            "{{hooks_init_block}}\n" ++
+            "fn gameFrame() callconv(.c) void {\n" ++
+            "    const dt: f32 = 0.016;\n" ++
+            "{{preview_heartbeat}}" ++ (if (sim_open) "{{editor_sim_open}}" else "") ++ "{{tick_code}}    g.tick(dt);\n" ++
+            (if (sim_close) "{{editor_sim_close}}" else "") ++ "\n" ++
+            "    window.beginFrame();\n" ++
+            "    window.endFrame();\n" ++
+            "}\n" ++
+            "pub fn main() !void {\n" ++
+            "    const allocator = std.heap.c_allocator;\n" ++
+            "    g = AssembledGame.init(allocator);\n" ++
+            "    g.setHooks(&hooks);\n" ++
+            "{{preview_setup}}{{setup_code}}" ++ (if (bind) "{{editor_bind}}" else "") ++ "    emscripten_set_main_loop(&gameFrame, 0, 1);\n" ++
+            "}\n";
+    }
+
+    fn genPreviewWith(comptime tmpl: []const u8) ![]const u8 {
+        return generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .wasm,
+            .editor_preview = true,
+            .ecs = .mock,
+        }, tmpl, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+    }
+
+    test "editor preview against a wasm template WITHOUT the holes is a hard error" {
+        // A backend whose wasm template predates the editor holes cannot
+        // produce a drivable Play-mode build — silently emitting a non-editor
+        // main would leave the studio connecting to a game it cannot drive.
+        try std.testing.expectError(error.EditorPreviewUnsupportedByBackend, genPreviewWith(comptime wasmTmpl(false, false, false)));
+    }
+
+    test "editor preview: a PARTIAL hole set is rejected, never partially spliced" {
+        // All-or-nothing (#526 review, CodeRabbit Major + codex P2):
+        // `tpl.render` silently drops values for undeclared holes, so a
+        // partial set would generate a syntactically broken main.zig (sim
+        // gate opened but never closed) or a silently un-gated one (bind
+        // without shouldTick/frame). Each hole individually missing must be
+        // the SAME hard error the hole-less template gets.
+        // missing {{editor_bind}} only:
+        try std.testing.expectError(error.EditorPreviewUnsupportedByBackend, genPreviewWith(comptime wasmTmpl(false, true, true)));
+        // missing {{editor_sim_open}} only:
+        try std.testing.expectError(error.EditorPreviewUnsupportedByBackend, genPreviewWith(comptime wasmTmpl(true, false, true)));
+        // missing {{editor_sim_close}} only:
+        try std.testing.expectError(error.EditorPreviewUnsupportedByBackend, genPreviewWith(comptime wasmTmpl(true, true, false)));
+    }
+
+    test "editor preview: the SAME minimal template with all three holes generates the full splice" {
+        // Positive control for the matrix above: the all-holes variant of the
+        // exact template the partial cases reject must generate — with all
+        // three splice points present (bind + gate + frame sync) and no
+        // leaked `{{editor_*}}` placeholder.
+        const main_zig = try genPreviewWith(comptime wasmTmpl(true, true, true));
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.editor_api.bind(&g, &runner);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (engine.editor_api.shouldTick()) {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.editor_api.frame(&g);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "{{editor_") == null);
+    }
+
+    test "editor-preview main.zig is syntactically valid Zig" {
+        const main_zig = try genBgfxWasm(true);
+        defer std.testing.allocator.free(main_zig);
+        const dup = try std.testing.allocator.dupeZ(u8, main_zig);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+};

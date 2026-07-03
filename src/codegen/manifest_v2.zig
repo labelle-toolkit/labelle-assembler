@@ -357,6 +357,20 @@ pub const HookContext = struct {
     /// `orelse 34` would emit a wrong `usr/lib/<triple>/34` path while appearing
     /// to honor the user's `target_sdk_version`).
     android_target_sdk: ?u32,
+
+    /// Editor-preview build (labelle-studio Play mode, wasm only). When true
+    /// the hook's wasm emcc arm must keep the `editor_*` exports alive:
+    /// `-sEXPORTED_FUNCTIONS=_main,_editor_*` + `-sEXPORTED_RUNTIME_METHODS=
+    /// ccall,cwrap,HEAPU8`. The exports MUST be conditional on this flag —
+    /// emcc hard-errors on exported symbols that don't exist ("wasm-ld:
+    /// error: symbol exported via --export not found", verified on emcc
+    /// 4.0.x), and the `editor_*` symbols only exist when the generated main
+    /// binds `engine.editor_api`. DEFAULTED so the generated post_wire call
+    /// omits the field on non-preview builds — older hooks (whose
+    /// HookContext predates this field) keep compiling for every normal
+    /// build; only an editor-preview generation requires a hook that
+    /// declares it (labelle-bgfx >= 0.6.1).
+    editor_preview: bool = false,
 };
 
 // ── Header-first bounded version parse (design §3/§6) ─────────────────────

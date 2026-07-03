@@ -1,6 +1,7 @@
 /// labelle-cli generator — reads project.labelle, outputs .labelle/ assembler files.
 /// Thin orchestrator that delegates to focused submodules.
 const std = @import("std");
+const builtin = @import("builtin");
 
 // ── Submodules ─────────────────────────────────────────────────────────
 const config = @import("config.zig");
@@ -32,6 +33,7 @@ const idents = @import("codegen/idents.zig");
 // Force test discovery for files that aren't transitively reached by
 // any compiled function path during `addTest` runs.
 test {
+    _ = @import("config.zig");
     _ = @import("plugin_manifest.zig");
     _ = @import("pack_validate.zig");
     _ = @import("check.zig");
@@ -964,6 +966,38 @@ pub fn generate(
     defer allocator.free(mutable_resources);
     cfg.resources = mutable_resources;
 
+    // ── Editor-preview activation (labelle-studio Play mode) ─────────────
+    // The studio spawns `labelle build --platform=wasm` with
+    // `LABELLE_EDITOR_PREVIEW=1` in the environment; the env propagates
+    // through the CLI into this assembler invocation, so reading it HERE
+    // (instead of adding a CLI flag through labelle-cli) needs no labelle-cli
+    // release. Preview is WASM-ONLY — the browser editor drives the running
+    // game through the `editor_*` wasm exports — so on every other platform
+    // the request is NORMALIZED OFF (not errored): a desktop build run with
+    // the var set must stay byte-identical to a plain build. Zig 0.16 note:
+    // `std.process.hasEnvVarConstant` / `std.posix.getenv` are gone; env
+    // access goes through the process `Environ` (`config.globalEnviron`),
+    // same as `cache/env.zig`.
+    if (cfg.platform != .wasm) {
+        cfg.editor_preview = false;
+    } else if (!cfg.editor_preview) {
+        const environ = config.globalEnviron();
+        if (environ.getAlloc(allocator, "LABELLE_EDITOR_PREVIEW")) |v| {
+            defer allocator.free(v);
+            cfg.editor_preview = config.editorPreviewEnvEnabled(v);
+        } else |_| {}
+    }
+    if (cfg.editor_preview) {
+        // Generate-time breadcrumb: the splice compiles only against an
+        // engine that ships `editor_api` (the generated main.zig carries a
+        // matching `@compileError` guard so a stale pin fails with a clear
+        // message rather than a bare "no member named 'editor_api'").
+        std.log.info(
+            "labelle-assembler: editor-preview wasm build (LABELLE_EDITOR_PREVIEW) — requires a labelle-engine that ships `editor_api`",
+            .{},
+        );
+    }
+
     const io = config.globalIo();
 
     // ── Provider identity + capability negotiation (RFC "Opening the
@@ -990,6 +1024,46 @@ pub fn generate(
     const backend_manifest_name = detectV2ManifestName(allocator, cfg, game_dir);
     try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, backend_manifest_name);
     try validateProviderContracts(allocator, cfg, game_dir, backend_manifest_name, is_tests_target);
+
+    // ── Editor-preview link-path gate (#526 review, codex P2) ────────────
+    // The `editor_*` exports reach the emcc link ONLY through the manifest-v2
+    // wasm splice: `renderWasmLinkV2` threads `.editor_preview = true` into
+    // the backend hook's `post_wire`, whose emcc arm adds the
+    // `-sEXPORTED_FUNCTIONS=_main,_editor_*` list. On any other wasm build
+    // path (v1/enum, or a v2 manifest without a wasm platform entry) nothing
+    // threads the export list — a hole-bearing template there would splice
+    // `editor_api` into main.zig while the JS side gets no callable editor
+    // entry points, so Play mode would connect to a game it cannot drive.
+    // Reject at generate time with the same upgrade-hint error the
+    // template-hole check uses. (The tests target never trips this: it is
+    // forced to `.desktop`, so the wasm-only normalization above already
+    // cleared the flag.)
+    if (cfg.editor_preview) {
+        const v2_wasm_link = blk: {
+            const name = backend_manifest_name orelse break :blk false;
+            const parsed = manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name) catch break :blk false;
+            defer parsed.free(allocator);
+            break :blk switch (parsed) {
+                .v2 => |m| m.platforms.wasm != null,
+                .v1 => false,
+            };
+        };
+        if (!v2_wasm_link) {
+            // Silenced under test — the Zig test runner fails any test that
+            // emits `std.log.err`, even when the error is the asserted
+            // outcome (see cache/env.zig's HOME-missing log for the same gate).
+            if (!builtin.is_test) {
+                std.log.err(
+                    "labelle-assembler: editor-preview build requested (LABELLE_EDITOR_PREVIEW) but " ++
+                        "backend '{s}' does not take the manifest-v2 wasm build path — only the v2 wasm " ++
+                        "backend hook (post_wire) can thread the editor_* exports into the emcc link. " ++
+                        "Upgrade the backend package (labelle-bgfx >= 0.6.1) or build without editor preview",
+                    .{cfg.backendName()},
+                );
+            }
+            return error.EditorPreviewUnsupportedByBackend;
+        }
+    }
 
     // Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
     // target platform opts into ASTC (`asset_compression`) and `labelle astc`

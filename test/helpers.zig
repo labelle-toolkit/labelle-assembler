@@ -264,6 +264,74 @@ pub const sokol_alloc_lifecycle =
     \\
 ;
 
+// Mirror of `labelle-bgfx/templates/wasm.txt` (≥ 0.6.1) — the bgfx wasm
+// lifecycle template WITH the editor-preview holes (labelle-studio Play
+// mode): `{{editor_bind}}` between `{{setup_code}}` and the
+// `emscripten_set_main_loop` call, `{{editor_sim_open}}` /
+// `{{editor_sim_close}}` bracketing the SIM half of `gameFrame`
+// (`{{tick_code}}` + `g.tick(dt)`). Hole placement is chosen so an EMPTY
+// fill reproduces the pre-preview template bytes exactly — the
+// editor-preview tests assert both fills against this one fixture.
+// (Trimmed of the real template's Zig-0.16 emscripten std shims + prose;
+// the placeholder shape and the splice-relevant line layout are exact.)
+pub const bgfx_wasm_lifecycle =
+    \\const screen_w: u32 = {{width}};
+    \\const screen_h: u32 = {{height}};
+    \\const screen_title = "{{title}}";
+    \\const target_fps: u32 = {{fps}};
+    \\
+    \\const BackendGfxType = @import("backend_gfx");
+    \\
+    \\pub const panic = std.debug.FullPanic(struct {
+    \\    fn handler(msg: []const u8, ret_addr: ?usize) noreturn {
+    \\        _ = msg;
+    \\        _ = ret_addr;
+    \\        @trap();
+    \\    }
+    \\}.handler);
+    \\
+    \\{{module_vars}}var g: AssembledGame = undefined;
+    \\{{hooks_init_block}}
+    \\var g_allocator: std.mem.Allocator = undefined;
+    \\
+    \\fn gameFrame() callconv(.c) void {
+    \\    const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
+    \\
+    \\    BackendGfxType.setScreenSize(window.width(), window.height());
+    \\    BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
+    \\{{preview_heartbeat}}{{editor_sim_open}}{{tick_code}}    g.tick(dt);
+    \\{{editor_sim_close}}
+    \\    window.beginFrame();
+    \\    window.clearBackground(245, 245, 245, 255);
+    \\    g.render();
+    \\    g.renderGizmos();
+    \\{{gui_draw_code}}    window.drawText(screen_title, 10, 10, 20, 80, 80, 80, 255);
+    \\    window.endFrame();
+    \\}
+    \\
+    \\extern "c" fn emscripten_set_main_loop(
+    \\    func: *const fn () callconv(.c) void,
+    \\    fps: c_int,
+    \\    simulate_infinite_loop: c_int,
+    \\) void;
+    \\
+    \\pub fn main() !void {
+    \\    const allocator = std.heap.c_allocator;
+    \\    g_allocator = allocator;
+    \\
+    \\{{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
+    \\
+    \\    g = AssembledGame.init(allocator);
+    \\
+    \\    g.setHooks(&hooks);
+    \\
+    \\    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    \\
+    \\{{preview_setup}}{{setup_code}}{{editor_bind}}    emscripten_set_main_loop(&gameFrame, 0, 1);
+    \\}
+    \\
+;
+
 pub const empty_names: []const []const u8 = &.{};
 pub const ScriptEntry = generate.script_scanner.ScriptScanner.ScriptEntry;
 pub const empty_entries: []const ScriptEntry = &.{};

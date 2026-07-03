@@ -818,7 +818,7 @@ fn renderWasmBackendDepV2(
 /// wiring. The wasm root artifact is `wasm` (a static lib emcc links). NO
 /// `resolve_target` (static triple); NO `renderPackageV2(.web)` (post_wire owns
 /// packaging — see the section note).
-fn renderWasmLinkV2(m: BackendManifestV2, w: anytype) !void {
+fn renderWasmLinkV2(m: BackendManifestV2, cfg: ProjectConfig, w: anytype) !void {
     const wasm = m.platforms.wasm orelse return error.V2PlatformUnsupported;
 
     // GENERATED (D): link the platform artifact(s) into the wasm lib. emcc scans
@@ -844,9 +844,29 @@ fn renderWasmLinkV2(m: BackendManifestV2, w: anytype) !void {
         \\        .platform = .wasm,
         \\        .ios_sdk_path = null,
         \\        .android_target_sdk = null,
-        \\    }});
         \\
     , .{manifest_v2.HOOK_ABI_VERSION});
+    // Editor preview (labelle-studio Play mode): tell the hook's emcc arm to
+    // keep the `editor_*` exports alive (-sEXPORTED_FUNCTIONS / _RUNTIME_
+    // METHODS). Emitted ONLY on an editor-preview generation so a normal
+    // build's post_wire call stays byte-identical AND keeps compiling against
+    // older hooks whose HookContext predates the field (the field defaults to
+    // false in the hook). A preview build against a too-old hook fails with a
+    // "no field named 'editor_preview'" error naming this line — the intended
+    // upgrade signal (labelle-bgfx >= 0.6.1).
+    if (cfg.editor_preview) {
+        try w.writeAll(
+            \\        // Editor preview (labelle-studio Play mode): keep the `_editor_*`
+            \\        // exports alive in the emcc link. Requires a backend hook whose
+            \\        // HookContext declares `editor_preview` (labelle-bgfx >= 0.6.1).
+            \\        .editor_preview = true,
+            \\
+        );
+    }
+    try w.writeAll(
+        \\    });
+        \\
+    );
 }
 
 /// v2 wasm FOOTER — the build-fn close + the `overrideImport`/`unifyGfxSubpackageCore`
@@ -876,7 +896,7 @@ pub fn renderLinkSectionV2(
             try renderDesktopLinkGenericV2(m, w),
         .android => try renderAndroidLinkV2(m, cfg, w),
         .ios => try renderIosLinkV2(m, w),
-        .wasm => try renderWasmLinkV2(m, w),
+        .wasm => try renderWasmLinkV2(m, cfg, w),
     }
     _ = allocator;
 }
