@@ -1,7 +1,7 @@
 .{
     .name = "example_external_null",
     .title = "LaBelle — external backend (nullfixture)",
-    .backend_package = .{ .name = "nullfixture", .repo = "github.com/labelle-toolkit/labelle-nullfixture-backend", .version = "0.2.0" },
+    .backend_package = .{ .name = "nullfixture", .repo = "github.com/labelle-toolkit/labelle-nullfixture-backend", .version = "0.3.0" },
     .y_axis = .up,
     .ecs = .mock,
     .core_version = "local:../../../labelle-core",
