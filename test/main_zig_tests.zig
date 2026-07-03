@@ -172,6 +172,8 @@ pub const MAIN_ZIG = struct {
     }
 
     test "bgfx android generates callback-driven main owning android_main" {
+        h.setBgfxAndroidLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
@@ -202,6 +204,8 @@ pub const MAIN_ZIG = struct {
         // codegen registers the engine's UI-thread hide with the shell, which
         // chains onWindowFocusChanged (a UI-thread callback). Assert the
         // registration lands in `android_main`, before `run`.
+        h.setBgfxAndroidLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
@@ -231,6 +235,8 @@ pub const MAIN_ZIG = struct {
         // Without the opt-in, no immersive call of any kind: the shell still
         // chains onWindowFocusChanged but with no callback registered it just
         // forwards, so applyImmersiveUiThread is never referenced.
+        h.setBgfxAndroidLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
@@ -244,61 +250,57 @@ pub const MAIN_ZIG = struct {
     }
 
     // ── #461: lifecycle SHAPE is manifest data, not a `cfg.backend` enum ──────
-    // The differential guard for the enum→manifest migration. Each test
-    // generates the SAME main.zig twice, varying ONLY `lifecycle_override`:
-    // null → the enum-path shape (`cfg.backend == .sokol` / `is_bgfx_android`
-    // branch), the manifest decl → the data-path shape (`shapeFromDecl`). Equal
-    // output proves the manifest declaration reproduces the built-in shape
-    // byte-for-byte, so the enum branch is a redundant fallback (deleted in the
-    // final #461 step once the external manifests declare their shape too).
+    // These were the differential guards for the enum→manifest migration
+    // (enum-path output vs manifest-declared output, asserted byte-identical).
+    // #461 DELETED the enum-path arms from `lifecycle/render.zig`, so there is no
+    // longer an enum baseline to compare against — the manifest declaration is
+    // now the ONLY path. Each test drives that path (via `set*Lifecycle`, the
+    // same values production resolves from the v2 manifest) and asserts the real
+    // callback SHAPE fired: the sokol-private readback / bgfx-shell markers plus
+    // the exported callback entry points. (The output equals the pre-#461 enum
+    // bytes — the deleted differential proved that; the committed goldens /
+    // acme_callback golden lock the byte shape going forward.)
 
-    test "sokol desktop: manifest-declared lifecycle == enum-path main (byte-identical, #461)" {
-        const enum_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+    test "sokol desktop: manifest-declared lifecycle drives the sokol callback shape (#461)" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
         }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
-        defer std.testing.allocator.free(enum_main);
+        defer std.testing.allocator.free(main_zig);
 
-        generate.main_template.lifecycle_override = h.sokol_lifecycle_decl;
-        defer generate.main_template.lifecycle_override = null;
-        const manifest_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
-            .name = "test-game",
-            .backend = .sokol,
-            .ecs = .mock,
-        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
-        defer std.testing.allocator.free(manifest_main);
-
-        try std.testing.expectEqualStrings(enum_main, manifest_main);
-        // Sanity: the shape actually fired (sokol-private readback + immersive seam).
-        try std.testing.expect(std.mem.indexOf(u8, manifest_main, "_sokol_preview") != null);
+        // The sokol callback shape fired: exported C callbacks + the module-scope
+        // runner + the sokol-private GL/D3D11/Metal readback seam.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn init() callconv(.c)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn frame() callconv(.c)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn cleanup() callconv(.c)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var runner: Runner = undefined;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_sokol_preview") != null);
     }
 
-    test "bgfx android: manifest-declared lifecycle == enum-path main (byte-identical, #461)" {
-        const enum_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+    test "bgfx android: manifest-declared lifecycle drives the bgfx-shell callback shape (#461)" {
+        h.setBgfxAndroidLifecycle();
+        defer h.clearLifecycleOverrides();
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
             .platform = .android,
             .ecs = .mock,
         }, bgfx_android_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
-        defer std.testing.allocator.free(enum_main);
+        defer std.testing.allocator.free(main_zig);
 
-        generate.main_template.lifecycle_override = h.bgfx_android_lifecycle_decl;
-        defer generate.main_template.lifecycle_override = null;
-        const manifest_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
-            .name = "test-game",
-            .backend = .bgfx,
-            .platform = .android,
-            .ecs = .mock,
-        }, bgfx_android_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
-        defer std.testing.allocator.free(manifest_main);
-
-        try std.testing.expectEqualStrings(enum_main, manifest_main);
-        // Sanity: the bgfx_shell android register actually fired.
-        try std.testing.expect(std.mem.indexOf(u8, manifest_main, "android_app.setInitCallback(&gameInit)") != null);
+        // The bgfx NativeActivity-shell shape fired: the game owns android_main,
+        // registers the init/tick callbacks, and drives the shell's `run`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "export fn android_main(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "android_app.setInitCallback(&gameInit)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "var runner: Runner = undefined;") != null);
     }
 
     test "sokol android registers the core Android backend seam before immersive (labelle-core#310)" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -334,6 +336,8 @@ pub const MAIN_ZIG = struct {
         // Gamepad detection needs the context regardless of immersive mode, so
         // the registration is emitted on every sokol-Android build; only the
         // immersive call is gated on `.android.immersive_mode`.
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -350,6 +354,8 @@ pub const MAIN_ZIG = struct {
     test "non-android sokol does NOT emit the Android backend registration" {
         // Desktop sokol must not reference the Android seam — the registration
         // is gated to sokol + Android in `buildImmersiveEntryCode`.
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -575,13 +581,14 @@ pub const NULL_BACKEND = struct {
     }
 
     test "external bgfx-android is NOT rejected — it has a real callback dispatch path (#386)" {
-        // The callback-external guard must reject only backends that would fall
-        // through to the raylib-wasm fallback. An EXTERNAL bgfx on Android keeps
-        // `cfg.backend == .bgfx` (the enum-as-shorthand preserves the tag), so
-        // `is_bgfx_android` still fires and the callback dispatch has a real
-        // branch — it must generate the bgfx-android callback main, not error.
-        // (Setting both `.backend = .bgfx` and `.backend_package` models the
-        // post-flip state: external resolution + preserved enum tag.)
+        // The callback-external guard must reject only backends whose callback
+        // shape codegen can't render. An EXTERNAL bgfx on Android declares its
+        // callback run-loop + lifecycle in its v2 manifest (modeled here by the
+        // overrides, as production resolves them), so `lifecycle_ovr != null`
+        // makes `callback_dispatch_handled` true and the bgfx-android callback
+        // main generates rather than erroring.
+        h.setBgfxAndroidLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
@@ -597,17 +604,16 @@ pub const NULL_BACKEND = struct {
     }
 
     test "external sokol-desktop is NOT rejected — it has a real callback dispatch path (#454)" {
-        // Regression-lock for the #454 re-check: sokol is now a fully EXTERNAL
-        // backend (`builtinProvider(.sokol)` resolves to labelle-sokol), and it
-        // declares a `.callback` run-loop. The callback-external guard must NOT
-        // reject it — the enum-as-shorthand preserves `cfg.backend == .sokol`, so
-        // `callback_dispatch_handled` is true and the sokol callback dispatch has
-        // a real branch. This must generate the sokol callback main (export
+        // Regression-lock for the #454 re-check: sokol is a fully EXTERNAL
+        // backend (`builtinProvider(.sokol)` resolves to labelle-sokol) that
+        // declares a `.callback` run-loop + its lifecycle blocks in its v2
+        // manifest (modeled here by the overrides). The callback-external guard
+        // must NOT reject it — `lifecycle_ovr != null` makes
+        // `callback_dispatch_handled` true and the sokol callback dispatch has a
+        // real shape. This must generate the sokol callback main (export
         // init/frame/cleanup), not `error.ExternalCallbackBackendUnsupported`.
-        // (Setting both `.backend = .sokol` and `.backend_package` models the
-        // post-flip state: external resolution + preserved enum tag. If someone
-        // ever drops `cfg.backend == .sokol` from `callback_dispatch_handled`,
-        // this test fails instead of production silently breaking sokol-desktop.)
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -755,6 +761,10 @@ pub const NULL_BACKEND = struct {
         // Rendering path intact.
         try std.testing.expect(std.mem.indexOf(u8, raylib_main, "g.render()") != null);
 
+        // Sokol takes the manifest-driven callback shape (raylib above stays on
+        // the loop path — its generation ran before the override is set).
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const sokol_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -836,6 +846,8 @@ pub const PLUGIN_CONTROLLERS = struct {
     }
 
     test "plugins present wires controllers into init/cleanup (sokol callback backend)" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -925,6 +937,8 @@ pub const PLUGIN_CONTROLLERS = struct {
 
 pub const SOKOL = struct {
     test "sets renderer screen height" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .height = 600,
@@ -937,6 +951,8 @@ pub const SOKOL = struct {
     }
 
     test "generates callback-style main" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -950,6 +966,8 @@ pub const SOKOL = struct {
     }
 
     test "uses module-level runner var" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -963,6 +981,8 @@ pub const SOKOL = struct {
     }
 
     test "initial_prefab overrides default jsonc_scene_names[0]" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const jsonc_scenes = &[_][]const u8{ "intro", "main_menu", "gameplay" };
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
@@ -977,6 +997,8 @@ pub const SOKOL = struct {
     }
 
     test "initial_scene legacy alias still overrides default jsonc_scene_names[0]" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const jsonc_scenes = &[_][]const u8{ "intro", "main_menu", "gameplay" };
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
@@ -1016,6 +1038,8 @@ pub const SOKOL = struct {
     }
 
     test "resolved_gui with lifecycle generates init in callback and shutdown in cleanup" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -1036,6 +1060,8 @@ pub const SOKOL = struct {
     // For wasm, the inner declaration must be omitted (allocator is
     // already in scope from the module-level `{{allocator_decl}}`).
     test "wasm: no duplicate const allocator declaration in main.zig" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -1060,6 +1086,8 @@ pub const SOKOL = struct {
     // `initInner` can refer to `allocator` (the module scope only has
     // `var gpa = ...`, not `const allocator = ...`).
     test "desktop: initInner declares allocator from gpa" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,

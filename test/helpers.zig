@@ -636,6 +636,40 @@ pub const bgfx_android_lifecycle_decl = generate.manifest_v2.BackendManifestV2.P
     .android_register = .bgfx_shell,
 };
 
+// ── Callback-lifecycle override helpers (#461) ────────────────────────────────
+// `generateMainZigFromTemplate` is a UNIT entry that bypasses manifest
+// resolution, so a callback-path test must inject the shape the production
+// `generate` resolves from the backend's v2 manifest. Since #461 deleted the
+// `cfg.backend == .sokol` / `is_bgfx_android` enum shortcuts from
+// `lifecycle/render.zig`, a sokol/bgfx callback test that leaves the overrides
+// null now falls to the LOOP path (wrong shape). These set the SAME values
+// production resolves (`loop_style = .callback` + the platform `.lifecycle`),
+// so the unit test exercises the real callback shape. Pair each with
+// `defer clearLifecycleOverrides();`.
+
+/// Drive the sokol callback shape (desktop/mobile/wasm): loop_style `.callback`
+/// + sokol's full lifecycle decl (module runner, cleanup callback, allocator
+/// holes, gui events, imgui dispatch, sokol readback preview).
+pub fn setSokolLifecycle() void {
+    generate.main_template.loop_style_override = .callback;
+    generate.main_template.lifecycle_override = sokol_lifecycle_decl;
+}
+
+/// Drive the bgfx-Android NativeActivity-shell callback shape: loop_style
+/// `.callback` + bgfx's lifecycle decl (module runner, imgui dispatch, bgfx
+/// shell android register).
+pub fn setBgfxAndroidLifecycle() void {
+    generate.main_template.loop_style_override = .callback;
+    generate.main_template.lifecycle_override = bgfx_android_lifecycle_decl;
+}
+
+/// Reset both lifecycle threadlocals to their null default. `defer` this after
+/// any `set*Lifecycle()` so the override never leaks into the next test.
+pub fn clearLifecycleOverrides() void {
+    generate.main_template.loop_style_override = null;
+    generate.main_template.lifecycle_override = null;
+}
+
 // Byte-copy MIRROR of `backends/acme_callback/templates/desktop.txt` — the
 // third-party callback entry template. Inlined so the codegen unit + golden
 // tests run offline against exactly the fixture the production path loads from

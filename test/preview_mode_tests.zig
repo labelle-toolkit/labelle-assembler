@@ -346,6 +346,8 @@ pub const PREVIEW_MODE = struct {
     ;
 
     test "sokol desktop emits PBO readback + publishFrame between flushScene and endFrame" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -441,6 +443,8 @@ pub const PREVIEW_MODE = struct {
         //     three lifecycle hooks
         // The GL slice (#124) is unchanged — sokol-Linux still has its
         // inline PBO template emitted here.
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -499,6 +503,8 @@ pub const PREVIEW_MODE = struct {
         // driven from inside `window.preview_mtl.beginFrame()` and
         // cleared by `window.preview_mtl.endFrame()`. The codegen
         // template just calls these around `g.render()`.
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -571,6 +577,8 @@ pub const PREVIEW_MODE = struct {
         // `_sokol_preview_d3d11_enabled` (`builtin.os.tag == .windows`).
         // Both blocks ship side by side; their gates are mutually
         // exclusive so only one runs per target.
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -741,6 +749,8 @@ pub const PREVIEW_MODE = struct {
     //      separate window-in-window surface; its `LABELLE_PREVIEW`
     //      block must not reference `window.hideWindow`.
     test "sokol callback emits window.hideWindow inside preview-connect arm (#137)" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,

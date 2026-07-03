@@ -435,6 +435,8 @@ pub const GATED_ADAPTER_WIRING = struct {
     test "sokol callback path also gates audio/font adapters" {
         // Sokol/wasm uses buildCallbackInitCode rather than
         // buildSetupCode — the gating must hold there too.
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
@@ -450,6 +452,8 @@ pub const GATED_ADAPTER_WIRING = struct {
     }
 
     test "sokol callback path: font-only project gets font adapter, not audio" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,

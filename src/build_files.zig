@@ -224,6 +224,35 @@ fn desktopUsesGenericV2(v2_manifest: ?manifest_v2.BackendManifestV2, cfg: Projec
     return !manifest_v2_splice.isDesktopByteAnchor(m);
 }
 
+/// Whether the Android exe's root module must import the NativeActivity shell
+/// module (published under the `backend_app` root alias). bgfx owns the
+/// `android_main` entry and needs the shell to register its init/tick callbacks
+/// + drive `run`; sokol's C runtime provides the entry and needs no such import.
+///
+/// Manifest-driven on the v2 path (assembler#461): the bgfx-Android platform
+/// entry declares the shell as an `extra_module` aliased to `backend_app`
+/// (`.{ .name = "android_app", .root_alias = "backend_app" }`), so this keys off
+/// THAT declaration instead of the `cfg.backend == .bgfx` enum. Any v2 backend
+/// (including a name-only third party) that declares such an extra module gets
+/// the import; one that does not (sokol-Android) does not.
+///
+/// The v1 / no-manifest legacy Android path has no such declaration to read, so
+/// it retains the enum fallback — byte-identical to the pre-#461 output. That
+/// fallback is the SAME closed enum residual as the `android_link_bgfx` link
+/// site, and is removed together with it by the separate device-gated enum-path
+/// deletion; production bgfx (v2 manifest) never reaches it.
+fn androidNeedsAppImport(v2_manifest: ?manifest_v2.BackendManifestV2, cfg: ProjectConfig) bool {
+    if (v2_manifest) |m| {
+        const entry = manifest_v2_splice.platformEntry(m, cfg.platform) orelse return false;
+        for (entry.extra_modules) |mod| {
+            const alias = mod.root_alias orelse mod.name;
+            if (std.mem.eql(u8, alias, "backend_app") or std.mem.eql(u8, mod.name, "android_app")) return true;
+        }
+        return false;
+    }
+    return cfg.backend == .bgfx;
+}
+
 pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: BuildZigOptions) ![]const u8 {
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer alloc_writer.deinit();
@@ -770,8 +799,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // generated `main.zig` imports the `android_app` shell module under
         // `backend_app` (registers init/tick callbacks, drives `run`). The
         // sokol Android path has no such import — sokol's C runtime
-        // provides the entry — so this is bgfx-only.
-        if (cfg.backend == .bgfx) {
+        // provides the entry. Keyed off the v2 manifest's `backend_app`
+        // extra-module declaration (assembler#461), not the backend enum.
+        if (androidNeedsAppImport(v2_manifest, cfg)) {
             try tpl.writeSection(build_zig_tmpl, "android_exe_app_import", w);
         }
 

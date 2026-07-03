@@ -136,6 +136,8 @@ pub const SCENE_ASSET_MANIFESTS = struct {
     }
 
     test "callback-init path also emits setSceneAssets loop (sokol)" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const jsonc_scenes = &[_][]const u8{"menu"};
         const manifests = [_]SceneManifest{
             .{ .name = "menu", .assets = &[_][]const u8{"background"} },

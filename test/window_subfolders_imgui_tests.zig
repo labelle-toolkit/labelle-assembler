@@ -56,6 +56,8 @@ pub const HIDDEN_WINDOW = struct {
     }
 
     test "hidden=true generates window hidden flag in sokol" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
