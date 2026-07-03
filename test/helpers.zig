@@ -613,6 +613,29 @@ pub const acme_callback_lifecycle_decl = generate.manifest_v2.BackendManifestV2.
     .cleanup_callback = true,
 };
 
+// The FULL sokol callback shape as a manifest decl (#461) — the exact values
+// `backends/sokol/backend.manifest.v2.zon` declares on every callback platform,
+// mirroring the former `cfg.backend == .sokol` enum literal in
+// `lifecycle/render.zig`. `sokol_readback` is PRIVILEGED (labelle.* only). The
+// differential tests set this on `lifecycle_override` and assert the generated
+// main is byte-identical to the enum-path output.
+pub const sokol_lifecycle_decl = generate.manifest_v2.BackendManifestV2.PlatformEntry.Lifecycle{
+    .runner_module_var = true,
+    .cleanup_callback = true,
+    .allocator_holes = true,
+    .gui_events = true,
+    .imgui_dispatch = true,
+    .preview = .sokol_readback,
+};
+
+// The bgfx-Android callback shape as a manifest decl (#461) — mirrors the former
+// `is_bgfx_android` enum literal. `bgfx_shell` is PRIVILEGED (labelle.* only).
+pub const bgfx_android_lifecycle_decl = generate.manifest_v2.BackendManifestV2.PlatformEntry.Lifecycle{
+    .runner_module_var = true,
+    .imgui_dispatch = true,
+    .android_register = .bgfx_shell,
+};
+
 // Byte-copy MIRROR of `backends/acme_callback/templates/desktop.txt` — the
 // third-party callback entry template. Inlined so the codegen unit + golden
 // tests run offline against exactly the fixture the production path loads from

@@ -243,6 +243,61 @@ pub const MAIN_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "applyImmersiveUiThread") == null);
     }
 
+    // ── #461: lifecycle SHAPE is manifest data, not a `cfg.backend` enum ──────
+    // The differential guard for the enum→manifest migration. Each test
+    // generates the SAME main.zig twice, varying ONLY `lifecycle_override`:
+    // null → the enum-path shape (`cfg.backend == .sokol` / `is_bgfx_android`
+    // branch), the manifest decl → the data-path shape (`shapeFromDecl`). Equal
+    // output proves the manifest declaration reproduces the built-in shape
+    // byte-for-byte, so the enum branch is a redundant fallback (deleted in the
+    // final #461 step once the external manifests declare their shape too).
+
+    test "sokol desktop: manifest-declared lifecycle == enum-path main (byte-identical, #461)" {
+        const enum_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(enum_main);
+
+        generate.main_template.lifecycle_override = h.sokol_lifecycle_decl;
+        defer generate.main_template.lifecycle_override = null;
+        const manifest_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(manifest_main);
+
+        try std.testing.expectEqualStrings(enum_main, manifest_main);
+        // Sanity: the shape actually fired (sokol-private readback + immersive seam).
+        try std.testing.expect(std.mem.indexOf(u8, manifest_main, "_sokol_preview") != null);
+    }
+
+    test "bgfx android: manifest-declared lifecycle == enum-path main (byte-identical, #461)" {
+        const enum_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .ecs = .mock,
+        }, bgfx_android_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(enum_main);
+
+        generate.main_template.lifecycle_override = h.bgfx_android_lifecycle_decl;
+        defer generate.main_template.lifecycle_override = null;
+        const manifest_main = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .ecs = .mock,
+        }, bgfx_android_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(manifest_main);
+
+        try std.testing.expectEqualStrings(enum_main, manifest_main);
+        // Sanity: the bgfx_shell android register actually fired.
+        try std.testing.expect(std.mem.indexOf(u8, manifest_main, "android_app.setInitCallback(&gameInit)") != null);
+    }
+
     test "sokol android registers the core Android backend seam before immersive (labelle-core#310)" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",

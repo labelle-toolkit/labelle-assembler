@@ -313,16 +313,42 @@ pub fn Mixin(comptime Self: type) type {
                 // callback backend (the wasm else-shape is the remaining
                 // first-party fall-through). Every callback hole below is a
                 // value keyed on this shape, rendered through ONE `tpl.render`.
-                const shape: LifecycleShape = if (cfg.backend == .sokol)
+                const shape: LifecycleShape = if (lifecycle_ovr) |decl|
+                    // Manifest-declared callback shape (#461). Every callback
+                    // block is now selected by DATA, not a `cfg.backend` enum
+                    // branch: a built-in sokol/bgfx manifest declares its FULL
+                    // shape (including the privileged `preview = .sokol_readback`
+                    // / `android_register = .bgfx_shell`), and an unprivileged
+                    // third-party callback backend declares only the safe flags
+                    // (its preview/android default to none). The privileged
+                    // values are namespace-gated at manifest validation
+                    // (`backend_registry.assertLifecyclePrivilege`), so a
+                    // non-`labelle.*` provider can never reach the backend-
+                    // private readback/shell blocks here.
+                    .{
+                        .runner = decl.runner_module_var,
+                        .cleanup = decl.cleanup_callback,
+                        .allocator = decl.allocator_holes,
+                        .gui_event = decl.gui_events,
+                        .imgui_dispatch = decl.imgui_dispatch,
+                        .preview = switch (decl.preview) {
+                            .none => .none,
+                            .callback_basic => .callback_basic,
+                            .sokol_readback => .sokol_readback,
+                        },
+                        .android = switch (decl.android_register) {
+                            .none => .none,
+                            .bgfx_shell => .bgfx_shell,
+                        },
+                    }
+                else if (cfg.backend == .sokol)
+                    // Fallback for a built-in whose (older) manifest predates the
+                    // #461 lifecycle-shape fields — byte-identical to the
+                    // manifest-declared shape above. Deleted once every built-in
+                    // manifest declares its shape (#461 step 12).
                     .{ .runner = true, .cleanup = true, .allocator = true, .gui_event = true, .imgui_dispatch = true, .preview = .sokol_readback, .android = .none }
                 else if (is_bgfx_android)
                     .{ .runner = true, .cleanup = false, .allocator = false, .gui_event = false, .imgui_dispatch = true, .preview = .none, .android = .bgfx_shell }
-                else if (lifecycle_ovr) |decl|
-                    // Declared third-party callback backend: only the fixed
-                    // engine-facing blocks are declarable — the sokol readback,
-                    // imgui-bridge externs, and bgfx shell reference backend-
-                    // private symbols and stay keyed to the built-in branches.
-                    .{ .runner = decl.runner_module_var, .cleanup = decl.cleanup_callback, .allocator = decl.allocator_holes, .gui_event = decl.gui_events, .imgui_dispatch = false, .preview = .none, .android = .none }
                 else
                     // Raylib/bgfx wasm (first-party): the generic emscripten
                     // callback else-path — module-scope runner, INIT/HEARTBEAT

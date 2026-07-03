@@ -415,6 +415,10 @@ pub fn validateProviderContracts(
         switch (parsed) {
             .v2 => |m| {
                 defer parsed.free(allocator);
+                // Privileged lifecycle blocks (sokol readback / bgfx shell) are
+                // reserved to the `labelle.*` namespace (#461) — checked here,
+                // where the parsed manifest's platforms are in scope.
+                try backend_registry.assertLifecyclePrivilege(cfg, m.declaresPrivilegedLifecycle(), m.id);
                 return validateProviderContractsInner(allocator, cfg, m.id, m.capabilities, is_tests_target);
             },
             .v1 => parsed.free(allocator), // not actually a v2 manifest — fall through
