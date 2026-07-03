@@ -40,45 +40,52 @@ test {
 // Varies the exact cfg inputs the declarative `dep_options` ValueSource predicates
 // branch on (gamepad auto/off, hidapi on/off), each of which must stay 0-diff.
 pub const MANIFEST_V2_DESKTOP_ANCHOR = struct {
-    fn expectV2MatchesEnum(cfg: generate.ProjectConfig) !void {
-        const enum_baseline = try h.genSokolBuildZig(std.testing.allocator, cfg, .{});
-        defer std.testing.allocator.free(enum_baseline);
+    // #461: the enum/v1 codegen path is DELETED, so there is no live enum
+    // baseline left to diff against. The desktop anchor therefore becomes a
+    // committed golden snapshot (design §7): the golden was captured ONCE from
+    // the v2 output while it was still proven byte-identical to the enum/v1
+    // baseline, so it locks the exact bytes the anchor used to prove. Drift now
+    // fails as a readable line delta.
+    const golden_default = @embedFile("goldens/sokol_desktop_v2.build.zig");
+    const golden_gamepad_off = @embedFile("goldens/sokol_desktop_v2_gamepad_off.build.zig");
+    const golden_hidapi = @embedFile("goldens/sokol_desktop_v2_hidapi.build.zig");
+    const golden_plugins = @embedFile("goldens/sokol_desktop_v2_plugins.build.zig");
+
+    fn expectV2MatchesGolden(cfg: generate.ProjectConfig, golden: []const u8) !void {
         const v2_out = try h.genSokolBuildZigV2(std.testing.allocator, cfg, .{});
         defer std.testing.allocator.free(v2_out);
-        // Byte anchor: 0 diff. `expectEqualStrings` prints the first divergence,
-        // so a regression in the v2 model surfaces as a readable line delta.
-        try std.testing.expectEqualStrings(enum_baseline, v2_out);
+        try std.testing.expectEqualStrings(golden, v2_out);
     }
 
-    test "byte anchor: v2 desktop == enum/v1, default cfg (gamepad auto, no gui)" {
-        try expectV2MatchesEnum(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock });
+    test "golden: v2 desktop matches committed golden, default cfg (gamepad auto, no gui)" {
+        try expectV2MatchesGolden(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock }, golden_default);
     }
 
-    test "byte anchor: v2 desktop == enum/v1, gamepad off" {
-        try expectV2MatchesEnum(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock, .gamepad = .none });
+    test "golden: v2 desktop matches committed golden, gamepad off" {
+        try expectV2MatchesGolden(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock, .gamepad = .none }, golden_gamepad_off);
     }
 
-    test "byte anchor: v2 desktop == enum/v1, gamepad hidapi on" {
-        try expectV2MatchesEnum(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock, .gamepad_hidapi = true });
+    test "golden: v2 desktop matches committed golden, gamepad hidapi on" {
+        try expectV2MatchesGolden(.{ .name = "anchor-game", .backend = .sokol, .ecs = .mock, .gamepad_hidapi = true }, golden_hidapi);
     }
 
-    test "byte anchor: v2 desktop == enum/v1, with plugins + zig_ecs (shared regions unaffected)" {
+    test "golden: v2 desktop matches committed golden, with plugins + zig_ecs (shared regions unaffected)" {
         // The backend-dep + link regions are the only v2-touched cells; wiring
         // plugins/ecs exercises that everything AROUND them stays identical too.
         // A REAL plugin entry is load-bearing here: plugin modules flow through
-        // the core-diamond `overrideImport` region, so the byte anchor only
-        // exercises the plugin-wiring path if a plugin is actually present. The
-        // plugin need not resolve on disk — `generateBuildZig` emits the plugin
-        // dep/module decls from the config alone (only build.zig.zon resolution
-        // touches disk), so a plausible labelle-toolkit slug is enough.
-        try expectV2MatchesEnum(.{
+        // the core-diamond `overrideImport` region, so the anchor only exercises
+        // the plugin-wiring path if a plugin is actually present. The plugin need
+        // not resolve on disk — `generateBuildZig` emits the plugin dep/module
+        // decls from the config alone (only build.zig.zon resolution touches
+        // disk), so a plausible labelle-toolkit slug is enough.
+        try expectV2MatchesGolden(.{
             .name = "anchor-game",
             .backend = .sokol,
             .ecs = .zig_ecs,
             .plugins = &.{
                 .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "2.6.0" },
             },
-        });
+        }, golden_plugins);
     }
 
     test "byte anchor: v2-only backend (no legacy manifest) reaches v2 == dual-manifest v2 (#453)" {
@@ -189,17 +196,6 @@ pub const PR466_FINDING1_TARGET_ALIAS = struct {
         var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
         defer ast.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
-    }
-
-    test "enum android: promoted scripts + no plugins/ecs/gui still defines `target`" {
-        const out = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "anchor-game",
-            .backend = .sokol,
-            .platform = .android,
-            .ecs = .mock,
-        }, .{ .promoted_scripts = &promoted });
-        defer std.testing.allocator.free(out);
-        try expectDefinesTarget(out);
     }
 
     test "v2 android: promoted scripts + no plugins/ecs/gui still defines `target`" {
@@ -736,35 +732,19 @@ pub const MANIFEST_V2_GENERATE_CUTOVER = struct {
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
     }
 
-    test "generate on a v1-only backend stays on the v1/enum path (no regression, no v2 markers)" {
-        // sokol_v1only ships ONLY the legacy `backend.manifest.zon` (no v2 sibling),
-        // so `generate`'s v2 probe returns null and generation stays on the v1 splice
-        // path — the generic v2 markers must be ABSENT. Proves the cutover is inert
-        // for a backend that ships no v2 manifest.
-        const cfg = generate.ProjectConfig{ .name = "v1-game", .backend = .sokol, .ecs = .mock };
-        const out = try h.generateAndReadBuildZig(std.testing.allocator, cfg, h.sokol_v1only_fixture_package);
-        defer std.testing.allocator.free(out);
-
-        // v1 sokol splice output — the unrolled core-diamond residual, NOT the
-        // generic loop-form v2 walk.
-        try std.testing.expect(std.mem.indexOf(u8, out, "unifyGfxSubpackageCore(gfx_mod, core_mod)") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "unifyCoreDiamond(b.allocator, gfx_mod, core_mod, gfx_mod,") == null);
-        // No hook import — the v1 path never stages a backend build hook.
-        try std.testing.expect(std.mem.indexOf(u8, out, "backend_build_hook") == null);
-    }
-
-    test "PRODUCTION NO-OP: a dual-manifest backend's auto-detected v2 output == the v1/enum baseline" {
-        // sokol ships BOTH v1 and v2 manifests; its v2 desktop cell is the byte
-        // anchor (§7), so `generate` auto-detecting v2 must be BYTE-IDENTICAL to the
-        // v1/enum splice. This is the production-no-op guarantee: even where a v2
-        // manifest IS present, the emitted build.zig does not change.
+    test "PRODUCTION cutover: a backend's auto-detected v2 output == the unit v2 helper" {
+        // sokol ships a v2 manifest; `generate` auto-detecting v2 must match the
+        // explicit-opt-in unit v2 helper for the SAME desktop build. This is the
+        // production guarantee that the auto-detect path and the unit codegen path
+        // agree byte-for-byte (both are v2 now that the enum/v1 path is deleted).
         const cfg = generate.ProjectConfig{ .name = "noop-game", .backend = .sokol, .ecs = .mock };
         const v2_auto = try h.generateAndReadBuildZig(std.testing.allocator, cfg, h.sokol_fixture_package);
         defer std.testing.allocator.free(v2_auto);
-        // The v1/enum baseline for the SAME desktop build (the unit helper, v1 path).
-        const v1_baseline = try h.genSokolBuildZig(std.testing.allocator, cfg, .{ .is_tests_target = true });
-        defer std.testing.allocator.free(v1_baseline);
-        try std.testing.expectEqualStrings(v1_baseline, v2_auto);
+        // The unit v2 baseline for the SAME desktop build (tests-target shape, as
+        // `generateAndReadBuildZig` emits).
+        const v2_unit = try h.genSokolBuildZigV2(std.testing.allocator, cfg, .{ .is_tests_target = true });
+        defer std.testing.allocator.free(v2_unit);
+        try std.testing.expectEqualStrings(v2_unit, v2_auto);
     }
 
     test "generate CATCHES a capability mismatch on the auto-detected v2 manifest (#473 finding 2)" {
@@ -964,28 +944,7 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
         );
     }
 
-    // ── Major (#473): the legacy loop_style path must run for a v1-by-name file ──
-
-    test "resolveLoopStyleOverride: a named manifest that parses as v1 STILL resolves its legacy loop_style (#473 Major)" {
-        // The Major: when `backend_manifest_name` is non-null but the named file
-        // parses as v1 (union tag `.v1`), the v2 arm no-ops. Before the fix the
-        // legacy loop_style path was chained with `else if (name == null)` and was
-        // therefore SKIPPED whenever a name was present — silently leaving
-        // `loop_style_override` null and dropping the v1 backend's loop_style.
-        // sokol_v1only ships a v1 `backend.manifest.zon` (`loop_style = .callback`);
-        // passing its name here exercises the EXACT `.v1`-from-named-file condition
-        // (production detects `backend.manifest.v2.zon`, but the load returns the
-        // SAME `.v1` union tag, so this reproduces the code path faithfully). The
-        // legacy pass must still run and resolve `.callback` — NOT null.
-        const cfg = generate.ProjectConfig{
-            .name = "loop-game",
-            .ecs = .mock,
-            .backend_package = h.sokol_v1only_fixture_package,
-        };
-        const override = try generate.resolveLoopStyleOverride(std.testing.allocator, cfg, ".", "backend.manifest.zon");
-        try std.testing.expect(override != null); // NOT left unset (the bug)
-        try std.testing.expect(override.? == .callback); // resolved from the v1 manifest
-    }
+    // ── v2 loop_style resolution (the v1/legacy paths were removed in #461) ──
 
     test "resolveLoopStyleOverride: a v2-only backend resolves loop_style from its per-platform matrix (not the absent legacy manifest)" {
         // Distinguishing complement: sokol_v2only ships NO legacy
@@ -1001,49 +960,6 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
         const override = try generate.resolveLoopStyleOverride(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon");
         try std.testing.expect(override != null);
         try std.testing.expect(override.? == .callback); // sokol desktop entry = .callback
-    }
-
-    // ── Major (#473) edge case: a v2-NAMED file whose CONTENT is v1, with NO
-    // canonical `backend.manifest.zon` sibling. `detectV2ManifestName` finds the
-    // v2 filename (existence-based), the load returns the `.v1` union tag, and the
-    // seams must resolve loop_style + template from THAT file — not retry the
-    // canonical (null) name (an absent file → dropped override / enum fall-through).
-
-    test "resolveLoopStyleOverride: a v2-NAMED-but-v1-CONTENT backend (no canonical sibling) resolves loop_style from THAT file (#473 Major)" {
-        // sokol_v1inv2 ships ONLY `backend.manifest.v2.zon` whose content is v1
-        // (`loop_style = .loop`, no `manifest_version`). Passing the DETECTED v2
-        // name reproduces production (`detectV2ManifestName` returns it): the load
-        // returns `.v1`, and the fix resolves loop_style straight from the parsed
-        // v1 manifest. Before the fix the legacy pass retried with the canonical
-        // (null) name, `manifestPathEnabled` probed the absent `backend.manifest.zon`
-        // → false → override left null (the bug). `.loop` (NOT sokol's `.callback`)
-        // proves it came from THIS file, not a stray canonical fallback.
-        const cfg = generate.ProjectConfig{
-            .name = "loop-game",
-            .ecs = .mock,
-            .backend_package = h.sokol_v1inv2_fixture_package,
-        };
-        const override = try generate.resolveLoopStyleOverride(std.testing.allocator, cfg, ".", "backend.manifest.v2.zon");
-        try std.testing.expect(override != null); // NOT dropped to null (the bug)
-        try std.testing.expect(override.? == .loop); // resolved from the v1-content v2-named file
-    }
-
-    test "loadBackendTemplate: a v2-NAMED-but-v1-CONTENT backend (no canonical sibling) resolves its template from THAT file's main_loop_template (#473 Major)" {
-        // The template-site half of the Major. sokol_v1inv2 has no canonical
-        // `backend.manifest.zon`, so before the fix the `.v1` arm freed + fell
-        // through to the legacy `manifestPathEnabled(.., null)` pass, which probed
-        // the absent canonical file → false → fell to the enum path (reading the
-        // closed `cfg.backend` for a backend with no tag → mis-generated). The fix
-        // resolves `.main_loop_template` from the parsed v1 manifest and reads that
-        // template (must succeed, non-empty), NOT error on a missing canonical.
-        const cfg = generate.ProjectConfig{
-            .name = "tmpl-game",
-            .ecs = .mock,
-            .backend_package = h.sokol_v1inv2_fixture_package,
-        };
-        const tmpl = try generate.loadBackendTemplate(std.testing.allocator, ".", cfg, "backend.manifest.v2.zon");
-        defer std.testing.allocator.free(tmpl);
-        try std.testing.expect(tmpl.len > 0);
     }
 
     test "resolveLoopStyleOverride: reads the PER-PLATFORM v2 loop_style — bgfx desktop is .loop, android .callback" {
@@ -1074,7 +990,7 @@ pub const MANIFEST_V2_CUTOVER_SEAMS = struct {
 
 pub const BUILD_ZIG = struct {
     test "links sokol_clib artifact" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1094,7 +1010,7 @@ pub const BUILD_ZIG = struct {
         // reintroduce a hard build/runtime dependency that defeats core's
         // graceful-degradation design. Runtime device-access setup lives in
         // docs/gamepad-linux.md.
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1114,9 +1030,11 @@ pub const BUILD_ZIG = struct {
     // resolution needed).
 
     test "bgfx android builds a NativeActivity shared library, not a glfw exe" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
+        // Drives the v2 bgfx-Android codegen (the enum path is gone). The bgfx v2
+        // fixture ships the android platform entry (`android_app` extra module
+        // aliased to `backend_app`, the NDK system libs, apk packaging).
+        const build_zig = try h.genBgfxV2BuildZig(std.testing.allocator, .{
             .name = "test-game",
-            .backend = .bgfx,
             .platform = .android,
             .ecs = .mock,
         }, .{});
@@ -1130,7 +1048,7 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "backend_dep.module(\"android_app\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, ".name = \"backend_app\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, ".linkage = .dynamic") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkLibrary(bgfx_artifact)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "lib.root_module.linkLibrary(bgfx)") != null);
 
         // NDK shell libs for the bgfx GLES renderer + NativeActivity glue.
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkSystemLibrary(\"GLESv3\"") != null);
@@ -1144,30 +1062,6 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "Package and sign Android APK") != null);
     }
 
-    test "external backend matching its enum tag uses the enum path on non-desktop (#386)" {
-        // bgfx extracted out-of-tree, selected via `.backend = .bgfx` while a
-        // package resolves it (the post-flip shape). On ANDROID the desktop-only
-        // manifest splice doesn't run, so the backend-dep section falls through
-        // to the enum `switch (cfg.backend)` — which is correct, because the tag
-        // is preserved and the android sections pull the backend from
-        // `b.dependency("labelle_bgfx")` (resolving to the fetched package). It
-        // must NOT raise ExternalBackendNeedsManifest. (Validated on-device: FP
-        // builds + runs against the external bgfx; the build_files guard that
-        // distinguishes "named by a tag" from "named only by string" is what
-        // lets the android path through.)
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .bgfx,
-            .platform = .android,
-            .backend_package = .{ .name = "bgfx", .repo = "local:../bgfx" },
-            .ecs = .mock,
-        }, .{});
-        defer std.testing.allocator.free(build_zig);
-
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.dependency(\"labelle_bgfx\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "backend_dep.module(\"android_app\")") != null);
-    }
-
     test "external backend named ONLY by string (no matching tag) still needs a manifest (#386)" {
         // A genuine third-party backend whose package name has no matching enum
         // tag (`cfg.backend` sits at its `.raylib` default) cannot use the enum
@@ -1178,56 +1072,6 @@ pub const BUILD_ZIG = struct {
             .backend_package = .{ .name = "thirdparty", .repo = "local:../tp" },
             .ecs = .mock,
         }, .{}));
-    }
-
-    test "tag-matched external raylib on wasm uses the enum path — emits emsdk + emcc link (#386 regression)" {
-        // Post-flip, `.backend = .raylib` resolves to labelle-raylib (external
-        // by default), so on wasm the old `if (!cfg.isExternal())` gates skipped
-        // the raylib emsdk/link sections AND the backend-dep switch hard-errored
-        // with ExternalBackendNeedsManifest — breaking the existing raylib web
-        // build. A tag-matched external on wasm must instead fall through to the
-        // enum path (no manifest splice on wasm) and emit the wasm sections.
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .raylib,
-            .platform = .wasm,
-            .ecs = .mock,
-        }, .{});
-        defer std.testing.allocator.free(build_zig);
-
-        // emsdk helper import + the emcc link step must both be present.
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "@import(\"labelle_raylib\").emsdk") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "emsdk.emccStep(b, raylib_artifact, wasm") != null);
-    }
-
-    test "tag-matched external sokol on wasm uses the enum path — emits sokol wasm dep + emLinkStep (#386 regression)" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .sokol,
-            .platform = .wasm,
-            .ecs = .mock,
-        }, .{});
-        defer std.testing.allocator.free(build_zig);
-
-        // Wasm-specific sokol backend dep + the emcc emLinkStep wiring.
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.dependency(\"labelle_sokol\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "sokol_em.emLinkStep(b, .{") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "wasm.root_module.linkLibrary(backend_dep.artifact(\"sokol_clib\"))") != null);
-    }
-
-    test "tag-matched external sokol on ios uses the enum path — emits sokol ios dep + framework link (#386 regression)" {
-        const build_zig = try generate.generateBuildZig(std.testing.allocator, .{
-            .name = "test-game",
-            .backend = .sokol,
-            .platform = .ios,
-            .ecs = .mock,
-        }, .{});
-        defer std.testing.allocator.free(build_zig);
-
-        // iOS sokol backend dep (dont_link_system_libs) + the manual framework link.
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.dependency(\"labelle_sokol\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, ".dont_link_system_libs = true") != null);
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "linkIosFrameworks(exe)") != null);
     }
 
     test "non-tag-matched external on wasm still needs a manifest (#386)" {
@@ -1258,7 +1102,7 @@ pub const BUILD_ZIG = struct {
     // generate + build + RUN a project on the fetched external null backend).
 
     test "deduplicates labelle-core across gfx and engine" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1277,7 +1121,7 @@ pub const BUILD_ZIG = struct {
         // tilemap sub-packages pin their OWN labelle-core, so without unifying
         // them onto `core_mod` the two `core.YAxis` enums don't match and the
         // example fails to compile ("expected 'YAxis', found 'YAxis'").
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1308,7 +1152,7 @@ pub const BUILD_ZIG = struct {
         // only when the import exists — asserting both halves here keeps the
         // guard from being "simplified" away into a dead-import injection
         // (#258) or dropped entirely (silent core type-split on Linux).
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1319,7 +1163,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "resolved_gui wires gui_backend" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1331,7 +1175,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "resolved_gui raw_backend wires bridge artifact" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1343,7 +1187,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "no gui omits gui_mod" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1353,7 +1197,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "emits test step rooted at __tests_root.zig wrapper" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1370,7 +1214,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "test step reuses exe module imports" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .zig_ecs,
@@ -1389,7 +1233,7 @@ pub const BUILD_ZIG = struct {
         // (sokol) so the unit test needs no external resolution. (The real
         // tests-target forces null — now external — which the examples-integration
         // covers end-to-end.)
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1413,7 +1257,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "names desktop exe after the sanitized project name (#362)" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "energy flow!",
             .backend = .sokol,
             .ecs = .mock,
@@ -1428,7 +1272,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "falls back to game when the sanitized exe name is empty (#362)" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "!!!",
             .backend = .sokol,
             .ecs = .mock,
@@ -1442,7 +1286,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "chains in-project @libs/ plugin test step into test step (issue #82)" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1461,7 +1305,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "chains every @libs/ plugin into test step (issue #82)" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1479,7 +1323,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "no @libs/ plugins emits no lib test chaining (issue #82)" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1492,7 +1336,7 @@ pub const BUILD_ZIG = struct {
     }
 
     test "out-of-project local: plugins are not chained as libs (issue #82)" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1510,7 +1354,7 @@ pub const BUILD_ZIG = struct {
     test "lib test chaining present in is_tests_target build (issue #82)" {
         // Lib-chaining is backend-agnostic; use a bundled backend (sokol) so the
         // unit test needs no external resolution (null is external post-#386).
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1546,7 +1390,7 @@ pub const PLUGINS = struct {
     }
 
     test "no plugins excludes pathfinding/physics from build.zig" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1578,7 +1422,7 @@ pub const PLUGINS = struct {
     }
 
     test "plugins enabled includes pathfinding/physics in build.zig" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1596,7 +1440,7 @@ pub const PLUGINS = struct {
     }
 
     test "plugins receive all engine subsystem imports" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .zig_ecs,
@@ -1622,7 +1466,7 @@ pub const PLUGINS = struct {
     }
 
     test "plugins with mock ecs omit ecs_backend import" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1640,7 +1484,7 @@ pub const PLUGINS = struct {
     }
 
     test "plugins receive gui_backend when gui is active" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -1655,7 +1499,7 @@ pub const PLUGINS = struct {
     }
 
     test "plugins omit gui_backend when no gui" {
-        const build_zig = try h.genSokolBuildZig(std.testing.allocator, .{
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,

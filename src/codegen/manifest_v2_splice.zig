@@ -119,10 +119,10 @@ pub fn emitCoreDiamondWalk(w: anytype) !void {
     try w.writeAll(core_diamond.generated_walk_zig);
 }
 
-/// v2 replacement for the backend-dep enum branch (`renderSection(.., "backend_<tag>")`)
-/// / the v1 `renderBackendDepSection`. Dispatches on the target platform: DESKTOP
-/// (PR 3, byte anchor) and ANDROID (PR 5, golden cell); other platforms land in
-/// later PRs.
+/// Renders the backend-dep section from typed v2 manifest data (the sole
+/// backend-dep codegen path since the enum/v1 branch was removed in #461).
+/// Dispatches on the target platform: DESKTOP (sokol byte anchor / generic
+/// declarative), ANDROID, IOS, WASM golden cells.
 pub fn renderBackendDepSectionV2(
     allocator: std.mem.Allocator,
     m: BackendManifestV2,
@@ -326,10 +326,9 @@ pub const hook_import_name = "backend_build_hook.zig";
 /// Mirrors how the orchestrator writes the other generated siblings (build.zig,
 /// game.zig, main.zig) into `target_dir`.
 ///
-/// No-op (returns false) when the named manifest is v1 or carries no `build_hook`;
-/// returns true when a hook was staged. `backend_manifest_name` is the SAME name the
-/// caller passed to `generateBuildZig` (null there ⇒ the enum path, so the caller
-/// should not invoke this).
+/// No-op (returns false) when the v2 manifest carries no `build_hook`; returns true
+/// when a hook was staged. `backend_manifest_name` is the SAME name the caller
+/// passed to `generateBuildZig`.
 pub fn stageBackendBuildHook(
     allocator: std.mem.Allocator,
     cfg: ProjectConfig,
@@ -337,12 +336,8 @@ pub fn stageBackendBuildHook(
     backend_manifest_name: []const u8,
     target_dir: []const u8,
 ) !bool {
-    const parsed = try manifest_v2.loadNamedManifest(allocator, cfg, project_dir, backend_manifest_name);
-    defer parsed.free(allocator);
-    const m = switch (parsed) {
-        .v1 => return false,
-        .v2 => |v| v,
-    };
+    const m = try manifest_v2.loadNamedManifest(allocator, cfg, project_dir, backend_manifest_name);
+    defer std.zon.parse.free(allocator, m);
     const hook_rel = m.build_hook orelse return false;
 
     const pkg_dir = try backend_registry.resolveBackendPackage(allocator, cfg, project_dir);
@@ -878,9 +873,9 @@ pub fn renderWasmFooterV2(w: anytype) !void {
     try w.writeAll(wasm_footer_helpers);
 }
 
-/// v2 replacement for the link enum branch (`writeSection(.., "link_<tag>")`) / the
-/// v1 `renderLinkSection`. Dispatches on the target platform: DESKTOP (PR 3 byte
-/// anchor), ANDROID (PR 5), IOS (PR 6), WASM (PR 7) golden cells.
+/// Renders the link section from typed v2 manifest data (the sole link codegen
+/// path since the enum/v1 branch was removed in #461). Dispatches on the target
+/// platform: DESKTOP (byte anchor), ANDROID, IOS, WASM golden cells.
 pub fn renderLinkSectionV2(
     allocator: std.mem.Allocator,
     m: BackendManifestV2,

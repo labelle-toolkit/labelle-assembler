@@ -30,7 +30,6 @@ const builtin = @import("builtin");
 const tpl = @import("../../template.zig");
 const config = @import("../../config.zig");
 const preview = @import("../preview.zig");
-const manifest_splice = @import("../manifest_splice.zig");
 const manifest_v2 = @import("../manifest_v2.zig");
 
 /// Which preview-mode wiring a callback lifecycle emits (assembler#501). The
@@ -135,7 +134,7 @@ pub fn Mixin(comptime Self: type) type {
             w: anytype,
             lifecycle_tmpl: []const u8,
             hooks_init: []const u8,
-            loop_style_ovr: ?manifest_splice.BackendManifest.LoopStyle,
+            loop_style_ovr: ?manifest_v2.BackendManifestV2.PlatformEntry.LoopStyle,
             /// Manifest-declared callback-lifecycle blocks (assembler#501).
             /// Non-null lifts the callback-external rejection AND drives the
             /// shape for a genuine third-party (non-enum-tag) callback backend.
@@ -253,23 +252,16 @@ pub fn Mixin(comptime Self: type) type {
             // `g`/`runner` + void-safe `init_code` via `buildCallbackInitCode`
             // rather than the procedural loop path the bgfx DESKTOP template uses.
             //
-            // V1/LEGACY RESIDUAL (#461 flag-day net): `is_bgfx_android` /
-            // `cfg.backend == .sokol` are the pre-manifest enum fallback, consulted
-            // ONLY in the `else` arm — i.e. when NO manifest `loop_style` was
-            // resolved (`loop_style_ovr == null`). Production sokol/bgfx ship v2
-            // manifests, so `loop_style_ovr` is always non-null there and this arm
-            // is never reached; the fallback covers a tag-matched built-in that
-            // resolves ONLY a v1 `backend.manifest.zon` (or none) on a NON-desktop
-            // target, where `manifestPathEnabled` doesn't read the v1 manifest so
-            // `loop_style_ovr` stays null (`resolveLoopStyleOverride` / #473). Same
-            // closed-enum residual as `build_files.androidNeedsAppImport`'s v1
-            // fallback and the untouched `android_link_bgfx` link site — all three
-            // are removed together by the separate device-gated enum-path deletion.
-            const is_bgfx_android = cfg.backend == .bgfx and cfg.platform == .android;
+            // With the enum/v1 codegen path deleted (#461), the run-loop style is
+            // DATA: the manifest `loop_style` (`loop_style_ovr`) decides callback
+            // vs loop for every backend. WASM is the one platform that ALWAYS
+            // forces the callback lifecycle (Emscripten owns the main loop),
+            // independent of any backend — it is the fall-through when no manifest
+            // `loop_style` is supplied.
             const use_callback_lifecycle = if (loop_style_ovr) |ls|
                 ls == .callback
             else
-                cfg.backend == .sokol or cfg.platform == .wasm or is_bgfx_android;
+                cfg.platform == .wasm;
 
             // A callback-style EXTERNAL backend is only safe where the callback
             // dispatch below has a real shape for it. Two data signals supply one:
@@ -294,19 +286,9 @@ pub fn Mixin(comptime Self: type) type {
             // production sokol/bgfx declare their shape in their v2 manifests.
             // An UNDECLARED callback external stays rejected — the fail-fast is the
             // safety property.
-            //
-            // V1/LEGACY RESIDUAL (#461 flag-day net): `is_bgfx_android` /
-            // `cfg.backend == .sokol` are the pre-manifest enum fallback. They are
-            // ordered AFTER the manifest signal, so `or` short-circuits past them
-            // whenever `lifecycle_ovr != null` — production v2 never consults them.
-            // They only decide the gate for a tag-matched built-in that resolves no
-            // v2 lifecycle (v1-only / no manifest), whose real callback dispatch is
-            // supplied by the restored enum shape fallback below. Removed together
-            // with the other enum residuals by the separate device-gated deletion.
             const callback_dispatch_handled =
                 lifecycle_ovr != null or
-                (cfg.platform == .wasm and cfg.isEnumTagBacked()) or
-                is_bgfx_android or cfg.backend == .sokol;
+                (cfg.platform == .wasm and cfg.isEnumTagBacked());
             if (use_callback_lifecycle and cfg.isExternal() and !callback_dispatch_handled) {
                 // Silenced under test (the Zig test runner fails any test that
                 // emits a `std.log.err`, even when the error is the asserted
@@ -359,25 +341,10 @@ pub fn Mixin(comptime Self: type) type {
                             .bgfx_shell => .bgfx_shell,
                         },
                     }
-                    // V1/LEGACY RESIDUAL (#461 flag-day net): reached ONLY when no
-                    // v2 lifecycle was resolved (`lifecycle_ovr == null`) for a
-                    // tag-matched built-in that ships only a v1 manifest / none.
-                    // Byte-identical to the manifest-declared shape production
-                    // resolves — without it a v1-only sokol/bgfx-android callback
-                    // build would fall to the wasm `callback_basic` literal below
-                    // (no readback / no shell register = wrong shape). Production
-                    // (v2) sets `lifecycle_ovr`, so it never takes these arms. Same
-                    // closed-enum residual as `androidNeedsAppImport` / the
-                    // `android_link_bgfx` link site — removed together by the
-                    // separate device-gated enum-path deletion.
-                else if (cfg.backend == .sokol)
-                    .{ .runner = true, .cleanup = true, .allocator = true, .gui_event = true, .imgui_dispatch = true, .preview = .sokol_readback, .android = .none }
-                else if (is_bgfx_android)
-                    .{ .runner = true, .cleanup = false, .allocator = false, .gui_event = false, .imgui_dispatch = true, .preview = .none, .android = .bgfx_shell }
                 else
-                    // Raylib/bgfx wasm (first-party): the generic emscripten
-                    // callback else-path — module-scope runner, INIT/HEARTBEAT
-                    // preview callbacks, no backend-specific holes.
+                    // First-party wasm (no manifest `.lifecycle`): the generic
+                    // emscripten callback else-path — module-scope runner,
+                    // INIT/HEARTBEAT preview callbacks, no backend-specific holes.
                     .{ .runner = true, .cleanup = false, .allocator = false, .gui_event = false, .imgui_dispatch = false, .preview = .callback_basic, .android = .none };
 
                 // The bgfx-Android NativeActivity shell shape (formerly a

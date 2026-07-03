@@ -439,34 +439,20 @@ pub fn testGuiRawBackendNoBridge(name: []const u8) generate.ResolvedGui {
 // backend-agnostic. `backends/sokol` is RETAINED purely as the offline
 // in-tree reference manifest / test fixture: codegen tests that inspect a
 // generated build.zig need *some* real backend manifest readable on disk.
-// Selecting it via an explicit `.backend_package` (instead of the bare
-// `.backend = .sokol` enum tag, which now resolves to the published
-// labelle-sokol package) repoints generation at that fixture; the manifest
-// splice then renders byte-identically to the pre-flip enum path.
+// It ships both `backend.manifest.v2.zon` (the v2 codegen source) and
+// `backend.manifest.zon` (the resolve-time identity/capabilities slice read by
+// `manifest_splice.loadProviderManifest`). Selecting it via an explicit
+// `.backend_package` (instead of the bare `.backend = .sokol` enum tag, which now
+// resolves to the published labelle-sokol package) repoints generation at that
+// fixture.
 pub const sokol_fixture_package = generate.PluginDep{ .name = "sokol", .repo = "local:backends/sokol" };
 
-/// Generate a build.zig against the retained in-tree sokol fixture. Injects
-/// the fixture `backend_package` + `project_dir = "."` (tests run with the
-/// assembler repo root as cwd) so the desktop manifest splice resolves
-/// `backends/sokol/backend.manifest.zon` offline. Any caller-supplied opts
-/// (e.g. `is_tests_target`) are preserved.
-pub fn genSokolBuildZig(
-    allocator: std.mem.Allocator,
-    cfg_in: generate.ProjectConfig,
-    opts_in: generate.BuildZigOptions,
-) ![]const u8 {
-    var cfg = cfg_in;
-    cfg.backend_package = sokol_fixture_package;
-    var opts = opts_in;
-    opts.project_dir = ".";
-    return generate.generateBuildZig(allocator, cfg, opts);
-}
-
-/// Generate a build.zig against the retained sokol fixture's SCHEMA-v2 manifest
-/// (`backend.manifest.v2.zon`) — the manifest-v2 desktop codegen path (epic #453
-/// item 3, PR 3). Identical wiring to `genSokolBuildZig` but points codegen at the
-/// v2 manifest via `backend_manifest_name`, so the byte-anchor test (§7) can drive
-/// the v2 path WITHOUT touching the v1 `backend.manifest.zon` other tests use.
+/// Generate a build.zig against the retained sokol fixture's v2 manifest
+/// (`backend.manifest.v2.zon`) — the manifest-v2 codegen path (epic #453 item 3;
+/// the enum/v1 path was removed in #461). Injects the fixture `backend_package` +
+/// `project_dir = "."` (tests run with the assembler repo root as cwd) +
+/// `backend_manifest_name` so codegen resolves the v2 manifest offline. Any
+/// caller-supplied opts (e.g. `is_tests_target`) are preserved.
 pub fn genSokolBuildZigV2(
     allocator: std.mem.Allocator,
     cfg_in: generate.ProjectConfig,
@@ -811,26 +797,6 @@ pub fn genBgfxV2BuildZig(
 // build.zig.zon generators (the zon path must not swallow the error with
 // `catch null` and silently fall back to enum output).
 pub const sokol_v2broken_fixture_package = generate.PluginDep{ .name = "sokol_v2broken", .repo = "local:backends/sokol_v2broken" };
-
-// A V1-ONLY backend fixture: `backends/sokol_v1only` ships ONLY the legacy
-// `backend.manifest.zon` (+ its desktop build fragments) — NO
-// `backend.manifest.v2.zon` sibling. The mirror of `sokol_v2only`. Used to prove
-// the manifest-v2 PRODUCTION CUTOVER (#453/#472 P2) is a no-op for a v1 backend:
-// the real `generate` entry probe finds no v2 manifest, so it stays on the v1/enum
-// splice path — the generated build.zig must NOT carry the v2 generic markers.
-pub const sokol_v1only_fixture_package = generate.PluginDep{ .name = "sokol_v1only", .repo = "local:backends/sokol_v1only" };
-
-// A V1-CONTENT-UNDER-V2-FILENAME backend fixture: `backends/sokol_v1inv2` ships
-// ONLY `backend.manifest.v2.zon` (NO canonical `backend.manifest.zon` sibling),
-// but that file's CONTENT is v1 — no `manifest_version` field, so `parseManifest`
-// defaults it to 1 and returns the `.v1` union tag. `detectV2ManifestName` keys
-// off file existence, so `generate` threads `backend.manifest.v2.zon` as the
-// detected name. Used to prove the #473 Major edge case: the loop_style + template
-// seams must resolve from THIS detected-but-v1 file (`loop_style = .loop`,
-// `main_loop_template = templates/desktop.txt`), NOT retry the canonical (null)
-// name — which would probe the absent `backend.manifest.zon` and silently drop
-// the backend into enum behavior.
-pub const sokol_v1inv2_fixture_package = generate.PluginDep{ .name = "sokol_v1inv2", .repo = "local:backends/sokol_v1inv2" };
 
 /// Drive the REAL `generate` entry point (the production codepath — NOT the
 /// `generateBuildZig` unit helper, which takes `backend_manifest_name` explicitly)

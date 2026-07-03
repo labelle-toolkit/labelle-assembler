@@ -1,8 +1,0 @@
-// V1-CONTENT-UNDER-V2-FILENAME fixture main-loop template (#473 Major).
-// Resolved from this backend's `.main_loop_template` in `backend.manifest.v2.zon`
-// (which parses as v1). Distinct, non-empty content proves `loadBackendTemplate`
-// read THIS file rather than falling through to the enum path for lack of a
-// canonical `backend.manifest.zon`.
-pub fn main() void {
-    // v1-in-v2 desktop loop marker
-}

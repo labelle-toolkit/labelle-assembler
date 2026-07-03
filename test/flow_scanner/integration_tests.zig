@@ -376,7 +376,7 @@ pub const GameModuleBinding = struct {
             .ecs = .mock,
         };
 
-        const build_zig = try generator.generateBuildZig(allocator, cfg, .{ .project_dir = "." });
+        const build_zig = try generator.generateBuildZig(allocator, cfg, .{ .project_dir = ".", .backend_manifest_name = "backend.manifest.v2.zon" });
         defer allocator.free(build_zig);
 
         // Module declaration: rooted at `game.zig`, with `labelle-engine`
@@ -558,11 +558,11 @@ pub const GameModuleBinding = struct {
             .plugins = &.{.{ .name = "box2d", .repo = "local:x" }},
         };
 
-        const tests_bz = try generator.generateBuildZig(allocator, cfg, .{ .is_tests_target = true, .project_dir = "." });
+        const tests_bz = try generator.generateBuildZig(allocator, cfg, .{ .is_tests_target = true, .project_dir = ".", .backend_manifest_name = "backend.manifest.v2.zon" });
         defer allocator.free(tests_bz);
         try std.testing.expect(std.mem.indexOf(u8, tests_bz, "overrideImport(game_mod, \"ecs_backend\", ecs_mod);") != null);
 
-        const exe_bz = try generator.generateBuildZig(allocator, cfg, .{ .is_tests_target = false, .project_dir = "." });
+        const exe_bz = try generator.generateBuildZig(allocator, cfg, .{ .is_tests_target = false, .project_dir = ".", .backend_manifest_name = "backend.manifest.v2.zon" });
         defer allocator.free(exe_bz);
         try std.testing.expect(std.mem.indexOf(u8, exe_bz, "overrideImport(game_mod, \"ecs_backend\", ecs_mod);") == null);
     }

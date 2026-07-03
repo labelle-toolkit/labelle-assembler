@@ -20,7 +20,6 @@
 
 const std = @import("std");
 const config = @import("../config.zig");
-const splice = @import("manifest_splice.zig");
 const backend_registry = @import("../backend_registry.zig");
 
 const ProjectConfig = config.ProjectConfig;
@@ -424,26 +423,19 @@ pub const HookContext = struct {
 
 /// Errors the header-first parse can surface:
 ///   error.BackendManifestParseError    — ZON parser rejected the file
-///   error.BackendManifestUnknownVersion — manifest_version is < 1 or
+///   error.BackendManifestUnknownVersion — manifest_version is < 2 or
 ///                                          > SUPPORTED_MANIFEST_VERSION
 ///
-/// (The parse-failure error name matches `manifest_splice.zig`'s `loadManifest`
-/// so callers can match on a single `BackendManifestParseError`.)
+/// The v1/legacy build-graph manifest is no longer a codegen input (#461 removed
+/// the v1 splice + enum path), so `manifest_version < 2` — including a field-less
+/// legacy `backend.manifest.zon` that reads as version 1 — is REJECTED here.
+/// Resolve-time identity/capabilities are read separately by
+/// `manifest_splice.loadProviderManifest`, which does not go through this parse.
 
-/// A manifest parsed and routed by version. The caller frees it with `free`.
-pub const ParsedManifest = union(enum) {
-    /// v1 (or a field-less legacy manifest) — the existing splice type.
-    v1: splice.BackendManifest,
-    /// v2 build-graph manifest.
-    v2: BackendManifestV2,
-
-    pub fn free(self: ParsedManifest, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .v1 => |m| std.zon.parse.free(allocator, m),
-            .v2 => |m| std.zon.parse.free(allocator, m),
-        }
-    }
-};
+/// The lowest `manifest_version` this assembler will still drive codegen from.
+/// v1 was retired with the enum/v1 splice (#461); the build-graph manifest is
+/// v2-only now.
+pub const MINIMUM_MANIFEST_VERSION: u8 = 2;
 
 /// Parse ONLY the version header off any manifest shape (v1 or v2). Defaulted +
 /// `ignore_unknown_fields`, so an absent `manifest_version` reads as 1 and every
@@ -455,59 +447,47 @@ pub fn parseHeader(allocator: std.mem.Allocator, raw_z: [:0]const u8) !ManifestH
     }) catch return error.BackendManifestParseError;
 }
 
-/// Header-first bounded parse + dispatch (design §6 step 1):
+/// Header-first bounded parse (design §6 step 1, #461 v2-only):
 ///   1. Parse `ManifestHeader` to read `manifest_version` (absent ⇒ 1).
-///   2. Reject `< 1` or `> SUPPORTED_MANIFEST_VERSION` with a readable error —
-///      an older assembler must NOT silently accept a future manifest and skip
-///      its unknown fields (that would generate an incomplete build graph).
-///   3. Dispatch: `<= 1` → re-parse into the v1 `BackendManifest` (the existing
-///      splice type, unchanged); `2..SUPPORTED` → re-parse into `BackendManifestV2`.
+///   2. Reject `< MINIMUM_MANIFEST_VERSION` (v1/legacy — no longer supported) or
+///      `> SUPPORTED_MANIFEST_VERSION` (a future schema an older assembler must
+///      not silently accept) with a readable error.
+///   3. Otherwise re-parse into `BackendManifestV2`.
 ///
-/// Both re-parses use `ignore_unknown_fields = true`, matching the repo-wide
+/// The re-parse uses `ignore_unknown_fields = true`, matching the repo-wide
 /// forward-compat convention (additive fields tolerated within a major; a hard
 /// incompatibility bumps `manifest_version` and is caught by the bound above).
-///
-/// Caller frees the result via `ParsedManifest.free`.
-pub fn parseManifest(allocator: std.mem.Allocator, raw_z: [:0]const u8) !ParsedManifest {
+pub fn parseManifest(allocator: std.mem.Allocator, raw_z: [:0]const u8) !BackendManifestV2 {
     const header = try parseHeader(allocator, raw_z);
     const v = header.manifest_version;
 
-    if (v < 1 or v > SUPPORTED_MANIFEST_VERSION) {
+    if (v < MINIMUM_MANIFEST_VERSION or v > SUPPORTED_MANIFEST_VERSION) {
         std.log.warn(
-            "labelle-assembler: backend.manifest.zon declares manifest_version {d}, " ++
-                "but this assembler release supports manifest_version 1..{d} — " ++
+            "labelle-assembler: backend.manifest.v2.zon declares manifest_version {d}, " ++
+                "but this assembler release supports manifest_version {d}..{d} " ++
+                "(v1/legacy manifests are no longer a codegen input) — " ++
                 "upgrade/downgrade the assembler or fix the manifest.",
-            .{ v, SUPPORTED_MANIFEST_VERSION },
+            .{ v, MINIMUM_MANIFEST_VERSION, SUPPORTED_MANIFEST_VERSION },
         );
         return error.BackendManifestUnknownVersion;
     }
 
-    if (v <= 1) {
-        const m = std.zon.parse.fromSliceAlloc(splice.BackendManifest, allocator, raw_z, null, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.BackendManifestParseError;
-        return .{ .v1 = m };
-    }
-
-    const m = std.zon.parse.fromSliceAlloc(BackendManifestV2, allocator, raw_z, null, .{
+    return std.zon.parse.fromSliceAlloc(BackendManifestV2, allocator, raw_z, null, .{
         .ignore_unknown_fields = true,
     }) catch return error.BackendManifestParseError;
-    return .{ .v2 = m };
 }
 
 /// Load + header-first parse a NAMED manifest file from the resolved backend
-/// package (design §6 step 1 dispatch). `filename` is relative to the backend
-/// package root — `"backend.manifest.zon"` for the production v1 file, or a v2
-/// fixture like `"backend.manifest.v2.zon"` for the byte-anchor test. Routed
-/// through `backend_registry.resolveBackendPackage` exactly as the v1
-/// `manifest_splice.loadManifest` locates the package. Caller frees via
-/// `ParsedManifest.free`.
+/// package (design §6 step 1). `filename` is relative to the backend package
+/// root — e.g. `"backend.manifest.v2.zon"`. Routed through
+/// `backend_registry.resolveBackendPackage`. Caller frees the result via
+/// `std.zon.parse.free`.
 pub fn loadNamedManifest(
     allocator: std.mem.Allocator,
     cfg: ProjectConfig,
     project_dir: []const u8,
     filename: []const u8,
-) !ParsedManifest {
+) !BackendManifestV2 {
     const pkg_dir = try backend_registry.resolveBackendPackage(allocator, cfg, project_dir);
     defer allocator.free(pkg_dir);
 
@@ -703,32 +683,29 @@ test "parseHeader: reads the version off both v1 (absent → 1) and v2 shapes" {
     }
 }
 
-test "parseManifest: v1-passthrough — a field-less v1 manifest routes to the v1 path" {
+test "parseManifest: a v1/legacy field-less manifest is REJECTED (v2-only, #461)" {
+    // The v1 splice + enum path were deleted (#461), so a field-less legacy
+    // manifest (reads as manifest_version 1) is no longer a codegen input and
+    // must be rejected the same way an unknown future version is.
     const v1_z = try dupeZ(legacy_v1);
     defer testing.allocator.free(v1_z);
 
-    const parsed = try parseManifest(testing.allocator, v1_z);
-    defer parsed.free(testing.allocator);
-
-    try testing.expect(parsed == .v1);
-    // The v1 splice fields are all present and unchanged.
-    try testing.expectEqualStrings("sokol", parsed.v1.dir_name);
-    try testing.expectEqual(splice.BackendManifest.LoopStyle.callback, parsed.v1.loop_style);
-    try testing.expectEqualStrings("templates/desktop.txt", parsed.v1.main_loop_template);
-    try testing.expectEqual(@as(usize, 1), parsed.v1.params.backend_dep.len);
+    try testing.expectError(
+        error.BackendManifestUnknownVersion,
+        parseManifest(testing.allocator, v1_z),
+    );
 }
 
-test "parseManifest: a v2 manifest routes to the v2 path" {
+test "parseManifest: a v2 manifest parses into BackendManifestV2" {
     const v2_z = try dupeZ(synthetic_v2);
     defer testing.allocator.free(v2_z);
 
-    const parsed = try parseManifest(testing.allocator, v2_z);
-    defer parsed.free(testing.allocator);
+    const m = try parseManifest(testing.allocator, v2_z);
+    defer std.zon.parse.free(testing.allocator, m);
 
-    try testing.expect(parsed == .v2);
-    try testing.expectEqual(@as(u8, 2), parsed.v2.manifest_version);
-    try testing.expectEqualStrings("labelle.sokol", parsed.v2.id.?);
-    try testing.expect(parsed.v2.platforms.desktop != null);
+    try testing.expectEqual(@as(u8, 2), m.manifest_version);
+    try testing.expectEqualStrings("labelle.sokol", m.id.?);
+    try testing.expect(m.platforms.desktop != null);
 }
 
 test "parseManifest: rejects manifest_version > SUPPORTED with a clear error" {
