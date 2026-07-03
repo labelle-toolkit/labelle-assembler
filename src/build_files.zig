@@ -191,23 +191,23 @@ fn desktopUsesGenericV2(v2_manifest: ?manifest_v2.BackendManifestV2, cfg: Projec
 /// declares such an extra module gets the import; one that does not (sokol-Android)
 /// does not. Takes the resolved v2 manifest directly — the enum/v1 path is gone,
 /// so an Android build always carries one.
-fn androidNeedsAppImport(allocator: std.mem.Allocator, m: manifest_v2.BackendManifestV2, cfg: ProjectConfig) !bool {
+fn androidNeedsAppImport(m: manifest_v2.BackendManifestV2, cfg: ProjectConfig) bool {
     const entry = manifest_v2_splice.platformEntry(m, cfg.platform) orelse return false;
     for (entry.extra_modules) |mod| {
-        // Compute the module's EFFECTIVE root alias EXACTLY as
-        // `manifest_v2_splice.moduleAlias` emits it — `root_alias` if declared,
-        // else the default `backend_<name>` — and match on THAT. A `.name =
-        // "android_app"` module with no `root_alias` is emitted as
-        // `backend_android_app`, so keying the import off the bare name would emit
+        // Match the module's EFFECTIVE root alias as `manifest_v2_splice.moduleAlias`
+        // emits it — `root_alias` if declared, else the default `backend_<name>`.
+        // That equals `backend_app` iff the declared `root_alias` is `backend_app`,
+        // OR (no `root_alias`) the name is `app` — so no allocation is needed. A
+        // `.name = "android_app"` module with no `root_alias` is emitted as
+        // `backend_android_app`, so keying off the bare name would emit
         // `.module = backend_app` for a module never declared under that alias → an
-        // undefined reference. bgfx sets `.root_alias = "backend_app"` explicitly,
-        // so it still matches; a name-only `android_app` correctly does not.
-        const alias = if (mod.root_alias) |a|
-            try allocator.dupe(u8, a)
-        else
-            try std.fmt.allocPrint(allocator, "backend_{s}", .{mod.name});
-        defer allocator.free(alias);
-        if (std.mem.eql(u8, alias, "backend_app")) return true;
+        // undefined reference. bgfx sets `.root_alias = "backend_app"` explicitly, so
+        // it matches; a name-only `android_app` correctly does not.
+        if (mod.root_alias) |a| {
+            if (std.mem.eql(u8, a, "backend_app")) return true;
+        } else if (std.mem.eql(u8, mod.name, "app")) {
+            return true;
+        }
     }
     return false;
 }
@@ -588,7 +588,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // sokol Android path has no such import — sokol's C runtime
         // provides the entry. Keyed off the v2 manifest's `backend_app`
         // extra-module declaration (assembler#461), not the backend enum.
-        if (try androidNeedsAppImport(allocator, manifest, cfg)) {
+        if (androidNeedsAppImport(manifest, cfg)) {
             try tpl.writeSection(build_zig_tmpl, "android_exe_app_import", w);
         }
 
