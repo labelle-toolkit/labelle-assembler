@@ -67,7 +67,11 @@ fn depOptionValue(vs: DepOption.ValueSource, cfg: ProjectConfig) []const u8 {
             (if (std.mem.eql(u8, gui.name, "imgui")) "true" else "false")
         else
             "false",
-        .gamepad_enabled => if (cfg.gamepad == .auto) "true" else "false",
+        // Route through the resolver (never read `cfg.gamepad` directly) so the
+        // codegen flag and `deps_linker.stagesSdlGamepad` can't disagree: a bgfx
+        // project with an absent `.gamepad` resolves to `.none` → "false"
+        // (assembler#533); raylib/sokol keep the `.auto` default → "true".
+        .gamepad_enabled => if (cfg.effectiveGamepad() == .auto) "true" else "false",
         .gamepad_hidapi => if (cfg.gamepad_hidapi) "true" else "false",
         .true_literal => "true",
         .false_literal => "false",
@@ -1296,9 +1300,22 @@ test "mergeDepOptions: per-platform overrides a base entry by name, no duplicate
     try testing.expectEqual(DepOption.ValueSource.true_literal, merged[0].value);
 }
 
+test "depOptionValue: gamepad_enabled routes through effectiveGamepad (assembler#533)" {
+    // bgfx with an ABSENT `.gamepad` resolves to `.none` → "false" (the default
+    // now differs from raylib/sokol). An explicit `.auto` on bgfx opts back in.
+    try testing.expectEqualStrings("false", depOptionValue(.gamepad_enabled, .{ .name = "g", .backend = .bgfx }));
+    try testing.expectEqualStrings("true", depOptionValue(.gamepad_enabled, .{ .name = "g", .backend = .bgfx, .gamepad = .auto }));
+    // raylib/sokol keep the historical `.auto` default when `.gamepad` is absent.
+    try testing.expectEqualStrings("true", depOptionValue(.gamepad_enabled, .{ .name = "g", .backend = .raylib }));
+    try testing.expectEqualStrings("true", depOptionValue(.gamepad_enabled, .{ .name = "g", .backend = .sokol }));
+    // Explicit `.none` opts out everywhere.
+    try testing.expectEqualStrings("false", depOptionValue(.gamepad_enabled, .{ .name = "g", .backend = .raylib, .gamepad = .none }));
+}
+
 test "depOptionValue: closed predicate set matches the v1 paramValue predicates" {
     const base_cfg = ProjectConfig{ .name = "g" };
-    // gamepad defaults to .auto → gamepad_enabled true; hidapi false; no gui → false.
+    // Default backend is raylib; absent `.gamepad` resolves to .auto →
+    // gamepad_enabled true; hidapi false; no gui → false.
     try testing.expectEqualStrings("true", depOptionValue(.gamepad_enabled, base_cfg));
     try testing.expectEqualStrings("false", depOptionValue(.gamepad_hidapi, base_cfg));
     try testing.expectEqualStrings("false", depOptionValue(.gui_is_imgui, base_cfg));

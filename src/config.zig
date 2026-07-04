@@ -154,10 +154,15 @@ pub const AssetCompression = struct {
 
 /// Desktop gamepad source selection (core#28 slice 5).
 ///
-/// - `.auto` (default): the shared windowless-SDL desktop gamepad source
+/// The DEFAULT when `.gamepad` is omitted is backend-aware — see
+/// `ProjectConfig.effectiveGamepad()`: raylib/sokol default to `.auto`, bgfx
+/// defaults to `.none` (assembler#533, bgfx is a pure renderer with no native
+/// input so it should not pull SDL unless the project opts in explicitly).
+///
+/// - `.auto`: the shared windowless-SDL desktop gamepad source
 ///   (`backends/sdl_gamepad/`) is staged, SDL2 is linked, and the raylib /
-///   sokol desktop backends route their gamepad queries through it — on ALL
-///   desktop OSes including Linux. This is the existing, unchanged behavior.
+///   sokol / bgfx desktop backends route their gamepad queries through it — on
+///   ALL desktop OSes including Linux.
 /// - `.none`: opt out entirely. `sdl_gamepad` is NOT staged, SDL2 is NOT
 ///   linked, and both backends' desktop gamepad queries resolve to a
 ///   truly-disabled path (return false/0/empty). For raylib this means NO
@@ -558,10 +563,16 @@ pub const ProjectConfig = struct {
     /// `.y_axis = .down`.
     y_axis: ?YAxis = null,
     ecs: EcsChoice = .mock,
-    /// Desktop gamepad source. `.auto` (default) stages + links + routes the
-    /// shared SDL desktop gamepad source for raylib/sokol desktop; `.none`
-    /// opts out entirely (no SDL, truly-disabled gamepad). See `GamepadSource`.
-    gamepad: GamepadSource = .auto,
+    /// Desktop gamepad source. `.auto` stages + links + routes the shared SDL
+    /// desktop gamepad source for raylib/sokol/bgfx desktop; `.none` opts out
+    /// entirely (no SDL, truly-disabled gamepad). See `GamepadSource`.
+    ///
+    /// OPTIONAL so an ABSENT key (`null`) is distinguishable from an explicit
+    /// `.auto`: the two must resolve differently on bgfx. NEVER read this field
+    /// directly — always go through `effectiveGamepad()`, which applies the
+    /// backend-aware default (bgfx → `.none`, all other desktop backends →
+    /// `.auto`). See that method for the rationale.
+    gamepad: ?GamepadSource = null,
     /// Opt into SDL's HIDAPI raw-HID driver for the desktop gamepad source.
     /// HIDAPI decodes Nintendo/8BitDo Switch-mode pads that GLFW/sokol can't,
     /// but its per-connect device init blocks the render thread for ~2-3s on
@@ -739,6 +750,28 @@ pub const ProjectConfig = struct {
         return @tagName(self.backend);
     }
 
+    /// Resolve the effective desktop gamepad source, applying the backend-aware
+    /// default when `.gamepad` is ABSENT from project.labelle (assembler#533).
+    ///
+    /// An explicit `.gamepad` (either `.auto` or `.none`) is honored verbatim on
+    /// EVERY backend — writing `.gamepad = .auto` on a bgfx project still links
+    /// SDL2. Only when the key is OMITTED does the default kick in:
+    ///
+    ///   - `.bgfx` → `.none`. bgfx is a pure renderer with no native input, so
+    ///     `.auto` would silently pull in SDL2 — a heavyweight system dependency
+    ///     that's painful on Windows. A bgfx project should build with zero
+    ///     system deps by default and opt into gamepad explicitly.
+    ///   - every other desktop backend (raylib/sokol/sdl/…) → `.auto`, the
+    ///     historical default (unchanged).
+    ///
+    /// This is the SINGLE source of truth for the gamepad decision — every reader
+    /// (`deps_linker.stagesSdlGamepad`, the codegen `gamepad_enabled` dep-option)
+    /// routes through here so they can never disagree. Never read `.gamepad`
+    /// directly.
+    pub fn effectiveGamepad(self: ProjectConfig) GamepadSource {
+        return self.gamepad orelse (if (self.backend == .bgfx) .none else .auto);
+    }
+
     /// True when the backend resolves from a PACKAGE (external) rather than the
     /// bundled slot — either an explicit `.backend_package` or a built-in enum
     /// tag mapped to a provider via `builtinProvider` (the enum-as-shorthand).
@@ -828,4 +861,21 @@ test "AssetCompression.formatFor maps platforms; default is png everywhere" {
     try std.testing.expectEqual(AssetFormat.astc, mixed.formatFor(.ios));
     try std.testing.expectEqual(AssetFormat.astc, mixed.formatFor(.desktop));
     try std.testing.expectEqual(AssetFormat.png, mixed.formatFor(.wasm)); // web -> wasm
+}
+
+test "effectiveGamepad: bgfx defaults to .none, other backends to .auto, explicit honored (assembler#533)" {
+    // ABSENT `.gamepad` (null): backend-aware default.
+    try std.testing.expectEqual(GamepadSource.none, (ProjectConfig{ .name = "g", .backend = .bgfx }).effectiveGamepad());
+    inline for (.{ Backend.raylib, .sokol, .sdl, .wgpu, .null }) |b| {
+        try std.testing.expectEqual(GamepadSource.auto, (ProjectConfig{ .name = "g", .backend = b }).effectiveGamepad());
+    }
+
+    // EXPLICIT `.gamepad` is honored verbatim on EVERY backend — an explicit
+    // `.auto` on bgfx still enables gamepad (opts back into SDL), and an explicit
+    // `.none` on raylib still opts out.
+    inline for (@typeInfo(Backend).@"enum".fields) |f| {
+        const tag = @field(Backend, f.name);
+        try std.testing.expectEqual(GamepadSource.auto, (ProjectConfig{ .name = "g", .backend = tag, .gamepad = .auto }).effectiveGamepad());
+        try std.testing.expectEqual(GamepadSource.none, (ProjectConfig{ .name = "g", .backend = tag, .gamepad = .none }).effectiveGamepad());
+    }
 }

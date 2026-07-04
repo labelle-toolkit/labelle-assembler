@@ -18,8 +18,10 @@ pub const DepEntry = struct {
 };
 
 /// Whether the shared SDL desktop-gamepad sub-package (`backends/sdl_gamepad`)
-/// is staged for `cfg`. Built-in-specific: raylib/sokol/bgfx with `gamepad =
-/// .auto`. An EXTERNAL backend is self-contained — it stages none of these
+/// is staged for `cfg`. Built-in-specific: raylib/sokol/bgfx whose EFFECTIVE
+/// gamepad source resolves to `.auto` (via `cfg.effectiveGamepad()` — so bgfx
+/// with an absent `.gamepad` resolves to `.none` and stages nothing, per
+/// assembler#533). An EXTERNAL backend is self-contained — it stages none of these
 /// sub-packages (it declares its own gamepad source in its staged zon), so the
 /// gate is OFF regardless of the enum. This is the exact predicate the
 /// `if (!cfg.isExternal()) switch (cfg.backend)` site below uses, factored out
@@ -34,7 +36,10 @@ pub const DepEntry = struct {
 pub fn stagesSdlGamepad(cfg: ProjectConfig) bool {
     if (cfg.isExternal()) return false;
     return switch (cfg.backend) {
-        .raylib, .sokol, .bgfx => cfg.gamepad == .auto,
+        // Route through the resolver (never read `cfg.gamepad` directly): a bgfx
+        // project with an ABSENT `.gamepad` resolves to `.none` (assembler#533),
+        // so it stages no SDL, while raylib/sokol keep the `.auto` default.
+        .raylib, .sokol, .bgfx => cfg.effectiveGamepad() == .auto,
         else => false,
     };
 }
@@ -132,9 +137,10 @@ pub fn createDepsLinks(
         // local plugins/gui are), so `../sdl_gamepad` resolves to
         // .labelle/deps/sdl_gamepad. Stage the sub-package there under exactly
         // that link name so the path resolves. Other backends don't depend on
-        // it, so only register it for raylib/sokol/bgfx. Gated on `cfg.gamepad
-        // == .auto`: the opt-out (`.none`, core#28 slice 5) does NOT stage the
-        // sub-package at all, so no SDL ends up in the generated build. (bgfx
+        // it, so only register it for raylib/sokol/bgfx. Gated on
+        // `cfg.effectiveGamepad() == .auto`: the opt-out (`.none`, core#28 slice
+        // 5 — and the assembler#533 bgfx default when `.gamepad` is absent) does
+        // NOT stage the sub-package at all, so no SDL ends up in the build. (bgfx
         // desktop reads gamepads through GLFW by default (#315) but GLFW can't
         // decode Switch-mode Nintendo pads; routing the desktop getters through
         // the SDL HIDAPI source fixes that, mirroring raylib/sokol.)

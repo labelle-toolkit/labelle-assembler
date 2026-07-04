@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const backend_dep = b.dependency("labelle_bgfx", .{ .target = target, .optimize = optimize, .gui_enabled = false, .gamepad_enabled = true, .gamepad_hidapi = false });
+    const backend_dep = b.dependency("labelle_bgfx", .{ .target = target, .optimize = optimize, .gui_enabled = false, .gamepad_enabled = false, .gamepad_hidapi = false });
     const backend_gfx = backend_dep.module("gfx");
     const backend_input = backend_dep.module("input");
     const backend_audio = backend_dep.module("audio");
