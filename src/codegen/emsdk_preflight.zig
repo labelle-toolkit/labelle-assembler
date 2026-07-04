@@ -22,8 +22,50 @@
 //! system emcc + sysroot would require changing every backend hook, not the
 //! generated build.zig. A clear error is the fix that is wholly the assembler's to
 //! make, and it is enough to save the next person the debugging hour.
+//!
+//! EMSDK-aware (labelle-studio#25 / #535 Option A): the backend hooks now honour a
+//! managed `EMSDK` env (cli#283 layout `<EMSDK>/upstream/emscripten/emcc`) — when
+//! set they link via that emcc instead of the zig-pkg dep. So the preflight would
+//! WRONGLY fail if `EMSDK` selects a working managed toolchain while the zig-pkg
+//! emsdk happens to be un-activated. The emitted helper therefore short-circuits:
+//! if `EMSDK` is set AND its `upstream/emscripten/emcc` exists, it passes. Only
+//! when there is no usable managed toolchain does it fall through to the zig-pkg
+//! activation check + the #492 message — so the EMSDK-unset behaviour (and that
+//! message) is unchanged. `managedToolchainReady` below is a pure mirror of the
+//! decision, unit-testable without a real build. NOTE: this must ship together
+//! with (or after) the backend hook change — an EMSDK-set + un-activated-zig-pkg
+//! project would otherwise fail with the opaque FileNotFound the check exists to
+//! prevent.
 
 const std = @import("std");
+
+/// Pure predicate mirroring the managed-toolchain branch the emitted helper
+/// runs at the consumer's configure time — factored out so the decision is
+/// unit-testable without a real build, a real emsdk install, or the env.
+///
+/// Returns `true` (⇒ preflight passes, skip the zig-pkg activation check) iff
+/// `EMSDK` is set, non-empty, and `<EMSDK>/upstream/emscripten/emcc` exists per
+/// `probe`. Otherwise `false` ⇒ the caller falls through to the zig-pkg check
+/// (which emits the #492 message when that too is un-activated). A bogus/empty
+/// `EMSDK`, or one whose managed emcc is missing, never silently passes.
+///
+/// `probe` is injected so tests can supply a fake filesystem; the emitted helper
+/// uses `std.Io.Dir.cwd().access` for the real probe.
+pub fn managedToolchainReady(
+    emsdk_env: ?[]const u8,
+    context: anytype,
+    probe: *const fn (@TypeOf(context), []const u8) bool,
+) bool {
+    const root = emsdk_env orelse return false;
+    if (root.len == 0) return false;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const managed_emcc = std.fmt.bufPrint(
+        &buf,
+        "{s}/upstream/emscripten/emcc",
+        .{root},
+    ) catch return false;
+    return probe(context, managed_emcc);
+}
 
 /// Call site emitted inside the generated `build(b)` fn, just before the emcc
 /// link step. Guards both the enum (`emccStep`/`emLinkStep`) and the manifest-v2
@@ -43,6 +85,15 @@ pub const helper_fn =
     \\/// `...upstream/emscripten/emcc file_hash FileNotFound`.
     \\fn ensureEmsdkActivated(b: *std.Build) void {
     \\    const io = b.graph.io;
+    \\    // Managed toolchain (labelle cli#283): when `EMSDK` is set and its
+    \\    // `upstream/emscripten/emcc` exists, the backend hook links via that
+    \\    // managed emcc, so the zig-pkg emsdk need not be activated. Pass.
+    \\    if (b.graph.environ_map.get("EMSDK")) |emsdk_root| {
+    \\        if (emsdk_root.len != 0) {
+    \\            const managed_emcc = b.pathJoin(&.{ emsdk_root, "upstream", "emscripten", "emcc" });
+    \\            if (std.Io.Dir.cwd().access(io, managed_emcc, .{})) |_| return else |_| {}
+    \\        }
+    \\    }
     \\    const emsdk_dep = b.dependency("emsdk", .{});
     \\    const root = emsdk_dep.builder.build_root.path orelse return;
     \\    const emcc_path = b.pathJoin(&.{ root, "upstream", "emscripten", "emcc" });
@@ -107,6 +158,74 @@ test "emitCheckCall / emitHelperFn write their constants" {
     try emitHelperFn(&aw.writer);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), check_call) != null);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "fn ensureEmsdkActivated") != null);
+}
+
+// ── EMSDK-aware branch (labelle-studio#25 / #535 Option A) ───────────────────
+
+const ProbeCtx = struct {
+    /// The single path this fake filesystem reports as existing (null ⇒ nothing
+    /// exists). Set by each test to the managed emcc it expects to be probed.
+    present: ?[]const u8 = null,
+
+    fn exists(self: ProbeCtx, path: []const u8) bool {
+        const p = self.present orelse return false;
+        return std.mem.eql(u8, p, path);
+    }
+};
+
+test "managedToolchainReady: unset EMSDK never passes (⇒ zig-pkg check + #492)" {
+    const ctx = ProbeCtx{ .present = "irrelevant" };
+    try std.testing.expect(!managedToolchainReady(null, ctx, ProbeCtx.exists));
+}
+
+test "managedToolchainReady: empty EMSDK never passes" {
+    const ctx = ProbeCtx{ .present = "/upstream/emscripten/emcc" };
+    try std.testing.expect(!managedToolchainReady("", ctx, ProbeCtx.exists));
+}
+
+test "managedToolchainReady: EMSDK set + managed emcc exists ⇒ passes" {
+    // Probes exactly the cli#283 managed layout `<EMSDK>/upstream/emscripten/emcc`.
+    const ctx = ProbeCtx{ .present = "/opt/emsdk/upstream/emscripten/emcc" };
+    try std.testing.expect(managedToolchainReady("/opt/emsdk", ctx, ProbeCtx.exists));
+}
+
+test "managedToolchainReady: EMSDK set but managed emcc missing ⇒ falls through" {
+    // A bogus EMSDK (no emcc under it) must NOT silently pass — the caller then
+    // runs the zig-pkg activation check rather than assuming a managed toolchain.
+    const ctx = ProbeCtx{ .present = null };
+    try std.testing.expect(!managedToolchainReady("/opt/emsdk", ctx, ProbeCtx.exists));
+}
+
+test "emitted helper honours a managed EMSDK before the zig-pkg check" {
+    // The EMSDK branch must appear, look up `EMSDK` from the build graph env, probe
+    // the managed `upstream/emscripten/emcc`, and short-circuit — all BEFORE the
+    // zig-pkg `b.dependency("emsdk", .{})` resolution.
+    const emsdk_branch = "b.graph.environ_map.get(\"EMSDK\")";
+    const managed_probe = "std.Io.Dir.cwd().access(io, managed_emcc, .{})";
+    try std.testing.expect(std.mem.indexOf(u8, helper_fn, emsdk_branch) != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_fn, managed_probe) != null);
+    const branch_idx = std.mem.indexOf(u8, helper_fn, emsdk_branch).?;
+    const zigpkg_idx = std.mem.indexOf(u8, helper_fn, "const emsdk_dep = b.dependency(\"emsdk\", .{})").?;
+    try std.testing.expect(branch_idx < zigpkg_idx);
+}
+
+test "emitted #492 message is byte-identical (EMSDK-unset path unchanged)" {
+    // The whole point of #492 must survive the EMSDK-aware refactor untouched:
+    // the exact actionable message block, verbatim.
+    const msg =
+        "        std.debug.print(\n" ++
+        "            \\\\\n" ++
+        "            \\\\[labelle] Emscripten (emsdk) is fetched but not activated — the wasm\n" ++
+        "            \\\\build cannot find `emcc`. Download + activate the pinned toolchain once:\n" ++
+        "            \\\\\n" ++
+        "            \\\\    cd \"{s}\" && ./emsdk install latest && ./emsdk activate latest\n" ++
+        "            \\\\\n" ++
+        "            \\\\then re-run your `zig build` command. (labelle-assembler#492)\n" ++
+        "            \\\\\n" ++
+        "            \\\\\n" ++
+        "        , .{root});\n" ++
+        "        std.process.exit(1);";
+    try std.testing.expect(std.mem.indexOf(u8, helper_fn, msg) != null);
 }
 
 test "emitted helper fn parses as valid Zig" {
