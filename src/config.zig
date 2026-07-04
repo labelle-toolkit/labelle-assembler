@@ -702,8 +702,10 @@ pub const ProjectConfig = struct {
             // declares the bgfx-Android callback lifecycle SHAPE in its v2
             // manifest (#461), so the assembler selects it from data instead of
             // the `is_bgfx_android` enum branch. The hole-bearing wasm template
-            // requires assembler ≥ 0.74.0.
-            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.6.4" },
+            // requires assembler ≥ 0.74.0. 0.6.5 honors an external EMSDK for a
+            // host-managed emsdk (assembler#535 / labelle-studio#25) — paired
+            // with this assembler's EMSDK-aware preflight (#536).
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.6.5" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.3.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.3.1" },
