@@ -764,6 +764,33 @@ pub const ProjectConfig = struct {
     ///   - every other desktop backend (raylib/sokol/sdl/…) → `.auto`, the
     ///     historical default (unchanged).
     ///
+    /// We key off the `.bgfx` ENUM TAG, not `backendName()` (assembler#534
+    /// review evaluated + rejected the name/capability alternatives):
+    ///   - The tag `.bgfx` IS the canonical identity of the built-in bgfx: the
+    ///     rest of the gamepad wiring (`deps_linker.stagesSdlGamepad`'s
+    ///     `switch (cfg.backend)`) already keys off it, so routing this decision
+    ///     through the same tag keeps the two in lockstep. A `.backend = .bgfx`
+    ///     project retains that tag even when it resolves to a fetched provider
+    ///     package (the enum-as-shorthand), so the tag is present on the real
+    ///     production path.
+    ///   - `backendName()` is NOT a reliable "is bgfx" signal: it returns the
+    ///     resolved PACKAGE name, which is not guaranteed to be "bgfx" — the
+    ///     in-tree v2 fixture package is literally named "bgfx_v2", and an
+    ///     external bgfx could ship as "labelle-bgfx" or anything else. A string
+    ///     match on "bgfx" would MISS those (wrongly re-enabling SDL).
+    ///   - There is no CAPABILITY signal to key off instead: the natural
+    ///     candidate `.gamepad_polling` is DECLARED by bgfx (its `.auto` gamepad
+    ///     IS the shared SDL source), so it's advertised by every windowed
+    ///     backend and cannot separate a renderer-only backend from an
+    ///     input-capable one. Adding a dedicated "no native gamepad" capability
+    ///     (and threading the resolved manifest into this pure config method) is
+    ///     deliberately out of scope for this change.
+    ///
+    /// LIMITATION (conscious + documented): a genuine THIRD-PARTY renderer-only
+    /// backend selected purely via `.backend_package` (with `.backend` left at
+    /// its default) therefore falls back to `.auto`. Such a project opts out
+    /// explicitly with `.gamepad = .none`.
+    ///
     /// This is the SINGLE source of truth for the gamepad decision — every reader
     /// (`deps_linker.stagesSdlGamepad`, the codegen `gamepad_enabled` dep-option)
     /// routes through here so they can never disagree. Never read `.gamepad`
@@ -869,6 +896,31 @@ test "effectiveGamepad: bgfx defaults to .none, other backends to .auto, explici
     inline for (.{ Backend.raylib, .sokol, .sdl, .wgpu, .null }) |b| {
         try std.testing.expectEqual(GamepadSource.auto, (ProjectConfig{ .name = "g", .backend = b }).effectiveGamepad());
     }
+
+    // The default keys off the `.bgfx` ENUM TAG (assembler#534). A `.backend =
+    // .bgfx` project keeps that tag even when the tag resolves to a fetched
+    // provider package (the enum-as-shorthand) OR is pinned to a `local:`
+    // dev-override whose package name differs (the in-tree fixture is named
+    // "bgfx_v2") — so the tag, not the package name, is the reliable signal.
+    try std.testing.expectEqual(GamepadSource.none, (ProjectConfig{
+        .name = "g",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "bgfx_v2", .repo = "local:backends/bgfx_v2" },
+    }).effectiveGamepad());
+    // Documented limitation (assembler#534): a THIRD-PARTY renderer-only backend
+    // selected purely via `.backend_package`, with `.backend` left at its
+    // default, falls back to `.auto` — no capability signal marks it as needing
+    // SDL for gamepad (`.gamepad_polling` is declared even by bgfx). It opts out
+    // with an explicit `.gamepad = .none`.
+    try std.testing.expectEqual(GamepadSource.auto, (ProjectConfig{
+        .name = "g",
+        .backend_package = .{ .name = "acme_vulkan", .repo = "local:../v" },
+    }).effectiveGamepad());
+    try std.testing.expectEqual(GamepadSource.none, (ProjectConfig{
+        .name = "g",
+        .backend_package = .{ .name = "acme_vulkan", .repo = "local:../v" },
+        .gamepad = .none,
+    }).effectiveGamepad());
 
     // EXPLICIT `.gamepad` is honored verbatim on EVERY backend — an explicit
     // `.auto` on bgfx still enables gamepad (opts back into SDL), and an explicit
