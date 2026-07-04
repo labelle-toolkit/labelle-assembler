@@ -1877,8 +1877,10 @@ pub const MANIFEST_V2_BGFX_DESKTOP_GOLDEN = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "resolve_target") == null);
         try std.testing.expect(std.mem.indexOf(u8, out, "post_wire") == null);
         // Declarative backend dep forwards gui_enabled (base) + gamepad_* (desktop
-        // append; default cfg: gamepad auto → true, hidapi false).
-        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"labelle_bgfx\", .{ .target = target, .optimize = optimize, .gui_enabled = false, .gamepad_enabled = true, .gamepad_hidapi = false });") != null);
+        // append). Default bgfx cfg omits `.gamepad`, which resolves to `.none`
+        // (assembler#533 — bgfx opts OUT of SDL by default) → gamepad_enabled
+        // false; hidapi false.
+        try std.testing.expect(std.mem.indexOf(u8, out, "b.dependency(\"labelle_bgfx\", .{ .target = target, .optimize = optimize, .gui_enabled = false, .gamepad_enabled = false, .gamepad_hidapi = false });") != null);
         // BOTH artifacts declared.
         try std.testing.expect(std.mem.indexOf(u8, out, "const bgfx = backend_dep.artifact(\"bgfx\");") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "const glfw = backend_dep.artifact(\"glfw\");") != null);
