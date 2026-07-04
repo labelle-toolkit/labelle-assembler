@@ -155,6 +155,15 @@ fn unifyCoreDiamond(
 /// `...upstream/emscripten/emcc file_hash FileNotFound`.
 fn ensureEmsdkActivated(b: *std.Build) void {
     const io = b.graph.io;
+    // Managed toolchain (labelle cli#283): when `EMSDK` is set and its
+    // `upstream/emscripten/emcc` exists, the backend hook links via that
+    // managed emcc, so the zig-pkg emsdk need not be activated. Pass.
+    if (b.graph.environ_map.get("EMSDK")) |emsdk_root| {
+        if (emsdk_root.len != 0) {
+            const managed_emcc = b.pathJoin(&.{ emsdk_root, "upstream", "emscripten", "emcc" });
+            if (std.Io.Dir.cwd().access(io, managed_emcc, .{})) |_| return else |_| {}
+        }
+    }
     const emsdk_dep = b.dependency("emsdk", .{});
     const root = emsdk_dep.builder.build_root.path orelse return;
     const emcc_path = b.pathJoin(&.{ root, "upstream", "emscripten", "emcc" });
