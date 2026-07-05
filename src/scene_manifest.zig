@@ -271,30 +271,58 @@ pub const MAX_CHILDREN_DEPTH: u32 = 64;
 /// that happens to carry `meta` alongside other entity-shape keys is
 /// walked normally — see `validateRootBlock`.
 fn hasFlatEntityShapeKey(obj: std.json.ObjectMap) bool {
-    if (obj.get("components") != null) return true;
-    if (obj.get("children") != null) return true;
-    if (obj.get("prefab") != null) return true;
-    if (obj.get("overrides") != null) return true;
-    // RFC #596: any PascalCase key is a flat-form component.
+    // Single pass over the keys: a flat-form entity-shape key is either
+    // one of the lowercase wrappers (`components` / `children` /
+    // `prefab` / `overrides`) or — per RFC #596 — any PascalCase key
+    // (a flat-form component reference).
     var iter = obj.iterator();
     while (iter.next()) |entry| {
-        if (isPascalCase(entry.key_ptr.*)) return true;
+        const key = entry.key_ptr.*;
+        if (isPascalCase(key)) return true;
+        if (std.mem.eql(u8, key, "components")) return true;
+        if (std.mem.eql(u8, key, "children")) return true;
+        if (std.mem.eql(u8, key, "prefab")) return true;
+        if (std.mem.eql(u8, key, "overrides")) return true;
     }
     return false;
 }
 
-/// Returns true if `obj` carries any PascalCase key — used by the
-/// hybrid-form gate at entity scope (engine #597 mirrors the same
-/// rule). A file or entity that carries BOTH an `overrides:` /
-/// `components:` wrapper AND PascalCase siblings is malformed: the
-/// walker can only descend one of the two, silently dropping the
-/// other would lose data for users mid-migration.
-fn hasFlatPascalCaseKey(obj: std.json.ObjectMap) bool {
+/// Returns the conflicting wrapper key name (`"overrides"` or
+/// `"components"`) if `obj` mixes a legacy wrapper with flat-form
+/// PascalCase component keys at this scope, or `null` if the shape is
+/// internally consistent.
+///
+/// A file or entity that carries BOTH an `overrides:` / `components:`
+/// wrapper AND PascalCase siblings is malformed: the walker can only
+/// descend one of the two, and silently dropping the other would lose
+/// data for users mid-migration (RFC #596 axis 2; engine #597 mirrors
+/// the same gate at every entity site).
+///
+/// The check is a single pass over `obj.keys()`, tracking whether a
+/// wrapper and any PascalCase key coexist. `overrides` takes precedence
+/// when both wrappers are present, preserving the diagnostic the call
+/// sites emitted before this consolidation (#236).
+///
+/// pub for the extracted test file (scene_manifest_test.zig).
+pub fn checkHybridForm(obj: std.json.ObjectMap) ?[]const u8 {
+    var has_pascal = false;
+    var has_overrides = false;
+    var has_components = false;
     var iter = obj.iterator();
     while (iter.next()) |entry| {
-        if (isPascalCase(entry.key_ptr.*)) return true;
+        const key = entry.key_ptr.*;
+        if (isPascalCase(key)) {
+            has_pascal = true;
+        } else if (std.mem.eql(u8, key, "overrides")) {
+            has_overrides = true;
+        } else if (std.mem.eql(u8, key, "components")) {
+            has_components = true;
+        }
     }
-    return false;
+    if (!has_pascal) return null;
+    if (has_overrides) return "overrides";
+    if (has_components) return "components";
+    return null;
 }
 
 /// Pure helper that classifies a parsed file's top-level object into
@@ -461,25 +489,23 @@ fn validateRootBlock(
     // We check this BEFORE the §B2 prefab+children gate so the message
     // points at the structural ambiguity first; a hybrid file that
     // ALSO trips §B2 is fixed by un-mixing the forms anyway.
-    if (hasFlatPascalCaseKey(obj)) {
-        if (obj.get("overrides") != null) {
+    if (checkHybridForm(obj)) |conflict| {
+        if (std.mem.eql(u8, conflict, "overrides")) {
             stderrPrint(
                 "labelle-assembler: scene '{s}' has a {s} that mixes 'overrides:' with flat-form PascalCase component keys.\n" ++
                     "  RFC #596 axis 2: lift the keys out of 'overrides' or wrap them back in — not both at once.\n" ++
                     "  Either {{prefab, overrides: {{Position, ...}}}} or {{prefab, Position, ...}}, never both.\n",
                 .{ display_path, site_label },
             );
-            return error.HybridForm;
-        }
-        if (obj.get("components") != null) {
+        } else {
             stderrPrint(
                 "labelle-assembler: scene '{s}' has a {s} that mixes 'components:' with flat-form PascalCase component keys.\n" ++
                     "  RFC #596 axis 2: lift the keys out of 'components' or wrap them back in — not both at once.\n" ++
                     "  Either {{components: {{Image, ...}}, children: [...]}} or {{Image, ..., children: [...]}}, never both.\n",
                 .{ display_path, site_label },
             );
-            return error.HybridForm;
         }
+        return error.HybridForm;
     }
 
     // Reference-mode root: §B2 forbids `children` here just as for
@@ -535,23 +561,21 @@ fn validateChildrenArrayDepth(value: std.json.Value, display_path: []const u8, d
         // gate as `validateRootBlock`. We don't have a `site_label`
         // parameter here (the scene's child-entry message is fixed),
         // so the message names "a child entry" directly.
-        if (hasFlatPascalCaseKey(obj)) {
-            if (obj.get("overrides") != null) {
+        if (checkHybridForm(obj)) |conflict| {
+            if (std.mem.eql(u8, conflict, "overrides")) {
                 stderrPrint(
                     "labelle-assembler: scene '{s}' has a child entry that mixes 'overrides:' with flat-form PascalCase component keys.\n" ++
                         "  RFC #596 axis 2: lift the keys out of 'overrides' or wrap them back in — not both at once.\n",
                     .{display_path},
                 );
-                return error.HybridForm;
-            }
-            if (obj.get("components") != null) {
+            } else {
                 stderrPrint(
                     "labelle-assembler: scene '{s}' has a child entry that mixes 'components:' with flat-form PascalCase component keys.\n" ++
                         "  RFC #596 axis 2: lift the keys out of 'components' or wrap them back in — not both at once.\n",
                     .{display_path},
                 );
-                return error.HybridForm;
             }
+            return error.HybridForm;
         }
         // Hoist into locals so the second use (`children_val`) is a
         // simple unwrap of the already-looked-up optional rather than
