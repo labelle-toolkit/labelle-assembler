@@ -18,6 +18,7 @@ const scene_manifest = @import("scene_manifest.zig");
 const parseSceneSource = scene_manifest.parseSceneSource;
 const freeManifest = scene_manifest.freeManifest;
 const classifyTopLevel = scene_manifest.classifyTopLevel;
+const checkHybridForm = scene_manifest.checkHybridForm;
 const MAX_CHILDREN_DEPTH = scene_manifest.MAX_CHILDREN_DEPTH;
 
 test "parses scene with assets array" {
@@ -711,6 +712,75 @@ test "§B2 site label — root-wrapped form classifies as 'root' (regression pin
     const label = try classifyTopLevel(parsed.value.object);
     try std.testing.expect(label != null);
     try std.testing.expectEqualStrings("root", label.?);
+}
+
+// ── #236: single-pass checkHybridForm helper ────────────────────────
+//
+// The two hybrid-form gates (`validateRootBlock` and
+// `validateChildrenArrayDepth`) share one classifier now. These pin the
+// exact key forms it accepts as conflicting and the wrapper-precedence
+// rule, so the collapse stays behavior-preserving.
+
+fn parseObj(src: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, std.testing.allocator, src, .{});
+}
+
+test "checkHybridForm: overrides wrapper + PascalCase sibling conflicts" {
+    var parsed = try parseObj(
+        \\{ "prefab": "x", "overrides": {}, "Position": {} }
+    );
+    defer parsed.deinit();
+    const conflict = checkHybridForm(parsed.value.object);
+    try std.testing.expect(conflict != null);
+    try std.testing.expectEqualStrings("overrides", conflict.?);
+}
+
+test "checkHybridForm: components wrapper + PascalCase sibling conflicts" {
+    var parsed = try parseObj(
+        \\{ "components": {}, "Image": {}, "children": [] }
+    );
+    defer parsed.deinit();
+    const conflict = checkHybridForm(parsed.value.object);
+    try std.testing.expect(conflict != null);
+    try std.testing.expectEqualStrings("components", conflict.?);
+}
+
+test "checkHybridForm: overrides wins when both wrappers coexist with PascalCase" {
+    // validateRootBlock historically checked `overrides` before
+    // `components`, so a triple-mix must still name `overrides`.
+    var parsed = try parseObj(
+        \\{ "overrides": {}, "components": {}, "Position": {} }
+    );
+    defer parsed.deinit();
+    const conflict = checkHybridForm(parsed.value.object);
+    try std.testing.expect(conflict != null);
+    try std.testing.expectEqualStrings("overrides", conflict.?);
+}
+
+test "checkHybridForm: wrapper without any PascalCase sibling is consistent" {
+    var parsed = try parseObj(
+        \\{ "prefab": "x", "overrides": { "Position": {} } }
+    );
+    defer parsed.deinit();
+    // The nested PascalCase lives inside `overrides`, not as a sibling,
+    // so this is the canonical wrapper form — no conflict.
+    try std.testing.expect(checkHybridForm(parsed.value.object) == null);
+}
+
+test "checkHybridForm: flat PascalCase without a wrapper is consistent" {
+    var parsed = try parseObj(
+        \\{ "prefab": "x", "Position": {}, "Sprite": {} }
+    );
+    defer parsed.deinit();
+    try std.testing.expect(checkHybridForm(parsed.value.object) == null);
+}
+
+test "checkHybridForm: structural-only object is consistent" {
+    var parsed = try parseObj(
+        \\{ "components": {}, "children": [] }
+    );
+    defer parsed.deinit();
+    try std.testing.expect(checkHybridForm(parsed.value.object) == null);
 }
 
 // ── RFC #596 — wrapper-flat + bundle + meta shapes (engine #597) ─────
