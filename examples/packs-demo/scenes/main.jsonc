@@ -1,0 +1,13 @@
+{
+    // The scene references the pack's component by its NAMESPACED key —
+    // scenes are data, the wall does nothing for them (docs/packs.md).
+    "name": "main",
+    "entities": [
+        {
+            "components": {
+                "Position": { "x": 100, "y": 200 },
+                "citizens__Counter": { "n": 1 }
+            }
+        }
+    ]
+}

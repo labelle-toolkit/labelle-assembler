@@ -1,0 +1,8 @@
+// The providing pack: ships a component, an event, a verb surface —
+// and exposes exactly ONE query to dependents.
+.{
+    .name = "citizens",
+    .manifest_version = 1,
+    .convention_dirs = .copy_and_scan,
+    .exposes = .{ .queries = .{"find_idle"} },
+}
