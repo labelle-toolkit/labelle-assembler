@@ -1242,3 +1242,98 @@ pub const FLOW_HANDLER_ROUTING = struct {
         try std.testing.expect(!contains(main_zig, "script__counter"));
     }
 };
+
+// ── #498 PR 4: exposes surfaces + depends_on wiring ──────────────────
+
+pub const PACK_SURFACE = struct {
+    test "renderSurface re-exports exactly the exposes lists through @import(\"pack\")" {
+        const src = try generate.pack_root.renderSurface(std.testing.allocator, "citizens", .{
+            .queries = &.{ "find_idle_worker", "worker_count" },
+            .commands = &.{"assign_job"},
+        });
+        defer std.testing.allocator.free(src);
+
+        try std.testing.expect(contains(src, "const pack = @import(\"pack\");"));
+        try std.testing.expect(contains(src, "pub const @\"find_idle_worker\" = pack.queries.@\"find_idle_worker\";"));
+        try std.testing.expect(contains(src, "pub const @\"worker_count\" = pack.queries.@\"worker_count\";"));
+        try std.testing.expect(contains(src, "pub const @\"assign_job\" = pack.commands.@\"assign_job\";"));
+    }
+
+    test "renderSurface with no exposes is a header-only module — dependents can call nothing" {
+        const src = try generate.pack_root.renderSurface(std.testing.allocator, "props", .{});
+        defer std.testing.allocator.free(src);
+
+        try std.testing.expect(contains(src, "Public surface of pack 'props'"));
+        try std.testing.expect(!contains(src, "@import(\"pack\")"));
+        try std.testing.expect(!contains(src, "pub const queries"));
+        try std.testing.expect(!contains(src, "pub const commands"));
+    }
+
+    test "checkExposesFiles: exposing verbs without the file is a generate-time error" {
+        try generate.pack_validate.checkExposesFiles("citizens", 2, 0, true, false);
+        try std.testing.expectError(
+            error.PackExposesMissingFile,
+            generate.pack_validate.checkExposesFiles("citizens", 2, 0, false, false),
+        );
+        try std.testing.expectError(
+            error.PackExposesMissingFile,
+            generate.pack_validate.checkExposesFiles("citizens", 0, 1, true, false),
+        );
+    }
+
+    test "scanPack copies queries.zig/commands.zig and prunes stale copies" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "src/citizens");
+        var pack_src = try tmp.dir.openDir(io, "src/citizens", .{});
+        defer pack_src.close(io);
+        try writeFileIn(pack_src, "queries.zig", "pub fn find_idle(game: anytype) void { _ = game; }\n");
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/citizens", allocator);
+        defer allocator.free(pack_src_path);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(target_path);
+
+        var scan1 = try generate.scanPack(allocator, pack_src_path, target_path, "citizens");
+        defer scan1.deinit(allocator);
+        try std.testing.expect(scan1.has_queries);
+        try std.testing.expect(!scan1.has_commands);
+        try tmp.dir.access(io, "packs/citizens/queries.zig", .{});
+
+        // Source removed → the stale copy is pruned on the next scan.
+        try pack_src.deleteFile(io, "queries.zig");
+        var scan2 = try generate.scanPack(allocator, pack_src_path, target_path, "citizens");
+        defer scan2.deinit(allocator);
+        try std.testing.expect(!scan2.has_queries);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "packs/citizens/queries.zig", .{}));
+    }
+
+    test "build wiring: every pack gets a surface module importing ONLY its pack; depends_on maps the dep name onto the dep's SURFACE" {
+        const pack_modules = [_]generate.pack_root.PackModule{
+            .{ .name = "citizens", .prefix = "citizens" },
+            .{ .name = "production", .prefix = "production", .depends_on = &.{"citizens"} },
+        };
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, .{ .pack_modules = &pack_modules });
+        defer std.testing.allocator.free(build_zig);
+
+        // Surface module: rooted at __surface.zig, sole import = the pack.
+        try std.testing.expect(contains(build_zig, "const pack_surface__citizens_mod = b.createModule(.{"));
+        try std.testing.expect(contains(build_zig, "b.path(\"packs/citizens/__surface.zig\")"));
+        try std.testing.expect(contains(build_zig, ".imports = &.{.{ .name = \"pack\", .module = pack__citizens_mod }},"));
+        // Surface modules are DEMAND-driven: nothing depends_on
+        // production, so declaring its surface would be an unused-const
+        // compile error in the generated build.zig.
+        try std.testing.expect(!contains(build_zig, "pack_surface__production_mod"));
+        // depends_on: production reaches citizens ONLY through the surface…
+        try std.testing.expect(contains(build_zig, "overrideImport(pack__production_mod, \"citizens\", pack_surface__citizens_mod);"));
+        // … never the pack module itself, and never the reverse direction.
+        try std.testing.expect(!contains(build_zig, "overrideImport(pack__production_mod, \"citizens\", pack__citizens_mod);"));
+        try std.testing.expect(!contains(build_zig, "overrideImport(pack__citizens_mod, \"production\""));
+    }
+};

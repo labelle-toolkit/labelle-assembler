@@ -133,6 +133,19 @@ pub fn loadPackFromDir(
     const parsed = std.zon.parse.fromSliceAlloc(ZonPackManifest, allocator, raw_z, null, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
+        // Targeted diagnostic for the RFC's scalar shorthand (#498 PR 4):
+        // `.exposes = .all` is deliberately unsupported — an unbounded
+        // surface defeats the wall. The generic ZON error for it is
+        // opaque ("expected struct"), so name the fix. Token-sequence
+        // scan (`.exposes` ws `=` ws `.all`) rather than two independent
+        // substring hits, so unrelated parse failures in manifests that
+        // merely MENTION either token don't get the misleading hint.
+        if (exposesAllShorthand(raw_bytes)) {
+            std.log.warn(
+                "labelle: pack '{s}': `.exposes = .all` is not supported — list queries/commands explicitly (`.exposes = .{{ .queries = .{{ \"...\" }} }}`). The shared `contracts` pack is implicit and needs no exposes.",
+                .{expected_name},
+            );
+        }
         std.log.warn(
             "labelle: failed to parse pack.labelle for pack '{s}' at {s}\n  parser error: {any}\n  see docs/RFC-packs.md for the pack manifest schema\n",
             .{ expected_name, manifest_path, err },
@@ -542,4 +555,23 @@ fn writeManifestFile(tmp_dir: std.Io.Dir, body: []const u8) !void {
     var f = try tmp_dir.createFile(testing.io, "plugin.labelle", .{});
     defer f.close(testing.io);
     try f.writeStreamingAll(testing.io, body);
+}
+
+/// True when `bytes` contains the literal token sequence
+/// `.exposes = .all` (arbitrary whitespace around `=`). Deliberately
+/// simple — commented-out occurrences can still match, but the hint is
+/// only ever printed AFTER a real parse failure, so the worst case is a
+/// redundant-but-related line above the real error.
+fn exposesAllShorthand(bytes: []const u8) bool {
+    var search: []const u8 = bytes;
+    while (std.mem.indexOf(u8, search, ".exposes")) |i| {
+        var rest = search[i + ".exposes".len ..];
+        rest = std.mem.trimStart(u8, rest, " \t\r\n");
+        if (rest.len > 0 and rest[0] == '=') {
+            rest = std.mem.trimStart(u8, rest[1..], " \t\r\n");
+            if (std.mem.startsWith(u8, rest, ".all")) return true;
+        }
+        search = search[i + 1 ..];
+    }
+    return false;
 }

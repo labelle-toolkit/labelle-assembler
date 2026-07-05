@@ -838,6 +838,26 @@ pub fn generate(
         const rel = try std.fs.path.join(allocator, &.{ "packs", pack.name, "__pack_root.zig" });
         defer allocator.free(rel);
         try scanner.writeFile(target_dir, rel, pack_root_src);
+
+        // `__surface.zig` (#498 PR 4): the exposes-narrowed module a
+        // dependent's `@import("<this pack>")` maps to. Validated here so
+        // a manifest exposing verbs from a file the pack doesn't ship
+        // fails BEFORE any build, with the manifest named — the compile
+        // error a dependent would eventually hit points at generated
+        // code instead of the author's mistake.
+        const exposes: pack_root_gen.SurfaceExposes = blk: {
+            const manifest = for (pack_entries.items) |e| {
+                if (std.mem.eql(u8, e.plugin.name, pack.name)) break e.manifest;
+            } else unreachable; // pack_scans is built FROM pack_entries
+            const ex = manifest.exposes orelse break :blk .{};
+            try pack_validate.checkExposesFiles(pack.name, ex.queries.len, ex.commands.len, pack.has_queries, pack.has_commands);
+            break :blk .{ .queries = ex.queries, .commands = ex.commands };
+        };
+        const surface_src = try pack_root_gen.renderSurface(allocator, pack.name, exposes);
+        defer allocator.free(surface_src);
+        const surface_rel = try std.fs.path.join(allocator, &.{ "packs", pack.name, "__surface.zig" });
+        defer allocator.free(surface_rel);
+        try scanner.writeFile(target_dir, surface_rel, surface_src);
     }
 
     // ── Module-plugin filter — light packs are dir-scan-only (#481) ────
@@ -968,7 +988,12 @@ pub fn generate(
     for (pack_scans.items) |pack| {
         var pfx_buf: [128]u8 = undefined;
         const pfx = scan.packNamespacePrefix(pack.name, &pfx_buf);
-        pack_modules.appendAssumeCapacity(.{ .name = pack.name, .prefix = try allocator.dupe(u8, pfx) });
+        // depends_on aliases the manifest's strings — safe: `pack_entries`'
+        // cleanup defer was declared before this list's, so it runs after.
+        const depends_on: []const []const u8 = for (pack_entries.items) |e| {
+            if (std.mem.eql(u8, e.plugin.name, pack.name)) break e.manifest.depends_on;
+        } else &.{};
+        pack_modules.appendAssumeCapacity(.{ .name = pack.name, .prefix = try allocator.dupe(u8, pfx), .depends_on = depends_on });
     }
 
     // Generate build.zig

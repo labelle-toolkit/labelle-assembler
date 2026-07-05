@@ -1,8 +1,8 @@
 # Packs: the module wall and the sanctioned surfaces
 
 *(assembler#498, the enforcement layer of the Packs epic —
-labelle-engine#650. Status: PRs 1–3 landed; `exposes`/`depends_on`
-surfaces are PR 4; the lint demotion notes are PR 5.)*
+labelle-engine#650. Status: PRs 1–4 landed; the lint demotion notes
+are PR 5.)*
 
 A **pack** is the light, directory-scanned form of a plugin: a
 namespaced subtree (`packs/<name>/{components,events,prefabs,hooks,scripts}/`)
@@ -29,7 +29,7 @@ What a pack module can import:
 | Engine substrate | `labelle-engine`, `labelle-core`, `labelle-gfx`, backend modules, `ecs_backend`/`gui_backend` | shared infrastructure |
 | Decl-module plugins | `@import("<plugin>")` by project.labelle name | plugins are the sanctioned inter-domain surface (e.g. FP routes worker access through `worker_controller`) |
 | Shared contracts pack | `@import("contracts")` | implicit dependency (`pack_validate.IMPLICIT_DEPS`) |
-| Declared pack deps | `@import("<dep>")` → the dep's `exposes` surface | **PR 4** |
+| Declared pack deps | `@import("<dep>")` → the dep's `exposes` surface (`__surface.zig`) | `depends_on` in `pack.labelle` |
 
 What it cannot import — the wall itself:
 
@@ -57,6 +57,38 @@ everything else `@compileError`s in the engine's `ComponentView`.
 Under a root module with no generated views (the tests target,
 preview shells) it falls back to a registry of the pack's own
 components only — no globals.
+
+## The verb surfaces: `exposes` + `depends_on`
+
+A pack's public API is its root-level `queries.zig` / `commands.zig`,
+narrowed by the manifest:
+
+```zig
+// packs/citizens/pack.labelle
+.{
+    .name = "citizens",
+    .manifest_version = 1,
+    .convention_dirs = .copy_and_scan,
+    .exposes = .{ .queries = .{"find_idle_worker"} },
+}
+// packs/production/pack.labelle
+.{ …, .depends_on = .{"citizens"} }
+// packs/production/scripts/…
+const citizens = @import("citizens");
+_ = citizens.queries.find_idle_worker(game);
+```
+
+`@import("<dep>")` maps to the dep's generated `__surface.zig` — a
+module that re-exports **exactly** the `exposes` lists through the
+dep's own pack module (its sole import). A `null`/empty `exposes`
+yields a header-only surface with no imports at all — dependents can
+call nothing. A non-exposed verb is "no member named …" at compile
+time; an undeclared dependency is "no module named …". Exposing verbs
+from a file the pack doesn't ship fails at generate time with the
+manifest named. `.exposes = .all` is deliberately unsupported (an
+unbounded surface defeats the wall): the manifest fails to parse and
+a targeted diagnostic names the explicit-list fix. `contracts` is the
+exception: implicit, full-module, no exposes-narrowing.
 
 ## What deliberately stays open
 

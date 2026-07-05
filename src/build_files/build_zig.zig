@@ -202,7 +202,9 @@ fn emitPackModules(
     }
     // Implicit `contracts` wiring — dependents reach the shared-vocabulary
     // pack as `@import("contracts")`. `contracts` itself must not
-    // self-import.
+    // self-import. Deliberately the FULL pack module, not a surface:
+    // exposes-narrowing doesn't apply to the shared-vocabulary pack
+    // (`pack_validate.IMPLICIT_DEPS`).
     const contracts: ?pack_root.PackModule = for (pack_modules) |p| {
         if (std.mem.eql(u8, p.name, pack_root.CONTRACTS_PACK_NAME)) break p;
     } else null;
@@ -210,6 +212,56 @@ fn emitPackModules(
         for (pack_modules) |p| {
             if (std.mem.eql(u8, p.name, c.name)) continue;
             try w.print("    overrideImport(pack__{s}_mod, \"contracts\", pack__{s}_mod);\n", .{ p.prefix, c.prefix });
+        }
+    }
+
+    // Surface modules (#498 PR 4): rooted at the generated
+    // `__surface.zig`, sole import = the pack module itself (as "pack" —
+    // the same self-name the pack's own code uses). Declared ON DEMAND:
+    // only packs some sibling actually `depends_on` get a module var —
+    // an unconditionally-declared one that nothing references would be
+    // Zig's "unused local constant" compile error in the generated
+    // build.zig (the `__surface.zig` FILE is still written for every
+    // pack, so adding a dependent later changes only this wiring).
+    var any_surface = false;
+    for (pack_modules) |p| {
+        const depended = blk: {
+            for (pack_modules) |q| {
+                for (q.depends_on) |dep| {
+                    if (std.mem.eql(u8, dep, pack_root.CONTRACTS_PACK_NAME)) continue;
+                    if (std.mem.eql(u8, dep, p.name)) break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        if (!depended) continue;
+        if (!any_surface) {
+            try w.writeAll("    // Pack `exposes` surfaces (#498 PR 4): the only face a dependent sees.\n");
+            any_surface = true;
+        }
+        try w.print("    const pack_surface__{s}_mod = b.createModule(.{{\n", .{p.prefix});
+        try w.print("        .root_source_file = b.path(\"packs/{s}/__surface.zig\"),\n", .{p.name});
+        try w.writeAll("        .target = target,\n");
+        try w.writeAll("        .optimize = optimize,\n");
+        try w.print("        .imports = &.{{.{{ .name = \"pack\", .module = pack__{s}_mod }}}},\n", .{p.prefix});
+        try w.writeAll("    });\n");
+    }
+
+    // `depends_on` wiring (#498 PR 4): a dependency that names a sibling
+    // PACK maps the dep's plain name onto its SURFACE module — dependents
+    // never see `pack__<prefix>` (whose root re-exports the private
+    // internals). Entries naming decl-module plugins are already in every
+    // pack module's import table; `contracts` was wired above as the
+    // implicit full module.
+    for (pack_modules) |p| {
+        for (p.depends_on) |dep| {
+            if (std.mem.eql(u8, dep, pack_root.CONTRACTS_PACK_NAME)) continue;
+            const dep_pack: ?pack_root.PackModule = for (pack_modules) |q| {
+                if (std.mem.eql(u8, q.name, dep)) break q;
+            } else null;
+            if (dep_pack) |d| {
+                try w.print("    overrideImport(pack__{s}_mod, \"{s}\", pack_surface__{s}_mod);\n", .{ p.prefix, dep, d.prefix });
+            }
         }
     }
 }
