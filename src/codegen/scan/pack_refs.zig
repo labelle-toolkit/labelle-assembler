@@ -47,6 +47,12 @@ pub const PackScan = struct {
     /// prefix so two packs shipping `overlay.zig` don't collide on the import
     /// alias / receiver-instance identifier.
     hook_names: []const []const u8 = &.{},
+    /// True when the pack ships a root-level `queries.zig` / `commands.zig`
+    /// (RFC §6 verb surfaces, #498 PR 4). Copied beside the convention dirs;
+    /// `__pack_root.zig` re-exports them and `__surface.zig` narrows them to
+    /// the manifest's `exposes` lists.
+    has_queries: bool = false,
+    has_commands: bool = false,
 
     pub fn deinit(self: *PackScan, allocator: std.mem.Allocator) void {
         allocator.free(self.name);

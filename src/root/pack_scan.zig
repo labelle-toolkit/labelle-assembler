@@ -183,6 +183,14 @@ pub fn scanPack(
     // (`"citizens__Worker"` / `"citizens__worker"`). Done against the copied
     // (destination) files so the source pack tree is never mutated.
     try rewritePackPrefabRefs(allocator, dst_base, pack_name, component_names, prefab_names);
+
+    // Verb-surface files (RFC §6, #498 PR 4): a pack's root-level
+    // `queries.zig` / `commands.zig` are copied beside the convention
+    // dirs so `__pack_root.zig` can re-export them and `__surface.zig`
+    // can narrow them to the manifest's `exposes` lists. Absent source
+    // prunes a stale copy (same #496 discipline as pack scripts).
+    const has_queries = try copyPackRootFile(allocator, pack_src_dir, dst_base, "queries.zig");
+    const has_commands = try copyPackRootFile(allocator, pack_src_dir, dst_base, "commands.zig");
     // …and rewrite the copied hook sources so a handler written with the pack's
     // bare local event name receives its `<pack>__`-prefixed event (chatgpt-codex
     // #3). Same "mutate the copy, never the source" discipline.
@@ -195,7 +203,42 @@ pub fn scanPack(
         .event_names = event_names,
         .prefab_names = prefab_names,
         .hook_names = hook_names,
+        .has_queries = has_queries,
+        .has_commands = has_commands,
     };
+}
+
+/// Copy one root-level pack file (`queries.zig`/`commands.zig`) into the
+/// generated pack dir, returning whether it exists. A missing source
+/// deletes any stale destination a prior generate copied — without the
+/// prune, a removed verb surface would keep compiling from the leftover
+/// (labelle-assembler#496's discipline, applied to single files).
+fn copyPackRootFile(
+    allocator: std.mem.Allocator,
+    pack_src_dir: []const u8,
+    dst_base: []const u8,
+    filename: []const u8,
+) !bool {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const src = try std.fs.path.join(allocator, &.{ pack_src_dir, filename });
+    defer allocator.free(src);
+    const dst = try std.fs.path.join(allocator, &.{ dst_base, filename });
+    defer allocator.free(dst);
+
+    const bytes = cwd.readFileAlloc(io, src, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            cwd.deleteFile(io, dst) catch {};
+            return false;
+        },
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    // A pack may ship ONLY a verb surface (no convention dirs), in which
+    // case nothing above created the destination dir yet.
+    try cwd.createDirPath(io, dst_base);
+    try scanner.writeFile(dst_base, filename, bytes);
+    return true;
 }
 
 /// Rewrite every copied pack prefab JSONC in place so its local references

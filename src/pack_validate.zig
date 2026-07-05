@@ -478,3 +478,31 @@ test "validate: diamond DAG (shared lower dep) is acyclic" {
     const declared = [_][]const u8{ "a", "b", "c", "d" };
     try validate(testing.allocator, &packs, &declared);
 }
+
+/// #498 PR 4: a manifest exposing verbs from a file the pack doesn't
+/// ship fails at GENERATE time with the manifest named — otherwise the
+/// dependent's eventual compile error points at generated code instead
+/// of the author's mistake. Called per pack from `generate()`; split
+/// out for direct unit testing.
+pub fn checkExposesFiles(
+    pack_name: []const u8,
+    exposes_queries: usize,
+    exposes_commands: usize,
+    has_queries: bool,
+    has_commands: bool,
+) error{PackExposesMissingFile}!void {
+    if (exposes_queries > 0 and !has_queries) {
+        std.log.warn(
+            "labelle: pack '{s}' exposes queries but ships no queries.zig — add packs/{s}/queries.zig or drop the exposes.queries list",
+            .{ pack_name, pack_name },
+        );
+        return error.PackExposesMissingFile;
+    }
+    if (exposes_commands > 0 and !has_commands) {
+        std.log.warn(
+            "labelle: pack '{s}' exposes commands but ships no commands.zig — add packs/{s}/commands.zig or drop the exposes.commands list",
+            .{ pack_name, pack_name },
+        );
+        return error.PackExposesMissingFile;
+    }
+}
