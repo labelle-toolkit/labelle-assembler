@@ -25,9 +25,10 @@ const PluginFlowNode = scan.PluginFlowNode;
 /// therefore promoted to a named build module (labelle-assembler#240
 /// Gap 2). `module_sanitized` of an `is_script` flow node equals
 /// `pathToIdent(rel_path)`, so the comparison is a direct string match.
-/// Used by the `AllScripts` emitter to switch promoted scripts to the
+/// Used by the `AllScripts` emitter — and the flow-handler sites in
+/// `blocks/hooks.zig` — to switch promoted scripts to the
 /// `@import("script__<ident>")` form.
-fn isFlowNodeScript(flow_nodes: []const PluginFlowNode, ident: []const u8) bool {
+pub fn isFlowNodeScript(flow_nodes: []const PluginFlowNode, ident: []const u8) bool {
     for (flow_nodes) |fn_| {
         if (!fn_.is_script) continue;
         if (std.mem.eql(u8, fn_.module_sanitized, ident)) return true;
@@ -241,7 +242,10 @@ pub fn Mixin(comptime Self: type) type {
                 const import_expr: []const u8 = if (is_promoted)
                     std.fmt.bufPrint(&expr_buf, "@import(\"script__{s}\")", .{ident}) catch return error.NameTooLong
                 else if (entry.import_base.len == 0) blk: {
-                    const pack_name = entry.plugin_name orelse return error.NameTooLong;
+                    // `""` import_base is only ever set by
+                    // `scanPackScriptsDir`, which always stamps the owning
+                    // pack — a null here is scanner-invariant breakage.
+                    const pack_name = entry.plugin_name orelse return error.PackScriptMissingOwner;
                     var pfx_buf: [128]u8 = undefined;
                     const pfx = scan.packNamespacePrefix(pack_name, &pfx_buf);
                     var rel_ident_buf: [256]u8 = undefined;

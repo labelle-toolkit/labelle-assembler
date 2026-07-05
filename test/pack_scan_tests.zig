@@ -1151,3 +1151,76 @@ pub const PACK_MODULE_BUILD = struct {
         try std.testing.expect(!contains(build_zig, "__pack_root.zig"));
     }
 };
+
+// ── Flow-handler import routing at the hook sites ─────────────────────
+//
+// `printFlowHandlerImport` must mirror the `AllScripts` emitter's three
+// shapes exactly, or a handler file lands in two modules. The pack shape
+// is covered by the wall's e2e fixture; these pin the game-script edges:
+// a FlowNodes-PROMOTED handler routes through its named module (the
+// pre-existing dual-module hole CodeRabbit flagged on #538), and a plain
+// handler keeps the path import.
+
+pub const FLOW_HANDLER_ROUTING = struct {
+    const handler_entry: generate.script_scanner.ScriptScanner.ScriptEntry = .{
+        .name = "counter",
+        .filename = "counter.zig",
+        .states = &.{},
+        .sort_order = null,
+        .subdir = null,
+        .rel_path = "counter.zig",
+        .has_event_handler = true,
+    };
+
+    fn gen(flow_nodes: []const h.PluginFlowNode) ![]const u8 {
+        const entries: []const generate.script_scanner.ScriptScanner.ScriptEntry = &.{handler_entry};
+        return generate.generateMainZigFromTemplate(
+            std.testing.allocator,
+            hooks_tmpl,
+            .{ .y_axis = .up, .name = "test-game", .backend = .raylib, .ecs = .mock },
+            raylib_lifecycle,
+            entries,
+            empty_names,
+            empty_names,
+            empty_scene_manifests,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_names,
+            empty_plugin_events,
+            flow_nodes,
+            empty_plugin_pin_styles,
+            empty_plugin_coercions,
+        );
+    }
+
+    test "a FlowNodes-promoted flow handler is reached via its named module at BOTH hook sites" {
+        const nodes = [_]h.PluginFlowNode{.{
+            .module_import_path = "counter.zig",
+            .module_sanitized = "counter",
+            .node_name = "log",
+            .is_script = true,
+        }};
+        const main_zig = try gen(&nodes);
+        defer std.testing.allocator.free(main_zig);
+
+        // Receiver-type tuple + hooks_init materialisation both route
+        // through the named module …
+        try std.testing.expect(contains(main_zig, "*@import(\"script__counter\").FlowEventHandler,"));
+        try std.testing.expect(contains(main_zig, "var counter_flow_handler: @import(\"script__counter\").FlowEventHandler = .{};"));
+        // … and the path form is fully gone (it would put the file in
+        // both the root module and its own named module).
+        try std.testing.expect(!contains(main_zig, "@import(\"scripts/counter.zig\")"));
+    }
+
+    test "a plain (unpromoted) flow handler keeps the scripts/ path import" {
+        const main_zig = try gen(empty_plugin_flow_nodes);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(contains(main_zig, "*@import(\"scripts/counter.zig\").FlowEventHandler,"));
+        try std.testing.expect(!contains(main_zig, "script__counter"));
+    }
+};

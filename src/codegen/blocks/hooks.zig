@@ -19,6 +19,7 @@ const std = @import("std");
 const idents = @import("../idents.zig");
 const scan = @import("../scan.zig");
 const pack_root = @import("../pack_root.zig");
+const registries = @import("registries.zig");
 const script_scanner = @import("../../script_scanner.zig");
 
 const pathToIdent = scan.pathToIdent;
@@ -27,21 +28,42 @@ const pathToPascal = idents.pathToPascal;
 const ScriptEntry = script_scanner.ScriptScanner.ScriptEntry;
 
 /// Write the import expression that reaches a flow-handler script's
-/// module: `@import("scripts/<rel>")` for game/plugin scripts, or the
-/// pack MODULE's re-export (`@import("pack__<pfx>").scripts.<rel_ident>`)
-/// for pack entries (`import_base == ""`, #498 PR 2 — pack files belong
-/// to the pack module, so the old `@import("scripts/packs/…")` form was
-/// both a wrong path AND a dual-module error). Shared by the
-/// `GameHooks` receiver-type tuple and the `hooks_init` materialisation
-/// so the two can never disagree on where a handler lives.
-fn printFlowHandlerImport(w: anytype, entry: ScriptEntry) !void {
+/// module. Three shapes, mirroring the `AllScripts` emitter exactly so
+/// a handler file always lives in ONE module:
+///   - pack entry (`import_base == ""`, #498 PR 2) → the pack MODULE's
+///     re-export, `@import("pack__<pfx>").scripts.<rel_ident>` (the old
+///     `@import("scripts/packs/…")` form was both a wrong path AND a
+///     dual-module error);
+///   - FlowNodes-promoted game script (#240 Gap 2) → its named module,
+///     `@import("script__<ident>")` — a handler that ALSO exports
+///     `FlowNodes` would otherwise be path-imported here while
+///     `AllScripts` reaches it through the named module, the exact
+///     dual-module error the promotion exists to prevent;
+///   - everything else → `@import("scripts/<rel>")`.
+/// Shared by the `GameHooks` receiver-type tuple and the `hooks_init`
+/// materialisation so the two can never disagree on where a handler
+/// lives.
+fn printFlowHandlerImport(
+    w: anytype,
+    entry: ScriptEntry,
+    flow_nodes: []const scan.PluginFlowNode,
+) !void {
     if (entry.import_base.len == 0) {
-        const pack_name = entry.plugin_name orelse return error.NameTooLong;
+        // `""` import_base is only ever set by `scanPackScriptsDir`,
+        // which always stamps the owning pack — a null here is
+        // scanner-invariant breakage.
+        const pack_name = entry.plugin_name orelse return error.PackScriptMissingOwner;
         var pfx_buf: [128]u8 = undefined;
         const pfx = scan.packNamespacePrefix(pack_name, &pfx_buf);
         var rel_ident_buf: [256]u8 = undefined;
         const rel_ident = pathToIdent(pack_root.packRelScriptPath(entry.rel_path, pack_name), &rel_ident_buf);
         try w.print("@import(\"pack__{s}\").scripts.{s}", .{ pfx, rel_ident });
+        return;
+    }
+    var ident_buf: [256]u8 = undefined;
+    const ident = pathToIdent(entry.rel_path, &ident_buf);
+    if (registries.isFlowNodeScript(flow_nodes, ident)) {
+        try w.print("@import(\"script__{s}\")", .{ident});
     } else {
         try w.print("@import(\"scripts/{s}\")", .{entry.rel_path});
     }
@@ -173,7 +195,7 @@ pub fn Mixin(comptime Self: type) type {
                 for (flow_order) |i| {
                     const entry = script_entries[i];
                     try w.writeAll(" *");
-                    try printFlowHandlerImport(w, entry);
+                    try printFlowHandlerImport(w, entry, self.plugin_flow_nodes);
                     try w.writeAll(".FlowEventHandler,");
                 }
                 try w.writeAll(" });\n\n");
@@ -228,7 +250,7 @@ pub fn Mixin(comptime Self: type) type {
                     const entry = script_entries[i];
                     const ident = pathToIdent(entry.rel_path, ident_buf);
                     try w.print("    var {s}_flow_handler: ", .{ident});
-                    try printFlowHandlerImport(w, entry);
+                    try printFlowHandlerImport(w, entry, self.plugin_flow_nodes);
                     try w.writeAll(".FlowEventHandler = .{};\n");
                 }
                 try w.writeAll("    var hooks = GameHooks{ .receivers = .{");

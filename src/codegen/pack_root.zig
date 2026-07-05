@@ -134,5 +134,9 @@ pub fn renderPackRoot(
     }
 
     var arr_list = alloc_writer.toArrayList();
+    // `toArrayList` resets the writer, so its errdefer no longer covers
+    // the buffer — without this, an OOM inside `toOwnedSlice` leaks it
+    // (no double-free: the reset writer's deinit is a no-op).
+    errdefer arr_list.deinit(allocator);
     return arr_list.toOwnedSlice(allocator);
 }
