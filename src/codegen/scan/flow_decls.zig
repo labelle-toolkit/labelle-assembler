@@ -537,7 +537,18 @@ pub fn discoverPluginFlowDecls(
             &flow_nodes,
             &pin_styles,
             &coercions,
-        ) catch continue; // tolerate per-plugin parse failures
+        ) catch |err| switch (err) {
+            // OOM must stay a HARD failure — swallowing it (the old
+            // `catch continue`) would silently leave the generated flow
+            // registry incomplete → wrong codegen with no error. Note the
+            // scan's inferred error set is *exactly* `error{OutOfMemory}`:
+            // `std.zig.Ast.parse` records parse errors in the AST rather
+            // than raising them, so there is no genuine per-plugin parse
+            // failure to tolerate here. The exhaustive switch makes that
+            // explicit — if the scan ever grows a tolerable error, this
+            // stops compiling and forces a deliberate `else => continue`.
+            error.OutOfMemory => return err,
+        };
     }
 
     // ── Game-script pass (RFC §5) ───────────────────────────────
@@ -573,7 +584,12 @@ pub fn discoverPluginFlowDecls(
             &flow_nodes,
             &pin_styles,
             &coercions,
-        ) catch continue;
+        ) catch |err| switch (err) {
+            // OOM must stay a HARD failure — see the plugin pass above for
+            // why the scan's only error is `error.OutOfMemory` and why
+            // this switch is intentionally exhaustive (no `else`).
+            error.OutOfMemory => return err,
+        };
     }
 
     // Each `toOwnedSlice` resets its source ArrayList to empty, so the
@@ -651,4 +667,86 @@ pub fn dedupePinStyles(
     const out = try kept.toOwnedSlice(allocator);
     std.mem.reverse(PluginPinStyle, out);
     return out;
+}
+
+// ── Regression: OOM must propagate as a hard failure (#540) ──────────
+//
+// The plugin + game-script passes previously did
+// `scanFlowDeclsInSource(...) catch continue`, which swallowed
+// `error.OutOfMemory` and returned a SILENTLY INCOMPLETE flow registry
+// (wrong codegen, no error). `std.zig.Ast.parse` never surfaces parse
+// *errors* as Zig errors — it records them in the AST and returns
+// normally — so `error.OutOfMemory` is in fact the ONLY error the scan
+// can raise. Swallowing it therefore masked the single failure mode the
+// module's design goal says must stay hard.
+//
+// This test drives `discoverPluginFlowDecls` over a game script that
+// declares a real `FlowNodes` block through a `FailingAllocator` forced
+// to fail at each allocation index in turn. Post-fix every forced
+// failure must surface as `error.OutOfMemory` — never a value with a
+// short/empty `flow_nodes` slice (which is exactly what the old
+// `catch continue` produced). The allocator's freed/allocated tally is
+// asserted balanced at every failure point to also cover the errdefer
+// chains.
+test "discoverPluginFlowDecls: OOM propagates, never a silent partial scan" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script_src =
+        \\const labelle = @import("labelle");
+        \\pub const FlowNodes = struct {
+        \\    pub const apply_impulse = labelle.FlowNode(.{ .impl = applyImpulseImpl });
+        \\    pub const get_velocity = labelle.FlowNode(.{ .impl = getVelocityImpl });
+        \\};
+        \\fn applyImpulseImpl() void {}
+        \\fn getVelocityImpl() f32 {
+        \\    return 0;
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "hits.zig", .data = script_src });
+
+    const scripts_root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(scripts_root);
+
+    const cfg = ProjectConfig{ .name = "tmp" };
+    const entries = [_]ScriptEntry{.{
+        .name = "hits",
+        .filename = "hits.zig",
+        .states = &.{},
+        .sort_order = null,
+        .subdir = null,
+        .rel_path = "hits.zig",
+    }};
+
+    // Success path: confirm the script's FlowNodes are actually
+    // discovered (so a "silent partial" pre-fix would be observable) and
+    // count the allocations.
+    const total_allocs = blk: {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var decls = try discoverPluginFlowDecls(fa.allocator(), cfg, scripts_root, scripts_root, &entries);
+        defer decls.deinit();
+        try std.testing.expect(decls.flow_nodes.len == 2);
+        break :blk fa.alloc_index;
+    };
+
+    // Force-fail each allocation index. The fixed scan raises
+    // `error.OutOfMemory` at every point — it must never return a value
+    // with a truncated node set.
+    var i: usize = 0;
+    while (i < total_allocs) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = i });
+        const a = fa.allocator();
+        if (discoverPluginFlowDecls(a, cfg, scripts_root, scripts_root, &entries)) |decls_val| {
+            var decls = decls_val;
+            defer decls.deinit();
+            // A value at a forced-fail index is only acceptable if it is
+            // the COMPLETE result (the failure landed after the last
+            // allocation) — never a silently truncated scan.
+            try std.testing.expect(decls.flow_nodes.len == 2);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        try std.testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
+    }
 }
