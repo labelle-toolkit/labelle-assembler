@@ -6,14 +6,21 @@
 //! "Enforcement — isolation is structural, not documented"; umbrella
 //! labelle-engine#651).
 //!
-//! Enforcement is a stack (RFC §6): module isolation (compile) → the
-//! `PackView` registry partition (compile, engine #652-remainder) →
-//! generate-time validation (`pack_validate.zig`, the DAG/cycle gate) →
-//! **this lint (the net)** → pit-of-success scaffolding. The lint is the
-//! interim backstop while the compile guarantees are still landing; once
-//! the registry partition ships, rules 1–2 become compile errors and only
-//! event *direction* (rule 3) and `.global`-facet *writes* stay lint-only
-//! (RFC §6 "honest limit even then").
+//! Enforcement is a stack (RFC §6): module isolation (compile, #498
+//! PR 2) → the `PackView` registry partition + `@import("pack").Registry`
+//! bridge (compile, #498 PRs 1/3) → `exposes` surfaces + `depends_on`
+//! narrowing (compile, #498 PR 4) → generate-time validation
+//! (`pack_validate.zig`, the DAG/cycle gate) → **this lint (the fast
+//! no-build net)** → pit-of-success scaffolding. With the wall shipped
+//! (`docs/packs.md`), the compile layer now also catches rule 1's TYPED
+//! half (`view(.{Foreign})` — the foreign type is unreachable from a
+//! pack module) and rule 4's literal cross-pack imports (dual-module /
+//! out-of-module errors). The lint keeps both as the fast pre-build
+//! diagnostic. What stays lint-ONLY, permanently, by design: rule 1's
+//! STRING half — `game.ComponentRegistry` through the `anytype` `game`
+//! param still resolves every name — plus `.global`-facet *writes*
+//! (rule 2) and event *direction* (rule 3), RFC §6's "honest limit even
+//! then".
 //!
 //! ## Rules
 //!
@@ -384,7 +391,7 @@ fn scanAccessorCall(
                     if (foreignPrefixOf(val, ctx)) |pfx| {
                         const msg = try std.fmt.allocPrint(
                             arena,
-                            "pack '{s}' reads foreign registry name \"{s}\" (owned by pack '{s}') via {s}(...); cross-pack reads must go through the owner's published queries, not the string-keyed registry (RFC §6)",
+                            "pack '{s}' reads foreign registry name \"{s}\" (owned by pack '{s}') via {s}(...); cross-pack reads must go through the owner's published queries — a pack's own names resolve via @import(\"pack\").Registry, and foreign names die there at compile time; only the anytype `game` param still resolves them, which is exactly what this lint nets (RFC §6 / #498)",
                             .{ ctx.current_prefix, val, pfx, accessor },
                         );
                         try emit(arena, findings, .cross_pack_registry_access, src, file, t.start, msg);
@@ -396,7 +403,7 @@ fn scanAccessorCall(
                 if (foreignComponentOwner(cname, ctx)) |owner_pfx| {
                     const msg = try std.fmt.allocPrint(
                         arena,
-                        "pack '{s}' views foreign component '{s}' (owned by pack '{s}') via {s}(...); a pack's components are private — read through the owner's published queries (RFC §6)",
+                        "pack '{s}' views foreign component '{s}' (owned by pack '{s}') via {s}(...); a pack's components are private — read through the owner's published queries. Since the pack module wall (#498) this also fails to compile; this lint is the fast pre-build diagnostic (RFC §6)",
                         .{ ctx.current_prefix, cname, owner_pfx, accessor },
                     );
                     try emit(arena, findings, .cross_pack_registry_access, src, file, t.start, msg);
@@ -512,7 +519,7 @@ fn checkCrossPackImport(
         if (fp.allowed) return; // declared dependency (or contracts) — permitted
         const msg = try std.fmt.allocPrint(
             arena,
-            "pack '{s}' @imports \"{s}\", a source file inside pack '{s}' — which it does not declare in depends_on; a pack may not reach around the ACL by importing another pack's files directly (add '{s}' to depends_on and go through its published surface, or drop the import). RFC §6 / engine #656",
+            "pack '{s}' @imports \"{s}\", a source file inside pack '{s}' — which it does not declare in depends_on; a pack may not reach around the ACL by importing another pack's files directly (add '{s}' to depends_on and go through its published surface, or drop the import). Since the pack module wall (#498) this also fails to compile; this lint is the fast pre-build diagnostic. RFC §6 / engine #656",
             .{ ctx.current_prefix, path, fp.name, fp.name },
         );
         try emit(arena, findings, .cross_pack_import, src, file, path_tok.start, msg);

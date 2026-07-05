@@ -13,12 +13,14 @@
 //!      acyclic graph. A proper DFS reports the offending cycle path.
 //!      → `error.PackDependencyCycle`
 //!
-//! This is the "gate" layer of RFC §6's enforcement stack. It does NOT
-//! implement the depends_on ENFORCEMENT (the restricted per-pack module
-//! graph / `PackView` registry partition) — that is engine-side
-//! #652-remainder. The "one-facet-one-owner" duplicate-component check
-//! from the RFC is mooted by #440's `<pack>__` name prefix (registry
-//! names become pack-unique) and is intentionally not implemented here.
+//! This is the "gate" layer of RFC §6's enforcement stack — it runs
+//! BEFORE any target is written. The COMPILE layer above it shipped with
+//! #498: the per-pack module graph, the `PackView` partition +
+//! `@import("pack").Registry` bridge, and the `exposes` surface modules
+//! `depends_on` maps onto (`docs/packs.md`). The "one-facet-one-owner"
+//! duplicate-component check from the RFC is mooted by #440's
+//! `<pack>__` name prefix (registry names become pack-unique) and is
+//! intentionally not implemented here.
 //!
 //! The core `validate` function is pure (data in, error out) so it can be
 //! unit-tested without touching the filesystem; `root.zig` gathers the
