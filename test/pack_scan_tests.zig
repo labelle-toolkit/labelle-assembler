@@ -1038,6 +1038,13 @@ pub const PACK_ROOT_RENDER = struct {
         // Prefabs are DATA — embedded by path from main.zig, never
         // re-exported here.
         try std.testing.expect(!contains(src, "worker.jsonc"));
+
+        // Registry bridge (#498 PR 3): resolves the generated PackView
+        // through @import("root") with a tests/preview fallback over the
+        // pack's OWN components (namespaced fields = the serde keys).
+        try std.testing.expect(contains(src, "pub const Registry = if (@hasDecl(root, \"citizens_pack_view\"))"));
+        try std.testing.expect(contains(src, "root.citizens_pack_view"));
+        try std.testing.expect(contains(src, ".citizens__WorkerState = components.worker_u_state.WorkerState,"));
     }
 
     test "renderPackRoot with no zig files emits only the header (prefab-only pack)" {
@@ -1057,6 +1064,10 @@ pub const PACK_ROOT_RENDER = struct {
         try std.testing.expect(!contains(src, "pub const events"));
         try std.testing.expect(!contains(src, "pub const hooks"));
         try std.testing.expect(!contains(src, "pub const scripts"));
+        // The Registry bridge is unconditional — component-less packs get
+        // the empty fallback so the authoring surface is uniform.
+        try std.testing.expect(contains(src, "pub const Registry = if (@hasDecl(root, \"props_pack_view\"))"));
+        try std.testing.expect(contains(src, "ComponentRegistry(.{});"));
     }
 
     test "packRelScriptPath strips the pack's scripts/ prefix and tolerates foreign shapes" {
@@ -1101,6 +1112,9 @@ pub const PACK_MODULE_BUILD = struct {
         try std.testing.expect(contains(build_zig, "exe.root_module.addImport(\"pack__citizens\", pack__citizens_mod);"));
         try std.testing.expect(contains(build_zig, "test_root.root_module.addImport(\"pack__citizens\", pack__citizens_mod);"));
         try std.testing.expect(contains(build_zig, "const pack__production_mod = b.createModule(.{"));
+        // Self-import (#498 PR 3): pack code reaches its own root — and
+        // the Registry bridge — as @import("pack").
+        try std.testing.expect(contains(build_zig, "overrideImport(pack__citizens_mod, \"pack\", pack__citizens_mod);"));
     }
 
     test "the pack module's import table is the wall: engine/core/plugins in, game + sibling packs OUT" {
@@ -1135,8 +1149,12 @@ pub const PACK_MODULE_BUILD = struct {
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(contains(build_zig, "overrideImport(pack__citizens_mod, \"contracts\", pack__contracts_mod);"));
-        // Direction check: contracts never imports a dependent, never itself.
-        try std.testing.expect(!contains(build_zig, "overrideImport(pack__contracts_mod,"));
+        // Direction check: contracts never imports a dependent and never
+        // gets ITSELF wired as "contracts" (its own "pack" self-import is
+        // fine — that's the PR 3 Registry bridge, every pack has one).
+        try std.testing.expect(!contains(build_zig, "overrideImport(pack__contracts_mod, \"contracts\""));
+        try std.testing.expect(!contains(build_zig, "overrideImport(pack__contracts_mod, \"citizens\""));
+        try std.testing.expect(contains(build_zig, "overrideImport(pack__contracts_mod, \"pack\", pack__contracts_mod);"));
     }
 
     test "no packs → build.zig has zero pack-module wiring (byte-identity invariant)" {

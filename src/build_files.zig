@@ -194,6 +194,10 @@ fn emitPackModules(
         }
         try w.writeAll("        },\n");
         try w.writeAll("    });\n");
+        // Self-import (#498 PR 3): pack code reaches its own module root —
+        // and the Registry bridge on it — as `@import("pack")`, uniform
+        // across packs so authored code never hardcodes its prefix.
+        try w.print("    overrideImport(pack__{s}_mod, \"pack\", pack__{s}_mod);\n", .{ p.prefix, p.prefix });
     }
     // Implicit `contracts` wiring — dependents reach the shared-vocabulary
     // pack as `@import("contracts")`. `contracts` itself must not

@@ -22,8 +22,10 @@
 //! route worker access through `worker_controller`'s citizens surface,
 //! per the pack's own boundary docs), plus the implicit `contracts`
 //! pack when the project declares one (`pack_validate.IMPLICIT_DEPS`).
-//! `depends_on` surface modules land in PR 4; the `@import("root")`
-//! Registry bridge + `@import("pack")` self-import land in PR 3.
+//! The `@import("root")` Registry bridge + `@import("pack")`
+//! self-import (PR 3) make `@import("pack").Registry` the sanctioned
+//! string-keyed surface — see `docs/packs.md`. `depends_on` surface
+//! modules land in PR 4.
 //!
 //! Prefab `.jsonc` files stay `@embedFile`d by path from `main.zig` —
 //! data files have no module membership, and the embed path + the
@@ -31,6 +33,7 @@
 
 const std = @import("std");
 const scan = @import("scan.zig");
+const idents = @import("idents.zig");
 
 /// The build-graph identity of one pack module, threaded from
 /// `generate()`'s `pack_scans` into `BuildZigOptions` so the generated
@@ -71,9 +74,23 @@ pub fn packRelScriptPath(rel_path: []const u8, pack_name: []const u8) []const u8
 /// sides can never drift.
 ///
 /// Sections are emitted only when non-empty; a pack with only prefabs
-/// produces a module with nothing but the header (still a valid module
-/// root — the build graph wires it unconditionally so the wiring shape
-/// doesn't depend on which convention dirs a pack happens to use).
+/// produces a module with just the header + `Registry` (still a valid
+/// module root — the build graph wires it unconditionally so the wiring
+/// shape doesn't depend on which convention dirs a pack happens to use).
+///
+/// The tail is the `Registry` bridge (#498 PR 3): the pack's sanctioned
+/// string-keyed registry, reached from pack code as
+/// `@import("pack").Registry` (the self-import `emitPackModules`
+/// wires). In a generated game it resolves — via `@import("root")`,
+/// legal from any module, the `std_options` mechanism — to the
+/// `<prefix>_pack_view` PackView main.zig emitted (PR 1): the pack's
+/// own `<pack>__` names plus `.global`-visibility components;
+/// foreign-private names `@compileError` in the engine's
+/// `ComponentView`. Under a root module that carries no view (the
+/// tests target's `__tests_root.zig`, editor preview shells), the
+/// `@hasDecl` guard falls back to a registry of the pack's own
+/// components only — no globals. Lazy decl analysis makes root↔pack
+/// non-circular.
 pub fn renderPackRoot(
     allocator: std.mem.Allocator,
     pack: scan.PackScan,
@@ -130,7 +147,34 @@ pub fn renderPackRoot(
             const ident = scan.pathToIdent(rel, &ident_buf);
             try w.print("    pub const {s} = @import(\"scripts/{s}\");\n", .{ ident, rel });
         }
-        try w.writeAll("};\n");
+        try w.writeAll("};\n\n");
+    }
+
+    // ── Registry bridge (#498 PR 3) ────────────────────────────────
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = scan.packNamespacePrefix(pack.name, &prefix_buf);
+    try w.writeAll("const root = @import(\"root\");\n");
+    try w.writeAll("/// The pack's sanctioned string-keyed registry: this pack's own\n");
+    try w.writeAll("/// `<pack>__` names + `.global`-visibility components. Any\n");
+    try w.writeAll("/// foreign-private name is a comptime error (engine ComponentView).\n");
+    try w.writeAll("/// Reach it as `@import(\"pack\").Registry` from pack code.\n");
+    try w.print("pub const Registry = if (@hasDecl(root, \"{s}_pack_view\"))\n", .{prefix});
+    try w.print("    root.{s}_pack_view\n", .{prefix});
+    try w.writeAll("else\n");
+    try w.writeAll("    // Root module without a generated view (tests target, preview\n");
+    try w.writeAll("    // shells): the pack's own components only, no globals.\n");
+    try w.writeAll("    @import(\"labelle-engine\").ComponentRegistry(.{");
+    if (pack.component_names.len == 0) {
+        try w.writeAll("});\n");
+    } else {
+        try w.writeAll("\n");
+        var pascal_buf: [128]u8 = undefined;
+        for (pack.component_names) |stem| {
+            const ident = scan.pathToIdent(stem, &ident_buf);
+            const pascal = idents.pathToPascal(stem, &pascal_buf);
+            try w.print("        .{s}__{s} = components.{s}.{s},\n", .{ prefix, pascal, ident, pascal });
+        }
+        try w.writeAll("    });\n");
     }
 
     var arr_list = alloc_writer.toArrayList();
