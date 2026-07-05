@@ -99,10 +99,14 @@ pub fn renderWasmBackendDepV2(
         try w.print("    const {s} = backend_dep.module(\"{s}\");\n", .{ alias, mod.name });
     }
 
-    // GENERATED: artifact decls (wasm has no `.pic`).
+    // GENERATED: artifact decls (wasm has no `.pic`). Var name is the SANITIZED
+    // artifact ident (raw name stays inside `artifact("...")`); decl + link sites
+    // must agree — see `common.artifactIdent` (review #469 f1+2, #546).
     for (wasm.artifacts) |art| {
-        try w.print("    const {s} = backend_dep.artifact(\"{s}\");\n", .{ art.name, art.name });
-        if (art.pic) try w.print("    {s}.root_module.pic = true;\n", .{art.name});
+        var ident_buf: [128]u8 = undefined;
+        const ident = common.artifactIdent(art.name, &ident_buf);
+        try w.print("    const {s} = backend_dep.artifact(\"{s}\");\n", .{ ident, art.name });
+        if (art.pic) try w.print("    {s}.root_module.pic = true;\n", .{ident});
     }
 
     // GENERATED: the generic core+gfx-diamond walk CALLS (design §5).
@@ -135,7 +139,9 @@ pub fn renderWasmLinkV2(m: BackendManifestV2, cfg: ProjectConfig, w: anytype) !v
     // GENERATED (D): link the platform artifact(s) into the wasm lib. emcc scans
     // the lib's transitive static deps, so this must run BEFORE post_wire.
     for (wasm.artifacts) |art| {
-        try w.print("    wasm.root_module.linkLibrary({s});\n", .{art.name});
+        var ident_buf: [128]u8 = undefined;
+        const ident = common.artifactIdent(art.name, &ident_buf);
+        try w.print("    wasm.root_module.linkLibrary({s});\n", .{ident});
     }
 
     // GENERATED (H-post): the emcc residual (design §2 (c)) — delegated to the
@@ -250,4 +256,57 @@ test "wasm_footer_helpers is the android_footer tail (drift guard)" {
     // Everything from the build-fn-closing `}` (col 0) onward is the shared tail.
     const close = std.mem.indexOf(u8, android_footer, "\n}\n").?;
     try testing.expectEqualStrings(android_footer[close + 1 ..], wasm_footer_helpers);
+}
+
+test "artifactIdent: wasm decl + link sites sanitize a free-form name consistently" {
+    // A manifest artifact name is free-form; `glfw-native` (hyphen) and `123lib`
+    // (leading digit) are NOT valid Zig identifiers, so the emitted variable name
+    // must be sanitized — and the decl site + the linkLibrary site must agree on it,
+    // or the generated build.zig won't compile (#546; review #469 findings 1+2).
+    const cases = [_]struct { raw: []const u8, ident: []const u8 }{
+        .{ .raw = "glfw-native", .ident = "glfw_native" },
+        .{ .raw = "123lib", .ident = "_123lib" },
+    };
+    const cfg = ProjectConfig{ .name = "g" };
+
+    for (cases) |c| {
+        const artifacts = [_]BackendManifestV2.ArtifactDecl{.{ .name = c.raw }};
+        const m: BackendManifestV2 = .{
+            .manifest_version = 2,
+            .dir_name = "x",
+            .dep_name = "labelle_x",
+            .modules = &.{},
+            .platforms = .{ .wasm = .{
+                .entry = "main.zig",
+                .loop_style = .callback,
+                .target = .{ .triple = "wasm32-emscripten" },
+                .artifacts = &artifacts,
+                .package = .{ .web = .{} },
+            } },
+        };
+
+        // Decl site: `const <ident> = backend_dep.artifact("<raw>");`
+        var decl: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer decl.deinit();
+        try renderWasmBackendDepV2(testing.allocator, m, cfg, &decl.writer);
+        const decl_line = try std.fmt.allocPrint(
+            testing.allocator,
+            "    const {s} = backend_dep.artifact(\"{s}\");\n",
+            .{ c.ident, c.raw },
+        );
+        defer testing.allocator.free(decl_line);
+        try testing.expect(std.mem.indexOf(u8, decl.written(), decl_line) != null);
+
+        // Link site (wasm lib): must reference the SAME sanitized identifier.
+        var link: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer link.deinit();
+        try renderWasmLinkV2(m, cfg, &link.writer);
+        const link_line = try std.fmt.allocPrint(
+            testing.allocator,
+            "    wasm.root_module.linkLibrary({s});\n",
+            .{c.ident},
+        );
+        defer testing.allocator.free(link_line);
+        try testing.expect(std.mem.indexOf(u8, link.written(), link_line) != null);
+    }
 }
