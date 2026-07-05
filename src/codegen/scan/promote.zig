@@ -86,6 +86,10 @@ pub fn collectPromotedScripts(
         const module_name = try promotedScriptModuleName(allocator, fn_.module_sanitized);
         errdefer allocator.free(module_name);
         const rel_path = try allocator.dupe(u8, fn_.module_import_path);
+        // Ownership hasn't transferred to `out` yet — the function-scope
+        // errdefer can't reach `rel_path`, so guard it locally against an
+        // OOM in `append`.
+        errdefer allocator.free(rel_path);
         try out.append(allocator, .{ .module_name = module_name, .rel_path = rel_path });
     }
     return out.toOwnedSlice(allocator);
@@ -98,4 +102,40 @@ pub fn freePromotedScripts(allocator: std.mem.Allocator, scripts: []const Promot
         allocator.free(p.rel_path);
     }
     allocator.free(scripts);
+}
+
+// ── Regression: no leak-on-OOM in the append path (#540) ─────────────
+//
+// `rel_path` is allocated after `module_name` and only becomes owned by
+// `out` once `out.append(...)` succeeds. If that append OOMs, the
+// freshly-duped `rel_path` used to leak — the function-scope errdefer
+// walks `out.items`, which does not yet include the pending entry. A
+// local `errdefer allocator.free(rel_path)` now covers the gap.
+//
+// This test runs `collectPromotedScripts` through a `FailingAllocator`
+// forced to fail at each allocation index and asserts the freed/allocated
+// tally balances at every point (any leak breaks the invariant).
+test "collectPromotedScripts: no allocator leak at any OOM point" {
+    const nodes = [_]PluginFlowNode{
+        .{ .module_import_path = "hits.zig", .module_sanitized = "hits", .node_name = "a", .is_script = true },
+        .{ .module_import_path = "flows/counter.zig", .module_sanitized = "flows_s_counter", .node_name = "b", .is_script = true },
+    };
+
+    const total_allocs = blk: {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const scripts = try collectPromotedScripts(fa.allocator(), &nodes);
+        freePromotedScripts(fa.allocator(), scripts);
+        break :blk fa.alloc_index;
+    };
+
+    var i: usize = 0;
+    while (i < total_allocs) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = i });
+        if (collectPromotedScripts(fa.allocator(), &nodes)) |scripts| {
+            freePromotedScripts(fa.allocator(), scripts);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        try std.testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
+    }
 }

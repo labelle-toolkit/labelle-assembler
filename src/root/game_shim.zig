@@ -243,5 +243,50 @@ pub fn generateGameShim(
     }
 
     var arr_list = aw.toArrayList();
+    // `toArrayList` resets the writer, so `aw.deinit` (the errdefer above)
+    // is now a no-op and `arr_list` owns the buffer — guard it so an OOM in
+    // `toOwnedSlice` frees the buffer instead of leaking it.
+    errdefer arr_list.deinit(allocator);
     return arr_list.toOwnedSlice(allocator);
+}
+
+// ── Regression: no leak-on-OOM in the final toOwnedSlice (#540) ──────
+//
+// `aw.toArrayList()` resets the writer and hands the accumulated buffer
+// to `arr_list`; the function-scope `errdefer aw.deinit()` then covers
+// nothing. If the trailing `arr_list.toOwnedSlice(allocator)` OOMs, the
+// buffer leaked until an `errdefer arr_list.deinit(allocator)` was added.
+//
+// Drive `generateGameShim` through a `FailingAllocator` forced to fail at
+// each allocation index and assert the freed/allocated tally balances at
+// every point.
+test "generateGameShim: no allocator leak at any OOM point" {
+    const flow_nodes = [_]main_zig.PluginFlowNode{
+        .{
+            .module_import_path = "flows/counter.zig",
+            .module_sanitized = "flows_s_counter",
+            .node_name = "tick",
+            .is_script = true,
+        },
+    };
+
+    const total_allocs = blk: {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const shim = try generateGameShim(fa.allocator(), &.{}, &flow_nodes, .{});
+        fa.allocator().free(shim);
+        break :blk fa.alloc_index;
+    };
+
+    var i: usize = 0;
+    while (i < total_allocs) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = i });
+        if (generateGameShim(fa.allocator(), &.{}, &flow_nodes, .{})) |shim| {
+            fa.allocator().free(shim);
+        } else |err| {
+            // `std.Io.Writer` maps allocator failures to WriteFailed;
+            // either surfaces the OOM, both are non-leaking failure paths.
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+        }
+        try std.testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
+    }
 }
