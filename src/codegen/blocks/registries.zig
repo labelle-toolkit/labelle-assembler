@@ -14,6 +14,7 @@
 const std = @import("std");
 const idents = @import("../idents.zig");
 const scan = @import("../scan.zig");
+const pack_root = @import("../pack_root.zig");
 
 const pathToIdent = scan.pathToIdent;
 const pathToPascal = idents.pathToPascal;
@@ -24,9 +25,10 @@ const PluginFlowNode = scan.PluginFlowNode;
 /// therefore promoted to a named build module (labelle-assembler#240
 /// Gap 2). `module_sanitized` of an `is_script` flow node equals
 /// `pathToIdent(rel_path)`, so the comparison is a direct string match.
-/// Used by the `AllScripts` emitter to switch promoted scripts to the
+/// Used by the `AllScripts` emitter — and the flow-handler sites in
+/// `blocks/hooks.zig` — to switch promoted scripts to the
 /// `@import("script__<ident>")` form.
-fn isFlowNodeScript(flow_nodes: []const PluginFlowNode, ident: []const u8) bool {
+pub fn isFlowNodeScript(flow_nodes: []const PluginFlowNode, ident: []const u8) bool {
     for (flow_nodes) |fn_| {
         if (!fn_.is_script) continue;
         if (std.mem.eql(u8, fn_.module_sanitized, ident)) return true;
@@ -67,20 +69,28 @@ pub fn Mixin(comptime Self: type) type {
             }
             // Pack components (Packs RFC §4, #439) land in the SAME registry
             // field-set as the game root — the "unified set" (§6-1b): they're
-            // stored + serialized identically, no separate registry. Files
-            // live under the pack's `import_prefix` (e.g. `packs/citizens`),
-            // scanned/copied by `root.zig`. #440: the registry FIELD is the
-            // invisible `<pack>__<Pascal>` (e.g. `.citizens__Worker`) so a pack
-            // and the game root that both define `Worker` never collide — the
-            // author still writes the bare local name in JSONC (rewritten by
-            // `scanPack`). The imported DECL name stays bare — it's the
-            // component type's own `pub const Worker` inside the pack file.
+            // stored + serialized identically, no separate registry. #440: the
+            // registry FIELD is the invisible `<pack>__<Pascal>` (e.g.
+            // `.citizens__Worker`) so a pack and the game root that both
+            // define `Worker` never collide — the author still writes the
+            // bare local name in JSONC (rewritten by `scanPack`).
+            //
+            // #498 PR 2 ("wire the wall"): pack files belong to the pack's
+            // OWN module now, so the import goes through the pack module
+            // root's re-export (`@import("pack__<prefix>").components.<stem>`)
+            // — a path import here would be the dual-module compile error.
+            // The accessor ident is `pathToIdent(stem)`, byte-matched to
+            // what `pack_root.renderPackRoot` declared. The trailing DECL
+            // access stays the Pascal type name — the component type's own
+            // `pub const Worker` inside the pack file.
             var pack_prefix_buf: [128]u8 = undefined;
+            var stem_ident_buf: [256]u8 = undefined;
             for (self.pack_scans) |pack| {
                 const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
                 for (pack.component_names) |name| {
                     const pascal = pathToPascal(name, &pascal_buf);
-                    try w.print("    .{s}__{s} = @import(\"{s}/components/{s}.zig\").{s},\n", .{ prefix, pascal, pack.import_prefix, name, pascal });
+                    const stem_ident = pathToIdent(name, &stem_ident_buf);
+                    try w.print("    .{s}__{s} = @import(\"pack__{s}\").components.{s}.{s},\n", .{ prefix, pascal, prefix, stem_ident, pascal });
                 }
             }
             if (has_plugins) {
@@ -210,26 +220,43 @@ pub fn Mixin(comptime Self: type) type {
                 // `scan.promotedScriptModuleName`. Scripts without FlowNodes
                 // keep the path import.
                 const is_promoted = isFlowNodeScript(plugin_flow_nodes, ident);
-                // Buffer the named module name so the import expr below is a
-                // single `{s}` regardless of promotion. `script__` + `ident`.
-                var named_buf: [256 + "script__".len]u8 = undefined;
-                const import_target: []const u8 = if (is_promoted)
-                    std.fmt.bufPrint(&named_buf, "script__{s}", .{ident}) catch return error.NameTooLong
-                else
-                    entry.rel_path;
-                // `entry.import_base` is `"scripts/"` for game + plugin
-                // scripts (rel_path relative to the generated scripts/ dir)
-                // and `""` for pack scripts, whose rel_path is already a full
-                // `packs/<name>/scripts/...` target-relative path
-                // (labelle-assembler#487). A FlowNode-promoted game script
-                // still imports through its named module, so it overrides
-                // both to `""`.
-                const import_prefix: []const u8 = if (is_promoted) "" else entry.import_base;
+                // Resolve the entry's full import EXPRESSION. Three shapes:
+                //   - FlowNodes-promoted game script → its named module
+                //     (`@import("script__<ident>")`, #240 Gap 2 — see the
+                //     dual-module rationale above).
+                //   - pack script (`import_base == ""`, the pack marker from
+                //     `scanPackScriptsDir`) → the pack MODULE's re-export,
+                //     `@import("pack__<pfx>").scripts.<rel_ident>` (#498
+                //     PR 2). Pack files belong to the pack module now, so a
+                //     path import from main.zig is the same dual-module
+                //     compile error. `<rel_ident>` is `pathToIdent` of the
+                //     path RELATIVE to the pack's `scripts/` dir — exactly
+                //     what `pack_root.renderPackRoot` declared. The
+                //     AllScripts FIELD ident stays `pathToIdent(rel_path)`
+                //     (the full target-relative form) — it's the stable name
+                //     the script-runner blocks reference.
+                //   - everything else → path import under `import_base`
+                //     (`"scripts/"` — rel_path is relative to the generated
+                //     scripts/ dir).
+                var expr_buf: [640]u8 = undefined;
+                const import_expr: []const u8 = if (is_promoted)
+                    std.fmt.bufPrint(&expr_buf, "@import(\"script__{s}\")", .{ident}) catch return error.NameTooLong
+                else if (entry.import_base.len == 0) blk: {
+                    // `""` import_base is only ever set by
+                    // `scanPackScriptsDir`, which always stamps the owning
+                    // pack — a null here is scanner-invariant breakage.
+                    const pack_name = entry.plugin_name orelse return error.PackScriptMissingOwner;
+                    var pfx_buf: [128]u8 = undefined;
+                    const pfx = scan.packNamespacePrefix(pack_name, &pfx_buf);
+                    var rel_ident_buf: [256]u8 = undefined;
+                    const rel_ident = pathToIdent(pack_root.packRelScriptPath(entry.rel_path, pack_name), &rel_ident_buf);
+                    break :blk std.fmt.bufPrint(&expr_buf, "@import(\"pack__{s}\").scripts.{s}", .{ pfx, rel_ident }) catch return error.NameTooLong;
+                } else std.fmt.bufPrint(&expr_buf, "@import(\"{s}{s}\")", .{ entry.import_base, entry.rel_path }) catch return error.NameTooLong;
                 if (entry.states.len == 0) {
-                    try w.print("    pub const {s} = @import(\"{s}{s}\");\n", .{ ident, import_prefix, import_target });
+                    try w.print("    pub const {s} = {s};\n", .{ ident, import_expr });
                 } else {
                     try w.print("    pub const {s} = struct {{\n", .{ident});
-                    try w.print("        const _inner = @import(\"{s}{s}\");\n", .{ import_prefix, import_target });
+                    try w.print("        const _inner = {s};\n", .{import_expr});
                     try w.writeAll("        pub const game_states = .{\n");
                     for (entry.states) |state| {
                         try w.print("            \"{s}\",\n", .{state});

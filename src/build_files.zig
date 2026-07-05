@@ -6,6 +6,7 @@ const cache = @import("cache.zig");
 const backend_registry = @import("backend_registry.zig");
 const capabilities = @import("capabilities.zig");
 const scan = @import("codegen/scan.zig");
+const pack_root = @import("codegen/pack_root.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 const manifest_v2 = @import("codegen/manifest_v2.zig");
 const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
@@ -138,6 +139,90 @@ fn emitPromotedScriptImports(
     }
 }
 
+/// Emit one `const pack__<prefix>_mod = b.createModule(...)` per light pack
+/// (assembler#498 PR 2, "wire the wall"), rooted at the generated
+/// `packs/<name>/__pack_root.zig`.
+///
+/// The import table is the pack isolation contract. It mirrors
+/// `emitPromotedScriptModules`' surface — engine/core/gfx, the four backend
+/// modules, `ecs_backend`/`gui_backend` when wired, and every decl-module
+/// plugin (plugins are the sanctioned inter-domain surface; FP's packs route
+/// worker access through `worker_controller`'s citizens surface by design) —
+/// and deliberately EXCLUDES the `game` shim and every sibling pack. A pack
+/// file importing either is now unresolvable, which is the wall. `depends_on`
+/// surface modules land in PR 4; the `@import("pack")` self-import + Registry
+/// bridge land in PR 3.
+///
+/// After all pack modules are declared, the implicit shared `contracts` pack
+/// (`pack_validate.IMPLICIT_DEPS`) — when the project declares one — is wired
+/// into every OTHER pack module via `overrideImport(…, "contracts", …)`. A
+/// two-pass shape because declaration order between packs is arbitrary.
+///
+/// Gated on pack presence: a pack-less project emits nothing (byte-identical
+/// build.zig, the invariant every #498 PR keeps).
+fn emitPackModules(
+    w: anytype,
+    cfg: ProjectConfig,
+    pack_modules: []const pack_root.PackModule,
+) !void {
+    if (pack_modules.len == 0) return;
+    try w.writeByte('\n');
+    try w.writeAll("    // Per-pack modules (assembler#498 \"wire the wall\"): each light\n");
+    try w.writeAll("    // pack's files belong to its OWN module, whose restricted import\n");
+    try w.writeAll("    // table (no `game`, no sibling packs) is the isolation boundary.\n");
+    for (pack_modules) |p| {
+        try w.print("    const pack__{s}_mod = b.createModule(.{{\n", .{p.prefix});
+        try w.print("        .root_source_file = b.path(\"packs/{s}/__pack_root.zig\"),\n", .{p.name});
+        try w.writeAll("        .target = target,\n");
+        try w.writeAll("        .optimize = optimize,\n");
+        try w.writeAll("        .imports = &.{\n");
+        try w.writeAll("            .{ .name = \"labelle-core\", .module = core_mod },\n");
+        try w.writeAll("            .{ .name = \"labelle-gfx\", .module = gfx_mod },\n");
+        try w.writeAll("            .{ .name = \"labelle-engine\", .module = engine_mod },\n");
+        try w.writeAll("            .{ .name = \"backend_gfx\", .module = backend_gfx },\n");
+        try w.writeAll("            .{ .name = \"backend_input\", .module = backend_input },\n");
+        try w.writeAll("            .{ .name = \"backend_audio\", .module = backend_audio },\n");
+        try w.writeAll("            .{ .name = \"backend_window\", .module = backend_window },\n");
+        if (cfg.ecs != .mock) {
+            try w.writeAll("            .{ .name = \"ecs_backend\", .module = ecs_mod },\n");
+        }
+        if (cfg.hasGui()) {
+            try w.writeAll("            .{ .name = \"gui_backend\", .module = gui_mod },\n");
+        }
+        for (cfg.plugins) |plugin| {
+            try w.print("            .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
+        }
+        try w.writeAll("        },\n");
+        try w.writeAll("    });\n");
+    }
+    // Implicit `contracts` wiring — dependents reach the shared-vocabulary
+    // pack as `@import("contracts")`. `contracts` itself must not
+    // self-import.
+    const contracts: ?pack_root.PackModule = for (pack_modules) |p| {
+        if (std.mem.eql(u8, p.name, pack_root.CONTRACTS_PACK_NAME)) break p;
+    } else null;
+    if (contracts) |c| {
+        for (pack_modules) |p| {
+            if (std.mem.eql(u8, p.name, c.name)) continue;
+            try w.print("    overrideImport(pack__{s}_mod, \"contracts\", pack__{s}_mod);\n", .{ p.prefix, c.prefix });
+        }
+    }
+}
+
+/// Emit `<artifact>.root_module.addImport("pack__<prefix>", pack__<prefix>_mod)`
+/// per pack, so the generated main.zig (and the tests root) reach pack
+/// contents EXCLUSIVELY through the module — the only sanctioned path once
+/// the pack's files stop being root-module members (#498 PR 2).
+fn emitPackImports(
+    w: anytype,
+    artifact: []const u8,
+    pack_modules: []const pack_root.PackModule,
+) !void {
+    for (pack_modules) |p| {
+        try w.print("    {s}.root_module.addImport(\"pack__{s}\", pack__{s}_mod);\n", .{ artifact, p.prefix, p.prefix });
+    }
+}
+
 pub const BuildZigOptions = struct {
     /// Emit a test-only build.zig: skip the exe step, the run step,
     /// and the backend artifact link. Used by `generateTestsTarget`
@@ -151,6 +236,13 @@ pub const BuildZigOptions = struct {
     /// empty — projects with no FlowNodes-bearing scripts (the common
     /// case) emit nothing here and keep their byte-identical build.zig.
     promoted_scripts: []const scan.PromotedScript = &.{},
+    /// Light packs promoted to per-pack build modules (assembler#498
+    /// PR 2, "wire the wall"). One `pack__<prefix>_mod` createModule per
+    /// entry (rooted at the generated `packs/<name>/__pack_root.zig`,
+    /// restricted import table) + an `addImport` on every target
+    /// artifact. Defaults to empty — pack-less projects keep their
+    /// byte-identical build.zig, the invariant every #498 PR holds.
+    pack_modules: []const pack_root.PackModule = &.{},
     /// Project root, used to locate the resolved backend package's
     /// `backend.manifest.v2.zon` (pluggable-backends RFC, assembler#453/#461).
     /// Null (default) means no manifest can be loaded, so codegen hard-errors —
@@ -454,6 +546,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // is path-imported by the root module.
     try emitPromotedScriptModules(w, cfg, opts.promoted_scripts);
 
+    // Per-pack modules (assembler#498 PR 2) — declared beside the promoted
+    // script modules, before any target artifact that imports them.
+    try emitPackModules(w, cfg, opts.pack_modules);
+
     if (cfg.platform == .wasm) {
         // manifest-v2 wasm: no emsdk-helper import in the generated build.zig — the
         // emcc residual moved into the backend hook's `post_wire`, which resolves
@@ -478,6 +574,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         // Promoted game-script modules → wasm root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "wasm", opts.promoted_scripts);
+        try emitPackImports(w, "wasm", opts.pack_modules);
 
         // Link bridge artifact for WASM (raw_backend GUIs) BEFORE the
         // backend-specific link step. sokol-zig's `emLinkStep` snapshots
@@ -539,6 +636,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         // Promoted game-script modules → iOS exe root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
+        try emitPackImports(w, "exe", opts.pack_modules);
 
         // manifest-v2 ios: the generic link (linkLibrary + link_libc + linkFramework
         // from `.frameworks.ios`) plus the `post_wire` hook call for the SDK
@@ -596,6 +694,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         // Promoted game-script modules → Android lib root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "lib", opts.promoted_scripts);
+        try emitPackImports(w, "lib", opts.pack_modules);
 
         // manifest-v2 android: the generic link (linkLibrary + linkSystemLibrary from
         // `.system_libs.android` + `link_libc`) plus the `post_wire` hook call for the
@@ -652,6 +751,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // module so main.zig's `AllScripts` + `PluginFlowNodes` can
             // `@import("<named>")` (labelle-assembler#240 Gap 2).
             try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
+            try emitPackImports(w, "exe", opts.pack_modules);
 
             // Link backend artifact. manifest-v2 desktop codegen: linkLibrary from
             // manifest artifacts + the per-OS framework/system-lib wiring (design
@@ -690,6 +790,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // tests target (issue #83) shares this codepath, so its
         // `__tests_root.zig` reaches the same named modules.
         try emitPromotedScriptImports(w, "test_root", opts.promoted_scripts);
+        try emitPackImports(w, "test_root", opts.pack_modules);
 
         // manifest-v2 GENERIC desktop (PR 8): mirror the native linkage
         // (artifact `linkLibrary` + per-OS framework/syslib switch) onto
@@ -1016,8 +1117,18 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
     switch (cfg.ecs) {
         .mock => {},
         .zig_ecs, .zflecs, .mr_ecs => {
-            const dn: []const u8 = switch (cfg.ecs) { .zig_ecs => "labelle_zig_ecs", .zflecs => "labelle_zflecs", .mr_ecs => "labelle_mr_ecs", .mock => unreachable };
-            const dd: []const u8 = switch (cfg.ecs) { .zig_ecs => "zig-ecs", .zflecs => "zflecs", .mr_ecs => "mr-ecs", .mock => unreachable };
+            const dn: []const u8 = switch (cfg.ecs) {
+                .zig_ecs => "labelle_zig_ecs",
+                .zflecs => "labelle_zflecs",
+                .mr_ecs => "labelle_mr_ecs",
+                .mock => unreachable,
+            };
+            const dd: []const u8 = switch (cfg.ecs) {
+                .zig_ecs => "zig-ecs",
+                .zflecs => "zflecs",
+                .mr_ecs => "mr-ecs",
+                .mock => unreachable,
+            };
             var spb: [128]u8 = undefined;
             const sp = std.fmt.bufPrint(&spb, "ecs/{s}", .{dd}) catch unreachable;
             const ep_abs = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, sp);

@@ -28,6 +28,7 @@ const scene_name_lint = @import("scene_name_lint.zig");
 const gui_resolve = @import("gui_resolve.zig");
 pub const app_icon = @import("app_icon.zig");
 const scan = @import("codegen/scan.zig");
+const pack_root_gen = @import("codegen/pack_root.zig");
 const idents = @import("codegen/idents.zig");
 
 // Force test discovery for files that aren't transitively reached by
@@ -107,6 +108,9 @@ pub const deps_linker = build_files.deps_linker;
 pub const stageBackendBuildHook = manifest_v2_splice.stageBackendBuildHook;
 pub const backend_build_hook_name = manifest_v2_splice.hook_import_name;
 pub const PromotedScript = @import("codegen/scan.zig").PromotedScript;
+/// Per-pack module generation (#498 PR 2): `__pack_root.zig` renderer +
+/// the `PackModule` build-wiring record. Exposed for tests.
+pub const pack_root = @import("codegen/pack_root.zig");
 
 pub const validateCache = cache.validateCache;
 pub const getCacheRoot = cache.getCacheRoot;
@@ -1462,11 +1466,14 @@ pub fn generate(
     // `<pack>_pack_view = engine.PackView(Components, &.{…})` name-lens over the
     // single full registry for every pack (see `writePackViewsBlock`).
     // `Components` stays one flat registry (it feeds the serializer / bridge);
-    // the view is the pack's sanctioned string-keyed surface. STILL DEFERRED with
-    // clean seams:
-    //   * the per-pack Zig MODULE graph + the `@import("root")` bridge that wires
-    //     pack code to its view (so a foreign name is a compile error, not a
-    //     lint) — assembler#498 PRs 2–3.
+    // the view is the pack's sanctioned string-keyed surface. #498 PR 2 wired
+    // the per-pack Zig MODULE graph: every pack's files belong to their own
+    // `pack__<prefix>` module (rooted at the generated `__pack_root.zig`,
+    // written below) with a restricted import table — no `game` shim, no
+    // sibling packs — so a cross-pack path import is a compile error, not a
+    // lint. STILL DEFERRED with clean seams:
+    //   * the `@import("root")` Registry bridge + `@import("pack")` self-import
+    //     that wire pack code to its view — assembler#498 PR 3.
     //   * `exposes` surface module / `depends_on` import narrowing (#440 / §6) —
     //     assembler#498 PR 4.
     //
@@ -1518,6 +1525,39 @@ pub fn generate(
         prefab_names,
         pack_scans.items,
     );
+
+    // ── Per-pack module roots (assembler#498 PR 2, "wire the wall") ────
+    //
+    // Generate `<target>/packs/<name>/__pack_root.zig` for every pack: the
+    // root of the pack's OWN build-system module, re-exporting each scanned
+    // component/event/hook/script so the generated main.zig reaches pack
+    // contents exclusively through `@import("pack__<prefix>")`. The pack's
+    // files thereby stop being ROOT-module members — a path import of any of
+    // them from main.zig (or a relative escape from another pack) is now the
+    // "file exists in two modules" compile error. That module boundary — not
+    // the `labelle check` lint — is the enforcement layer the Packs epic
+    // (labelle-engine#650) deferred.
+    //
+    // Pack SCRIPT entries were registered by the `cfg.plugins` loop above
+    // (`scanPackScriptsAt`, declaration order, #494), so the scanner already
+    // holds every pack script: filter by the `import_base == ""` pack marker
+    // + the owning pack's name, and re-root each `packs/<name>/scripts/<rel>`
+    // path at the module root (`scripts/<rel>`).
+    for (pack_scans.items) |pack| {
+        var script_rels: std.ArrayList([]const u8) = .empty;
+        defer script_rels.deinit(allocator);
+        for (script_scan.getEntries()) |entry| {
+            if (entry.import_base.len != 0) continue;
+            const pname = entry.plugin_name orelse continue;
+            if (!std.mem.eql(u8, pname, pack.name)) continue;
+            try script_rels.append(allocator, pack_root_gen.packRelScriptPath(entry.rel_path, pack.name));
+        }
+        const pack_root_src = try pack_root_gen.renderPackRoot(allocator, pack, script_rels.items);
+        defer allocator.free(pack_root_src);
+        const rel = try std.fs.path.join(allocator, &.{ "packs", pack.name, "__pack_root.zig" });
+        defer allocator.free(rel);
+        try scanner.writeFile(target_dir, rel, pack_root_src);
+    }
 
     // ── Module-plugin filter — light packs are dir-scan-only (#481) ────
     //
@@ -1634,13 +1674,33 @@ pub fn generate(
     const promoted_scripts = try main_zig.collectPromotedScripts(allocator, plugin_flow_decls.flow_nodes);
     defer main_zig.freePromotedScripts(allocator, promoted_scripts);
 
+    // Pack-module wiring info for the generated build.zig (#498 PR 2):
+    // one `pack__<prefix>_mod` per pack, rooted at the `__pack_root.zig`
+    // written above. The prefix is duped (the shared scratch buf doesn't
+    // outlive the loop); freed with the list.
+    var pack_modules: std.ArrayList(pack_root_gen.PackModule) = .empty;
+    defer {
+        for (pack_modules.items) |p| allocator.free(p.prefix);
+        pack_modules.deinit(allocator);
+    }
+    try pack_modules.ensureTotalCapacity(allocator, pack_scans.items.len);
+    for (pack_scans.items) |pack| {
+        var pfx_buf: [128]u8 = undefined;
+        const pfx = scan.packNamespacePrefix(pack.name, &pfx_buf);
+        pack_modules.appendAssumeCapacity(.{ .name = pack.name, .prefix = try allocator.dupe(u8, pfx) });
+    }
+
     // Generate build.zig
     // `cfg_modules` (not `cfg`): light packs get no `b.dependency` /
     // `overrideImport` module wiring — their contribution is dir-scan
-    // registry entries, not an importable module (#481).
+    // registry entries, not an importable module (#481). Their PACK
+    // modules (`pack__<prefix>_mod`, #498 PR 2) ride `pack_modules`
+    // instead — a third wiring category driven by `pack_scans`, never by
+    // `cfg.plugins`.
     const build_zig = try build_files.generateBuildZig(allocator, cfg_modules, .{
         .is_tests_target = is_tests_target,
         .promoted_scripts = promoted_scripts,
+        .pack_modules = pack_modules.items,
         // Manifest-driven backend splice (assembler#378): pass the project
         // root so the splice can locate `backend.manifest.zon` + fragments.
         // Only consulted when the gate (desktop + manifest present) fires.
