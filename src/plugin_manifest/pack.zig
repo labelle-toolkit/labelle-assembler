@@ -17,11 +17,11 @@
 //! `exposes` / `depends_on` (the §6 isolation inputs) are PARSED here
 //! (labelle-assembler#441) and fed to the generate-time validation pass
 //! (`pack_validate.zig`) that rejects dependency cycles and unknown deps.
-//! This ticket parses the fields + runs that validation only; the
-//! depends_on ENFORCEMENT (the restricted per-pack module graph / the
-//! `PackView` registry partition, RFC §6.1a/1b) is engine-side
-//! #652-remainder, and the one-facet-one-owner duplicate check is mooted
-//! by #440's `<pack>__` name prefix — see the PR / RFC §6.
+//! Their ENFORCEMENT shipped with #498: the restricted per-pack module
+//! graph (PR 2), the `PackView` partition + `@import("pack").Registry`
+//! bridge (PRs 1/3), and the `exposes` surface modules `depends_on` maps
+//! onto (PR 4) — see `docs/packs.md`. The one-facet-one-owner duplicate
+//! check is mooted by #440's `<pack>__` name prefix.
 //!
 //! Re-exported unchanged from the `plugin_manifest.zig` barrel.
 const std = @import("std");

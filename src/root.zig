@@ -752,11 +752,13 @@ pub fn generate(
     // `pack__<prefix>` module (rooted at the generated `__pack_root.zig`,
     // written below) with a restricted import table — no `game` shim, no
     // sibling packs — so a cross-pack path import is a compile error, not a
-    // lint. STILL DEFERRED with clean seams:
-    //   * the `@import("root")` Registry bridge + `@import("pack")` self-import
-    //     that wire pack code to its view — assembler#498 PR 3.
-    //   * `exposes` surface module / `depends_on` import narrowing (#440 / §6) —
-    //     assembler#498 PR 4.
+    // lint. PR 3 wired `@import("pack").Registry` (the sanctioned
+    // string-keyed surface, via the `@import("root")` bridge); PR 4 wired
+    // `exposes` surface modules + `depends_on` import narrowing. The wall
+    // is COMPLETE — see `docs/packs.md` for the full contract. What stays
+    // lint-only by design: the `game.ComponentRegistry` anytype hole,
+    // `.global`-facet write discipline, and event direction (`labelle
+    // check`, src/check.zig).
     //
     // The pack manifests reused below were parsed ONCE near the top of
     // `generate()` (`pack_entries`), where the dependency-validation gate AND

@@ -1,8 +1,8 @@
 # Packs: the module wall and the sanctioned surfaces
 
 *(assembler#498, the enforcement layer of the Packs epic —
-labelle-engine#650. Status: PRs 1–4 landed; the lint demotion notes
-are PR 5.)*
+labelle-engine#650. Status: PRs 1–5 landed — the wall is complete;
+`examples/packs-demo` + the CI e2e fixture are PR 6.)*
 
 A **pack** is the light, directory-scanned form of a plugin: a
 namespaced subtree (`packs/<name>/{components,events,prefabs,hooks,scripts}/`)
