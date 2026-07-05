@@ -715,8 +715,11 @@ pub const ProjectConfig = struct {
             // the `is_bgfx_android` enum branch. The hole-bearing wasm template
             // requires assembler ≥ 0.74.0. 0.6.5 honors an external EMSDK for a
             // host-managed emsdk (assembler#535 / labelle-studio#25) — paired
-            // with this assembler's EMSDK-aware preflight (#536).
-            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.6.5" },
+            // with this assembler's EMSDK-aware preflight (#536). 0.6.6 =
+            // labelle-bgfx#30 fix: don't auto-select Direct3D on Windows (was
+            // crashing at first sprite draw — engine#683) + #31 desktop-video
+            // Windows fix.
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.6.6" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.3.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.3.1" },
