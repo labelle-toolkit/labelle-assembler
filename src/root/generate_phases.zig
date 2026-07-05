@@ -1,0 +1,555 @@
+//! Sequential phases of `root.generate()` carved out verbatim
+//! (behavior-preserving split, keeps root.zig under 1000 lines). Each fn
+//! below is a faithful move of one contiguous block of the original
+//! `generate` body — same statement order, same mutations, same error/early-
+//! return paths — reading only a bounded subset of the caller's locals passed
+//! explicitly. No block was reordered or "cleaned up".
+//!
+//! Lifetime contract: helpers that build state consumed later by `generate`
+//! (`loadPackEntries`, `loadPackScans`) RETURN the owned container and use
+//! `errdefer` for the failure path; the CALLER holds the success-path cleanup
+//! `defer`, exactly as the original generate-scope `defer` did. Helpers that
+//! only touch the filesystem / mutate a threaded object own their scratch
+//! allocations internally.
+//!
+//! Bit-identical contract: the copied dirs, scanned stems, rewritten pack
+//! sources, and generated `__pack_root.zig` / `__surface.zig` bytes all feed
+//! the codegen registries — the plugin/pack golden + codegen suites cover the
+//! end-to-end shape.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const config = @import("../config.zig");
+const scanner = @import("../scanner.zig");
+const cache = @import("../cache.zig");
+const plugin_manifest = @import("../plugin_manifest.zig");
+const pack_validate = @import("../pack_validate.zig");
+const script_scanner = @import("../script_scanner.zig");
+const main_zig = @import("../main_zig.zig");
+const pack_root_gen = @import("../codegen/pack_root.zig");
+const manifest_v2 = @import("../codegen/manifest_v2.zig");
+const scan = @import("../codegen/scan.zig");
+const pack_scan = @import("pack_scan.zig");
+
+const ProjectConfig = config.ProjectConfig;
+const ResourceDef = config.ResourceDef;
+
+/// Normalize the editor-preview request (labelle-studio Play mode). Preview is
+/// WASM-ONLY — the browser editor drives the running game through the
+/// `editor_*` wasm exports — so on every other platform the request is
+/// NORMALIZED OFF (not errored): a desktop build run with the var set stays
+/// byte-identical to a plain build. On wasm, honor an explicit
+/// `cfg.editor_preview` or read the `LABELLE_EDITOR_PREVIEW` env var (Zig 0.16:
+/// env goes through the process `Environ`, `std.process.hasEnvVarConstant` /
+/// `std.posix.getenv` are gone). Mutates `cfg.editor_preview` in place.
+pub fn normalizeEditorPreview(allocator: std.mem.Allocator, cfg: *ProjectConfig) void {
+    if (cfg.platform != .wasm) {
+        cfg.editor_preview = false;
+    } else if (!cfg.editor_preview) {
+        const environ = config.globalEnviron();
+        if (environ.getAlloc(allocator, "LABELLE_EDITOR_PREVIEW")) |v| {
+            defer allocator.free(v);
+            cfg.editor_preview = config.editorPreviewEnvEnabled(v);
+        } else |_| {}
+    }
+    if (cfg.editor_preview) {
+        // Generate-time breadcrumb: the splice compiles only against an
+        // engine that ships `editor_api` (the generated main.zig carries a
+        // matching `@compileError` guard so a stale pin fails with a clear
+        // message rather than a bare "no member named 'editor_api'").
+        std.log.info(
+            "labelle-assembler: editor-preview wasm build (LABELLE_EDITOR_PREVIEW) — requires a labelle-engine that ships `editor_api`",
+            .{},
+        );
+    }
+}
+
+/// Editor-preview link-path gate (#526 review, codex P2). The `editor_*`
+/// exports reach the emcc link ONLY through the manifest-v2 wasm splice
+/// (`renderWasmLinkV2` → backend hook `post_wire`). On any other wasm build
+/// path nothing threads the export list, so a hole-bearing template would
+/// splice `editor_api` into main.zig while the JS side gets no callable editor
+/// entry points. Reject at generate time with the upgrade-hint error. No-op
+/// unless `cfg.editor_preview` is set (already normalized OFF off-wasm).
+pub fn checkEditorPreviewLinkPath(
+    allocator: std.mem.Allocator,
+    cfg: ProjectConfig,
+    game_dir: []const u8,
+    backend_manifest_name: ?[]const u8,
+) !void {
+    if (!cfg.editor_preview) return;
+    const v2_wasm_link = blk: {
+        const name = backend_manifest_name orelse break :blk false;
+        const m = manifest_v2.loadNamedManifest(allocator, cfg, game_dir, name) catch break :blk false;
+        defer std.zon.parse.free(allocator, m);
+        break :blk m.platforms.wasm != null;
+    };
+    if (!v2_wasm_link) {
+        // Silenced under test — the Zig test runner fails any test that
+        // emits `std.log.err`, even when the error is the asserted
+        // outcome (see cache/env.zig's HOME-missing log for the same gate).
+        if (!builtin.is_test) {
+            std.log.err(
+                "labelle-assembler: editor-preview build requested (LABELLE_EDITOR_PREVIEW) but " ++
+                    "backend '{s}' does not take the manifest-v2 wasm build path — only the v2 wasm " ++
+                    "backend hook (post_wire) can thread the editor_* exports into the emcc link. " ++
+                    "Upgrade the backend package (labelle-bgfx >= 0.6.1) or build without editor preview",
+                .{cfg.backendName()},
+            );
+        }
+        return error.EditorPreviewUnsupportedByBackend;
+    }
+}
+
+/// Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
+/// target platform opts into ASTC (`asset_compression`) and `labelle astc`
+/// produced one (labelle-gfx#269 / #340). Done BEFORE the `.rgba` swap so ASTC
+/// wins. Falls back to the source PNG when no `.astc` sibling exists. Returns
+/// the owned list of allocated `.astc` rel-paths — the swapped `res.texture`
+/// slices point INTO it, so the CALLER holds the cleanup `defer` (the paths
+/// must outlive this call for the rest of `generate`).
+pub fn swapAstcTexturePaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: ProjectConfig,
+    mutable_resources: []ResourceDef,
+    game_dir: []const u8,
+) !std.ArrayList([]const u8) {
+    var astc_path_allocs: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (astc_path_allocs.items) |s| allocator.free(s);
+        astc_path_allocs.deinit(allocator);
+    }
+    if (cfg.asset_compression.formatFor(cfg.platform) == .astc) {
+        for (mutable_resources) |*res| {
+            if (res.texture.len == 0) continue;
+            if (!std.mem.endsWith(u8, res.texture, ".png")) continue;
+            const astc_rel = try std.mem.concat(allocator, u8, &.{ res.texture[0 .. res.texture.len - 4], ".astc" });
+            errdefer allocator.free(astc_rel);
+            const abs = try std.fs.path.join(allocator, &.{ game_dir, astc_rel });
+            defer allocator.free(abs);
+            std.Io.Dir.cwd().access(io, abs, .{}) catch {
+                allocator.free(astc_rel);
+                continue;
+            };
+            try astc_path_allocs.append(allocator, astc_rel);
+            res.texture = astc_rel;
+        }
+    }
+    return astc_path_allocs;
+}
+
+/// Swap `.texture = "...png"` to the pre-baked `.rgba` sibling when `labelle
+/// build --bake` produced one (runtime decoder detects the LRGBA magic and
+/// skips stb_image). Leaves the path untouched when no sibling exists. Returns
+/// the owned rel-path list — swapped `res.texture` slices point INTO it, so the
+/// CALLER holds the cleanup `defer`.
+pub fn swapRgbaTexturePaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    mutable_resources: []ResourceDef,
+    game_dir: []const u8,
+) !std.ArrayList([]const u8) {
+    var rgba_path_allocs: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (rgba_path_allocs.items) |s| allocator.free(s);
+        rgba_path_allocs.deinit(allocator);
+    }
+    for (mutable_resources) |*res| {
+        if (res.texture.len == 0) continue;
+        if (!std.mem.endsWith(u8, res.texture, ".png")) continue;
+        const rgba_rel = try std.mem.concat(allocator, u8, &.{ res.texture[0 .. res.texture.len - 4], ".rgba" });
+        errdefer allocator.free(rgba_rel);
+        const abs = try std.fs.path.join(allocator, &.{ game_dir, rgba_rel });
+        defer allocator.free(abs);
+        std.Io.Dir.cwd().access(io, abs, .{}) catch {
+            allocator.free(rgba_rel);
+            continue;
+        };
+        try rgba_path_allocs.append(allocator, rgba_rel);
+        res.texture = rgba_rel;
+    }
+    return rgba_path_allocs;
+}
+
+/// One declared pack: its `.plugins` entry paired with its parsed
+/// `pack.labelle`. The manifest owns heap memory freed via `.deinit()`.
+pub const PackEntry = struct {
+    plugin: config.PluginDep,
+    manifest: plugin_manifest.PackManifest,
+};
+
+/// Read every declared pack's `pack.labelle` ONCE (Packs RFC §6, #441). The
+/// parsed manifests stay alive for the whole of `generate` (reused by the
+/// pack-scan / pack-root / sidecar phases) — the CALLER holds the cleanup
+/// `defer`; on the failure path the `errdefer` here frees what was parsed.
+///
+/// Reserve one slot per declared plugin (upper bound — non-pack plugins are
+/// skipped) so the append cannot fail. This closes the window where a parsed
+/// PackManifest is owned but not yet in the list, so a mid-loop OutOfMemory
+/// would leak it (Gemini review, #441).
+pub fn loadPackEntries(
+    allocator: std.mem.Allocator,
+    plugins: []const config.PluginDep,
+    game_dir: []const u8,
+) !std.ArrayList(PackEntry) {
+    var pack_entries: std.ArrayList(PackEntry) = .empty;
+    errdefer {
+        for (pack_entries.items) |*e| e.manifest.deinit();
+        pack_entries.deinit(allocator);
+    }
+    try pack_entries.ensureTotalCapacity(allocator, plugins.len);
+    for (plugins) |plugin| {
+        const pm = (try plugin_manifest.loadPackOptional(allocator, plugin, game_dir)) orelse continue;
+        pack_entries.appendAssumeCapacity(.{ .plugin = plugin, .manifest = pm });
+    }
+    return pack_entries;
+}
+
+/// Dependency-validation gate for the parsed pack manifests (Packs RFC §6,
+/// #441). Runs BEFORE the target dir is created so a bad graph rejects the
+/// build cheaply without leaving stale output. Fully self-contained — all
+/// scratch is freed here.
+pub fn validatePackGraph(
+    allocator: std.mem.Allocator,
+    pack_entries: []const PackEntry,
+    plugins: []const config.PluginDep,
+) !void {
+    var pack_deps: std.ArrayList(pack_validate.PackDep) = .empty;
+    defer pack_deps.deinit(allocator);
+    try pack_deps.ensureTotalCapacity(allocator, pack_entries.len);
+    for (pack_entries) |e| {
+        pack_deps.appendAssumeCapacity(.{ .name = e.manifest.name, .depends_on = e.manifest.depends_on });
+    }
+
+    // Legal depends_on targets = every plugin/pack declared in
+    // project.labelle (plus the implicit `contracts`, handled inside).
+    var declared_names: std.ArrayList([]const u8) = .empty;
+    defer declared_names.deinit(allocator);
+    try declared_names.ensureTotalCapacity(allocator, plugins.len);
+    for (plugins) |plugin| declared_names.appendAssumeCapacity(plugin.name);
+
+    try pack_validate.validate(allocator, pack_deps.items, declared_names.items);
+
+    // Prefix-collision gate (#440 / CodeRabbit): a pack's name feeds
+    // `scan.packNamespacePrefix` (codegen). Two packs whose names sanitize
+    // to the same `<pack>__` prefix (e.g. `my-pack` and `my_pack`) would
+    // emit duplicate namespaced symbols and break the generated
+    // imports/registries/hook tuples. Check over the SAME name the pack-scan
+    // loop feeds `scanPack` (`plugin.name` → `PackScan.name` → prefix), so
+    // the gate matches the symbols actually emitted. Fails before any target
+    // is written.
+    var pack_names: std.ArrayList([]const u8) = .empty;
+    defer pack_names.deinit(allocator);
+    try pack_names.ensureTotalCapacity(allocator, pack_entries.len);
+    for (pack_entries) |e| pack_names.appendAssumeCapacity(e.plugin.name);
+    try pack_validate.checkPrefixCollisions(pack_names.items);
+}
+
+/// Copy (and scan, per manifest `mode`) each plugin's declared convention
+/// directories into the target (RFC-plugin-manifest). See
+/// `docs/RFC-plugin-manifest.md`.
+///
+/// The manifest is read regardless of `plugin.states` (game-state gating
+/// affects runtime, not generate-time layout). Missing source directories are
+/// silently tolerated, matching the hardcoded scans in `generate`.
+///
+/// Duplicate directory declarations ACROSS plugins are a hard error (RFC E3);
+/// a single plugin may re-declare a name across entries (multi-extension, Q3).
+/// All manifests are loaded first and kept alive until every copy pass has run
+/// so the duplicate-detection map (slices into parsed manifest memory) stays
+/// valid. Capacity is pre-reserved so the per-plugin append cannot fail (a
+/// fallible append could leak a loaded manifest on OOM-resize).
+pub fn copyPluginConventionDirs(
+    allocator: std.mem.Allocator,
+    plugins: []const config.PluginDep,
+    game_dir: []const u8,
+    target_dir: []const u8,
+) !void {
+    var loaded_manifests: std.ArrayList(plugin_manifest.PluginManifest) = .empty;
+    defer {
+        for (loaded_manifests.items) |*m| m.deinit();
+        loaded_manifests.deinit(allocator);
+    }
+    try loaded_manifests.ensureTotalCapacity(allocator, plugins.len);
+
+    var owner_of_dir: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer owner_of_dir.deinit(allocator);
+
+    for (plugins) |plugin| {
+        const maybe_manifest = try plugin_manifest.loadOptional(allocator, plugin, game_dir);
+        const manifest = maybe_manifest orelse continue;
+        // Capacity was reserved above — this cannot fail, so there's
+        // no window where `manifest` is owned but outside the cleanup
+        // list's reach.
+        loaded_manifests.appendAssumeCapacity(manifest);
+
+        for (manifest.convention_dirs) |dir| {
+            // Duplicate detection is *cross-plugin only*. A single plugin
+            // is allowed to declare the same directory name in multiple
+            // convention_dirs entries with different extensions — that's
+            // the RFC Q3 multi-extension pattern (e.g. a plugin wanting
+            // both .zig and .zon files under state_machines/). Only error
+            // when a different plugin already claimed the name.
+            if (owner_of_dir.get(dir.name)) |prev_owner| {
+                if (!std.mem.eql(u8, prev_owner, plugin.name)) {
+                    std.debug.print(
+                        "labelle: two plugins want the same convention directory '{s}':\n  - plugin '{s}' already declared it\n  - plugin '{s}' is trying to declare it again\n  each plugin must use a unique directory name\n",
+                        .{ dir.name, prev_owner, plugin.name },
+                    );
+                    return error.PluginManifestDuplicateDir;
+                }
+                // Same plugin re-declaring the name (multi-extension) —
+                // don't overwrite the claim, just keep going and let the
+                // copy pass below handle it.
+            } else {
+                try owner_of_dir.put(allocator, dir.name, plugin.name);
+            }
+
+            switch (dir.mode) {
+                .copy_and_scan => {
+                    // `extension` is required for copy_and_scan and is
+                    // validated by plugin_manifest.loadFromDir at load
+                    // time, so .? here is safe.
+                    const ext = dir.extension.?;
+                    const names = try scanner.linkAndScan(
+                        allocator,
+                        game_dir,
+                        target_dir,
+                        dir.name,
+                        ext,
+                    );
+                    // v1: name list is computed but not exposed to codegen.
+                    // Future RFC will decide how plugins drive main.zig
+                    // generation from these names.
+                    scanner.freeNames(allocator, names);
+                },
+                .copy_only => {
+                    try scanner.linkDir(
+                        allocator,
+                        game_dir,
+                        target_dir,
+                        dir.name,
+                    );
+                },
+                .ship_from_plugin => {
+                    // Plugin-shipped content: source dir lives in the
+                    // plugin's cached package rather than the consuming
+                    // game. Resolves the plugin's path up-front because
+                    // copyAndScan takes a base and a folder-under-base.
+                    // Silently skips if the plugin doesn't actually ship
+                    // the declared directory — matches copy_and_scan's
+                    // missing-source tolerance so a plugin author can
+                    // declare the convention eagerly and ship content
+                    // incrementally.
+                    const ext = dir.extension.?;
+                    const plugin_src_dir = try cache.resolvePlugin(allocator, plugin, game_dir);
+                    defer allocator.free(plugin_src_dir);
+                    const names = try scanner.copyAndScan(
+                        allocator,
+                        plugin_src_dir,
+                        target_dir,
+                        dir.name,
+                        ext,
+                    );
+                    scanner.freeNames(allocator, names);
+                },
+            }
+        }
+    }
+}
+
+/// Copy each plugin's own `scripts/` dir into the target and feed it to the
+/// scanner (RFC-plugin-controllers §2). Game scripts live under `scripts/`;
+/// each plugin's scripts land under `scripts/.plugin_<name>/`, forming their
+/// own numeric-prefix namespace so the duplicate-prefix validator treats each
+/// block independently. Both `copyAndScanAbs` and `scanPluginDir` no-op on a
+/// missing source dir, so plugins without `scripts/` contribute nothing.
+///
+/// A *light pack* is also a `.plugins` entry, but its scripts flow through the
+/// pack dir-scan (landing under `packs/<name>/scripts/` so their `../components`
+/// relative imports resolve) — so packs are scanned HERE via
+/// `scanPackScriptsAt`, at the pack's declaration-order position within this
+/// loop (interleaved with decl-module plugins), so the scanner's `plugin_index`
+/// reflects `.plugins` order. Scanning all packs in a SEPARATE later loop would
+/// break the per-state script ordering contract (#487 / #494, codex review).
+pub fn copyPluginShippedScripts(
+    allocator: std.mem.Allocator,
+    script_scan: *script_scanner.ScriptScanner,
+    plugins: []const config.PluginDep,
+    pack_entries: []const PackEntry,
+    game_dir: []const u8,
+    target_dir: []const u8,
+) !void {
+    for (plugins) |plugin| {
+        const is_pack = blk: {
+            for (pack_entries) |e| {
+                if (std.mem.eql(u8, e.plugin.name, plugin.name)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (is_pack) {
+            const pack_src_dir = try cache.resolvePlugin(allocator, plugin, game_dir);
+            defer allocator.free(pack_src_dir);
+            _ = try pack_scan.scanPackScriptsAt(allocator, script_scan, pack_src_dir, target_dir, plugin.name);
+            continue;
+        }
+
+        // Plugin was already resolved during the manifest-loading loop
+        // above; re-resolving here is infallible in practice. Use `try`
+        // to match the manifest-load contract — a failure here is a
+        // cache corruption, not a plugin configuration error, and
+        // should fail the generate rather than silently skip.
+        const plugin_src_dir = try cache.resolvePlugin(allocator, plugin, game_dir);
+        defer allocator.free(plugin_src_dir);
+
+        const plugin_scripts_src = try std.fs.path.join(allocator, &.{ plugin_src_dir, "scripts" });
+        defer allocator.free(plugin_scripts_src);
+
+        // Destination: `<target>/scripts/.plugin_<name>/`. The leading `.`
+        // prevents accidental collision with a game state directory (states
+        // must be lowercase alphanumeric + `_`, per `isValidStateName`, so
+        // `.plugin_foo` can never be mistaken for a state dir by the
+        // scanner).
+        const plugin_dst_subdir = try std.fmt.allocPrint(allocator, ".plugin_{s}", .{plugin.name});
+        defer allocator.free(plugin_dst_subdir);
+        const plugin_scripts_dst = try std.fs.path.join(allocator, &.{ target_dir, "scripts", plugin_dst_subdir });
+        defer allocator.free(plugin_scripts_dst);
+
+        const names = try scanner.copyAndScanAbs(
+            allocator,
+            plugin_scripts_src,
+            plugin_scripts_dst,
+            ".zig",
+        );
+        scanner.freeNames(allocator, names);
+
+        // Feed the plugin's scripts into the scanner as a new block,
+        // isolated under the plugin's namespace so the duplicate-prefix
+        // validator treats it independently of the game block.
+        try script_scan.scanPluginDir(plugin_scripts_dst, plugin.name);
+    }
+}
+
+/// Pack dir-scan (Packs RFC §4, #439/#440): for every parsed pack, copy its
+/// convention subdirs into `<target>/packs/<name>/<subdir>/` and record the
+/// scanned stems (namespaced `<pack>__<Name>`, prefab refs rewritten). Returns
+/// the owned scan list — the CALLER holds the success-path cleanup `defer`; the
+/// `errdefer` here covers the failure path. Reuses the manifests parsed by
+/// `loadPackEntries` (only the source dir is resolved here).
+///
+/// A pack's OWN per-frame system (`<pack>/scripts/<state>/*.zig`) is copied +
+/// registered by the `cfg.plugins` script loop (`copyPluginShippedScripts`) at
+/// its declaration-order position, NOT here — doing it in this pack-only loop
+/// would order all pack scripts behind all plugin scripts (#494).
+pub fn loadPackScans(
+    allocator: std.mem.Allocator,
+    pack_entries: []const PackEntry,
+    game_dir: []const u8,
+    target_dir: []const u8,
+) !std.ArrayList(main_zig.PackScan) {
+    var pack_scans: std.ArrayList(main_zig.PackScan) = .empty;
+    errdefer {
+        for (pack_scans.items) |*p| p.deinit(allocator);
+        pack_scans.deinit(allocator);
+    }
+    try pack_scans.ensureTotalCapacity(allocator, pack_entries.len);
+    for (pack_entries) |e| {
+        // Reuse the manifest parsed above; only the source dir is resolved here.
+        const pack_src_dir = try cache.resolvePlugin(allocator, e.plugin, game_dir);
+        defer allocator.free(pack_src_dir);
+
+        // ensureTotalCapacity above reserved pack_entries.len slots, so this
+        // append cannot fail — no window where a scanned pack is owned but
+        // outside the cleanup list's reach.
+        const scanned = try pack_scan.scanPack(allocator, pack_src_dir, target_dir, e.plugin.name);
+        pack_scans.appendAssumeCapacity(scanned);
+    }
+    return pack_scans;
+}
+
+/// Per-pack module roots (assembler#498 PR 2, "wire the wall"). Generate
+/// `<target>/packs/<name>/__pack_root.zig` (re-exports each scanned
+/// component/event/hook/script so main.zig reaches pack contents exclusively
+/// through `@import("pack__<prefix>")`) and `__surface.zig` (the exposes-
+/// narrowed module a dependent's `@import("<pack>")` maps to). Fully
+/// self-contained — writes to disk, all scratch freed per iteration.
+///
+/// Pack SCRIPT entries were registered by the `cfg.plugins` loop
+/// (`copyPluginShippedScripts`, declaration order, #494), so the scanner
+/// already holds every pack script: filter by the `import_base == ""` pack
+/// marker + the owning pack's name, re-rooting each `packs/<name>/scripts/<rel>`
+/// path at the module root (`scripts/<rel>`).
+pub fn writePackModuleRoots(
+    allocator: std.mem.Allocator,
+    pack_scans: []const main_zig.PackScan,
+    pack_entries: []const PackEntry,
+    script_scan: *script_scanner.ScriptScanner,
+    target_dir: []const u8,
+) !void {
+    for (pack_scans) |pack| {
+        var script_rels: std.ArrayList([]const u8) = .empty;
+        defer script_rels.deinit(allocator);
+        for (script_scan.getEntries()) |entry| {
+            if (entry.import_base.len != 0) continue;
+            const pname = entry.plugin_name orelse continue;
+            if (!std.mem.eql(u8, pname, pack.name)) continue;
+            try script_rels.append(allocator, pack_root_gen.packRelScriptPath(entry.rel_path, pack.name));
+        }
+        const pack_root_src = try pack_root_gen.renderPackRoot(allocator, pack, script_rels.items);
+        defer allocator.free(pack_root_src);
+        const rel = try std.fs.path.join(allocator, &.{ "packs", pack.name, "__pack_root.zig" });
+        defer allocator.free(rel);
+        try scanner.writeFile(target_dir, rel, pack_root_src);
+
+        // `__surface.zig` (#498 PR 4): the exposes-narrowed module a
+        // dependent's `@import("<this pack>")` maps to. Validated here so
+        // a manifest exposing verbs from a file the pack doesn't ship
+        // fails BEFORE any build, with the manifest named — the compile
+        // error a dependent would eventually hit points at generated
+        // code instead of the author's mistake.
+        const exposes: pack_root_gen.SurfaceExposes = blk: {
+            const manifest = for (pack_entries) |e| {
+                if (std.mem.eql(u8, e.plugin.name, pack.name)) break e.manifest;
+            } else unreachable; // pack_scans is built FROM pack_entries
+            const ex = manifest.exposes orelse break :blk .{};
+            try pack_validate.checkExposesFiles(pack.name, ex.queries.len, ex.commands.len, pack.has_queries, pack.has_commands);
+            break :blk .{ .queries = ex.queries, .commands = ex.commands };
+        };
+        const surface_src = try pack_root_gen.renderSurface(allocator, pack.name, exposes);
+        defer allocator.free(surface_src);
+        const surface_rel = try std.fs.path.join(allocator, &.{ "packs", pack.name, "__surface.zig" });
+        defer allocator.free(surface_rel);
+        try scanner.writeFile(target_dir, surface_rel, surface_src);
+    }
+}
+
+/// Pack-module wiring records for the generated build.zig (#498 PR 2): one
+/// `pack__<prefix>_mod` per pack, rooted at the `__pack_root.zig` written by
+/// `writePackModuleRoots`. Returns the owned list — each record's `.prefix` is
+/// duped (the shared scratch buf doesn't outlive the loop), so the CALLER holds
+/// the cleanup `defer`. `.depends_on` aliases the manifest's strings, valid
+/// while `pack_entries` outlives the returned list.
+pub fn buildPackModules(
+    allocator: std.mem.Allocator,
+    pack_scans: []const main_zig.PackScan,
+    pack_entries: []const PackEntry,
+) !std.ArrayList(pack_root_gen.PackModule) {
+    var pack_modules: std.ArrayList(pack_root_gen.PackModule) = .empty;
+    errdefer {
+        for (pack_modules.items) |p| allocator.free(p.prefix);
+        pack_modules.deinit(allocator);
+    }
+    try pack_modules.ensureTotalCapacity(allocator, pack_scans.len);
+    for (pack_scans) |pack| {
+        var pfx_buf: [128]u8 = undefined;
+        const pfx = scan.packNamespacePrefix(pack.name, &pfx_buf);
+        // depends_on aliases the manifest's strings — safe: `pack_entries`'
+        // cleanup defer was declared before this list's, so it runs after.
+        const depends_on: []const []const u8 = for (pack_entries) |e| {
+            if (std.mem.eql(u8, e.plugin.name, pack.name)) break e.manifest.depends_on;
+        } else &.{};
+        pack_modules.appendAssumeCapacity(.{ .name = pack.name, .prefix = try allocator.dupe(u8, pfx), .depends_on = depends_on });
+    }
+    return pack_modules;
+}
