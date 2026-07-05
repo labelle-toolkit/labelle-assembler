@@ -136,7 +136,7 @@ pub const SCAN_PACK = struct {
         // prefixed field, so the rewritten JSONC key resolves against it.
         const main_zig = try genWithPack(component_tmpl, cfg_with_pack, scan);
         defer std.testing.allocator.free(main_zig);
-        try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"packs/citizens/components/Worker.zig\").Worker,"));
+        try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"pack__citizens\").components.Worker.Worker,"));
     }
 
     test "rewrites a FLAT-shape pack prefab into the wrapped namespaced form (#513)" {
@@ -376,9 +376,9 @@ pub const PACK_EMISSION = struct {
         // prefix (#440) — imported through the pack prefix, but the DECL
         // access stays bare (the component type's own `pub const Worker`).
         try std.testing.expect(contains(main_zig, "engine.ComponentRegistryWithPlugins(.{"));
-        try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"packs/citizens/components/Worker.zig\").Worker,"));
+        try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"pack__citizens\").components.Worker.Worker,"));
         // The bare (un-prefixed) field must NOT be emitted.
-        try std.testing.expect(!contains(main_zig, ".Worker = @import(\"packs/citizens"));
+        try std.testing.expect(!contains(main_zig, ".Worker = @import(\"pack__citizens"));
     }
 
     test "pack event widens GameEvents and is imported through the pack prefix" {
@@ -393,7 +393,7 @@ pub const PACK_EMISSION = struct {
         defer std.testing.allocator.free(main_zig);
 
         // Imported through the pack prefix, aliased under `<pack>__` (#440) …
-        try std.testing.expect(contains(main_zig, "const citizens__worker_died = @import(\"packs/citizens/events/worker_died.zig\");"));
+        try std.testing.expect(contains(main_zig, "const citizens__worker_died = @import(\"pack__citizens\").events.worker_u_died;"));
         // … and folded into the GameEvents union as a prefixed variant, whose
         // type reference uses the same prefixed alias.
         try std.testing.expect(contains(main_zig, "citizens__worker_died: citizens__worker_died.WorkerDied,"));
@@ -447,7 +447,7 @@ pub const PACK_EMISSION = struct {
         defer std.testing.allocator.free(main_zig);
 
         // Imported through the pack prefix, aliased under `<pack>__` (#440).
-        try std.testing.expect(contains(main_zig, "const citizens__overlay = @import(\"packs/citizens/hooks/overlay.zig\");"));
+        try std.testing.expect(contains(main_zig, "const citizens__overlay = @import(\"pack__citizens\").hooks.overlay;"));
         // Wired into the GameHooks receiver-type tuple …
         try std.testing.expect(contains(main_zig, "*citizens__overlay.Overlay,"));
         // … and instantiated + referenced in the receivers tuple (same order).
@@ -659,8 +659,8 @@ pub const LIGHT_PACK_BUILDS_END_TO_END = struct {
 
         // …yet the pack's component/event/prefab ARE compiled in, via the
         // dir-scan `pack_scans` path, under the invisible `<pack>__` namespace.
-        try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"packs/citizens/components/Worker.zig\").Worker,"));
-        try std.testing.expect(contains(main_zig, "@import(\"packs/citizens/events/worker_died.zig\")"));
+        try std.testing.expect(contains(main_zig, ".citizens__Worker = @import(\"pack__citizens\").components.Worker.Worker,"));
+        try std.testing.expect(contains(main_zig, "@import(\"pack__citizens\").events.worker_u_died"));
         try std.testing.expect(contains(main_zig, "@embedFile(\"packs/citizens/prefabs/worker.jsonc\")"));
     }
 
@@ -808,9 +808,13 @@ pub const PACK_SCRIPTS = struct {
         );
         defer std.testing.allocator.free(main_zig);
 
-        // Imported verbatim from the copied pack subtree — NOT re-prefixed with
-        // `scripts/`, so the pack script's own ../components imports resolve.
-        try std.testing.expect(contains(main_zig, "@import(\"packs/citizens/scripts/playing/10_worker_tick.zig\")"));
+        // Reached through the pack MODULE's re-export (#498 PR 2) — the
+        // accessor is `pathToIdent` of the scripts-relative path. Neither
+        // the old direct path form nor a `scripts/`-prefixed one may
+        // remain: the file belongs to the pack module now, so either
+        // path import is the dual-module compile error.
+        try std.testing.expect(contains(main_zig, "@import(\"pack__citizens\").scripts.playing_s_10_u_worker_u_tick"));
+        try std.testing.expect(!contains(main_zig, "@import(\"packs/citizens/scripts/"));
         try std.testing.expect(!contains(main_zig, "@import(\"scripts/packs/citizens"));
         // State-scoped: the wrapper carries the pack's declared game_states.
         try std.testing.expect(contains(main_zig, "pub const game_states = .{"));
@@ -985,10 +989,165 @@ pub const PACK_SCRIPTS = struct {
         );
         defer std.testing.allocator.free(main_zig);
 
-        // Imported through AllScripts, verbatim from the copied pack subtree.
-        try std.testing.expect(contains(main_zig, "@import(\"packs/media/scripts/context.zig\")"));
+        // Imported through AllScripts via the pack module's re-export (#498).
+        try std.testing.expect(contains(main_zig, "@import(\"pack__media\").scripts.context"));
         // …but NOT wired as the game GameContext (the game root has none).
         try std.testing.expect(contains(main_zig, "const GameContext = struct {};"));
         try std.testing.expect(!contains(main_zig, "@import(\"scripts/context.zig\")"));
+    }
+};
+
+// ── #498 PR 2: per-pack module roots + build wiring ──────────────────
+//
+// The wall's mechanism: every pack's files belong to a `pack__<prefix>`
+// module rooted at the generated `__pack_root.zig`, with a restricted
+// import table (no `game` shim, no sibling packs — plugins/engine/core
+// stay in, they're the shared substrate). These tests pin (a) the
+// renderer's re-export shape (the accessor idents the main.zig emission
+// sites print) and (b) the generated build.zig wiring: `createModule`
+// per pack, `addImport` on every artifact, the restricted table, and
+// the implicit `contracts` wiring direction.
+
+pub const PACK_ROOT_RENDER = struct {
+    test "renderPackRoot re-exports components/events/hooks/scripts under pathToIdent accessors" {
+        const pack: generate.PackScan = .{
+            .name = "citizens",
+            .import_prefix = "packs/citizens",
+            .component_names = &.{"worker_state"},
+            .event_names = &.{"worker_died"},
+            .prefab_names = &.{"worker"},
+            .hook_names = &.{"overlay"},
+        };
+        const src = try generate.pack_root.renderPackRoot(
+            std.testing.allocator,
+            pack,
+            &.{"playing/10_worker_tick.zig"},
+        );
+        defer std.testing.allocator.free(src);
+
+        // Section decl names are `pathToIdent` of the stem — the exact
+        // accessors `main.zig` prints after `@import("pack__citizens").`.
+        try std.testing.expect(contains(src, "pub const components = struct {"));
+        try std.testing.expect(contains(src, "pub const worker_u_state = @import(\"components/worker_state.zig\");"));
+        try std.testing.expect(contains(src, "pub const events = struct {"));
+        try std.testing.expect(contains(src, "pub const worker_u_died = @import(\"events/worker_died.zig\");"));
+        try std.testing.expect(contains(src, "pub const hooks = struct {"));
+        try std.testing.expect(contains(src, "pub const overlay = @import(\"hooks/overlay.zig\");"));
+        try std.testing.expect(contains(src, "pub const scripts = struct {"));
+        try std.testing.expect(contains(src, "pub const playing_s_10_u_worker_u_tick = @import(\"scripts/playing/10_worker_tick.zig\");"));
+        // Prefabs are DATA — embedded by path from main.zig, never
+        // re-exported here.
+        try std.testing.expect(!contains(src, "worker.jsonc"));
+    }
+
+    test "renderPackRoot with no zig files emits only the header (prefab-only pack)" {
+        const pack: generate.PackScan = .{
+            .name = "props",
+            .import_prefix = "packs/props",
+            .component_names = &.{},
+            .event_names = &.{},
+            .prefab_names = &.{"crate"},
+            .hook_names = &.{},
+        };
+        const src = try generate.pack_root.renderPackRoot(std.testing.allocator, pack, &.{});
+        defer std.testing.allocator.free(src);
+
+        try std.testing.expect(contains(src, "Module root of pack 'props'"));
+        try std.testing.expect(!contains(src, "pub const components"));
+        try std.testing.expect(!contains(src, "pub const events"));
+        try std.testing.expect(!contains(src, "pub const hooks"));
+        try std.testing.expect(!contains(src, "pub const scripts"));
+    }
+
+    test "packRelScriptPath strips the pack's scripts/ prefix and tolerates foreign shapes" {
+        try std.testing.expectEqualStrings(
+            "playing/10_worker_tick.zig",
+            generate.pack_root.packRelScriptPath("packs/citizens/scripts/playing/10_worker_tick.zig", "citizens"),
+        );
+        // Defensive: unexpected shape passes through unchanged.
+        try std.testing.expectEqualStrings(
+            "hits.zig",
+            generate.pack_root.packRelScriptPath("hits.zig", "citizens"),
+        );
+    }
+};
+
+pub const PACK_MODULE_BUILD = struct {
+    const pack_modules = [_]generate.pack_root.PackModule{
+        .{ .name = "citizens", .prefix = "citizens" },
+        .{ .name = "production", .prefix = "production" },
+    };
+
+    /// The slice of `build_zig` between a pack module's `createModule`
+    /// open and its closing `});` — the restricted import table under
+    /// test. Returns null when the decl is absent.
+    fn moduleSlice(build_zig: []const u8, decl: []const u8) ?[]const u8 {
+        const start = std.mem.indexOf(u8, build_zig, decl) orelse return null;
+        const end = std.mem.indexOfPos(u8, build_zig, start, "});") orelse return null;
+        return build_zig[start..end];
+    }
+
+    test "each pack gets a createModule rooted at its __pack_root.zig, imported by exe AND test_root" {
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "physics", .repo = "github:x/physics" }},
+        }, .{ .pack_modules = &pack_modules });
+        defer std.testing.allocator.free(build_zig);
+
+        try std.testing.expect(contains(build_zig, "const pack__citizens_mod = b.createModule(.{"));
+        try std.testing.expect(contains(build_zig, "b.path(\"packs/citizens/__pack_root.zig\")"));
+        try std.testing.expect(contains(build_zig, "exe.root_module.addImport(\"pack__citizens\", pack__citizens_mod);"));
+        try std.testing.expect(contains(build_zig, "test_root.root_module.addImport(\"pack__citizens\", pack__citizens_mod);"));
+        try std.testing.expect(contains(build_zig, "const pack__production_mod = b.createModule(.{"));
+    }
+
+    test "the pack module's import table is the wall: engine/core/plugins in, game + sibling packs OUT" {
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = &.{.{ .name = "physics", .repo = "github:x/physics" }},
+        }, .{ .pack_modules = &pack_modules });
+        defer std.testing.allocator.free(build_zig);
+
+        const slice = moduleSlice(build_zig, "const pack__citizens_mod = b.createModule(.{").?;
+        // Shared substrate IS importable.
+        try std.testing.expect(contains(slice, ".{ .name = \"labelle-engine\", .module = engine_mod },"));
+        try std.testing.expect(contains(slice, ".{ .name = \"labelle-core\", .module = core_mod },"));
+        try std.testing.expect(contains(slice, ".{ .name = \"physics\", .module = plugin_physics_mod },"));
+        // The wall: no `game` shim, no sibling pack.
+        try std.testing.expect(!contains(slice, "\"game\""));
+        try std.testing.expect(!contains(slice, "production"));
+    }
+
+    test "an implicitly-shared contracts pack is wired into every other pack module, one direction only" {
+        const with_contracts = [_]generate.pack_root.PackModule{
+            .{ .name = "citizens", .prefix = "citizens" },
+            .{ .name = "contracts", .prefix = "contracts" },
+        };
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, .{ .pack_modules = &with_contracts });
+        defer std.testing.allocator.free(build_zig);
+
+        try std.testing.expect(contains(build_zig, "overrideImport(pack__citizens_mod, \"contracts\", pack__contracts_mod);"));
+        // Direction check: contracts never imports a dependent, never itself.
+        try std.testing.expect(!contains(build_zig, "overrideImport(pack__contracts_mod,"));
+    }
+
+    test "no packs → build.zig has zero pack-module wiring (byte-identity invariant)" {
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, .{});
+        defer std.testing.allocator.free(build_zig);
+
+        try std.testing.expect(!contains(build_zig, "pack__"));
+        try std.testing.expect(!contains(build_zig, "__pack_root.zig"));
     }
 };

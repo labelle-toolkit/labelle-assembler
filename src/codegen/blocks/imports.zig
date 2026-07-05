@@ -59,17 +59,18 @@ pub fn Mixin(comptime Self: type) type {
                     const ident = pathToIdent(name, ident_buf);
                     try w.print("const {s} = @import(\"hooks/{s}.zig\");\n", .{ ident, name });
                 }
-                // Pack hooks (Packs RFC §4, #440): imported through the pack's
-                // `import_prefix` and aliased `<pack>__<ident>` so two packs
-                // shipping `overlay.zig` don't collide on the alias. The alias
+                // Pack hooks (Packs RFC §4, #440): aliased `<pack>__<ident>`
+                // so two packs shipping `overlay.zig` don't collide. The alias
                 // MUST match the receiver-type + instance idents the hook
-                // blocks emit.
+                // blocks emit. #498 PR 2: the RHS goes through the pack
+                // MODULE's re-export (`.hooks.<ident>` — same `pathToIdent`
+                // both sides), never a path import (dual-module error).
                 var pack_prefix_buf: [128]u8 = undefined;
                 for (self.pack_scans) |pack| {
                     const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
                     for (pack.hook_names) |name| {
                         const ident = pathToIdent(name, ident_buf);
-                        try w.print("const {s}__{s} = @import(\"{s}/hooks/{s}.zig\");\n", .{ prefix, ident, pack.import_prefix, name });
+                        try w.print("const {s}__{s} = @import(\"pack__{s}\").hooks.{s};\n", .{ prefix, ident, prefix, ident });
                     }
                 }
             }
@@ -189,17 +190,21 @@ pub fn Mixin(comptime Self: type) type {
                     try w.print("const {s} = @import(\"events/{s}.zig\");\n", .{ ident, name });
                 }
                 // Pack events (Packs RFC §4, #439). Same alias = variant-name
-                // convention as game events, but imported through the pack's
-                // `import_prefix` (e.g. `packs/citizens/events/...`) and under
-                // the invisible `<pack>__` prefix (#440) so two packs shipping
-                // `hit.zig` don't collide on the import alias. The alias here
-                // MUST match the variant type reference in `writePackEventVariants`.
+                // convention as game events, under the invisible `<pack>__`
+                // prefix (#440) so two packs shipping `hit.zig` don't collide
+                // on the import alias. The alias here MUST match the variant
+                // type reference in `writePackEventVariants`. #498 PR 2: the
+                // RHS goes through the pack MODULE's re-export — the accessor
+                // is `pathToIdent(stem)` (what `renderPackRoot` declares); the
+                // ALIAS keeps the `eventVariantName` convention.
                 var pack_prefix_buf: [128]u8 = undefined;
+                var stem_ident_buf: [256]u8 = undefined;
                 for (self.pack_scans) |pack| {
                     const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
                     for (pack.event_names) |name| {
                         const ident = eventVariantName(name);
-                        try w.print("const {s}__{s} = @import(\"{s}/events/{s}.zig\");\n", .{ prefix, ident, pack.import_prefix, name });
+                        const stem_ident = pathToIdent(name, &stem_ident_buf);
+                        try w.print("const {s}__{s} = @import(\"pack__{s}\").events.{s};\n", .{ prefix, ident, prefix, stem_ident });
                     }
                 }
             }
