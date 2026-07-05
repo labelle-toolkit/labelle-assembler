@@ -1,0 +1,8 @@
+// The consuming pack: declares its dependency and calls ONLY the
+// exposed surface.
+.{
+    .name = "production",
+    .manifest_version = 1,
+    .convention_dirs = .copy_and_scan,
+    .depends_on = .{"citizens"},
+}

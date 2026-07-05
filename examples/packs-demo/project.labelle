@@ -1,0 +1,29 @@
+.{
+    .name = "packs_demo",
+    .title = "LaBelle — Packs wall end-to-end demo",
+    .width = 800,
+    .height = 600,
+    .target_fps = 60,
+    // Headless null backend: this fixture proves the PACK MODULE WALL
+    // (assembler#498 / docs/packs.md) end-to-end — module isolation,
+    // the @import("pack").Registry bridge, and the exposes/depends_on
+    // surfaces. No window / GPU needed to build or run it.
+    .backend = .null,
+    .y_axis = .up,
+    .ecs = .zig_ecs,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .resources = .{},
+    .layers = .{
+        .{ .name = "world", .order = 0, .space = .world },
+    },
+    .plugins = .{
+        .{ .name = "citizens", .repo = "@packs/citizens" },
+        .{ .name = "production", .repo = "@packs/production" },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}

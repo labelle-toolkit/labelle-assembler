@@ -444,6 +444,69 @@ jobs:
       # required and lets the loop exit cleanly so `defer
       # PluginControllers.deinit(&g)` actually runs (which is the whole
       # point of asserting `[demo-plugin] deinit` in the canonical log).
+      # The pack module wall (#498 / docs/packs.md), end-to-end: a two-pack
+      # game builds headless on null, then four negative probes each FAIL
+      # to compile with the wall's message. Positive first so a probe
+      # failure can't mask a broken baseline.
+      - name: Generate + build the packs-demo example (+ wall probes)
+        run: |
+          cd labelle-assembler/examples/packs-demo
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          $ASM install --project-root .
+          $ASM generate --project-root .
+
+          # Generated-shape assertions: the pack module + Registry bridge
+          # + exposes surface all present.
+          grep -q 'pack__citizens_mod = b.createModule' .labelle/null_desktop/build.zig
+          grep -q 'pub const Registry' .labelle/null_desktop/packs/citizens/__pack_root.zig
+          grep -q 'find_idle' .labelle/null_desktop/packs/citizens/__surface.zig
+
+          cd .labelle/null_desktop
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+          LABELLE_NULL_FRAMES=10 ./zig-out/bin/packs_demo
+          echo "PASS: packs-demo built + ran headless (wall positive)"
+          cd ../..
+
+          # Negative probes: append an escape to the consuming script,
+          # regenerate, and require the build to FAIL with the wall's
+          # message. `git checkout` restores between probes.
+          probe() {
+            local snippet="$1" needle="$2" label="$3"
+            printf '%s\n' "$snippet" >> packs/production/scripts/playing/20_consume.zig
+            $ASM generate --project-root . > /dev/null
+            set +e
+            OUT=$(cd .labelle/null_desktop && zig build 2>&1)
+            RC=$?
+            set -e
+            if [ $RC -eq 0 ]; then echo "FAIL: probe '$label' compiled"; exit 1; fi
+            printf '%s\n' "$OUT" | grep -q "$needle" || { echo "FAIL: probe '$label' died without the wall message ($needle)"; printf '%s\n' "$OUT" | tail -20; exit 1; }
+            git -C "$GITHUB_WORKSPACE/labelle-assembler" checkout -- examples/packs-demo/packs/production/scripts/playing/20_consume.zig
+            echo "PASS: probe '$label' blocked"
+          }
+
+          probe 'const stolen = @import("../../../citizens/components/counter.zig"); comptime { _ = stolen; }' \
+                "file exists in modules" "sibling relative import"
+          probe 'const shim = @import("game"); comptime { _ = shim; }' \
+                "no module named .game." "game shim from a pack"
+          probe 'comptime { _ = @import("citizens").queries.internal_reset; }' \
+                "no member named .internal_reset." "non-exposed verb"
+          probe 'comptime { _ = @import("pack").Registry.getType("citizens__Counter"); }' \
+                "is not visible to this pack" "foreign name through the Registry bridge"
+
+          # Baseline still green after the probe cycle.
+          $ASM generate --project-root . > /dev/null
+          (cd .labelle/null_desktop && zig build)
+          echo "PASS: packs-demo wall — 1 positive + 4 blocked probes"
+
       - name: Generate + build the plugin-controllers example
         run: |
           cd labelle-assembler/examples/plugin-controllers
