@@ -166,6 +166,14 @@ jobs:
           # (secrets are not readable in job/step `if:` expressions).
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # R2's S3 API needs a region; "auto" is Cloudflare's documented value.
+          # The preinstalled aws CLI v2 (>=2.23) also sends integrity checksums
+          # R2 rejects, so downgrade calculation/validation to when_required
+          # (same compat settings labelle-studio's R2 upload uses).
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           # On `push: tags:` github.ref_name is the tag; on workflow_dispatch
@@ -175,18 +183,23 @@ jobs:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           # Gate the whole upload on the credential secrets being present so a
-          # release run stays green before the R2 API token is added. Once
-          # R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY land and the next tag is
-          # cut, this lights up and studio starts sourcing the assembler from
-          # R2 (its GitHub-release fallback goes dormant automatically).
-          if [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] && [ -n "$R2_BUCKET" ]; then
-            pip install awscli
+          # release run stays green before the R2 API token is added. The
+          # endpoint is built from R2_ACCOUNT_ID (job env), so it's gated too:
+          # if it were unset the endpoint would be a malformed
+          # `https://.r2.cloudflarestorage.com` and the job would FAIL instead
+          # of taking the intended green-skip. Once the R2 API token lands and
+          # the next tag is cut, this lights up and studio starts sourcing the
+          # assembler from R2 (its GitHub-release fallback goes dormant).
+          if [ -n "$R2_ACCOUNT_ID" ] && [ -n "$R2_ACCESS_KEY_ID" ] && \
+             [ -n "$R2_SECRET_ACCESS_KEY" ] && [ -n "$R2_BUCKET" ]; then
             VERSION="$RELEASE_TAG"
 
             # download-artifact (no merge-multiple) lays each matrix artifact
             # out as artifacts/<name>/<name>; publish it verbatim so the R2 key
             # is labelle-assembler-<os>-<arch> — byte-for-byte what studio's
             # fetch-sidecars requests (assembler/<tag>/labelle-assembler-<os>-<arch>).
+            # aws is preinstalled on ubuntu-latest; no `pip install awscli`
+            # (that breaks under Ubuntu 24.04's PEP 668 externally-managed env).
             for dir in artifacts/*/; do
               name=$(basename "$dir")
               for file in "$dir"*; do
@@ -195,10 +208,17 @@ jobs:
               done
             done
 
-            echo "$VERSION" | aws s3 cp - "s3://$R2_BUCKET/assembler/latest.txt" \
-              --endpoint-url "$R2_ENDPOINT"
-
-            echo "Released $VERSION to R2"
+            # Only advance the latest.txt pointer on a real tag push. A
+            # workflow_dispatch run can rebuild an OLDER tag; overwriting
+            # latest.txt there would downgrade studio consumers that follow it.
+            # Re-uploading a prior version's per-tag objects (above) is harmless.
+            if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              echo "$VERSION" | aws s3 cp - "s3://$R2_BUCKET/assembler/latest.txt" \
+                --endpoint-url "$R2_ENDPOINT"
+              echo "Released $VERSION to R2 (advanced assembler/latest.txt)"
+            else
+              echo "::notice::Backfilled $VERSION artifacts to R2 via $GITHUB_EVENT_NAME; left assembler/latest.txt unchanged so consumers aren't downgraded."
+            fi
           else
-            echo "::notice::R2 creds absent — skipping upload (add R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY to publish)"
+            echo "::notice::R2 creds absent — skipping upload (add R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY; R2_ACCOUNT_ID + R2_BUCKET are already set)"
           fi
