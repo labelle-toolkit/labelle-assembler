@@ -127,12 +127,13 @@ test "firstExternalTileset finds an external .tsx tileset, null for inline" {
     try testing.expect(tilemap_scan.firstExternalTileset(commented) == null);
 }
 
-test "extractImageSources XML-unescapes the source attribute" {
-    // On-disk file is `tiles&decor<x>.png`; the TMX escapes it. Both the
-    // @embedFile path and the engine registry key must be the DECODED string.
+test "extractImageSources keeps the source RAW (no XML-entity decode)" {
+    // gfx v1.21.0 stores image_source verbatim (no &amp;→& decode), so the
+    // engine's ImageProvider looks up the RAW string — the registry key must
+    // match byte-for-byte. Decoding here would silently miss (see #564).
     const tmx =
         \\<map>
-        \\ <tileset firstgid="1"><image source="tiles&amp;decor&lt;x&gt;.png" width="16" height="16"/></tileset>
+        \\ <tileset firstgid="1"><image source="tiles&amp;decor.png" width="16" height="16"/></tileset>
         \\</map>
     ;
     const imgs = try tilemap_scan.extractImageSources(testing.allocator, tmx);
@@ -141,7 +142,26 @@ test "extractImageSources XML-unescapes the source attribute" {
         testing.allocator.free(imgs);
     }
     try testing.expectEqual(@as(usize, 1), imgs.len);
-    try testing.expectEqualStrings("tiles&decor<x>.png", imgs[0]);
+    try testing.expectEqualStrings("tiles&amp;decor.png", imgs[0]);
+}
+
+test "extractImageSources ignores an <imagelayer> image, keeps the tileset image" {
+    // Only TILESET images are fetched by the engine's ImageProvider; an
+    // image-layer background must NOT be embedded (it would require an absent
+    // file / collide, though the runtime never requests it).
+    const tmx =
+        \\<map>
+        \\ <imagelayer name="bg"><image source="draft_bg.png" width="64" height="32"/></imagelayer>
+        \\ <tileset firstgid="1"><image source="tiles.png" width="64" height="32"/></tileset>
+        \\</map>
+    ;
+    const imgs = try tilemap_scan.extractImageSources(testing.allocator, tmx);
+    defer {
+        for (imgs) |s| testing.allocator.free(s);
+        testing.allocator.free(imgs);
+    }
+    try testing.expectEqual(@as(usize, 1), imgs.len);
+    try testing.expectEqualStrings("tiles.png", imgs[0]);
 }
 
 test "tmxEmbedPath appends .tmx for a bare asset name" {
@@ -166,6 +186,13 @@ test "imageEmbedPath normalises a parent-relative image source" {
     const p = try tilemap_scan.imageEmbedPath(testing.allocator, "assets/maps/level.tmx", "../textures/tiles.png");
     defer testing.allocator.free(p);
     try testing.expectEqualStrings("assets/textures/tiles.png", p);
+}
+
+test "imageEmbedPath normalises Windows backslash separators to `/`" {
+    // A Tiled-on-Windows source; the copied asset lives at assets/tiles/x.png.
+    const p = try tilemap_scan.imageEmbedPath(testing.allocator, "assets/colony_map.tmx", "tiles\\terrain.png");
+    defer testing.allocator.free(p);
+    try testing.expectEqualStrings("assets/tiles/terrain.png", p);
 }
 
 fn writeFileAbs(dir: std.Io.Dir, rel: []const u8, content: []const u8) !void {
@@ -198,6 +225,33 @@ test "collect embeds the .tmx and its tileset image, keyed for the engine" {
     // the engine's ImageProvider.get is called with exactly this string).
     try testing.expectEqualStrings("tiles.png", regs[1].key);
     try testing.expectEqualStrings("assets/tiles.png", regs[1].embed_path);
+}
+
+test "collect: backslash source → RAW key, `/`-normalized embed path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A Windows-authored source. gfx keeps `image_source` raw, so the engine
+    // looks up the backslash key — the registration KEY must stay raw; only
+    // the @embedFile PATH is normalized to the copied asset location.
+    const tmx =
+        \\<map>
+        \\ <tileset firstgid="1"><image source="tiles\terrain.png" width="16" height="16"/></tileset>
+        \\</map>
+    ;
+    try writeFileAbs(tmp.dir, "assets/level.tmx", tmx);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_scan.collect(testing.allocator, target_dir, &.{"level"});
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    try testing.expectEqual(@as(usize, 2), regs.len);
+    // KEY: raw backslash (matches gfx's ImageProvider lookup).
+    try testing.expectEqualStrings("tiles\\terrain.png", regs[1].key);
+    // PATH: `/`-normalized to the copied asset.
+    try testing.expectEqualStrings("assets/tiles/terrain.png", regs[1].embed_path);
 }
 
 test "collect dedups a shared tileset image across two maps" {

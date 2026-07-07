@@ -84,6 +84,14 @@ pub fn tmxEmbedPath(allocator: std.mem.Allocator, asset_name: []const u8) ![]u8 
 /// `@embedFile`-relative image path, normalising `.`/`..` segments and
 /// forcing `/` separators. `tmx_path` is the value from `tmxEmbedPath`.
 /// Caller owns the result.
+///
+/// **Windows separators.** A Tiled map authored on Windows can emit
+/// `source="tiles\terrain.png"`. The copied asset lives at
+/// `assets/tiles/terrain.png` on any builder, so backslash separators are
+/// normalised to `/` for the `@embedFile` PATH here. The registry KEY,
+/// however, stays the raw `image_source` (backslash intact) — gfx v1.21.0
+/// keeps `image_source` verbatim, so that is the string the engine's
+/// `ImageProvider.get` looks up (see `extractImageSources`).
 pub fn imageEmbedPath(
     allocator: std.mem.Allocator,
     tmx_path: []const u8,
@@ -95,6 +103,11 @@ pub fn imageEmbedPath(
     else
         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, image_source });
     defer allocator.free(joined);
+    // Windows `\` separators → `/` before segment normalisation, so a
+    // backslash-authored source resolves to the copied asset's real path.
+    for (joined) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
     return normalizePosix(allocator, joined);
 }
 
@@ -136,16 +149,24 @@ fn normalizePosix(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// Extract every tileset `<image source="...">` value from raw `.tmx`
+/// Extract every TILESET `<image source="...">` value from raw `.tmx`
 /// bytes, in document order. Pure string scan — the assembler has no full
 /// TMX parser and only needs the image references (the engine's gfx
 /// decoder does the real parsing at runtime).
 ///
-/// Handles inline-image tilesets — the T2 shape:
-///   `<tileset ...><image source="tiles.png" .../></tileset>`
-/// External `<tileset source="foo.tsx"/>` references carry no inline
-/// `<image>` and are skipped (gfx can't load an external `.tsx` from
-/// memory under the embedded base_path anyway). Returns owned dupes.
+/// **Tileset-scoped.** Only `<image>` elements INSIDE a `<tileset>…</tileset>`
+/// are collected. The engine's `ImageProvider` is queried only for decoded
+/// TILESET images, so an `<imagelayer><image source="bg.png"/></imagelayer>`
+/// (a background image layer) must NOT be embedded — the runtime never
+/// requests it, and embedding it could require an absent file or collide.
+///
+/// **Raw values.** The returned source is the VERBATIM attribute-value
+/// bytes — no XML-entity decoding and no `\`→`/` normalization. gfx v1.21.0's
+/// TMX parser stores `image_source` as a raw dupe (`tilemap/src/root.zig`
+/// `parseAttributes` + `tileset.image_source = dupe(src)`), so the engine's
+/// `ImageProvider.get` looks up by the raw string — the registry key MUST
+/// match it byte-for-byte. (The `@embedFile` PATH is normalized separately in
+/// `imageEmbedPath`.) Returns owned dupes.
 pub fn extractImageSources(allocator: std.mem.Allocator, tmx: []const u8) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -154,19 +175,31 @@ pub fn extractImageSources(allocator: std.mem.Allocator, tmx: []const u8) ![][]c
     }
 
     var search: usize = 0;
-    while (indexOfTagSkippingComments(tmx, search, "<image")) |tag_start| {
-        // Bound the attribute search to this element so a later element's
-        // `source="..."` can't be attributed to a `<image>` that had none.
-        const tag_end = std.mem.indexOfPos(u8, tmx, tag_start, ">") orelse tmx.len;
-        const tag = tmx[tag_start..tag_end];
-        if (attrValue(tag, "source")) |src| {
-            // XML-unescape the attribute value: `source="a&amp;b.png"` on
-            // disk is `a&b.png`, and gfx's TMX parser hands the engine the
-            // DECODED string — so both the `@embedFile` path and the
-            // registry key must be decoded to match.
-            try out.append(allocator, try xmlUnescape(allocator, src));
+    while (indexOfTagSkippingComments(tmx, search, "<tileset")) |ts_start| {
+        const ts_tag_end = std.mem.indexOfPos(u8, tmx, ts_start, ">") orelse tmx.len;
+        // A self-closed `<tileset .../>` (external or empty) has no inner
+        // `<image>` child — nothing to scan; advance past its opening tag.
+        if (ts_tag_end > ts_start and tmx[ts_tag_end - 1] == '/') {
+            search = ts_tag_end;
+            continue;
         }
-        search = tag_end;
+        // Bound the `<image>` scan to THIS tileset's content span so an
+        // imagelayer / object image after `</tileset>` is never attributed
+        // to it.
+        const ts_close = std.mem.indexOfPos(u8, tmx, ts_tag_end, "</tileset>") orelse tmx.len;
+        var isearch = ts_tag_end;
+        while (indexOfTagSkippingComments(tmx, isearch, "<image")) |img_start| {
+            if (img_start >= ts_close) break;
+            // Bound the attr search to this element so a later element's
+            // `source=` can't be attributed to an `<image>` that had none.
+            const img_tag_end = std.mem.indexOfPos(u8, tmx, img_start, ">") orelse tmx.len;
+            const tag = tmx[img_start..img_tag_end];
+            if (attrValue(tag, "source")) |src| {
+                try out.append(allocator, try allocator.dupe(u8, src));
+            }
+            isearch = img_tag_end;
+        }
+        search = ts_close;
     }
 
     return out.toOwnedSlice(allocator);
@@ -214,43 +247,7 @@ fn indexOfTagSkippingComments(tmx: []const u8, from: usize, needle: []const u8) 
     }
 }
 
-/// Decode the standard XML predefined entities in an attribute value into a
-/// freshly allocated string the caller owns: `&amp; &lt; &gt; &quot;
-/// &apos;`. Any other `&…;` run is left verbatim (a real TMX from Tiled
-/// only ever emits the five predefined entities in path attributes).
-fn xmlUnescape(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    // No `&` → no entities; fast path keeps the common case a plain dupe.
-    if (std.mem.indexOfScalar(u8, s, '&') == null) return allocator.dupe(u8, s);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    const entities = [_]struct { name: []const u8, ch: u8 }{
-        .{ .name = "&amp;", .ch = '&' },
-        .{ .name = "&lt;", .ch = '<' },
-        .{ .name = "&gt;", .ch = '>' },
-        .{ .name = "&quot;", .ch = '"' },
-        .{ .name = "&apos;", .ch = '\'' },
-    };
-
-    var i: usize = 0;
-    outer: while (i < s.len) {
-        if (s[i] == '&') {
-            for (entities) |e| {
-                if (std.mem.startsWith(u8, s[i..], e.name)) {
-                    try out.append(allocator, e.ch);
-                    i += e.name.len;
-                    continue :outer;
-                }
-            }
-        }
-        try out.append(allocator, s[i]);
-        i += 1;
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-/// Return the raw (still-escaped) value of the `name` attribute inside a
+/// Return the raw value of the `name` attribute inside a
 /// single tag slice, or null. Tolerates the legal XML variations Tiled and
 /// hand-authored maps emit: optional whitespace around `=`, and either
 /// double or single quotes (`source="x"`, `source = "x"`, `source='x'`).
