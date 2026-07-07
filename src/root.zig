@@ -9,6 +9,7 @@ const cache = @import("cache.zig");
 const backend_registry = @import("backend_registry.zig");
 pub const scanner = @import("scanner.zig");
 pub const scene_manifest = @import("scene_manifest.zig");
+pub const tilemap_scan = @import("tilemap_scan.zig");
 pub const asset_validator = @import("asset_validator.zig");
 pub const lazy_inference = @import("lazy_inference.zig");
 pub const main_zig = @import("main_zig.zig");
@@ -40,6 +41,7 @@ const manifest_detect = @import("root/manifest_detect.zig");
 const pack_scan = @import("root/pack_scan.zig");
 const templates = @import("root/templates.zig");
 const generate_phases = @import("root/generate_phases.zig");
+const tilemap_phase = @import("root/tilemap_phase.zig");
 
 // Force test discovery for files that aren't transitively reached by
 // any compiled function path during `addTest` runs.
@@ -51,6 +53,7 @@ test {
     _ = @import("scene_name_lint.zig");
     _ = @import("scene_manifest.zig");
     _ = @import("scene_manifest_test.zig");
+    _ = @import("tilemap_scan_test.zig"); // covers tilemap_scan + tilemap_scene_scan
     _ = @import("asset_validator.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
@@ -507,6 +510,11 @@ pub fn generate(
         pack_scans.deinit(allocator);
     }
 
+    // Embedded-tilemap registrations (T2 Phase 4). AFTER `loadPackScans` so the
+    // prefab fail-loud (assembler#561) sees pack prefabs. See tilemap_phase.
+    const tilemap_registrations = try tilemap_phase.collectRegistrations(allocator, target_dir, scene_manifests, component_names, prefab_names, pack_scans.items);
+    defer tilemap_scan.freeRegistrations(allocator, tilemap_registrations);
+
     // Injectivity gate (#440 / chatgpt-codex events L164): the `<pack>__<name>`
     // scheme is not injective on its own — two distinct (pack, name) pairs can
     // fold to the same emitted symbol (e.g. pack `a` + `b__hit` and pack `a__b`
@@ -881,6 +889,13 @@ pub fn generate(
         // cleared right after. Empty when the project declares no packs.
         defer main_zig.main_template.pack_scans = &.{};
         main_zig.main_template.pack_scans = pack_scans.items;
+
+        // Embedded-tilemap registrations (T2 Phase 4) — same scoped
+        // module-level-var pattern as pack_scans. Set to the list collected
+        // after the assets link above; cleared right after this generation.
+        // Empty for tilemap-free projects, so their main.zig is byte-identical.
+        defer main_zig.main_template.tilemap_registrations = &.{};
+        main_zig.main_template.tilemap_registrations = tilemap_registrations;
 
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,

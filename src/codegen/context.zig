@@ -34,6 +34,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const script_scanner = @import("../script_scanner.zig");
 const scene_manifest = @import("../scene_manifest.zig");
+const tilemap_scan = @import("../tilemap_scan.zig");
 const scan = @import("scan.zig");
 const manifest_v2 = @import("manifest_v2.zig");
 
@@ -91,6 +92,15 @@ pub const Codegen = struct {
     // registry/import/prefab block-writers iterate this AFTER the game-root
     // loops to register pack items into the SAME (unified) registries.
     pack_scans: []const scan.PackScan = &.{},
+
+    // Embedded-tilemap registrations (T2 Phase 4, tilemap epic). Each entry
+    // is one `addEmbeddedTilemapAsset("<key>", @embedFile("<embed_path>"))`
+    // the lifecycle emitters write into `init()` — the scene-referenced
+    // `.tmx` documents plus their tileset images, deduped by registry key.
+    // Borrowed; owned by `root.zig` (via the module-level var set before
+    // `generateMainZigFromTemplate`). Empty by default so every caller that
+    // never sets it (tests, preview, tilemap-free projects) emits nothing.
+    tilemap_registrations: []const tilemap_scan.Registration = &.{},
 
     // Priority-aware flow-handler ordering (indices into `script_entries`),
     // built by `blocks/hooks.zig:buildFlowOrder`. Borrowed: the

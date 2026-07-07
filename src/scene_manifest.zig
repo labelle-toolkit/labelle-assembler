@@ -14,6 +14,7 @@
 /// validation lives in `asset_validator.zig` (ticket #47).
 const std = @import("std");
 const config = @import("config.zig");
+const tilemap_scene_scan = @import("tilemap_scene_scan.zig");
 
 /// Write a formatted diagnostic directly to stderr, matching the
 /// repo-wide convention (see `flow_scanner.reportFlowError`,
@@ -55,6 +56,16 @@ pub const SceneManifest = struct {
     /// honors it at runtime. See labelle-engine#500.
     /// String is owned by this manifest's allocator.
     initial_state: ?[]const u8 = null,
+    /// `asset_name`s of every `Tilemap` component declared anywhere in the
+    /// scene's entity tree (T2 Phase 4, tilemap epic). The assembler
+    /// resolves each to a `.tmx` file, `@embedFile`s it + its tileset
+    /// images, and emits `addEmbeddedTilemapAsset` registrations in the
+    /// generated `init()` (see `tilemap_scan.zig`). May be empty (the
+    /// common case — most scenes carry no tilemap). Each string is owned
+    /// by this manifest's allocator; the built-in `Tilemap` component is
+    /// resolved by the engine's dedicated scene-loader channel, so its
+    /// `asset_name` is the exact registry key the runtime looks up.
+    tilemap_assets: []const []const u8 = &.{},
 };
 
 /// Whitelisted lowercase top-level keys allowed in a scene .jsonc file.
@@ -597,6 +608,31 @@ fn validateChildrenArrayDepth(value: std.json.Value, display_path: []const u8, d
     }
 }
 
+/// Scan a raw JSONC entity/prefab source for `Tilemap` component
+/// `asset_name`s, WITHOUT the scene-specific unknown-key / §B2 validation
+/// (prefabs have their own allowed-key set). Used to detect tilemaps in
+/// prefab files — which minimal-T2 does not yet embed (assembler#561) —
+/// so the assembler can fail loud instead of shipping a broken binary.
+/// Returns an owned slice (empty → `&.{}`); caller frees each string +
+/// the slice. Malformed JSON yields an empty result (the real parse error
+/// surfaces elsewhere).
+pub fn scanTilemapAssets(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) ![]const []const u8 {
+    const stripped = stripJsonc(allocator, source) catch return &.{};
+    defer allocator.free(stripped);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, stripped, .{}) catch return &.{};
+    defer parsed.deinit();
+    return tilemap_scene_scan.parseTilemapAssets(allocator, parsed.value);
+}
+
+/// Free a slice returned by `scanTilemapAssets`.
+pub fn freeTilemapAssets(allocator: std.mem.Allocator, assets: []const []const u8) void {
+    for (assets) |s| allocator.free(s);
+    if (assets.len > 0) allocator.free(assets);
+}
+
 /// Parse a single scene file's source buffer. `scene_name` is the name the
 /// assembler uses elsewhere (e.g. "menu" or "world/intro") and `display_path`
 /// is the path printed in error messages so users can find the offending file.
@@ -673,6 +709,7 @@ pub fn parseSceneSource(
             .name = scene_name,
             .assets = bundle_assets,
             .initial_state = null,
+            .tilemap_assets = try tilemap_scene_scan.parseTilemapAssets(allocator, parsed.value),
         };
     }
 
@@ -803,6 +840,7 @@ pub fn parseSceneSource(
         .name = scene_name,
         .assets = assets,
         .initial_state = initial_state,
+        .tilemap_assets = try tilemap_scene_scan.parseTilemapAssets(allocator, parsed.value),
     };
 }
 
@@ -813,6 +851,10 @@ pub fn freeManifest(allocator: std.mem.Allocator, manifest: SceneManifest) void 
         allocator.free(manifest.assets);
     }
     if (manifest.initial_state) |s| allocator.free(s);
+    for (manifest.tilemap_assets) |s| allocator.free(s);
+    if (manifest.tilemap_assets.len > 0) {
+        allocator.free(manifest.tilemap_assets);
+    }
 }
 
 /// Free a slice of manifests in one shot.
