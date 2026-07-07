@@ -9,6 +9,7 @@ const cache = @import("cache.zig");
 const backend_registry = @import("backend_registry.zig");
 pub const scanner = @import("scanner.zig");
 pub const scene_manifest = @import("scene_manifest.zig");
+pub const tilemap_scan = @import("tilemap_scan.zig");
 pub const asset_validator = @import("asset_validator.zig");
 pub const lazy_inference = @import("lazy_inference.zig");
 pub const main_zig = @import("main_zig.zig");
@@ -51,6 +52,8 @@ test {
     _ = @import("scene_name_lint.zig");
     _ = @import("scene_manifest.zig");
     _ = @import("scene_manifest_test.zig");
+    _ = @import("tilemap_scan.zig");
+    _ = @import("tilemap_scan_test.zig");
     _ = @import("asset_validator.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
@@ -397,6 +400,25 @@ pub fn generate(
     // Runs after the assets dir is linked so the default lands beside
     // the project's own copied assets.
     try app_icon.injectDefaultIcon(allocator, cfg, target_dir);
+
+    // Embedded-tilemap registrations (T2 Phase 4, tilemap epic). Aggregate
+    // every scene's `Tilemap` `asset_name`s (collected by
+    // `scene_manifest`), resolve each to a `.tmx` under the linked
+    // `assets/` dir, and build the `.tmx` + tileset-image `@embedFile`
+    // registrations the generated `init()` emits via
+    // `addEmbeddedTilemapAsset`. Runs AFTER the assets dir is linked so the
+    // `.tmx` files are present in the target tree for reading here and for
+    // `@embedFile` at build time. `collect` dedups by registry key, so
+    // passing the raw (possibly repeated) names across scenes is fine. An
+    // empty list (no scene declares a Tilemap) reads no files and emits
+    // nothing.
+    var tilemap_asset_names: std.ArrayList([]const u8) = .empty;
+    defer tilemap_asset_names.deinit(allocator);
+    for (scene_manifests) |m| {
+        for (m.tilemap_assets) |an| try tilemap_asset_names.append(allocator, an);
+    }
+    const tilemap_registrations = try tilemap_scan.collect(allocator, target_dir, tilemap_asset_names.items);
+    defer tilemap_scan.freeRegistrations(allocator, tilemap_registrations);
 
     // `tests/` mirrors the project source tree (e.g. `tests/components/foo.zig`
     // tests `components/foo.zig`). Linked + scanned so the generated
@@ -881,6 +903,13 @@ pub fn generate(
         // cleared right after. Empty when the project declares no packs.
         defer main_zig.main_template.pack_scans = &.{};
         main_zig.main_template.pack_scans = pack_scans.items;
+
+        // Embedded-tilemap registrations (T2 Phase 4) — same scoped
+        // module-level-var pattern as pack_scans. Set to the list collected
+        // after the assets link above; cleared right after this generation.
+        // Empty for tilemap-free projects, so their main.zig is byte-identical.
+        defer main_zig.main_template.tilemap_registrations = &.{};
+        main_zig.main_template.tilemap_registrations = tilemap_registrations;
 
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,

@@ -26,6 +26,7 @@ const tpl = @import("../template.zig");
 const config = @import("../config.zig");
 const script_scanner = @import("../script_scanner.zig");
 const scene_manifest = @import("../scene_manifest.zig");
+const tilemap_scan = @import("../tilemap_scan.zig");
 const scan = @import("scan.zig");
 const validate = @import("validate.zig");
 const context = @import("context.zig");
@@ -63,6 +64,16 @@ pub threadlocal var lifecycle_override: ?manifest_v2.BackendManifestV2.PlatformE
 /// has 100+ call sites in the test suite). Empty (the default) → no packs,
 /// every registry block emits its exact pre-pack shape.
 pub threadlocal var pack_scans: []const scan.PackScan = &.{};
+
+/// Embedded-tilemap registrations (T2 Phase 4, tilemap epic). Each entry
+/// becomes one `addEmbeddedTilemapAsset("<key>", @embedFile("<embed_path>"))`
+/// call in the generated `init()` — the scene-referenced `.tmx` documents
+/// plus their tileset images. `root.zig` sets this immediately before the
+/// `generateMainZigFromTemplate` call and clears it after (same
+/// scoped-threadlocal pattern as `pack_scans`, kept off the ~19-arg
+/// generator signature). Empty (the default) → tilemap-free project, no
+/// tilemap registrations emitted.
+pub threadlocal var tilemap_registrations: []const tilemap_scan.Registration = &.{};
 
 const ProjectConfig = config.ProjectConfig;
 const LayerDef = config.LayerDef;
@@ -205,6 +216,11 @@ pub fn generateMainZigFromTemplate(
         // root.zig. Defaults to empty so every existing call site (tests,
         // preview) keeps its exact pre-pack emission.
         .pack_scans = pack_scans,
+        // Embedded-tilemap registrations (T2 Phase 4) — read from the
+        // module-level var set by root.zig. Empty for every existing call
+        // site (tests, preview, tilemap-free projects), so those emit no
+        // tilemap registrations.
+        .tilemap_registrations = tilemap_registrations,
         // wasm-only: does the backend's lifecycle (wasm) template ship its own
         // `pub const panic`? If so, the assembler must NOT also emit its
         // stopgap panic shim (they would duplicate the root decl). Scanned from

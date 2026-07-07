@@ -55,6 +55,16 @@ pub const SceneManifest = struct {
     /// honors it at runtime. See labelle-engine#500.
     /// String is owned by this manifest's allocator.
     initial_state: ?[]const u8 = null,
+    /// `asset_name`s of every `Tilemap` component declared anywhere in the
+    /// scene's entity tree (T2 Phase 4, tilemap epic). The assembler
+    /// resolves each to a `.tmx` file, `@embedFile`s it + its tileset
+    /// images, and emits `addEmbeddedTilemapAsset` registrations in the
+    /// generated `init()` (see `tilemap_scan.zig`). May be empty (the
+    /// common case — most scenes carry no tilemap). Each string is owned
+    /// by this manifest's allocator; the built-in `Tilemap` component is
+    /// resolved by the engine's dedicated scene-loader channel, so its
+    /// `asset_name` is the exact registry key the runtime looks up.
+    tilemap_assets: []const []const u8 = &.{},
 };
 
 /// Whitelisted lowercase top-level keys allowed in a scene .jsonc file.
@@ -597,6 +607,66 @@ fn validateChildrenArrayDepth(value: std.json.Value, display_path: []const u8, d
     }
 }
 
+/// Recursively walk a parsed scene JSON value collecting the `asset_name`
+/// of every `Tilemap` component it declares, in document order (T2 Phase
+/// 4). Appends owned dupes to `out`.
+///
+/// `Tilemap` is an engine built-in resolved by the scene loader's own
+/// channel (like `Position` / `PrefabInstance`), so it can appear under
+/// any entity shape: flat-form (`{ "Tilemap": {...} }`), wrapped
+/// (`{ "components": { "Tilemap": {...} } }`), or nested inside
+/// `children` / `entities` / a bundle array. A generic deep walk for the
+/// distinctive PascalCase `Tilemap` key handles every shape without
+/// re-implementing the engine's entity-tree grammar. A `Tilemap` whose
+/// `asset_name` is missing or empty contributes nothing — there's no
+/// asset to embed.
+fn collectTilemapAssets(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    out: *std.ArrayList([]const u8),
+) !void {
+    switch (value) {
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "Tilemap") and entry.value_ptr.* == .object) {
+                    if (entry.value_ptr.object.get("asset_name")) |an| {
+                        if (an == .string and an.string.len > 0) {
+                            try out.append(allocator, try allocator.dupe(u8, an.string));
+                        }
+                    }
+                }
+                // Recurse into every value so a Tilemap nested under
+                // `components` / `children` / `root` / etc. is still found.
+                try collectTilemapAssets(allocator, entry.value_ptr.*, out);
+            }
+        },
+        .array => |arr| {
+            for (arr.items) |item| try collectTilemapAssets(allocator, item, out);
+        },
+        else => {},
+    }
+}
+
+/// Collect a scene's `Tilemap` asset names into an owned slice (empty →
+/// `&.{}`, no allocation). Caller frees via `freeManifest`.
+fn parseTilemapAssets(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |s| allocator.free(s);
+        list.deinit(allocator);
+    }
+    try collectTilemapAssets(allocator, value, &list);
+    if (list.items.len == 0) {
+        list.deinit(allocator);
+        return &.{};
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 /// Parse a single scene file's source buffer. `scene_name` is the name the
 /// assembler uses elsewhere (e.g. "menu" or "world/intro") and `display_path`
 /// is the path printed in error messages so users can find the offending file.
@@ -673,6 +743,7 @@ pub fn parseSceneSource(
             .name = scene_name,
             .assets = bundle_assets,
             .initial_state = null,
+            .tilemap_assets = try parseTilemapAssets(allocator, parsed.value),
         };
     }
 
@@ -803,6 +874,7 @@ pub fn parseSceneSource(
         .name = scene_name,
         .assets = assets,
         .initial_state = initial_state,
+        .tilemap_assets = try parseTilemapAssets(allocator, parsed.value),
     };
 }
 
@@ -813,6 +885,10 @@ pub fn freeManifest(allocator: std.mem.Allocator, manifest: SceneManifest) void 
         allocator.free(manifest.assets);
     }
     if (manifest.initial_state) |s| allocator.free(s);
+    for (manifest.tilemap_assets) |s| allocator.free(s);
+    if (manifest.tilemap_assets.len > 0) {
+        allocator.free(manifest.tilemap_assets);
+    }
 }
 
 /// Free a slice of manifests in one shot.

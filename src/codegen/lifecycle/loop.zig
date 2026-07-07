@@ -24,6 +24,7 @@ const config = @import("../../config.zig");
 const scan = @import("../scan.zig");
 const asset_wiring = @import("../blocks/asset_wiring.zig");
 const resource_loader = @import("../blocks/resource_loader.zig");
+const tilemap_assets = @import("../blocks/tilemap_assets.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const ResourceDef = config.ResourceDef;
@@ -163,6 +164,13 @@ pub fn Mixin(comptime Self: type) type {
                 }
                 try w.writeByte('\n');
             }
+
+            // Embedded tilemaps (T2 Phase 4). Register every scene-referenced
+            // `.tmx` + its tileset images BEFORE `setScene` below — the
+            // engine decodes a Tilemap component's `.tmx` during scene load,
+            // reading the bytes back from this same registry. No-op for a
+            // tilemap-free project.
+            try tilemap_assets.emitTilemapRegistrations(w, self.tilemap_registrations, .try_style);
 
             // Register JSONC scenes
             if (jsonc_scene_names.len > 0) {

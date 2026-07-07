@@ -1351,3 +1351,46 @@ pub const EDITOR_PREVIEW = struct {
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
     }
 };
+
+// Embedded-tilemap registration emit (T2 Phase 4, tilemap epic). Drives the
+// `main_template.tilemap_registrations` module-level var (the same scoped
+// pattern as pack_scans / loop_style_override) and asserts the generated
+// `init()` registers the `.tmx` and its tileset image through the engine's
+// `addEmbeddedTilemapAsset` API — the `.try_style` (loop backends) and
+// `.catch_panic_style` (sokol/wasm callback) spellings.
+pub const TILEMAP_EMBED = struct {
+    const Registration = generate.tilemap_scan.Registration;
+
+    const sample_regs = [_]Registration{
+        .{ .key = "colony_map", .embed_path = "assets/colony_map.tmx" },
+        .{ .key = "tiles.png", .embed_path = "assets/tiles.png" },
+    };
+
+    test "loop backend emits `try g.addEmbeddedTilemapAsset` for the .tmx + image" {
+        generate.main_template.tilemap_registrations = &sample_regs;
+        defer generate.main_template.tilemap_registrations = &.{};
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "try g.addEmbeddedTilemapAsset(\"colony_map\", @embedFile(\"assets/colony_map.tmx\"));") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "try g.addEmbeddedTilemapAsset(\"tiles.png\", @embedFile(\"assets/tiles.png\"));") != null);
+    }
+
+    test "no tilemap registrations → no addEmbeddedTilemapAsset call (purely additive)" {
+        // Default (empty) — a tilemap-free project must be byte-identical to
+        // the pre-Phase-4 output.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "addEmbeddedTilemapAsset") == null);
+    }
+};
