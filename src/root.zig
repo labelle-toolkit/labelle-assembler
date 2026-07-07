@@ -41,6 +41,7 @@ const manifest_detect = @import("root/manifest_detect.zig");
 const pack_scan = @import("root/pack_scan.zig");
 const templates = @import("root/templates.zig");
 const generate_phases = @import("root/generate_phases.zig");
+const tilemap_phase = @import("root/tilemap_phase.zig");
 
 // Force test discovery for files that aren't transitively reached by
 // any compiled function path during `addTest` runs.
@@ -52,8 +53,7 @@ test {
     _ = @import("scene_name_lint.zig");
     _ = @import("scene_manifest.zig");
     _ = @import("scene_manifest_test.zig");
-    _ = @import("tilemap_scan.zig");
-    _ = @import("tilemap_scan_test.zig");
+    _ = @import("tilemap_scan_test.zig"); // covers tilemap_scan + tilemap_scene_scan
     _ = @import("asset_validator.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
@@ -401,23 +401,9 @@ pub fn generate(
     // the project's own copied assets.
     try app_icon.injectDefaultIcon(allocator, cfg, target_dir);
 
-    // Embedded-tilemap registrations (T2 Phase 4, tilemap epic). Aggregate
-    // every scene's `Tilemap` `asset_name`s (collected by
-    // `scene_manifest`), resolve each to a `.tmx` under the linked
-    // `assets/` dir, and build the `.tmx` + tileset-image `@embedFile`
-    // registrations the generated `init()` emits via
-    // `addEmbeddedTilemapAsset`. Runs AFTER the assets dir is linked so the
-    // `.tmx` files are present in the target tree for reading here and for
-    // `@embedFile` at build time. `collect` dedups by registry key, so
-    // passing the raw (possibly repeated) names across scenes is fine. An
-    // empty list (no scene declares a Tilemap) reads no files and emits
-    // nothing.
-    var tilemap_asset_names: std.ArrayList([]const u8) = .empty;
-    defer tilemap_asset_names.deinit(allocator);
-    for (scene_manifests) |m| {
-        for (m.tilemap_assets) |an| try tilemap_asset_names.append(allocator, an);
-    }
-    const tilemap_registrations = try tilemap_scan.collect(allocator, target_dir, tilemap_asset_names.items);
+    // Embedded-tilemap registrations (T2 Phase 4): resolve scene-declared
+    // `Tilemap` assets to `@embedFile` registrations. See `root/tilemap_phase.zig`.
+    const tilemap_registrations = try tilemap_phase.collectRegistrations(allocator, target_dir, scene_manifests, component_names, prefab_names);
     defer tilemap_scan.freeRegistrations(allocator, tilemap_registrations);
 
     // `tests/` mirrors the project source tree (e.g. `tests/components/foo.zig`

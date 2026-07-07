@@ -14,6 +14,7 @@
 /// validation lives in `asset_validator.zig` (ticket #47).
 const std = @import("std");
 const config = @import("config.zig");
+const tilemap_scene_scan = @import("tilemap_scene_scan.zig");
 
 /// Write a formatted diagnostic directly to stderr, matching the
 /// repo-wide convention (see `flow_scanner.reportFlowError`,
@@ -607,64 +608,29 @@ fn validateChildrenArrayDepth(value: std.json.Value, display_path: []const u8, d
     }
 }
 
-/// Recursively walk a parsed scene JSON value collecting the `asset_name`
-/// of every `Tilemap` component it declares, in document order (T2 Phase
-/// 4). Appends owned dupes to `out`.
-///
-/// `Tilemap` is an engine built-in resolved by the scene loader's own
-/// channel (like `Position` / `PrefabInstance`), so it can appear under
-/// any entity shape: flat-form (`{ "Tilemap": {...} }`), wrapped
-/// (`{ "components": { "Tilemap": {...} } }`), or nested inside
-/// `children` / `entities` / a bundle array. A generic deep walk for the
-/// distinctive PascalCase `Tilemap` key handles every shape without
-/// re-implementing the engine's entity-tree grammar. A `Tilemap` whose
-/// `asset_name` is missing or empty contributes nothing — there's no
-/// asset to embed.
-fn collectTilemapAssets(
+/// Scan a raw JSONC entity/prefab source for `Tilemap` component
+/// `asset_name`s, WITHOUT the scene-specific unknown-key / §B2 validation
+/// (prefabs have their own allowed-key set). Used to detect tilemaps in
+/// prefab files — which minimal-T2 does not yet embed (assembler#561) —
+/// so the assembler can fail loud instead of shipping a broken binary.
+/// Returns an owned slice (empty → `&.{}`); caller frees each string +
+/// the slice. Malformed JSON yields an empty result (the real parse error
+/// surfaces elsewhere).
+pub fn scanTilemapAssets(
     allocator: std.mem.Allocator,
-    value: std.json.Value,
-    out: *std.ArrayList([]const u8),
-) !void {
-    switch (value) {
-        .object => |obj| {
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "Tilemap") and entry.value_ptr.* == .object) {
-                    if (entry.value_ptr.object.get("asset_name")) |an| {
-                        if (an == .string and an.string.len > 0) {
-                            try out.append(allocator, try allocator.dupe(u8, an.string));
-                        }
-                    }
-                }
-                // Recurse into every value so a Tilemap nested under
-                // `components` / `children` / `root` / etc. is still found.
-                try collectTilemapAssets(allocator, entry.value_ptr.*, out);
-            }
-        },
-        .array => |arr| {
-            for (arr.items) |item| try collectTilemapAssets(allocator, item, out);
-        },
-        else => {},
-    }
+    source: []const u8,
+) ![]const []const u8 {
+    const stripped = stripJsonc(allocator, source) catch return &.{};
+    defer allocator.free(stripped);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, stripped, .{}) catch return &.{};
+    defer parsed.deinit();
+    return tilemap_scene_scan.parseTilemapAssets(allocator, parsed.value);
 }
 
-/// Collect a scene's `Tilemap` asset names into an owned slice (empty →
-/// `&.{}`, no allocation). Caller frees via `freeManifest`.
-fn parseTilemapAssets(
-    allocator: std.mem.Allocator,
-    value: std.json.Value,
-) ![]const []const u8 {
-    var list: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (list.items) |s| allocator.free(s);
-        list.deinit(allocator);
-    }
-    try collectTilemapAssets(allocator, value, &list);
-    if (list.items.len == 0) {
-        list.deinit(allocator);
-        return &.{};
-    }
-    return list.toOwnedSlice(allocator);
+/// Free a slice returned by `scanTilemapAssets`.
+pub fn freeTilemapAssets(allocator: std.mem.Allocator, assets: []const []const u8) void {
+    for (assets) |s| allocator.free(s);
+    if (assets.len > 0) allocator.free(assets);
 }
 
 /// Parse a single scene file's source buffer. `scene_name` is the name the
@@ -743,7 +709,7 @@ pub fn parseSceneSource(
             .name = scene_name,
             .assets = bundle_assets,
             .initial_state = null,
-            .tilemap_assets = try parseTilemapAssets(allocator, parsed.value),
+            .tilemap_assets = try tilemap_scene_scan.parseTilemapAssets(allocator, parsed.value),
         };
     }
 
@@ -874,7 +840,7 @@ pub fn parseSceneSource(
         .name = scene_name,
         .assets = assets,
         .initial_state = initial_state,
-        .tilemap_assets = try parseTilemapAssets(allocator, parsed.value),
+        .tilemap_assets = try tilemap_scene_scan.parseTilemapAssets(allocator, parsed.value),
     };
 }
 

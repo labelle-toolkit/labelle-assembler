@@ -70,6 +70,23 @@ test "extractImageSources ignores an external <tileset source> (no inline image)
     try testing.expectEqual(@as(usize, 0), imgs.len);
 }
 
+test "extractImageSources XML-unescapes the source attribute" {
+    // On-disk file is `tiles&decor<x>.png`; the TMX escapes it. Both the
+    // @embedFile path and the engine registry key must be the DECODED string.
+    const tmx =
+        \\<map>
+        \\ <tileset firstgid="1"><image source="tiles&amp;decor&lt;x&gt;.png" width="16" height="16"/></tileset>
+        \\</map>
+    ;
+    const imgs = try tilemap_scan.extractImageSources(testing.allocator, tmx);
+    defer {
+        for (imgs) |s| testing.allocator.free(s);
+        testing.allocator.free(imgs);
+    }
+    try testing.expectEqual(@as(usize, 1), imgs.len);
+    try testing.expectEqualStrings("tiles&decor<x>.png", imgs[0]);
+}
+
 test "tmxEmbedPath appends .tmx for a bare asset name" {
     const p = try tilemap_scan.tmxEmbedPath(testing.allocator, "colony_map");
     defer testing.allocator.free(p);
@@ -164,6 +181,31 @@ test "collect errors clearly when the .tmx is missing" {
     );
 }
 
+test "collect hard-errors when a .tmx asset_name collides with a tileset image key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // level.tmx references a tileset image literally named "shared"; a second
+    // scene declares a Tilemap whose asset_name is ALSO "shared" — both would
+    // land under the same engine registry key.
+    const level_tmx =
+        \\<map>
+        \\ <tileset firstgid="1"><image source="shared" width="16" height="16"/></tileset>
+        \\</map>
+    ;
+    try writeFileAbs(tmp.dir, "assets/level.tmx", level_tmx);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    // "level" registers image key "shared"; "shared" (a .tmx asset_name) then
+    // collides — detected before its file is even read.
+    try testing.expectError(
+        error.TilemapKeyCollision,
+        tilemap_scan.collect(testing.allocator, target_dir, &.{ "level", "shared" }),
+    );
+}
+
 // ── emitTilemapRegistrations spellings (the generated init() call shapes) ──
 
 const sample_regs = [_]tilemap_scan.Registration{
@@ -250,4 +292,47 @@ test "scene_manifest: scene without a Tilemap yields empty tilemap_assets" {
     const m = try scene_manifest.parseSceneSource(testing.allocator, "world", "world.jsonc", src);
     defer scene_manifest.freeManifest(testing.allocator, m);
     try testing.expectEqual(@as(usize, 0), m.tilemap_assets.len);
+}
+
+test "scene_manifest: a `Tilemap` key nested in ANOTHER component's data is NOT collected" {
+    // `Spawner` is the component; its opaque data happens to contain a
+    // `Tilemap` key. This must NOT be treated as a tilemap component (the
+    // over-match bug) — otherwise the assembler would try to embed
+    // assets/should_not_embed.tmx for an unrelated scene.
+    const src =
+        \\{
+        \\    "components": {
+        \\        "Spawner": { "Tilemap": { "asset_name": "should_not_embed" } }
+        \\    }
+        \\}
+    ;
+    const m = try scene_manifest.parseSceneSource(testing.allocator, "world", "world.jsonc", src);
+    defer scene_manifest.freeManifest(testing.allocator, m);
+    try testing.expectEqual(@as(usize, 0), m.tilemap_assets.len);
+}
+
+test "scene_manifest: a `Tilemap` key inside a flat-form component's data is NOT collected" {
+    const src =
+        \\{
+        \\    "Spawner": { "Tilemap": { "asset_name": "should_not_embed" } }
+        \\}
+    ;
+    const m = try scene_manifest.parseSceneSource(testing.allocator, "world", "world.jsonc", src);
+    defer scene_manifest.freeManifest(testing.allocator, m);
+    try testing.expectEqual(@as(usize, 0), m.tilemap_assets.len);
+}
+
+test "scene_manifest.scanTilemapAssets detects a prefab-borne Tilemap (fail-loud input)" {
+    // Backs root/tilemap_phase.failOnPrefabTilemaps: prefabs use raw JSONC
+    // (no scene unknown-key validation), and a Tilemap in one must be
+    // detected so generation aborts (assembler#561).
+    const src =
+        \\{
+        \\    "components": { "Tilemap": { "asset_name": "room_map" } }
+        \\}
+    ;
+    const assets = try scene_manifest.scanTilemapAssets(testing.allocator, src);
+    defer scene_manifest.freeTilemapAssets(testing.allocator, assets);
+    try testing.expectEqual(@as(usize, 1), assets.len);
+    try testing.expectEqualStrings("room_map", assets[0]);
 }

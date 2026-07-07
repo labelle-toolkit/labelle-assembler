@@ -56,6 +56,7 @@ pub const Registration = struct {
 
 pub const Error = error{
     TilemapAssetNotFound,
+    TilemapKeyCollision,
 } || std.mem.Allocator.Error;
 
 fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
@@ -158,11 +159,51 @@ pub fn extractImageSources(allocator: std.mem.Allocator, tmx: []const u8) ![][]c
         const tag_end = std.mem.indexOfPos(u8, tmx, tag_start, ">") orelse tmx.len;
         const tag = tmx[tag_start..tag_end];
         if (attrValue(tag, "source")) |src| {
-            try out.append(allocator, try allocator.dupe(u8, src));
+            // XML-unescape the attribute value: `source="a&amp;b.png"` on
+            // disk is `a&b.png`, and gfx's TMX parser hands the engine the
+            // DECODED string — so both the `@embedFile` path and the
+            // registry key must be decoded to match.
+            try out.append(allocator, try xmlUnescape(allocator, src));
         }
         search = tag_end;
     }
 
+    return out.toOwnedSlice(allocator);
+}
+
+/// Decode the standard XML predefined entities in an attribute value into a
+/// freshly allocated string the caller owns: `&amp; &lt; &gt; &quot;
+/// &apos;`. Any other `&…;` run is left verbatim (a real TMX from Tiled
+/// only ever emits the five predefined entities in path attributes).
+fn xmlUnescape(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    // No `&` → no entities; fast path keeps the common case a plain dupe.
+    if (std.mem.indexOfScalar(u8, s, '&') == null) return allocator.dupe(u8, s);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    const entities = [_]struct { name: []const u8, ch: u8 }{
+        .{ .name = "&amp;", .ch = '&' },
+        .{ .name = "&lt;", .ch = '<' },
+        .{ .name = "&gt;", .ch = '>' },
+        .{ .name = "&quot;", .ch = '"' },
+        .{ .name = "&apos;", .ch = '\'' },
+    };
+
+    var i: usize = 0;
+    outer: while (i < s.len) {
+        if (s[i] == '&') {
+            for (entities) |e| {
+                if (std.mem.startsWith(u8, s[i..], e.name)) {
+                    try out.append(allocator, e.ch);
+                    i += e.name.len;
+                    continue :outer;
+                }
+            }
+        }
+        try out.append(allocator, s[i]);
+        i += 1;
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -196,11 +237,12 @@ fn attrValue(tag: []const u8, name: []const u8) ?[]const u8 {
 /// For each unique `asset_name`: registers the `.tmx` (key = `asset_name`,
 /// embed = `assets/<asset_name>.tmx`), reads that `.tmx` from
 /// `<target_dir>/<embed>`, and registers each unique tileset image
-/// (key = verbatim `image_source`, embed = image path relative to the
-/// `.tmx`). Registrations are deduped by key across all inputs so a
+/// (key = XML-decoded `image_source`, embed = image path relative to the
+/// `.tmx`). Registrations are deduped by key within each key space so a
 /// tileset image shared by two maps — or a repeated `asset_name` — emits
-/// once. A missing `.tmx` is a hard build error (its `@embedFile` would
-/// fail later anyway, with a worse message).
+/// once. A `.tmx` key that collides with an image key is a hard error
+/// (`TilemapKeyCollision`); a missing `.tmx` is a hard build error
+/// (`TilemapAssetNotFound`).
 ///
 /// Caller frees via `freeRegistrations`.
 pub fn collect(
@@ -217,15 +259,33 @@ pub fn collect(
         regs.deinit(allocator);
     }
 
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
+    // The `.tmx` documents and the tileset images share ONE engine registry
+    // (`addEmbeddedTilemapAsset`), so a `.tmx` key and an image key that
+    // collide would silently overwrite each other — the runtime would then
+    // hand the wrong bytes to whichever lost. Track the two key spaces
+    // separately: within a space, an identical key is a benign dedup (same
+    // map / same shared image); ACROSS spaces it is a hard error.
+    var tmx_seen = std.StringHashMap(void).init(allocator);
+    defer tmx_seen.deinit();
+    var img_seen = std.StringHashMap(void).init(allocator);
+    defer img_seen.deinit();
 
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
     for (asset_names) |asset_name| {
         // Dedup the `.tmx` registration by its key (the asset_name).
-        if (seen.contains(asset_name)) continue;
+        if (tmx_seen.contains(asset_name)) continue;
+        // Cross-space collision: a tileset image already claimed this key.
+        if (img_seen.contains(asset_name)) {
+            stderrPrint(
+                "labelle-assembler: tilemap key collision on '{s}' — a scene's Tilemap\n" ++
+                    "  `asset_name` matches a tileset `<image source>` already embedded. Both share the\n" ++
+                    "  engine's single tilemap registry; rename the `.tmx` asset or the tileset image.\n",
+                .{asset_name},
+            );
+            return error.TilemapKeyCollision;
+        }
 
         const tmx_embed = try tmxEmbedPath(allocator, asset_name);
         // From here `tmx_embed` is freed explicitly on every failure path
@@ -262,7 +322,10 @@ pub fn collect(
             allocator.free(tmx_embed);
             return err;
         };
-        try seen.put(asset_name, {});
+        // Store the DUPED key (owned by `regs`) in `tmx_seen`, not the
+        // borrowed `asset_name` — uniform with the image side and robust if
+        // the caller frees `asset_names` early.
+        try tmx_seen.put(tmx_key, {});
 
         const images = try extractImageSources(allocator, tmx_bytes);
         defer {
@@ -271,10 +334,20 @@ pub fn collect(
         }
 
         for (images) |image_source| {
-            // Dedup images by their registry key (the verbatim
-            // image_source): a tileset image shared by two maps, or two
-            // tilesets in one map, registers once.
-            if (seen.contains(image_source)) continue;
+            // Dedup images by their registry key (the decoded image_source):
+            // a tileset image shared by two maps, or two tilesets in one map,
+            // registers once.
+            if (img_seen.contains(image_source)) continue;
+            // Cross-space collision: a `.tmx` already claimed this key.
+            if (tmx_seen.contains(image_source)) {
+                stderrPrint(
+                    "labelle-assembler: tilemap key collision on '{s}' — a tileset `<image source>`\n" ++
+                        "  matches a scene's Tilemap `asset_name` already embedded. Both share the engine's\n" ++
+                        "  single tilemap registry; rename the tileset image or the `.tmx` asset.\n",
+                    .{image_source},
+                );
+                return error.TilemapKeyCollision;
+            }
 
             const img_embed = try imageEmbedPath(allocator, tmx_embed, image_source);
             const key = allocator.dupe(u8, image_source) catch |err| {
@@ -286,10 +359,10 @@ pub fn collect(
                 allocator.free(img_embed);
                 return err;
             };
-            // Store the DUPED key (owned by `regs`) in `seen`, not the
+            // Store the DUPED key (owned by `regs`) in `img_seen`, not the
             // soon-freed `image_source`, so cross-map dedup lookups never
             // read freed memory.
-            try seen.put(key, {});
+            try img_seen.put(key, {});
         }
     }
 
