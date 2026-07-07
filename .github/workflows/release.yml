@@ -132,3 +132,73 @@ jobs:
           # On `push: tags:` this is implicit; on workflow_dispatch we must
           # pass the tag so assets land on the correct release.
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+
+  # Publish the same binaries to the shared R2 bucket, mirroring labelle-cli's
+  # `upload-r2` job (objects at assembler/<tag>/<asset>, latest tag in
+  # assembler/latest.txt). labelle-studio's fetch-sidecars sources the
+  # assembler from here; the GitHub release above stays as its fallback.
+  # Runs alongside `release` (both only need `build`), so a broken R2 upload
+  # never blocks the GitHub release, and vice versa.
+  upload-r2:
+    needs: build
+    runs-on: ubuntu-latest
+    name: Upload to R2
+    # Just downloads the built artifacts and copies them to R2 — seconds of
+    # work; 10 is plenty and bounds a stuck runner.
+    timeout-minutes: 10
+
+    env:
+      # R2_ACCOUNT_ID + R2_BUCKET are already provisioned as repo secrets; the
+      # endpoint is the account's S3 API host (same shape labelle-cli uses).
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload to R2
+        env:
+          # The R2 API token doubles as the AWS creds the CLI reads; also
+          # expose the raw R2_* names so the gate below can probe them
+          # (secrets are not readable in job/step `if:` expressions).
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # On `push: tags:` github.ref_name is the tag; on workflow_dispatch
+          # it's the workflow branch, so fall back to the dispatch input. Kept
+          # with the leading `v` so the R2 tag path + latest.txt match what
+          # studio's fetch-sidecars reads back (it uses the value verbatim).
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          # Gate the whole upload on the credential secrets being present so a
+          # release run stays green before the R2 API token is added. Once
+          # R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY land and the next tag is
+          # cut, this lights up and studio starts sourcing the assembler from
+          # R2 (its GitHub-release fallback goes dormant automatically).
+          if [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] && [ -n "$R2_BUCKET" ]; then
+            pip install awscli
+            VERSION="$RELEASE_TAG"
+
+            # download-artifact (no merge-multiple) lays each matrix artifact
+            # out as artifacts/<name>/<name>; publish it verbatim so the R2 key
+            # is labelle-assembler-<os>-<arch> — byte-for-byte what studio's
+            # fetch-sidecars requests (assembler/<tag>/labelle-assembler-<os>-<arch>).
+            for dir in artifacts/*/; do
+              name=$(basename "$dir")
+              for file in "$dir"*; do
+                aws s3 cp "$file" "s3://$R2_BUCKET/assembler/$VERSION/$name" \
+                  --endpoint-url "$R2_ENDPOINT"
+              done
+            done
+
+            echo "$VERSION" | aws s3 cp - "s3://$R2_BUCKET/assembler/latest.txt" \
+              --endpoint-url "$R2_ENDPOINT"
+
+            echo "Released $VERSION to R2"
+          else
+            echo "::notice::R2 creds absent — skipping upload (add R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY to publish)"
+          fi
