@@ -88,6 +88,25 @@ test "extractImageSources accepts spaces around `=` and single quotes" {
     try testing.expectEqualStrings("single.png", imgs[1]);
 }
 
+test "extractImageSources ignores a commented-out <image>, keeps a real one" {
+    // A stale `<image>` kept in an XML comment must NOT yield a registration
+    // (the generated @embedFile would reference an asset the map never uses,
+    // breaking the build). The real one alongside it still registers.
+    const tmx =
+        \\<map>
+        \\ <!-- old tileset: <image source="old.png" width="16"/> -->
+        \\ <tileset firstgid="1"><image source="real.png" width="16"/></tileset>
+        \\</map>
+    ;
+    const imgs = try tilemap_scan.extractImageSources(testing.allocator, tmx);
+    defer {
+        for (imgs) |s| testing.allocator.free(s);
+        testing.allocator.free(imgs);
+    }
+    try testing.expectEqual(@as(usize, 1), imgs.len);
+    try testing.expectEqualStrings("real.png", imgs[0]);
+}
+
 test "firstExternalTileset finds an external .tsx tileset, null for inline" {
     const external =
         \\<map>
@@ -98,6 +117,14 @@ test "firstExternalTileset finds an external .tsx tileset, null for inline" {
     try testing.expectEqualStrings("terrain.tsx", tilemap_scan.firstExternalTileset(external).?);
     // Inline tileset: the `source` lives on <image>, not <tileset>.
     try testing.expect(tilemap_scan.firstExternalTileset(minimal_tmx) == null);
+    // A commented-out external tileset must NOT be treated as external.
+    const commented =
+        \\<map>
+        \\ <!-- <tileset firstgid="1" source="terrain.tsx"/> -->
+        \\ <tileset firstgid="1"><image source="real.png" width="16"/></tileset>
+        \\</map>
+    ;
+    try testing.expect(tilemap_scan.firstExternalTileset(commented) == null);
 }
 
 test "extractImageSources XML-unescapes the source attribute" {

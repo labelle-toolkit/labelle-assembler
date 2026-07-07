@@ -401,11 +401,6 @@ pub fn generate(
     // the project's own copied assets.
     try app_icon.injectDefaultIcon(allocator, cfg, target_dir);
 
-    // Embedded-tilemap registrations (T2 Phase 4): resolve scene-declared
-    // `Tilemap` assets to `@embedFile` registrations. See `root/tilemap_phase.zig`.
-    const tilemap_registrations = try tilemap_phase.collectRegistrations(allocator, target_dir, scene_manifests, component_names, prefab_names);
-    defer tilemap_scan.freeRegistrations(allocator, tilemap_registrations);
-
     // `tests/` mirrors the project source tree (e.g. `tests/components/foo.zig`
     // tests `components/foo.zig`). Linked + scanned so the generated
     // `__tests_root.zig` wrapper can `_ = @import(...)` each test file.
@@ -514,6 +509,11 @@ pub fn generate(
         for (pack_scans.items) |*p| p.deinit(allocator);
         pack_scans.deinit(allocator);
     }
+
+    // Embedded-tilemap registrations (T2 Phase 4). AFTER `loadPackScans` so the
+    // prefab fail-loud (assembler#561) sees pack prefabs. See tilemap_phase.
+    const tilemap_registrations = try tilemap_phase.collectRegistrations(allocator, target_dir, scene_manifests, component_names, prefab_names, pack_scans.items);
+    defer tilemap_scan.freeRegistrations(allocator, tilemap_registrations);
 
     // Injectivity gate (#440 / chatgpt-codex events L164): the `<pack>__<name>`
     // scheme is not injective on its own — two distinct (pack, name) pairs can
