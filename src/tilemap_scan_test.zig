@@ -70,6 +70,36 @@ test "extractImageSources ignores an external <tileset source> (no inline image)
     try testing.expectEqual(@as(usize, 0), imgs.len);
 }
 
+test "extractImageSources accepts spaces around `=` and single quotes" {
+    // Both are legal XML/TMX attribute syntax and must still be found.
+    const tmx =
+        \\<map>
+        \\ <tileset firstgid="1"><image source = "spaced.png" width="16"/></tileset>
+        \\ <tileset firstgid="9"><image source='single.png' width="16"/></tileset>
+        \\</map>
+    ;
+    const imgs = try tilemap_scan.extractImageSources(testing.allocator, tmx);
+    defer {
+        for (imgs) |s| testing.allocator.free(s);
+        testing.allocator.free(imgs);
+    }
+    try testing.expectEqual(@as(usize, 2), imgs.len);
+    try testing.expectEqualStrings("spaced.png", imgs[0]);
+    try testing.expectEqualStrings("single.png", imgs[1]);
+}
+
+test "firstExternalTileset finds an external .tsx tileset, null for inline" {
+    const external =
+        \\<map>
+        \\ <tileset firstgid="1" source="terrain.tsx"/>
+        \\</map>
+    ;
+    try testing.expect(tilemap_scan.firstExternalTileset(external) != null);
+    try testing.expectEqualStrings("terrain.tsx", tilemap_scan.firstExternalTileset(external).?);
+    // Inline tileset: the `source` lives on <image>, not <tileset>.
+    try testing.expect(tilemap_scan.firstExternalTileset(minimal_tmx) == null);
+}
+
 test "extractImageSources XML-unescapes the source attribute" {
     // On-disk file is `tiles&decor<x>.png`; the TMX escapes it. Both the
     // @embedFile path and the engine registry key must be the DECODED string.
@@ -206,6 +236,66 @@ test "collect hard-errors when a .tmx asset_name collides with a tileset image k
     );
 }
 
+test "collect hard-errors when one image key resolves to two different files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Two maps in different dirs BOTH reference `source="tiles.png"` — same
+    // runtime key, different files (assets/maps/tiles.png vs assets/other/…).
+    const tmx =
+        \\<map>
+        \\ <tileset firstgid="1"><image source="tiles.png" width="16" height="16"/></tileset>
+        \\</map>
+    ;
+    try writeFileAbs(tmp.dir, "assets/maps/a.tmx", tmx);
+    try writeFileAbs(tmp.dir, "assets/other/b.tmx", tmx);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    try testing.expectError(
+        error.TilemapKeyCollision,
+        tilemap_scan.collect(testing.allocator, target_dir, &.{ "maps/a", "other/b" }),
+    );
+}
+
+test "collect: same image key + SAME path across two maps is a benign dedup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Both maps sit in the same dir → `tiles.png` resolves to one file.
+    try writeFileAbs(tmp.dir, "assets/a.tmx", minimal_tmx);
+    try writeFileAbs(tmp.dir, "assets/b.tmx", minimal_tmx);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_scan.collect(testing.allocator, target_dir, &.{ "a", "b" });
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+    // a.tmx, b.tmx, tiles.png (once).
+    try testing.expectEqual(@as(usize, 3), regs.len);
+}
+
+test "collect hard-errors on an external .tsx tileset" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const external_tmx =
+        \\<map>
+        \\ <tileset firstgid="1" source="terrain.tsx"/>
+        \\</map>
+    ;
+    try writeFileAbs(tmp.dir, "assets/level.tmx", external_tmx);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    try testing.expectError(
+        error.ExternalTilesetUnsupported,
+        tilemap_scan.collect(testing.allocator, target_dir, &.{"level"}),
+    );
+}
+
 // ── emitTilemapRegistrations spellings (the generated init() call shapes) ──
 
 const sample_regs = [_]tilemap_scan.Registration{
@@ -239,6 +329,26 @@ test "emitTilemapRegistrations: empty regs emit nothing" {
     const out = try emitToString(&.{}, .try_style);
     defer testing.allocator.free(out);
     try testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "emitTilemapRegistrations: escapes backslashes + quotes into valid Zig" {
+    // A Windows-authored `<image source>` with a backslash and a double
+    // quote must produce a valid, correctly-keyed Zig literal — raw `{s}`
+    // would emit broken source (or reinterpret `\t` as a tab).
+    const regs = [_]tilemap_scan.Registration{
+        .{ .key = "ti\"le\\s.png", .embed_path = "assets\\ti\"le\\s.png" },
+    };
+    const out = try emitToString(&regs, .try_style);
+    defer testing.allocator.free(out);
+
+    // The literal carries the ESCAPED forms (\\ and \") — not the raw bytes.
+    try testing.expect(std.mem.indexOf(u8, out, "ti\\\"le\\\\s.png") != null);
+    // And the whole emitted snippet is valid Zig.
+    const wrapped = try std.fmt.allocPrintSentinel(testing.allocator, "pub fn f(g: anytype) !void {{\n{s}}}\n", .{out}, 0);
+    defer testing.allocator.free(wrapped);
+    var ast = try std.zig.Ast.parse(testing.allocator, wrapped, .zig);
+    defer ast.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), ast.errors.len);
 }
 
 // ── scene_manifest Tilemap extraction (the upstream that feeds collect) ──

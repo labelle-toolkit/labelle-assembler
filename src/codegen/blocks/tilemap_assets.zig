@@ -18,6 +18,7 @@
 //! run before `setScene` (which triggers the engine's tilemap decode), so
 //! both callers emit this block before the scene-registration block.
 
+const std = @import("std");
 const resource_loader = @import("resource_loader.zig");
 const tilemap_scan = @import("../../tilemap_scan.zig");
 
@@ -26,6 +27,15 @@ pub const LoadStyle = resource_loader.LoadStyle;
 /// Emit `addEmbeddedTilemapAsset` calls for every registration. No-op
 /// (emits nothing) when `regs` is empty, so tilemap-free projects are
 /// byte-identical to the pre-Phase-4 output.
+///
+/// The registry key and the `@embedFile` path are emitted through
+/// `std.zig.fmtString` (the `{f}` slots), NOT raw `{s}`: a tileset
+/// `<image source>` or scene `asset_name` may legally contain a backslash
+/// or quote (e.g. a Windows-authored `tiles\terrain.png`), which raw
+/// interpolation would turn into invalid Zig or a mis-decoded literal — so
+/// the generated key would no longer match what the engine requests at
+/// runtime. Escaping keeps the emitted literal both valid AND byte-faithful
+/// to the resolver key `tilemap_scan` computed.
 pub fn emitTilemapRegistrations(
     w: anytype,
     regs: []const tilemap_scan.Registration,
@@ -35,14 +45,16 @@ pub fn emitTilemapRegistrations(
 
     try w.writeAll("    // Embedded tilemaps (.tmx + tileset images via @embedFile, T2 Phase 4)\n");
     for (regs) |r| {
+        const key = std.zig.fmtString(r.key);
+        const path = std.zig.fmtString(r.embed_path);
         switch (style) {
             .try_style => try w.print(
-                "    try g.addEmbeddedTilemapAsset(\"{s}\", @embedFile(\"{s}\"));\n",
-                .{ r.key, r.embed_path },
+                "    try g.addEmbeddedTilemapAsset(\"{f}\", @embedFile(\"{f}\"));\n",
+                .{ key, path },
             ),
             .catch_panic_style => try w.print(
-                "    g.addEmbeddedTilemapAsset(\"{s}\", @embedFile(\"{s}\")) catch @panic(\"failed to register embedded tilemap asset: {s}\");\n",
-                .{ r.key, r.embed_path, r.key },
+                "    g.addEmbeddedTilemapAsset(\"{f}\", @embedFile(\"{f}\")) catch @panic(\"failed to register embedded tilemap asset: {f}\");\n",
+                .{ key, path, key },
             ),
         }
     }

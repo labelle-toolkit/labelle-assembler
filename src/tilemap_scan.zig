@@ -57,6 +57,7 @@ pub const Registration = struct {
 pub const Error = error{
     TilemapAssetNotFound,
     TilemapKeyCollision,
+    ExternalTilesetUnsupported,
 } || std.mem.Allocator.Error;
 
 fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
@@ -171,6 +172,25 @@ pub fn extractImageSources(allocator: std.mem.Allocator, tmx: []const u8) ![][]c
     return out.toOwnedSlice(allocator);
 }
 
+/// Return the `source` of the FIRST external `<tileset ... source="...">`
+/// — a tileset that references an external `.tsx` file instead of carrying
+/// an inline `<image>` — or null when every tileset is inline. The opening
+/// `<tileset …>` tag of an inline tileset has NO `source` attribute (that
+/// lives on the inner `<image>`), so a `source` on the tileset element is
+/// the external marker. Minimal-T2 embeds inline tilesets only; `collect`
+/// fails loud on an external one (assembler#563).
+pub fn firstExternalTileset(tmx: []const u8) ?[]const u8 {
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, tmx, search, "<tileset")) |tag_start| {
+        const tag_end = std.mem.indexOfPos(u8, tmx, tag_start, ">") orelse tmx.len;
+        const tag = tmx[tag_start..tag_end];
+        if (attrValue(tag, "source")) |src| return src;
+        if (tag_end >= tmx.len) break;
+        search = tag_end + 1;
+    }
+    return null;
+}
+
 /// Decode the standard XML predefined entities in an attribute value into a
 /// freshly allocated string the caller owns: `&amp; &lt; &gt; &quot;
 /// &apos;`. Any other `&…;` run is left verbatim (a real TMX from Tiled
@@ -207,28 +227,38 @@ fn xmlUnescape(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// Return the value of `name="..."` inside a single tag slice, or null.
-/// Matches on a `name="` needle preceded by whitespace (or at tag start,
-/// after the `<image` token) so `foosource="x"` doesn't match `source`.
+/// Return the raw (still-escaped) value of the `name` attribute inside a
+/// single tag slice, or null. Tolerates the legal XML variations Tiled and
+/// hand-authored maps emit: optional whitespace around `=`, and either
+/// double or single quotes (`source="x"`, `source = "x"`, `source='x'`).
+/// A separator (whitespace / `<`) must precede the name so `source` isn't
+/// matched inside another attribute name (`foosource="x"`). Still a tight
+/// scan, not a full XML parser.
 fn attrValue(tag: []const u8, name: []const u8) ?[]const u8 {
     var search: usize = 0;
     while (std.mem.indexOfPos(u8, tag, search, name)) |at| {
-        const after = at + name.len;
-        // Require `="` immediately after the attribute name.
-        if (after + 1 < tag.len and tag[after] == '=' and tag[after + 1] == '"') {
-            // Require a separator before the name (whitespace or `<`),
-            // so `source` isn't matched inside another attribute name.
-            const ok_before = at == 0 or tag[at - 1] == ' ' or tag[at - 1] == '\t' or
-                tag[at - 1] == '\n' or tag[at - 1] == '\r' or tag[at - 1] == '<';
-            if (ok_before) {
-                const val_start = after + 2;
-                const val_end = std.mem.indexOfScalarPos(u8, tag, val_start, '"') orelse return null;
-                return tag[val_start..val_end];
-            }
-        }
         search = at + name.len;
+        // Require a separator before the name (whitespace or `<`).
+        const ok_before = at == 0 or isXmlSpace(tag[at - 1]) or tag[at - 1] == '<';
+        if (!ok_before) continue;
+
+        // Skip whitespace, then require `=`, then whitespace, then a quote.
+        var i = at + name.len;
+        while (i < tag.len and isXmlSpace(tag[i])) : (i += 1) {}
+        if (i >= tag.len or tag[i] != '=') continue;
+        i += 1;
+        while (i < tag.len and isXmlSpace(tag[i])) : (i += 1) {}
+        if (i >= tag.len or (tag[i] != '"' and tag[i] != '\'')) continue;
+        const quote = tag[i];
+        const val_start = i + 1;
+        const val_end = std.mem.indexOfScalarPos(u8, tag, val_start, quote) orelse return null;
+        return tag[val_start..val_end];
     }
     return null;
+}
+
+fn isXmlSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
 /// Turn a set of scene-declared `asset_name`s into the flat list of
@@ -238,11 +268,11 @@ fn attrValue(tag: []const u8, name: []const u8) ?[]const u8 {
 /// embed = `assets/<asset_name>.tmx`), reads that `.tmx` from
 /// `<target_dir>/<embed>`, and registers each unique tileset image
 /// (key = XML-decoded `image_source`, embed = image path relative to the
-/// `.tmx`). Registrations are deduped by key within each key space so a
-/// tileset image shared by two maps — or a repeated `asset_name` — emits
-/// once. A `.tmx` key that collides with an image key is a hard error
-/// (`TilemapKeyCollision`); a missing `.tmx` is a hard build error
-/// (`TilemapAssetNotFound`).
+/// `.tmx`). A tileset image shared by two maps — or a repeated `asset_name`
+/// — emits once. Hard errors: a `.tmx` key colliding with an image key, or
+/// the same image key resolving to two different files (`TilemapKeyCollision`);
+/// an external `<tileset source="*.tsx">` (`ExternalTilesetUnsupported`,
+/// assembler#563); a missing `.tmx` (`TilemapAssetNotFound`).
 ///
 /// Caller frees via `freeRegistrations`.
 pub fn collect(
@@ -260,14 +290,20 @@ pub fn collect(
     }
 
     // The `.tmx` documents and the tileset images share ONE engine registry
-    // (`addEmbeddedTilemapAsset`), so a `.tmx` key and an image key that
-    // collide would silently overwrite each other — the runtime would then
-    // hand the wrong bytes to whichever lost. Track the two key spaces
-    // separately: within a space, an identical key is a benign dedup (same
-    // map / same shared image); ACROSS spaces it is a hard error.
+    // (`addEmbeddedTilemapAsset`), so keys that collide would silently
+    // overwrite each other — the runtime would then hand the wrong bytes to
+    // whichever lost. Guard three ways:
+    //   - a `.tmx` key equal to an image key (ACROSS spaces) → hard error;
+    //   - the SAME image key resolving to DIFFERENT embed paths (e.g. two
+    //     maps in different dirs both referencing `source="tiles.png"`) →
+    //     hard error (the second would otherwise silently reuse the first's
+    //     bytes). `img_seen` therefore maps key → resolved embed path so a
+    //     same-key-DIFFERENT-path clash is caught; same-key-same-path stays
+    //     a benign dedup;
+    //   - a repeated `.tmx` `asset_name` (SAME space) → benign dedup.
     var tmx_seen = std.StringHashMap(void).init(allocator);
     defer tmx_seen.deinit();
-    var img_seen = std.StringHashMap(void).init(allocator);
+    var img_seen = std.StringHashMap([]const u8).init(allocator);
     defer img_seen.deinit();
 
     const io = config.globalIo();
@@ -310,6 +346,21 @@ pub fn collect(
         };
         defer allocator.free(tmx_bytes);
 
+        // External `<tileset source="*.tsx">` isn't embedded in minimal-T2:
+        // gfx's loader returns error.ExternalTilesetUnsupported for it under
+        // the embedded base_path, so the map would fail at runtime. Fail loud
+        // now with the offending `.tsx` named (assembler#563).
+        if (firstExternalTileset(tmx_bytes)) |tsx| {
+            stderrPrint(
+                "labelle-assembler: tilemap '{s}' uses an external tileset '{s}' (<tileset source=...>),\n" ++
+                    "  which is not supported yet (minimal-T2 embeds inline tilesets only). Inline the\n" ++
+                    "  tileset in the .tmx, or track external-tileset support at labelle-assembler#563.\n",
+                .{ asset_name, tsx },
+            );
+            allocator.free(tmx_embed); // not yet handed to `regs`
+            return error.ExternalTilesetUnsupported;
+        }
+
         // Append the `.tmx` registration; once it is in `regs` the outer
         // errdefer owns both strings, so later failures free them exactly
         // once.
@@ -334,10 +385,6 @@ pub fn collect(
         }
 
         for (images) |image_source| {
-            // Dedup images by their registry key (the decoded image_source):
-            // a tileset image shared by two maps, or two tilesets in one map,
-            // registers once.
-            if (img_seen.contains(image_source)) continue;
             // Cross-space collision: a `.tmx` already claimed this key.
             if (tmx_seen.contains(image_source)) {
                 stderrPrint(
@@ -349,7 +396,28 @@ pub fn collect(
                 return error.TilemapKeyCollision;
             }
 
+            // Resolve the embed path up front so a same-key dedup can compare
+            // the RESOLVED path, not just the key.
             const img_embed = try imageEmbedPath(allocator, tmx_embed, image_source);
+
+            if (img_seen.get(image_source)) |existing_path| {
+                // Same registry key seen before. If it resolves to the SAME
+                // file it's a benign dedup; a DIFFERENT file under the same
+                // key would make the runtime hand the wrong bytes — hard error.
+                if (!std.mem.eql(u8, existing_path, img_embed)) {
+                    stderrPrint(
+                        "labelle-assembler: tilemap image key collision on '{s}' — two tilesets resolve it\n" ++
+                            "  to different files ('{s}' vs '{s}'), but the engine keys images by the bare\n" ++
+                            "  `<image source>` string. Give the images distinct source names.\n",
+                        .{ image_source, existing_path, img_embed },
+                    );
+                    allocator.free(img_embed);
+                    return error.TilemapKeyCollision;
+                }
+                allocator.free(img_embed);
+                continue;
+            }
+
             const key = allocator.dupe(u8, image_source) catch |err| {
                 allocator.free(img_embed);
                 return err;
@@ -359,10 +427,10 @@ pub fn collect(
                 allocator.free(img_embed);
                 return err;
             };
-            // Store the DUPED key (owned by `regs`) in `img_seen`, not the
-            // soon-freed `image_source`, so cross-map dedup lookups never
-            // read freed memory.
-            try img_seen.put(key, {});
+            // Store the DUPED key + its resolved path (both owned by `regs`)
+            // so later dedup lookups never read freed memory and can compare
+            // paths. `key` is the registration's key; `img_embed` its path.
+            try img_seen.put(key, img_embed);
         }
     }
 
