@@ -13,11 +13,13 @@ pub fn build(b: *std.Build) void {
     // build of the CLI overrides each with `-D<pkg>_version=`.
     // Keep this trio a MUTUALLY COMPATIBLE set: a fresh `labelle init` resolves
     // these defaults, so a mismatch fails `labelle build` before any user code.
-    // engine 1.75.1 pins gfx v1.21.0 (test-only) and floors core at v1.24.0;
+    // engine 1.76.0 pins gfx v1.21.0 (test-only) and floors core at v1.24.0;
     // gfx v1.21.0 in turn pins core v1.24.0 — read straight from those tags'
     // build.zig.zon. Bump all three together when moving the engine default.
+    // (engine 1.76.0 = world-space background tilemap rendering; 1.75.1 rendered
+    // tilemaps post-sprite/screen-space, so fresh projects want 1.76.0.)
     const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.24.0";
-    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "1.75.1";
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "1.76.0";
     const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.21.0";
     // Version this assembler binary stamps into a freshly scaffolded
     // project.labelle's `assembler_version` field. Defaults to the
