@@ -134,7 +134,13 @@ fn appendPrefabAssets(
     for (prefab_names) |name| {
         const rel = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}.jsonc", .{ target_dir, subdir, name });
         defer allocator.free(rel);
-        const src = cwd.readFileAlloc(io, rel, allocator, .limited(1024 * 1024)) catch continue;
+        // A prefab file may legitimately be absent (skip), but never swallow
+        // OOM — that would silently drop a real prefab's tilemap under memory
+        // pressure. Propagate OOM; continue only on other read errors.
+        const src = cwd.readFileAlloc(io, rel, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
         defer allocator.free(src);
         const assets = try scene_manifest.scanTilemapAssets(allocator, src);
         // Empty → `&.{}` (no allocation); nothing to retain or embed.
