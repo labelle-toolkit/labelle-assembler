@@ -1,0 +1,18 @@
+{
+    // #569 scoping scene: one entity authoring the engine BUILT-IN `Camera`
+    // component alongside `Position`, in the RFC #560 unified `root`/`children`
+    // form. Engine v1.81.0 (#714) deserializes `"Camera"` as `GameType.CameraComp`
+    // in component_apply.zig, so this needs no `components/Camera.zig` and no
+    // assembler registry entry — the assembler passes the key through verbatim.
+    "name": "main",
+    "root": {
+        "children": [
+            {
+                "components": {
+                    "Position": { "x": 100, "y": 100 },
+                    "Camera": { "zoom": 1.5 }
+                }
+            }
+        ]
+    }
+}
