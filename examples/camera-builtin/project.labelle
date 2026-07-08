@@ -1,0 +1,43 @@
+// Scoping fixture for labelle-assembler#569 — proves a scene that AUTHORS
+// the engine BUILT-IN `Camera` component assembles + builds + runs
+// end-to-end against engine v1.81.0 (#714) with NO assembler change.
+//
+// Engine v1.81.0 special-cases `"Camera"` in `src/jsonc/component_apply.zig`
+// (guarded `!Components.has("Camera")`, `deserialize(GameType.CameraComp)` ->
+// `game.addComponent`, returning before the warn-unknown-component fallback)
+// — EXACTLY like `Tilemap`. The assembler therefore passes the (to-it
+// unknown) `"Camera"` key straight through: it is NOT added to the generated
+// `Components` registry (only `VideoComponent` is, because that one rides the
+// generic registry dispatch), and the scene `.jsonc` is embedded verbatim for
+// the engine's runtime loader to parse. See scoping notes on #569.
+//
+// Deliberately version-PINNED at engine v1.81.0 (not the `local:` sibling
+// layout the other examples use) so it targets the exact release that shipped
+// the built-in `Camera`. Headless `.null` backend: no window / GPU / input;
+// the generated `main()` runs a fixed-frame tick loop and exits cleanly.
+//
+// Manual repro (from this directory):
+//   ASM=../../zig-out/bin/labelle-assembler   # after `zig build` at repo root
+//   $ASM install  --project-root .
+//   $ASM generate --project-root .
+//   cd .labelle/null_desktop && zig build
+//   LABELLE_NULL_FRAMES=5 ./zig-out/bin/cam_test_569
+.{
+    .name = "cam_test_569",
+    .title = "LaBelle — Camera builtin scoping (#569)",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    .backend = .null,
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .core_version = "1.24.0",
+    .engine_version = "1.81.0",
+    .gfx_version = "1.23.0",
+    .labelle_version = "1.30.0",
+    // The bundled backends/ecs/gui ship WITH the assembler binary; point at
+    // this repo root (mirrors the in-tree examples' `local:../../`).
+    .assembler_version = "local:../../",
+}
