@@ -513,10 +513,10 @@ test "scene_manifest: a `Tilemap` key inside a flat-form component's data is NOT
     try testing.expectEqual(@as(usize, 0), m.tilemap_assets.len);
 }
 
-test "scene_manifest.scanTilemapAssets detects a prefab-borne Tilemap (fail-loud input)" {
-    // Backs root/tilemap_phase.failOnPrefabTilemaps: prefabs use raw JSONC
+test "scene_manifest.scanTilemapAssets detects a prefab-borne Tilemap" {
+    // Backs root/tilemap_phase.appendPrefabAssets: prefabs use raw JSONC
     // (no scene unknown-key validation), and a Tilemap in one must be
-    // detected so generation aborts (assembler#561).
+    // detected so its `.tmx`/images are embedded (assembler#561).
     const src =
         \\{
         \\    "components": { "Tilemap": { "asset_name": "room_map" } }
@@ -526,4 +526,163 @@ test "scene_manifest.scanTilemapAssets detects a prefab-borne Tilemap (fail-loud
     defer scene_manifest.freeTilemapAssets(testing.allocator, assets);
     try testing.expectEqual(@as(usize, 1), assets.len);
     try testing.expectEqualStrings("room_map", assets[0]);
+}
+
+// ── collectRegistrations: prefab + pack + registered-Tilemap (T3 #561/#562) ──
+//
+// End-to-end against a hermetic tmpDir. These exercise `tilemap_phase`'s
+// aggregation policy directly (scenes + game-root prefabs + pack prefabs, and
+// the project/pack-registered-`Tilemap` override), not just the pure scanner.
+
+const tilemap_phase = @import("root/tilemap_phase.zig");
+const scan = @import("codegen/scan.zig");
+
+// Find a registration by its engine registry key, or null.
+fn findReg(regs: []const tilemap_scan.Registration, key: []const u8) ?tilemap_scan.Registration {
+    for (regs) |r| {
+        if (std.mem.eql(u8, r.key, key)) return r;
+    }
+    return null;
+}
+
+test "collectRegistrations embeds a GAME-ROOT prefab's Tilemap (.tmx + image)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFileAbs(tmp.dir, "assets/room_map.tmx", minimal_tmx);
+    try writeFileAbs(tmp.dir, "assets/tiles.png", fake_png);
+    try writeFileAbs(tmp.dir, "prefabs/room.jsonc",
+        \\{ "components": { "Tilemap": { "asset_name": "room_map" } } }
+    );
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_phase.collectRegistrations(
+        testing.allocator,
+        target_dir,
+        &.{}, // no scenes
+        &.{}, // no project components
+        &.{"room"}, // game-root prefab stems
+        &.{}, // no packs
+    );
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    try testing.expectEqual(@as(usize, 2), regs.len);
+    try testing.expect(findReg(regs, "room_map") != null);
+    const img = findReg(regs, "tiles.png") orelse return error.MissingImageReg;
+    try testing.expectEqualStrings("assets/tiles.png", img.embed_path);
+}
+
+test "collectRegistrations embeds a PACK prefab's Tilemap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFileAbs(tmp.dir, "assets/pack_map.tmx", minimal_tmx);
+    try writeFileAbs(tmp.dir, "assets/tiles.png", fake_png);
+    // Pack prefab lives under the pack's staged import-prefix tree.
+    try writeFileAbs(tmp.dir, "packs/mappack/prefabs/room.jsonc",
+        \\{ "components": { "Tilemap": { "asset_name": "pack_map" } } }
+    );
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const pack: scan.PackScan = .{
+        .name = "mappack",
+        .import_prefix = "packs/mappack",
+        .component_names = &.{},
+        .event_names = &.{},
+        .prefab_names = &.{"room"},
+    };
+
+    const regs = try tilemap_phase.collectRegistrations(
+        testing.allocator,
+        target_dir,
+        &.{},
+        &.{},
+        &.{}, // no game-root prefabs
+        &.{pack},
+    );
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    try testing.expectEqual(@as(usize, 2), regs.len);
+    try testing.expect(findReg(regs, "pack_map") != null);
+    try testing.expect(findReg(regs, "tiles.png") != null);
+}
+
+test "collectRegistrations: a PACK-registered `Tilemap` skips the built-in embed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A scene references a `Tilemap` by asset_name, BUT the pack ships its own
+    // `Tilemap` component — so it overrides the built-in (#562) and NOTHING is
+    // embedded. No `.tmx` exists, proving no embed was attempted (else the
+    // missing-asset read would error).
+    const scene: scene_manifest.SceneManifest = .{
+        .name = "world",
+        .assets = &.{},
+        .tilemap_assets = &.{"never_embedded"},
+    };
+    // A component stem the pack registers — pascal-matches `Tilemap`.
+    const pack_components = [_][]const u8{"Tilemap"};
+    const pack: scan.PackScan = .{
+        .name = "custom",
+        .import_prefix = "packs/custom",
+        .component_names = &pack_components,
+        .event_names = &.{},
+        .prefab_names = &.{},
+    };
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_phase.collectRegistrations(
+        testing.allocator,
+        target_dir,
+        &.{scene},
+        &.{}, // no project components
+        &.{},
+        &.{pack},
+    );
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    try testing.expectEqual(@as(usize, 0), regs.len);
+}
+
+test "collectRegistrations embeds BOTH a scene and a prefab tilemap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFileAbs(tmp.dir, "assets/scene_map.tmx", minimal_tmx);
+    try writeFileAbs(tmp.dir, "assets/prefab_map.tmx", minimal_tmx);
+    try writeFileAbs(tmp.dir, "assets/tiles.png", fake_png);
+    try writeFileAbs(tmp.dir, "prefabs/room.jsonc",
+        \\{ "components": { "Tilemap": { "asset_name": "prefab_map" } } }
+    );
+
+    const scene: scene_manifest.SceneManifest = .{
+        .name = "world",
+        .assets = &.{},
+        .tilemap_assets = &.{"scene_map"},
+    };
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_phase.collectRegistrations(
+        testing.allocator,
+        target_dir,
+        &.{scene},
+        &.{},
+        &.{"room"},
+        &.{},
+    );
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    // scene_map.tmx + prefab_map.tmx + one shared tiles.png (deduped).
+    try testing.expectEqual(@as(usize, 3), regs.len);
+    try testing.expect(findReg(regs, "scene_map") != null);
+    try testing.expect(findReg(regs, "prefab_map") != null);
+    try testing.expect(findReg(regs, "tiles.png") != null);
 }

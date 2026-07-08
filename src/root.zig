@@ -510,8 +510,10 @@ pub fn generate(
         pack_scans.deinit(allocator);
     }
 
-    // Embedded-tilemap registrations (T2 Phase 4). AFTER `loadPackScans` so the
-    // prefab fail-loud (assembler#561) sees pack prefabs. See tilemap_phase.
+    // Embedded-tilemap registrations (T2 Phase 4 + T3 #561/#562). AFTER
+    // `loadPackScans` so the prefab scan (assembler#561) sees the staged pack
+    // prefab JSONC and pack-registered `Tilemap` (assembler#562). See
+    // tilemap_phase.
     const tilemap_registrations = try tilemap_phase.collectRegistrations(allocator, target_dir, scene_manifests, component_names, prefab_names, pack_scans.items);
     defer tilemap_scan.freeRegistrations(allocator, tilemap_registrations);
 
