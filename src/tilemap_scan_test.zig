@@ -611,20 +611,54 @@ test "collectRegistrations embeds a PACK prefab's Tilemap" {
     try testing.expect(findReg(regs, "tiles.png") != null);
 }
 
-test "collectRegistrations: a PACK-registered `Tilemap` skips the built-in embed" {
+test "collectRegistrations: a PROJECT `Tilemap` component skips the built-in embed" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A scene references a `Tilemap` by asset_name, BUT the pack ships its own
-    // `Tilemap` component — so it overrides the built-in (#562) and NOTHING is
-    // embedded. No `.tmx` exists, proving no embed was attempted (else the
-    // missing-asset read would error).
+    // A scene references a `Tilemap` by asset_name, BUT the PROJECT ships its
+    // own `components/Tilemap.zig` (exact built-in name) — so it overrides the
+    // built-in (engine C2 / #562) and NOTHING is embedded. No `.tmx` exists,
+    // proving no embed was attempted (else the missing-asset read would error).
     const scene: scene_manifest.SceneManifest = .{
         .name = "world",
         .assets = &.{},
         .tilemap_assets = &.{"never_embedded"},
     };
-    // A component stem the pack registers — pascal-matches `Tilemap`.
+    const project_components = [_][]const u8{"Tilemap"};
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_phase.collectRegistrations(
+        testing.allocator,
+        target_dir,
+        &.{scene},
+        &project_components, // project registers `Tilemap`
+        &.{},
+        &.{},
+    );
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    try testing.expectEqual(@as(usize, 0), regs.len);
+}
+
+test "collectRegistrations: a pack's namespaced `Tilemap` does NOT suppress the built-in" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // P1 regression (assembler#562): a project legitimately uses the built-in
+    // `Tilemap` in a scene AND imports a pack that happens to ship its own
+    // `components/Tilemap.zig`. The pack's component is namespaced
+    // (`<pack>__Tilemap`) and does NOT satisfy the engine's `has("Tilemap")`
+    // gate, so the built-in `.tmx` + tileset images MUST still be embedded.
+    try writeFileAbs(tmp.dir, "assets/scene_map.tmx", minimal_tmx);
+    try writeFileAbs(tmp.dir, "assets/tiles.png", fake_png);
+
+    const scene: scene_manifest.SceneManifest = .{
+        .name = "world",
+        .assets = &.{},
+        .tilemap_assets = &.{"scene_map"},
+    };
     const pack_components = [_][]const u8{"Tilemap"};
     const pack: scan.PackScan = .{
         .name = "custom",
@@ -641,13 +675,15 @@ test "collectRegistrations: a PACK-registered `Tilemap` skips the built-in embed
         testing.allocator,
         target_dir,
         &.{scene},
-        &.{}, // no project components
+        &.{}, // no PROJECT components
         &.{},
-        &.{pack},
+        &.{pack}, // pack ships a (namespaced) Tilemap — must not suppress
     );
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
-    try testing.expectEqual(@as(usize, 0), regs.len);
+    try testing.expectEqual(@as(usize, 2), regs.len);
+    try testing.expect(findReg(regs, "scene_map") != null);
+    try testing.expect(findReg(regs, "tiles.png") != null);
 }
 
 test "collectRegistrations embeds BOTH a scene and a prefab tilemap" {

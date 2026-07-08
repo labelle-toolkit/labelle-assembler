@@ -27,17 +27,20 @@ const PackScan = scan.PackScan;
 /// are present for reading here and for `@embedFile` at build time, and the
 /// pack prefabs are visible on disk.
 ///
-/// Engine C2 (labelle-engine#703): a project — or a plugin/pack — that
-/// registers its OWN `Tilemap` component wins over the engine built-in: the
-/// engine routes all `Tilemap` components to the registered type, so the
-/// assembler must embed NOTHING. T2 checked only project `components/*.zig`;
-/// T3 (assembler#562) also honors a pack-registered `Tilemap` (pack component
-/// stems are enumerable via `PackScan`). Decl-module plugins register their
-/// components in Zig source the assembler never parses, so a plugin-shipped
-/// `Tilemap` is not name-detectable here — but a scene/prefab reference to it
-/// only triggers an embed when it carries a non-empty `asset_name`, so the
-/// benign case (a plugin `Tilemap` without `asset_name`) already embeds
-/// nothing.
+/// Engine C2 (labelle-engine#703): a project that registers its OWN `Tilemap`
+/// component (a `components/Tilemap.zig`, pascal-matched) wins over the engine
+/// built-in — the engine gates the built-in on `Components.has("Tilemap")`, an
+/// EXACT-name check — so the assembler must embed NOTHING. Only an
+/// un-namespaced `Tilemap` satisfies that gate; see `registersTilemap`.
+///
+/// A PACK's `components/Tilemap.zig` registers under the namespaced field
+/// `<pack>__Tilemap`, a DIFFERENT component that does NOT shadow the built-in,
+/// so a pack-registered `Tilemap` must NOT suppress embedding (assembler#562
+/// P1 fix). Decl-module plugins register their components in Zig source the
+/// assembler never parses, so an un-namespaced plugin `Tilemap` is not
+/// name-detectable here — but a scene/prefab reference to it only triggers an
+/// embed when it carries a non-empty `asset_name`, so the benign case (a
+/// plugin `Tilemap` without `asset_name`) already embeds nothing.
 ///
 /// Prefab-borne tilemaps (assembler#561) are embedded exactly like scene ones
 /// now — the earlier fail-loud guard is gone. A pack's own `Tilemap` component
@@ -55,10 +58,11 @@ pub fn collectRegistrations(
     prefab_names: []const []const u8,
     pack_scans: []const PackScan,
 ) ![]const tilemap_scan.Registration {
-    // #562: a project- OR pack-registered `Tilemap` overrides the built-in —
-    // embed nothing and let the generic component dispatch route it.
-    if (registersTilemap(component_names, pack_scans)) {
-        std.log.info("labelle-assembler: a registered `Tilemap` component (project or pack) overrides the built-in — skipping tilemap embedding (engine C2)", .{});
+    // #562: a PROJECT-registered `Tilemap` (exact built-in name) overrides the
+    // built-in — embed nothing and let the generic component dispatch route it.
+    // A pack's namespaced `<pack>__Tilemap` does NOT override (P1 fix).
+    if (registersTilemap(component_names)) {
+        std.log.info("labelle-assembler: project registers its own `Tilemap` component — skipping built-in tilemap embedding (engine C2)", .{});
         return tilemap_scan.collect(allocator, target_dir, &.{});
     }
 
@@ -96,22 +100,24 @@ pub fn collectRegistrations(
     return tilemap_scan.collect(allocator, target_dir, asset_names.items);
 }
 
-/// True iff any registered component name — project or pack — pascal-matches
-/// `Tilemap` (engine C2 override, assembler#562). Decl-module plugin component
-/// names aren't enumerable by the assembler and are handled by the benign
-/// no-`asset_name` path (see `collectRegistrations`).
-fn registersTilemap(
-    component_names: []const []const u8,
-    pack_scans: []const PackScan,
-) bool {
+/// True iff a PROJECT component pascal-matches the EXACT built-in name
+/// `Tilemap` (engine C2 override, assembler#562). This mirrors the engine's
+/// `Components.has("Tilemap")` gate, which is an exact-name check.
+///
+/// Deliberately does NOT consider pack components: a pack's `components/
+/// Tilemap.zig` registers under the NAMESPACED field `<pack>__Tilemap`, a
+/// DIFFERENT component that does not satisfy `has("Tilemap")` and so does not
+/// shadow the built-in — a project legitimately using the built-in `Tilemap`
+/// while importing such a pack must still get its `.tmx`/images embedded. A
+/// pack's own tilemap usage is a normal namespaced component and never matches
+/// the built-in `Tilemap { asset_name }` shape the prefab scan looks for.
+/// Decl-module plugins that register an un-namespaced `Tilemap` aren't
+/// enumerable by the assembler (their components live in Zig source we never
+/// parse) — a known limitation, handled by the benign no-`asset_name` path.
+fn registersTilemap(component_names: []const []const u8) bool {
     var pascal_buf: [128]u8 = undefined;
     for (component_names) |name| {
         if (std.mem.eql(u8, idents.pathToPascal(name, &pascal_buf), "Tilemap")) return true;
-    }
-    for (pack_scans) |pack| {
-        for (pack.component_names) |name| {
-            if (std.mem.eql(u8, idents.pathToPascal(name, &pascal_buf), "Tilemap")) return true;
-        }
     }
     return false;
 }
