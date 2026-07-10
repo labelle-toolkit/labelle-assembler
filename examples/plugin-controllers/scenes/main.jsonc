@@ -4,5 +4,5 @@
     // the setup path. The plugin-Controller discovery fires on scene
     // load; the scene itself contributes zero runtime behaviour.
     "name": "main",
-    "entities": []
+    "children": []
 }
