@@ -280,6 +280,47 @@ fn emitPackImports(
     }
 }
 
+/// A declared plugin that ships a native build hook (`plugin.hook.zig`,
+/// labelle-assembler#518). Discovered + staged by `plugin_build_hook.zig`; here
+/// it only carries the plugin name, which MUST match a `cfg.plugins` entry so
+/// the `plugin_<name>_mod` / `plugin_<name>_dep` variables are already in scope
+/// when the hook CALL is emitted.
+pub const PluginHook = struct {
+    plugin_name: []const u8,
+};
+
+/// Emit the native build-hook CALL for every plugin that ships a
+/// `plugin.hook.zig` (labelle-assembler#518), mirroring the backend
+/// `backend.hook.zig` `post_wire` mechanism. The assembler stages each hook
+/// next to the generated build.zig as `plugin_<name>_build_hook.zig` (see
+/// `plugin_build_hook.stage`), so the `@import` here resolves at build time.
+///
+/// Runs AFTER `artifact` (`exe`/`wasm`/`lib`) and its imports are assembled, so
+/// the hook can `addCSourceFiles` / `linkLibCpp` / `addIncludePath` onto
+/// `ctx.artifact` (or contribute to `ctx.module`). The context struct also
+/// carries `.plugin_dep` (the plugin's `b.dependency` result) so the hook can
+/// reach files/modules shipped by the plugin package, plus `.target` /
+/// `.optimize` for any native sub-artifact it builds.
+///
+/// A project whose plugins ship no hook passes an empty `plugin_hooks` and
+/// emits nothing here — the generated build.zig stays byte-identical.
+fn emitPluginBuildHooks(
+    w: anytype,
+    artifact: []const u8,
+    plugin_hooks: []const PluginHook,
+) !void {
+    for (plugin_hooks) |h| {
+        try w.print("    const plugin_{s}_build_hook = @import(\"plugin_{s}_build_hook.zig\");\n", .{ h.plugin_name, h.plugin_name });
+        try w.print("    plugin_{s}_build_hook.postWire(b, .{{\n", .{h.plugin_name});
+        try w.print("        .artifact = {s},\n", .{artifact});
+        try w.print("        .module = plugin_{s}_mod,\n", .{h.plugin_name});
+        try w.print("        .plugin_dep = plugin_{s}_dep,\n", .{h.plugin_name});
+        try w.writeAll("        .target = target,\n");
+        try w.writeAll("        .optimize = optimize,\n");
+        try w.writeAll("    });\n");
+    }
+}
+
 pub const BuildZigOptions = struct {
     /// Emit a test-only build.zig: skip the exe step, the run step,
     /// and the backend artifact link. Used by `generateTestsTarget`
@@ -300,6 +341,14 @@ pub const BuildZigOptions = struct {
     /// artifact. Defaults to empty — pack-less projects keep their
     /// byte-identical build.zig, the invariant every #498 PR holds.
     pack_modules: []const pack_root.PackModule = &.{},
+    /// Plugins that ship a native build hook (`plugin.hook.zig`,
+    /// labelle-assembler#518). Each entry emits an `@import` of the staged
+    /// `plugin_<name>_build_hook.zig` + a `postWire(b, .{ … })` CALL after the
+    /// game artifact is assembled, letting the plugin contribute native
+    /// (C/C++) sources / link steps / include paths — mirroring the backend
+    /// `backend.hook.zig` mechanism. Defaults to empty: a project whose
+    /// plugins ship no hook keeps a byte-identical build.zig.
+    plugin_hooks: []const PluginHook = &.{},
     /// Project root, used to locate the resolved backend package's
     /// `backend.manifest.v2.zon` (pluggable-backends RFC, assembler#453/#461).
     /// Null (default) means no manifest can be loaded, so codegen hard-errors —
@@ -633,6 +682,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         try emitPromotedScriptImports(w, "wasm", opts.promoted_scripts);
         try emitPackImports(w, "wasm", opts.pack_modules);
 
+        // Plugin native build hooks (#518).
+        try emitPluginBuildHooks(w, "wasm", opts.plugin_hooks);
+
         // Link bridge artifact for WASM (raw_backend GUIs) BEFORE the
         // backend-specific link step. sokol-zig's `emLinkStep` snapshots
         // `lib_main.getCompileDependencies(false)` to assemble the emcc
@@ -695,6 +747,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
         try emitPackImports(w, "exe", opts.pack_modules);
 
+        // Plugin native build hooks (#518).
+        try emitPluginBuildHooks(w, "exe", opts.plugin_hooks);
+
         // manifest-v2 ios: the generic link (linkLibrary + link_libc + linkFramework
         // from `.frameworks.ios`) plus the `post_wire` hook call for the SDK
         // include/lib/framework paths residual (design §4).
@@ -753,6 +808,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         try emitPromotedScriptImports(w, "lib", opts.promoted_scripts);
         try emitPackImports(w, "lib", opts.pack_modules);
 
+        // Plugin native build hooks (#518).
+        try emitPluginBuildHooks(w, "lib", opts.plugin_hooks);
+
         // manifest-v2 android: the generic link (linkLibrary + linkSystemLibrary from
         // `.system_libs.android` + `link_libc`) plus the `post_wire` hook call for the
         // NDK-sysroot / addLibraryPath / libc.txt residual (design §4).
@@ -809,6 +867,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // `@import("<named>")` (labelle-assembler#240 Gap 2).
             try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
             try emitPackImports(w, "exe", opts.pack_modules);
+
+            // Plugin native build hooks (#518): let a plugin contribute C/C++
+            // sources / link steps / include paths to the exe.
+            try emitPluginBuildHooks(w, "exe", opts.plugin_hooks);
 
             // Link backend artifact. manifest-v2 desktop codegen: linkLibrary from
             // manifest artifacts + the per-OS framework/system-lib wiring (design
@@ -911,4 +973,52 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
     var arr_list = alloc_writer.toArrayList();
     return arr_list.toOwnedSlice(allocator);
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+const testing = std.testing;
+
+test "emitPluginBuildHooks: emits the postWire CALL for a plugin native hook" {
+    // A plugin declaring a native build hook (#518) gets its `plugin.hook.zig`
+    // staged as `plugin_<name>_build_hook.zig` and the generated build.zig
+    // `@import`s it + calls `postWire` on the game artifact, so the plugin can
+    // contribute C/C++ sources / link steps / include paths.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try emitPluginBuildHooks(&aw.writer, "exe", &.{.{ .plugin_name = "spine" }});
+
+    try testing.expectEqualStrings(
+        "    const plugin_spine_build_hook = @import(\"plugin_spine_build_hook.zig\");\n" ++
+            "    plugin_spine_build_hook.postWire(b, .{\n" ++
+            "        .artifact = exe,\n" ++
+            "        .module = plugin_spine_mod,\n" ++
+            "        .plugin_dep = plugin_spine_dep,\n" ++
+            "        .target = target,\n" ++
+            "        .optimize = optimize,\n" ++
+            "    });\n",
+        aw.written(),
+    );
+}
+
+test "emitPluginBuildHooks: threads the given artifact name (wasm/lib/exe)" {
+    // The same seam serves every platform's artifact variable — desktop/ios
+    // `exe`, wasm `wasm`, android `lib`.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try emitPluginBuildHooks(&aw.writer, "lib", &.{.{ .plugin_name = "spine" }});
+    try testing.expect(std.mem.indexOf(u8, aw.written(), ".artifact = lib,\n") != null);
+}
+
+test "emitPluginBuildHooks: no hooks emits nothing (byte-identical build.zig)" {
+    // The additive invariant: a project whose plugins ship no `plugin.hook.zig`
+    // passes an empty slice and this helper writes zero bytes, so the generated
+    // build.zig is byte-identical to before #518.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try emitPluginBuildHooks(&aw.writer, "exe", &.{});
+    try testing.expectEqualStrings("", aw.written());
 }
