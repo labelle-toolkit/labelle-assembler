@@ -4,5 +4,5 @@
     // smoke check. Exists so `g.setScene("main")` has a name to bind to
     // during the generated setup path.
     "name": "main",
-    "entities": []
+    "children": []
 }
