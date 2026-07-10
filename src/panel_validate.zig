@@ -57,6 +57,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
+const plugin_manifest = @import("plugin_manifest.zig");
 
 /// The convention directory panels live in (`<unit>/studio/*.panel.jsonc`).
 pub const STUDIO_DIR = "studio";
@@ -409,12 +410,11 @@ fn validateActions(
 
 // ── Discovery + filesystem entry point ──────────────────────────────────
 
-/// Discover and validate every `studio/*.panel.jsonc` shipped by a declared
-/// plugin (at the plugin root and inside any pack it bundles), printing a
-/// diagnostic per problem. Returns `error.InvalidPanelDescriptor` if any
-/// panel is invalid. Additive: a project with no panels is unaffected, and a
-/// plugin dir that can't be resolved/read is skipped (other passes report a
-/// genuinely missing plugin).
+/// Discover and validate every `studio/*.panel.jsonc` a declared plugin (or a
+/// pack it DECLARES) ships, printing a diagnostic per problem. Returns
+/// `error.InvalidPanelDescriptor` if any panel is invalid. Additive: a project
+/// with no panels is unaffected, and a plugin dir that can't be resolved/read
+/// is skipped (other passes report a genuinely missing plugin).
 pub fn validatePluginPanels(
     allocator: std.mem.Allocator,
     cfg: config.ProjectConfig,
@@ -426,11 +426,7 @@ pub fn validatePluginPanels(
         errors.deinit(allocator);
     }
 
-    for (cfg.plugins) |plugin| {
-        const plugin_dir = cache.resolvePlugin(allocator, plugin, game_dir) catch continue;
-        defer allocator.free(plugin_dir);
-        try walk(allocator, plugin_dir, plugin_dir, 0, &errors);
-    }
+    try collectPluginPanelErrors(allocator, cfg, game_dir, &errors);
 
     if (errors.items.len == 0) return;
 
@@ -439,46 +435,74 @@ pub fn validatePluginPanels(
     return Error.InvalidPanelDescriptor;
 }
 
-const MAX_WALK_DEPTH: usize = 5;
+/// The scoped discovery: for each declared plugin, validate ONLY (a) the
+/// plugin-root `studio/` dir and (b) the `studio/` dir of each pack the plugin
+/// DECLARES in `plugin.labelle`'s `.packs` — the exact set the pack-discovery
+/// path registers (`generate_phases.discoverNestedPacks`). It deliberately does
+/// NOT walk every descendant directory: an UNDECLARED pack (e.g.
+/// `packs/experimental/`) or a non-shipped `examples/` tree is not part of
+/// generation, so a broken panel there must never fail `labelle generate`
+/// (assembler#588 review). Split from `validatePluginPanels` so tests can
+/// inspect the collected diagnostics.
+fn collectPluginPanelErrors(
+    allocator: std.mem.Allocator,
+    cfg: config.ProjectConfig,
+    game_dir: []const u8,
+    errors: *Errors,
+) !void {
+    for (cfg.plugins) |plugin| {
+        const plugin_dir = cache.resolvePlugin(allocator, plugin, game_dir) catch continue;
+        defer allocator.free(plugin_dir);
 
-/// Walk `dir_abs` (bounded, skipping build/hidden dirs) validating every
-/// `studio/*.panel.jsonc`. `root_abs` anchors the relative path used in
-/// diagnostics.
-fn walk(
+        // (a) The plugin's OWN `studio/` (the plugin itself is declared in
+        //     project.labelle, so this is always shipped).
+        try scanStudioDir(allocator, plugin_dir, plugin_dir, errors);
+
+        // (b) Only the packs the plugin DECLARES via `plugin.labelle .packs`.
+        //     A plugin with no `plugin.labelle` (or an empty `.packs`) adds
+        //     nothing here — same tolerance the pack-discovery path has.
+        var pmani = (plugin_manifest.loadOptional(allocator, plugin, game_dir) catch continue) orelse continue;
+        defer pmani.deinit();
+        for (pmani.packs) |nested_name| {
+            const pack_dir = try std.fs.path.join(allocator, &.{ plugin_dir, "packs", nested_name });
+            defer allocator.free(pack_dir);
+            try scanStudioDir(allocator, plugin_dir, pack_dir, errors);
+        }
+    }
+}
+
+/// Validate the panel files DIRECTLY in `<unit_dir_abs>/studio/` (non-recursive
+/// — a `studio/` dir is a flat file list by convention). `root_abs` anchors the
+/// unit-relative path used in diagnostics. A missing `studio/` dir is a no-op.
+fn scanStudioDir(
     allocator: std.mem.Allocator,
     root_abs: []const u8,
-    dir_abs: []const u8,
-    depth: usize,
+    unit_dir_abs: []const u8,
     errors: *Errors,
 ) AllocErr!void {
     const io = config.globalIo();
-    var dir = std.Io.Dir.cwd().openDir(io, dir_abs, .{ .iterate = true }) catch return;
-    defer dir.close(io);
+    const studio_abs = try std.fs.path.join(allocator, &.{ unit_dir_abs, STUDIO_DIR });
+    defer allocator.free(studio_abs);
 
-    const in_studio = std.mem.eql(u8, std.fs.path.basename(dir_abs), STUDIO_DIR);
+    var dir = std.Io.Dir.cwd().openDir(io, studio_abs, .{ .iterate = true }) catch return;
+    defer dir.close(io);
 
     var it = dir.iterate();
     while (it.next(io) catch return) |entry| {
-        if (entry.kind == .directory) {
-            if (depth + 1 > MAX_WALK_DEPTH) continue;
-            if (isSkippedDir(entry.name)) continue;
-            const child = try std.fs.path.join(allocator, &.{ dir_abs, entry.name });
-            defer allocator.free(child);
-            try walk(allocator, root_abs, child, depth + 1, errors);
-        } else if (entry.kind == .file and in_studio and isPanelFile(entry.name)) {
-            const abs = try std.fs.path.join(allocator, &.{ dir_abs, entry.name });
-            defer allocator.free(abs);
-            // `abs` is built under `root_abs`, so a readable unit-relative path
-            // is just the prefix-stripped suffix (borrowed; no allocation).
-            const rel = relTo(root_abs, abs);
+        if (entry.kind != .file or !isPanelFile(entry.name)) continue;
 
-            const source = std.Io.Dir.cwd().readFileAlloc(io, abs, allocator, .limited(MAX_PANEL_BYTES)) catch |err| {
-                try addLine(allocator, errors, rel, "could not read panel file: {s}", .{@errorName(err)});
-                continue;
-            };
-            defer allocator.free(source);
-            try validatePanelSource(allocator, rel, source, errors);
-        }
+        const abs = try std.fs.path.join(allocator, &.{ studio_abs, entry.name });
+        defer allocator.free(abs);
+        // `abs` is built under `root_abs`, so a readable unit-relative path is
+        // just the prefix-stripped suffix (borrowed; no allocation).
+        const rel = relTo(root_abs, abs);
+
+        const source = std.Io.Dir.cwd().readFileAlloc(io, abs, allocator, .limited(MAX_PANEL_BYTES)) catch |err| {
+            try addLine(allocator, errors, rel, "could not read panel file: {s}", .{@errorName(err)});
+            continue;
+        };
+        defer allocator.free(source);
+        try validatePanelSource(allocator, rel, source, errors);
     }
 }
 
@@ -497,11 +521,6 @@ fn relTo(root_abs: []const u8, abs: []const u8) []const u8 {
 
 fn isPanelFile(name: []const u8) bool {
     return std.mem.endsWith(u8, name, PANEL_SUFFIX) and name.len > PANEL_SUFFIX.len;
-}
-
-fn isSkippedDir(name: []const u8) bool {
-    if (name.len > 0 and name[0] == '.') return true; // .git, .labelle, .zig-cache
-    return isOneOf(name, &.{ "node_modules", "zig-out", "zig-cache", "dist", "target" });
 }
 
 // ── Small helpers ───────────────────────────────────────────────────────
@@ -828,7 +847,7 @@ test "collects multiple problems in one pass" {
     try testing.expect(std.mem.indexOf(u8, out, "a slider requires a numeric `min`") != null);
 }
 
-// ── Filesystem discovery (the `studio/` walk + gating seam) ──────────────
+// ── Filesystem discovery (the `studio/` scan + declared-scope seam) ──────
 
 fn writePanel(dir: std.Io.Dir, rel: []const u8, body: []const u8) !void {
     if (std.fs.path.dirname(rel)) |sub| try dir.createDirPath(testing.io, sub);
@@ -837,22 +856,17 @@ fn writePanel(dir: std.Io.Dir, rel: []const u8, body: []const u8) !void {
     try f.writeStreamingAll(testing.io, body);
 }
 
-test "discovery: validates studio/*.panel.jsonc under a unit root, ignoring non-studio files" {
+test "scanStudioDir: validates files directly in studio/, ignoring non-studio files" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A valid plugin-level panel, a valid nested-pack panel, an INVALID
-    // plugin-level panel, and a `.panel.jsonc` NOT under a `studio/` dir
-    // (must be ignored — only `studio/*.panel.jsonc` are panels).
     try writePanel(tmp.dir, "studio/generator.panel.jsonc",
         \\{ "id": "g", "title": "Generator", "actions": [ { "label": "Go", "command": "go", "target": "preview" } ] }
-    );
-    try writePanel(tmp.dir, "packs/dungeon/studio/nested.panel.jsonc",
-        \\{ "id": "n", "title": "Nested" }
     );
     try writePanel(tmp.dir, "studio/broken.panel.jsonc",
         \\{ "id": "b", "title": "B", "fields": [ { "name": "s", "type": "slider" } ] }
     );
+    // NOT under `studio/` — must be ignored (only studio/*.panel.jsonc count).
     try writePanel(tmp.dir, "notstudio/decoy.panel.jsonc",
         \\{ this is not even json }
     );
@@ -865,25 +879,22 @@ test "discovery: validates studio/*.panel.jsonc under a unit root, ignoring non-
         for (errors.items) |e| testing.allocator.free(e);
         errors.deinit(testing.allocator);
     }
-    try walk(testing.allocator, root, root, 0, &errors);
+    try scanStudioDir(testing.allocator, root, root, &errors);
 
-    // Only the broken slider contributes problems. The decoy (not under a
-    // `studio/` dir) and the two valid panels contribute nothing — so EVERY
-    // error references broken.panel.jsonc, and the slider's min/max gap is
-    // among them.
+    // Only the broken slider contributes problems: the decoy and the valid
+    // panel add nothing.
     try testing.expect(errors.items.len >= 1);
     var saw_min = false;
     for (errors.items) |e| {
         try testing.expect(std.mem.indexOf(u8, e, "studio/broken.panel.jsonc") != null);
         try testing.expect(std.mem.indexOf(u8, e, "decoy") == null);
         try testing.expect(std.mem.indexOf(u8, e, "generator") == null);
-        try testing.expect(std.mem.indexOf(u8, e, "nested") == null);
         if (std.mem.indexOf(u8, e, "a slider requires a numeric `min`") != null) saw_min = true;
     }
     try testing.expect(saw_min);
 }
 
-test "discovery: a unit with no panels is a clean no-op" {
+test "scanStudioDir: a unit with no studio/ dir is a clean no-op" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try writePanel(tmp.dir, "components/foo.zig", "// not a panel");
@@ -893,6 +904,63 @@ test "discovery: a unit with no panels is a clean no-op" {
 
     var errors: Errors = .empty;
     defer errors.deinit(testing.allocator);
-    try walk(testing.allocator, root, root, 0, &errors);
+    try scanStudioDir(testing.allocator, root, root, &errors);
     try testing.expectEqual(@as(usize, 0), errors.items.len);
+}
+
+test "discovery scope: a DECLARED pack's broken panel fails; an UNDECLARED pack's does NOT" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A plugin that declares ONLY the `shipped` pack in its manifest.
+    try writePanel(tmp.dir, "plugin.labelle",
+        \\.{
+        \\    .name = "myplugin",
+        \\    .manifest_version = 1,
+        \\    .packs = .{ "shipped" },
+        \\}
+    );
+    // Plugin-root panel: valid.
+    try writePanel(tmp.dir, "studio/root.panel.jsonc",
+        \\{ "id": "r", "title": "Root" }
+    );
+    // DECLARED pack with a broken panel → MUST fail generate.
+    try writePanel(tmp.dir, "packs/shipped/studio/broken.panel.jsonc",
+        \\{ "id": "s", "title": "S", "fields": [ { "name": "x", "type": "slider" } ] }
+    );
+    // UNDECLARED pack (not in `.packs`) with a broken panel → MUST be ignored:
+    // it isn't part of generation, so it must never fail `labelle generate`.
+    try writePanel(tmp.dir, "packs/experimental/studio/wild.panel.jsonc",
+        \\{ this is not even json }
+    );
+
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    // A local-path plugin whose dir IS the tmp root (absolute → game_dir is
+    // ignored by the resolver).
+    const repo = try std.fmt.allocPrint(testing.allocator, "local:{s}", .{root});
+    defer testing.allocator.free(repo);
+    const plugins = [_]config.PluginDep{.{ .name = "myplugin", .repo = repo }};
+    const cfg = config.ProjectConfig{ .name = "test", .plugins = &plugins };
+
+    var errors: Errors = .empty;
+    defer {
+        for (errors.items) |e| testing.allocator.free(e);
+        errors.deinit(testing.allocator);
+    }
+    try collectPluginPanelErrors(testing.allocator, cfg, root, &errors);
+
+    // The declared pack's broken slider is reported…
+    var saw_shipped = false;
+    for (errors.items) |e| {
+        // …and NOTHING from the undeclared `experimental` pack or the valid
+        // root panel is.
+        try testing.expect(std.mem.indexOf(u8, e, "experimental") == null);
+        try testing.expect(std.mem.indexOf(u8, e, "wild") == null);
+        try testing.expect(std.mem.indexOf(u8, e, "root.panel.jsonc") == null);
+        if (std.mem.indexOf(u8, e, "packs/shipped/studio/broken.panel.jsonc") != null and
+            std.mem.indexOf(u8, e, "a slider requires a numeric `min`") != null) saw_shipped = true;
+    }
+    try testing.expect(saw_shipped);
 }
