@@ -133,7 +133,14 @@ pub fn processPackAssets(
         if (e.manifest.resources.len == 0 and e.manifest.depends_on_resources.len == 0) continue;
         // A nested pack / plugin-level resource unit (Phase 2, #576) carries an
         // already-resolved `src_dir`; a game-local pack resolves by name.
-        const pack_src_dir = e.resolveSrcDir(allocator, game_dir) catch continue;
+        //
+        // Propagate a resolution failure rather than `catch continue`-skipping
+        // it: every entry that reaches here DECLARES `.resources` /
+        // `.depends_on_resources`, so failing to resolve its source dir (OOM, a
+        // broken package cache, or a declared-but-missing bundled pack) means
+        // its assets would silently vanish from the build — a blank-sprite
+        // runtime bug. Surface it as a clear generate-time error instead.
+        const pack_src_dir = try e.resolveSrcDir(allocator, game_dir);
         defer allocator.free(pack_src_dir);
         try processOnePack(allocator, e, merged, pack_src_dir, target_dir);
     }
