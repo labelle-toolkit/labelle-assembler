@@ -1,0 +1,46 @@
+// Scripting-plugin smoke (labelle-assembler#593 splice; Phase-1 proof for
+// labelle-engine#739, epic labelle-engine#237). A `lua/behavior.lua` behavior
+// drives the REAL engine through the Script Runtime Contract
+// (labelle-engine#749): create an entity, set Position, emit a custom game
+// event, subscribe + react to it AND to the engine's own `engine__tick` —
+// all through the generated main's bind/registerScript/drainEvents
+// touchpoints, not a mock.
+//
+// CI builds this example headless and asserts the LUA_* milestone lines
+// appear in order over a bounded `LABELLE_NULL_FRAMES=5` run (see
+// `.github/workflows/ci.yml` → `examples-integration`).
+.{
+    .name = "scripting_smoke",
+    .title = "LaBelle — Lua Scripting Smoke (null backend)",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    // Headless null backend, but pinned as an EXPLICIT external
+    // `backend_package` to the SIBLING checkout rather than the registry
+    // `.backend = .null` shorthand: the generated main's
+    // `script_contract.bind` touchpoint lives in labelle-null's
+    // `templates/headless.txt`, and the registry-resolved release doesn't
+    // ship it yet. CI clones labelle-null beside this repo (branch
+    // fallback, same pattern as core/engine).
+    .backend_package = .{ .name = "null", .repo = "local:../../../labelle-null" },
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // THE consumer path under test: the scripting plugin fetched from its
+    // real repo at a real tag, with the one-language-per-project param
+    // (#584/#589) that arms the assembler's scripting splice (#593).
+    .plugins = .{
+        .{
+            .name = "scripting",
+            .repo = "github.com/labelle-toolkit/labelle-scripting",
+            .version = "0.1.0",
+            .params = .{ .language = "lua" },
+        },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}
