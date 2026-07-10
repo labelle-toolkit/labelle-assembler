@@ -1,0 +1,35 @@
+// Demo scene — instantiates the plugin's namespaced pack prefabs and its
+// plugin-level banner sprite. It names NO pack atlas by hand: referencing a
+// `<pack>__<prefab>` prefab auto-wires that pack's non-lazy resources into
+// this scene's asset manifest (assembler#579 scene auto-wiring). Only the
+// plugin-level `fantasy_dungeon__banner` — not owned by a scannable pack — is
+// listed explicitly in `meta.assets`.
+[
+    { "meta": { "assets": ["fantasy_dungeon__banner"] } },
+
+    // Floor row from the `tiles` pack — sprite `tiles/floor.png`, auto-wired
+    // atlas `tiles__tileset`.
+    { "prefab": "tiles__floor_tile", "Position": { "x": 300, "y": 300 } },
+    { "prefab": "tiles__floor_tile", "Position": { "x": 332, "y": 300 } },
+    { "prefab": "tiles__floor_tile", "Position": { "x": 364, "y": 300 } },
+
+    // Walls bracketing the floor — same `tiles__tileset` atlas.
+    { "prefab": "tiles__wall_tile", "Position": { "x": 268, "y": 300 } },
+    { "prefab": "tiles__wall_tile", "Position": { "x": 396, "y": 300 } },
+
+    // Props from the second bundled pack (`props__atlas`, auto-wired).
+    { "prefab": "props__torch", "Position": { "x": 300, "y": 332 } },
+    { "prefab": "props__chest", "Position": { "x": 364, "y": 332 } },
+
+    // Plugin-LEVEL atlas: the banner sprite, drawn from the namespaced
+    // `fantasy_dungeon/banner.png` frame the plugin ships directly.
+    {
+        "Position": { "x": 332, "y": 500 },
+        "Sprite": {
+            "sprite_name": "fantasy_dungeon/banner.png",
+            "pivot": "center",
+            "layer": "world",
+            "z_index": 10
+        }
+    }
+]

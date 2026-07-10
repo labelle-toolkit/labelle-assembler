@@ -26,6 +26,7 @@ const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
 pub const pack_validate = @import("pack_validate.zig");
+pub const panel_validate = @import("panel_validate.zig");
 const scene_name_lint = @import("scene_name_lint.zig");
 const gui_resolve = @import("gui_resolve.zig");
 pub const app_icon = @import("app_icon.zig");
@@ -59,6 +60,7 @@ test {
     _ = @import("asset_validator.zig");
     _ = @import("pack_resources.zig");
     _ = @import("language_policy.zig");
+    _ = @import("panel_validate.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
     _ = @import("deps_linker.zig");
@@ -347,6 +349,14 @@ pub fn generate(
     // is a separate ticket), so a clean project generates byte-identical
     // output.
     try generate_phases.validateLanguagePolicy(allocator, pack_entries.items, cfg.plugins, game_dir);
+
+    // ── Asset-Plugins Phase 3: studio panel descriptors (#577) ─────────
+    // Validate every `studio/*.panel.jsonc` a plugin (or a pack it bundles)
+    // ships, BEFORE any target is written — a malformed panel is a
+    // generate-time error with a file (and line) location, so the studio
+    // never renders an invalid panel from a generated project. Additive: a
+    // project with no panels is a no-op.
+    try panel_validate.validatePluginPanels(allocator, cfg, game_dir);
 
     // ── Asset-Plugins Phase 2: plugin-level `.resources` units (#576) ──
     // A decl-module plugin may declare its OWN atlases in `plugin.labelle`

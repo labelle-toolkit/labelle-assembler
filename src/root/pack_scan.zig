@@ -166,6 +166,19 @@ pub fn scanPack(
     const dst_base = try std.fs.path.join(allocator, &.{ target_dir, "packs", pack_name });
     defer allocator.free(dst_base);
 
+    // Create the generated pack dir up front so an EMPTY pack — one shipping
+    // ONLY `pack.labelle`, no convention subdirs and no verb files — still
+    // gets a target dir. Otherwise every `scanPackSubdir` no-ops on its
+    // missing source (never creating `dst_base`), and the later
+    // `writePackModuleRoots` hits FileNotFound opening `<pack>/` to write
+    // `__pack_root.zig` (labelle-assembler#590). An empty light pack is a
+    // legitimate no-op: it produces an empty (but valid) module root.
+    {
+        const io = config.globalIo();
+        const cwd = std.Io.Dir.cwd();
+        try cwd.createDirPath(io, dst_base);
+    }
+
     const component_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "components", ".zig");
     errdefer scanner.freeNames(allocator, component_names);
     const event_names = try scanPackSubdir(allocator, pack_src_dir, dst_base, "events", ".zig");

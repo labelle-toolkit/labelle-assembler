@@ -174,6 +174,16 @@ pub fn Mixin(comptime Self: type) type {
                     try w.print("    g.addEmbeddedSceneSource(\"scenes/{s}.jsonc\", @embedFile(\"scenes/{s}.jsonc\")) catch @panic(\"failed to register embedded scene source\");\n", .{ name, name });
                 }
 
+                // Hand each scene's JSONC source to the engine by NAME for
+                // sprite-based asset inference (labelle-engine#563) — see the
+                // loop-based setup path for the full rationale. Gated on
+                // `@hasDecl` for forward-compat with older engines; `init` is
+                // void here (C-callback backends) so panic on the impossible
+                // SceneNotFound instead of `try`, matching setSceneAssets above.
+                for (jsonc_scene_names) |name| {
+                    try w.print("    if (@hasDecl(AssembledGame, \"setSceneSource\")) g.setSceneSource(\"{s}\", @embedFile(\"scenes/{s}.jsonc\")) catch @panic(\"failed to set scene source\");\n", .{ name, name });
+                }
+
                 // Attach parsed asset manifests — mirrors the loop-based setup path.
                 // See `buildSetupCode` for the rationale. `init` is void here (C
                 // compatibility for sokol/wasm callback backends), so we can't

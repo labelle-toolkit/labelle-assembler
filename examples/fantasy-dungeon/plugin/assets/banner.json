@@ -1,0 +1,11 @@
+{
+  "frames": {
+    "banner.png": {
+      "frame": { "x": 0, "y": 0, "w": 96, "h": 16 },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": { "x": 0, "y": 0, "w": 96, "h": 16 },
+      "sourceSize": { "w": 96, "h": 16 }
+    }
+  }
+}

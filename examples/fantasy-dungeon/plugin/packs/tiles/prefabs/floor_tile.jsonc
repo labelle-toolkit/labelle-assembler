@@ -1,0 +1,14 @@
+// Floor tile prefab. `sprite_name` is authored as the BARE frame name
+// (`floor.png`) exactly as it appears in this pack's `assets/tileset.json`.
+// At copy time the assembler rewrites it to the namespaced `tiles/floor.png`
+// (matching the rewritten atlas frame key) — the pack author never types the
+// prefix, and generate-time validation guarantees the ref resolves.
+{
+    "Position": { "x": 0, "y": 0 },
+    "Sprite": {
+        "sprite_name": "floor.png",
+        "pivot": "center",
+        "layer": "world",
+        "z_index": 0
+    }
+}

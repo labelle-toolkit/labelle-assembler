@@ -1,12 +1,20 @@
-{
-    // Main scene — rendered only after the loading controller has
-    // decoded every atlas listed in `assets:` below. The assembler
-    // parses this block, validates each name against `project.labelle`,
-    // and emits it into `SceneAssetManifests.entries` so engine code
-    // (and the loading controller) can iterate it at runtime via
-    // `game.scenes.get("main").?.assets`.
-    "name": "main",
-    "assets": ["sprites", "jump"],
+// Main scene — rendered only after the loading controller has decoded
+// every atlas listed in the `meta.assets` header below. Under the
+// unified format (engine v2.0, RFC #560/#563/#596) the file is a
+// BUNDLE (top-level JSON array of sibling entities): the first element
+// is a `{ meta: { ... } }` file header that carries the explicit
+// preload manifest, and every subsequent element is an entity.
+//
+// The assembler parses `meta.assets`, validates each name against
+// `project.labelle`, and emits it into `SceneAssetManifests.entries`
+// so engine code (and the loading controller) can iterate it at
+// runtime via `game.scenes.get("main").?.assets`. The bundle form is
+// required here: the top-level `assets:` key was dropped in v2.0, and
+// the assembler only reads an explicit manifest from a bundle header's
+// `meta.assets` (an object-form scene infers assets from sprite refs).
+[
+    { "meta": { "assets": ["sprites", "jump"] } },
+
     // World coords are Y-up after the centerOnScreen call in
     // scripts/playing/main_scene.zig — origin at the bottom-left of
     // the 800×600 viewport. (550, 450) and (650, 450) place both
@@ -14,41 +22,40 @@
     // test's "sprites visible" assertion is unambiguous: anything
     // appearing in any other quadrant means the asset-streaming
     // pipeline ate the position somewhere.
-    "entities": [
-        // One sprite from the "sprites" atlas — proves a late-loaded
-        // texture actually made it to the GPU.
-        {
-            "components": {
-                "Position": { "x": 550, "y": 450 },
-                "Sprite": {
-                    "sprite_name": "player.png",
-                    "pivot": "center",
-                    "layer": "world",
-                    "scale_x": 3.0,
-                    "scale_y": 3.0
-                },
-                "SpriteMarker": {}
-            }
-        },
-        // One sprite from the "jump" atlas — proves both atlases
-        // decoded and uploaded independently. The JumpAnim marker
-        // opts this entity into scripts/playing/jump_animator.zig,
-        // which cycles sprite_name through jump_0001..jump_0009 to
-        // prove the streaming pipeline keeps re-resolving sprite
-        // names after the initial load.
-        {
-            "components": {
-                "Position": { "x": 650, "y": 450 },
-                "Sprite": {
-                    "sprite_name": "jump_0001.png",
-                    "pivot": "center",
-                    "layer": "world",
-                    "scale_x": 3.0,
-                    "scale_y": 3.0
-                },
-                "SpriteMarker": {},
-                "JumpAnim": {}
-            }
+
+    // One sprite from the "sprites" atlas — proves a late-loaded
+    // texture actually made it to the GPU.
+    {
+        "components": {
+            "Position": { "x": 550, "y": 450 },
+            "Sprite": {
+                "sprite_name": "player.png",
+                "pivot": "center",
+                "layer": "world",
+                "scale_x": 3.0,
+                "scale_y": 3.0
+            },
+            "SpriteMarker": {}
         }
-    ]
-}
+    },
+    // One sprite from the "jump" atlas — proves both atlases
+    // decoded and uploaded independently. The JumpAnim marker
+    // opts this entity into scripts/playing/jump_animator.zig,
+    // which cycles sprite_name through jump_0001..jump_0009 to
+    // prove the streaming pipeline keeps re-resolving sprite
+    // names after the initial load.
+    {
+        "components": {
+            "Position": { "x": 650, "y": 450 },
+            "Sprite": {
+                "sprite_name": "jump_0001.png",
+                "pivot": "center",
+                "layer": "world",
+                "scale_x": 3.0,
+                "scale_y": 3.0
+            },
+            "SpriteMarker": {},
+            "JumpAnim": {}
+        }
+    }
+]

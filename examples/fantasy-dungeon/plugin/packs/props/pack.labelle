@@ -1,0 +1,12 @@
+// `props` — dungeon props (torch, chest), bundled inside the fantasy-dungeon
+// plugin at `plugin/packs/props/`. Second nested pack of the reference plugin,
+// proving a plugin can bundle MORE THAN ONE pack and each flows through the
+// same Phase-1 resource merge + `<pack>/<frame>` namespacing independently.
+.{
+    .name = "props",
+    .manifest_version = 1,
+    .convention_dirs = .copy_and_scan,
+    .resources = .{
+        .{ .name = "atlas", .json = "assets/props.json", .texture = "assets/props.png" },
+    },
+}

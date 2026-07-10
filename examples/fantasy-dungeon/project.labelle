@@ -1,0 +1,39 @@
+// Consuming game for the `fantasy-dungeon` reference asset plugin
+// (Asset-Plugins RFC Phase 2, labelle-engine#725 / labelle-assembler#576).
+//
+// The whole point: this project attaches ONE plugin (`local:./plugin`) and
+// gets a full dungeon content kit — two bundled packs (`tiles`, `props`), a
+// plugin-level `banner` atlas, and a generator script — with ZERO manual
+// `.resources` entries below. Every atlas the scene renders is merged +
+// namespaced by the assembler from the plugin's own manifests.
+//
+// Headless `.null` backend so the fixture generates (and, where the backend
+// allows, builds) without a window/GPU — the acceptance is that
+// `labelle generate` validates the plugin end to end and the demo prefabs
+// resolve their namespaced sprites.
+.{
+    .name = "fantasy_dungeon_demo",
+    .title = "LaBelle — Fantasy Dungeon asset-plugin demo",
+    .width = 800,
+    .height = 600,
+    .target_fps = 60,
+    .backend = .null,
+    .y_axis = .up,
+    .ecs = .zig_ecs,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // No `.resources` here — the plugin ships them all. This emptiness IS the
+    // acceptance criterion ("zero manual `.resources` edits").
+    .resources = .{},
+    .layers = .{
+        .{ .name = "world", .order = 0, .space = .world },
+    },
+    .plugins = .{
+        .{ .name = "fantasy_dungeon", .repo = "local:./plugin" },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}

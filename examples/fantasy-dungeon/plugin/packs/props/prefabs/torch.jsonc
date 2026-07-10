@@ -1,0 +1,11 @@
+// Torch prop prefab — draws `torch.png` from this pack's own `props__atlas`,
+// rewritten to the namespaced `props/torch.png` at copy time.
+{
+    "Position": { "x": 0, "y": 0 },
+    "Sprite": {
+        "sprite_name": "torch.png",
+        "pivot": "bottom_center",
+        "layer": "world",
+        "z_index": 2
+    }
+}
