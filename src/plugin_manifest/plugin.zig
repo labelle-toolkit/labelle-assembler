@@ -93,9 +93,10 @@ pub const PluginManifest = struct {
     /// (RFC-LANGUAGE-PLUGINS revs 8–9, assembler#584) — symmetric with
     /// `depends_on_resources`. Validated at load against
     /// `language_policy.SUPPORTED_LANGUAGES`, and at attach against the
-    /// project's declared `.language` (a Lua-scripted plugin fails loudly in
-    /// a Rust project, naming both sides). Absent = the plugin ships no
-    /// language scripts (every plugin before this ticket) → byte-identical.
+    /// project's declared `.params.language` (a Lua-scripted plugin fails
+    /// loudly in a Rust project, naming both sides). Absent = the plugin
+    /// ships no language scripts (every plugin before this ticket) →
+    /// byte-identical.
     requires_language: ?[]const u8 = null,
 
     /// SPDX-style license identifier for a shipped/sold plugin (Asset-Plugins
@@ -317,7 +318,7 @@ pub fn loadFromDir(
 
     // ── Validate `requires_language` vocabulary (#584) ──
     // The value must come from the closed language table. The MATCH against
-    // the project's declared `.language` needs project context and runs in
+    // the project's declared `.params.language` needs project context and runs in
     // the generate-time policy gate (`language_policy.checkRequiresLanguage`);
     // this load-time check rejects typos at the source with the manifest named.
     if (parsed.requires_language) |req| {
@@ -888,7 +889,7 @@ test "loadFromDir: parses requires_language (#584)" {
 
     // A plugin whose shipped scripts are Lua declares the requirement
     // (symmetric with depends_on_resources); the attach-time match against
-    // the project's `.language` runs in the generate gate.
+    // the project's `.params.language` runs in the generate gate.
     try writeManifestFile(tmp.dir,
         \\.{
         \\    .name = "lua_toolkit",

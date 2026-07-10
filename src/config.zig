@@ -199,15 +199,39 @@ pub const PluginDep = struct {
     /// Overrides the plugin's own `Systems.game_states` if set.
     states: []const []const u8 = &.{},
 
-    /// Script language this plugin provides (RFC-LANGUAGE-PLUGINS revs 8–9,
-    /// epic labelle-engine#237, assembler#584). Set on the ONE scripting
-    /// plugin entry (`labelle-scripting`): `.language = "lua"`. Deliberately
-    /// SINGULAR — one script language per project; mixing is unrepresentable
-    /// in config. Validated at generate time (`language_policy`): the value
-    /// must be a supported language and at most one `.plugins` entry may set
-    /// it. Parse + validate only for now — no codegen consumes it yet (the
-    /// scripting plugin that does lands separately).
-    language: ?[]const u8 = null,
+    /// Plugin-specific parameters — the generic `.params` bag (assembler#584
+    /// design review). Plugin options deliberately do NOT become bespoke
+    /// `PluginDep` fields; they ride this one nested literal:
+    ///
+    ///     .{ .name = "scripting", .repo = "github.com/labelle-toolkit/labelle-scripting",
+    ///        .version = "…", .params = .{ .language = "lua" } },
+    ///
+    /// `Params` below is the v1 slice of the mechanism. `null` = the plugin
+    /// takes no parameters (every entry before #584) → byte-identical default.
+    params: ?Params = null,
+
+    /// V1 slice of the GENERIC plugin-params mechanism: a closed struct whose
+    /// only recognized parameter today is `.language`. Schema-declared params
+    /// — each plugin publishing the keys it accepts, the assembler validating
+    /// `.params` against that schema — land with the plugin params follow-up
+    /// ticket; widening this struct in the meantime is additive. An unknown
+    /// key inside `.params` is a hard parse error BY CONSTRUCTION: the
+    /// project.labelle parse runs with the default
+    /// `ignore_unknown_fields = false`, so a stray key fails with
+    /// `error.ParseZon` exactly like a typo'd key on the plugin entry itself —
+    /// nothing silently drops.
+    pub const Params = struct {
+        /// Script language this plugin provides (RFC-LANGUAGE-PLUGINS revs
+        /// 8–9, epic labelle-engine#237, assembler#584). Set on the ONE
+        /// scripting plugin entry (`labelle-scripting`):
+        /// `.params = .{ .language = "lua" }`. Deliberately SINGULAR — one
+        /// script language per project; mixing is unrepresentable in config.
+        /// Validated at generate time (`language_policy`): the value must be
+        /// a supported language and at most one `.plugins` entry may set it.
+        /// Parse + validate only for now — no codegen consumes it yet (the
+        /// scripting plugin that does lands separately).
+        language: ?[]const u8 = null,
+    };
 
     /// Returns true if this plugin uses a local path.
     /// Supports `local:../path` (relative to project) and `@libs/path` (inside project).
@@ -919,22 +943,65 @@ test "AssetCompression.formatFor maps platforms; default is png everywhere" {
     try std.testing.expectEqual(AssetFormat.png, mixed.formatFor(.wasm)); // web -> wasm
 }
 
-test "PluginDep: `.language` parses from ZON and defaults to null (#584)" {
+test "PluginDep: `.params = .{ .language = … }` parses from ZON and defaults to null (#584)" {
     // The project.labelle `.plugins` entries parse through the same typed ZON
-    // path `main.zig` uses; `.language` is additive — an entry that omits it
+    // path `main.zig` uses; `.params` is additive — an entry that omits it
     // must land on the byte-identical `null` default.
     const alloc = std.testing.allocator;
     const src: [:0]const u8 =
         \\.{
-        \\    .{ .name = "labelle-scripting", .version = "0.1.0", .language = "lua" },
+        \\    .{ .name = "labelle-scripting", .version = "0.1.0", .params = .{ .language = "lua" } },
         \\    .{ .name = "pathfinding", .version = "4.0.1" },
         \\}
     ;
     const parsed = try std.zon.parse.fromSliceAlloc([]const PluginDep, alloc, src, null, .{});
     defer std.zon.parse.free(alloc, parsed);
     try std.testing.expectEqual(@as(usize, 2), parsed.len);
-    try std.testing.expectEqualStrings("lua", parsed[0].language.?);
-    try std.testing.expect(parsed[1].language == null);
+    try std.testing.expectEqualStrings("lua", parsed[0].params.?.language.?);
+    try std.testing.expect(parsed[1].params == null);
+}
+
+test "PluginDep: an EMPTY `.params` bag parses — every param stays null (#584)" {
+    // `.params = .{}` is legal: the bag is present, no parameter is set. The
+    // policy layer treats it exactly like an absent bag (no script language
+    // declared).
+    const alloc = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\.{
+        \\    .{ .name = "labelle-scripting", .version = "0.1.0", .params = .{} },
+        \\}
+    ;
+    const parsed = try std.zon.parse.fromSliceAlloc([]const PluginDep, alloc, src, null, .{});
+    defer std.zon.parse.free(alloc, parsed);
+    try std.testing.expect(parsed[0].params != null);
+    try std.testing.expect(parsed[0].params.?.language == null);
+}
+
+test "PluginDep: an unknown key inside `.params` is a hard parse error (#584)" {
+    // BY CONSTRUCTION: the project.labelle parse uses the default
+    // `ignore_unknown_fields = false`, so a key `Params` doesn't declare
+    // fails the parse — nothing silently drops. Schema-declared params (a
+    // plugin publishing its own accepted keys) are the plugin params
+    // follow-up ticket.
+    const alloc = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\.{
+        \\    .{ .name = "labelle-scripting", .version = "0.1.0", .params = .{ .lenguage = "lua" } },
+        \\}
+    ;
+    // Diagnostics rather than `null`: (a) the parser's owned
+    // unexpected-field note would leak on the null path (std.zon quirk),
+    // (b) it lets us pin the diagnostic that names the stray key.
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(alloc);
+    try std.testing.expectError(
+        error.ParseZon,
+        std.zon.parse.fromSliceAlloc([]const PluginDep, alloc, src, &diag, .{}),
+    );
+    const rendered = try std.fmt.allocPrint(alloc, "{f}", .{&diag});
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "unexpected field 'lenguage'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "supported: 'language'") != null);
 }
 
 test "effectiveGamepad: bgfx defaults to .none, other backends to .auto, explicit honored (assembler#533)" {

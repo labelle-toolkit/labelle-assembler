@@ -10,9 +10,9 @@
 //!
 //!   1. the gate is WIRED into `generate()` and fires BEFORE any target
 //!      write (a violating project leaves no stale `.labelle/<target>/`);
-//!   2. a clean project — no `.language`, no language dirs — generates
-//!      byte-identical output (the no-behavior-change regression guard:
-//!      the ticket is parse + validate ONLY).
+//!   2. a clean project — no `.params.language`, no language dirs —
+//!      generates byte-identical output (the no-behavior-change regression
+//!      guard: the ticket is parse + validate ONLY).
 
 const std = @import("std");
 const zspec = @import("zspec");
@@ -78,11 +78,12 @@ const StagedProject = struct {
 };
 
 /// The scripting-plugin `.plugins` entry every staged project uses:
-/// `.language = "lua"`, repo pointing at the staged empty local dir.
+/// `.params = .{ .language = "lua" }` (the generic plugin-params bag, v1
+/// slice), repo pointing at the staged empty local dir.
 const scripting_lua = generate.PluginDep{
     .name = "labelle-scripting",
     .repo = "local:plugins/scripting",
-    .language = "lua",
+    .params = .{ .language = "lua" },
 };
 
 pub const GENERATE_GATE = struct {
@@ -195,11 +196,11 @@ pub const GENERATE_GATE = struct {
 };
 
 pub const CLEAN_PROJECT_BYTE_IDENTITY = struct {
-    test "clean project (no .language, no language dirs): REAL generate output is byte-identical (#584)" {
+    test "clean project (no .params.language, no language dirs): REAL generate output is byte-identical (#584)" {
         // The load-bearing no-behavior-change guard. `generateAndReadBuildZig`
         // drives the PRODUCTION `generate` (which now runs the #584 language
         // gate) over the repo root — a clean project: no `.plugins` entry
-        // declares `.language`, no language convention dirs exist. The unit
+        // declares `.params.language`, no language convention dirs exist. The unit
         // helper calls `generateBuildZig` directly and NEVER runs the gate,
         // and its output is pinned to the committed pre-#584 golden by
         // MANIFEST_V2_DESKTOP_ANCHOR — so byte-equality here proves the gate

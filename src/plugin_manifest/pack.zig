@@ -90,9 +90,9 @@ pub const PackManifest = struct {
     /// (RFC-LANGUAGE-PLUGINS revs 8–9, assembler#584) — symmetric with
     /// `depends_on_resources`. Validated at load against
     /// `language_policy.SUPPORTED_LANGUAGES`, and at attach against the
-    /// project's declared `.language` (a Lua-scripted pack fails loudly in a
-    /// Rust project, naming both sides). Absent = the pack ships no language
-    /// scripts (every pack before this ticket) → byte-identical.
+    /// project's declared `.params.language` (a Lua-scripted pack fails
+    /// loudly in a Rust project, naming both sides). Absent = the pack ships
+    /// no language scripts (every pack before this ticket) → byte-identical.
     requires_language: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
@@ -205,10 +205,11 @@ pub fn loadPackFromDir(
     }
 
     // ── Validate `requires_language` vocabulary (#584) ──
-    // Same closed table as the plugin manifest / the project `.language`. The
-    // MATCH against the project's declared language runs in the generate-time
-    // policy gate (`language_policy.checkRequiresLanguage`) — this load-time
-    // check rejects typos at the source with the manifest named.
+    // Same closed table as the plugin manifest / the project's
+    // `.params.language`. The MATCH against the project's declared language
+    // runs in the generate-time policy gate
+    // (`language_policy.checkRequiresLanguage`) — this load-time check
+    // rejects typos at the source with the manifest named.
     if (parsed.requires_language) |req| {
         if (!language_policy.isSupportedLanguage(req)) {
             std.log.warn(
@@ -473,7 +474,7 @@ test "loadPackFromDir: parses requires_language (#584)" {
 
     // A pack whose bundled scripts are Ruby declares the requirement
     // (RFC-LANGUAGE-PLUGINS §6, symmetric with depends_on_resources); the
-    // attach-time match against the project's `.language` runs in the
+    // attach-time match against the project's `.params.language` runs in the
     // generate gate.
     try writePackManifestFile(tmp.dir,
         \\.{

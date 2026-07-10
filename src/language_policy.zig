@@ -2,13 +2,14 @@
 //! labelle-engine#237, `RFC-LANGUAGE-PLUGINS.md` revs 8–9).
 //!
 //! Scripting languages ship as ONE plugin (`labelle-scripting`) whose
-//! `.plugins` entry carries a **singular** `.language = "lua"` field — mixing
-//! is unrepresentable in config. This module is the generate-time enforcement
-//! layer of that policy:
+//! `.plugins` entry carries a **singular** `.params = .{ .language = "lua" }`
+//! parameter (the v1 slice of the generic plugin-params bag — see
+//! `config.PluginDep.Params`) — mixing is unrepresentable in config. This
+//! module is the generate-time enforcement layer of that policy:
 //!
-//!   1. **`.language` rules** (`resolveProjectLanguage`): the value must be a
-//!      supported language (`SUPPORTED_LANGUAGES`), and at most ONE `.plugins`
-//!      entry may declare it — two scripting plugins are an error.
+//!   1. **`.params.language` rules** (`resolveProjectLanguage`): the value
+//!      must be a supported language (`SUPPORTED_LANGUAGES`), and at most ONE
+//!      `.plugins` entry may declare it — two scripting plugins are an error.
 //!   2. **`requires_language` matching** (`checkRequiresLanguage`): a
 //!      plugin/pack manifest that declares `requires_language` (symmetric
 //!      with `depends_on_resources`) must match the project's declared
@@ -21,10 +22,11 @@
 //!      listing up to `MAX_LISTED_FILES` offenders; files with NO scripting
 //!      plugin declared error with the attach hint; EMPTY language dirs are
 //!      warn-only. Dir-presence detection is a cross-check, not the selector
-//!      (RFC rev 8) — the declared `.language` is authoritative.
+//!      (RFC rev 8) — the declared `.params.language` is authoritative.
 //!
-//! Everything here is parse + validate ONLY: no codegen consumes `.language`
-//! yet (the scripting plugin that does is a separate ticket), so a project
+//! Everything here is parse + validate ONLY: no codegen consumes
+//! `.params.language` yet (the scripting plugin that does is a separate
+//! ticket), so a project
 //! that declares no language and ships no language dirs generates
 //! byte-identical output. The orchestrator that feeds this module from the
 //! parsed config + pack entries is `generate_phases.validateLanguagePolicy`,
@@ -79,20 +81,23 @@ pub const DeclaredLanguage = struct {
 };
 
 /// Resolve the project's declared script language from its `.plugins` list
-/// (RFC rev 8: the plugin declaration carries a SINGULAR `.language`).
+/// (RFC rev 8: the plugin declaration carries a SINGULAR language, spelled
+/// `.params = .{ .language = "…" }` — the plugin-params bag's v1 parameter).
 ///
-/// Returns `null` when no plugin declares `.language` (a script-less project
-/// — the overwhelmingly common case). Errors on:
-///   - `error.UnknownScriptLanguage` — a `.language` outside
+/// Returns `null` when no plugin declares `.params.language` (a script-less
+/// project — the overwhelmingly common case; a `.params` bag WITHOUT
+/// `.language` counts as no declaration too). Errors on:
+///   - `error.UnknownScriptLanguage` — a `.params.language` outside
 ///     `SUPPORTED_LANGUAGES`.
 ///   - `error.MultipleLanguagePlugins` — two `.plugins` entries both declare
-///     `.language` (one script language per project; mixing is banned).
+///     `.params.language` (one script language per project; mixing is banned).
 pub fn resolveProjectLanguage(
     plugins: []const config.PluginDep,
 ) error{ UnknownScriptLanguage, MultipleLanguagePlugins }!?DeclaredLanguage {
     var found: ?DeclaredLanguage = null;
     for (plugins) |p| {
-        const lang = p.language orelse continue;
+        const params = p.params orelse continue;
+        const lang = params.language orelse continue;
         if (!isSupportedLanguage(lang)) {
             std.debug.print(
                 "labelle-assembler: plugin '{s}' declares unknown script language \"{s}\".\n" ++
@@ -103,9 +108,9 @@ pub fn resolveProjectLanguage(
         }
         if (found) |first| {
             std.debug.print(
-                "labelle-assembler: at most ONE plugin may declare `.language` (one script language per project):\n" ++
-                    "  plugin '{s}' declares .language = \"{s}\"\n" ++
-                    "  plugin '{s}' declares .language = \"{s}\"\n" ++
+                "labelle-assembler: at most ONE plugin may declare `.params.language` (one script language per project):\n" ++
+                    "  plugin '{s}' declares .params.language = \"{s}\"\n" ++
+                    "  plugin '{s}' declares .params.language = \"{s}\"\n" ++
                     "  remove one of the two declarations.\n",
                 .{ first.plugin_name, first.language, p.name, lang },
             );
@@ -147,14 +152,14 @@ pub fn checkRequiresLanguage(
         if (std.mem.eql(u8, d.language, req)) return;
         std.debug.print(
             "labelle-assembler: {s} '{s}' requires script language \"{s}\" but the project's declared language is \"{s}\" (plugin '{s}').\n" ++
-                "  one script language per project: attach only {s}s matching the project language, or change the scripting plugin's `.language`.\n",
+                "  one script language per project: attach only {s}s matching the project language, or change the scripting plugin's `.params.language`.\n",
             .{ unit_kind, unit_name, req, d.language, d.plugin_name, unit_kind },
         );
         return error.LanguageRequirementMismatch;
     }
     std.debug.print(
         "labelle-assembler: {s} '{s}' requires script language \"{s}\" but the project declares no script language.\n" ++
-            "  attach the scripting plugin in project.labelle with `.language = \"{s}\"`.\n",
+            "  attach the scripting plugin in project.labelle with `.params = .{{ .language = \"{s}\" }}`.\n",
         .{ unit_kind, unit_name, req, req },
     );
     return error.LanguageRequirementMismatch;
@@ -284,7 +289,7 @@ pub fn scanUnitLanguageDirs(
             );
             printListed(scanned);
             std.debug.print(
-                "  one script language per project (RFC-LANGUAGE-PLUGINS): remove these files or change the scripting plugin's `.language`.\n",
+                "  one script language per project (RFC-LANGUAGE-PLUGINS): remove these files or change the scripting plugin's `.params.language`.\n",
                 .{},
             );
             return error.ScriptLanguageMismatch;
@@ -297,7 +302,7 @@ pub fn scanUnitLanguageDirs(
         printListed(scanned);
         std.debug.print(
             "  attach the scripting plugin in project.labelle to run them, e.g.\n" ++
-                "    .plugins = .{{ .{{ .name = \"labelle-scripting\", .version = \"...\", .language = \"{s}\" }} }}\n" ++
+                "    .plugins = .{{ .{{ .name = \"labelle-scripting\", .version = \"...\", .params = .{{ .language = \"{s}\" }} }} }}\n" ++
                 "  or remove the {s}/ directory.\n",
             .{ lang, lang },
         );
@@ -342,10 +347,20 @@ test "resolveProjectLanguage: no declaration → null (script-less project)" {
     try testing.expect((try resolveProjectLanguage(&.{})) == null);
 }
 
+test "resolveProjectLanguage: `.params` bag WITHOUT `.language` → null (#584)" {
+    // A plugin may carry a `.params` bag that sets no `.language` (today the
+    // bag has no other parameter; schema-declared params are the follow-up
+    // ticket). That is NOT a script-language declaration.
+    const plugins = [_]config.PluginDep{
+        .{ .name = "pathfinding", .version = "4.0.1", .params = .{} },
+    };
+    try testing.expect((try resolveProjectLanguage(&plugins)) == null);
+}
+
 test "resolveProjectLanguage: one valid declaration → language + owning plugin" {
     const plugins = [_]config.PluginDep{
         .{ .name = "pathfinding", .version = "4.0.1" },
-        .{ .name = "labelle-scripting", .version = "0.1.0", .language = "lua" },
+        .{ .name = "labelle-scripting", .version = "0.1.0", .params = .{ .language = "lua" } },
     };
     const declared = (try resolveProjectLanguage(&plugins)).?;
     try testing.expectEqualStrings("lua", declared.language);
@@ -354,23 +369,23 @@ test "resolveProjectLanguage: one valid declaration → language + owning plugin
 
 test "resolveProjectLanguage: unknown vocabulary errors (#584)" {
     const plugins = [_]config.PluginDep{
-        .{ .name = "labelle-scripting", .language = "cobol" },
+        .{ .name = "labelle-scripting", .params = .{ .language = "cobol" } },
     };
     try testing.expectError(error.UnknownScriptLanguage, resolveProjectLanguage(&plugins));
 }
 
-test "resolveProjectLanguage: two `.language` declarations error (#584)" {
+test "resolveProjectLanguage: two `.params.language` declarations error (#584)" {
     // Two scripting plugins — even AGREEING on the language — are an error:
-    // the policy is one scripting plugin entry, singular `.language`.
+    // the policy is one scripting plugin entry, singular `.params.language`.
     const plugins = [_]config.PluginDep{
-        .{ .name = "labelle-scripting", .language = "lua" },
-        .{ .name = "acme-scripting", .language = "rust" },
+        .{ .name = "labelle-scripting", .params = .{ .language = "lua" } },
+        .{ .name = "acme-scripting", .params = .{ .language = "rust" } },
     };
     try testing.expectError(error.MultipleLanguagePlugins, resolveProjectLanguage(&plugins));
 
     const agreeing = [_]config.PluginDep{
-        .{ .name = "labelle-scripting", .language = "lua" },
-        .{ .name = "acme-scripting", .language = "lua" },
+        .{ .name = "labelle-scripting", .params = .{ .language = "lua" } },
+        .{ .name = "acme-scripting", .params = .{ .language = "lua" } },
     };
     try testing.expectError(error.MultipleLanguagePlugins, resolveProjectLanguage(&agreeing));
 }

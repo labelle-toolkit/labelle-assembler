@@ -428,8 +428,8 @@ pub fn validatePackGraph(
 /// cheaply without leaving stale output. Three layers, all fed from state
 /// `generate` already has:
 ///
-///   1. `.language` rules over `cfg.plugins` — supported vocabulary, at most
-///      ONE declaring entry (`language_policy.resolveProjectLanguage`).
+///   1. `.params.language` rules over `cfg.plugins` — supported vocabulary,
+///      at most ONE declaring entry (`language_policy.resolveProjectLanguage`).
 ///   2. `requires_language` matching — every attached plugin manifest
 ///      (re-read via `loadOptional`, same per-phase pattern as
 ///      `copyPluginConventionDirs`) and every pack manifest (already parsed
@@ -442,8 +442,8 @@ pub fn validatePackGraph(
 ///      the attach hint, empty dirs warn only.
 ///
 /// Parse + validate ONLY: nothing here writes, and a project with no
-/// `.language` and no language dirs passes through untouched (byte-identical
-/// generation).
+/// `.params.language` and no language dirs passes through untouched
+/// (byte-identical generation).
 pub fn validateLanguagePolicy(
     allocator: std.mem.Allocator,
     pack_entries: []const PackEntry,
@@ -987,15 +987,16 @@ test "Phase 2: a code-only plugin discovers nothing → byte-identical (#576)" {
 // Tests — one-language-per-project policy gate (#584)
 // ============================================================================
 
-/// A `.plugins` entry for the scripting plugin: `.language = "lua"`, repo a
-/// staged EMPTY local dir (`<project>/plugins/scripting/`) so `loadOptional`
-/// resolves cleanly to "no plugin.labelle" without warnings or cache access.
+/// A `.plugins` entry for the scripting plugin:
+/// `.params = .{ .language = … }`, repo a staged EMPTY local dir
+/// (`<project>/plugins/scripting/`) so `loadOptional` resolves cleanly to
+/// "no plugin.labelle" without warnings or cache access.
 fn stageScriptingPlugin(tmp: *std.testing.TmpDir, lang: []const u8) !config.PluginDep {
     try tmp.dir.createDirPath(testing.io, "plugins/scripting");
-    return .{ .name = "labelle-scripting", .repo = "local:plugins/scripting", .language = lang };
+    return .{ .name = "labelle-scripting", .repo = "local:plugins/scripting", .params = .{ .language = lang } };
 }
 
-test "validateLanguagePolicy: clean project (no .language, no language dirs) passes (#584)" {
+test "validateLanguagePolicy: clean project (no .params.language, no language dirs) passes (#584)" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1036,7 +1037,7 @@ test "validateLanguagePolicy: language files with NO scripting plugin error with
     );
 }
 
-test "validateLanguagePolicy: two plugins declaring .language error (#584)" {
+test "validateLanguagePolicy: two plugins declaring .params.language error (#584)" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1044,8 +1045,8 @@ test "validateLanguagePolicy: two plugins declaring .language error (#584)" {
     defer allocator.free(project_dir);
 
     const plugins = [_]config.PluginDep{
-        .{ .name = "labelle-scripting", .repo = "local:plugins/a", .language = "lua" },
-        .{ .name = "acme-scripting", .repo = "local:plugins/b", .language = "rust" },
+        .{ .name = "labelle-scripting", .repo = "local:plugins/a", .params = .{ .language = "lua" } },
+        .{ .name = "acme-scripting", .repo = "local:plugins/b", .params = .{ .language = "rust" } },
     };
     // Fails on the config alone — before any manifest/dir access, so the
     // (nonexistent) repo dirs are never touched.
