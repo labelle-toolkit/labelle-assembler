@@ -1,7 +1,7 @@
 {
     // Main scene — example game
     "name": "main",
-    "entities": [
+    "children": [
         // Player entity
         {
             "name": "player",

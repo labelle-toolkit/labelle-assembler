@@ -8,7 +8,7 @@
     // scene load — the only assertion this CI cares about is that
     // the whole pipeline compiles.
     "name": "main",
-    "entities": [
+    "children": [
         {
             "components": {
                 "Position": { "x": 100, "y": 200 }
