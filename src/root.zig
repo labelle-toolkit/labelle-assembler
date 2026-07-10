@@ -18,6 +18,7 @@ pub const flow_scanner = @import("flow_scanner.zig");
 pub const flow_catalog = @import("flow_catalog.zig");
 pub const pack_manifest = @import("manifest.zig");
 const build_files = @import("build_files.zig");
+const plugin_build_hook = @import("plugin_build_hook.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 pub const manifest_v2 = @import("codegen/manifest_v2.zig");
 const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
@@ -48,6 +49,7 @@ const tilemap_phase = @import("root/tilemap_phase.zig");
 test {
     _ = @import("config.zig");
     _ = @import("plugin_manifest.zig");
+    _ = @import("plugin_build_hook.zig");
     _ = @import("pack_validate.zig");
     _ = @import("check.zig");
     _ = @import("scene_name_lint.zig");
@@ -725,6 +727,19 @@ pub fn generate(
         pack_modules.deinit(allocator);
     }
 
+    // Plugin native build hooks (labelle-assembler#518): probe each declared
+    // plugin's resolved directory for a `plugin.hook.zig`. Discovered hooks are
+    // (a) emitted as `postWire` CALLs in the generated build.zig and (b) staged
+    // next to it below. `cfg_modules` (not `cfg`): only decl-module plugins are
+    // `b.dependency`-wired modules the hook can attach native sources to; light
+    // packs contribute dir-scan registry entries, never a module. Empty when no
+    // plugin ships a hook — the generated build.zig then stays byte-identical.
+    var plugin_hook_disc = try plugin_build_hook.discover(allocator, cfg_modules, game_dir);
+    defer plugin_build_hook.freeDiscovered(allocator, &plugin_hook_disc);
+    const plugin_hooks = try allocator.alloc(build_files.PluginHook, plugin_hook_disc.items.len);
+    defer allocator.free(plugin_hooks);
+    for (plugin_hook_disc.items, 0..) |d, i| plugin_hooks[i] = .{ .plugin_name = d.plugin_name };
+
     // Generate build.zig
     // `cfg_modules` (not `cfg`): light packs get no `b.dependency` /
     // `overrideImport` module wiring — their contribution is dir-scan
@@ -736,6 +751,7 @@ pub fn generate(
         .is_tests_target = is_tests_target,
         .promoted_scripts = promoted_scripts,
         .pack_modules = pack_modules.items,
+        .plugin_hooks = plugin_hooks,
         // Manifest-driven backend splice (assembler#378): pass the project
         // root so the splice can locate `backend.manifest.zon` + fragments.
         // Only consulted when the gate (desktop + manifest present) fires.
@@ -756,6 +772,12 @@ pub fn generate(
     if (backend_manifest_name) |name| {
         _ = try manifest_v2_splice.stageBackendBuildHook(allocator, cfg, game_dir, name, target_dir);
     }
+
+    // Plugin build hooks (#518): stage each discovered `plugin.hook.zig` next to
+    // the generated build.zig as `plugin_<name>_build_hook.zig`, so the
+    // `@import` the codegen above emitted resolves in the real output dir.
+    // Mirrors `stageBackendBuildHook`. No-op when no plugin ships a hook.
+    try plugin_build_hook.stage(allocator, plugin_hook_disc.items, target_dir);
 
     // Discover each plugin's `pub const Events` decls at assembler time
     // by AST-walking `<plugin>/src/root.zig`. The shim + main.zig

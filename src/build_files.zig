@@ -20,6 +20,7 @@ const build_zig_zon = @import("build_files/build_zig_zon.zig");
 // ── build.zig generator (build_files/build_zig.zig) ──────────────────
 pub const sanitizeExeName = build_zig.sanitizeExeName;
 pub const BuildZigOptions = build_zig.BuildZigOptions;
+pub const PluginHook = build_zig.PluginHook;
 pub const generateBuildZig = build_zig.generateBuildZig;
 
 // ── build.zig.zon generator (build_files/build_zig_zon.zig) ──────────
