@@ -45,10 +45,12 @@ extern "c" fn _wremove(filename: [*:0]const u16) c_int;
 // POSIX `remove` (std does not surface it via `std.c`).
 extern "c" fn remove(path: [*:0]const u8) c_int;
 
-/// Largest path (in UTF-16 code units) the Windows conversion buffer holds.
-/// Any real asset/screenshot path is far shorter; longer paths return null
-/// rather than truncate. A UTF-8 path of N bytes encodes to at most N UTF-16
-/// code units, so a path whose byte length fits also fits after conversion.
+/// Size (in UTF-16 code units) of the Windows conversion buffer, INCLUDING
+/// the slot reserved for the NUL terminator — so at most `max_path_wide - 1`
+/// code units of an actual path are stored. Any real asset/screenshot path is
+/// far shorter; longer paths return null rather than truncate or overflow. A
+/// UTF-8 path of N bytes encodes to at most N UTF-16 code units, so a path
+/// whose byte length fits also fits after conversion.
 const max_path_wide = 4096;
 
 /// Open `path` (UTF-8) with the C stdio `mode` string ("rb", "wb", …),
@@ -60,10 +62,10 @@ const max_path_wide = 4096;
 pub fn openC(path: [:0]const u8, comptime mode: [:0]const u8) ?*std.c.FILE {
     if (!is_windows) return std.c.fopen(path.ptr, mode.ptr);
 
-    var path_w: [max_path_wide:0]u16 = undefined;
-    const path_w_z = toWide(&path_w, path) orelse return null;
+    var path_w: [max_path_wide]u16 = undefined;
+    const path_w_z = utf8PathToWideZ(&path_w, path) catch return null;
     const mode_w = std.unicode.utf8ToUtf16LeStringLiteral(mode);
-    return _wfopen(path_w_z, mode_w);
+    return _wfopen(path_w_z.ptr, mode_w);
 }
 
 /// Delete the file at `path` (UTF-8). Returns true on success. UTF-8-correct
@@ -71,19 +73,29 @@ pub fn openC(path: [:0]const u8, comptime mode: [:0]const u8) ?*std.c.FILE {
 pub fn removeC(path: [:0]const u8) bool {
     if (!is_windows) return remove(path.ptr) == 0;
 
-    var path_w: [max_path_wide:0]u16 = undefined;
-    const path_w_z = toWide(&path_w, path) orelse return false;
-    return _wremove(path_w_z) == 0;
+    var path_w: [max_path_wide]u16 = undefined;
+    const path_w_z = utf8PathToWideZ(&path_w, path) catch return false;
+    return _wremove(path_w_z.ptr) == 0;
 }
 
-/// Convert a UTF-8 path into the caller-owned wide buffer, returning a
-/// null-terminated pointer into it, or null if the path is invalid UTF-8 or
-/// does not fit. Windows-only helper.
-fn toWide(buf: *[max_path_wide:0]u16, path: []const u8) ?[*:0]const u16 {
-    if (path.len > buf.len) return null;
-    const len = std.unicode.utf8ToUtf16Le(buf, path) catch return null;
+/// Convert a UTF-8 `path` into `buf` as a NUL-terminated UTF-16LE string,
+/// returning a sentinel-terminated slice that borrows `buf`.
+///
+/// Buffer safety: one slot is reserved for the NUL terminator, so the
+/// conversion is handed `buf[0 .. buf.len - 1]` and can write at most
+/// `buf.len - 1` code units — `buf[len] = 0` is therefore always in bounds.
+/// A UTF-8 path of N bytes encodes to at most N UTF-16 code units, so any
+/// `path` with `path.len >= buf.len` cannot leave room for the terminator
+/// and is rejected up front with `error.PathTooLong` (never truncated, never
+/// overflowed). Invalid UTF-8 yields `error.InvalidUtf8`.
+///
+/// Not platform-gated so the bounds logic is unit-testable on any host.
+fn utf8PathToWideZ(buf: []u16, path: []const u8) error{ PathTooLong, InvalidUtf8 }![:0]u16 {
+    if (path.len >= buf.len) return error.PathTooLong;
+    const len = std.unicode.utf8ToUtf16Le(buf[0 .. buf.len - 1], path) catch
+        return error.InvalidUtf8;
     buf[len] = 0;
-    return buf[0..len :0].ptr;
+    return buf[0..len :0];
 }
 
 test "openC round-trips a UTF-8 path" {
@@ -106,4 +118,32 @@ test "openC round-trips a UTF-8 path" {
     defer _ = std.c.fclose(fp);
     const n = std.c.fread(&buf, 1, buf.len, fp);
     try std.testing.expectEqualStrings(payload, buf[0..n]);
+}
+
+test "utf8PathToWideZ is bounds-safe at and over the buffer limit" {
+    // Small buffer so the boundary is easy to hit exactly. One slot is
+    // reserved for the NUL, so the longest path that fits is `buf.len - 1`.
+    var buf: [8]u16 = undefined;
+
+    // buf.len - 1 (7) ASCII chars fit, with the terminator at index 7.
+    {
+        const w = try utf8PathToWideZ(&buf, "abcdefg");
+        try std.testing.expectEqual(@as(usize, 7), w.len);
+        try std.testing.expectEqual(@as(u16, 0), buf[7]);
+        try std.testing.expectEqual(@as(u16, 'a'), w[0]);
+    }
+
+    // Exactly buf.len (8) chars would need an 8th unit + a NUL = 9 > 8, so it
+    // must be rejected — this is the case that previously wrote buf[8] OOB.
+    try std.testing.expectError(error.PathTooLong, utf8PathToWideZ(&buf, "abcdefgh"));
+
+    // Well over the limit is likewise safe (error, not panic/overflow).
+    try std.testing.expectError(error.PathTooLong, utf8PathToWideZ(&buf, "abcdefghijklmnop"));
+
+    // A zero-length path still fits and produces an empty NUL-terminated slice.
+    {
+        const w = try utf8PathToWideZ(&buf, "");
+        try std.testing.expectEqual(@as(usize, 0), w.len);
+        try std.testing.expectEqual(@as(u16, 0), buf[0]);
+    }
 }
