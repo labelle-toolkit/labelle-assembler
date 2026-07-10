@@ -43,6 +43,7 @@ pub const targets_audio_playback_contract: u32 = 1;
 pub const targets_audio_loader_contract: u32 = 1;
 
 const std = @import("std");
+const file_io = @import("file_io");
 const labelle_audio = @import("labelle-audio");
 const SokolSink = @import("audio/sink.zig");
 const decode = @import("audio/decode.zig");
@@ -86,7 +87,10 @@ extern "c" fn ftell(stream: *std.c.FILE) c_long;
 /// requested size). Caller owns the returned slice and frees it via
 /// `std.heap.page_allocator`.
 fn readFileBytes(path: [:0]const u8) ?[]u8 {
-    const file = std.c.fopen(path.ptr, "rb") orelse return null;
+    // `openC` routes through `_wfopen` on Windows so UTF-8 paths open by
+    // their real Unicode name (libc `fopen` mangles them via the ANSI
+    // codepage — labelle-assembler#232).
+    const file = file_io.openC(path, "rb") orelse return null;
     defer _ = std.c.fclose(file);
 
     if (fseek(file, 0, SEEK_END) != 0) return null;

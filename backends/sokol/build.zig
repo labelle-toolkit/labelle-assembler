@@ -154,6 +154,21 @@ pub fn build(b: *std.Build) void {
     input_opts.addOption(bool, "gamepad_enabled", gamepad_enabled);
     input_opts.addOption(bool, "gamepad_hidapi", gamepad_hidapi);
 
+    // ── Shared UTF-8-correct file-open shim (labelle-assembler#232) ──
+    // `src/file_io.zig` centralises the libc `fopen`/`remove` calls used by
+    // the texture / audio / screenshot loaders so a UTF-8 path opens by its
+    // real Unicode name on Windows (`_wfopen`) instead of being mangled by
+    // the ANSI codepage. It is reached from THREE module roots (gfx, audio,
+    // window), so it must be a NAMED module rather than a plain path import
+    // — a bare `src/file_io.zig` reached across module-root boundaries is
+    // rejected by Zig 0.16. Imported below as `file_io` into each consumer.
+    const file_io_mod = b.addModule("file_io", .{
+        .root_source_file = b.path("src/file_io.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     // ── Gfx backend module ──────────────────────────────────────────
     const gfx_mod = b.addModule("gfx", .{
         .root_source_file = b.path("src/gfx.zig"),
@@ -162,6 +177,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     gfx_mod.addImport("sokol", sokol_mod);
+    gfx_mod.addImport("file_io", file_io_mod);
     gfx_mod.addIncludePath(b.path("src"));
 
     // When cross-compiling to wasm32-emscripten the C compile of
@@ -287,6 +303,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     audio_mod.addImport("sokol", sokol_mod);
+    audio_mod.addImport("file_io", file_io_mod);
     audio_mod.addIncludePath(b.path("src"));
 
     // Shared audio engine (Phase 2 of the pluggable-backends RFC). The WAV
@@ -332,6 +349,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     window_mod.addImport("sokol", sokol_mod);
+    window_mod.addImport("file_io", file_io_mod);
 
     // ── Re-export the native artifact so consumers can link it ──────
     b.installArtifact(sokol_clib);
@@ -361,6 +379,21 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(astc_run).step);
+
+    // Run the UTF-8 fopen-shim round-trip test (labelle-assembler#232).
+    // `file_io.zig` depends only on std + libc (no sokol), so it EXECUTES on
+    // the host: it writes and reads back a non-ASCII path through `openC`,
+    // proving UTF-8 paths open correctly (via `_wfopen` on Windows, straight
+    // pass-through on POSIX). `link_libc` for the `fopen`/`remove` externs.
+    const file_io_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/file_io.zig"),
+            .target = host_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(file_io_run).step);
 
     // Compile-check audio.zig via a test binary off audio_mod. This
     // pulls in the full sokol module graph so it only works when the
