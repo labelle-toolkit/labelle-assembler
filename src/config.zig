@@ -263,6 +263,12 @@ pub const LayerDef = struct {
     /// projects that author no binding see zero output drift. Validated at
     /// generate time: the tag must be ≤ 15 chars and a valid identifier
     /// (`[A-Za-z_][A-Za-z0-9_]*`).
+    ///
+    /// REQUIRES gfx ≥ 1.26.0 (the release that adds `LayerConfig.camera`). The
+    /// assembler stays version-agnostic by design (RFC: "passes the tag through
+    /// verbatim, no resolution at generate time"), so authoring `.camera` on an
+    /// older gfx pin makes the generated `main.zig` fail to compile on that
+    /// field. Opt-in: only projects that use the binding take on the floor.
     camera: ?[]const u8 = null,
 };
 
