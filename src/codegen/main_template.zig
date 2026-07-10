@@ -27,6 +27,7 @@ const config = @import("../config.zig");
 const script_scanner = @import("../script_scanner.zig");
 const scene_manifest = @import("../scene_manifest.zig");
 const tilemap_scan = @import("../tilemap_scan.zig");
+const scripting = @import("../scripting_splice.zig");
 const scan = @import("scan.zig");
 const validate = @import("validate.zig");
 const context = @import("context.zig");
@@ -74,6 +75,17 @@ pub threadlocal var pack_scans: []const scan.PackScan = &.{};
 /// generator signature). Empty (the default) → tilemap-free project, no
 /// tilemap registrations emitted.
 pub threadlocal var tilemap_registrations: []const tilemap_scan.Registration = &.{};
+
+/// Scripting splice (labelle-assembler#593). Non-null when THE scripting
+/// plugin is attached with `.params.language` (see
+/// `scripting_splice.detect`): drives the `registerScript` registrations,
+/// the module-scope `scripting` alias + `scripting_enabled` flag, and the
+/// per-frame `script_contract.drainEvents` tap. `root.zig` sets this
+/// immediately before the `generateMainZigFromTemplate` call and clears it
+/// after — the same scoped-threadlocal pattern as `pack_scans`, kept off the
+/// ~19-arg generator signature. Null (the default) → script-less project,
+/// byte-identical emission.
+pub threadlocal var scripting_splice: ?scripting.ScriptingSplice = null;
 
 const ProjectConfig = config.ProjectConfig;
 const LayerDef = config.LayerDef;
@@ -221,6 +233,11 @@ pub fn generateMainZigFromTemplate(
         // site (tests, preview, tilemap-free projects), so those emit no
         // tilemap registrations.
         .tilemap_registrations = tilemap_registrations,
+        // Scripting splice (labelle-assembler#593) — read from the
+        // module-level var set by root.zig. Null for every existing call
+        // site (tests, preview, script-less projects), so those emit
+        // byte-identical output.
+        .scripting = scripting_splice,
         // wasm-only: does the backend's lifecycle (wasm) template ship its own
         // `pub const panic`? If so, the assembler must NOT also emit its
         // stopgap panic shim (they would duplicate the root decl). Scanned from

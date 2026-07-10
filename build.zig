@@ -144,6 +144,10 @@ pub fn build(b: *std.Build) void {
         // `generate` — the gate fires before any target write, and a clean
         // project generates byte-identical output.
         "test/language_policy_tests.zig",
+        // Scripting codegen splice (#593): registerScript embedding +
+        // scripting_enabled flag + drainEvents tap in the generated main,
+        // and the -Dlanguage dep option in the generated build.zig.
+        "test/scripting_splice_tests.zig",
     };
 
     for (test_files) |test_file| {

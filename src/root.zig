@@ -25,6 +25,7 @@ const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
 const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
+pub const scripting_splice = @import("scripting_splice.zig");
 pub const pack_validate = @import("pack_validate.zig");
 pub const panel_validate = @import("panel_validate.zig");
 const scene_name_lint = @import("scene_name_lint.zig");
@@ -60,6 +61,7 @@ test {
     _ = @import("asset_validator.zig");
     _ = @import("pack_resources.zig");
     _ = @import("language_policy.zig");
+    _ = @import("scripting_splice.zig");
     _ = @import("panel_validate.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
@@ -350,6 +352,17 @@ pub fn generate(
     // output.
     try generate_phases.validateLanguagePolicy(allocator, pack_entries.items, cfg.plugins, game_dir);
 
+    // ── Scripting splice detection (labelle-assembler#593) ─────────────
+    // The consuming half of the policy above: when THE scripting plugin
+    // (manifest name `scripting`) declares `.params.language`, resolve the
+    // splice (plugin import name + language + embed extension) once. The
+    // game root's `<language>/` dir is copied + scanned below (after the
+    // target dir exists); the splice then drives the generated main's
+    // registerScript calls / `scripting_enabled` flag / drainEvents tap and
+    // the generated build's `-Dlanguage` dep option. Null for every project
+    // without the plugin — all downstream sites are byte-identical no-ops.
+    var maybe_scripting = try scripting_splice.detect(allocator, cfg.plugins, game_dir);
+
     // ── Asset-Plugins Phase 3: studio panel descriptors (#577) ─────────
     // Validate every `studio/*.panel.jsonc` a plugin (or a pack it bundles)
     // ships, BEFORE any target is written — a malformed panel is a
@@ -445,6 +458,21 @@ pub fn generate(
     // prefix ordering, etc.). `linkDir` gives the same layout as
     // `linkAndScan` without the redundant name collection.
     try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
+
+    // ── Scripting splice: copy + scan the language dir (#593) ──────────
+    // Mirror the prefabs/scenes convention-dir copy for the declared
+    // language's `<language>/` dir (game root; `requires_language` pack dirs
+    // come later): link it into the target so the generated main's
+    // `@embedFile("<language>/<stem><ext>")` resolves, and record the SORTED
+    // stems (subdir paths joined with `/`, `linkAndScan`'s contract) as the
+    // script names the lifecycle builders register. A missing dir scans
+    // empty — the plugin is wired, nothing embeds.
+    var scripting_script_names: ?[][]const u8 = null;
+    defer if (scripting_script_names) |names| scanner.freeNames(allocator, names);
+    if (maybe_scripting) |*s| {
+        scripting_script_names = try scanner.linkAndScan(allocator, game_dir, target_dir, s.language, s.extension);
+        s.script_names = scripting_script_names.?;
+    }
 
     const scripts_target = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
     defer allocator.free(scripts_target);
@@ -810,6 +838,10 @@ pub fn generate(
         // byte-unchanged). When a v2 manifest is present this routes the
         // backend-dep + link sections to the v2 codegen (`manifest_v2_splice`).
         .backend_manifest_name = backend_manifest_name,
+        // Scripting splice (labelle-assembler#593): thread the declared
+        // language into the scripting plugin's `b.dependency` args
+        // (`-Dlanguage`). Null → byte-identical dep args.
+        .scripting = if (maybe_scripting) |s| .{ .plugin_name = s.plugin_name, .language = s.language } else null,
     });
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
@@ -1015,6 +1047,13 @@ pub fn generate(
         // Empty for tilemap-free projects, so their main.zig is byte-identical.
         defer main_zig.main_template.tilemap_registrations = &.{};
         main_zig.main_template.tilemap_registrations = tilemap_registrations;
+
+        // Scripting splice (labelle-assembler#593) — same scoped pattern.
+        // Carries the plugin import name + language + the sorted script
+        // stems scanned by the `<language>/` copy above. Null for projects
+        // without the scripting plugin, so their main.zig is byte-identical.
+        defer main_zig.main_template.scripting_splice = null;
+        main_zig.main_template.scripting_splice = maybe_scripting;
 
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,
