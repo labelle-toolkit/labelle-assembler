@@ -321,10 +321,30 @@ pub fn generate(
     // so a bad graph rejects the build without leaving stale output (#441).
     var pack_entries = try generate_phases.loadPackEntries(allocator, cfg.plugins, game_dir);
     defer {
-        for (pack_entries.items) |*e| e.manifest.deinit();
+        for (pack_entries.items) |*e| e.deinit(allocator);
         pack_entries.deinit(allocator);
     }
     try generate_phases.validatePackGraph(allocator, pack_entries.items, cfg.plugins);
+
+    // ── Asset-Plugins Phase 2: plugin-level `.resources` units (#576) ──
+    // A decl-module plugin may declare its OWN atlases in `plugin.labelle`
+    // (namespaced `<plugin>__<name>`, copied into `packs/<plugin>/assets/`). A
+    // plugin is NOT a scannable pack, so these units feed ONLY the resource
+    // merge + asset copy/namespace/validate below — never the pack scan / module
+    // / script phases (which stay keyed on `pack_entries`). Combined with the
+    // packs into `resource_entries`, they ride the exact Phase-1 machinery.
+    var plugin_res_units = try generate_phases.loadPluginResourceEntries(allocator, cfg.plugins, game_dir);
+    defer plugin_res_units.deinit(allocator);
+
+    // `resource_entries` = game/nested packs ++ plugin-level resource units.
+    // The merge + `processPackAssets` consume this combined view; everything
+    // else consumes `pack_entries`. Empty plugin-resource list → identical to
+    // `pack_entries` (byte-identity for plugins that ship no `.resources`).
+    var resource_entries: std.ArrayList(generate_phases.PackEntry) = .empty;
+    defer resource_entries.deinit(allocator);
+    try resource_entries.ensureTotalCapacity(allocator, pack_entries.items.len + plugin_res_units.entries.items.len);
+    resource_entries.appendSliceAssumeCapacity(pack_entries.items);
+    resource_entries.appendSliceAssumeCapacity(plugin_res_units.entries.items);
 
     // ── Asset-Plugins Phase 1: merge pack `.resources` (#573) ──────────
     // Fold every pack's declared `.resources` into the game's resource list,
@@ -337,7 +357,7 @@ pub fn generate(
     // rgba texture-path swaps above already ran on the game resources (their
     // `.astc`/`.rgba` siblings live in the game tree); pack resources ship
     // prebuilt and ride the plain `.png` path.
-    var merged_resources = try pack_resources.mergePackResources(allocator, mutable_resources, pack_entries.items);
+    var merged_resources = try pack_resources.mergePackResources(allocator, mutable_resources, resource_entries.items);
     defer merged_resources.deinit();
     cfg.resources = merged_resources.resources;
 
@@ -553,7 +573,7 @@ pub fn generate(
     // shipped or `depends_on_resources` frame — a dangling ref is a
     // generate-time error, not a silent runtime blank (#575). No-op for packs
     // without `.resources`.
-    try pack_resources.processPackAssets(allocator, pack_entries.items, cfg.resources, game_dir, target_dir);
+    try pack_resources.processPackAssets(allocator, resource_entries.items, cfg.resources, game_dir, target_dir);
 
     // Embedded-tilemap registrations (T2 Phase 4 + T3 #561/#562). AFTER
     // `loadPackScans` so the prefab scan (assembler#561) sees the staged pack

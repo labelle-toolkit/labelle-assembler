@@ -131,7 +131,9 @@ pub fn processPackAssets(
 ) !void {
     for (pack_entries) |e| {
         if (e.manifest.resources.len == 0 and e.manifest.depends_on_resources.len == 0) continue;
-        const pack_src_dir = cache.resolvePlugin(allocator, e.plugin, game_dir) catch continue;
+        // A nested pack / plugin-level resource unit (Phase 2, #576) carries an
+        // already-resolved `src_dir`; a game-local pack resolves by name.
+        const pack_src_dir = e.resolveSrcDir(allocator, game_dir) catch continue;
         defer allocator.free(pack_src_dir);
         try processOnePack(allocator, e, merged, pack_src_dir, target_dir);
     }
@@ -829,6 +831,79 @@ test "processOnePack: a dangling sprite ref fails generate" {
 
     const r = processOnePack(allocator, entry, &.{}, src_path, target_path);
     try testing.expectError(error.DanglingSpriteRef, r);
+}
+
+test "processOnePack: an unmet depends_on_resources is a generate error (#300)" {
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A pack/plugin overlay that declares it draws from a game atlas which is
+    // NOT in the merged resource set → the hidden-contract miss must fail
+    // generate rather than blank at runtime (labelle-cli#300 validation, run
+    // assembler-side).
+    try tmp.dir.createDirPath(tio, "src/overlay");
+    try tmp.dir.createDirPath(tio, "target/packs/overlay");
+    const src_path = try tmp.dir.realPathFileAlloc(tio, "src/overlay", allocator);
+    defer allocator.free(src_path);
+    const target_path = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target_path);
+
+    const manifest = plugin_manifest.PackManifest{
+        .name = "overlay",
+        .manifest_version = 1,
+        .convention_dirs = .copy_and_scan,
+        .depends_on_resources = &.{"characters"},
+        .allocator = allocator,
+    };
+    const entry = PackEntry{ .plugin = .{ .name = "overlay" }, .manifest = manifest };
+
+    // Merged set does NOT contain "characters".
+    const merged = [_]ResourceDef{
+        .{ .name = "background", .json = "bg.json", .texture = "bg.png" },
+    };
+    const r = processOnePack(allocator, entry, &merged, src_path, target_path);
+    try testing.expectError(error.UnknownResourceDependency, r);
+}
+
+test "processOnePack: a met depends_on_resources validates the overlay (#300)" {
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The game atlas the overlay depends on exists in the merged set and its
+    // JSON ships at the target — the overlay's prefab references a frame that
+    // atlas provides, so validation passes.
+    try tmp.dir.createDirPath(tio, "src/overlay");
+    try writeTestFile(tmp.dir, "target/characters.json",
+        \\{ "frames": { "hero_idle.png": { "frame": {} } }, "meta": {} }
+    );
+    try tmp.dir.createDirPath(tio, "target/packs/overlay/prefabs");
+    try writeTestFile(tmp.dir, "target/packs/overlay/prefabs/hero.jsonc",
+        \\{ "Sprite": { "sprite_name": "hero_idle.png" } }
+    );
+
+    const src_path = try tmp.dir.realPathFileAlloc(tio, "src/overlay", allocator);
+    defer allocator.free(src_path);
+    const target_path = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target_path);
+
+    const manifest = plugin_manifest.PackManifest{
+        .name = "overlay",
+        .manifest_version = 1,
+        .convention_dirs = .copy_and_scan,
+        .depends_on_resources = &.{"characters"},
+        .allocator = allocator,
+    };
+    const entry = PackEntry{ .plugin = .{ .name = "overlay" }, .manifest = manifest };
+
+    const merged = [_]ResourceDef{
+        .{ .name = "characters", .json = "characters.json", .texture = "characters.png" },
+    };
+    // No error — the overlay's `hero_idle.png` resolves via the depends_on atlas.
+    try processOnePack(allocator, entry, &merged, src_path, target_path);
 }
 
 test "generated resource loader for a merged pack atlas compiles under AstGen" {
