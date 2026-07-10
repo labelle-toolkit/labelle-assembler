@@ -174,9 +174,48 @@ pub fn swapRgbaTexturePaths(
 
 /// One declared pack: its `.plugins` entry paired with its parsed
 /// `pack.labelle`. The manifest owns heap memory freed via `.deinit()`.
+///
+/// Asset-Plugins Phase 2 (#576) adds two optional fields so a pack bundled
+/// INSIDE a plugin (`<plugin>/packs/<name>/`) — or a plugin's own plugin-level
+/// `.resources` unit — flows through the SAME pack machinery as a game-local
+/// pack. When `src_dir` is set the pack's source tree is already-resolved at
+/// that absolute path (rather than at `cache.resolvePlugin(plugin, game_dir)`);
+/// `owner_plugin` is the declaring plugin's name so the declaration-order
+/// script loop scans the nested pack at its owner's position. Both are null for
+/// a top-level game-local pack, preserving byte-identical behavior.
 pub const PackEntry = struct {
     plugin: config.PluginDep,
     manifest: plugin_manifest.PackManifest,
+    /// Already-resolved absolute source dir (nested pack / plugin root). Owned
+    /// by the entry, freed in `deinit`. Null → resolve via `cache.resolvePlugin`.
+    src_dir: ?[]const u8 = null,
+    /// Declaring plugin's name for a nested-pack entry (borrowed from
+    /// `cfg.plugins`; not freed). Null for a game-local pack.
+    owner_plugin: ?[]const u8 = null,
+    /// Whether this entry OWNS its `manifest` (frees it in `deinit`). A
+    /// plugin-level `.resources` unit borrows its manifest slices from a
+    /// kept-alive `PluginManifest`, so it sets this false to avoid a
+    /// double-free. Game-local and nested packs own their manifest.
+    owns_manifest: bool = true,
+
+    /// Resolve the pack's source directory: the `src_dir` override when set
+    /// (a nested / plugin-level unit), else `cache.resolvePlugin`. Always
+    /// returns an owned string the caller frees.
+    pub fn resolveSrcDir(
+        self: PackEntry,
+        allocator: std.mem.Allocator,
+        game_dir: []const u8,
+    ) ![]const u8 {
+        if (self.src_dir) |d| return allocator.dupe(u8, d);
+        return cache.resolvePlugin(allocator, self.plugin, game_dir);
+    }
+
+    /// Release everything the entry owns: the parsed manifest plus the owned
+    /// `src_dir` (if any). `owner_plugin` is borrowed and never freed.
+    pub fn deinit(self: *PackEntry, allocator: std.mem.Allocator) void {
+        if (self.owns_manifest) self.manifest.deinit();
+        if (self.src_dir) |d| allocator.free(d);
+    }
 };
 
 /// Read every declared pack's `pack.labelle` ONCE (Packs RFC §6, #441). The
@@ -195,15 +234,146 @@ pub fn loadPackEntries(
 ) !std.ArrayList(PackEntry) {
     var pack_entries: std.ArrayList(PackEntry) = .empty;
     errdefer {
-        for (pack_entries.items) |*e| e.manifest.deinit();
+        for (pack_entries.items) |*e| e.deinit(allocator);
         pack_entries.deinit(allocator);
     }
-    try pack_entries.ensureTotalCapacity(allocator, plugins.len);
     for (plugins) |plugin| {
-        const pm = (try plugin_manifest.loadPackOptional(allocator, plugin, game_dir)) orelse continue;
-        pack_entries.appendAssumeCapacity(.{ .plugin = plugin, .manifest = pm });
+        // A game-local pack: the `.plugins` entry itself carries `pack.labelle`.
+        // Reserve BEFORE the (fallible) load so a parsed manifest is never
+        // owned-but-unreachable on an OOM resize (#441 leak-window rule).
+        try pack_entries.ensureUnusedCapacity(allocator, 1);
+        if (try plugin_manifest.loadPackOptional(allocator, plugin, game_dir)) |pm| {
+            pack_entries.appendAssumeCapacity(.{ .plugin = plugin, .manifest = pm });
+        }
+        // Asset-Plugins Phase 2 (#576): packs BUNDLED inside a decl-module
+        // plugin at `<plugin>/packs/<name>/` register as first-class packs.
+        try discoverNestedPacks(allocator, &pack_entries, plugin, game_dir);
     }
     return pack_entries;
+}
+
+/// Append a `PackEntry` for every pack `plugin` bundles under its `.packs`
+/// (Asset-Plugins Phase 2, #576). Each nested pack is a light pack with the
+/// identical structure to a game-local one — its own `pack.labelle` under
+/// `<plugin>/packs/<name>/` — so it flows through the SAME pack machinery
+/// (scan, `pack__` namespacing, resource merge). The entry records the resolved
+/// nested `src_dir` (so downstream phases skip the `cache.resolvePlugin` name
+/// lookup that only resolves top-level plugins) and the `owner_plugin` (so the
+/// declaration-order script loop scans it at its owner's position). No-op for a
+/// plugin with no `plugin.labelle` or an empty `.packs`.
+fn discoverNestedPacks(
+    allocator: std.mem.Allocator,
+    pack_entries: *std.ArrayList(PackEntry),
+    plugin: config.PluginDep,
+    game_dir: []const u8,
+) !void {
+    var pmani = (try plugin_manifest.loadOptional(allocator, plugin, game_dir)) orelse return;
+    defer pmani.deinit();
+    if (pmani.packs.len == 0) return;
+
+    const plugin_dir = try cache.resolvePlugin(allocator, plugin, game_dir);
+    defer allocator.free(plugin_dir);
+
+    for (pmani.packs) |nested_name| {
+        try pack_entries.ensureUnusedCapacity(allocator, 1);
+        const entry = (try loadNestedPackEntry(allocator, nested_name, plugin.name, plugin_dir)) orelse continue;
+        pack_entries.appendAssumeCapacity(entry);
+    }
+}
+
+/// Load one nested pack's `pack.labelle` from `<plugin_dir>/packs/<nested_name>/`
+/// and build its `PackEntry` (Phase 2, #576). Returns `null` when the bundled
+/// dir has no `pack.labelle` (tolerated, matching the game-local pack path).
+/// `owner_name` is borrowed from `cfg.plugins` (lives the whole generate);
+/// `.plugin.name` aliases the manifest's OWN duped `name`, so the entry needs no
+/// separate name allocation.
+fn loadNestedPackEntry(
+    allocator: std.mem.Allocator,
+    nested_name: []const u8,
+    owner_name: []const u8,
+    plugin_dir: []const u8,
+) !?PackEntry {
+    const nested_dir = try std.fs.path.join(allocator, &.{ plugin_dir, "packs", nested_name });
+    errdefer allocator.free(nested_dir);
+    const pm = (try plugin_manifest.loadPackFromDir(allocator, nested_dir, nested_name)) orelse {
+        allocator.free(nested_dir);
+        return null;
+    };
+    return PackEntry{
+        .plugin = .{ .name = pm.name },
+        .manifest = pm,
+        .src_dir = nested_dir,
+        .owner_plugin = owner_name,
+    };
+}
+
+/// Plugin-level `.resources` units (Asset-Plugins Phase 2, #576): a decl-module
+/// plugin may declare its OWN atlases directly in `plugin.labelle` (namespaced
+/// `<plugin>__<name>`, copied into `packs/<plugin>/assets/`). Unlike a nested
+/// pack, a plugin is NOT a scannable pack, so these entries feed ONLY the
+/// resource-merge + asset-copy/validate path — never the pack scan / module /
+/// script machinery.
+///
+/// Ownership: each unit's `PackManifest` BORROWS its slices from the kept-alive
+/// `PluginManifest` (`owns_manifest = false`), so the parsed plugin manifests
+/// must outlive the entries. `PluginResourceUnits` owns both; free the entries
+/// FIRST (they touch only `src_dir`), then the manifests.
+pub const PluginResourceUnits = struct {
+    entries: std.ArrayList(PackEntry) = .empty,
+    manifests: std.ArrayList(plugin_manifest.PluginManifest) = .empty,
+
+    pub fn deinit(self: *PluginResourceUnits, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |*e| e.deinit(allocator);
+        self.entries.deinit(allocator);
+        for (self.manifests.items) |*m| m.deinit();
+        self.manifests.deinit(allocator);
+    }
+};
+
+pub fn loadPluginResourceEntries(
+    allocator: std.mem.Allocator,
+    plugins: []const config.PluginDep,
+    game_dir: []const u8,
+) !PluginResourceUnits {
+    var units: PluginResourceUnits = .{};
+    errdefer units.deinit(allocator);
+
+    for (plugins) |plugin| {
+        // Reserve the manifest slot BEFORE the fallible load so a parsed
+        // PluginManifest is never owned-but-unreachable on an OOM resize.
+        try units.manifests.ensureUnusedCapacity(allocator, 1);
+        var pmani = (try plugin_manifest.loadOptional(allocator, plugin, game_dir)) orelse continue;
+        if (pmani.resources.len == 0 and pmani.depends_on_resources.len == 0) {
+            pmani.deinit();
+            continue;
+        }
+
+        // Build the borrowing PackManifest from `pmani`'s stable heap slices
+        // (they point at separately-allocated strings, not into the ArrayList
+        // buffer, so a later manifests-resize can't invalidate them).
+        const borrowed = plugin_manifest.PackManifest{
+            .name = pmani.name,
+            .manifest_version = pmani.manifest_version,
+            .convention_dirs = .copy_and_scan,
+            .resources = pmani.resources,
+            .depends_on_resources = pmani.depends_on_resources,
+            .allocator = allocator,
+        };
+        units.manifests.appendAssumeCapacity(pmani); // now owned by the list
+
+        // Reserve the entry slot BEFORE resolving the plugin dir so the owned
+        // `src_dir` is taken by an infallible append (no leak window).
+        try units.entries.ensureUnusedCapacity(allocator, 1);
+        const plugin_dir = try cache.resolvePlugin(allocator, plugin, game_dir);
+        units.entries.appendAssumeCapacity(.{
+            .plugin = plugin,
+            .manifest = borrowed,
+            .src_dir = plugin_dir,
+            .owner_plugin = plugin.name,
+            .owns_manifest = false,
+        });
+    }
+    return units;
 }
 
 /// Dependency-validation gate for the parsed pack manifests (Packs RFC §6,
@@ -226,8 +396,13 @@ pub fn validatePackGraph(
     // project.labelle (plus the implicit `contracts`, handled inside).
     var declared_names: std.ArrayList([]const u8) = .empty;
     defer declared_names.deinit(allocator);
-    try declared_names.ensureTotalCapacity(allocator, plugins.len);
+    try declared_names.ensureTotalCapacity(allocator, plugins.len + pack_entries.len);
     for (plugins) |plugin| declared_names.appendAssumeCapacity(plugin.name);
+    // Phase 2 (#576): nested packs are legal `depends_on` targets too — a pack
+    // bundled inside a plugin isn't in `.plugins`, so add every pack entry's
+    // own name (game-local names re-added harmlessly; membership is all the
+    // dep check needs).
+    for (pack_entries) |e| declared_names.appendAssumeCapacity(e.plugin.name);
 
     try pack_validate.validate(allocator, pack_deps.items, declared_names.items);
 
@@ -395,6 +570,20 @@ pub fn copyPluginShippedScripts(
             continue;
         }
 
+        // Asset-Plugins Phase 2 (#576): scan the scripts of every pack this
+        // decl-module plugin BUNDLES, at the OWNER plugin's declaration
+        // position — so a nested pack's per-frame scripts keep the same
+        // ordering guarantee a game-local pack gets (#494). Runs BEFORE the
+        // plugin's own `scripts/` scan below so the bundled packs' scripts
+        // order ahead of the host plugin's, matching declaration nesting.
+        for (pack_entries) |e| {
+            const owner = e.owner_plugin orelse continue;
+            if (!std.mem.eql(u8, owner, plugin.name)) continue;
+            const nested_src = try e.resolveSrcDir(allocator, game_dir);
+            defer allocator.free(nested_src);
+            _ = try pack_scan.scanPackScriptsAt(allocator, script_scan, nested_src, target_dir, e.plugin.name);
+        }
+
         // Plugin was already resolved during the manifest-loading loop
         // above; re-resolving here is infallible in practice. Use `try`
         // to match the manifest-load contract — a failure here is a
@@ -456,7 +645,9 @@ pub fn loadPackScans(
     try pack_scans.ensureTotalCapacity(allocator, pack_entries.len);
     for (pack_entries) |e| {
         // Reuse the manifest parsed above; only the source dir is resolved here.
-        const pack_src_dir = try cache.resolvePlugin(allocator, e.plugin, game_dir);
+        // A nested pack (Phase 2, #576) carries an already-resolved `src_dir`
+        // override; a game-local pack resolves via `cache.resolvePlugin`.
+        const pack_src_dir = try e.resolveSrcDir(allocator, game_dir);
         defer allocator.free(pack_src_dir);
 
         // ensureTotalCapacity above reserved pack_entries.len slots, so this
@@ -552,4 +743,185 @@ pub fn buildPackModules(
         pack_modules.appendAssumeCapacity(.{ .name = pack.name, .prefix = try allocator.dupe(u8, pfx), .depends_on = depends_on });
     }
     return pack_modules;
+}
+
+// ============================================================================
+// Tests — Asset-Plugins Phase 2 (#576): plugin `.resources` + nested `.packs`
+// ============================================================================
+
+const testing = std.testing;
+const pack_resources = @import("../pack_resources.zig");
+
+fn writeTestFile(dir: std.Io.Dir, rel: []const u8, body: []const u8) !void {
+    const tio = testing.io;
+    if (std.fs.path.dirname(rel)) |sub| try dir.createDirPath(tio, sub);
+    var f = try dir.createFile(tio, rel, .{});
+    defer f.close(tio);
+    try f.writeStreamingAll(tio, body);
+}
+
+/// Stage a full Phase-2 plugin tree under `<tmp>/myplugin/`:
+///   plugin.labelle (.resources = ui, .packs = { dungeon })
+///   assets/ui.{json,png}
+///   packs/dungeon/pack.labelle + assets/tiles.{json,png}
+/// Returns the plugin as a `local:` PluginDep pointing at its absolute path.
+fn stagePhase2Plugin(tmp: *std.testing.TmpDir, allocator: std.mem.Allocator) !config.PluginDep {
+    try writeTestFile(tmp.dir, "myplugin/plugin.labelle",
+        \\.{
+        \\    .name = "myplugin",
+        \\    .manifest_version = 1,
+        \\    .license = "MIT",
+        \\    .author = "acme",
+        \\    .resources = .{
+        \\        .{ .name = "ui", .json = "assets/ui.json", .texture = "assets/ui.png" },
+        \\    },
+        \\    .packs = .{ "dungeon" },
+        \\}
+    );
+    try writeTestFile(tmp.dir, "myplugin/assets/ui.json",
+        \\{ "frames": { "button.png": {} }, "meta": {} }
+    );
+    try writeTestFile(tmp.dir, "myplugin/assets/ui.png", "PNG");
+    try writeTestFile(tmp.dir, "myplugin/packs/dungeon/pack.labelle",
+        \\.{
+        \\    .name = "dungeon",
+        \\    .manifest_version = 1,
+        \\    .resources = .{
+        \\        .{ .name = "tiles", .json = "assets/tiles.json", .texture = "assets/tiles.png" },
+        \\    },
+        \\}
+    );
+    try writeTestFile(tmp.dir, "myplugin/packs/dungeon/assets/tiles.json",
+        \\{ "frames": { "wall.png": {} }, "meta": {} }
+    );
+    try writeTestFile(tmp.dir, "myplugin/packs/dungeon/assets/tiles.png", "PNG");
+
+    const abs = try tmp.dir.realPathFileAlloc(testing.io, "myplugin", allocator);
+    defer allocator.free(abs);
+    const repo = try std.fmt.allocPrint(allocator, "local:{s}", .{abs});
+    // `repo` is owned by the returned PluginDep; the caller frees it.
+    return config.PluginDep{ .name = "myplugin", .repo = repo };
+}
+
+test "Phase 2: a plugin's nested .packs are discovered as first-class packs (#576)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const plugin = try stagePhase2Plugin(&tmp, allocator);
+    defer allocator.free(plugin.repo);
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    var pack_entries = try loadPackEntries(allocator, &.{plugin}, project_dir);
+    defer {
+        for (pack_entries.items) |*e| e.deinit(allocator);
+        pack_entries.deinit(allocator);
+    }
+
+    // The plugin itself is NOT a game-local pack (no pack.labelle at its root);
+    // only its bundled `dungeon` pack is discovered.
+    try testing.expectEqual(@as(usize, 1), pack_entries.items.len);
+    const nested = pack_entries.items[0];
+    try testing.expectEqualStrings("dungeon", nested.plugin.name);
+    try testing.expectEqualStrings("myplugin", nested.owner_plugin.?);
+    try testing.expect(nested.src_dir != null);
+    try testing.expect(std.mem.endsWith(u8, nested.src_dir.?, "dungeon"));
+
+    // resolveSrcDir returns the override, not a name-resolution.
+    const resolved = try nested.resolveSrcDir(allocator, project_dir);
+    defer allocator.free(resolved);
+    try testing.expectEqualStrings(nested.src_dir.?, resolved);
+}
+
+test "Phase 2: a plugin's own .resources become a plugin-level unit (#576)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const plugin = try stagePhase2Plugin(&tmp, allocator);
+    defer allocator.free(plugin.repo);
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    var units = try loadPluginResourceEntries(allocator, &.{plugin}, project_dir);
+    defer units.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), units.entries.items.len);
+    const unit = units.entries.items[0];
+    try testing.expectEqualStrings("myplugin", unit.plugin.name);
+    try testing.expect(!unit.owns_manifest); // borrows from the kept-alive PluginManifest
+    try testing.expect(unit.src_dir != null);
+    try testing.expectEqual(@as(usize, 1), unit.manifest.resources.len);
+    try testing.expectEqualStrings("ui", unit.manifest.resources[0].name);
+}
+
+test "Phase 2: plugin `.resources` + nested-pack resources merge namespaced (#576)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const plugin = try stagePhase2Plugin(&tmp, allocator);
+    defer allocator.free(plugin.repo);
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    var pack_entries = try loadPackEntries(allocator, &.{plugin}, project_dir);
+    defer {
+        for (pack_entries.items) |*e| e.deinit(allocator);
+        pack_entries.deinit(allocator);
+    }
+    var units = try loadPluginResourceEntries(allocator, &.{plugin}, project_dir);
+    defer units.deinit(allocator);
+
+    // Combined resource view = nested packs ++ plugin-level units (the exact
+    // slice root.generate builds).
+    var combined: std.ArrayList(PackEntry) = .empty;
+    defer combined.deinit(allocator);
+    try combined.appendSlice(allocator, pack_entries.items);
+    try combined.appendSlice(allocator, units.entries.items);
+
+    const game = [_]ResourceDef{
+        .{ .name = "background", .json = "assets/bg.json", .texture = "assets/bg.png" },
+    };
+    var merged = try pack_resources.mergePackResources(allocator, &game, combined.items);
+    defer merged.deinit();
+
+    // Game resource first (byte-identical), then dungeon pack + plugin unit.
+    try testing.expectEqual(@as(usize, 3), merged.resources.len);
+    try testing.expectEqualStrings("background", merged.resources[0].name);
+    try testing.expectEqualStrings("dungeon__tiles", merged.resources[1].name);
+    try testing.expectEqualStrings("packs/dungeon/assets/tiles.json", merged.resources[1].json);
+    try testing.expectEqualStrings("myplugin__ui", merged.resources[2].name);
+    try testing.expectEqualStrings("packs/myplugin/assets/ui.json", merged.resources[2].json);
+}
+
+test "Phase 2: a code-only plugin discovers nothing → byte-identical (#576)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A plugin.labelle with no .resources and no .packs — every plugin before
+    // this ticket. No nested packs, no plugin-level resource units.
+    try writeTestFile(tmp.dir, "codeonly/plugin.labelle",
+        \\.{ .name = "codeonly", .manifest_version = 1 }
+    );
+    const abs = try tmp.dir.realPathFileAlloc(testing.io, "codeonly", allocator);
+    defer allocator.free(abs);
+    const repo = try std.fmt.allocPrint(allocator, "local:{s}", .{abs});
+    defer allocator.free(repo);
+    const plugin = config.PluginDep{ .name = "codeonly", .repo = repo };
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    var pack_entries = try loadPackEntries(allocator, &.{plugin}, project_dir);
+    defer {
+        for (pack_entries.items) |*e| e.deinit(allocator);
+        pack_entries.deinit(allocator);
+    }
+    var units = try loadPluginResourceEntries(allocator, &.{plugin}, project_dir);
+    defer units.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 0), pack_entries.items.len);
+    try testing.expectEqual(@as(usize, 0), units.entries.items.len);
 }

@@ -65,6 +65,37 @@ pub const PluginManifest = struct {
     manifest_version: u8,
     convention_dirs: []const ConventionDir = &.{},
 
+    /// Plugin-level assets (Asset-Plugins RFC Phase 2, labelle-assembler#576).
+    /// Same `ResourceDef` shape as `project.labelle` / `pack.labelle`. Paths
+    /// are relative to the plugin root (e.g. `assets/ui.json`). The assembler
+    /// merges these into the game resource list namespaced `<plugin>__<name>`,
+    /// copied+repathed into `packs/<plugin>/…` — exactly like a pack's
+    /// `.resources` (Phase 1). Empty/absent = a code-only plugin (every plugin
+    /// before this ticket) → byte-identical output.
+    resources: []const config.ResourceDef = &.{},
+
+    /// Names of packs BUNDLED inside this plugin at `<plugin>/packs/<name>/`
+    /// (Asset-Plugins RFC Phase 2, labelle-assembler#576). Each nested pack has
+    /// the identical structure to a game-local pack (its own `pack.labelle` +
+    /// convention dirs) and registers through the SAME pack machinery — copy,
+    /// scan, `pack__` namespacing, resource merge — as if declared directly in
+    /// `project.labelle`. Empty/absent = a plugin that bundles no packs.
+    packs: []const []const u8 = &.{},
+
+    /// Game (or other unit) atlases this plugin's own `.resources`/prefabs
+    /// deliberately draw from (Asset-Plugins RFC Phase 2). Same contract as a
+    /// pack's `depends_on_resources`: every entry must resolve in the merged
+    /// resource list. Empty/absent = self-contained.
+    depends_on_resources: []const []const u8 = &.{},
+
+    /// SPDX-style license identifier for a shipped/sold plugin (Asset-Plugins
+    /// RFC Phase 2, labelle-cli#300). Surfaced by `labelle plugins`. Optional.
+    license: ?[]const u8 = null,
+
+    /// Author/vendor of the plugin (Asset-Plugins RFC Phase 2). Surfaced by
+    /// `labelle plugins`. Optional.
+    author: ?[]const u8 = null,
+
     /// Allocator that owns the parsed strings and slice. Stored on
     /// the manifest so the caller doesn't have to remember to pass
     /// the right allocator to deinit.
@@ -78,6 +109,11 @@ pub const PluginManifest = struct {
         // outer slice.
         std.zon.parse.free(self.allocator, self.name);
         std.zon.parse.free(self.allocator, self.convention_dirs);
+        std.zon.parse.free(self.allocator, self.resources);
+        std.zon.parse.free(self.allocator, self.packs);
+        std.zon.parse.free(self.allocator, self.depends_on_resources);
+        std.zon.parse.free(self.allocator, self.license);
+        std.zon.parse.free(self.allocator, self.author);
     }
 };
 
@@ -252,10 +288,29 @@ pub fn loadFromDir(
         }
     }
 
+    // ── Validate every nested `.packs` name (Phase 2, #576) ──
+    // A nested pack name is concatenated into `<plugin>/packs/<name>/` and into
+    // the target `packs/<name>/…`, so it must be a plain relative segment for
+    // the same path-traversal reason `convention_dirs` names are guarded.
+    for (parsed.packs) |pack_name| {
+        if (!isSafeDirName(pack_name)) {
+            std.debug.print(
+                "labelle: plugin '{s}' declared nested pack name '{s}' that is not a safe relative directory name\n  pack names must be plain single segments (no '/', '\\', '..', '.', absolute paths, or NUL)\n",
+                .{ expected_name, pack_name },
+            );
+            return error.PluginManifestUnsafeDirName;
+        }
+    }
+
     return PluginManifest{
         .name = parsed.name,
         .manifest_version = parsed.manifest_version,
         .convention_dirs = parsed.convention_dirs,
+        .resources = parsed.resources,
+        .packs = parsed.packs,
+        .depends_on_resources = parsed.depends_on_resources,
+        .license = parsed.license,
+        .author = parsed.author,
         .allocator = allocator,
     };
 }
@@ -268,6 +323,13 @@ const ZonManifest = struct {
     name: []const u8,
     manifest_version: u8,
     convention_dirs: []const ConventionDir = &.{},
+    // Asset-Plugins Phase 2 (#576 / cli#300). All optional/additive; an older
+    // manifest that omits them parses to the byte-identical empty/null defaults.
+    resources: []const config.ResourceDef = &.{},
+    packs: []const []const u8 = &.{},
+    depends_on_resources: []const []const u8 = &.{},
+    license: ?[]const u8 = null,
+    author: ?[]const u8 = null,
 };
 
 // ============================================================================
@@ -726,6 +788,86 @@ test "loadFromDir: rejects copy_and_scan without extension" {
 
     const result = loadFromDir(testing.allocator, tmp_path, "fsm");
     try testing.expectError(error.PluginManifestMissingExtension, result);
+}
+
+test "loadFromDir: parses Phase-2 .resources/.packs/depends_on_resources/license/author (#576)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Asset-Plugins Phase 2: a full plugin declares its OWN atlases, bundles
+    // nested packs, overlays game atlases, and carries provenance metadata.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "dungeon_kit",
+        \\    .manifest_version = 1,
+        \\    .license = "MIT",
+        \\    .author = "acme",
+        \\    .resources = .{
+        \\        .{ .name = "ui", .json = "assets/ui.json", .texture = "assets/ui.png" },
+        \\    },
+        \\    .packs = .{ "dungeon", "props" },
+        \\    .depends_on_resources = .{ "characters" },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "dungeon_kit")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqual(@as(usize, 1), manifest.resources.len);
+    try testing.expectEqualStrings("ui", manifest.resources[0].name);
+    try testing.expectEqualStrings("assets/ui.json", manifest.resources[0].json);
+    try testing.expectEqual(@as(usize, 2), manifest.packs.len);
+    try testing.expectEqualStrings("dungeon", manifest.packs[0]);
+    try testing.expectEqualStrings("props", manifest.packs[1]);
+    try testing.expectEqual(@as(usize, 1), manifest.depends_on_resources.len);
+    try testing.expectEqualStrings("characters", manifest.depends_on_resources[0]);
+    try testing.expectEqualStrings("MIT", manifest.license.?);
+    try testing.expectEqualStrings("acme", manifest.author.?);
+}
+
+test "loadFromDir: Phase-2 fields absent → empty/null (byte-identity default)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{ .name = "code_only", .manifest_version = 1 }
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "code_only")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqual(@as(usize, 0), manifest.resources.len);
+    try testing.expectEqual(@as(usize, 0), manifest.packs.len);
+    try testing.expectEqual(@as(usize, 0), manifest.depends_on_resources.len);
+    try testing.expect(manifest.license == null);
+    try testing.expect(manifest.author == null);
+}
+
+test "loadFromDir: rejects a nested pack name that escapes the plugin dir (#576)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A `.packs` entry is joined into `<plugin>/packs/<name>/` — a traversal
+    // segment would let a plugin reach outside its own tree.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "evil",
+        \\    .manifest_version = 1,
+        \\    .packs = .{ "../../etc" },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadFromDir(testing.allocator, tmp_path, "evil");
+    try testing.expectError(error.PluginManifestUnsafeDirName, result);
 }
 
 test "loadFromDir: ignore_unknown_fields allows forward-compat manifests" {
