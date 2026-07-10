@@ -1,0 +1,18 @@
+// `tiles` — the dungeon tileset pack, bundled inside the fantasy-dungeon
+// plugin at `plugin/packs/tiles/`. A light pack (no module / build.zig —
+// dir-scanned convention files), namespaced `tiles__*`.
+//
+// Asset-Plugins Phase 1 (labelle-assembler#579): it SHIPS its own atlas via
+// `.resources`. The assembler merges `tileset` into the game resource list as
+// `tiles__tileset`, copies `assets/` into `packs/tiles/…`, and rewrites the
+// atlas frame keys to `tiles/<frame>` + this pack's prefab `sprite_name` refs
+// to match — so the tiles can never collide with the game's or another pack's
+// sprites, with zero engine changes.
+.{
+    .name = "tiles",
+    .manifest_version = 1,
+    .convention_dirs = .copy_and_scan,
+    .resources = .{
+        .{ .name = "tileset", .json = "assets/tileset.json", .texture = "assets/tileset.png" },
+    },
+}

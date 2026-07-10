@@ -1,0 +1,30 @@
+// `fantasy-dungeon` — the REFERENCE asset plugin (Asset-Plugins RFC Phase 2,
+// labelle-engine#725 §use-case-2 / labelle-assembler#576). A vendor-style
+// "full plugin" a game attaches by one `.plugins` entry to get a whole
+// dungeon content kit — bundled packs, plugin-level art, and provenance —
+// with ZERO manual `.resources` edits in the consuming project.
+//
+// What it exercises:
+//   - `.packs` — two packs BUNDLED at `plugin/packs/<name>/` (`tiles` +
+//     `props`). Each is discovered as a first-class pack and flows through the
+//     SAME machinery (copy, scan, `pack__` namespacing, resource merge, script
+//     wiring) as a game-local pack.
+//   - `.resources` — a PLUGIN-LEVEL atlas (`banner`) the plugin ships directly,
+//     merged as `fantasy_dungeon__banner` and copied into
+//     `packs/fantasy_dungeon/assets/…` — namespaced exactly like a pack's.
+//   - `.license` / `.author` — provenance metadata for a shipped/sold plugin,
+//     surfaced by `labelle plugins`.
+//
+// The `tiles` pack also ships a small generator script — proving the RFC's
+// "a map generator is just an ordinary script; tiles are entities, tilesets
+// are just atlases" claim with no new engine machinery.
+.{
+    .name = "fantasy_dungeon",
+    .manifest_version = 1,
+    .packs = .{ "tiles", "props" },
+    .resources = .{
+        .{ .name = "banner", .json = "assets/banner.json", .texture = "assets/banner.png" },
+    },
+    .license = "CC0-1.0",
+    .author = "LaBelle Toolkit",
+}
