@@ -133,6 +133,12 @@ pub const SCENE_ASSET_MANIFESTS = struct {
         // labelle-engine#445 for the consumer.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "inline for (SceneAssetManifests.entries) |scene_asset_entry|") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets)") != null);
+
+        // Sprite-based asset inference (labelle-engine#563): each scene's
+        // source is handed to the engine by name, gated on `@hasDecl` for
+        // forward-compat with older engines. The `try` form (non-void init).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (@hasDecl(AssembledGame, \"setSceneSource\")) try g.setSceneSource(\"menu\", @embedFile(\"scenes/menu.jsonc\"))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (@hasDecl(AssembledGame, \"setSceneSource\")) try g.setSceneSource(\"gameplay\", @embedFile(\"scenes/gameplay.jsonc\"))") != null);
     }
 
     test "callback-init path also emits setSceneAssets loop (sokol)" {
@@ -151,5 +157,10 @@ pub const SCENE_ASSET_MANIFESTS = struct {
 
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "inline for (SceneAssetManifests.entries) |scene_asset_entry|") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setSceneAssets(scene_asset_entry.name, scene_asset_entry.assets)") != null);
+
+        // Sprite-based asset inference (labelle-engine#563): the callback-init
+        // (void `init`) path emits the `@hasDecl`-gated setter with a panic on
+        // the impossible SceneNotFound instead of `try`.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (@hasDecl(AssembledGame, \"setSceneSource\")) g.setSceneSource(\"menu\", @embedFile(\"scenes/menu.jsonc\")) catch @panic(\"failed to set scene source\")") != null);
     }
 };

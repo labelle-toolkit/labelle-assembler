@@ -192,6 +192,19 @@ pub fn Mixin(comptime Self: type) type {
                     try w.print("    try g.addEmbeddedSceneSource(\"scenes/{s}.jsonc\", @embedFile(\"scenes/{s}.jsonc\"));\n", .{ name, name });
                 }
 
+                // Hand each scene's JSONC source to the engine by NAME for
+                // sprite-based asset inference (labelle-engine#563): a scene
+                // with NO explicit `"assets"` manifest derives one by walking
+                // its Sprite/Image refs against the runtime reverse index.
+                // Gated on `@hasDecl` so an older engine without
+                // `setSceneSource` still compiles — the guard is comptime, so
+                // the whole call folds away there (no flag day). Distinct from
+                // `addEmbeddedSceneSource` above, which is keyed by include
+                // PATH for `"include"` resolution, not by scene name.
+                for (jsonc_scene_names) |name| {
+                    try w.print("    if (@hasDecl(AssembledGame, \"setSceneSource\")) try g.setSceneSource(\"{s}\", @embedFile(\"scenes/{s}.jsonc\"));\n", .{ name, name });
+                }
+
                 // Attach parsed asset manifests (Asset Streaming RFC #437 /
                 // labelle-engine#445). The comptime `SceneAssetManifests` struct is
                 // emitted into this file by `writeSceneAssetManifests` — each
