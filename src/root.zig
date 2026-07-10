@@ -55,6 +55,7 @@ test {
     _ = @import("scene_manifest_test.zig");
     _ = @import("tilemap_scan_test.zig"); // covers tilemap_scan + tilemap_scene_scan
     _ = @import("asset_validator.zig");
+    _ = @import("pack_resources.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
     _ = @import("deps_linker.zig");
@@ -180,6 +181,11 @@ pub const resolveLifecycleOverride = manifest_detect.resolveLifecycleOverride;
 pub const declModulePlugins = pack_scan.declModulePlugins;
 pub const scanPackScriptsAt = pack_scan.scanPackScriptsAt;
 pub const scanPack = pack_scan.scanPack;
+
+// ── Asset-Plugins Phase 1: pack resources (pack_resources.zig) ──────
+// The merge (#573) + copy/namespace/validate (#574/#575) + scene auto-wiring
+// (#575) entry points, wired into `generate()` above. Exposed for tests.
+pub const pack_resources = @import("pack_resources.zig");
 
 pub fn generate(
     allocator: std.mem.Allocator,
@@ -320,6 +326,21 @@ pub fn generate(
     }
     try generate_phases.validatePackGraph(allocator, pack_entries.items, cfg.plugins);
 
+    // ── Asset-Plugins Phase 1: merge pack `.resources` (#573) ──────────
+    // Fold every pack's declared `.resources` into the game's resource list,
+    // namespaced `<pack>__<name>` and repathed into the copied `packs/<pack>/…`
+    // dir, so ALL downstream resource codegen (`resource_loader`,
+    // `asset_wiring`, `scene_manifests`) + the scene-asset validation + lazy
+    // inference below consume the pack atlases unchanged. Additive: with no
+    // pack `.resources`, the merged list is byte-identical to the game's, so a
+    // project without asset-bearing packs generates identical output. The astc/
+    // rgba texture-path swaps above already ran on the game resources (their
+    // `.astc`/`.rgba` siblings live in the game tree); pack resources ship
+    // prebuilt and ride the plain `.png` path.
+    var merged_resources = try pack_resources.mergePackResources(allocator, mutable_resources, pack_entries.items);
+    defer merged_resources.deinit();
+    cfg.resources = merged_resources.resources;
+
     try cwd.createDirPath(io, target_dir);
 
     // Copy game folders into target dir and scan file stems in one pass.
@@ -339,6 +360,17 @@ pub fn generate(
     const scene_manifests = try scene_manifest.parseSceneDir(allocator, scenes_target, jsonc_scene_names);
     defer scene_manifest.freeManifests(allocator, scene_manifests);
 
+    // ── Asset-Plugins Phase 1: scene auto-wiring (#575) ────────────────
+    // A scene that instantiates any prefab from a pack gets that pack's
+    // non-lazy resources auto-added to its asset manifest, so a scene using
+    // `sky__sky_system` preloads the sky pack's atlases without hand-editing
+    // `meta.assets`. Runs BEFORE `validateSceneAssets` (the added names are
+    // namespaced `<pack>__<name>` entries the merge above put in the resource
+    // list, so validation passes) and before lazy inference (a scene-referenced
+    // resource infers lazy → scene-scoped preload). No-op when no scene
+    // references a pack prefab, keeping non-pack projects byte-identical.
+    try pack_resources.autoWireScenes(allocator, scene_manifests, pack_entries.items, scenes_target);
+
     // Reject scene `assets:` entries that don't match a resource
     // declared in project.labelle. Runs before any codegen so typos
     // like `backgroud` surface as a build error against the scene file
@@ -351,8 +383,9 @@ pub fn generate(
     // (lazy) when the resource is referenced by any scene's `assets:`
     // list, or to `false` (eager) otherwise. The eager fallback keeps
     // unmigrated projects — the ones without `assets:` blocks — using
-    // the old always-eager behavior. Ticket #48.
-    try lazy_inference.resolveLazyDefaults(allocator, mutable_resources, scene_manifests);
+    // the old always-eager behavior. Ticket #48. Operates on the MERGED
+    // resource list (game + pack) so pack atlases get lazy defaults too.
+    try lazy_inference.resolveLazyDefaults(allocator, merged_resources.resources, scene_manifests);
 
     // Symlink the scripts directory; names from a shallow scan are
     // thrown away here because `script_scanner.ScriptScanner` below
@@ -510,6 +543,17 @@ pub fn generate(
         for (pack_scans.items) |*p| p.deinit(allocator);
         pack_scans.deinit(allocator);
     }
+
+    // ── Asset-Plugins Phase 1: copy + namespace + validate pack assets ──
+    // Runs AFTER `loadPackScans` copied each pack's convention dirs (its
+    // prefabs are now under `<target>/packs/<pack>/prefabs/`). For every pack
+    // declaring `.resources`: copy its `assets/` into the target, rewrite its
+    // atlas frame keys to `<pack>/<frame>` + the pack's own prefab `sprite_name`
+    // refs to match (#574), then validate every pack sprite ref resolves to a
+    // shipped or `depends_on_resources` frame — a dangling ref is a
+    // generate-time error, not a silent runtime blank (#575). No-op for packs
+    // without `.resources`.
+    try pack_resources.processPackAssets(allocator, pack_entries.items, cfg.resources, game_dir, target_dir);
 
     // Embedded-tilemap registrations (T2 Phase 4 + T3 #561/#562). AFTER
     // `loadPackScans` so the prefab scan (assembler#561) sees the staged pack

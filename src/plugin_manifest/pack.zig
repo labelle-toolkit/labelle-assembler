@@ -70,6 +70,21 @@ pub const PackManifest = struct {
     /// legacy loose mode (sees the global registry). Feeds the
     /// generate-time acyclic + unknown-dep checks.
     depends_on: []const []const u8 = &.{},
+    /// Assets the pack ships (Asset-Plugins RFC Phase 1, labelle-assembler#573).
+    /// Same `ResourceDef` shape as `project.labelle`'s `.resources`
+    /// (`name`/`json`/`texture`/`sound`/`font`/`lazy`). Paths are relative to
+    /// the pack root (e.g. `assets/tiles.json`). Empty/absent = a code-only
+    /// pack (every pack before this ticket) — byte-identical output. The
+    /// assembler merges these into the game resource list namespaced
+    /// `<pack>__<name>`, repathed into the copied `packs/<pack>/…` dir.
+    resources: []const config.ResourceDef = &.{},
+    /// Game (or other unit) atlases this pack deliberately draws from
+    /// (Asset-Plugins RFC Phase 1, labelle-assembler#575). Makes the previously
+    /// hidden "the game must declare this atlas" contract explicit and
+    /// checkable: a `sprite_name` the pack references is valid if it resolves
+    /// in the pack's OWN shipped atlases ∪ the atlases named here. Every entry
+    /// must exist in the merged resource list. Empty/absent = self-contained.
+    depends_on_resources: []const []const u8 = &.{},
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PackManifest) void {
@@ -78,6 +93,8 @@ pub const PackManifest = struct {
         // so these free the nested query/command/dep strings too.
         std.zon.parse.free(self.allocator, self.exposes);
         std.zon.parse.free(self.allocator, self.depends_on);
+        std.zon.parse.free(self.allocator, self.resources);
+        std.zon.parse.free(self.allocator, self.depends_on_resources);
     }
 };
 
@@ -90,6 +107,8 @@ const ZonPackManifest = struct {
     convention_dirs: PackConventionMode = .copy_and_scan,
     exposes: ?PackExposes = null,
     depends_on: []const []const u8 = &.{},
+    resources: []const config.ResourceDef = &.{},
+    depends_on_resources: []const []const u8 = &.{},
 };
 
 /// Read and parse `pack.labelle` for the given plugin if it exists.
@@ -211,6 +230,8 @@ pub fn loadPackFromDir(
         .convention_dirs = parsed.convention_dirs,
         .exposes = parsed.exposes,
         .depends_on = parsed.depends_on,
+        .resources = parsed.resources,
+        .depends_on_resources = parsed.depends_on_resources,
         .allocator = allocator,
     };
 }
@@ -356,6 +377,62 @@ test "loadPackFromDir: parses exposes/depends_on round-trip (#441)" {
     try testing.expectEqual(@as(usize, 2), manifest.depends_on.len);
     try testing.expectEqualStrings("rooms", manifest.depends_on[0]);
     try testing.expectEqualStrings("pathfinder", manifest.depends_on[1]);
+}
+
+test "loadPackFromDir: parses .resources + depends_on_resources (#573/#575)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Asset-Plugins Phase 1: a pack declares the atlases it ships (same
+    // ResourceDef shape as project.labelle) plus the game atlases it overlays.
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "sky",
+        \\    .manifest_version = 1,
+        \\    .resources = .{
+        \\        .{ .name = "background", .json = "assets/bg.json", .texture = "assets/bg.png" },
+        \\        .{ .name = "cloud", .json = "assets/cloud.json", .texture = "assets/cloud.png", .lazy = true },
+        \\    },
+        \\    .depends_on_resources = .{ "characters" },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadPackFromDir(testing.allocator, tmp_path, "sky")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqual(@as(usize, 2), manifest.resources.len);
+    try testing.expectEqualStrings("background", manifest.resources[0].name);
+    try testing.expectEqualStrings("assets/bg.json", manifest.resources[0].json);
+    try testing.expectEqualStrings("assets/bg.png", manifest.resources[0].texture);
+    try testing.expectEqualStrings("cloud", manifest.resources[1].name);
+    try testing.expectEqual(true, manifest.resources[1].lazy.?);
+
+    try testing.expectEqual(@as(usize, 1), manifest.depends_on_resources.len);
+    try testing.expectEqualStrings("characters", manifest.depends_on_resources[0]);
+}
+
+test "loadPackFromDir: .resources absent → empty (byte-identity default)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "citizens",
+        \\    .manifest_version = 1,
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadPackFromDir(testing.allocator, tmp_path, "citizens")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqual(@as(usize, 0), manifest.resources.len);
+    try testing.expectEqual(@as(usize, 0), manifest.depends_on_resources.len);
 }
 
 test "loadPackFromDir: exposes/depends_on absent → null/empty (#441)" {
