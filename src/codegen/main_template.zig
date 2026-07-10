@@ -536,6 +536,47 @@ fn injectYAxis(
     return arr.toOwnedSlice(allocator);
 }
 
+/// Maximum length of a camera tag on a `.layers` entry (Camera-Bound Layers
+/// RFC, engine#723/#724). Mirrors the fixed-buffer tag cap the gfx/engine side
+/// stores the binding in, so an over-long tag is rejected at generate time
+/// rather than silently truncated downstream.
+const camera_tag_max_len = 15;
+
+/// Validate a per-layer `.camera` tag at generate time: it must be a non-empty,
+/// `≤ camera_tag_max_len`-char identifier (`[A-Za-z_][A-Za-z0-9_]*`). On
+/// violation, print a labelled `labelle-assembler:` diagnostic (mirroring the
+/// codebase's other generate-time validation errors) and fail. Emits nothing on
+/// success — an unbound layer (`camera == null`) never reaches here.
+fn validateCameraTag(layer_name: []const u8, tag: []const u8) !void {
+    const bad = tag.len == 0 or
+        tag.len > camera_tag_max_len or
+        !isIdentifier(tag);
+    if (!bad) return;
+
+    const io = config.globalIo();
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "labelle-assembler: layer '{s}' has an invalid `.camera` tag \"{s}\" — a camera tag must be a non-empty identifier ([A-Za-z_][A-Za-z0-9_]*) of at most {d} characters.\n",
+        .{ layer_name, tag, camera_tag_max_len },
+    ) catch "labelle-assembler: invalid `.camera` tag on a layer.\n";
+    std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+    return error.InvalidCameraTag;
+}
+
+/// True when `s` matches the identifier grammar `[A-Za-z_][A-Za-z0-9_]*`.
+fn isIdentifier(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s, 0..) |ch, i| {
+        const ok = ch == '_' or
+            (ch >= 'A' and ch <= 'Z') or
+            (ch >= 'a' and ch <= 'z') or
+            (i != 0 and ch >= '0' and ch <= '9');
+        if (!ok) return false;
+    }
+    return true;
+}
+
 /// Generate the GameLayers enum from project.labelle layer definitions.
 pub fn generateGameLayers(layers: []const LayerDef, w: anytype) !void {
     try w.writeAll("const GameLayers = enum(u8) {\n");
@@ -545,11 +586,19 @@ pub fn generateGameLayers(layers: []const LayerDef, w: anytype) !void {
     try w.writeAll("\n    pub fn config(self: GameLayers) gfx.LayerConfig {\n");
     try w.writeAll("        return switch (self) {\n");
     for (layers) |layer| {
-        try w.print("            .{s} => .{{ .order = {d}, .space = .{s} }},\n", .{
+        // Unbound layers (the overwhelming default) emit exactly the pre-RFC
+        // literal — byte-for-byte identical, the load-bearing zero-migration
+        // guarantee. Only a layer that authored `.camera` appends the binding.
+        try w.print("            .{s} => .{{ .order = {d}, .space = .{s}", .{
             layer.name,
             layer.order,
             @tagName(layer.space),
         });
+        if (layer.camera) |tag| {
+            try validateCameraTag(layer.name, tag);
+            try w.print(", .camera = \"{s}\"", .{tag});
+        }
+        try w.writeAll(" },\n");
     }
     try w.writeAll("        };\n");
     try w.writeAll("    }\n");
@@ -575,4 +624,114 @@ pub fn generateResourceRegistry(resources: []const ResourceDef, w: anytype) !voi
     }
     try w.writeAll("    };\n");
     try w.writeAll("};\n");
+}
+
+// ── Tests: GameLayers emit (Camera-Bound Layers RFC, engine#723/#724) ──
+
+const testing = std.testing;
+
+/// Render `generateGameLayers` for `layers` into a caller-freed buffer.
+fn renderLayers(layers: []const LayerDef) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer aw.deinit();
+    try generateGameLayers(layers, &aw.writer);
+    var arr = aw.toArrayList();
+    errdefer arr.deinit(testing.allocator);
+    return arr.toOwnedSlice(testing.allocator);
+}
+
+/// Run Zig's front-end (parse → AstGen) over `src` and fail if it produced any
+/// parse OR compile error. Stronger than a parse-only check: it exercises the
+/// same ZIR lowering `zig build` does, catching bad literals a parser would
+/// accept. Self-contained — it does NOT resolve `@import`ed modules, so the
+/// generated arm need not have gfx's `LayerConfig.camera` field to exist yet.
+fn expectAstGenOk(src: []const u8) !void {
+    const src_z = try testing.allocator.dupeZ(u8, src);
+    defer testing.allocator.free(src_z);
+    var ast = try std.zig.Ast.parse(testing.allocator, src_z, .zig);
+    defer ast.deinit(testing.allocator);
+    if (ast.errors.len != 0) {
+        std.debug.print("expectAstGenOk: {d} parse error(s)\n", .{ast.errors.len});
+        return error.AstGenParseError;
+    }
+    var zir = try std.zig.AstGen.generate(testing.allocator, ast);
+    defer zir.deinit(testing.allocator);
+    if (zir.hasCompileErrors()) {
+        std.debug.print("expectAstGenOk: AstGen reported compile errors\n", .{});
+        return error.AstGenCompileError;
+    }
+}
+
+test "generateGameLayers: no .camera emits the pre-RFC literal byte-for-byte" {
+    // The load-bearing zero-migration guarantee: a `.layers` set that authors no
+    // `.camera` must produce output IDENTICAL to the pre-change golden.
+    const layers = [_]LayerDef{
+        .{ .name = "background", .order = 0, .space = .screen },
+        .{ .name = "world", .order = 1, .space = .world },
+        .{ .name = "ui", .order = 2, .space = .screen },
+    };
+    const got = try renderLayers(&layers);
+    defer testing.allocator.free(got);
+
+    const golden =
+        "const GameLayers = enum(u8) {\n" ++
+        "    background,\n" ++
+        "    world,\n" ++
+        "    ui,\n" ++
+        "\n" ++
+        "    pub fn config(self: GameLayers) gfx.LayerConfig {\n" ++
+        "        return switch (self) {\n" ++
+        "            .background => .{ .order = 0, .space = .screen },\n" ++
+        "            .world => .{ .order = 1, .space = .world },\n" ++
+        "            .ui => .{ .order = 2, .space = .screen },\n" ++
+        "        };\n" ++
+        "    }\n" ++
+        "};\n";
+    try testing.expectEqualStrings(golden, got);
+}
+
+test "generateGameLayers: a bound layer appends .camera and compiles under AstGen" {
+    const layers = [_]LayerDef{
+        .{ .name = "sky", .order = 0, .space = .world, .camera = "sky_parallax" },
+        .{ .name = "world", .order = 1, .space = .world },
+    };
+    const got = try renderLayers(&layers);
+    defer testing.allocator.free(got);
+
+    // The bound arm carries the tag; the unbound arm stays pre-RFC exact.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        got,
+        ".sky => .{ .order = 0, .space = .world, .camera = \"sky_parallax\" },",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        got,
+        ".world => .{ .order = 1, .space = .world },",
+    ) != null);
+
+    // Wrap in a self-contained unit and run Zig's front-end over it. This does
+    // NOT resolve gfx, so it does not require `LayerConfig.camera` to exist.
+    const unit = "const gfx = struct { const LayerConfig = struct {\n" ++
+        "    order: i8 = 0,\n" ++
+        "    space: enum { world, screen, screen_fill } = .world,\n" ++
+        "    camera: ?[]const u8 = null,\n" ++
+        "}; };\n";
+    const full = try std.mem.concat(testing.allocator, u8, &.{ unit, got });
+    defer testing.allocator.free(full);
+    try expectAstGenOk(full);
+}
+
+test "generateGameLayers: a 16-char camera tag is rejected at generate time" {
+    const layers = [_]LayerDef{
+        .{ .name = "sky", .space = .world, .camera = "sixteen_chars_xx" }, // len 16
+    };
+    try testing.expectError(error.InvalidCameraTag, renderLayers(&layers));
+}
+
+test "generateGameLayers: an invalid-charset camera tag is rejected" {
+    const layers = [_]LayerDef{
+        .{ .name = "sky", .space = .world, .camera = "has space" },
+    };
+    try testing.expectError(error.InvalidCameraTag, renderLayers(&layers));
 }

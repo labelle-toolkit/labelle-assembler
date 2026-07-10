@@ -256,6 +256,14 @@ pub const LayerDef = struct {
     name: []const u8,
     order: i8 = 0,
     space: LayerSpace = .world,
+    /// Optional camera tag binding (Camera-Bound Layers RFC, engine#723/#724).
+    /// When set, this layer's `gfx.LayerConfig` carries `.camera = "<tag>"`,
+    /// binding the layer to the camera registered under that tag. `null` (the
+    /// default) emits the pre-RFC `LayerConfig` literal byte-for-byte, so
+    /// projects that author no binding see zero output drift. Validated at
+    /// generate time: the tag must be ≤ 15 chars and a valid identifier
+    /// (`[A-Za-z_][A-Za-z0-9_]*`).
+    camera: ?[]const u8 = null,
 };
 
 /// Half-open codepoint range `[first, last)` baked into a font atlas.
