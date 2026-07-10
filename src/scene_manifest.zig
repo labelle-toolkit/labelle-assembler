@@ -633,6 +633,68 @@ pub fn freeTilemapAssets(allocator: std.mem.Allocator, assets: []const []const u
     if (assets.len > 0) allocator.free(assets);
 }
 
+/// Collect every `"prefab"` reference string anywhere in the scene file at
+/// `scene_path` (Asset-Plugins RFC Phase 1, labelle-assembler#575 scene
+/// auto-wiring). Walks the whole entity tree — a `"prefab"` value at any depth
+/// is an instantiation. Returns the raw reference strings (e.g. `"worker"`,
+/// `"sky__sky_system"`); the caller maps them to packs. A missing or
+/// unparseable scene yields an empty list rather than erroring — auto-wiring
+/// is best-effort, and real parse errors surface through `parseSceneDir`.
+///
+/// Caller owns the slice + each string; free via `freePrefabRefs`.
+pub fn scanScenePrefabRefs(
+    allocator: std.mem.Allocator,
+    scene_path: []const u8,
+) ![]const []const u8 {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const bytes = cwd.readFileAlloc(io, scene_path, allocator, .limited(8 * 1024 * 1024)) catch return &.{};
+    defer allocator.free(bytes);
+
+    const stripped = stripJsonc(allocator, bytes) catch return &.{};
+    defer allocator.free(stripped);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, stripped, .{}) catch return &.{};
+    defer parsed.deinit();
+
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |s| allocator.free(s);
+        out.deinit(allocator);
+    }
+    try collectPrefabRefs(allocator, parsed.value, &out);
+    return out.toOwnedSlice(allocator);
+}
+
+fn collectPrefabRefs(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    out: *std.ArrayList([]const u8),
+) !void {
+    switch (value) {
+        .object => |obj| {
+            if (obj.get("prefab")) |p| {
+                if (p == .string) {
+                    const dup = try allocator.dupe(u8, p.string);
+                    errdefer allocator.free(dup);
+                    try out.append(allocator, dup);
+                }
+            }
+            var it = obj.iterator();
+            while (it.next()) |kv| try collectPrefabRefs(allocator, kv.value_ptr.*, out);
+        },
+        .array => |arr| {
+            for (arr.items) |item| try collectPrefabRefs(allocator, item, out);
+        },
+        else => {},
+    }
+}
+
+/// Free a slice returned by `scanScenePrefabRefs`.
+pub fn freePrefabRefs(allocator: std.mem.Allocator, refs: []const []const u8) void {
+    for (refs) |s| allocator.free(s);
+    if (refs.len > 0) allocator.free(refs);
+}
+
 /// Parse a single scene file's source buffer. `scene_name` is the name the
 /// assembler uses elsewhere (e.g. "menu" or "world/intro") and `display_path`
 /// is the path printed in error messages so users can find the offending file.
