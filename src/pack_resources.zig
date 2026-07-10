@@ -174,7 +174,11 @@ pub fn processOnePack(
             for (frames) |f| allocator.free(f);
             allocator.free(frames);
         }
-        for (frames) |f| try own_frames.append(allocator, try allocator.dupe(u8, f));
+        for (frames) |f| {
+            const dup = try allocator.dupe(u8, f);
+            errdefer allocator.free(dup);
+            try own_frames.append(allocator, dup);
+        }
         try namespaceAtlasFile(allocator, json_path, pack_name, frames);
     }
 
@@ -202,7 +206,11 @@ pub fn processOnePack(
             for (frames) |f| allocator.free(f);
             allocator.free(frames);
         }
-        for (frames) |f| try dep_frames.append(allocator, try allocator.dupe(u8, f));
+        for (frames) |f| {
+            const dup = try allocator.dupe(u8, f);
+            errdefer allocator.free(dup);
+            try dep_frames.append(allocator, dup);
+        }
     }
 
     // 4. Rewrite + validate each of the pack's OWN prefabs.
@@ -323,7 +331,9 @@ pub fn collectAtlasFramesFromBytes(allocator: std.mem.Allocator, bytes: []const 
     }
     var it = frames.object.iterator();
     while (it.next()) |kv| {
-        try out.append(allocator, try allocator.dupe(u8, kv.key_ptr.*));
+        const dup = try allocator.dupe(u8, kv.key_ptr.*);
+        errdefer allocator.free(dup);
+        try out.append(allocator, dup);
     }
     return out.toOwnedSlice(allocator);
 }
@@ -372,10 +382,10 @@ pub fn namespaceAtlasFrameKeys(
         const replacement = try std.fmt.allocPrint(allocator, "\"{s}/{s}\":", .{ pack_name, frame });
         defer allocator.free(replacement);
         const next = try replaceAllOwned(allocator, buf.items, needle, replacement);
+        defer allocator.free(next);
         buf.deinit(allocator);
         buf = .empty;
         try buf.appendSlice(allocator, next);
-        allocator.free(next);
     }
     return buf.toOwnedSlice(allocator);
 }
@@ -536,7 +546,12 @@ pub fn autoWireScenes(
 
         // Collect the non-lazy resource names of every pack this scene uses.
         var add: std.ArrayList([]const u8) = .empty;
+        // The buffer is always freed; the in-progress dup'd strings are freed
+        // ONLY on the error path (on success they are moved into `new_assets`
+        // and `add` is cleared, so this errdefer then frees nothing — no
+        // double-free of the transferred strings).
         defer add.deinit(allocator);
+        errdefer for (add.items) |s| allocator.free(s);
         for (pack_entries) |e| {
             if (e.manifest.resources.len == 0) continue;
             if (!sceneUsesPack(refs, e.plugin.name)) continue;
@@ -545,16 +560,21 @@ pub fn autoWireScenes(
                 const ns = try std.fmt.allocPrint(allocator, "{s}__{s}", .{ e.plugin.name, res.name });
                 defer allocator.free(ns);
                 if (!containsStr(m.assets, ns) and !containsStrList(add.items, ns)) {
-                    try add.append(allocator, try allocator.dupe(u8, ns));
+                    const dup = try allocator.dupe(u8, ns);
+                    errdefer allocator.free(dup);
+                    try add.append(allocator, dup);
                 }
             }
         }
         if (add.items.len == 0) continue;
 
-        // Re-materialise `assets` = old ++ additions (old freed).
-        var new_assets = try allocator.alloc([]const u8, m.assets.len + add.items.len);
+        // Re-materialise `assets` = old ++ additions (old freed). The alloc is
+        // the last fallible op; if it throws the errdefer above frees the added
+        // strings. After the move, clear `add` so its errdefer owns nothing.
+        const new_assets = try allocator.alloc([]const u8, m.assets.len + add.items.len);
         for (m.assets, 0..) |s, idx| new_assets[idx] = s; // move ownership
         for (add.items, 0..) |s, idx| new_assets[m.assets.len + idx] = s;
+        add.clearRetainingCapacity();
         if (m.assets.len > 0) allocator.free(m.assets);
         m.assets = new_assets;
     }

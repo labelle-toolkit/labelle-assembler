@@ -673,7 +673,11 @@ fn collectPrefabRefs(
     switch (value) {
         .object => |obj| {
             if (obj.get("prefab")) |p| {
-                if (p == .string) try out.append(allocator, try allocator.dupe(u8, p.string));
+                if (p == .string) {
+                    const dup = try allocator.dupe(u8, p.string);
+                    errdefer allocator.free(dup);
+                    try out.append(allocator, dup);
+                }
             }
             var it = obj.iterator();
             while (it.next()) |kv| try collectPrefabRefs(allocator, kv.value_ptr.*, out);
