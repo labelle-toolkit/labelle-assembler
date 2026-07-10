@@ -1,0 +1,10 @@
+// Wall tile prefab — second sprite drawn from the same `tiles__tileset` atlas.
+{
+    "Position": { "x": 0, "y": 0 },
+    "Sprite": {
+        "sprite_name": "wall.png",
+        "pivot": "center",
+        "layer": "world",
+        "z_index": 1
+    }
+}

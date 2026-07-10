@@ -584,3 +584,55 @@ jobs:
           fi
           echo "PASS: plugin-controllers lifecycle order matches canonical sequence"
           echo "  ($(wc -l < actual.txt | tr -d ' ') lifecycle events in order)"
+
+      # Asset-Plugins Phase 2 reference (labelle-engine#728). The
+      # fantasy-dungeon plugin bundles two packs (`tiles`, `props`) + a
+      # plugin-level `banner` atlas + license/author, attached by a single
+      # `local:./plugin` entry. This step is the Phase-2 acceptance fixture:
+      # a fresh generate wires every atlas namespaced + merged with ZERO
+      # `.resources` in the game, then builds + runs headless so the pack
+      # generator script actually fires.
+      - name: Generate + build + run the fantasy-dungeon asset-plugin example
+        run: |
+          cd labelle-assembler/examples/fantasy-dungeon
+          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+
+          M=.labelle/null_desktop/main.zig
+
+          # #573/#576 resource MERGE: all three atlases registered under their
+          # namespaced <unit>__<name> keys, repathed into packs/<unit>/assets/.
+          grep -qF 'registerAtlasFromMemory("tiles__tileset", @embedFile("packs/tiles/assets/tileset.json")' "$M"
+          grep -qF 'registerAtlasFromMemory("props__atlas", @embedFile("packs/props/assets/props.json")' "$M"
+          grep -qF 'registerAtlasFromMemory("fantasy_dungeon__banner", @embedFile("packs/fantasy_dungeon/assets/banner.json")' "$M"
+
+          # #575 scene auto-wiring: referencing the pack prefabs pulled each
+          # pack's atlas into the scene manifest with no hand-listed assets.
+          grep -qE 'pub const main:.*"tiles__tileset".*"props__atlas"' "$M"
+
+          # #574 frame-key namespacing on disk: bare `floor.png` became
+          # `tiles/floor.png`; the plugin banner became `fantasy_dungeon/banner.png`.
+          grep -qF '"tiles/floor.png"' .labelle/null_desktop/packs/tiles/assets/tileset.json
+          grep -qF '"props/torch.png"' .labelle/null_desktop/packs/props/assets/props.json
+          grep -qF '"fantasy_dungeon/banner.png"' .labelle/null_desktop/packs/fantasy_dungeon/assets/banner.json
+          # ...and the pack prefab's own sprite_name ref was rewritten to match.
+          grep -qF '"tiles/floor.png"' .labelle/null_desktop/packs/tiles/prefabs/floor_tile.jsonc
+          echo "PASS: fantasy-dungeon resources merged + namespaced (zero game .resources)"
+
+          cd .labelle/null_desktop
+          # Same labelle-cli-equivalent fixFingerprint dance the other examples use.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+          LABELLE_NULL_FRAMES=10 ./zig-out/bin/fantasy_dungeon_demo > run.log 2>&1
+
+          # The bundled `tiles` pack's generator script (an ordinary pack
+          # script) ran each `playing` tick and stamped the room silhouette.
+          grep -q '\[fantasy-dungeon:tiles\] generate row 0: ####' run.log
+          grep -q '\[fantasy-dungeon:tiles\] generate row 3: ####' run.log
+          echo "PASS: fantasy-dungeon built + ran headless; pack generator fired"
