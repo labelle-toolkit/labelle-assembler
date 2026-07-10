@@ -1,6 +1,7 @@
 /// Texture loading + GPU upload for the sokol gfx backend.
 /// stb_image is the decode path; sokol_gfx owns the device-side image.
 const std = @import("std");
+const file_io = @import("file_io");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const types = @import("types.zig");
@@ -51,7 +52,10 @@ extern "c" fn ftell(stream: *std.c.FILE) c_long;
 pub fn loadTexture(path: [:0]const u8) !Texture {
     // Read the file from disk, then decode from memory. See the libc
     // rationale in the block comment above this function.
-    const file = std.c.fopen(path.ptr, "rb") orelse return error.LoadFailed;
+    // `openC` routes through `_wfopen` on Windows so UTF-8 paths open by
+    // their real Unicode name (libc `fopen` mangles them via the ANSI
+    // codepage — labelle-assembler#232).
+    const file = file_io.openC(path, "rb") orelse return error.LoadFailed;
     defer _ = std.c.fclose(file);
 
     if (fseek(file, 0, SEEK_END) != 0) return error.LoadFailed;

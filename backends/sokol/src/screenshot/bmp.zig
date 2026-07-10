@@ -24,18 +24,21 @@
 //! in `backends/sokol/build.zig`, so libc is already on the link line.
 
 const std = @import("std");
+const file_io = @import("file_io");
 
 /// Open `path` (UTF-8), write `data` verbatim, close. Returns
 /// `error.FileWriteFailed` on any libc-level failure. Allocates a
-/// null-terminated copy of the path because `fopen` is C and needs a
-/// `[*:0]const u8`; freed before return. Uses the caller's allocator
-/// rather than `std.heap.page_allocator` so the call site controls the
-/// allocation strategy (matches the existing `allocator` param threaded
-/// through `writeBmp` / `writeBmpFromBgra`).
+/// null-terminated copy of the path because `openC` needs a `[:0]const u8`;
+/// freed before return. Uses the caller's allocator rather than
+/// `std.heap.page_allocator` so the call site controls the allocation
+/// strategy (matches the existing `allocator` param threaded through
+/// `writeBmp` / `writeBmpFromBgra`). `openC` routes through `_wfopen` on
+/// Windows so UTF-8 screenshot paths open by their real Unicode name — libc
+/// `fopen` mangles them via the ANSI codepage (labelle-assembler#232).
 fn writeBytesViaLibc(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const fp = std.c.fopen(path_z.ptr, "wb") orelse return error.FileWriteFailed;
+    const fp = file_io.openC(path_z, "wb") orelse return error.FileWriteFailed;
     defer _ = std.c.fclose(fp);
     if (std.c.fwrite(data.ptr, 1, data.len, fp) != data.len) return error.FileWriteFailed;
 }
