@@ -283,6 +283,49 @@ pub const SCAN_PACK = struct {
         try std.testing.expect(!contains(rewritten, "citizens__tick"));
     }
 
+    test "an empty pack (only pack.labelle, no convention dirs) creates its target dir so module roots can be written (#590)" {
+        const allocator = std.testing.allocator;
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        // A light pack shipping ONLY `pack.labelle` — no components/ events/
+        // prefabs/ hooks/ scripts/, no queries.zig/commands.zig. Every
+        // `scanPackSubdir` no-ops on its missing source, so before the fix
+        // nothing ever created `<target>/packs/empty/` and the later
+        // `writePackModuleRoots` hit FileNotFound opening it to write
+        // `__pack_root.zig`.
+        try tmp.dir.createDirPath(io, "src/empty");
+        var pack_src = try tmp.dir.openDir(io, "src/empty", .{});
+        defer pack_src.close(io);
+        try writeFileIn(pack_src, "pack.labelle", ".{ .name = \"empty\" }\n");
+
+        const pack_src_path = try tmp.dir.realPathFileAlloc(io, "src/empty", allocator);
+        defer allocator.free(pack_src_path);
+        const target_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(target_path);
+
+        // Behavior (a): an empty pack is a clean no-op — scanPack succeeds with
+        // empty scans and STILL lays down the generated pack dir.
+        var scan = try generate.scanPack(allocator, pack_src_path, target_path, "empty");
+        defer scan.deinit(allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), scan.component_names.len);
+        try std.testing.expectEqual(@as(usize, 0), scan.event_names.len);
+        try std.testing.expectEqual(@as(usize, 0), scan.prefab_names.len);
+        try std.testing.expectEqual(@as(usize, 0), scan.hook_names.len);
+
+        // The generated pack dir exists…
+        try tmp.dir.access(io, "packs/empty", .{});
+
+        // …so the exact operation that used to throw — `writePackModuleRoots`
+        // writing `packs/<name>/__pack_root.zig` via `scanner.writeFile`
+        // (which OPENS the dir, never creates it) — now succeeds instead of
+        // FileNotFound.
+        try generate.scanner.writeFile(target_path, "packs/empty/__pack_root.zig", "// generated\n");
+        try tmp.dir.access(io, "packs/empty/__pack_root.zig", .{});
+    }
+
     test "tolerates a pack that ships only some convention dirs" {
         const allocator = std.testing.allocator;
 
