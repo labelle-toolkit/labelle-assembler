@@ -28,6 +28,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const cache = @import("../cache.zig");
 const common = @import("common.zig");
+const language_policy = @import("../language_policy.zig");
 
 const SUPPORTED_MANIFEST_VERSION = common.SUPPORTED_MANIFEST_VERSION;
 
@@ -85,6 +86,14 @@ pub const PackManifest = struct {
     /// in the pack's OWN shipped atlases ∪ the atlases named here. Every entry
     /// must exist in the merged resource list. Empty/absent = self-contained.
     depends_on_resources: []const []const u8 = &.{},
+    /// Script language this pack's bundled scripts are written in
+    /// (RFC-LANGUAGE-PLUGINS revs 8–9, assembler#584) — symmetric with
+    /// `depends_on_resources`. Validated at load against
+    /// `language_policy.SUPPORTED_LANGUAGES`, and at attach against the
+    /// project's declared `.language` (a Lua-scripted pack fails loudly in a
+    /// Rust project, naming both sides). Absent = the pack ships no language
+    /// scripts (every pack before this ticket) → byte-identical.
+    requires_language: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PackManifest) void {
@@ -95,6 +104,7 @@ pub const PackManifest = struct {
         std.zon.parse.free(self.allocator, self.depends_on);
         std.zon.parse.free(self.allocator, self.resources);
         std.zon.parse.free(self.allocator, self.depends_on_resources);
+        std.zon.parse.free(self.allocator, self.requires_language);
     }
 };
 
@@ -109,6 +119,9 @@ const ZonPackManifest = struct {
     depends_on: []const []const u8 = &.{},
     resources: []const config.ResourceDef = &.{},
     depends_on_resources: []const []const u8 = &.{},
+    // Language plugins P1 (#584). Optional/additive — absent parses to the
+    // byte-identical null default.
+    requires_language: ?[]const u8 = null,
 };
 
 /// Read and parse `pack.labelle` for the given plugin if it exists.
@@ -130,7 +143,9 @@ pub fn loadPackOptional(
 ///
 /// Returns `null` if there is no `pack.labelle`. Errors on parse failure
 /// (`PackManifestParseError`), name mismatch (`PackManifestNameMismatch`),
-/// or an unsupported `manifest_version` (`PackManifestUnknownVersion`).
+/// an unsupported `manifest_version` (`PackManifestUnknownVersion`), or a
+/// `requires_language` outside the supported table
+/// (`PackManifestUnknownLanguage`, #584).
 pub fn loadPackFromDir(
     allocator: std.mem.Allocator,
     pack_dir: []const u8,
@@ -189,6 +204,21 @@ pub fn loadPackFromDir(
         return error.PackManifestUnknownVersion;
     }
 
+    // ── Validate `requires_language` vocabulary (#584) ──
+    // Same closed table as the plugin manifest / the project `.language`. The
+    // MATCH against the project's declared language runs in the generate-time
+    // policy gate (`language_policy.checkRequiresLanguage`) — this load-time
+    // check rejects typos at the source with the manifest named.
+    if (parsed.requires_language) |req| {
+        if (!language_policy.isSupportedLanguage(req)) {
+            std.log.warn(
+                "labelle: pack '{s}' declares requires_language \"{s}\"\n  which is not a supported script language ({s})\n  at {s}\n",
+                .{ expected_name, req, language_policy.SUPPORTED_LANGUAGES_LIST, manifest_path },
+            );
+            return error.PackManifestUnknownLanguage;
+        }
+    }
+
     // ── Mutual-exclusivity guard: pack XOR decl-module plugin (CodeRabbit, #481) ─
     //
     // A `pack.labelle` marks a *light pack*: a module-less, directory-scanned
@@ -232,6 +262,7 @@ pub fn loadPackFromDir(
         .depends_on = parsed.depends_on,
         .resources = parsed.resources,
         .depends_on_resources = parsed.depends_on_resources,
+        .requires_language = parsed.requires_language,
         .allocator = allocator,
     };
 }
@@ -433,6 +464,51 @@ test "loadPackFromDir: .resources absent → empty (byte-identity default)" {
 
     try testing.expectEqual(@as(usize, 0), manifest.resources.len);
     try testing.expectEqual(@as(usize, 0), manifest.depends_on_resources.len);
+    try testing.expect(manifest.requires_language == null); // #584
+}
+
+test "loadPackFromDir: parses requires_language (#584)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A pack whose bundled scripts are Ruby declares the requirement
+    // (RFC-LANGUAGE-PLUGINS §6, symmetric with depends_on_resources); the
+    // attach-time match against the project's `.language` runs in the
+    // generate gate.
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "dungeon",
+        \\    .manifest_version = 1,
+        \\    .requires_language = "ruby",
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadPackFromDir(testing.allocator, tmp_path, "dungeon")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqualStrings("ruby", manifest.requires_language.?);
+}
+
+test "loadPackFromDir: rejects an unknown requires_language (#584)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "dungeon",
+        \\    .manifest_version = 1,
+        \\    .requires_language = "brainfuck",
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadPackFromDir(testing.allocator, tmp_path, "dungeon");
+    try testing.expectError(error.PackManifestUnknownLanguage, result);
 }
 
 test "loadPackFromDir: exposes/depends_on absent → null/empty (#441)" {

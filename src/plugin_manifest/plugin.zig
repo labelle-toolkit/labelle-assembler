@@ -12,6 +12,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const cache = @import("../cache.zig");
 const common = @import("common.zig");
+const language_policy = @import("../language_policy.zig");
 
 const SUPPORTED_MANIFEST_VERSION = common.SUPPORTED_MANIFEST_VERSION;
 const RESERVED_DIR_NAMES = common.RESERVED_DIR_NAMES;
@@ -88,6 +89,15 @@ pub const PluginManifest = struct {
     /// resource list. Empty/absent = self-contained.
     depends_on_resources: []const []const u8 = &.{},
 
+    /// Script language this plugin's shipped scripts are written in
+    /// (RFC-LANGUAGE-PLUGINS revs 8–9, assembler#584) — symmetric with
+    /// `depends_on_resources`. Validated at load against
+    /// `language_policy.SUPPORTED_LANGUAGES`, and at attach against the
+    /// project's declared `.language` (a Lua-scripted plugin fails loudly in
+    /// a Rust project, naming both sides). Absent = the plugin ships no
+    /// language scripts (every plugin before this ticket) → byte-identical.
+    requires_language: ?[]const u8 = null,
+
     /// SPDX-style license identifier for a shipped/sold plugin (Asset-Plugins
     /// RFC Phase 2, labelle-cli#300). Surfaced by `labelle plugins`. Optional.
     license: ?[]const u8 = null,
@@ -112,6 +122,7 @@ pub const PluginManifest = struct {
         std.zon.parse.free(self.allocator, self.resources);
         std.zon.parse.free(self.allocator, self.packs);
         std.zon.parse.free(self.allocator, self.depends_on_resources);
+        std.zon.parse.free(self.allocator, self.requires_language);
         std.zon.parse.free(self.allocator, self.license);
         std.zon.parse.free(self.allocator, self.author);
     }
@@ -129,6 +140,8 @@ pub const PluginManifest = struct {
 //   error.PluginManifestUnsafeDirName      — convention_dir name is not a safe relative segment
 //   error.PluginManifestMissingExtension   — copy_and_scan entry omitted its required extension
 //   error.PluginManifestUnknownVersion     — manifest_version is < 1 or > what we support
+//   error.PluginManifestUnknownLanguage    — requires_language names a language outside
+//                                             language_policy.SUPPORTED_LANGUAGES (#584)
 //
 // The pack-manifest path (`loadPackFromDir`) additionally raises:
 //   error.PackAndPluginManifestConflict    — a pack.labelle dir ALSO ships
@@ -302,6 +315,21 @@ pub fn loadFromDir(
         }
     }
 
+    // ── Validate `requires_language` vocabulary (#584) ──
+    // The value must come from the closed language table. The MATCH against
+    // the project's declared `.language` needs project context and runs in
+    // the generate-time policy gate (`language_policy.checkRequiresLanguage`);
+    // this load-time check rejects typos at the source with the manifest named.
+    if (parsed.requires_language) |req| {
+        if (!language_policy.isSupportedLanguage(req)) {
+            std.debug.print(
+                "labelle: plugin '{s}' declares requires_language \"{s}\"\n  which is not a supported script language ({s})\n  at {s}\n",
+                .{ expected_name, req, language_policy.SUPPORTED_LANGUAGES_LIST, manifest_path },
+            );
+            return error.PluginManifestUnknownLanguage;
+        }
+    }
+
     return PluginManifest{
         .name = parsed.name,
         .manifest_version = parsed.manifest_version,
@@ -309,6 +337,7 @@ pub fn loadFromDir(
         .resources = parsed.resources,
         .packs = parsed.packs,
         .depends_on_resources = parsed.depends_on_resources,
+        .requires_language = parsed.requires_language,
         .license = parsed.license,
         .author = parsed.author,
         .allocator = allocator,
@@ -330,6 +359,9 @@ const ZonManifest = struct {
     depends_on_resources: []const []const u8 = &.{},
     license: ?[]const u8 = null,
     author: ?[]const u8 = null,
+    // Language plugins P1 (#584). Optional/additive — absent parses to the
+    // byte-identical null default.
+    requires_language: ?[]const u8 = null,
 };
 
 // ============================================================================
@@ -847,6 +879,50 @@ test "loadFromDir: Phase-2 fields absent → empty/null (byte-identity default)"
     try testing.expectEqual(@as(usize, 0), manifest.depends_on_resources.len);
     try testing.expect(manifest.license == null);
     try testing.expect(manifest.author == null);
+    try testing.expect(manifest.requires_language == null); // #584
+}
+
+test "loadFromDir: parses requires_language (#584)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A plugin whose shipped scripts are Lua declares the requirement
+    // (symmetric with depends_on_resources); the attach-time match against
+    // the project's `.language` runs in the generate gate.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "lua_toolkit",
+        \\    .manifest_version = 1,
+        \\    .requires_language = "lua",
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "lua_toolkit")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqualStrings("lua", manifest.requires_language.?);
+}
+
+test "loadFromDir: rejects an unknown requires_language (#584)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "lua_toolkit",
+        \\    .manifest_version = 1,
+        \\    .requires_language = "cobol",
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadFromDir(testing.allocator, tmp_path, "lua_toolkit");
+    try testing.expectError(error.PluginManifestUnknownLanguage, result);
 }
 
 test "loadFromDir: rejects a nested pack name that escapes the plugin dir (#576)" {

@@ -24,6 +24,7 @@ const scanner = @import("../scanner.zig");
 const cache = @import("../cache.zig");
 const plugin_manifest = @import("../plugin_manifest.zig");
 const pack_validate = @import("../pack_validate.zig");
+const language_policy = @import("../language_policy.zig");
 const script_scanner = @import("../script_scanner.zig");
 const main_zig = @import("../main_zig.zig");
 const pack_root_gen = @import("../codegen/pack_root.zig");
@@ -419,6 +420,62 @@ pub fn validatePackGraph(
     try pack_names.ensureTotalCapacity(allocator, pack_entries.len);
     for (pack_entries) |e| pack_names.appendAssumeCapacity(e.plugin.name);
     try pack_validate.checkPrefixCollisions(pack_names.items);
+}
+
+/// One-language-per-project policy gate (labelle-assembler#584,
+/// RFC-LANGUAGE-PLUGINS revs 8–9). Runs beside `validatePackGraph` — BEFORE
+/// the target dir is created — so a policy violation rejects the build
+/// cheaply without leaving stale output. Three layers, all fed from state
+/// `generate` already has:
+///
+///   1. `.language` rules over `cfg.plugins` — supported vocabulary, at most
+///      ONE declaring entry (`language_policy.resolveProjectLanguage`).
+///   2. `requires_language` matching — every attached plugin manifest
+///      (re-read via `loadOptional`, same per-phase pattern as
+///      `copyPluginConventionDirs`) and every pack manifest (already parsed
+///      into `pack_entries`, game-local AND plugin-bundled) must match the
+///      declared language.
+///   3. Script-dir scan — the game root and every pack SOURCE dir (resolved
+///      exactly as the asset copy does, via `PackEntry.resolveSrcDir`) are
+///      walked for language convention dirs; foreign-language files are a
+///      hard error listing the offenders, files with no scripting plugin get
+///      the attach hint, empty dirs warn only.
+///
+/// Parse + validate ONLY: nothing here writes, and a project with no
+/// `.language` and no language dirs passes through untouched (byte-identical
+/// generation).
+pub fn validateLanguagePolicy(
+    allocator: std.mem.Allocator,
+    pack_entries: []const PackEntry,
+    plugins: []const config.PluginDep,
+    game_dir: []const u8,
+) !void {
+    const declared = try language_policy.resolveProjectLanguage(plugins);
+
+    // requires_language on every attached plugin manifest (decl-module
+    // plugins; a light pack ships no plugin.labelle so loadOptional is null
+    // for it — its manifest is covered by the pack loop below).
+    for (plugins) |plugin| {
+        var pmani = (try plugin_manifest.loadOptional(allocator, plugin, game_dir)) orelse continue;
+        defer pmani.deinit();
+        try language_policy.checkRequiresLanguage("plugin", plugin.name, pmani.requires_language, declared);
+    }
+
+    // requires_language on every pack manifest — game-local packs AND packs
+    // bundled inside plugins (Phase-2 nested entries) ride the same list.
+    for (pack_entries) |e| {
+        try language_policy.checkRequiresLanguage("pack", e.manifest.name, e.manifest.requires_language, declared);
+    }
+
+    // Script-dir scan: the game root, then every pack's SOURCE dir.
+    try language_policy.scanUnitLanguageDirs(allocator, game_dir, "project root", declared);
+    for (pack_entries) |e| {
+        const pack_src_dir = try e.resolveSrcDir(allocator, game_dir);
+        defer allocator.free(pack_src_dir);
+        const label = try std.fmt.allocPrint(allocator, "pack '{s}'", .{e.manifest.name});
+        defer allocator.free(label);
+        try language_policy.scanUnitLanguageDirs(allocator, pack_src_dir, label, declared);
+    }
 }
 
 /// Copy (and scan, per manifest `mode`) each plugin's declared convention
@@ -924,4 +981,203 @@ test "Phase 2: a code-only plugin discovers nothing → byte-identical (#576)" {
 
     try testing.expectEqual(@as(usize, 0), pack_entries.items.len);
     try testing.expectEqual(@as(usize, 0), units.entries.items.len);
+}
+
+// ============================================================================
+// Tests — one-language-per-project policy gate (#584)
+// ============================================================================
+
+/// A `.plugins` entry for the scripting plugin: `.language = "lua"`, repo a
+/// staged EMPTY local dir (`<project>/plugins/scripting/`) so `loadOptional`
+/// resolves cleanly to "no plugin.labelle" without warnings or cache access.
+fn stageScriptingPlugin(tmp: *std.testing.TmpDir, lang: []const u8) !config.PluginDep {
+    try tmp.dir.createDirPath(testing.io, "plugins/scripting");
+    return .{ .name = "labelle-scripting", .repo = "local:plugins/scripting", .language = lang };
+}
+
+test "validateLanguagePolicy: clean project (no .language, no language dirs) passes (#584)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    try validateLanguagePolicy(allocator, &.{}, &.{}, project_dir);
+}
+
+test "validateLanguagePolicy: a rust/ file in a lua project fails the generate gate (#584)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "rust/native/collision.rs", "pub fn solve() {}\n");
+    const scripting = try stageScriptingPlugin(&tmp, "lua");
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    try testing.expectError(
+        error.ScriptLanguageMismatch,
+        validateLanguagePolicy(allocator, &.{}, &.{scripting}, project_dir),
+    );
+}
+
+test "validateLanguagePolicy: language files with NO scripting plugin error with the attach hint (#584)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "lua/player_ai.lua", "return {}\n");
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    try testing.expectError(
+        error.MissingScriptingPlugin,
+        validateLanguagePolicy(allocator, &.{}, &.{}, project_dir),
+    );
+}
+
+test "validateLanguagePolicy: two plugins declaring .language error (#584)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        .{ .name = "labelle-scripting", .repo = "local:plugins/a", .language = "lua" },
+        .{ .name = "acme-scripting", .repo = "local:plugins/b", .language = "rust" },
+    };
+    // Fails on the config alone — before any manifest/dir access, so the
+    // (nonexistent) repo dirs are never touched.
+    try testing.expectError(
+        error.MultipleLanguagePlugins,
+        validateLanguagePolicy(allocator, &.{}, &plugins, project_dir),
+    );
+}
+
+test "validateLanguagePolicy: pack requires_language mismatch errors naming the pack (#584)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A Ruby-scripted pack attached to a Lua project (RFC rev 8's example).
+    try writeTestFile(tmp.dir, "packs/dungeon/pack.labelle",
+        \\.{
+        \\    .name = "dungeon",
+        \\    .manifest_version = 1,
+        \\    .requires_language = "ruby",
+        \\}
+    );
+    const scripting = try stageScriptingPlugin(&tmp, "lua");
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        scripting,
+        .{ .name = "dungeon", .repo = "@packs/dungeon" },
+    };
+    var pack_entries = try loadPackEntries(allocator, &plugins, project_dir);
+    defer {
+        for (pack_entries.items) |*e| e.deinit(allocator);
+        pack_entries.deinit(allocator);
+    }
+    try testing.expectEqual(@as(usize, 1), pack_entries.items.len);
+
+    try testing.expectError(
+        error.LanguageRequirementMismatch,
+        validateLanguagePolicy(allocator, pack_entries.items, &plugins, project_dir),
+    );
+}
+
+test "validateLanguagePolicy: pack requires_language match passes (#584)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "packs/dungeon/pack.labelle",
+        \\.{
+        \\    .name = "dungeon",
+        \\    .manifest_version = 1,
+        \\    .requires_language = "lua",
+        \\}
+    );
+    // The pack's own lua/ scripts are the declared language — legal.
+    try writeTestFile(tmp.dir, "packs/dungeon/lua/room.lua", "return {}\n");
+    const scripting = try stageScriptingPlugin(&tmp, "lua");
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        scripting,
+        .{ .name = "dungeon", .repo = "@packs/dungeon" },
+    };
+    var pack_entries = try loadPackEntries(allocator, &plugins, project_dir);
+    defer {
+        for (pack_entries.items) |*e| e.deinit(allocator);
+        pack_entries.deinit(allocator);
+    }
+
+    try validateLanguagePolicy(allocator, pack_entries.items, &plugins, project_dir);
+}
+
+test "validateLanguagePolicy: a pack dir bundling a foreign-language script errors (#584)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The pack declares NO requires_language but smuggles ruby/ scripts —
+    // the dir scan (the cross-check layer) still catches it.
+    try writeTestFile(tmp.dir, "packs/dungeon/pack.labelle",
+        \\.{
+        \\    .name = "dungeon",
+        \\    .manifest_version = 1,
+        \\}
+    );
+    try writeTestFile(tmp.dir, "packs/dungeon/ruby/room.rb", "class Room; end\n");
+    const scripting = try stageScriptingPlugin(&tmp, "lua");
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        scripting,
+        .{ .name = "dungeon", .repo = "@packs/dungeon" },
+    };
+    var pack_entries = try loadPackEntries(allocator, &plugins, project_dir);
+    defer {
+        for (pack_entries.items) |*e| e.deinit(allocator);
+        pack_entries.deinit(allocator);
+    }
+
+    try testing.expectError(
+        error.ScriptLanguageMismatch,
+        validateLanguagePolicy(allocator, pack_entries.items, &plugins, project_dir),
+    );
+}
+
+test "validateLanguagePolicy: plugin manifest requires_language mismatch errors (#584)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A decl-module plugin whose plugin.labelle requires ruby, attached to a
+    // lua project — the plugin-manifest half of the attach check.
+    try writeTestFile(tmp.dir, "plugins/rubyplug/plugin.labelle",
+        \\.{
+        \\    .name = "rubyplug",
+        \\    .manifest_version = 1,
+        \\    .requires_language = "ruby",
+        \\}
+    );
+    const scripting = try stageScriptingPlugin(&tmp, "lua");
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        scripting,
+        .{ .name = "rubyplug", .repo = "local:plugins/rubyplug" },
+    };
+    try testing.expectError(
+        error.LanguageRequirementMismatch,
+        validateLanguagePolicy(allocator, &.{}, &plugins, project_dir),
+    );
 }

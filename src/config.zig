@@ -199,6 +199,16 @@ pub const PluginDep = struct {
     /// Overrides the plugin's own `Systems.game_states` if set.
     states: []const []const u8 = &.{},
 
+    /// Script language this plugin provides (RFC-LANGUAGE-PLUGINS revs 8–9,
+    /// epic labelle-engine#237, assembler#584). Set on the ONE scripting
+    /// plugin entry (`labelle-scripting`): `.language = "lua"`. Deliberately
+    /// SINGULAR — one script language per project; mixing is unrepresentable
+    /// in config. Validated at generate time (`language_policy`): the value
+    /// must be a supported language and at most one `.plugins` entry may set
+    /// it. Parse + validate only for now — no codegen consumes it yet (the
+    /// scripting plugin that does lands separately).
+    language: ?[]const u8 = null,
+
     /// Returns true if this plugin uses a local path.
     /// Supports `local:../path` (relative to project) and `@libs/path` (inside project).
     pub fn isLocal(self: PluginDep) bool {
@@ -907,6 +917,24 @@ test "AssetCompression.formatFor maps platforms; default is png everywhere" {
     try std.testing.expectEqual(AssetFormat.astc, mixed.formatFor(.ios));
     try std.testing.expectEqual(AssetFormat.astc, mixed.formatFor(.desktop));
     try std.testing.expectEqual(AssetFormat.png, mixed.formatFor(.wasm)); // web -> wasm
+}
+
+test "PluginDep: `.language` parses from ZON and defaults to null (#584)" {
+    // The project.labelle `.plugins` entries parse through the same typed ZON
+    // path `main.zig` uses; `.language` is additive — an entry that omits it
+    // must land on the byte-identical `null` default.
+    const alloc = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\.{
+        \\    .{ .name = "labelle-scripting", .version = "0.1.0", .language = "lua" },
+        \\    .{ .name = "pathfinding", .version = "4.0.1" },
+        \\}
+    ;
+    const parsed = try std.zon.parse.fromSliceAlloc([]const PluginDep, alloc, src, null, .{});
+    defer std.zon.parse.free(alloc, parsed);
+    try std.testing.expectEqual(@as(usize, 2), parsed.len);
+    try std.testing.expectEqualStrings("lua", parsed[0].language.?);
+    try std.testing.expect(parsed[1].language == null);
 }
 
 test "effectiveGamepad: bgfx defaults to .none, other backends to .auto, explicit honored (assembler#533)" {
