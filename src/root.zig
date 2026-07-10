@@ -59,6 +59,7 @@ test {
     _ = @import("tilemap_scan_test.zig"); // covers tilemap_scan + tilemap_scene_scan
     _ = @import("asset_validator.zig");
     _ = @import("pack_resources.zig");
+    _ = @import("language_policy.zig");
     _ = @import("panel_validate.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
@@ -190,6 +191,13 @@ pub const scanPack = pack_scan.scanPack;
 // The merge (#573) + copy/namespace/validate (#574/#575) + scene auto-wiring
 // (#575) entry points, wired into `generate()` above. Exposed for tests.
 pub const pack_resources = @import("pack_resources.zig");
+
+// ── One-language-per-project policy (#584, RFC-LANGUAGE-PLUGINS) ────
+// The supported-language table plus the `.params.language` /
+// `requires_language` / script-dir checks. Wired into `generate()` via
+// `generate_phases.validateLanguagePolicy` (beside the pack-graph gate,
+// before any target write). Exposed for tests.
+pub const language_policy = @import("language_policy.zig");
 
 pub fn generate(
     allocator: std.mem.Allocator,
@@ -329,6 +337,18 @@ pub fn generate(
         pack_entries.deinit(allocator);
     }
     try generate_phases.validatePackGraph(allocator, pack_entries.items, cfg.plugins);
+
+    // ── One-language-per-project policy gate (#584, RFC-LANGUAGE-PLUGINS) ─
+    // Enforce the `.params.language` declaration rules (supported vocabulary,
+    // at most ONE declaring plugin), every plugin/pack manifest's
+    // `requires_language`, and the script-dir language scan (game root +
+    // every pack source dir) — BEFORE the target dir is created, so a policy
+    // violation rejects the build cheaply without leaving stale output,
+    // exactly like the pack-graph gate above. Parse + validate ONLY: no
+    // codegen consumes `.params.language` yet (the scripting plugin that does
+    // is a separate ticket), so a clean project generates byte-identical
+    // output.
+    try generate_phases.validateLanguagePolicy(allocator, pack_entries.items, cfg.plugins, game_dir);
 
     // ── Asset-Plugins Phase 3: studio panel descriptors (#577) ─────────
     // Validate every `studio/*.panel.jsonc` a plugin (or a pack it bundles)

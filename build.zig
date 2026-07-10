@@ -140,6 +140,10 @@ pub fn build(b: *std.Build) void {
         // `discoverPluginEvents` (engine pass walks
         // `labelle-engine/src/root.zig` for `pub const Events`).
         "test/engine_events_discovery_test.zig",
+        // One-language-per-project policy (#584): e2e through the real
+        // `generate` — the gate fires before any target write, and a clean
+        // project generates byte-identical output.
+        "test/language_policy_tests.zig",
     };
 
     for (test_files) |test_file| {
