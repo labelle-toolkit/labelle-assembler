@@ -363,6 +363,20 @@ pub const BuildZigOptions = struct {
     /// #461). Null means no v2 manifest → codegen hard-errors. Tests pass
     /// `"backend.manifest.v2.zon"` explicitly to drive the v2 path against a fixture.
     backend_manifest_name: ?[]const u8 = null,
+    /// Scripting plugin build wiring (labelle-assembler#593). When set, the
+    /// `.plugins` entry whose name matches `plugin_name` gets
+    /// `.language = .<language>` appended to its `b.dependency` args, driving
+    /// labelle-scripting's `-Dlanguage` build option (which language
+    /// sub-module + vendored VM the plugin embeds). `language` comes from the
+    /// validated `.params.language` (a `language_policy.SUPPORTED_LANGUAGES`
+    /// member, so always a valid enum-literal spelling). Defaults to null —
+    /// splice-less projects keep a byte-identical build.zig.
+    scripting: ?ScriptingDep = null,
+
+    pub const ScriptingDep = struct {
+        plugin_name: []const u8,
+        language: []const u8,
+    };
 };
 
 /// True when the DESKTOP build should take the manifest-v2 GENERIC declarative
@@ -548,11 +562,25 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
     // Plugin dep/module declarations (for all declared plugins)
     for (cfg.plugins) |plugin| {
+        // Scripting plugin (labelle-assembler#593): thread the project's
+        // declared script language into the plugin's `-Dlanguage` build
+        // option, selecting which language sub-module (and vendored VM) the
+        // plugin embeds. Empty for every other plugin — and for every
+        // project without the splice — so existing dep args stay
+        // byte-identical. The language vocabulary is closed
+        // (`language_policy.SUPPORTED_LANGUAGES`, all short identifiers), so
+        // the fixed buffer cannot overflow.
+        var scripting_lang_buf: [64]u8 = undefined;
+        const scripting_lang_arg: []const u8 = blk: {
+            const s = opts.scripting orelse break :blk "";
+            if (!std.mem.eql(u8, s.plugin_name, plugin.name)) break :blk "";
+            break :blk std.fmt.bufPrint(&scripting_lang_buf, ", .language = .{s}", .{s.language}) catch unreachable;
+        };
         if (cfg.platform == .ios) {
             // Pass iOS SDK path to plugins so C dependencies can find system headers
-            try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize, .ios_sdk_path = @as(?[]const u8, sdk_path) }});\n", .{ plugin.name, plugin.name });
+            try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize{s}, .ios_sdk_path = @as(?[]const u8, sdk_path) }});\n", .{ plugin.name, plugin.name, scripting_lang_arg });
         } else {
-            try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize }});\n", .{ plugin.name, plugin.name });
+            try w.print("    const plugin_{s}_dep = b.dependency(\"labelle_{s}\", .{{ .target = target, .optimize = optimize{s} }});\n", .{ plugin.name, plugin.name, scripting_lang_arg });
         }
         try w.print("    const plugin_{s}_mod = plugin_{s}_dep.module(\"labelle_{s}\");\n", .{ plugin.name, plugin.name, plugin.name });
     }

@@ -192,13 +192,61 @@ pub fn Mixin(comptime Self: type) type {
             const editor_sim_open: []const u8 = if (editor_preview_on) preview.EDITOR_PREVIEW_SIM_OPEN else "";
             const editor_sim_close: []const u8 = if (editor_preview_on) preview.EDITOR_PREVIEW_SIM_CLOSE else "";
 
-            const tick_code = if (cfg.plugins.len > 0)
+            // Scripting module-scope decls (labelle-assembler#593), appended
+            // to `{{module_vars}}` on both lifecycle paths: the plugin-module
+            // alias the embedded-script registrations call through, plus the
+            // `scripting_enabled` flag backend templates gate their
+            // `script_contract.bind` touchpoint on — the generated-flag half
+            // of the fullscreen-style double `@hasDecl` (the engine half is
+            // `@hasDecl(engine, "script_contract")`). Empty for a splice-less
+            // project, so `module_vars` stays byte-identical.
+            const scripting_decls: []const u8 = if (self.scripting) |s|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "// Scripting language plugin (labelle-assembler#593): the module the\n" ++
+                        "// embedded-script registrations feed, plus the enabled flag backend\n" ++
+                        "// templates gate their `script_contract` bind touchpoint on.\n" ++
+                        "const scripting = @import(\"{s}\");\n" ++
+                        "const scripting_enabled = true;\n",
+                    .{s.plugin_name},
+                )
+            else
+                "";
+            defer if (self.scripting != null) allocator.free(scripting_decls);
+
+            // The plugins tick block, split at the drain seam (labelle-
+            // assembler#593): the scripting variant splices the
+            // `script_contract.drainEvents` tap between the plugin ticks and
+            // `g.dispatchEvents()` — the engine contract's load-bearing
+            // "AFTER tick, BEFORE dispatchEvents" ordering (the tap copies
+            // subscribed events out of the SAME buffer dispatchEvents then
+            // consumes; after dispatch it would see an emptied buffer). The
+            // tap sits OUTSIDE the `scaled_dt > 0` gate on purpose: it must
+            // run exactly once per frame (it also recycles the
+            // `labelle_event_emit` payload arenas), and a paused game still
+            // dispatches buffered events the scripts subscribed to. Gated on
+            // `@hasDecl(engine, "script_contract")` so an engine predating
+            // the contract still builds (the assembler only emits the line
+            // when the scripting plugin is attached, so the flag side of the
+            // backend templates' double-gate is the emission itself).
+            const plugins_tick_head =
                 "        const scaled_dt = dt * g.time_scale;\n" ++
                 "        if (scaled_dt > 0) {\n" ++
                 "            runner.tick(&g, scaled_dt);\n" ++
                 "            PluginSystems.tick(&g, scaled_dt);\n" ++
                 "            PluginSystems.postTick(&g, scaled_dt);\n" ++
-                "        }\n" ++
+                "        }\n";
+            const scripting_drain =
+                "        // Script event tap (Script Runtime Contract, labelle-engine#749):\n" ++
+                "        // copy this frame's buffered events into the language scripts'\n" ++
+                "        // inbox AFTER the plugin ticks (the scripts have emitted), BEFORE\n" ++
+                "        // dispatchEvents (which consumes the buffer). Exactly once per\n" ++
+                "        // frame, even at time_scale == 0 — the drain is also the arena\n" ++
+                "        // maintenance point. Folds away on engines predating the contract.\n" ++
+                "        if (comptime @hasDecl(engine, \"script_contract\")) {\n" ++
+                "            engine.script_contract.drainEvents(&g);\n" ++
+                "        }\n";
+            const plugins_tick_tail =
                 "        g.dispatchEvents();\n" ++
                 "        // Update profiling pointers (debug only)\n" ++
                 "        if (comptime @TypeOf(runner).profiling_enabled) {\n" ++
@@ -208,7 +256,11 @@ pub fn Mixin(comptime Self: type) type {
                 "        if (comptime PluginSystems.profiling_enabled) {\n" ++
                 "            g.plugin_profile_ptr = @ptrCast(@alignCast(&PluginSystems.plugin_profile));\n" ++
                 "            g.plugin_profile_count = PluginSystems.plugin_system_count;\n" ++
-                "        }\n"
+                "        }\n";
+            const tick_code: []const u8 = if (cfg.plugins.len > 0 and self.scripting != null)
+                plugins_tick_head ++ scripting_drain ++ plugins_tick_tail
+            else if (cfg.plugins.len > 0)
+                plugins_tick_head ++ plugins_tick_tail
             else
                 "        const scaled_dt = dt * g.time_scale;\n" ++
                 "        if (scaled_dt > 0) {\n" ++
@@ -397,7 +449,7 @@ pub fn Mixin(comptime Self: type) type {
                 else
                     PREVIEW_INPUT_DISPATCH_STUB;
                 const input_dispatch: []const u8 = if (shape.imgui_dispatch) input_dispatch_cb else PREVIEW_INPUT_DISPATCH_STUB;
-                const module_vars = try std.mem.concat(allocator, u8, &.{ runner_decl, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch });
+                const module_vars = try std.mem.concat(allocator, u8, &.{ runner_decl, PREVIEW_HELPERS, sokol_readback_helpers, input_dispatch, scripting_decls });
                 defer allocator.free(module_vars);
                 const init_code = try self.buildCallbackInitCode();
                 defer allocator.free(init_code);
@@ -628,9 +680,9 @@ pub fn Mixin(comptime Self: type) type {
                 // dispatch lives on the sokol-callback site above.
                 const input_dispatch: []const u8 = PREVIEW_INPUT_DISPATCH_STUB;
                 const module_vars_loop = if (is_raylib_desktop)
-                    try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, PREVIEW_READBACK_HELPERS, input_dispatch })
+                    try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, PREVIEW_READBACK_HELPERS, input_dispatch, scripting_decls })
                 else
-                    try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, input_dispatch });
+                    try std.mem.concat(allocator, u8, &.{ PREVIEW_HELPERS, input_dispatch, scripting_decls });
                 defer allocator.free(module_vars_loop);
                 const preview_setup_loop = if (is_raylib_desktop)
                     try std.mem.concat(allocator, u8, &.{ PREVIEW_LOOP_SETUP, PREVIEW_READBACK_SETUP })

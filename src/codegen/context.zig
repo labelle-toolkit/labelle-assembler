@@ -35,6 +35,7 @@ const config = @import("../config.zig");
 const script_scanner = @import("../script_scanner.zig");
 const scene_manifest = @import("../scene_manifest.zig");
 const tilemap_scan = @import("../tilemap_scan.zig");
+const scripting_splice = @import("../scripting_splice.zig");
 const scan = @import("scan.zig");
 const manifest_v2 = @import("manifest_v2.zig");
 
@@ -101,6 +102,18 @@ pub const Codegen = struct {
     // `generateMainZigFromTemplate`). Empty by default so every caller that
     // never sets it (tests, preview, tilemap-free projects) emits nothing.
     tilemap_registrations: []const tilemap_scan.Registration = &.{},
+
+    // Scripting splice (labelle-assembler#593). Non-null when THE scripting
+    // plugin (`plugin.labelle` name `scripting`) is attached with
+    // `.params.language`: the lifecycle builders emit the
+    // `scripting.registerScript(...)` calls (loop/callback setup, before
+    // `PluginControllers.setup`), and the lifecycle render emits the
+    // module-scope alias + `scripting_enabled` flag and the per-frame
+    // `script_contract.drainEvents` tap. Borrowed; owned by `root.zig` (via
+    // the module-level var set before `generateMainZigFromTemplate`). Null by
+    // default so every caller that never sets it (tests, preview,
+    // script-less projects) emits byte-identical output.
+    scripting: ?scripting_splice.ScriptingSplice = null,
 
     // Priority-aware flow-handler ordering (indices into `script_entries`),
     // built by `blocks/hooks.zig:buildFlowOrder`. Borrowed: the
