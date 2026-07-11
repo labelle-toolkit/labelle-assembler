@@ -369,3 +369,120 @@ pub const BYTE_IDENTITY = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "params_mod") == null);
     }
 };
+
+pub const ENUM_LITERAL_LANGUAGE = struct {
+    test "a schema-declared enum `.language = .lua` reaches the policy AND the scripting splice (#591 P2)" {
+        // The silent-failure gap: the policy gate and `scripting_splice
+        // .detect` resolve the language through `PluginDep.declaredLanguage`
+        // BEFORE param resolution runs. When the scripting plugin's schema
+        // declares `language` as an enum and the project writes the natural
+        // enum-literal spelling, a str-only accessor read "no declaration"
+        // — one-language checks and the WHOLE splice silently skipped while
+        // validateAndResolve happily accepted the value. This pins the
+        // repaired path end to end from the project.labelle SOURCE: the
+        // splice fires (the `-Dlanguage` dep arg is emitted) and the params
+        // module still delivers the enum comptime.
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "game/plugins/scripting");
+        try tmp.dir.createDirPath(io, "out");
+        try writeFileIn(tmp.dir, "game/plugins/scripting/plugin.labelle",
+            \\.{
+            \\    .name = "scripting",
+            \\    .manifest_version = 1,
+            \\    .params_schema = .{
+            \\        .{ .name = "language", .type = .@"enum", .values = .{ "lua", "typescript" }, .required = true },
+            \\    },
+            \\}
+        );
+        const game_abs = try tmp.dir.realPathFileAlloc(io, "game", allocator);
+        defer allocator.free(game_abs);
+        const out_abs = try tmp.dir.realPathFileAlloc(io, "out", allocator);
+        defer allocator.free(out_abs);
+
+        const backend = try sokolFixtureAbs(allocator);
+        defer allocator.free(backend.repo);
+
+        const source: [:0]const u8 =
+            \\.{
+            \\    .name = "enum-lang-game",
+            \\    .plugins = .{
+            \\        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = .lua } },
+            \\    },
+            \\}
+        ;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var cfg = try generate.plugin_params.parseProjectConfig(arena.allocator(), source);
+        cfg.backend = .sokol;
+        cfg.backend_package = backend;
+        cfg.ecs = .mock;
+
+        try generate.generate(allocator, cfg, out_abs, game_abs, .{ .is_tests_target = true });
+
+        // The splice fired: the scripting plugin's b.dependency args carry
+        // the `-Dlanguage` option — absent exactly when detect() silently
+        // skipped (the pre-fix behavior).
+        const build_zig = try tmp.dir.readFileAlloc(io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
+        defer allocator.free(build_zig);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, ".language = .lua") != null);
+
+        // And the schema path still delivers the enum comptime.
+        const module = try tmp.dir.readFileAlloc(io, "out/sokol_desktop/plugin_scripting_params.zig", allocator, .limited(1 << 20));
+        defer allocator.free(module);
+        try std.testing.expect(std.mem.indexOf(u8, module, "pub const Language = enum { lua, typescript };") != null);
+        try std.testing.expect(std.mem.indexOf(u8, module, "pub const language: Language = .lua;") != null);
+    }
+
+    test "an enum-literal `.language` outside the POLICY vocabulary still fails the policy gate (#591 P2)" {
+        // Defense in depth: a third-party schema could vocabulary a language
+        // the toolkit doesn't support ("klingon") — validateAndResolve would
+        // accept it, but the one-language policy stays authoritative and
+        // rejects it (now that the enum spelling is visible to the gate at
+        // all — before the fix this ALSO silently skipped).
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "game/plugins/scripting");
+        try tmp.dir.createDirPath(io, "out");
+        try writeFileIn(tmp.dir, "game/plugins/scripting/plugin.labelle",
+            \\.{
+            \\    .name = "scripting",
+            \\    .manifest_version = 1,
+            \\    .params_schema = .{
+            \\        .{ .name = "language", .type = .@"enum", .values = .{ "klingon" } },
+            \\    },
+            \\}
+        );
+        const game_abs = try tmp.dir.realPathFileAlloc(io, "game", allocator);
+        defer allocator.free(game_abs);
+        const out_abs = try tmp.dir.realPathFileAlloc(io, "out", allocator);
+        defer allocator.free(out_abs);
+
+        const backend = try sokolFixtureAbs(allocator);
+        defer allocator.free(backend.repo);
+
+        const bag = [_]generate.plugin_params.Param{
+            .{ .name = "language", .value = .{ .enum_tag = "klingon" } },
+        };
+        const plugins = [_]generate.PluginDep{
+            .{ .name = "scripting", .repo = "local:plugins/scripting", .params_bag = &bag },
+        };
+        const cfg = generate.ProjectConfig{
+            .name = "klingon-game",
+            .backend = .sokol,
+            .backend_package = backend,
+            .ecs = .mock,
+            .plugins = &plugins,
+        };
+        try std.testing.expectError(
+            error.UnknownScriptLanguage,
+            generate.generate(allocator, cfg, out_abs, game_abs, .{ .is_tests_target = true }),
+        );
+        try std.testing.expectError(
+            error.FileNotFound,
+            tmp.dir.access(io, "out/sokol_desktop", .{}),
+        );
+    }
+};

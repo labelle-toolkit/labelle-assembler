@@ -701,12 +701,48 @@ pub fn parseSchemaFromManifestSource(
                 );
                 return error.PluginManifestInvalidParamsSchema;
             }
-            for (values) |v| {
+            for (values, 0..) |v, vi| {
                 if (!isIdent(v)) {
                     std.debug.print(
                         "labelle-assembler: plugin '{s}': enum param '{s}': value \"{s}\" is not a valid identifier.\n" ++
                             "  enum values become Zig enum tags in the generated params module.\n",
                         .{ plugin_name, entry_name, v },
+                    );
+                    return error.PluginManifestInvalidParamsSchema;
+                }
+                // A duplicate tag would render `enum { topdown, topdown }` —
+                // a generated module that fails to COMPILE instead of a
+                // manifest error here (#591 review P2).
+                for (values[0..vi]) |prev_v| {
+                    if (std.mem.eql(u8, prev_v, v)) {
+                        std.debug.print(
+                            "labelle-assembler: plugin '{s}': enum param '{s}': duplicate value \"{s}\" in `.values`.\n" ++
+                                "  each vocabulary entry becomes a Zig enum tag — remove the duplicate.\n",
+                            .{ plugin_name, entry_name, v },
+                        );
+                        return error.PluginManifestInvalidParamsSchema;
+                    }
+                }
+            }
+            // Two enum params whose names NORMALIZE to the same PascalCase
+            // type decl (`mode` / `mode_`, `foo_bar` / `foo__bar`) would
+            // render duplicate `pub const <Type>` decls — the same
+            // compile-instead-of-manifest-error failure (#591 review P2).
+            // Param DECLS can never collide with type decls by construction
+            // (names are validated lower_snake, rendered types start
+            // uppercase), so enum-type-vs-enum-type is the only collision
+            // the render can produce.
+            const type_name = try pascalCase(gpa, entry_name);
+            defer gpa.free(type_name);
+            for (list.items) |prev| {
+                if (prev.type != .@"enum") continue;
+                const prev_type_name = try pascalCase(gpa, prev.name);
+                defer gpa.free(prev_type_name);
+                if (std.mem.eql(u8, prev_type_name, type_name)) {
+                    std.debug.print(
+                        "labelle-assembler: plugin '{s}': enum params '{s}' and '{s}' both render the Zig type '{s}' in the generated params module.\n" ++
+                            "  rename one so their PascalCase forms differ.\n",
+                        .{ plugin_name, prev.name, entry_name, type_name },
                     );
                     return error.PluginManifestInvalidParamsSchema;
                 }
@@ -858,6 +894,12 @@ pub fn validateAndResolve(
         // Native fast path (#589 compat): a schema-less plugin whose bag is
         // exactly the singular string `language` — the shape every published
         // scripting pin uses — is the language policy's business, not ours.
+        // Deliberately STRING-only: the enum-literal spelling
+        // (`.language = .lua`) belongs to the schema world, so against a
+        // schema-less plugin it takes the LOUD error below (which names the
+        // fix) rather than widening the legacy surface. The policy accessor
+        // (`PluginDep.declaredLanguage`) recognizes both spellings, so the
+        // one-language checks still ran before this error fires.
         if (bag.len == 1 and std.mem.eql(u8, bag[0].name, "language") and bag[0].value == .str) {
             return null;
         }
@@ -1390,6 +1432,23 @@ test "parseSchemaFromManifestSource: shape rules reject at load" {
         // a name that can't be a Zig decl
         \\.{ .params_schema = .{ .{ .name = "Grid-Size", .type = .i64 } } }
         ,
+        // duplicate enum vocabulary entry (would RENDER `enum { topdown,
+        // topdown }` — a generated module that fails to compile) (#591 P2)
+        \\.{ .params_schema = .{ .{ .name = "mode", .type = .@"enum", .values = .{ "topdown", "topdown" } } } }
+        ,
+        // two enum params normalizing to the SAME PascalCase type decl
+        // (`mode` / `mode_` → `Mode`) — duplicate `pub const Mode` (#591 P2)
+        \\.{ .params_schema = .{
+        \\    .{ .name = "mode", .type = .@"enum", .values = .{ "a" } },
+        \\    .{ .name = "mode_", .type = .@"enum", .values = .{ "b" } },
+        \\} }
+        ,
+        // same collision through underscore runs (`foo_bar` / `foo__bar`)
+        \\.{ .params_schema = .{
+        \\    .{ .name = "foo_bar", .type = .@"enum", .values = .{ "a" } },
+        \\    .{ .name = "foo__bar", .type = .@"enum", .values = .{ "b" } },
+        \\} }
+        ,
     };
     for (cases) |src| {
         try testing.expectError(
@@ -1397,6 +1456,22 @@ test "parseSchemaFromManifestSource: shape rules reject at load" {
             parseSchemaFromManifestSource(testing.allocator, src, "acme"),
         );
     }
+}
+
+test "parseSchemaFromManifestSource: distinct PascalCase enums + a non-enum near-name are NOT collisions" {
+    // Positive control for the #591 P2 collision checks: `mode` (enum) vs
+    // `mode_kind` (enum, distinct PascalCase) vs `mode_` (a NON-enum param —
+    // it renders no type decl, so its PascalCase twin never exists).
+    const src: [:0]const u8 =
+        \\.{ .params_schema = .{
+        \\    .{ .name = "mode", .type = .@"enum", .values = .{ "a", "b" } },
+        \\    .{ .name = "mode_kind", .type = .@"enum", .values = .{ "x" } },
+        \\    .{ .name = "mode_", .type = .i64, .default = 1 },
+        \\} }
+    ;
+    const schema = try parseSchemaFromManifestSource(testing.allocator, src, "acme");
+    defer freeSchema(testing.allocator, schema);
+    try testing.expectEqual(@as(usize, 3), schema.len);
 }
 
 // ── layer 3: validation + resolution ────────────────────────────────

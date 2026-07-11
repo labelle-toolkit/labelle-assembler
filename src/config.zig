@@ -248,11 +248,15 @@ pub const PluginDep = struct {
 
     /// The entry's declared script language, whichever spelling carried it:
     /// the typed `.params.language` fast path (#589 — in-code literals and
-    /// the closed typed parse) or a `language` STRING in the generic
+    /// the closed typed parse) or a `language` entry in the generic
     /// `params_bag` (#591 — the tolerant parse extracts every `.params` key
-    /// there). The single accessor `language_policy` resolves through, so
-    /// the one-language policy sees the declaration in both worlds. When
-    /// both are set (only possible on a hand-built config) the typed field
+    /// there), spelled EITHER as the legacy string (`.language = "lua"`) or
+    /// as the enum literal (`.language = .lua`) a schema-declared enum param
+    /// accepts. The single accessor `language_policy` and the scripting
+    /// splice resolve through — and they run BEFORE param resolution, so a
+    /// spelling missed here would silently skip the one-language checks and
+    /// the whole splice (#591 review P2). When both the typed field and the
+    /// bag are set (only possible on a hand-built config) the typed field
     /// wins; the parse path never populates both.
     pub fn declaredLanguage(self: PluginDep) ?[]const u8 {
         if (self.params) |p| {
@@ -262,7 +266,7 @@ pub const PluginDep = struct {
             for (bag) |param| {
                 if (std.mem.eql(u8, param.name, "language")) {
                     return switch (param.value) {
-                        .str => |s| s,
+                        .str, .enum_tag => |s| s,
                         else => null,
                     };
                 }
@@ -1071,6 +1075,36 @@ test "PluginDep: an unknown key inside `.params` is a hard parse error (#584)" {
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "unexpected field 'lenguage'") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "supported: 'language'") != null);
+}
+
+test "PluginDep.declaredLanguage: typed field, bag string, AND bag enum literal all resolve (#591 P2)" {
+    const Param = @import("plugin_params.zig").Param;
+
+    // Typed fast path (#589 in-code literals).
+    const typed = PluginDep{ .name = "s", .params = .{ .language = "lua" } };
+    try std.testing.expectEqualStrings("lua", typed.declaredLanguage().?);
+
+    // Bag, legacy string spelling.
+    const str_bag = [_]Param{.{ .name = "language", .value = .{ .str = "lua" } }};
+    const via_str = PluginDep{ .name = "s", .params_bag = &str_bag };
+    try std.testing.expectEqualStrings("lua", via_str.declaredLanguage().?);
+
+    // Bag, ENUM-LITERAL spelling (`.language = .lua` against a schema that
+    // declares `language` as an enum). The policy gate and the scripting
+    // splice read this accessor BEFORE param resolution — before the fix a
+    // null here silently skipped the one-language checks and the splice.
+    const enum_bag = [_]Param{.{ .name = "language", .value = .{ .enum_tag = "lua" } }};
+    const via_enum = PluginDep{ .name = "s", .params_bag = &enum_bag };
+    try std.testing.expectEqualStrings("lua", via_enum.declaredLanguage().?);
+
+    // A `language` of any other shape is no declaration (resolution rejects
+    // it against a schema; the schema-less path errors on it loudly).
+    const int_bag = [_]Param{.{ .name = "language", .value = .{ .int = 1 } }};
+    const via_int = PluginDep{ .name = "s", .params_bag = &int_bag };
+    try std.testing.expect(via_int.declaredLanguage() == null);
+
+    // No params at all.
+    try std.testing.expect((PluginDep{ .name = "s" }).declaredLanguage() == null);
 }
 
 test "effectiveGamepad: bgfx defaults to .none, other backends to .auto, explicit honored (assembler#533)" {

@@ -436,6 +436,27 @@ test "resolveProjectLanguage: unknown vocabulary errors (#584)" {
     try testing.expectError(error.UnknownScriptLanguage, resolveProjectLanguage(&plugins));
 }
 
+test "resolveProjectLanguage: the enum-literal bag spelling (.lua) resolves — and its vocabulary is checked (#591 P2)" {
+    // A schema-declared enum `language` param arrives in the generic bag as
+    // an ENUM TAG (`.params = .{ .language = .lua }`). The policy resolves
+    // it through `PluginDep.declaredLanguage` — before the fix the enum
+    // spelling read as "no declaration" and the one-language checks (and
+    // the scripting splice downstream) silently skipped.
+    const Param = @import("plugin_params.zig").Param;
+    const lua_bag = [_]Param{.{ .name = "language", .value = .{ .enum_tag = "lua" } }};
+    const plugins = [_]config.PluginDep{
+        .{ .name = "scripting", .params_bag = &lua_bag },
+    };
+    const declared = (try resolveProjectLanguage(&plugins)).?;
+    try testing.expectEqualStrings("lua", declared.language);
+    try testing.expectEqualStrings("scripting", declared.plugin_name);
+
+    // The closed-vocabulary check applies to the enum spelling too.
+    const bad_bag = [_]Param{.{ .name = "language", .value = .{ .enum_tag = "cobol" } }};
+    const bad = [_]config.PluginDep{.{ .name = "scripting", .params_bag = &bad_bag }};
+    try testing.expectError(error.UnknownScriptLanguage, resolveProjectLanguage(&bad));
+}
+
 test "resolveProjectLanguage: two `.params.language` declarations error (#584)" {
     // Two scripting plugins — even AGREEING on the language — are an error:
     // the policy is one scripting plugin entry, singular `.params.language`.
