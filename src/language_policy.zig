@@ -113,8 +113,11 @@ pub fn resolveProjectLanguage(
 ) error{ UnknownScriptLanguage, MultipleLanguagePlugins }!?DeclaredLanguage {
     var found: ?DeclaredLanguage = null;
     for (plugins) |p| {
-        const params = p.params orelse continue;
-        const lang = params.language orelse continue;
+        // `declaredLanguage` resolves BOTH spellings: the typed
+        // `.params.language` fast path (#589) and a `language` string in the
+        // generic `params_bag` (#591's tolerant parse) — the policy sees the
+        // declaration no matter which parse produced the config.
+        const lang = p.declaredLanguage() orelse continue;
         if (!isSupportedLanguage(lang)) {
             std.debug.print(
                 "labelle-assembler: plugin '{s}' declares unknown script language \"{s}\".\n" ++

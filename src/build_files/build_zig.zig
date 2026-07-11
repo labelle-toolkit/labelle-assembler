@@ -6,6 +6,7 @@
 const std = @import("std");
 const tpl = @import("../template.zig");
 const config = @import("../config.zig");
+const plugin_params = @import("../plugin_params.zig");
 const backend_registry = @import("../backend_registry.zig");
 const capabilities = @import("../capabilities.zig");
 const scan = @import("../codegen/scan.zig");
@@ -372,6 +373,15 @@ pub const BuildZigOptions = struct {
     /// member, so always a valid enum-literal spelling). Defaults to null —
     /// splice-less projects keep a byte-identical build.zig.
     scripting: ?ScriptingDep = null,
+    /// Schema-declared plugin params (labelle-assembler#591): one entry per
+    /// plugin that resolved a non-empty schema. Each emits — inside the
+    /// shared plugin-injection block, so every platform and the tests target
+    /// get it — a `plugin_<name>_params_mod` createModule rooted at the
+    /// staged `plugin_<name>_params.zig` (see `plugin_params.stage`) plus
+    /// the `overrideImport(plugin_<name>_mod, "plugin_params", …)` that lets
+    /// the plugin read `@import("plugin_params")` comptime. Defaults to
+    /// empty — params-less projects keep a byte-identical build.zig.
+    plugin_params: []const plugin_params.ResolvedPluginParams = &.{},
 
     pub const ScriptingDep = struct {
         plugin_name: []const u8,
@@ -659,6 +669,25 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // when the shim doesn't import the plugin (project with no
             // plugins), so wiring every plugin is safe.
             try w.print("    overrideImport(game_mod, \"{s}\", plugin_{s}_mod);\n", .{ plugin.name, plugin.name });
+
+            // Schema-declared params (#591): a plugin that resolved params
+            // gets the staged `plugin_<name>_params.zig` as its OWN module,
+            // injected under the FIXED `plugin_params` import name (the
+            // packs' `@import("pack")` self-name convention) — so the
+            // plugin's code reads `@import("plugin_params")` comptime.
+            // Emitted LAST in the plugin's wiring so it wins any name
+            // shadowing (a sibling literally named `plugin_params` is
+            // already rejected at resolve time). Params-less plugins emit
+            // nothing — byte-identical build.zig.
+            for (opts.plugin_params) |pp| {
+                if (!std.mem.eql(u8, pp.plugin_name, plugin.name)) continue;
+                try w.print("    const plugin_{s}_params_mod = b.createModule(.{{\n", .{plugin.name});
+                try w.print("        .root_source_file = b.path(\"plugin_{s}_params.zig\"),\n", .{plugin.name});
+                try w.writeAll("        .target = target,\n");
+                try w.writeAll("        .optimize = optimize,\n");
+                try w.writeAll("    });\n");
+                try w.print("    overrideImport(plugin_{s}_mod, \"{s}\", plugin_{s}_params_mod);\n", .{ plugin.name, plugin_params.IMPORT_NAME, plugin.name });
+            }
         }
     }
 

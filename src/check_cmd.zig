@@ -508,7 +508,9 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
     const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
     const source_raw = try std.Io.Dir.cwd().readFileAlloc(io, labelle_path, allocator, .limited(1024 * 1024));
     const source = try allocator.dupeZ(u8, source_raw);
-    return try std.zon.parse.fromSliceAlloc(ProjectConfig, allocator, source, null, .{});
+    // Params-tolerant parse (#591) — `labelle check` must not choke on a
+    // project whose plugins take schema-declared params.
+    return try @import("plugin_params.zig").parseProjectConfig(allocator, source);
 }
 
 // ════════════════════════════════════════════════════════════════════════

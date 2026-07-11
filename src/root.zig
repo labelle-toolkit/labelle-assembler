@@ -25,6 +25,7 @@ const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
 const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
+pub const plugin_params = @import("plugin_params.zig");
 pub const scripting_splice = @import("scripting_splice.zig");
 pub const scripting_declare = @import("scripting_declare.zig");
 pub const pack_validate = @import("pack_validate.zig");
@@ -62,6 +63,7 @@ test {
     _ = @import("asset_validator.zig");
     _ = @import("pack_resources.zig");
     _ = @import("language_policy.zig");
+    _ = @import("plugin_params.zig");
     _ = @import("scripting_splice.zig");
     _ = @import("scripting_declare.zig");
     _ = @import("panel_validate.zig");
@@ -353,6 +355,18 @@ pub fn generate(
     // is a separate ticket), so a clean project generates byte-identical
     // output.
     try generate_phases.validateLanguagePolicy(allocator, pack_entries.items, cfg.plugins, game_dir);
+
+    // ── Schema-declared plugin params gate + resolution (#591) ─────────
+    // Validate every plugin entry's `.params` bag against its manifest's
+    // `.params_schema` and resolve the final param sets (project values +
+    // schema defaults) — beside the language gate, BEFORE the target dir is
+    // created, so an unknown/mistyped/missing-required param rejects the
+    // build with no stale output. The resolved sets drive the staged
+    // `plugin_<name>_params.zig` modules + the generated build.zig's
+    // `overrideImport` wiring below; an empty list (every params-less
+    // project) is a byte-identical no-op at every consumption site.
+    var resolved_plugin_params = try generate_phases.resolvePluginParams(allocator, cfg.plugins, game_dir);
+    defer plugin_params.freeResolvedList(allocator, &resolved_plugin_params);
 
     // ── Scripting splice detection (labelle-assembler#593) ─────────────
     // The consuming half of the policy above: when THE scripting plugin
@@ -894,6 +908,11 @@ pub fn generate(
         // language into the scripting plugin's `b.dependency` args
         // (`-Dlanguage`). Null → byte-identical dep args.
         .scripting = if (maybe_scripting) |s| .{ .plugin_name = s.plugin_name, .language = s.language } else null,
+        // Schema-declared plugin params (#591): each entry emits the
+        // `plugin_<name>_params_mod` createModule + the `overrideImport`
+        // that injects it into the plugin as `@import("plugin_params")`.
+        // Empty → byte-identical build.zig.
+        .plugin_params = resolved_plugin_params.items,
     });
     defer allocator.free(build_zig);
     try scanner.writeFile(target_dir, "build.zig", build_zig);
@@ -912,6 +931,13 @@ pub fn generate(
     // `@import` the codegen above emitted resolves in the real output dir.
     // Mirrors `stageBackendBuildHook`. No-op when no plugin ships a hook.
     try plugin_build_hook.stage(allocator, plugin_hook_disc.items, target_dir);
+
+    // Plugin params modules (#591): render each resolved param set as
+    // `plugin_<name>_params.zig` next to the generated build.zig, so the
+    // `b.path(…)` the codegen above emitted resolves in the real output
+    // dir. Same staging shape as the build hooks. No-op when no plugin
+    // resolved params (every schema-less project — byte-identical output).
+    try plugin_params.stage(allocator, resolved_plugin_params.items, target_dir);
 
     // Discover each plugin's `pub const Events` decls at assembler time
     // by AST-walking `<plugin>/src/root.zig`. The shim + main.zig

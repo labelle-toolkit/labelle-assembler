@@ -317,7 +317,10 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
     defer allocator.free(source_raw);
 
     const source = try allocator.dupeZ(u8, source_raw);
-    return try std.zon.parse.fromSliceAlloc(gen.ProjectConfig, allocator, source, null, .{});
+    // The params-tolerant parse (#591): identical to the plain typed parse
+    // for every source without a `.params` bag; extracts plugin-declared
+    // heterogeneous params into `PluginDep.params_bag` otherwise.
+    return try gen.plugin_params.parseProjectConfig(allocator, source);
 }
 
 // Pull in the subcommand modules' tests when this file is the test root.
