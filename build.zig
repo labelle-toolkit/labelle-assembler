@@ -41,6 +41,16 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "gfx_version", gfx_version);
     options.addOption([]const u8, "assembler_version", assembler_version);
 
+    // Test-only options: the exact zig binary driving THIS build, so the
+    // plugin-build-steps e2e (`test/plugin_build_steps_tests.zig`, #586) can
+    // run a real `zig build` of a spliced project without assuming a `zig`
+    // on PATH (the suite's hermeticity rule — see scripting_declare.zig).
+    // Deliberately NOT on `options`: that module compiles into release
+    // binaries, and a machine-local path must never be embedded there.
+    const test_options = b.addOptions();
+    test_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    const test_options_module = test_options.createModule();
+
     const generator_module = b.addModule("generator", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -156,6 +166,12 @@ pub fn build(b: *std.Build) void {
         // declared_components threaded, plus the declare phase e2e through
         // the real `generate` (override runner seam).
         "test/scripting_declare_tests.zig",
+        // Plugin build-integration hooks (#586): plugin.labelle `.build`
+        // steps through the real `generate` — wiring pins, the additive
+        // no-op invariant, the platform gate, and a REAL command+link e2e
+        // (`zig build-lib` → staticlib → extern symbol) via the spliced
+        // emitted block.
+        "test/plugin_build_steps_tests.zig",
     };
 
     for (test_files) |test_file| {
@@ -168,6 +184,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "generator", .module = generator_module },
                     .{ .name = "zspec", .module = zspec_dep.module("zspec") },
                     .{ .name = "flow_codegen", .module = flow_codegen_module },
+                    .{ .name = "test_options", .module = test_options_module },
                 },
             }),
         });

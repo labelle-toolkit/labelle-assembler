@@ -6,6 +6,7 @@
 const std = @import("std");
 const tpl = @import("../template.zig");
 const config = @import("../config.zig");
+const plugin_build_steps = @import("../plugin_build_steps.zig");
 const backend_registry = @import("../backend_registry.zig");
 const capabilities = @import("../capabilities.zig");
 const scan = @import("../codegen/scan.zig");
@@ -321,6 +322,189 @@ fn emitPluginBuildHooks(
     }
 }
 
+/// A declared plugin whose `plugin.labelle` carries a `.build` block
+/// (labelle-assembler#586). Loaded + validated + placeholder-root-resolved by
+/// root.zig (via `plugin_build_steps.loadFromDir`); here it drives
+/// `emitPluginBuildSteps` — the b.addSystemCommand + addObjectFile wiring in
+/// the generated build.zig. See `src/plugin_build_steps.zig` for the schema,
+/// placeholder language, and safety posture.
+pub const PluginBuildStepsWiring = struct {
+    /// Matches a `cfg.plugins` entry name (already identifier-safe — the
+    /// same guarantee `plugin_<name>_mod` emission relies on).
+    plugin_name: []const u8,
+    /// ABSOLUTE staged package dir — the `{package}` placeholder value and
+    /// the base every step cwd resolves under. Generate-time resolved
+    /// (deps copy, cache fallback), so the emitted command never depends
+    /// on the invoker's cwd.
+    package_abs: []const u8,
+    /// Build-root-RELATIVE persistent work dir — the `{cache}` placeholder
+    /// (`plugin-build/<name>`), resolved at build time via `b.pathFromRoot`
+    /// so the generated tree stays relocatable on that axis.
+    cache_rel: []const u8,
+    steps: []const plugin_build_steps.Step,
+};
+
+/// Emit one declared argv element as generated build.zig source.
+///
+/// `{package}` is substituted NOW (a generate-time absolute literal);
+/// `{cache}` / `{target}` become `{s}` slots of a `b.fmt(...)` resolved at
+/// build time against the per-plugin `plugin_<name>_build_cache` const /
+/// the shared `plugin_build_target_triple` const. An arg that IS exactly
+/// one build-time placeholder references the const directly (no b.fmt).
+/// All literal content is escaped for the Zig string literal; when the
+/// b.fmt layer wraps the arg, literal braces (only reachable via a
+/// substituted package path — declared args cannot carry stray braces,
+/// validated at load) are doubled so the format string stays well-formed.
+fn emitBuildStepArg(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    entry: PluginBuildStepsWiring,
+    arg: []const u8,
+) !void {
+    const has_slots =
+        plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_CACHE) or
+        plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_TARGET);
+
+    var fmt_body: std.ArrayList(u8) = .empty;
+    defer fmt_body.deinit(allocator);
+    var refs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (refs.items) |r| allocator.free(r);
+        refs.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    while (i < arg.len) {
+        if (plugin_build_steps.placeholderAt(arg, i)) |ph| {
+            if (std.mem.eql(u8, ph, plugin_build_steps.PLACEHOLDER_PACKAGE)) {
+                for (entry.package_abs) |ch| {
+                    try fmt_body.append(allocator, ch);
+                    // Double braces ONLY under a b.fmt wrap — a plain string
+                    // literal must carry them verbatim.
+                    if (has_slots and (ch == '{' or ch == '}')) try fmt_body.append(allocator, ch);
+                }
+            } else if (std.mem.eql(u8, ph, plugin_build_steps.PLACEHOLDER_CACHE)) {
+                try fmt_body.appendSlice(allocator, "{s}");
+                try refs.append(allocator, try std.fmt.allocPrint(allocator, "plugin_{s}_build_cache", .{entry.plugin_name}));
+            } else {
+                try fmt_body.appendSlice(allocator, "{s}");
+                try refs.append(allocator, try allocator.dupe(u8, "plugin_build_target_triple"));
+            }
+            i += ph.len;
+        } else {
+            try fmt_body.append(allocator, arg[i]);
+            i += 1;
+        }
+    }
+
+    if (!has_slots) {
+        try w.print("\"{f}\"", .{std.zig.fmtString(fmt_body.items)});
+    } else if (refs.items.len == 1 and std.mem.eql(u8, fmt_body.items, "{s}")) {
+        try w.writeAll(refs.items[0]);
+    } else {
+        try w.print("b.fmt(\"{f}\", .{{ ", .{std.zig.fmtString(fmt_body.items)});
+        for (refs.items, 0..) |r, ri| {
+            if (ri > 0) try w.writeAll(", ");
+            try w.writeAll(r);
+        }
+        try w.writeAll(" })");
+    }
+}
+
+/// Emit the declarative plugin build steps (labelle-assembler#586): per step
+/// a `b.addSystemCommand` run step (cwd inside the staged package, declared
+/// argv — no shell), chained in DECLARED ORDER within a plugin; per linked
+/// artifact an `addObjectFile` on the game artifact's root module plus the
+/// step dependency that orders the command before the link. `.static_lib`
+/// and `.object` both wire through `addObjectFile` (zig's build API treats
+/// `.a`/`.o` uniformly there — the mode is declarative intent, see
+/// `plugin_build_steps.LinkMode`).
+///
+/// Runs AFTER `artifact` (`exe`/`wasm`/`lib`) is assembled, mirroring
+/// `emitPluginBuildHooks`. Steps run on every `zig build` (a Run step with
+/// no declared outputs always executes); staleness is the TOOL's job —
+/// cargo / zig build-lib are internally incremental, so an unchanged input
+/// re-runs in tool-cache time. Wired into the MAIN artifact only (not
+/// `test_root`): game tests that extern-call plugin native symbols are a
+/// documented follow-up, and unreferenced externs don't link-fail.
+///
+/// A project whose plugins declare no `.build` passes an empty slice and
+/// emits nothing — the generated build.zig stays byte-identical (#586's
+/// additive invariant).
+fn emitPluginBuildSteps(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    artifact: []const u8,
+    entries: []const PluginBuildStepsWiring,
+) !void {
+    if (entries.len == 0) return;
+
+    // The shared triple const: emitted ONCE (a per-plugin decl would
+    // collide), and only when some arg uses {target} — an unused local
+    // const is a compile error in the generated build.zig.
+    var wants_triple = false;
+    for (entries) |e| {
+        for (e.steps) |s| {
+            for (s.command) |arg| {
+                if (plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_TARGET)) wants_triple = true;
+            }
+        }
+    }
+
+    try w.writeAll("\n    // Plugin build steps (labelle-assembler#586): declared argv from each\n");
+    try w.writeAll("    // plugin's plugin.labelle `.build` block; produced artifacts link onto\n");
+    try w.writeAll("    // the game artifact. Declared order = execution order within a plugin.\n");
+    if (wants_triple) {
+        try w.writeAll("    const plugin_build_target_triple = target.result.zigTriple(b.allocator) catch @panic(\"OOM\");\n");
+    }
+
+    for (entries) |e| {
+        // The {cache} const: per plugin, only when an arg references it
+        // (artifact paths use b.path directly and never need the const).
+        var wants_cache = false;
+        for (e.steps) |s| {
+            for (s.command) |arg| {
+                if (plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_CACHE)) wants_cache = true;
+            }
+        }
+        if (wants_cache) {
+            try w.print("    const plugin_{s}_build_cache = b.pathFromRoot(\"{f}\");\n", .{ e.plugin_name, std.zig.fmtString(e.cache_rel) });
+        }
+
+        for (e.steps, 0..) |s, i| {
+            try w.print("    // .build step '{s}' of plugin '{s}'\n", .{ s.name, e.plugin_name });
+            try w.print("    const plugin_{s}_build_step_{d} = b.addSystemCommand(&.{{ ", .{ e.plugin_name, i });
+            for (s.command, 0..) |arg, ai| {
+                if (ai > 0) try w.writeAll(", ");
+                try emitBuildStepArg(allocator, w, e, arg);
+            }
+            try w.writeAll(" });\n");
+            if (s.cwd) |c| {
+                try w.print("    plugin_{s}_build_step_{d}.setCwd(.{{ .cwd_relative = \"{f}/{f}\" }});\n", .{ e.plugin_name, i, std.zig.fmtString(e.package_abs), std.zig.fmtString(c) });
+            } else {
+                try w.print("    plugin_{s}_build_step_{d}.setCwd(.{{ .cwd_relative = \"{f}\" }});\n", .{ e.plugin_name, i, std.zig.fmtString(e.package_abs) });
+            }
+            if (i > 0) {
+                try w.print("    plugin_{s}_build_step_{d}.step.dependOn(&plugin_{s}_build_step_{d}.step);\n", .{ e.plugin_name, i, e.plugin_name, i - 1 });
+            }
+            if (s.link != .none) {
+                const a = s.artifact.?; // load-time validation guarantees presence + root
+                if (std.mem.startsWith(u8, a, plugin_build_steps.PLACEHOLDER_CACHE ++ "/")) {
+                    const rest = a[plugin_build_steps.PLACEHOLDER_CACHE.len + 1 ..];
+                    try w.print("    const plugin_{s}_build_artifact_{d} = b.path(\"{f}/{f}\");\n", .{ e.plugin_name, i, std.zig.fmtString(e.cache_rel), std.zig.fmtString(rest) });
+                } else {
+                    const rest = a[plugin_build_steps.PLACEHOLDER_PACKAGE.len + 1 ..];
+                    try w.print("    const plugin_{s}_build_artifact_{d}: std.Build.LazyPath = .{{ .cwd_relative = \"{f}/{f}\" }};\n", .{ e.plugin_name, i, std.zig.fmtString(e.package_abs), std.zig.fmtString(rest) });
+                }
+                try w.print("    {s}.root_module.addObjectFile(plugin_{s}_build_artifact_{d});\n", .{ artifact, e.plugin_name, i });
+            }
+        }
+        // The game artifact waits for the plugin's LAST step; the chain
+        // orders everything before it.
+        try w.print("    {s}.step.dependOn(&plugin_{s}_build_step_{d}.step);\n", .{ artifact, e.plugin_name, e.steps.len - 1 });
+    }
+}
+
 pub const BuildZigOptions = struct {
     /// Emit a test-only build.zig: skip the exe step, the run step,
     /// and the backend artifact link. Used by `generateTestsTarget`
@@ -349,6 +533,13 @@ pub const BuildZigOptions = struct {
     /// `backend.hook.zig` mechanism. Defaults to empty: a project whose
     /// plugins ship no hook keeps a byte-identical build.zig.
     plugin_hooks: []const PluginHook = &.{},
+    /// Declarative plugin build steps (labelle-assembler#586): each entry
+    /// emits `b.addSystemCommand` run steps + artifact `addObjectFile` link
+    /// wiring after the game artifact is assembled (`emitPluginBuildSteps`).
+    /// Loaded/validated/resolved by root.zig from each plugin.labelle's
+    /// `.build` block. Defaults to empty — a project whose plugins declare
+    /// no `.build` keeps a byte-identical build.zig.
+    plugin_build_steps: []const PluginBuildStepsWiring = &.{},
     /// Project root, used to locate the resolved backend package's
     /// `backend.manifest.v2.zon` (pluggable-backends RFC, assembler#453/#461).
     /// Null (default) means no manifest can be loaded, so codegen hard-errors —
@@ -713,6 +904,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Plugin native build hooks (#518).
         try emitPluginBuildHooks(w, "wasm", opts.plugin_hooks);
 
+        // Declarative plugin build steps (#586).
+        try emitPluginBuildSteps(allocator, w, "wasm", opts.plugin_build_steps);
+
         // Link bridge artifact for WASM (raw_backend GUIs) BEFORE the
         // backend-specific link step. sokol-zig's `emLinkStep` snapshots
         // `lib_main.getCompileDependencies(false)` to assemble the emcc
@@ -778,6 +972,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Plugin native build hooks (#518).
         try emitPluginBuildHooks(w, "exe", opts.plugin_hooks);
 
+        // Declarative plugin build steps (#586).
+        try emitPluginBuildSteps(allocator, w, "exe", opts.plugin_build_steps);
+
         // manifest-v2 ios: the generic link (linkLibrary + link_libc + linkFramework
         // from `.frameworks.ios`) plus the `post_wire` hook call for the SDK
         // include/lib/framework paths residual (design §4).
@@ -839,6 +1036,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Plugin native build hooks (#518).
         try emitPluginBuildHooks(w, "lib", opts.plugin_hooks);
 
+        // Declarative plugin build steps (#586).
+        try emitPluginBuildSteps(allocator, w, "lib", opts.plugin_build_steps);
+
         // manifest-v2 android: the generic link (linkLibrary + linkSystemLibrary from
         // `.system_libs.android` + `link_libc`) plus the `post_wire` hook call for the
         // NDK-sysroot / addLibraryPath / libc.txt residual (design §4).
@@ -899,6 +1099,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // Plugin native build hooks (#518): let a plugin contribute C/C++
             // sources / link steps / include paths to the exe.
             try emitPluginBuildHooks(w, "exe", opts.plugin_hooks);
+
+            // Declarative plugin build steps (#586): run each plugin's declared
+            // commands and link the produced staticlib/object into the exe.
+            try emitPluginBuildSteps(allocator, w, "exe", opts.plugin_build_steps);
 
             // Link backend artifact. manifest-v2 desktop codegen: linkLibrary from
             // manifest artifacts + the per-OS framework/system-lib wiring (design
@@ -1048,5 +1252,100 @@ test "emitPluginBuildHooks: no hooks emits nothing (byte-identical build.zig)" {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     try emitPluginBuildHooks(&aw.writer, "exe", &.{});
+    try testing.expectEqualStrings("", aw.written());
+}
+
+test "emitPluginBuildSteps: the ticket's cargo shape — command, cwd, artifact link (byte pin)" {
+    // The #586 acceptance wiring: a {cache}-parameterised command becomes a
+    // b.addSystemCommand with the per-plugin cache const spliced as the arg,
+    // cwd lands inside the staged package, the produced staticlib links via
+    // addObjectFile, and the exe waits on the step.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try emitPluginBuildSteps(testing.allocator, &aw.writer, "exe", &.{.{
+        .plugin_name = "foo",
+        .package_abs = "/abs/deps/labelle-foo",
+        .cache_rel = "plugin-build/foo",
+        .steps = &.{.{
+            .name = "cargo-lib",
+            .command = &.{ "cargo", "build", "--release", "--target-dir", "{cache}" },
+            .cwd = "native",
+            .artifact = "{cache}/release/libfoo.a",
+            .link = .static_lib,
+        }},
+    }});
+
+    try testing.expectEqualStrings(
+        "\n    // Plugin build steps (labelle-assembler#586): declared argv from each\n" ++
+            "    // plugin's plugin.labelle `.build` block; produced artifacts link onto\n" ++
+            "    // the game artifact. Declared order = execution order within a plugin.\n" ++
+            "    const plugin_foo_build_cache = b.pathFromRoot(\"plugin-build/foo\");\n" ++
+            "    // .build step 'cargo-lib' of plugin 'foo'\n" ++
+            "    const plugin_foo_build_step_0 = b.addSystemCommand(&.{ \"cargo\", \"build\", \"--release\", \"--target-dir\", plugin_foo_build_cache });\n" ++
+            "    plugin_foo_build_step_0.setCwd(.{ .cwd_relative = \"/abs/deps/labelle-foo/native\" });\n" ++
+            "    const plugin_foo_build_artifact_0 = b.path(\"plugin-build/foo/release/libfoo.a\");\n" ++
+            "    exe.root_module.addObjectFile(plugin_foo_build_artifact_0);\n" ++
+            "    exe.step.dependOn(&plugin_foo_build_step_0.step);\n",
+        aw.written(),
+    );
+}
+
+test "emitPluginBuildSteps: {package}/{target} args, step chaining, package-rooted artifact" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try emitPluginBuildSteps(testing.allocator, &aw.writer, "lib", &.{.{
+        .plugin_name = "bar",
+        .package_abs = "/pkg/bar",
+        .cache_rel = "plugin-build/bar",
+        .steps = &.{
+            .{
+                .name = "gen",
+                .command = &.{ "tool", "--triple={target}", "{package}/src" },
+            },
+            .{
+                .name = "pack",
+                .command = &.{ "pack", "{package}/out.o" },
+                .artifact = "{package}/libbar.a",
+                .link = .object,
+            },
+        },
+    }});
+    const out = aw.written();
+
+    // {target} in an arg → ONE shared triple const, resolved at build time.
+    const triple_decl = "    const plugin_build_target_triple = target.result.zigTriple(b.allocator) catch @panic(\"OOM\");\n";
+    const first = std.mem.indexOf(u8, out, triple_decl) orelse return error.MissingTripleDecl;
+    try testing.expect(std.mem.indexOfPos(u8, out, first + 1, triple_decl) == null);
+
+    // Mixed-text {target} arg → b.fmt; {package} arg → generate-time literal.
+    try testing.expect(std.mem.indexOf(u8, out, "    const plugin_bar_build_step_0 = b.addSystemCommand(&.{ \"tool\", b.fmt(\"--triple={s}\", .{ plugin_build_target_triple }), \"/pkg/bar/src\" });\n") != null);
+
+    // No {cache} use anywhere → no cache const (would be an unused-const
+    // compile error in the generated build.zig).
+    try testing.expect(std.mem.indexOf(u8, out, "plugin_bar_build_cache") == null);
+
+    // Declared order = execution order: step 1 waits on step 0; the lib
+    // artifact waits on the LAST step.
+    try testing.expect(std.mem.indexOf(u8, out, "    plugin_bar_build_step_1.step.dependOn(&plugin_bar_build_step_0.step);\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    lib.step.dependOn(&plugin_bar_build_step_1.step);\n") != null);
+
+    // {package}-rooted artifact → absolute cwd_relative LazyPath.
+    try testing.expect(std.mem.indexOf(u8, out, "    const plugin_bar_build_artifact_1: std.Build.LazyPath = .{ .cwd_relative = \"/pkg/bar/libbar.a\" };\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    lib.root_module.addObjectFile(plugin_bar_build_artifact_1);\n") != null);
+
+    // A .link = .none step links nothing.
+    try testing.expect(std.mem.indexOf(u8, out, "plugin_bar_build_artifact_0") == null);
+
+    // Default cwd = the package root.
+    try testing.expect(std.mem.indexOf(u8, out, "    plugin_bar_build_step_0.setCwd(.{ .cwd_relative = \"/pkg/bar\" });\n") != null);
+}
+
+test "emitPluginBuildSteps: no declared steps emits nothing (byte-identical build.zig)" {
+    // #586's additive invariant, same shape as the #518 no-hooks pin.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try emitPluginBuildSteps(testing.allocator, &aw.writer, "exe", &.{});
     try testing.expectEqualStrings("", aw.written());
 }
