@@ -395,7 +395,7 @@ fn parseField(a: std.mem.Allocator, comp_name: []const u8, val: std.json.Value) 
     };
 
     const default: Default = switch (field_type) {
-        .f32 => .{ .f32 = try expectNumber(comp_name, name, default_val) },
+        .f32 => .{ .f32 = try expectF32(comp_name, name, default_val) },
         .i32 => .{ .i32 = std.math.cast(i32, try expectInteger(comp_name, name, default_val)) orelse
             return failRange(comp_name, name, "i32") },
         .u32 => .{ .u32 = std.math.cast(u32, try expectInteger(comp_name, name, default_val)) orelse
@@ -420,8 +420,8 @@ fn parseField(a: std.mem.Allocator, comp_name: []const u8, val: std.json.Value) 
                 const x = vo.get("x") orelse return failVec2(comp_name, name);
                 const y = vo.get("y") orelse return failVec2(comp_name, name);
                 break :blk .{ .vec2 = .{
-                    .x = try expectNumber(comp_name, name, x),
-                    .y = try expectNumber(comp_name, name, y),
+                    .x = try expectF32(comp_name, name, x),
+                    .y = try expectF32(comp_name, name, y),
                 } };
             },
             else => return failVec2(comp_name, name),
@@ -442,6 +442,26 @@ fn expectNumber(comp_name: []const u8, field_name: []const u8, val: std.json.Val
             return error.ScriptSchemaInvalid;
         },
     };
+}
+
+/// Largest finite magnitude an f32 default may carry — the declare TOOL's
+/// own gate mirrored with the identical constant (labelle-scripting#5,
+/// `F32_MAX` in declare_prelude.lua; its golden pins that 3.4e38 passes).
+const f32_max: f64 = 3.4028235e38;
+
+/// `expectNumber` + the f32 range gate for `f32` fields and `vec2` axes:
+/// the schema carries f64, so a runner emitting `1e100` would otherwise
+/// pass validation and only fail LATER, as a compile error on the
+/// generated `level: f32 = 1e100` — far from the declaration. Finite-only
+/// (non-finite handling is unchanged; the tool rejects nan/inf on its
+/// side), so the beyond-max check mirrors the tool's semantics exactly.
+fn expectF32(comp_name: []const u8, field_name: []const u8, val: std.json.Value) !f64 {
+    const v = try expectNumber(comp_name, field_name, val);
+    if (std.math.isFinite(v) and @abs(v) > f32_max) {
+        diag("script-declared component '{s}' field '{s}': default {e} is outside f32 range (magnitude must not exceed 3.4028235e38)", .{ comp_name, field_name, v });
+        return error.ScriptSchemaInvalid;
+    }
+    return v;
 }
 
 fn expectInteger(comp_name: []const u8, field_name: []const u8, val: std.json.Value) !i64 {
@@ -622,6 +642,45 @@ pub fn checkCollisions(
 
 // ── The exec slice ───────────────────────────────────────────────────
 
+/// The three paths the tool build uses — the install prefix, its zig
+/// cache, and the resulting binary — all ABSOLUTE.
+///
+/// Absolutized against OUR cwd (PR #598 finding 1) because the `zig build`
+/// child runs with cwd = the plugin package: with a relative `output_dir`
+/// (the common `--project-root .` CLI shape builds `./.labelle`) the child
+/// would resolve `--cache-dir`/`--prefix` relative to the package —
+/// installing the tool inside the staged, wiped-per-generate deps copy —
+/// while our own post-build `dirExists(tool_path)` check resolves the same
+/// spelling against OUR cwd, so the build "succeeds" yet the tool is never
+/// found (DeclareToolBuildFailed, only for relative project roots).
+/// `output_dir` always exists by the time the declare phase runs (deps
+/// were staged under it), so realpath is available; the absolute
+/// `tool_path` also keeps the in-process cache and the later exec
+/// cwd-independent.
+const ToolPaths = struct {
+    prefix: []const u8,
+    zig_cache: []const u8,
+    tool_path: []const u8,
+
+    fn deinit(self: ToolPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.prefix);
+        allocator.free(self.zig_cache);
+        allocator.free(self.tool_path);
+    }
+};
+
+fn declareToolPaths(allocator: std.mem.Allocator, output_dir: []const u8) !ToolPaths {
+    const output_abs = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), output_dir, allocator);
+    defer allocator.free(output_abs);
+    const prefix = try std.fs.path.join(allocator, &.{ output_abs, "declare-tool" });
+    errdefer allocator.free(prefix);
+    const zig_cache = try std.fs.path.join(allocator, &.{ prefix, "zig-cache" });
+    errdefer allocator.free(zig_cache);
+    const exe_name = if (builtin.os.tag == .windows) "labelle-declare.exe" else "labelle-declare";
+    const tool_path = try std.fs.path.join(allocator, &.{ prefix, "bin", exe_name });
+    return .{ .prefix = prefix, .zig_cache = zig_cache, .tool_path = tool_path };
+}
+
 /// Resolve (building if needed) the declare tool for the scripting plugin
 /// package at `pkg_dir`, installing under `<output_dir>/declare-tool/`.
 /// Returns a path valid for the rest of the process (override, or the
@@ -636,6 +695,10 @@ fn ensureDeclareTool(allocator: std.mem.Allocator, pkg_dir: []const u8, output_d
     // a WORKING project (scripts run, none declare), not a generate
     // failure, or upgrading the assembler breaks every existing scripting
     // pin. runPhase turns this error into a note + phase skip.
+    //
+    // A RELATIVE `pkg_dir` is fine here (unlike `output_dir` below): the
+    // probe and the spawn's `.cwd` are both resolved against OUR cwd, so
+    // every consumer of the spelling agrees.
     const marker = try std.fs.path.join(allocator, &.{ pkg_dir, "tools", "declare" });
     defer allocator.free(marker);
     if (!cache.dirExists(marker)) return error.DeclareToolAbsent;
@@ -649,14 +712,20 @@ fn ensureDeclareTool(allocator: std.mem.Allocator, pkg_dir: []const u8, output_d
 
     // Cache dir + install prefix OUTSIDE the (wiped-per-generate) deps
     // copy — this is what makes re-generates warm; see the module doc.
-    const prefix = try std.fs.path.join(allocator, &.{ output_dir, "declare-tool" });
-    defer allocator.free(prefix);
-    const zig_cache = try std.fs.path.join(allocator, &.{ prefix, "zig-cache" });
-    defer allocator.free(zig_cache);
+    // Absolute (never output_dir-relative): the child's cwd is `pkg_dir`,
+    // not ours — see `declareToolPaths`.
+    const paths = declareToolPaths(allocator, output_dir) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            diag("could not resolve the declare-tool install dir under {s}: {s}", .{ output_dir, @errorName(err) });
+            return error.DeclareToolBuildFailed;
+        },
+    };
+    defer paths.deinit(allocator);
 
     const io = config.globalIo();
     const result = std.process.run(allocator, io, .{
-        .argv = &.{ "zig", "build", "labelle-declare", "--cache-dir", zig_cache, "--prefix", prefix },
+        .argv = &.{ "zig", "build", "labelle-declare", "--cache-dir", paths.zig_cache, "--prefix", paths.prefix },
         .cwd = .{ .path = pkg_dir },
     }) catch |err| {
         diag("could not run `zig build labelle-declare` in {s}: {s}", .{ pkg_dir, @errorName(err) });
@@ -677,19 +746,16 @@ fn ensureDeclareTool(allocator: std.mem.Allocator, pkg_dir: []const u8, output_d
         },
     }
 
-    const exe_name = if (builtin.os.tag == .windows) "labelle-declare.exe" else "labelle-declare";
-    const tool_path = try std.fs.path.join(allocator, &.{ prefix, "bin", exe_name });
-    defer allocator.free(tool_path);
-    if (!cache.dirExists(tool_path)) {
-        diag("`zig build labelle-declare` succeeded but {s} is missing", .{tool_path});
+    if (!cache.dirExists(paths.tool_path)) {
+        diag("`zig build labelle-declare` succeeded but {s} is missing", .{paths.tool_path});
         return error.DeclareToolBuildFailed;
     }
-    if (pkg_dir.len > cached_pkg.len or tool_path.len > cached_tool.len)
+    if (pkg_dir.len > cached_pkg.len or paths.tool_path.len > cached_tool.len)
         return error.NameTooLong;
     @memcpy(cached_pkg[0..pkg_dir.len], pkg_dir);
     cached_pkg_len = pkg_dir.len;
-    @memcpy(cached_tool[0..tool_path.len], tool_path);
-    cached_tool_len = tool_path.len;
+    @memcpy(cached_tool[0..paths.tool_path.len], paths.tool_path);
+    cached_tool_len = paths.tool_path.len;
     return cached_tool[0..cached_tool_len];
 }
 
@@ -722,6 +788,11 @@ fn resolvePluginPackageDir(
 /// Exec the declare tool over the copied `<language>/` scripts and parse
 /// its stdout as the schema. A nonzero exit relays the tool's stderr (the
 /// file-and-name-bearing declaration error) and fails generation.
+///
+/// Relative-path audit (PR #598 finding 1): unlike the tool BUILD, this
+/// spawn sets no `.cwd` — the child inherits OURS — so a relative
+/// `target_dir` in the script argv (and a relative `tool_path`) resolves
+/// exactly where our own checks resolved it. No absolutization needed.
 fn runDeclareTool(
     allocator: std.mem.Allocator,
     tool_path: []const u8,
@@ -984,6 +1055,39 @@ test "parseSchema: reserved names reject — keyword/primitive fields, the gener
     schema.deinit();
 }
 
+test "parseSchema: f32 defaults beyond f32 range reject at generate time (the declare tool's F32_MAX gate, mirrored)" {
+    // The schema carries f64 — without the gate a runner emitting 1e100
+    // passes validation and the generated `x: f32 = 1e100` fails at COMPILE
+    // time instead (PR #598 finding 3). f32 fields and both vec2 axes gate.
+    const overflow_cases = [_][]const u8{
+        \\{"components":[{"name":"A","fields":[{"name":"level","type":"f32","default":1e100}]}]}
+        ,
+        \\{"components":[{"name":"A","fields":[{"name":"level","type":"f32","default":-1e100}]}]}
+        ,
+        \\{"components":[{"name":"A","fields":[{"name":"pos","type":"vec2","default":{"x":1e100,"y":0}}]}]}
+        ,
+        \\{"components":[{"name":"A","fields":[{"name":"pos","type":"vec2","default":{"x":0,"y":-1e100}}]}]}
+        ,
+    };
+    for (overflow_cases) |case| {
+        try testing.expectError(error.ScriptSchemaInvalid, parseSchema(testing.allocator, case));
+    }
+    // The tool-side golden's boundary values still pass: 3.4e38 (the
+    // labelle-scripting#5 byte-exact pass case) and the F32_MAX constant
+    // itself (the gate is strictly greater-than).
+    var schema = try parseSchema(testing.allocator,
+        \\{"components":[{"name":"A","fields":[
+        \\  {"name":"big","type":"f32","default":3.4e38},
+        \\  {"name":"edge","type":"f32","default":3.4028235e38},
+        \\  {"name":"pos","type":"vec2","default":{"x":3.4e38,"y":-3.4e38}}
+        \\]}]}
+    );
+    defer schema.deinit();
+    try testing.expectEqual(@as(f64, 3.4e38), schema.components[0].fields[0].default.f32);
+    try testing.expectEqual(@as(f64, 3.4e38), schema.components[0].fields[2].default.vec2.x);
+    try testing.expectEqual(@as(f64, -3.4e38), schema.components[0].fields[2].default.vec2.y);
+}
+
 /// Render `components` into a caller-freed buffer.
 fn renderForTest(components: []const DeclaredComponent) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -1066,6 +1170,44 @@ test "renderComponentsFile: transient policy, entity_refs, str escaping, vec2 ba
         "    pub const save = @import(\"labelle-core\").Saveable(.transient, @This(), .{});\n" ++
         "};\n") != null);
     try expectAstGenOk(got);
+}
+
+test "declareToolPaths: a RELATIVE output dir absolutizes against OUR cwd (never the plugin package's)" {
+    // The `zig build` child runs with cwd = the plugin package, so every
+    // path it receives must already be absolute — a relative `output_dir`
+    // (the `--project-root .` CLI shape) previously produced
+    // package-relative `--prefix`/`--cache-dir` while our post-build
+    // existence check resolved the same spelling against OUR cwd (PR #598
+    // finding 1). The spawn itself isn't exercised here — building the
+    // real tool needs `zig` on PATH + a network lua fetch, exactly what
+    // the suite must not depend on — so the pin sits on the path helper
+    // the spawn consumes.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `testing.tmpDir` always creates `.zig-cache/tmp/<sub>` under the
+    // test cwd — its cwd-RELATIVE spelling is exactly the shape that broke.
+    var rel_buf: [64]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+
+    const paths = try declareToolPaths(testing.allocator, rel);
+    defer paths.deinit(testing.allocator);
+
+    try testing.expect(std.fs.path.isAbsolute(paths.prefix));
+    try testing.expect(std.fs.path.isAbsolute(paths.zig_cache));
+    try testing.expect(std.fs.path.isAbsolute(paths.tool_path));
+
+    // And they resolve to the SAME place our own cwd-relative checks do.
+    const abs = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), rel, testing.allocator);
+    defer testing.allocator.free(abs);
+    const expected_prefix = try std.fs.path.join(testing.allocator, &.{ abs, "declare-tool" });
+    defer testing.allocator.free(expected_prefix);
+    const expected_cache = try std.fs.path.join(testing.allocator, &.{ expected_prefix, "zig-cache" });
+    defer testing.allocator.free(expected_cache);
+    try testing.expectEqualStrings(expected_prefix, paths.prefix);
+    try testing.expectEqualStrings(expected_cache, paths.zig_cache);
+    try testing.expect(std.mem.startsWith(u8, paths.tool_path, expected_prefix));
+    try testing.expect(std.mem.indexOf(u8, paths.tool_path, "labelle-declare") != null);
 }
 
 test "checkCollisions: game components, packs, and the VideoComponent built-in all gate" {
