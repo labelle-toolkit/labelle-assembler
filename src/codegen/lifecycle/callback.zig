@@ -224,9 +224,10 @@ pub fn Mixin(comptime Self: type) type {
             // convention-dir source (`lua/`, `ts/` — the splice's `dir`)
             // with the scripting plugin BEFORE `PluginControllers.setup`
             // below boots the VM. Pre-sorted stems, byte-stable; no-op for
-            // splice-less projects.
+            // splice-less projects. EMBED family only (labelle-engine#741):
+            // native-compiled splices link, never embed — see loop.zig.
             if (self.scripting) |s| {
-                if (s.script_names.len > 0) {
+                if (s.family == .embed and s.script_names.len > 0) {
                     try w.writeByte('\n');
                     try w.print("    // Embedded {s} scripts (via @embedFile) — registered with the\n", .{s.language});
                     try w.writeAll("    // scripting plugin before PluginControllers.setup boots the VM.\n");

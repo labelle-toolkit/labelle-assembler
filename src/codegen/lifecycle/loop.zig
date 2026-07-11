@@ -262,8 +262,12 @@ pub fn Mixin(comptime Self: type) type {
             // Names are the stems relative to the script dir (subdirs
             // joined with `/`), pre-sorted by the root.zig scan so the
             // emission is byte-stable. No-op for splice-less projects.
+            // EMBED family only (labelle-engine#741): a native-compiled
+            // splice links its scripts as a staticlib — no registerScript,
+            // no @embedFile. `script_names` is empty for natives anyway;
+            // the family gate keeps that invariant explicit here.
             if (self.scripting) |s| {
-                if (s.script_names.len > 0) {
+                if (s.family == .embed and s.script_names.len > 0) {
                     try w.writeByte('\n');
                     try w.print("    // Embedded {s} scripts (via @embedFile) — registered with the\n", .{s.language});
                     try w.writeAll("    // scripting plugin before PluginControllers.setup boots the VM.\n");

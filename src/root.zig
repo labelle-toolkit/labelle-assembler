@@ -494,12 +494,20 @@ pub fn generate(
     // transpile hook) fail generate FIRST — the scan collects only the
     // embed extension, so without the gate an authored `.ts` would neither
     // embed nor error.
+    //
+    // EMBED family only: a native-compiled language (rust) never embeds —
+    // its sources are staged over the plugin package's crate instead
+    // (`stageNativeSources` below, AFTER `createDepsLinks` staged that
+    // package), and `script_names` stays empty so the registerScript
+    // builders emit nothing.
     var scripting_script_names: ?[][]const u8 = null;
     defer if (scripting_script_names) |names| scanner.freeNames(allocator, names);
     if (maybe_scripting) |*s| {
-        try scripting_splice.rejectUntranspiledScripts(allocator, game_dir, s.*);
-        scripting_script_names = try scanner.linkAndScan(allocator, game_dir, target_dir, s.dir, s.extension);
-        s.script_names = scripting_script_names.?;
+        if (s.family == .embed) {
+            try scripting_splice.rejectUntranspiledScripts(allocator, game_dir, s.*);
+            scripting_script_names = try scanner.linkAndScan(allocator, game_dir, target_dir, s.dir, s.extension);
+            s.script_names = scripting_script_names.?;
+        }
     }
 
     const scripts_target = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
@@ -824,6 +832,10 @@ pub fn generate(
     var declare_schema: ?scripting_declare.Schema = null;
     defer if (declare_schema) |*sch| sch.deinit();
     if (maybe_scripting) |*s| {
+        // The declare phase is embed-only by construction: a native splice
+        // keeps `script_names` empty (nothing embeds), so `runPhase`
+        // returns null at its zero-scripts gate before the lua-only
+        // language gate is even consulted.
         declare_schema = try scripting_declare.runPhase(allocator, .{
             .plugins = cfg.plugins,
             .plugin_name = s.plugin_name,
@@ -837,6 +849,25 @@ pub fn generate(
             .pack_scans = pack_scans.items,
         });
         if (declare_schema) |sch| s.declared_components = sch.components;
+    }
+
+    // ── Native-language game-source staging (labelle-engine#741) ───────
+    // The native family's replacement for the embed copy above: stage the
+    // game's `<dir>/` sources (rust/) OVER the scripting plugin's staged
+    // package (`deps/labelle-<name>/native/src/game/`, replacing the
+    // shipped placeholder), so the plugin's `.language_builds` step
+    // (cargo) compiles the GAME's scripts into the staticlib the build
+    // wiring below links. Ordered like the declare phase: AFTER
+    // build.zig.zon generation (`createDepsLinks` just staged the
+    // package) and BEFORE the plugin-build-steps wiring resolves
+    // `{package}`. Hard-errors when deps staging fell back to the shared
+    // plugin cache — game sources are never written there (see
+    // `stageNativeSources`' module doc). Runs on the tests-target pass
+    // too (deps survive it un-restaged; the copy is idempotent).
+    if (maybe_scripting) |s| {
+        if (s.family == .native) {
+            try scripting_splice.stageNativeSources(allocator, game_dir, output_dir, s);
+        }
     }
 
     // Embedded-tilemap registrations (T2 Phase 4 + T3 #561/#562 + #585).
@@ -892,9 +923,12 @@ pub fn generate(
     for (plugin_hook_disc.items, 0..) |d, i| plugin_hooks[i] = .{ .plugin_name = d.plugin_name };
 
     // Plugin declarative build steps (labelle-assembler#586): load each
-    // decl-module plugin's `plugin.labelle` `.build` block, gate platform
-    // constraints, resolve the two placeholder roots, and thread the wiring
-    // into the generated build.zig (`emitPluginBuildSteps`: b.addSystemCommand
+    // decl-module plugin's `plugin.labelle` `.build` block PLUS the
+    // `.language_builds` entry matching the project's declared script
+    // language (labelle-engine#741 — the native-compiled family's cargo
+    // step), gate platform constraints, resolve the two placeholder roots,
+    // and thread the wiring into the generated build.zig
+    // (`emitPluginBuildSteps`: b.addSystemCommand
     // + addObjectFile + step deps — see plugin_build_steps.zig for the design,
     // placeholder language, and safety posture). Skipped for the tests target:
     // it assembles no exe, so there is nothing to hang a produced artifact on
@@ -911,6 +945,24 @@ pub fn generate(
         for (plugin_build_loaded.items) |*l| l.deinit();
         plugin_build_loaded.deinit(allocator);
     }
+    // Per-language step lists (labelle-engine#741): each plugin's
+    // `.language_builds` entry matching the project's declared language,
+    // loaded beside `.build` and wired through the SAME emission. Kept in
+    // their own list because the parse tree owns the steps the wiring
+    // borrows.
+    var plugin_langbuild_loaded: std.ArrayList(plugin_build_steps.LanguageBuilds) = .empty;
+    defer {
+        for (plugin_langbuild_loaded.items) |*l| l.deinit();
+        plugin_langbuild_loaded.deinit(allocator);
+    }
+    // Concatenated `.build` ++ `.language_builds` step slices for plugins
+    // declaring BOTH (the emitter needs ONE entry per plugin — its
+    // generated variable names are `plugin_<name>_build_step_<i>`).
+    var plugin_build_concat: std.ArrayList([]plugin_build_steps.Step) = .empty;
+    defer {
+        for (plugin_build_concat.items) |c| allocator.free(c);
+        plugin_build_concat.deinit(allocator);
+    }
     var plugin_build_wirings: std.ArrayList(build_files.PluginBuildStepsWiring) = .empty;
     defer {
         for (plugin_build_wirings.items) |pw| {
@@ -920,6 +972,14 @@ pub fn generate(
         plugin_build_wirings.deinit(allocator);
     }
     if (!is_tests_target) {
+        // The project's declared script language, if any — selects each
+        // plugin's `.language_builds` entry. Resolved from the FULL plugin
+        // list (the same view the policy phase validated; a decl-module
+        // filter is irrelevant to the declaration). Same re-parse-per-phase
+        // pattern as the splice detection.
+        const declared_language: ?[]const u8 =
+            if (try language_policy.resolveProjectLanguage(cfg.plugins)) |d| d.language else null;
+
         for (cfg_modules.plugins) |plugin| {
             // A plugin whose directory cannot be resolved is a pre-existing
             // hard error elsewhere in the pipeline (same posture as the #518
@@ -927,28 +987,71 @@ pub fn generate(
             const plugin_dir = cache.resolvePlugin(allocator, plugin, game_dir) catch continue;
             defer allocator.free(plugin_dir);
 
-            var loaded = (try plugin_build_steps.loadFromDir(allocator, plugin_dir, plugin.name)) orelse continue;
-            errdefer loaded.deinit();
+            var maybe_build = try plugin_build_steps.loadFromDir(allocator, plugin_dir, plugin.name);
+            errdefer if (maybe_build) |*l| l.deinit();
+            // `.language_builds` applies only when the project declares a
+            // language — a language-less project loads nothing, no matter
+            // what the manifest carries (the "runs for EVERY consumer"
+            // trap `.build` has is exactly what this key exists to avoid).
+            var maybe_lang: ?plugin_build_steps.LanguageBuilds = null;
+            errdefer if (maybe_lang) |*l| l.deinit();
+            if (declared_language) |lang| {
+                maybe_lang = try plugin_build_steps.loadLanguageBuildsFromDir(allocator, plugin_dir, plugin.name, lang);
+            }
+            if (maybe_build == null and maybe_lang == null) continue;
 
-            // Both appends below must be infallible once owned resources are
+            const build_steps_slice: []const plugin_build_steps.Step =
+                if (maybe_build) |l| l.steps else &.{};
+            const lang_steps_slice: []const plugin_build_steps.Step =
+                if (maybe_lang) |l| l.steps else &.{};
+
+            // All appends below must be infallible once owned resources are
             // handed over, or an error between them double-frees.
             try plugin_build_loaded.ensureUnusedCapacity(allocator, 1);
+            try plugin_langbuild_loaded.ensureUnusedCapacity(allocator, 1);
+            try plugin_build_concat.ensureUnusedCapacity(allocator, 1);
             try plugin_build_wirings.ensureUnusedCapacity(allocator, 1);
 
             // Platform gate: a declared allowlist excluding THIS platform
             // fails the generate up front — the alternative is a
             // missing-symbols link failure much later, far from the cause.
-            for (loaded.steps) |step| {
-                if (!plugin_build_steps.stepAllowsPlatform(step, cfg.platform)) {
-                    const list = try std.mem.join(allocator, ", ", step.platforms);
-                    defer allocator.free(list);
-                    std.debug.print(
-                        "labelle: plugin '{s}' .build step '{s}' does not support platform '{s}' (declared platforms: {s})\n",
-                        .{ plugin.name, step.name, @tagName(cfg.platform), list },
-                    );
-                    return error.PluginBuildUnsupportedPlatform;
+            // Both step sources gate identically; the label names the
+            // offending block (a desktop-only rust `.language_builds` step
+            // must fail a wasm generate pointing at itself).
+            const gated_sets = [_]struct {
+                steps: []const plugin_build_steps.Step,
+                label: []const u8,
+            }{
+                .{ .steps = build_steps_slice, .label = ".build" },
+                .{ .steps = lang_steps_slice, .label = ".language_builds" },
+            };
+            for (gated_sets) |set| {
+                for (set.steps) |step| {
+                    if (!plugin_build_steps.stepAllowsPlatform(step, cfg.platform)) {
+                        const list = try std.mem.join(allocator, ", ", step.platforms);
+                        defer allocator.free(list);
+                        std.debug.print(
+                            "labelle: plugin '{s}' {s} step '{s}' does not support platform '{s}' (declared platforms: {s})\n",
+                            .{ plugin.name, set.label, step.name, @tagName(cfg.platform), list },
+                        );
+                        return error.PluginBuildUnsupportedPlatform;
+                    }
                 }
             }
+
+            // ONE wiring entry per plugin: `.build` steps first, the
+            // matched language's steps AFTER them (documented ordering —
+            // the emitter chains a plugin's steps sequentially in slice
+            // order, so language builds always run after plain builds).
+            const combined: []const plugin_build_steps.Step = blk: {
+                if (lang_steps_slice.len == 0) break :blk build_steps_slice;
+                if (build_steps_slice.len == 0) break :blk lang_steps_slice;
+                const c = try allocator.alloc(plugin_build_steps.Step, build_steps_slice.len + lang_steps_slice.len);
+                @memcpy(c[0..build_steps_slice.len], build_steps_slice);
+                @memcpy(c[build_steps_slice.len..], lang_steps_slice);
+                plugin_build_concat.appendAssumeCapacity(c);
+                break :blk c;
+            };
 
             // `{package}` root: prefer the staged deps copy (byte-consistent
             // with what the game links, inside .labelle); fall back to the
@@ -975,14 +1078,15 @@ pub fn generate(
 
             // Every declared cwd must exist in the staged package NOW — a
             // pointed generate error beats the child-spawn failure the user
-            // would otherwise hit mid-`zig build`.
-            for (loaded.steps) |step| {
+            // would otherwise hit mid-`zig build`. Walks the COMBINED steps
+            // so `.language_builds` cwds are held to the same rule.
+            for (combined) |step| {
                 const c = step.cwd orelse continue;
                 const step_cwd = try std.fs.path.join(allocator, &.{ package_abs, c });
                 defer allocator.free(step_cwd);
                 fs_cwd.access(io_l, step_cwd, .{}) catch {
                     std.debug.print(
-                        "labelle: plugin '{s}' .build step '{s}' cwd '{s}' does not exist in the staged package ({s})\n",
+                        "labelle: plugin '{s}' build step '{s}' cwd '{s}' does not exist in the staged package ({s})\n",
                         .{ plugin.name, step.name, c, step_cwd },
                     );
                     return error.PluginBuildMissingCwd;
@@ -1002,9 +1106,19 @@ pub fn generate(
                 .plugin_name = plugin.name,
                 .package_abs = package_abs,
                 .cache_rel = cache_rel,
-                .steps = loaded.steps,
+                .steps = combined,
             });
-            plugin_build_loaded.appendAssumeCapacity(loaded);
+            // Hand the parse trees over to their lifetime lists and disarm
+            // the errdefers (assume-capacity appends cannot fail between
+            // the handovers).
+            if (maybe_build) |l| {
+                plugin_build_loaded.appendAssumeCapacity(l);
+                maybe_build = null;
+            }
+            if (maybe_lang) |l| {
+                plugin_langbuild_loaded.appendAssumeCapacity(l);
+                maybe_lang = null;
+            }
         }
     }
 

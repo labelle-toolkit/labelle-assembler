@@ -177,6 +177,12 @@ pub fn build(b: *std.Build) void {
         // (`zig build-lib` → staticlib → extern symbol) via the spliced
         // emitted block.
         "test/plugin_build_steps_tests.zig",
+        // Native-language scripting splice (labelle-engine#741, rust):
+        // family-shared touchpoints without the embed ones, game rust/
+        // staged over the plugin crate's placeholder, `.language_builds`
+        // consumption ({staticlib:NAME} + per-OS system_libs) through the
+        // real `generate`, plus the #586-style splice-run acceptance.
+        "test/native_splice_tests.zig",
     };
 
     for (test_files) |test_file| {
