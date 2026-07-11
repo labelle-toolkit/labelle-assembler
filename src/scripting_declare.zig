@@ -630,6 +630,16 @@ pub fn checkCollisions(
 fn ensureDeclareTool(allocator: std.mem.Allocator, pkg_dir: []const u8, output_dir: []const u8) ![]const u8 {
     if (declare_tool_override) |p| return p;
 
+    // Capability probe. The declare tool lives in the plugin package's
+    // `tools/declare/` (in labelle-scripting's `.paths` from v0.2.0 on);
+    // an older pinned plugin simply doesn't ship it — and that must stay
+    // a WORKING project (scripts run, none declare), not a generate
+    // failure, or upgrading the assembler breaks every existing scripting
+    // pin. runPhase turns this error into a note + phase skip.
+    const marker = try std.fs.path.join(allocator, &.{ pkg_dir, "tools", "declare" });
+    defer allocator.free(marker);
+    if (!cache.dirExists(marker)) return error.DeclareToolAbsent;
+
     if (cached_tool_len > 0 and
         std.mem.eql(u8, cached_pkg[0..cached_pkg_len], pkg_dir) and
         cache.dirExists(cached_tool[0..cached_tool_len]))
@@ -800,7 +810,14 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     );
     defer allocator.free(pkg_dir);
 
-    const tool_path = try ensureDeclareTool(allocator, pkg_dir, opts.output_dir);
+    const tool_path = ensureDeclareTool(allocator, pkg_dir, opts.output_dir) catch |err| switch (err) {
+        error.DeclareToolAbsent => {
+            diag("the pinned scripting plugin ships no declare tool (no tools/declare in the package) — script-declared components are disabled this generate; pin labelle-scripting >= 0.2.0 to use labelle.component declarations", .{});
+            removeStaleGeneratedFile(allocator, opts.target_dir);
+            return null;
+        },
+        else => return err,
+    };
     var schema = try runDeclareTool(
         allocator,
         tool_path,

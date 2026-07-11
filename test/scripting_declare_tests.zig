@@ -337,6 +337,34 @@ pub const DECLARE_PHASE_E2E = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "scripting_components") == null);
     }
 
+    test "a scripting plugin without the declare tool skips the phase (old pin keeps generating)" {
+        // NO declare_tool_override: the phase resolves the staged plugin
+        // package for real. The fixture ships only plugin.labelle — like
+        // labelle-scripting v0.1.0, no tools/declare — so the capability
+        // probe must SKIP declaration rather than run `zig build
+        // labelle-declare` into a hard failure (the exact break the
+        // scripting-smoke example hit on CI: an assembler upgrade must
+        // not fail projects holding an older scripting pin).
+        const allocator = std.testing.allocator;
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = true });
+
+        // Skipped means skipped: no generated component file, no registry
+        // wiring — the target matches a never-declaring project even
+        // though lua/hunger.lua carries a labelle.component declaration.
+        try std.testing.expectError(
+            error.FileNotFound,
+            staged.tmp.dir.access(io, "out/sokol_desktop/scripting_components.zig", .{}),
+        );
+        const build_zig = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/build.zig", allocator, .limited(1024 * 1024));
+        defer allocator.free(build_zig);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "scripting_components") == null);
+    }
+
     test "a declared name colliding with a game component fails generate naming both providers" {
         const allocator = std.testing.allocator;
         var staged = try StagedProject.init(allocator);
