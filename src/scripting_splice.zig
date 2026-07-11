@@ -96,6 +96,11 @@ pub const TS_TRANSPILE_HINT: []const u8 =
 /// or erroring at VM load, far from the author.
 pub const EMBED_LANGUAGES = [_]EmbedLanguage{
     .{ .language = "lua", .extension = ".lua" },
+    // ruby (labelle-scripting v0.3.0, mruby 3.4.0) embeds `.rb` sources —
+    // no transpile gap (ruby is what the VM runs) and no declare mode yet
+    // (`scripting_declare.DECLARE_LANGUAGE` gates that phase to lua;
+    // `Component.ref` views resolve at runtime against real components).
+    .{ .language = "ruby", .extension = ".rb" },
     .{ .language = "typescript", .extension = ".js", .transpile_gap = .{
         .source_extension = ".ts",
         .declaration_suffix = ".d.ts",
@@ -280,8 +285,9 @@ fn walkUntranspiled(
 
 const testing = std.testing;
 
-test "embedExtension: lua maps to .lua, typescript embeds .js; native-compiled languages are absent" {
+test "embedExtension: lua maps to .lua, ruby to .rb, typescript embeds .js; native-compiled languages are absent" {
     try testing.expectEqualStrings(".lua", embedExtension("lua").?);
+    try testing.expectEqualStrings(".rb", embedExtension("ruby").?);
     // typescript embeds PLAIN JS (quickjs-ng runs ES modules; TS→JS
     // transpile is the #586 gap) — never `.ts`.
     try testing.expectEqualStrings(".js", embedExtension("typescript").?);
@@ -289,8 +295,9 @@ test "embedExtension: lua maps to .lua, typescript embeds .js; native-compiled l
     try testing.expect(embedExtension("cobol") == null);
 }
 
-test "EMBED_LANGUAGES: lua has no transpile gap; typescript gates .ts (exempting .d.ts) with the pointed #586 hint" {
+test "EMBED_LANGUAGES: lua and ruby have no transpile gap; typescript gates .ts (exempting .d.ts) with the pointed #586 hint" {
     try testing.expect(embedRow("lua").?.transpile_gap == null);
+    try testing.expect(embedRow("ruby").?.transpile_gap == null);
     const gap = embedRow("typescript").?.transpile_gap.?;
     try testing.expectEqualStrings(".ts", gap.source_extension);
     try testing.expectEqualStrings(".d.ts", gap.declaration_suffix);
