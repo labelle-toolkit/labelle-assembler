@@ -1,0 +1,55 @@
+// Showcase seed for labelle-toolkit#607 — "curated example games across
+// backends and features". This is the first small, *complete*, self-
+// contained game the showcase repo will host: a multi-layer parallax
+// side-scroller that demonstrates the CAMERA-LAYER stack (screen_fill
+// backdrop + two world-space parallax planes + a screen-space HUD) and
+// a per-frame gameplay script driving Position through the engine's
+// `getPosition` / `setPosition` API.
+//
+// BACKEND-SELECTABLE by design — the whole point of a showcase game.
+// It ships targeting the headless `.null` backend so CI can generate +
+// build + RUN it deterministically (fixed dt, frame-capped, clean exit)
+// and assert the transcript, exactly like the in-repo smoke fixtures.
+// Flip `.backend` to `.raylib`, `.sokol`, or the external `.bgfx`
+// package to actually SEE the layers scroll — the scene, scripts, and
+// components are all renderer-agnostic, so nothing else changes.
+//
+// NOTE ON VERSION PINS: while it lives in this repo the project resolves
+// the runtime packages through `local:` paths to its sibling checkouts
+// (same as every other example here). When lifted into the standalone
+// showcase repo (#607) these become a pinned assembler *release* +
+// published package versions — see docs/showcase-plan.md.
+.{
+    .name = "parallax_scroll",
+    .title = "LaBelle — Parallax Layers Showcase",
+    .width = 480,
+    .height = 270,
+    .target_fps = 60,
+    // Headless by default so CI can build AND run it with no window / GPU
+    // / display server. Swap for a graphics backend to view the scroll.
+    .backend = .null,
+    .y_axis = .up,
+    // Real component storage so the scroll script's `view(.{Parallax})`
+    // query and `getPosition` / `setPosition` round-trip against a live
+    // world (mirrors examples/asset-streaming-smoke).
+    .ecs = .zig_ecs,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .resources = .{},
+    // The camera-layer stack this game showcases. Lower `order` draws
+    // first (further back). `space` decides camera behaviour:
+    //   screen_fill — stretches past the pillarbox; static sky backdrop.
+    //   world       — camera-transformed; the two parallax planes.
+    //   screen      — fixed to the viewport; the HUD title.
+    .layers = .{
+        .{ .name = "sky", .order = -20, .space = .screen_fill },
+        .{ .name = "far", .order = -10, .space = .world },
+        .{ .name = "ground", .order = 0, .space = .world },
+        .{ .name = "hud", .order = 10, .space = .screen },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}

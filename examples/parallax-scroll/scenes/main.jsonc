@@ -1,0 +1,125 @@
+{
+    // Parallax showcase scene. Y-up design canvas is 480×270 (origin
+    // bottom-left). Scrolling entities are authored across the x-range
+    // [0, 960) so the scroll driver can wrap them by one 960-unit span
+    // for a seamless infinite loop (see 10_parallax_scroll.zig).
+    //
+    // Everything is a `Shape` so the scene is renderer-agnostic: the
+    // headless `.null` backend, raylib, sokol, and bgfx all draw the
+    // same rectangles. Depth is expressed purely through layer `order`
+    // and per-plane `Parallax.speed` — no atlas or texture assets, so
+    // the whole game is one project.labelle + one scene + one script.
+    "name": "main",
+    "entities": [
+        // ── sky ── static screen_fill backdrop behind everything.
+        {
+            "name": "sky",
+            "components": {
+                "Position": { "x": 240, "y": 135 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 480, "height": 270 } },
+                    "color": { "r": 30, "g": 40, "b": 70, "a": 255 },
+                    "layer": "sky",
+                    "z_index": 0
+                }
+            }
+        },
+
+        // ── far plane ── distant ridge line, scrolls slowly (depth cue).
+        {
+            "name": "ridge_a",
+            "components": {
+                "Position": { "x": 120, "y": 90 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 260, "height": 110 } },
+                    "color": { "r": 70, "g": 90, "b": 120, "a": 255 },
+                    "layer": "far",
+                    "z_index": 0
+                },
+                "Parallax": { "speed": 15 }
+            }
+        },
+        {
+            "name": "ridge_b",
+            "components": {
+                "Position": { "x": 480, "y": 100 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 300, "height": 130 } },
+                    "color": { "r": 80, "g": 100, "b": 130, "a": 255 },
+                    "layer": "far",
+                    "z_index": 0
+                },
+                "Parallax": { "speed": 15 }
+            }
+        },
+        {
+            "name": "ridge_c",
+            "components": {
+                "Position": { "x": 840, "y": 85 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 260, "height": 100 } },
+                    "color": { "r": 70, "g": 90, "b": 120, "a": 255 },
+                    "layer": "far",
+                    "z_index": 0
+                },
+                "Parallax": { "speed": 15 }
+            }
+        },
+
+        // ── ground plane ── near foreground, scrolls 3× faster.
+        {
+            "name": "ground_a",
+            "components": {
+                "Position": { "x": 80, "y": 30 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 240, "height": 60 } },
+                    "color": { "r": 40, "g": 110, "b": 60, "a": 255 },
+                    "layer": "ground",
+                    "z_index": 0
+                },
+                "Parallax": { "speed": 45 }
+            }
+        },
+        {
+            "name": "ground_b",
+            "components": {
+                "Position": { "x": 400, "y": 30 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 240, "height": 60 } },
+                    "color": { "r": 45, "g": 120, "b": 65, "a": 255 },
+                    "layer": "ground",
+                    "z_index": 0
+                },
+                "Parallax": { "speed": 45 }
+            }
+        },
+        {
+            "name": "ground_c",
+            "components": {
+                "Position": { "x": 720, "y": 30 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 240, "height": 60 } },
+                    "color": { "r": 40, "g": 110, "b": 60, "a": 255 },
+                    "layer": "ground",
+                    "z_index": 0
+                },
+                "Parallax": { "speed": 45 }
+            }
+        },
+
+        // ── hud ── screen-space badge: fixed to the viewport, never
+        // scrolls (proves the `.screen` layer ignores the parallax).
+        {
+            "name": "hud_badge",
+            "components": {
+                "Position": { "x": 60, "y": 240 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 90, "height": 20 } },
+                    "color": { "r": 235, "g": 235, "b": 245, "a": 255 },
+                    "layer": "hud",
+                    "z_index": 0
+                }
+            }
+        }
+    ]
+}
