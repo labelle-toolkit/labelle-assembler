@@ -146,16 +146,30 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         try std.testing.expect(reg_guard < reg_player);
         try std.testing.expect(reg_player < controllers_setup);
 
-        // Drain tap: AFTER the plugin ticks, BEFORE g.dispatchEvents() —
-        // the engine contract's load-bearing ordering — and engine-gated so
-        // pre-contract engines still build.
+        // VM tick: the scripting plugin's `Controller.tick` (inbox dispatch
+        // + script `update(dt)`s) — spliced INSIDE the scaled_dt gate, after
+        // the plugin systems. Nothing generic dispatches it (the plugin
+        // ships no `Systems`; PluginControllers wires only setup/deinit), so
+        // its absence would silently freeze every language script after
+        // init.
         const plugin_tick = try indexOfOrFail(main_zig, "PluginSystems.postTick(&g, scaled_dt);");
+        const vm_tick = try indexOfOrFail(main_zig, "scripting.Controller.tick(&g, scaled_dt);");
+        try std.testing.expect(plugin_tick < vm_tick);
+
+        // Drain tap: AFTER the plugin ticks (VM tick included — the scripts
+        // have emitted), BEFORE g.dispatchEvents() — the engine contract's
+        // load-bearing ordering — and engine-gated so pre-contract engines
+        // still build.
         const drain = try indexOfOrFail(main_zig, "if (comptime @hasDecl(engine, \"script_contract\")) {");
         const drain_call = try indexOfOrFail(main_zig, "engine.script_contract.drainEvents(&g);");
         const dispatch = try indexOfOrFail(main_zig, "g.dispatchEvents();");
-        try std.testing.expect(plugin_tick < drain);
+        try std.testing.expect(vm_tick < drain);
         try std.testing.expect(drain < drain_call);
         try std.testing.expect(drain_call < dispatch);
+
+        // Controller teardown is arity-dispatched (labelle-assembler#593):
+        // labelle-scripting's module-singleton `deinit()` takes no game.
+        _ = try indexOfOrFail(main_zig, "if (comptime @typeInfo(@TypeOf(C.deinit)).@\"fn\".params.len == 0) C.deinit() else C.deinit(game);");
 
         // The whole generated main still passes Zig's front-end (parse +
         // AstGen — imports unresolved, so no engine checkout needed).
@@ -186,8 +200,10 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         try std.testing.expect(reg_guard < reg_player);
         try std.testing.expect(reg_player < controllers_setup);
 
+        const vm_tick = try indexOfOrFail(main_zig, "scripting.Controller.tick(&g, scaled_dt);");
         const drain_call = try indexOfOrFail(main_zig, "engine.script_contract.drainEvents(&g);");
         const dispatch = try indexOfOrFail(main_zig, "g.dispatchEvents();");
+        try std.testing.expect(vm_tick < drain_call);
         try std.testing.expect(drain_call < dispatch);
 
         try expectAstGenOk(main_zig);
@@ -211,6 +227,7 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         defer std.testing.allocator.free(main_zig);
 
         _ = try indexOfOrFail(main_zig, "const scripting_enabled = true;");
+        _ = try indexOfOrFail(main_zig, "scripting.Controller.tick(&g, scaled_dt);");
         _ = try indexOfOrFail(main_zig, "engine.script_contract.drainEvents(&g);");
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript") == null);
     }
@@ -231,6 +248,7 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "scripting_enabled") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "script_contract") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "Controller.tick") == null);
     }
 };
 

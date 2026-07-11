@@ -161,6 +161,20 @@ jobs:
           || git clone --depth 1 --branch main \
             https://github.com/labelle-toolkit/labelle-engine.git labelle-engine
 
+      # Sibling checkout for the scripting-smoke example: its explicit
+      # `backend_package` pins `local:../../../labelle-null` so the generated
+      # main carries the `script_contract.bind` touchpoint from labelle-null's
+      # `templates/headless.txt` (labelle-engine#749 / #739) — the registry-
+      # resolved null release predates it. Branch fallback, same pattern as
+      # core/engine above: try the touchpoint branch first, fall back to main
+      # once it merges/is deleted.
+      - name: Checkout labelle-null (scripting-touchpoint branch first)
+        run: |
+          git clone --depth 1 --branch feat/scripting-touchpoint \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null \
+          || git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null
+
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-gfx
@@ -349,6 +363,96 @@ jobs:
             exit 1
           fi
           echo "PASS: null headless example ran 5 frames and exited cleanly"
+
+      # Lua scripting end-to-end smoke (labelle-assembler#593 splice;
+      # Phase-1 proof for labelle-engine#739, epic labelle-engine#237).
+      # The REAL consumer chain, nothing mocked:
+      #
+      #   project.labelle `.params.language = "lua"` on the labelle-scripting
+      #   plugin (fetched from GitHub at v0.1.0) → splice embeds
+      #   lua/behavior.lua + registers it pre-VM-boot → labelle-null's
+      #   headless template binds `engine.script_contract` → per-frame
+      #   `scripting.Controller.tick` runs the VM → `drainEvents` taps the
+      #   engine event bus → the behavior creates an entity, moves its
+      #   Position, emits a custom `lua_ping` event AND receives it back,
+      #   plus the engine's own `engine__tick`.
+      #
+      # Runs bounded (LABELLE_NULL_FRAMES=5) and pins the exact ordered
+      # LUA_* milestone sequence — this run doubles as the Script Runtime
+      # Contract's end-to-end integration test (labelle-engine#749).
+      - name: Generate + build + run the scripting-smoke example (Lua end-to-end)
+        run: |
+          cd labelle-assembler/examples/scripting-smoke
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          # Fetch the scripting plugin (GitHub, v0.1.0) into the package
+          # cache. The backend needs no fetch — `backend_package` pins the
+          # sibling labelle-null checkout (see the clone step above).
+          $ASM install --project-root .
+          $ASM generate --project-root .
+
+          # Codegen assertions — each is one link of the chain; fail loudly
+          # if a regression drops it.
+          M=.labelle/null_desktop/main.zig
+          # Splice: embedded script registered before the VM boots.
+          grep -qF 'scripting.registerScript("behavior", @embedFile("lua/behavior.lua"));' $M
+          # Splice: the generated flag half of the templates' double-gate.
+          grep -qF 'const scripting_enabled = true;' $M
+          # labelle-null template: the bind touchpoint (proves the sibling
+          # checkout — not a stale registry release — was staged).
+          grep -qF 'engine.script_contract.bind(&g);' $M
+          # Splice: the VM tick that actually advances the scripts.
+          grep -qF 'scripting.Controller.tick(&g, scaled_dt);' $M
+          # Splice: the event tap between plugin ticks and dispatchEvents.
+          grep -qF 'engine.script_contract.drainEvents(&g);' $M
+          # Build wiring: the plugin's -Dlanguage option.
+          grep -qF '.language = .lua' .labelle/null_desktop/build.zig
+
+          cd .labelle/null_desktop
+
+          # labelle-cli-equivalent fixFingerprint dance (see the null step
+          # above) — the assembler emits a placeholder fingerprint.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # Headless bounded run: no window, no GL — the binary runs to
+          # completion (rc=0) or crashes.
+          LABELLE_NULL_FRAMES=5 ./zig-out/bin/scripting_smoke > run.log 2>&1
+
+          # Pin the exact ordered milestone sequence. Payload facts are
+          # encoded IN the tokens (LUA_EVENT_SEEN_N_2 = the emitted payload
+          # round-tripped bit-exact; LUA_MOVED_X_30 = Position reached x=30
+          # on tick 3), so token extraction pins behavior, not just
+          # liveness. See lua/behavior.lua for the frame-by-frame timeline.
+          grep -oE 'LUA_[A-Z0-9_]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          LUA_INIT
+          LUA_TICK_1
+          LUA_TICK_2
+          LUA_EMIT_OK
+          LUA_ENGINE_TICK_SEEN
+          LUA_EVENT_SEEN_N_2
+          LUA_TICK_3
+          LUA_MOVED_X_30
+          LUA_TICK_4
+          LUA_TICK_5
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: scripting-smoke LUA milestone sequence mismatch"
+            echo "--- full captured output ---"
+            cat run.log
+            exit 1
+          fi
+          echo "PASS: Lua behavior drove the real engine — entity + Position + emit/subscribe round-trip over 5 headless frames"
 
       # Smoke test for the Flows end-to-end compile loop
       # (labelle-gui#96). Exercises the full pipeline shipped by

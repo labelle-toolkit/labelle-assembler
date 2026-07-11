@@ -214,9 +214,10 @@ pub fn Mixin(comptime Self: type) type {
                 "";
             defer if (self.scripting != null) allocator.free(scripting_decls);
 
-            // The plugins tick block, split at the drain seam (labelle-
-            // assembler#593): the scripting variant splices the
-            // `script_contract.drainEvents` tap between the plugin ticks and
+            // The plugins tick block, split at the scripting seams (labelle-
+            // assembler#593): the scripting variant splices the VM tick
+            // inside the scaled_dt gate (see `scripting_vm_tick` below) and
+            // the `script_contract.drainEvents` tap between the plugin ticks and
             // `g.dispatchEvents()` — the engine contract's load-bearing
             // "AFTER tick, BEFORE dispatchEvents" ordering (the tap copies
             // subscribed events out of the SAME buffer dispatchEvents then
@@ -229,13 +230,32 @@ pub fn Mixin(comptime Self: type) type {
             // the contract still builds (the assembler only emits the line
             // when the scripting plugin is attached, so the flag side of the
             // backend templates' double-gate is the emission itself).
-            const plugins_tick_head =
+            const plugins_tick_gate_open =
                 "        const scaled_dt = dt * g.time_scale;\n" ++
                 "        if (scaled_dt > 0) {\n" ++
                 "            runner.tick(&g, scaled_dt);\n" ++
                 "            PluginSystems.tick(&g, scaled_dt);\n" ++
-                "            PluginSystems.postTick(&g, scaled_dt);\n" ++
-                "        }\n";
+                "            PluginSystems.postTick(&g, scaled_dt);\n";
+            const plugins_tick_gate_close = "        }\n";
+            const plugins_tick_head = plugins_tick_gate_open ++ plugins_tick_gate_close;
+            // The language-script VM tick (the scripting plugin's
+            // `Controller.tick`: stamp dt → dispatch the event inbox → run
+            // every registered script's `update(dt)`). Emitted by the SPLICE,
+            // not discovered: the plugin deliberately ships no `Systems`
+            // (there is no per-game state to schedule) and the generic
+            // `PluginControllers` dispatcher wires only setup/deinit — so
+            // without this line no machinery ever advances the VM and every
+            // language script would silently freeze after init. Sits INSIDE
+            // the `scaled_dt > 0` gate, after the plugin systems, so language
+            // scripts pause with the game exactly like Zig scripts; the drain
+            // below still runs every frame regardless.
+            const scripting_vm_tick =
+                "            // Language-script VM tick (labelle-assembler#593): dispatch the\n" ++
+                "            // event inbox + run each registered script's update(dt). Spliced\n" ++
+                "            // explicitly — the scripting plugin ships no `Systems`, and the\n" ++
+                "            // PluginControllers dispatcher wires only setup/deinit. Inside\n" ++
+                "            // the scaled_dt gate so language scripts pause with the game.\n" ++
+                "            scripting.Controller.tick(&g, scaled_dt);\n";
             const scripting_drain =
                 "        // Script event tap (Script Runtime Contract, labelle-engine#749):\n" ++
                 "        // copy this frame's buffered events into the language scripts'\n" ++
@@ -258,7 +278,7 @@ pub fn Mixin(comptime Self: type) type {
                 "            g.plugin_profile_count = PluginSystems.plugin_system_count;\n" ++
                 "        }\n";
             const tick_code: []const u8 = if (cfg.plugins.len > 0 and self.scripting != null)
-                plugins_tick_head ++ scripting_drain ++ plugins_tick_tail
+                plugins_tick_gate_open ++ scripting_vm_tick ++ plugins_tick_gate_close ++ scripting_drain ++ plugins_tick_tail
             else if (cfg.plugins.len > 0)
                 plugins_tick_head ++ plugins_tick_tail
             else
