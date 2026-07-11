@@ -1,0 +1,54 @@
+// Showcase game #3 for labelle-toolkit#607 — the RUBY scripting cell of
+// the grid, the ticket's seed candidate #3. The Ruby counterpart of the
+// in-repo Lua `scripting-smoke`: a `ruby/orbit.rb` script drives the REAL
+// engine through the Script Runtime Contract (labelle-engine#749) from
+// the assembler's generated main — create an entity, move its Position
+// each frame, and react to the engine's own `engine__tick` — all headless
+// over the null backend.
+//
+// Wiring mirrors labelle-scripting's own `examples/ruby-game`:
+//   - the scripting plugin is pinned `local:` to the SIBLING checkout so
+//     this exercises the CURRENT plugin tree (vendored mruby, prelude,
+//     bindings, Controller), not a release;
+//   - `.params.language = "ruby"` selects ruby (validated at generate
+//     against the plugin's params_schema, labelle-assembler#591). Ruby is
+//     a non-declare language, so the assembler's declare phase SKIPS with
+//     a note — no declare tool build needed;
+//   - the backend is pinned as an EXPLICIT external `backend_package` to
+//     the labelle-null SIBLING, because the generated main's
+//     `script_contract.bind` touchpoint lives in labelle-null's
+//     `templates/headless.txt` and the registry release predates it (same
+//     reason the Lua scripting-smoke pins the sibling).
+//
+// VERSION PINS: core/engine/gfx resolve through `local:` siblings (the
+// in-repo convention). Lifted into the standalone showcase repo (#607)
+// these become a pinned assembler release + published versions, and the
+// two `local:` deps (plugin + labelle-null) become registry pins — see
+// docs/showcase-plan.md.
+.{
+    .name = "ruby_orbit",
+    .title = "LaBelle — Ruby Scripting Showcase (null backend)",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    // Headless null backend, pinned to the sibling checkout for the
+    // scripting bind touchpoint (see header).
+    .backend_package = .{ .name = "null", .repo = "local:../../../labelle-null" },
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // The scripting plugin from the SIBLING working tree, ruby selected.
+    .plugins = .{
+        .{
+            .name = "scripting",
+            .repo = "local:../../../labelle-scripting",
+            .params = .{ .language = "ruby" },
+        },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}

@@ -9,8 +9,12 @@
     // same rectangles. Depth is expressed purely through layer `order`
     // and per-plane `Parallax.speed` — no atlas or texture assets, so
     // the whole game is one project.labelle + one scene + one script.
+    //
+    // File-level entities live under "children" (unified RFC #560 format;
+    // the legacy top-level "entities" array was removed in engine v2.0,
+    // #592). Each inline entity keeps its "components" wrapper.
     "name": "main",
-    "entities": [
+    "children": [
         // ── sky ── static screen_fill backdrop behind everything.
         {
             "name": "sky",

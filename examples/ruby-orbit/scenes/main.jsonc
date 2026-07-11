@@ -1,0 +1,8 @@
+{
+    // Minimal scene — no entities, no assets. The ruby script creates its
+    // own entity through the Script Runtime Contract; the scene exists so
+    // `g.setScene("main")` has a name to bind to during setup. File-level
+    // entities would live under "children" (unified RFC #560 format).
+    "name": "main",
+    "children": []
+}
