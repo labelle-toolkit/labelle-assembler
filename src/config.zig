@@ -568,32 +568,22 @@ pub const ResolvedGui = struct {
     bridge_artifact: []const u8 = "",
 };
 
-/// Curated post-fx pass kinds — mirrors `labelle-core`
-/// `backend_contract.PostPassKind` (labelle-gfx#305).
-pub const PostPassKind = enum { bloom, vignette, color_grade, crt };
-
-/// One declared post-fx pass in `project.labelle`'s `.post_fx` list, e.g.
-/// `.{ .kind = .bloom, .threshold = 0.8, .intensity = 1.0, .radius = 1.0 }`.
-/// A FLAT struct (all friendly params coexist as optional fields); codegen
-/// maps the kind-relevant params into the flat `PostPassUniforms` slots per
-/// RFC §2.2. Unknown kinds / field-name typos are rejected by zon parse.
-pub const PostFxPass = struct {
-    kind: PostPassKind,
-    // bloom
-    threshold: f32 = 0,
-    intensity: f32 = 0, // bloom + vignette (different slot per kind)
-    radius: f32 = 0, // bloom + vignette
-    // vignette
-    softness: f32 = 0,
-    tint: [3]f32 = .{ 0, 0, 0 },
-    // color_grade
-    strength: f32 = 0,
-    lut: u32 = 0,
-    // crt
-    curvature: f32 = 0,
-    scanline: f32 = 0,
-    mask: f32 = 0,
-    aberration: f32 = 0,
+/// One declared post-fx pass in `project.labelle`'s `.post_fx` list — a
+/// tagged union so each kind carries ONLY its own friendly params (RFC §2.5).
+/// zon parse rejects a param that doesn't belong to the chosen kind (real
+/// per-kind validation, no silent-ignore footgun) — the union tag IS the kind.
+/// Codegen maps these into the flat runtime `PostPassUniforms` per RFC §2.2.
+///
+/// Authoring shape:
+///     .post_fx = .{
+///         .{ .bloom = .{ .threshold = 0.8, .intensity = 1.0, .radius = 1.0 } },
+///         .{ .crt = .{ .curvature = 0.1, .scanline = 0.5, .mask = 0.3, .aberration = 0.2 } },
+///     },
+pub const PostFxPass = union(enum) {
+    bloom: struct { threshold: f32 = 0, intensity: f32 = 0, radius: f32 = 0 },
+    vignette: struct { intensity: f32 = 0, radius: f32 = 0, softness: f32 = 0, tint: [3]f32 = .{ 0, 0, 0 } },
+    color_grade: struct { strength: f32 = 0, lut: u32 = 0 },
+    crt: struct { curvature: f32 = 0, scanline: f32 = 0, mask: f32 = 0, aberration: f32 = 0 },
 };
 
 pub const ProjectConfig = struct {

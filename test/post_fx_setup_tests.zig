@@ -31,7 +31,7 @@ pub const POST_FX_SETUP = struct {
             .backend = .raylib,
             .ecs = .mock,
             .post_fx = &.{
-                .{ .kind = .bloom, .threshold = 0.8, .intensity = 1.0, .radius = 1.0 },
+                .{ .bloom = .{ .threshold = 0.8, .intensity = 1.0, .radius = 1.0 } },
             },
         }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
         defer std.testing.allocator.free(main_zig);
@@ -55,7 +55,7 @@ pub const POST_FX_SETUP = struct {
             .backend = .sokol,
             .ecs = .mock,
             .post_fx = &.{
-                .{ .kind = .bloom, .threshold = 0.8, .intensity = 1.0, .radius = 1.0 },
+                .{ .bloom = .{ .threshold = 0.8, .intensity = 1.0, .radius = 1.0 } },
             },
         }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
         defer std.testing.allocator.free(main_zig);
@@ -77,8 +77,8 @@ pub const POST_FX_SETUP = struct {
             .backend = .raylib,
             .ecs = .mock,
             .post_fx = &.{
-                .{ .kind = .bloom, .threshold = 0.5, .intensity = 2.0, .radius = 1.0 },
-                .{ .kind = .crt, .curvature = 0.2, .scanline = 0.5, .mask = 0.3, .aberration = 0.1 },
+                .{ .bloom = .{ .threshold = 0.5, .intensity = 2.0, .radius = 1.0 } },
+                .{ .crt = .{ .curvature = 0.2, .scanline = 0.5, .mask = 0.3, .aberration = 0.1 } },
             },
         }, raylib_lifecycle, empty_entries, empty_names, jsonc_scenes, &manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
         defer std.testing.allocator.free(main_zig);

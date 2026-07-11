@@ -29,7 +29,7 @@ pub fn emitPostFxSetup(w: anytype, cfg: ProjectConfig, indent: []const u8) !void
     if (cfg.post_fx.len == 0) return;
     try w.print("{s}if (@hasDecl(AssembledGame, \"setPostFx\")) g.setPostFx(&.{{\n", .{indent});
     for (cfg.post_fx) |pass| {
-        try w.print("{s}    engine.PostPass{{ .kind = .{s}, .uniforms = .{{ ", .{ indent, @tagName(pass.kind) });
+        try w.print("{s}    engine.PostPass{{ .kind = .{s}, .uniforms = .{{ ", .{ indent, @tagName(pass) });
         try writeUniforms(w, pass);
         try w.writeAll(" } },\n");
     }
@@ -45,10 +45,10 @@ pub fn emitPostFxSetup(w: anytype, cfg: ProjectConfig, indent: []const u8) !void
 ///   - crt:         curvature→scalar0, scanline→scalar1, mask→scalar2,
 ///                  aberration→scalar3
 fn writeUniforms(w: anytype, pass: PostFxPass) !void {
-    switch (pass.kind) {
-        .bloom => try w.print(".scalar0 = {d}, .scalar1 = {d}, .scalar2 = {d}", .{ pass.threshold, pass.intensity, pass.radius }),
-        .vignette => try w.print(".scalar0 = {d}, .scalar1 = {d}, .scalar2 = {d}, .r = {d}, .g = {d}, .b = {d}", .{ pass.intensity, pass.radius, pass.softness, pass.tint[0], pass.tint[1], pass.tint[2] }),
-        .color_grade => try w.print(".scalar0 = {d}, .aux_texture = {d}", .{ pass.strength, pass.lut }),
-        .crt => try w.print(".scalar0 = {d}, .scalar1 = {d}, .scalar2 = {d}, .scalar3 = {d}", .{ pass.curvature, pass.scanline, pass.mask, pass.aberration }),
+    switch (pass) {
+        .bloom => |b| try w.print(".scalar0 = {d}, .scalar1 = {d}, .scalar2 = {d}", .{ b.threshold, b.intensity, b.radius }),
+        .vignette => |v| try w.print(".scalar0 = {d}, .scalar1 = {d}, .scalar2 = {d}, .r = {d}, .g = {d}, .b = {d}", .{ v.intensity, v.radius, v.softness, v.tint[0], v.tint[1], v.tint[2] }),
+        .color_grade => |c| try w.print(".scalar0 = {d}, .aux_texture = {d}", .{ c.strength, c.lut }),
+        .crt => |c| try w.print(".scalar0 = {d}, .scalar1 = {d}, .scalar2 = {d}, .scalar3 = {d}", .{ c.curvature, c.scanline, c.mask, c.aberration }),
     }
 }
