@@ -568,6 +568,34 @@ pub const ResolvedGui = struct {
     bridge_artifact: []const u8 = "",
 };
 
+/// Curated post-fx pass kinds — mirrors `labelle-core`
+/// `backend_contract.PostPassKind` (labelle-gfx#305).
+pub const PostPassKind = enum { bloom, vignette, color_grade, crt };
+
+/// One declared post-fx pass in `project.labelle`'s `.post_fx` list, e.g.
+/// `.{ .kind = .bloom, .threshold = 0.8, .intensity = 1.0, .radius = 1.0 }`.
+/// A FLAT struct (all friendly params coexist as optional fields); codegen
+/// maps the kind-relevant params into the flat `PostPassUniforms` slots per
+/// RFC §2.2. Unknown kinds / field-name typos are rejected by zon parse.
+pub const PostFxPass = struct {
+    kind: PostPassKind,
+    // bloom
+    threshold: f32 = 0,
+    intensity: f32 = 0, // bloom + vignette (different slot per kind)
+    radius: f32 = 0, // bloom + vignette
+    // vignette
+    softness: f32 = 0,
+    tint: [3]f32 = .{ 0, 0, 0 },
+    // color_grade
+    strength: f32 = 0,
+    lut: u32 = 0,
+    // crt
+    curvature: f32 = 0,
+    scanline: f32 = 0,
+    mask: f32 = 0,
+    aberration: f32 = 0,
+};
+
 pub const ProjectConfig = struct {
     name: []const u8,
     description: []const u8 = "",
@@ -657,6 +685,10 @@ pub const ProjectConfig = struct {
     initial_scene: ?[]const u8 = null,
     /// Sprite atlas resources — each entry declares a named atlas with frame data and texture.
     resources: []const ResourceDef = &.{},
+    /// Initial post-fx stack, seeded at startup via `g.setPostFx(...)`
+    /// (labelle-gfx#305 P2 Slice C). Empty ⇒ no emission. Runtime API on the
+    /// engine can still mutate the stack later.
+    post_fx: []const PostFxPass = &.{},
     /// Per-platform texture-compression selection. When a platform is set to
     /// `.astc`, the generator references each atlas's pre-converted `<name>.astc`
     /// sibling (produced by `labelle astc`) instead of the source `.png`, so the

@@ -39,6 +39,7 @@ const scan = @import("../scan.zig");
 const asset_wiring = @import("../blocks/asset_wiring.zig");
 const resource_loader = @import("../blocks/resource_loader.zig");
 const tilemap_assets = @import("../blocks/tilemap_assets.zig");
+const post_fx_block = @import("../blocks/post_fx.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -208,6 +209,13 @@ pub fn Mixin(comptime Self: type) type {
                 const initial = cfg.resolvedInitialPrefab() orelse jsonc_scene_names[0];
                 try w.print("    g.setScene(\"{s}\") catch @panic(\"failed to set initial scene\");\n", .{initial});
             }
+
+            // Seed the declared static post-fx stack (labelle-gfx#305 P2 Slice
+            // C) — same lexical slot + IDENTICAL statement as the loop path.
+            // `setPostFx` is void, so no `catch @panic` distinction here.
+            // Gated on `@hasDecl(AssembledGame, "setPostFx")` for forward-compat;
+            // no-op when `.post_fx` is empty.
+            try post_fx_block.emitPostFxSetup(w, cfg, "    ");
 
             try w.writeAll("    runner.setup(&g);\n");
 
