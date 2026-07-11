@@ -158,6 +158,11 @@ pub fn build(b: *std.Build) void {
         // `generate` — the gate fires before any target write, and a clean
         // project generates byte-identical output.
         "test/language_policy_tests.zig",
+        // Schema-declared plugin params (#591): e2e through the real
+        // `generate` — schema + `.params` → staged params module + build.zig
+        // injection; violations fail before any target write; params-less
+        // and legacy-language projects stay byte-identical.
+        "test/plugin_params_tests.zig",
         // Scripting codegen splice (#593): registerScript embedding +
         // scripting_enabled flag + drainEvents tap in the generated main,
         // and the -Dlanguage dep option in the generated build.zig.

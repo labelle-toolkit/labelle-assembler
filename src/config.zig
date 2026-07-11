@@ -210,16 +210,29 @@ pub const PluginDep = struct {
     /// takes no parameters (every entry before #584) → byte-identical default.
     params: ?Params = null,
 
-    /// V1 slice of the GENERIC plugin-params mechanism: a closed struct whose
-    /// only recognized parameter today is `.language`. Schema-declared params
-    /// — each plugin publishing the keys it accepts, the assembler validating
-    /// `.params` against that schema — land with the plugin params follow-up
-    /// ticket; widening this struct in the meantime is additive. An unknown
-    /// key inside `.params` is a hard parse error BY CONSTRUCTION: the
-    /// project.labelle parse runs with the default
-    /// `ignore_unknown_fields = false`, so a stray key fails with
-    /// `error.ParseZon` exactly like a typo'd key on the plugin entry itself —
-    /// nothing silently drops.
+    /// The GENERIC params bag (#591): every `.params` key/value pair as the
+    /// project declared it, heterogeneously typed
+    /// (`plugin_params.Param` — string/i64/f64/bool/enum-literal scalars).
+    /// Populated by `plugin_params.parseProjectConfig`'s Zoir side-walk of
+    /// the raw project.labelle (the STRICT typed parser cannot represent
+    /// plugin-declared keys — see that module's doc), never by the typed ZON
+    /// parse: treat it as assembler-internal, not authorable. Validated at
+    /// generate time against the attached plugin's `.params_schema`
+    /// (`plugin_params.validateAndResolve`). `null` = the entry declares no
+    /// `.params` (byte-identical default). Shapes are
+    /// `std.zon.parse.free`-compatible, so freeing a parsed `ProjectConfig`
+    /// frees the bag with it.
+    params_bag: ?[]const @import("plugin_params.zig").Param = null,
+
+    /// The typed FAST-PATH slice of the params mechanism (#589): `language`
+    /// is the one natively recognized param — a schema-less plugin (every
+    /// published scripting pin predating #591's `.params_schema`) may set it
+    /// and nothing else. Kept closed deliberately: an unknown key here is a
+    /// hard parse error BY CONSTRUCTION for any caller on the plain typed
+    /// parse (`ignore_unknown_fields = false`), so nothing silently drops if
+    /// the tolerant `plugin_params.parseProjectConfig` path is bypassed.
+    /// Schema-declared params (#591) ride `params_bag` above and SUPERSEDE
+    /// this fast path the moment the plugin publishes a schema.
     pub const Params = struct {
         /// Script language this plugin provides (RFC-LANGUAGE-PLUGINS revs
         /// 8–9, epic labelle-engine#237, assembler#584). Set on the ONE
@@ -232,6 +245,35 @@ pub const PluginDep = struct {
         /// scripting plugin that does lands separately).
         language: ?[]const u8 = null,
     };
+
+    /// The entry's declared script language, whichever spelling carried it:
+    /// the typed `.params.language` fast path (#589 — in-code literals and
+    /// the closed typed parse) or a `language` entry in the generic
+    /// `params_bag` (#591 — the tolerant parse extracts every `.params` key
+    /// there), spelled EITHER as the legacy string (`.language = "lua"`) or
+    /// as the enum literal (`.language = .lua`) a schema-declared enum param
+    /// accepts. The single accessor `language_policy` and the scripting
+    /// splice resolve through — and they run BEFORE param resolution, so a
+    /// spelling missed here would silently skip the one-language checks and
+    /// the whole splice (#591 review P2). When both the typed field and the
+    /// bag are set (only possible on a hand-built config) the typed field
+    /// wins; the parse path never populates both.
+    pub fn declaredLanguage(self: PluginDep) ?[]const u8 {
+        if (self.params) |p| {
+            if (p.language) |lang| return lang;
+        }
+        if (self.params_bag) |bag| {
+            for (bag) |param| {
+                if (std.mem.eql(u8, param.name, "language")) {
+                    return switch (param.value) {
+                        .str, .enum_tag => |s| s,
+                        else => null,
+                    };
+                }
+            }
+        }
+        return null;
+    }
 
     /// Returns true if this plugin uses a local path.
     /// Supports `local:../path` (relative to project) and `@libs/path` (inside project).
@@ -328,7 +370,7 @@ pub const CodepointRange = struct {
 /// ASCII printable range (0x20..0x7F), 512×512 atlas.
 pub const FontBakeParams = struct {
     pixel_height: f32 = 16,
-    ranges: []const CodepointRange = &.{ .{ .first = 0x20, .last = 0x7F } },
+    ranges: []const CodepointRange = &.{.{ .first = 0x20, .last = 0x7F }},
     atlas_width: u32 = 512,
     atlas_height: u32 = 512,
 };
@@ -1033,6 +1075,36 @@ test "PluginDep: an unknown key inside `.params` is a hard parse error (#584)" {
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "unexpected field 'lenguage'") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "supported: 'language'") != null);
+}
+
+test "PluginDep.declaredLanguage: typed field, bag string, AND bag enum literal all resolve (#591 P2)" {
+    const Param = @import("plugin_params.zig").Param;
+
+    // Typed fast path (#589 in-code literals).
+    const typed = PluginDep{ .name = "s", .params = .{ .language = "lua" } };
+    try std.testing.expectEqualStrings("lua", typed.declaredLanguage().?);
+
+    // Bag, legacy string spelling.
+    const str_bag = [_]Param{.{ .name = "language", .value = .{ .str = "lua" } }};
+    const via_str = PluginDep{ .name = "s", .params_bag = &str_bag };
+    try std.testing.expectEqualStrings("lua", via_str.declaredLanguage().?);
+
+    // Bag, ENUM-LITERAL spelling (`.language = .lua` against a schema that
+    // declares `language` as an enum). The policy gate and the scripting
+    // splice read this accessor BEFORE param resolution — before the fix a
+    // null here silently skipped the one-language checks and the splice.
+    const enum_bag = [_]Param{.{ .name = "language", .value = .{ .enum_tag = "lua" } }};
+    const via_enum = PluginDep{ .name = "s", .params_bag = &enum_bag };
+    try std.testing.expectEqualStrings("lua", via_enum.declaredLanguage().?);
+
+    // A `language` of any other shape is no declaration (resolution rejects
+    // it against a schema; the schema-less path errors on it loudly).
+    const int_bag = [_]Param{.{ .name = "language", .value = .{ .int = 1 } }};
+    const via_int = PluginDep{ .name = "s", .params_bag = &int_bag };
+    try std.testing.expect(via_int.declaredLanguage() == null);
+
+    // No params at all.
+    try std.testing.expect((PluginDep{ .name = "s" }).declaredLanguage() == null);
 }
 
 test "effectiveGamepad: bgfx defaults to .none, other backends to .auto, explicit honored (assembler#533)" {

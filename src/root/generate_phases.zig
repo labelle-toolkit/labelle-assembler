@@ -25,6 +25,7 @@ const cache = @import("../cache.zig");
 const plugin_manifest = @import("../plugin_manifest.zig");
 const pack_validate = @import("../pack_validate.zig");
 const language_policy = @import("../language_policy.zig");
+const plugin_params = @import("../plugin_params.zig");
 const script_scanner = @import("../script_scanner.zig");
 const main_zig = @import("../main_zig.zig");
 const pack_root_gen = @import("../codegen/pack_root.zig");
@@ -476,6 +477,74 @@ pub fn validateLanguagePolicy(
         defer allocator.free(label);
         try language_policy.scanUnitLanguageDirs(allocator, pack_src_dir, label, declared);
     }
+}
+
+/// Schema-declared plugin params gate + resolution (labelle-assembler#591).
+/// Runs beside `validateLanguagePolicy` — BEFORE the target dir is created —
+/// so an invalid `.params` rejects the build cheaply with no stale output.
+/// For each declared plugin:
+///
+///   1. Its manifest (re-read via `loadOptional`, the same per-phase pattern
+///      as the language gate) supplies the `.params_schema` — empty for a
+///      manifest-less or schema-less plugin.
+///   2. The entry's EFFECTIVE bag — the generic `params_bag` when the
+///      tolerant parse extracted one, else the typed `.params.language` fast
+///      path viewed as a one-entry bag — is validated + resolved against the
+///      schema (`plugin_params.validateAndResolve`): unknown param, wrong
+///      type, out-of-vocabulary enum, missing required → actionable errors
+///      naming plugin + param; schema defaults fill unset optionals.
+///
+/// Returns the resolved sets (owned; caller frees via
+/// `plugin_params.freeResolvedList`) that drive the staged
+/// `plugin_<name>_params.zig` modules + the generated build.zig's
+/// `overrideImport` wiring. Params-less plugins resolve to nothing —
+/// the list stays empty and every emission site is a byte-identical no-op.
+pub fn resolvePluginParams(
+    allocator: std.mem.Allocator,
+    plugins: []const config.PluginDep,
+    game_dir: []const u8,
+) !std.ArrayList(plugin_params.ResolvedPluginParams) {
+    var resolved: std.ArrayList(plugin_params.ResolvedPluginParams) = .empty;
+    errdefer plugin_params.freeResolvedList(allocator, &resolved);
+
+    for (plugins) |plugin| {
+        // The effective bag: the generic bag wins (the parse path fills it
+        // for every `.params` literal, `language` included); a hand-built
+        // config carrying only the typed fast-path field is viewed as the
+        // equivalent one-entry bag so both spellings validate identically.
+        var language_view: [1]plugin_params.Param = undefined;
+        const bag: []const plugin_params.Param = if (plugin.params_bag) |b| b else blk: {
+            const typed = plugin.params orelse break :blk &.{};
+            const lang = typed.language orelse break :blk &.{};
+            language_view[0] = .{ .name = "language", .value = .{ .str = lang } };
+            break :blk &language_view;
+        };
+
+        var maybe_manifest = try plugin_manifest.loadOptional(allocator, plugin, game_dir);
+        defer if (maybe_manifest) |*m| m.deinit();
+        const schema: []const plugin_params.ParamSchema = if (maybe_manifest) |m| m.params_schema else &.{};
+
+        const params = (try plugin_params.validateAndResolve(allocator, plugin.name, bag, schema)) orelse continue;
+        errdefer plugin_params.freeResolved(allocator, params);
+
+        // The staged module is injected under the FIXED import name
+        // `plugin_params` (see `plugin_params.IMPORT_NAME`); a sibling
+        // plugin literally named that would be shadowed inside THIS
+        // plugin's imports — fail loudly instead of silently rewiring.
+        for (plugins) |sibling| {
+            if (std.mem.eql(u8, sibling.name, plugin_params.IMPORT_NAME)) {
+                std.debug.print(
+                    "labelle-assembler: plugin '{s}' resolves params, but a plugin is named '{s}' — the params module would shadow it inside '{s}'.\n" ++
+                        "  rename the '{s}' plugin.\n",
+                    .{ plugin.name, plugin_params.IMPORT_NAME, plugin.name, plugin_params.IMPORT_NAME },
+                );
+                return error.PluginParamsNameCollision;
+            }
+        }
+
+        try resolved.append(allocator, .{ .plugin_name = plugin.name, .params = params });
+    }
+    return resolved;
 }
 
 /// Copy (and scan, per manifest `mode`) each plugin's declared convention

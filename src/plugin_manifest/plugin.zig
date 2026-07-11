@@ -13,6 +13,7 @@ const config = @import("../config.zig");
 const cache = @import("../cache.zig");
 const common = @import("common.zig");
 const language_policy = @import("../language_policy.zig");
+const plugin_params = @import("../plugin_params.zig");
 
 const SUPPORTED_MANIFEST_VERSION = common.SUPPORTED_MANIFEST_VERSION;
 const RESERVED_DIR_NAMES = common.RESERVED_DIR_NAMES;
@@ -99,6 +100,20 @@ pub const PluginManifest = struct {
     /// byte-identical.
     requires_language: ?[]const u8 = null,
 
+    /// Schema of the params this plugin accepts on its project.labelle
+    /// `.plugins` entry (`.params = .{ … }`) — labelle-assembler#591.
+    /// Declared under the `.params_schema` manifest key (NOT `.params`: on
+    /// the plugin side that spelling would read as the plugin *setting*
+    /// values; this is the schema the project's values are validated
+    /// against). Parsed by a dedicated strict walk
+    /// (`plugin_params.parseSchemaFromManifestSource`) — unknown keys inside
+    /// a schema entry hard-fail even though the manifest-wide parse ignores
+    /// unknown fields, so a typo'd `.requird` can't silently relax a
+    /// contract. Empty = the plugin takes no schema-declared params (every
+    /// plugin before #591; the native `language` fast path still applies) →
+    /// byte-identical output.
+    params_schema: []const plugin_params.ParamSchema = &.{},
+
     /// SPDX-style license identifier for a shipped/sold plugin (Asset-Plugins
     /// RFC Phase 2, labelle-cli#300). Surfaced by `labelle plugins`. Optional.
     license: ?[]const u8 = null,
@@ -126,6 +141,9 @@ pub const PluginManifest = struct {
         std.zon.parse.free(self.allocator, self.requires_language);
         std.zon.parse.free(self.allocator, self.license);
         std.zon.parse.free(self.allocator, self.author);
+        // Not parser-allocated (the strict schema walk owns its copies) but
+        // shape-compatible; freed through its own helper for symmetry.
+        plugin_params.freeSchema(self.allocator, self.params_schema);
     }
 };
 
@@ -143,6 +161,10 @@ pub const PluginManifest = struct {
 //   error.PluginManifestUnknownVersion     — manifest_version is < 1 or > what we support
 //   error.PluginManifestUnknownLanguage    — requires_language names a language outside
 //                                             language_policy.SUPPORTED_LANGUAGES (#584)
+//   error.PluginManifestInvalidParamsSchema — a `.params_schema` entry breaks the shape
+//                                             rules (unknown key, missing name/type,
+//                                             enum⇔values pairing, default/type mismatch,
+//                                             required×default, non-identifier names) (#591)
 //
 // The pack-manifest path (`loadPackFromDir`) additionally raises:
 //   error.PackAndPluginManifestConflict    — a pack.labelle dir ALSO ships
@@ -331,6 +353,17 @@ pub fn loadFromDir(
         }
     }
 
+    // ── Parse + validate `.params_schema` (#591) ──
+    // A dedicated STRICT walk over the raw source: the typed parse above
+    // deliberately ignores the key (manifest-wide forward compat — an older
+    // assembler still loads a schema-bearing manifest), while inside a
+    // schema entry unknown keys hard-fail with the plugin named. Shape rules
+    // (identifier names, enum⇔values pairing, default/type agreement,
+    // required×default) reject HERE, at manifest load, so a broken schema
+    // never reaches generate-time validation.
+    const params_schema = try plugin_params.parseSchemaFromManifestSource(allocator, raw_z, expected_name);
+    errdefer plugin_params.freeSchema(allocator, params_schema);
+
     return PluginManifest{
         .name = parsed.name,
         .manifest_version = parsed.manifest_version,
@@ -339,6 +372,7 @@ pub fn loadFromDir(
         .packs = parsed.packs,
         .depends_on_resources = parsed.depends_on_resources,
         .requires_language = parsed.requires_language,
+        .params_schema = params_schema,
         .license = parsed.license,
         .author = parsed.author,
         .allocator = allocator,

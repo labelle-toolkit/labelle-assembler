@@ -706,7 +706,9 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
     defer allocator.free(source_raw);
 
     const source = try allocator.dupeZ(u8, source_raw);
-    return try std.zon.parse.fromSliceAlloc(config.ProjectConfig, allocator, source, null, .{});
+    // Params-tolerant parse (#591) — cache/upgrade must not choke on a
+    // project whose plugins take schema-declared params.
+    return try @import("plugin_params.zig").parseProjectConfig(allocator, source);
 }
 
 /// readProjectConfig that returns an error instead of treating a missing
