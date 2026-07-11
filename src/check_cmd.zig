@@ -153,9 +153,95 @@ fn scanSceneNames(
         try game_owned.append(arena, try arena.dupe(u8, idents.pathToPascal(stem, &pb)));
     }
 
+    // Script-declared components (labelle-assembler#585, PR #598 finding 2):
+    // the declare phase registers `labelle.component(...)` names into the
+    // SAME bare game-root namespace as `components/*.zig`, so a bare scene
+    // reference to one is legitimate — without them here, a declared name
+    // that happens to match a pack component's bare name false-positives
+    // as `scene-bare-pack-component`, suggesting a pack-prefixed rename of
+    // a component the game genuinely owns.
+    //
+    // Source: the manifest sidecar the last `generate` emitted (which lists
+    // declared components in the game realm) — NOT the declare tool itself.
+    // Running the tool from a lint is a non-starter: it `zig build`s the
+    // pinned plugin's runner (network lua fetch, seconds of compile), and
+    // an old pin ships no tool at all (the generate-side phase gracefully
+    // skips, yielding no names anyway). The sidecar is ADVISORY by design:
+    // check reads no other generated artifact, so this is its one
+    // deliberate source-vs-artifact seam — a missing or stale sidecar
+    // degrades to the pre-#585 set (a declaration added since the last
+    // generate may false-positive until the next generate; a removed one
+    // may suppress a finding), both self-healing on regenerate, and the
+    // lint stays fast, offline, and functional against ANY scripting pin.
+    try appendSidecarGameComponents(arena, io, root, &game_owned);
+
     inline for (.{ "scenes", "prefabs" }) |subdir| {
         const dir = try std.fs.path.join(arena, &.{ root, subdir });
         try scene_name_lint.scanScenesDir(arena, io, findings, dir, pack_components.items, game_owned.items);
+    }
+}
+
+/// Append the game realm's component names from `<root>/.labelle/
+/// manifest.json` (the `index.realms[name=="game"].owns.components` string
+/// array) to `game_owned`. See the call site for why the sidecar is the
+/// chosen source for script-declared components and why it's advisory:
+/// every non-OOM failure — no sidecar (never generated), unparseable JSON,
+/// an unexpected shape — silently degrades to the disk-scanned set.
+/// Duplicates with the `components/*.zig` pascals are harmless (the lint
+/// does a linear membership check).
+fn appendSidecarGameComponents(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    game_owned: *std.ArrayList([]const u8),
+) !void {
+    const path = try std.fs.path.join(arena, &.{ root, ".labelle", "manifest.json" });
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+
+    const root_obj = switch (parsed) {
+        .object => |o| o,
+        else => return,
+    };
+    const index_obj = switch (root_obj.get("index") orelse return) {
+        .object => |o| o,
+        else => return,
+    };
+    const realms = switch (index_obj.get("realms") orelse return) {
+        .array => |a| a,
+        else => return,
+    };
+    for (realms.items) |realm_val| {
+        const realm = switch (realm_val) {
+            .object => |o| o,
+            else => continue,
+        };
+        const name = switch (realm.get("name") orelse continue) {
+            .string => |s| s,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, name, "game")) continue;
+        const owns = switch (realm.get("owns") orelse return) {
+            .object => |o| o,
+            else => return,
+        };
+        const comps = switch (owns.get("components") orelse return) {
+            .array => |a| a,
+            else => return,
+        };
+        for (comps.items) |comp_val| {
+            switch (comp_val) {
+                .string => |s| try game_owned.append(arena, try arena.dupe(u8, s)),
+                else => {},
+            }
+        }
+        return;
     }
 }
 
@@ -651,6 +737,64 @@ test "runLint: a game-root scene using a bare pack-component name is flagged (#4
         }
     }
     try testing.expect(saw_scene);
+}
+
+test "runLint: a SCRIPT-DECLARED game component listed by the manifest sidecar is game-owned (#598)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try scaffoldFixture(io, tmp.dir);
+    try writeFile(io, tmp.dir, "packs/production/scripts/00_work.zig",
+        \\pub fn work() void {}
+    );
+
+    // The game's scripts declared a game-global `Worker`
+    // (`labelle.component("Worker", ...)`) whose bare name collides with
+    // citizens' pack component. A game-root scene referencing it bare is
+    // LEGITIMATE — the declared component registers under exactly that key.
+    try writeFile(io, tmp.dir, "scenes/main.jsonc",
+        \\{ "components": { "Worker": { "hunger": 0 } } }
+    );
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    // Phase 1 — no manifest sidecar (never generated): the lint cannot see
+    // the declaration, so this is the pre-#598 false positive. Pinning it
+    // here proves the suppression below comes from the sidecar, not from
+    // the collision being unreal.
+    {
+        const result = try runLint(arena, io, root);
+        var saw_scene = false;
+        for (result.findings) |f| {
+            if (f.rule == .scene_bare_pack_component) saw_scene = true;
+        }
+        try testing.expect(saw_scene);
+    }
+
+    // Phase 2 — the sidecar the last `generate` emitted lists the declared
+    // component in the game realm (labelle-assembler#585): the bare
+    // reference is now recognized as game-owned and the finding is gone.
+    try writeFile(io, tmp.dir, ".labelle/manifest.json",
+        \\{
+        \\  "schema": "labelle.manifest/v1",
+        \\  "index": {
+        \\    "realms": [
+        \\      { "name": "game", "tier": "root",
+        \\        "owns": { "components": ["Worker"] } }
+        \\    ]
+        \\  }
+        \\}
+    );
+    {
+        const result = try runLint(arena, io, root);
+        for (result.findings) |f| {
+            try testing.expect(f.rule != .scene_bare_pack_component);
+        }
+    }
 }
 
 test "runLint: a game-root scene using the namespaced key is silent (#490)" {

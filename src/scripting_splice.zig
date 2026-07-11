@@ -33,6 +33,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const language_policy = @import("language_policy.zig");
 const plugin_manifest = @import("plugin_manifest.zig");
+const scripting_declare = @import("scripting_declare.zig");
 
 /// The resolved `plugin.labelle` name that identifies THE scripting plugin
 /// (labelle-toolkit/labelle-scripting ships `.name = "scripting"`). Manifest
@@ -82,6 +83,16 @@ pub const ScriptingSplice = struct {
     language: []const u8,
     extension: []const u8,
     script_names: []const []const u8 = &.{},
+    /// Script-declared components (labelle-assembler#585): the parsed
+    /// declare-mode schema, set by root.zig after
+    /// `scripting_declare.runPhase` ran the plugin's runner over
+    /// `script_names` (borrowed from the phase's `Schema` arena, alive
+    /// through main.zig emission). Consumed by
+    /// `registries.writeComponentRegistryBlock`, which registers each
+    /// under its declared name against the generated
+    /// `scripting_components.zig`. Empty (the default) for every
+    /// declaration-less project — all emission sites stay byte-identical.
+    declared_components: []const scripting_declare.DeclaredComponent = &.{},
 };
 
 /// Detect the scripting splice for this project: the `.plugins` entry

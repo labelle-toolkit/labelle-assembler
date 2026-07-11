@@ -33,6 +33,12 @@ const PackScan = scan.PackScan;
 /// EXACT-name check — so the assembler must embed NOTHING. Only an
 /// un-namespaced `Tilemap` satisfies that gate; see `registersTilemap`.
 ///
+/// A SCRIPT-DECLARED `Tilemap` (labelle-assembler#585) registers under its
+/// exact declared name in the same root namespace, so it satisfies the same
+/// gate and must suppress embedding identically — which is why `generate`
+/// runs this phase AFTER the declare phase and threads the declared names in
+/// (`declared_component_names`, matched verbatim by `declaresTilemap`).
+///
 /// A PACK's `components/Tilemap.zig` registers under the namespaced field
 /// `<pack>__Tilemap`, a DIFFERENT component that does NOT shadow the built-in,
 /// so a pack-registered `Tilemap` must NOT suppress embedding (assembler#562
@@ -55,13 +61,16 @@ pub fn collectRegistrations(
     target_dir: []const u8,
     scene_manifests: []const SceneManifest,
     component_names: []const []const u8,
+    declared_component_names: []const []const u8,
     prefab_names: []const []const u8,
     pack_scans: []const PackScan,
 ) ![]const tilemap_scan.Registration {
     // #562: a PROJECT-registered `Tilemap` (exact built-in name) overrides the
     // built-in — embed nothing and let the generic component dispatch route it.
-    // A pack's namespaced `<pack>__Tilemap` does NOT override (P1 fix).
-    if (registersTilemap(component_names)) {
+    // A pack's namespaced `<pack>__Tilemap` does NOT override (P1 fix). A
+    // script-declared `Tilemap` (#585) registers un-namespaced and overrides
+    // exactly like a `components/Tilemap.zig`.
+    if (registersTilemap(component_names) or declaresTilemap(declared_component_names)) {
         std.log.info("labelle-assembler: project registers its own `Tilemap` component — skipping built-in tilemap embedding (engine C2)", .{});
         return tilemap_scan.collect(allocator, target_dir, &.{});
     }
@@ -118,6 +127,19 @@ fn registersTilemap(component_names: []const []const u8) bool {
     var pascal_buf: [128]u8 = undefined;
     for (component_names) |name| {
         if (std.mem.eql(u8, idents.pathToPascal(name, &pascal_buf), "Tilemap")) return true;
+    }
+    return false;
+}
+
+/// True iff a SCRIPT-DECLARED component carries the EXACT built-in name
+/// `Tilemap` (labelle-assembler#585). Declared components register under
+/// their declared name verbatim (no pathToPascal, no pack namespace — see
+/// the registry block's `.{name} = @import("scripting_components.zig")`
+/// emission), so a literal compare mirrors the engine's exact-name
+/// `Components.has("Tilemap")` gate.
+fn declaresTilemap(declared_component_names: []const []const u8) bool {
+    for (declared_component_names) |name| {
+        if (std.mem.eql(u8, name, "Tilemap")) return true;
     }
     return false;
 }
