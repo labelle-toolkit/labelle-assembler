@@ -401,10 +401,14 @@ fn emitBuildStepArg(
                 // load-validated) can't carry braces/quotes, so it splices
                 // into the format string verbatim.
                 try fmt_body.appendSlice(allocator, "{s}");
-                try refs.append(allocator, try allocator.dupe(u8, "plugin_build_lib_prefix"));
+                const prefix_ref = try allocator.dupe(u8, "plugin_build_lib_prefix");
+                errdefer allocator.free(prefix_ref);
+                try refs.append(allocator, prefix_ref);
                 try fmt_body.appendSlice(allocator, plugin_build_steps.staticlibName(ph));
                 try fmt_body.appendSlice(allocator, "{s}");
-                try refs.append(allocator, try allocator.dupe(u8, "plugin_build_lib_ext"));
+                const ext_ref = try allocator.dupe(u8, "plugin_build_lib_ext");
+                errdefer allocator.free(ext_ref);
+                try refs.append(allocator, ext_ref);
             }
             i += ph.len;
         } else {
