@@ -19,6 +19,7 @@ pub const flow_catalog = @import("flow_catalog.zig");
 pub const pack_manifest = @import("manifest.zig");
 const build_files = @import("build_files.zig");
 const plugin_build_hook = @import("plugin_build_hook.zig");
+pub const plugin_build_steps = @import("plugin_build_steps.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
 pub const manifest_v2 = @import("codegen/manifest_v2.zig");
 const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
@@ -54,6 +55,12 @@ test {
     _ = @import("config.zig");
     _ = @import("plugin_manifest.zig");
     _ = @import("plugin_build_hook.zig");
+    _ = @import("plugin_build_steps.zig");
+    // Pulls in the build_files/ sub-modules' inline tests (its own `test`
+    // block references build_zig.zig + build_zig_zon.zig). Was missing —
+    // the #518 emitPluginBuildHooks pins and the #586 emitPluginBuildSteps
+    // goldens were dormant until this reference.
+    _ = @import("build_files.zig");
     _ = @import("pack_validate.zig");
     _ = @import("check.zig");
     _ = @import("scene_name_lint.zig");
@@ -884,6 +891,123 @@ pub fn generate(
     defer allocator.free(plugin_hooks);
     for (plugin_hook_disc.items, 0..) |d, i| plugin_hooks[i] = .{ .plugin_name = d.plugin_name };
 
+    // Plugin declarative build steps (labelle-assembler#586): load each
+    // decl-module plugin's `plugin.labelle` `.build` block, gate platform
+    // constraints, resolve the two placeholder roots, and thread the wiring
+    // into the generated build.zig (`emitPluginBuildSteps`: b.addSystemCommand
+    // + addObjectFile + step deps — see plugin_build_steps.zig for the design,
+    // placeholder language, and safety posture). Skipped for the tests target:
+    // it assembles no exe, so there is nothing to hang a produced artifact on
+    // (its build.zig stays byte-identical; the exe target of the same project
+    // still runs the steps). `{package}` resolves to the deps copy
+    // `createDepsLinks` just staged (build.zig.zon generation above — the same
+    // ordering dependency the declare phase has); when deps staging fell back
+    // to cache-relative paths, the cache-resolved plugin dir is used instead,
+    // mirroring `scripting_declare`'s fallback. `{cache}` dirs are created
+    // here so a command's first write (`-femit-bin={cache}/…`) never hits a
+    // missing parent.
+    var plugin_build_loaded: std.ArrayList(plugin_build_steps.BuildSteps) = .empty;
+    defer {
+        for (plugin_build_loaded.items) |*l| l.deinit();
+        plugin_build_loaded.deinit(allocator);
+    }
+    var plugin_build_wirings: std.ArrayList(build_files.PluginBuildStepsWiring) = .empty;
+    defer {
+        for (plugin_build_wirings.items) |pw| {
+            allocator.free(pw.package_abs);
+            allocator.free(pw.cache_rel);
+        }
+        plugin_build_wirings.deinit(allocator);
+    }
+    if (!is_tests_target) {
+        for (cfg_modules.plugins) |plugin| {
+            // A plugin whose directory cannot be resolved is a pre-existing
+            // hard error elsewhere in the pipeline (same posture as the #518
+            // hook probe above) — the .build probe must not surface it.
+            const plugin_dir = cache.resolvePlugin(allocator, plugin, game_dir) catch continue;
+            defer allocator.free(plugin_dir);
+
+            var loaded = (try plugin_build_steps.loadFromDir(allocator, plugin_dir, plugin.name)) orelse continue;
+            errdefer loaded.deinit();
+
+            // Both appends below must be infallible once owned resources are
+            // handed over, or an error between them double-frees.
+            try plugin_build_loaded.ensureUnusedCapacity(allocator, 1);
+            try plugin_build_wirings.ensureUnusedCapacity(allocator, 1);
+
+            // Platform gate: a declared allowlist excluding THIS platform
+            // fails the generate up front — the alternative is a
+            // missing-symbols link failure much later, far from the cause.
+            for (loaded.steps) |step| {
+                if (!plugin_build_steps.stepAllowsPlatform(step, cfg.platform)) {
+                    const list = try std.mem.join(allocator, ", ", step.platforms);
+                    defer allocator.free(list);
+                    std.debug.print(
+                        "labelle: plugin '{s}' .build step '{s}' does not support platform '{s}' (declared platforms: {s})\n",
+                        .{ plugin.name, step.name, @tagName(cfg.platform), list },
+                    );
+                    return error.PluginBuildUnsupportedPlatform;
+                }
+            }
+
+            // `{package}` root: prefer the staged deps copy (byte-consistent
+            // with what the game links, inside .labelle); fall back to the
+            // cache-resolved dir when deps staging degraded. Absolutized —
+            // the emitted setCwd/argv must not depend on the invoker's cwd.
+            const io_l = config.globalIo();
+            const fs_cwd = std.Io.Dir.cwd();
+            const staged_rel = try std.fmt.allocPrint(allocator, "{s}/deps/labelle-{s}", .{ output_dir, plugin.name });
+            defer allocator.free(staged_rel);
+            const package_abs: []const u8 = blk: {
+                // realPathFileAlloc returns [:0]; dupe to a plain slice so the
+                // DebugAllocator size bookkeeping matches on free (same dance
+                // as deps_linker).
+                if (fs_cwd.realPathFileAlloc(io_l, staged_rel, allocator)) |abs| {
+                    defer allocator.free(abs);
+                    break :blk try allocator.dupe(u8, abs);
+                } else |_| {
+                    const abs = try fs_cwd.realPathFileAlloc(io_l, plugin_dir, allocator);
+                    defer allocator.free(abs);
+                    break :blk try allocator.dupe(u8, abs);
+                }
+            };
+            errdefer allocator.free(package_abs);
+
+            // Every declared cwd must exist in the staged package NOW — a
+            // pointed generate error beats the child-spawn failure the user
+            // would otherwise hit mid-`zig build`.
+            for (loaded.steps) |step| {
+                const c = step.cwd orelse continue;
+                const step_cwd = try std.fs.path.join(allocator, &.{ package_abs, c });
+                defer allocator.free(step_cwd);
+                fs_cwd.access(io_l, step_cwd, .{}) catch {
+                    std.debug.print(
+                        "labelle: plugin '{s}' .build step '{s}' cwd '{s}' does not exist in the staged package ({s})\n",
+                        .{ plugin.name, step.name, c, step_cwd },
+                    );
+                    return error.PluginBuildMissingCwd;
+                };
+            }
+
+            // `{cache}` root: per-plugin persistent dir under THIS build root
+            // (per backend×platform — cross-target artifacts never collide),
+            // outside the wiped deps tree so tool caches survive regenerates.
+            const cache_rel = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ plugin_build_steps.CACHE_DIR_NAME, plugin.name });
+            errdefer allocator.free(cache_rel);
+            const cache_abs = try std.fs.path.join(allocator, &.{ target_dir, cache_rel });
+            defer allocator.free(cache_abs);
+            try fs_cwd.createDirPath(io_l, cache_abs);
+
+            plugin_build_wirings.appendAssumeCapacity(.{
+                .plugin_name = plugin.name,
+                .package_abs = package_abs,
+                .cache_rel = cache_rel,
+                .steps = loaded.steps,
+            });
+            plugin_build_loaded.appendAssumeCapacity(loaded);
+        }
+    }
+
     // Generate build.zig
     // `cfg_modules` (not `cfg`): light packs get no `b.dependency` /
     // `overrideImport` module wiring — their contribution is dir-scan
@@ -896,6 +1020,10 @@ pub fn generate(
         .promoted_scripts = promoted_scripts,
         .pack_modules = pack_modules.items,
         .plugin_hooks = plugin_hooks,
+        // Declarative plugin build steps (#586): system-command + artifact
+        // link wiring emitted after the game artifact is assembled. Empty
+        // when no plugin declares `.build` — byte-identical build.zig.
+        .plugin_build_steps = plugin_build_wirings.items,
         // Manifest-driven backend splice (assembler#378): pass the project
         // root so the splice can locate `backend.manifest.zon` + fragments.
         // Only consulted when the gate (desktop + manifest present) fires.

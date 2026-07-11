@@ -64,6 +64,17 @@ const ts_splice = generate.scripting_splice.ScriptingSplice{
     .script_names = &.{ "ai/guard", "behavior" },
 };
 
+/// The ruby twin (labelle-scripting v0.3.0, mruby 3.4.0): language == dir
+/// (`ruby/`), sources embed as `.rb` verbatim — no transpile gap. Same
+/// nested-subdir shape so the `/`-joined stems ride the identical builders.
+const ruby_splice = generate.scripting_splice.ScriptingSplice{
+    .plugin_name = "scripting",
+    .language = "ruby",
+    .dir = "ruby",
+    .extension = ".rb",
+    .script_names = &.{ "10_ball", "npc/vendor" },
+};
+
 /// A project.labelle plugin list carrying THE scripting plugin plus an
 /// ordinary sibling — the sibling proves the splice never leaks onto other
 /// plugins' wiring.
@@ -75,6 +86,12 @@ const scripting_plugins = [_]generate.PluginDep{
 /// The typescript spelling of the same list.
 const ts_scripting_plugins = [_]generate.PluginDep{
     .{ .name = "scripting", .repo = "github:labelle-toolkit/labelle-scripting", .version = "0.3.0", .params = .{ .language = "typescript" } },
+    .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "4.0.1" },
+};
+
+/// The ruby spelling of the same list.
+const ruby_scripting_plugins = [_]generate.PluginDep{
+    .{ .name = "scripting", .repo = "github:labelle-toolkit/labelle-scripting", .version = "0.4.0", .params = .{ .language = "ruby" } },
     .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "4.0.1" },
 };
 
@@ -143,7 +160,8 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         generate.main_template.scripting_splice = lua_splice;
         defer generate.main_template.scripting_splice = null;
 
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -201,7 +219,8 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         generate.main_template.scripting_splice = lua_splice;
         defer generate.main_template.scripting_splice = null;
 
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
             .platform = .android,
@@ -264,6 +283,38 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         try expectAstGenOk(main_zig);
     }
 
+    test "ruby loop lifecycle: ruby/-rooted .rb embeds ride the same builders" {
+        generate.main_template.scripting_splice = ruby_splice;
+        defer generate.main_template.scripting_splice = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &ruby_scripting_plugins,
+        }, loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        _ = try indexOfOrFail(main_zig, "const scripting = @import(\"scripting\");");
+        _ = try indexOfOrFail(main_zig, "const scripting_enabled = true;");
+
+        // Embed paths root at the `ruby/` convention dir (language == dir
+        // for ruby) with the `.rb` extension; sorted; strictly before
+        // PluginControllers.setup.
+        const reg_ball = try indexOfOrFail(main_zig, "scripting.registerScript(\"10_ball\", @embedFile(\"ruby/10_ball.rb\"));");
+        const reg_vendor = try indexOfOrFail(main_zig, "scripting.registerScript(\"npc/vendor\", @embedFile(\"ruby/npc/vendor.rb\"));");
+        const controllers_setup = try indexOfOrFail(main_zig, "PluginControllers.setup(&g)");
+        try std.testing.expect(reg_ball < reg_vendor);
+        try std.testing.expect(reg_vendor < controllers_setup);
+
+        // The language-keyed halves are untouched: VM tick + drain tap.
+        _ = try indexOfOrFail(main_zig, "scripting.Controller.tick(&g, scaled_dt);");
+        _ = try indexOfOrFail(main_zig, "engine.script_contract.drainEvents(&g);");
+
+        try expectAstGenOk(main_zig);
+    }
+
     test "an EMPTY script set still wires the plugin: alias + flag + drain, but no registerScript" {
         // Empty `lua/` dir (or none): the plugin is attached and the VM
         // boots, so the flag/alias/drain must be present — only the
@@ -273,7 +324,8 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         generate.main_template.scripting_splice = empty_scripts;
         defer generate.main_template.scripting_splice = null;
 
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -292,7 +344,8 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         // this is the explicit no-markers regression for a plugins-bearing
         // main generated WITHOUT the splice (the threadlocal at its null
         // default, as every pre-#593 call site leaves it).
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -337,6 +390,21 @@ pub const SCRIPTING_BUILD_WIRING = struct {
         defer std.testing.allocator.free(build_zig);
 
         _ = try indexOfOrFail(build_zig, "const plugin_scripting_dep = b.dependency(\"labelle_scripting\", .{ .target = target, .optimize = optimize, .language = .typescript });");
+        _ = try indexOfOrFail(build_zig, "const plugin_pathfinding_dep = b.dependency(\"labelle_pathfinding\", .{ .target = target, .optimize = optimize });");
+    }
+
+    test "a ruby declaration passes .language = .ruby to the scripting dep" {
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = &ruby_scripting_plugins,
+        }, .{
+            .scripting = .{ .plugin_name = "scripting", .language = "ruby" },
+        });
+        defer std.testing.allocator.free(build_zig);
+
+        _ = try indexOfOrFail(build_zig, "const plugin_scripting_dep = b.dependency(\"labelle_scripting\", .{ .target = target, .optimize = optimize, .language = .ruby });");
         _ = try indexOfOrFail(build_zig, "const plugin_pathfinding_dep = b.dependency(\"labelle_pathfinding\", .{ .target = target, .optimize = optimize });");
     }
 
