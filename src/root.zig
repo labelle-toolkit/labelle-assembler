@@ -637,13 +637,6 @@ pub fn generate(
     // without `.resources`.
     try pack_resources.processPackAssets(allocator, resource_entries.items, cfg.resources, game_dir, target_dir);
 
-    // Embedded-tilemap registrations (T2 Phase 4 + T3 #561/#562). AFTER
-    // `loadPackScans` so the prefab scan (assembler#561) sees the staged pack
-    // prefab JSONC and pack-registered `Tilemap` (assembler#562). See
-    // tilemap_phase.
-    const tilemap_registrations = try tilemap_phase.collectRegistrations(allocator, target_dir, scene_manifests, component_names, prefab_names, pack_scans.items);
-    defer tilemap_scan.freeRegistrations(allocator, tilemap_registrations);
-
     // Injectivity gate (#440 / chatgpt-codex events L164): the `<pack>__<name>`
     // scheme is not injective on its own — two distinct (pack, name) pairs can
     // fold to the same emitted symbol (e.g. pack `a` + `b__hit` and pack `a__b`
@@ -819,6 +812,27 @@ pub fn generate(
         });
         if (declare_schema) |sch| s.declared_components = sch.components;
     }
+
+    // Embedded-tilemap registrations (T2 Phase 4 + T3 #561/#562 + #585).
+    // AFTER `loadPackScans` so the prefab scan (assembler#561) sees the
+    // staged pack prefab JSONC and pack-registered `Tilemap` (assembler#562),
+    // and AFTER the declare phase so a SCRIPT-DECLARED `Tilemap` joins the
+    // built-in-override decision exactly like a `components/Tilemap.zig`
+    // (engine C2). The declare phase itself can't move up — it needs
+    // `createDepsLinks` (build.zig.zon generation above) to have staged the
+    // plugin package — so the collection moved down here instead; nothing
+    // between the old spot (right after `loadPackScans`) and this one reads
+    // the registrations or rewrites the prefab JSONC / `.tmx` files the scan
+    // consumes, and the only consumer is main.zig emission far below.
+    const declared_component_names: []const []const u8 = blk: {
+        const sch = declare_schema orelse break :blk &.{};
+        const names = try allocator.alloc([]const u8, sch.components.len);
+        for (sch.components, names) |comp, *slot| slot.* = comp.name;
+        break :blk names;
+    };
+    defer allocator.free(declared_component_names);
+    const tilemap_registrations = try tilemap_phase.collectRegistrations(allocator, target_dir, scene_manifests, component_names, declared_component_names, prefab_names, pack_scans.items);
+    defer tilemap_scan.freeRegistrations(allocator, tilemap_registrations);
 
     // labelle-assembler#240 Gap 2 — game scripts exporting `FlowNodes`
     // must be promoted to named build modules so the same file isn't a
@@ -1022,6 +1036,10 @@ pub fn generate(
             labelle_dir,
             target_dir,
             component_names,
+            // Script-declared components (#585) — registered into the same
+            // game-root namespace as components/*.zig, so the sidecar's game
+            // realm must list them too. Empty for declaration-less projects.
+            if (maybe_scripting) |s| s.declared_components else &.{},
             prefab_names,
             enum_names,
             event_names,

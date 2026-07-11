@@ -563,6 +563,7 @@ test "collectRegistrations embeds a GAME-ROOT prefab's Tilemap (.tmx + image)" {
         target_dir,
         &.{}, // no scenes
         &.{}, // no project components
+        &.{}, // no script-declared components
         &.{"room"}, // game-root prefab stems
         &.{}, // no packs
     );
@@ -601,6 +602,7 @@ test "collectRegistrations embeds a PACK prefab's Tilemap" {
         target_dir,
         &.{},
         &.{},
+        &.{}, // no script-declared components
         &.{}, // no game-root prefabs
         &.{pack},
     );
@@ -634,6 +636,40 @@ test "collectRegistrations: a PROJECT `Tilemap` component skips the built-in emb
         target_dir,
         &.{scene},
         &project_components, // project registers `Tilemap`
+        &.{}, // no script-declared components
+        &.{},
+        &.{},
+    );
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    try testing.expectEqual(@as(usize, 0), regs.len);
+}
+
+test "collectRegistrations: a SCRIPT-DECLARED `Tilemap` component skips the built-in embed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Mirror of the PROJECT-component override above (#585): the declare
+    // phase registers a script-declared `Tilemap` under the EXACT built-in
+    // name (un-namespaced, same root registry), so it satisfies the engine's
+    // `has("Tilemap")` gate the same way `components/Tilemap.zig` does —
+    // NOTHING is embedded. No `.tmx` exists, proving no embed was attempted.
+    const scene: scene_manifest.SceneManifest = .{
+        .name = "world",
+        .assets = &.{},
+        .tilemap_assets = &.{"never_embedded"},
+    };
+    const declared_components = [_][]const u8{"Tilemap"};
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_phase.collectRegistrations(
+        testing.allocator,
+        target_dir,
+        &.{scene},
+        &.{}, // no PROJECT components
+        &declared_components, // script declares `Tilemap`
         &.{},
         &.{},
     );
@@ -676,6 +712,7 @@ test "collectRegistrations: a pack's namespaced `Tilemap` does NOT suppress the 
         target_dir,
         &.{scene},
         &.{}, // no PROJECT components
+        &.{}, // no script-declared components
         &.{},
         &.{pack}, // pack ships a (namespaced) Tilemap — must not suppress
     );
@@ -711,6 +748,7 @@ test "collectRegistrations embeds BOTH a scene and a prefab tilemap" {
         target_dir,
         &.{scene},
         &.{},
+        &.{}, // no script-declared components
         &.{"room"},
         &.{},
     );

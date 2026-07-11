@@ -20,6 +20,11 @@
 //!      labelle-scripting's own goldens): generated file written, stale
 //!      file dropped on the no-declaration path, collisions fail generate,
 //!      and a declaring run's build files carry no accidental new markers.
+//!   3. The declared components' CROSS-PHASE consumers (PR #598 findings
+//!      2+3): a script-declared `Tilemap` joins the built-in-override
+//!      decision (the tilemap collection is ordered after the declare
+//!      phase), and the exe-target manifest sidecar lists declared
+//!      components in the game realm.
 
 const std = @import("std");
 const zspec = @import("zspec");
@@ -66,6 +71,24 @@ fn indexOfOrFail(haystack: []const u8, needle: []const u8) !usize {
         std.debug.print("expected to find:\n  {s}\nin generated output\n", .{needle});
         return error.MissingExpectedEmission;
     };
+}
+
+/// Find the realm object named `name` in a manifest `realms` array.
+fn findJsonRealm(arr: std.json.Array, name: []const u8) ?std.json.ObjectMap {
+    for (arr.items) |item| {
+        const obj = item.object;
+        if (std.mem.eql(u8, obj.get("name").?.string, name)) return obj;
+    }
+    return null;
+}
+
+/// Find the component object named `name` in a realm's `components` array.
+fn findJsonComponent(arr: std.json.Array, name: []const u8) ?std.json.ObjectMap {
+    for (arr.items) |item| {
+        const obj = item.object;
+        if (std.mem.eql(u8, obj.get("name").?.string, name)) return obj;
+    }
+    return null;
 }
 
 /// parse → AstGen gate (the `main_template.zig` fragment check; imports
@@ -341,6 +364,101 @@ pub const DECLARE_PHASE_E2E = struct {
             error.ScriptComponentCollision,
             generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = true }),
         );
+    }
+
+    test "a script-declared `Tilemap` overrides the built-in embed (declare runs BEFORE tilemap collection)" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
+
+        // A game-root prefab references the built-in `Tilemap` by asset_name,
+        // but NO `assets/never_embedded.tmx` exists — if generate still tries
+        // to embed it, tilemap collection fails (`TilemapAssetNotFound`). A
+        // script-declared `Tilemap` must override the built-in (engine C2)
+        // exactly like `components/Tilemap.zig`, which requires the declare
+        // phase to have run BEFORE the tilemap phase decides (#598 finding 3
+        // — pre-fix the collection ran first and this generate errored).
+        var game = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game.close(io);
+        try writeFileIn(game, "prefabs/room.jsonc",
+            \\{ "components": { "Tilemap": { "asset_name": "never_embedded" } } }
+        );
+
+        const tilemap_schema =
+            \\{"components":[{"name":"Tilemap","fields":[{"name":"asset_name","type":"str","default":""}]}]}
+        ;
+        const fake = try staged.stageFakeRunner(allocator, tilemap_schema);
+        defer allocator.free(fake);
+        generate.scripting_declare.declare_tool_override = fake;
+        defer generate.scripting_declare.declare_tool_override = null;
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = true });
+
+        // The declared component was generated (the override had a real
+        // provider to defer to), and no embed was attempted for the prefab.
+        const gen_src = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/scripting_components.zig", allocator, .limited(64 * 1024));
+        defer allocator.free(gen_src);
+        _ = try indexOfOrFail(gen_src, "pub const Tilemap = struct {");
+    }
+
+    test "the manifest sidecar lists a script-declared component in the game realm (exe target)" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
+
+        // The sidecar only emits on the EXE target, whose main.zig emission
+        // needs an engine template — stage the unit-test fixture template as
+        // a `local:` engine package inside the project so the full exe-path
+        // generate runs hermetically.
+        var game = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game.close(io);
+        try writeFileIn(game, "engine-fixture/codegen/main.zig.template", engine_template);
+
+        const fake = try staged.stageFakeRunner(allocator, hunger_schema);
+        defer allocator.free(fake);
+        generate.scripting_declare.declare_tool_override = fake;
+        defer generate.scripting_declare.declare_tool_override = null;
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        var cfg = staged.config(backend_repo);
+        cfg.engine_version = "local:engine-fixture";
+        // The exe target emits main.zig, which requires the project's
+        // declared y-axis convention (RFC-Y-AXIS-CONVENTION build guard).
+        cfg.y_axis = .up;
+        try generate.generate(allocator, cfg, staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        // manifest.json is project-level: `<game>/.labelle/manifest.json`.
+        const bytes = try staged.tmp.dir.readFileAlloc(io, "game/.labelle/manifest.json", allocator, .limited(1 << 20));
+        defer allocator.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+
+        // Detail realm: the declared component rides the game realm with the
+        // codegen-exact save policy + field types (#598 finding 2 — pre-fix
+        // the sidecar carried only `components/*.zig` scans and script
+        // declarations were invisible to consumers).
+        const realms = root.get("realms").?.array;
+        const game_realm = findJsonRealm(realms, "game") orelse return error.MissingGameRealm;
+        const comps = game_realm.get("components").?.array;
+        const hunger = findJsonComponent(comps, "Hunger") orelse return error.MissingDeclaredComponent;
+        try std.testing.expectEqualStrings("saveable", hunger.get("save").?.string);
+        const fields = hunger.get("fields").?.object;
+        try std.testing.expectEqualStrings("f32", fields.get("level").?.string);
+        try std.testing.expectEqualStrings("bool", fields.get("starving").?.string);
+
+        // Index realm: `owns.components` names it too.
+        const realms_idx = root.get("index").?.object.get("realms").?.array;
+        const game_idx = findJsonRealm(realms_idx, "game") orelse return error.MissingGameRealm;
+        const owned = game_idx.get("owns").?.object.get("components").?.array;
+        var found = false;
+        for (owned.items) |item| {
+            if (std.mem.eql(u8, item.string, "Hunger")) found = true;
+        }
+        try std.testing.expect(found);
     }
 
     test "a runner failure (malformed declaration) fails generate with the tool's exit relayed" {

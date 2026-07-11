@@ -11,6 +11,7 @@ const config = @import("../config.zig");
 const script_scanner = @import("../script_scanner.zig");
 const scan = @import("../codegen/scan.zig");
 const plugin_manifest = @import("../plugin_manifest.zig");
+const scripting_declare = @import("../scripting_declare.zig");
 const parse = @import("parse.zig");
 const json = @import("json.zig");
 
@@ -49,6 +50,7 @@ pub fn emitManifestSidecar(
     labelle_dir: []const u8,
     target_dir: []const u8,
     component_names: []const []const u8,
+    declared_components: []const scripting_declare.DeclaredComponent,
     prefab_names: []const []const u8,
     enum_names: []const []const u8,
     event_names: []const []const u8,
@@ -63,8 +65,41 @@ pub fn emitManifestSidecar(
     const aa = arena.allocator();
 
     // ── Game-realm detail (AST-parsed from the realm we author) ──────
-    const components = try parse.parseStructDir(aa, game_dir, "components", component_names);
+    var components = try parse.parseStructDir(aa, game_dir, "components", component_names);
     const game_events = try parse.parseStructDir(aa, game_dir, "events", event_names);
+
+    // ── Script-declared components (labelle-assembler#585) ───────────
+    // The declare phase registers these into the SAME game-root registry
+    // namespace as `components/*.zig` (un-namespaced, via the generated
+    // `scripting_components.zig`), so the game realm must list them too —
+    // same name/save/visibility/fields shape as the AST-parsed entries.
+    // Converted straight from the typed schema rather than re-parsing the
+    // generated file: `savePolicyName`/`zigFieldTypeName` are the exact
+    // mappings `renderComponentsFile` writes, so the sidecar can't drift
+    // from codegen. Appended AFTER the components/ entries, mirroring the
+    // registry block's emission order.
+    if (declared_components.len > 0) {
+        var list: std.ArrayList(parse.StructDecl) = .empty;
+        try list.ensureTotalCapacity(aa, components.len + declared_components.len);
+        list.appendSliceAssumeCapacity(components);
+        for (declared_components) |dc| {
+            const fields = try aa.alloc(parse.Field, dc.fields.len);
+            for (dc.fields, fields) |df, *out| out.* = .{
+                .name = df.name,
+                .zig_type = scripting_declare.zigFieldTypeName(df.default),
+            };
+            list.appendAssumeCapacity(.{
+                .name = dc.name,
+                .save = scripting_declare.savePolicyName(dc.persist),
+                // No visibility decl is rendered — the writer resolves null
+                // to the engine default, exactly like a plain components/
+                // file that declares none.
+                .visibility = null,
+                .fields = fields,
+            });
+        }
+        components = try list.toOwnedSlice(aa);
+    }
 
     // Game scripts only — plugin-shipped scripts belong to their plugin.
     var game_scripts: std.ArrayList(ScriptEntry) = .empty;
@@ -154,7 +189,7 @@ test "emitManifestSidecar: writes a parseable sidecar for an empty project" {
     defer aa.free(dir);
 
     const cfg = ProjectConfig{ .name = "tmp" };
-    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{});
+    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{});
 
     const path = try std.fs.path.join(aa, &.{ dir, MANIFEST_FILENAME });
     defer aa.free(path);
@@ -209,7 +244,7 @@ test "emitManifestSidecar: AST-parses a staged pack's components" {
     const cfg = ProjectConfig{ .name = "tmp", .plugins = &.{.{ .name = "citizens" }} };
     // game_dir and target_dir both point at the tmp dir; the pack files live
     // under `<target>/packs/citizens/`.
-    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &packs);
+    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &packs);
 
     const path = try std.fs.path.join(aa, &.{ dir, MANIFEST_FILENAME });
     defer aa.free(path);
@@ -226,4 +261,73 @@ test "emitManifestSidecar: AST-parses a staged pack's components" {
     try std.testing.expectEqualStrings("citizens__Worker", comp0.get("emitted_name").?.string);
     try std.testing.expectEqualStrings("pack", comp0.get("visibility").?.string);
     try std.testing.expectEqualStrings("?u64", comp0.get("fields").?.object.get("home").?.string);
+}
+
+test "emitManifestSidecar: lists script-declared components in the game realm (#585)" {
+    const aa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = config.globalIo();
+
+    // One hand-written game component beside the declaration, proving the
+    // declared entry is APPENDED to (not replacing) the components/ scan.
+    try tmp.dir.createDirPath(io, "components");
+    {
+        var cdir = try tmp.dir.openDir(io, "components", .{});
+        defer cdir.close(io);
+        var f = try cdir.createFile(io, "bed.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\pub const Bed = struct { sleeper: ?u64 = null };
+            \\
+        );
+    }
+
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", aa);
+    defer aa.free(dir);
+
+    // The schema the declare phase extracted — every mapping-relevant field
+    // type (persist policy, entity→u64, str→[]const u8).
+    const declared_fields = [_]scripting_declare.DeclaredField{
+        .{ .name = "level", .default = .{ .f32 = 1.0 } },
+        .{ .name = "owner", .default = .{ .entity = 0 } },
+        .{ .name = "label", .default = .{ .str = "x" } },
+    };
+    const declared = [_]scripting_declare.DeclaredComponent{
+        .{ .name = "Hunger", .persist = .transient, .fields = &declared_fields },
+    };
+
+    const cfg = ProjectConfig{ .name = "tmp" };
+    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{"bed"}, &declared, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{});
+
+    const path = try std.fs.path.join(aa, &.{ dir, MANIFEST_FILENAME });
+    defer aa.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, aa, .limited(1 << 20));
+    defer aa.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, aa, bytes, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    // Detail realm: components/ entry first, declared entry appended with
+    // the codegen-exact save policy + field types.
+    const realms = root.get("realms").?.array;
+    const game = json.findRealm(realms, "game").?;
+    const comps = game.get("components").?.array;
+    try std.testing.expectEqual(@as(usize, 2), comps.items.len);
+    try std.testing.expectEqualStrings("Bed", comps.items[0].object.get("name").?.string);
+    const hunger = comps.items[1].object;
+    try std.testing.expectEqualStrings("Hunger", hunger.get("name").?.string);
+    try std.testing.expectEqualStrings("transient", hunger.get("save").?.string);
+    const fields = hunger.get("fields").?.object;
+    try std.testing.expectEqualStrings("f32", fields.get("level").?.string);
+    try std.testing.expectEqualStrings("u64", fields.get("owner").?.string);
+    try std.testing.expectEqualStrings("[]const u8", fields.get("label").?.string);
+
+    // Index realm: `owns.components` carries the declared name too.
+    const realms_idx = root.get("index").?.object.get("realms").?.array;
+    const game_idx = json.findRealm(realms_idx, "game").?;
+    const owned = game_idx.get("owns").?.object.get("components").?.array;
+    try std.testing.expectEqual(@as(usize, 2), owned.items.len);
+    try std.testing.expectEqualStrings("Hunger", owned.items[1].string);
 }

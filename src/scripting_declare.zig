@@ -169,6 +169,9 @@ fn relayChildStderr(text: []const u8) void {
 
 fn isIdentifier(s: []const u8) bool {
     if (s.len == 0) return false;
+    // `_` alone is Zig's discard token, not an identifier — `pub const _`
+    // and `_: f32` both fail to compile.
+    if (s.len == 1 and s[0] == '_') return false;
     for (s, 0..) |ch, i| {
         const ok = ch == '_' or
             (ch >= 'A' and ch <= 'Z') or
@@ -178,6 +181,29 @@ fn isIdentifier(s: []const u8) bool {
     }
     return true;
 }
+
+/// The generated file spells component and field names as BARE Zig
+/// identifiers (`pub const <name> = struct { <field>: T = ..., }`), so a
+/// Zig keyword (`error`, `align`, `struct`, …) passes the char-class check
+/// above yet renders code that cannot compile in ANY position. The list is
+/// the compiler's own tokenizer table, so it can never drift.
+fn isZigKeyword(s: []const u8) bool {
+    return std.zig.Token.keywords.has(s);
+}
+
+/// Primitive type/value names (`type`, `f32`, `u64`, `true`, …) are NOT
+/// tokenizer keywords, but a decl spelling one is "name shadows primitive"
+/// (breaks a component named `type`) — and they're reserved for FIELDS too,
+/// so a declared field name stays spellable as a bare identifier in every
+/// generated context, present and future. The compiler's own table again.
+fn isZigPrimitive(s: []const u8) bool {
+    return std.zig.primitives.isPrimitive(s);
+}
+
+/// Member decls EVERY rendered component struct carries (see
+/// `renderComponentsFile`) — a field with one of these names would collide
+/// with its own struct's generated decl.
+const generated_member_decls = [_][]const u8{"save"};
 
 /// Parse + validate one schema JSON document into typed components.
 /// Validation is deliberately re-done here even though the lua runner
@@ -257,6 +283,14 @@ fn parseComponent(a: std.mem.Allocator, val: std.json.Value) !DeclaredComponent 
         diag("script-declared component '{s}' is not a valid identifier", .{name});
         return error.ScriptSchemaInvalid;
     }
+    if (isZigKeyword(name)) {
+        diag("script-declared component '{s}': the name is a Zig keyword — the generated `pub const {s} = struct` would not compile; pick another name", .{ name, name });
+        return error.ScriptSchemaInvalid;
+    }
+    if (isZigPrimitive(name)) {
+        diag("script-declared component '{s}': the name shadows a Zig primitive — the generated `pub const {s} = struct` would not compile; pick another name", .{ name, name });
+        return error.ScriptSchemaInvalid;
+    }
     if (std.mem.eql(u8, name, "Vec2")) {
         // The generated file reserves `Vec2` for the vec2-field backing
         // struct (see renderComponentsFile).
@@ -325,6 +359,20 @@ fn parseField(a: std.mem.Allocator, comp_name: []const u8, val: std.json.Value) 
     if (!isIdentifier(name)) {
         diag("script-declared component '{s}' field '{s}' is not a valid identifier", .{ comp_name, name });
         return error.ScriptSchemaInvalid;
+    }
+    if (isZigKeyword(name)) {
+        diag("script-declared component '{s}' field '{s}': the name is a Zig keyword — the generated `{s}: <type> = ...` field would not compile; pick another name", .{ comp_name, name, name });
+        return error.ScriptSchemaInvalid;
+    }
+    if (isZigPrimitive(name)) {
+        diag("script-declared component '{s}' field '{s}': the name is a Zig primitive type/value name — reserved so generated code can always spell the field bare; pick another name", .{ comp_name, name });
+        return error.ScriptSchemaInvalid;
+    }
+    for (generated_member_decls) |decl| {
+        if (std.mem.eql(u8, name, decl)) {
+            diag("script-declared component '{s}' field '{s}': the name collides with the `{s}` decl every generated component struct carries — pick another name", .{ comp_name, name, decl });
+            return error.ScriptSchemaInvalid;
+        }
     }
     const type_str = switch (obj.get("type") orelse .null) {
         .string => |s| s,
@@ -423,6 +471,33 @@ fn truncateForDiag(s: []const u8) []const u8 {
 
 // ── Codegen: schema → scripting_components.zig ───────────────────────
 
+/// The save-policy enum literal `renderComponentsFile` writes into the
+/// generated `Saveable(.<policy>, …)` decl — persistent→`saveable` (core
+/// has no `.persistent`), transient→`transient`. Public so the manifest
+/// sidecar reports the SAME policy codegen emits.
+pub fn savePolicyName(p: Persist) []const u8 {
+    return switch (p) {
+        .persistent => "saveable",
+        .transient => "transient",
+    };
+}
+
+/// The Zig type `renderComponentsFile` writes for a field — public so the
+/// manifest sidecar reports the SAME field types codegen emits (`str` is
+/// the slice type, `vec2` the generated-file-local backing struct,
+/// `entity` the core Stored idiom's u64 id).
+pub fn zigFieldTypeName(default: Default) []const u8 {
+    return switch (default) {
+        .f32 => "f32",
+        .i32 => "i32",
+        .u32 => "u32",
+        .bool => "bool",
+        .str => "[]const u8",
+        .vec2 => "Vec2",
+        .entity => "u64",
+    };
+}
+
 /// Render the generated `scripting_components.zig` for `components`.
 /// Each struct copies the canonical hand-written component shape (the
 /// `examples/packs-demo` pack components / `labelle add feature`
@@ -463,18 +538,15 @@ pub fn renderComponentsFile(components: []const DeclaredComponent, w: anytype) !
     for (components) |comp| {
         try w.print("pub const {s} = struct {{\n", .{comp.name});
 
-        const policy: []const u8 = switch (comp.persist) {
-            .persistent => ".saveable",
-            .transient => ".transient",
-        };
+        const policy = savePolicyName(comp.persist);
         var entity_ref_count: usize = 0;
         for (comp.fields) |field| {
             if (field.default == .entity) entity_ref_count += 1;
         }
         if (entity_ref_count == 0) {
-            try w.print("    pub const save = @import(\"labelle-core\").Saveable({s}, @This(), .{{}});\n", .{policy});
+            try w.print("    pub const save = @import(\"labelle-core\").Saveable(.{s}, @This(), .{{}});\n", .{policy});
         } else {
-            try w.print("    pub const save = @import(\"labelle-core\").Saveable({s}, @This(), .{{\n", .{policy});
+            try w.print("    pub const save = @import(\"labelle-core\").Saveable(.{s}, @This(), .{{\n", .{policy});
             try w.writeAll("        .entity_refs = &.{");
             var emitted: usize = 0;
             for (comp.fields) |field| {
@@ -488,15 +560,17 @@ pub fn renderComponentsFile(components: []const DeclaredComponent, w: anytype) !
 
         if (comp.fields.len > 0) try w.writeAll("\n");
         for (comp.fields) |field| {
+            try w.print("    {s}: {s} = ", .{ field.name, zigFieldTypeName(field.default) });
             switch (field.default) {
-                .f32 => |v| try w.print("    {s}: f32 = {d},\n", .{ field.name, v }),
-                .i32 => |v| try w.print("    {s}: i32 = {d},\n", .{ field.name, v }),
-                .u32 => |v| try w.print("    {s}: u32 = {d},\n", .{ field.name, v }),
-                .bool => |v| try w.print("    {s}: bool = {},\n", .{ field.name, v }),
-                .str => |v| try w.print("    {s}: []const u8 = \"{f}\",\n", .{ field.name, std.zig.fmtString(v) }),
-                .vec2 => |v| try w.print("    {s}: Vec2 = .{{ .x = {d}, .y = {d} }},\n", .{ field.name, v.x, v.y }),
-                .entity => |v| try w.print("    {s}: u64 = {d},\n", .{ field.name, v }),
+                .f32 => |v| try w.print("{d}", .{v}),
+                .i32 => |v| try w.print("{d}", .{v}),
+                .u32 => |v| try w.print("{d}", .{v}),
+                .bool => |v| try w.print("{}", .{v}),
+                .str => |v| try w.print("\"{f}\"", .{std.zig.fmtString(v)}),
+                .vec2 => |v| try w.print(".{{ .x = {d}, .y = {d} }}", .{ v.x, v.y }),
+                .entity => |v| try w.print("{d}", .{v}),
             }
+            try w.writeAll(",\n");
         }
         try w.writeAll("};\n\n");
     }
@@ -851,6 +925,46 @@ test "parseSchema: malformed documents reject (bad JSON, bad names, ranges, dupl
     for (bad_cases) |case| {
         try testing.expectError(error.ScriptSchemaInvalid, parseSchema(testing.allocator, case));
     }
+}
+
+test "parseSchema: reserved names reject — keyword/primitive fields, the generated `save` decl, keyword/primitive components" {
+    // Every name below passes the char-class identifier check yet is
+    // reserved (PR #598 finding 1): keywords break generated code in any
+    // position, primitives break decl position (`pub const type = struct`
+    // is "name shadows primitive") and are reserved for fields too, and
+    // `save` collides with the decl every generated struct carries.
+    const reserved_cases = [_][]const u8{
+        // Field named the `type` primitive.
+        \\{"components":[{"name":"A","fields":[{"name":"type","type":"f32","default":0}]}]}
+        ,
+        // Fields named Zig keywords → `error: i32 = 0,` is a parse error.
+        \\{"components":[{"name":"A","fields":[{"name":"error","type":"i32","default":0}]}]}
+        ,
+        \\{"components":[{"name":"A","fields":[{"name":"align","type":"u32","default":0}]}]}
+        ,
+        // Field named `save` → collides with the generated Saveable decl.
+        \\{"components":[{"name":"A","fields":[{"name":"save","type":"bool","default":false}]}]}
+        ,
+        // Component named the `type` primitive → "name shadows primitive".
+        \\{"components":[{"name":"type","fields":[]}]}
+        ,
+        // Component named a Zig keyword → `pub const error = struct` fails.
+        \\{"components":[{"name":"error","fields":[]}]}
+        ,
+        // `_` is the discard token, not an identifier — component or field.
+        \\{"components":[{"name":"_","fields":[]}]}
+        ,
+        \\{"components":[{"name":"A","fields":[{"name":"_","type":"f32","default":0}]}]}
+        ,
+    };
+    for (reserved_cases) |case| {
+        try testing.expectError(error.ScriptSchemaInvalid, parseSchema(testing.allocator, case));
+    }
+    // The gate is exact — a name merely CONTAINING a keyword still passes.
+    var schema = try parseSchema(testing.allocator,
+        \\{"components":[{"name":"ErrorLog","fields":[{"name":"save_count","type":"u32","default":0},{"name":"type_name","type":"str","default":""}]}]}
+    );
+    schema.deinit();
 }
 
 /// Render `components` into a caller-freed buffer.
