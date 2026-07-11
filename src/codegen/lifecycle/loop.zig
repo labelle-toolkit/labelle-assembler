@@ -25,6 +25,7 @@ const scan = @import("../scan.zig");
 const asset_wiring = @import("../blocks/asset_wiring.zig");
 const resource_loader = @import("../blocks/resource_loader.zig");
 const tilemap_assets = @import("../blocks/tilemap_assets.zig");
+const post_fx_block = @import("../blocks/post_fx.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const ResourceDef = config.ResourceDef;
@@ -243,6 +244,13 @@ pub fn Mixin(comptime Self: type) type {
                 try w.print("    try g.setScene(\"{s}\");\n", .{initial});
                 try w.writeByte('\n');
             }
+
+            // Seed the declared static post-fx stack (labelle-gfx#305 P2 Slice
+            // C). Gated on `@hasDecl(AssembledGame, "setPostFx")` for forward-
+            // compat with older engines; `setPostFx` is void so this emits the
+            // SAME statement as the callback path. No-op when `.post_fx` is
+            // empty, so back-compat projects stay byte-identical.
+            try post_fx_block.emitPostFxSetup(w, cfg, "    ");
 
             try w.writeAll("    runner.setup(&g);\n");
 

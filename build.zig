@@ -118,6 +118,10 @@ pub fn build(b: *std.Build) void {
         "test/build_zig_tests.zig",
         "test/main_zig_tests.zig",
         "test/scene_asset_manifests_tests.zig",
+        // project.labelle `.post_fx` → gated setPostFx codegen (labelle-gfx#305
+        // P2 Slice C): loop + callback emit the same `@hasDecl`-gated statement,
+        // RFC §2.2 friendly-param → PostPassUniforms slot mapping.
+        "test/post_fx_setup_tests.zig",
         "test/backend_wiring_tests.zig",
         "test/scripts_prefabs_views_layers_tests.zig",
         "test/resources_tests.zig",
