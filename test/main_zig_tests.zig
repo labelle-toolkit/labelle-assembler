@@ -809,6 +809,11 @@ pub const PLUGIN_CONTROLLERS = struct {
         // setup is `!void` (controllers can fail), deinit is `void` (must not)
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn setup(game: anytype) !void") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub fn deinit(game: anytype) void") != null);
+
+        // deinit is arity-dispatched (labelle-assembler#593): module-singleton
+        // controllers declare `deinit()` (e.g. labelle-scripting's process-wide
+        // VM), stateful ones keep `deinit(game)` — both must compile.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (comptime @typeInfo(@TypeOf(C.deinit)).@\"fn\".params.len == 0) C.deinit() else C.deinit(game);") != null);
     }
 
     test "plugins present wires controllers into setup_code (loop backend)" {
