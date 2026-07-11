@@ -20,19 +20,23 @@
 //!      copied `rust/` in the target); the generated build.zig carries
 //!      `.language = .rust` + the `.language_builds` step wiring
 //!      (staticlib b.fmt artifact, per-OS system-libs switch); the game's
-//!      `rust/` tree REPLACED the staged package's placeholder; the
-//!      declare phase never ran. Then the #586 splice-run: the EMITTED
-//!      wiring lines, spliced into a minimal build.zig, run the command,
+//!      `rust/` dir is LINKED over the staged package's placeholder
+//!      (the linkAndScan primitive — scanner.linkDirAbs); the declare
+//!      phase never ran. Then the #586 splice-run: the EMITTED wiring
+//!      lines, spliced into a minimal build.zig, run the command,
 //!      expand `{staticlib:NAME}` for the host OS, link the artifact, and
 //!      the binary reaches the symbol.
-//!   2. `.build` + `.language_builds` coexist: one chained sequence per
+//!   2. THE EDIT LOOP IS LIVE (codex P2): a `rust/*.rs` edit after
+//!      generate reaches the staged crate with no re-generate — the pin
+//!      a copy-based staging fails.
+//!   3. `.build` + `.language_builds` coexist: one chained sequence per
 //!      plugin, language steps strictly AFTER plain steps.
-//!   3. Zero-scripts shape: no `rust/` dir → the plugin still wires
+//!   4. Zero-scripts shape: no `rust/` dir → the plugin still wires
 //!      (flag/tick/tap), the placeholder survives, generate succeeds.
-//!   4. The staging gates fire through generate: an empty `rust/` dir is
+//!   5. The staging gates fire through generate: an empty `rust/` dir is
 //!      a pointed error; a `desktop`-allowlisted language step still
 //!      passes a desktop generate while an android-only one fails it.
-//!   5. Negative controls: no declared language → `.language_builds` is
+//!   6. Negative controls: no declared language → `.language_builds` is
 //!      inert (no markers, no staging); a lua project over a rust-only
 //!      list is equally inert (wrong-language ignored) while the lua
 //!      embed splice keeps working.
@@ -264,14 +268,14 @@ pub const NATIVE_SPLICE_E2E = struct {
         // hit a missing parent).
         try staged.tmp.dir.access(io, "out/sokol_desktop/plugin-build/scripting", .{});
 
-        // ── Game-source staging: placeholder replaced, tree mirrored ──
+        // ── Game-source staging: placeholder replaced by the dir link ──
         const staged_mod = try staged.tmp.dir.readFileAlloc(io, "out/deps/labelle-scripting/native/src/game/mod.rs", allocator, .limited(4096));
         defer allocator.free(staged_mod);
         try std.testing.expect(std.mem.indexOf(u8, staged_mod, "REPLACED AT GENERATE") == null);
         _ = try indexOfOrFail(staged_mod, "mod player;");
         try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native/src/game/player.rs", .{});
         try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native/src/game/ai/brain.rs", .{});
-        // The GAME tree is untouched (staging copies, never moves).
+        // The GAME tree is untouched (staging links, never moves).
         try staged.tmp.dir.access(io, "game/rust/mod.rs", .{});
 
         // ── Declare phase skipped (native family embeds nothing) ──
@@ -361,6 +365,36 @@ pub const NATIVE_SPLICE_E2E = struct {
                 return error.SymbolNotReachable;
             }
         }
+    }
+
+    test "the edit loop is live: a rust/*.rs edit AFTER generate reaches the staged crate without re-generating" {
+        // The codex P2 pin: the staged package's native/src/game is the
+        // linkAndScan primitive (a dir link back into the game), NOT a
+        // generate-time copy — so `edit rust/player.rs; zig build` runs
+        // cargo over the CURRENT sources, exactly like editing lua/*.lua
+        // flows through the linked embed script dir. A copy design goes
+        // silently stale here until the next generate.
+        const allocator = std.testing.allocator;
+        var staged = try StagedRustProject.init(allocator, .{});
+        defer staged.deinit(allocator);
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        // Post-generate edit — no second generate follows.
+        var game_root = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game_root.close(io);
+        try writeFileIn(game_root, "rust/player.rs", "pub struct Player { edited_after_generate: bool }\n");
+
+        const staged_player = try staged.tmp.dir.readFileAlloc(io, "out/deps/labelle-scripting/native/src/game/player.rs", allocator, .limited(4096));
+        defer allocator.free(staged_player);
+        try std.testing.expect(std.mem.indexOf(u8, staged_player, "edited_after_generate") != null);
+
+        // A brand-new script file appears in the staged crate too (the
+        // link exposes the dir, not a snapshot of its file list).
+        try writeFileIn(game_root, "rust/enemy.rs", "pub struct Enemy;\n");
+        try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native/src/game/enemy.rs", .{});
     }
 
     test ".build + .language_builds coexist: one chained sequence, language steps strictly after plain steps" {

@@ -852,18 +852,21 @@ pub fn generate(
     }
 
     // ── Native-language game-source staging (labelle-engine#741) ───────
-    // The native family's replacement for the embed copy above: stage the
-    // game's `<dir>/` sources (rust/) OVER the scripting plugin's staged
-    // package (`deps/labelle-<name>/native/src/game/`, replacing the
-    // shipped placeholder), so the plugin's `.language_builds` step
-    // (cargo) compiles the GAME's scripts into the staticlib the build
-    // wiring below links. Ordered like the declare phase: AFTER
-    // build.zig.zon generation (`createDepsLinks` just staged the
-    // package) and BEFORE the plugin-build-steps wiring resolves
-    // `{package}`. Hard-errors when deps staging fell back to the shared
-    // plugin cache — game sources are never written there (see
-    // `stageNativeSources`' module doc). Runs on the tests-target pass
-    // too (deps survive it un-restaged; the copy is idempotent).
+    // The native family's counterpart of the embed link above: LINK the
+    // game's `<dir>/` (rust/) OVER the scripting plugin's staged package
+    // (`deps/labelle-<name>/native/src/game`, replacing the shipped
+    // placeholder — `scanner.linkDirAbs`, the same live-view primitive
+    // `linkAndScan` gives embed script dirs), so the plugin's
+    // `.language_builds` step (cargo) compiles the GAME's CURRENT
+    // scripts into the staticlib the build wiring below links — edits to
+    // rust/*.rs flow into the next `zig build` without a re-generate.
+    // Ordered like the declare phase: AFTER build.zig.zon generation
+    // (`createDepsLinks` just staged the package) and BEFORE the
+    // plugin-build-steps wiring resolves `{package}`. Hard-errors when
+    // deps staging fell back to the shared plugin cache — game sources
+    // are never placed there (see `stageNativeSources`' doc). Runs on
+    // the tests-target pass too (deps survive it un-restaged; the
+    // correct-link reconcile is a no-op).
     if (maybe_scripting) |s| {
         if (s.family == .native) {
             try scripting_splice.stageNativeSources(allocator, game_dir, output_dir, s);

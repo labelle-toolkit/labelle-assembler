@@ -35,6 +35,7 @@ const cache = @import("cache.zig");
 const config = @import("config.zig");
 const language_policy = @import("language_policy.zig");
 const plugin_manifest = @import("plugin_manifest.zig");
+const scanner = @import("scanner.zig");
 const scripting_declare = @import("scripting_declare.zig");
 
 /// The resolved `plugin.labelle` name that identifies THE scripting plugin
@@ -363,27 +364,38 @@ fn walkUntranspiled(
 // ── Native-language game-source staging (labelle-engine#741) ──────────
 
 /// Stage the game's native-language sources over the scripting plugin's
-/// STAGED package: `<game>/<dir>/**<ext>` → `<output>/deps/labelle-
-/// <plugin>/<stage_subdir>/`, replacing the plugin's shipped placeholder
-/// module so the plugin's declared `.language_builds` step (cargo)
+/// STAGED package: LINK `<game>/<dir>` at `<output>/deps/labelle-
+/// <plugin>/<stage_subdir>` (replacing the plugin's shipped placeholder
+/// module) so the plugin's declared `.language_builds` step (cargo)
 /// compiles the GAME's scripts into the linked staticlib. Runs AFTER
 /// `deps_linker.createDepsLinks` (build.zig.zon generation), the same
 /// ordering dependency the declare phase has.
+///
+/// The placement is `scanner.linkDirAbs` — the SAME primitive
+/// `linkAndScan` uses for embed-language script dirs — so the staged
+/// view is LIVE: editing `rust/*.rs` and rerunning the generated `zig
+/// build` compiles the current sources without a re-generate, exactly
+/// like editing `lua/*.lua` does. (A copy went stale the moment the
+/// author's edit loop started — the silent-staleness class `labelle
+/// run`'s stale-binary rule exists for.) The primitive also owns the
+/// Windows posture: symlink first, copy fallback when symlinks are
+/// denied — on that fallback the staged sources are as stale-until-
+/// regenerate as every OTHER linked game dir on the same machine, no
+/// new behavior. Its reconcile step (real dir → deleteTree + relink)
+/// is what removes the shipped placeholder: hardlinked placeholder
+/// FILES are unlinked, never written through, so the shared-cache
+/// bytes are untouched.
 ///
 /// Hard rules:
 ///   - Deps staging MUST have produced the staged copy. When
 ///     `createDepsLinks` fell back ("falling back to cache-relative dep
 ///     paths"), `{package}` resolves to the SHARED plugin cache
-///     (`~/.labelle`) — writing game sources there would poison every
-///     other project's copy of the plugin, so this fails generate instead
-///     (`error.NativeScriptsDepsUnstaged`). Same staged-first probe as
+///     (`~/.labelle`) — placing a link to game sources there would leak
+///     one project's tree into every other consumer of the plugin, so
+///     this fails generate instead (`error.NativeScriptsDepsUnstaged`),
+///     BEFORE any placement. Same staged-first probe as
 ///     `scripting_declare.resolvePluginPackageDir`, minus the cache
 ///     fallback that function is allowed (it only READS).
-///   - The staged tree's FILES are hardlinks into the shared cache
-///     (`deps_linker.hardlinkTree`). The placeholder dir is therefore
-///     DELETED first (unlinking never touches cache bytes) and the game
-///     sources written as fresh copies — never opened-for-write in
-///     place, which could scribble through a hardlink into the cache.
 ///   - A missing `<dir>/` is a no-op (scripting plugin attached, zero
 ///     scripts — exactly how the embed rows treat a missing script dir):
 ///     the shipped placeholder stays and registers nothing.
@@ -395,10 +407,14 @@ fn walkUntranspiled(
 ///     source exists: it becomes the crate's game-module root
 ///     (`error.NativeScriptsMissingModuleRoot` names the convention).
 ///
-/// Copies `<ext>` files only (+ subdirs, recursively), sorted
-/// (deterministic copy order), dot-entries skipped. Idempotent: the
-/// delete+recopy also serves the tests-target pass, whose deps tree is
-/// NOT re-staged (`recreate_deps = false`).
+/// Validation walks the SOURCE dir (`<ext>` files, dot-entries skipped);
+/// the link then exposes the whole dir as-is — a stray non-`<ext>` file
+/// (notes.toml) IS visible to cargo through the link, unlike the
+/// earlier copy design. Benign by construction: rustc compiles only the
+/// modules `mod.rs` reachably declares, and the crate's Cargo.toml
+/// lives in the plugin's `native/`, not the game dir. Idempotent: the
+/// primitive's correct-link no-op also serves the tests-target pass,
+/// whose deps tree is NOT re-staged (`recreate_deps = false`).
 pub fn stageNativeSources(
     allocator: std.mem.Allocator,
     game_dir: []const u8,
@@ -413,7 +429,7 @@ pub fn stageNativeSources(
 
     // Collect the game's sources FIRST: a project with no <dir>/ stages
     // nothing (the placeholder stays), so the deps probe below only gates
-    // projects that actually write.
+    // projects that actually place a link.
     const src_dir_path = try std.fs.path.join(allocator, &.{ game_dir, splice.dir });
     defer allocator.free(src_dir_path);
     var src_dir = cwd.openDir(io, src_dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -438,11 +454,6 @@ pub fn stageNativeSources(
         );
         return error.NativeScriptDirEmpty;
     }
-    std.mem.sort([]const u8, rel_paths.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lessThan);
 
     var has_module_root = false;
     for (rel_paths.items) |rel| {
@@ -468,7 +479,7 @@ pub fn stageNativeSources(
         std.debug.print(
             "labelle-assembler: cannot stage {s}/ sources: the scripting plugin has no staged deps copy at {s}\n" ++
                 "  (deps staging fell back to cache-relative paths — see the \"createDepsLinks failed\" warning above).\n" ++
-                "  game sources are never written into the shared plugin cache; fix the deps staging failure and regenerate.\n",
+                "  game sources are never placed into the shared plugin cache; fix the deps staging failure and regenerate.\n",
             .{ splice.dir, staged_pkg },
         );
         return error.NativeScriptsDepsUnstaged;
@@ -491,33 +502,22 @@ pub fn stageNativeSources(
         return error.NativeCrateLayoutMissing;
     }
 
+    // Place the LIVE link (module doc): linkDirAbs reconciles whatever is
+    // at the destination — the shipped placeholder dir (hardlinked files
+    // unlinked, cache bytes untouched), a stale link, or the correct link
+    // (no-op) — then links the game dir so edits flow through without a
+    // re-generate, matching the embed script dirs' linkAndScan layout.
     const dest_root = try std.fs.path.join(allocator, &.{ staged_pkg, row.stage_subdir });
     defer allocator.free(dest_root);
-    // Placeholder out: DELETE, never overwrite in place (hardlink rule
-    // above). deleteTree is delete-if-exists, so a plugin shipping no
-    // placeholder dir is fine too.
-    try cwd.deleteTree(io, dest_root);
-    try cwd.createDirPath(io, dest_root);
-
-    for (rel_paths.items) |rel| {
-        if (std.fs.path.dirname(rel)) |sub| {
-            const sub_path = try std.fs.path.join(allocator, &.{ dest_root, sub });
-            defer allocator.free(sub_path);
-            try cwd.createDirPath(io, sub_path);
-        }
-        const src_path = try std.fs.path.join(allocator, &.{ src_dir_path, rel });
-        defer allocator.free(src_path);
-        const dst_path = try std.fs.path.join(allocator, &.{ dest_root, rel });
-        defer allocator.free(dst_path);
-        try cwd.copyFile(src_path, cwd, dst_path, io, .{});
-    }
+    try scanner.linkDirAbs(allocator, src_dir_path, dest_root);
 }
 
 /// Recursive `<ext>`-filtered collection of `dir`'s files as rel paths
-/// (subdirs joined with the platform separator). Dot-entries skipped —
-/// `.gitkeep`/`.DS_Store` are not sources, so a dir holding only those is
-/// "empty" for the `NativeScriptDirEmpty` rule (matching the
-/// language-policy scan's dot rule).
+/// (subdirs joined with the platform separator) — VALIDATION input only
+/// (`NativeScriptDirEmpty` / module-root); placement links the whole dir.
+/// Dot-entries skipped — `.gitkeep`/`.DS_Store` are not sources, so a dir
+/// holding only those is "empty" for the `NativeScriptDirEmpty` rule
+/// (matching the language-policy scan's dot rule).
 fn collectNativeSources(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -888,7 +888,7 @@ const NativeStagingFixture = struct {
     }
 };
 
-test "stageNativeSources: replaces the placeholder with the game's sorted .rs tree (subdirs in, foreign files out)" {
+test "stageNativeSources: LINKS the game dir over the placeholder — live view, subdirs in, edits flow without re-staging" {
     const allocator = testing.allocator;
     var fx = try NativeStagingFixture.init(allocator, .{});
     defer fx.deinit(allocator);
@@ -896,37 +896,52 @@ test "stageNativeSources: replaces the placeholder with the game's sorted .rs tr
     try writeTestFile(fx.tmp.dir, "game/rust/mod.rs", "mod player;\nmod ai;\npub fn register() {}\n");
     try writeTestFile(fx.tmp.dir, "game/rust/player.rs", "pub struct Player;\n");
     try writeTestFile(fx.tmp.dir, "game/rust/ai/brain.rs", "pub fn think() {}\n");
-    // Foreign files never stage: not sources (.toml), dot-entries.
+    // Foreign files: validation counts only .rs sources, but the LINK
+    // exposes the whole game dir (delta from the earlier copy design,
+    // documented on stageNativeSources) — asserted further down.
     try writeTestFile(fx.tmp.dir, "game/rust/notes.toml", "# not a source\n");
-    try writeTestFile(fx.tmp.dir, "game/rust/.hidden.rs", "// dot-entry\n");
 
     try stageNativeSources(allocator, fx.game_abs, fx.out_abs, rust_splice_fixture);
 
+    // The placement is the linkAndScan primitive: a symlink whose text is
+    // RELATIVE (survives a project move) — the same mechanism pin the
+    // scanner_symlink suite makes for embed script dirs.
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link_len = try fx.tmp.dir.readLink(testing.io, "out/deps/labelle-scripting/native/src/game", &link_buf);
+    try testing.expect(!std.fs.path.isAbsolute(link_buf[0..link_len]));
+
     const game_mod = try fx.tmp.dir.readFileAlloc(testing.io, "out/deps/labelle-scripting/native/src/game/mod.rs", allocator, .limited(4096));
     defer allocator.free(game_mod);
-    // The PLACEHOLDER body is gone — the game's mod.rs is the module root.
+    // The PLACEHOLDER is gone — the game's mod.rs is the module root.
     try testing.expect(std.mem.indexOf(u8, game_mod, "REPLACED AT GENERATE") == null);
     try testing.expect(std.mem.indexOf(u8, game_mod, "mod player;") != null);
 
     try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/player.rs", .{});
     try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/ai/brain.rs", .{});
-    try testing.expectError(
-        error.FileNotFound,
-        fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/notes.toml", .{}),
-    );
-    try testing.expectError(
-        error.FileNotFound,
-        fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/.hidden.rs", .{}),
-    );
+    // The delta from the copy design: non-.rs files ARE reachable through
+    // the link. Benign — rustc compiles only what mod.rs declares.
+    try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/notes.toml", .{});
 
-    // Idempotent (the tests-target pass re-runs it over surviving deps):
-    // a removed game file disappears from the staged tree on the next run.
+    // THE STALENESS PIN (the codex P2): edit a game source AFTER staging —
+    // the staged view sees the new bytes WITHOUT re-staging, so the
+    // generated `zig build`'s cargo step compiles current sources. A copy
+    // design fails exactly here.
+    try writeTestFile(fx.tmp.dir, "game/rust/player.rs", "pub struct Player { hp: u32 }\n");
+    const staged_player = try fx.tmp.dir.readFileAlloc(testing.io, "out/deps/labelle-scripting/native/src/game/player.rs", allocator, .limited(4096));
+    defer allocator.free(staged_player);
+    try testing.expect(std.mem.indexOf(u8, staged_player, "hp: u32") != null);
+
+    // Deletions flow too — a removed game file is gone from the staged
+    // view immediately (no second staging pass needed)…
     try fx.tmp.dir.deleteFile(testing.io, "game/rust/player.rs");
-    try stageNativeSources(allocator, fx.game_abs, fx.out_abs, rust_splice_fixture);
     try testing.expectError(
         error.FileNotFound,
         fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/player.rs", .{}),
     );
+    // …and a re-run over the correct link is a no-op reconcile (the
+    // tests-target pass re-runs staging over surviving deps).
+    try stageNativeSources(allocator, fx.game_abs, fx.out_abs, rust_splice_fixture);
+    try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/mod.rs", .{});
 }
 
 test "stageNativeSources: no rust/ dir at all → no-op, the shipped placeholder stays (zero scripts)" {
@@ -969,10 +984,11 @@ test "stageNativeSources: .rs sources without the mod.rs module root fail pointi
     );
 }
 
-test "stageNativeSources: deps staging fell back to the shared cache → HARD error, nothing written" {
+test "stageNativeSources: deps staging fell back to the shared cache → HARD error, nothing placed" {
     // The load-bearing negative: when `createDepsLinks` degraded, the
     // `{package}` resolution falls back to the SHARED plugin cache — and
-    // game sources must never be written there. The staged-deps probe is
+    // game sources must never be placed there (a link there would leak
+    // one project's tree into every consumer). The staged-deps probe is
     // the same one the declare phase uses; here its miss is fatal.
     const allocator = testing.allocator;
     var fx = try NativeStagingFixture.init(allocator, .{ .stage_deps = false });
