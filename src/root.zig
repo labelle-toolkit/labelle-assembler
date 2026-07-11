@@ -26,6 +26,7 @@ const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
 pub const scripting_splice = @import("scripting_splice.zig");
+pub const scripting_declare = @import("scripting_declare.zig");
 pub const pack_validate = @import("pack_validate.zig");
 pub const panel_validate = @import("panel_validate.zig");
 const scene_name_lint = @import("scene_name_lint.zig");
@@ -62,6 +63,7 @@ test {
     _ = @import("pack_resources.zig");
     _ = @import("language_policy.zig");
     _ = @import("scripting_splice.zig");
+    _ = @import("scripting_declare.zig");
     _ = @import("panel_validate.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
@@ -786,6 +788,37 @@ pub fn generate(
     });
     defer allocator.free(zon);
     try scanner.writeFile(target_dir, "build.zig.zon", zon);
+
+    // ── Script-declared components: declare-mode extraction (#585) ─────
+    // RFC-LANGUAGE-PLUGINS revs 6-7 (epic labelle-engine#237), the second
+    // consumer of the scripting splice: run the plugin's declare-mode
+    // runner over the copied `<language>/` scripts, codegen the declared
+    // components into `scripting_components.zig`, and thread them onto the
+    // splice so the component-registry block registers them by name.
+    // Ordered AFTER build.zig.zon generation — `createDepsLinks` just
+    // staged the plugin package under `<output>/deps/labelle-<name>/`,
+    // which is where the runner is built from (`zig build labelle-declare`;
+    // see scripting_declare.zig's exec-slice doc + the #586 cross-ref) —
+    // and BEFORE main.zig emission, which consumes `declared_components`.
+    // Null/no-op for: no splice, no scripts, or scripts declaring nothing
+    // — those emit byte-identical output (and drop a stale generated file).
+    var declare_schema: ?scripting_declare.Schema = null;
+    defer if (declare_schema) |*sch| sch.deinit();
+    if (maybe_scripting) |*s| {
+        declare_schema = try scripting_declare.runPhase(allocator, .{
+            .plugins = cfg.plugins,
+            .plugin_name = s.plugin_name,
+            .language = s.language,
+            .extension = s.extension,
+            .script_names = s.script_names,
+            .output_dir = output_dir,
+            .target_dir = target_dir,
+            .project_dir = game_dir,
+            .component_names = component_names,
+            .pack_scans = pack_scans.items,
+        });
+        if (declare_schema) |sch| s.declared_components = sch.components;
+    }
 
     // labelle-assembler#240 Gap 2 — game scripts exporting `FlowNodes`
     // must be promoted to named build modules so the same file isn't a

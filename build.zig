@@ -148,6 +148,10 @@ pub fn build(b: *std.Build) void {
         // scripting_enabled flag + drainEvents tap in the generated main,
         // and the -Dlanguage dep option in the generated build.zig.
         "test/scripting_splice_tests.zig",
+        // Script-declared components (#585): registry emission with
+        // declared_components threaded, plus the declare phase e2e through
+        // the real `generate` (override runner seam).
+        "test/scripting_declare_tests.zig",
     };
 
     for (test_files) |test_file| {

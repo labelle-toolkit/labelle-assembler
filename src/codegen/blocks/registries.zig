@@ -93,6 +93,22 @@ pub fn Mixin(comptime Self: type) type {
                     try w.print("    .{s}__{s} = @import(\"pack__{s}\").components.{s}.{s},\n", .{ prefix, pascal, prefix, stem_ident, pascal });
                 }
             }
+            // Script-declared components (labelle-assembler#585): real Zig
+            // structs the declare phase codegen'd into the target's
+            // `scripting_components.zig` (see scripting_declare.zig),
+            // registered under their DECLARED names — game-global like the
+            // root's own components (scenes/prefabs instantiate `"Hunger"`,
+            // the save bucket and the script contract's by-name dispatch
+            // use the same key). Name collisions with any field emitted
+            // above were rejected at generate time by
+            // `scripting_declare.checkCollisions`. Empty (the default —
+            // splice-less projects included) emits nothing, keeping this
+            // block byte-identical.
+            if (self.scripting) |s| {
+                for (s.declared_components) |comp| {
+                    try w.print("    .{s} = @import(\"scripting_components.zig\").{s},\n", .{ comp.name, comp.name });
+                }
+            }
             if (has_plugins) {
                 try w.writeAll("}, .{\n");
                 try w.writeAll("    @import(\"labelle-gfx\"),\n");
