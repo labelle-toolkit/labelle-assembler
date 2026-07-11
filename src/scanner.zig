@@ -272,21 +272,34 @@ pub fn linkDir(
     dst_base: []const u8,
     folder: []const u8,
 ) !void {
-    const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
-
     const src_path = try std.fs.path.join(allocator, &.{ src_base, folder });
     defer allocator.free(src_path);
     const dst_path = try std.fs.path.join(allocator, &.{ dst_base, folder });
     defer allocator.free(dst_path);
+    try linkDirAbs(allocator, src_path, dst_path);
+}
+
+/// `linkDir` over two fully-resolved paths (the `copyAndScanAbs`
+/// precedent: source and destination need not share a last segment —
+/// the native scripting splice links the game's `rust/` at the staged
+/// plugin package's `native/src/game`). Same semantics as the wrapper:
+/// idempotent reconcile, relative link text, missing-source skip, and
+/// the Windows copy fallback.
+pub fn linkDirAbs(
+    allocator: std.mem.Allocator,
+    src_path: []const u8,
+    dst_path: []const u8,
+) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
 
     // Skip silently if source doesn't exist — matches copyDirRecursive.
     cwd.access(io, src_path, .{}) catch return;
 
     // Ensure the symlink's immediate parent exists. Using dst_parent
-    // (not dst_base) handles plugin-declared nested `folder` values
-    // like "foo/bar" correctly — makePath(dst_base) alone would fail
-    // on symLink() because `dst_base/foo` wouldn't exist.
+    // (not the caller's base) handles nested destinations like
+    // "foo/bar" correctly — makePath of the base alone would fail
+    // on symLink() because the intermediate dirs wouldn't exist.
     const dst_parent = std.fs.path.dirname(dst_path) orelse ".";
     try cwd.createDirPath(io, dst_parent);
 
@@ -299,8 +312,10 @@ pub fn linkDir(
     // Inspect whatever is at dst_path. `deleteTree` handles every
     // case uniformly — it removes file symlinks, directory symlinks
     // (on Windows where deleteFile can't), and real directories left
-    // over from older copy-based generates. Safe because `dst_base`
-    // is the CLI's managed target directory (`.labelle/<target>/`).
+    // over from older copy-based generates (or, for the native splice,
+    // the plugin package's shipped placeholder dir). Safe because every
+    // caller's destination is CLI-managed (`.labelle/<target>/`, the
+    // staged deps tree).
     var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (cwd.readLink(io, dst_path, &link_buf)) |existing_len| {
         const existing = link_buf[0..existing_len];
@@ -316,7 +331,7 @@ pub fn linkDir(
         // Windows needs admin / Developer Mode for symlinks — fall back
         // to a copy-based layout, mirroring cache/disk.zig's fallback.
         if (err == error.AccessDenied or err == error.PermissionDenied) {
-            try copyDirRecursive(allocator, src_base, dst_base, folder);
+            try copyDirRecursiveAbs(allocator, src_path, dst_path);
             return;
         }
         return err;
@@ -415,13 +430,20 @@ fn scanRecursive(
 /// Recursively copy a directory tree from src_base/folder to dst_base/folder.
 /// Copies all files and subdirectories. Used for assets which have nested folders.
 pub fn copyDirRecursive(allocator: std.mem.Allocator, src_base: []const u8, dst_base: []const u8, folder: []const u8) !void {
-    const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
-
     const src_path = try std.fs.path.join(allocator, &.{ src_base, folder });
     defer allocator.free(src_path);
     const dst_path = try std.fs.path.join(allocator, &.{ dst_base, folder });
     defer allocator.free(dst_path);
+    try copyDirRecursiveAbs(allocator, src_path, dst_path);
+}
+
+/// `copyDirRecursive` over two fully-resolved paths (the `copyAndScanAbs`
+/// precedent: source and destination need not share a last segment).
+/// Extracted for `linkDirAbs`'s Windows fallback — behavior is exactly the
+/// base+folder wrapper's.
+pub fn copyDirRecursiveAbs(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
 
     try cwd.createDirPath(io, dst_path);
 
@@ -445,9 +467,11 @@ pub fn copyDirRecursive(allocator: std.mem.Allocator, src_base: []const u8, dst_
                 try src_dir.copyFile(entry.name, dst_dir, entry.name, io, .{});
             },
             .directory => {
-                const sub_folder = try std.fs.path.join(allocator, &.{ folder, entry.name });
-                defer allocator.free(sub_folder);
-                try copyDirRecursive(allocator, src_base, dst_base, sub_folder);
+                const sub_src = try std.fs.path.join(allocator, &.{ src_path, entry.name });
+                defer allocator.free(sub_src);
+                const sub_dst = try std.fs.path.join(allocator, &.{ dst_path, entry.name });
+                defer allocator.free(sub_dst);
+                try copyDirRecursiveAbs(allocator, sub_src, sub_dst);
             },
             else => {},
         }

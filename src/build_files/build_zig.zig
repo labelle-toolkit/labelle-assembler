@@ -348,14 +348,18 @@ pub const PluginBuildStepsWiring = struct {
 /// Emit one declared argv element as generated build.zig source.
 ///
 /// `{package}` is substituted NOW (a generate-time absolute literal);
-/// `{cache}` / `{target}` become `{s}` slots of a `b.fmt(...)` resolved at
-/// build time against the per-plugin `plugin_<name>_build_cache` const /
-/// the shared `plugin_build_target_triple` const. An arg that IS exactly
-/// one build-time placeholder references the const directly (no b.fmt).
-/// All literal content is escaped for the Zig string literal; when the
-/// b.fmt layer wraps the arg, literal braces (only reachable via a
-/// substituted package path — declared args cannot carry stray braces,
-/// validated at load) are doubled so the format string stays well-formed.
+/// `{cache}` / `{target}` / `{staticlib:NAME}` become `{s}` slots of a
+/// `b.fmt(...)` resolved at build time against the per-plugin
+/// `plugin_<name>_build_cache` const / the shared
+/// `plugin_build_target_triple` const / the shared
+/// `plugin_build_lib_prefix` + `plugin_build_lib_ext` pair (a staticlib
+/// token expands to `{s}NAME{s}` — `libNAME.a` everywhere but Windows's
+/// `NAME.lib`). An arg that IS exactly one build-time placeholder
+/// references the const directly (no b.fmt). All literal content is
+/// escaped for the Zig string literal; when the b.fmt layer wraps the
+/// arg, literal braces (only reachable via a substituted package path —
+/// declared args cannot carry stray braces, validated at load) are
+/// doubled so the format string stays well-formed.
 fn emitBuildStepArg(
     allocator: std.mem.Allocator,
     w: anytype,
@@ -364,7 +368,8 @@ fn emitBuildStepArg(
 ) !void {
     const has_slots =
         plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_CACHE) or
-        plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_TARGET);
+        plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_TARGET) or
+        plugin_build_steps.containsStaticlibPlaceholder(arg);
 
     var fmt_body: std.ArrayList(u8) = .empty;
     defer fmt_body.deinit(allocator);
@@ -387,9 +392,23 @@ fn emitBuildStepArg(
             } else if (std.mem.eql(u8, ph, plugin_build_steps.PLACEHOLDER_CACHE)) {
                 try fmt_body.appendSlice(allocator, "{s}");
                 try refs.append(allocator, try std.fmt.allocPrint(allocator, "plugin_{s}_build_cache", .{entry.plugin_name}));
-            } else {
+            } else if (std.mem.eql(u8, ph, plugin_build_steps.PLACEHOLDER_TARGET)) {
                 try fmt_body.appendSlice(allocator, "{s}");
                 try refs.append(allocator, try allocator.dupe(u8, "plugin_build_target_triple"));
+            } else {
+                // {staticlib:NAME} → "{s}NAME{s}" over the shared lib
+                // prefix/ext consts. NAME's charset ([A-Za-z0-9_-],
+                // load-validated) can't carry braces/quotes, so it splices
+                // into the format string verbatim.
+                try fmt_body.appendSlice(allocator, "{s}");
+                const prefix_ref = try allocator.dupe(u8, "plugin_build_lib_prefix");
+                errdefer allocator.free(prefix_ref);
+                try refs.append(allocator, prefix_ref);
+                try fmt_body.appendSlice(allocator, plugin_build_steps.staticlibName(ph));
+                try fmt_body.appendSlice(allocator, "{s}");
+                const ext_ref = try allocator.dupe(u8, "plugin_build_lib_ext");
+                errdefer allocator.free(ext_ref);
+                try refs.append(allocator, ext_ref);
             }
             i += ph.len;
         } else {
@@ -440,14 +459,19 @@ fn emitPluginBuildSteps(
 ) !void {
     if (entries.len == 0) return;
 
-    // The shared triple const: emitted ONCE (a per-plugin decl would
-    // collide), and only when some arg uses {target} — an unused local
-    // const is a compile error in the generated build.zig.
+    // The shared consts: emitted ONCE (a per-plugin decl would collide),
+    // and only when some arg/artifact uses the placeholder — an unused
+    // local const is a compile error in the generated build.zig.
     var wants_triple = false;
+    var wants_staticlib = false;
     for (entries) |e| {
         for (e.steps) |s| {
             for (s.command) |arg| {
                 if (plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_TARGET)) wants_triple = true;
+                if (plugin_build_steps.containsStaticlibPlaceholder(arg)) wants_staticlib = true;
+            }
+            if (s.artifact) |a| {
+                if (plugin_build_steps.containsStaticlibPlaceholder(a)) wants_staticlib = true;
             }
         }
     }
@@ -457,6 +481,13 @@ fn emitPluginBuildSteps(
     try w.writeAll("    // the game artifact. Declared order = execution order within a plugin.\n");
     if (wants_triple) {
         try w.writeAll("    const plugin_build_target_triple = target.result.zigTriple(b.allocator) catch @panic(\"OOM\");\n");
+    }
+    if (wants_staticlib) {
+        // {staticlib:NAME}: cargo-style toolchains emit `NAME.lib` on
+        // Windows and `libNAME.a` everywhere else — resolved at build
+        // time so one declared path finds the artifact on every OS.
+        try w.writeAll("    const plugin_build_lib_prefix: []const u8 = if (target.result.os.tag == .windows) \"\" else \"lib\";\n");
+        try w.writeAll("    const plugin_build_lib_ext: []const u8 = if (target.result.os.tag == .windows) \".lib\" else \".a\";\n");
     }
 
     for (entries) |e| {
@@ -490,14 +521,62 @@ fn emitPluginBuildSteps(
             }
             if (s.link != .none) {
                 const a = s.artifact.?; // load-time validation guarantees presence + root
+                const has_lib_slot = plugin_build_steps.containsStaticlibPlaceholder(a);
                 if (std.mem.startsWith(u8, a, plugin_build_steps.PLACEHOLDER_CACHE ++ "/")) {
                     const rest = a[plugin_build_steps.PLACEHOLDER_CACHE.len + 1 ..];
-                    try w.print("    const plugin_{s}_build_artifact_{d} = b.path(\"{f}/{f}\");\n", .{ e.plugin_name, i, std.zig.fmtString(e.cache_rel), std.zig.fmtString(rest) });
+                    if (has_lib_slot) {
+                        // {staticlib:NAME} in the tail → a build-time
+                        // b.fmt path. The {cache} root becomes the
+                        // LITERAL cache_rel here (b.path wants a
+                        // build-root-relative path, not the absolute
+                        // pathFromRoot const) — cache_rel is
+                        // `plugin-build/<name>` with an identifier-safe
+                        // name, so splicing it into the arg emitter's
+                        // input never introduces stray braces.
+                        const arg_text = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ e.cache_rel, rest });
+                        defer allocator.free(arg_text);
+                        try w.print("    const plugin_{s}_build_artifact_{d} = b.path(", .{ e.plugin_name, i });
+                        try emitBuildStepArg(allocator, w, e, arg_text);
+                        try w.writeAll(");\n");
+                    } else {
+                        try w.print("    const plugin_{s}_build_artifact_{d} = b.path(\"{f}/{f}\");\n", .{ e.plugin_name, i, std.zig.fmtString(e.cache_rel), std.zig.fmtString(rest) });
+                    }
                 } else {
                     const rest = a[plugin_build_steps.PLACEHOLDER_PACKAGE.len + 1 ..];
-                    try w.print("    const plugin_{s}_build_artifact_{d}: std.Build.LazyPath = .{{ .cwd_relative = \"{f}/{f}\" }};\n", .{ e.plugin_name, i, std.zig.fmtString(e.package_abs), std.zig.fmtString(rest) });
+                    if (has_lib_slot) {
+                        // Package-rooted twin: re-feed the declared
+                        // `{package}/<tail>` through the arg emitter so
+                        // the absolute package path keeps its
+                        // brace-doubling under the b.fmt wrap.
+                        try w.print("    const plugin_{s}_build_artifact_{d}: std.Build.LazyPath = .{{ .cwd_relative = ", .{ e.plugin_name, i });
+                        try emitBuildStepArg(allocator, w, e, a);
+                        try w.writeAll(" };\n");
+                    } else {
+                        try w.print("    const plugin_{s}_build_artifact_{d}: std.Build.LazyPath = .{{ .cwd_relative = \"{f}/{f}\" }};\n", .{ e.plugin_name, i, std.zig.fmtString(e.package_abs), std.zig.fmtString(rest) });
+                    }
                 }
                 try w.print("    {s}.root_module.addObjectFile(plugin_{s}_build_artifact_{d});\n", .{ artifact, e.plugin_name, i });
+                if (!s.system_libs.isEmpty()) {
+                    // Per-OS system libs (declared `.system_libs`): the
+                    // linked artifact's final-link dependencies — e.g. a
+                    // rust panic=unwind staticlib needs gcc_s/pthread/…
+                    // on Linux, none of which exist on macOS. One switch
+                    // per step; the resolved target picks its arm.
+                    try w.print("    // Final-link system libs for step '{s}' of plugin '{s}' (per target OS).\n", .{ s.name, e.plugin_name });
+                    try w.writeAll("    switch (target.result.os.tag) {\n");
+                    inline for (@typeInfo(plugin_build_steps.SystemLibs).@"struct".fields) |f| {
+                        const libs = @field(s.system_libs, f.name);
+                        if (libs.len > 0) {
+                            try w.print("        .{s} => {{\n", .{f.name});
+                            for (libs) |lib| {
+                                try w.print("            {s}.root_module.linkSystemLibrary(\"{f}\", .{{}});\n", .{ artifact, std.zig.fmtString(lib) });
+                            }
+                            try w.writeAll("        },\n");
+                        }
+                    }
+                    try w.writeAll("        else => {},\n");
+                    try w.writeAll("    }\n");
+                }
             }
         }
         // The game artifact waits for the plugin's LAST step; the chain
@@ -1377,4 +1456,94 @@ test "emitPluginBuildSteps: no declared steps emits nothing (byte-identical buil
     defer aw.deinit();
     try emitPluginBuildSteps(testing.allocator, &aw.writer, "exe", &.{});
     try testing.expectEqualStrings("", aw.written());
+}
+
+test "emitPluginBuildSteps: {staticlib:NAME} artifact + per-OS system_libs — the rust cargo shape (linux+windows golden)" {
+    // The labelle-engine#741 wiring: the artifact name is TARGET-specific
+    // (`labelle_rust_scripts.lib` on Windows, `liblabelle_rust_scripts.a`
+    // elsewhere), and the panic=unwind staticlib needs gcc_s/… at the
+    // final link on Linux ONLY. One generated build.zig carries both:
+    // build-time prefix/ext consts + a per-OS linkSystemLibrary switch.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try emitPluginBuildSteps(testing.allocator, &aw.writer, "exe", &.{.{
+        .plugin_name = "scripting",
+        .package_abs = "/abs/deps/labelle-scripting",
+        .cache_rel = "plugin-build/scripting",
+        .steps = &.{.{
+            .name = "cargo-scripts",
+            .command = &.{ "cargo", "build", "--release", "--locked", "--manifest-path", "{package}/native/Cargo.toml", "--target-dir", "{cache}" },
+            .artifact = "{cache}/release/{staticlib:labelle_rust_scripts}",
+            .link = .static_lib,
+            .system_libs = .{
+                .linux = &.{ "gcc_s", "util", "rt", "pthread", "m", "dl" },
+                .windows = &.{ "ws2_32", "userenv" },
+            },
+        }},
+    }});
+    const out = aw.written();
+
+    // The shared lib-name consts, emitted once, resolved at build time.
+    try testing.expect(std.mem.indexOf(u8, out, "    const plugin_build_lib_prefix: []const u8 = if (target.result.os.tag == .windows) \"\" else \"lib\";\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    const plugin_build_lib_ext: []const u8 = if (target.result.os.tag == .windows) \".lib\" else \".a\";\n") != null);
+
+    // The artifact path becomes a build-time b.fmt (windows finds its
+    // `.lib`, unix its `lib….a` — no per-OS manifest duplication).
+    try testing.expect(std.mem.indexOf(u8, out, "    const plugin_scripting_build_artifact_0 = b.path(b.fmt(\"plugin-build/scripting/release/{s}labelle_rust_scripts{s}\", .{ plugin_build_lib_prefix, plugin_build_lib_ext }));\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    exe.root_module.addObjectFile(plugin_scripting_build_artifact_0);\n") != null);
+
+    // The per-OS final-link switch: linux + windows arms exactly as
+    // declared, NO macos arm (empty list = no arm), else fallthrough.
+    const switch_golden =
+        "    switch (target.result.os.tag) {\n" ++
+        "        .linux => {\n" ++
+        "            exe.root_module.linkSystemLibrary(\"gcc_s\", .{});\n" ++
+        "            exe.root_module.linkSystemLibrary(\"util\", .{});\n" ++
+        "            exe.root_module.linkSystemLibrary(\"rt\", .{});\n" ++
+        "            exe.root_module.linkSystemLibrary(\"pthread\", .{});\n" ++
+        "            exe.root_module.linkSystemLibrary(\"m\", .{});\n" ++
+        "            exe.root_module.linkSystemLibrary(\"dl\", .{});\n" ++
+        "        },\n" ++
+        "        .windows => {\n" ++
+        "            exe.root_module.linkSystemLibrary(\"ws2_32\", .{});\n" ++
+        "            exe.root_module.linkSystemLibrary(\"userenv\", .{});\n" ++
+        "        },\n" ++
+        "        else => {},\n" ++
+        "    }\n";
+    try testing.expect(std.mem.indexOf(u8, out, switch_golden) != null);
+    try testing.expect(std.mem.indexOf(u8, out, ".macos =>") == null);
+
+    // Ordering: the switch belongs to the artifact link, after the
+    // addObjectFile and before the exe→step dependency close.
+    const add_obj = std.mem.indexOf(u8, out, "addObjectFile(plugin_scripting_build_artifact_0)").?;
+    const sw = std.mem.indexOf(u8, out, "switch (target.result.os.tag)").?;
+    const dep = std.mem.indexOf(u8, out, "exe.step.dependOn(&plugin_scripting_build_step_0.step);").?;
+    try testing.expect(add_obj < sw);
+    try testing.expect(sw < dep);
+}
+
+test "emitPluginBuildSteps: {staticlib:NAME} in command args and package-rooted artifacts rides b.fmt" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try emitPluginBuildSteps(testing.allocator, &aw.writer, "exe", &.{.{
+        .plugin_name = "foo",
+        .package_abs = "/pkg/foo",
+        .cache_rel = "plugin-build/foo",
+        .steps = &.{.{
+            .name = "ziglib",
+            .command = &.{ "zig", "build-lib", "-femit-bin={cache}/{staticlib:adder}" },
+            .artifact = "{package}/out/{staticlib:adder}",
+            .link = .static_lib,
+        }},
+    }});
+    const out = aw.written();
+
+    // Mixed {cache} + staticlib arg: one b.fmt, slots in token order.
+    try testing.expect(std.mem.indexOf(u8, out, "b.fmt(\"-femit-bin={s}/{s}adder{s}\", .{ plugin_foo_build_cache, plugin_build_lib_prefix, plugin_build_lib_ext })") != null);
+    // Package-rooted artifact with the token: absolute cwd_relative b.fmt.
+    try testing.expect(std.mem.indexOf(u8, out, "    const plugin_foo_build_artifact_0: std.Build.LazyPath = .{ .cwd_relative = b.fmt(\"/pkg/foo/out/{s}adder{s}\", .{ plugin_build_lib_prefix, plugin_build_lib_ext }) };\n") != null);
+    // No system_libs declared → no per-OS switch anywhere.
+    try testing.expect(std.mem.indexOf(u8, out, "switch (target.result.os.tag)") == null);
 }
