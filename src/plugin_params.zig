@@ -807,6 +807,7 @@ fn joinNames(gpa: std.mem.Allocator, comptime what: []const u8, names: anytype) 
         }
     }
     var arr = aw.toArrayList();
+    errdefer arr.deinit(gpa);
     return arr.toOwnedSlice(gpa);
 }
 
@@ -962,6 +963,7 @@ pub fn validateAndResolve(
             .enum_tag => |v| .{ .enum_tag = try gpa.dupe(u8, v) },
             else => value,
         };
+        errdefer freeParamValue(gpa, value_owned);
         try resolved.append(gpa, .{
             .name = name_owned,
             .type = s.type,
@@ -1038,6 +1040,7 @@ pub fn renderParamsModule(
     }
 
     var arr = aw.toArrayList();
+    errdefer arr.deinit(gpa);
     return arr.toOwnedSlice(gpa);
 }
 
