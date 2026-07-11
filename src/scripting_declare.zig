@@ -56,9 +56,14 @@
 //!
 //! This narrow "exec `zig build <step>` inside a staged plugin package at
 //! generate time" is deliberately the FIRST SLICE of the generic plugin
-//! build hooks (labelle-assembler#586): when #586 lands its general
-//! protocol, this hardcoded labelle-declare invocation folds into it —
-//! until then the mechanics live here, scoped to THE scripting plugin.
+//! build hooks (labelle-assembler#586). #586's declarative `.build` block
+//! (`plugin_build_steps.zig`) now covers the OTHER flavor — build-time
+//! commands whose artifacts link into the game. This generate-time
+//! HOST-tool exec stays hardcoded here until a second consumer exists;
+//! the documented fold-in path is a `.stage = .generate` variant of the
+//! `.build` step schema running with these exact mechanics (cache/prefix
+//! outside the wiped deps tree, capability probe, path absolutization) —
+//! see the exec-time rationale in plugin_build_steps.zig's module doc.
 //!
 //! Hermetic-test seam: `declare_tool_override` (below) bypasses the
 //! build-and-locate step entirely — the assembler's own suite must not
