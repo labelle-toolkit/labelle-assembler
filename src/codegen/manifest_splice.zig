@@ -120,6 +120,15 @@ fn backendPackageDir(allocator: std.mem.Allocator, cfg: ProjectConfig, project_d
 pub const ProviderManifest = struct {
     id: ?[]const u8 = null,
     capabilities: []const config.Capability = &.{},
+    /// Curated post-fx passes the backend implements (labelle-gfx#305 P2/P3) —
+    /// the DATA mirror of `core.postFxCapabilities(...)` / the runtime
+    /// `postPassSupported`. OPTIONAL so an OLDER manifest that predates the field
+    /// parses as `null` (the field is newer than some backends) — distinct from
+    /// an explicit empty `.{}` (the backend implements NONE). The resolve-time
+    /// check (`capabilities.warnUnsupportedPostFx`) skips silently on `null`
+    /// (can't know what it supports) and warns loudly on an empty set (the whole
+    /// post-fx stack is inert on this backend).
+    post_fx_passes: ?[]const config.PostFxKind = null,
 };
 
 /// Load the provider-identity / capability slice of `backend.manifest.zon`,
@@ -292,4 +301,59 @@ test "loadProviderManifest: reads the retained sokol fixture's id + capabilities
 
     try std.testing.expectEqualStrings("labelle.sokol", pm.id.?);
     try std.testing.expect(pm.capabilities.len > 0);
+}
+
+test "ProviderManifest: reads the .post_fx_passes slice when the manifest declares it (#305 P3)" {
+    const alloc = std.testing.allocator;
+    const src =
+        \\.{
+        \\    .id = "labelle.bgfx",
+        \\    .capabilities = .{ .screenshots },
+        \\    .post_fx_passes = .{ .bloom, .vignette, .color_grade, .crt },
+        \\}
+    ;
+    const src_z = try alloc.dupeZ(u8, src);
+    defer alloc.free(src_z);
+
+    const pm = try std.zon.parse.fromSliceAlloc(ProviderManifest, alloc, src_z, null, .{ .ignore_unknown_fields = true });
+    defer std.zon.parse.free(alloc, pm);
+
+    try std.testing.expect(pm.post_fx_passes != null);
+    try std.testing.expectEqual(@as(usize, 4), pm.post_fx_passes.?.len);
+    try std.testing.expectEqual(config.PostFxKind.bloom, pm.post_fx_passes.?[0]);
+    try std.testing.expectEqual(config.PostFxKind.crt, pm.post_fx_passes.?[3]);
+}
+
+test "ProviderManifest: a manifest with NO .post_fx_passes field parses as null (older backend, skip)" {
+    // Back-compat: a manifest predating the field must NOT error — the resolve-
+    // time check (`capabilities.warnUnsupportedPostFx`) treats null as "unknown"
+    // and skips silently.
+    const alloc = std.testing.allocator;
+    const src =
+        \\.{ .id = "labelle.legacy", .capabilities = .{ .screenshots } }
+    ;
+    const src_z = try alloc.dupeZ(u8, src);
+    defer alloc.free(src_z);
+
+    const pm = try std.zon.parse.fromSliceAlloc(ProviderManifest, alloc, src_z, null, .{ .ignore_unknown_fields = true });
+    defer std.zon.parse.free(alloc, pm);
+
+    try std.testing.expect(pm.post_fx_passes == null);
+}
+
+test "ProviderManifest: an explicit empty .post_fx_passes is non-null (implements NONE)" {
+    // The `.{}` case must be DISTINCT from an absent field: the backend opts into
+    // the vocabulary but advertises zero passes — the whole-stack-inert warning.
+    const alloc = std.testing.allocator;
+    const src =
+        \\.{ .id = "labelle.headless", .post_fx_passes = .{} }
+    ;
+    const src_z = try alloc.dupeZ(u8, src);
+    defer alloc.free(src_z);
+
+    const pm = try std.zon.parse.fromSliceAlloc(ProviderManifest, alloc, src_z, null, .{ .ignore_unknown_fields = true });
+    defer std.zon.parse.free(alloc, pm);
+
+    try std.testing.expect(pm.post_fx_passes != null);
+    try std.testing.expectEqual(@as(usize, 0), pm.post_fx_passes.?.len);
 }

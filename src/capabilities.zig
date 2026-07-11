@@ -218,6 +218,131 @@ pub fn validateSurfaceLossConsistency(
     return error.SurfaceLossManifestMismatch;
 }
 
+/// Outcome of the resolve-time post-fx capability check — the testable core of
+/// `warnUnsupportedPostFx`, split out so the behavior can be asserted directly
+/// without capturing `std.log` output.
+pub const PostFxReport = struct {
+    /// The backend manifest ships NO `.post_fx_passes` field (null) — we can't
+    /// know what it implements, so the check is a silent no-op.
+    skipped: bool = false,
+    /// The backend advertises the field but implements NONE (`.{}`) while the
+    /// project declares at least one pass — the ENTIRE stack no-ops at runtime.
+    whole_stack_inert: bool = false,
+    /// Distinct declared pass-kinds the backend does not implement (a slice into
+    /// the caller-provided buffer; de-duplicated so a kind declared twice warns
+    /// once). Empty when everything declared is supported.
+    unsupported: []const config.PostFxKind = &.{},
+
+    /// True when nothing needs reporting (supported, empty, or skipped).
+    pub fn isClean(self: PostFxReport) bool {
+        return !self.whole_stack_inert and self.unsupported.len == 0;
+    }
+};
+
+/// Pure core of the post-fx capability check (labelle-gfx#305 Phase 3, RFC §4).
+/// Compares the project's declared `.post_fx` passes against the backend's
+/// advertised `.post_fx_passes` and reports what the runtime would silently skip.
+///
+/// `backend_post_fx` mirrors the manifest field's OPTIONAL shape:
+///   - `null`    — no `.post_fx_passes` field (older backend / predates it):
+///     unknown ⇒ `skipped` (never false-warn).
+///   - `.{}`     — advertises the field but implements NONE: `whole_stack_inert`.
+///   - non-empty — each declared kind absent from the set lands in `unsupported`.
+///
+/// De-duplicates by kind into `unsupported_buf` (size ≥ the number of
+/// `PostFxKind` variants covers any input, since results are per-KIND).
+pub fn checkPostFx(
+    declared_passes: []const config.PostFxPass,
+    backend_post_fx: ?[]const config.PostFxKind,
+    unsupported_buf: []config.PostFxKind,
+) PostFxReport {
+    // Older backend: no `.post_fx_passes` field → unknown, skip silently.
+    const supported = backend_post_fx orelse return .{ .skipped = true };
+    if (declared_passes.len == 0) return .{}; // nothing declared → nothing to check.
+
+    // Whole stack inert: the backend advertises the field but implements NONE.
+    if (supported.len == 0) return .{ .whole_stack_inert = true };
+
+    var n: usize = 0;
+    outer: for (declared_passes) |pass| {
+        const kind = std.meta.activeTag(pass);
+        if (postFxSupported(supported, kind)) continue;
+        // De-dup: a kind declared twice is reported once.
+        for (unsupported_buf[0..n]) |seen| {
+            if (seen == kind) continue :outer;
+        }
+        if (n == unsupported_buf.len) break; // full (unreachable at max width) — truncate.
+        unsupported_buf[n] = kind;
+        n += 1;
+    }
+    return .{ .unsupported = unsupported_buf[0..n] };
+}
+
+/// Resolve-time POST-FX capability check (labelle-gfx#305 Phase 3, RFC §4 —
+/// the `.capabilities` manifest mirror). Cross-checks the project's declared
+/// `.post_fx` passes against the resolved backend's advertised
+/// `.post_fx_passes` and WARNS (never fails) about a pass the backend cannot do,
+/// so the author learns at BUILD time instead of a silent per-frame runtime skip.
+///
+/// WARN-not-error is deliberate: the runtime degrades gracefully
+/// (`postPassSupported` no-ops an unimplemented pass), so a declared-but-
+/// unsupported pass must not break the build — it warns. See `checkPostFx` for
+/// the OPTIONAL manifest-field semantics (null skips silently; `.{}` is a louder
+/// whole-stack-inert warning).
+pub fn warnUnsupportedPostFx(
+    declared_passes: []const config.PostFxPass,
+    backend_post_fx: ?[]const config.PostFxKind,
+    provider_id: []const u8,
+) void {
+    var unsupported_buf: [@typeInfo(config.PostFxKind).@"enum".fields.len]config.PostFxKind = undefined;
+    const report = checkPostFx(declared_passes, backend_post_fx, &unsupported_buf);
+    if (report.skipped or report.isClean()) return;
+
+    // Whole stack inert: one louder warning is clearer than one per pass —
+    // EVERY declared pass will no-op at runtime on this backend.
+    if (report.whole_stack_inert) {
+        std.log.warn(
+            "labelle-assembler: project.labelle .post_fx declares {d} pass(es) but the '{s}' backend implements NO post-fx passes — the entire post-fx stack will be skipped at runtime.",
+            .{ declared_passes.len, provider_id },
+        );
+        return;
+    }
+
+    var list_buf: [128]u8 = undefined;
+    const supported_list = formatKindList(&list_buf, backend_post_fx.?);
+    for (report.unsupported) |kind| {
+        std.log.warn(
+            "labelle-assembler: project.labelle .post_fx declares '{s}' but the '{s}' backend does not implement it — it will be skipped at runtime. Supported: {s}.",
+            .{ @tagName(kind), provider_id, supported_list },
+        );
+    }
+}
+
+/// True if `kind` is in the backend's advertised `.post_fx_passes` set.
+fn postFxSupported(supported: []const config.PostFxKind, kind: config.PostFxKind) bool {
+    for (supported) |s| {
+        if (s == kind) return true;
+    }
+    return false;
+}
+
+/// Render an advertised post-fx set as a comma-joined tag list into `buf`
+/// (allocation-free — the kind set is tiny and the names are short). Truncates
+/// rather than overflowing if the buffer is ever too small.
+fn formatKindList(buf: []u8, kinds: []const config.PostFxKind) []const u8 {
+    var len: usize = 0;
+    for (kinds, 0..) |k, i| {
+        const sep: []const u8 = if (i == 0) "" else ", ";
+        const name = @tagName(k);
+        if (len + sep.len + name.len > buf.len) break; // truncate, never overflow.
+        @memcpy(buf[len..][0..sep.len], sep);
+        len += sep.len;
+        @memcpy(buf[len..][0..name.len], name);
+        len += name.len;
+    }
+    return buf[0..len];
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -466,4 +591,94 @@ fn hasCap(caps: []const Capability, cap: Capability) bool {
         if (c == cap) return true;
     }
     return false;
+}
+
+// ── Post-fx capability check (labelle-gfx#305 Phase 3) ────────────────
+
+/// A stack buffer wide enough for any `checkPostFx` result (results are per
+/// distinct KIND, so the enum-cardinality bound suffices).
+fn postFxBuf() [@typeInfo(config.PostFxKind).@"enum".fields.len]config.PostFxKind {
+    return undefined;
+}
+
+test "checkPostFx (a): declared bloom+crt against a backend advertising both — no warning" {
+    const declared: []const config.PostFxPass = &.{
+        .{ .bloom = .{ .threshold = 0.8 } },
+        .{ .crt = .{ .curvature = 0.1 } },
+    };
+    const advertised: []const config.PostFxKind = &.{ .bloom, .vignette, .color_grade, .crt };
+    var buf = postFxBuf();
+    const report = checkPostFx(declared, advertised, &buf);
+    try testing.expect(!report.skipped);
+    try testing.expect(report.isClean());
+    try testing.expectEqual(@as(usize, 0), report.unsupported.len);
+}
+
+test "checkPostFx (b): declared crt against a backend advertising only bloom — warns, names crt" {
+    const declared: []const config.PostFxPass = &.{
+        .{ .bloom = .{ .threshold = 0.8 } }, // supported
+        .{ .crt = .{ .curvature = 0.1 } }, // NOT supported
+    };
+    const advertised: []const config.PostFxKind = &.{.bloom};
+    var buf = postFxBuf();
+    const report = checkPostFx(declared, advertised, &buf);
+    try testing.expect(!report.isClean());
+    try testing.expect(!report.whole_stack_inert);
+    try testing.expectEqual(@as(usize, 1), report.unsupported.len);
+    try testing.expectEqual(config.PostFxKind.crt, report.unsupported[0]);
+
+    // The supported set is rendered for the diagnostic's "Supported: <list>" tail.
+    var list_buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("bloom", formatKindList(&list_buf, advertised));
+}
+
+test "checkPostFx (c): a manifest with NO .post_fx_passes field — skipped, no warning" {
+    const declared: []const config.PostFxPass = &.{
+        .{ .crt = .{ .curvature = 0.1 } },
+    };
+    var buf = postFxBuf();
+    const report = checkPostFx(declared, null, &buf); // null = field absent (older backend)
+    try testing.expect(report.skipped);
+    try testing.expect(report.isClean()); // skipped ⇒ nothing to warn about
+}
+
+test "checkPostFx: an empty advertised set (implements NONE) is whole-stack-inert" {
+    const declared: []const config.PostFxPass = &.{
+        .{ .bloom = .{} },
+        .{ .vignette = .{} },
+    };
+    const advertised: []const config.PostFxKind = &.{}; // explicit empty = implements none
+    var buf = postFxBuf();
+    const report = checkPostFx(declared, advertised, &buf);
+    try testing.expect(report.whole_stack_inert);
+    try testing.expect(!report.isClean());
+}
+
+test "checkPostFx: no declared passes is trivially clean even when advertised is null" {
+    var buf = postFxBuf();
+    const report = checkPostFx(&.{}, null, &buf);
+    try testing.expect(report.skipped); // null short-circuits first — still nothing to warn
+    try testing.expect(report.isClean());
+}
+
+test "checkPostFx: a kind declared twice is reported once (de-dup)" {
+    const declared: []const config.PostFxPass = &.{
+        .{ .crt = .{} },
+        .{ .crt = .{ .scanline = 0.5 } }, // same KIND, different params
+    };
+    const advertised: []const config.PostFxKind = &.{ .bloom, .vignette };
+    var buf = postFxBuf();
+    const report = checkPostFx(declared, advertised, &buf);
+    try testing.expectEqual(@as(usize, 1), report.unsupported.len);
+    try testing.expectEqual(config.PostFxKind.crt, report.unsupported[0]);
+}
+
+test "warnUnsupportedPostFx: the log wrapper is a no-op for the clean/skip paths" {
+    // No assertion on log output — just exercise the wrapper across every arm to
+    // prove it composes `checkPostFx` without tripping (the buffer-width bound,
+    // the null skip, the inert path, and the per-kind path).
+    warnUnsupportedPostFx(&.{}, null, "labelle.test"); // skip
+    warnUnsupportedPostFx(&.{.{ .bloom = .{} }}, &.{.bloom}, "labelle.test"); // clean
+    warnUnsupportedPostFx(&.{.{ .crt = .{} }}, &.{}, "labelle.test"); // inert (warns)
+    warnUnsupportedPostFx(&.{.{ .crt = .{} }}, &.{.bloom}, "labelle.test"); // unsupported (warns)
 }
