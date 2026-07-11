@@ -55,15 +55,19 @@ pub fn validateProviderContracts(
         // to the `labelle.*` namespace (#461) — checked here, where the parsed
         // manifest's platforms are in scope.
         try backend_registry.assertLifecyclePrivilege(cfg, m.declaresPrivilegedLifecycle(), m.id);
-        return validateProviderContractsInner(allocator, cfg, m.id, m.capabilities, is_tests_target);
+        return validateProviderContractsInner(allocator, cfg, m.id, m.capabilities, m.post_fx_passes, is_tests_target);
     }
 
     const maybe_pm = try manifest_splice.loadProviderManifest(allocator, cfg, game_dir);
     const manifest_id: ?[]const u8 = if (maybe_pm) |pm| pm.id else null;
     const declared: []const config.Capability = if (maybe_pm) |pm| pm.capabilities else &.{};
+    // Post-fx passes the backend advertises — OPTIONAL: null = no manifest, or an
+    // older manifest with no `.post_fx_passes` field, in which case the resolve-
+    // time check skips silently. See `capabilities.warnUnsupportedPostFx`.
+    const backend_post_fx: ?[]const config.PostFxKind = if (maybe_pm) |pm| pm.post_fx_passes else null;
     defer if (maybe_pm) |pm| manifest_splice.freeProviderManifest(allocator, pm);
 
-    return validateProviderContractsInner(allocator, cfg, manifest_id, declared, is_tests_target);
+    return validateProviderContractsInner(allocator, cfg, manifest_id, declared, backend_post_fx, is_tests_target);
 }
 
 /// The identity + capability contract checks, factored out so BOTH the legacy
@@ -75,6 +79,7 @@ fn validateProviderContractsInner(
     cfg: ProjectConfig,
     manifest_id: ?[]const u8,
     declared: []const config.Capability,
+    backend_post_fx: ?[]const config.PostFxKind,
     is_tests_target: bool,
 ) !void {
     // Provider identity: reserved-namespace + enum-shorthand drift.
@@ -103,4 +108,15 @@ fn validateProviderContractsInner(
     defer allocator.free(required);
     const provider_id = manifest_id orelse cfg.backendName();
     try capabilities.validate(required, declared, provider_id);
+
+    // Post-fx resolve-time capability check (labelle-gfx#305 Phase 3, RFC §4).
+    // WARN — never fail — on a `.post_fx` pass the resolved backend does not
+    // implement: the runtime degrades gracefully (an unimplemented pass no-ops),
+    // so a declared-but-unsupported pass surfaces at build time as a note rather
+    // than a hard error. Reads the backend's advertised `.post_fx_passes` off
+    // whichever manifest shape resolved (v1 or v2); a manifest without the field
+    // (older backend) skips the check silently. Gated with the capability
+    // negotiation above so it runs on the real exe target only, not the forced-
+    // null tests harness (avoiding a duplicate warning per `generate`).
+    capabilities.warnUnsupportedPostFx(cfg.post_fx, backend_post_fx, provider_id);
 }

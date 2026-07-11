@@ -579,7 +579,16 @@ pub const ResolvedGui = struct {
 ///         .{ .bloom = .{ .threshold = 0.8, .intensity = 1.0, .radius = 1.0 } },
 ///         .{ .crt = .{ .curvature = 0.1, .scanline = 0.5, .mask = 0.3, .aberration = 0.2 } },
 ///     },
-pub const PostFxPass = union(enum) {
+/// The KIND of a post-fx pass — the `PostFxPass` union tag promoted to a NAMED
+/// enum so a backend manifest can advertise the passes it implements as data
+/// (`.post_fx_passes = .{ .bloom, .crt }`) and the resolve-time capability check
+/// (`capabilities.warnUnsupportedPostFx`) can compare a declared pass's kind
+/// against that advertised list (labelle-gfx#305 P3, RFC §4 — the `.capabilities`
+/// manifest mirror). Tag names MUST match the backends' `.post_fx_passes`
+/// spelling and the engine-side `PostPass.kind`.
+pub const PostFxKind = enum { bloom, vignette, color_grade, crt };
+
+pub const PostFxPass = union(PostFxKind) {
     bloom: struct { threshold: f32 = 0, intensity: f32 = 0, radius: f32 = 0 },
     vignette: struct { intensity: f32 = 0, radius: f32 = 0, softness: f32 = 0, tint: [3]f32 = .{ 0, 0, 0 } },
     color_grade: struct { strength: f32 = 0, lut: u32 = 0 },

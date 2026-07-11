@@ -78,6 +78,15 @@ pub const BackendManifestV2 = struct {
     /// capability still parses.
     capabilities: []const config.Capability = &.{},
 
+    /// Curated post-fx passes this backend implements (labelle-gfx#305 P2/P3) —
+    /// the DATA mirror of `core.postFxCapabilities(...)`, carried on the v2
+    /// manifest exactly like the v1 `ProviderManifest` slice so the resolve-time
+    /// check reads it off whichever manifest shape the backend ships. OPTIONAL so
+    /// a v2 manifest predating the field parses as `null` (skip the check — can't
+    /// know); an explicit empty `.{}` means the backend implements NONE (the
+    /// whole post-fx stack is inert). Feeds `capabilities.warnUnsupportedPostFx`.
+    post_fx_passes: ?[]const config.PostFxKind = null,
+
     /// Named modules the provider exposes. Replaces the four hand-written
     /// `.module("gfx"/"input"/"audio"/"window")` lines in every fragment.
     /// Platform-scoped modules (bgfx-Android's `android_app`) are declared under
