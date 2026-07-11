@@ -47,8 +47,21 @@ test {
 const lua_splice = generate.scripting_splice.ScriptingSplice{
     .plugin_name = "scripting",
     .language = "lua",
+    .dir = "lua",
     .extension = ".lua",
     .script_names = &.{ "ai/guard", "player_ai" },
+};
+
+/// The typescript twin (labelle-scripting v0.3.0, quickjs-ng): language ≠
+/// dir — scripts live in `ts/` and embed as PLAIN `.js` (the TS→JS
+/// transpile hook is the #586 gap). Same nested-subdir shape as the lua
+/// fixture so the `/`-joined stems ride the identical builders.
+const ts_splice = generate.scripting_splice.ScriptingSplice{
+    .plugin_name = "scripting",
+    .language = "typescript",
+    .dir = "ts",
+    .extension = ".js",
+    .script_names = &.{ "ai/guard", "behavior" },
 };
 
 /// A project.labelle plugin list carrying THE scripting plugin plus an
@@ -56,6 +69,12 @@ const lua_splice = generate.scripting_splice.ScriptingSplice{
 /// plugins' wiring.
 const scripting_plugins = [_]generate.PluginDep{
     .{ .name = "scripting", .repo = "github:labelle-toolkit/labelle-scripting", .version = "0.1.0", .params = .{ .language = "lua" } },
+    .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "4.0.1" },
+};
+
+/// The typescript spelling of the same list.
+const ts_scripting_plugins = [_]generate.PluginDep{
+    .{ .name = "scripting", .repo = "github:labelle-toolkit/labelle-scripting", .version = "0.3.0", .params = .{ .language = "typescript" } },
     .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "4.0.1" },
 };
 
@@ -209,6 +228,42 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         try expectAstGenOk(main_zig);
     }
 
+    test "typescript loop lifecycle: ts/-rooted .js embeds ride the same builders (never typescript/, never .ts)" {
+        generate.main_template.scripting_splice = ts_splice;
+        defer generate.main_template.scripting_splice = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &ts_scripting_plugins,
+        }, loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        _ = try indexOfOrFail(main_zig, "const scripting = @import(\"scripting\");");
+        _ = try indexOfOrFail(main_zig, "const scripting_enabled = true;");
+
+        // Embed paths root at the `ts/` convention dir (the splice's `dir`
+        // — language and dir DIFFER for typescript) with the `.js` runtime
+        // extension; sorted; strictly before PluginControllers.setup.
+        const reg_guard = try indexOfOrFail(main_zig, "scripting.registerScript(\"ai/guard\", @embedFile(\"ts/ai/guard.js\"));");
+        const reg_behavior = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"ts/behavior.js\"));");
+        const controllers_setup = try indexOfOrFail(main_zig, "PluginControllers.setup(&g)");
+        try std.testing.expect(reg_guard < reg_behavior);
+        try std.testing.expect(reg_behavior < controllers_setup);
+
+        // The language-keyed halves are untouched: VM tick + drain tap.
+        _ = try indexOfOrFail(main_zig, "scripting.Controller.tick(&g, scaled_dt);");
+        _ = try indexOfOrFail(main_zig, "engine.script_contract.drainEvents(&g);");
+
+        // No `typescript/`-rooted or `.ts` embed can appear anywhere.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"typescript/") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".ts\")") == null);
+
+        try expectAstGenOk(main_zig);
+    }
+
     test "an EMPTY script set still wires the plugin: alias + flag + drain, but no registerScript" {
         // Empty `lua/` dir (or none): the plugin is attached and the VM
         // boots, so the flag/alias/drain must be present — only the
@@ -268,6 +323,23 @@ pub const SCRIPTING_BUILD_WIRING = struct {
         _ = try indexOfOrFail(build_zig, "const plugin_pathfinding_dep = b.dependency(\"labelle_pathfinding\", .{ .target = target, .optimize = optimize });");
     }
 
+    test "a typescript declaration passes .language = .typescript to the scripting dep" {
+        // The plugin's `-Dlanguage` option (labelle-scripting v0.3.0:
+        // lua|ruby|typescript) selects the quickjs-ng sub-module.
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = &ts_scripting_plugins,
+        }, .{
+            .scripting = .{ .plugin_name = "scripting", .language = "typescript" },
+        });
+        defer std.testing.allocator.free(build_zig);
+
+        _ = try indexOfOrFail(build_zig, "const plugin_scripting_dep = b.dependency(\"labelle_scripting\", .{ .target = target, .optimize = optimize, .language = .typescript });");
+        _ = try indexOfOrFail(build_zig, "const plugin_pathfinding_dep = b.dependency(\"labelle_pathfinding\", .{ .target = target, .optimize = optimize });");
+    }
+
     test "no BuildZigOptions.scripting → no .language arg on any plugin dep" {
         // The default-null path — the byte anchor for this cell is the
         // committed `sokol_desktop_v2_plugins.build.zig` golden (which this
@@ -282,5 +354,154 @@ pub const SCRIPTING_BUILD_WIRING = struct {
         defer std.testing.allocator.free(build_zig);
 
         try std.testing.expect(std.mem.indexOf(u8, build_zig, ".language") == null);
+    }
+};
+
+// ── typescript e2e: the REAL generate over a staged project ───────────
+//
+// The declare-phase e2e harness shape (`test/scripting_declare_tests.zig`
+// StagedProject), typescript-flavored. Hermetic on the HAPPY path: the
+// lua-only declare gate returns before any tool build, so no `zig` child
+// process and no network — which is itself the pin: the staged plugin
+// fixture SHIPS a `tools/declare/` dir (the capability probe would pass),
+// so if the language gate were removed, generate would charge into
+// `zig build labelle-declare` inside a build.zig-less fixture and fail —
+// exactly the negative this test exists to catch.
+
+const e2e_io = std.testing.io;
+
+fn writeFileIn(dir: std.Io.Dir, rel: []const u8, body: []const u8) !void {
+    if (std.fs.path.dirname(rel)) |sub| try dir.createDirPath(e2e_io, sub);
+    var f = try dir.createFile(e2e_io, rel, .{});
+    defer f.close(e2e_io);
+    try f.writeStreamingAll(e2e_io, body);
+}
+
+/// A staged tmp typescript game project: `game/` with a manifest-bearing
+/// scripting plugin (plus its declare-tool marker), a `ts/` dir holding a
+/// runnable `.js` script AND the copied `labelle.d.ts` authoring companion
+/// (the documented `// @ts-check` workflow — pinning that declaration
+/// files never trip the transpile gate), the engine template fixture (exe
+/// main.zig emission), and `out/`.
+const StagedTsProject = struct {
+    tmp: std.testing.TmpDir,
+    game_abs: [:0]const u8,
+    out_abs: [:0]const u8,
+
+    fn init(allocator: std.mem.Allocator) !StagedTsProject {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.createDirPath(e2e_io, "out");
+        try tmp.dir.createDirPath(e2e_io, "game");
+        var game_root = try tmp.dir.openDir(e2e_io, "game", .{});
+        defer game_root.close(e2e_io);
+        try writeFileIn(game_root, "plugins/scripting/plugin.labelle",
+            \\.{ .name = "scripting", .manifest_version = 1 }
+        );
+        // The declare-tool capability marker (labelle-scripting >= 0.2.0
+        // ships tools/declare): with it present, ONLY the lua-only
+        // language gate keeps the phase from building the runner here.
+        try writeFileIn(game_root, "plugins/scripting/tools/declare/declare.lua", "-- lua declare runner (fixture marker)\n");
+        try writeFileIn(game_root, "ts/behavior.js",
+            \\// @ts-check
+            \\export function update(dt) {}
+        );
+        try writeFileIn(game_root, "ts/labelle.d.ts", "declare const labelle: any;\n");
+        // Exe main.zig emission loads the engine's codegen template — the
+        // unit-test fixture template staged as a `local:` engine package.
+        try writeFileIn(game_root, "engine-fixture/codegen/main.zig.template", engine_template);
+        const game_abs = try tmp.dir.realPathFileAlloc(e2e_io, "game", allocator);
+        errdefer allocator.free(game_abs);
+        const out_abs = try tmp.dir.realPathFileAlloc(e2e_io, "out", allocator);
+        return .{ .tmp = tmp, .game_abs = game_abs, .out_abs = out_abs };
+    }
+
+    fn deinit(self: *StagedTsProject, allocator: std.mem.Allocator) void {
+        allocator.free(self.game_abs);
+        allocator.free(self.out_abs);
+        self.tmp.cleanup();
+    }
+
+    fn config(self: *StagedTsProject, backend_repo: []const u8) generate.ProjectConfig {
+        _ = self;
+        return .{
+            .name = "ts-game",
+            .backend = .sokol,
+            .backend_package = .{ .name = "sokol", .repo = backend_repo },
+            .ecs = .mock,
+            .engine_version = "local:engine-fixture",
+            .y_axis = .up,
+            .plugins = &.{
+                .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "typescript" } },
+            },
+        };
+    }
+};
+
+/// The in-tree sokol backend fixture as an ABSOLUTE `local:` repo (staged
+/// games live in tmp dirs, so the repo-relative spelling can't resolve).
+fn sokolFixtureRepoAbs(allocator: std.mem.Allocator) ![]const u8 {
+    const abs = try std.Io.Dir.cwd().realPathFileAlloc(e2e_io, "backends/sokol", allocator);
+    defer allocator.free(abs);
+    return std.fmt.allocPrint(allocator, "local:{s}", .{abs});
+}
+
+pub const TYPESCRIPT_SPLICE_E2E = struct {
+    test "a ts/behavior.js project generates end to end: ts/-rooted embed, .typescript dep language, declare skipped" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTsProject.init(allocator);
+        defer staged.deinit(allocator);
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        // Generated main: the registration embeds the copied ts/ source
+        // (the linked dir must actually resolve the embed path), plus the
+        // module-scope alias + backend-gate flag.
+        const main_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
+        defer allocator.free(main_zig);
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"ts/behavior.js\"));");
+        _ = try indexOfOrFail(main_zig, "const scripting = @import(\"scripting\");");
+        _ = try indexOfOrFail(main_zig, "const scripting_enabled = true;");
+        try staged.tmp.dir.access(e2e_io, "out/sokol_desktop/ts/behavior.js", .{});
+        // The d.ts authoring companion is NOT a script: no registration.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle.d") == null);
+
+        // Generated build: the plugin dep selects the typescript sub-module.
+        const build_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
+        defer allocator.free(build_zig);
+        _ = try indexOfOrFail(build_zig, "const plugin_scripting_dep = b.dependency(\"labelle_scripting\", .{ .target = target, .optimize = optimize, .language = .typescript });");
+
+        // Declare phase SKIPPED without error (lua-only v1): no generated
+        // component file — even though the plugin fixture ships the
+        // tools/declare capability marker, which is what makes this line a
+        // real pin on the language gate (see the block comment above).
+        try std.testing.expectError(
+            error.FileNotFound,
+            staged.tmp.dir.access(e2e_io, "out/sokol_desktop/scripting_components.zig", .{}),
+        );
+    }
+
+    test "a .ts source fails generate with ScriptNeedsTranspile (the #586 gate); removing it generates again" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTsProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(e2e_io, "game", .{});
+        defer game_root.close(e2e_io);
+        try writeFileIn(game_root, "ts/enemy.ts", "export function update(dt: number) {}\n");
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try std.testing.expectError(
+            error.ScriptNeedsTranspile,
+            generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false }),
+        );
+
+        // Negative control (the exact same staging minus the .ts file
+        // generates — the failure above is the gate, not the staging):
+        try game_root.deleteFile(e2e_io, "ts/enemy.ts");
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+        try staged.tmp.dir.access(e2e_io, "out/sokol_desktop/main.zig", .{});
     }
 };

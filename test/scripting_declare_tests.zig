@@ -57,6 +57,7 @@ const hunger_schema =
 const lua_splice = generate.scripting_splice.ScriptingSplice{
     .plugin_name = "scripting",
     .language = "lua",
+    .dir = "lua",
     .extension = ".lua",
     .script_names = &.{"hunger"},
 };

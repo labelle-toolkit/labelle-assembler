@@ -461,18 +461,23 @@ pub fn generate(
     // `linkAndScan` without the redundant name collection.
     try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 
-    // ── Scripting splice: copy + scan the language dir (#593) ──────────
+    // ── Scripting splice: copy + scan the script dir (#593) ────────────
     // Mirror the prefabs/scenes convention-dir copy for the declared
-    // language's `<language>/` dir (game root; `requires_language` pack dirs
-    // come later): link it into the target so the generated main's
-    // `@embedFile("<language>/<stem><ext>")` resolves, and record the SORTED
-    // stems (subdir paths joined with `/`, `linkAndScan`'s contract) as the
-    // script names the lifecycle builders register. A missing dir scans
-    // empty — the plugin is wired, nothing embeds.
+    // language's convention dir (`lua/`, `ts/` — the splice's `dir`; game
+    // root, `requires_language` pack dirs come later): link it into the
+    // target so the generated main's `@embedFile("<dir>/<stem><ext>")`
+    // resolves, and record the SORTED stems (subdir paths joined with `/`,
+    // `linkAndScan`'s contract) as the script names the lifecycle builders
+    // register. A missing dir scans empty — the plugin is wired, nothing
+    // embeds. Sources the assembler can't run yet (`.ts` until the #586
+    // transpile hook) fail generate FIRST — the scan collects only the
+    // embed extension, so without the gate an authored `.ts` would neither
+    // embed nor error.
     var scripting_script_names: ?[][]const u8 = null;
     defer if (scripting_script_names) |names| scanner.freeNames(allocator, names);
     if (maybe_scripting) |*s| {
-        scripting_script_names = try scanner.linkAndScan(allocator, game_dir, target_dir, s.language, s.extension);
+        try scripting_splice.rejectUntranspiledScripts(allocator, game_dir, s.*);
+        scripting_script_names = try scanner.linkAndScan(allocator, game_dir, target_dir, s.dir, s.extension);
         s.script_names = scripting_script_names.?;
     }
 
