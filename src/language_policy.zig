@@ -16,13 +16,14 @@
 //!      language — a Lua-scripted pack fails loudly in a Rust project,
 //!      naming both sides.
 //!   3. **Script-dir scan** (`scanUnitLanguageDirs`): every language
-//!      convention dir (`lua/ typescript/ ruby/ rust/ crystal/ go/ csharp/`)
-//!      in the game root AND in every pack dir is walked. Files in a dir
-//!      belonging to a language OTHER than the declared one are a hard error
-//!      listing up to `MAX_LISTED_FILES` offenders; files with NO scripting
-//!      plugin declared error with the attach hint; EMPTY language dirs are
-//!      warn-only. Dir-presence detection is a cross-check, not the selector
-//!      (RFC rev 8) — the declared `.params.language` is authoritative.
+//!      convention dir (`lua/ ts/ ruby/ rust/ crystal/ go/ csharp/` — see
+//!      `conventionDir`) in the game root AND in every pack dir is walked.
+//!      Files in a dir belonging to a language OTHER than the declared one
+//!      are a hard error listing up to `MAX_LISTED_FILES` offenders; files
+//!      with NO scripting plugin declared error with the attach hint; EMPTY
+//!      language dirs are warn-only. Dir-presence detection is a
+//!      cross-check, not the selector (RFC rev 8) — the declared
+//!      `.params.language` is authoritative.
 //!
 //! Everything here is parse + validate ONLY: no codegen consumes
 //! `.params.language` yet (the scripting plugin that does is a separate
@@ -37,9 +38,11 @@ const config = @import("config.zig");
 
 /// The closed set of script languages the toolkit recognizes
 /// (RFC-LANGUAGE-PLUGINS §2/§3 — the `labelle-scripting` sub-modules). Each
-/// name doubles as the language's convention-dir name (`lua/`, `rust/`, …).
-/// Widening this table is additive; validation everywhere goes through
-/// `isSupportedLanguage` so there is exactly one vocabulary.
+/// name usually doubles as the language's convention-dir name (`lua/`,
+/// `rust/`, …) — `conventionDir` is the mapping's single source of truth
+/// (typescript's dir is `ts/`). Widening this table is additive; validation
+/// everywhere goes through `isSupportedLanguage` so there is exactly one
+/// vocabulary.
 pub const SUPPORTED_LANGUAGES = [_][]const u8{
     "lua",
     "typescript",
@@ -49,6 +52,20 @@ pub const SUPPORTED_LANGUAGES = [_][]const u8{
     "go",
     "csharp",
 };
+
+/// The convention-dir name for a language's scripts — labelle-scripting's
+/// documented layout ("Drop scripts in your language's convention dir
+/// (`lua/`, `ruby/`, `ts/`, …)"). Every language's dir is its
+/// `SUPPORTED_LANGUAGES` name except typescript, whose dir is `ts/` (the
+/// plugin README + `@embedFile("ts/player.js")` examples; the ecosystem
+/// short form). This helper is the ONLY place the mapping lives: the
+/// script-dir scan below and the scripting splice's copy/embed
+/// (`scripting_splice.detect`) both consume it, so policy and codegen can
+/// never police/embed different dirs.
+pub fn conventionDir(language: []const u8) []const u8 {
+    if (std.mem.eql(u8, language, "typescript")) return "ts";
+    return language;
+}
 
 /// Comma-joined display form of `SUPPORTED_LANGUAGES` for diagnostics.
 pub const SUPPORTED_LANGUAGES_LIST: []const u8 = blk: {
@@ -242,12 +259,18 @@ fn walkCollect(
 /// Scan ONE unit root (the game root, or a pack's source dir) for language
 /// convention dirs and enforce the policy (RFC rev 8's generate-time layer):
 ///
-///   - a dir of the DECLARED language → fine, skipped entirely;
-///   - a dir of another language WITH files → `error.ScriptLanguageMismatch`,
-///     listing up to `MAX_LISTED_FILES` offenders + the fix;
-///   - any language dir WITH files but NO declared language →
+///   - the DECLARED language's convention dir → fine, skipped entirely;
+///   - another language's convention dir WITH files →
+///     `error.ScriptLanguageMismatch`, listing up to `MAX_LISTED_FILES`
+///     offenders + the fix;
+///   - any convention dir WITH files but NO declared language →
 ///     `error.MissingScriptingPlugin`, with the attach hint;
-///   - an EMPTY language dir → warn-only (a placeholder never fails a build).
+///   - an EMPTY language dir → warn-only (a placeholder never fails a build);
+///   - a language-NAME dir that is NOT the convention dir (`typescript/`,
+///     whose convention dir is `ts/` — `conventionDir`) WITH files →
+///     `error.MisplacedLanguageDir`. NOTHING ever consumes such a dir, so
+///     scripts dropped there (an easy guess from the language vocabulary)
+///     would otherwise be silently dead — fail loudly naming the real home.
 ///
 /// `unit_label` names the scanned unit in diagnostics — `"project root"` or
 /// `"pack 'sky'"`.
@@ -258,25 +281,53 @@ pub fn scanUnitLanguageDirs(
     declared: ?DeclaredLanguage,
 ) !void {
     for (SUPPORTED_LANGUAGES) |lang| {
+        const dir = conventionDir(lang);
+
+        // The language-name-≠-convention-dir trap (typescript/ vs ts/):
+        // policed for EVERY language declaration state, because no
+        // declaration state makes the dir meaningful.
+        if (!std.mem.eql(u8, dir, lang)) {
+            var maybe_misplaced = try collectLanguageDirFiles(allocator, unit_root, lang);
+            if (maybe_misplaced) |*misplaced| {
+                defer misplaced.deinit(allocator);
+                if (misplaced.total > 0) {
+                    std.debug.print(
+                        "labelle-assembler: {s} contains {s}/ files, but the {s} script convention dir is {s}/:\n",
+                        .{ unit_label, lang, lang, dir },
+                    );
+                    printListed(misplaced.*);
+                    std.debug.print(
+                        "  nothing reads {s}/ — move the scripts to {s}/ (or remove the directory).\n",
+                        .{ lang, dir },
+                    );
+                    return error.MisplacedLanguageDir;
+                }
+                std.log.warn(
+                    "labelle: {s} has an empty '{s}/' dir; ignoring it (the {s} script convention dir is '{s}/')",
+                    .{ unit_label, lang, lang, dir },
+                );
+            }
+        }
+
         if (declared) |d| {
             // The declared language's own dir is the legal home of the
             // project's scripts — nothing to police there in this ticket
             // (the scripting plugin consumes it, separately).
             if (std.mem.eql(u8, d.language, lang)) continue;
         }
-        var scanned = (try collectLanguageDirFiles(allocator, unit_root, lang)) orelse continue;
+        var scanned = (try collectLanguageDirFiles(allocator, unit_root, dir)) orelse continue;
         defer scanned.deinit(allocator);
 
         if (scanned.total == 0) {
             if (declared) |d| {
                 std.log.warn(
                     "labelle: {s} has an empty '{s}/' script-language dir; ignoring it (the project's script language is \"{s}\")",
-                    .{ unit_label, lang, d.language },
+                    .{ unit_label, dir, d.language },
                 );
             } else {
                 std.log.warn(
                     "labelle: {s} has an empty '{s}/' script-language dir; ignoring it (no scripting plugin is declared)",
-                    .{ unit_label, lang },
+                    .{ unit_label, dir },
                 );
             }
             continue;
@@ -285,7 +336,7 @@ pub fn scanUnitLanguageDirs(
         if (declared) |d| {
             std.debug.print(
                 "labelle-assembler: {s} contains {s}/ scripts but the project's script language is \"{s}\" (plugin '{s}'):\n",
-                .{ unit_label, lang, d.language, d.plugin_name },
+                .{ unit_label, dir, d.language, d.plugin_name },
             );
             printListed(scanned);
             std.debug.print(
@@ -297,14 +348,14 @@ pub fn scanUnitLanguageDirs(
 
         std.debug.print(
             "labelle-assembler: {s} contains {s}/ scripts but no scripting plugin is declared:\n",
-            .{ unit_label, lang },
+            .{ unit_label, dir },
         );
         printListed(scanned);
         std.debug.print(
             "  attach the scripting plugin in project.labelle to run them, e.g.\n" ++
                 "    .plugins = .{{ .{{ .name = \"labelle-scripting\", .version = \"...\", .params = .{{ .language = \"{s}\" }} }} }}\n" ++
                 "  or remove the {s}/ directory.\n",
-            .{ lang, lang },
+            .{ lang, dir },
         );
         return error.MissingScriptingPlugin;
     }
@@ -337,6 +388,14 @@ test "SUPPORTED_LANGUAGES_LIST: comma-joined display form" {
         "lua, typescript, ruby, rust, crystal, go, csharp",
         SUPPORTED_LANGUAGES_LIST,
     );
+}
+
+test "conventionDir: typescript maps to ts/; every other language dirs under its own name" {
+    try testing.expectEqualStrings("ts", conventionDir("typescript"));
+    for (SUPPORTED_LANGUAGES) |lang| {
+        if (std.mem.eql(u8, lang, "typescript")) continue;
+        try testing.expectEqualStrings(lang, conventionDir(lang));
+    }
 }
 
 test "resolveProjectLanguage: no declaration → null (script-less project)" {
@@ -529,6 +588,69 @@ test "scanUnitLanguageDirs: an EMPTY foreign language dir is warn-only" {
     try scanUnitLanguageDirs(allocator, root, "project root", declared);
     // Same for a project with no scripting plugin at all.
     try scanUnitLanguageDirs(allocator, root, "project root", null);
+}
+
+test "scanUnitLanguageDirs: typescript scripts live in ts/ — skipped when declared, mismatch/attach errors otherwise" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "ts/behavior.js", "export function update(dt) {}\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    // Declared typescript → ts/ is the legal home (the conventionDir keys
+    // the declared-language skip, or the scan would reject its own scripts).
+    const ts_declared = DeclaredLanguage{ .language = "typescript", .plugin_name = "scripting" };
+    try scanUnitLanguageDirs(allocator, root, "project root", ts_declared);
+
+    // Declared lua → ts/ files are a foreign language, hard error.
+    const lua_declared = DeclaredLanguage{ .language = "lua", .plugin_name = "scripting" };
+    try testing.expectError(
+        error.ScriptLanguageMismatch,
+        scanUnitLanguageDirs(allocator, root, "project root", lua_declared),
+    );
+
+    // No plugin at all → the attach hint (spelling the POLICY vocabulary
+    // "typescript", not the dir name).
+    try testing.expectError(
+        error.MissingScriptingPlugin,
+        scanUnitLanguageDirs(allocator, root, "project root", null),
+    );
+}
+
+test "scanUnitLanguageDirs: a typescript/ dir with files is a MISPLACED-dir error in every declaration state" {
+    // `typescript/` is the language NAME, not its convention dir (`ts/` —
+    // conventionDir); nothing ever reads it, so scripts dropped there would
+    // be silently dead. Loud in all three states — including declared
+    // typescript, where the declared-language skip must NOT excuse it.
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "typescript/behavior.js", "export function update(dt) {}\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const ts_declared = DeclaredLanguage{ .language = "typescript", .plugin_name = "scripting" };
+    const lua_declared = DeclaredLanguage{ .language = "lua", .plugin_name = "scripting" };
+    try testing.expectError(error.MisplacedLanguageDir, scanUnitLanguageDirs(allocator, root, "project root", ts_declared));
+    try testing.expectError(error.MisplacedLanguageDir, scanUnitLanguageDirs(allocator, root, "project root", lua_declared));
+    try testing.expectError(error.MisplacedLanguageDir, scanUnitLanguageDirs(allocator, root, "project root", null));
+}
+
+test "scanUnitLanguageDirs: an EMPTY typescript/ dir is warn-only, like every empty language dir" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(testing.io, "typescript");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    try scanUnitLanguageDirs(allocator, root, "project root", null);
+    const ts_declared = DeclaredLanguage{ .language = "typescript", .plugin_name = "scripting" };
+    try scanUnitLanguageDirs(allocator, root, "project root", ts_declared);
 }
 
 test "scanUnitLanguageDirs: no language dirs at all is a clean pass" {

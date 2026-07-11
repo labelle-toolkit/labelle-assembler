@@ -254,11 +254,12 @@ pub fn Mixin(comptime Self: type) type {
 
             try w.writeAll("    runner.setup(&g);\n");
 
-            // Embedded language scripts (labelle-assembler#593): register every
-            // copied `<language>/` source with the scripting plugin BEFORE
+            // Embedded language scripts (labelle-assembler#593): register
+            // every copied convention-dir source (`lua/`, `ts/` — the
+            // splice's `dir`) with the scripting plugin BEFORE
             // `PluginControllers.setup` below boots the VM — registration is
             // the plugin's boot seam (labelle-scripting `registerScript`).
-            // Names are the stems relative to the language dir (subdirs
+            // Names are the stems relative to the script dir (subdirs
             // joined with `/`), pre-sorted by the root.zig scan so the
             // emission is byte-stable. No-op for splice-less projects.
             if (self.scripting) |s| {
@@ -267,7 +268,7 @@ pub fn Mixin(comptime Self: type) type {
                     try w.print("    // Embedded {s} scripts (via @embedFile) — registered with the\n", .{s.language});
                     try w.writeAll("    // scripting plugin before PluginControllers.setup boots the VM.\n");
                     for (s.script_names) |name| {
-                        try w.print("    scripting.registerScript(\"{s}\", @embedFile(\"{s}/{s}{s}\"));\n", .{ name, s.language, name, s.extension });
+                        try w.print("    scripting.registerScript(\"{s}\", @embedFile(\"{s}/{s}{s}\"));\n", .{ name, s.dir, name, s.extension });
                     }
                     try w.writeByte('\n');
                 }

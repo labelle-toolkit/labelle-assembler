@@ -78,6 +78,17 @@ const idents = @import("codegen/idents.zig");
 /// The registry block imports it verbatim (`@import("scripting_components.zig")`).
 pub const GENERATED_FILENAME = "scripting_components.zig";
 
+/// The ONLY language the v1 declare phase runs: the plugin's runner
+/// (`tools/declare`) IS a lua interpreter executing chunk bodies against a
+/// stub `labelle` — pointing it at any other language's sources (a
+/// typescript project's `ts/*.js`) would "run" JS as lua and fail with a
+/// nonsense parse error naming the wrong problem. `runPhase` skips
+/// non-lua languages cleanly instead (scripts still run; nothing
+/// declares). typescript declarations arrive LATER via `.d.ts`/interface
+/// extraction (a typescript-side declare runner feeding the same schema
+/// seam), at which point this becomes a per-language capability lookup.
+pub const DECLARE_LANGUAGE = "lua";
+
 /// Test seam: absolute path of a prebuilt declare tool. When set, the
 /// build-and-locate step is skipped entirely and this binary is exec'd
 /// over the scripts instead. Same scoped-threadlocal pattern as
@@ -863,11 +874,28 @@ pub const PhaseOptions = struct {
 /// generated `scripting_components.zig` into the target. Returns the
 /// owned Schema when at least one component was declared (the caller
 /// threads `schema.components` onto the splice and keeps the Schema alive
-/// through main.zig emission), null for both no-op shapes (no scripts at
-/// all; scripts but no declarations). Both no-op shapes also delete a
-/// stale generated file left by a previously-declaring project state.
+/// through main.zig emission), null for every no-op shape (no scripts at
+/// all; a non-`DECLARE_LANGUAGE` splice — typescript; scripts but no
+/// declarations). Every no-op shape also deletes a stale generated file
+/// left by a previously-declaring project state.
 pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     if (opts.script_names.len == 0) {
+        removeStaleGeneratedFile(allocator, opts.target_dir);
+        return null;
+    }
+
+    // Language gate (see `DECLARE_LANGUAGE`): the phase is lua-only in v1
+    // — for any other splice language (typescript today) it must SKIP, not
+    // run the lua runner over foreign sources. Note-level stderr line +
+    // the same stale-file cleanup as the other no-op shapes, so a project
+    // switching lua→typescript leaves no orphaned generated file. (The
+    // `runDeclareTool` path join below also assumes dir == language ==
+    // "lua" — revisit when a second declare-capable language lands.)
+    if (!std.mem.eql(u8, opts.language, DECLARE_LANGUAGE)) {
+        diag(
+            "script-declared components are lua-only today — skipping the declare phase for \"{s}\" scripts (they still run, they just can't declare components yet)",
+            .{opts.language},
+        );
         removeStaleGeneratedFile(allocator, opts.target_dir);
         return null;
     }
@@ -1241,4 +1269,54 @@ test "checkCollisions: game components, packs, and the VideoComponent built-in a
         error.ScriptComponentCollision,
         checkCollisions(&packish, &.{}, &.{pack}),
     );
+}
+
+test "runPhase: a non-lua splice (typescript) skips cleanly — null, stale file dropped, tool machinery untouched" {
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A stale generated file from a previous lua project state: the skip
+    // must clean it up exactly like the other no-op shapes.
+    try tmp.dir.createDirPath(tio, "target");
+    {
+        var f = try tmp.dir.createFile(tio, "target/" ++ GENERATED_FILENAME, .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio, "pub const Stale = struct {};\n");
+    }
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target);
+
+    // Deliberately hostile opts: an EMPTY plugin list, no override, no
+    // staged deps — every step past the gate would error. The gate fires
+    // BEFORE `resolvePluginPackageDir`, so typescript returns null without
+    // touching any of it (and without spawning a lua runner over .js).
+    var opts = PhaseOptions{
+        .plugins = &.{},
+        .plugin_name = "scripting",
+        .language = "typescript",
+        .extension = ".js",
+        .script_names = &.{"behavior"},
+        .output_dir = root,
+        .target_dir = target,
+        .project_dir = root,
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+    try testing.expect((try runPhase(allocator, opts)) == null);
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(tio, "target/" ++ GENERATED_FILENAME, .{}),
+    );
+
+    // Negative control: the SAME opts with language "lua" sail past the
+    // gate into the tool machinery (package resolution fails on the empty
+    // plugin list) — the skip above is the language gate, not an accident
+    // of the hostile opts.
+    opts.language = DECLARE_LANGUAGE;
+    opts.extension = ".lua";
+    try testing.expectError(error.DeclareToolBuildFailed, runPhase(allocator, opts));
 }
