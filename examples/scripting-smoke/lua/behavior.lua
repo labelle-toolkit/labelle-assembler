@@ -10,6 +10,8 @@
 -- bounded run, LABELLE_NULL_FRAMES=5:
 --
 --   setup   LUA_INIT               init(): entity created + Position set
+--           LUA_DECLARED_LEVEL_0.875   declared-component round-trip (see
+--                                       the Hunger declaration below)
 --   tick 1  LUA_TICK_1             (subscriptions from chunk load turn
 --                                   ACTIVE at this tick's drain boundary)
 --   tick 2  LUA_TICK_2, LUA_EMIT_OK    emit lua_ping{n=2} onto the bus
@@ -28,6 +30,15 @@
 local tick = 0
 local ball
 local engine_tick_seen = false
+
+-- Declare-mode (labelle-assembler#585/#598, scripting v0.2.0): this ONE
+-- chunk-scope line is read by two consumers. At BUILD time the real
+-- labelle-declare tool (shipped in the plugin's `tools/declare`) extracts
+-- it and the assembler codegens a `Hunger` struct into the target's
+-- `scripting_components.zig`, registered like any components/*.zig file.
+-- At RUNTIME it evaluates to a lightweight ref the Entity methods accept.
+-- 0.875 = 7/8, exact in binary floating point at every width en route.
+local Hunger = labelle.component("Hunger", { level = 0.875, starving = false })
 
 -- Receive side, registered at chunk load (before init): an ENGINE event
 -- that fires every frame in any game shape...
@@ -48,6 +59,25 @@ function init()
     ball = Entity.new()
     ball:set("Position", { x = 0, y = 0 })
     labelle.log("LUA_INIT id=" .. labelle.u64str(ball.id))
+
+    -- Declared-component round-trip. "Hunger" resolves in the engine's
+    -- by-name registry dispatch ONLY because the build extracted the
+    -- declaration above and codegened it. The write is deliberately
+    -- PARTIAL — `level` is absent — so the read-back 0.875 can only be
+    -- the DECLARED default having traveled schema → codegen → registry →
+    -- the contract's parse-with-defaults, through the real ECS and back;
+    -- `starving = true` (non-default) proves the written half too. The
+    -- token is derived from the get, not a constant.
+    if ball:set(Hunger, { starving = true }) then
+        local h = ball:get(Hunger)
+        if h and h.starving then
+            labelle.log("LUA_DECLARED_LEVEL_" .. h.level)
+        else
+            labelle.log("LUA_DECLARED_READBACK_BAD")
+        end
+    else
+        labelle.log("LUA_DECLARED_SET_FAIL")
+    end
 end
 
 function update(dt)

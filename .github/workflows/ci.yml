@@ -369,13 +369,22 @@ jobs:
       # The REAL consumer chain, nothing mocked:
       #
       #   project.labelle `.params.language = "lua"` on the labelle-scripting
-      #   plugin (fetched from GitHub at v0.1.0) → splice embeds
+      #   plugin (fetched from GitHub at v0.2.0) → splice embeds
       #   lua/behavior.lua + registers it pre-VM-boot → labelle-null's
       #   headless template binds `engine.script_contract` → per-frame
       #   `scripting.Controller.tick` runs the VM → `drainEvents` taps the
       #   engine event bus → the behavior creates an entity, moves its
       #   Position, emits a custom `lua_ping` event AND receives it back,
       #   plus the engine's own `engine__tick`.
+      #
+      # v0.2.0 also ships the declare tool, so this run exercises DECLARE
+      # MODE (#585/#598) end-to-end against the real thing: generate builds
+      # `labelle-declare` from the resolved dep (`zig build labelle-declare`),
+      # runs it over lua/, and codegens the behavior's chunk-scope
+      # `labelle.component("Hunger", ...)` into `scripting_components.zig` +
+      # the registry — and the running game then writes/reads the declared
+      # component through the contract (the LUA_DECLARED_LEVEL_0.875 token,
+      # derived from the read-back value, pins the round-trip).
       #
       # Runs bounded (LABELLE_NULL_FRAMES=5) and pins the exact ordered
       # LUA_* milestone sequence — this run doubles as the Script Runtime
@@ -385,9 +394,12 @@ jobs:
           cd labelle-assembler/examples/scripting-smoke
           ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
 
-          # Fetch the scripting plugin (GitHub, v0.1.0) into the package
+          # Fetch the scripting plugin (GitHub, v0.2.0) into the package
           # cache. The backend needs no fetch — `backend_package` pins the
           # sibling labelle-null checkout (see the clone step above).
+          # generate then ALSO builds + runs the dep's real declare tool
+          # (fetching its lua.org dep on first build) — see the step
+          # comment above.
           $ASM install --project-root .
           $ASM generate --project-root .
 
@@ -407,6 +419,17 @@ jobs:
           grep -qF 'engine.script_contract.drainEvents(&g);' $M
           # Build wiring: the plugin's -Dlanguage option.
           grep -qF '.language = .lua' .labelle/null_desktop/build.zig
+          # Declare mode (#585/#598): the REAL labelle-declare tool ran from
+          # the resolved v0.2.0 dep and codegened the script-declared
+          # component into the target...
+          C=.labelle/null_desktop/scripting_components.zig
+          grep -qF 'pub const Hunger = struct' $C
+          # ...with the declared f32 default intact (0.875 = 7/8, exact)...
+          grep -qF 'level: f32 = 0.875,' $C
+          # ...and the registry wires it under its declared name, so the
+          # contract's by-name dispatch (and scenes, saves, queries) see it
+          # like any components/*.zig file.
+          grep -qF '.Hunger = @import("scripting_components.zig").Hunger,' $M
 
           cd .labelle/null_desktop
 
@@ -430,11 +453,15 @@ jobs:
           # Pin the exact ordered milestone sequence. Payload facts are
           # encoded IN the tokens (LUA_EVENT_SEEN_N_2 = the emitted payload
           # round-tripped bit-exact; LUA_MOVED_X_30 = Position reached x=30
-          # on tick 3), so token extraction pins behavior, not just
-          # liveness. See lua/behavior.lua for the frame-by-frame timeline.
-          grep -oE 'LUA_[A-Z0-9_]+' run.log > actual.txt || true
+          # on tick 3; LUA_DECLARED_LEVEL_0.875 = the DECLARED default of
+          # the script-declared Hunger component read back through the real
+          # ECS — the char class includes '.' for exactly that token), so
+          # token extraction pins behavior, not just liveness. See
+          # lua/behavior.lua for the frame-by-frame timeline.
+          grep -oE 'LUA_[A-Z0-9_.]+' run.log > actual.txt || true
           cat > expected.txt <<'END'
           LUA_INIT
+          LUA_DECLARED_LEVEL_0.875
           LUA_TICK_1
           LUA_TICK_2
           LUA_EMIT_OK
@@ -452,7 +479,7 @@ jobs:
             cat run.log
             exit 1
           fi
-          echo "PASS: Lua behavior drove the real engine — entity + Position + emit/subscribe round-trip over 5 headless frames"
+          echo "PASS: Lua behavior drove the real engine — entity + Position + emit/subscribe + declared-component (declare-mode) round-trips over 5 headless frames"
 
       # Smoke test for the Flows end-to-end compile loop
       # (labelle-gui#96). Exercises the full pipeline shipped by
