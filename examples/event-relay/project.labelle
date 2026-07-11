@@ -1,0 +1,41 @@
+// Showcase game for labelle-toolkit#607 — the pure-Zig EVENT BUS cell.
+// `event-relay` proves the game event bus + the assembler's game-root
+// convention scans end to end, with no scripting language and no plugin:
+//
+//   scripts/playing/10_emitter.zig  emits a custom `Pulse` event each
+//                                   frame via `game.emit(...)`,
+//   events/pulse.zig                declares the event payload (scanned
+//                                   into `GameEvents`),
+//   hooks/pulse_watcher.zig         a game-root native hook the assembler
+//                                   auto-folds into `GameHooks`; its
+//                                   `pulse` method fires at the frame's
+//                                   `dispatchEvents`.
+//
+// One `game.emit` reaches the native hook over the real engine bus with
+// zero glue — the Zig twin of the cross-layer interop the scripting
+// examples show from a script language. All engine-level and
+// backend-agnostic, so it builds AND runs deterministically headless on
+// `.null` for CI.
+//
+// VERSION PINS: `local:` siblings in-repo; a pinned assembler release +
+// published versions once lifted into the showcase repo — see
+// docs/showcase-plan.md.
+.{
+    .name = "event_relay",
+    .title = "LaBelle — Event Bus + Hooks Showcase",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    .backend = .null,
+    .y_axis = .up,
+    // No ECS gameplay — the demo is purely the event bus, so the mock
+    // backend keeps it minimal.
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}

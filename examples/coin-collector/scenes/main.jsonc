@@ -1,0 +1,65 @@
+{
+    // Coin-collector field. Y-up design canvas is 480×270 (origin
+    // bottom-left). One Player entity and five Coins; the collect script
+    // homes the player onto the nearest coin and clears the field.
+    //
+    // Everything is a `Shape` so the scene is renderer-agnostic — the
+    // headless `.null` backend, raylib, sokol, and bgfx all draw the
+    // same circles. Gameplay lives entirely in the script; the scene is
+    // just the opening board state.
+    "name": "main",
+    "children": [
+        {
+            "name": "player",
+            "components": {
+                "Position": { "x": 200, "y": 135 },
+                "Shape": {
+                    "shape": { "circle": { "radius": 12 } },
+                    "color": { "r": 240, "g": 210, "b": 60, "a": 255 },
+                    "layer": "world",
+                    "z_index": 5
+                },
+                "Player": { "speed": 300 }
+            }
+        },
+
+        { "name": "coin_0", "components": {
+            "Position": { "x": 240, "y": 135 },
+            "Shape": { "shape": { "circle": { "radius": 6 } }, "color": { "r": 80, "g": 200, "b": 240, "a": 255 }, "layer": "world", "z_index": 1 },
+            "Coin": { "radius": 8 }
+        } },
+        { "name": "coin_1", "components": {
+            "Position": { "x": 180, "y": 190 },
+            "Shape": { "shape": { "circle": { "radius": 6 } }, "color": { "r": 80, "g": 200, "b": 240, "a": 255 }, "layer": "world", "z_index": 1 },
+            "Coin": { "radius": 8 }
+        } },
+        { "name": "coin_2", "components": {
+            "Position": { "x": 110, "y": 95 },
+            "Shape": { "shape": { "circle": { "radius": 6 } }, "color": { "r": 80, "g": 200, "b": 240, "a": 255 }, "layer": "world", "z_index": 1 },
+            "Coin": { "radius": 8 }
+        } },
+        { "name": "coin_3", "components": {
+            "Position": { "x": 320, "y": 100 },
+            "Shape": { "shape": { "circle": { "radius": 6 } }, "color": { "r": 80, "g": 200, "b": 240, "a": 255 }, "layer": "world", "z_index": 1 },
+            "Coin": { "radius": 8 }
+        } },
+        { "name": "coin_4", "components": {
+            "Position": { "x": 280, "y": 210 },
+            "Shape": { "shape": { "circle": { "radius": 6 } }, "color": { "r": 80, "g": 200, "b": 240, "a": 255 }, "layer": "world", "z_index": 1 },
+            "Coin": { "radius": 8 }
+        } },
+
+        {
+            "name": "hud_badge",
+            "components": {
+                "Position": { "x": 60, "y": 245 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 90, "height": 18 } },
+                    "color": { "r": 235, "g": 235, "b": 245, "a": 255 },
+                    "layer": "hud",
+                    "z_index": 0
+                }
+            }
+        }
+    ]
+}

@@ -1,0 +1,46 @@
+// Showcase game for labelle-toolkit#607 — a small *complete* game, not a
+// one-subsystem fixture. `coin-collector` is a top-down collect-'em-up: a
+// player entity homes in on the nearest coin each frame, and picking one
+// up (AABB overlap) destroys it and bumps the score, until the field is
+// cleared.
+//
+// It rounds out the showcase grid with a cell the other examples don't
+// cover: an actual GAMEPLAY LOOP — per-frame ECS queries, homing
+// movement through `getPosition`/`setPosition`, runtime entity
+// destruction (`destroyEntity`), and a win condition — all in one game
+// script. Every touchpoint is renderer-agnostic, so it builds AND runs
+// deterministically on the headless `.null` backend for CI (fixed dt,
+// frame-capped, clean exit) and renders as-is on raylib/sokol/bgfx.
+//
+// VERSION PINS: while it lives in this repo it resolves the runtime
+// packages through `local:` sibling paths (same as every other example
+// here). Lifted into the standalone showcase repo (#607) these become a
+// pinned assembler release + published package versions — see
+// docs/showcase-plan.md.
+.{
+    .name = "coin_collector",
+    .title = "LaBelle — Coin Collector Showcase",
+    .width = 480,
+    .height = 270,
+    .target_fps = 60,
+    // Headless by default so CI can build AND run it with no window / GPU.
+    // Swap for a graphics backend to watch the player sweep the field.
+    .backend = .null,
+    .y_axis = .up,
+    // Real component storage: the collect script's `view(.{Coin})` /
+    // `view(.{Player})` queries and `getPosition` / `setPosition` /
+    // `destroyEntity` round-trip against a live world.
+    .ecs = .zig_ecs,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .resources = .{},
+    .layers = .{
+        .{ .name = "world", .order = 0, .space = .world },
+        .{ .name = "hud", .order = 10, .space = .screen },
+    },
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}

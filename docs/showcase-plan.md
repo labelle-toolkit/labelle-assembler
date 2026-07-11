@@ -32,7 +32,9 @@ draw features from, but they are deliberately minimal, not "games":
 | `flows-smoke`                 | `.null`        | `.flow.jsonc` → flow_codegen → generated scripts    |
 | `packs-demo`                  | `.null`        | pack module wall (isolation, Registry, exposes)     |
 | `plugin-controllers`          | `.null`        | plugin `Controller` setup/tick/deinit lifecycle     |
-| `parallax-scroll` *(new)*     | `.null`        | **showcase seed** — camera layers + parallax scroll |
+| `camera-builtin`              | `.null`        | engine built-in `Camera` component pass-through     |
+| `fantasy-dungeon`             | `.null`        | asset-plugin: bundled packs + atlases, zero config  |
+| `scripting-smoke`             | `.null`+null-sib | Lua scripting via `labelle-scripting` (declare mode) |
 
 Grounded feature surfaces available today (from these fixtures + the
 sibling packages): sprites + `AnimationDef` cycling, camera-layer stack
@@ -41,6 +43,16 @@ sibling packages): sprites + `AnimationDef` cycling, camera-layer stack
 T2 Phase 4 / #560), and scripting languages via `labelle-scripting`
 (lua, ruby). Materials are gated on gfx#305 and are therefore a
 *deferred* showcase entry, not a launch one.
+
+### Scene format note (engine v2.0, #592)
+
+Scene `.jsonc` files use the **unified format**: file-level entities live
+under `"children"` (not the pre-#560 top-level `"entities"` array, which
+engine v2.0 now *rejects* with `error.InvalidFormat`), and asset lists
+are inferred from sprite references (no top-level `"assets"`). Inline
+entities keep their `"components": { … }` wrapper (or flat PascalCase
+keys); only prefab *references* must use `"overrides"`. All showcase
+games below follow this.
 
 ## Proposed showcase games
 
@@ -52,15 +64,28 @@ backend-selectable; the headless ones also run in CI).
 | # | Game                | Primary feature                          | Ships on   | CI assertion            | Status / seed candidate            |
 |---|---------------------|------------------------------------------|------------|-------------------------|------------------------------------|
 | 1 | **parallax-scroll** | camera layers + parallax (`screen_fill` / `world` / `screen`) | `.null` (→ raylib/bgfx) | transcript (`scrolled=N`) | **scaffolded + verified** (this repo) |
-| 2 | **scripting-smoke** | Lua gameplay script via `labelle-scripting` | raylib     | transcript              | ticket seed — lua game             |
-| 3 | **ruby-arena**      | Ruby gameplay script (shape ports from labelle-scripting's ruby example) | raylib | transcript              | ticket seed — ruby example         |
-| 4 | **pack-city**       | packs wall as a real game (bgfx-wasm)    | bgfx-wasm  | build + screenshot      | ticket seed — packs validation game|
-| 5 | **sprite-runner**   | sprite atlas + `AnimationDef` animation  | sokol      | screenshot              | derives from asset-streaming-smoke |
-| 6 | **tile-explorer**   | `.tmx` tilemap + camera follow           | raylib     | screenshot              | uses T2 Phase 4 tilemap embedding  |
-| 7 | **material-demo**   | materials / shaders                      | bgfx/wgpu  | screenshot              | **deferred** — blocked on gfx#305  |
+| 2 | **scripting-smoke** | Lua gameplay script via `labelle-scripting` | `.null`+null-sib | transcript (`LUA_*`) | **scaffolded + verified** (this repo, ticket seed) |
+| 3 | **ruby-orbit**      | Ruby gameplay script via `labelle-scripting` | `.null`+null-sib | transcript (`RUBY_*`) | **scaffolded + verified** (this repo, ticket seed) |
+| 4 | **coin-collector**  | full gameplay loop: queries, homing, collision, `destroyEntity`, win | `.null` (→ raylib/bgfx) | transcript (`score`/`cleared`) | **scaffolded + verified** (this repo) |
+| 5 | **event-relay**     | game event bus + game-root `events/`+`hooks/` (pure Zig) | `.null` (→ any) | transcript (`emit`/`pulse`) | **scaffolded + verified** (this repo) |
+| 6 | **pack-city**       | packs wall as a real game (bgfx-wasm)    | bgfx-wasm  | build + screenshot      | ticket seed — packs validation game|
+| 7 | **sprite-runner**   | sprite atlas + `AnimationDef` animation  | sokol      | screenshot              | derives from asset-streaming-smoke |
+| 8 | **tile-explorer**   | `.tmx` tilemap + camera follow           | raylib     | screenshot              | uses T2 Phase 4 tilemap embedding  |
+| 9 | **material-demo**   | materials / shaders                      | bgfx/wgpu  | screenshot              | **deferred** — blocked on gfx#305  |
 
-Games 2–4 are the ticket's explicit seed candidates. 5–6 round out the
-sprite/animation and tilemap surfaces. 7 is deferred until gfx#305 lands.
+Games 1–5 are scaffolded + verified end-to-end in this repo (generate →
+`zig build` → deterministic headless run). 2 and 3 are the ticket's
+explicit scripting seed candidates (Lua + Ruby). 6 is the ticket's packs
+seed. 7–8 round out the sprite/animation and tilemap surfaces; 9 is
+deferred until gfx#305 lands.
+
+> **`+null-sib`** = the scripting games pin the backend to a
+> `labelle-null` SIBLING checkout (not the registry `.null` shorthand),
+> because the generated main's `script_contract.bind` touchpoint lives in
+> labelle-null's `templates/headless.txt` and the registry release
+> predates it. CI clones labelle-null beside the repo (branch fallback,
+> same pattern as core/engine). Switch to a registry pin once labelle-null
+> cuts a release carrying the touchpoint.
 
 ## Proposed showcase-repo layout
 
@@ -122,20 +147,22 @@ For each game, per its "CI assertion" column:
    into a PNG artifact (raylib desktop exposes `takeScreenshot`; see
    `asset-streaming-smoke`'s `main_scene.zig`).
 
-## Seed delivered in this PR
+## Games delivered in this repo
 
-`examples/parallax-scroll/` is game #1, scaffolded and verified end to
-end in this repo:
+Five games (#1–#5) are scaffolded and verified end to end
+(`assembler install` → `generate` → `zig build` → deterministic headless
+run on `.null`):
 
-```
-$ assembler install  --project-root examples/parallax-scroll
-$ assembler generate --project-root examples/parallax-scroll   # → .labelle/null_desktop/
-$ cd examples/parallax-scroll/.labelle/null_desktop && zig build
-$ ./zig-out/bin/parallax_scroll
-[parallax] frame=1 scrolled=6
-… deterministic, clean exit after LABELLE_NULL_FRAMES frames …
-```
+| Game            | Verified transcript (headless)                                   |
+|-----------------|------------------------------------------------------------------|
+| parallax-scroll | `[parallax] frame=N scrolled=6` — sky + hud stay fixed           |
+| scripting-smoke | ordered `LUA_*` milestone sequence (declare-mode round-trip)     |
+| ruby-orbit      | ordered `RUBY_*` sequence (`RUBY_INIT … RUBY_MOVED_X_50.0 … RUBY_DONE`) |
+| coin-collector  | `score`/`coins_left` per frame, `[collector] cleared` on frame 87 |
+| event-relay     | `[relay] emit n=N` paired with the hook's `[relay] pulse n=N`     |
 
-It is the concrete template the remaining games follow, and it can be
-lifted into the showcase repo's `games/parallax-scroll/` with only the
-version-pin edit described above.
+Each is the concrete template its grid row follows, and each lifts into
+the showcase repo's `games/<name>/` with only the version-pin edit
+described above (plus, for the scripting games, swapping the two `local:`
+deps — the plugin and labelle-null — for registry pins once a
+touchpoint-carrying labelle-null release exists).
