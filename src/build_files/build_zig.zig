@@ -289,6 +289,44 @@ pub const PluginHook = struct {
     plugin_name: []const u8,
 };
 
+/// A declared plugin whose `plugin.labelle` publishes a `.params` schema
+/// (labelle-assembler#591). The assembler stages the resolved params as
+/// `plugin_<name>_params.zig` next to the generated build.zig; here it only
+/// carries the plugin name, which MUST match a `cfg.plugins` entry so the
+/// `plugin_<name>_mod` variable is in scope when the wiring is emitted.
+pub const PluginParamsModule = struct {
+    plugin_name: []const u8,
+};
+
+/// Emit the resolved-params module wiring for every schema-bearing plugin
+/// (labelle-assembler#591): a `b.createModule` rooted at the staged
+/// `plugin_<name>_params.zig` + an `overrideImport(plugin_<name>_mod,
+/// "plugin_config", …)` so the plugin reads its validated params as
+/// `@import("plugin_config")` comptime values — the same `overrideImport`
+/// delivery every other injected module rides.
+///
+/// Must be called AFTER the plugin module decls (`plugin_<name>_mod`) are in
+/// scope. A project whose plugins declare no schema passes an empty slice and
+/// emits nothing — the generated build.zig stays byte-identical.
+fn emitPluginParamsModules(
+    w: anytype,
+    plugin_params: []const PluginParamsModule,
+) !void {
+    if (plugin_params.len == 0) return;
+    try w.writeByte('\n');
+    try w.writeAll("    // Per-plugin resolved `.params` (assembler#591): each schema-bearing\n");
+    try w.writeAll("    // plugin reads its validated params as `@import(\"plugin_config\")`\n");
+    try w.writeAll("    // comptime values from its generated plugin_<name>_params.zig.\n");
+    for (plugin_params) |p| {
+        try w.print("    const plugin_{s}_params_mod = b.createModule(.{{\n", .{p.plugin_name});
+        try w.print("        .root_source_file = b.path(\"plugin_{s}_params.zig\"),\n", .{p.plugin_name});
+        try w.writeAll("        .target = target,\n");
+        try w.writeAll("        .optimize = optimize,\n");
+        try w.writeAll("    });\n");
+        try w.print("    overrideImport(plugin_{s}_mod, \"plugin_config\", plugin_{s}_params_mod);\n", .{ p.plugin_name, p.plugin_name });
+    }
+}
+
 /// Emit the native build-hook CALL for every plugin that ships a
 /// `plugin.hook.zig` (labelle-assembler#518), mirroring the backend
 /// `backend.hook.zig` `post_wire` mechanism. The assembler stages each hook
@@ -349,6 +387,13 @@ pub const BuildZigOptions = struct {
     /// `backend.hook.zig` mechanism. Defaults to empty: a project whose
     /// plugins ship no hook keeps a byte-identical build.zig.
     plugin_hooks: []const PluginHook = &.{},
+    /// Plugins whose `plugin.labelle` publishes a `.params` schema
+    /// (labelle-assembler#591). Each entry emits a `b.createModule` for the
+    /// staged `plugin_<name>_params.zig` + an
+    /// `overrideImport(plugin_<name>_mod, "plugin_config", …)` so the plugin
+    /// reads its validated + resolved params comptime. Defaults to empty:
+    /// params-less projects keep a byte-identical build.zig.
+    plugin_params: []const PluginParamsModule = &.{},
     /// Project root, used to locate the resolved backend package's
     /// `backend.manifest.v2.zon` (pluggable-backends RFC, assembler#453/#461).
     /// Null (default) means no manifest can be loaded, so codegen hard-errors —
@@ -661,6 +706,11 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             try w.print("    overrideImport(game_mod, \"{s}\", plugin_{s}_mod);\n", .{ plugin.name, plugin.name });
         }
     }
+
+    // Resolved plugin-params modules (#591): wire each schema-bearing
+    // plugin's generated `plugin_<name>_params.zig` under the
+    // `plugin_config` import. Emits nothing for params-less projects.
+    try emitPluginParamsModules(w, opts.plugin_params);
 
     // ── Named-module promotion for FlowNodes-bearing game scripts ──
     // (labelle-assembler#240 Gap 2). A game script that exports
@@ -1039,6 +1089,31 @@ test "emitPluginBuildHooks: threads the given artifact name (wasm/lib/exe)" {
     defer aw.deinit();
     try emitPluginBuildHooks(&aw.writer, "lib", &.{.{ .plugin_name = "spine" }});
     try testing.expect(std.mem.indexOf(u8, aw.written(), ".artifact = lib,\n") != null);
+}
+
+test "emitPluginParamsModules: emits the params module + plugin_config overrideImport (#591)" {
+    // A schema-bearing plugin gets its resolved params staged as
+    // `plugin_<name>_params.zig`; the generated build.zig roots a module at
+    // it and injects it under the fixed `plugin_config` import name.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try emitPluginParamsModules(&aw.writer, &.{.{ .plugin_name = "scripting" }});
+
+    try testing.expect(std.mem.indexOf(u8, aw.written(),
+        "    const plugin_scripting_params_mod = b.createModule(.{\n" ++
+            "        .root_source_file = b.path(\"plugin_scripting_params.zig\"),\n" ++
+            "        .target = target,\n" ++
+            "        .optimize = optimize,\n" ++
+            "    });\n" ++
+            "    overrideImport(plugin_scripting_mod, \"plugin_config\", plugin_scripting_params_mod);\n") != null);
+}
+
+test "emitPluginParamsModules: no params emits nothing (byte-identical build.zig, #591)" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try emitPluginParamsModules(&aw.writer, &.{});
+    try testing.expectEqualStrings("", aw.written());
 }
 
 test "emitPluginBuildHooks: no hooks emits nothing (byte-identical build.zig)" {

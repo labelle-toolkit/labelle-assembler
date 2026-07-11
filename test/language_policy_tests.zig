@@ -44,9 +44,10 @@ fn sokolFixtureAbs(allocator: std.mem.Allocator) !generate.PluginDep {
     return .{ .name = "sokol", .repo = repo };
 }
 
-/// A staged tmp game project: `game/` (the project root, with a staged empty
-/// `plugins/scripting/` dir so the scripting `.plugins` entry resolves
-/// cleanly to "no plugin.labelle") and `out/` (the generate output dir).
+/// A staged tmp game project: `game/` (the project root, with a staged
+/// `plugins/scripting/` dir whose plugin.labelle declares the migrated
+/// `language` param schema (#591) so the entry's `.params.language`
+/// validates) and `out/` (the generate output dir).
 const StagedProject = struct {
     tmp: std.testing.TmpDir,
     // `realPathFileAlloc` returns a SENTINEL-terminated slice; keep the
@@ -60,6 +61,21 @@ const StagedProject = struct {
         errdefer tmp.cleanup();
         try tmp.dir.createDirPath(io, "game/plugins/scripting");
         try tmp.dir.createDirPath(io, "out");
+        {
+            var game_root = try tmp.dir.openDir(io, "game", .{});
+            defer game_root.close(io);
+            try writeFileIn(game_root, "plugins/scripting/plugin.labelle",
+                \\.{
+                \\    .name = "labelle-scripting",
+                \\    .manifest_version = 1,
+                \\    .params = .{
+                \\        .{ .name = "language", .type = .@"enum",
+                \\           .values = .{ "lua", "typescript", "ruby", "rust", "crystal", "go", "csharp" },
+                \\           .required = true },
+                \\    },
+                \\}
+            );
+        }
         const game_abs = try tmp.dir.realPathFileAlloc(io, "game", allocator);
         errdefer allocator.free(game_abs);
         const out_abs = try tmp.dir.realPathFileAlloc(io, "out", allocator);
@@ -78,12 +94,12 @@ const StagedProject = struct {
 };
 
 /// The scripting-plugin `.plugins` entry every staged project uses:
-/// `.params = .{ .language = "lua" }` (the generic plugin-params bag, v1
-/// slice), repo pointing at the staged empty local dir.
+/// `.params = .{ .language = "lua" }` in project.labelle spelling (the
+/// generic plugin-params bag), repo pointing at the staged empty local dir.
 const scripting_lua = generate.PluginDep{
     .name = "labelle-scripting",
     .repo = "local:plugins/scripting",
-    .params = .{ .language = "lua" },
+    .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } },
 };
 
 pub const GENERATE_GATE = struct {

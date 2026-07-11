@@ -321,7 +321,7 @@ test "detect: scripting manifest + .params.language → splice with the entry's 
 
     const plugins = [_]config.PluginDep{
         .{ .name = "pathfinding", .repo = "local:plugins/pathfinding" },
-        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "lua" } },
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } } },
     };
     const splice = (try detect(allocator, &plugins, project_dir)).?;
     try testing.expectEqualStrings("scripting", splice.plugin_name);
@@ -343,7 +343,7 @@ test "detect: a typescript declaration splices with the ts/ convention dir and t
     defer allocator.free(project_dir);
 
     const plugins = [_]config.PluginDep{
-        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "typescript" } },
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "typescript" } } } },
     };
     const splice = (try detect(allocator, &plugins, project_dir)).?;
     try testing.expectEqualStrings("scripting", splice.plugin_name);
@@ -381,7 +381,7 @@ test "detect: .params.language on a manifest-less plugin → null (no splice)" {
     defer allocator.free(project_dir);
 
     const plugins = [_]config.PluginDep{
-        .{ .name = "labelle-scripting", .repo = "local:plugins/scripting", .params = .{ .language = "lua" } },
+        .{ .name = "labelle-scripting", .repo = "local:plugins/scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } } },
     };
     try testing.expect((try detect(allocator, &plugins, project_dir)) == null);
 }
@@ -398,7 +398,7 @@ test "detect: .params.language on a differently-named manifest → null" {
     defer allocator.free(project_dir);
 
     const plugins = [_]config.PluginDep{
-        .{ .name = "acme", .repo = "local:plugins/acme", .params = .{ .language = "lua" } },
+        .{ .name = "acme", .repo = "local:plugins/acme", .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } } },
     };
     try testing.expect((try detect(allocator, &plugins, project_dir)) == null);
 }
@@ -436,7 +436,7 @@ test "detect: an embeddable-extension gap (declared language outside the table) 
     // `std.log.warn`, which the Zig test runner tolerates (only a logged
     // `err` fails a test — see the same gate noted in render.zig).
     const plugins = [_]config.PluginDep{
-        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "rust" } },
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "rust" } } } },
     };
     try testing.expect((try detect(allocator, &plugins, project_dir)) == null);
 }

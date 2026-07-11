@@ -14,6 +14,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const cache = @import("cache.zig");
 const plugin_manifest = @import("plugin_manifest.zig");
+const plugin_params = @import("plugin_params.zig");
 const scan = @import("codegen/scan.zig");
 const idents = @import("codegen/idents.zig");
 const check = @import("check.zig");
@@ -508,7 +509,8 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
     const labelle_path = try std.fs.path.join(allocator, &.{ project_dir, "project.labelle" });
     const source_raw = try std.Io.Dir.cwd().readFileAlloc(io, labelle_path, allocator, .limited(1024 * 1024));
     const source = try allocator.dupeZ(u8, source_raw);
-    return try std.zon.parse.fromSliceAlloc(ProjectConfig, allocator, source, null, .{});
+    // #591: route through the params-aware parse (see plugin_params.zig).
+    return try plugin_params.parseProjectConfig(allocator, source);
 }
 
 // ════════════════════════════════════════════════════════════════════════

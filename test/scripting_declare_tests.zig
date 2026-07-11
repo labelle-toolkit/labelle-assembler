@@ -63,7 +63,7 @@ const lua_splice = generate.scripting_splice.ScriptingSplice{
 };
 
 const scripting_plugins = [_]generate.PluginDep{
-    .{ .name = "scripting", .repo = "github:labelle-toolkit/labelle-scripting", .version = "0.1.0", .params = .{ .language = "lua" } },
+    .{ .name = "scripting", .repo = "github:labelle-toolkit/labelle-scripting", .version = "0.1.0", .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } } },
     .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "4.0.1" },
 };
 
@@ -221,7 +221,15 @@ const StagedProject = struct {
         var game = try tmp.dir.openDir(io, "game", .{});
         defer game.close(io);
         try writeFileIn(game, "plugins/scripting/plugin.labelle",
-            \\.{ .name = "scripting", .manifest_version = 1 }
+            \\.{
+            \\    .name = "scripting",
+            \\    .manifest_version = 1,
+            \\    .params = .{
+            \\        .{ .name = "language", .type = .@"enum",
+            \\           .values = .{ "lua", "typescript", "ruby", "rust", "crystal", "go", "csharp" },
+            \\           .required = true },
+            \\    },
+            \\}
         );
         // The script whose chunk scope carries the declaration. Its content
         // is REAL but unread by the staged fake runner below — the runner
@@ -264,7 +272,7 @@ const StagedProject = struct {
             .backend_package = .{ .name = "sokol", .repo = backend_repo },
             .ecs = .mock,
             .plugins = &.{
-                .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "lua" } },
+                .{ .name = "scripting", .repo = "local:plugins/scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } } },
             },
         };
     }

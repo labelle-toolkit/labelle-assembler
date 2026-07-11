@@ -317,7 +317,9 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
     defer allocator.free(source_raw);
 
     const source = try allocator.dupeZ(u8, source_raw);
-    return try std.zon.parse.fromSliceAlloc(gen.ProjectConfig, allocator, source, null, .{});
+    // #591: `.params` bags carry OPEN plugin-declared keys — route through
+    // the params-aware parse (typed fast path when no `.params` is present).
+    return try gen.plugin_params.parseProjectConfig(allocator, source);
 }
 
 // Pull in the subcommand modules' tests when this file is the test root.

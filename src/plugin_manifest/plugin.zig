@@ -13,6 +13,7 @@ const config = @import("../config.zig");
 const cache = @import("../cache.zig");
 const common = @import("common.zig");
 const language_policy = @import("../language_policy.zig");
+const plugin_params = @import("../plugin_params.zig");
 
 const SUPPORTED_MANIFEST_VERSION = common.SUPPORTED_MANIFEST_VERSION;
 const RESERVED_DIR_NAMES = common.RESERVED_DIR_NAMES;
@@ -99,6 +100,17 @@ pub const PluginManifest = struct {
     /// byte-identical.
     requires_language: ?[]const u8 = null,
 
+    /// Schema for the parameters this plugin accepts via its project.labelle
+    /// entry's `.params` bag (plugin-params mechanism, assembler#591). Each
+    /// entry declares a param's name, type (`.str/.i64/.f64/.bool/.@"enum"`
+    /// with `.values`), optional default, and required-ness — see
+    /// `plugin_params.ParamSchema`. The assembler validates the project's
+    /// declared `.params` against this schema at generate time and delivers
+    /// the resolved set comptime as the plugin's `@import("plugin_config")`.
+    /// Empty/absent = the plugin takes no parameters (every plugin before
+    /// this ticket) → byte-identical output.
+    params: []const plugin_params.ParamSchema = &.{},
+
     /// SPDX-style license identifier for a shipped/sold plugin (Asset-Plugins
     /// RFC Phase 2, labelle-cli#300). Surfaced by `labelle plugins`. Optional.
     license: ?[]const u8 = null,
@@ -124,6 +136,7 @@ pub const PluginManifest = struct {
         std.zon.parse.free(self.allocator, self.packs);
         std.zon.parse.free(self.allocator, self.depends_on_resources);
         std.zon.parse.free(self.allocator, self.requires_language);
+        std.zon.parse.free(self.allocator, self.params);
         std.zon.parse.free(self.allocator, self.license);
         std.zon.parse.free(self.allocator, self.author);
     }
@@ -143,6 +156,10 @@ pub const PluginManifest = struct {
 //   error.PluginManifestUnknownVersion     — manifest_version is < 1 or > what we support
 //   error.PluginManifestUnknownLanguage    — requires_language names a language outside
 //                                             language_policy.SUPPORTED_LANGUAGES (#584)
+//   error.PluginManifestInvalidParams      — the `.params` schema is malformed (#591):
+//                                             non-identifier/duplicate name, enum without
+//                                             values, values on a non-enum, default/type
+//                                             mismatch, or required + default
 //
 // The pack-manifest path (`loadPackFromDir`) additionally raises:
 //   error.PackAndPluginManifestConflict    — a pack.labelle dir ALSO ships
@@ -331,6 +348,15 @@ pub fn loadFromDir(
         }
     }
 
+    // ── Validate the `.params` schema (#591) ──
+    // Schema-shape rules (identifier + unique names, enum⇔values pairing,
+    // default/type agreement, required×default exclusivity) are checked at
+    // load so a broken schema is rejected at its source, manifest named. The
+    // MATCH of a project's declared `.params` against this schema needs
+    // project context and runs in the generate-time gate
+    // (`generate_phases.resolvePluginParams`).
+    try plugin_params.validateSchema(expected_name, parsed.params);
+
     return PluginManifest{
         .name = parsed.name,
         .manifest_version = parsed.manifest_version,
@@ -339,6 +365,7 @@ pub fn loadFromDir(
         .packs = parsed.packs,
         .depends_on_resources = parsed.depends_on_resources,
         .requires_language = parsed.requires_language,
+        .params = parsed.params,
         .license = parsed.license,
         .author = parsed.author,
         .allocator = allocator,
@@ -363,6 +390,9 @@ const ZonManifest = struct {
     // Language plugins P1 (#584). Optional/additive — absent parses to the
     // byte-identical null default.
     requires_language: ?[]const u8 = null,
+    // Plugin-params schema (#591). Optional/additive — absent parses to the
+    // byte-identical empty default (no params accepted, no module generated).
+    params: []const plugin_params.ParamSchema = &.{},
 };
 
 // ============================================================================
@@ -945,6 +975,78 @@ test "loadFromDir: rejects a nested pack name that escapes the plugin dir (#576)
 
     const result = loadFromDir(testing.allocator, tmp_path, "evil");
     try testing.expectError(error.PluginManifestUnsafeDirName, result);
+}
+
+test "loadFromDir: parses a `.params` schema (#591)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The migrated scripting shape: `language` is a schema-declared enum
+    // param (no natively-recognized special case), plus an optional tunable.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .params = .{
+        \\        .{ .name = "language", .type = .@"enum",
+        \\           .values = .{ "lua", "typescript" }, .required = true },
+        \\        .{ .name = "heap_kb", .type = .i64, .default = .{ .i64 = 256 } },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "scripting")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqual(@as(usize, 2), manifest.params.len);
+    try testing.expectEqualStrings("language", manifest.params[0].name);
+    try testing.expectEqual(plugin_params.ParamType.@"enum", manifest.params[0].type);
+    try testing.expect(manifest.params[0].required);
+    try testing.expectEqual(@as(usize, 2), manifest.params[0].values.len);
+    try testing.expectEqualStrings("heap_kb", manifest.params[1].name);
+    try testing.expectEqual(@as(i64, 256), manifest.params[1].default.?.i64);
+}
+
+test "loadFromDir: `.params` absent → empty schema (byte-identity default, #591)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{ .name = "code_only", .manifest_version = 1 }
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "code_only")).?;
+    defer manifest.deinit();
+    try testing.expectEqual(@as(usize, 0), manifest.params.len);
+}
+
+test "loadFromDir: rejects a malformed `.params` schema at the source (#591)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Enum without .values — one representative of the schema-shape rules
+    // (the full matrix is pinned by plugin_params.validateSchema's own tests).
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .params = .{
+        \\        .{ .name = "language", .type = .@"enum" },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const result = loadFromDir(testing.allocator, tmp_path, "scripting");
+    try testing.expectError(error.PluginManifestInvalidParams, result);
 }
 
 test "loadFromDir: ignore_unknown_fields allows forward-compat manifests" {

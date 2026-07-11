@@ -3,8 +3,8 @@
 //!
 //! Scripting languages ship as ONE plugin (`labelle-scripting`) whose
 //! `.plugins` entry carries a **singular** `.params = .{ .language = "lua" }`
-//! parameter (the v1 slice of the generic plugin-params bag — see
-//! `config.PluginDep.Params`) — mixing is unrepresentable in config. This
+//! parameter (a schema-declared param of the generic plugin-params bag —
+//! see `plugin_params.zig`) — mixing is unrepresentable in config. This
 //! module is the generate-time enforcement layer of that policy:
 //!
 //!   1. **`.params.language` rules** (`resolveProjectLanguage`): the value
@@ -113,8 +113,11 @@ pub fn resolveProjectLanguage(
 ) error{ UnknownScriptLanguage, MultipleLanguagePlugins }!?DeclaredLanguage {
     var found: ?DeclaredLanguage = null;
     for (plugins) |p| {
-        const params = p.params orelse continue;
-        const lang = params.language orelse continue;
+        // Generic-bag lookup (#591): `language` is now a schema-declared
+        // param like any other — a bag without it (or with a non-string
+        // value, which schema validation rejects separately) is not a
+        // script-language declaration.
+        const lang = p.paramStr("language") orelse continue;
         if (!isSupportedLanguage(lang)) {
             std.debug.print(
                 "labelle-assembler: plugin '{s}' declares unknown script language \"{s}\".\n" ++
@@ -406,12 +409,13 @@ test "resolveProjectLanguage: no declaration → null (script-less project)" {
     try testing.expect((try resolveProjectLanguage(&.{})) == null);
 }
 
-test "resolveProjectLanguage: `.params` bag WITHOUT `.language` → null (#584)" {
-    // A plugin may carry a `.params` bag that sets no `.language` (today the
-    // bag has no other parameter; schema-declared params are the follow-up
-    // ticket). That is NOT a script-language declaration.
+test "resolveProjectLanguage: `.params` bag WITHOUT `.language` → null (#584/#591)" {
+    // A plugin may carry a `.params` bag that sets no `.language` — other
+    // schema-declared params are not this policy's business. That is NOT a
+    // script-language declaration; neither is an empty bag.
     const plugins = [_]config.PluginDep{
-        .{ .name = "pathfinding", .version = "4.0.1", .params = .{} },
+        .{ .name = "pathfinding", .version = "4.0.1", .params = &.{} },
+        .{ .name = "pathfinder", .version = "1.0.0", .params = &.{.{ .name = "grid_size", .value = .{ .i64 = 32 } }} },
     };
     try testing.expect((try resolveProjectLanguage(&plugins)) == null);
 }
@@ -419,7 +423,7 @@ test "resolveProjectLanguage: `.params` bag WITHOUT `.language` → null (#584)"
 test "resolveProjectLanguage: one valid declaration → language + owning plugin" {
     const plugins = [_]config.PluginDep{
         .{ .name = "pathfinding", .version = "4.0.1" },
-        .{ .name = "labelle-scripting", .version = "0.1.0", .params = .{ .language = "lua" } },
+        .{ .name = "labelle-scripting", .version = "0.1.0", .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } } },
     };
     const declared = (try resolveProjectLanguage(&plugins)).?;
     try testing.expectEqualStrings("lua", declared.language);
@@ -428,7 +432,7 @@ test "resolveProjectLanguage: one valid declaration → language + owning plugin
 
 test "resolveProjectLanguage: unknown vocabulary errors (#584)" {
     const plugins = [_]config.PluginDep{
-        .{ .name = "labelle-scripting", .params = .{ .language = "cobol" } },
+        .{ .name = "labelle-scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "cobol" } } } },
     };
     try testing.expectError(error.UnknownScriptLanguage, resolveProjectLanguage(&plugins));
 }
@@ -437,14 +441,14 @@ test "resolveProjectLanguage: two `.params.language` declarations error (#584)" 
     // Two scripting plugins — even AGREEING on the language — are an error:
     // the policy is one scripting plugin entry, singular `.params.language`.
     const plugins = [_]config.PluginDep{
-        .{ .name = "labelle-scripting", .params = .{ .language = "lua" } },
-        .{ .name = "acme-scripting", .params = .{ .language = "rust" } },
+        .{ .name = "labelle-scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } } },
+        .{ .name = "acme-scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "rust" } } } },
     };
     try testing.expectError(error.MultipleLanguagePlugins, resolveProjectLanguage(&plugins));
 
     const agreeing = [_]config.PluginDep{
-        .{ .name = "labelle-scripting", .params = .{ .language = "lua" } },
-        .{ .name = "acme-scripting", .params = .{ .language = "lua" } },
+        .{ .name = "labelle-scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } } },
+        .{ .name = "acme-scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } } },
     };
     try testing.expectError(error.MultipleLanguagePlugins, resolveProjectLanguage(&agreeing));
 }

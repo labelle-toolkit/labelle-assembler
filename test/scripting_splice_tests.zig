@@ -68,13 +68,13 @@ const ts_splice = generate.scripting_splice.ScriptingSplice{
 /// ordinary sibling — the sibling proves the splice never leaks onto other
 /// plugins' wiring.
 const scripting_plugins = [_]generate.PluginDep{
-    .{ .name = "scripting", .repo = "github:labelle-toolkit/labelle-scripting", .version = "0.1.0", .params = .{ .language = "lua" } },
+    .{ .name = "scripting", .repo = "github:labelle-toolkit/labelle-scripting", .version = "0.1.0", .params = &.{ .{ .name = "language", .value = .{ .str = "lua" } } } },
     .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "4.0.1" },
 };
 
 /// The typescript spelling of the same list.
 const ts_scripting_plugins = [_]generate.PluginDep{
-    .{ .name = "scripting", .repo = "github:labelle-toolkit/labelle-scripting", .version = "0.3.0", .params = .{ .language = "typescript" } },
+    .{ .name = "scripting", .repo = "github:labelle-toolkit/labelle-scripting", .version = "0.3.0", .params = &.{ .{ .name = "language", .value = .{ .str = "typescript" } } } },
     .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "4.0.1" },
 };
 
@@ -396,7 +396,15 @@ const StagedTsProject = struct {
         var game_root = try tmp.dir.openDir(e2e_io, "game", .{});
         defer game_root.close(e2e_io);
         try writeFileIn(game_root, "plugins/scripting/plugin.labelle",
-            \\.{ .name = "scripting", .manifest_version = 1 }
+            \\.{
+            \\    .name = "scripting",
+            \\    .manifest_version = 1,
+            \\    .params = .{
+            \\        .{ .name = "language", .type = .@"enum",
+            \\           .values = .{ "lua", "typescript", "ruby", "rust", "crystal", "go", "csharp" },
+            \\           .required = true },
+            \\    },
+            \\}
         );
         // The declare-tool capability marker (labelle-scripting >= 0.2.0
         // ships tools/declare): with it present, ONLY the lua-only
@@ -432,7 +440,7 @@ const StagedTsProject = struct {
             .engine_version = "local:engine-fixture",
             .y_axis = .up,
             .plugins = &.{
-                .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "typescript" } },
+                .{ .name = "scripting", .repo = "local:plugins/scripting", .params = &.{ .{ .name = "language", .value = .{ .str = "typescript" } } } },
             },
         };
     }
@@ -472,6 +480,17 @@ pub const TYPESCRIPT_SPLICE_E2E = struct {
         const build_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
         defer allocator.free(build_zig);
         _ = try indexOfOrFail(build_zig, "const plugin_scripting_dep = b.dependency(\"labelle_scripting\", .{ .target = target, .optimize = optimize, .language = .typescript });");
+
+        // Plugin-params delivery (#591 acceptance): the plugin's schema
+        // resolved the declared `.params` and the assembler (a) staged the
+        // per-plugin config module with the validated value as a comptime
+        // const, and (b) wired it under the `plugin_config` import via
+        // overrideImport in the generated build.zig.
+        const params_mod = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/plugin_scripting_params.zig", allocator, .limited(1 << 20));
+        defer allocator.free(params_mod);
+        _ = try indexOfOrFail(params_mod, "pub const language: []const u8 = \"typescript\";");
+        _ = try indexOfOrFail(build_zig, "const plugin_scripting_params_mod = b.createModule(.{");
+        _ = try indexOfOrFail(build_zig, "overrideImport(plugin_scripting_mod, \"plugin_config\", plugin_scripting_params_mod);");
 
         // Declare phase SKIPPED without error (lua-only v1): no generated
         // component file — even though the plugin fixture ships the

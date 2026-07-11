@@ -25,6 +25,7 @@ const manifest_v2_splice = @import("codegen/manifest_v2_splice.zig");
 const capabilities = @import("capabilities.zig");
 pub const template = @import("template.zig");
 pub const plugin_manifest = @import("plugin_manifest.zig");
+pub const plugin_params = @import("plugin_params.zig");
 pub const scripting_splice = @import("scripting_splice.zig");
 pub const scripting_declare = @import("scripting_declare.zig");
 pub const pack_validate = @import("pack_validate.zig");
@@ -52,6 +53,7 @@ const tilemap_phase = @import("root/tilemap_phase.zig");
 test {
     _ = @import("config.zig");
     _ = @import("plugin_manifest.zig");
+    _ = @import("plugin_params.zig");
     _ = @import("plugin_build_hook.zig");
     _ = @import("pack_validate.zig");
     _ = @import("check.zig");
@@ -353,6 +355,18 @@ pub fn generate(
     // is a separate ticket), so a clean project generates byte-identical
     // output.
     try generate_phases.validateLanguagePolicy(allocator, pack_entries.items, cfg.plugins, game_dir);
+
+    // ── Plugin-params gate + resolution (#591) ─────────────────────────
+    // Validate every plugin entry's `.params` bag against the plugin's
+    // published `plugin.labelle` schema and resolve the final set (project
+    // values + schema defaults) — BEFORE the target dir is created, so an
+    // unknown/mistyped param rejects the build cheaply. The resolved entries
+    // are delivered below: staged as `plugin_<name>_params.zig` next to the
+    // generated build.zig and wired into the plugin's module as
+    // `@import("plugin_config")`. Empty for every schema-less project —
+    // byte-identical output.
+    var plugin_params_entries = try generate_phases.resolvePluginParams(allocator, cfg.plugins, game_dir);
+    defer generate_phases.freePluginParams(allocator, &plugin_params_entries);
 
     // ── Scripting splice detection (labelle-assembler#593) ─────────────
     // The consuming half of the policy above: when THE scripting plugin
@@ -870,6 +884,14 @@ pub fn generate(
     defer allocator.free(plugin_hooks);
     for (plugin_hook_disc.items, 0..) |d, i| plugin_hooks[i] = .{ .plugin_name = d.plugin_name };
 
+    // Resolved plugin params → build.zig wiring entries (#591). Every entry
+    // came from a `plugin.labelle`-bearing plugin, which is by definition a
+    // decl-module plugin (never a light pack), so its `plugin_<name>_mod`
+    // variable is in scope in the generated build.zig.
+    const plugin_params_mods = try allocator.alloc(build_files.PluginParamsModule, plugin_params_entries.items.len);
+    defer allocator.free(plugin_params_mods);
+    for (plugin_params_entries.items, 0..) |e, i| plugin_params_mods[i] = .{ .plugin_name = e.plugin_name };
+
     // Generate build.zig
     // `cfg_modules` (not `cfg`): light packs get no `b.dependency` /
     // `overrideImport` module wiring — their contribution is dir-scan
@@ -882,6 +904,10 @@ pub fn generate(
         .promoted_scripts = promoted_scripts,
         .pack_modules = pack_modules.items,
         .plugin_hooks = plugin_hooks,
+        // Schema-bearing plugins' resolved `.params` (#591): wires each
+        // staged `plugin_<name>_params.zig` (written below) under the
+        // plugin's `plugin_config` import. Empty → byte-identical.
+        .plugin_params = plugin_params_mods,
         // Manifest-driven backend splice (assembler#378): pass the project
         // root so the splice can locate `backend.manifest.zon` + fragments.
         // Only consulted when the gate (desktop + manifest present) fires.
@@ -912,6 +938,18 @@ pub fn generate(
     // `@import` the codegen above emitted resolves in the real output dir.
     // Mirrors `stageBackendBuildHook`. No-op when no plugin ships a hook.
     try plugin_build_hook.stage(allocator, plugin_hook_disc.items, target_dir);
+
+    // Resolved plugin-params modules (#591): stage each schema-bearing
+    // plugin's `plugin_<name>_params.zig` next to the generated build.zig so
+    // the `b.path(...)` module root the codegen above emitted resolves.
+    // Mirrors the build-hook staging. No-op when no plugin declares a schema.
+    for (plugin_params_entries.items) |e| {
+        const fname = try plugin_params.paramsModuleFilename(allocator, e.plugin_name);
+        defer allocator.free(fname);
+        const content = try plugin_params.renderParamsModule(allocator, e.plugin_name, e.resolved);
+        defer allocator.free(content);
+        try scanner.writeFile(target_dir, fname, content);
+    }
 
     // Discover each plugin's `pub const Events` decls at assembler time
     // by AST-walking `<plugin>/src/root.zig`. The shim + main.zig

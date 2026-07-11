@@ -706,7 +706,8 @@ fn readProjectConfig(allocator: std.mem.Allocator, io: std.Io, project_dir: []co
     defer allocator.free(source_raw);
 
     const source = try allocator.dupeZ(u8, source_raw);
-    return try std.zon.parse.fromSliceAlloc(config.ProjectConfig, allocator, source, null, .{});
+    // #591: route through the params-aware parse (see plugin_params.zig).
+    return try gen.plugin_params.parseProjectConfig(allocator, source);
 }
 
 /// readProjectConfig that returns an error instead of treating a missing

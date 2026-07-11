@@ -25,6 +25,7 @@ const cache = @import("../cache.zig");
 const plugin_manifest = @import("../plugin_manifest.zig");
 const pack_validate = @import("../pack_validate.zig");
 const language_policy = @import("../language_policy.zig");
+const plugin_params = @import("../plugin_params.zig");
 const script_scanner = @import("../script_scanner.zig");
 const main_zig = @import("../main_zig.zig");
 const pack_root_gen = @import("../codegen/pack_root.zig");
@@ -476,6 +477,81 @@ pub fn validateLanguagePolicy(
         defer allocator.free(label);
         try language_policy.scanUnitLanguageDirs(allocator, pack_src_dir, label, declared);
     }
+}
+
+/// One plugin's resolved params, ready for delivery: the schema-bearing
+/// plugin's name (borrowed from `cfg.plugins`) plus the validated + resolved
+/// param set (owned — schema defaults were duped out of the manifest's
+/// allocation, which is freed before delivery).
+pub const PluginParamsEntry = struct {
+    plugin_name: []const u8,
+    resolved: []config.Param,
+};
+
+pub fn freePluginParams(allocator: std.mem.Allocator, entries: *std.ArrayList(PluginParamsEntry)) void {
+    for (entries.items) |e| plugin_params.freeParams(allocator, e.resolved);
+    entries.deinit(allocator);
+}
+
+/// Plugin-params validation + resolution gate (labelle-assembler#591). Runs
+/// beside `validateLanguagePolicy` — BEFORE the target dir is created — so a
+/// bad `.params` bag rejects the build cheaply without leaving stale output.
+///
+/// For every `.plugins` entry, load its `plugin.labelle` (same
+/// re-read-per-phase pattern as `validateLanguagePolicy`) and:
+///   - schema declared → validate the entry's `.params` against it
+///     (`plugin_params.validateAndResolve`: unknown key / wrong type /
+///     out-of-vocabulary enum / missing required are actionable errors
+///     naming plugin + param) and collect the resolved set (project values
+///     + schema defaults) for comptime delivery;
+///   - NO schema (or no manifest) but a non-empty `.params` bag →
+///     `error.PluginParamsNotAccepted` — the keys would silently mean
+///     nothing otherwise;
+///   - no schema, no params → skipped entirely (byte-identical: no module,
+///     no wiring).
+///
+/// The returned entries drive the staged `plugin_<name>_params.zig` modules
+/// + the generated build.zig's `overrideImport(…, "plugin_config", …)` calls.
+/// Caller frees via `freePluginParams`.
+pub fn resolvePluginParams(
+    allocator: std.mem.Allocator,
+    plugins: []const config.PluginDep,
+    game_dir: []const u8,
+) !std.ArrayList(PluginParamsEntry) {
+    var entries: std.ArrayList(PluginParamsEntry) = .empty;
+    errdefer freePluginParams(allocator, &entries);
+
+    for (plugins) |plugin| {
+        const declared: []const config.Param = plugin.params orelse &.{};
+
+        var maybe_manifest = try plugin_manifest.loadOptional(allocator, plugin, game_dir);
+        defer if (maybe_manifest) |*m| m.deinit();
+        const schema: []const plugin_params.ParamSchema =
+            if (maybe_manifest) |m| m.params else &.{};
+
+        if (schema.len == 0) {
+            // An EMPTY bag (`.params = .{}`) on a schema-less plugin is
+            // tolerated like an absent one — it declares nothing.
+            if (declared.len > 0) {
+                std.debug.print(
+                    "labelle-assembler: plugin '{s}' does not accept parameters (its plugin.labelle declares no `.params` schema), but project.labelle sets:",
+                    .{plugin.name},
+                );
+                for (declared) |d| std.debug.print(" {s}", .{d.name});
+                std.debug.print(
+                    "\n  remove the `.params` from the plugin entry, or upgrade to a plugin version that declares these params.\n",
+                    .{},
+                );
+                return error.PluginParamsNotAccepted;
+            }
+            continue;
+        }
+
+        const resolved = try plugin_params.validateAndResolve(allocator, plugin.name, declared, schema);
+        errdefer plugin_params.freeParams(allocator, resolved);
+        try entries.append(allocator, .{ .plugin_name = plugin.name, .resolved = resolved });
+    }
+    return entries;
 }
 
 /// Copy (and scan, per manifest `mode`) each plugin's declared convention
@@ -991,9 +1067,10 @@ test "Phase 2: a code-only plugin discovers nothing → byte-identical (#576)" {
 /// `.params = .{ .language = … }`, repo a staged EMPTY local dir
 /// (`<project>/plugins/scripting/`) so `loadOptional` resolves cleanly to
 /// "no plugin.labelle" without warnings or cache access.
-fn stageScriptingPlugin(tmp: *std.testing.TmpDir, lang: []const u8) !config.PluginDep {
+fn stageScriptingPlugin(tmp: *std.testing.TmpDir, comptime lang: []const u8) !config.PluginDep {
     try tmp.dir.createDirPath(testing.io, "plugins/scripting");
-    return .{ .name = "labelle-scripting", .repo = "local:plugins/scripting", .params = .{ .language = lang } };
+    // `lang` is comptime so the params literal has static lifetime.
+    return .{ .name = "labelle-scripting", .repo = "local:plugins/scripting", .params = &.{.{ .name = "language", .value = .{ .str = lang } }} };
 }
 
 test "validateLanguagePolicy: clean project (no .params.language, no language dirs) passes (#584)" {
@@ -1045,8 +1122,8 @@ test "validateLanguagePolicy: two plugins declaring .params.language error (#584
     defer allocator.free(project_dir);
 
     const plugins = [_]config.PluginDep{
-        .{ .name = "labelle-scripting", .repo = "local:plugins/a", .params = .{ .language = "lua" } },
-        .{ .name = "acme-scripting", .repo = "local:plugins/b", .params = .{ .language = "rust" } },
+        .{ .name = "labelle-scripting", .repo = "local:plugins/a", .params = &.{.{ .name = "language", .value = .{ .str = "lua" } }} },
+        .{ .name = "acme-scripting", .repo = "local:plugins/b", .params = &.{.{ .name = "language", .value = .{ .str = "rust" } }} },
     };
     // Fails on the config alone — before any manifest/dir access, so the
     // (nonexistent) repo dirs are never touched.
