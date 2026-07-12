@@ -1563,6 +1563,10 @@ fn finalizeSchema(
 const MAX_DECL_BYTES = 4 * 1024 * 1024;
 /// Cap on the cached schema JSON re-read on a skip hit.
 const MAX_SCHEMA_BYTES = 16 * 1024 * 1024;
+/// Cap on the declare-tool binary read folded into the skip key. Generous —
+/// a Debug native-probe exe is a handful of MB; over the cap folds a read
+/// error (forcing a safe re-run), never a silent stale hit.
+const MAX_TOOL_BYTES = 256 * 1024 * 1024;
 
 /// The outcome of `runGenericDeclarePhase`: either it drove the generic
 /// path (`.handled`, carrying the final schema or null for a no-op/skip),
@@ -1708,7 +1712,7 @@ fn acquireSchemaWithSkip(
     const json_path = try std.fs.path.join(allocator, &.{ skip_dir, "schema.json" });
     defer allocator.free(json_path);
 
-    const digest = try declInputsDigestHex(allocator, opts.target_dir, opts.script_files);
+    const digest = try declInputsDigestHex(allocator, tool_path, opts.target_dir, opts.script_files);
     defer allocator.free(digest);
 
     // Skip hit: stored digest matches AND the cached JSON is readable.
@@ -1732,19 +1736,35 @@ fn acquireSchemaWithSkip(
     return parseSchema(allocator, out);
 }
 
-/// SHA-256 of the declaration inputs (each file's target-relative path +
-/// its bytes), hex-encoded. Path is folded in so a rename/reorder is a
-/// change; an unreadable file folds its error name (never spuriously
-/// matches a prior good run — the tool run then surfaces the real error).
-/// Caller frees.
+/// SHA-256 of the resolved TOOL identity + the declaration inputs (each a
+/// path + its bytes), hex-encoded. The tool binary's bytes are folded in
+/// FIRST so the skip key is tied to the exact declare tool that produced the
+/// cached schema: a scripting pin bump (or a local plugin checkout change)
+/// rebuilds a different exe — a different digest — forcing a re-run even when
+/// the declaration files are byte-identical, so a plugin upgrade can never
+/// leave stale generated components/events (codex #622). Path is folded in
+/// so a rename/reorder is a change; an unreadable input (or an unreadable
+/// tool) folds its error name (never spuriously matches a prior good run —
+/// the tool run then surfaces the real error). Caller frees.
 fn declInputsDigestHex(
     allocator: std.mem.Allocator,
+    tool_path: []const u8,
     target_dir: []const u8,
     script_files: []const []const u8,
 ) ![]u8 {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    // Tool identity first: the exact binary the cached schema came from.
+    hasher.update(tool_path);
+    hasher.update(&.{0});
+    if (cwd.readFileAlloc(io, tool_path, allocator, .limited(MAX_TOOL_BYTES))) |bytes| {
+        defer allocator.free(bytes);
+        hasher.update(bytes);
+    } else |err| {
+        hasher.update(@errorName(err));
+    }
+    hasher.update(&.{0});
     for (script_files) |file_name| {
         hasher.update(file_name);
         hasher.update(&.{0});
@@ -2859,6 +2879,95 @@ test "runPhase: the #619 dispatch flip — a FROZEN-TABLE language (lua) prefers
     // after the lua tool. The table path never creates it.
     try tmp.dir.access(tio, "declare-tool/labelle-declare-cache/.assembler-skip/schema.json", .{});
     try tmp.dir.access(tio, "declare-tool/labelle-declare-cache/.assembler-skip/inputs.sha256", .{});
+}
+
+test "runPhase: the generic skip cache invalidates when the declare TOOL changes (codex #622 — no stale schema on a plugin bump)" {
+    // The skip cache is keyed on the tool binary's bytes + the declaration
+    // inputs. A scripting pin bump ships a DIFFERENT declare tool that can
+    // yield a different schema for byte-identical declaration files; the
+    // cache must NOT reuse the old schema.json. Modelled by rewriting the
+    // (override) tool between two generates with UNCHANGED inputs: run 1
+    // caches schema X, run 2's tool emits schema Y, and run 2 must return Y.
+    // Without the tool identity in the skip key this test returns X (stale).
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "target/components");
+    try tmp.dir.createDirPath(tio, "deps/labelle-scripting");
+    {
+        var f = try tmp.dir.createFile(tio, "deps/labelle-scripting/plugin.labelle", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio,
+            \\.{
+            \\    .name = "scripting",
+            \\    .manifest_version = 1,
+            \\    .languages = .{
+            \\        .{ .name = "rust", .extensions = .{"rs"}, .kind = .native,
+            \\           .module_root = "mod.rs",
+            \\           .declare = .{ .tool = "labelle-declare-rs", .dir = "tools/declare-rs", .events = true } },
+            \\    },
+            \\}
+        );
+    }
+    {
+        var f = try tmp.dir.createFile(tio, "target/components/hunger.rs", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio, "labelle::component! { Hunger { level: f32 = 0.5 } }\n");
+    }
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target);
+
+    const local_pin = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:../labelle-scripting" },
+    };
+    const opts = PhaseOptions{
+        .plugins = &local_pin,
+        .plugin_name = "scripting",
+        .language = "rust",
+        .script_files = &.{"components/hunger.rs"},
+        .output_dir = root,
+        .target_dir = target,
+        .project_dir = root,
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+
+    // Run 1: tool emits a "Hunger" component. Caches schema X.
+    {
+        const tool_x = try writeFakeDeclareTool(
+            allocator,
+            &tmp,
+            "{\"components\":[{\"name\":\"Hunger\",\"persist\":\"persistent\",\"fields\":[]}]}",
+        );
+        defer allocator.free(tool_x);
+        declare_tool_override = tool_x;
+        defer declare_tool_override = null;
+        var schema = (try runPhase(allocator, opts)) orelse return error.TestExpectedSchema;
+        defer schema.deinit();
+        try testing.expectEqualStrings("Hunger", schema.components[0].name);
+    }
+
+    // Run 2: the (rewritten) tool now emits a DIFFERENT component name, with
+    // the declaration file untouched. A tool-blind skip key would return the
+    // stale "Hunger"; the tool-bytes-keyed digest forces a re-run → "Stamina".
+    {
+        const tool_y = try writeFakeDeclareTool(
+            allocator,
+            &tmp,
+            "{\"components\":[{\"name\":\"Stamina\",\"persist\":\"persistent\",\"fields\":[]}]}",
+        );
+        defer allocator.free(tool_y);
+        declare_tool_override = tool_y;
+        defer declare_tool_override = null;
+        var schema = (try runPhase(allocator, opts)) orelse return error.TestExpectedSchema;
+        defer schema.deinit();
+        try testing.expectEqual(@as(usize, 1), schema.components.len);
+        try testing.expectEqualStrings("Stamina", schema.components[0].name);
+    }
 }
 
 test "runPhase: declared events land in the Schema + scripting_events.zig; collisions with events/*.zig gate; stale cleanup" {
