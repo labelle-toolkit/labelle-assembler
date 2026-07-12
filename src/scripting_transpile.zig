@@ -1174,6 +1174,12 @@ pub const PhaseOptions = struct {
     /// typescript row in `DECLARE_RUNNERS` — but wired so a ts-capable
     /// declare runner feeds the same map).
     declared_components: []const scripting_declare.DeclaredComponent = &.{},
+    /// The splice's row-driven authoring→embed transpile source (rev 19),
+    /// threaded from `ScriptingSplice.transpile`. PRIMARY: when set, it is
+    /// the resolved manifest row's source. Null falls back to the frozen
+    /// `EMBED_LANGUAGES` table via `transpileSource(language)` — the shape
+    /// the hermetic tests (which pass only a language name) exercise.
+    transpile: ?scripting_splice.TranspileSource = null,
 };
 
 /// Run the transpile phase for an active embed splice. Returns the NEW
@@ -1196,7 +1202,10 @@ pub const PhaseOptions = struct {
 /// generate's `linkAndScan`, which also removed the stale generated
 /// d.ts inside it).
 pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?[]scripting_splice.EmbedScript {
-    const src = scripting_splice.transpileSource(opts.language) orelse return null;
+    // PRIMARY: the splice's row-derived transpile source (rev 19). Frozen
+    // fallback: the `EMBED_LANGUAGES` table by language name (the hermetic
+    // tests' shape, and pre-`.languages` manifests).
+    const src = opts.transpile orelse scripting_splice.transpileSource(opts.language) orelse return null;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

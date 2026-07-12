@@ -1612,13 +1612,20 @@ fn runGenericDeclarePhase(allocator: std.mem.Allocator, opts: PhaseOptions) !Gen
     const declare = row.declare orelse return .not_applicable;
 
     // ".rs" spelling for messages (finalizeSchema's events-none note),
-    // dot-prefixed to match the hardcoded rows' `.extension`. Stack-lived —
-    // every use is within this frame (before the `manifest.deinit` defer).
+    // in the leading-dot form the hardcoded rows' `.extension` uses. rev 19
+    // A1 pins `.extensions` to the authored dot-spelled form (".rs"), but
+    // this NORMALIZES either spelling — a dotless legacy `"rs"` gets a dot
+    // prepended, a dotted ".rs" is taken verbatim — so the migration is
+    // forgiving. Stack-lived: every use is within this frame (before the
+    // `manifest.deinit` defer).
     var ext_buf: [32]u8 = undefined;
-    const dotted_ext = if (row.extensions.len > 0 and row.extensions[0].len + 1 < ext_buf.len)
-        std.fmt.bufPrint(&ext_buf, ".{s}", .{row.extensions[0]}) catch ""
-    else
-        "";
+    const dotted_ext = blk: {
+        if (row.extensions.len == 0) break :blk "";
+        const raw = row.extensions[0];
+        if (raw.len > 0 and raw[0] == '.') break :blk raw;
+        if (raw.len + 1 >= ext_buf.len) break :blk "";
+        break :blk std.fmt.bufPrint(&ext_buf, ".{s}", .{raw}) catch "";
+    };
 
     // Events capability gate — the rev-17 self-describing capability that
     // replaces the hardcoded `events_min_pin` table: events/ files need the
