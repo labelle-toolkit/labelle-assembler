@@ -120,6 +120,24 @@ pub const GENERATED_FILENAME = "scripting_components.zig";
 /// <Pascal>` payload struct per declared event.
 pub const GENERATED_EVENTS_FILENAME = "scripting_events.zig";
 
+/// How a runner turns the game's declaration files into the schema JSON.
+/// The embed-family languages (lua, ruby) ship a PREBUILT interpreter exe
+/// (`zig build <step_name>`) that is RUN OVER the source files (argv = the
+/// declaration paths) — the runner evaluates them against a stub `labelle`
+/// and prints the schema. Rust has NO interpreter, so its runner is a
+/// CARGO PROBE the assembler GENERATES from the game's `components/*.rs` +
+/// `events/*.rs`: it recomposes the plugin's shipped `component!`/`event!`
+/// macros + `%.14g` emitter (`native/src/labelle.rs`, labelle-scripting PR
+/// #29) around COPIES of those files, `cargo build`s it against a
+/// persistent target dir, and RUNS it with NO arguments — the declarations
+/// are compiled in and `main` prints the accumulated schema (the
+/// compile-and-run route settled on labelle-engine#774). Both kinds end at
+/// the SAME `parseSchema` consumer, so the schema JSON is byte-identical
+/// across every runner (the labelle-scripting cross-runner golden proves
+/// it). Kept a single-field discriminant so assembler#619's fold of this
+/// table into plugin.labelle capability rows stays a mechanical move.
+pub const RunnerKind = enum { exe_over_files, cargo_probe };
+
 /// One declare-capable language: the plugin-shipped runner that extracts
 /// its declarations (each runner IS an interpreter for its language —
 /// pointing it at another language's sources would "run" them as the
@@ -157,6 +175,10 @@ pub const DeclareRunner = struct {
     /// non-semver refs) satisfy the floor, exactly like the capability
     /// probes treat them — the tree is the authority there.
     events_min_pin: []const u8,
+    /// How this runner produces its schema (see `RunnerKind`). Defaults to
+    /// `.exe_over_files` so the lua/ruby rows read unchanged; the rust row
+    /// is the sole `.cargo_probe` today.
+    kind: RunnerKind = .exe_over_files,
 };
 
 /// The declare-capable languages (labelle-engine#237; ruby via
@@ -183,6 +205,26 @@ pub const DECLARE_RUNNERS = [_]DeclareRunner{
         .min_pin = "0.9.0",
         .events_min_pin = "0.10.0",
     },
+    // rust (labelle-engine#774, labelle-scripting PR #29): the native
+    // family's first DECLARING language, and the first `.cargo_probe`
+    // runner. There is no prebuilt exe — `step_name` names the probe
+    // binary the generated crate produces; `tool_dir` is the shipped
+    // native crate whose PRESENCE is the capability probe (an older pin
+    // without `native/src/` predates native-compiled rust and skips
+    // declaration cleanly, exactly like a lua pin without `tools/declare`).
+    // The `component!`/`event!` macros + the schema emitter live in that
+    // crate's `labelle.rs` (checked for real by `runCargoProbe`). rust
+    // declarations are net-new (no released assembler supports them), so
+    // both pins floor at the release that first ships the macros.
+    .{
+        .language = "rust",
+        .step_name = "labelle-declare-rs",
+        .tool_dir = "native/src",
+        .extension = ".rs",
+        .min_pin = "0.11.0",
+        .events_min_pin = "0.11.0",
+        .kind = .cargo_probe,
+    },
 };
 
 /// The declare runner for `language`, or null when script-declared
@@ -200,6 +242,18 @@ pub fn declareRunner(language: []const u8) ?DeclareRunner {
 /// `main_template.scripting_splice` — tests set it around a `generate`
 /// call and clear it after.
 pub threadlocal var declare_tool_override: ?[]const u8 = null;
+
+/// Test seam for the `.cargo_probe` runner (rust): absolute path of a
+/// PREBUILT probe binary that prints the schema JSON on stdout when run
+/// with NO arguments (the declarations are compiled in). When set, the
+/// generate-probe-crate + `cargo build` step is skipped and this binary is
+/// run instead — the assembler suite must never depend on a `cargo` on
+/// PATH or a network crate fetch, the same reason `declare_tool_override`
+/// bypasses the lua/ruby `zig build`. The real probe generation + build is
+/// exercised by labelle-scripting's `rust-example` CI (a released
+/// assembler over the real macros), exactly as the lua/ruby tools' own
+/// behavior is pinned by that repo's goldens rather than here.
+pub threadlocal var declare_probe_override: ?[]const u8 = null;
 
 // In-process cache of the last tool built (see the exec-slice doc above):
 // the package dir it was built from, the runner STEP it was built for
@@ -1293,6 +1347,317 @@ fn runDeclareTool(
     return parseSchema(allocator, result.stdout);
 }
 
+// ── The cargo-probe runner (rust — labelle-engine#774) ───────────────
+//
+// The lua/ruby runners are prebuilt exes RUN OVER the game's source files.
+// Rust has no interpreter: the runner is a probe crate the assembler
+// GENERATES from the game's `components/*.rs` + `events/*.rs`,
+// `cargo build`s, and runs. The generated crate mirrors labelle-scripting's
+// `tools/declare-rs/src/main.rs` — it recomposes the plugin's shipped
+// `native/src/labelle.rs` (the `component!`/`event!` macros + the pure-Rust
+// `%.14g` emitter) via `#[path]`, includes the game's declaration files as
+// modules, and prints `labelle::emit_schema()`. The one twist over the
+// single-file golden: the emitter recovers DECLARATION ORDER from
+// `(file!(), line!())`, so each game file is COPIED into the probe's `src/`
+// under an ordering-encoded name (`decl_0000.rs`, `decl_0001.rs`, …) in the
+// caller's order (components first, then events, alphabetical within each —
+// the same order the lua/ruby argv carries). `file!()` then sorts on that
+// prefix and reproduces the cross-runner order exactly.
+
+/// The probe crate's `Cargo.toml`, mirroring `tools/declare-rs/Cargo.toml`:
+/// the `declare` feature (default-on here — the probe always registers
+/// schemas) turns on the OPTIONAL `inventory` dep the macros collect
+/// through. Never built into a game (games build the staticlib with no
+/// features); only this generate-time probe compiles it.
+const probe_cargo_toml =
+    \\# GENERATED by labelle-assembler — the rust declare probe
+    \\# (labelle-engine#774). Regenerated every `generate`; do not edit.
+    \\[package]
+    \\name = "labelle_declare_rs_probe"
+    \\version = "0.0.0"
+    \\edition = "2021"
+    \\
+    \\[[bin]]
+    \\name = "labelle-declare-rs"
+    \\path = "src/main.rs"
+    \\
+    \\[features]
+    \\default = ["declare"]
+    \\declare = ["dep:inventory"]
+    \\
+    \\[dependencies]
+    \\inventory = { version = "0.3", optional = true }
+    \\
+;
+
+/// The declare-probe binary basename (matches `probe_cargo_toml`'s
+/// `[[bin]].name`), `.exe`-suffixed on Windows for the built-artifact path.
+fn probeBinName(buf: []u8) []const u8 {
+    if (builtin.os.tag == .windows)
+        return std.fmt.bufPrint(buf, "labelle-declare-rs.exe", .{}) catch "labelle-declare-rs.exe";
+    return "labelle-declare-rs";
+}
+
+/// Render the probe's `src/main.rs`: `pub mod labelle` recomposed from the
+/// plugin's shipped `labelle.rs` (absolute `#[path]`, forward-slashed so
+/// the string literal carries no backslash escapes on Windows), one `mod
+/// decl_NNNN;` per copied declaration file (source order preserved by the
+/// zero-padded prefix), and `main` printing the schema. Pure — the writer
+/// side (`buildRustProbe`) copies the files + writes this.
+fn renderProbeMainRs(allocator: std.mem.Allocator, decl_count: usize, labelle_path_fwd: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try w.writeAll(
+        \\//! GENERATED by labelle-assembler — the rust declare probe
+        \\//! (labelle-engine#774). Recomposes the plugin's native/src/labelle.rs
+        \\//! macros around the game's components/*.rs + events/*.rs declaration
+        \\//! files and prints the schema JSON. Regenerated every `generate`; do
+        \\//! not edit.
+        \\
+        \\// The probe uses only labelle's declare surface (macros + emitter),
+        \\// never the runtime Script/Scripts wrappers — those are the game's.
+        \\#![allow(dead_code)]
+        \\
+        \\
+    );
+    try w.print(
+        \\#[path = "{s}"]
+        \\pub mod labelle;
+        \\
+        \\
+    , .{labelle_path_fwd});
+
+    var i: usize = 0;
+    while (i < decl_count) : (i += 1) {
+        try w.print(
+            \\#[path = "decl_{d:0>4}.rs"]
+            \\mod decl_{d:0>4};
+            \\
+        , .{ i, i });
+    }
+
+    try w.writeAll(
+        \\
+        \\fn main() {
+        \\    println!("{}", labelle::emit_schema());
+        \\}
+        \\
+    );
+
+    var arr = aw.toArrayList();
+    errdefer arr.deinit(allocator);
+    return arr.toOwnedSlice(allocator);
+}
+
+/// Write `body` to `abs_path` only when it differs from the current
+/// contents (or the file is absent) — an unchanged file keeps its mtime, so
+/// cargo's fingerprint stays warm and a re-generate that changed nothing is
+/// a no-op build (the module-doc "warm re-generate is a no-op" promise, the
+/// rust twin of the lua/ruby content-keyed zig cache).
+fn writeFileAbsIfDifferent(allocator: std.mem.Allocator, abs_path: []const u8, body: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.readFileAlloc(io, abs_path, allocator, .limited(4 * 1024 * 1024))) |existing| {
+        defer allocator.free(existing);
+        if (std.mem.eql(u8, existing, body)) return;
+    } else |_| {}
+    var f = try cwd.createFile(io, abs_path, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, body);
+}
+
+/// Generate the probe crate under `<output>/declare-tool/rust-probe/`,
+/// `cargo build` it against the persistent `<output>/declare-tool/
+/// rust-probe-target/` dir (both EXTERNAL to the wiped-per-generate deps
+/// tree — same rationale as the lua/ruby install prefix), and return the
+/// built binary's absolute path (caller frees). `labelle_rs` is the
+/// plugin's shipped macro module.
+fn buildRustProbe(allocator: std.mem.Allocator, labelle_rs: []const u8, opts: PhaseOptions) ![]const u8 {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    // Absolutize against OUR cwd: the paths outlive this call (the returned
+    // binary path) and must be cwd-independent for the cargo child (which,
+    // like the lua/ruby `zig build`, we drive with absolute path args).
+    // `output_dir` always exists by now (deps were staged under it).
+    const output_abs = try cwd.realPathFileAlloc(io, opts.output_dir, allocator);
+    defer allocator.free(output_abs);
+    const probe_dir = try std.fs.path.join(allocator, &.{ output_abs, "declare-tool", "rust-probe" });
+    defer allocator.free(probe_dir);
+    const src_dir = try std.fs.path.join(allocator, &.{ probe_dir, "src" });
+    defer allocator.free(src_dir);
+    const target_dir = try std.fs.path.join(allocator, &.{ output_abs, "declare-tool", "rust-probe-target" });
+    defer allocator.free(target_dir);
+    try cwd.createDirPath(io, src_dir);
+
+    // The macro module, absolute + forward-slashed for the `#[path]` string
+    // literal (rustc accepts `/` on every OS; backslashes would be escapes).
+    const labelle_abs = try cwd.realPathFileAlloc(io, labelle_rs, allocator);
+    defer allocator.free(labelle_abs);
+    const labelle_fwd = try allocator.dupe(u8, labelle_abs);
+    defer allocator.free(labelle_fwd);
+    std.mem.replaceScalar(u8, labelle_fwd, '\\', '/');
+
+    // Copy each declaration file into `src/decl_NNNN.rs` (ordering-encoded —
+    // see the section doc), reading through the target link exactly as the
+    // lua/ruby argv joins `<target>/<file>`.
+    for (opts.script_files, 0..) |file, i| {
+        const src_path = try std.fs.path.join(allocator, &.{ opts.target_dir, file });
+        defer allocator.free(src_path);
+        const body = cwd.readFileAlloc(io, src_path, allocator, .limited(4 * 1024 * 1024)) catch |err| {
+            diag("could not read the rust declaration file {s}: {s}", .{ src_path, @errorName(err) });
+            return error.DeclareToolBuildFailed;
+        };
+        defer allocator.free(body);
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "decl_{d:0>4}.rs", .{i}) catch return error.NameTooLong;
+        const dest = try std.fs.path.join(allocator, &.{ src_dir, name });
+        defer allocator.free(dest);
+        try writeFileAbsIfDifferent(allocator, dest, body);
+    }
+
+    const manifest = try std.fs.path.join(allocator, &.{ probe_dir, "Cargo.toml" });
+    defer allocator.free(manifest);
+    try writeFileAbsIfDifferent(allocator, manifest, probe_cargo_toml);
+
+    const main_rs_path = try std.fs.path.join(allocator, &.{ src_dir, "main.rs" });
+    defer allocator.free(main_rs_path);
+    const main_rs = try renderProbeMainRs(allocator, opts.script_files.len, labelle_fwd);
+    defer allocator.free(main_rs);
+    try writeFileAbsIfDifferent(allocator, main_rs_path, main_rs);
+
+    // Build (debug — the spike measured cold ~1.4s / warm ~0.4s, well inside
+    // the accepted lua/ruby envelope). `--manifest-path`/`--target-dir` are
+    // absolute, so no `.cwd` is needed; cargo inherits our environment
+    // (RUSTUP_HOME/CARGO_HOME the native rust lane already requires).
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "cargo", "build", "--quiet", "--manifest-path", manifest, "--target-dir", target_dir },
+    }) catch |err| {
+        diag("could not run `cargo build` for the rust declare probe in {s}: {s}", .{ probe_dir, @errorName(err) });
+        return error.DeclareToolBuildFailed;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            relayChildStderr(result.stderr);
+            diag("`cargo build` failed (exit {d}) for the rust declare probe in {s}", .{ code, probe_dir });
+            return error.DeclareToolBuildFailed;
+        },
+        else => {
+            relayChildStderr(result.stderr);
+            diag("`cargo build` terminated abnormally for the rust declare probe in {s}", .{probe_dir});
+            return error.DeclareToolBuildFailed;
+        },
+    }
+
+    var exe_buf: [64]u8 = undefined;
+    const bin = try std.fs.path.join(allocator, &.{ target_dir, "debug", probeBinName(&exe_buf) });
+    errdefer allocator.free(bin);
+    if (!cache.dirExists(bin)) {
+        diag("`cargo build` succeeded but the rust declare probe binary {s} is missing", .{bin});
+        return error.DeclareToolBuildFailed;
+    }
+    return bin;
+}
+
+/// Run a prebuilt declare-probe binary (no arguments — the declarations are
+/// compiled in) and parse its stdout as the schema. Shares the exit/stderr
+/// contract with `runDeclareTool`.
+fn runProbeBinary(allocator: std.mem.Allocator, bin_path: []const u8) !Schema {
+    const io = config.globalIo();
+    const result = std.process.run(allocator, io, .{ .argv = &.{bin_path} }) catch |err| {
+        diag("could not run the rust declare probe {s}: {s}", .{ bin_path, @errorName(err) });
+        return error.ScriptDeclarationFailed;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            relayChildStderr(result.stderr);
+            diag("rust declarations failed (declare probe exit {d})", .{code});
+            return error.ScriptDeclarationFailed;
+        },
+        else => {
+            relayChildStderr(result.stderr);
+            diag("the rust declare probe terminated abnormally", .{});
+            return error.ScriptDeclarationFailed;
+        },
+    }
+    return parseSchema(allocator, result.stdout);
+}
+
+/// The `.cargo_probe` runner: capability-probe the plugin's macro module,
+/// generate + build the probe crate, run it, parse the schema — the rust
+/// analogue of `ensureDeclareTool` + `runDeclareTool`. Returns
+/// `error.DeclareToolAbsent` (→ the shared skip) when the pinned plugin
+/// ships no native crate.
+fn runCargoProbe(allocator: std.mem.Allocator, pkg_dir: []const u8, opts: PhaseOptions) !Schema {
+    // Hermetic-test bypass: run a prebuilt fake probe over no sources.
+    if (declare_probe_override) |p| return runProbeBinary(allocator, p);
+
+    // Capability probe: the shipped macro module must exist. A pre-macro /
+    // pre-native pin lacks it — skip declaration (a working native project),
+    // never a hard failure, mirroring the lua/ruby tool-dir presence probe.
+    const labelle_rs = try std.fs.path.join(allocator, &.{ pkg_dir, "native", "src", "labelle.rs" });
+    defer allocator.free(labelle_rs);
+    if (!cache.dirExists(labelle_rs)) return error.DeclareToolAbsent;
+
+    const bin = try buildRustProbe(allocator, labelle_rs, opts);
+    defer allocator.free(bin);
+    return runProbeBinary(allocator, bin);
+}
+
+/// The shared absent-tool outcome for both runner kinds: the pointed
+/// events-floor error when `events/*` files exist (they can't declare
+/// without the tool), else the note-level component skip + stale-file
+/// cleanup + a null return (the phase no-ops, the project keeps
+/// generating). `mode` only selects the wording — the two kinds name
+/// different missing artifacts (a declare tool dir vs the native crate).
+const ToolAbsentMode = enum { exe, cargo };
+
+fn declareToolAbsent(
+    allocator: std.mem.Allocator,
+    opts: PhaseOptions,
+    runner: DeclareRunner,
+    mode: ToolAbsentMode,
+) !?Schema {
+    switch (mode) {
+        .exe => {
+            if (opts.event_files.len > 0) {
+                diag(
+                    "the pinned scripting plugin ships no {s} declare tool (no {s} in the package), but the project declares events in events/ files — script-declared events need labelle-scripting >= {s}:",
+                    .{ opts.language, runner.tool_dir, runner.events_min_pin },
+                );
+                diagFileList(opts.event_files);
+                return error.ScriptEventsPinTooOld;
+            }
+            diag(
+                "the pinned scripting plugin ships no {s} declare tool (no {s} in the package) — script-declared components are disabled this generate; pin labelle-scripting >= {s} to use component declarations",
+                .{ opts.language, runner.tool_dir, runner.min_pin },
+            );
+        },
+        .cargo => {
+            if (opts.event_files.len > 0) {
+                diag(
+                    "the pinned scripting plugin ships no {s} native crate ({s}/labelle.rs — the declare macros), but the project declares events in events/*{s} files — script-declared events need labelle-scripting >= {s}:",
+                    .{ opts.language, runner.tool_dir, runner.extension, runner.events_min_pin },
+                );
+                diagFileList(opts.event_files);
+                return error.ScriptEventsPinTooOld;
+            }
+            diag(
+                "the pinned scripting plugin ships no {s} native crate ({s}/labelle.rs — the declare macros) — script-declared components are disabled this generate; pin labelle-scripting >= {s} to use component declarations",
+                .{ opts.language, runner.tool_dir, runner.min_pin },
+            );
+        },
+    }
+    removeStaleGeneratedFiles(allocator, opts.target_dir);
+    return null;
+}
+
 // ── Phase orchestration (called from root.zig's generate) ────────────
 
 pub const PhaseOptions = struct {
@@ -1405,31 +1770,30 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     );
     defer allocator.free(pkg_dir);
 
-    const tool_path = ensureDeclareTool(allocator, pkg_dir, opts.output_dir, runner) catch |err| switch (err) {
-        error.DeclareToolAbsent => {
-            if (opts.event_files.len > 0) {
-                diag(
-                    "the pinned scripting plugin ships no {s} declare tool (no {s} in the package), but the project declares events in events/ files — script-declared events need labelle-scripting >= {s}:",
-                    .{ opts.language, runner.tool_dir, runner.events_min_pin },
-                );
-                diagFileList(opts.event_files);
-                return error.ScriptEventsPinTooOld;
-            }
-            diag(
-                "the pinned scripting plugin ships no {s} declare tool (no {s} in the package) — script-declared components are disabled this generate; pin labelle-scripting >= {s} to use component declarations",
-                .{ opts.language, runner.tool_dir, runner.min_pin },
+    // The two runner kinds differ ONLY in how the schema JSON is produced
+    // (see `RunnerKind`) — the absent-tool skip and the whole consumer path
+    // below are shared. The lua/ruby (`.exe_over_files`) branch is left
+    // byte-for-byte as it shipped; rust adds the `.cargo_probe` branch.
+    var schema = switch (runner.kind) {
+        .exe_over_files => exe: {
+            const tool_path = ensureDeclareTool(allocator, pkg_dir, opts.output_dir, runner) catch |err| switch (err) {
+                error.DeclareToolAbsent => return declareToolAbsent(allocator, opts, runner, .exe),
+                else => return err,
+            };
+            break :exe try runDeclareTool(
+                allocator,
+                tool_path,
+                opts.target_dir,
+                opts.script_files,
             );
-            removeStaleGeneratedFiles(allocator, opts.target_dir);
-            return null;
         },
-        else => return err,
+        .cargo_probe => probe: {
+            break :probe runCargoProbe(allocator, pkg_dir, opts) catch |err| switch (err) {
+                error.DeclareToolAbsent => return declareToolAbsent(allocator, opts, runner, .cargo),
+                else => return err,
+            };
+        },
     };
-    var schema = try runDeclareTool(
-        allocator,
-        tool_path,
-        opts.target_dir,
-        opts.script_files,
-    );
     errdefer schema.deinit();
 
     // events/ files that declare NOTHING are a pointed error, not a
@@ -2485,4 +2849,57 @@ test "runPhase: declared events land in the Schema + scripting_events.zig; colli
         error.FileNotFound,
         tmp.dir.access(tio, "target/" ++ GENERATED_EVENTS_FILENAME, .{}),
     );
+}
+
+// ── The cargo-probe runner (rust) — probe-crate generation ───────────
+
+test "DECLARE_RUNNERS: the rust row is a cargo_probe; lua/ruby stay exe_over_files" {
+    try testing.expectEqual(RunnerKind.cargo_probe, declareRunner("rust").?.kind);
+    try testing.expectEqual(RunnerKind.exe_over_files, declareRunner("lua").?.kind);
+    try testing.expectEqual(RunnerKind.exe_over_files, declareRunner("ruby").?.kind);
+    try testing.expectEqualStrings(".rs", declareRunner("rust").?.extension);
+}
+
+test "renderProbeMainRs: recomposes labelle + one ordered mod per decl + emits the schema" {
+    const got = try renderProbeMainRs(testing.allocator, 3, "/abs/deps/labelle-scripting/native/src/labelle.rs");
+    defer testing.allocator.free(got);
+
+    // The macro module is recomposed from the plugin's shipped labelle.rs
+    // (absolute #[path]) at the CRATE ROOT (`pub mod labelle`) so each decl
+    // module's `use crate::labelle;` and the macros' `$crate::labelle::…`
+    // resolve — exactly the tools/declare-rs/src/main.rs shape.
+    try testing.expect(std.mem.indexOf(u8, got, "#[path = \"/abs/deps/labelle-scripting/native/src/labelle.rs\"]\npub mod labelle;") != null);
+    // One module per declaration file, zero-padded so file!() sorts in the
+    // caller's (components-then-events) order.
+    try testing.expect(std.mem.indexOf(u8, got, "#[path = \"decl_0000.rs\"]\nmod decl_0000;") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "#[path = \"decl_0001.rs\"]\nmod decl_0001;") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "#[path = \"decl_0002.rs\"]\nmod decl_0002;") != null);
+    // Exactly `decl_count` modules — no decl_0003.
+    try testing.expect(std.mem.indexOf(u8, got, "decl_0003") == null);
+    // The probe main prints the accumulated schema (the labelle-declare
+    // main.zig contract — one line + newline).
+    try testing.expect(std.mem.indexOf(u8, got, "println!(\"{}\", labelle::emit_schema());") != null);
+    // The declare surface is dead-code-clean (the runtime wrappers unused).
+    try testing.expect(std.mem.indexOf(u8, got, "#![allow(dead_code)]") != null);
+}
+
+test "renderProbeMainRs: a Windows backslash macro path is forward-slashed for the literal (no escapes)" {
+    // buildRustProbe forward-slashes the absolute labelle.rs path before it
+    // reaches the renderer; the renderer emits it verbatim, so a raw
+    // backslash would be an invalid Rust escape. Pin that the caller's
+    // forward-slashed spelling passes through and no backslash survives.
+    const got = try renderProbeMainRs(testing.allocator, 0, "C:/Users/x/deps/labelle-scripting/native/src/labelle.rs");
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "#[path = \"C:/Users/x/deps/labelle-scripting/native/src/labelle.rs\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\\") == null);
+    // Zero declarations → no decl modules, still a valid main.
+    try testing.expect(std.mem.indexOf(u8, got, "decl_0000") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "fn main()") != null);
+}
+
+test "probe_cargo_toml: turns on the optional inventory dep via the declare feature; names the bin" {
+    try testing.expect(std.mem.indexOf(u8, probe_cargo_toml, "declare = [\"dep:inventory\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, probe_cargo_toml, "default = [\"declare\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, probe_cargo_toml, "inventory = { version = \"0.3\", optional = true }") != null);
+    try testing.expect(std.mem.indexOf(u8, probe_cargo_toml, "name = \"labelle-declare-rs\"") != null);
 }

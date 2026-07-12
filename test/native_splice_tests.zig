@@ -72,6 +72,23 @@ fn indexOfOrFail(haystack: []const u8, needle: []const u8) !usize {
     };
 }
 
+/// Stage an executable fake declare PROBE beside the fixture and return its
+/// absolute path (caller frees). Rust's runner runs a prebuilt probe binary
+/// with NO arguments (the declarations are compiled in), so the fake just
+/// prints the schema — a `#!/bin/sh` stub, not a real cargo build, exactly
+/// like the lua/ruby `stageFakeRunner`: the assembler suite must never
+/// depend on a `cargo` on PATH or a network crate fetch (the real generate
+/// + build is labelle-scripting's `rust-example` CI). Pointed at
+/// `scripting_declare.declare_probe_override` by the caller.
+fn stageFakeProbe(tmp: std.testing.TmpDir, allocator: std.mem.Allocator, schema_json: []const u8) ![:0]const u8 {
+    const body = try std.fmt.allocPrint(allocator, "#!/bin/sh\necho '{s}'\n", .{schema_json});
+    defer allocator.free(body);
+    var f = try tmp.dir.createFile(io, "fake-declare-rs", .{ .permissions = .executable_file });
+    defer f.close(io);
+    try f.writeStreamingAll(io, body);
+    return tmp.dir.realPathFileAlloc(io, "fake-declare-rs", allocator);
+}
+
 /// The in-tree sokol backend fixture as an ABSOLUTE `local:` repo (staged
 /// games live in tmp dirs, so the repo-relative spelling can't resolve).
 fn sokolFixtureRepoAbs(allocator: std.mem.Allocator) ![]const u8 {
@@ -618,5 +635,83 @@ pub const NATIVE_SPLICE_E2E = struct {
         const staged_mod = try staged.tmp.dir.readFileAlloc(io, "out/deps/labelle-scripting/native/src/game/mod.rs", allocator, .limited(4096));
         defer allocator.free(staged_mod);
         _ = try indexOfOrFail(staged_mod, "REPLACED AT GENERATE");
+    }
+};
+
+// ── The declare phase for the NATIVE family (labelle-engine#774) ──────
+//
+// The native family DECLARES components/events in `.rs` the same way the
+// embed family declares them in `.rb`/`.lua`; only the runner mechanism
+// differs (a generated cargo probe vs a prebuilt exe). These pin the
+// assembler's half — the collection + the cargo-probe wiring + the shared
+// consumer path — through the real `generate`, with the cargo build itself
+// bypassed by `declare_probe_override` (the real build is the scripting
+// repo's `rust-example` CI, exactly as the lua/ruby tools' behavior is
+// pinned by that repo's goldens, not here).
+pub const NATIVE_DECLARE_E2E = struct {
+    /// The pinned schema example — what the staged fake probe prints.
+    const hunger_schema =
+        \\{"components":[{"name":"Hunger","persist":"persistent","fields":[{"name":"level","type":"f32","default":1.0},{"name":"starving","type":"bool","default":false}]}]}
+    ;
+
+    test "a declaring RUST project generates scripting_components.zig (real generate, cargo-probe override)" {
+        const allocator = std.testing.allocator;
+        // No scripts/ dir: the declare phase is independent of the native
+        // script staging (a 100% .rs-declarations game needs no behavior
+        // scripts to declare components), so stageNativeSources no-ops and
+        // the tests target needs no deps recreation.
+        var staged = try StagedRustProject.init(allocator, .{ .with_rust_dir = false });
+        defer staged.deinit(allocator);
+        var game = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game.close(io);
+        // The rust declaration file, where its KIND lives (#237) — beside
+        // any Zig components. Its body is REAL but unread by the fake probe
+        // (the macros' real behavior is the scripting repo's golden).
+        try writeFileIn(game, "components/hunger.rs",
+            \\use crate::labelle;
+            \\labelle::component! { Hunger { level: f32 = 0.875, starving: bool = false } }
+        );
+
+        const fake = try stageFakeProbe(staged.tmp, allocator, hunger_schema);
+        defer allocator.free(fake);
+        generate.scripting_declare.declare_probe_override = fake;
+        defer generate.scripting_declare.declare_probe_override = null;
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = true });
+
+        // The cargo-probe path fed the SAME consumer as lua/ruby: the
+        // component codegenned into scripting_components.zig, canonical shape.
+        const gen_src = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/scripting_components.zig", allocator, .limited(64 * 1024));
+        defer allocator.free(gen_src);
+        _ = try indexOfOrFail(gen_src, "pub const Hunger = struct {");
+        // The fake prints hunger_schema (level 1.0 → `= 1`); the REAL macro's
+        // 0.875 byte-parity is the scripting repo's cross-runner golden.
+        _ = try indexOfOrFail(gen_src, "level: f32 = 1,");
+    }
+
+    test "no .rs declarations → the native declare phase is a silent no-op (no generated file)" {
+        // The invariant the rust-example CI pins for a NON-declaring native
+        // game: with no components/*.rs (and no events/*.rs) the phase
+        // returns at its zero-files gate before touching the cargo probe —
+        // no file, no note. (The override is set but never reached.)
+        const allocator = std.testing.allocator;
+        var staged = try StagedRustProject.init(allocator, .{ .with_rust_dir = false });
+        defer staged.deinit(allocator);
+
+        const fake = try stageFakeProbe(staged.tmp, allocator, hunger_schema);
+        defer allocator.free(fake);
+        generate.scripting_declare.declare_probe_override = fake;
+        defer generate.scripting_declare.declare_probe_override = null;
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = true });
+
+        try std.testing.expectError(
+            error.FileNotFound,
+            staged.tmp.dir.access(io, "out/sokol_desktop/scripting_components.zig", .{}),
+        );
     }
 };

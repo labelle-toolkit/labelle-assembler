@@ -582,9 +582,17 @@ pub fn generate(
     var combined_embeds: ?[]scripting_splice.EmbedScript = null;
     defer if (combined_embeds) |cb| allocator.free(cb);
     if (maybe_scripting) |*s| {
+        // Declaration files (`components/*.<ext>`, `events/*.<ext>`) are
+        // collected for BOTH families (labelle-engine#774): a native
+        // language declares components/events in `.rs` the same way an
+        // embed language declares them in `.rb`/`.lua` — only SCRIPTS
+        // differ (embed embeds+registers them, native stages+compiles them
+        // via `stageNativeSources`). These feed the declare phase's runner;
+        // for the native family they are NOT concatenated onto `s.scripts`
+        // (nothing embeds — the `registerScript` builders stay empty).
+        component_embeds = try scripting_splice.collectComponentEmbeds(allocator, game_dir, s.*);
+        event_embeds = try scripting_splice.collectEventEmbeds(allocator, game_dir, s.*);
         if (s.family == .embed) {
-            component_embeds = try scripting_splice.collectComponentEmbeds(allocator, game_dir, s.*);
-            event_embeds = try scripting_splice.collectEventEmbeds(allocator, game_dir, s.*);
             script_embeds = try scripting_splice.collectEmbedScripts(allocator, game_dir, target_dir, s.*);
             combined_embeds = try scripting_splice.concatEmbeds3(allocator, component_embeds.?, event_embeds.?, script_embeds.?);
             s.scripts = combined_embeds.?;
@@ -931,9 +939,35 @@ pub fn generate(
         // chunk-scope declarations remain legal, all sources feed ONE
         // schema (the runner owns duplicate detection with
         // first-declared-in attribution).
-        const script_files = try allocator.alloc([]const u8, s.scripts.len);
+        // The runner input: for the EMBED family it is the whole collection
+        // (`s.scripts` = components ++ events ++ scripts — in-script
+        // chunk-scope declarations remain legal). For the NATIVE family
+        // (labelle-engine#774) `s.scripts` is empty (nothing embeds); the
+        // declaration files are the `components/*.<ext>` + `events/*.<ext>`
+        // collections instead — components first, then events, alphabetical
+        // within each, exactly the order the embed argv carries (no
+        // script-dir files: a native script can't chunk-declare).
+        const script_files = blk: {
+            if (s.family == .embed) {
+                const sf = try allocator.alloc([]const u8, s.scripts.len);
+                for (s.scripts, sf) |sc, *f| f.* = sc.file;
+                break :blk sf;
+            }
+            const nc = if (component_embeds) |ce| ce.len else 0;
+            const ne = if (event_embeds) |ee| ee.len else 0;
+            const sf = try allocator.alloc([]const u8, nc + ne);
+            var i: usize = 0;
+            if (component_embeds) |ce| for (ce) |sc| {
+                sf[i] = sc.file;
+                i += 1;
+            };
+            if (event_embeds) |ee| for (ee) |sc| {
+                sf[i] = sc.file;
+                i += 1;
+            };
+            break :blk sf;
+        };
         defer allocator.free(script_files);
-        for (s.scripts, script_files) |sc, *f| f.* = sc.file;
         // The events-dir subset rides along separately (labelle-engine
         // #772): the phase's events gates (`events_min_pin` floor,
         // no-runner hard error, declares-nothing error) fire on these
