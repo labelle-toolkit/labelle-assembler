@@ -517,32 +517,45 @@ pub fn generate(
     // does its own richer walk (state-directory binding, numeric
     // prefix ordering, etc.). `linkDir` gives the same layout as
     // `linkAndScan` without the redundant name collection.
+    //
+    // The SAME dir doubles as the script-LANGUAGE convention home
+    // (labelle-engine#237): a scripting splice's `scripts/*.lua` (.rb, …)
+    // live beside the Zig scripts, extension-keyed — the Zig scanner
+    // collects only `.zig`, the splice collection below only the
+    // language's extension, so the two layers share one structure without
+    // ever seeing each other's files.
     try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 
-    // ── Scripting splice: copy + scan the script dir (#593) ────────────
-    // Mirror the prefabs/scenes convention-dir copy for the declared
-    // language's convention dir (`lua/`, `ts/` — the splice's `dir`; game
-    // root, `requires_language` pack dirs come later): link it into the
-    // target so the generated main's `@embedFile("<dir>/<stem><ext>")`
-    // resolves, and record the SORTED stems (subdir paths joined with `/`,
-    // `linkAndScan`'s contract) as the script names the lifecycle builders
-    // register. A missing dir scans empty — the plugin is wired, nothing
-    // embeds. Authored `.ts` sources are NOT collected here (the scan is
-    // embed-extension-only) — the transpile phase below (labelle-engine
-    // #745, ordered after deps staging) checks + emits them and REPLACES
-    // this scan's names with the materialized dir's.
+    // ── Scripting splice: collect the script dir (#593/#237) ───────────
+    // Collect the declared language's sources from the dir `detect`
+    // resolved — `scripts/` (top level only, Zig ordering convention:
+    // numeric prefixes first, stripped from the registered stem) or the
+    // deprecated legacy dir on the one-release grace fallback (verbatim
+    // pre-#237 recursive scan, plain sorted stems). `collectEmbedScripts`
+    // places/reuses the target link so the generated main's
+    // `@embedFile("<dir>/<file>")` resolves (for `scripts/` that's the
+    // link just placed above — shared with the Zig scanner). A missing
+    // dir collects empty — the plugin is wired, nothing embeds. Game
+    // root only; `requires_language` pack dirs come later. Authored `.ts`
+    // sources are NOT collected here (the collection is embed-extension-
+    // only) — the transpile phase below (labelle-engine#745, ordered
+    // after deps staging) checks + emits them and REPLACES these entries
+    // with the materialized dir's re-collection. (Language files in
+    // `scripts/<state>/` subdirs already failed generate inside `detect`
+    // — state subdirs are Zig-only until the scripting Controller grows
+    // state awareness.)
     //
     // EMBED family only: a native-compiled language (rust) never embeds —
     // its sources are staged over the plugin package's crate instead
     // (`stageNativeSources` below, AFTER `createDepsLinks` staged that
-    // package), and `script_names` stays empty so the registerScript
+    // package), and `scripts` stays empty so the registerScript
     // builders emit nothing.
-    var scripting_script_names: ?[][]const u8 = null;
-    defer if (scripting_script_names) |names| scanner.freeNames(allocator, names);
+    var scripting_scripts: ?[]scripting_splice.EmbedScript = null;
+    defer if (scripting_scripts) |ss| scripting_splice.freeEmbedScripts(allocator, ss);
     if (maybe_scripting) |*s| {
         if (s.family == .embed) {
-            scripting_script_names = try scanner.linkAndScan(allocator, game_dir, target_dir, s.dir, s.extension);
-            s.script_names = scripting_script_names.?;
+            scripting_scripts = try scripting_splice.collectEmbedScripts(allocator, game_dir, target_dir, s.*);
+            s.scripts = scripting_scripts.?;
         }
     }
 
@@ -855,7 +868,8 @@ pub fn generate(
     // ── Script-declared components: declare-mode extraction (#585) ─────
     // RFC-LANGUAGE-PLUGINS revs 6-7 (epic labelle-engine#237), the second
     // consumer of the scripting splice: run the plugin's declare-mode
-    // runner over the copied `<language>/` scripts, codegen the declared
+    // runner over the collected script-dir sources (`scripts/`, or the
+    // legacy dir on the grace fallback), codegen the declared
     // components into `scripting_components.zig`, and thread them onto the
     // splice so the component-registry block registers them by name.
     // Ordered AFTER build.zig.zon generation — `createDepsLinks` just
@@ -869,15 +883,20 @@ pub fn generate(
     defer if (declare_schema) |*sch| sch.deinit();
     if (maybe_scripting) |*s| {
         // The declare phase is embed-only by construction: a native splice
-        // keeps `script_names` empty (nothing embeds), so `runPhase`
+        // keeps `scripts` empty (nothing embeds), so `runPhase`
         // returns null at its zero-scripts gate before the lua-only
-        // language gate is even consulted.
+        // language gate is even consulted. The runner gets the collected
+        // dir-relative FILES (not stems — ordering prefixes are stripped
+        // from stems, so only the file column can rebuild the path).
+        const script_files = try allocator.alloc([]const u8, s.scripts.len);
+        defer allocator.free(script_files);
+        for (s.scripts, script_files) |sc, *f| f.* = sc.file;
         declare_schema = try scripting_declare.runPhase(allocator, .{
             .plugins = cfg.plugins,
             .plugin_name = s.plugin_name,
             .language = s.language,
-            .extension = s.extension,
-            .script_names = s.script_names,
+            .dir = s.dir,
+            .script_files = script_files,
             .output_dir = output_dir,
             .target_dir = target_dir,
             .project_dir = game_dir,
@@ -890,23 +909,29 @@ pub fn generate(
     // ── TS→JS transpile: check + emit at generate (labelle-engine#745) ─
     // The third consumer of the scripting splice: when the splice's
     // language carries a transpile row (typescript's `.ts`) AND the
-    // game's script dir actually holds such sources, run the fetched
-    // TS 7 native compiler over them — type errors fail generate with
-    // tsc's diagnostics relayed — and swap the splice's script names for
-    // the MATERIALIZED target dir's scan (copied plain `.js` + emitted
-    // `.js`), which is what the registerScript builders embed. Ordered
-    // like the declare phase (deps just staged — the plugin package's
-    // shipped contract/labelle.d.ts feeds the generated tsconfig) and
-    // BEFORE main.zig emission, which consumes `script_names`. Null for
-    // every skip shape (no transpile row; no `.ts` sources — the need
-    // probe, so `.js`-only projects never fetch the toolchain and keep
-    // the plain symlink layout, byte-identical output).
+    // game's RESOLVED script dir (`scripts/` — the #237 convention — or
+    // the legacy `ts/` on the grace fallback; the phase follows
+    // `splice.dir`/`legacy` either way) actually holds such sources, run
+    // the fetched TS 7 native compiler over them — type errors fail
+    // generate with tsc's diagnostics relayed — and swap the splice's
+    // entries for the MATERIALIZED target dir's re-collection
+    // (`collectEmbedScriptsAbs`: copied game tree + emitted `.js`, same
+    // ordering/stripping rules as the first collection; the coexisting
+    // Zig scripts ride the materialized copy so their generated
+    // `@import("scripts/…")`s keep resolving). Ordered like the declare
+    // phase (deps just staged — the plugin package's shipped
+    // contract/labelle.d.ts feeds the generated tsconfig) and BEFORE
+    // main.zig emission, which consumes `scripts`. Null for every skip
+    // shape (no transpile row; no `.ts` sources — the need probe, so
+    // `.js`-only projects never fetch the toolchain and keep the plain
+    // symlink layout, byte-identical output).
     if (maybe_scripting) |*s| {
         if (try scripting_transpile.runPhase(allocator, .{
             .plugins = cfg.plugins,
             .plugin_name = s.plugin_name,
             .language = s.language,
             .dir = s.dir,
+            .legacy = s.legacy,
             .extension = s.extension,
             .game_dir = game_dir,
             .output_dir = output_dir,
@@ -915,22 +940,24 @@ pub fn generate(
             .component_names = component_names,
             .pack_scans = pack_scans.items,
             .declared_components = s.declared_components,
-        })) |transpiled_names| {
-            if (scripting_script_names) |old| scanner.freeNames(allocator, old);
-            scripting_script_names = transpiled_names;
-            s.script_names = transpiled_names;
+        })) |transpiled| {
+            if (scripting_scripts) |old| scripting_splice.freeEmbedScripts(allocator, old);
+            scripting_scripts = transpiled;
+            s.scripts = transpiled;
         }
     }
 
     // ── Native-language game-source staging (labelle-engine#741) ───────
     // The native family's counterpart of the embed link above: LINK the
-    // game's `<dir>/` (rust/) OVER the scripting plugin's staged package
-    // (`deps/labelle-<name>/native/src/game`, replacing the shipped
-    // placeholder — `scanner.linkDirAbs`, the same live-view primitive
-    // `linkAndScan` gives embed script dirs), so the plugin's
+    // game's `<dir>/` (`scripts/` — the #237 convention; the legacy
+    // `rust/` on the grace fallback) OVER the scripting plugin's staged
+    // package (`deps/labelle-<name>/native/src/game`, replacing the
+    // shipped placeholder — `scanner.linkDirAbs`, the same live-view
+    // primitive `linkAndScan` gives embed script dirs), so the plugin's
     // `.language_builds` step (cargo) compiles the GAME's CURRENT
     // scripts into the staticlib the build wiring below links — edits to
-    // rust/*.rs flow into the next `zig build` without a re-generate.
+    // scripts/*.rs flow into the next `zig build` without a re-generate.
+    // `scripts/mod.rs` is the crate's game-module root.
     // Ordered like the declare phase: AFTER build.zig.zon generation
     // (`createDepsLinks` just staged the package) and BEFORE the
     // plugin-build-steps wiring resolves `{package}`. Hard-errors when

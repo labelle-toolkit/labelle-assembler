@@ -86,8 +86,8 @@ pub const GENERATED_FILENAME = "scripting_components.zig";
 /// The ONLY language the v1 declare phase runs: the plugin's runner
 /// (`tools/declare`) IS a lua interpreter executing chunk bodies against a
 /// stub `labelle` — pointing it at any other language's sources (a
-/// typescript project's `ts/*.js`) would "run" JS as lua and fail with a
-/// nonsense parse error naming the wrong problem. `runPhase` skips
+/// typescript project's `scripts/*.js`) would "run" JS as lua and fail
+/// with a nonsense parse error naming the wrong problem. `runPhase` skips
 /// non-lua languages cleanly instead (scripts still run; nothing
 /// declares). typescript declarations arrive LATER via `.d.ts`/interface
 /// extraction (a typescript-side declare runner feeding the same schema
@@ -803,9 +803,15 @@ pub fn resolvePluginPackageDir(
     return error.DeclareToolBuildFailed;
 }
 
-/// Exec the declare tool over the copied `<language>/` scripts and parse
+/// Exec the declare tool over the copied script-dir sources and parse
 /// its stdout as the schema. A nonzero exit relays the tool's stderr (the
 /// file-and-name-bearing declaration error) and fails generation.
+///
+/// `dir` is the splice's RESOLVED script dir (`scripts/` — the #237
+/// convention — or the deprecated legacy dir on the grace fallback) and
+/// `script_files` the dir-relative filenames the collection produced; the
+/// argv paths join `target_dir/<dir>/<file>` directly, so ordering-prefix
+/// stripping in the registered stems never desyncs the tool's input.
 ///
 /// Relative-path audit (PR #598 finding 1): unlike the tool BUILD, this
 /// spawn sets no `.cwd` — the child inherits OURS — so a relative
@@ -815,9 +821,8 @@ fn runDeclareTool(
     allocator: std.mem.Allocator,
     tool_path: []const u8,
     target_dir: []const u8,
-    language: []const u8,
-    extension: []const u8,
-    script_names: []const []const u8,
+    dir: []const u8,
+    script_files: []const []const u8,
 ) !Schema {
     var argv: std.ArrayList([]const u8) = .empty;
     defer {
@@ -826,13 +831,10 @@ fn runDeclareTool(
         if (argv.items.len > 0) for (argv.items[1..]) |p| allocator.free(p);
         argv.deinit(allocator);
     }
-    try argv.ensureTotalCapacity(allocator, script_names.len + 1);
+    try argv.ensureTotalCapacity(allocator, script_files.len + 1);
     argv.appendAssumeCapacity(tool_path);
-    for (script_names) |stem| {
-        var name_buf: [512]u8 = undefined;
-        const file_name = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ stem, extension }) catch
-            return error.NameTooLong;
-        const p = try std.fs.path.join(allocator, &.{ target_dir, language, file_name });
+    for (script_files) |file_name| {
+        const p = try std.fs.path.join(allocator, &.{ target_dir, dir, file_name });
         argv.appendAssumeCapacity(p);
     }
 
@@ -865,8 +867,14 @@ pub const PhaseOptions = struct {
     plugins: []const config.PluginDep,
     plugin_name: []const u8,
     language: []const u8,
-    extension: []const u8,
-    script_names: []const []const u8,
+    /// The splice's RESOLVED script dir (`scripts/`, or the deprecated
+    /// legacy dir on the one-release grace fallback) — where the runner
+    /// finds the copied sources under `target_dir`.
+    dir: []const u8,
+    /// Dir-relative script filenames (extension included, subdir paths
+    /// joined with `/` for legacy-dir collections) — the collection's
+    /// `EmbedScript.file` column.
+    script_files: []const []const u8,
     output_dir: []const u8,
     target_dir: []const u8,
     project_dir: []const u8,
@@ -886,7 +894,7 @@ pub const PhaseOptions = struct {
 /// declarations). Every no-op shape also deletes a stale generated file
 /// left by a previously-declaring project state.
 pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
-    if (opts.script_names.len == 0) {
+    if (opts.script_files.len == 0) {
         removeStaleGeneratedFile(allocator, opts.target_dir);
         return null;
     }
@@ -895,9 +903,7 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     // — for any other splice language (typescript today) it must SKIP, not
     // run the lua runner over foreign sources. Note-level stderr line +
     // the same stale-file cleanup as the other no-op shapes, so a project
-    // switching lua→typescript leaves no orphaned generated file. (The
-    // `runDeclareTool` path join below also assumes dir == language ==
-    // "lua" — revisit when a second declare-capable language lands.)
+    // switching lua→typescript leaves no orphaned generated file.
     if (!std.mem.eql(u8, opts.language, DECLARE_LANGUAGE)) {
         diag(
             "script-declared components are lua-only today — skipping the declare phase for \"{s}\" scripts (they still run, they just can't declare components yet)",
@@ -928,9 +934,8 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
         allocator,
         tool_path,
         opts.target_dir,
-        opts.language,
-        opts.extension,
-        opts.script_names,
+        opts.dir,
+        opts.script_files,
     );
     errdefer schema.deinit();
 
@@ -1305,8 +1310,8 @@ test "runPhase: a non-lua splice (typescript) skips cleanly — null, stale file
         .plugins = &.{},
         .plugin_name = "scripting",
         .language = "typescript",
-        .extension = ".js",
-        .script_names = &.{"behavior"},
+        .dir = "scripts",
+        .script_files = &.{"behavior.js"},
         .output_dir = root,
         .target_dir = target,
         .project_dir = root,
@@ -1324,6 +1329,6 @@ test "runPhase: a non-lua splice (typescript) skips cleanly — null, stale file
     // plugin list) — the skip above is the language gate, not an accident
     // of the hostile opts.
     opts.language = DECLARE_LANGUAGE;
-    opts.extension = ".lua";
+    opts.script_files = &.{"behavior.lua"};
     try testing.expectError(error.DeclareToolBuildFailed, runPhase(allocator, opts));
 }

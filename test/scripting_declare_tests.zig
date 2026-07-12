@@ -52,14 +52,14 @@ const hunger_schema =
     \\{"components":[{"name":"Hunger","persist":"persistent","fields":[{"name":"level","type":"f32","default":1.0},{"name":"starving","type":"bool","default":false}]}]}
 ;
 
-/// Splice fixture matching `scripting_splice_tests.lua_splice` (stems
-/// pre-sorted, one nested subdir).
+/// Splice fixture matching `scripting_splice_tests.lua_splice` — the
+/// scripts/ convention (#237).
 const lua_splice = generate.scripting_splice.ScriptingSplice{
     .plugin_name = "scripting",
     .language = "lua",
-    .dir = "lua",
+    .dir = "scripts",
     .extension = ".lua",
-    .script_names = &.{"hunger"},
+    .scripts = &.{.{ .name = "hunger", .file = "hunger.lua" }},
 };
 
 const scripting_plugins = [_]generate.PluginDep{
@@ -169,7 +169,7 @@ pub const DECLARED_COMPONENT_REGISTRY_EMISSION = struct {
         try std.testing.expect(hunger < plugins_tuple);
 
         // The #593 splice halves still ride along (registration + flag).
-        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"hunger\", @embedFile(\"lua/hunger.lua\"));");
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"hunger\", @embedFile(\"scripts/hunger.lua\"));");
         _ = try indexOfOrFail(main_zig, "const scripting_enabled = true;");
 
         try expectAstGenOk(main_zig);
@@ -206,8 +206,8 @@ fn writeFileIn(dir: std.Io.Dir, rel: []const u8, body: []const u8) !void {
 
 /// A staged tmp game project (the language-policy staging shape, plus a
 /// MANIFEST-BEARING scripting plugin so `scripting_splice.detect` fires):
-/// `game/` with `plugins/scripting/plugin.labelle`, a `lua/` script, and
-/// `out/`.
+/// `game/` with `plugins/scripting/plugin.labelle`, a `scripts/*.lua`
+/// script beside a Zig script (the #237 shared dir), and `out/`.
 const StagedProject = struct {
     tmp: std.testing.TmpDir,
     game_abs: [:0]const u8,
@@ -226,10 +226,13 @@ const StagedProject = struct {
         // The script whose chunk scope carries the declaration. Its content
         // is REAL but unread by the staged fake runner below — the runner
         // binary's own behavior is pinned by labelle-scripting's goldens.
-        try writeFileIn(game, "lua/hunger.lua",
+        try writeFileIn(game, "scripts/hunger.lua",
             \\local Hunger = labelle.component("Hunger", { level = 1.0, starving = false })
             \\function update(dt) end
         );
+        // A Zig script sharing scripts/ (#237 coexistence) — must never
+        // reach the declare runner's argv (it collects only .lua files).
+        try writeFileIn(game, "scripts/01_move.zig", "pub fn tick() void {}\n");
         const game_abs = try tmp.dir.realPathFileAlloc(io, "game", allocator);
         errdefer allocator.free(game_abs);
         const out_abs = try tmp.dir.realPathFileAlloc(io, "out", allocator);
@@ -356,7 +359,7 @@ pub const DECLARE_PHASE_E2E = struct {
 
         // Skipped means skipped: no generated component file, no registry
         // wiring — the target matches a never-declaring project even
-        // though lua/hunger.lua carries a labelle.component declaration.
+        // though scripts/hunger.lua carries a labelle.component declaration.
         try std.testing.expectError(
             error.FileNotFound,
             staged.tmp.dir.access(io, "out/sokol_desktop/scripting_components.zig", .{}),
@@ -498,7 +501,7 @@ pub const DECLARE_PHASE_E2E = struct {
         // A fake runner that fails like the real one does on a malformed
         // spec: file-and-name-bearing message on stderr, exit 1.
         var f = try staged.tmp.dir.createFile(io, "fake-declare", .{ .permissions = .executable_file });
-        try f.writeStreamingAll(io, "#!/bin/sh\necho 'labelle-declare: lua/hunger.lua:1: bad spec' >&2\nexit 1\n");
+        try f.writeStreamingAll(io, "#!/bin/sh\necho 'labelle-declare: scripts/hunger.lua:1: bad spec' >&2\nexit 1\n");
         f.close(io);
         const fake = try staged.tmp.dir.realPathFileAlloc(io, "fake-declare", allocator);
         defer allocator.free(fake);

@@ -10,14 +10,16 @@
 //! suite must never depend on; the real toolchain's behavior was pinned
 //! manually against tsc 7.0.2 during design):
 //!
-//!   1. a `.ts` project transpiles end to end — the target's script dir
-//!      MATERIALIZES (symlink → real dir), the fake tsc's emitted `.js`
-//!      embeds beside the copied plain `.js`, the generated
+//!   1. a `scripts/*.ts` project transpiles end to end — the target's
+//!      shared script dir MATERIALIZES (symlink → real dir, the game's
+//!      ZIG scripts riding the copy so their generated imports keep
+//!      resolving — the #237 shared-dir pin), the fake tsc's emitted
+//!      `.js` embeds beside the copied plain `.js`, the generated
 //!      `labelle-components.d.ts` + `tsconfig.json` land where the
-//!      design says, and the tsconfig's `files` list is exactly right
-//!      (game sources; the game's OWN labelle.d.ts copy suppressing the
-//!      package contract — and the package contract present when the
-//!      game has no copy);
+//!      design says (and the d.ts is NEVER collected as a script), and
+//!      the tsconfig's `files` list is exactly right (game sources; the
+//!      game's OWN labelle.d.ts copy suppressing the package contract —
+//!      and the package contract present when the game has no copy);
 //!   2. a type error (fake tsc exits nonzero) FAILS generate — the
 //!      ticket's acceptance criterion;
 //!   3. a `.js`-only project SKIPS the whole phase — poison override
@@ -25,7 +27,12 @@
 //!      no-fetch pin (the probe precedes tool resolution);
 //!   4. a `.ts`/`.js` same-stem collision fails BEFORE the tool runs;
 //!   5. removing every `.ts` restores the pre-transpile layout (stale
-//!      tsconfig dropped, symlink back, only plain scripts registered).
+//!      tsconfig dropped, symlink back, only plain scripts registered);
+//!   6. transpiled output rides the scripts/ ORDERING convention —
+//!      `10_a.ts` + `20_b.ts` register prefix-ordered with STRIPPED
+//!      stems (#237 over #745);
+//!   7. the LEGACY `ts/` grace dir still transpiles this release —
+//!      pre-#237 plain stems, ts/-rooted embeds.
 
 const std = @import("std");
 const zspec = @import("zspec");
@@ -57,9 +64,11 @@ fn writeFileIn(dir: std.Io.Dir, rel: []const u8, body: []const u8) !void {
 /// A staged tmp typescript game project (the scripting_splice_tests
 /// `StagedTsProject` shape): `game/` with a manifest-bearing scripting
 /// plugin that SHIPS a `contract/labelle.d.ts` (so the package-contract
-/// tsconfig row is exercisable), a `ts/` dir holding a plain `.js`
-/// script AND a `.ts` script, a component file (the d.ts provider), the
-/// engine template fixture (exe main.zig emission), and `out/`.
+/// tsconfig row is exercisable), a `scripts/` dir holding a plain `.js`
+/// script, a `.ts` script AND coexisting Zig scripts (top-level + state
+/// subdir — the #237 shared structure), a component file (the d.ts
+/// provider), the engine template fixture (exe main.zig emission), and
+/// `out/`.
 const StagedTranspileProject = struct {
     tmp: std.testing.TmpDir,
     game_abs: [:0]const u8,
@@ -81,13 +90,18 @@ const StagedTranspileProject = struct {
             \\declare const labelle: { log(msg: unknown): void };
             \\
         );
-        try writeFileIn(game_root, "ts/behavior.js",
+        try writeFileIn(game_root, "scripts/behavior.js",
             \\// @ts-check
             \\export function update(dt) {}
         );
-        try writeFileIn(game_root, "ts/enemy.ts",
+        try writeFileIn(game_root, "scripts/enemy.ts",
             \\export function update(dt: number): void {}
         );
+        // The ZIG layer sharing the dir (extension-keyed coexistence):
+        // the transpile materialization must keep BOTH reachable in the
+        // target, or the generated @import("scripts/…")s break.
+        try writeFileIn(game_root, "scripts/01_move.zig", "pub fn tick() void {}\n");
+        try writeFileIn(game_root, "scripts/playing/02_hud.zig", "pub fn tick() void {}\n");
         // A game component with the mapping-interesting field types —
         // the generated d.ts golden's provider.
         try writeFileIn(game_root, "components/ship.zig",
@@ -161,7 +175,7 @@ const happy_fake_tsc =
 /// real tsc prints), nonzero exit, nothing emitted (noEmitOnError).
 const type_error_fake_tsc =
     \\#!/bin/sh
-    \\echo "ts/enemy.ts(1,34): error TS2551: Property 'levl' does not exist on type '{ level: number; }'. Did you mean 'level'?"
+    \\echo "scripts/enemy.ts(1,34): error TS2551: Property 'levl' does not exist on type '{ level: number; }'. Did you mean 'level'?"
     \\exit 2
     \\
 ;
@@ -199,7 +213,7 @@ fn filesContainSuffix(files: std.json.Array, suffix: []const u8) bool {
 }
 
 pub const TRANSPILE_E2E = struct {
-    test "a ts/enemy.ts project transpiles end to end: materialized dir, emitted embed, generated d.ts + tsconfig" {
+    test "a scripts/enemy.ts project transpiles end to end: materialized dir (Zig scripts riding), emitted embed, generated d.ts + tsconfig" {
         const allocator = std.testing.allocator;
         var staged = try StagedTranspileProject.init(allocator);
         defer staged.deinit(allocator);
@@ -207,7 +221,7 @@ pub const TRANSPILE_E2E = struct {
         defer game_root.close(io);
         // The game carries its OWN contract copy — the package's must
         // then stay OUT of the tsconfig (duplicate globals).
-        try writeFileIn(game_root, "ts/labelle.d.ts", "declare const labelle: any;\n");
+        try writeFileIn(game_root, "scripts/labelle.d.ts", "declare const labelle: any;\n");
 
         const fake = try staged.stageFakeTsc(allocator, happy_fake_tsc);
         defer allocator.free(fake);
@@ -223,31 +237,44 @@ pub const TRANSPILE_E2E = struct {
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
         try std.testing.expectError(
             error.NotLink,
-            staged.tmp.dir.readLink(io, "out/sokol_desktop/ts", &link_buf),
+            staged.tmp.dir.readLink(io, "out/sokol_desktop/scripts", &link_buf),
         );
 
+        // THE SHARED-DIR PIN (#237 over #745): the game's ZIG scripts —
+        // top-level AND state-subdir — survived the materialization, so
+        // the generated `@import("scripts/…")`s still resolve in the
+        // target tree.
+        try staged.tmp.dir.access(io, "out/sokol_desktop/scripts/01_move.zig", .{});
+        try staged.tmp.dir.access(io, "out/sokol_desktop/scripts/playing/02_hud.zig", .{});
+
         // Copied plain script + fake-emitted transpile output, side by side.
-        const behavior = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/ts/behavior.js", allocator, .limited(4096));
+        const behavior = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/scripts/behavior.js", allocator, .limited(4096));
         defer allocator.free(behavior);
         _ = try indexOfOrFail(behavior, "// @ts-check");
-        const enemy = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/ts/enemy.js", allocator, .limited(4096));
+        const enemy = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/scripts/enemy.js", allocator, .limited(4096));
         defer allocator.free(enemy);
         _ = try indexOfOrFail(enemy, "emitted-by-fake-tsc");
 
-        // The generated main registers BOTH (sorted stems), embedding
-        // from the materialized dir — and no `.ts` embed anywhere.
+        // The generated main registers BOTH (collection order), embedding
+        // from the materialized dir — no `.ts` embed anywhere, and the
+        // Zig scripts never leak into the language layer.
         const main_zig = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
         defer allocator.free(main_zig);
-        const reg_behavior = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"ts/behavior.js\"));");
-        const reg_enemy = try indexOfOrFail(main_zig, "scripting.registerScript(\"enemy\", @embedFile(\"ts/enemy.js\"));");
+        const reg_behavior = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"scripts/behavior.js\"));");
+        const reg_enemy = try indexOfOrFail(main_zig, "scripting.registerScript(\"enemy\", @embedFile(\"scripts/enemy.js\"));");
         try std.testing.expect(reg_behavior < reg_enemy);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".ts\")") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript(\"move\"") == null);
+        // The generated declarations are typecheck INPUT, never a script:
+        // no registration mentions them (their .d.ts suffix can't match
+        // the .js collection).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle-components") == null);
 
         // The generated d.ts sits next to the copied scripts and maps the
         // game component's REAL field shapes (bigint ids, `| null`
         // optionals, vec2 object, string, number, boolean) under the
         // quoted registry key, plus the Entity class-merge overloads.
-        const dts = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/ts/labelle-components.d.ts", allocator, .limited(64 * 1024));
+        const dts = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/scripts/labelle-components.d.ts", allocator, .limited(64 * 1024));
         defer allocator.free(dts);
         _ = try indexOfOrFail(dts, "\"Ship\": { owner: bigint; target: bigint | null; pos: { x: number; y: number }; label: string; hp: number; docked: boolean };");
         _ = try indexOfOrFail(dts, "interface Entity {");
@@ -259,9 +286,9 @@ pub const TRANSPILE_E2E = struct {
         var parsed: std.json.Parsed(std.json.Value) = undefined;
         const files = try readTsconfigFiles(allocator, &staged.tmp, &parsed);
         defer parsed.deinit();
-        try std.testing.expect(filesContainSuffix(files, "ts/enemy.ts"));
-        try std.testing.expect(filesContainSuffix(files, "ts/labelle.d.ts"));
-        try std.testing.expect(filesContainSuffix(files, "ts/labelle-components.d.ts"));
+        try std.testing.expect(filesContainSuffix(files, "scripts/enemy.ts"));
+        try std.testing.expect(filesContainSuffix(files, "scripts/labelle.d.ts"));
+        try std.testing.expect(filesContainSuffix(files, "scripts/labelle-components.d.ts"));
         try std.testing.expect(!filesContainSuffix(files, "contract/labelle.d.ts"));
     }
 
@@ -313,7 +340,7 @@ pub const TRANSPILE_E2E = struct {
         // materialized dir (only the copied plain script is there).
         try std.testing.expectError(
             error.FileNotFound,
-            staged.tmp.dir.access(io, "out/sokol_desktop/ts/enemy.js", .{}),
+            staged.tmp.dir.access(io, "out/sokol_desktop/scripts/enemy.js", .{}),
         );
     }
 
@@ -324,7 +351,7 @@ pub const TRANSPILE_E2E = struct {
         var game_root = try staged.tmp.dir.openDir(io, "game", .{});
         defer game_root.close(io);
         // Remove the .ts source → a plain .js-only typescript project.
-        try game_root.deleteFile(io, "ts/enemy.ts");
+        try game_root.deleteFile(io, "scripts/enemy.ts");
 
         // POISON: the phase consulting the tool AT ALL fails generate —
         // and since tool resolution (and therefore the fetch) sits
@@ -340,20 +367,22 @@ pub const TRANSPILE_E2E = struct {
         try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
 
         // The pre-#745 layout, byte-for-byte: the script dir is STILL the
-        // linkAndScan symlink, and no transpile artifacts exist.
+        // linkAndScan symlink (the Zig scanner's shared link), and no
+        // transpile artifacts exist — in the target OR through the link
+        // into the game tree.
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        _ = try staged.tmp.dir.readLink(io, "out/sokol_desktop/ts", &link_buf);
+        _ = try staged.tmp.dir.readLink(io, "out/sokol_desktop/scripts", &link_buf);
         try std.testing.expectError(
             error.FileNotFound,
             staged.tmp.dir.access(io, "out/sokol_desktop/tsconfig.json", .{}),
         );
         try std.testing.expectError(
             error.FileNotFound,
-            staged.tmp.dir.access(io, "game/ts/labelle-components.d.ts", .{}),
+            staged.tmp.dir.access(io, "game/scripts/labelle-components.d.ts", .{}),
         );
         const main_zig = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
         defer allocator.free(main_zig);
-        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"ts/behavior.js\"));");
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"scripts/behavior.js\"));");
     }
 
     test "a same-stem .ts/.js pair fails generate BEFORE the tool runs (poison override untouched)" {
@@ -363,7 +392,7 @@ pub const TRANSPILE_E2E = struct {
         var game_root = try staged.tmp.dir.openDir(io, "game", .{});
         defer game_root.close(io);
         // enemy.ts already exists — author the stale twin.
-        try writeFileIn(game_root, "ts/enemy.js", "export function update(dt) {}\n");
+        try writeFileIn(game_root, "scripts/enemy.js", "export function update(dt) {}\n");
 
         const fake = try staged.stageFakeTsc(allocator, poison_fake_tsc);
         defer allocator.free(fake);
@@ -384,7 +413,7 @@ pub const TRANSPILE_E2E = struct {
         defer staged.deinit(allocator);
         var game_root = try staged.tmp.dir.openDir(io, "game", .{});
         defer game_root.close(io);
-        try writeFileIn(game_root, "ts/labelle.d.ts", "declare const labelle: any;\n");
+        try writeFileIn(game_root, "scripts/labelle.d.ts", "declare const labelle: any;\n");
 
         const fake = try staged.stageFakeTsc(allocator, happy_fake_tsc);
         defer allocator.free(fake);
@@ -397,28 +426,113 @@ pub const TRANSPILE_E2E = struct {
         // Pass 1: transpiling state — materialized dir + tsconfig.
         try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
         try staged.tmp.dir.access(io, "out/sokol_desktop/tsconfig.json", .{});
-        try staged.tmp.dir.access(io, "out/sokol_desktop/ts/enemy.js", .{});
+        try staged.tmp.dir.access(io, "out/sokol_desktop/scripts/enemy.js", .{});
 
         // Pass 2: the author deletes the .ts — the phase skips, the
         // script-dir link reconciles back, the stale tsconfig is dropped,
         // and the emitted enemy.js is GONE (it lived only in the
         // materialized dir, which the re-link replaced).
-        try game_root.deleteFile(io, "ts/enemy.ts");
+        try game_root.deleteFile(io, "scripts/enemy.ts");
         try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
 
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        _ = try staged.tmp.dir.readLink(io, "out/sokol_desktop/ts", &link_buf);
+        _ = try staged.tmp.dir.readLink(io, "out/sokol_desktop/scripts", &link_buf);
         try std.testing.expectError(
             error.FileNotFound,
             staged.tmp.dir.access(io, "out/sokol_desktop/tsconfig.json", .{}),
         );
         try std.testing.expectError(
             error.FileNotFound,
-            staged.tmp.dir.access(io, "out/sokol_desktop/ts/enemy.js", .{}),
+            staged.tmp.dir.access(io, "out/sokol_desktop/scripts/enemy.js", .{}),
         );
         const main_zig = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
         defer allocator.free(main_zig);
-        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"ts/behavior.js\"));");
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"scripts/behavior.js\"));");
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript(\"enemy\"") == null);
+    }
+
+    test "transpiled output rides the ordering convention: 10_a.ts + 20_b.ts register prefix-ordered with STRIPPED stems" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTranspileProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game_root.close(io);
+        // Replace the default fixture sources with the ordered pair (the
+        // ticket's shape): the FILES keep their prefixes end to end, the
+        // registered stems drop them — through transpile, not around it.
+        try game_root.deleteFile(io, "scripts/enemy.ts");
+        try game_root.deleteFile(io, "scripts/behavior.js");
+        try writeFileIn(game_root, "scripts/20_b.ts", "export function update(dt: number): void {}\n");
+        try writeFileIn(game_root, "scripts/10_a.ts", "export function update(dt: number): void {}\n");
+
+        // A fake tsc that emits BOTH prefix-named outputs into outDir.
+        const ordering_fake_tsc =
+            \\#!/bin/sh
+            \\[ "$1" = "-p" ] || exit 3
+            \\out=$(sed -n 's/^ *"outDir": "\(.*\)".*$/\1/p' "$2")
+            \\[ -n "$out" ] || exit 4
+            \\printf 'export function update(dt) {}\n' > "$out/10_a.js"
+            \\printf 'export function update(dt) {}\n' > "$out/20_b.js"
+            \\exit 0
+            \\
+        ;
+        const fake = try staged.stageFakeTsc(allocator, ordering_fake_tsc);
+        defer allocator.free(fake);
+        generate.scripting_transpile.tsc_tool_override = fake;
+        defer generate.scripting_transpile.tsc_tool_override = null;
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        const main_zig = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
+        defer allocator.free(main_zig);
+        const reg_a = try indexOfOrFail(main_zig, "scripting.registerScript(\"a\", @embedFile(\"scripts/10_a.js\"));");
+        const reg_b = try indexOfOrFail(main_zig, "scripting.registerScript(\"b\", @embedFile(\"scripts/20_b.js\"));");
+        try std.testing.expect(reg_a < reg_b);
+        // Prefixed names never register (the stem stripped exactly like
+        // the Zig scanner's).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript(\"10_a\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript(\"20_b\"") == null);
+    }
+
+    test "LEGACY ts/ still transpiles through the grace release: ts/-rooted embeds, pre-#237 plain stems" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTranspileProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game_root.close(io);
+        // Unmigrate: language sources move to the deprecated ts/ dir; the
+        // Zig scripts stay in scripts/ (which then holds NO language
+        // files, so resolve falls back to the legacy dir with the note).
+        try game_root.deleteFile(io, "scripts/enemy.ts");
+        try game_root.deleteFile(io, "scripts/behavior.js");
+        try writeFileIn(game_root, "ts/behavior.js", "// @ts-check\nexport function update(dt) {}\n");
+        try writeFileIn(game_root, "ts/enemy.ts", "export function update(dt: number): void {}\n");
+
+        const fake = try staged.stageFakeTsc(allocator, happy_fake_tsc);
+        defer allocator.free(fake);
+        generate.scripting_transpile.tsc_tool_override = fake;
+        defer generate.scripting_transpile.tsc_tool_override = null;
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        // The LEGACY dir materialized (target/ts) and the embeds root
+        // there — plain stems, byte-compatible with the pre-#237 release;
+        // the shared scripts/ link stays a symlink (untouched by the
+        // phase — it materializes only the RESOLVED dir).
+        try staged.tmp.dir.access(io, "out/sokol_desktop/ts/enemy.js", .{});
+        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+        _ = try staged.tmp.dir.readLink(io, "out/sokol_desktop/scripts", &link_buf);
+        const main_zig = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
+        defer allocator.free(main_zig);
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"ts/behavior.js\"));");
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"enemy\", @embedFile(\"ts/enemy.js\"));");
+        // The generated d.ts landed in the materialized LEGACY dir and —
+        // as everywhere — never registered.
+        try staged.tmp.dir.access(io, "out/sokol_desktop/ts/labelle-components.d.ts", .{});
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle-components") == null);
     }
 };

@@ -37,8 +37,10 @@
 //! Ordered after the declare phase (deps are staged, `{package}` paths
 //! resolve; script-declared components — none for typescript today, the
 //! declare phase is lua-only — are already threaded). Every path below is
-//! rooted at THE SPLICE ROW'S script dir (`splice.dir` — `ts/` today; the
-//! scripts/-convention migration changes the row, never this phase) and
+//! rooted at the splice's RESOLVED script dir (`splice.dir` — `scripts/`,
+//! the #237 convention, or the deprecated legacy `ts/` on the one-release
+//! grace fallback; `resolveScriptDir` decided which at detect, and a
+//! grace-window `ts/` project transpiles exactly like a migrated one) and
 //! keyed by the row's extensions — nothing here hardcodes a dir name.
 //! The NEED PROBE runs first: a project whose script dir has no `.ts`
 //! sources (`.d.ts` exempt — declaration files carry no runtime code)
@@ -51,10 +53,13 @@
 //!      `enemy.js` would silently REPLACE a hand-authored `enemy.js`
 //!      sibling).
 //!   2. The target's script-dir link (the `linkAndScan` symlink) is
-//!      MATERIALIZED into a real directory: the game's plain `.js`
-//!      scripts are copied in (they keep working untranspiled alongside),
-//!      and tsc emits beside them — so the generated main's
-//!      `@embedFile("<dir>/<stem>.js")` resolves both kinds from one dir.
+//!      MATERIALIZED into a real directory: the WHOLE game script dir is
+//!      copied in — plain `.js` scripts keep working untranspiled
+//!      alongside, and (the #237 shared-dir consequence) the game's ZIG
+//!      scripts + state subdirs ride the copy so the generated
+//!      `@import("scripts/…")`s keep resolving through the same tree —
+//!      and tsc emits beside them, so the generated main's
+//!      `@embedFile("<dir>/<file>")` resolves both kinds from one dir.
 //!      The live-edit property of the symlink is deliberately traded
 //!      away here: a `.ts` edit needs a re-generate to re-transpile
 //!      anyway, so the whole dir goes stale-until-regenerate together.
@@ -63,6 +68,7 @@
 //!      (game `components/*.zig` fields + pack components + script-
 //!      declared components — the manifest sidecar's `parseStructDir`
 //!      machinery). See `renderComponentsDts` for the augmentation shape.
+//!      Its `.d.ts` suffix keeps it OUT of every script collection.
 //!   4. A `tsconfig.json` is generated at the target root (`--strict`,
 //!      ES2020 for quickjs-ng, `module esnext` + `moduleDetection force`
 //!      to keep ES-module-per-script semantics — two scripts' top-level
@@ -74,8 +80,13 @@
 //!      REAL component shapes: a typo'd field name fails generate.
 //!   5. `tsc -p <tsconfig>` runs check+emit (`noEmitOnError`); a nonzero
 //!      exit relays tsc's stdout/stderr verbatim and fails generate.
-//!   6. The target's `ts/` is re-scanned for `.js` stems — the new
-//!      script_names the registerScript builders embed.
+//!   6. The materialized dir is RE-collected through the splice's own
+//!      collection (`scripting_splice.collectEmbedScriptsAbs`) — the new
+//!      entries the registerScript builders embed, under the SAME rules
+//!      as the first collection: numeric ordering prefixes order and
+//!      strip (`10_a.ts` → emitted `10_a.js` → registered "a", before
+//!      `20_b`'s), duplicate orders error, legacy splices keep plain
+//!      recursive stems.
 //!
 //! ── Bespoke phase, not `.stage = .generate` (decision) ───────────────
 //! plugin_build_steps.zig documents a future `.stage = .generate` step
@@ -84,8 +95,8 @@
 //! (the version pin and integrity hashes must live in assembler source,
 //! not in a plugin manifest a third party edits), the tool is FETCHED
 //! per-platform rather than built from the plugin package, and the
-//! phase's inputs/outputs (tsconfig codegen, d.ts codegen, script_names
-//! rewrite) are splice-specific — a manifest schema would need
+//! phase's inputs/outputs (tsconfig codegen, d.ts codegen, the splice
+//! entries' rewrite) are splice-specific — a manifest schema would need
 //! placeholder vocabulary for all of that with exactly one consumer,
 //! against the documented "stay hardcoded until a second consumer
 //! exists" rule (scripting_declare.zig's exec-slice doc). The fold-in
@@ -805,10 +816,15 @@ pub const PhaseOptions = struct {
     plugins: []const config.PluginDep,
     plugin_name: []const u8,
     language: []const u8,
-    /// The splice ROW's script dir (`ts` today; the scripts/-convention
-    /// migration re-points the row and this phase follows) and embed
-    /// extension (`.js`). Never hardcoded here — always the row's.
+    /// The splice's RESOLVED script dir (`scripts` — the #237 convention
+    /// — or the deprecated legacy `ts` on the grace fallback) and embed
+    /// extension (`.js`). Never hardcoded here — always the splice's.
     dir: []const u8,
+    /// The splice's grace flag: threads into the post-emission
+    /// re-collection so a legacy `ts/` project keeps its pre-#237
+    /// registration stems while a `scripts/` one gets the ordering
+    /// convention (`scripting_splice.collectEmbedScriptsAbs`).
+    legacy: bool = false,
     extension: []const u8,
     game_dir: []const u8,
     output_dir: []const u8,
@@ -825,9 +841,11 @@ pub const PhaseOptions = struct {
 };
 
 /// Run the transpile phase for an active embed splice. Returns the NEW
-/// sorted script stems (owned by `allocator`, the `linkAndScan` contract
-/// — the caller swaps them onto the splice) when the phase transpiled,
-/// null for every skip shape:
+/// embed entries (owned by `allocator` — `scripting_splice
+/// .collectEmbedScriptsAbs` over the materialized dir, the same
+/// ordering/stripping rules as the game-dir collection; the caller swaps
+/// them onto the splice and frees with `freeEmbedScripts`) when the phase
+/// transpiled, null for every skip shape:
 ///
 ///   * the splice language has no transpile row (lua, ruby — and native
 ///     rows never reach here);
@@ -841,7 +859,7 @@ pub const PhaseOptions = struct {
 /// dir itself was already reconciled back to a symlink by this
 /// generate's `linkAndScan`, which also removed the stale generated
 /// d.ts inside it).
-pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?[][]const u8 {
+pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?[]scripting_splice.EmbedScript {
     const src = scripting_splice.transpileSource(opts.language) orelse return null;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -887,23 +905,18 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?[][]const u8
 
     // Materialize the target's script dir as a REAL directory (replacing
     // the linkAndScan symlink — CLI-managed, same posture as linkDirAbs's
-    // reconcile) holding the copied plain .js scripts; tsc emits beside
+    // reconcile) holding a full copy of the game's script tree — the
+    // faithful materialization of what the symlink exposed: plain `.js`
+    // scripts keep working untranspiled, and the game's ZIG scripts +
+    // state subdirs stay reachable for the generated
+    // `@import("scripts/…")`s (the #237 shared dir). tsc emits beside
     // them below.
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
     const game_script_dir = try std.fs.path.join(aa, &.{ opts.game_dir, opts.dir });
     const target_script_dir = try std.fs.path.join(aa, &.{ opts.target_dir, opts.dir });
     try cwd.deleteTree(io, target_script_dir);
-    try cwd.createDirPath(io, target_script_dir);
-    for (sources.js_files) |rel| {
-        const from = try std.fs.path.join(aa, &.{ game_script_dir, rel });
-        const to = try std.fs.path.join(aa, &.{ target_script_dir, rel });
-        if (std.fs.path.dirname(to)) |parent| try cwd.createDirPath(io, parent);
-        const bytes = try cwd.readFileAlloc(io, from, aa, .limited(16 * 1024 * 1024));
-        var f = try cwd.createFile(io, to, .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, bytes);
-    }
+    try scanner.copyDirRecursiveAbs(aa, game_script_dir, target_script_dir);
 
     // The generated declarations, next to the copied scripts.
     {
@@ -970,8 +983,17 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?[][]const u8
     }
 
     // The embeddable set is now the MATERIALIZED dir's: copied plain .js
-    // + tsc-emitted .js, one sorted scan (the linkAndScan stem contract).
-    return try scanner.scanDirAbs(allocator, target_script_dir, opts.extension);
+    // + tsc-emitted .js, re-collected through the splice's OWN collection
+    // so ordering prefixes strip/order identically to the first pass and
+    // the generated labelle-components.d.ts can never register (it does
+    // not carry the embed extension).
+    return try scripting_splice.collectEmbedScriptsAbs(allocator, target_script_dir, .{
+        .plugin_name = opts.plugin_name,
+        .language = opts.language,
+        .dir = opts.dir,
+        .legacy = opts.legacy,
+        .extension = opts.extension,
+    });
 }
 
 /// Best-effort cleanup of a stale generated tsconfig (a project whose
@@ -1465,7 +1487,7 @@ test "runPhase: a language without a transpile row returns null before any probe
         .plugins = &.{},
         .plugin_name = "scripting",
         .language = "lua",
-        .dir = "lua",
+        .dir = "scripts",
         .extension = ".lua",
         .game_dir = "/nonexistent",
         .output_dir = "/nonexistent",
@@ -1485,8 +1507,9 @@ test "runPhase: no .ts sources → null BEFORE tool resolution (the no-fetch pin
     const tio = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeTestFile(tmp.dir, "game/ts/behavior.js", "export function update(dt) {}\n");
-    try writeTestFile(tmp.dir, "game/ts/labelle.d.ts", "declare const labelle: any;\n");
+    try writeTestFile(tmp.dir, "game/scripts/behavior.js", "export function update(dt) {}\n");
+    try writeTestFile(tmp.dir, "game/scripts/labelle.d.ts", "declare const labelle: any;\n");
+    try writeTestFile(tmp.dir, "game/scripts/01_move.zig", "pub fn tick() void {}\n");
     try writeTestFile(tmp.dir, "target/" ++ TSCONFIG_FILENAME, "{ \"stale\": true }\n");
     const game = try tmp.dir.realPathFileAlloc(tio, "game", testing.allocator);
     defer testing.allocator.free(game);
@@ -1500,7 +1523,7 @@ test "runPhase: no .ts sources → null BEFORE tool resolution (the no-fetch pin
         .plugins = &.{},
         .plugin_name = "scripting",
         .language = "typescript",
-        .dir = "ts",
+        .dir = "scripts",
         .extension = ".js",
         .game_dir = game,
         .output_dir = target,
@@ -1519,8 +1542,8 @@ test "runPhase: a .ts/.js stem collision fails BEFORE tool resolution (poison ov
     const tio = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeTestFile(tmp.dir, "game/ts/enemy.ts", "export function update(dt: number) {}\n");
-    try writeTestFile(tmp.dir, "game/ts/enemy.js", "export function update(dt) {}\n");
+    try writeTestFile(tmp.dir, "game/scripts/enemy.ts", "export function update(dt: number) {}\n");
+    try writeTestFile(tmp.dir, "game/scripts/enemy.js", "export function update(dt) {}\n");
     const game = try tmp.dir.realPathFileAlloc(tio, "game", testing.allocator);
     defer testing.allocator.free(game);
 
@@ -1531,7 +1554,7 @@ test "runPhase: a .ts/.js stem collision fails BEFORE tool resolution (poison ov
         .plugins = &.{},
         .plugin_name = "scripting",
         .language = "typescript",
-        .dir = "ts",
+        .dir = "scripts",
         .extension = ".js",
         .game_dir = game,
         .output_dir = game,

@@ -1,6 +1,8 @@
 // Scripting-plugin smoke (labelle-assembler#593 splice; Phase-1 proof for
-// labelle-engine#739, epic labelle-engine#237). A `lua/behavior.lua` behavior
-// drives the REAL engine through the Script Runtime Contract
+// labelle-engine#739, epic labelle-engine#237). A `scripts/behavior.lua`
+// behavior (the scripts/ convention — the same dir Zig scripts use, the
+// extension selecting the language) drives the REAL engine through the
+// Script Runtime Contract
 // (labelle-engine#749): create an entity, set Position, emit a custom game
 // event, subscribe + react to it AND to the engine's own `engine__tick` —
 // all through the generated main's bind/registerScript/drainEvents
@@ -33,7 +35,7 @@
     // v0.2.0 ships the declare tool (`tools/declare`), so the capability
     // probe (#598) passes and generate ALSO runs declare mode (#585) for
     // real: the chunk-scope `labelle.component("Hunger", ...)` in
-    // lua/behavior.lua becomes a codegen'd `scripting_components.zig`
+    // scripts/behavior.lua becomes a codegen'd `scripting_components.zig`
     // registry component the behavior then writes/reads back at runtime.
     .plugins = .{
         .{

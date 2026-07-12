@@ -5,12 +5,28 @@
 //! (resolved manifest name `"scripting"`, labelle-toolkit/labelle-scripting)
 //! is attached with `.params = .{ .language = "…" }`, the generate pipeline
 //!
-//!   1. copies the game root's convention dir (`lua/`, `ts/`, … —
-//!      `language_policy.conventionDir`) into the target
-//!      (`scanner.linkAndScan`, sorted stems — root.zig),
+//!   1. collects the game root's script-language sources from the `scripts/`
+//!      convention dir — the SAME structure Zig scripts use
+//!      (labelle-engine#237: extension-keyed coexistence, the two-layer
+//!      architecture in one dir). Collection is TOP-LEVEL only with the Zig
+//!      ordering convention (numeric prefixes first, stripped from the
+//!      registered stem; state subdirs are Zig-only for now — a language
+//!      file inside `scripts/<state>/` is a pointed generate error, see
+//!      `resolveScriptDir`). The target's `scripts/` link (placed for the
+//!      Zig scanner) doubles as the embed root. The DEPRECATED per-language
+//!      dirs (`lua/`, `ts/`, … — `language_policy.legacyDir`) keep working
+//!      for one release of grace: when `scripts/` holds no language files
+//!      and the legacy dir does, the splice consumes the legacy dir
+//!      verbatim (recursive `linkAndScan`, plain sorted stems — the
+//!      pre-#237 behavior, byte-identical) with a pointed note; BOTH
+//!      populated is a hard error (never merged). For typescript the
+//!      transpile phase (labelle-engine#745, `scripting_transpile.zig`)
+//!      then checks + emits `.ts` sources against the RESOLVED dir and the
+//!      splice's entries are RE-collected from the materialized target dir
+//!      (`collectEmbedScriptsAbs`, same ordering rules),
 //!   2. registers each script with the plugin in the generated main BEFORE
 //!      `PluginControllers.setup` boots the VM
-//!      (`scripting.registerScript("<stem>", @embedFile("<dir>/<stem><ext>"))`
+//!      (`scripting.registerScript("<stem>", @embedFile("<dir>/<file>"))`
 //!      — lifecycle loop/callback builders),
 //!   3. emits the module-scope `const scripting = @import("<plugin>");` alias
 //!      + the `const scripting_enabled = true;` flag backend templates gate
@@ -36,6 +52,7 @@ const config = @import("config.zig");
 const language_policy = @import("language_policy.zig");
 const plugin_manifest = @import("plugin_manifest.zig");
 const scanner = @import("scanner.zig");
+const script_scanner = @import("script_scanner.zig");
 const scripting_declare = @import("scripting_declare.zig");
 
 /// The resolved `plugin.labelle` name that identifies THE scripting plugin
@@ -60,15 +77,18 @@ pub const TranspileSource = struct {
     /// carry no runtime code — they're the documented `// @ts-check`
     /// authoring companion (labelle-scripting README: "copy it or point
     /// at the resolved package's contract/ dir") and become typecheck
-    /// INPUTS, so a copied `labelle.d.ts` never makes the phase run by
-    /// itself and never fails generate.
+    /// INPUTS, so a copied `scripts/labelle.d.ts` never makes the phase
+    /// run by itself and never fails generate. The same suffix is exempt
+    /// from `resolveScriptDir`'s probes — a declaration file never marks
+    /// a dir populated and never trips the state-subdir gate.
     declaration_suffix: []const u8,
 };
 
 /// One embeddable language: its `language_policy.SUPPORTED_LANGUAGES` name
-/// (the convention DIR comes from `language_policy.conventionDir` — `ts/`
-/// for typescript) and the source-file extension the copy + `@embedFile`
-/// registration collect.
+/// (the convention DIR is `language_policy.SCRIPTS_DIR` for every language;
+/// the legacy grace dir comes from `language_policy.legacyDir` — `ts/` for
+/// typescript) and the source-file extension the collection + `@embedFile`
+/// registration select the language's files by.
 const EmbedLanguage = struct {
     language: []const u8,
     extension: []const u8,
@@ -82,6 +102,10 @@ const EmbedLanguage = struct {
 /// additive — one row per language as its labelle-scripting sub-module
 /// lands. Native-compiled languages (rust, crystal, go) integrate by
 /// linking, not embedding — their rows live in `NATIVE_LANGUAGES`.
+///
+/// Every row's scripts live in the `scripts/` convention dir (the
+/// extension selects the language — labelle-engine#237); the deprecated
+/// per-language dirs ride the one-release grace fallback (`resolveScriptDir`).
 ///
 /// typescript (labelle-scripting v0.3.0, quickjs-ng) EMBEDS `.js` only —
 /// the runtime evaluates plain-JS ES modules. `.ts` sources reach that
@@ -111,22 +135,23 @@ pub const EMBED_LANGUAGES = [_]EmbedLanguage{
 /// pipeline stages the game's sources over the plugin package's shipped
 /// placeholder module (`stageNativeSources`).
 const NativeLanguage = struct {
-    /// `language_policy.SUPPORTED_LANGUAGES` name; the convention dir
-    /// comes from `language_policy.conventionDir` like every row.
+    /// `language_policy.SUPPORTED_LANGUAGES` name; the convention dir is
+    /// `language_policy.SCRIPTS_DIR` (legacy grace dir: `legacyDir`) like
+    /// every row.
     language: []const u8,
-    /// Source extension collected by the staging copy (`.rs`).
+    /// Source extension collected by the staging validation (`.rs`).
     extension: []const u8,
-    /// Package-relative dir the game's convention-dir sources are staged
+    /// Package-relative dir the game's script-dir sources are staged
     /// OVER (replacing the plugin's shipped placeholder): the plugin
     /// crate's game-module dir (labelle-scripting `native/` crate —
     /// `lib.rs` declares `mod game;`, so the game's sources become
     /// `src/game/`).
     stage_subdir: []const u8,
-    /// The file that must sit at the convention dir's ROOT: the crate
-    /// module root the plugin's crate resolves (`mod.rs` for rust —
-    /// without it the staged crate cannot compile, so its absence is a
-    /// generate-time error naming the convention, not a cargo error far
-    /// from the author).
+    /// The file that must sit at the script dir's ROOT — `scripts/mod.rs`
+    /// is rust's module root (was `rust/mod.rs`): the crate module root
+    /// the plugin's crate resolves. Without it the staged crate cannot
+    /// compile, so its absence is a generate-time error naming the
+    /// convention, not a cargo error far from the author.
     module_root: []const u8,
 };
 
@@ -146,7 +171,7 @@ pub const NATIVE_LANGUAGES = [_]NativeLanguage{
         .extension = ".cr",
         .stage_subdir = "native-crystal/src/game",
         // The crate's game-module root: native-crystal/src/main.cr
-        // requires "./game/game" — crystal/game.cr is the mod.rs twin
+        // requires "./game/game" — scripts/game.cr is the mod.rs twin
         // (`Labelle::Game.register` composes the scripts).
         .module_root = "game.cr",
     },
@@ -199,33 +224,58 @@ pub fn transpileSource(language: []const u8) ?TranspileSource {
 /// #586 wiring — the splice doesn't carry them).
 pub const Family = enum { embed, native };
 
+/// One collected embed script: what `registerScript` registers it AS and
+/// which file (relative to the splice's `dir`) `@embedFile` reads. Split
+/// because the `scripts/` convention strips numeric ordering prefixes from
+/// the registered stem (`10_spawner.rb` registers as "spawner") — the stem
+/// alone can no longer reconstruct the embed path.
+pub const EmbedScript = struct {
+    /// Registered stem: ordering prefix + extension stripped, exactly as
+    /// the Zig script scanner strips them (`script_scanner.stripPrefixAndExt`).
+    /// Legacy-dir scripts keep the pre-#237 plain stem (no prefix
+    /// stripping; subdirs joined with `/`) so unmigrated projects stay
+    /// byte-identical through the grace release.
+    name: []const u8,
+    /// Path relative to the splice's `dir` — the `@embedFile("<dir>/<file>")`
+    /// tail. Top-level filename for `scripts/`-collected entries.
+    file: []const u8,
+};
+
 /// Everything the emission sites need, resolved once by `detect` and
 /// threaded through `main_template.scripting_splice` (the same scoped
 /// module-var pattern as `pack_scans`) + `BuildZigOptions.scripting`.
 /// Borrows `plugin_name`/`language` from the parsed `ProjectConfig`;
-/// `extension` is a static table slice; `script_names` is set by root.zig
-/// after the `<language>/` copy (owned by root.zig's scan, sorted —
-/// `scanner.linkAndScan` stems relative to the language dir, subdirs joined
-/// with `/`). Owns nothing.
+/// `extension` is a static table slice; `scripts` is set by root.zig
+/// after the collection (`collectEmbedScripts` — owned by root.zig).
+/// Owns nothing.
 pub const ScriptingSplice = struct {
     plugin_name: []const u8,
     language: []const u8,
-    /// The convention dir the scripts live in and the `@embedFile` paths
-    /// are rooted at — `language_policy.conventionDir(language)` (`lua/`,
-    /// `ts/`), resolved once by `detect` so every emission site agrees.
+    /// The dir the scripts live in and the `@embedFile` paths are rooted
+    /// at, resolved once by `detect` so every emission site agrees:
+    /// `language_policy.SCRIPTS_DIR` ("scripts" — the convention), or the
+    /// language's DEPRECATED legacy dir (`lua/`, `ts/` —
+    /// `language_policy.legacyDir`) when the one-release grace fallback
+    /// engaged (`legacy` below).
     dir: []const u8,
     extension: []const u8,
+    /// True when `detect`'s `resolveScriptDir` fell back to the deprecated
+    /// per-language dir (scripts/ had no language files, the legacy dir
+    /// did — note printed). Legacy keeps the pre-#237 semantics verbatim:
+    /// recursive collection, plain sorted stems, no prefix stripping, and
+    /// (native family) the pointed empty-dir error.
+    legacy: bool = false,
     /// Embed vs native-compiled (see `Family`). `.embed` default keeps
     /// every pre-#741 fixture/caller byte-identical.
     family: Family = .embed,
     /// Always empty for `.native` splices — nothing embeds, so the
     /// registerScript builders (which iterate this) emit nothing.
-    script_names: []const []const u8 = &.{},
+    scripts: []const EmbedScript = &.{},
     /// Script-declared components (labelle-assembler#585): the parsed
     /// declare-mode schema, set by root.zig after
-    /// `scripting_declare.runPhase` ran the plugin's runner over
-    /// `script_names` (borrowed from the phase's `Schema` arena, alive
-    /// through main.zig emission). Consumed by
+    /// `scripting_declare.runPhase` ran the plugin's runner over the
+    /// collected script files (borrowed from the phase's `Schema` arena,
+    /// alive through main.zig emission). Consumed by
     /// `registries.writeComponentRegistryBlock`, which registers each
     /// under its declared name against the generated
     /// `scripting_components.zig`. Empty (the default) for every
@@ -259,21 +309,41 @@ pub fn detect(
         defer pmani.deinit();
         if (!std.mem.eql(u8, pmani.name, SCRIPTING_MANIFEST_NAME)) return null;
 
-        if (embedExtension(declared.language)) |ext| {
+        if (embedRow(declared.language)) |row| {
+            // Probe by the runnable extension AND the transpile-gap
+            // authoring extension (`.ts`), exempting declaration files
+            // (`.d.ts`) — see `ProbeSpec`.
+            var ext_buf: [2][]const u8 = .{ row.extension, undefined };
+            var ext_len: usize = 1;
+            var exempt: ?[]const u8 = null;
+            if (row.transpile) |t| {
+                ext_buf[1] = t.source_extension;
+                ext_len = 2;
+                exempt = t.declaration_suffix;
+            }
+            const resolved = try resolveScriptDir(allocator, game_dir, declared.language, .{
+                .extensions = ext_buf[0..ext_len],
+                .exempt_suffix = exempt,
+            });
             return .{
                 .plugin_name = plugin.name,
                 .language = declared.language,
-                .dir = language_policy.conventionDir(declared.language),
-                .extension = ext,
+                .dir = resolved.dir,
+                .legacy = resolved.legacy,
+                .extension = row.extension,
                 .family = .embed,
             };
         }
-        if (nativeExtension(declared.language)) |ext| {
+        if (nativeRow(declared.language)) |row| {
+            const resolved = try resolveScriptDir(allocator, game_dir, declared.language, .{
+                .extensions = &.{row.extension},
+            });
             return .{
                 .plugin_name = plugin.name,
                 .language = declared.language,
-                .dir = language_policy.conventionDir(declared.language),
-                .extension = ext,
+                .dir = resolved.dir,
+                .legacy = resolved.legacy,
+                .extension = row.extension,
                 .family = .native,
             };
         }
@@ -281,13 +351,416 @@ pub fn detect(
             "labelle: script language \"{s}\" has no scripting integration yet " ++
                 "(neither an embedded-VM nor a native-compiled row); " ++
                 "the scripting plugin is wired but no {s}/ sources are consumed",
-            .{ declared.language, language_policy.conventionDir(declared.language) },
+            .{ declared.language, language_policy.SCRIPTS_DIR },
         );
         return null;
     }
     // `declared.plugin_name` always names a member of `plugins` (it came
     // from the same slice), so this is unreachable in practice.
     return null;
+}
+
+// ── Script-dir resolution: scripts/ convention + legacy grace (#237) ──
+
+/// The dir `detect` resolved the splice onto — `scripts/` (the convention)
+/// or the language's deprecated legacy dir (one release of grace).
+pub const ResolvedScriptDir = struct {
+    dir: []const u8,
+    legacy: bool,
+};
+
+const ProbeSpec = struct {
+    /// Extensions that identify the language's files for the probes — the
+    /// runnable extension plus any authoring extension the transpile phase
+    /// compiles (`.ts`), so a `.ts`-only `scripts/` still selects
+    /// `scripts/` (and then transpiles from there — labelle-engine#745 —
+    /// instead of silently falling back to the legacy dir). This is what
+    /// keeps the resolve probe and `scripting_transpile`'s need probe
+    /// agreeing on WHICH dir a `.ts`-only project reads.
+    extensions: []const []const u8,
+    /// Suffix EXEMPT from every probe (`.d.ts`): declaration files carry no
+    /// runtime code — a copied `scripts/labelle.d.ts` (even in a subdir)
+    /// never counts as a script, never trips the state-subdir gate, and
+    /// never marks `scripts/` populated.
+    exempt_suffix: ?[]const u8 = null,
+
+    fn matches(self: ProbeSpec, name: []const u8) bool {
+        if (self.exempt_suffix) |suffix| {
+            if (std.mem.endsWith(u8, name, suffix)) return false;
+        }
+        for (self.extensions) |ext| {
+            if (std.mem.endsWith(u8, name, ext)) return true;
+        }
+        return false;
+    }
+};
+
+/// Resolve which dir the splice reads the game's `language` scripts from
+/// (labelle-engine#237's rollout contract):
+///
+///   - `scripts/` holds language files at its TOP LEVEL → `scripts/` (the
+///     convention; state subdirs stay Zig-only, see below);
+///   - `scripts/` has none but the legacy dir (`lua/`, `ts/` —
+///     `language_policy.legacyDir`) has some → the legacy dir, with a
+///     pointed deprecation note (one release of grace);
+///   - BOTH populated → `error.LegacyScriptDirConflict` (never merged);
+///   - NEITHER → `scripts/` (zero scripts — the plugin wires, nothing
+///     embeds/stages).
+///
+/// Independent of which dir wins: a language file inside a `scripts/`
+/// SUBDIR is `error.ScriptInStateSubdir` — state-scoped subdirs
+/// (`scripts/<state>/`) are Zig-only until the scripting Controller grows
+/// state awareness, and silently ignoring the file would be the exact
+/// dead-script class this module polices. Dot-entries are skipped
+/// everywhere (`.plugin_*`, `.gitkeep`).
+pub fn resolveScriptDir(
+    allocator: std.mem.Allocator,
+    game_dir: []const u8,
+    language: []const u8,
+    spec: ProbeSpec,
+) !ResolvedScriptDir {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    // Probe scripts/: top-level language files + subdir offenders.
+    var top_count: usize = 0;
+    var offenders: std.ArrayList([]const u8) = .empty;
+    var offenders_total: usize = 0;
+    defer {
+        for (offenders.items) |p| allocator.free(p);
+        offenders.deinit(allocator);
+    }
+    const scripts_path = try std.fs.path.join(allocator, &.{ game_dir, language_policy.SCRIPTS_DIR });
+    defer allocator.free(scripts_path);
+    if (cwd.openDir(io, scripts_path, .{ .iterate = true })) |scripts_dir_const| {
+        var scripts_dir = scripts_dir_const;
+        defer scripts_dir.close(io);
+        var iter = scripts_dir.iterate();
+        while (try iter.next(io)) |entry| {
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            switch (entry.kind) {
+                .directory => {
+                    var sub = scripts_dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                    defer sub.close(io);
+                    const sub_prefix = try std.fs.path.join(allocator, &.{ language_policy.SCRIPTS_DIR, entry.name });
+                    defer allocator.free(sub_prefix);
+                    try collectMatchingFiles(allocator, io, sub, sub_prefix, spec, &offenders, &offenders_total);
+                },
+                else => {
+                    if (spec.matches(entry.name)) top_count += 1;
+                },
+            }
+        }
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => return err,
+    }
+
+    if (offenders_total > 0) {
+        std.debug.print(
+            "labelle-assembler: {s} scripts cannot live in {s}/ subdirectories yet — " ++
+                "state-scoped subdirs ({s}/<state>/) are Zig-only until the scripting Controller grows state awareness:\n",
+            .{ language, language_policy.SCRIPTS_DIR, language_policy.SCRIPTS_DIR },
+        );
+        for (offenders.items) |rel| std.debug.print("  {s}\n", .{rel});
+        if (offenders_total > offenders.items.len) {
+            std.debug.print("  ... and {d} more\n", .{offenders_total - offenders.items.len});
+        }
+        std.debug.print(
+            "  move them to the top level of {s}/ (numeric prefixes order them: 01_foo, 02_bar).\n",
+            .{language_policy.SCRIPTS_DIR},
+        );
+        return error.ScriptInStateSubdir;
+    }
+
+    // Probe the legacy dir (recursively — its old layout allowed subdirs).
+    const legacy_dir = language_policy.legacyDir(language);
+    var legacy_exists = false;
+    var legacy_listed: std.ArrayList([]const u8) = .empty;
+    var legacy_count: usize = 0;
+    defer {
+        for (legacy_listed.items) |p| allocator.free(p);
+        legacy_listed.deinit(allocator);
+    }
+    const legacy_path = try std.fs.path.join(allocator, &.{ game_dir, legacy_dir });
+    defer allocator.free(legacy_path);
+    if (cwd.openDir(io, legacy_path, .{ .iterate = true })) |legacy_dir_const| {
+        var ldir = legacy_dir_const;
+        defer ldir.close(io);
+        legacy_exists = true;
+        try collectMatchingFiles(allocator, io, ldir, legacy_dir, spec, &legacy_listed, &legacy_count);
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => return err,
+    }
+
+    if (top_count > 0 and legacy_count > 0) {
+        std.debug.print(
+            "labelle-assembler: both {s}/ and the deprecated {s}/ dir contain {s} scripts — they are never merged:\n" ++
+                "  {s}/: {d} file(s)\n  {s}/: {d} file(s)\n" ++
+                "  move everything to {s}/ ({s}/ support ends next release).\n",
+            .{
+                language_policy.SCRIPTS_DIR, legacy_dir,                  language,
+                language_policy.SCRIPTS_DIR, top_count,                   legacy_dir,
+                legacy_count,                language_policy.SCRIPTS_DIR, legacy_dir,
+            },
+        );
+        return error.LegacyScriptDirConflict;
+    }
+
+    if (top_count == 0 and legacy_count > 0) {
+        std.log.warn(
+            "labelle: {s}/ is deprecated — move scripts to {s}/ ({s}/ keeps working for one release of grace)",
+            .{ legacy_dir, language_policy.SCRIPTS_DIR, legacy_dir },
+        );
+        return .{ .dir = legacy_dir, .legacy = true };
+    }
+
+    if (top_count == 0 and legacy_exists) {
+        // The legacy dir EXISTS but holds no language sources, and
+        // scripts/ has none either: keep the splice on the legacy dir
+        // (silently — nothing is consumed, so no deprecation note) so its
+        // pre-#237 semantics still apply — in particular the native
+        // family's pointed "exists but empty" error
+        // (`stageNativeSources`), which a dedicated per-language dir
+        // earns and the shared scripts/ dir doesn't.
+        return .{ .dir = legacy_dir, .legacy = true };
+    }
+
+    return .{ .dir = language_policy.SCRIPTS_DIR, .legacy = false };
+}
+
+/// Recursive spec-matching file collection (rel paths under `rel_prefix`,
+/// capped at `language_policy.MAX_LISTED_FILES`; `total` keeps the true
+/// count). Dot-entries skipped — the policy scan's rule.
+fn collectMatchingFiles(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    spec: ProbeSpec,
+    listed: *std.ArrayList([]const u8),
+    total: *usize,
+) !void {
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        switch (entry.kind) {
+            .directory => {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                const sub_prefix = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
+                defer allocator.free(sub_prefix);
+                try collectMatchingFiles(allocator, io, sub, sub_prefix, spec, listed, total);
+            },
+            else => {
+                if (!spec.matches(entry.name)) continue;
+                total.* += 1;
+                if (listed.items.len < language_policy.MAX_LISTED_FILES) {
+                    const rel = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
+                    errdefer allocator.free(rel);
+                    try listed.append(allocator, rel);
+                }
+            },
+        }
+    }
+}
+
+// ── Embed-script collection (the scripts/ convention + legacy grace) ──
+
+/// Collect the game's embed scripts for an `.embed` splice and place the
+/// target link:
+///
+///   `scripts/` (the convention): TOP-LEVEL `<extension>` files only
+///   (subdir offenders already errored in `detect`'s `resolveScriptDir`),
+///   ordered by the ZIG scripts/ convention — numeric prefixes first
+///   (ascending, `01_` before `02_`), unprefixed after, alphabetically by
+///   stripped stem; the prefix is stripped from the registered `name`
+///   exactly as the Zig scanner strips it (`stripPrefixAndExt`). Duplicate
+///   numeric prefixes are `error.DuplicateSortOrder`, mirroring the Zig
+///   scanner's validation (one scope: the language's top level). The
+///   target's `scripts/` link is (re)placed idempotently — it's the same
+///   link root.zig lays down for the Zig scanner; the two scanners share
+///   the dir and each sees only its own extension.
+///
+///   Legacy dir (grace): the pre-#237 behavior VERBATIM —
+///   `scanner.linkAndScan` (recursive, plain sorted stems, subdirs joined
+///   with `/`, no prefix stripping), stems doubling as names with
+///   `file = stem ++ extension`. Unmigrated projects stay byte-identical.
+///
+/// Returns owned entries (both strings allocated); free with
+/// `freeEmbedScripts`. A missing dir collects empty (the plugin wires,
+/// nothing embeds).
+pub fn collectEmbedScripts(
+    allocator: std.mem.Allocator,
+    game_dir: []const u8,
+    target_dir: []const u8,
+    splice: ScriptingSplice,
+) ![]EmbedScript {
+    if (splice.legacy) {
+        const stems = try scanner.linkAndScan(allocator, game_dir, target_dir, splice.dir, splice.extension);
+        defer scanner.freeNames(allocator, stems);
+        return embedScriptsFromStems(allocator, stems, splice.extension);
+    }
+
+    // The convention dir: link (idempotent — root.zig already linked it
+    // for the Zig scanner; a correct link is a no-op reconcile) + collect
+    // the top level.
+    try scanner.linkDir(allocator, game_dir, target_dir, splice.dir);
+
+    const dir_path = try std.fs.path.join(allocator, &.{ game_dir, splice.dir });
+    defer allocator.free(dir_path);
+    return collectOrderedTopLevelAbs(allocator, dir_path, splice);
+}
+
+/// The same collection over a FULLY-RESOLVED directory, no link placement
+/// — the transpile phase's post-emission re-scan (labelle-engine#745): the
+/// target's script dir was MATERIALIZED (copied game tree + tsc-emitted
+/// `.js`), so the embeddable set must be re-collected from THAT dir, under
+/// the SAME rules the game-dir collection uses — ordering prefixes strip
+/// and order (a `10_a.ts` emits `10_a.js` and registers as "a", before
+/// `20_b`'s), duplicate orders error, and the generated
+/// `labelle-components.d.ts` is never collected (it doesn't carry the
+/// embed extension). Legacy splices keep the pre-#237 recursive
+/// plain-stem semantics (`scanner.scanDirAbs`), so a grace-window `ts/`
+/// project transpiles AND registers exactly as it embedded before.
+pub fn collectEmbedScriptsAbs(
+    allocator: std.mem.Allocator,
+    abs_dir: []const u8,
+    splice: ScriptingSplice,
+) ![]EmbedScript {
+    if (splice.legacy) {
+        const stems = try scanner.scanDirAbs(allocator, abs_dir, splice.extension);
+        defer scanner.freeNames(allocator, stems);
+        return embedScriptsFromStems(allocator, stems, splice.extension);
+    }
+    return collectOrderedTopLevelAbs(allocator, abs_dir, splice);
+}
+
+/// Legacy stems → entries: names stay the plain stems (subdirs joined
+/// with `/`, numeric prefixes KEPT — byte-identical registration through
+/// the grace release), files re-derive as `<stem><ext>`.
+fn embedScriptsFromStems(
+    allocator: std.mem.Allocator,
+    stems: []const []const u8,
+    extension: []const u8,
+) ![]EmbedScript {
+    var out: std.ArrayList(EmbedScript) = .empty;
+    errdefer freeEmbedScriptList(allocator, &out);
+    try out.ensureTotalCapacity(allocator, stems.len);
+    for (stems) |stem| {
+        const name = try allocator.dupe(u8, stem);
+        errdefer allocator.free(name);
+        const file = try std.fmt.allocPrint(allocator, "{s}{s}", .{ stem, extension });
+        errdefer allocator.free(file);
+        out.appendAssumeCapacity(.{ .name = name, .file = file });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// The scripts/-convention collection core over one absolute dir: TOP
+/// LEVEL only, Zig ordering, prefix-stripped names, duplicate-order
+/// validation. Shared by the game-dir collection and the transpile
+/// phase's materialized-dir re-scan.
+fn collectOrderedTopLevelAbs(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    splice: ScriptingSplice,
+) ![]EmbedScript {
+    const io = config.globalIo();
+
+    const Collected = struct {
+        script: EmbedScript,
+        sort_order: ?u32,
+    };
+    var entries: std.ArrayList(Collected) = .empty;
+    defer entries.deinit(allocator);
+    errdefer for (entries.items) |e| {
+        allocator.free(e.script.name);
+        allocator.free(e.script.file);
+    };
+
+    if (std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true })) |dir_const| {
+        var dir = dir_const;
+        defer dir.close(io);
+        var iter = dir.iterate();
+        while (try iter.next(io)) |entry| {
+            // Skip only directories (matching `resolveScriptDir`'s probe,
+            // so "populated" and "collected" can never disagree — e.g. on
+            // a symlinked script file).
+            if (entry.kind == .directory) continue;
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            if (!std.mem.endsWith(u8, entry.name, splice.extension)) continue;
+            const name = try allocator.dupe(u8, script_scanner.stripPrefixAndExt(entry.name, splice.extension));
+            errdefer allocator.free(name);
+            const file = try allocator.dupe(u8, entry.name);
+            errdefer allocator.free(file);
+            try entries.append(allocator, .{
+                .script = .{ .name = name, .file = file },
+                .sort_order = script_scanner.extractSortOrder(entry.name),
+            });
+        }
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => return err,
+    }
+
+    // The Zig scripts/ ordering: numbered before unnumbered, numbered
+    // ascending, then alphabetical by stripped name (filename tiebreak for
+    // full determinism).
+    std.mem.sortUnstable(Collected, entries.items, {}, struct {
+        fn lessThan(_: void, a: Collected, b: Collected) bool {
+            const a_has = a.sort_order != null;
+            const b_has = b.sort_order != null;
+            if (a_has != b_has) return a_has;
+            if (a.sort_order) |a_order| {
+                if (b.sort_order) |b_order| {
+                    if (a_order != b_order) return a_order < b_order;
+                }
+            }
+            const by_name = std.mem.order(u8, a.script.name, b.script.name);
+            if (by_name != .eq) return by_name == .lt;
+            return std.mem.order(u8, a.script.file, b.script.file) == .lt;
+        }
+    }.lessThan);
+
+    // Duplicate-prefix validation — the Zig scanner's rule, one scope
+    // (the language's top level). Sorted, so duplicates are adjacent.
+    var i: usize = 1;
+    while (i < entries.items.len) : (i += 1) {
+        const a = entries.items[i - 1];
+        const b = entries.items[i];
+        const a_order = a.sort_order orelse continue;
+        const b_order = b.sort_order orelse continue;
+        if (a_order != b_order) continue;
+        std.debug.print(
+            "error: duplicate {s} script order {d:0>2} in {s}/:\n  - {s}\n  - {s}\n",
+            .{ splice.language, a_order, splice.dir, a.script.file, b.script.file },
+        );
+        return error.DuplicateSortOrder;
+    }
+
+    var out = try allocator.alloc(EmbedScript, entries.items.len);
+    for (entries.items, 0..) |e, idx| out[idx] = e.script;
+    entries.clearRetainingCapacity(); // ownership moved to `out`
+    return out;
+}
+
+fn freeEmbedScriptList(allocator: std.mem.Allocator, list: *std.ArrayList(EmbedScript)) void {
+    for (list.items) |s| {
+        allocator.free(s.name);
+        allocator.free(s.file);
+    }
+    list.deinit(allocator);
+}
+
+/// Free a `collectEmbedScripts` result (entries own both strings).
+pub fn freeEmbedScripts(allocator: std.mem.Allocator, scripts: []EmbedScript) void {
+    for (scripts) |s| {
+        allocator.free(s.name);
+        allocator.free(s.file);
+    }
+    allocator.free(scripts);
 }
 
 // ── Native-language game-source staging (labelle-engine#741) ──────────
@@ -302,9 +775,9 @@ pub fn detect(
 ///
 /// The placement is `scanner.linkDirAbs` — the SAME primitive
 /// `linkAndScan` uses for embed-language script dirs — so the staged
-/// view is LIVE: editing `rust/*.rs` and rerunning the generated `zig
+/// view is LIVE: editing `scripts/*.rs` and rerunning the generated `zig
 /// build` compiles the current sources without a re-generate, exactly
-/// like editing `lua/*.lua` does. (A copy went stale the moment the
+/// like editing `scripts/*.lua` does. (A copy went stale the moment the
 /// author's edit loop started — the silent-staleness class `labelle
 /// run`'s stale-binary rule exists for.) The primitive also owns the
 /// Windows posture: symlink first, copy fallback when symlinks are
@@ -328,19 +801,26 @@ pub fn detect(
 ///   - A missing `<dir>/` is a no-op (scripting plugin attached, zero
 ///     scripts — exactly how the embed rows treat a missing script dir):
 ///     the shipped placeholder stays and registers nothing.
-///   - An EXISTING `<dir>/` with no `<ext>` sources is a pointed error
-///     (`error.NativeScriptDirEmpty`) — unlike a missing dir it can only
-///     be a half-finished setup, and cargo would otherwise fail far from
-///     the author.
-///   - `<dir>/<module_root>` (rust: `rust/mod.rs`) is REQUIRED once any
+///   - `scripts/` with no `<ext>` sources is ALSO a no-op: the shared
+///     convention dir legitimately holds a Zig-only game's scripts, so
+///     "exists but no native sources" is indistinguishable from "zero
+///     native scripts yet" — the placeholder stays. Only the LEGACY dir
+///     (`splice.legacy` — `rust/` exists but holds no `.rs`) keeps the
+///     pointed `error.NativeScriptDirEmpty`: a dedicated per-language dir
+///     with nothing in it can only be a half-finished setup, and cargo
+///     would otherwise fail far from the author.
+///   - `<dir>/<module_root>` (rust: `scripts/mod.rs`) is REQUIRED once any
 ///     source exists: it becomes the crate's game-module root
 ///     (`error.NativeScriptsMissingModuleRoot` names the convention).
 ///
-/// Validation walks the SOURCE dir (`<ext>` files, dot-entries skipped);
-/// the link then exposes the whole dir as-is — a stray non-`<ext>` file
-/// (notes.toml) IS visible to cargo through the link, unlike the
-/// earlier copy design. Benign by construction: rustc compiles only the
-/// modules `mod.rs` reachably declares, and the crate's Cargo.toml
+/// Validation walks the SOURCE dir (`<ext>` files, dot-entries skipped;
+/// the walk is recursive so LEGACY-dir module subtrees keep working —
+/// `scripts/` subdir sources were already gated by `resolveScriptDir`'s
+/// state-subdir error at detect); the link then exposes the whole dir
+/// as-is — a stray non-`<ext>` file (notes.toml), and for `scripts/` the
+/// game's `.zig` scripts, IS visible to cargo through the link, unlike
+/// the earlier copy design. Benign by construction: rustc compiles only
+/// the modules `mod.rs` reachably declares, and the crate's Cargo.toml
 /// lives in the plugin's `native/`, not the game dir. Idempotent: the
 /// primitive's correct-link no-op also serves the tests-target pass,
 /// whose deps tree is NOT re-staged (`recreate_deps = false`).
@@ -375,6 +855,11 @@ pub fn stageNativeSources(
     try collectNativeSources(allocator, io, src_dir, "", splice.extension, &rel_paths);
 
     if (rel_paths.items.len == 0) {
+        // The shared scripts/ dir with zero native sources is a normal
+        // Zig-only shape — no-op, the placeholder stays (module doc). The
+        // pointed error is legacy-dir-only: a dedicated rust/ with no .rs
+        // can only be a half-finished setup.
+        if (!splice.legacy) return;
         std.debug.print(
             "labelle-assembler: {s}/ exists but contains no {s} sources.\n" ++
                 "  the scripting plugin (language \"{s}\") compiles {s}/ into the game — " ++
@@ -535,12 +1020,15 @@ test "detect: scripting manifest + .params.language → splice with the entry's 
     const splice = (try detect(allocator, &plugins, project_dir)).?;
     try testing.expectEqualStrings("scripting", splice.plugin_name);
     try testing.expectEqualStrings("lua", splice.language);
-    try testing.expectEqualStrings("lua", splice.dir);
+    // The scripts/ convention (labelle-engine#237): no lua/ files exist,
+    // so the resolve lands on the default — scripts/, non-legacy.
+    try testing.expectEqualStrings("scripts", splice.dir);
+    try testing.expect(!splice.legacy);
     try testing.expectEqualStrings(".lua", splice.extension);
-    try testing.expectEqual(@as(usize, 0), splice.script_names.len);
+    try testing.expectEqual(@as(usize, 0), splice.scripts.len);
 }
 
-test "detect: a typescript declaration splices with the ts/ convention dir and the .js embed extension" {
+test "detect: a typescript declaration splices with the scripts/ convention dir and the .js embed extension" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -557,9 +1045,10 @@ test "detect: a typescript declaration splices with the ts/ convention dir and t
     const splice = (try detect(allocator, &plugins, project_dir)).?;
     try testing.expectEqualStrings("scripting", splice.plugin_name);
     try testing.expectEqualStrings("typescript", splice.language);
-    // dir ≠ language for typescript: scripts live in `ts/` (the
-    // labelle-scripting convention) and embed paths root there.
-    try testing.expectEqualStrings("ts", splice.dir);
+    // Same scripts/ home as every language (ts/ is only the legacy grace
+    // dir now); the embed extension stays the runnable .js.
+    try testing.expectEqualStrings("scripts", splice.dir);
+    try testing.expect(!splice.legacy);
     try testing.expectEqualStrings(".js", splice.extension);
 }
 
@@ -629,7 +1118,7 @@ test "detect: scripting manifest WITHOUT .params.language → null (policy owns 
     try testing.expect((try detect(allocator, &plugins, project_dir)) == null);
 }
 
-test "detect: a rust declaration splices as the NATIVE family — rust/ dir, .rs extension, no embed" {
+test "detect: a rust declaration splices as the NATIVE family — scripts/ dir, .rs extension, no embed" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -646,12 +1135,13 @@ test "detect: a rust declaration splices as the NATIVE family — rust/ dir, .rs
     const splice = (try detect(allocator, &plugins, project_dir)).?;
     try testing.expectEqualStrings("scripting", splice.plugin_name);
     try testing.expectEqualStrings("rust", splice.language);
-    try testing.expectEqualStrings("rust", splice.dir);
+    try testing.expectEqualStrings("scripts", splice.dir);
+    try testing.expect(!splice.legacy);
     try testing.expectEqualStrings(".rs", splice.extension);
     try testing.expectEqual(Family.native, splice.family);
     // Nothing embeds for a native splice — the registerScript builders
-    // iterate script_names, which stays empty for the family.
-    try testing.expectEqual(@as(usize, 0), splice.script_names.len);
+    // iterate `scripts`, which stays empty for the family.
+    try testing.expectEqual(@as(usize, 0), splice.scripts.len);
 }
 
 test "NATIVE_LANGUAGES: rust + crystal row shapes — extension, crate stage dir, module root; nativeExtension table" {
@@ -678,7 +1168,7 @@ test "NATIVE_LANGUAGES: rust + crystal row shapes — extension, crate stage dir
     try testing.expect(nativeExtension("go") == null);
 }
 
-test "detect: a crystal declaration splices as the NATIVE family — crystal/ dir, .cr extension" {
+test "detect: a crystal declaration splices as the NATIVE family — scripts/ dir, .cr extension" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -694,10 +1184,138 @@ test "detect: a crystal declaration splices as the NATIVE family — crystal/ di
     };
     const splice = (try detect(allocator, &plugins, project_dir)).?;
     try testing.expectEqualStrings("crystal", splice.language);
-    try testing.expectEqualStrings("crystal", splice.dir);
+    try testing.expectEqualStrings("scripts", splice.dir);
+    try testing.expect(!splice.legacy);
     try testing.expectEqualStrings(".cr", splice.extension);
     try testing.expectEqual(Family.native, splice.family);
-    try testing.expectEqual(@as(usize, 0), splice.script_names.len);
+    try testing.expectEqual(@as(usize, 0), splice.scripts.len);
+}
+
+// ── resolveScriptDir: the scripts/ convention + legacy grace (#237) ───
+
+test "detect: legacy grace — lua/ scripts with an empty scripts/ resolve onto the deprecated dir (note printed)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "plugins/scripting/plugin.labelle",
+        \\.{ .name = "scripting", .manifest_version = 1 }
+    );
+    // The unmigrated project shape: lua/ populated (nested subdirs were
+    // legal there), scripts/ holding only Zig scripts.
+    try writeTestFile(tmp.dir, "lua/behavior.lua", "return {}\n");
+    try writeTestFile(tmp.dir, "lua/ai/guard.lua", "return {}\n");
+    try writeTestFile(tmp.dir, "scripts/01_move.zig", "pub fn tick() void {}\n");
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "lua" } },
+    };
+    const splice = (try detect(allocator, &plugins, project_dir)).?;
+    try testing.expectEqualStrings("lua", splice.dir);
+    try testing.expect(splice.legacy);
+    // (The deprecation note is a std.log.warn — tolerated by the test
+    // runner; the RESULT is the pin, the note's wording is the fallback
+    // branch's only exit.)
+}
+
+test "detect: BOTH scripts/ and the legacy dir populated → pointed conflict error (never merged)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "plugins/scripting/plugin.labelle",
+        \\.{ .name = "scripting", .manifest_version = 1 }
+    );
+    try writeTestFile(tmp.dir, "scripts/spawner.lua", "return {}\n");
+    try writeTestFile(tmp.dir, "lua/behavior.lua", "return {}\n");
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "lua" } },
+    };
+    try testing.expectError(error.LegacyScriptDirConflict, detect(allocator, &plugins, project_dir));
+}
+
+test "detect: a language file in a scripts/ subdir is the pointed state-subdir error — even when the legacy dir would win" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "plugins/scripting/plugin.labelle",
+        \\.{ .name = "scripting", .manifest_version = 1 }
+    );
+    // State subdirs are Zig-only until the scripting Controller grows
+    // state awareness — a language file there must FAIL generate, never
+    // be silently ignored (and never silently excluded by a legacy
+    // fallback that would leave it dead).
+    try writeTestFile(tmp.dir, "scripts/playing/10_spawner.lua", "return {}\n");
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "lua" } },
+    };
+    try testing.expectError(error.ScriptInStateSubdir, detect(allocator, &plugins, project_dir));
+
+    // The legacy-populated variant: scripts/ top level empty, lua/ has
+    // scripts — the subdir offender STILL errors (it precedes the
+    // fallback decision by design).
+    try writeTestFile(tmp.dir, "lua/behavior.lua", "return {}\n");
+    try testing.expectError(error.ScriptInStateSubdir, detect(allocator, &plugins, project_dir));
+}
+
+test "resolveScriptDir: negative controls — zig/organizational subdirs don't trip the gate; .d.ts is exempt everywhere" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Zig state subdirs + non-language files in subdirs are the Zig
+    // scanner's business — the language probe must not see them.
+    try writeTestFile(tmp.dir, "scripts/behavior.lua", "return {}\n");
+    try writeTestFile(tmp.dir, "scripts/playing/02_hud.zig", "pub fn tick() void {}\n");
+    try writeTestFile(tmp.dir, "scripts/playing/README.md", "# notes\n");
+    try writeTestFile(tmp.dir, "scripts/.plugin_fake/evil.lua", "-- dot-dirs are skipped\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const lua = try resolveScriptDir(allocator, root, "lua", .{ .extensions = &.{".lua"} });
+    try testing.expectEqualStrings("scripts", lua.dir);
+    try testing.expect(!lua.legacy);
+
+    // typescript: a declaration file is NOT a script — subdir-placed
+    // labelle.d.ts neither trips the state-subdir gate nor marks
+    // scripts/ populated (a .js-in-ts/ project with a copied d.ts in
+    // scripts/ still legacy-falls-back).
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try writeTestFile(tmp2.dir, "scripts/types/labelle.d.ts", "declare const labelle: any;\n");
+    try writeTestFile(tmp2.dir, "ts/behavior.js", "export function update(dt) {}\n");
+    const root2 = try tmp2.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root2);
+    const ts = try resolveScriptDir(allocator, root2, "typescript", .{
+        .extensions = &.{ ".js", ".ts" },
+        .exempt_suffix = ".d.ts",
+    });
+    try testing.expectEqualStrings("ts", ts.dir);
+    try testing.expect(ts.legacy);
+
+    // …while a runnable .ts in scripts/ top level DOES mark it populated
+    // (the transpile gate owns the pointed error downstream) — so the
+    // same project WITHOUT the legacy dir resolves onto scripts/.
+    var tmp3 = testing.tmpDir(.{});
+    defer tmp3.cleanup();
+    try writeTestFile(tmp3.dir, "scripts/enemy.ts", "export function update(dt: number) {}\n");
+    const root3 = try tmp3.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root3);
+    const ts3 = try resolveScriptDir(allocator, root3, "typescript", .{
+        .extensions = &.{ ".js", ".ts" },
+        .exempt_suffix = ".d.ts",
+    });
+    try testing.expectEqualStrings("scripts", ts3.dir);
+    try testing.expect(!ts3.legacy);
 }
 
 test "detect: an integration gap (declared language in NEITHER table) → null with a warning" {
@@ -722,12 +1340,324 @@ test "detect: an integration gap (declared language in NEITHER table) → null w
     try testing.expect((try detect(allocator, &plugins, project_dir)) == null);
 }
 
+// ── the typescript fixtures (transpile phase re-scan seam, #745) ─────
+
+const ts_splice_fixture = ScriptingSplice{
+    .plugin_name = "scripting",
+    .language = "typescript",
+    .dir = "scripts",
+    .extension = ".js",
+};
+
+/// The grace-fallback twin: detect resolved the deprecated ts/ dir.
+const ts_legacy_splice_fixture = ScriptingSplice{
+    .plugin_name = "scripting",
+    .language = "typescript",
+    .dir = "ts",
+    .legacy = true,
+    .extension = ".js",
+};
+
+test "collectEmbedScriptsAbs: the transpile re-scan — ordering + stripping over a materialized dir; the generated d.ts is never a script" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The exact materialized-dir shape the transpile phase leaves behind
+    // for a scripts/-convention project (labelle-engine#745 over #237):
+    // tsc-emitted `.js` twins of `10_a.ts`/`20_b.ts` (prefixes intact in
+    // the FILENAME), a copied plain `.js`, the copied game tree's `.zig`
+    // scripts + state subdir, and the generated components declaration.
+    try writeTestFile(tmp.dir, "materialized/10_a.js", "export function update(dt) {}\n");
+    try writeTestFile(tmp.dir, "materialized/20_b.js", "export function update(dt) {}\n");
+    try writeTestFile(tmp.dir, "materialized/plain.js", "export function update(dt) {}\n");
+    try writeTestFile(tmp.dir, "materialized/01_move.zig", "pub fn tick() void {}\n");
+    try writeTestFile(tmp.dir, "materialized/playing/02_hud.zig", "pub fn tick() void {}\n");
+    try writeTestFile(tmp.dir, "materialized/labelle-components.d.ts", "declare global {}\n");
+    try writeTestFile(tmp.dir, "materialized/labelle.d.ts", "declare const labelle: any;\n");
+    const abs = try tmp.dir.realPathFileAlloc(testing.io, "materialized", allocator);
+    defer allocator.free(abs);
+
+    const scripts = try collectEmbedScriptsAbs(allocator, abs, ts_splice_fixture);
+    defer freeEmbedScripts(allocator, scripts);
+
+    // Prefix order first (10 before 20), unprefixed after; stems stripped
+    // exactly like the game-dir collection; .zig/.d.ts invisible.
+    try testing.expectEqual(@as(usize, 3), scripts.len);
+    try testing.expectEqualStrings("a", scripts[0].name);
+    try testing.expectEqualStrings("10_a.js", scripts[0].file);
+    try testing.expectEqualStrings("b", scripts[1].name);
+    try testing.expectEqualStrings("20_b.js", scripts[1].file);
+    try testing.expectEqualStrings("plain", scripts[2].name);
+
+    // Duplicate orders error here exactly like the game-dir collection —
+    // including the cross-source shape only the re-scan can see (an
+    // emitted 10_a.js colliding with a hand-authored 10_z.js).
+    try writeTestFile(tmp.dir, "materialized/10_z.js", "export function update(dt) {}\n");
+    try testing.expectError(error.DuplicateSortOrder, collectEmbedScriptsAbs(allocator, abs, ts_splice_fixture));
+}
+
+test "collectEmbedScriptsAbs: LEGACY re-scan keeps pre-#237 semantics — recursive, plain stems, no stripping; d.ts still excluded" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A materialized legacy ts/ (grace release): nested subdirs were
+    // legal there, stems keep prefixes and join with '/'.
+    try writeTestFile(tmp.dir, "materialized/10_boot.js", "export function update(dt) {}\n");
+    try writeTestFile(tmp.dir, "materialized/ai/guard.js", "export function update(dt) {}\n");
+    try writeTestFile(tmp.dir, "materialized/labelle-components.d.ts", "declare global {}\n");
+    const abs = try tmp.dir.realPathFileAlloc(testing.io, "materialized", allocator);
+    defer allocator.free(abs);
+
+    const scripts = try collectEmbedScriptsAbs(allocator, abs, ts_legacy_splice_fixture);
+    defer freeEmbedScripts(allocator, scripts);
+
+    try testing.expectEqual(@as(usize, 2), scripts.len);
+    try testing.expectEqualStrings("10_boot", scripts[0].name);
+    try testing.expectEqualStrings("10_boot.js", scripts[0].file);
+    try testing.expectEqualStrings("ai/guard", scripts[1].name);
+    try testing.expectEqualStrings("ai/guard.js", scripts[1].file);
+}
+
+// ── collectEmbedScripts: ordering, coexistence, legacy verbatim ───────
+
+test "collectEmbedScripts: numeric prefixes order first and strip from the stem — the Zig scripts/ convention (ordering pin)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The ticket's example plus an unprefixed tail: 10_spawner.rb before
+    // 20_hunger.rb (stems "spawner"/"hunger"), 02_boot before both,
+    // unprefixed after, alphabetically.
+    try writeTestFile(tmp.dir, "scripts/20_hunger.rb", "class Hunger; end\n");
+    try writeTestFile(tmp.dir, "scripts/10_spawner.rb", "class Spawner; end\n");
+    try writeTestFile(tmp.dir, "scripts/02_boot.rb", "class Boot; end\n");
+    try writeTestFile(tmp.dir, "scripts/zeta.rb", "class Zeta; end\n");
+    try writeTestFile(tmp.dir, "scripts/alpha.rb", "class Alpha; end\n");
+    try tmp.dir.createDirPath(testing.io, "target");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(testing.io, "target", allocator);
+    defer allocator.free(target);
+
+    const splice = ScriptingSplice{
+        .plugin_name = "scripting",
+        .language = "ruby",
+        .dir = "scripts",
+        .extension = ".rb",
+    };
+    const scripts = try collectEmbedScripts(allocator, root, target, splice);
+    defer freeEmbedScripts(allocator, scripts);
+
+    try testing.expectEqual(@as(usize, 5), scripts.len);
+    try testing.expectEqualStrings("boot", scripts[0].name);
+    try testing.expectEqualStrings("02_boot.rb", scripts[0].file);
+    try testing.expectEqualStrings("spawner", scripts[1].name);
+    try testing.expectEqualStrings("10_spawner.rb", scripts[1].file);
+    try testing.expectEqualStrings("hunger", scripts[2].name);
+    try testing.expectEqualStrings("20_hunger.rb", scripts[2].file);
+    try testing.expectEqualStrings("alpha", scripts[3].name);
+    try testing.expectEqualStrings("zeta", scripts[4].name);
+
+    // Stripping parity is BY CONSTRUCTION (the same function the Zig
+    // scanner uses) — pin one exotic case both ways anyway.
+    try testing.expectEqualStrings(
+        script_scanner.stripPrefixAndExt("10x.rb", ".rb"),
+        "10x", // digits without '_' are not a prefix
+    );
+}
+
+test "collectEmbedScripts: duplicate numeric prefixes error like the Zig scanner (negative + control)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "scripts/10_ai.lua", "return {}\n");
+    try writeTestFile(tmp.dir, "scripts/10_boot.lua", "return {}\n");
+    try tmp.dir.createDirPath(testing.io, "target");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(testing.io, "target", allocator);
+    defer allocator.free(target);
+
+    const splice = ScriptingSplice{
+        .plugin_name = "scripting",
+        .language = "lua",
+        .dir = "scripts",
+        .extension = ".lua",
+    };
+    try testing.expectError(error.DuplicateSortOrder, collectEmbedScripts(allocator, root, target, splice));
+
+    // Control: renumbering one of them collects cleanly.
+    try tmp.dir.rename("scripts/10_boot.lua", tmp.dir, "scripts/11_boot.lua", testing.io);
+    const scripts = try collectEmbedScripts(allocator, root, target, splice);
+    defer freeEmbedScripts(allocator, scripts);
+    try testing.expectEqual(@as(usize, 2), scripts.len);
+    try testing.expectEqualStrings("ai", scripts[0].name);
+    try testing.expectEqualStrings("boot", scripts[1].name);
+}
+
+test "collectEmbedScripts + ScriptScanner: one mixed scripts/ dir, two scanners, disjoint extension-keyed views (coexistence pin)" {
+    // THE two-layer-in-one-structure pin (labelle-engine#237): .zig and
+    // .lua files share scripts/; the Zig scanner sees ONLY .zig (its
+    // state-subdir machinery intact), the language collection ONLY .lua.
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "scripts/01_move.zig", "pub fn tick() void {}\n");
+    try writeTestFile(tmp.dir, "scripts/hud.zig", "pub fn tick() void {}\n");
+    try writeTestFile(tmp.dir, "scripts/playing/02_camera.zig", "pub fn tick() void {}\n");
+    try writeTestFile(tmp.dir, "scripts/01_spawner.lua", "return {}\n");
+    try writeTestFile(tmp.dir, "scripts/hunger.lua", "return {}\n");
+    try tmp.dir.createDirPath(testing.io, "target");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(testing.io, "target", allocator);
+    defer allocator.free(target);
+    const scripts_path = try std.fs.path.join(allocator, &.{ root, "scripts" });
+    defer allocator.free(scripts_path);
+
+    // Layer 1: the ZIG scanner — .zig only, .lua invisible. Note BOTH
+    // layers use order 01 without colliding: the duplicate-order scopes
+    // are per-scanner, exactly like the per-plugin scopes.
+    var zig_scan = script_scanner.ScriptScanner.init(allocator, &.{"playing"});
+    defer zig_scan.deinit();
+    try zig_scan.scanDir(scripts_path);
+    const zig_entries = zig_scan.getEntries();
+    try testing.expectEqual(@as(usize, 3), zig_entries.len);
+    for (zig_entries) |e| {
+        try testing.expect(std.mem.endsWith(u8, e.filename, ".zig"));
+    }
+    try testing.expectEqualStrings("move", zig_entries[0].name);
+    try testing.expectEqualStrings("hud", zig_entries[1].name);
+    try testing.expectEqualStrings("camera", zig_entries[2].name);
+
+    // Layer 2: the language collection — .lua only, .zig invisible, the
+    // state-scoped playing/ dir not descended into.
+    const splice = ScriptingSplice{
+        .plugin_name = "scripting",
+        .language = "lua",
+        .dir = "scripts",
+        .extension = ".lua",
+    };
+    const lua_scripts = try collectEmbedScripts(allocator, root, target, splice);
+    defer freeEmbedScripts(allocator, lua_scripts);
+    try testing.expectEqual(@as(usize, 2), lua_scripts.len);
+    try testing.expectEqualStrings("spawner", lua_scripts[0].name);
+    try testing.expectEqualStrings("01_spawner.lua", lua_scripts[0].file);
+    try testing.expectEqualStrings("hunger", lua_scripts[1].name);
+
+    // And the shared target link exists once, serving both layers.
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try tmp.dir.readLink(testing.io, "target/scripts", &link_buf);
+}
+
+test "collectEmbedScripts: legacy dir keeps the pre-#237 behavior verbatim — recursive, plain sorted stems, no stripping" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The old ruby fixture shape: a numbered stem (NOT stripped — legacy
+    // registration names are byte-stable through the grace release) and a
+    // nested subdir (joined with '/').
+    try writeTestFile(tmp.dir, "ruby/10_ball.rb", "class Ball; end\n");
+    try writeTestFile(tmp.dir, "ruby/npc/vendor.rb", "class Vendor; end\n");
+    try tmp.dir.createDirPath(testing.io, "target");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(testing.io, "target", allocator);
+    defer allocator.free(target);
+
+    const splice = ScriptingSplice{
+        .plugin_name = "scripting",
+        .language = "ruby",
+        .dir = "ruby",
+        .legacy = true,
+        .extension = ".rb",
+    };
+    const scripts = try collectEmbedScripts(allocator, root, target, splice);
+    defer freeEmbedScripts(allocator, scripts);
+
+    try testing.expectEqual(@as(usize, 2), scripts.len);
+    try testing.expectEqualStrings("10_ball", scripts[0].name);
+    try testing.expectEqualStrings("10_ball.rb", scripts[0].file);
+    try testing.expectEqualStrings("npc/vendor", scripts[1].name);
+    try testing.expectEqualStrings("npc/vendor.rb", scripts[1].file);
+
+    // linkAndScan placed the legacy dir's target link.
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try tmp.dir.readLink(testing.io, "target/ruby", &link_buf);
+}
+
+test "collectEmbedScripts: a missing scripts/ dir collects empty (plugin wired, nothing embeds)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "target");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(testing.io, "target", allocator);
+    defer allocator.free(target);
+
+    const splice = ScriptingSplice{
+        .plugin_name = "scripting",
+        .language = "lua",
+        .dir = "scripts",
+        .extension = ".lua",
+    };
+    const scripts = try collectEmbedScripts(allocator, root, target, splice);
+    defer freeEmbedScripts(allocator, scripts);
+    try testing.expectEqual(@as(usize, 0), scripts.len);
+}
+
+test "EMBED/NATIVE extensions agree with the policy's scriptExtensions vocabulary (single-source pin)" {
+    // language_policy.scriptExtensions drives the scripts/-content policing
+    // and the resolve probes attribute files through the same extensions —
+    // a row whose extension the policy doesn't know would be policed as
+    // foreign in its own project.
+    for (EMBED_LANGUAGES) |row| {
+        const exts = language_policy.scriptExtensions(row.language);
+        var found = false;
+        for (exts) |e| {
+            if (std.mem.eql(u8, e, row.extension)) found = true;
+        }
+        try testing.expect(found);
+        if (row.transpile) |t| {
+            var src_found = false;
+            for (exts) |e| {
+                if (std.mem.eql(u8, e, t.source_extension)) src_found = true;
+            }
+            try testing.expect(src_found);
+        }
+    }
+    for (NATIVE_LANGUAGES) |row| {
+        const exts = language_policy.scriptExtensions(row.language);
+        var found = false;
+        for (exts) |e| {
+            if (std.mem.eql(u8, e, row.extension)) found = true;
+        }
+        try testing.expect(found);
+    }
+}
+
 // ── stageNativeSources (labelle-engine#741) ──────────────────────────
 
 const rust_splice_fixture = ScriptingSplice{
     .plugin_name = "scripting",
     .language = "rust",
+    .dir = "scripts",
+    .extension = ".rs",
+    .family = .native,
+};
+
+/// The grace-fallback twin: detect resolved the deprecated rust/ dir.
+const rust_legacy_splice_fixture = ScriptingSplice{
+    .plugin_name = "scripting",
+    .language = "rust",
     .dir = "rust",
+    .legacy = true,
     .extension = ".rs",
     .family = .native,
 };
@@ -777,13 +1707,16 @@ test "stageNativeSources: LINKS the game dir over the placeholder — live view,
     var fx = try NativeStagingFixture.init(allocator, .{});
     defer fx.deinit(allocator);
 
-    try writeTestFile(fx.tmp.dir, "game/rust/mod.rs", "mod player;\nmod ai;\npub fn register() {}\n");
-    try writeTestFile(fx.tmp.dir, "game/rust/player.rs", "pub struct Player;\n");
-    try writeTestFile(fx.tmp.dir, "game/rust/ai/brain.rs", "pub fn think() {}\n");
+    // The convention shape: mod.rs at the TOP LEVEL of the shared scripts/
+    // dir (subdir .rs sources are gated earlier, at detect's resolve).
+    try writeTestFile(fx.tmp.dir, "game/scripts/mod.rs", "mod player;\npub fn register() {}\n");
+    try writeTestFile(fx.tmp.dir, "game/scripts/player.rs", "pub struct Player;\n");
     // Foreign files: validation counts only .rs sources, but the LINK
     // exposes the whole game dir (delta from the earlier copy design,
-    // documented on stageNativeSources) — asserted further down.
-    try writeTestFile(fx.tmp.dir, "game/rust/notes.toml", "# not a source\n");
+    // documented on stageNativeSources) — asserted further down. The
+    // game's ZIG scripts share the dir now and ride along the same way.
+    try writeTestFile(fx.tmp.dir, "game/scripts/notes.toml", "# not a source\n");
+    try writeTestFile(fx.tmp.dir, "game/scripts/01_move.zig", "pub fn tick() void {}\n");
 
     try stageNativeSources(allocator, fx.game_abs, fx.out_abs, rust_splice_fixture);
 
@@ -796,28 +1729,29 @@ test "stageNativeSources: LINKS the game dir over the placeholder — live view,
 
     const game_mod = try fx.tmp.dir.readFileAlloc(testing.io, "out/deps/labelle-scripting/native/src/game/mod.rs", allocator, .limited(4096));
     defer allocator.free(game_mod);
-    // The PLACEHOLDER is gone — the game's mod.rs is the module root.
+    // The PLACEHOLDER is gone — the game's scripts/mod.rs is the module root.
     try testing.expect(std.mem.indexOf(u8, game_mod, "REPLACED AT GENERATE") == null);
     try testing.expect(std.mem.indexOf(u8, game_mod, "mod player;") != null);
 
     try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/player.rs", .{});
-    try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/ai/brain.rs", .{});
     // The delta from the copy design: non-.rs files ARE reachable through
-    // the link. Benign — rustc compiles only what mod.rs declares.
+    // the link — the game's Zig scripts included. Benign — rustc compiles
+    // only what mod.rs declares.
     try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/notes.toml", .{});
+    try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/01_move.zig", .{});
 
     // THE STALENESS PIN (the codex P2): edit a game source AFTER staging —
     // the staged view sees the new bytes WITHOUT re-staging, so the
     // generated `zig build`'s cargo step compiles current sources. A copy
     // design fails exactly here.
-    try writeTestFile(fx.tmp.dir, "game/rust/player.rs", "pub struct Player { hp: u32 }\n");
+    try writeTestFile(fx.tmp.dir, "game/scripts/player.rs", "pub struct Player { hp: u32 }\n");
     const staged_player = try fx.tmp.dir.readFileAlloc(testing.io, "out/deps/labelle-scripting/native/src/game/player.rs", allocator, .limited(4096));
     defer allocator.free(staged_player);
     try testing.expect(std.mem.indexOf(u8, staged_player, "hp: u32") != null);
 
     // Deletions flow too — a removed game file is gone from the staged
     // view immediately (no second staging pass needed)…
-    try fx.tmp.dir.deleteFile(testing.io, "game/rust/player.rs");
+    try fx.tmp.dir.deleteFile(testing.io, "game/scripts/player.rs");
     try testing.expectError(
         error.FileNotFound,
         fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/player.rs", .{}),
@@ -828,7 +1762,28 @@ test "stageNativeSources: LINKS the game dir over the placeholder — live view,
     try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/mod.rs", .{});
 }
 
-test "stageNativeSources: no rust/ dir at all → no-op, the shipped placeholder stays (zero scripts)" {
+test "stageNativeSources: the LEGACY rust/ dir stages verbatim through the grace release — nested module subtrees included" {
+    const allocator = testing.allocator;
+    var fx = try NativeStagingFixture.init(allocator, .{});
+    defer fx.deinit(allocator);
+
+    // The unmigrated shape: rust/ with a nested module dir (legal in the
+    // legacy layout; under scripts/ the same nesting is the resolve-time
+    // state-subdir error).
+    try writeTestFile(fx.tmp.dir, "game/rust/mod.rs", "mod player;\nmod ai;\npub fn register() {}\n");
+    try writeTestFile(fx.tmp.dir, "game/rust/player.rs", "pub struct Player;\n");
+    try writeTestFile(fx.tmp.dir, "game/rust/ai/brain.rs", "pub fn think() {}\n");
+
+    try stageNativeSources(allocator, fx.game_abs, fx.out_abs, rust_legacy_splice_fixture);
+
+    const game_mod = try fx.tmp.dir.readFileAlloc(testing.io, "out/deps/labelle-scripting/native/src/game/mod.rs", allocator, .limited(4096));
+    defer allocator.free(game_mod);
+    try testing.expect(std.mem.indexOf(u8, game_mod, "REPLACED AT GENERATE") == null);
+    try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/player.rs", .{});
+    try fx.tmp.dir.access(testing.io, "out/deps/labelle-scripting/native/src/game/ai/brain.rs", .{});
+}
+
+test "stageNativeSources: no scripts/ dir at all → no-op, the shipped placeholder stays (zero scripts)" {
     const allocator = testing.allocator;
     var fx = try NativeStagingFixture.init(allocator, .{});
     defer fx.deinit(allocator);
@@ -840,27 +1795,49 @@ test "stageNativeSources: no rust/ dir at all → no-op, the shipped placeholder
     try testing.expect(std.mem.indexOf(u8, game_mod, "REPLACED AT GENERATE") != null);
 }
 
-test "stageNativeSources: a rust/ dir with no .rs sources is a pointed error (unlike a missing dir)" {
+test "stageNativeSources: a Zig-only scripts/ (zero .rs) is a NO-OP — the placeholder stays, nothing is linked over the crate" {
+    // The shared-dir consequence: scripts/ existing without native sources
+    // is every Zig game's normal state, NOT a half-finished setup — so no
+    // pointed error, and crucially NO link either (linking a .rs-less dir
+    // over the crate's game module would break the plugin build).
     const allocator = testing.allocator;
     var fx = try NativeStagingFixture.init(allocator, .{});
     defer fx.deinit(allocator);
 
-    // .gitkeep is a dot-entry — the dir is "empty" for the rule.
+    try writeTestFile(fx.tmp.dir, "game/scripts/01_move.zig", "pub fn tick() void {}\n");
+    try writeTestFile(fx.tmp.dir, "game/scripts/.gitkeep", "");
+
+    try stageNativeSources(allocator, fx.game_abs, fx.out_abs, rust_splice_fixture);
+
+    const game_mod = try fx.tmp.dir.readFileAlloc(testing.io, "out/deps/labelle-scripting/native/src/game/mod.rs", allocator, .limited(4096));
+    defer allocator.free(game_mod);
+    try testing.expect(std.mem.indexOf(u8, game_mod, "REPLACED AT GENERATE") != null);
+}
+
+test "stageNativeSources: a LEGACY rust/ dir with no .rs sources keeps the pointed error (unlike a missing dir)" {
+    const allocator = testing.allocator;
+    var fx = try NativeStagingFixture.init(allocator, .{});
+    defer fx.deinit(allocator);
+
+    // .gitkeep is a dot-entry — the dir is "empty" for the rule. A
+    // DEDICATED per-language dir with nothing in it can only be a
+    // half-finished setup, so the legacy path errors where scripts/
+    // no-ops.
     try writeTestFile(fx.tmp.dir, "game/rust/.gitkeep", "");
     try writeTestFile(fx.tmp.dir, "game/rust/README.md", "no sources here\n");
 
     try testing.expectError(
         error.NativeScriptDirEmpty,
-        stageNativeSources(allocator, fx.game_abs, fx.out_abs, rust_splice_fixture),
+        stageNativeSources(allocator, fx.game_abs, fx.out_abs, rust_legacy_splice_fixture),
     );
 }
 
-test "stageNativeSources: .rs sources without the mod.rs module root fail pointing at the convention" {
+test "stageNativeSources: .rs sources without the scripts/mod.rs module root fail pointing at the convention" {
     const allocator = testing.allocator;
     var fx = try NativeStagingFixture.init(allocator, .{});
     defer fx.deinit(allocator);
 
-    try writeTestFile(fx.tmp.dir, "game/rust/player.rs", "pub struct Player;\n");
+    try writeTestFile(fx.tmp.dir, "game/scripts/player.rs", "pub struct Player;\n");
 
     try testing.expectError(
         error.NativeScriptsMissingModuleRoot,
@@ -878,7 +1855,7 @@ test "stageNativeSources: deps staging fell back to the shared cache → HARD er
     var fx = try NativeStagingFixture.init(allocator, .{ .stage_deps = false });
     defer fx.deinit(allocator);
 
-    try writeTestFile(fx.tmp.dir, "game/rust/mod.rs", "pub fn register() {}\n");
+    try writeTestFile(fx.tmp.dir, "game/scripts/mod.rs", "pub fn register() {}\n");
 
     try testing.expectError(
         error.NativeScriptsDepsUnstaged,
@@ -896,7 +1873,7 @@ test "stageNativeSources: a staged plugin package without the native/ crate fail
     var fx = try NativeStagingFixture.init(allocator, .{ .ship_crate = false });
     defer fx.deinit(allocator);
 
-    try writeTestFile(fx.tmp.dir, "game/rust/mod.rs", "pub fn register() {}\n");
+    try writeTestFile(fx.tmp.dir, "game/scripts/mod.rs", "pub fn register() {}\n");
 
     try testing.expectError(
         error.NativeCrateLayoutMissing,
@@ -912,11 +1889,11 @@ test "stageNativeSources: an embed-family splice is a no-op (family gate)" {
     // Even with a source dir present and NO staged deps (the hard-error
     // shape for natives), an embed splice must never reach the staging
     // logic — root.zig gates on family, and so does the function itself.
-    try writeTestFile(fx.tmp.dir, "game/lua/player.lua", "-- lua\n");
+    try writeTestFile(fx.tmp.dir, "game/scripts/player.lua", "-- lua\n");
     const lua_splice = ScriptingSplice{
         .plugin_name = "scripting",
         .language = "lua",
-        .dir = "lua",
+        .dir = "scripts",
         .extension = ".lua",
     };
     try stageNativeSources(allocator, fx.game_abs, fx.out_abs, lua_splice);
