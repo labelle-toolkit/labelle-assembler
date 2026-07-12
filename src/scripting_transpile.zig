@@ -17,11 +17,34 @@
 //! satisfy "type errors fail at generate"); TS 7 native does check+emit
 //! in one binary fast enough to run per-generate.
 //!
-//! The pin is EXACT (`TSC_VERSION`) and per-platform, with the npm
-//! registry `dist.integrity` sha512 pinned in source (`TSC_PLATFORMS`).
-//! Fetching rides the same plain-HTTPS curl + system-tar mechanics every
-//! other assembler fetch uses (`cache/fetch.zig`); the tarball is
-//! integrity-verified BEFORE extraction. The extracted toolchain lands in
+//! ── Where the fetch pin lives (rev 18: manifest PRIMARY, table frozen) ─
+//! The transpile toolchain fetch pin — exact version + per-platform npm
+//! package + in-tarball binary + MANDATORY sha512 — is now DATA the
+//! scripting plugin owns, carried in its `plugin.labelle` typescript
+//! `.languages` row's `.transpile` capability (RFC-LANGUAGE-PLUGINS rev 18
+//! §7 "Transpile fetch-pin contract"; the resolved option (b),
+//! manifest-with-mandatory-hashes). `runPhase` resolves the tool through
+//! `resolveTranspileTool`: the manifest `.transpile` row is the PRIMARY
+//! path (`tryGenericTranspileTool` — select the host `(os, arch)` pin,
+//! REFUSE a hash-less/SRI-prefixed hash, fetch → verify → safe-extract →
+//! run, learning nothing tsc-specific), and the in-source `TSC_VERSION` /
+//! `TSC_PLATFORMS` table is a FROZEN FALLBACK for manifests predating the
+//! `.transpile` capability (`ensureTscTool`). "Agnosticism with
+//! integrity": the manifest owns *what* to fetch and its exact hashes; the
+//! assembler still owns *whether* a byte is trusted — it refuses a
+//! hash-less row and verifies every byte before extraction. The frozen
+//! table's values were the source lifted into the manifest, so both paths
+//! fetch byte-identical tarballs. NEW languages come via a manifest row,
+//! never a table entry (the python litmus test); the tsconfig/collision/
+//! `-p`-invocation codegen stays assembler-owned (the RFC's "honest
+//! boundary").
+//!
+//! The pin is EXACT (`.version` / frozen `TSC_VERSION`) and per-platform,
+//! with the npm registry `dist.integrity` sha512 (`.sha512` / frozen
+//! `TSC_PLATFORMS`). Fetching rides the same plain-HTTPS curl + system-tar
+//! mechanics every other assembler fetch uses (`cache/fetch.zig`); the
+//! tarball is integrity-verified BEFORE extraction. The extracted
+//! toolchain lands in
 //! the SHARED tool cache — `~/.labelle/tools/typescript/<version>/
 //! <platform>/` — not the per-project `.labelle/`: unlike the declare
 //! runner (built from the project's pinned plugin package, hence
@@ -117,6 +140,7 @@ const config = @import("config.zig");
 const scan = @import("codegen/scan.zig");
 const idents = @import("codegen/idents.zig");
 const manifest_parse = @import("manifest/parse.zig");
+const plugin_manifest = @import("plugin_manifest.zig");
 const scanner = @import("scanner.zig");
 const scripting_declare = @import("scripting_declare.zig");
 const scripting_splice = @import("scripting_splice.zig");
@@ -152,6 +176,21 @@ const CONTRACT_DTS_BASENAME = "labelle.d.ts";
 /// `scripting_declare.declare_tool_override`.
 pub threadlocal var tsc_tool_override: ?[]const u8 = null;
 
+/// Test seam: override the shared cache root (default `~/.labelle`) so a
+/// test can drive the FULL manifest→`.transpile`→cache-hit path against a
+/// tmp cache dir without touching `$HOME` or the network. Consulted by
+/// `resolveCacheRoot` (both the frozen and the generic fetch paths). Unset
+/// in production — the real cache root is used.
+pub threadlocal var tsc_cache_root_override: ?[]const u8 = null;
+
+/// The shared tool-cache root: the test override, else `~/.labelle` (via
+/// `cache.getCacheRoot`). Always allocator-owned (the override is duped so
+/// callers free uniformly).
+fn resolveCacheRoot(allocator: std.mem.Allocator) ![]const u8 {
+    if (tsc_cache_root_override) |r| return allocator.dupe(u8, r);
+    return cache.getCacheRoot(allocator);
+}
+
 // ── Toolchain pin (npm registry platform packages) ───────────────────
 
 /// One supported host platform: the zig os/arch pair, the npm platform-
@@ -165,9 +204,17 @@ const TscPlatform = struct {
     tarball_sha512_b64: []const u8,
 };
 
-/// The platforms the assembler runs generate on today (the desktop set —
-/// matching the platform reach of the declare exec and the plugin build
-/// steps). Adding a platform = one row + one registry hash.
+/// FROZEN FALLBACK (RFC-LANGUAGE-PLUGINS rev 18 §7, the Migration bullet).
+/// These rows are the transpile fetch pin for manifests that PREDATE the
+/// `.transpile` capability — resolved pins of releases before
+/// labelle-scripting shipped the typescript `.transpile` row keep working
+/// unchanged. When a resolved manifest DOES carry a `.transpile` row for
+/// the language, `resolveTranspileTool`'s generic path
+/// (`tryGenericTranspileTool`) handles it first and this table is never
+/// consulted. The table is FROZEN: never extended again — a new transpiled
+/// language (or a version bump) comes via a manifest row, not a row here
+/// (the python litmus test). The desktop set — matching the platform reach
+/// of the declare exec and the plugin build steps.
 pub const TSC_PLATFORMS = [_]TscPlatform{
     .{
         .os = .macos,
@@ -270,12 +317,6 @@ pub fn verifyTarballSha512(allocator: std.mem.Allocator, path: []const u8, expec
     }
 }
 
-/// The tool dir for a platform row under `cache_root`:
-/// `<cache_root>/tools/typescript/<version>/<npm_suffix>`. Caller frees.
-fn tscToolDir(allocator: std.mem.Allocator, cache_root: []const u8, row: TscPlatform) ![]u8 {
-    return std.fs.path.join(allocator, &.{ cache_root, "tools", "typescript", TSC_VERSION, row.npm_suffix });
-}
-
 /// Resolve (fetching if needed) the tsc binary for `row` under
 /// `cache_root`. Split from `ensureTscTool` so tests can drive the cache
 /// probe against a tmp root without touching `$HOME` or the network (a
@@ -295,75 +336,168 @@ fn tscToolDir(allocator: std.mem.Allocator, cache_root: []const u8, row: TscPlat
 /// complete-or-not-at-all, so "the binary exists" implies the whole
 /// extracted tree does.
 fn ensureTscToolAt(allocator: std.mem.Allocator, cache_root: []const u8, row: TscPlatform) ![]u8 {
+    const url = try tscTarballUrl(allocator, row);
+    defer allocator.free(url);
+    return fetchAndStageTool(allocator, cache_root, .{
+        .name = "typescript",
+        .version = TSC_VERSION,
+        // Frozen path: the bare npm suffix. Its hash is fixed per version
+        // (assembler-owned), so the (name,version,suffix) tuple already
+        // identifies one binary — no hash-binding needed here (unlike the
+        // manifest path; see `fetchGenericTool`).
+        .platform_dir = row.npm_suffix,
+        .url = url,
+        .binary_rel = tscBinaryRelPath(row.os),
+        .sha512_b64 = row.tarball_sha512_b64,
+        .label = row.npm_suffix,
+    });
+}
+
+/// A fully-resolved toolchain fetch pin — the shape BOTH the frozen
+/// `TSC_PLATFORMS` table and a manifest `.transpile` row (rev 18) reduce to,
+/// so ONE fetch/verify/extract/promote implementation serves both. All
+/// slices are borrowed for the duration of the `fetchAndStageTool` call.
+const ResolvedTool = struct {
+    /// Shared-cache tool segment: `tools/<name>/<version>/<platform_dir>`.
+    /// Frozen path passes `"typescript"`; the generic path passes the row's
+    /// `.toolchain` (e.g. `"tsc"`).
+    name: []const u8,
+    version: []const u8,
+    /// The leaf dir under the version dir. The GENERIC path binds the
+    /// `.sha512` into it (rev 18 §7 point 5: a repin — or a second manifest
+    /// reusing the same (toolchain,version,platform) tuple with a DIFFERENT
+    /// url/hash — must NOT run a binary never proven against the current
+    /// pin). The frozen path uses the bare npm suffix.
+    platform_dir: []const u8,
+    /// Fully-resolved registry URL (placeholders already filled).
+    url: []const u8,
+    /// In-tarball binary path, package wrapper stripped (`lib/tsc`).
+    binary_rel: []const u8,
+    /// Expected tarball digest, RAW standard base64.
+    sha512_b64: []const u8,
+    /// Human label for diagnostics (the platform suffix).
+    label: []const u8,
+};
+
+/// Fetch (on cache miss), integrity-verify, safe-extract and atomically
+/// promote a toolchain binary into the shared cache, returning its absolute
+/// path (caller frees). The generic executor rev 18's consume contract
+/// funnels through — shared by the frozen `TSC_PLATFORMS` fallback and a
+/// manifest `.transpile` row. The concurrency discipline (per-process
+/// staging + atomic promote) is unchanged from the original tsc fetch; see
+/// `promoteStagedTool`.
+fn fetchAndStageTool(allocator: std.mem.Allocator, cache_root: []const u8, t: ResolvedTool) ![]u8 {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
-    const tool_dir = try tscToolDir(allocator, cache_root, row);
+    const version_dir = try std.fs.path.join(allocator, &.{ cache_root, "tools", t.name, t.version });
+    defer allocator.free(version_dir);
+    const tool_dir = try std.fs.path.join(allocator, &.{ version_dir, t.platform_dir });
     defer allocator.free(tool_dir);
-    const bin_path = try std.fs.path.join(allocator, &.{ tool_dir, tscBinaryRelPath(row.os) });
+    const bin_path = try std.fs.path.join(allocator, &.{ tool_dir, t.binary_rel });
     errdefer allocator.free(bin_path);
     if (cache.dirExists(bin_path)) return bin_path;
 
-    const url = try tscTarballUrl(allocator, row);
-    defer allocator.free(url);
-    diag("fetching the typescript {s} native compiler ({s}) into {s} ...", .{ TSC_VERSION, row.npm_suffix, tool_dir });
+    diag("fetching the {s} {s} compiler ({s}) into {s} ...", .{ t.name, t.version, t.label, tool_dir });
 
-    // Per-process unique suffix — concurrent cold fetches must never
-    // share a download or staging path (random bytes, not a PID: unique
-    // even across PID reuse and across threads of one process; the same
-    // `io.random` idiom `std.testing.tmpDir` uses).
+    // Per-process unique suffix — concurrent cold fetches must never share
+    // a download or staging path (random bytes, not a PID: unique even
+    // across PID reuse and across threads; the `io.random` idiom
+    // `std.testing.tmpDir` uses).
     var raw: [8]u8 = undefined;
     io.random(&raw);
     const unique = std.fmt.bytesToHex(raw, .lower);
 
-    var slug_buf: [96]u8 = undefined;
-    const slug = std.fmt.bufPrint(&slug_buf, "{s}-{s}-{s}", .{ TSC_VERSION, row.npm_suffix, unique }) catch
+    var slug_buf: [160]u8 = undefined;
+    const slug = std.fmt.bufPrint(&slug_buf, "{s}-{s}-{s}", .{ t.version, t.label, unique }) catch
         return error.NameTooLong;
     const archive = try cache.getTempPath(allocator, "labelle-tsc", slug);
     defer allocator.free(archive);
-    cache.downloadFile(allocator, url, archive) catch {
-        diag("could not download the typescript compiler from {s} — check network access; the pin is typescript {s}", .{ url, TSC_VERSION });
+    cache.downloadFile(allocator, t.url, archive) catch {
+        diag("could not download the {s} compiler from {s} — check network access; the pin is {s} {s}", .{ t.name, t.url, t.name, t.version });
         return error.TscToolFetchFailed;
     };
     defer cwd.deleteTree(io, archive) catch {};
 
     // Integrity gates extraction: nothing lands in the tool cache from a
-    // tarball whose bytes don't match the source-pinned registry hash —
-    // and the archive path is process-private, so the bytes hashed here
-    // are exactly the bytes extracted below.
-    try verifyTarballSha512(allocator, archive, row.tarball_sha512_b64);
+    // tarball whose bytes don't match the pinned hash — and the archive
+    // path is process-private, so the bytes hashed here are exactly the
+    // bytes extracted below.
+    try verifyTarballSha512(allocator, archive, t.sha512_b64);
 
-    // Extract into the per-process STAGING dir, a sibling of the final
-    // dir (same filesystem — the promotion rename is atomic; the `.`
-    // prefix keeps it visually apart from real platform dirs).
-    // `--strip-components=1` drops the npm `package/` wrapper, so
-    // `lib/tsc` lands directly under it.
-    var staging_name_buf: [64]u8 = undefined;
-    const staging_name = std.fmt.bufPrint(&staging_name_buf, ".staging-{s}-{s}", .{ row.npm_suffix, unique }) catch
+    // Extract into the per-process STAGING dir, a sibling of the final dir
+    // (same filesystem — the promotion rename is atomic; the `.` prefix
+    // keeps it visually apart from real platform dirs). `--strip-components=1`
+    // drops the npm `package/` wrapper, so `lib/tsc` lands directly under it.
+    var staging_name_buf: [96]u8 = undefined;
+    const staging_name = std.fmt.bufPrint(&staging_name_buf, ".staging-{s}-{s}", .{ t.label, unique }) catch
         return error.NameTooLong;
-    const staging_dir = try std.fs.path.join(allocator, &.{ cache_root, "tools", "typescript", TSC_VERSION, staging_name });
+    const staging_dir = try std.fs.path.join(allocator, &.{ version_dir, staging_name });
     defer allocator.free(staging_dir);
     errdefer cwd.deleteTree(io, staging_dir) catch {};
     try cwd.createDirPath(io, staging_dir);
     cache.extractTarGz(allocator, archive, staging_dir) catch {
-        diag("could not extract the typescript compiler tarball into {s}", .{staging_dir});
+        diag("could not extract the {s} compiler tarball into {s}", .{ t.name, staging_dir });
         return error.TscToolFetchFailed;
     };
 
-    // Validate the staged tree BEFORE promotion — only complete trees
+    // Validate the staged tree BEFORE promotion — only complete, SAFE trees
     // ever reach the final path.
-    const staged_bin = try std.fs.path.join(allocator, &.{ staging_dir, tscBinaryRelPath(row.os) });
+    const staged_bin = try std.fs.path.join(allocator, &.{ staging_dir, t.binary_rel });
     defer allocator.free(staged_bin);
     if (!cache.dirExists(staged_bin)) {
-        diag("the typescript tarball extracted but {s} is missing — the {s} package layout changed?", .{ staged_bin, row.npm_suffix });
+        diag("the {s} tarball extracted but {s} is missing — the {s} package layout changed?", .{ t.name, staged_bin, t.label });
         return error.TscToolFetchFailed;
     }
+    // Archive-safe validation of the ONE artifact we execute (rev 18 §7
+    // point 3a): a valid tarball sha512 authenticates the whole archive but
+    // not against a path-traversal / symlink entry escaping the extraction
+    // dir. System tar already refuses `..` / absolute members; the residual
+    // risk is a symlink AT the binary path pointing outside — reject it.
+    try assertBinaryWithinStaging(allocator, staging_dir, staged_bin, t.name);
     // npm tarballs carry the executable bit and system tar preserves it;
     // belt-and-braces for exotic tar/umask setups (windows needs none).
     if (builtin.os.tag != .windows) ensureExecutable(staged_bin);
 
     try promoteStagedTool(staging_dir, tool_dir, bin_path);
     return bin_path;
+}
+
+/// Reject a staged binary that is a symlink OR whose real path escapes the
+/// staging dir (rev 18 §7 point 3a — "validate the row's `.binary` is a
+/// normal file within it"). A symlink INTO the tree would realpath-contain,
+/// but we reject symlinks outright: the pinned binary is always a plain
+/// file. `name` is the toolchain name for the diagnostic.
+fn assertBinaryWithinStaging(
+    allocator: std.mem.Allocator,
+    staging_dir: []const u8,
+    staged_bin: []const u8,
+    name: []const u8,
+) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    if (cache.isSymlink(staged_bin)) {
+        diag("the {s} tarball's binary {s} is a symlink — refusing to run an archive entry that escapes the extraction dir", .{ name, staged_bin });
+        return error.TscToolFetchFailed;
+    }
+    const real_bin = cwd.realPathFileAlloc(io, staged_bin, allocator) catch {
+        diag("could not resolve the extracted {s} binary {s}", .{ name, staged_bin });
+        return error.TscToolFetchFailed;
+    };
+    defer allocator.free(real_bin);
+    const real_staging = cwd.realPathFileAlloc(io, staging_dir, allocator) catch {
+        diag("could not resolve the {s} staging dir {s}", .{ name, staging_dir });
+        return error.TscToolFetchFailed;
+    };
+    defer allocator.free(real_staging);
+    // Containment: the resolved binary must live under the resolved staging
+    // dir (a shared prefix on both sides — e.g. macOS /var→/private/var —
+    // resolves identically, so the prefix check is sound).
+    if (!std.mem.startsWith(u8, real_bin, real_staging)) {
+        diag("the {s} tarball's binary resolves to {s}, outside the extraction dir {s} — refusing a path-escaping archive entry", .{ name, real_bin, real_staging });
+        return error.TscToolFetchFailed;
+    }
 }
 
 /// Atomically promote a VALIDATED staging tree to the final tool dir.
@@ -427,9 +561,210 @@ fn ensureTscTool(allocator: std.mem.Allocator) ![]const u8 {
         );
         return error.TscToolUnsupportedPlatform;
     };
-    const cache_root = try cache.getCacheRoot(allocator);
+    const cache_root = try resolveCacheRoot(allocator);
     defer allocator.free(cache_root);
     return ensureTscToolAt(allocator, cache_root, row);
+}
+
+// ── Generic `.transpile` toolchain resolution (rev 18 §7, PRIMARY) ────
+
+/// Resolve the transpile tool for THIS host, mirroring the declare slice's
+/// dispatch flip (labelle-assembler#622): the override seam first, then the
+/// resolved plugin manifest's `.transpile` capability row (the PRIMARY path
+/// for every manifest that carries one), then the FROZEN `TSC_PLATFORMS`
+/// fallback for manifests predating the capability. Returned path is
+/// allocator-owned EXCEPT the override (borrowed — `runPhase`'s free is
+/// guarded on `tsc_tool_override == null`).
+fn resolveTranspileTool(allocator: std.mem.Allocator, opts: PhaseOptions) ![]const u8 {
+    if (tsc_tool_override) |p| return p;
+
+    // PRIMARY: the manifest `.transpile` row. `.not_applicable` (no staged
+    // package / no manifest / no `.languages` transpile row for this
+    // language) falls through to the frozen table; a manifest that DOES
+    // declare a transpile row is authoritative, so its own gaps (an
+    // unsupported host, a hash-less/malformed pin) are HARD errors here,
+    // never a silent fall-through to the frozen table.
+    switch (try tryGenericTranspileTool(allocator, opts)) {
+        .resolved => |path| return path,
+        .not_applicable => {},
+    }
+
+    return ensureTscTool(allocator);
+}
+
+/// Outcome of the generic transpile-tool resolution: a resolved (owned) tool
+/// path, or `.not_applicable` when the language has no `.transpile` row so
+/// the caller falls through to the frozen `TSC_PLATFORMS` table.
+const GenericToolOutcome = union(enum) {
+    not_applicable,
+    resolved: []u8,
+};
+
+/// Resolve the transpile tool via the resolved plugin manifest's
+/// `.languages` `.transpile` capability row (rev 18). Package/manifest load
+/// failures fall through as `.not_applicable` (the frozen fallback then
+/// handles a degenerate setup exactly as before this migration) — the same
+/// "no-row language, machinery untouched" invariant the declare generic path
+/// keeps.
+fn tryGenericTranspileTool(allocator: std.mem.Allocator, opts: PhaseOptions) !GenericToolOutcome {
+    const pkg_dir = scripting_declare.resolvePluginPackageDir(
+        allocator,
+        opts.plugins,
+        opts.plugin_name,
+        opts.output_dir,
+        opts.project_dir,
+    ) catch return .not_applicable;
+    defer allocator.free(pkg_dir);
+
+    var manifest = (plugin_manifest.loadFromDir(allocator, pkg_dir, opts.plugin_name) catch return .not_applicable) orelse
+        return .not_applicable;
+    defer manifest.deinit();
+
+    const row = manifest.languageRow(opts.language) orelse return .not_applicable;
+    const cap = row.transpile orelse return .not_applicable;
+
+    // From here the manifest is authoritative — consume the capability
+    // (host-match, hash gates, fetch/verify/extract). `cap`'s strings are
+    // borrowed from `manifest`, valid until the deinit defer above; the
+    // returned path is freshly allocated (independent of `manifest`).
+    const path = try fetchGenericTool(allocator, cap);
+    return .{ .resolved = path };
+}
+
+/// The generic rev-18 consume contract for a `.transpile` capability:
+///   1. select the `.platforms` pin matching the host `(os, arch)` — no
+///      match is a pointed generate error naming the host + supported set;
+///   2. REFUSE a hash-less pin, and reject an SRI (`sha512-`-prefixed) hash
+///      (the schema is RAW base64) — "agnosticism with integrity";
+///   3. fill the `.fetch_url` template, then fetch → verify → safe-extract
+///      via the shared `fetchAndStageTool`, with the cache path HASH-BOUND
+///      (point 5) so a repin / cross-manifest tuple reuse can never run a
+///      binary unproven against the current `.sha512`.
+/// Returns the owned tool path. Wraps `fetchGenericToolAt` with the shared
+/// cache root; split so tests drive the gates + cache probe against a tmp
+/// root without `$HOME` or the network (the `ensureTscTool`/`…At` pattern).
+fn fetchGenericTool(allocator: std.mem.Allocator, cap: plugin_manifest.TranspileCapability) ![]u8 {
+    const cache_root = try resolveCacheRoot(allocator);
+    defer allocator.free(cache_root);
+    return fetchGenericToolAt(allocator, cache_root, cap);
+}
+
+fn fetchGenericToolAt(
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    cap: plugin_manifest.TranspileCapability,
+) ![]u8 {
+    const platform = selectHostPlatform(cap) orelse {
+        diagUnsupportedHost(cap);
+        return error.TscToolUnsupportedPlatform;
+    };
+
+    const sha512 = platform.sha512 orelse {
+        diag(
+            "the scripting plugin's \"{s}\" transpile pin for {s}-{s} carries no `.sha512` — the assembler refuses a hash-less toolchain fetch (rev 18: manifest owns WHAT to fetch, assembler verifies every byte). Add the npm dist.integrity sha512 (raw base64) to the platform row",
+            .{ cap.toolchain, platform.os, platform.arch },
+        );
+        return error.TranspileToolHashMissing;
+    };
+    if (std.mem.startsWith(u8, sha512, "sha512-")) {
+        diag(
+            "the scripting plugin's \"{s}\" transpile pin for {s}-{s} has a `sha512-`-prefixed hash — the schema is RAW base64 (strip the `sha512-` SRI prefix from the npm dist.integrity value)",
+            .{ cap.toolchain, platform.os, platform.arch },
+        );
+        return error.TranspileToolHashMalformed;
+    }
+
+    const url = try fillFetchUrl(allocator, cap.fetch_url, platform.platform, cap.version);
+    defer allocator.free(url);
+
+    // Hash-bound cache leaf (rev 18 point 5): fold the pin's sha512 into the
+    // cache path so a different hash for the same (toolchain,version,
+    // platform) tuple is a distinct dir — a cold, re-verified fetch — never
+    // a hit on a binary proven against a stale pin.
+    const slug = cacheHashSlug(sha512);
+    const platform_dir = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ platform.platform, &slug });
+    defer allocator.free(platform_dir);
+
+    return fetchAndStageTool(allocator, cache_root, .{
+        .name = cap.toolchain,
+        .version = cap.version,
+        .platform_dir = platform_dir,
+        .url = url,
+        .binary_rel = platform.binary,
+        .sha512_b64 = sha512,
+        .label = platform.platform,
+    });
+}
+
+/// The host `(os, arch)` in the manifest row's spelling (the zig `@tagName`
+/// forms the RFC sketch uses). Null for a host outside the shipped set.
+fn hostOsName(tag: std.Target.Os.Tag) ?[]const u8 {
+    return switch (tag) {
+        .macos => "macos",
+        .linux => "linux",
+        .windows => "windows",
+        else => null,
+    };
+}
+
+fn hostArchName(arch: std.Target.Cpu.Arch) ?[]const u8 {
+    return switch (arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        else => null,
+    };
+}
+
+/// The `.platforms` pin matching this host, or null (unknown host, or no
+/// row covers it).
+fn selectHostPlatform(cap: plugin_manifest.TranspileCapability) ?plugin_manifest.TranspilePlatform {
+    const os_name = hostOsName(builtin.os.tag) orelse return null;
+    const arch_name = hostArchName(builtin.cpu.arch) orelse return null;
+    for (cap.platforms) |p| {
+        if (std.mem.eql(u8, p.os, os_name) and std.mem.eql(u8, p.arch, arch_name)) return p;
+    }
+    return null;
+}
+
+/// The pointed unsupported-host error (rev 18 point 1: name the host AND the
+/// row's supported set, never a silent skip).
+fn diagUnsupportedHost(cap: plugin_manifest.TranspileCapability) void {
+    const io = config.globalIo();
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    w.print(
+        "labelle-assembler: no pinned \"{s}\" transpile toolchain for {s}-{s} — the scripting plugin's `.transpile` platforms are:",
+        .{ cap.toolchain, @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) },
+    ) catch {};
+    for (cap.platforms) |p| {
+        w.print(" {s}-{s}", .{ p.os, p.arch }) catch {};
+    }
+    w.writeAll(" (author .js against contract/labelle.d.ts on this host, or add the platform pin to plugin.labelle)\n") catch {};
+    std.Io.File.stderr().writeStreamingAll(io, w.buffered()) catch {};
+}
+
+/// Fill a `.fetch_url` template's `{platform}` (all occurrences) and
+/// `{version}` placeholders. Caller frees.
+fn fillFetchUrl(
+    allocator: std.mem.Allocator,
+    template: []const u8,
+    platform: []const u8,
+    version: []const u8,
+) ![]u8 {
+    const step1 = try std.mem.replaceOwned(u8, allocator, template, "{platform}", platform);
+    defer allocator.free(step1);
+    return std.mem.replaceOwned(u8, allocator, step1, "{version}", version);
+}
+
+/// A filesystem-safe, deterministic cache-key slug that BINDS the pin's
+/// sha512 (rev 18 point 5). The base64 digest itself carries `/` (path
+/// separator) and `+`/`=`, so it's hashed to a short hex tag rather than
+/// embedded raw — distinct hashes yield distinct slugs (the identity
+/// property), and the slug is a legal single path segment on every OS.
+fn cacheHashSlug(sha512_b64: []const u8) [32]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(sha512_b64, &digest, .{});
+    return std.fmt.bytesToHex(digest[0..16], .lower);
 }
 
 // ── The need probe (game-side ts/ walk) ──────────────────────────────
@@ -876,8 +1211,9 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?[]scripting_
 
     // Tool AFTER the probe (the no-fetch guarantee) and BEFORE any target
     // mutation — an unsupported platform / failed fetch leaves the
-    // symlink layout untouched.
-    const tool_path = try ensureTscTool(allocator);
+    // symlink layout untouched. PRIMARY path: the manifest `.transpile`
+    // capability (rev 18); FROZEN `TSC_PLATFORMS` fallback for older pins.
+    const tool_path = try resolveTranspileTool(allocator, opts);
     defer if (tsc_tool_override == null) allocator.free(tool_path);
 
     // The shipped contract d.ts from the staged plugin package — unless
@@ -1565,4 +1901,255 @@ test "runPhase: a .ts/.js stem collision fails BEFORE tool resolution (poison ov
         .pack_scans = &.{},
     };
     try testing.expectError(error.ScriptTranspileCollision, runPhase(testing.allocator, opts));
+}
+
+// ── Generic `.transpile` toolchain resolution (rev 18 §7) ────────────
+
+/// A one-row `.transpile` platform pin for the CURRENT host (null when the
+/// host is outside the shipped os/arch set — the caller skips the test).
+fn hostPlatformRow(sha512: ?[]const u8) ?plugin_manifest.TranspilePlatform {
+    const os_name = hostOsName(builtin.os.tag) orelse return null;
+    const arch_name = hostArchName(builtin.cpu.arch) orelse return null;
+    return .{ .os = os_name, .arch = arch_name, .platform = "host-pkg", .binary = "lib/tsc", .sha512 = sha512 };
+}
+
+test "fillFetchUrl: fills {platform} (every occurrence) and {version}" {
+    const url = try fillFetchUrl(
+        testing.allocator,
+        "https://registry.npmjs.org/@typescript/typescript-{platform}/-/typescript-{platform}-{version}.tgz",
+        "linux-x64",
+        "7.0.2",
+    );
+    defer testing.allocator.free(url);
+    try testing.expectEqualStrings(
+        "https://registry.npmjs.org/@typescript/typescript-linux-x64/-/typescript-linux-x64-7.0.2.tgz",
+        url,
+    );
+}
+
+test "cacheHashSlug: deterministic, filesystem-safe, distinct per hash (rev 18 point 5)" {
+    const a = cacheHashSlug("gowzar9MwS/aRWp6f3a4KUqzRjAZ==");
+    const b = cacheHashSlug("gowzar9MwS/aRWp6f3a4KUqzRjAZ==");
+    const c = cacheHashSlug("SZ9xZInqApNlNGc9s0W1VSsktYSO==");
+    // Deterministic — same hash → same slug.
+    try testing.expectEqualSlices(u8, &a, &b);
+    // The identity property: a DIFFERENT pin hash → a DIFFERENT cache leaf,
+    // so a repin can never hit a binary proven against a stale pin.
+    try testing.expect(!std.mem.eql(u8, &a, &c));
+    // 32 lowercase-hex chars: a legal single path segment on every OS (the
+    // raw base64 digest carries `/`, `+`, `=` — path-hostile — hence the hash).
+    try testing.expectEqual(@as(usize, 32), a.len);
+    for (a) |ch| try testing.expect((ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f'));
+}
+
+test "host platform mapping: known hosts map to the row spelling, exotic hosts are null" {
+    try testing.expectEqualStrings("macos", hostOsName(.macos).?);
+    try testing.expectEqualStrings("linux", hostOsName(.linux).?);
+    try testing.expectEqualStrings("windows", hostOsName(.windows).?);
+    try testing.expect(hostOsName(.freebsd) == null);
+    try testing.expectEqualStrings("x86_64", hostArchName(.x86_64).?);
+    try testing.expectEqualStrings("aarch64", hostArchName(.aarch64).?);
+    try testing.expect(hostArchName(.riscv64) == null);
+}
+
+test "fetchGenericToolAt: REFUSES a hash-less host pin (rev 18 — agnosticism with integrity)" {
+    // The gate fires before any cache/network use, so the cache root is
+    // never touched (a poison path proves it).
+    const row = hostPlatformRow(null) orelse return error.SkipZigTest;
+    const cap = plugin_manifest.TranspileCapability{
+        .emits = "js",
+        .toolchain = "tsc",
+        .version = "7.0.2",
+        .fetch_url = "https://example.invalid/{platform}-{version}.tgz",
+        .platforms = &.{row},
+    };
+    try testing.expectError(
+        error.TranspileToolHashMissing,
+        fetchGenericToolAt(testing.allocator, "/poison/cache/root", cap),
+    );
+}
+
+test "fetchGenericToolAt: rejects an SRI (`sha512-`-prefixed) hash — the schema is raw base64" {
+    const row = hostPlatformRow("sha512-gowzar9MwS/aRWp6==") orelse return error.SkipZigTest;
+    const cap = plugin_manifest.TranspileCapability{
+        .emits = "js",
+        .toolchain = "tsc",
+        .version = "7.0.2",
+        .fetch_url = "https://example.invalid/{platform}-{version}.tgz",
+        .platforms = &.{row},
+    };
+    try testing.expectError(
+        error.TranspileToolHashMalformed,
+        fetchGenericToolAt(testing.allocator, "/poison/cache/root", cap),
+    );
+}
+
+test "fetchGenericToolAt: a capability that doesn't cover the host errors pointedly (never silent)" {
+    // No platform row for anything → the host match fails → the pointed
+    // unsupported-platform error, NOT a silent fall-through.
+    const cap = plugin_manifest.TranspileCapability{
+        .emits = "js",
+        .toolchain = "tsc",
+        .version = "7.0.2",
+        .fetch_url = "https://example.invalid/{platform}-{version}.tgz",
+        .platforms = &.{},
+    };
+    try testing.expectError(
+        error.TscToolUnsupportedPlatform,
+        fetchGenericToolAt(testing.allocator, "/poison/cache/root", cap),
+    );
+}
+
+test "fetchGenericToolAt: a pre-staged binary at the HASH-BOUND cache path is a HIT (no fetch)" {
+    // The hermetic half of the generic fetch: the cache leaf is
+    // `tools/<toolchain>/<version>/<platform>-<sha512-slug>/<binary>`, so a
+    // pre-staged binary there is returned without any download — and the
+    // slug pins the hash into the path (rev 18 point 5).
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const row = hostPlatformRow("gowzar9MwS/aRWp6f3a4KUqzRjAZ==") orelse return error.SkipZigTest;
+    const cap = plugin_manifest.TranspileCapability{
+        .emits = "js",
+        .toolchain = "tsc",
+        .version = "7.0.2",
+        .fetch_url = "https://example.invalid/{platform}-{version}.tgz",
+        .platforms = &.{row},
+    };
+
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const slug = cacheHashSlug(row.sha512.?);
+    const leaf = try std.fmt.allocPrint(
+        testing.allocator,
+        "cache-root/tools/tsc/7.0.2/{s}-{s}/lib",
+        .{ row.platform, slug[0..] },
+    );
+    defer testing.allocator.free(leaf);
+    try tmp.dir.createDirPath(tio, leaf);
+    {
+        const bin_rel = try std.fmt.allocPrint(testing.allocator, "{s}/tsc", .{leaf});
+        defer testing.allocator.free(bin_rel);
+        var f = try tmp.dir.createFile(tio, bin_rel, .{ .permissions = .executable_file });
+        defer f.close(tio);
+        try f.writeStreamingAll(tio, "#!/bin/sh\nexit 0\n");
+    }
+    const cache_root = try tmp.dir.realPathFileAlloc(tio, "cache-root", testing.allocator);
+    defer testing.allocator.free(cache_root);
+
+    const bin = try fetchGenericToolAt(testing.allocator, cache_root, cap);
+    defer testing.allocator.free(bin);
+    try testing.expect(std.mem.startsWith(u8, bin, cache_root));
+    try testing.expect(std.mem.endsWith(u8, bin, "tsc"));
+    // The hash slug is bound into the resolved path.
+    try testing.expect(std.mem.indexOf(u8, bin, slug[0..]) != null);
+    // The toolchain segment is the row's `.toolchain`, not the frozen
+    // "typescript" — proof the GENERIC path resolved this, not the fallback.
+    try testing.expect(std.mem.indexOf(u8, bin, std.fs.path.sep_str ++ "tsc" ++ std.fs.path.sep_str) != null);
+}
+
+test "resolveTranspileTool: the override seam short-circuits before any manifest resolution" {
+    tsc_tool_override = "/override/tsc";
+    defer tsc_tool_override = null;
+    const opts = PhaseOptions{
+        .plugins = &.{},
+        .plugin_name = "scripting",
+        .language = "typescript",
+        .dir = "scripts",
+        .extension = ".js",
+        .game_dir = "/nonexistent",
+        .output_dir = "/nonexistent",
+        .target_dir = "/nonexistent",
+        .project_dir = "/nonexistent",
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+    const got = try resolveTranspileTool(testing.allocator, opts);
+    try testing.expectEqualStrings("/override/tsc", got);
+}
+
+test "resolveTranspileTool: a staged manifest `.transpile` row drives resolution (PRIMARY path, cache HIT)" {
+    // The transpile dispatch flip, end to end: a resolved plugin manifest
+    // that carries a typescript `.transpile` row is the PRIMARY toolchain
+    // source — `resolveTranspileTool` reads the row, selects the host pin,
+    // binds the hash into the cache leaf, and (here) hits a pre-staged
+    // binary. Proven WITHOUT the frozen table: the cache segment is the
+    // row's `.toolchain` ("acme-tsc", deliberately NOT "typescript"), so a
+    // returned binary under `tools/acme-tsc/...` can only be the generic
+    // path's doing.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    const os_name = hostOsName(builtin.os.tag) orelse return error.SkipZigTest;
+    const arch_name = hostArchName(builtin.cpu.arch) orelse return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The staged plugin package (the `<output>/deps/labelle-scripting/`
+    // copy resolvePluginPackageDir finds first), carrying a typescript
+    // `.transpile` row for the host.
+    try tmp.dir.createDirPath(tio, "out/deps/labelle-scripting");
+    {
+        var f = try tmp.dir.createFile(tio, "out/deps/labelle-scripting/plugin.labelle", .{});
+        defer f.close(tio);
+        var buf: [1024]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf,
+            \\.{{
+            \\    .name = "scripting",
+            \\    .manifest_version = 1,
+            \\    .languages = .{{
+            \\        .{{ .name = "typescript", .extensions = .{{"ts"}}, .kind = .embedded,
+            \\           .transpile = .{{ .emits = "js", .toolchain = "acme-tsc", .version = "9.9.9",
+            \\               .fetch_url = "https://example.invalid/{{platform}}-{{version}}.tgz",
+            \\               .platforms = .{{
+            \\                   .{{ .os = "{s}", .arch = "{s}", .platform = "host-pkg", .binary = "lib/tsc", .sha512 = "AbC123/def+GHI==" }},
+            \\               }} }} }},
+            \\    }},
+            \\}}
+        , .{ os_name, arch_name });
+        try f.writeStreamingAll(tio, body);
+    }
+
+    // Pre-stage the binary at the HASH-BOUND generic cache leaf.
+    const slug = cacheHashSlug("AbC123/def+GHI==");
+    const leaf = try std.fmt.allocPrint(allocator, "cache/tools/acme-tsc/9.9.9/host-pkg-{s}/lib", .{slug[0..]});
+    defer allocator.free(leaf);
+    try tmp.dir.createDirPath(tio, leaf);
+    {
+        const bin_rel = try std.fmt.allocPrint(allocator, "{s}/tsc", .{leaf});
+        defer allocator.free(bin_rel);
+        var f = try tmp.dir.createFile(tio, bin_rel, .{ .permissions = .executable_file });
+        defer f.close(tio);
+        try f.writeStreamingAll(tio, "#!/bin/sh\nexit 0\n");
+    }
+
+    const out_abs = try tmp.dir.realPathFileAlloc(tio, "out", allocator);
+    defer allocator.free(out_abs);
+    const cache_abs = try tmp.dir.realPathFileAlloc(tio, "cache", allocator);
+    defer allocator.free(cache_abs);
+    tsc_cache_root_override = cache_abs;
+    defer tsc_cache_root_override = null;
+
+    const opts = PhaseOptions{
+        .plugins = &.{.{ .name = "scripting", .repo = "local:../labelle-scripting" }},
+        .plugin_name = "scripting",
+        .language = "typescript",
+        .dir = "scripts",
+        .extension = ".js",
+        .game_dir = out_abs,
+        .output_dir = out_abs,
+        .target_dir = out_abs,
+        .project_dir = out_abs,
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+
+    const bin = try resolveTranspileTool(allocator, opts);
+    defer allocator.free(bin);
+    // The generic path resolved via the manifest's `.toolchain` segment —
+    // NOT the frozen "typescript" — and bound the pin's hash slug.
+    try testing.expect(std.mem.indexOf(u8, bin, "acme-tsc") != null);
+    try testing.expect(std.mem.indexOf(u8, bin, slug[0..]) != null);
+    try testing.expect(std.mem.startsWith(u8, bin, cache_abs));
 }

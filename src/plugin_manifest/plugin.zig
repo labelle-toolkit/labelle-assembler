@@ -78,21 +78,65 @@ pub const DeclareCapability = struct {
     events: bool = false,
 };
 
+/// One `(os, arch)` platform pin inside a `.transpile` capability
+/// (RFC-LANGUAGE-PLUGINS rev 18 §7). `os`/`arch` are the host tuple the
+/// assembler matches against (spellings: os ∈ {macos, linux, windows};
+/// arch ∈ {aarch64, x86_64} — the zig `@tagName` forms). `platform` is the
+/// registry package suffix filled into the `.fetch_url` `{platform}`
+/// placeholder (e.g. `darwin-arm64`). `binary` is the in-tarball path to
+/// the tool executable (`lib/tsc`, `lib/tsc.exe`), package-wrapper stripped.
+/// `sha512` is the tarball's digest as RAW base64 (npm `dist.integrity`
+/// with its `sha512-` SRI prefix stripped). It is `?` in the SCHEMA only so
+/// a hash-less pin PARSES and the assembler can refuse it with a pointed
+/// generate error ("agnosticism with integrity", rev 18) rather than an
+/// opaque ZON "missing field" — a real pin MUST carry it.
+pub const TranspilePlatform = struct {
+    os: []const u8,
+    arch: []const u8,
+    platform: []const u8,
+    binary: []const u8,
+    sha512: ?[]const u8 = null,
+};
+
+/// A language's transpile-toolchain FETCH PIN (RFC-LANGUAGE-PLUGINS rev 18
+/// §7 "Transpile fetch-pin contract"). The one non-agnostic table the
+/// assembler used to hardcode (`scripting_transpile.zig`'s `TSC_VERSION` /
+/// `TSC_PLATFORMS`), relocated to the manifest of the package that owns the
+/// toolchain. `emits` is the transpiled extension (`js`); `toolchain` names
+/// the tool identity (the assembler's shared-cache segment); `version` is
+/// the exact published pin; `fetch_url` is a template with `{platform}` /
+/// `{version}` placeholders; `platforms` is one pin per host `(os, arch)`.
+/// The assembler consumes this GENERICALLY: select the host row, REFUSE a
+/// hash-less pin, fetch → verify-sha512 → safe-extract → run. It never
+/// learns anything tsc-specific beyond "a toolchain fetched-and-verified
+/// per its rows". The tsconfig codegen, the `.ts`↔`.js` collision gate and
+/// the `<binary> -p` invocation are NOT described here — they stay
+/// assembler-owned codegen (the RFC's "honest boundary" residue).
+pub const TranspileCapability = struct {
+    emits: []const u8,
+    toolchain: []const u8,
+    version: []const u8,
+    fetch_url: []const u8,
+    platforms: []const TranspilePlatform = &.{},
+};
+
 /// One row of the manifest `.languages` capability table
 /// (RFC-LANGUAGE-PLUGINS rev 17 §7). Everything the assembler knows per
 /// language: name, source extensions, embed `kind`, the native crate's
-/// module root (native only), and — when the language supports declared
-/// components/events — a `declare` capability. The assembler reads these
-/// GENERICALLY (it never learns "rust"/"cargo"); a language that omits
-/// `.declare` simply has no declare phase. Unknown row keys (e.g. a future
-/// `.transpile`) are tolerated by the manifest-wide `ignore_unknown_fields`
-/// parse, so a new capability never breaks a bystander assembler.
+/// module root (native only), a `declare` capability (when the language
+/// supports declared components/events), and a `transpile` capability (rev
+/// 18 — when the language's sources are transpiled at generate). The
+/// assembler reads these GENERICALLY (it never learns "rust"/"cargo"/"tsc");
+/// a language that omits a capability simply has no such phase. Unknown row
+/// keys are tolerated by the manifest-wide `ignore_unknown_fields` parse, so
+/// a new capability never breaks a bystander assembler.
 pub const LanguageRow = struct {
     name: []const u8,
     extensions: []const []const u8 = &.{},
     kind: LanguageKind,
     module_root: ?[]const u8 = null,
     declare: ?DeclareCapability = null,
+    transpile: ?TranspileCapability = null,
 };
 
 /// Parsed and validated `plugin.labelle` manifest.
@@ -571,17 +615,20 @@ test "ZonManifest: parses a .languages row with a declare capability (rev 17)" {
 }
 
 test "ZonManifest: a .languages row tolerates unknown keys under ignore_unknown_fields (forward-compat)" {
-    // A future row key (e.g. `.transpile`) must not break a bystander
-    // assembler: the manifest-wide `ignore_unknown_fields` (loadFromDir's
-    // parse mode) must reach nested rows too. A `.declare`-less row (an
-    // embedded language not yet on this table) parses to a null capability.
+    // A future row key must not break a bystander assembler: the
+    // manifest-wide `ignore_unknown_fields` (loadFromDir's parse mode) must
+    // reach nested rows too. Uses a genuinely-unknown capability key (a
+    // stand-in for the NEXT one after `.transpile`) so the test keeps
+    // proving forward-compat even now that `.transpile` is a KNOWN field. A
+    // `.declare`-less row (an embedded language not yet on this table)
+    // parses to a null capability.
     const src =
         \\.{
         \\    .name = "scripting",
         \\    .manifest_version = 1,
         \\    .languages = .{
         \\        .{ .name = "typescript", .extensions = .{"ts"}, .kind = .embedded,
-        \\           .transpile = .{ .emits = "js", .toolchain = "tsc" },
+        \\           .some_future_capability = .{ .foo = "bar" },
         \\           .declare = .{ .tool = "labelle-declare-ts", .dir = "tools/declare-ts", .events = true } },
         \\        .{ .name = "lua", .extensions = .{"lua"}, .kind = .embedded },
         \\    },
@@ -604,6 +651,56 @@ test "ZonManifest: a .languages row tolerates unknown keys under ignore_unknown_
     // The `.declare`-less lua row → null capability, no events.
     try testing.expect(parsed.languages[1].declare == null);
     try testing.expect(parsed.languages[1].module_root == null);
+}
+
+test "ZonManifest: parses a typescript .transpile capability with per-platform pins (rev 18)" {
+    // The rev-18 transpile fetch-pin: a `.transpile` capability carrying the
+    // exact version, the fetch-url template, and one `.platforms` pin per
+    // host tuple (each with a mandatory `.sha512`). A `.declare`-less row —
+    // typescript declares nothing today — parses to a null declare
+    // capability beside a present transpile capability.
+    const src =
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "typescript", .extensions = .{"ts"}, .kind = .embedded,
+        \\           .transpile = .{
+        \\               .emits = "js", .toolchain = "tsc", .version = "7.0.2",
+        \\               .fetch_url = "https://registry.npmjs.org/@typescript/typescript-{platform}/-/typescript-{platform}-{version}.tgz",
+        \\               .platforms = .{
+        \\                   .{ .os = "linux", .arch = "x86_64", .platform = "linux-x64", .binary = "lib/tsc", .sha512 = "AAAA==" },
+        \\                   .{ .os = "windows", .arch = "x86_64", .platform = "win32-x64", .binary = "lib/tsc.exe", .sha512 = "BBBB==" },
+        \\               },
+        \\           } },
+        \\    },
+        \\}
+    ;
+    const src_z = try testing.allocator.dupeZ(u8, src);
+    defer testing.allocator.free(src_z);
+
+    const parsed = try std.zon.parse.fromSliceAlloc(
+        ZonManifest,
+        testing.allocator,
+        src_z,
+        null,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer std.zon.parse.free(testing.allocator, parsed);
+
+    try testing.expectEqual(@as(usize, 1), parsed.languages.len);
+    const row = parsed.languages[0];
+    try testing.expectEqualStrings("typescript", row.name);
+    try testing.expect(row.declare == null);
+    const t = row.transpile orelse return error.TestExpectedTranspile;
+    try testing.expectEqualStrings("js", t.emits);
+    try testing.expectEqualStrings("tsc", t.toolchain);
+    try testing.expectEqualStrings("7.0.2", t.version);
+    try testing.expectEqual(@as(usize, 2), t.platforms.len);
+    try testing.expectEqualStrings("linux-x64", t.platforms[0].platform);
+    try testing.expectEqualStrings("lib/tsc", t.platforms[0].binary);
+    try testing.expectEqualStrings("AAAA==", t.platforms[0].sha512.?);
+    try testing.expectEqualStrings("lib/tsc.exe", t.platforms[1].binary);
 }
 
 test "ZonManifest: parses ship_from_plugin mode with extension" {

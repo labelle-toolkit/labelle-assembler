@@ -39,9 +39,12 @@ pub const ConventionDir = plugin.ConventionDir;
 pub const PluginManifest = plugin.PluginManifest;
 pub const loadOptional = plugin.loadOptional;
 pub const loadFromDir = plugin.loadFromDir;
-// Language capability rows (RFC-LANGUAGE-PLUGINS rev 17 §7, #619/#774).
+// Language capability rows (RFC-LANGUAGE-PLUGINS rev 17 §7, #619/#774;
+// transpile fetch-pin rev 18 §7, #619).
 pub const LanguageKind = plugin.LanguageKind;
 pub const DeclareCapability = plugin.DeclareCapability;
+pub const TranspilePlatform = plugin.TranspilePlatform;
+pub const TranspileCapability = plugin.TranspileCapability;
 pub const LanguageRow = plugin.LanguageRow;
 
 // ── Pack manifest (`pack.labelle`) (plugin_manifest/pack.zig) ────────

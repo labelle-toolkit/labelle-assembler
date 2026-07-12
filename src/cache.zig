@@ -55,6 +55,7 @@ pub const populateFrameworkPackage = disk.populateFrameworkPackage;
 pub const populatePlugin = disk.populatePlugin;
 pub const patchCachedDeps = disk.patchCachedDeps;
 pub const dirExists = disk.dirExists;
+pub const isSymlink = disk.isSymlink;
 pub const copyDirRecursive = disk.copyDirRecursive;
 
 // ── remote fetching ──────────────────────────────────────────────────
