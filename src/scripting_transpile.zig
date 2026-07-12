@@ -160,6 +160,12 @@ pub const GENERATED_DTS_FILENAME = "labelle-components.d.ts";
 /// `<tool> -p <target>/tsconfig.json`.
 pub const TSCONFIG_FILENAME = "tsconfig.json";
 
+/// The declaration-dir compiler config (RFC-LANGUAGE-PLUGINS rev 20 option
+/// (b)): distinct from `TSCONFIG_FILENAME` so the pre-declare declaration
+/// transpile (`transpileDeclDirs`) and the post-declare script transpile
+/// (`runPhase`) never clobber each other's generated config in the target.
+pub const DECL_TSCONFIG_FILENAME = "tsconfig.declare.json";
+
 /// The shipped contract declarations inside the scripting plugin package
 /// (labelle-scripting >= 0.3.0) — the global `labelle`/`Entity`/`game`
 /// surface the generated d.ts merges into.
@@ -1340,6 +1346,135 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?[]scripting_
         .legacy = opts.legacy,
         .extension = opts.extension,
     });
+}
+
+/// Transpile the DECLARATION dirs (`components/` + `events/`) for a
+/// transpile-row embed language BEFORE the declare phase (RFC-LANGUAGE-
+/// PLUGINS rev 20 option (b)): the assembler transpiles the declaration
+/// files and hands the declare tool the EMITTED output, so the declare
+/// tool stays a toolchain-agnostic embedded-VM evaluator.
+///
+/// Materializes `<target>/components` and `<target>/events` (symlink →
+/// real dir, a faithful copy of the game tree so coexisting Zig files stay
+/// reachable for the generated `@import`s) and runs the fetched compiler
+/// over their `.ts` sources in ONE game-rooted invocation, emitting `.js`
+/// beside them — so BOTH the declare tool (which reads
+/// `<target>/<dir>/<stem>.js`) and the runtime `@embedFile` find the
+/// emitted output. No-op (leaves the `linkAndScan` symlink untouched, no
+/// toolchain fetch — the need probe) when the language carries no
+/// transpile row or neither declaration dir holds `.ts` sources.
+///
+/// UNLIKE the script `runPhase` this needs no generated components d.ts
+/// (declaration files reference only the `labelle` DSL from the contract
+/// d.ts, never the typed `LabelleComponents` map). It leaves the script
+/// dir alone — `runPhase` runs AFTER declare, once the declared components
+/// exist for its d.ts. Ordered so `ensureTscTool` runs here first, warming
+/// the shared toolchain cache the later script transpile reuses.
+pub fn transpileDeclDirs(allocator: std.mem.Allocator, opts: PhaseOptions) !void {
+    const src = opts.transpile orelse scripting_splice.transpileSource(opts.language) orelse return;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const decl_dirs = [_][]const u8{ "components", "events" };
+    var all_ts: std.ArrayList([]const u8) = .empty; // game-relative (dir/rel)
+    var all_dts: std.ArrayList([]const u8) = .empty;
+    var has_contract_copy = false;
+    var materialize = [_]bool{ false, false };
+    for (decl_dirs, 0..) |dir, i| {
+        const set = try collectTsSources(aa, opts.game_dir, dir, src, opts.extension);
+        try rejectStemCollisions(set, dir, src, opts.extension);
+        if (set.has_contract_copy) has_contract_copy = true;
+        if (set.ts_files.len > 0) materialize[i] = true;
+        for (set.ts_files) |rel| try all_ts.append(aa, try std.fs.path.join(aa, &.{ dir, rel }));
+        for (set.dts_files) |rel| try all_dts.append(aa, try std.fs.path.join(aa, &.{ dir, rel }));
+    }
+    // The need probe: no declaration `.ts` anywhere → nothing to transpile,
+    // no toolchain fetch, symlink layout intact (the declare tool reads any
+    // plain `.js` declarations through the existing linkAndScan symlink).
+    if (all_ts.items.len == 0) return;
+
+    // Tool AFTER the probe (the no-fetch guarantee) and BEFORE any target
+    // mutation. PRIMARY: the manifest `.transpile` row; frozen fallback for
+    // older pins. Shared toolchain cache — idempotent with the later script
+    // transpile's own resolution.
+    const tool_path = try resolveTranspileTool(allocator, opts);
+    defer if (tsc_tool_override == null) allocator.free(tool_path);
+
+    // The shipped contract d.ts (the `labelle` DSL globals) — unless a
+    // declaration dir carries its own copy.
+    var contract_path: ?[]const u8 = null;
+    if (!has_contract_copy) {
+        const pkg_dir = try scripting_declare.resolvePluginPackageDir(
+            aa,
+            opts.plugins,
+            opts.plugin_name,
+            opts.output_dir,
+            opts.project_dir,
+        );
+        const candidate = try std.fs.path.join(aa, &.{ pkg_dir, CONTRACT_DTS_REL });
+        if (cache.dirExists(candidate)) {
+            contract_path = candidate;
+        } else {
+            diag(
+                "the pinned scripting plugin ships no contract/labelle.d.ts — declaration .ts files typecheck without the labelle globals (pin labelle-scripting >= 0.3.0)",
+                .{},
+            );
+        }
+    }
+
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    // Materialize each declaration dir that holds `.ts` (symlink → real
+    // copy) so tsc emits INTO the target, never THROUGH the symlink back
+    // into the game sources. Dirs with no `.ts` keep their symlink.
+    for (decl_dirs, 0..) |dir, i| {
+        if (!materialize[i]) continue;
+        const game_dir_path = try std.fs.path.join(aa, &.{ opts.game_dir, dir });
+        const target_dir_path = try std.fs.path.join(aa, &.{ opts.target_dir, dir });
+        try cwd.deleteTree(io, target_dir_path);
+        try scanner.copyDirRecursiveAbs(aa, game_dir_path, target_dir_path);
+    }
+
+    // One game-rooted tsconfig: `components/x.ts` → `<target>/components/x.js`,
+    // `events/y.ts` → `<target>/events/y.js` (rootDir = game root, outDir =
+    // target root preserve the dir structure).
+    const game_abs = try cwd.realPathFileAlloc(io, opts.game_dir, aa);
+    const target_abs = try cwd.realPathFileAlloc(io, opts.target_dir, aa);
+    var files: std.ArrayList([]const u8) = .empty;
+    for (all_ts.items) |rel| try files.append(aa, try std.fs.path.join(aa, &.{ game_abs, rel }));
+    for (all_dts.items) |rel| try files.append(aa, try std.fs.path.join(aa, &.{ game_abs, rel }));
+    if (contract_path) |p| try files.append(aa, try cwd.realPathFileAlloc(io, p, aa));
+
+    var rendered: std.Io.Writer.Allocating = .init(aa);
+    try renderTsconfig(&rendered.writer, game_abs, target_abs, files.items);
+    try scanner.writeFile(opts.target_dir, DECL_TSCONFIG_FILENAME, rendered.writer.buffered());
+    const tsconfig_path = try std.fs.path.join(aa, &.{ opts.target_dir, DECL_TSCONFIG_FILENAME });
+
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ tool_path, "-p", tsconfig_path },
+    }) catch |err| {
+        diag("could not run the typescript compiler {s} for declaration files: {s}", .{ tool_path, @errorName(err) });
+        return error.ScriptTypecheckFailed;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            relayChildOutput(result.stdout);
+            relayChildOutput(result.stderr);
+            diag("typescript check failed (tsc exit {d}) on declaration files — fix the errors above; nothing was emitted", .{code});
+            return error.ScriptTypecheckFailed;
+        },
+        else => {
+            relayChildOutput(result.stdout);
+            relayChildOutput(result.stderr);
+            diag("the typescript compiler terminated abnormally on declaration files", .{});
+            return error.ScriptTypecheckFailed;
+        },
+    }
 }
 
 /// Best-effort cleanup of a stale generated tsconfig (a project whose

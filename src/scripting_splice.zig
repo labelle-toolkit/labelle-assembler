@@ -811,11 +811,14 @@ pub fn collectEmbedScripts(
 /// organizational, mirroring the Zig component scan) — NO ordering-prefix
 /// machinery; numeric prefixes are a scripts/-only convention.
 ///
-/// For a transpile-row language (typescript), authoring-extension sources
-/// in `components/` are a pointed error (`error.ComponentsDirNeedsTranspile`)
-/// — the transpile phase materializes only the SCRIPT dir, so a
-/// `components/foo.ts` would silently never run (`.d.ts` declaration
-/// files exempt, as everywhere). Runnable `components/*.js` embeds fine.
+/// For a transpile-row language (typescript, rev 20 option (b)), an
+/// authoring-extension source in `components/` (`components/hunger.ts`)
+/// registers + embeds as its EMITTED twin (`components/hunger.js`): the
+/// assembler transpiles the declaration dirs BEFORE the declare phase
+/// (`scripting_transpile.transpileDeclDirs`), so the `.js` exists in the
+/// target for both the declare tool's argv and the runtime `@embedFile`.
+/// `.d.ts` declaration files are typecheck inputs, never embedded. Runnable
+/// `components/*.js` embeds directly.
 ///
 /// The target's `components/` link is root.zig's existing
 /// `linkAndScan(components, ".zig")` — the whole dir is exposed, so the
@@ -835,7 +838,7 @@ pub fn collectComponentEmbeds(
 /// #237 refinement `components/` follows). Same mechanics as
 /// `collectComponentEmbeds` in every respect — extension-keyed
 /// coexistence with the Zig event scan, alphabetical order, plain rel
-/// stems, the transpile pointed error (`error.EventsDirNeedsTranspile`),
+/// stems, the transpile authoring→emitted mapping (rev 20 option (b)),
 /// missing dir collects empty.
 ///
 /// Entries register BETWEEN the component declarations and the script
@@ -866,13 +869,6 @@ const DeclDir = enum {
             .events => "events",
         };
     }
-
-    fn transpileError(self: DeclDir) anyerror {
-        return switch (self) {
-            .components => error.ComponentsDirNeedsTranspile,
-            .events => error.EventsDirNeedsTranspile,
-        };
-    }
 };
 
 /// The shared components/-and-events/ declaration-file collection (see
@@ -899,7 +895,14 @@ fn collectDeclEmbeds(
     // Row-driven (rev 19): the authoring→embed transpile source rides the
     // splice (resolved by `detect` from the manifest row / frozen fallback),
     // not a re-lookup of the frozen table here.
-    const transpile: ?TranspileSource = splice.transpile;
+    // PRIMARY: the splice's row-derived transpile source (rev 19, resolved
+    // by `detect` from the manifest `.transpile` row). Frozen fallback:
+    // `transpileSource(language)` (the `EMBED_LANGUAGES` table) for pins
+    // predating `.transpile` rows or a manifest carrying `.declare` without
+    // `.transpile` — the SAME fallback `runPhase`/`transpileDeclDirs` use,
+    // so the authoring→emitted (`.ts`→`.js`) mapping stays consistent
+    // across the collection and the transpile that emits it (rev 20).
+    const transpile: ?TranspileSource = splice.transpile orelse transpileSource(splice.language);
     try collectDeclEmbedsWalk(allocator, io, dir, "", splice, transpile, decl_dir, &out);
 
     // Deterministic order: plain alphabetical by target-relative file.
@@ -937,42 +940,44 @@ fn collectDeclEmbedsWalk(
                 try collectDeclEmbedsWalk(allocator, io, sub, sub_prefix, splice, transpile, decl_dir, out);
             },
             else => {
-                // Authoring sources the assembler can't run from here: the
-                // transpile phase covers the SCRIPT dir only (the doc's
-                // pointed-error rule — never silently dead).
+                // The stem (rel-prefixed, extension-stripped) and the emitted
+                // extension differ only for a TRANSPILE-row language: an
+                // authoring `components/hunger.ts` registers + embeds as its
+                // EMITTED `hunger.js` (RFC-LANGUAGE-PLUGINS rev 20 option (b) —
+                // the assembler transpiles the declaration dirs BEFORE declare,
+                // `scripting_transpile.transpileDeclDirs`, so the emitted `.js`
+                // exists in the target for both the declare tool and the
+                // runtime `@embedFile`). `.d.ts` declaration files are
+                // typecheck inputs, never embeds — skipped. For a
+                // non-transpile language the authored extension IS the embed
+                // extension, so this collapses to the plain collection.
+                var stem_ext: []const u8 = splice.extension;
                 if (transpile) |t| {
-                    if (std.mem.endsWith(u8, entry.name, t.source_extension) and
-                        !std.mem.endsWith(u8, entry.name, t.declaration_suffix))
-                    {
-                        std.debug.print(
-                            "labelle-assembler: {s}/{s}{s}{s} is a {s} authoring source, but the transpile step covers only the script dir.\n" ++
-                                "  author runnable {s} in {s}/ (or keep {s} sources in {s}/).\n",
-                            .{
-                                decl_dir.dirName(),
-                                rel_prefix,
-                                if (rel_prefix.len == 0) "" else "/",
-                                entry.name,
-                                t.source_extension,
-                                splice.extension,
-                                decl_dir.dirName(),
-                                t.source_extension,
-                                splice.dir,
-                            },
-                        );
-                        return decl_dir.transpileError();
+                    if (std.mem.endsWith(u8, entry.name, t.declaration_suffix)) continue;
+                    if (std.mem.endsWith(u8, entry.name, t.source_extension)) {
+                        // A transpiled authoring source: strip the AUTHORING
+                        // extension for the stem, but register/embed the
+                        // EMITTED extension below.
+                        stem_ext = t.source_extension;
+                    } else if (!std.mem.endsWith(u8, entry.name, splice.extension)) {
+                        continue;
                     }
+                } else if (!std.mem.endsWith(u8, entry.name, splice.extension)) {
+                    continue;
                 }
-                if (!std.mem.endsWith(u8, entry.name, splice.extension)) continue;
-                const rel_stem_len = entry.name.len - splice.extension.len;
+                const rel_stem_len = entry.name.len - stem_ext.len;
+                const stem = entry.name[0..rel_stem_len];
                 const name = if (rel_prefix.len == 0)
-                    try allocator.dupe(u8, entry.name[0..rel_stem_len])
+                    try allocator.dupe(u8, stem)
                 else
-                    try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, entry.name[0..rel_stem_len] });
+                    try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, stem });
                 errdefer allocator.free(name);
+                // The embedded/declared file always carries the EMBED
+                // extension (`.js` for typescript — the emitted twin).
                 const file = if (rel_prefix.len == 0)
-                    try std.fmt.allocPrint(allocator, "{s}/{s}", .{ decl_dir.dirName(), entry.name })
+                    try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ decl_dir.dirName(), stem, splice.extension })
                 else
-                    try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ decl_dir.dirName(), rel_prefix, entry.name });
+                    try std.fmt.allocPrint(allocator, "{s}/{s}/{s}{s}", .{ decl_dir.dirName(), rel_prefix, stem, splice.extension });
                 errdefer allocator.free(file);
                 try out.append(allocator, .{ .name = name, .file = file });
             },
@@ -1906,8 +1911,9 @@ const ts_splice_fixture = ScriptingSplice{
     .dir = "scripts",
     .extension = ".js",
     // rev 19: the transpile source rides the splice — `collectDeclEmbeds`
-    // reads it here (was a frozen-table lookup) to reject `.ts` authoring
-    // sources in components/events dirs.
+    // reads it here (was a frozen-table lookup) to map `.ts` authoring
+    // sources in components/events dirs to their emitted `.js` twin (rev 20
+    // option (b)); `.d.ts` declaration files are skipped.
     .transpile = .{ .source_extension = ".ts", .declaration_suffix = ".d.ts" },
 };
 
@@ -2031,14 +2037,14 @@ test "collectComponentEmbeds: components/*.<ext> collect alphabetically with pla
     try testing.expectEqual(@as(usize, 0), none.len);
 }
 
-test "collectComponentEmbeds: a typescript authoring source in components/ is a pointed error; runnable .js and .d.ts pass" {
+test "collectComponentEmbeds: a typescript authoring .ts registers as its emitted .js; runnable .js and .d.ts handled" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Runnable .js + a declaration file: both fine (the .d.ts is not a
-    // script anywhere; the .js embeds like any component-dir language
-    // file).
+    // Runnable .js + a declaration file: the .js embeds like any
+    // component-dir language file; the .d.ts is a typecheck input, never a
+    // script anywhere.
     try writeTestFile(tmp.dir, "components/glue.js", "export const GLUE = 1;\n");
     try writeTestFile(tmp.dir, "components/labelle.d.ts", "declare const labelle: any;\n");
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
@@ -2050,13 +2056,18 @@ test "collectComponentEmbeds: a typescript authoring source in components/ is a 
     try testing.expectEqualStrings("glue", embeds[0].name);
     try testing.expectEqualStrings("components/glue.js", embeds[0].file);
 
-    // An authoring .ts source would be silently dead (the transpile
-    // phase materializes only the SCRIPT dir) — pointed error instead.
-    try writeTestFile(tmp.dir, "components/shape.ts", "export type Shape = { w: number };\n");
-    try testing.expectError(
-        error.ComponentsDirNeedsTranspile,
-        collectComponentEmbeds(allocator, root, ts_splice_fixture),
-    );
+    // An authoring .ts source registers + embeds as its EMITTED .js twin
+    // (RFC-LANGUAGE-PLUGINS rev 20 option (b): the transpile-decl phase
+    // emits it into the target for both the declare tool and @embedFile).
+    try writeTestFile(tmp.dir, "components/shape.ts", "export const Shape = labelle.component(\"Shape\", { w: 1.0 });\n");
+    const embeds2 = try collectComponentEmbeds(allocator, root, ts_splice_fixture);
+    defer freeEmbedScripts(allocator, embeds2);
+    try testing.expectEqual(@as(usize, 2), embeds2.len);
+    // Alphabetical by target-relative file: components/glue.js < components/shape.js.
+    try testing.expectEqualStrings("glue", embeds2[0].name);
+    try testing.expectEqualStrings("components/glue.js", embeds2[0].file);
+    try testing.expectEqualStrings("shape", embeds2[1].name);
+    try testing.expectEqualStrings("components/shape.js", embeds2[1].file);
 
     // Gap-less languages never trip the guard — a stray .ts in a lua
     // project's components/ is the POLICY scan's business, not this one's
@@ -2634,20 +2645,23 @@ test "collectEventEmbeds: events/*.<ext> collect alphabetically with plain stems
     try testing.expectEqual(@as(usize, 0), none.len);
 }
 
-test "collectEventEmbeds: a typescript authoring source in events/ is its own pointed error; .d.ts exempt" {
+test "collectEventEmbeds: a typescript authoring .ts registers as its emitted .js; .d.ts exempt" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestFile(tmp.dir, "events/labelle.d.ts", "declare const labelle: any;\n");
-    try writeTestFile(tmp.dir, "events/hit.ts", "export type Hit = { damage: number };\n");
+    try writeTestFile(tmp.dir, "events/hit.ts", "export const Hit = labelle.event(\"hit\", { damage: 1.0 });\n");
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
 
-    try testing.expectError(
-        error.EventsDirNeedsTranspile,
-        collectEventEmbeds(allocator, root, ts_splice_fixture),
-    );
+    // The authoring .ts registers + embeds as its EMITTED .js twin (rev 20
+    // option (b)); the .d.ts is a typecheck input, never embedded.
+    const embeds = try collectEventEmbeds(allocator, root, ts_splice_fixture);
+    defer freeEmbedScripts(allocator, embeds);
+    try testing.expectEqual(@as(usize, 1), embeds.len);
+    try testing.expectEqualStrings("hit", embeds[0].name);
+    try testing.expectEqualStrings("events/hit.js", embeds[0].file);
 }
 
 test "concatEmbeds3: components -> events -> scripts registration order (the #772 order pin) — shallow, inputs keep ownership" {

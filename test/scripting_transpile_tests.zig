@@ -544,3 +544,172 @@ pub const TRANSPILE_E2E = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle-components") == null);
     }
 };
+
+// ── declaration-file transpile BEFORE declare (rev 20 option (b), #773) ──
+// The full option-(b) path end to end: a typescript project authoring its
+// component/event declarations as `.ts`. The assembler must (1) NOT reject
+// `components/*.ts`/`events/*.ts` (the lifted gate), (2) transpile the
+// declaration dirs into the target BEFORE declare (fake tsc emits the `.js`),
+// (3) hand the declare tool ONLY the emitted declaration `.js` (components ++
+// events — never scripts), (4) thread the schema into scripting_components.zig
+// / scripting_events.zig, and (5) register the emitted `.js` from the
+// materialized dirs. Both the tsc AND the declare runner are staged fakes
+// (the real ones fetch tsc / build a quickjs exe — the non-hermetic steps the
+// override seams exist to bypass); the declare runner RECORDS its argv so the
+// "declare over the emitted declaration .js, decls-only" contract is pinned.
+
+/// A typescript scripting plugin whose `.languages` row carries BOTH a
+/// `.transpile` capability (so the embed extension resolves to `.js`) and a
+/// `.declare` capability (so the generic declare path picks up the ts tool).
+/// The `.transpile` pins are minimal — `detect` reads only `.emits`, and the
+/// tsc fetch is bypassed by `tsc_tool_override`.
+const ts_decl_plugin_manifest =
+    \\.{ .name = "scripting", .manifest_version = 1,
+    \\   .languages = .{
+    \\       .{ .name = "typescript", .extensions = .{".ts"}, .kind = .embedded,
+    \\          .transpile = .{ .emits = "js", .toolchain = "tsc", .version = "7.0.2",
+    \\                          .fetch_url = "https://registry.npmjs.org/@typescript/typescript-{platform}/-/typescript-{platform}-{version}.tgz" },
+    \\          .declare = .{ .tool = "labelle-declare-ts", .dir = "tools/declare-ts", .events = true } },
+    \\   },
+    \\}
+;
+
+/// The fake tsc for the declaration+script transpile: emits the KNOWN `.js`
+/// for whichever tsconfig it is handed (`tsconfig.declare.json` -> the
+/// declaration dirs' `.js`; the script tsconfig -> the script `.js`). Honors
+/// the `<tool> -p <tsconfig>` contract and reads `outDir` from the config.
+const decl_transpile_fake_tsc =
+    \\#!/bin/sh
+    \\[ "$1" = "-p" ] || exit 3
+    \\out=$(sed -n 's/^ *"outDir": "\(.*\)".*$/\1/p' "$2")
+    \\[ -n "$out" ] || exit 4
+    \\case "$2" in
+    \\  *tsconfig.declare.json)
+    \\    mkdir -p "$out/components" "$out/events"
+    \\    printf 'export const Hunger = labelle.component("Hunger", { level: 0.875 });\n' > "$out/components/hunger.js"
+    \\    printf 'export const Feed = labelle.event("hunger__feed", { amount: 0.5 });\n' > "$out/events/feed.js"
+    \\    ;;
+    \\  *)
+    \\    printf 'export function update(dt) {}\n' > "$out/logic.js"
+    \\    ;;
+    \\esac
+    \\exit 0
+    \\
+;
+
+const decl_schema_json =
+    \\{"components":[{"name":"Hunger","persist":"persistent","fields":[{"name":"level","type":"f32","default":0.875}]}],"events":[{"name":"hunger__feed","fields":[{"name":"amount","type":"f32","default":0.5}]}]}
+;
+
+pub const DECL_TRANSPILE_E2E = struct {
+    test "a typescript project declaring in components/*.ts + events/*.ts: transpile-before-declare, decls-only argv, schema + embeds flow (rev 20 option (b))" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "out");
+        try tmp.dir.createDirPath(io, "game");
+        var game = try tmp.dir.openDir(io, "game", .{});
+        defer game.close(io);
+
+        try writeFileIn(game, "plugins/scripting/plugin.labelle", ts_decl_plugin_manifest);
+        try writeFileIn(game, "plugins/scripting/contract/labelle.d.ts",
+            \\declare const labelle: { component(n: string, s?: object, o?: object): any; event(n: string, s?: object): string; id: number };
+            \\
+        );
+        // Authored declarations as `.ts` — the gate that used to reject
+        // these (ComponentsDirNeedsTranspile / EventsDirNeedsTranspile) is
+        // lifted; they transpile to `.js` and feed the declare tool.
+        try writeFileIn(game, "components/hunger.ts",
+            \\export const Hunger = labelle.component("Hunger", { level: 0.875 });
+        );
+        try writeFileIn(game, "events/feed.ts",
+            \\export const Feed = labelle.event("hunger__feed", { amount: 0.5 });
+        );
+        // A gameplay script (transpiled AFTER declare) — proves the reorder
+        // and that scripts never reach the declare tool's argv.
+        try writeFileIn(game, "scripts/logic.ts",
+            \\export function update(dt: number): void {}
+        );
+        try writeFileIn(game, "engine-fixture/codegen/main.zig.template", engine_template);
+        const game_abs = try tmp.dir.realPathFileAlloc(io, "game", allocator);
+        defer allocator.free(game_abs);
+        const out_abs = try tmp.dir.realPathFileAlloc(io, "out", allocator);
+        defer allocator.free(out_abs);
+
+        // Fake tsc.
+        var tf = try tmp.dir.createFile(io, "fake-tsc", .{ .permissions = .executable_file });
+        try tf.writeStreamingAll(io, decl_transpile_fake_tsc);
+        tf.close(io);
+        const fake_tsc = try tmp.dir.realPathFileAlloc(io, "fake-tsc", allocator);
+        defer allocator.free(fake_tsc);
+        generate.scripting_transpile.tsc_tool_override = fake_tsc;
+        defer generate.scripting_transpile.tsc_tool_override = null;
+
+        // Fake declare runner that RECORDS its argv, then echoes the schema.
+        const args_abs = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(args_abs);
+        const decl_body = try std.fmt.allocPrint(
+            allocator,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{s}/recorded-args.txt\"\necho '{s}'\n",
+            .{ args_abs, decl_schema_json },
+        );
+        defer allocator.free(decl_body);
+        var df = try tmp.dir.createFile(io, "fake-declare", .{ .permissions = .executable_file });
+        try df.writeStreamingAll(io, decl_body);
+        df.close(io);
+        const fake_declare = try tmp.dir.realPathFileAlloc(io, "fake-declare", allocator);
+        defer allocator.free(fake_declare);
+        generate.scripting_declare.declare_tool_override = fake_declare;
+        defer generate.scripting_declare.declare_tool_override = null;
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        const cfg = generate.ProjectConfig{
+            .name = "ts-decl-game",
+            .backend = .sokol,
+            .backend_package = .{ .name = "sokol", .repo = backend_repo },
+            .ecs = .mock,
+            .engine_version = "local:engine-fixture",
+            .y_axis = .up,
+            .plugins = &.{
+                .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "typescript" } },
+            },
+        };
+        try generate.generate(allocator, cfg, out_abs, game_abs, .{ .is_tests_target = true });
+
+        // (2) The declaration dirs transpiled into the target BEFORE declare:
+        // the emitted `.js` exist where the declare tool + @embedFile read them.
+        try tmp.dir.access(io, "out/sokol_desktop/components/hunger.js", .{});
+        try tmp.dir.access(io, "out/sokol_desktop/events/feed.js", .{});
+
+        // (3) The declare tool saw ONLY the emitted declaration `.js`
+        // (components ++ events) — never the gameplay script, never a `.ts`.
+        const recorded = try tmp.dir.readFileAlloc(io, "recorded-args.txt", allocator, .limited(1 << 16));
+        defer allocator.free(recorded);
+        _ = try indexOfOrFail(recorded, "components/hunger.js");
+        _ = try indexOfOrFail(recorded, "events/feed.js");
+        try std.testing.expect(std.mem.indexOf(u8, recorded, "logic") == null);
+        try std.testing.expect(std.mem.indexOf(u8, recorded, ".ts") == null);
+
+        // (4) The schema flowed into the generated component + event files.
+        const comps = try tmp.dir.readFileAlloc(io, "out/sokol_desktop/scripting_components.zig", allocator, .limited(1 << 20));
+        defer allocator.free(comps);
+        _ = try indexOfOrFail(comps, "Hunger");
+        const events = try tmp.dir.readFileAlloc(io, "out/sokol_desktop/scripting_events.zig", allocator, .limited(1 << 20));
+        defer allocator.free(events);
+        _ = try indexOfOrFail(events, "hunger__feed");
+
+        // (5) The generated main registers the emitted declaration `.js` from
+        // the materialized dirs (components-first), plus the transpiled script.
+        const main_zig = try tmp.dir.readFileAlloc(io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
+        defer allocator.free(main_zig);
+        const reg_hunger = try indexOfOrFail(main_zig, "scripting.registerScript(\"hunger\", @embedFile(\"components/hunger.js\"));");
+        const reg_feed = try indexOfOrFail(main_zig, "scripting.registerScript(\"feed\", @embedFile(\"events/feed.js\"));");
+        const reg_logic = try indexOfOrFail(main_zig, "scripting.registerScript(\"logic\", @embedFile(\"scripts/logic.js\"));");
+        // components-first, events next, scripts last (the #772 order).
+        try std.testing.expect(reg_hunger < reg_feed);
+        try std.testing.expect(reg_feed < reg_logic);
+        // No `.ts` embed anywhere.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, ".ts\")") == null);
+    }
+};

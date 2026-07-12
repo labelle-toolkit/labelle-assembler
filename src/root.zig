@@ -942,6 +942,38 @@ pub fn generate(
     // and BEFORE main.zig emission, which consumes `declared_components`.
     // Null/no-op for: no splice, no scripts, or scripts declaring nothing
     // — those emit byte-identical output (and drop a stale generated file).
+    // ── Declaration-file transpile, BEFORE declare (RFC-LANGUAGE-PLUGINS
+    // rev 20 option (b), labelle-engine#773) ─────────────────────────────
+    // For a transpile-row embed language (typescript) the declare tool is a
+    // toolchain-agnostic embedded-VM evaluator that receives the EMITTED
+    // `.js`: the assembler transpiles `components/*.ts` + `events/*.ts` into
+    // the target HERE — materializing those dirs, emitting `.js` beside the
+    // authored sources — so the declare phase below reads
+    // `<target>/components/*.js` + `<target>/events/*.js`, and the runtime
+    // `@embedFile` finds the same output. No-op for lua/ruby (no transpile
+    // row) and native (never reaches here). Idempotent, shared toolchain
+    // cache — pulls `ensureTscTool` ahead of the later gameplay-script
+    // transpile, warming the cache it reuses.
+    if (maybe_scripting) |*s| {
+        if (s.family == .embed) {
+            try scripting_transpile.transpileDeclDirs(allocator, .{
+                .plugins = cfg.plugins,
+                .plugin_name = s.plugin_name,
+                .language = s.language,
+                .dir = s.dir,
+                .legacy = s.legacy,
+                .extension = s.extension,
+                .game_dir = game_dir,
+                .output_dir = output_dir,
+                .target_dir = target_dir,
+                .project_dir = game_dir,
+                .component_names = component_names,
+                .pack_scans = pack_scans.items,
+                .transpile = s.transpile,
+            });
+        }
+    }
+
     var declare_schema: ?scripting_declare.Schema = null;
     defer if (declare_schema) |*sch| sch.deinit();
     if (maybe_scripting) |*s| {
@@ -956,8 +988,28 @@ pub fn generate(
         // (nothing embeds) and gameplay scripts are compiler-staged, never fed
         // to the declare probe. Either way the generic/hardcoded runPhase gets
         // components-first order.
-        const declare_inputs: []const scripting_splice.EmbedScript =
-            if (s.family == .native) (native_decl_embeds orelse &.{}) else s.scripts;
+        // NATIVE (rust/crystal): components ++ events only (`native_decl_embeds`).
+        // TRANSPILE embed (typescript, rev 20 option (b)): also components ++
+        // events only — the transpiled `.js` declaration files just emitted
+        // above; gameplay scripts are transpiled AFTER declare and reference
+        // declarations BY NAME, never re-declaring, so they never feed the
+        // declare tool. Plain embed (lua/ruby): the whole collection
+        // (components ++ events ++ scripts — in-script chunk-scope
+        // declarations are legal, and the constant ledger needs the scripts).
+        const is_transpile = s.transpile != null or scripting_splice.transpileSource(s.language) != null;
+        var decl_only_embeds: ?[]scripting_splice.EmbedScript = null;
+        defer if (decl_only_embeds) |d| allocator.free(d);
+        const declare_inputs: []const scripting_splice.EmbedScript = if (s.family == .native)
+            (native_decl_embeds orelse &.{})
+        else if (is_transpile) blk: {
+            const ce = component_embeds orelse &.{};
+            const ee = event_embeds orelse &.{};
+            const d = try allocator.alloc(scripting_splice.EmbedScript, ce.len + ee.len);
+            @memcpy(d[0..ce.len], ce);
+            @memcpy(d[ce.len..], ee);
+            decl_only_embeds = d;
+            break :blk d;
+        } else s.scripts;
         const script_files = try allocator.alloc([]const u8, declare_inputs.len);
         defer allocator.free(script_files);
         for (declare_inputs, script_files) |sc, *f| f.* = sc.file;
