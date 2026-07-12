@@ -342,7 +342,16 @@ pub const PluginBuildStepsWiring = struct {
     /// (`plugin-build/<name>`), resolved at build time via `b.pathFromRoot`
     /// so the generated tree stays relocatable on that axis.
     cache_rel: []const u8,
+    /// The steps to EMIT — root.zig already applied the generate-time
+    /// `.os` filter (`stepAllowsOs`), so slice order here IS the emitted
+    /// chain order.
     steps: []const plugin_build_steps.Step,
+    /// Library SEARCH paths for the game's final link, RESOLVED at
+    /// generate time by root.zig from the emitted steps' `.library_paths`
+    /// (`{crystal_env:VAR}` expanded via `crystal env`, deduped, declared
+    /// order). Each becomes one `addLibraryPath` on the artifact's root
+    /// module. Empty for every pre-crystal plugin — byte-identity holds.
+    library_paths: []const []const u8 = &.{},
 };
 
 /// Emit one declared argv element as generated build.zig source.
@@ -369,6 +378,7 @@ fn emitBuildStepArg(
     const has_slots =
         plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_CACHE) or
         plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_TARGET) or
+        plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_CRYSTAL_TARGET) or
         plugin_build_steps.containsStaticlibPlaceholder(arg);
 
     var fmt_body: std.ArrayList(u8) = .empty;
@@ -395,6 +405,11 @@ fn emitBuildStepArg(
             } else if (std.mem.eql(u8, ph, plugin_build_steps.PLACEHOLDER_TARGET)) {
                 try fmt_body.appendSlice(allocator, "{s}");
                 try refs.append(allocator, try allocator.dupe(u8, "plugin_build_target_triple"));
+            } else if (std.mem.eql(u8, ph, plugin_build_steps.PLACEHOLDER_CRYSTAL_TARGET)) {
+                try fmt_body.appendSlice(allocator, "{s}");
+                const ct_ref = try allocator.dupe(u8, "plugin_build_crystal_target");
+                errdefer allocator.free(ct_ref);
+                try refs.append(allocator, ct_ref);
             } else {
                 // {staticlib:NAME} → "{s}NAME{s}" over the shared lib
                 // prefix/ext consts. NAME's charset ([A-Za-z0-9_-],
@@ -464,10 +479,12 @@ fn emitPluginBuildSteps(
     // local const is a compile error in the generated build.zig.
     var wants_triple = false;
     var wants_staticlib = false;
+    var wants_crystal_target = false;
     for (entries) |e| {
         for (e.steps) |s| {
             for (s.command) |arg| {
                 if (plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_TARGET)) wants_triple = true;
+                if (plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_CRYSTAL_TARGET)) wants_crystal_target = true;
                 if (plugin_build_steps.containsStaticlibPlaceholder(arg)) wants_staticlib = true;
             }
             if (s.artifact) |a| {
@@ -481,6 +498,29 @@ fn emitPluginBuildSteps(
     try w.writeAll("    // the game artifact. Declared order = execution order within a plugin.\n");
     if (wants_triple) {
         try w.writeAll("    const plugin_build_target_triple = target.result.zigTriple(b.allocator) catch @panic(\"OOM\");\n");
+    }
+    if (wants_crystal_target) {
+        // The labelle-scripting `crystalTriple` mapping, verbatim: crystal's
+        // `--target` names are not zig triples, and only the desktop
+        // macos/linux × aarch64/x86_64 cells exist. The @panic arms are
+        // unreachable for supported projects (the generate-time `.os` +
+        // platform gates rejected everything else already) — they fire only
+        // when the GENERATED project is hand-crossed via `-Dtarget=`, with
+        // a message naming the constraint.
+        try w.writeAll("    // {crystal_target}: crystal's --target triple for the resolved zig target.\n");
+        try w.writeAll("    const plugin_build_crystal_target: []const u8 = switch (target.result.os.tag) {\n");
+        try w.writeAll("        .macos => switch (target.result.cpu.arch) {\n");
+        try w.writeAll("            .aarch64 => \"aarch64-apple-darwin\",\n");
+        try w.writeAll("            .x86_64 => \"x86_64-apple-darwin\",\n");
+        try w.writeAll("            else => @panic(\"crystal scripts: unsupported cpu arch (aarch64/x86_64 only)\"),\n");
+        try w.writeAll("        },\n");
+        try w.writeAll("        .linux => switch (target.result.cpu.arch) {\n");
+        try w.writeAll("            .aarch64 => \"aarch64-linux-gnu\",\n");
+        try w.writeAll("            .x86_64 => \"x86_64-linux-gnu\",\n");
+        try w.writeAll("            else => @panic(\"crystal scripts: unsupported cpu arch (aarch64/x86_64 only)\"),\n");
+        try w.writeAll("        },\n");
+        try w.writeAll("        else => @panic(\"crystal scripts: unsupported target OS (macos/linux only)\"),\n");
+        try w.writeAll("    };\n");
     }
     if (wants_staticlib) {
         // {staticlib:NAME}: cargo-style toolchains emit `NAME.lib` on
@@ -577,6 +617,16 @@ fn emitPluginBuildSteps(
                     try w.writeAll("        else => {},\n");
                     try w.writeAll("    }\n");
                 }
+            }
+        }
+        // Library search paths (declared `.library_paths`, generate-time
+        // resolved — crystal's runtime libs live wherever `crystal env
+        // CRYSTAL_LIBRARY_PATH` says): one addLibraryPath per entry, on
+        // the game artifact's module like the system libs above.
+        if (e.library_paths.len > 0) {
+            try w.print("    // Library search paths for plugin '{s}' (.library_paths, resolved at generate).\n", .{e.plugin_name});
+            for (e.library_paths) |lp| {
+                try w.print("    {s}.root_module.addLibraryPath(.{{ .cwd_relative = \"{f}\" }});\n", .{ artifact, std.zig.fmtString(lp) });
             }
         }
         // The game artifact waits for the plugin's LAST step; the chain
@@ -1546,4 +1596,61 @@ test "emitPluginBuildSteps: {staticlib:NAME} in command args and package-rooted 
     try testing.expect(std.mem.indexOf(u8, out, "    const plugin_foo_build_artifact_0: std.Build.LazyPath = .{ .cwd_relative = b.fmt(\"/pkg/foo/out/{s}adder{s}\", .{ plugin_build_lib_prefix, plugin_build_lib_ext }) };\n") != null);
     // No system_libs declared → no per-OS switch anywhere.
     try testing.expect(std.mem.indexOf(u8, out, "switch (target.result.os.tag)") == null);
+}
+
+test "emitPluginBuildSteps: the crystal shape — {crystal_target} const, artifact-less chaining, library paths (golden)" {
+    // The wiring arrives PRE-FILTERED (root.zig applied the `.os` gate,
+    // so a macOS generate emits crystal-build + the macOS localization
+    // only) with the {crystal_env:…} library paths already resolved.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try emitPluginBuildSteps(testing.allocator, &aw.writer, "exe", &.{.{
+        .plugin_name = "scripting",
+        .package_abs = "/abs/deps/labelle-scripting",
+        .cache_rel = "plugin-build/scripting",
+        .library_paths = &.{ "/opt/homebrew/lib", "/opt/crystal/lib" },
+        .steps = &.{
+            .{
+                .name = "crystal-build",
+                .command = &.{ "crystal", "build", "--release", "--cross-compile", "--target", "{crystal_target}", "{package}/native-crystal/src/main.cr", "-o", "{cache}/labelle_crystal_scripts" },
+                .os = &.{ "macos", "linux" },
+            },
+            .{
+                .name = "localize-main-macos",
+                .command = &.{ "ld", "-r", "{cache}/labelle_crystal_scripts.o", "-o", "{cache}/labelle_crystal_scripts_lib.o", "-exported_symbols_list", "{package}/native-crystal/exported_symbols_macos.txt" },
+                .artifact = "{cache}/labelle_crystal_scripts_lib.o",
+                .link = .object,
+                .os = &.{"macos"},
+                .system_libs = .{ .macos = &.{ "gc", "iconv", "pcre2-8" } },
+            },
+        },
+    }});
+    const out = aw.written();
+
+    // The shared crystal-target const: the crystalTriple mapping verbatim,
+    // resolved at build time, emitted once.
+    const ct_decl = "    const plugin_build_crystal_target: []const u8 = switch (target.result.os.tag) {\n";
+    const first = std.mem.indexOf(u8, out, ct_decl) orelse return error.MissingCrystalTargetDecl;
+    try testing.expect(std.mem.indexOfPos(u8, out, first + 1, ct_decl) == null);
+    try testing.expect(std.mem.indexOf(u8, out, "            .aarch64 => \"aarch64-apple-darwin\",\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "            .x86_64 => \"x86_64-linux-gnu\",\n") != null);
+    // …and the argv references it as a bare build-time slot.
+    try testing.expect(std.mem.indexOf(u8, out, "\"--target\", plugin_build_crystal_target,") != null);
+
+    // Artifact-less intermediate: step 0 links nothing (no artifact
+    // const), the localization step chains after it and ITS object links.
+    try testing.expect(std.mem.indexOf(u8, out, "plugin_scripting_build_artifact_0") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "    plugin_scripting_build_step_1.step.dependOn(&plugin_scripting_build_step_0.step);\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    const plugin_scripting_build_artifact_1 = b.path(\"plugin-build/scripting/labelle_crystal_scripts_lib.o\");\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    exe.root_module.addObjectFile(plugin_scripting_build_artifact_1);\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    exe.step.dependOn(&plugin_scripting_build_step_1.step);\n") != null);
+
+    // Resolved library paths: one addLibraryPath per entry, declared order.
+    const lp_a = std.mem.indexOf(u8, out, "    exe.root_module.addLibraryPath(.{ .cwd_relative = \"/opt/homebrew/lib\" });\n") orelse return error.MissingLibraryPath;
+    const lp_b = std.mem.indexOf(u8, out, "    exe.root_module.addLibraryPath(.{ .cwd_relative = \"/opt/crystal/lib\" });\n") orelse return error.MissingLibraryPath;
+    try testing.expect(lp_a < lp_b);
+
+    // The per-OS system libs ride the existing switch emission.
+    try testing.expect(std.mem.indexOf(u8, out, "            exe.root_module.linkSystemLibrary(\"iconv\", .{});\n") != null);
 }

@@ -139,14 +139,24 @@ const NativeLanguage = struct {
 };
 
 /// The native-compiled rows. rust first (labelle-scripting PR #17, the
-/// family's pattern-setter); crystal/go land as their plugin sub-modules
-/// do.
+/// family's pattern-setter), crystal second (PR #19, scripting v0.7.0 —
+/// same live-link staging over its own crate, `.link = .object` steps);
+/// go lands as its plugin sub-module does.
 pub const NATIVE_LANGUAGES = [_]NativeLanguage{
     .{
         .language = "rust",
         .extension = ".rs",
         .stage_subdir = "native/src/game",
         .module_root = "mod.rs",
+    },
+    .{
+        .language = "crystal",
+        .extension = ".cr",
+        .stage_subdir = "native-crystal/src/game",
+        // The crate's game-module root: native-crystal/src/main.cr
+        // requires "./game/game" — crystal/game.cr is the mod.rs twin
+        // (`Labelle::Game.register` composes the scripts).
+        .module_root = "game.cr",
     },
 };
 
@@ -496,8 +506,8 @@ pub fn stageNativeSources(
         std.debug.print(
             "labelle-assembler: the pinned scripting plugin ships no {s}/ crate — it predates " ++
                 "{s} (native-compiled) support.\n" ++
-                "  pin a labelle-scripting version whose package ships {s}/ (PR #17 or later).\n",
-            .{ stage_parent, splice.language, row.stage_subdir },
+                "  pin a labelle-scripting version whose package ships {s}/ (the release that added {s}).\n",
+            .{ stage_parent, splice.language, row.stage_subdir, splice.language },
         );
         return error.NativeCrateLayoutMissing;
     }
@@ -726,19 +736,50 @@ test "detect: a rust declaration splices as the NATIVE family — rust/ dir, .rs
     try testing.expectEqual(@as(usize, 0), splice.script_names.len);
 }
 
-test "NATIVE_LANGUAGES: rust row shape — extension, crate stage dir, module root; nativeExtension table" {
+test "NATIVE_LANGUAGES: rust + crystal row shapes — extension, crate stage dir, module root; nativeExtension table" {
     const rust = nativeRow("rust").?;
     try testing.expectEqualStrings(".rs", rust.extension);
     try testing.expectEqualStrings("native/src/game", rust.stage_subdir);
     try testing.expectEqualStrings("mod.rs", rust.module_root);
 
+    // Crystal (labelle-scripting PR #19 / v0.7.0): its OWN crate
+    // (`native-crystal/`) beside rust's, game.cr as the module root the
+    // crate's main.cr requires.
+    const crystal = nativeRow("crystal").?;
+    try testing.expectEqualStrings(".cr", crystal.extension);
+    try testing.expectEqualStrings("native-crystal/src/game", crystal.stage_subdir);
+    try testing.expectEqualStrings("game.cr", crystal.module_root);
+
     try testing.expectEqualStrings(".rs", nativeExtension("rust").?);
+    try testing.expectEqualStrings(".cr", nativeExtension("crystal").?);
     // Embed languages never appear in the native table (and vice versa —
     // the families are disjoint; detect() checks embed first).
     try testing.expect(nativeExtension("lua") == null);
     try testing.expect(nativeExtension("ruby") == null);
     try testing.expect(nativeExtension("typescript") == null);
-    try testing.expect(nativeExtension("crystal") == null);
+    try testing.expect(nativeExtension("go") == null);
+}
+
+test "detect: a crystal declaration splices as the NATIVE family — crystal/ dir, .cr extension" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "plugins/scripting/plugin.labelle",
+        \\.{ .name = "scripting", .manifest_version = 1 }
+    );
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "crystal" } },
+    };
+    const splice = (try detect(allocator, &plugins, project_dir)).?;
+    try testing.expectEqualStrings("crystal", splice.language);
+    try testing.expectEqualStrings("crystal", splice.dir);
+    try testing.expectEqualStrings(".cr", splice.extension);
+    try testing.expectEqual(Family.native, splice.family);
+    try testing.expectEqual(@as(usize, 0), splice.script_names.len);
 }
 
 test "detect: an integration gap (declared language in NEITHER table) → null with a warning" {
@@ -752,13 +793,13 @@ test "detect: an integration gap (declared language in NEITHER table) → null w
     const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(project_dir);
 
-    // `crystal` is policy-supported (SUPPORTED_LANGUAGES) but has neither
-    // an embed row nor a native row yet — so the splice is skipped. The
+    // `go` is policy-supported (SUPPORTED_LANGUAGES) but has neither an
+    // embed row nor a native row yet — so the splice is skipped. The
     // skip logs via `std.log.warn`, which the Zig test runner tolerates
     // (only a logged `err` fails a test — see the same gate noted in
     // render.zig).
     const plugins = [_]config.PluginDep{
-        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "crystal" } },
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "go" } },
     };
     try testing.expect((try detect(allocator, &plugins, project_dir)) == null);
 }

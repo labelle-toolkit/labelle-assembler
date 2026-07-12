@@ -186,7 +186,42 @@ pub const generateGameShim = game_shim_mod.generateGameShim;
 pub const GenerateOptions = struct {
     target_name_override: ?[]const u8 = null,
     is_tests_target: bool = false,
+    /// The target OS the per-step `.os` allowlists select against
+    /// (labelle-engine#741 crystal: the main-localization pass differs
+    /// per OS, so exactly one variant is emitted). Null (production) =
+    /// the HOST OS (`builtin.os.tag`) — desktop generates build for the
+    /// machine they run on; cross-desktop `zig build -Dtarget=` of the
+    /// generated project is outside the per-OS step model's v1 scope.
+    /// TEST SEAM: the suite drives macos/linux/windows selection through
+    /// the real generate with it (the declare phase's override-runner
+    /// pattern).
+    plugin_build_os: ?std.Target.Os.Tag = null,
 };
+
+/// The `.os`-filtered view of `steps` for `os_tag`
+/// (`plugin_build_steps.stepAllowsOs`), or null when every step already
+/// allows it — callers then borrow the original slice, keeping the
+/// no-`.os` common case allocation-free (and byte-identical downstream).
+fn filterStepsByOs(
+    allocator: std.mem.Allocator,
+    steps: []const plugin_build_steps.Step,
+    os_tag: std.Target.Os.Tag,
+) !?[]plugin_build_steps.Step {
+    var all = true;
+    for (steps) |s| {
+        if (!plugin_build_steps.stepAllowsOs(s, os_tag)) {
+            all = false;
+            break;
+        }
+    }
+    if (all) return null;
+    var kept: std.ArrayList(plugin_build_steps.Step) = .empty;
+    errdefer kept.deinit(allocator);
+    for (steps) |s| {
+        if (plugin_build_steps.stepAllowsOs(s, os_tag)) try kept.append(allocator, s);
+    }
+    return try kept.toOwnedSlice(allocator);
+}
 
 // ── Provider-contract checks (root/provider_contracts.zig) ──────────
 pub const validateProviderContracts = provider_contracts.validateProviderContracts;
@@ -971,6 +1006,8 @@ pub fn generate(
         for (plugin_build_wirings.items) |pw| {
             allocator.free(pw.package_abs);
             allocator.free(pw.cache_rel);
+            for (pw.library_paths) |p| allocator.free(p);
+            allocator.free(pw.library_paths);
         }
         plugin_build_wirings.deinit(allocator);
     }
@@ -1003,30 +1040,34 @@ pub fn generate(
             }
             if (maybe_build == null and maybe_lang == null) continue;
 
-            const build_steps_slice: []const plugin_build_steps.Step =
+            const build_steps_all: []const plugin_build_steps.Step =
                 if (maybe_build) |l| l.steps else &.{};
-            const lang_steps_slice: []const plugin_build_steps.Step =
+            const lang_steps_all: []const plugin_build_steps.Step =
                 if (maybe_lang) |l| l.steps else &.{};
 
             // All appends below must be infallible once owned resources are
-            // handed over, or an error between them double-frees.
+            // handed over, or an error between them double-frees. Three
+            // concat-list slots: the two possible OS-filter allocations plus
+            // the combined slice.
             try plugin_build_loaded.ensureUnusedCapacity(allocator, 1);
             try plugin_langbuild_loaded.ensureUnusedCapacity(allocator, 1);
-            try plugin_build_concat.ensureUnusedCapacity(allocator, 1);
+            try plugin_build_concat.ensureUnusedCapacity(allocator, 3);
             try plugin_build_wirings.ensureUnusedCapacity(allocator, 1);
 
             // Platform gate: a declared allowlist excluding THIS platform
             // fails the generate up front — the alternative is a
             // missing-symbols link failure much later, far from the cause.
-            // Both step sources gate identically; the label names the
+            // Both step sources gate identically (UNfiltered — a step that
+            // demands a platform this project doesn't build is an error no
+            // matter which OS it is scoped to); the label names the
             // offending block (a desktop-only rust `.language_builds` step
             // must fail a wasm generate pointing at itself).
             const gated_sets = [_]struct {
                 steps: []const plugin_build_steps.Step,
                 label: []const u8,
             }{
-                .{ .steps = build_steps_slice, .label = ".build" },
-                .{ .steps = lang_steps_slice, .label = ".language_builds" },
+                .{ .steps = build_steps_all, .label = ".build" },
+                .{ .steps = lang_steps_all, .label = ".language_builds" },
             };
             for (gated_sets) |set| {
                 for (set.steps) |step| {
@@ -1039,6 +1080,73 @@ pub fn generate(
                         );
                         return error.PluginBuildUnsupportedPlatform;
                     }
+                }
+            }
+
+            // ── Per-OS step selection (labelle-engine#741 crystal) ─────
+            // Emit only the steps whose `.os` allowlist matches the target
+            // OS (host, unless the test seam overrides): the crystal entry
+            // declares one main-localization step per OS and exactly one
+            // may run. `.build` blocks filter silently (a fully OS-gated
+            // block is a declared per-OS no-op); the SELECTED language
+            // entry is gated below — a Windows crystal generate must fail
+            // up front, not select an artifact-less chain (codex, PR #19).
+            const step_os: std.Target.Os.Tag = opts.plugin_build_os orelse builtin.os.tag;
+            const build_steps_slice: []const plugin_build_steps.Step = blk: {
+                if (try filterStepsByOs(allocator, build_steps_all, step_os)) |f| {
+                    plugin_build_concat.appendAssumeCapacity(f);
+                    break :blk f;
+                }
+                break :blk build_steps_all;
+            };
+            const lang_steps_slice: []const plugin_build_steps.Step = blk: {
+                if (try filterStepsByOs(allocator, lang_steps_all, step_os)) |f| {
+                    plugin_build_concat.appendAssumeCapacity(f);
+                    break :blk f;
+                }
+                break :blk lang_steps_all;
+            };
+            if (maybe_lang != null) {
+                const declared_os_union = blk: {
+                    var list: std.ArrayList([]const u8) = .empty;
+                    errdefer list.deinit(allocator);
+                    for (lang_steps_all) |step| {
+                        for (step.os) |o| {
+                            const dup = for (list.items) |seen| {
+                                if (std.mem.eql(u8, seen, o)) break true;
+                            } else false;
+                            if (!dup) try list.append(allocator, o);
+                        }
+                    }
+                    break :blk try list.toOwnedSlice(allocator);
+                };
+                defer allocator.free(declared_os_union);
+                const os_list = try std.mem.join(allocator, ", ", declared_os_union);
+                defer allocator.free(os_list);
+
+                if (lang_steps_slice.len == 0) {
+                    std.debug.print(
+                        "labelle: plugin '{s}' .language_builds entry \"{s}\" has no build steps for OS '{s}' (steps declare .os: {s})\n" ++
+                            "  {s} games build on those OSes only today — generate on one of them, or switch script language.\n",
+                        .{ plugin.name, declared_language.?, @tagName(step_os), os_list, declared_language.? },
+                    );
+                    return error.PluginBuildNoStepsForOs;
+                }
+                var had_artifact = false;
+                for (lang_steps_all) |step| {
+                    if (step.link != .none) had_artifact = true;
+                }
+                var has_artifact = false;
+                for (lang_steps_slice) |step| {
+                    if (step.link != .none) has_artifact = true;
+                }
+                if (had_artifact and !has_artifact) {
+                    std.debug.print(
+                        "labelle: plugin '{s}' .language_builds entry \"{s}\" produces no linked artifact on OS '{s}' (artifact steps declare .os: {s})\n" ++
+                            "  the {s} scripts object would never link — generate on a supported OS, or switch script language.\n",
+                        .{ plugin.name, declared_language.?, @tagName(step_os), os_list, declared_language.? },
+                    );
+                    return error.PluginBuildNoArtifactForOs;
                 }
             }
 
@@ -1055,6 +1163,65 @@ pub fn generate(
                 plugin_build_concat.appendAssumeCapacity(c);
                 break :blk c;
             };
+            if (combined.len == 0) {
+                // Every step OS-filtered away and no language entry (the
+                // gates above own THAT case): a per-OS `.build` no-op.
+                // Explicit deinits — `continue` is a normal exit, so the
+                // errdefers won't fire.
+                if (maybe_build) |*l| l.deinit();
+                maybe_build = null;
+                if (maybe_lang) |*l| l.deinit();
+                maybe_lang = null;
+                continue;
+            }
+
+            // ── Library search paths (.library_paths, generate-resolved) ──
+            // `{crystal_env:VAR}` tokens expand by running `crystal env`
+            // (or the test override); literals pass through. Deduped —
+            // both per-OS localization variants declare the same token,
+            // and even the single emitted one may repeat entries.
+            var resolved_lib_paths: std.ArrayList([]const u8) = .empty;
+            errdefer {
+                for (resolved_lib_paths.items) |p| allocator.free(p);
+                resolved_lib_paths.deinit(allocator);
+            }
+            for (combined) |step| {
+                for (step.library_paths) |lp| {
+                    if (plugin_build_steps.isCrystalEnvToken(lp)) {
+                        try plugin_build_steps.resolveCrystalEnv(
+                            allocator,
+                            plugin.name,
+                            step.name,
+                            plugin_build_steps.crystalEnvVar(lp),
+                            &resolved_lib_paths,
+                        );
+                    } else {
+                        const owned = try allocator.dupe(u8, lp);
+                        errdefer allocator.free(owned);
+                        try resolved_lib_paths.append(allocator, owned);
+                    }
+                }
+            }
+            {
+                var w_i: usize = 0;
+                for (resolved_lib_paths.items) |p| {
+                    const dup = for (resolved_lib_paths.items[0..w_i]) |q| {
+                        if (std.mem.eql(u8, p, q)) break true;
+                    } else false;
+                    if (dup) {
+                        allocator.free(p);
+                    } else {
+                        resolved_lib_paths.items[w_i] = p;
+                        w_i += 1;
+                    }
+                }
+                resolved_lib_paths.shrinkRetainingCapacity(w_i);
+            }
+            const lib_paths_owned = try resolved_lib_paths.toOwnedSlice(allocator);
+            errdefer {
+                for (lib_paths_owned) |p| allocator.free(p);
+                allocator.free(lib_paths_owned);
+            }
 
             // `{package}` root: prefer the staged deps copy (byte-consistent
             // with what the game links, inside .labelle); fall back to the
@@ -1110,6 +1277,7 @@ pub fn generate(
                 .package_abs = package_abs,
                 .cache_rel = cache_rel,
                 .steps = combined,
+                .library_paths = lib_paths_owned,
             });
             // Hand the parse trees over to their lifetime lists and disarm
             // the errdefers (assume-capacity appends cannot fail between
