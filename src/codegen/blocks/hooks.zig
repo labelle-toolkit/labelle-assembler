@@ -134,7 +134,12 @@ pub fn Mixin(comptime Self: type) type {
             // Pack events (Packs RFC §4, #439) are dir-scanned like the game
             // root's, so they widen `GameEvents` — fold `GameEvents` into
             // `AllHookPayloads` even when a pack is the ONLY source of events.
-            const has_game_events = self.event_names.len > 0 or self.hasPackEvents();
+            // Script-DECLARED events (labelle-engine#772) widen it the same
+            // way — this gate must match `writeGameEventsBlock`'s exactly, or
+            // a declared-events-only project would emit a `GameEvents` union
+            // that never folds into the dispatcher.
+            const has_game_events = self.event_names.len > 0 or self.hasPackEvents() or
+                self.declaredEvents().len > 0;
             // Gate on **discovered** events, not declared plugins — a project
             // can declare a plugin whose `Events` decl is empty (or absent, e.g.
             // the plugin-controllers demo plugin), in which case `PluginEvents`

@@ -527,22 +527,30 @@ pub fn generate(
     try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 
     // ── Scripting splice: collect the language sources (#593/#237) ─────
-    // TWO collections, concatenated components-first onto the splice:
+    // THREE collections, concatenated components → events → scripts onto
+    // the splice (the registration order — each layer's constants must
+    // exist when the next loads):
     //
     //   1. `components/*.<ext>` declaration files (#237's refinement:
     //      declarations live where their KIND lives — beside the Zig
     //      components; `collectComponentEmbeds`, plain alphabetical, no
     //      ordering prefixes). They register FIRST so the view constants
     //      they define exist by the time scripts load.
-    //   2. The script dir `detect` resolved — `scripts/` (top level only,
+    //   2. `events/*.<ext>` declaration files (labelle-engine#772, the
+    //      same where-their-kind-lives convention beside the Zig events;
+    //      `collectEventEmbeds`, identical mechanics). They register
+    //      after components and before scripts so the event-name
+    //      constants they define (`HungerFeed = Labelle.event ...`)
+    //      exist by the time scripts load.
+    //   3. The script dir `detect` resolved — `scripts/` (top level only,
     //      Zig ordering convention: numeric prefixes first, stripped from
     //      the registered stem) or the deprecated legacy dir on the
     //      one-release grace fallback (verbatim pre-#237 recursive scan,
     //      plain sorted stems). `collectEmbedScripts` places/reuses the
     //      target link so the generated main's `@embedFile("<file>")`
     //      resolves (for `scripts/` that's the link just placed above —
-    //      shared with the Zig scanner; for `components/` it's the
-    //      components link placed just below).
+    //      shared with the Zig scanner; for `components/` and `events/`
+    //      it's the links placed just below).
     //
     // Entries carry TARGET-RELATIVE files. Missing dirs collect empty —
     // the plugin is wired, nothing embeds. Game root only;
@@ -564,18 +572,21 @@ pub fn generate(
     // builders emit nothing.
     var component_embeds: ?[]scripting_splice.EmbedScript = null;
     defer if (component_embeds) |ce| scripting_splice.freeEmbedScripts(allocator, ce);
+    var event_embeds: ?[]scripting_splice.EmbedScript = null;
+    defer if (event_embeds) |ee| scripting_splice.freeEmbedScripts(allocator, ee);
     var script_embeds: ?[]scripting_splice.EmbedScript = null;
     defer if (script_embeds) |se| scripting_splice.freeEmbedScripts(allocator, se);
-    // The emission slice: components ++ scripts, SHALLOW (entries owned by
-    // the two collections above) — freed as a bare slice, never through
-    // freeEmbedScripts.
+    // The emission slice: components ++ events ++ scripts, SHALLOW
+    // (entries owned by the three collections above) — freed as a bare
+    // slice, never through freeEmbedScripts.
     var combined_embeds: ?[]scripting_splice.EmbedScript = null;
     defer if (combined_embeds) |cb| allocator.free(cb);
     if (maybe_scripting) |*s| {
         if (s.family == .embed) {
             component_embeds = try scripting_splice.collectComponentEmbeds(allocator, game_dir, s.*);
+            event_embeds = try scripting_splice.collectEventEmbeds(allocator, game_dir, s.*);
             script_embeds = try scripting_splice.collectEmbedScripts(allocator, game_dir, target_dir, s.*);
-            combined_embeds = try scripting_splice.concatEmbeds(allocator, component_embeds.?, script_embeds.?);
+            combined_embeds = try scripting_splice.concatEmbeds3(allocator, component_embeds.?, event_embeds.?, script_embeds.?);
             s.scripts = combined_embeds.?;
         }
     }
@@ -886,15 +897,18 @@ pub fn generate(
     defer allocator.free(zon);
     try scanner.writeFile(target_dir, "build.zig.zon", zon);
 
-    // ── Script-declared components: declare-mode extraction (#585) ─────
+    // ── Script-declared components + events: declare extraction (#585,
+    // labelle-engine#772) ───────────────────────────────────────────────
     // RFC-LANGUAGE-PLUGINS revs 6-7 (epic labelle-engine#237), the second
     // consumer of the scripting splice: run the LANGUAGE's declare runner
     // (`DECLARE_RUNNERS` — lua + ruby today) over the collected sources
-    // (`components/*.<ext>` declarations first, then the script dir's
-    // files — `scripts/`, or the legacy dir on the grace fallback),
-    // codegen the declared components into `scripting_components.zig`,
-    // and thread them onto the splice so the component-registry block
-    // registers them by name.
+    // (`components/*.<ext>` declarations first, then `events/*.<ext>`
+    // declarations, then the script dir's files — `scripts/`, or the
+    // legacy dir on the grace fallback), codegen the declared components
+    // into `scripting_components.zig` and the declared events into
+    // `scripting_events.zig`, and thread both onto the splice so the
+    // component-registry block registers components by name and the
+    // game-events block emits one union variant per event.
     // Ordered AFTER build.zig.zon generation — `createDepsLinks` just
     // staged the plugin package under `<output>/deps/labelle-<name>/`,
     // which is where the language's runner is built from (`zig build
@@ -912,25 +926,41 @@ pub fn generate(
         // consulted. The runner gets the collected TARGET-RELATIVE files
         // (not stems — ordering prefixes are stripped from stems, so only
         // the file column can rebuild the path): `components/*.<ext>`
-        // declarations first, then the script dir's files — in-script
-        // chunk-scope declarations remain legal, both sources feed ONE
+        // declarations first, then `events/*.<ext>` declarations
+        // (labelle-engine#772), then the script dir's files — in-script
+        // chunk-scope declarations remain legal, all sources feed ONE
         // schema (the runner owns duplicate detection with
         // first-declared-in attribution).
         const script_files = try allocator.alloc([]const u8, s.scripts.len);
         defer allocator.free(script_files);
         for (s.scripts, script_files) |sc, *f| f.* = sc.file;
+        // The events-dir subset rides along separately (labelle-engine
+        // #772): the phase's events gates (`events_min_pin` floor,
+        // no-runner hard error, declares-nothing error) fire on these
+        // files specifically — they're already IN `script_files` above,
+        // so the runner argv is untouched.
+        const event_files = try allocator.alloc([]const u8, if (event_embeds) |ee| ee.len else 0);
+        defer allocator.free(event_files);
+        if (event_embeds) |ee| {
+            for (ee, event_files) |sc, *f| f.* = sc.file;
+        }
         declare_schema = try scripting_declare.runPhase(allocator, .{
             .plugins = cfg.plugins,
             .plugin_name = s.plugin_name,
             .language = s.language,
             .script_files = script_files,
+            .event_files = event_files,
             .output_dir = output_dir,
             .target_dir = target_dir,
             .project_dir = game_dir,
             .component_names = component_names,
+            .event_names = event_names,
             .pack_scans = pack_scans.items,
         });
-        if (declare_schema) |sch| s.declared_components = sch.components;
+        if (declare_schema) |sch| {
+            s.declared_components = sch.components;
+            s.declared_events = sch.events;
+        }
     }
 
     // ── TS→JS transpile: check + emit at generate (labelle-engine#745) ─
@@ -972,11 +1002,12 @@ pub fn generate(
         })) |transpiled| {
             if (script_embeds) |old| scripting_splice.freeEmbedScripts(allocator, old);
             script_embeds = transpiled;
-            // Compute-then-swap: concatEmbeds is fallible, and freeing the
+            // Compute-then-swap: concatEmbeds3 is fallible, and freeing the
             // old slice first would leave `combined_embeds` dangling across
             // the try — the deferred free would double-free on that error
-            // path.
-            const recombined = try scripting_splice.concatEmbeds(allocator, component_embeds.?, transpiled);
+            // path. The declaration-dir prefixes (components ++ events)
+            // survive the swap — the phase materializes only the script dir.
+            const recombined = try scripting_splice.concatEmbeds3(allocator, component_embeds.?, event_embeds.?, transpiled);
             if (combined_embeds) |cb| allocator.free(cb);
             combined_embeds = recombined;
             s.scripts = recombined;
@@ -1465,6 +1496,18 @@ pub fn generate(
     var plugin_events = try main_zig.discoverPluginEvents(allocator, cfg_modules, game_dir);
     defer plugin_events.deinit();
 
+    // Script-DECLARED events (labelle-engine#772) were gated against the
+    // game/pack event namespaces inside the declare phase — but plugin
+    // `Events` discovery only happens NOW, so a declared name that spells
+    // a plugin's qualified tag (`box2d__collision_begin`) would sail
+    // through `checkEventCollisions` and only explode later inside the
+    // generated main.zig's `MergeHookPayloads` comptime duplicate-field
+    // check — a terrible error for a user mistake. Gate it here, right
+    // after discovery, with the declare phase's pointed collision voice.
+    if (maybe_scripting) |s| {
+        try scripting_declare.checkEventPluginCollisions(s.declared_events, plugin_events.entries);
+    }
+
     // Emit the `game.zig` shim — a tiny re-export module that surfaces
     // `Game` and `EntityId` so generated flow files at
     // `scripts/flows/*.zig` can `@import("game")`. See
@@ -1583,6 +1626,10 @@ pub fn generate(
             // game-root namespace as components/*.zig, so the sidecar's game
             // realm must list them too. Empty for declaration-less projects.
             if (maybe_scripting) |s| s.declared_components else &.{},
+            // Script-declared events (labelle-engine#772) — one GameEvents
+            // union variant each, exactly like events/*.zig; the sidecar's
+            // game realm lists them the same way.
+            if (maybe_scripting) |s| s.declared_events else &.{},
             prefab_names,
             enum_names,
             event_names,
