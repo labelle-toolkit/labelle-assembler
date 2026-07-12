@@ -160,13 +160,17 @@ pub const DeclareRunner = struct {
     events_min_pin: []const u8,
 };
 
-/// The declare-capable languages (labelle-engine#237; ruby via
-/// labelle-scripting PR #21 / v0.9.0 — `tools/declare-ruby`, its own exe
-/// so the capability probe stays filesystem-presence per row and a
-/// unified exe never compiles both VMs into every generate). typescript
-/// declarations arrive LATER via `.d.ts`/interface extraction (a
-/// typescript-side declare runner feeding the same schema seam) — one
-/// more row when they do.
+/// FROZEN FALLBACK (RFC-LANGUAGE-PLUGINS rev 17, the Migration bullet).
+/// These rows are the declare capability for manifests that PREDATE the
+/// `.languages` capability table — resolved pins of releases before
+/// labelle-scripting shipped the lua/ruby rows keep working unchanged.
+/// When a resolved manifest DOES carry a `.languages` declare row for the
+/// language, `runPhase`'s generic path (the #619 dispatch flip) handles it
+/// first and this table is never consulted. The table is FROZEN: never
+/// extended again — a new language comes via a manifest row, not a row
+/// here (the python litmus test). typescript is deliberately absent (no
+/// declare tool; its declarations, when they arrive, come as a `.languages`
+/// row, not a table entry).
 pub const DECLARE_RUNNERS = [_]DeclareRunner{
     .{
         .language = "lua",
@@ -1355,9 +1359,12 @@ pub const PhaseOptions = struct {
     pack_scans: []const scan.PackScan,
 };
 
-/// Run the whole declare phase for an active scripting splice: select the
-/// language's runner row (`DECLARE_RUNNERS`), gate the events floor
-/// (labelle-engine#772), build (or reuse) the runner, extract the schema,
+/// Run the whole declare phase for an active scripting splice: try the
+/// generic `.languages` capability path FIRST (the #619 dispatch flip — the
+/// primary path for every language whose resolved manifest declares a row),
+/// then fall back to the language's FROZEN `DECLARE_RUNNERS` row, gate the
+/// events floor (labelle-engine#772), build (or reuse) the runner, extract
+/// the schema,
 /// gate collisions, and write the generated `scripting_components.zig` /
 /// `scripting_events.zig` into the target. Returns the owned Schema when
 /// at least one component OR event was declared (the caller threads
@@ -1384,22 +1391,24 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
         return null;
     }
 
-    // Generic `.languages` declare path (RFC-LANGUAGE-PLUGINS rev 17 §7):
-    // a language ABSENT from the hardcoded `DECLARE_RUNNERS` table may still
-    // declare via the resolved plugin manifest's `.languages` capability row
-    // (rust #774). The assembler reads the row generically — build
-    // `.declare.tool` via `zig build`, run it with a persistent `--cache-dir`
-    // + the declaration files, hash-and-skip when unchanged — learning
-    // nothing language-specific. lua/ruby (and typescript/crystal, still on
-    // the table) are untouched: they short-circuit this branch because
-    // `declareRunner` finds their row, and fall through to the table below.
-    // `.not_applicable` (no manifest, or no `.languages` declare row for this
-    // language) also falls through — to the table's existing skip/hard-error.
-    if (declareRunner(opts.language) == null) {
-        switch (try runGenericDeclarePhase(allocator, opts)) {
-            .handled => |maybe_schema| return maybe_schema,
-            .not_applicable => {},
-        }
+    // Generic `.languages` declare path (RFC-LANGUAGE-PLUGINS rev 17 §7 +
+    // the Migration bullet): the resolved plugin manifest's `.languages`
+    // capability row is the PRIMARY declare path for EVERY language — the
+    // assembler reads the row generically (build `.declare.tool` via `zig
+    // build`, run it with a persistent `--cache-dir` + the declaration
+    // files, hash-and-skip when unchanged), learning nothing
+    // language-specific. This is the #619 dispatch flip: it is attempted
+    // first for lua/ruby/rust alike, NOT only for languages absent from the
+    // hardcoded `DECLARE_RUNNERS` table. A manifest that carries a
+    // `.languages` declare row for the language wins here; one that predates
+    // `.languages` (or has no declare row for it) returns `.not_applicable`
+    // and falls through to the table below — which is now a FROZEN FALLBACK
+    // for pins predating capability rows, never the primary path when a row
+    // exists. So a new language needs only a `.languages` row + tool, zero
+    // assembler changes (the litmus test).
+    switch (try runGenericDeclarePhase(allocator, opts)) {
+        .handled => |maybe_schema| return maybe_schema,
+        .not_applicable => {},
     }
 
     // Runner-row gate (see `DECLARE_RUNNERS`): a language without a
@@ -1554,6 +1563,10 @@ fn finalizeSchema(
 const MAX_DECL_BYTES = 4 * 1024 * 1024;
 /// Cap on the cached schema JSON re-read on a skip hit.
 const MAX_SCHEMA_BYTES = 16 * 1024 * 1024;
+/// Cap on the declare-tool binary read folded into the skip key. Generous —
+/// a Debug native-probe exe is a handful of MB; over the cap folds a read
+/// error (forcing a safe re-run), never a silent stale hit.
+const MAX_TOOL_BYTES = 256 * 1024 * 1024;
 
 /// The outcome of `runGenericDeclarePhase`: either it drove the generic
 /// path (`.handled`, carrying the final schema or null for a no-op/skip),
@@ -1699,7 +1712,7 @@ fn acquireSchemaWithSkip(
     const json_path = try std.fs.path.join(allocator, &.{ skip_dir, "schema.json" });
     defer allocator.free(json_path);
 
-    const digest = try declInputsDigestHex(allocator, opts.target_dir, opts.script_files);
+    const digest = try declInputsDigestHex(allocator, tool_path, opts.target_dir, opts.script_files);
     defer allocator.free(digest);
 
     // Skip hit: stored digest matches AND the cached JSON is readable.
@@ -1723,19 +1736,35 @@ fn acquireSchemaWithSkip(
     return parseSchema(allocator, out);
 }
 
-/// SHA-256 of the declaration inputs (each file's target-relative path +
-/// its bytes), hex-encoded. Path is folded in so a rename/reorder is a
-/// change; an unreadable file folds its error name (never spuriously
-/// matches a prior good run — the tool run then surfaces the real error).
-/// Caller frees.
+/// SHA-256 of the resolved TOOL identity + the declaration inputs (each a
+/// path + its bytes), hex-encoded. The tool binary's bytes are folded in
+/// FIRST so the skip key is tied to the exact declare tool that produced the
+/// cached schema: a scripting pin bump (or a local plugin checkout change)
+/// rebuilds a different exe — a different digest — forcing a re-run even when
+/// the declaration files are byte-identical, so a plugin upgrade can never
+/// leave stale generated components/events (codex #622). Path is folded in
+/// so a rename/reorder is a change; an unreadable input (or an unreadable
+/// tool) folds its error name (never spuriously matches a prior good run —
+/// the tool run then surfaces the real error). Caller frees.
 fn declInputsDigestHex(
     allocator: std.mem.Allocator,
+    tool_path: []const u8,
     target_dir: []const u8,
     script_files: []const []const u8,
 ) ![]u8 {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    // Tool identity first: the exact binary the cached schema came from.
+    hasher.update(tool_path);
+    hasher.update(&.{0});
+    if (cwd.readFileAlloc(io, tool_path, allocator, .limited(MAX_TOOL_BYTES))) |bytes| {
+        defer allocator.free(bytes);
+        hasher.update(bytes);
+    } else |err| {
+        hasher.update(@errorName(err));
+    }
+    hasher.update(&.{0});
     for (script_files) |file_name| {
         hasher.update(file_name);
         hasher.update(&.{0});
@@ -2216,11 +2245,13 @@ test "runPhase: a splice without a runner row (typescript) skips cleanly — nul
         tmp.dir.access(tio, "target/" ++ GENERATED_FILENAME, .{}),
     );
 
-    // Negative controls: the SAME opts with a RUNNER-ROW language sail
-    // past the gate into the tool machinery (package resolution fails on
-    // the empty plugin list) — the skip above is the row gate, not an
-    // accident of the hostile opts. Both rows, so ruby's selection is
-    // pinned end-to-start too.
+    // Negative controls: the SAME opts with a FROZEN-TABLE language reach
+    // the tool machinery and error. With no staged package the generic path
+    // falls through as `.not_applicable` (nothing to resolve), so dispatch
+    // lands on the `DECLARE_RUNNERS` fallback, whose package resolution then
+    // fails on the empty plugin list — the typescript skip above is the
+    // no-row outcome, not an accident of the hostile opts. Both rows, so
+    // ruby's selection is pinned end-to-start too.
     opts.language = "lua";
     opts.script_files = &.{"scripts/behavior.lua"};
     try testing.expectError(error.DeclareToolBuildFailed, runPhase(allocator, opts));
@@ -2768,6 +2799,175 @@ test "runPhase: the generic .languages path declares for rust (staged manifest r
     // the persistent <output>/declare-tool/<tool>-cache/.assembler-skip.
     try tmp.dir.access(tio, "declare-tool/labelle-declare-rs-cache/.assembler-skip/schema.json", .{});
     try tmp.dir.access(tio, "declare-tool/labelle-declare-rs-cache/.assembler-skip/inputs.sha256", .{});
+}
+
+test "runPhase: the #619 dispatch flip — a FROZEN-TABLE language (lua) prefers its `.languages` row over DECLARE_RUNNERS" {
+    // The declare slice's dispatch flip: lua/ruby are still in the frozen
+    // `DECLARE_RUNNERS` table (the fallback for pins predating `.languages`),
+    // but a resolved manifest that carries a lua `.languages` declare row now
+    // wins — `runPhase` tries the generic path FIRST for every language, not
+    // only those absent from the table. Proven by the artifact ONLY the
+    // generic path leaves: the persistent `<output>/declare-tool/<tool>-cache`
+    // (the rev-17 `--cache-dir`). The table path (`runDeclareTool`) passes no
+    // cache dir and writes nothing there, so its presence pins that lua took
+    // the generic branch — the flip, not the fallback.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "target/components");
+
+    // A staged package carrying the EMBEDDED lua row (same `.declare` shape a
+    // native language uses — the whole point of the migration).
+    try tmp.dir.createDirPath(tio, "deps/labelle-scripting");
+    {
+        var f = try tmp.dir.createFile(tio, "deps/labelle-scripting/plugin.labelle", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio,
+            \\.{
+            \\    .name = "scripting",
+            \\    .manifest_version = 1,
+            \\    .languages = .{
+            \\        .{ .name = "lua", .extensions = .{"lua"}, .kind = .embedded,
+            \\           .declare = .{ .tool = "labelle-declare", .dir = "tools/declare", .events = true } },
+            \\    },
+            \\}
+        );
+    }
+    {
+        var f = try tmp.dir.createFile(tio, "target/components/hunger.lua", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio, "labelle.component(\"Hunger\", { level = 0.5 })\n");
+    }
+
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target);
+
+    const tool = try writeFakeDeclareTool(
+        allocator,
+        &tmp,
+        "{\"components\":[{\"name\":\"Hunger\",\"persist\":\"persistent\",\"fields\":[{\"name\":\"level\",\"type\":\"f32\",\"default\":0.5}]}]}",
+    );
+    defer allocator.free(tool);
+    declare_tool_override = tool;
+    defer declare_tool_override = null;
+
+    const local_pin = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:../labelle-scripting" },
+    };
+    const opts = PhaseOptions{
+        .plugins = &local_pin,
+        .plugin_name = "scripting",
+        .language = "lua",
+        .script_files = &.{"components/hunger.lua"},
+        .output_dir = root,
+        .target_dir = target,
+        .project_dir = root,
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+
+    var schema = (try runPhase(allocator, opts)) orelse return error.TestExpectedSchema;
+    defer schema.deinit();
+    try testing.expectEqual(@as(usize, 1), schema.components.len);
+    try testing.expectEqualStrings("Hunger", schema.components[0].name);
+
+    // The GENERIC path's tell: the persistent per-project cache dir, named
+    // after the lua tool. The table path never creates it.
+    try tmp.dir.access(tio, "declare-tool/labelle-declare-cache/.assembler-skip/schema.json", .{});
+    try tmp.dir.access(tio, "declare-tool/labelle-declare-cache/.assembler-skip/inputs.sha256", .{});
+}
+
+test "runPhase: the generic skip cache invalidates when the declare TOOL changes (codex #622 — no stale schema on a plugin bump)" {
+    // The skip cache is keyed on the tool binary's bytes + the declaration
+    // inputs. A scripting pin bump ships a DIFFERENT declare tool that can
+    // yield a different schema for byte-identical declaration files; the
+    // cache must NOT reuse the old schema.json. Modelled by rewriting the
+    // (override) tool between two generates with UNCHANGED inputs: run 1
+    // caches schema X, run 2's tool emits schema Y, and run 2 must return Y.
+    // Without the tool identity in the skip key this test returns X (stale).
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "target/components");
+    try tmp.dir.createDirPath(tio, "deps/labelle-scripting");
+    {
+        var f = try tmp.dir.createFile(tio, "deps/labelle-scripting/plugin.labelle", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio,
+            \\.{
+            \\    .name = "scripting",
+            \\    .manifest_version = 1,
+            \\    .languages = .{
+            \\        .{ .name = "rust", .extensions = .{"rs"}, .kind = .native,
+            \\           .module_root = "mod.rs",
+            \\           .declare = .{ .tool = "labelle-declare-rs", .dir = "tools/declare-rs", .events = true } },
+            \\    },
+            \\}
+        );
+    }
+    {
+        var f = try tmp.dir.createFile(tio, "target/components/hunger.rs", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio, "labelle::component! { Hunger { level: f32 = 0.5 } }\n");
+    }
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target);
+
+    const local_pin = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:../labelle-scripting" },
+    };
+    const opts = PhaseOptions{
+        .plugins = &local_pin,
+        .plugin_name = "scripting",
+        .language = "rust",
+        .script_files = &.{"components/hunger.rs"},
+        .output_dir = root,
+        .target_dir = target,
+        .project_dir = root,
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+
+    // Run 1: tool emits a "Hunger" component. Caches schema X.
+    {
+        const tool_x = try writeFakeDeclareTool(
+            allocator,
+            &tmp,
+            "{\"components\":[{\"name\":\"Hunger\",\"persist\":\"persistent\",\"fields\":[]}]}",
+        );
+        defer allocator.free(tool_x);
+        declare_tool_override = tool_x;
+        defer declare_tool_override = null;
+        var schema = (try runPhase(allocator, opts)) orelse return error.TestExpectedSchema;
+        defer schema.deinit();
+        try testing.expectEqualStrings("Hunger", schema.components[0].name);
+    }
+
+    // Run 2: the (rewritten) tool now emits a DIFFERENT component name, with
+    // the declaration file untouched. A tool-blind skip key would return the
+    // stale "Hunger"; the tool-bytes-keyed digest forces a re-run → "Stamina".
+    {
+        const tool_y = try writeFakeDeclareTool(
+            allocator,
+            &tmp,
+            "{\"components\":[{\"name\":\"Stamina\",\"persist\":\"persistent\",\"fields\":[]}]}",
+        );
+        defer allocator.free(tool_y);
+        declare_tool_override = tool_y;
+        defer declare_tool_override = null;
+        var schema = (try runPhase(allocator, opts)) orelse return error.TestExpectedSchema;
+        defer schema.deinit();
+        try testing.expectEqual(@as(usize, 1), schema.components.len);
+        try testing.expectEqualStrings("Stamina", schema.components[0].name);
+    }
 }
 
 test "runPhase: declared events land in the Schema + scripting_events.zig; collisions with events/*.zig gate; stale cleanup" {
