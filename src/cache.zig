@@ -34,6 +34,7 @@ const fetch = @import("cache/fetch.zig");
 // ── env / layout ─────────────────────────────────────────────────────
 pub const getCacheRoot = env.getCacheRoot;
 pub const getPackagesDir = env.getPackagesDir;
+pub const getTempPath = env.getTempPath;
 
 // ── path resolution ──────────────────────────────────────────────────
 pub const resolveFrameworkPackage = resolve.resolveFrameworkPackage;
@@ -58,6 +59,8 @@ pub const copyDirRecursive = disk.copyDirRecursive;
 
 // ── remote fetching ──────────────────────────────────────────────────
 pub const R2_BASE_URL = fetch.R2_BASE_URL;
+pub const downloadFile = fetch.downloadFile;
+pub const extractTarGz = fetch.extractTarGz;
 pub const fetchFrameworkPackage = fetch.fetchFrameworkPackage;
 pub const fetchPlugin = fetch.fetchPlugin;
 pub const fetchAssemblerPackages = fetch.fetchAssemblerPackages;

@@ -29,6 +29,7 @@ pub const plugin_manifest = @import("plugin_manifest.zig");
 pub const plugin_params = @import("plugin_params.zig");
 pub const scripting_splice = @import("scripting_splice.zig");
 pub const scripting_declare = @import("scripting_declare.zig");
+pub const scripting_transpile = @import("scripting_transpile.zig");
 pub const pack_validate = @import("pack_validate.zig");
 pub const panel_validate = @import("panel_validate.zig");
 const scene_name_lint = @import("scene_name_lint.zig");
@@ -73,6 +74,7 @@ test {
     _ = @import("plugin_params.zig");
     _ = @import("scripting_splice.zig");
     _ = @import("scripting_declare.zig");
+    _ = @import("scripting_transpile.zig");
     _ = @import("panel_validate.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
@@ -525,10 +527,10 @@ pub fn generate(
     // resolves, and record the SORTED stems (subdir paths joined with `/`,
     // `linkAndScan`'s contract) as the script names the lifecycle builders
     // register. A missing dir scans empty — the plugin is wired, nothing
-    // embeds. Sources the assembler can't run yet (`.ts` until the #586
-    // transpile hook) fail generate FIRST — the scan collects only the
-    // embed extension, so without the gate an authored `.ts` would neither
-    // embed nor error.
+    // embeds. Authored `.ts` sources are NOT collected here (the scan is
+    // embed-extension-only) — the transpile phase below (labelle-engine
+    // #745, ordered after deps staging) checks + emits them and REPLACES
+    // this scan's names with the materialized dir's.
     //
     // EMBED family only: a native-compiled language (rust) never embeds —
     // its sources are staged over the plugin package's crate instead
@@ -539,7 +541,6 @@ pub fn generate(
     defer if (scripting_script_names) |names| scanner.freeNames(allocator, names);
     if (maybe_scripting) |*s| {
         if (s.family == .embed) {
-            try scripting_splice.rejectUntranspiledScripts(allocator, game_dir, s.*);
             scripting_script_names = try scanner.linkAndScan(allocator, game_dir, target_dir, s.dir, s.extension);
             s.script_names = scripting_script_names.?;
         }
@@ -884,6 +885,41 @@ pub fn generate(
             .pack_scans = pack_scans.items,
         });
         if (declare_schema) |sch| s.declared_components = sch.components;
+    }
+
+    // ── TS→JS transpile: check + emit at generate (labelle-engine#745) ─
+    // The third consumer of the scripting splice: when the splice's
+    // language carries a transpile row (typescript's `.ts`) AND the
+    // game's script dir actually holds such sources, run the fetched
+    // TS 7 native compiler over them — type errors fail generate with
+    // tsc's diagnostics relayed — and swap the splice's script names for
+    // the MATERIALIZED target dir's scan (copied plain `.js` + emitted
+    // `.js`), which is what the registerScript builders embed. Ordered
+    // like the declare phase (deps just staged — the plugin package's
+    // shipped contract/labelle.d.ts feeds the generated tsconfig) and
+    // BEFORE main.zig emission, which consumes `script_names`. Null for
+    // every skip shape (no transpile row; no `.ts` sources — the need
+    // probe, so `.js`-only projects never fetch the toolchain and keep
+    // the plain symlink layout, byte-identical output).
+    if (maybe_scripting) |*s| {
+        if (try scripting_transpile.runPhase(allocator, .{
+            .plugins = cfg.plugins,
+            .plugin_name = s.plugin_name,
+            .language = s.language,
+            .dir = s.dir,
+            .extension = s.extension,
+            .game_dir = game_dir,
+            .output_dir = output_dir,
+            .target_dir = target_dir,
+            .project_dir = game_dir,
+            .component_names = component_names,
+            .pack_scans = pack_scans.items,
+            .declared_components = s.declared_components,
+        })) |transpiled_names| {
+            if (scripting_script_names) |old| scanner.freeNames(allocator, old);
+            scripting_script_names = transpiled_names;
+            s.script_names = transpiled_names;
+        }
     }
 
     // ── Native-language game-source staging (labelle-engine#741) ───────

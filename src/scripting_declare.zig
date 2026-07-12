@@ -778,8 +778,10 @@ fn ensureDeclareTool(allocator: std.mem.Allocator, pkg_dir: []const u8, output_d
 /// Locate the scripting plugin package to build the tool from: the staged
 /// `<output>/deps/labelle-<name>/` copy (the exact package the game
 /// builds against), falling back to the cache/local resolution when deps
-/// staging fell back. Caller frees.
-fn resolvePluginPackageDir(
+/// staging fell back. Caller frees. Pub: the transpile phase
+/// (`scripting_transpile.zig`) resolves the SAME plugin package to read
+/// its shipped `contract/labelle.d.ts` — one resolution, no drift.
+pub fn resolvePluginPackageDir(
     allocator: std.mem.Allocator,
     plugins: []const config.PluginDep,
     plugin_name: []const u8,
