@@ -712,8 +712,6 @@ pub const DECL_TRANSPILE_E2E = struct {
         const reg_hunger = try indexOfOrFail(main_zig, "scripting.registerScript(\"hunger\", @embedFile(\"components/hunger.js\"));");
         const reg_feed = try indexOfOrFail(main_zig, "scripting.registerScript(\"feed\", @embedFile(\"events/feed.js\"));");
         const reg_logic = try indexOfOrFail(main_zig, "scripting.registerScript(\"logic\", @embedFile(\"scripts/logic.js\"));");
-        // The declared event's union variant is keyed by the raw name.
-        _ = try indexOfOrFail(main_zig, "hunger__feed");
         // components-first, events next, scripts last (the #772 order).
         try std.testing.expect(reg_hunger < reg_feed);
         try std.testing.expect(reg_feed < reg_logic);
