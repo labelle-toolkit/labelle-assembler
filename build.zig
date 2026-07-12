@@ -171,6 +171,12 @@ pub fn build(b: *std.Build) void {
         // declared_components threaded, plus the declare phase e2e through
         // the real `generate` (override runner seam).
         "test/scripting_declare_tests.zig",
+        // TypeScript check+emit at generate (labelle-engine#745): the
+        // transpile phase e2e through the real `generate` (fake-tsc
+        // override seam) — materialized script dir, emitted embeds,
+        // generated labelle-components.d.ts + tsconfig, the type-error
+        // failure, and the js-only no-fetch skip.
+        "test/scripting_transpile_tests.zig",
         // Plugin build-integration hooks (#586): plugin.labelle `.build`
         // steps through the real `generate` — wiring pins, the additive
         // no-op invariant, the platform gate, and a REAL command+link e2e

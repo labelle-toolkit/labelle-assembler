@@ -377,6 +377,34 @@ pub fn linkAndScan(
     return names.toOwnedSlice(allocator);
 }
 
+/// Scan a fully-resolved directory (recursively, NO link/copy) for file
+/// stems matching `ext` — sorted, subfolder paths `/`-joined, the exact
+/// `linkAndScan` stem contract. A missing dir scans empty. Motivating
+/// use: the typescript transpile phase re-scans the target's
+/// MATERIALIZED script dir (copied `.js` + tsc-emitted `.js`) after the
+/// link was already placed and replaced — there is nothing left to link.
+pub fn scanDirAbs(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    ext: []const u8,
+) ![][]const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+
+    try scanRecursive(allocator, std.Io.Dir.cwd(), dir_path, "", ext, &names);
+
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    return names.toOwnedSlice(allocator);
+}
+
 fn scanRecursive(
     allocator: std.mem.Allocator,
     cwd: std.Io.Dir,

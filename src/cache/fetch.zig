@@ -345,7 +345,9 @@ fn slugify(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 }
 
 /// `curl` the archive at `url` to `dest`. Fails closed with a diagnostic.
-fn downloadFile(allocator: std.mem.Allocator, url: []const u8, dest: []const u8) !void {
+/// Pub (via the cache.zig façade): the typescript transpile phase fetches
+/// the pinned tsc-native tarball with the same mechanics.
+pub fn downloadFile(allocator: std.mem.Allocator, url: []const u8, dest: []const u8) !void {
     const io = config.globalIo();
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "curl", "-fSL", "--retry", "3", "-o", dest, url },
@@ -372,7 +374,9 @@ fn downloadFile(allocator: std.mem.Allocator, url: []const u8, dest: []const u8)
 /// Windows uses the system bsdtar (`%SystemRoot%\System32\tar.exe`, Win10
 /// 1803+) by full path — NOT a bare `tar`, which on a dev box's PATH is often
 /// GNU tar. macOS/Linux use their native `tar`. Both auto-detect gzip.
-fn extractTarGz(allocator: std.mem.Allocator, archive: []const u8, target: []const u8) !void {
+/// Pub (via the cache.zig façade): npm platform tarballs carry the same
+/// one-wrapper-dir shape (`package/`), so the tsc fetch strips it here too.
+pub fn extractTarGz(allocator: std.mem.Allocator, archive: []const u8, target: []const u8) !void {
     const io = config.globalIo();
 
     var tar_exe: ?[]u8 = null;

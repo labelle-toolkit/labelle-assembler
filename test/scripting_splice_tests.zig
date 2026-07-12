@@ -551,25 +551,12 @@ pub const TYPESCRIPT_SPLICE_E2E = struct {
         );
     }
 
-    test "a .ts source fails generate with ScriptNeedsTranspile (the #586 gate); removing it generates again" {
-        const allocator = std.testing.allocator;
-        var staged = try StagedTsProject.init(allocator);
-        defer staged.deinit(allocator);
-        var game_root = try staged.tmp.dir.openDir(e2e_io, "game", .{});
-        defer game_root.close(e2e_io);
-        try writeFileIn(game_root, "ts/enemy.ts", "export function update(dt: number) {}\n");
-
-        const backend_repo = try sokolFixtureRepoAbs(allocator);
-        defer allocator.free(backend_repo);
-        try std.testing.expectError(
-            error.ScriptNeedsTranspile,
-            generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false }),
-        );
-
-        // Negative control (the exact same staging minus the .ts file
-        // generates — the failure above is the gate, not the staging):
-        try game_root.deleteFile(e2e_io, "ts/enemy.ts");
-        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
-        try staged.tmp.dir.access(e2e_io, "out/sokol_desktop/main.zig", .{});
-    }
+    // The old `.ts fails generate with ScriptNeedsTranspile` pin lived
+    // here while transpile was the #586 gap. The gate flipped to the real
+    // TS 7 check+emit path (labelle-engine#745): every `.ts` shape —
+    // transpile-and-embed, type-error relay, stem collisions, the
+    // js-only no-fetch skip — is pinned in
+    // `test/scripting_transpile_tests.zig`. The happy test above stays
+    // THE pin that a `.js`-only project's splice layout is byte-identical
+    // to the pre-#745 one.
 };

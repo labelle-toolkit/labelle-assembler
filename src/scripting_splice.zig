@@ -46,24 +46,23 @@ const scripting_declare = @import("scripting_declare.zig");
 /// the `labelle_scripting` dep/module names in the generated build use.
 pub const SCRIPTING_MANIFEST_NAME = "scripting";
 
-/// An authoring extension in the script dir that the assembler cannot turn
-/// into runnable source yet: `rejectUntranspiledScripts` hard-fails
-/// generate on its presence instead of embedding something the VM will
-/// choke on later (or worse, silently skipping it). This is the seam the
-/// TS→JS transpile build hook (labelle-assembler#586) replaces: when #586
-/// lands, the row's gap is deleted and `.ts` sources transpile instead of
-/// erroring.
-const TranspileGap = struct {
-    /// The extension that needs the missing transpile step (`.ts`).
+/// An AUTHORING extension in the script dir that the assembler turns into
+/// the embed extension at generate time (labelle-engine#745): typescript's
+/// `.ts` sources are type-checked + emitted to `.js` by the transpile
+/// phase (`scripting_transpile.runPhase` — TS 7 native, fetched per
+/// platform, no node/npm). Until #745 this row was a HARD-FAIL gate
+/// (`rejectUntranspiledScripts`, the #586 placeholder); now its presence
+/// marks the language transpilable and the phase consumes it.
+pub const TranspileSource = struct {
+    /// The authoring extension the transpile phase compiles (`.ts`).
     source_extension: []const u8,
-    /// Suffix EXEMPT from the gate (`.d.ts`): declaration files carry no
-    /// runtime code — they're the documented `// @ts-check` authoring
-    /// companion (labelle-scripting README: "copy it or point at the
-    /// resolved package's contract/ dir"), so a copied `ts/labelle.d.ts`
-    /// must never fail generate.
+    /// Suffix EXEMPT from "needs transpile" (`.d.ts`): declaration files
+    /// carry no runtime code — they're the documented `// @ts-check`
+    /// authoring companion (labelle-scripting README: "copy it or point
+    /// at the resolved package's contract/ dir") and become typecheck
+    /// INPUTS, so a copied `labelle.d.ts` never makes the phase run by
+    /// itself and never fails generate.
     declaration_suffix: []const u8,
-    /// The pointed fix, printed under the offender list.
-    hint: []const u8,
 };
 
 /// One embeddable language: its `language_policy.SUPPORTED_LANGUAGES` name
@@ -74,15 +73,9 @@ const EmbedLanguage = struct {
     language: []const u8,
     extension: []const u8,
     /// Non-null when the language ALSO has an authoring extension the
-    /// assembler can't run yet (typescript's `.ts` until #586).
-    transpile_gap: ?TranspileGap = null,
+    /// transpile phase compiles into `extension` (typescript's `.ts`).
+    transpile: ?TranspileSource = null,
 };
-
-/// The `.ts`-present generate error's fix line (pub so the test pinning the
-/// message and the emission stay one string).
-pub const TS_TRANSPILE_HINT: []const u8 =
-    "transpile not yet available (labelle-assembler#586) — author .js against " ++
-    "contract/labelle.d.ts (ts/ dir, // @ts-check); .d.ts declaration files are fine.";
 
 /// Languages whose scripts are EMBEDDED as source and fed to the plugin's
 /// VM via `registerScript` (the RFC's embedded-VM family). Widening is
@@ -90,22 +83,21 @@ pub const TS_TRANSPILE_HINT: []const u8 =
 /// lands. Native-compiled languages (rust, crystal, go) integrate by
 /// linking, not embedding — their rows live in `NATIVE_LANGUAGES`.
 ///
-/// typescript (labelle-scripting v0.3.0, quickjs-ng) embeds `.js` ONLY:
-/// the runtime evaluates plain-JS ES modules, and the TS→JS transpile hook
-/// doesn't exist yet (#586) — so a `.ts` source in `ts/` fails generate
-/// loudly (`rejectUntranspiledScripts`) rather than silently not running
-/// or erroring at VM load, far from the author.
+/// typescript (labelle-scripting v0.3.0, quickjs-ng) EMBEDS `.js` only —
+/// the runtime evaluates plain-JS ES modules. `.ts` sources reach that
+/// form through the generate-time transpile phase (the `transpile` row,
+/// labelle-engine#745): checked + emitted by the fetched TS 7 native
+/// compiler, with type errors failing generate.
 pub const EMBED_LANGUAGES = [_]EmbedLanguage{
     .{ .language = "lua", .extension = ".lua" },
     // ruby (labelle-scripting v0.3.0, mruby 3.4.0) embeds `.rb` sources —
-    // no transpile gap (ruby is what the VM runs) and no declare mode yet
+    // no transpile row (ruby is what the VM runs) and no declare mode yet
     // (`scripting_declare.DECLARE_LANGUAGE` gates that phase to lua;
     // `Component.ref` views resolve at runtime against real components).
     .{ .language = "ruby", .extension = ".rb" },
-    .{ .language = "typescript", .extension = ".js", .transpile_gap = .{
+    .{ .language = "typescript", .extension = ".js", .transpile = .{
         .source_extension = ".ts",
         .declaration_suffix = ".d.ts",
-        .hint = TS_TRANSPILE_HINT,
     } },
 };
 
@@ -187,6 +179,14 @@ pub fn embedExtension(language: []const u8) ?[]const u8 {
 pub fn nativeExtension(language: []const u8) ?[]const u8 {
     const row = nativeRow(language) orelse return null;
     return row.extension;
+}
+
+/// The transpile row for `language` (typescript's `.ts`/`.d.ts`), or null
+/// when the language's authored sources ARE what embeds (lua, ruby) — the
+/// transpile phase's gate (`scripting_transpile.runPhase` returns null).
+pub fn transpileSource(language: []const u8) ?TranspileSource {
+    const row = embedRow(language) orelse return null;
+    return row.transpile;
 }
 
 /// Which integration family a detected splice belongs to — the axis every
@@ -288,87 +288,6 @@ pub fn detect(
     // `declared.plugin_name` always names a member of `plugins` (it came
     // from the same slice), so this is unreachable in practice.
     return null;
-}
-
-/// Fail generate when the splice's script dir holds sources the assembler
-/// cannot run yet (the language's `TranspileGap` — today: `.ts` files in a
-/// typescript project's `ts/`, minus `.d.ts` declaration files). The copy +
-/// scan collect only `splice.extension` files, so without this gate a
-/// `.ts`-authored script would neither embed nor error — a script that
-/// silently never runs. Listing caps at `language_policy.MAX_LISTED_FILES`
-/// (the script-dir scan's rule); a missing dir or a gap-less language
-/// (lua) is a no-op. Runs against the game-root SOURCE dir, before the
-/// target link — root.zig calls it right ahead of the script copy.
-pub fn rejectUntranspiledScripts(
-    allocator: std.mem.Allocator,
-    game_dir: []const u8,
-    splice: ScriptingSplice,
-) !void {
-    const row = embedRow(splice.language) orelse return;
-    const gap = row.transpile_gap orelse return;
-
-    const io = config.globalIo();
-    const dir_path = try std.fs.path.join(allocator, &.{ game_dir, splice.dir });
-    defer allocator.free(dir_path);
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return,
-        else => return err,
-    };
-    defer dir.close(io);
-
-    var listed: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (listed.items) |p| allocator.free(p);
-        listed.deinit(allocator);
-    }
-    var total: usize = 0;
-    try walkUntranspiled(allocator, io, dir, splice.dir, gap, &listed, &total);
-    if (total == 0) return;
-
-    std.debug.print(
-        "labelle-assembler: {s}/ contains {s} sources, but the assembler has no {s}→{s} transpile step yet:\n",
-        .{ splice.dir, gap.source_extension, gap.source_extension, row.extension },
-    );
-    for (listed.items) |rel| std.debug.print("  {s}\n", .{rel});
-    if (total > listed.items.len) {
-        std.debug.print("  ... and {d} more\n", .{total - listed.items.len});
-    }
-    std.debug.print("  {s}\n", .{gap.hint});
-    return error.ScriptNeedsTranspile;
-}
-
-fn walkUntranspiled(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    dir: std.Io.Dir,
-    rel_prefix: []const u8,
-    gap: TranspileGap,
-    listed: *std.ArrayList([]const u8),
-    total: *usize,
-) !void {
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
-        if (entry.name.len == 0 or entry.name[0] == '.') continue;
-        switch (entry.kind) {
-            .directory => {
-                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
-                defer sub.close(io);
-                const sub_prefix = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
-                defer allocator.free(sub_prefix);
-                try walkUntranspiled(allocator, io, sub, sub_prefix, gap, listed, total);
-            },
-            else => {
-                if (!std.mem.endsWith(u8, entry.name, gap.source_extension)) continue;
-                if (std.mem.endsWith(u8, entry.name, gap.declaration_suffix)) continue;
-                total.* += 1;
-                if (listed.items.len < language_policy.MAX_LISTED_FILES) {
-                    const rel = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
-                    errdefer allocator.free(rel);
-                    try listed.append(allocator, rel);
-                }
-            },
-        }
-    }
 }
 
 // ── Native-language game-source staging (labelle-engine#741) ──────────
@@ -572,23 +491,22 @@ const testing = std.testing;
 test "embedExtension: lua maps to .lua, ruby to .rb, typescript embeds .js; native-compiled languages are absent" {
     try testing.expectEqualStrings(".lua", embedExtension("lua").?);
     try testing.expectEqualStrings(".rb", embedExtension("ruby").?);
-    // typescript embeds PLAIN JS (quickjs-ng runs ES modules; TS→JS
-    // transpile is the #586 gap) — never `.ts`.
+    // typescript embeds PLAIN JS (quickjs-ng runs ES modules; `.ts`
+    // reaches that form through the #745 transpile phase) — never `.ts`.
     try testing.expectEqualStrings(".js", embedExtension("typescript").?);
     try testing.expect(embedExtension("rust") == null);
     try testing.expect(embedExtension("cobol") == null);
 }
 
-test "EMBED_LANGUAGES: lua and ruby have no transpile gap; typescript gates .ts (exempting .d.ts) with the pointed #586 hint" {
-    try testing.expect(embedRow("lua").?.transpile_gap == null);
-    try testing.expect(embedRow("ruby").?.transpile_gap == null);
-    const gap = embedRow("typescript").?.transpile_gap.?;
-    try testing.expectEqualStrings(".ts", gap.source_extension);
-    try testing.expectEqualStrings(".d.ts", gap.declaration_suffix);
-    // The pointed fix names the authoring workflow that works TODAY and
-    // the ticket that lifts the gate.
-    try testing.expect(std.mem.indexOf(u8, gap.hint, "author .js against contract/labelle.d.ts (ts/ dir, // @ts-check)") != null);
-    try testing.expect(std.mem.indexOf(u8, gap.hint, "labelle-assembler#586") != null);
+test "transpileSource: only typescript carries a transpile row — .ts sources, .d.ts declarations exempt" {
+    try testing.expect(transpileSource("lua") == null);
+    try testing.expect(transpileSource("ruby") == null);
+    // Native and unknown languages have no EMBED row at all.
+    try testing.expect(transpileSource("rust") == null);
+    try testing.expect(transpileSource("cobol") == null);
+    const src = transpileSource("typescript").?;
+    try testing.expectEqualStrings(".ts", src.source_extension);
+    try testing.expectEqualStrings(".d.ts", src.declaration_suffix);
 }
 
 fn writeTestFile(dir: std.Io.Dir, rel: []const u8, body: []const u8) !void {
@@ -802,81 +720,6 @@ test "detect: an integration gap (declared language in NEITHER table) → null w
         .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "go" } },
     };
     try testing.expect((try detect(allocator, &plugins, project_dir)) == null);
-}
-
-// ── the .ts transpile gate (#586 seam) ───────────────────────────────
-
-const ts_splice_fixture = ScriptingSplice{
-    .plugin_name = "scripting",
-    .language = "typescript",
-    .dir = "ts",
-    .extension = ".js",
-};
-
-test "rejectUntranspiledScripts: a .js-only ts/ passes — including a copied labelle.d.ts and a missing dir" {
-    const allocator = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
-    defer allocator.free(root);
-
-    // No ts/ dir at all → no-op (the plugin is wired, nothing embeds).
-    try rejectUntranspiledScripts(allocator, root, ts_splice_fixture);
-
-    // Runnable .js + the documented @ts-check companion (`.d.ts` carries
-    // no runtime code — copying the plugin's contract d.ts next to the
-    // scripts is the README workflow, so it must never fail generate).
-    try writeTestFile(tmp.dir, "ts/behavior.js", "// @ts-check\nexport function update(dt) {}\n");
-    try writeTestFile(tmp.dir, "ts/labelle.d.ts", "declare const labelle: any;\n");
-    try rejectUntranspiledScripts(allocator, root, ts_splice_fixture);
-}
-
-test "rejectUntranspiledScripts: a .ts source (top-level or nested) fails generate loudly" {
-    const allocator = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    // The exact silent-death shape without the gate: authored .ts beside
-    // embedded .js — the scan collects only .js, so `enemy.ts` would
-    // never run and never error.
-    try writeTestFile(tmp.dir, "ts/behavior.js", "export function update(dt) {}\n");
-    try writeTestFile(tmp.dir, "ts/enemy.ts", "export function update(dt: number) {}\n");
-    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
-    defer allocator.free(root);
-    try testing.expectError(
-        error.ScriptNeedsTranspile,
-        rejectUntranspiledScripts(allocator, root, ts_splice_fixture),
-    );
-
-    // Nested subdirs gate too (stems may live in `ts/ai/…`).
-    var tmp2 = testing.tmpDir(.{});
-    defer tmp2.cleanup();
-    try writeTestFile(tmp2.dir, "ts/ai/guard.ts", "export function update(dt: number) {}\n");
-    const root2 = try tmp2.dir.realPathFileAlloc(testing.io, ".", allocator);
-    defer allocator.free(root2);
-    try testing.expectError(
-        error.ScriptNeedsTranspile,
-        rejectUntranspiledScripts(allocator, root2, ts_splice_fixture),
-    );
-}
-
-test "rejectUntranspiledScripts: gap-less languages are a no-op (a stray .ts in lua/ is not this gate's business)" {
-    const allocator = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeTestFile(tmp.dir, "lua/notes.ts", "// not a lua source; not embedded, not policed here\n");
-    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
-    defer allocator.free(root);
-
-    const lua_splice = ScriptingSplice{
-        .plugin_name = "scripting",
-        .language = "lua",
-        .dir = "lua",
-        .extension = ".lua",
-    };
-    try rejectUntranspiledScripts(allocator, root, lua_splice);
 }
 
 // ── stageNativeSources (labelle-engine#741) ──────────────────────────
