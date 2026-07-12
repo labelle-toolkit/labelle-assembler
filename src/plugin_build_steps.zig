@@ -117,15 +117,21 @@
 //! Unlike `.build` (which runs for EVERY consumer of the plugin), an entry
 //! applies ONLY when the project's declared `.params.language` matches its
 //! `.language` — a lua game attaching the scripting plugin must not need
-//! cargo. Entries for OTHER languages are structurally validated (one
-//! manifest, one validity standard) but ignored; an entry vocabulary wider
-//! than this assembler's language tables is legal (forward-compat with
-//! newer plugins). Deliberately a manifest-level key, NOT a `.build`
-//! sub-key: `.build`'s strict subtree parse would hard-fail assemblers
-//! that predate the key, while a manifest-level key rides the documented
-//! `ignore_unknown_fields` forward-compat. When a plugin declares BOTH,
-//! root.zig wires the matched language steps AFTER the `.build` steps
-//! (one chained sequence per plugin — declared order within each list).
+//! cargo. Strictness is scoped to the SELECTED entry: non-selected entries
+//! are probed for `.language` (the schema-stable selection key) and
+//! duplicate-checked, but their step interiors are NOT validated — unknown
+//! keys there WARN instead of failing (see `loadLanguageBuildsFromSource`;
+//! v0.84.0 validated every entry strictly, and the crystal entry's new
+//! `.os`/`.library_paths` keys would have hard-failed every consumer of
+//! the plugin, rust and lua games included — future language entries must
+//! never re-break released assemblers). An entry vocabulary wider than
+//! this assembler's language tables is equally legal. Deliberately a
+//! manifest-level key, NOT a `.build` sub-key: `.build`'s strict subtree
+//! parse would hard-fail assemblers that predate the key, while a
+//! manifest-level key rides the documented `ignore_unknown_fields`
+//! forward-compat. When a plugin declares BOTH, root.zig wires the matched
+//! language steps AFTER the `.build` steps (one chained sequence per
+//! plugin — declared order within each list).
 //!
 //! ── Determinism & safety posture ────────────────────────────────────────
 //! Commands are DECLARED argv arrays in a manifest you can read: no shell
@@ -177,9 +183,27 @@ pub const CACHE_DIR_NAME = "plugin-build";
 pub const PLACEHOLDER_CACHE = "{cache}";
 pub const PLACEHOLDER_PACKAGE = "{package}";
 pub const PLACEHOLDER_TARGET = "{target}";
+/// The crystal `--target` triple for the resolved zig target
+/// (labelle-engine#741 crystal row): `<arch>-apple-darwin` /
+/// `<arch>-linux-gnu`, arch ∈ {aarch64, x86_64} — the exact
+/// `crystalTriple` mapping labelle-scripting's build.zig established.
+/// Substituted at build time (a shared const in the generated build.zig
+/// that @panics with a pointed message on an unsupported cross-configure;
+/// the generate-time `.os` + platform gates keep supported projects from
+/// reaching it).
+pub const PLACEHOLDER_CRYSTAL_TARGET = "{crystal_target}";
 /// Prefix of the parameterized `{staticlib:NAME}` form (module doc): the
 /// target OS's static-library filename for NAME, resolved at build time.
 pub const PLACEHOLDER_STATICLIB_PREFIX = "{staticlib:";
+/// Prefix of the parameterized `{crystal_env:VAR}` form — legal ONLY as a
+/// whole `.library_paths` entry (never in argv/artifact/cwd): resolved AT
+/// GENERATE by running `crystal env VAR` and splitting the output on `:`
+/// (labelle-scripting `tools/crystal_lib_paths.zig` is the reference
+/// split — one path per entry, empties skipped, whitespace trimmed.
+/// `CRYSTAL_LIBRARY_PATH` is a colon-separated LIST; a whole-value
+/// addLibraryPath would turn any multi-entry environment into one bogus
+/// literal path and lose gc/pcre2 at the final link).
+pub const PLACEHOLDER_CRYSTAL_ENV_PREFIX = "{crystal_env:";
 
 /// How the generated build consumes a step's produced artifact.
 /// `static_lib` and `object` both wire through `addObjectFile` (zig's
@@ -223,6 +247,22 @@ pub const Step = struct {
     /// Per-OS system libraries the CONSUMING artifact links when this
     /// step's artifact is linked (module doc). Requires `link != .none`.
     system_libs: SystemLibs = .{},
+    /// Library SEARCH paths the game's final link needs when this step's
+    /// artifact is linked (crystal's runtime libs live wherever the
+    /// toolchain keeps them). Each entry is EITHER a literal path or the
+    /// whole-entry `{crystal_env:VAR}` token, resolved at generate time
+    /// (module doc). Requires `link != .none`, like `system_libs`.
+    library_paths: []const []const u8 = &.{},
+    /// Target-OS allowlist (`macos`/`linux`/`windows` — the `SystemLibs`
+    /// vocabulary). Empty = all OSes. Steps whose allowlist excludes the
+    /// generate's target OS are NOT emitted (the crystal main-localization
+    /// pass differs per OS: `ld -r` on macOS, `objcopy` on linux — one
+    /// step each, exactly one selected). Orthogonal to `.platforms`
+    /// (labelle platform: desktop/android/…): `.os` narrows WITHIN
+    /// desktop. A language entry whose steps leave the target OS without
+    /// any linked artifact fails generate pointedly (root.zig — a Windows
+    /// crystal generate must die up front, not at link time).
+    os: []const []const u8 = &.{},
     /// Platform allowlist (labelle platform names). Empty = all.
     platforms: []const []const u8 = &.{},
 };
@@ -251,17 +291,18 @@ pub const LanguageBuildEntry = struct {
     steps: []const Step = &.{},
 };
 
-/// Parsed `.language_builds` selection for one plugin: the full validated
-/// entry list (parser-owned) plus the SELECTED language's steps — a view
-/// into `entries`, guaranteed non-empty (selection misses load as null).
+/// Parsed `.language_builds` selection for one plugin: the SELECTED
+/// language's entry (parser-owned — the only entry parsed strictly; see
+/// the forward-compat rules on `loadLanguageBuildsFromSource`) and its
+/// steps view, guaranteed non-empty (selection misses load as null).
 pub const LanguageBuilds = struct {
-    entries: []const LanguageBuildEntry,
+    entry: LanguageBuildEntry,
     steps: []const Step,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *LanguageBuilds) void {
-        std.zon.parse.free(self.allocator, self.entries);
-        self.entries = &.{};
+        std.zon.parse.free(self.allocator, self.entry);
+        self.entry = .{ .language = "" };
         self.steps = &.{};
     }
 };
@@ -288,6 +329,13 @@ pub const LanguageBuilds = struct {
 //   error.PluginBuildSystemLibsWithoutLink — `.system_libs` on a step with
 //                                          link == .none (nothing is linked,
 //                                          so nothing needs system libs)
+//   error.PluginBuildUnknownOs           — an `.os` entry outside the
+//                                          macos/linux/windows vocabulary
+//   error.PluginBuildBadLibraryPath      — a `.library_paths` entry that is
+//                                          neither a plain path nor a whole
+//                                          `{crystal_env:VAR}` token
+//   error.PluginBuildLibraryPathsWithoutLink — `.library_paths` on a step
+//                                          with link == .none
 //   error.PluginBuildBadLanguageName     — a `.language_builds` entry with
 //                                          an empty/unsafe `.language`
 //   error.PluginBuildDuplicateLanguage   — two `.language_builds` entries
@@ -299,6 +347,17 @@ pub const LanguageBuilds = struct {
 //                                          allowlist (`stepAllowsPlatform`)
 //   error.PluginBuildMissingCwd          — a declared cwd does not exist in
 //                                          the staged package
+//   error.PluginBuildNoStepsForOs        — the selected language entry has
+//                                          no step for the target OS
+//   error.PluginBuildNoArtifactForOs     — the selected language entry's
+//                                          target-OS steps produce no
+//                                          linked artifact (a Windows
+//                                          crystal generate must fail up
+//                                          front, not select an
+//                                          artifact-less chain)
+//   error.CrystalEnvUnavailable          — a `{crystal_env:VAR}` entry
+//                                          needs `crystal env`, which is
+//                                          not runnable on this host
 
 fn diag(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("labelle: " ++ fmt ++ "\n", args);
@@ -312,7 +371,7 @@ fn diag(comptime fmt: []const u8, args: anytype) void {
 /// language; a malformed staticlib token (empty/unsafe NAME, no closing
 /// brace) is NOT a placeholder and fails `validatePlaceholders`.
 pub fn placeholderAt(text: []const u8, i: usize) ?[]const u8 {
-    const candidates = [_][]const u8{ PLACEHOLDER_CACHE, PLACEHOLDER_PACKAGE, PLACEHOLDER_TARGET };
+    const candidates = [_][]const u8{ PLACEHOLDER_CACHE, PLACEHOLDER_PACKAGE, PLACEHOLDER_TARGET, PLACEHOLDER_CRYSTAL_TARGET };
     for (candidates) |ph| {
         if (std.mem.startsWith(u8, text[i..], ph)) return ph;
     }
@@ -355,6 +414,103 @@ pub fn containsStaticlibPlaceholder(text: []const u8) bool {
         }
     }
     return false;
+}
+
+// ── {crystal_env:VAR} (.library_paths entries) ─────────────────────────
+
+/// True when `entry` is EXACTLY one well-formed `{crystal_env:VAR}` token
+/// (VAR: [A-Z0-9_], 1..64). The token is whole-entry only — it expands to
+/// a LIST of paths, so embedding it mid-path is meaningless.
+pub fn isCrystalEnvToken(entry: []const u8) bool {
+    if (!std.mem.startsWith(u8, entry, PLACEHOLDER_CRYSTAL_ENV_PREFIX)) return false;
+    if (entry.len < PLACEHOLDER_CRYSTAL_ENV_PREFIX.len + 2) return false;
+    if (entry[entry.len - 1] != '}') return false;
+    const name = entry[PLACEHOLDER_CRYSTAL_ENV_PREFIX.len .. entry.len - 1];
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// The VAR of a `{crystal_env:VAR}` entry (`isCrystalEnvToken` must hold).
+pub fn crystalEnvVar(entry: []const u8) []const u8 {
+    return entry[PLACEHOLDER_CRYSTAL_ENV_PREFIX.len .. entry.len - 1];
+}
+
+/// Append the entries of a colon-separated crystal path value to `out`
+/// (owned dupes): one path per entry, empties skipped, whitespace (the
+/// trailing newline of `crystal env` output) trimmed — the EXACT split of
+/// labelle-scripting's `tools/crystal_lib_paths.zig` reference (its module
+/// doc is the contract this must match).
+pub fn appendCrystalPathEntries(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    out: *std.ArrayList([]const u8),
+) !void {
+    var it = std.mem.tokenizeScalar(u8, value, ':');
+    while (it.next()) |raw| {
+        const entry = std.mem.trim(u8, raw, " \t\r\n");
+        if (entry.len == 0) continue;
+        const owned = try allocator.dupe(u8, entry);
+        errdefer allocator.free(owned);
+        try out.append(allocator, owned);
+    }
+}
+
+/// TEST SEAM: when set, `resolveCrystalEnv` splits THIS value instead of
+/// running `crystal env` — the suite must not depend on a crystal
+/// toolchain (the same override-instead-of-exec pattern as the declare
+/// phase's runner seam). Production never sets it.
+pub threadlocal var crystal_env_output_override: ?[]const u8 = null;
+
+/// Resolve one `{crystal_env:VAR}` token: run `crystal env VAR` and append
+/// the split entries (`appendCrystalPathEntries`) to `out`. A host without
+/// a runnable `crystal` fails pointedly — the step that declared the token
+/// cannot produce a linkable game without the toolchain's library dirs.
+pub fn resolveCrystalEnv(
+    allocator: std.mem.Allocator,
+    plugin_name: []const u8,
+    step_name: []const u8,
+    var_name: []const u8,
+    out: *std.ArrayList([]const u8),
+) !void {
+    if (crystal_env_output_override) |v| {
+        return appendCrystalPathEntries(allocator, v, out);
+    }
+
+    const io = config.globalIo();
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "crystal", "env", var_name },
+    }) catch |err| {
+        diag(
+            "plugin '{s}' step '{s}' needs `crystal env {s}` ({{crystal_env:{s}}} in .library_paths), " ++
+                "but `crystal` could not be run: {s}\n" ++
+                "  install the crystal toolchain (https://crystal-lang.org/install/) or switch script language",
+            .{ plugin_name, step_name, var_name, var_name, @errorName(err) },
+        );
+        return error.CrystalEnvUnavailable;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            diag(
+                "plugin '{s}' step '{s}': `crystal env {s}` exited {d}\n{s}",
+                .{ plugin_name, step_name, var_name, code, result.stderr },
+            );
+            return error.CrystalEnvUnavailable;
+        },
+        else => {
+            diag(
+                "plugin '{s}' step '{s}': `crystal env {s}` terminated abnormally",
+                .{ plugin_name, step_name, var_name },
+            );
+            return error.CrystalEnvUnavailable;
+        },
+    }
+    try appendCrystalPathEntries(allocator, result.stdout, out);
 }
 
 /// Reject any `{`/`}` that is not part of a recognized placeholder. Keeps
@@ -473,6 +629,20 @@ pub fn stepAllowsPlatform(step: Step, platform: config.Platform) bool {
     if (step.platforms.len == 0) return true;
     for (step.platforms) |p| {
         if (std.mem.eql(u8, p, @tagName(platform))) return true;
+    }
+    return false;
+}
+
+/// Generate-time check: is `step` emitted for the target OS? Empty `.os`
+/// allowlist = every OS. Unlike the platform gate (which REJECTS the
+/// generate), an OS miss merely FILTERS the step out — the crystal entry
+/// declares one localization step per OS and exactly one is selected;
+/// root.zig then gates the FILTERED result (no steps / no artifact for
+/// the OS = pointed errors).
+pub fn stepAllowsOs(step: Step, os_tag: std.Target.Os.Tag) bool {
+    if (step.os.len == 0) return true;
+    for (step.os) |o| {
+        if (std.mem.eql(u8, o, @tagName(os_tag))) return true;
     }
     return false;
 }
@@ -724,6 +894,46 @@ fn validateSteps(plugin_name: []const u8, block_label: []const u8, steps: []cons
                 }
             }
         }
+        if (step.library_paths.len > 0) {
+            if (step.link == .none) {
+                diag(
+                    "plugin '{s}' {s} step '{s}' declares .library_paths but .link = .none — nothing is linked, so nothing needs search paths",
+                    .{ plugin_name, block_label, step.name },
+                );
+                return error.PluginBuildLibraryPathsWithoutLink;
+            }
+            for (step.library_paths) |lp| {
+                // Each entry is EITHER the whole-entry {crystal_env:VAR}
+                // token OR a plain literal path — no other placeholder, no
+                // stray braces (a mid-path token would splice a LIST into
+                // one path).
+                if (isCrystalEnvToken(lp)) continue;
+                if (lp.len == 0 or std.mem.indexOfAny(u8, lp, "{}") != null or
+                    std.mem.indexOfScalar(u8, lp, 0) != null)
+                {
+                    diag(
+                        "plugin '{s}' {s} step '{s}' .library_paths entry \"{s}\" is neither a plain path nor a whole {{crystal_env:VAR}} token",
+                        .{ plugin_name, block_label, step.name, lp },
+                    );
+                    return error.PluginBuildBadLibraryPath;
+                }
+            }
+        }
+        for (step.os) |o| {
+            const known = blk: {
+                inline for (@typeInfo(SystemLibs).@"struct".fields) |f| {
+                    if (std.mem.eql(u8, o, f.name)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (!known) {
+                diag(
+                    "plugin '{s}' {s} step '{s}' names unknown os \"{s}\" (known: linux, macos, windows)",
+                    .{ plugin_name, block_label, step.name, o },
+                );
+                return error.PluginBuildUnknownOs;
+            }
+        }
         for (step.platforms) |p| {
             const known = blk: {
                 inline for (@typeInfo(config.Platform).@"enum".fields) |f| {
@@ -782,14 +992,132 @@ pub fn loadFromSource(
     return BuildSteps{ .steps = parsed.steps, .allocator = allocator };
 }
 
+/// Lenient single-node parse: no diagnostics printed, parser-allocated
+/// failure state released via the detach dance (`parseStrictSubtree`'s
+/// leak note). The forward-compat probe path — callers decide what a
+/// failure means.
+fn parseNodeLenient(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    parsed_zon: ParsedZon,
+    node: std.zig.Zoir.Node.Index,
+) error{ OutOfMemory, ParseZon }!T {
+    var pdiag: std.zon.parse.Diagnostics = .{};
+    return std.zon.parse.fromZoirNodeAlloc(
+        T,
+        allocator,
+        parsed_zon.ast,
+        parsed_zon.zoir,
+        node,
+        &pdiag,
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| switch (err) {
+        error.ParseZon => {
+            pdiag.ast = .{ .source = "", .tokens = .empty, .nodes = .empty, .extra_data = &.{}, .mode = .zon, .errors = &.{} };
+            pdiag.zoir = .{ .nodes = .empty, .extra = &.{}, .limbs = &.{}, .string_bytes = &.{}, .compile_errors = &.{}, .error_notes = &.{} };
+            pdiag.deinit(allocator);
+            return error.ParseZon;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Best-effort unknown-key scan of a NON-selected `.language_builds`
+/// entry, for the forward-compat warning: entry-level keys outside
+/// {language, steps} and step-level keys outside the `Step` vocabulary
+/// are collected (deduped) and warned ONCE — never failed. This is the
+/// v0.84.0 lesson: that release strict-validated every entry, so the
+/// crystal entry's (then-unknown) `.os` key hard-failed generate for
+/// every consumer of the plugin, rust and lua games included.
+fn warnUnknownEntryKeys(
+    allocator: std.mem.Allocator,
+    parsed_zon: ParsedZon,
+    node: std.zig.Zoir.Node.Index,
+    plugin_name: []const u8,
+    entry_language: []const u8,
+) void {
+    var unknown: std.ArrayList([]const u8) = .empty;
+    defer unknown.deinit(allocator);
+
+    const record = struct {
+        fn add(a: std.mem.Allocator, list: *std.ArrayList([]const u8), name: []const u8) void {
+            for (list.items) |seen| {
+                if (std.mem.eql(u8, seen, name)) return;
+            }
+            list.append(a, name) catch {};
+        }
+    }.add;
+
+    switch (node.get(parsed_zon.zoir)) {
+        .struct_literal => |sl| {
+            var steps_node: ?std.zig.Zoir.Node.Index = null;
+            for (sl.names, 0..) |n, i| {
+                const key = n.get(parsed_zon.zoir);
+                if (std.mem.eql(u8, key, "steps")) {
+                    steps_node = sl.vals.at(@intCast(i));
+                } else if (!std.mem.eql(u8, key, "language")) {
+                    record(allocator, &unknown, key);
+                }
+            }
+            if (steps_node) |sn| {
+                switch (sn.get(parsed_zon.zoir)) {
+                    .array_literal => |steps| {
+                        var si: u32 = 0;
+                        while (si < steps.len) : (si += 1) {
+                            switch (steps.at(si).get(parsed_zon.zoir)) {
+                                .struct_literal => |step_sl| {
+                                    for (step_sl.names) |stn| {
+                                        const key = stn.get(parsed_zon.zoir);
+                                        const known = blk: {
+                                            inline for (@typeInfo(Step).@"struct".fields) |f| {
+                                                if (std.mem.eql(u8, key, f.name)) break :blk true;
+                                            }
+                                            break :blk false;
+                                        };
+                                        if (!known) record(allocator, &unknown, key);
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        },
+        else => {},
+    }
+
+    if (unknown.items.len == 0) return;
+    const joined = std.mem.join(allocator, ", ", unknown.items) catch return;
+    defer allocator.free(joined);
+    std.log.warn(
+        "labelle: plugin '{s}' .language_builds entry \"{s}\" uses step keys this assembler doesn't know ({s}); " ++
+            "the entry is not this project's language, so it is ignored — building a {s} project may need a newer labelle-assembler",
+        .{ plugin_name, entry_language, joined, entry_language },
+    );
+}
+
 /// `loadLanguageBuildsFromDir` over an in-memory manifest source (the
 /// file-less seam the unit tests drive). `manifest_path` is
 /// diagnostics-only. Returns the steps of the entry matching `language`,
 /// or null for every step-less shape: no manifest `.language_builds` key,
 /// an empty entry list, no entry for `language` (wrong-language entries
 /// are IGNORED — a lua project loads nothing from a rust-only list), or a
-/// matching entry with empty steps (a declared no-op). Every entry —
-/// selected or not — is structurally validated first.
+/// matching entry with empty steps (a declared no-op).
+///
+/// ── Forward-compat: strict for the SELECTED entry only ────────────────
+/// Only the entry matching `language` is strictly parsed + validated
+/// (typos there must hard-fail — the #586 posture). NON-selected entries
+/// are probed for their `.language` (the selection key — schema-stable)
+/// and duplicate-checked, but their steps are NOT validated and unknown
+/// keys merely WARN (`warnUnknownEntryKeys`). This is load-bearing
+/// compatibility, not leniency for its own sake: v0.84.0 strict-validated
+/// every entry, so shipping the crystal entry (whose steps carry the
+/// then-unknown `.os`/`.library_paths` keys) would have hard-failed
+/// generate for EVERY consumer of the plugin — a lua game suddenly
+/// couldn't build because a language it never selected gained features.
+/// Future language entries must never re-break released assemblers.
 pub fn loadLanguageBuildsFromSource(
     allocator: std.mem.Allocator,
     source: [:0]const u8,
@@ -802,53 +1130,108 @@ pub fn loadLanguageBuildsFromSource(
 
     const lb_node = rootStructField(parsed_zon.zoir, "language_builds") orelse return null;
 
-    const entries = try parseStrictSubtree(
-        []const LanguageBuildEntry,
-        allocator,
-        parsed_zon,
-        lb_node,
-        plugin_name,
-        manifest_path,
-        ".language_builds",
-        ".language_builds = .{{ .{{ .language = \"…\", .steps = .{{ <#586 steps> }} }}, … }}",
-    );
-    errdefer std.zon.parse.free(allocator, entries);
+    // The CONTAINER shape stays strict (a list of entries — this is the
+    // schema-stable spine selection depends on); only entry INTERIORS get
+    // the forward-compat treatment.
+    const elems = switch (lb_node.get(parsed_zon.zoir)) {
+        .empty_literal => return null,
+        .array_literal => |arr| arr,
+        else => {
+            diag(
+                "plugin '{s}' has an invalid .language_builds block at {s}\n" ++
+                    "  allowed: .language_builds = .{{ .{{ .language = \"…\", .steps = .{{ <#586 steps> }} }}, … }}",
+                .{ plugin_name, manifest_path },
+            );
+            return error.PluginBuildParseError;
+        },
+    };
 
-    for (entries, 0..) |entry, i| {
-        // The language NAME is validated for shape only, never for table
-        // membership: an entry for a language this assembler predates is
-        // forward-compat, not an error (module doc).
-        if (!isSafeStepName(entry.language)) {
+    // Probed language names, kept for duplicate detection (owned dupes —
+    // the probe parses are freed per iteration).
+    var seen_languages: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (seen_languages.items) |s| allocator.free(s);
+        seen_languages.deinit(allocator);
+    }
+
+    var result: ?LanguageBuilds = null;
+    errdefer if (result) |*r| r.deinit();
+
+    const LanguageProbe = struct { language: []const u8 = "" };
+
+    var i: u32 = 0;
+    while (i < elems.len) : (i += 1) {
+        const elem = elems.at(i);
+
+        const probe = parseNodeLenient(LanguageProbe, allocator, parsed_zon, elem) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // An entry whose SELECTION KEY can't be read can never be
+            // selected — warn (it may be a future spelling) and skip
+            // rather than break every consumer of the plugin.
+            error.ParseZon => {
+                std.log.warn(
+                    "labelle: plugin '{s}' .language_builds entry #{d} could not be read (future format?); ignoring it",
+                    .{ plugin_name, i },
+                );
+                continue;
+            },
+        };
+        defer std.zon.parse.free(allocator, probe);
+
+        // The selection key itself is schema-stable: empty/unsafe names
+        // are authoring errors for EVERY assembler version, not schema
+        // evolution — hard-fail like #608 did.
+        if (!isSafeStepName(probe.language)) {
             diag(
                 "plugin '{s}' .language_builds entry #{d} has an invalid .language '{s}' ([A-Za-z0-9_-], 1..64 chars)",
-                .{ plugin_name, i, entry.language },
+                .{ plugin_name, i, probe.language },
             );
             return error.PluginBuildBadLanguageName;
         }
-        for (entries[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.language, entry.language)) {
+        for (seen_languages.items) |prior| {
+            if (std.mem.eql(u8, prior, probe.language)) {
                 diag(
                     "plugin '{s}' .language_builds declares \"{s}\" twice — one entry per language",
-                    .{ plugin_name, entry.language },
+                    .{ plugin_name, probe.language },
                 );
                 return error.PluginBuildDuplicateLanguage;
             }
         }
-        try validateSteps(plugin_name, ".language_builds", entry.steps);
-    }
-
-    const selected: []const Step = blk: {
-        for (entries) |entry| {
-            if (std.mem.eql(u8, entry.language, language)) break :blk entry.steps;
+        {
+            const owned = try allocator.dupe(u8, probe.language);
+            errdefer allocator.free(owned);
+            try seen_languages.append(allocator, owned);
         }
-        break :blk &.{};
-    };
-    if (selected.len == 0) {
-        std.zon.parse.free(allocator, entries);
-        return null;
+
+        if (std.mem.eql(u8, probe.language, language)) {
+            // THE selected entry: full #586 strictness — unknown keys,
+            // placeholder discipline, link/artifact rules all hard-fail.
+            const entry = try parseStrictSubtree(
+                LanguageBuildEntry,
+                allocator,
+                parsed_zon,
+                elem,
+                plugin_name,
+                manifest_path,
+                ".language_builds",
+                ".language_builds = .{{ .{{ .language = \"…\", .steps = .{{ <#586 steps> }} }}, … }}",
+            );
+            errdefer std.zon.parse.free(allocator, entry);
+            try validateSteps(plugin_name, ".language_builds", entry.steps);
+            result = LanguageBuilds{ .entry = entry, .steps = entry.steps, .allocator = allocator };
+        } else {
+            warnUnknownEntryKeys(allocator, parsed_zon, elem, plugin_name, probe.language);
+        }
     }
 
-    return LanguageBuilds{ .entries = entries, .steps = selected, .allocator = allocator };
+    if (result) |*r| {
+        if (r.steps.len == 0) {
+            // A matching entry with empty steps: a declared no-op.
+            r.deinit();
+            return null;
+        }
+    }
+    return result;
 }
 
 /// Read and strictly parse the `.language_builds` block of
@@ -1332,11 +1715,33 @@ test "loadLanguageBuildsFromSource: strict subtree — a typo'd entry key hard-f
     , "rust"));
 }
 
-test "loadLanguageBuildsFromSource: one validity standard — a NON-selected entry's broken step still fails" {
-    // The go entry is broken ({typo} placeholder); a rust project must
-    // still refuse the manifest — a plugin shipping a broken block should
-    // hear about it from its FIRST consumer, not its go-using one.
-    try testing.expectError(error.PluginBuildUnknownPlaceholder, loadLangSrc(
+test "loadLanguageBuildsFromSource: forward-compat — non-selected entries tolerate unknown keys (the v0.84.0 re-break scenario)" {
+    // THE EXACT v0.84.0-vs-crystal-entry scenario: an entry carrying step
+    // keys this schema version knows (`.os`, `.library_paths` — but posed
+    // here as genuinely-unknown `.futurekey`) plus a DIFFERENT selected
+    // language. v0.84.0 strict-validated every entry, so the crystal
+    // entry hard-failed generate for every rust/lua consumer of the
+    // plugin ("unexpected field 'os'"). Now: the rust selection loads
+    // clean; the foreign entry warns (std.log.warn — test-runner
+    // tolerated) and is ignored.
+    var lb = (try loadLangSrc(
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .language_builds = .{
+        \\        .{ .language = "rust", .steps = .{ .{ .name = "ok", .command = .{ "cargo", "build" } } } },
+        \\        .{ .language = "zig2", .steps = .{ .{ .name = "future", .command = .{ "zig2" }, .futurekey = .{ "x" } } } },
+        \\    },
+        \\}
+    , "rust")).?;
+    defer lb.deinit();
+    try testing.expectEqualStrings("ok", lb.steps[0].name);
+
+    // Even a BROKEN non-selected step (a {typo} placeholder — a value
+    // error, not just an unknown key) must not fail a rust project: its
+    // validation is the crystal consumer's business, on an assembler
+    // that selects it.
+    var lb2 = (try loadLangSrc(
         \\.{
         \\    .name = "scripting",
         \\    .manifest_version = 1,
@@ -1345,7 +1750,157 @@ test "loadLanguageBuildsFromSource: one validity standard — a NON-selected ent
         \\        .{ .language = "go", .steps = .{ .{ .name = "bad", .command = .{ "go", "{typo}" } } } },
         \\    },
         \\}
-    , "rust"));
+    , "rust")).?;
+    defer lb2.deinit();
+    try testing.expectEqualStrings("ok", lb2.steps[0].name);
+
+    // The SELECTED entry keeps full #586 strictness — the same unknown
+    // key that only warned above hard-fails when the entry is the one
+    // this project builds with.
+    try testing.expectError(error.PluginBuildParseError, loadLangSrc(
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .language_builds = .{
+        \\        .{ .language = "zig2", .steps = .{ .{ .name = "future", .command = .{ "zig2" }, .futurekey = .{ "x" } } } },
+        \\    },
+        \\}
+    , "zig2"));
+}
+
+test "loadLanguageBuildsFromSource: the crystal entry shape — .os, artifact-less intermediate, {crystal_target}, .library_paths" {
+    // The PR #19 canonical entry (zig-command spellings aside): a
+    // desktop-gated artifact-less crystal-build step plus per-OS
+    // localization steps carrying the object artifact, the crystal env
+    // library paths, and the per-OS system libs.
+    var lb = (try loadLangSrc(
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .language_builds = .{
+        \\        .{
+        \\            .language = "crystal",
+        \\            .steps = .{
+        \\                .{ .name = "crystal-build",
+        \\                   .command = .{ "crystal", "build", "--release", "--cross-compile", "--target", "{crystal_target}", "{package}/native-crystal/src/main.cr", "-o", "{cache}/labelle_crystal_scripts" },
+        \\                   .os = .{ "macos", "linux" },
+        \\                   .platforms = .{"desktop"} },
+        \\                .{ .name = "localize-main-macos",
+        \\                   .command = .{ "ld", "-r", "{cache}/labelle_crystal_scripts.o", "-o", "{cache}/labelle_crystal_scripts_lib.o", "-exported_symbols_list", "{package}/native-crystal/exported_symbols_macos.txt" },
+        \\                   .artifact = "{cache}/labelle_crystal_scripts_lib.o",
+        \\                   .link = .object,
+        \\                   .os = .{"macos"},
+        \\                   .system_libs = .{ .macos = .{ "gc", "iconv", "pcre2-8" } },
+        \\                   .library_paths = .{"{crystal_env:CRYSTAL_LIBRARY_PATH}"},
+        \\                   .platforms = .{"desktop"} },
+        \\                .{ .name = "localize-main-linux",
+        \\                   .command = .{ "objcopy", "--keep-global-symbols={package}/native-crystal/exported_symbols_linux.txt", "{cache}/labelle_crystal_scripts.o", "{cache}/labelle_crystal_scripts_lib.o" },
+        \\                   .artifact = "{cache}/labelle_crystal_scripts_lib.o",
+        \\                   .link = .object,
+        \\                   .os = .{"linux"},
+        \\                   .system_libs = .{ .linux = .{ "gc", "pcre2-8", "gcc_s", "pthread", "dl", "rt", "m" } },
+        \\                   .library_paths = .{"{crystal_env:CRYSTAL_LIBRARY_PATH}"},
+        \\                   .platforms = .{"desktop"} },
+        \\            },
+        \\        },
+        \\    },
+        \\}
+    , "crystal")).?;
+    defer lb.deinit();
+
+    try testing.expectEqual(@as(usize, 3), lb.steps.len);
+    // Artifact-less intermediate: link .none, no artifact — chained only.
+    try testing.expectEqual(LinkMode.none, lb.steps[0].link);
+    try testing.expect(lb.steps[0].artifact == null);
+    try testing.expectEqual(@as(usize, 2), lb.steps[0].os.len);
+    // Per-OS localization variants.
+    try testing.expectEqualStrings("macos", lb.steps[1].os[0]);
+    try testing.expectEqualStrings("linux", lb.steps[2].os[0]);
+    try testing.expectEqual(LinkMode.object, lb.steps[1].link);
+    try testing.expect(isCrystalEnvToken(lb.steps[1].library_paths[0]));
+    try testing.expectEqualStrings("CRYSTAL_LIBRARY_PATH", crystalEnvVar(lb.steps[1].library_paths[0]));
+
+    // OS-filter semantics over the parsed steps.
+    try testing.expect(stepAllowsOs(lb.steps[0], .macos));
+    try testing.expect(stepAllowsOs(lb.steps[0], .linux));
+    try testing.expect(!stepAllowsOs(lb.steps[0], .windows));
+    try testing.expect(stepAllowsOs(lb.steps[1], .macos));
+    try testing.expect(!stepAllowsOs(lb.steps[1], .linux));
+    try testing.expect(!stepAllowsOs(lb.steps[2], .macos));
+    try testing.expect(stepAllowsOs(lb.steps[2], .linux));
+}
+
+test "loadFromSource: unknown .os values and misused .library_paths rejected (selected-entry strictness)" {
+    try testing.expectError(error.PluginBuildUnknownOs, loadSrc(
+        \\.{
+        \\    .name = "fixture",
+        \\    .manifest_version = 1,
+        \\    .build = .{ .steps = .{ .{ .name = "s", .command = .{ "true" }, .os = .{ "beos" } } } },
+        \\}
+    ));
+    // library_paths without a linked artifact: nothing consumes them.
+    try testing.expectError(error.PluginBuildLibraryPathsWithoutLink, loadSrc(
+        \\.{
+        \\    .name = "fixture",
+        \\    .manifest_version = 1,
+        \\    .build = .{ .steps = .{ .{ .name = "s", .command = .{ "true" }, .library_paths = .{ "/opt/lib" } } } },
+        \\}
+    ));
+    // Entries must be a whole {crystal_env:VAR} token or a plain path —
+    // never a mid-path token or another placeholder.
+    try testing.expectError(error.PluginBuildBadLibraryPath, loadSrc(
+        \\.{
+        \\    .name = "fixture",
+        \\    .manifest_version = 1,
+        \\    .build = .{ .steps = .{ .{ .name = "s", .command = .{ "true" }, .artifact = "{cache}/x.a", .link = .static_lib, .library_paths = .{ "{cache}/libs" } } } },
+        \\}
+    ));
+    try testing.expectError(error.PluginBuildBadLibraryPath, loadSrc(
+        \\.{
+        \\    .name = "fixture",
+        \\    .manifest_version = 1,
+        \\    .build = .{ .steps = .{ .{ .name = "s", .command = .{ "true" }, .artifact = "{cache}/x.a", .link = .static_lib, .library_paths = .{ "pre{crystal_env:CRYSTAL_LIBRARY_PATH}" } } } },
+        \\}
+    ));
+}
+
+test "isCrystalEnvToken/crystalEnvVar: whole-entry exact form only" {
+    try testing.expect(isCrystalEnvToken("{crystal_env:CRYSTAL_LIBRARY_PATH}"));
+    try testing.expectEqualStrings("CRYSTAL_LIBRARY_PATH", crystalEnvVar("{crystal_env:CRYSTAL_LIBRARY_PATH}"));
+    try testing.expect(!isCrystalEnvToken("{crystal_env:}"));
+    try testing.expect(!isCrystalEnvToken("{crystal_env:lower}"));
+    try testing.expect(!isCrystalEnvToken("{crystal_env:CRYSTAL_LIBRARY_PATH}/sub"));
+    try testing.expect(!isCrystalEnvToken("/opt/lib"));
+    try testing.expect(!isCrystalEnvToken("{crystal_env:UNCLOSED"));
+}
+
+test "appendCrystalPathEntries: the crystal_lib_paths reference split — colon list, trim, skip empties" {
+    const allocator = testing.allocator;
+    var out: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+    // Multi-entry with a trailing newline (the `crystal env` output shape)
+    // and an empty segment — the naive whole-value addLibraryPath trap.
+    try appendCrystalPathEntries(allocator, "/custom/libs::/opt/crystal/lib\n", &out);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expectEqualStrings("/custom/libs", out.items[0]);
+    try testing.expectEqualStrings("/opt/crystal/lib", out.items[1]);
+
+    // Single-dir installs (brew) stay one entry; blank input adds none.
+    try appendCrystalPathEntries(allocator, " /opt/homebrew/lib \n", &out);
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+    try testing.expectEqualStrings("/opt/homebrew/lib", out.items[2]);
+    try appendCrystalPathEntries(allocator, "\n", &out);
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+}
+
+test "placeholderAt/validatePlaceholders: {crystal_target} is an exact argv token; artifact tails still reject it" {
+    try testing.expectEqualStrings(PLACEHOLDER_CRYSTAL_TARGET, placeholderAt("--target={crystal_target}", 9).?);
+    try validatePlaceholders("{crystal_target}");
+    // Artifact tails allow only {staticlib:NAME} content.
+    try testing.expect(!isSafeArtifactTail("release/{crystal_target}.o"));
 }
 
 test "loadLanguageBuildsFromSource: duplicate language entries and unsafe language names rejected" {

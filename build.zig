@@ -183,6 +183,12 @@ pub fn build(b: *std.Build) void {
         // consumption ({staticlib:NAME} + per-OS system_libs) through the
         // real `generate`, plus the #586-style splice-run acceptance.
         "test/native_splice_tests.zig",
+        // Crystal splice (labelle-engine#741 slice 2, scripting PR #19):
+        // per-OS step selection + the windows pointed failures,
+        // artifact-less chaining, {crystal_target}, resolved
+        // .library_paths, and the forward-compat pin (non-selected
+        // entries with unknown keys never re-break released assemblers).
+        "test/crystal_splice_tests.zig",
     };
 
     for (test_files) |test_file| {
