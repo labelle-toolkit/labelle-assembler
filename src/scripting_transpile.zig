@@ -27,7 +27,11 @@
 //! runner (built from the project's pinned plugin package, hence
 //! per-project), tsc is pinned by the ASSEMBLER, so one fetch serves
 //! every project on the machine. Outside any wiped deps tree, like
-//! `declare-tool/`.
+//! `declare-tool/`. Because that cache is shared, cold fetches follow
+//! the stage-and-atomic-rename discipline (download/verify/extract under
+//! per-process unique paths, validate, then one atomic `rename` into
+//! place; a lost race resolves in the winner's favor) — see
+//! `ensureTscToolAt`/`promoteStagedTool`.
 //!
 //! ── The phase (embed splice, typescript row only) ────────────────────
 //! Ordered after the declare phase (deps are staged, `{package}` paths
@@ -264,6 +268,20 @@ fn tscToolDir(allocator: std.mem.Allocator, cache_root: []const u8, row: TscPlat
 /// `cache_root`. Split from `ensureTscTool` so tests can drive the cache
 /// probe against a tmp root without touching `$HOME` or the network (a
 /// pre-staged binary is a cache HIT — no fetch path runs).
+///
+/// ── Concurrency (the shared-cache discipline) ────────────────────────
+/// The tool cache is SHARED across projects, so two `labelle generate`
+/// processes can cold-fetch the same platform at once. Everything before
+/// promotion is therefore PER-PROCESS (unique random suffix): the
+/// download target, the integrity check (hashing a private file no other
+/// process can overwrite mid-verify), and the extraction — into a
+/// staging dir BESIDE the final one (same filesystem), so promotion is
+/// one atomic `rename`. The staged tree is validated (binary present,
+/// executable) BEFORE promotion; `promoteStagedTool` renames it into
+/// place and resolves a lost race in the winner's favor. The presence
+/// probe below is sound BECAUSE of that: the final dir only ever appears
+/// complete-or-not-at-all, so "the binary exists" implies the whole
+/// extracted tree does.
 fn ensureTscToolAt(allocator: std.mem.Allocator, cache_root: []const u8, row: TscPlatform) ![]u8 {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -278,12 +296,19 @@ fn ensureTscToolAt(allocator: std.mem.Allocator, cache_root: []const u8, row: Ts
     defer allocator.free(url);
     diag("fetching the typescript {s} native compiler ({s}) into {s} ...", .{ TSC_VERSION, row.npm_suffix, tool_dir });
 
-    var slug_buf: [64]u8 = undefined;
-    const slug = std.fmt.bufPrint(&slug_buf, "{s}-{s}", .{ TSC_VERSION, row.npm_suffix }) catch
+    // Per-process unique suffix — concurrent cold fetches must never
+    // share a download or staging path (random bytes, not a PID: unique
+    // even across PID reuse and across threads of one process; the same
+    // `io.random` idiom `std.testing.tmpDir` uses).
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const unique = std.fmt.bytesToHex(raw, .lower);
+
+    var slug_buf: [96]u8 = undefined;
+    const slug = std.fmt.bufPrint(&slug_buf, "{s}-{s}-{s}", .{ TSC_VERSION, row.npm_suffix, unique }) catch
         return error.NameTooLong;
     const archive = try cache.getTempPath(allocator, "labelle-tsc", slug);
     defer allocator.free(archive);
-    cwd.deleteTree(io, archive) catch {};
     cache.downloadFile(allocator, url, archive) catch {
         diag("could not download the typescript compiler from {s} — check network access; the pin is typescript {s}", .{ url, TSC_VERSION });
         return error.TscToolFetchFailed;
@@ -291,27 +316,82 @@ fn ensureTscToolAt(allocator: std.mem.Allocator, cache_root: []const u8, row: Ts
     defer cwd.deleteTree(io, archive) catch {};
 
     // Integrity gates extraction: nothing lands in the tool cache from a
-    // tarball whose bytes don't match the source-pinned registry hash.
+    // tarball whose bytes don't match the source-pinned registry hash —
+    // and the archive path is process-private, so the bytes hashed here
+    // are exactly the bytes extracted below.
     try verifyTarballSha512(allocator, archive, row.tarball_sha512_b64);
 
-    // Fresh extract — a partial prior tree (interrupted fetch) must not
-    // shadow the verified one. `--strip-components=1` drops the npm
-    // `package/` wrapper, so `lib/tsc` lands directly under the tool dir.
-    cwd.deleteTree(io, tool_dir) catch {};
-    try cwd.createDirPath(io, tool_dir);
-    cache.extractTarGz(allocator, archive, tool_dir) catch {
-        diag("could not extract the typescript compiler tarball into {s}", .{tool_dir});
+    // Extract into the per-process STAGING dir, a sibling of the final
+    // dir (same filesystem — the promotion rename is atomic; the `.`
+    // prefix keeps it visually apart from real platform dirs).
+    // `--strip-components=1` drops the npm `package/` wrapper, so
+    // `lib/tsc` lands directly under it.
+    var staging_name_buf: [64]u8 = undefined;
+    const staging_name = std.fmt.bufPrint(&staging_name_buf, ".staging-{s}-{s}", .{ row.npm_suffix, unique }) catch
+        return error.NameTooLong;
+    const staging_dir = try std.fs.path.join(allocator, &.{ cache_root, "tools", "typescript", TSC_VERSION, staging_name });
+    defer allocator.free(staging_dir);
+    errdefer cwd.deleteTree(io, staging_dir) catch {};
+    try cwd.createDirPath(io, staging_dir);
+    cache.extractTarGz(allocator, archive, staging_dir) catch {
+        diag("could not extract the typescript compiler tarball into {s}", .{staging_dir});
         return error.TscToolFetchFailed;
     };
 
-    if (!cache.dirExists(bin_path)) {
-        diag("the typescript tarball extracted but {s} is missing — the {s} package layout changed?", .{ bin_path, row.npm_suffix });
+    // Validate the staged tree BEFORE promotion — only complete trees
+    // ever reach the final path.
+    const staged_bin = try std.fs.path.join(allocator, &.{ staging_dir, tscBinaryRelPath(row.os) });
+    defer allocator.free(staged_bin);
+    if (!cache.dirExists(staged_bin)) {
+        diag("the typescript tarball extracted but {s} is missing — the {s} package layout changed?", .{ staged_bin, row.npm_suffix });
         return error.TscToolFetchFailed;
     }
     // npm tarballs carry the executable bit and system tar preserves it;
     // belt-and-braces for exotic tar/umask setups (windows needs none).
-    if (builtin.os.tag != .windows) ensureExecutable(bin_path);
+    if (builtin.os.tag != .windows) ensureExecutable(staged_bin);
+
+    try promoteStagedTool(staging_dir, tool_dir, bin_path);
     return bin_path;
+}
+
+/// Atomically promote a VALIDATED staging tree to the final tool dir.
+/// Owns `staging_dir`: it is gone on every return — renamed into place
+/// on success, discarded when the race was lost to a valid winner,
+/// deleted on every failure path (errdefer).
+///
+/// Race resolution, in order:
+///   1. `rename(staging, final)` — the atomic happy path (on POSIX this
+///      also silently replaces an EMPTY leftover final dir).
+///   2. rename failed and the final BINARY now exists → another process
+///      won with a complete tree (its promotion was equally atomic):
+///      keep the winner byte-for-byte, discard our staging.
+///   3. rename failed, the final dir exists but has NO binary → an
+///      invalid leftover (an interrupted install predating this staging
+///      discipline, or outside interference): replace it DELIBERATELY —
+///      delete + retry the rename ONCE, with a note. (Should another
+///      process land between the delete and the retry, the retry fails
+///      and propagates — corrupt-leftover recovery is best-effort by
+///      design, never silent.)
+///   4. anything else → propagate the original rename error.
+fn promoteStagedTool(staging_dir: []const u8, tool_dir: []const u8, final_bin_path: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    errdefer cwd.deleteTree(io, staging_dir) catch {};
+
+    cwd.rename(staging_dir, cwd, tool_dir, io) catch |rename_err| {
+        if (cache.dirExists(final_bin_path)) {
+            // Lost the race to a COMPLETE winner — use it.
+            cwd.deleteTree(io, staging_dir) catch {};
+            return;
+        }
+        if (cache.dirExists(tool_dir)) {
+            diag("replacing an incomplete typescript tool dir at {s} (no compiler binary inside)", .{tool_dir});
+            cwd.deleteTree(io, tool_dir) catch {};
+            try cwd.rename(staging_dir, cwd, tool_dir, io);
+            return;
+        }
+        return rename_err;
+    };
 }
 
 fn ensureExecutable(path: []const u8) void {
@@ -999,6 +1079,137 @@ test "ensureTscToolAt: a pre-staged binary is a cache HIT — returned without a
     try testing.expect(std.mem.endsWith(u8, bin, "tsc"));
     try testing.expect(std.mem.indexOf(u8, bin, "typescript") != null);
     try testing.expect(std.mem.indexOf(u8, bin, TSC_VERSION) != null);
+}
+
+/// Promotion-fixture paths: a validated staging tree + the final tool
+/// dir/bin paths, all under one tmp "version dir" (the real layout's
+/// `tools/typescript/<ver>/`). Caller frees via the arena.
+const PromoteFixture = struct {
+    staging_dir: []const u8,
+    tool_dir: []const u8,
+    bin_path: []const u8,
+
+    fn init(aa: std.mem.Allocator, tmp: *std.testing.TmpDir, staged_bin_content: []const u8) !PromoteFixture {
+        try writeTestFile(tmp.dir, "ver/.staging-darwin-arm64-cafe0123/lib/tsc", staged_bin_content);
+        try writeTestFile(tmp.dir, "ver/.staging-darwin-arm64-cafe0123/lib/lib.es2020.d.ts", "// stdlib\n");
+        const ver_dir = try tmp.dir.realPathFileAlloc(testing.io, "ver", aa);
+        const staging_dir = try std.fs.path.join(aa, &.{ ver_dir, ".staging-darwin-arm64-cafe0123" });
+        const tool_dir = try std.fs.path.join(aa, &.{ ver_dir, "darwin-arm64" });
+        const bin_path = try std.fs.path.join(aa, &.{ tool_dir, "lib", "tsc" });
+        return .{ .staging_dir = staging_dir, .tool_dir = tool_dir, .bin_path = bin_path };
+    }
+};
+
+test "promoteStagedTool: clean promotion — staging renamed into place atomically, no staging residue" {
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const fx = try PromoteFixture.init(arena.allocator(), &tmp, "#!/bin/sh\n# ours\n");
+    try promoteStagedTool(fx.staging_dir, fx.tool_dir, fx.bin_path);
+
+    // The final tree is the staged one — binary AND stdlib beside it —
+    // and the staging dir is gone (renamed, not copied).
+    const got = try tmp.dir.readFileAlloc(tio, "ver/darwin-arm64/lib/tsc", testing.allocator, .limited(4096));
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "# ours") != null);
+    try tmp.dir.access(tio, "ver/darwin-arm64/lib/lib.es2020.d.ts", .{});
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(tio, "ver/.staging-darwin-arm64-cafe0123", .{}),
+    );
+}
+
+test "promoteStagedTool: a lost race keeps the WINNER byte-for-byte and discards the staging" {
+    // THE race pin (CodeRabbit finding on PR #613): two processes
+    // cold-fetch concurrently; the loser's promotion must NOT disturb
+    // the winner's complete tree. The pre-fix in-place discipline
+    // (deleteTree final + extract into it) fails exactly this assertion
+    // — the winner's dir would be destroyed and rebuilt by the loser
+    // (negative-verified by simulating that discipline; see the fix PR).
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const fx = try PromoteFixture.init(arena.allocator(), &tmp, "#!/bin/sh\n# loser\n");
+    // The winner landed first: a COMPLETE tool dir (binary present).
+    try writeTestFile(tmp.dir, "ver/darwin-arm64/lib/tsc", "#!/bin/sh\n# winner\n");
+    try writeTestFile(tmp.dir, "ver/darwin-arm64/lib/lib.es2020.d.ts", "// winner stdlib\n");
+
+    try promoteStagedTool(fx.staging_dir, fx.tool_dir, fx.bin_path);
+
+    const got = try tmp.dir.readFileAlloc(tio, "ver/darwin-arm64/lib/tsc", testing.allocator, .limited(4096));
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "# winner") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "# loser") == null);
+    // Our staging was discarded, not left to rot in the shared cache.
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(tio, "ver/.staging-darwin-arm64-cafe0123", .{}),
+    );
+}
+
+test "promoteStagedTool: an invalid pre-existing final dir (no binary) is replaced deliberately" {
+    // The corrupt-leftover shape: a NON-EMPTY final dir without the
+    // compiler binary (an install interrupted before this staging
+    // discipline existed). The probe rejects it (no bin), promotion
+    // rename fails (dir not empty) — the fix replaces it with the
+    // validated staging, with a note.
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const fx = try PromoteFixture.init(arena.allocator(), &tmp, "#!/bin/sh\n# ours\n");
+    // Partial junk: stdlib extracted, binary missing (tar interrupted).
+    try writeTestFile(tmp.dir, "ver/darwin-arm64/lib/lib.es2020.d.ts", "// truncated install\n");
+
+    try promoteStagedTool(fx.staging_dir, fx.tool_dir, fx.bin_path);
+
+    const got = try tmp.dir.readFileAlloc(tio, "ver/darwin-arm64/lib/tsc", testing.allocator, .limited(4096));
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "# ours") != null);
+    // The junk tree is gone wholesale (deleted, then replaced by rename).
+    const junk = tmp.dir.readFileAlloc(tio, "ver/darwin-arm64/lib/lib.es2020.d.ts", testing.allocator, .limited(4096)) catch null;
+    if (junk) |j| {
+        defer testing.allocator.free(j);
+        try testing.expect(std.mem.indexOf(u8, j, "truncated install") == null);
+    }
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(tio, "ver/.staging-darwin-arm64-cafe0123", .{}),
+    );
+}
+
+test "promoteStagedTool: an unresolvable rename failure propagates AND cleans the staging (errdefer)" {
+    // No winner, no invalid leftover — the final path's PARENT doesn't
+    // even exist, so the rename fails outright. The error must propagate
+    // (never a silent half-install) and the staging must not linger in
+    // the shared cache.
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const fx = try PromoteFixture.init(aa, &tmp, "#!/bin/sh\n# ours\n");
+    const bad_tool_dir = try std.fs.path.join(aa, &.{ fx.tool_dir, "..", "..", "no-such-parent", "darwin-arm64" });
+    const bad_bin = try std.fs.path.join(aa, &.{ bad_tool_dir, "lib", "tsc" });
+
+    try testing.expectError(
+        error.FileNotFound,
+        promoteStagedTool(fx.staging_dir, bad_tool_dir, bad_bin),
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(tio, "ver/.staging-darwin-arm64-cafe0123", .{}),
+    );
 }
 
 test "tsFieldType: the zig→ts mapping table — numbers, bigint ids, bool, string, vec2, optionals, unknown" {
