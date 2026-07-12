@@ -697,7 +697,10 @@ pub const DECL_TRANSPILE_E2E = struct {
         _ = try indexOfOrFail(comps, "Hunger");
         const events = try tmp.dir.readFileAlloc(io, "out/sokol_desktop/scripting_events.zig", allocator, .limited(1 << 20));
         defer allocator.free(events);
-        _ = try indexOfOrFail(events, "hunger__feed");
+        // The generated event type is PascalCase (`hunger__feed` ->
+        // `HungerFeed`); the raw union-variant name lives in main.zig's
+        // event-union row, not in this file.
+        _ = try indexOfOrFail(events, "pub const HungerFeed = struct {");
 
         // (5) The generated main registers the emitted declaration `.js` from
         // the materialized dirs (components-first), plus the transpiled script.
@@ -706,6 +709,8 @@ pub const DECL_TRANSPILE_E2E = struct {
         const reg_hunger = try indexOfOrFail(main_zig, "scripting.registerScript(\"hunger\", @embedFile(\"components/hunger.js\"));");
         const reg_feed = try indexOfOrFail(main_zig, "scripting.registerScript(\"feed\", @embedFile(\"events/feed.js\"));");
         const reg_logic = try indexOfOrFail(main_zig, "scripting.registerScript(\"logic\", @embedFile(\"scripts/logic.js\"));");
+        // The declared event's union variant is keyed by the raw name.
+        _ = try indexOfOrFail(main_zig, "hunger__feed");
         // components-first, events next, scripts last (the #772 order).
         try std.testing.expect(reg_hunger < reg_feed);
         try std.testing.expect(reg_feed < reg_logic);
