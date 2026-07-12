@@ -675,7 +675,10 @@ pub const DECL_TRANSPILE_E2E = struct {
                 .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "typescript" } },
             },
         };
-        try generate.generate(allocator, cfg, out_abs, game_abs, .{ .is_tests_target = true });
+        // is_tests_target = false so the game main.zig is emitted (the
+        // registration assertions below read it); the declare phase runs
+        // regardless (it gates on the splice + declaration files).
+        try generate.generate(allocator, cfg, out_abs, game_abs, .{ .is_tests_target = false });
 
         // (2) The declaration dirs transpiled into the target BEFORE declare:
         // the emitted `.js` exist where the declare tool + @embedFile read them.
