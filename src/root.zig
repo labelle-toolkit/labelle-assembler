@@ -1496,6 +1496,18 @@ pub fn generate(
     var plugin_events = try main_zig.discoverPluginEvents(allocator, cfg_modules, game_dir);
     defer plugin_events.deinit();
 
+    // Script-DECLARED events (labelle-engine#772) were gated against the
+    // game/pack event namespaces inside the declare phase — but plugin
+    // `Events` discovery only happens NOW, so a declared name that spells
+    // a plugin's qualified tag (`box2d__collision_begin`) would sail
+    // through `checkEventCollisions` and only explode later inside the
+    // generated main.zig's `MergeHookPayloads` comptime duplicate-field
+    // check — a terrible error for a user mistake. Gate it here, right
+    // after discovery, with the declare phase's pointed collision voice.
+    if (maybe_scripting) |s| {
+        try scripting_declare.checkEventPluginCollisions(s.declared_events, plugin_events.entries);
+    }
+
     // Emit the `game.zig` shim — a tiny re-export module that surfaces
     // `Game` and `EntityId` so generated flow files at
     // `scripts/flows/*.zig` can `@import("game")`. See

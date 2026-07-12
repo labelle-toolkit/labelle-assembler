@@ -303,9 +303,10 @@ fn walkCollect(
 /// generate-time layer, re-homed on the `scripts/` convention —
 /// labelle-engine#237):
 ///
-///   `scripts/` and `components/` (the shared convention dirs — policed by
-///   EXTENSION, since the extension is the language selector there; `.zig`
-///   belongs to no script language and is invisible to this scan):
+///   `scripts/`, `components/`, and `events/` (the shared convention dirs —
+///   policed by EXTENSION, since the extension is the language selector
+///   there; `.zig` belongs to no script language and is invisible to this
+///   scan):
 ///   - the DECLARED language's files → fine, skipped entirely (the
 ///     scripting splice consumes them and owns the deeper checks — the
 ///     state-subdir gate, the transpile machinery, the components/
@@ -421,19 +422,24 @@ pub fn scanUnitLanguageDirs(
 
     try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, SCRIPTS_DIR);
     try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, "components");
+    try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, "events");
 }
 
 /// The shared-convention-dir half of `scanUnitLanguageDirs`: walk ONE
-/// extension-keyed shared dir (`scripts/` — and, since labelle-engine#237's
-/// refinement, `components/`, where the declared language's DECLARATION
-/// files live beside the Zig components) once, bucket every file by the
-/// language its extension belongs to (`scriptExtensions`; unmatched
-/// extensions — `.zig`, `.md`, editor droppings — are invisible), and
-/// enforce the same two rules the legacy dirs get: foreign language →
-/// mismatch, no declared language → attach hint. The DECLARED language's
-/// files are never collected — the scripting splice owns them (collection,
-/// state-subdir gate, ordering, the components/ transpile guard). Buckets
-/// error in `SUPPORTED_LANGUAGES` order so diagnostics are deterministic.
+/// extension-keyed shared dir (`scripts/` — and, per labelle-engine#237's
+/// "where their kind lives" refinement, `components/` and `events/`
+/// [labelle-engine#772], where the declared language's DECLARATION files
+/// live beside their Zig kin) once, bucket every file by the language its
+/// extension belongs to (`scriptExtensions`; unmatched extensions —
+/// `.zig`, `.md`, editor droppings — are invisible), and enforce the same
+/// two rules the legacy dirs get: foreign language → mismatch, no
+/// declared language → attach hint. The DECLARED language's files are
+/// never collected — the scripting splice owns them (collection,
+/// state-subdir gate, ordering, the components/ transpile guard; for
+/// events/, `collectEventEmbeds` reads only the active extension — which
+/// is exactly why a foreign-language events file would otherwise die
+/// silently). Buckets error in `SUPPORTED_LANGUAGES` order so diagnostics
+/// are deterministic.
 fn scanSharedDirLanguages(
     allocator: std.mem.Allocator,
     unit_root: []const u8,
@@ -498,7 +504,7 @@ const LanguageBucket = struct {
 };
 
 /// One recursive walk of a shared convention dir (`scripts/`,
-/// `components/`), bucketing files by extension-owning language.
+/// `components/`, `events/`), bucketing files by extension-owning language.
 /// Dot-entries skipped (same rule as `walkCollect`); the declared
 /// language's files are skipped entirely — their policing belongs to the
 /// scripting splice.
@@ -1024,6 +1030,57 @@ test "scanUnitLanguageDirs: a Zig-only components/ is invisible to the language 
     try writeTestFile(tmp.dir, "components/worker.zig", "pub const Worker = struct {};\n");
     try writeTestFile(tmp.dir, "components/needs/hunger.zig", "pub const Hunger = struct {};\n");
     try writeTestFile(tmp.dir, "components/.gitkeep", "");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    try scanUnitLanguageDirs(allocator, root, "project root", null);
+    const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
+    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+}
+
+test "scanUnitLanguageDirs: events/ is policed like scripts/ — declared-language declarations pass, foreign extensions error (labelle-engine#772)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The canonical declare-mode shape: a ruby event declaration beside
+    // the Zig events — the declared language's own files pass.
+    try writeTestFile(tmp.dir, "events/hunger__feed.rb", "HungerFeed = Labelle.event \"hunger__feed\"\n");
+    try writeTestFile(tmp.dir, "events/door_opened.zig", "pub const DoorOpened = struct {};\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const ruby_declared = DeclaredLanguage{ .language = "ruby", .plugin_name = "scripting" };
+    try scanUnitLanguageDirs(allocator, root, "project root", ruby_declared);
+
+    // A FOREIGN language's file in events/ errors exactly like in
+    // scripts/ — `collectEventEmbeds` reads only the ACTIVE extension,
+    // so a lua project's events/*.rb would be silently dead (the
+    // silent-death class).
+    const lua_declared = DeclaredLanguage{ .language = "lua", .plugin_name = "scripting" };
+    try testing.expectError(
+        error.ScriptLanguageMismatch,
+        scanUnitLanguageDirs(allocator, root, "project root", lua_declared),
+    );
+
+    // No scripting plugin at all → the attach hint.
+    try testing.expectError(
+        error.MissingScriptingPlugin,
+        scanUnitLanguageDirs(allocator, root, "project root", null),
+    );
+}
+
+test "scanUnitLanguageDirs: a Zig-only events/ is invisible to the language scan (coexistence negative control)" {
+    // Every existing game has events/*.zig and no scripting plugin — the
+    // extension-keyed scan must never see them (the components/-side
+    // control's events twin).
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "events/door_opened.zig", "pub const DoorOpened = struct {};\n");
+    try writeTestFile(tmp.dir, "events/combat/hit.zig", "pub const Hit = struct {};\n");
+    try writeTestFile(tmp.dir, "events/.gitkeep", "");
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
 

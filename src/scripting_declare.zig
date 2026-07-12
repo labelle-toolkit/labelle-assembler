@@ -969,7 +969,6 @@ pub fn checkCollisions(
     var pascal_buf: [128]u8 = undefined;
     var pack_pascal_buf: [128]u8 = undefined;
     var prefix_buf: [128]u8 = undefined;
-    var full_buf: [280]u8 = undefined;
 
     for (declared) |comp| {
         if (std.mem.eql(u8, comp.name, "VideoComponent")) {
@@ -984,11 +983,19 @@ pub fn checkCollisions(
             }
         }
         for (pack_scans) |pack| {
+            // Slice-wise `<pack>__<Pascal>` match — never a formatted
+            // copy into a fixed buffer whose overflow would skip the
+            // comparison (PR #618 review; the sibling event check hit
+            // that for real — see `checkEventCollisions`). The pack
+            // prefix + `__` split depends only on the pack, so it hoists
+            // out of the per-name loop.
             const prefix = scan.packNamespacePrefix(pack.name, &prefix_buf);
+            if (!std.mem.startsWith(u8, comp.name, prefix)) continue;
+            const rest = comp.name[prefix.len..];
+            if (!std.mem.startsWith(u8, rest, "__")) continue;
+            const bare = rest[2..];
             for (pack.component_names) |name| {
-                const pascal = idents.pathToPascal(name, &pack_pascal_buf);
-                const full = std.fmt.bufPrint(&full_buf, "{s}__{s}", .{ prefix, pascal }) catch continue;
-                if (std.mem.eql(u8, full, comp.name)) {
+                if (std.mem.eql(u8, bare, idents.pathToPascal(name, &pack_pascal_buf))) {
                     diag("script-declared component '{s}' collides with pack '{s}' component {s}.zig — rename one", .{ comp.name, pack.name, name });
                     return error.ScriptComponentCollision;
                 }
@@ -1012,7 +1019,6 @@ pub fn checkEventCollisions(
     pack_scans: []const scan.PackScan,
 ) !void {
     var prefix_buf: [128]u8 = undefined;
-    var full_buf: [280]u8 = undefined;
 
     for (declared) |ev| {
         for (event_names) |stem| {
@@ -1022,14 +1028,51 @@ pub fn checkEventCollisions(
             }
         }
         for (pack_scans) |pack| {
+            // Slice-wise `<pack>__<variant>` match, mirroring the pack
+            // loop in `checkCollisions`. The old format-then-compare
+            // (`bufPrint` into a fixed 280-byte buffer, `catch continue`)
+            // silently SKIPPED the check when the joined name overflowed —
+            // reachable here because `eventVariantName` is a slice of the
+            // stem (unbounded), unlike the 128-capped Pascal/prefix
+            // transforms (PR #618 review).
             const prefix = scan.packNamespacePrefix(pack.name, &prefix_buf);
+            if (!std.mem.startsWith(u8, ev.name, prefix)) continue;
+            const rest = ev.name[prefix.len..];
+            if (!std.mem.startsWith(u8, rest, "__")) continue;
+            const bare = rest[2..];
             for (pack.event_names) |stem| {
-                const full = std.fmt.bufPrint(&full_buf, "{s}__{s}", .{ prefix, idents.eventVariantName(stem) }) catch continue;
-                if (std.mem.eql(u8, full, ev.name)) {
+                if (std.mem.eql(u8, bare, idents.eventVariantName(stem))) {
                     diag("script-declared event '{s}' collides with pack '{s}' event {s}.zig — rename one", .{ ev.name, pack.name, stem });
                     return error.ScriptEventCollision;
                 }
             }
+        }
+    }
+}
+
+/// Reject a declared EVENT whose name spells a PLUGIN event's qualified
+/// union tag (`<plugin_sanitized>__<event>` — `writePluginEventsBlock`'s
+/// variant shape; the engine's own `Events` decls arrive in the same list
+/// under the `engine` prefix). Plugin `Events` discovery
+/// (`discoverPluginEvents`) runs AFTER the declare phase, so this gate
+/// can't sit inside `runPhase` beside `checkEventCollisions` — root.zig
+/// calls it right after discovery instead. Without it, a declared
+/// `box2d__collision_begin` only explodes later inside the generated
+/// main.zig's `MergeHookPayloads` comptime duplicate-field check — a
+/// terrible error for a user mistake. Same slice-wise compare as the
+/// pack gates above: no fixed-size format buffer, no silent skip.
+pub fn checkEventPluginCollisions(
+    declared: []const DeclaredEvent,
+    plugin_events: []const scan.PluginEvent,
+) !void {
+    for (declared) |ev| {
+        for (plugin_events) |pe| {
+            if (!std.mem.startsWith(u8, ev.name, pe.plugin_sanitized)) continue;
+            const rest = ev.name[pe.plugin_sanitized.len..];
+            if (!std.mem.startsWith(u8, rest, "__")) continue;
+            if (!std.mem.eql(u8, rest[2..], pe.event_name)) continue;
+            diag("script-declared event '{s}' collides with plugin '{s}' event {s} — rename the declaration (plugin events already own the '{s}__' prefix)", .{ ev.name, pe.plugin_import_name, pe.event_name, pe.plugin_sanitized });
+            return error.ScriptEventPluginCollision;
         }
     }
 }
@@ -1797,6 +1840,26 @@ test "checkCollisions: game components, packs, and the VideoComponent built-in a
         error.ScriptComponentCollision,
         checkCollisions(&packish, &.{}, &.{pack}),
     );
+    // Long-name pin for the slice-wise pack compare (PR #618 review made
+    // this loop buffer-free like the event check's; unlike there, the old
+    // component buffer could never actually overflow — both operands are
+    // 128-capped transforms — so this locks equivalence, not a bug fix).
+    const long_pack = "p" ** 100;
+    const long_stem = "e" ** 120; // pathToPascal → "E" + "e"*119, under its 128 cap
+    const long_packish = [_]DeclaredComponent{
+        .{ .name = long_pack ++ "__E" ++ ("e" ** 119), .persist = .persistent, .fields = &.{} },
+    };
+    const long_pack_scan = scan.PackScan{
+        .name = long_pack,
+        .import_prefix = "packs/" ++ long_pack,
+        .component_names = &.{long_stem},
+        .event_names = &.{},
+        .prefab_names = &.{},
+    };
+    try testing.expectError(
+        error.ScriptComponentCollision,
+        checkCollisions(&long_packish, &.{}, &.{long_pack_scan}),
+    );
 }
 
 test "DECLARE_RUNNERS: row selection — lua + ruby rows with their step/tool/extension; non-listed languages have none" {
@@ -2120,6 +2183,84 @@ test "checkEventCollisions: game events (variant = file basename) and pack event
     // An event sharing a COMPONENT's registry name is legal — different
     // namespaces; `checkEventCollisions` never sees component names.
     try checkEventCollisions(&declared, &.{}, &.{pack});
+
+    // Pathologically long names: `<pack>__<variant>` at 302 bytes — past
+    // the old 280-byte format buffer whose overflow `catch continue`d,
+    // silently SKIPPING the collision (PR #618 review; reachable because
+    // the event variant is an unbounded slice of the stem). The slice-wise
+    // compare has no length ceiling, so the gate still fires.
+    const long_pack = "p" ** 100;
+    const long_stem = "e" ** 200;
+    const long_declared = [_]DeclaredEvent{
+        .{ .name = long_pack ++ "__" ++ long_stem, .fields = &.{} },
+    };
+    const long_pack_scan = scan.PackScan{
+        .name = long_pack,
+        .import_prefix = "packs/" ++ long_pack,
+        .component_names = &.{},
+        .event_names = &.{long_stem},
+        .prefab_names = &.{},
+    };
+    try testing.expectError(
+        error.ScriptEventCollision,
+        checkEventCollisions(&long_declared, &.{}, &.{long_pack_scan}),
+    );
+    // Same-length near miss (last byte differs) passes — the slice logic
+    // matches exactly, it doesn't over-match on the pack prefix.
+    const long_near_miss = [_]DeclaredEvent{
+        .{ .name = long_pack ++ "__" ++ ("e" ** 199) ++ "x", .fields = &.{} },
+    };
+    try checkEventCollisions(&long_near_miss, &.{}, &.{long_pack_scan});
+}
+
+test "checkEventPluginCollisions: a declared event spelling a plugin's qualified tag gates (incl. engine + sanitized names); near misses pass" {
+    // Entries shaped exactly like `discoverPluginEvents` builds them —
+    // the same literal constructor the manifest plugin_events tests use.
+    const entries = [_]scan.PluginEvent{
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
+        .{ .plugin_import_name = "labelle-physics", .plugin_sanitized = "labelle_physics", .event_name = "impact" },
+        .{ .plugin_import_name = "engine", .plugin_sanitized = "engine", .event_name = "tick" },
+    };
+
+    // The motivating case: the declared name IS the plugin union tag —
+    // without this gate it only explodes inside MergeHookPayloads'
+    // comptime duplicate-field check in the generated main.zig.
+    const declared = [_]DeclaredEvent{
+        .{ .name = "box2d__collision_begin", .fields = &.{} },
+    };
+    try testing.expectError(
+        error.ScriptEventPluginCollision,
+        checkEventPluginCollisions(&declared, &entries),
+    );
+    // Hyphenated plugin: the tag uses the SANITIZED prefix.
+    const sanitized = [_]DeclaredEvent{
+        .{ .name = "labelle_physics__impact", .fields = &.{} },
+    };
+    try testing.expectError(
+        error.ScriptEventPluginCollision,
+        checkEventPluginCollisions(&sanitized, &entries),
+    );
+    // Engine events are discovered alongside plugins (labelle-engine#578)
+    // and gate identically.
+    const engineish = [_]DeclaredEvent{
+        .{ .name = "engine__tick", .fields = &.{} },
+    };
+    try testing.expectError(
+        error.ScriptEventPluginCollision,
+        checkEventPluginCollisions(&engineish, &entries),
+    );
+
+    // Near misses all pass: the bare event name, a single-underscore
+    // join, a prefix-only truncation, and a different plugin prefix.
+    const clean = [_]DeclaredEvent{
+        .{ .name = "collision_begin", .fields = &.{} },
+        .{ .name = "box2d_collision_begin", .fields = &.{} },
+        .{ .name = "box2d__collision", .fields = &.{} },
+        .{ .name = "box3d__collision_begin", .fields = &.{} },
+    };
+    try checkEventPluginCollisions(&clean, &entries);
+    // No plugin events discovered → nothing can collide.
+    try checkEventPluginCollisions(&declared, &.{});
 }
 
 test "semverBelow: parseable pins compare against the floor; local/branch/empty pins satisfy it" {
