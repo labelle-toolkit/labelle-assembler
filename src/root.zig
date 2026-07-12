@@ -1115,6 +1115,28 @@ pub fn generate(
     if (maybe_scripting) |s| {
         if (s.family == .native) {
             try scripting_splice.stageNativeSources(allocator, game_dir, output_dir, s);
+
+            // Dev `.csproj` for IDE support (labelle-assembler#617): a csharp
+            // game is ALSO a first-class C# project the author opens in Visual
+            // Studio / Rider / VS Code — IntelliSense + build-in-place over the
+            // game's scripts/ + components/ + events/ against the shipped
+            // Labelle surface. Emitted AFTER staging so the resolved plugin
+            // package (whose native-csharp/src the project references) is on
+            // disk. Purely a dev aid — the real build stays the
+            // `.language_builds` `dotnet publish` this splice already drives.
+            if (std.mem.eql(u8, s.language, "csharp")) {
+                const plugin_pkg = try scripting_declare.resolvePluginPackageDir(
+                    allocator,
+                    cfg.plugins,
+                    s.plugin_name,
+                    output_dir,
+                    game_dir,
+                );
+                defer allocator.free(plugin_pkg);
+                const plugin_src = try std.fs.path.join(allocator, &.{ plugin_pkg, "native-csharp", "src" });
+                defer allocator.free(plugin_src);
+                try scripting_splice.emitCsharpDevProject(allocator, game_dir, cfg.name, plugin_src);
+            }
         }
     }
 
