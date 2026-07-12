@@ -294,6 +294,46 @@ pub const ScriptingSplice = struct {
     /// (`blocks/hooks.zig`). Empty (the default) for every
     /// declaration-less project — all emission sites stay byte-identical.
     declared_events: []const scripting_declare.DeclaredEvent = &.{},
+    /// Native-only staging geometry (RFC-LANGUAGE-PLUGINS rev 19 §7 "Native
+    /// wiring contract"), resolved once by `detect` from the manifest
+    /// `.languages` row (PRIMARY) or the frozen `NATIVE_LANGUAGES` table
+    /// (fallback): `module_root` is the crate module-root filename required
+    /// at the script-dir root (`mod.rs`/`game.cr`); `stage_subdir` is the
+    /// plugin-crate-relative dir the game sources link over
+    /// (`native/src/game`). Both null for embed splices —
+    /// `stageNativeSources` reads them instead of a frozen-table lookup.
+    module_root: ?[]const u8 = null,
+    stage_subdir: ?[]const u8 = null,
+    /// Embed-only authoring→embed transpile source (typescript `.ts`/
+    /// `.d.ts`), resolved once by `detect` from the row's `.transpile`
+    /// capability (PRIMARY) or the frozen `EMBED_LANGUAGES` table (fallback).
+    /// Null when the authored extension IS the embedded one (lua, ruby) or
+    /// for native. The transpile phase and `collectDeclEmbeds` read it here
+    /// rather than re-deriving from a table, so the `.ts`→embed knowledge is
+    /// fully row-driven (rev 19 A3: the hard-coded `#586` gap dissolved into
+    /// the row's `.transpile` presence, exactly as `min_pin` did).
+    transpile: ?TranspileSource = null,
+    /// Set to the allocator when `detect` resolved this splice from a
+    /// manifest `.languages` row and HEAP-DUPED the row-derived strings
+    /// (`extension`, `module_root`, `stage_subdir`, `transpile.*`); `deinit`
+    /// then frees exactly those. A null owner means every string is static
+    /// (the frozen-table fallback, or a test/`.detect`-less literal), so
+    /// `deinit` is a no-op and every existing caller stays byte-identical.
+    owner: ?std.mem.Allocator = null,
+
+    /// Free the row-derived strings `detect` duped from the manifest — a
+    /// no-op for a frozen-fallback / literal splice (see `owner`).
+    pub fn deinit(self: *ScriptingSplice) void {
+        const a = self.owner orelse return;
+        a.free(self.extension);
+        if (self.module_root) |m| a.free(m);
+        if (self.stage_subdir) |s| a.free(s);
+        if (self.transpile) |t| {
+            a.free(t.source_extension);
+            a.free(t.declaration_suffix);
+        }
+        self.owner = null;
+    }
 };
 
 /// Detect the scripting splice for this project: the `.plugins` entry
@@ -322,22 +362,24 @@ pub fn detect(
         defer pmani.deinit();
         if (!std.mem.eql(u8, pmani.name, SCRIPTING_MANIFEST_NAME)) return null;
 
+        // PRIMARY (rev 19): the manifest `.languages` capability row drives
+        // the splice — `.kind` → family, `.extensions`/`.transpile` → the
+        // embed extension + transpile source (embedded), `.module_root` +
+        // `.stage_subdir` → the native staging geometry. The row's strings
+        // are duped onto the splice (freed by `ScriptingSplice.deinit`)
+        // because `pmani` is released when detect returns. A present row with
+        // an incomplete NATIVE geometry (missing `.module_root`/
+        // `.stage_subdir`) is not drivable → falls through to the frozen
+        // table (rust/crystal covered there) or the integration-gap warning.
+        if (pmani.languageRow(declared.language)) |row| {
+            if (try spliceFromRow(allocator, plugin.name, declared.language, game_dir, row)) |s| return s;
+        }
+
+        // FROZEN FALLBACK (Migration bullet): manifests predating `.languages`
+        // rows keep resolving via the built-in tables — never extended again
+        // (a new language comes via a manifest row, the python litmus test).
         if (embedRow(declared.language)) |row| {
-            // Probe by the runnable extension AND the transpile-gap
-            // authoring extension (`.ts`), exempting declaration files
-            // (`.d.ts`) — see `ProbeSpec`.
-            var ext_buf: [2][]const u8 = .{ row.extension, undefined };
-            var ext_len: usize = 1;
-            var exempt: ?[]const u8 = null;
-            if (row.transpile) |t| {
-                ext_buf[1] = t.source_extension;
-                ext_len = 2;
-                exempt = t.declaration_suffix;
-            }
-            const resolved = try resolveScriptDir(allocator, game_dir, declared.language, .{
-                .extensions = ext_buf[0..ext_len],
-                .exempt_suffix = exempt,
-            });
+            const resolved = try resolveEmbedScriptDir(allocator, game_dir, declared.language, row.extension, row.transpile);
             return .{
                 .plugin_name = plugin.name,
                 .language = declared.language,
@@ -345,6 +387,7 @@ pub fn detect(
                 .legacy = resolved.legacy,
                 .extension = row.extension,
                 .family = .embed,
+                .transpile = row.transpile,
             };
         }
         if (nativeRow(declared.language)) |row| {
@@ -358,6 +401,8 @@ pub fn detect(
                 .legacy = resolved.legacy,
                 .extension = row.extension,
                 .family = .native,
+                .module_root = row.module_root,
+                .stage_subdir = row.stage_subdir,
             };
         }
         std.log.warn(
@@ -371,6 +416,130 @@ pub fn detect(
     // `declared.plugin_name` always names a member of `plugins` (it came
     // from the same slice), so this is unreachable in practice.
     return null;
+}
+
+// ── Row-driven splice resolution (rev 19 §7, PRIMARY) ─────────────────
+
+/// Normalize an extension to the leading-dot form every scan/`endsWith`
+/// comparison uses (rev 19 A1: `.extensions` rows are authored dot-spelled,
+/// `".rb"`). Tolerant of a dotless spelling (`"rb"`) — the dot is prepended
+/// when absent — so a manifest written either way resolves and the migration
+/// is forgiving. Returns an allocator-owned copy (freed via
+/// `ScriptingSplice.deinit`).
+fn dupDotExtension(allocator: std.mem.Allocator, ext: []const u8) ![]u8 {
+    if (ext.len > 0 and ext[0] == '.') return allocator.dupe(u8, ext);
+    return std.fmt.allocPrint(allocator, ".{s}", .{ext});
+}
+
+/// Build the embed splice's `resolveScriptDir` probe: the runnable embed
+/// extension plus (for a transpiled row) the authoring source extension,
+/// exempting declaration files — the same probe shape the pre-row code
+/// inlined, shared now by the row PRIMARY path and the frozen fallback.
+fn resolveEmbedScriptDir(
+    allocator: std.mem.Allocator,
+    game_dir: []const u8,
+    language: []const u8,
+    embed_ext: []const u8,
+    transpile: ?TranspileSource,
+) !ResolvedScriptDir {
+    var ext_buf: [2][]const u8 = .{ embed_ext, undefined };
+    var ext_len: usize = 1;
+    var exempt: ?[]const u8 = null;
+    if (transpile) |t| {
+        ext_buf[1] = t.source_extension;
+        ext_len = 2;
+        exempt = t.declaration_suffix;
+    }
+    return resolveScriptDir(allocator, game_dir, language, .{
+        .extensions = ext_buf[0..ext_len],
+        .exempt_suffix = exempt,
+    });
+}
+
+/// Resolve a splice from a manifest `.languages` row (rev 19 — the PRIMARY
+/// path for every manifest carrying rows). Returns an OWNED splice (row
+/// strings duped, `owner` set) or null when the row cannot drive a splice on
+/// its own (empty `.extensions`, or a native row missing `.module_root`/
+/// `.stage_subdir`) — the caller then falls through to the frozen table.
+///
+/// Derivations (rev 19 §7):
+///   - EMBEDDED: `.extensions[0]` is the AUTHORED source. The registered/
+///     embedded extension is `.transpile.emits` when the row transpiles
+///     (authored `.ts` → embedded `.js`), else the authored extension
+///     verbatim (lua/ruby: authored IS embedded) — dissolving the old
+///     `EmbedLanguage.extension` / `TranspileGap.source_extension` split.
+///     The declaration companion suffix (`.d.ts`) is the assembler-owned
+///     transpile-codegen residue (the RFC's "honest boundary"): the row
+///     does not carry it, so it is derived `".d" ++ <source>` — reproducing
+///     `.d.ts` for the only transpiled language.
+///   - NATIVE: `.extensions[0]` is the staged source extension; the staging
+///     geometry (`.module_root`, `.stage_subdir`) rides the row (B1).
+fn spliceFromRow(
+    allocator: std.mem.Allocator,
+    plugin_name: []const u8,
+    language: []const u8,
+    game_dir: []const u8,
+    row: plugin_manifest.LanguageRow,
+) !?ScriptingSplice {
+    if (row.extensions.len == 0) return null; // malformed → frozen fallback
+    const authored = row.extensions[0];
+
+    switch (row.kind) {
+        .embedded => {
+            var transpile: ?TranspileSource = null;
+            errdefer if (transpile) |t| {
+                allocator.free(t.source_extension);
+                allocator.free(t.declaration_suffix);
+            };
+            const embed_ext: []u8 = blk: {
+                if (row.transpile) |t| {
+                    const src_ext = try dupDotExtension(allocator, authored);
+                    errdefer allocator.free(src_ext);
+                    const decl = try std.fmt.allocPrint(allocator, ".d{s}", .{src_ext});
+                    transpile = .{ .source_extension = src_ext, .declaration_suffix = decl };
+                    break :blk try dupDotExtension(allocator, t.emits);
+                }
+                break :blk try dupDotExtension(allocator, authored);
+            };
+            errdefer allocator.free(embed_ext);
+
+            const resolved = try resolveEmbedScriptDir(allocator, game_dir, language, embed_ext, transpile);
+            return .{
+                .plugin_name = plugin_name,
+                .language = language,
+                .dir = resolved.dir,
+                .legacy = resolved.legacy,
+                .extension = embed_ext,
+                .family = .embed,
+                .transpile = transpile,
+                .owner = allocator,
+            };
+        },
+        .native => {
+            const module_root_src = row.module_root orelse return null;
+            const stage_subdir_src = row.stage_subdir orelse return null;
+
+            const ext = try dupDotExtension(allocator, authored);
+            errdefer allocator.free(ext);
+            const module_root = try allocator.dupe(u8, module_root_src);
+            errdefer allocator.free(module_root);
+            const stage_subdir = try allocator.dupe(u8, stage_subdir_src);
+            errdefer allocator.free(stage_subdir);
+
+            const resolved = try resolveScriptDir(allocator, game_dir, language, .{ .extensions = &.{ext} });
+            return .{
+                .plugin_name = plugin_name,
+                .language = language,
+                .dir = resolved.dir,
+                .legacy = resolved.legacy,
+                .extension = ext,
+                .family = .native,
+                .module_root = module_root,
+                .stage_subdir = stage_subdir,
+                .owner = allocator,
+            };
+        },
+    }
 }
 
 // ── Script-dir resolution: scripts/ convention + legacy grace (#237) ──
@@ -727,7 +896,10 @@ fn collectDeclEmbeds(
     };
     defer dir.close(io);
 
-    const transpile: ?TranspileSource = if (embedRow(splice.language)) |row| row.transpile else null;
+    // Row-driven (rev 19): the authoring→embed transpile source rides the
+    // splice (resolved by `detect` from the manifest row / frozen fallback),
+    // not a re-lookup of the frozen table here.
+    const transpile: ?TranspileSource = splice.transpile;
     try collectDeclEmbedsWalk(allocator, io, dir, "", splice, transpile, decl_dir, &out);
 
     // Deterministic order: plain alphabetical by target-relative file.
@@ -1063,7 +1235,11 @@ pub fn stageNativeSources(
     splice: ScriptingSplice,
 ) !void {
     if (splice.family != .native) return; // embed splices never stage
-    const row = nativeRow(splice.language) orelse return;
+    // Row-driven (rev 19): the staging geometry rides the splice (resolved
+    // by `detect` from the manifest `.languages` row / frozen fallback), not
+    // a re-lookup of the frozen `NATIVE_LANGUAGES` table.
+    const module_root = splice.module_root orelse return;
+    const stage_subdir = splice.stage_subdir orelse return;
 
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -1096,21 +1272,21 @@ pub fn stageNativeSources(
             "labelle-assembler: {s}/ exists but contains no {s} sources.\n" ++
                 "  the scripting plugin (language \"{s}\") compiles {s}/ into the game — " ++
                 "add {s}/{s} (the crate's game-module root) or remove the empty directory.\n",
-            .{ splice.dir, splice.extension, splice.language, splice.dir, splice.dir, row.module_root },
+            .{ splice.dir, splice.extension, splice.language, splice.dir, splice.dir, module_root },
         );
         return error.NativeScriptDirEmpty;
     }
 
     var has_module_root = false;
     for (rel_paths.items) |rel| {
-        if (std.mem.eql(u8, rel, row.module_root)) has_module_root = true;
+        if (std.mem.eql(u8, rel, module_root)) has_module_root = true;
     }
     if (!has_module_root) {
         std.debug.print(
             "labelle-assembler: {s}/ has {s} sources but no {s}/{s} — the file that becomes " ++
                 "the plugin crate's game-module root ({s}/{s}).\n" ++
                 "  declare your scripts there; its `pub fn register(...)` composes them.\n",
-            .{ splice.dir, splice.extension, splice.dir, row.module_root, row.stage_subdir, row.module_root },
+            .{ splice.dir, splice.extension, splice.dir, module_root, stage_subdir, module_root },
         );
         return error.NativeScriptsMissingModuleRoot;
     }
@@ -1131,19 +1307,22 @@ pub fn stageNativeSources(
         return error.NativeScriptsDepsUnstaged;
     }
 
-    // The pinned plugin must actually ship the crate the sources stage
-    // into (`native/src/` for rust) — a pre-native plugin version cannot
-    // consume them, so fail here with the fix rather than letting cargo
-    // fail against a half-staged package.
-    const stage_parent = std.fs.path.dirname(row.stage_subdir).?;
+    // Self-describing crate-layout gate (rev 19 B2): the `.native` row
+    // DECLARING `.stage_subdir` is the pinned manifest's CLAIM to ship that
+    // crate, so a missing crate parent is a plugin-PACKAGING error naming the
+    // pin — no version compare (symmetric with rev 17's missing-`.declare`-
+    // tool handling). Fail here with the fix rather than letting cargo fail
+    // against a half-staged package.
+    const stage_parent = std.fs.path.dirname(stage_subdir).?;
     const parent_path = try std.fs.path.join(allocator, &.{ staged_pkg, stage_parent });
     defer allocator.free(parent_path);
     if (!cache.dirExists(parent_path)) {
         std.debug.print(
-            "labelle-assembler: the pinned scripting plugin ships no {s}/ crate — it predates " ++
-                "{s} (native-compiled) support.\n" ++
-                "  pin a labelle-scripting version whose package ships {s}/ (the release that added {s}).\n",
-            .{ stage_parent, splice.language, row.stage_subdir, splice.language },
+            "labelle-assembler: the pinned scripting plugin's \"{s}\" language row declares " ++
+                ".stage_subdir = \"{s}\", but its package ships no {s}/ crate to stage into — " ++
+                "a plugin-packaging error.\n" ++
+                "  pin a labelle-scripting version whose package ships {s}/.\n",
+            .{ splice.language, stage_subdir, stage_parent, stage_subdir },
         );
         return error.NativeCrateLayoutMissing;
     }
@@ -1153,7 +1332,7 @@ pub fn stageNativeSources(
     // unlinked, cache bytes untouched), a stale link, or the correct link
     // (no-op) — then links the game dir so edits flow through without a
     // re-generate, matching the embed script dirs' linkAndScan layout.
-    const dest_root = try std.fs.path.join(allocator, &.{ staged_pkg, row.stage_subdir });
+    const dest_root = try std.fs.path.join(allocator, &.{ staged_pkg, stage_subdir });
     defer allocator.free(dest_root);
     try scanner.linkDirAbs(allocator, src_dir_path, dest_root);
 }
@@ -1572,6 +1751,153 @@ test "detect: an integration gap (declared language in NEITHER table) → null w
     try testing.expect((try detect(allocator, &plugins, project_dir)) == null);
 }
 
+// ── Row-driven PRIMARY path (rev 19 §7): detect reads `.languages` ────
+
+test "detect (PRIMARY): a `.languages` embedded row drives the splice — derived embed ext, owner set, leading-dot spelling" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A manifest carrying a `.languages` ruby row (dot-spelled `.extensions`,
+    // A1) — the row, not the frozen table, resolves the splice.
+    try writeTestFile(tmp.dir, "plugins/scripting/plugin.labelle",
+        \\.{ .name = "scripting", .manifest_version = 1,
+        \\   .languages = .{
+        \\     .{ .name = "ruby", .extensions = .{".rb"}, .kind = .embedded,
+        \\        .declare = .{ .tool = "labelle-declare-ruby", .dir = "tools/declare-ruby", .events = true } },
+        \\   } }
+    );
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "ruby" } },
+    };
+    var splice = (try detect(allocator, &plugins, project_dir)).?;
+    defer splice.deinit();
+    try testing.expect(splice.owner != null); // row-derived strings are owned
+    try testing.expectEqualStrings("ruby", splice.language);
+    try testing.expectEqual(Family.embed, splice.family);
+    // Non-transpiled embed: the authored `.extensions[0]` IS the embed ext.
+    try testing.expectEqualStrings(".rb", splice.extension);
+    try testing.expect(splice.transpile == null);
+    try testing.expect(splice.module_root == null);
+}
+
+test "detect (PRIMARY): a transpiled embedded row derives the embed ext from `.transpile.emits` (authored .ts → embedded .js)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `.emits` is dotless in the sketch/manifest ("js"); the derivation
+    // normalizes it to the leading-dot embed extension the scan uses.
+    try writeTestFile(tmp.dir, "plugins/scripting/plugin.labelle",
+        \\.{ .name = "scripting", .manifest_version = 1,
+        \\   .languages = .{
+        \\     .{ .name = "typescript", .extensions = .{".ts"}, .kind = .embedded,
+        \\        .transpile = .{ .emits = "js", .toolchain = "tsc", .version = "7.0.2",
+        \\                        .fetch_url = "https://example.invalid/{platform}-{version}.tgz" } },
+        \\   } }
+    );
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "typescript" } },
+    };
+    var splice = (try detect(allocator, &plugins, project_dir)).?;
+    defer splice.deinit();
+    try testing.expectEqual(Family.embed, splice.family);
+    // Embed ext = `.transpile.emits`, dot-normalized.
+    try testing.expectEqualStrings(".js", splice.extension);
+    // The authoring source rides the splice: `.ts` authored, `.d.ts`
+    // declaration companion derived (`.d` ++ source).
+    const t = splice.transpile.?;
+    try testing.expectEqualStrings(".ts", t.source_extension);
+    try testing.expectEqualStrings(".d.ts", t.declaration_suffix);
+}
+
+test "detect (PRIMARY): a native row carries the staging geometry (.module_root + .stage_subdir, rev 19 B1)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "plugins/scripting/plugin.labelle",
+        \\.{ .name = "scripting", .manifest_version = 1,
+        \\   .languages = .{
+        \\     .{ .name = "rust", .extensions = .{".rs"}, .kind = .native,
+        \\        .module_root = "mod.rs", .stage_subdir = "native/src/game",
+        \\        .declare = .{ .tool = "labelle-declare-rs", .dir = "tools/declare-rs", .events = true } },
+        \\   } }
+    );
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "rust" } },
+    };
+    var splice = (try detect(allocator, &plugins, project_dir)).?;
+    defer splice.deinit();
+    try testing.expectEqual(Family.native, splice.family);
+    try testing.expectEqualStrings(".rs", splice.extension);
+    try testing.expectEqualStrings("mod.rs", splice.module_root.?);
+    try testing.expectEqualStrings("native/src/game", splice.stage_subdir.?);
+    try testing.expect(splice.transpile == null);
+}
+
+test "detect (PRIMARY): dotless `.extensions` is tolerated — the derivation normalizes to leading-dot" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The pre-A1 dotless spelling ("lua") still resolves — `dupDotExtension`
+    // prepends the dot, so the migration is forgiving.
+    try writeTestFile(tmp.dir, "plugins/scripting/plugin.labelle",
+        \\.{ .name = "scripting", .manifest_version = 1,
+        \\   .languages = .{
+        \\     .{ .name = "lua", .extensions = .{"lua"}, .kind = .embedded },
+        \\   } }
+    );
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "lua" } },
+    };
+    var splice = (try detect(allocator, &plugins, project_dir)).?;
+    defer splice.deinit();
+    try testing.expectEqualStrings(".lua", splice.extension);
+}
+
+test "detect (FALLBACK): a native row missing `.stage_subdir` falls through to the frozen table" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // An incomplete native row (no `.stage_subdir`) cannot drive staging on
+    // its own → `spliceFromRow` returns null and detect falls through to the
+    // frozen `NATIVE_LANGUAGES` table, which covers rust.
+    try writeTestFile(tmp.dir, "plugins/scripting/plugin.labelle",
+        \\.{ .name = "scripting", .manifest_version = 1,
+        \\   .languages = .{
+        \\     .{ .name = "rust", .extensions = .{".rs"}, .kind = .native, .module_root = "mod.rs" },
+        \\   } }
+    );
+    const project_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(project_dir);
+
+    const plugins = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "rust" } },
+    };
+    var splice = (try detect(allocator, &plugins, project_dir)).?;
+    defer splice.deinit();
+    try testing.expectEqual(Family.native, splice.family);
+    // Frozen fallback → static strings (owner null), rust's frozen geometry.
+    try testing.expect(splice.owner == null);
+    try testing.expectEqualStrings("native/src/game", splice.stage_subdir.?);
+    try testing.expectEqualStrings("mod.rs", splice.module_root.?);
+}
+
 // ── the typescript fixtures (transpile phase re-scan seam, #745) ─────
 
 const ts_splice_fixture = ScriptingSplice{
@@ -1579,6 +1905,10 @@ const ts_splice_fixture = ScriptingSplice{
     .language = "typescript",
     .dir = "scripts",
     .extension = ".js",
+    // rev 19: the transpile source rides the splice — `collectDeclEmbeds`
+    // reads it here (was a frozen-table lookup) to reject `.ts` authoring
+    // sources in components/events dirs.
+    .transpile = .{ .source_extension = ".ts", .declaration_suffix = ".d.ts" },
 };
 
 /// The grace-fallback twin: detect resolved the deprecated ts/ dir.
@@ -1588,6 +1918,7 @@ const ts_legacy_splice_fixture = ScriptingSplice{
     .dir = "ts",
     .legacy = true,
     .extension = ".js",
+    .transpile = .{ .source_extension = ".ts", .declaration_suffix = ".d.ts" },
 };
 
 test "collectEmbedScriptsAbs: the transpile re-scan — ordering + stripping over a materialized dir; the generated d.ts is never a script" {
@@ -2002,6 +2333,10 @@ const rust_splice_fixture = ScriptingSplice{
     .dir = "scripts",
     .extension = ".rs",
     .family = .native,
+    // rev 19: the staging geometry rides the splice — `stageNativeSources`
+    // reads these here (was a frozen `NATIVE_LANGUAGES` lookup).
+    .module_root = "mod.rs",
+    .stage_subdir = "native/src/game",
 };
 
 /// The grace-fallback twin: detect resolved the deprecated rust/ dir.
@@ -2012,6 +2347,8 @@ const rust_legacy_splice_fixture = ScriptingSplice{
     .legacy = true,
     .extension = ".rs",
     .family = .native,
+    .module_root = "mod.rs",
+    .stage_subdir = "native/src/game",
 };
 
 /// A staged-plugin-package fixture: `out/deps/labelle-scripting/native/

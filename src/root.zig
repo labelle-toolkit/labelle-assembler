@@ -422,6 +422,11 @@ pub fn generate(
     // the generated build's `-Dlanguage` dep option. Null for every project
     // without the plugin — all downstream sites are byte-identical no-ops.
     var maybe_scripting = try scripting_splice.detect(allocator, cfg.plugins, game_dir);
+    // Frees the row-derived strings `detect` duped from the manifest (rev
+    // 19); a no-op for the frozen-fallback / no-splice shapes (see
+    // `ScriptingSplice.deinit`). Runs last — every read of `s.*` completes
+    // first.
+    defer if (maybe_scripting) |*s| s.deinit();
 
     // ── Asset-Plugins Phase 3: studio panel descriptors (#577) ─────────
     // Validate every `studio/*.panel.jsonc` a plugin (or a pack it bundles)
@@ -1021,6 +1026,7 @@ pub fn generate(
             .component_names = component_names,
             .pack_scans = pack_scans.items,
             .declared_components = s.declared_components,
+            .transpile = s.transpile,
         })) |transpiled| {
             if (script_embeds) |old| scripting_splice.freeEmbedScripts(allocator, old);
             script_embeds = transpiled;

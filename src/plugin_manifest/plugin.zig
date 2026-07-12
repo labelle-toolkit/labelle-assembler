@@ -134,7 +134,23 @@ pub const LanguageRow = struct {
     name: []const u8,
     extensions: []const []const u8 = &.{},
     kind: LanguageKind,
+    /// The filename the author places at the script dir root that becomes
+    /// the native crate's module root (`mod.rs`, `game.cr`). NATIVE rows
+    /// only — its absence at generate is a pointed error naming the
+    /// convention. Null for embedded languages (`.embedded` never stages a
+    /// crate).
     module_root: ?[]const u8 = null,
+    /// The PLUGIN-crate-relative directory the assembler links the game's
+    /// script sources OVER, replacing the plugin's shipped placeholder
+    /// module (rust `native/src/game`, crystal `native-crystal/src/game`) —
+    /// RFC-LANGUAGE-PLUGINS rev 19 §7 "Native wiring contract" (B1). NATIVE
+    /// rows only; it is genuinely the *plugin's* crate layout (differs per
+    /// language/plugin), so the assembler must be told it rather than
+    /// hardcode a convention. A `.native` row DECLARING `.stage_subdir` is
+    /// the pinned manifest's claim to ship that crate — a missing crate is
+    /// then a packaging error naming the pin (B2), no version compare. Null
+    /// for embedded languages.
+    stage_subdir: ?[]const u8 = null,
     declare: ?DeclareCapability = null,
     transpile: ?TranspileCapability = null,
 };
@@ -589,8 +605,8 @@ test "ZonManifest: parses a .languages row with a declare capability (rev 17)" {
         \\    .name = "scripting",
         \\    .manifest_version = 1,
         \\    .languages = .{
-        \\        .{ .name = "rust", .extensions = .{"rs"}, .kind = .native,
-        \\           .module_root = "mod.rs",
+        \\        .{ .name = "rust", .extensions = .{".rs"}, .kind = .native,
+        \\           .module_root = "mod.rs", .stage_subdir = "native/src/game",
         \\           .declare = .{ .tool = "labelle-declare-rs", .dir = "tools/declare-rs", .events = true } },
         \\    },
         \\}
@@ -606,8 +622,11 @@ test "ZonManifest: parses a .languages row with a declare capability (rev 17)" {
     try testing.expectEqualStrings("rust", row.name);
     try testing.expectEqual(LanguageKind.native, row.kind);
     try testing.expectEqual(@as(usize, 1), row.extensions.len);
-    try testing.expectEqualStrings("rs", row.extensions[0]);
+    // A1 (rev 19): `.extensions` is authored dot-spelled.
+    try testing.expectEqualStrings(".rs", row.extensions[0]);
     try testing.expectEqualStrings("mod.rs", row.module_root.?);
+    // B1 (rev 19): the native staging subdir rides the row.
+    try testing.expectEqualStrings("native/src/game", row.stage_subdir.?);
     try testing.expect(row.declare != null);
     try testing.expectEqualStrings("labelle-declare-rs", row.declare.?.tool);
     try testing.expectEqualStrings("tools/declare-rs", row.declare.?.dir);
