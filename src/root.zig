@@ -972,9 +972,14 @@ pub fn generate(
         })) |transpiled| {
             if (script_embeds) |old| scripting_splice.freeEmbedScripts(allocator, old);
             script_embeds = transpiled;
+            // Compute-then-swap: concatEmbeds is fallible, and freeing the
+            // old slice first would leave `combined_embeds` dangling across
+            // the try — the deferred free would double-free on that error
+            // path.
+            const recombined = try scripting_splice.concatEmbeds(allocator, component_embeds.?, transpiled);
             if (combined_embeds) |cb| allocator.free(cb);
-            combined_embeds = try scripting_splice.concatEmbeds(allocator, component_embeds.?, transpiled);
-            s.scripts = combined_embeds.?;
+            combined_embeds = recombined;
+            s.scripts = recombined;
         }
     }
 
