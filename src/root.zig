@@ -581,6 +581,16 @@ pub fn generate(
     // slice, never through freeEmbedScripts.
     var combined_embeds: ?[]scripting_splice.EmbedScript = null;
     defer if (combined_embeds) |cb| allocator.free(cb);
+    // The native family's declaration-file set (components/*.<ext> ++
+    // events/*.<ext>), fed to the generic `.languages` declare tool
+    // (RFC-LANGUAGE-PLUGINS rev 17, rust #774). SHALLOW over
+    // `component_embeds`/`event_embeds` (freed as a bare slice). Unlike the
+    // embed family this is NOT assigned to `s.scripts` — a native splice
+    // embeds nothing; gameplay scripts are staged for the compiler
+    // (`stageNativeSources`), never fed to the declare probe (they would not
+    // compile as standalone declaration modules).
+    var native_decl_embeds: ?[]scripting_splice.EmbedScript = null;
+    defer if (native_decl_embeds) |nd| allocator.free(nd);
     if (maybe_scripting) |*s| {
         if (s.family == .embed) {
             component_embeds = try scripting_splice.collectComponentEmbeds(allocator, game_dir, s.*);
@@ -588,6 +598,16 @@ pub fn generate(
             script_embeds = try scripting_splice.collectEmbedScripts(allocator, game_dir, target_dir, s.*);
             combined_embeds = try scripting_splice.concatEmbeds3(allocator, component_embeds.?, event_embeds.?, script_embeds.?);
             s.scripts = combined_embeds.?;
+        } else {
+            // Native family (rust): collect ONLY the declaration files. The
+            // Zig `components/`/`events/` links (below) expose them in the
+            // target, so the declare tool's `target_dir/<file>` argv resolves.
+            component_embeds = try scripting_splice.collectComponentEmbeds(allocator, game_dir, s.*);
+            event_embeds = try scripting_splice.collectEventEmbeds(allocator, game_dir, s.*);
+            const nd = try allocator.alloc(scripting_splice.EmbedScript, component_embeds.?.len + event_embeds.?.len);
+            @memcpy(nd[0..component_embeds.?.len], component_embeds.?);
+            @memcpy(nd[component_embeds.?.len..], event_embeds.?);
+            native_decl_embeds = nd;
         }
     }
 
@@ -920,20 +940,22 @@ pub fn generate(
     var declare_schema: ?scripting_declare.Schema = null;
     defer if (declare_schema) |*sch| sch.deinit();
     if (maybe_scripting) |*s| {
-        // The declare phase is embed-only by construction: a native splice
-        // keeps `scripts` empty (nothing embeds), so `runPhase` returns
-        // null at its zero-files gate before the runner-row gate is even
-        // consulted. The runner gets the collected TARGET-RELATIVE files
-        // (not stems — ordering prefixes are stripped from stems, so only
-        // the file column can rebuild the path): `components/*.<ext>`
-        // declarations first, then `events/*.<ext>` declarations
-        // (labelle-engine#772), then the script dir's files — in-script
-        // chunk-scope declarations remain legal, all sources feed ONE
-        // schema (the runner owns duplicate detection with
-        // first-declared-in attribution).
-        const script_files = try allocator.alloc([]const u8, s.scripts.len);
+        // The declare tool's input files, TARGET-RELATIVE (the `EmbedScript.file`
+        // column — not stems, whose ordering prefixes are stripped, so only the
+        // file column rebuilds the path). For the EMBED family: every collected
+        // source (`components/*.<ext>` declarations, then `events/*.<ext>`, then
+        // the script dir — in-script chunk-scope declarations are legal, all
+        // feed ONE schema with the runner owning duplicate detection). For the
+        // NATIVE family (rev 17, rust #774): ONLY the declaration files
+        // (`native_decl_embeds` = components ++ events); `s.scripts` is empty
+        // (nothing embeds) and gameplay scripts are compiler-staged, never fed
+        // to the declare probe. Either way the generic/hardcoded runPhase gets
+        // components-first order.
+        const declare_inputs: []const scripting_splice.EmbedScript =
+            if (s.family == .native) (native_decl_embeds orelse &.{}) else s.scripts;
+        const script_files = try allocator.alloc([]const u8, declare_inputs.len);
         defer allocator.free(script_files);
-        for (s.scripts, script_files) |sc, *f| f.* = sc.file;
+        for (declare_inputs, script_files) |sc, *f| f.* = sc.file;
         // The events-dir subset rides along separately (labelle-engine
         // #772): the phase's events gates (`events_min_pin` floor,
         // no-runner hard error, declares-nothing error) fire on these

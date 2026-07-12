@@ -109,6 +109,7 @@ const cache = @import("cache.zig");
 const scanner = @import("scanner.zig");
 const scan = @import("codegen/scan.zig");
 const idents = @import("codegen/idents.zig");
+const plugin_manifest = @import("plugin_manifest.zig");
 
 /// The generated file name, written beside `main.zig` in the target dir.
 /// The registry block imports it verbatim (`@import("scripting_components.zig")`).
@@ -1250,21 +1251,34 @@ pub fn resolvePluginPackageDir(
 /// spawn sets no `.cwd` — the child inherits OURS — so a relative
 /// `target_dir` in the script argv (and a relative `tool_path`) resolves
 /// exactly where our own checks resolved it. No absolutization needed.
-fn runDeclareTool(
+/// Exec the declare tool over the collected sources and return its RAW
+/// stdout (the schema JSON, owned by the caller). `cache_dir`, when set, is
+/// passed as a leading `--cache-dir <dir>` argument — the rev-17 invocation
+/// contract for a tool that stages a persistent per-project workspace (a
+/// native probe's cargo target-dir). The hardcoded lua/ruby tools take no
+/// cache dir, so `runDeclareTool` passes null and their argv is unchanged.
+fn execDeclareTool(
     allocator: std.mem.Allocator,
     tool_path: []const u8,
     target_dir: []const u8,
     script_files: []const []const u8,
-) !Schema {
+    cache_dir: ?[]const u8,
+) ![]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
+    // Borrowed argv entries: tool_path, plus the `--cache-dir <dir>` pair
+    // when present. Only the joined script paths (from `owned_start` on) are
+    // owned by us and freed here.
+    const owned_start: usize = if (cache_dir != null) 3 else 1;
     defer {
-        // argv[0] is borrowed (tool_path); the script paths are owned. The
-        // len guard covers the ensureTotalCapacity-failed path (empty list).
-        if (argv.items.len > 0) for (argv.items[1..]) |p| allocator.free(p);
+        if (argv.items.len > owned_start) for (argv.items[owned_start..]) |p| allocator.free(p);
         argv.deinit(allocator);
     }
-    try argv.ensureTotalCapacity(allocator, script_files.len + 1);
+    try argv.ensureTotalCapacity(allocator, script_files.len + owned_start);
     argv.appendAssumeCapacity(tool_path);
+    if (cache_dir) |cd| {
+        argv.appendAssumeCapacity("--cache-dir");
+        argv.appendAssumeCapacity(cd);
+    }
     for (script_files) |file_name| {
         const p = try std.fs.path.join(allocator, &.{ target_dir, file_name });
         argv.appendAssumeCapacity(p);
@@ -1275,22 +1289,38 @@ fn runDeclareTool(
         diag("could not run the declare tool {s}: {s}", .{ tool_path, @errorName(err) });
         return error.ScriptDeclarationFailed;
     };
-    defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     switch (result.term) {
         .exited => |code| if (code != 0) {
+            allocator.free(result.stdout);
             relayChildStderr(result.stderr);
             diag("script component declarations failed (declare tool exit {d})", .{code});
             return error.ScriptDeclarationFailed;
         },
         else => {
+            allocator.free(result.stdout);
             relayChildStderr(result.stderr);
             diag("the declare tool terminated abnormally", .{});
             return error.ScriptDeclarationFailed;
         },
     }
+    return result.stdout;
+}
 
-    return parseSchema(allocator, result.stdout);
+/// Exec the declare tool (no cache dir — the hardcoded lua/ruby path) and
+/// parse its stdout as the schema. See `execDeclareTool` for the
+/// relative-path audit (PR #598 finding 1): this spawn sets no `.cwd`, so a
+/// relative `target_dir` in the argv resolves against OUR cwd, as our own
+/// checks did.
+fn runDeclareTool(
+    allocator: std.mem.Allocator,
+    tool_path: []const u8,
+    target_dir: []const u8,
+    script_files: []const []const u8,
+) !Schema {
+    const out = try execDeclareTool(allocator, tool_path, target_dir, script_files, null);
+    defer allocator.free(out);
+    return parseSchema(allocator, out);
 }
 
 // ── Phase orchestration (called from root.zig's generate) ────────────
@@ -1352,6 +1382,24 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     if (opts.script_files.len == 0) {
         removeStaleGeneratedFiles(allocator, opts.target_dir);
         return null;
+    }
+
+    // Generic `.languages` declare path (RFC-LANGUAGE-PLUGINS rev 17 §7):
+    // a language ABSENT from the hardcoded `DECLARE_RUNNERS` table may still
+    // declare via the resolved plugin manifest's `.languages` capability row
+    // (rust #774). The assembler reads the row generically — build
+    // `.declare.tool` via `zig build`, run it with a persistent `--cache-dir`
+    // + the declaration files, hash-and-skip when unchanged — learning
+    // nothing language-specific. lua/ruby (and typescript/crystal, still on
+    // the table) are untouched: they short-circuit this branch because
+    // `declareRunner` finds their row, and fall through to the table below.
+    // `.not_applicable` (no manifest, or no `.languages` declare row for this
+    // language) also falls through — to the table's existing skip/hard-error.
+    if (declareRunner(opts.language) == null) {
+        switch (try runGenericDeclarePhase(allocator, opts)) {
+            .handled => |maybe_schema| return maybe_schema,
+            .not_applicable => {},
+        }
     }
 
     // Runner-row gate (see `DECLARE_RUNNERS`): a language without a
@@ -1424,12 +1472,29 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
         },
         else => return err,
     };
-    var schema = try runDeclareTool(
+    const schema = try runDeclareTool(
         allocator,
         tool_path,
         opts.target_dir,
         opts.script_files,
     );
+    return finalizeSchema(allocator, opts, schema, runner.extension);
+}
+
+/// The shared declare-phase tail, run for BOTH the hardcoded-runner path
+/// and the generic `.languages` path (rev 17): the events-none gate, the
+/// declares-nothing no-op, the collision checks, and the
+/// `scripting_components.zig` / `scripting_events.zig` renders. Takes
+/// OWNERSHIP of `schema` — it is deinited on the empty no-op and on any
+/// error, and returned to the caller otherwise. `events_ext` is the
+/// language's source extension (`.rb`, `.rs`) for the events-none message.
+fn finalizeSchema(
+    allocator: std.mem.Allocator,
+    opts: PhaseOptions,
+    schema_in: Schema,
+    events_ext: []const u8,
+) !?Schema {
+    var schema = schema_in;
     errdefer schema.deinit();
 
     // events/ files that declare NOTHING are a pointed error, not a
@@ -1444,7 +1509,7 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     if (opts.event_files.len > 0 and schema.events.len == 0) {
         diag(
             "the project's events/*{s} file(s) declare no events — `HungerFeed = Labelle.event \"hunger__feed\", entity: Labelle.id, ...` is the declaration shape; a declaration-less events file is almost certainly a mistake:",
-            .{runner.extension},
+            .{events_ext},
         );
         diagFileList(opts.event_files);
         return error.ScriptEventsNoneDeclared;
@@ -1480,6 +1545,214 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     }
 
     return schema;
+}
+
+// ── Generic `.languages` declare path (RFC-LANGUAGE-PLUGINS rev 17) ───
+
+/// Per-declaration-file read cap for the input digest (a hand-written
+/// schema file — megabytes means something is wrong).
+const MAX_DECL_BYTES = 4 * 1024 * 1024;
+/// Cap on the cached schema JSON re-read on a skip hit.
+const MAX_SCHEMA_BYTES = 16 * 1024 * 1024;
+
+/// The outcome of `runGenericDeclarePhase`: either it drove the generic
+/// path (`.handled`, carrying the final schema or null for a no-op/skip),
+/// or the language has no `.languages` declare row so the caller falls
+/// through to the hardcoded `DECLARE_RUNNERS` table's skip/hard-error.
+const GenericOutcome = union(enum) {
+    not_applicable,
+    handled: ?Schema,
+};
+
+/// Run the declare phase for a language via the resolved plugin manifest's
+/// `.languages` capability row (rev 17) — the GENERIC path rust flows.
+/// Reads the row's `.declare` capability, gates events by the
+/// self-describing `.events` flag (no version table), builds the tool via
+/// `zig build <.tool>` (the same `ensureDeclareTool` path every runner
+/// uses), and runs it with a persistent `--cache-dir` + the declaration
+/// files, hashing the inputs to skip a re-run when unchanged. Returns
+/// `.not_applicable` when the language has no such row (fall through).
+fn runGenericDeclarePhase(allocator: std.mem.Allocator, opts: PhaseOptions) !GenericOutcome {
+    // Package resolution / manifest load failures fall through as
+    // `.not_applicable` rather than erroring: a language that turns out to
+    // have no `.languages` declare row must skip CLEANLY even when the
+    // plugin setup is degenerate (the runner-row gate's long-standing
+    // "no-runner language, tool machinery untouched" invariant — a
+    // typescript project with no staged package must not fail here). A real
+    // rust project resolves its scripting package fine and proceeds; only a
+    // project whose scripting splice is already broken falls through, and
+    // then the table below degrades it to the same graceful skip.
+    const pkg_dir = resolvePluginPackageDir(
+        allocator,
+        opts.plugins,
+        opts.plugin_name,
+        opts.output_dir,
+        opts.project_dir,
+    ) catch return .not_applicable;
+    defer allocator.free(pkg_dir);
+
+    var manifest = (plugin_manifest.loadFromDir(allocator, pkg_dir, opts.plugin_name) catch return .not_applicable) orelse
+        return .not_applicable;
+    defer manifest.deinit();
+
+    const row = manifest.languageRow(opts.language) orelse return .not_applicable;
+    const declare = row.declare orelse return .not_applicable;
+
+    // ".rs" spelling for messages (finalizeSchema's events-none note),
+    // dot-prefixed to match the hardcoded rows' `.extension`. Stack-lived —
+    // every use is within this frame (before the `manifest.deinit` defer).
+    var ext_buf: [32]u8 = undefined;
+    const dotted_ext = if (row.extensions.len > 0 and row.extensions[0].len + 1 < ext_buf.len)
+        std.fmt.bufPrint(&ext_buf, ".{s}", .{row.extensions[0]}) catch ""
+    else
+        "";
+
+    // Events capability gate — the rev-17 self-describing capability that
+    // replaces the hardcoded `events_min_pin` table: events/ files need the
+    // row's `.declare.events = true`, else they can never declare.
+    if (opts.event_files.len > 0 and !declare.events) {
+        diag(
+            "script-declared events are not supported by the pinned scripting plugin's \"{s}\" language row (its `.declare` capability has no `.events = true`) — these events/ files can never declare a game event:",
+            .{opts.language},
+        );
+        diagFileList(opts.event_files);
+        return error.ScriptEventsUnsupported;
+    }
+
+    // The generic tool build reuses the same `zig build <step> --prefix
+    // <output>/declare-tool` machinery as the hardcoded rows — the step
+    // name AND installed exe name are `.declare.tool`, the capability probe
+    // dir is `.declare.dir`. min/events pins are unused on this path (the
+    // capability is self-describing), so they stay empty.
+    const synth = DeclareRunner{
+        .language = opts.language,
+        .step_name = declare.tool,
+        .tool_dir = declare.dir,
+        .extension = dotted_ext,
+        .min_pin = "",
+        .events_min_pin = "",
+    };
+    const tool_path = ensureDeclareTool(allocator, pkg_dir, opts.output_dir, synth) catch |err| switch (err) {
+        error.DeclareToolAbsent => {
+            if (opts.event_files.len > 0) {
+                diag(
+                    "the pinned scripting plugin ships no \"{s}\" declare tool ({s} absent), but the project declares events in events/ files:",
+                    .{ opts.language, declare.dir },
+                );
+                diagFileList(opts.event_files);
+                return error.ScriptEventsUnsupported;
+            }
+            diag(
+                "the pinned scripting plugin ships no \"{s}\" declare tool ({s} absent) — script-declared components are disabled this generate",
+                .{ opts.language, declare.dir },
+            );
+            removeStaleGeneratedFiles(allocator, opts.target_dir);
+            return .{ .handled = null };
+        },
+        else => return err,
+    };
+
+    // The persistent per-project cache dir (rev 17): under the survives-
+    // generate `<output>/declare-tool/`, so the tool's own workspace (a
+    // native probe's cargo target-dir) stays warm across generates. Opaque
+    // to us — we only hand it over.
+    const cache_dir = try genericProbeCacheDir(allocator, opts.output_dir, declare.tool);
+    defer allocator.free(cache_dir);
+
+    const schema = try acquireSchemaWithSkip(allocator, opts, tool_path, cache_dir);
+    return .{ .handled = try finalizeSchema(allocator, opts, schema, dotted_ext) };
+}
+
+/// `<output>/declare-tool/<tool>-cache` (absolute) — the persistent
+/// per-project workspace handed to a `.languages` declare tool as
+/// `--cache-dir`. Under the same survives-generate prefix as the built tool
+/// exes; caller frees.
+fn genericProbeCacheDir(allocator: std.mem.Allocator, output_dir: []const u8, tool: []const u8) ![]const u8 {
+    const output_abs = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), output_dir, allocator);
+    defer allocator.free(output_abs);
+    const sub = try std.fmt.allocPrint(allocator, "{s}-cache", .{tool});
+    defer allocator.free(sub);
+    return std.fs.path.join(allocator, &.{ output_abs, "declare-tool", sub });
+}
+
+/// Acquire the schema for the generic path, hashing the declaration inputs
+/// to SKIP re-invoking the tool when unchanged (rev 17 invariant 1: the
+/// declaration files alone determine the schema, so editing a gameplay
+/// script never re-extracts — for the native family, gameplay scripts are
+/// staged for the compiler and are not in `script_files` at all). On a hit
+/// the cached schema JSON is re-parsed; on a miss the tool runs and its raw
+/// JSON + the input digest are cached (best-effort — a cache write failure
+/// never fails generate).
+fn acquireSchemaWithSkip(
+    allocator: std.mem.Allocator,
+    opts: PhaseOptions,
+    tool_path: []const u8,
+    cache_dir: []const u8,
+) !Schema {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const skip_dir = try std.fs.path.join(allocator, &.{ cache_dir, ".assembler-skip" });
+    defer allocator.free(skip_dir);
+    const hash_path = try std.fs.path.join(allocator, &.{ skip_dir, "inputs.sha256" });
+    defer allocator.free(hash_path);
+    const json_path = try std.fs.path.join(allocator, &.{ skip_dir, "schema.json" });
+    defer allocator.free(json_path);
+
+    const digest = try declInputsDigestHex(allocator, opts.target_dir, opts.script_files);
+    defer allocator.free(digest);
+
+    // Skip hit: stored digest matches AND the cached JSON is readable.
+    // Any read miss / mismatch just falls through to a fresh run.
+    if (cwd.readFileAlloc(io, hash_path, allocator, .limited(128))) |stored| {
+        defer allocator.free(stored);
+        if (std.mem.eql(u8, std.mem.trim(u8, stored, " \r\n"), digest)) {
+            if (cwd.readFileAlloc(io, json_path, allocator, .limited(MAX_SCHEMA_BYTES))) |json| {
+                defer allocator.free(json);
+                return parseSchema(allocator, json);
+            } else |_| {}
+        }
+    } else |_| {}
+
+    const out = try execDeclareTool(allocator, tool_path, opts.target_dir, opts.script_files, cache_dir);
+    defer allocator.free(out);
+    // Best-effort cache write — correctness never depends on it.
+    cwd.createDirPath(io, skip_dir) catch {};
+    cwd.writeFile(io, .{ .sub_path = json_path, .data = out }) catch {};
+    cwd.writeFile(io, .{ .sub_path = hash_path, .data = digest }) catch {};
+    return parseSchema(allocator, out);
+}
+
+/// SHA-256 of the declaration inputs (each file's target-relative path +
+/// its bytes), hex-encoded. Path is folded in so a rename/reorder is a
+/// change; an unreadable file folds its error name (never spuriously
+/// matches a prior good run — the tool run then surfaces the real error).
+/// Caller frees.
+fn declInputsDigestHex(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    script_files: []const []const u8,
+) ![]u8 {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (script_files) |file_name| {
+        hasher.update(file_name);
+        hasher.update(&.{0});
+        const p = try std.fs.path.join(allocator, &.{ target_dir, file_name });
+        defer allocator.free(p);
+        if (cwd.readFileAlloc(io, p, allocator, .limited(MAX_DECL_BYTES))) |bytes| {
+            defer allocator.free(bytes);
+            hasher.update(bytes);
+        } else |err| {
+            hasher.update(@errorName(err));
+        }
+        hasher.update(&.{0});
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &hex);
 }
 
 /// The project's `plugins` entry named `plugin_name`, or null. The events
@@ -1921,10 +2194,11 @@ test "runPhase: a splice without a runner row (typescript) skips cleanly — nul
     defer allocator.free(target);
 
     // Deliberately hostile opts: an EMPTY plugin list, no override, no
-    // staged deps — every step past the gate would error. The gate fires
-    // BEFORE `resolvePluginPackageDir`, so typescript returns null without
-    // touching any of it (and without spawning another language's runner
-    // over .js).
+    // staged deps — every step past the gate would error. typescript has
+    // neither a hardcoded `DECLARE_RUNNERS` row NOR a `.languages` declare
+    // row it could reach here (the generic probe's package resolution +
+    // manifest load fall through as `.not_applicable` on this degenerate
+    // setup), so it returns null without spawning any tool over .js.
     var opts = PhaseOptions{
         .plugins = &.{},
         .plugin_name = "scripting",
@@ -2409,6 +2683,91 @@ test "runPhase: events-dir files that declare NO events are a pointed error (fak
         .pack_scans = &.{},
     };
     try testing.expectError(error.ScriptEventsNoneDeclared, runPhase(allocator, opts));
+}
+
+test "runPhase: the generic .languages path declares for rust (staged manifest row + fake tool, hash-skip cache written)" {
+    // The rev-17 native declare lane (rust #774): a language ABSENT from the
+    // hardcoded DECLARE_RUNNERS table declares via the resolved plugin
+    // manifest's `.languages` capability row. Drives the whole generic path —
+    // manifest load → row + `.declare` capability → tool (the override seam
+    // stands in for `zig build labelle-declare-rs`) → hash-and-skip → exec →
+    // the SHARED finalize tail rendering scripting_components.zig.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "target/components");
+
+    // A STAGED plugin package (what resolvePluginPackageDir finds first,
+    // <output>/deps/labelle-<name>) carrying the rust `.languages` row.
+    try tmp.dir.createDirPath(tio, "deps/labelle-scripting");
+    {
+        var f = try tmp.dir.createFile(tio, "deps/labelle-scripting/plugin.labelle", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio,
+            \\.{
+            \\    .name = "scripting",
+            \\    .manifest_version = 1,
+            \\    .languages = .{
+            \\        .{ .name = "rust", .extensions = .{"rs"}, .kind = .native,
+            \\           .module_root = "mod.rs",
+            \\           .declare = .{ .tool = "labelle-declare-rs", .dir = "tools/declare-rs", .events = true } },
+            \\    },
+            \\}
+        );
+    }
+    // A declaration file — the input hash reads it (the fake tool ignores
+    // argv and prints a fixed schema).
+    {
+        var f = try tmp.dir.createFile(tio, "target/components/hunger.rs", .{});
+        defer f.close(tio);
+        try f.writeStreamingAll(tio, "labelle::component! { Hunger { level: f32 = 0.5 } }\n");
+    }
+
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target);
+
+    const tool = try writeFakeDeclareTool(
+        allocator,
+        &tmp,
+        "{\"components\":[{\"name\":\"Hunger\",\"persist\":\"persistent\",\"fields\":[{\"name\":\"level\",\"type\":\"f32\",\"default\":0.5}]}]}",
+    );
+    defer allocator.free(tool);
+    declare_tool_override = tool;
+    defer declare_tool_override = null;
+
+    const local_pin = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:../labelle-scripting" },
+    };
+    const opts = PhaseOptions{
+        .plugins = &local_pin,
+        .plugin_name = "scripting",
+        .language = "rust",
+        .script_files = &.{"components/hunger.rs"},
+        .output_dir = root,
+        .target_dir = target,
+        .project_dir = root,
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+
+    var schema = (try runPhase(allocator, opts)) orelse return error.TestExpectedSchema;
+    defer schema.deinit();
+    try testing.expectEqual(@as(usize, 1), schema.components.len);
+    try testing.expectEqualStrings("Hunger", schema.components[0].name);
+
+    // The SHARED finalize tail rendered the components file at the target root.
+    const generated = try tmp.dir.readFileAlloc(tio, "target/" ++ GENERATED_FILENAME, allocator, .limited(1 << 20));
+    defer allocator.free(generated);
+    try testing.expect(std.mem.indexOf(u8, generated, "Hunger") != null);
+
+    // Hash-and-skip: the tool's raw JSON + the input digest were cached under
+    // the persistent <output>/declare-tool/<tool>-cache/.assembler-skip.
+    try tmp.dir.access(tio, "declare-tool/labelle-declare-rs-cache/.assembler-skip/schema.json", .{});
+    try tmp.dir.access(tio, "declare-tool/labelle-declare-rs-cache/.assembler-skip/inputs.sha256", .{});
 }
 
 test "runPhase: declared events land in the Schema + scripting_events.zig; collisions with events/*.zig gate; stale cleanup" {
