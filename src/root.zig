@@ -526,36 +526,57 @@ pub fn generate(
     // ever seeing each other's files.
     try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 
-    // ── Scripting splice: collect the script dir (#593/#237) ───────────
-    // Collect the declared language's sources from the dir `detect`
-    // resolved — `scripts/` (top level only, Zig ordering convention:
-    // numeric prefixes first, stripped from the registered stem) or the
-    // deprecated legacy dir on the one-release grace fallback (verbatim
-    // pre-#237 recursive scan, plain sorted stems). `collectEmbedScripts`
-    // places/reuses the target link so the generated main's
-    // `@embedFile("<dir>/<file>")` resolves (for `scripts/` that's the
-    // link just placed above — shared with the Zig scanner). A missing
-    // dir collects empty — the plugin is wired, nothing embeds. Game
-    // root only; `requires_language` pack dirs come later. Authored `.ts`
-    // sources are NOT collected here (the collection is embed-extension-
-    // only) — the transpile phase below (labelle-engine#745, ordered
-    // after deps staging) checks + emits them and REPLACES these entries
-    // with the materialized dir's re-collection. (Language files in
-    // `scripts/<state>/` subdirs already failed generate inside `detect`
-    // — state subdirs are Zig-only until the scripting Controller grows
-    // state awareness.)
+    // ── Scripting splice: collect the language sources (#593/#237) ─────
+    // TWO collections, concatenated components-first onto the splice:
+    //
+    //   1. `components/*.<ext>` declaration files (#237's refinement:
+    //      declarations live where their KIND lives — beside the Zig
+    //      components; `collectComponentEmbeds`, plain alphabetical, no
+    //      ordering prefixes). They register FIRST so the view constants
+    //      they define exist by the time scripts load.
+    //   2. The script dir `detect` resolved — `scripts/` (top level only,
+    //      Zig ordering convention: numeric prefixes first, stripped from
+    //      the registered stem) or the deprecated legacy dir on the
+    //      one-release grace fallback (verbatim pre-#237 recursive scan,
+    //      plain sorted stems). `collectEmbedScripts` places/reuses the
+    //      target link so the generated main's `@embedFile("<file>")`
+    //      resolves (for `scripts/` that's the link just placed above —
+    //      shared with the Zig scanner; for `components/` it's the
+    //      components link placed just below).
+    //
+    // Entries carry TARGET-RELATIVE files. Missing dirs collect empty —
+    // the plugin is wired, nothing embeds. Game root only;
+    // `requires_language` pack dirs come later. Authored `.ts` sources
+    // are NOT collected (the collections are embed-extension-only) — the
+    // transpile phase below (labelle-engine#745, ordered after deps
+    // staging) checks + emits them and REPLACES the script-dir entries
+    // with the materialized dir's re-collection (the components entries
+    // survive the swap). (Language files in `scripts/<state>/` subdirs
+    // already failed generate inside `detect` — state subdirs are
+    // Zig-only until the scripting Controller grows state awareness; a
+    // `components/*.ts` authoring source is `collectComponentEmbeds`'
+    // pointed error.)
     //
     // EMBED family only: a native-compiled language (rust) never embeds —
     // its sources are staged over the plugin package's crate instead
     // (`stageNativeSources` below, AFTER `createDepsLinks` staged that
     // package), and `scripts` stays empty so the registerScript
     // builders emit nothing.
-    var scripting_scripts: ?[]scripting_splice.EmbedScript = null;
-    defer if (scripting_scripts) |ss| scripting_splice.freeEmbedScripts(allocator, ss);
+    var component_embeds: ?[]scripting_splice.EmbedScript = null;
+    defer if (component_embeds) |ce| scripting_splice.freeEmbedScripts(allocator, ce);
+    var script_embeds: ?[]scripting_splice.EmbedScript = null;
+    defer if (script_embeds) |se| scripting_splice.freeEmbedScripts(allocator, se);
+    // The emission slice: components ++ scripts, SHALLOW (entries owned by
+    // the two collections above) — freed as a bare slice, never through
+    // freeEmbedScripts.
+    var combined_embeds: ?[]scripting_splice.EmbedScript = null;
+    defer if (combined_embeds) |cb| allocator.free(cb);
     if (maybe_scripting) |*s| {
         if (s.family == .embed) {
-            scripting_scripts = try scripting_splice.collectEmbedScripts(allocator, game_dir, target_dir, s.*);
-            s.scripts = scripting_scripts.?;
+            component_embeds = try scripting_splice.collectComponentEmbeds(allocator, game_dir, s.*);
+            script_embeds = try scripting_splice.collectEmbedScripts(allocator, game_dir, target_dir, s.*);
+            combined_embeds = try scripting_splice.concatEmbeds(allocator, component_embeds.?, script_embeds.?);
+            s.scripts = combined_embeds.?;
         }
     }
 
@@ -867,15 +888,18 @@ pub fn generate(
 
     // ── Script-declared components: declare-mode extraction (#585) ─────
     // RFC-LANGUAGE-PLUGINS revs 6-7 (epic labelle-engine#237), the second
-    // consumer of the scripting splice: run the plugin's declare-mode
-    // runner over the collected script-dir sources (`scripts/`, or the
-    // legacy dir on the grace fallback), codegen the declared
-    // components into `scripting_components.zig`, and thread them onto the
-    // splice so the component-registry block registers them by name.
+    // consumer of the scripting splice: run the LANGUAGE's declare runner
+    // (`DECLARE_RUNNERS` — lua + ruby today) over the collected sources
+    // (`components/*.<ext>` declarations first, then the script dir's
+    // files — `scripts/`, or the legacy dir on the grace fallback),
+    // codegen the declared components into `scripting_components.zig`,
+    // and thread them onto the splice so the component-registry block
+    // registers them by name.
     // Ordered AFTER build.zig.zon generation — `createDepsLinks` just
     // staged the plugin package under `<output>/deps/labelle-<name>/`,
-    // which is where the runner is built from (`zig build labelle-declare`;
-    // see scripting_declare.zig's exec-slice doc + the #586 cross-ref) —
+    // which is where the language's runner is built from (`zig build
+    // <step_name>` per `scripting_declare.DECLARE_RUNNERS`; see the
+    // exec-slice doc + the #586 cross-ref) —
     // and BEFORE main.zig emission, which consumes `declared_components`.
     // Null/no-op for: no splice, no scripts, or scripts declaring nothing
     // — those emit byte-identical output (and drop a stale generated file).
@@ -883,11 +907,15 @@ pub fn generate(
     defer if (declare_schema) |*sch| sch.deinit();
     if (maybe_scripting) |*s| {
         // The declare phase is embed-only by construction: a native splice
-        // keeps `scripts` empty (nothing embeds), so `runPhase`
-        // returns null at its zero-scripts gate before the lua-only
-        // language gate is even consulted. The runner gets the collected
-        // dir-relative FILES (not stems — ordering prefixes are stripped
-        // from stems, so only the file column can rebuild the path).
+        // keeps `scripts` empty (nothing embeds), so `runPhase` returns
+        // null at its zero-files gate before the runner-row gate is even
+        // consulted. The runner gets the collected TARGET-RELATIVE files
+        // (not stems — ordering prefixes are stripped from stems, so only
+        // the file column can rebuild the path): `components/*.<ext>`
+        // declarations first, then the script dir's files — in-script
+        // chunk-scope declarations remain legal, both sources feed ONE
+        // schema (the runner owns duplicate detection with
+        // first-declared-in attribution).
         const script_files = try allocator.alloc([]const u8, s.scripts.len);
         defer allocator.free(script_files);
         for (s.scripts, script_files) |sc, *f| f.* = sc.file;
@@ -895,7 +923,6 @@ pub fn generate(
             .plugins = cfg.plugins,
             .plugin_name = s.plugin_name,
             .language = s.language,
-            .dir = s.dir,
             .script_files = script_files,
             .output_dir = output_dir,
             .target_dir = target_dir,
@@ -924,7 +951,9 @@ pub fn generate(
     // main.zig emission, which consumes `scripts`. Null for every skip
     // shape (no transpile row; no `.ts` sources — the need probe, so
     // `.js`-only projects never fetch the toolchain and keep the plain
-    // symlink layout, byte-identical output).
+    // symlink layout, byte-identical output). The swap replaces only the
+    // SCRIPT-DIR entries — the components-first prefix survives (the
+    // phase never touches `components/`).
     if (maybe_scripting) |*s| {
         if (try scripting_transpile.runPhase(allocator, .{
             .plugins = cfg.plugins,
@@ -941,9 +970,16 @@ pub fn generate(
             .pack_scans = pack_scans.items,
             .declared_components = s.declared_components,
         })) |transpiled| {
-            if (scripting_scripts) |old| scripting_splice.freeEmbedScripts(allocator, old);
-            scripting_scripts = transpiled;
-            s.scripts = transpiled;
+            if (script_embeds) |old| scripting_splice.freeEmbedScripts(allocator, old);
+            script_embeds = transpiled;
+            // Compute-then-swap: concatEmbeds is fallible, and freeing the
+            // old slice first would leave `combined_embeds` dangling across
+            // the try — the deferred free would double-free on that error
+            // path.
+            const recombined = try scripting_splice.concatEmbeds(allocator, component_embeds.?, transpiled);
+            if (combined_embeds) |cb| allocator.free(cb);
+            combined_embeds = recombined;
+            s.scripts = recombined;
         }
     }
 

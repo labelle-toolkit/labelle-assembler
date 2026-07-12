@@ -2,14 +2,21 @@
 //! (labelle-assembler#585; RFC-LANGUAGE-PLUGINS revs 6-7, epic
 //! labelle-engine#237).
 //!
-//! Scripts declare components natively at chunk scope
-//! (`labelle.component("Hunger", { level = 1.0 })`). At generate time this
-//! phase — the second consumer of the #593 scripting splice — runs the
-//! plugin's DECLARE-MODE RUNNER (`labelle-declare`, shipped inside the
-//! labelle-scripting package under tools/declare/) over the project's
-//! collected scripts. The runner executes only chunk bodies against a stub
-//! `labelle` and prints ONE schema JSON on stdout — the runner↔assembler
-//! contract:
+//! Scripts declare components natively in their own language — canonically
+//! in `components/*.<ext>` beside the Zig components (labelle-engine#237's
+//! refinement: `Hunger = Labelle.component "Hunger", level: 0.875` in
+//! `components/hunger.rb`), with in-script chunk-scope declarations
+//! (`labelle.component("Hunger", { level = 1.0 })` — the shipped lua
+//! mechanism) remaining legal. At generate time this phase — the second
+//! consumer of the #593 scripting splice — runs the language's DECLARE
+//! RUNNER (`DECLARE_RUNNERS`: `labelle-declare` under `tools/declare` for
+//! lua, `labelle-declare-ruby` under `tools/declare-ruby` for ruby — each
+//! shipped inside the labelle-scripting package) over the project's
+//! collected files: `components/*.<ext>` FIRST, then the script dir's.
+//! Every runner executes only chunk bodies against a stub `labelle`/
+//! `Labelle` and prints ONE schema JSON on stdout (byte-identical across
+//! runners — the scripting repo's cross-runner golden is the proof) — the
+//! runner↔assembler contract:
 //!
 //!   {"components":[{"name":"Hunger","persist":"persistent",
 //!     "fields":[{"name":"level","type":"f32","default":1.0},
@@ -33,14 +40,14 @@
 //! The runner binary is built FROM THE CONSUMING GAME'S staged plugin
 //! package: `build.zig.zon` generation stages every plugin under
 //! `<output>/.labelle/deps/labelle-<name>/` (deps_linker hardlinks), so
-//! this phase — ordered right after it — invokes
+//! this phase — ordered right after it — invokes (per the selected row)
 //!
-//!   zig build labelle-declare
+//!   zig build <step_name>            # labelle-declare / labelle-declare-ruby
 //!       --cache-dir <output>/declare-tool/zig-cache
 //!       --prefix    <output>/declare-tool
 //!       (cwd = <output>/deps/labelle-scripting)
 //!
-//! via std.process and picks up `<output>/declare-tool/bin/labelle-declare`.
+//! via std.process and picks up `<output>/declare-tool/bin/<step_name>`.
 //! Building from the staged copy keeps the runner byte-consistent with the
 //! plugin version the game links, and every artifact lands inside
 //! `.labelle/` (never in the user's plugin checkout). The cache dir and
@@ -49,9 +56,10 @@
 //! force a from-scratch tool rebuild each time — parked under
 //! `<output>/declare-tool/` they survive, and zig's content-keyed cache
 //! (hardlinks preserve content) makes the warm re-generate a no-op build.
-//! The resulting path is ALSO cached in-process (keyed by the package
-//! dir), so the tests-target pass in the same process skips even the no-op
-//! `zig build`. When the deps copy is missing (deps linking fell back to
+//! The resulting path is ALSO cached in-process (keyed by the package dir
+//! + the row's step, so a lua build never satisfies a ruby lookup), so the
+//! tests-target pass in the same process skips even the no-op `zig build`.
+//! When the deps copy is missing (deps linking fell back to
 //! cache-relative paths) the cache-resolved plugin dir is used instead.
 //!
 //! This narrow "exec `zig build <step>` inside a staged plugin package at
@@ -83,16 +91,67 @@ const idents = @import("codegen/idents.zig");
 /// The registry block imports it verbatim (`@import("scripting_components.zig")`).
 pub const GENERATED_FILENAME = "scripting_components.zig";
 
-/// The ONLY language the v1 declare phase runs: the plugin's runner
-/// (`tools/declare`) IS a lua interpreter executing chunk bodies against a
-/// stub `labelle` — pointing it at any other language's sources (a
-/// typescript project's `scripts/*.js`) would "run" JS as lua and fail
-/// with a nonsense parse error naming the wrong problem. `runPhase` skips
-/// non-lua languages cleanly instead (scripts still run; nothing
-/// declares). typescript declarations arrive LATER via `.d.ts`/interface
-/// extraction (a typescript-side declare runner feeding the same schema
-/// seam), at which point this becomes a per-language capability lookup.
-pub const DECLARE_LANGUAGE = "lua";
+/// One declare-capable language: the plugin-shipped runner that extracts
+/// its declarations (each runner IS an interpreter for its language —
+/// pointing it at another language's sources would "run" them as the
+/// wrong language and fail with a nonsense parse error naming the wrong
+/// problem, which is why `runPhase` selects by row and skips non-listed
+/// languages cleanly instead). Every runner speaks the SAME schema-JSON
+/// contract (`parseSchema` — untouched by widening this table; the
+/// cross-runner byte-parity golden in the labelle-scripting repo is the
+/// contract proof).
+pub const DeclareRunner = struct {
+    /// `language_policy.SUPPORTED_LANGUAGES` name the row serves.
+    language: []const u8,
+    /// The plugin package's `zig build` step AND the installed exe name
+    /// (`zig-out`-style prefix layout: `bin/<step_name>`).
+    step_name: []const u8,
+    /// Package-relative dir whose PRESENCE is the capability probe: an
+    /// older pinned plugin simply doesn't ship it, and that must stay a
+    /// WORKING project (scripts run, none declare) — never a generate
+    /// failure.
+    tool_dir: []const u8,
+    /// The language's source extension (matches the embed row's — a test
+    /// pins the agreement). Informational for diagnostics; collection is
+    /// driven by the splice's extension.
+    extension: []const u8,
+    /// The labelle-scripting release that first shipped the runner — the
+    /// absent-tool note's pointed pin hint.
+    min_pin: []const u8,
+};
+
+/// The declare-capable languages (labelle-engine#237; ruby via
+/// labelle-scripting PR #21 / v0.9.0 — `tools/declare-ruby`, its own exe
+/// so the capability probe stays filesystem-presence per row and a
+/// unified exe never compiles both VMs into every generate). typescript
+/// declarations arrive LATER via `.d.ts`/interface extraction (a
+/// typescript-side declare runner feeding the same schema seam) — one
+/// more row when they do.
+pub const DECLARE_RUNNERS = [_]DeclareRunner{
+    .{
+        .language = "lua",
+        .step_name = "labelle-declare",
+        .tool_dir = "tools/declare",
+        .extension = ".lua",
+        .min_pin = "0.2.0",
+    },
+    .{
+        .language = "ruby",
+        .step_name = "labelle-declare-ruby",
+        .tool_dir = "tools/declare-ruby",
+        .extension = ".rb",
+        .min_pin = "0.9.0",
+    },
+};
+
+/// The declare runner for `language`, or null when script-declared
+/// components aren't supported for it yet (runPhase's pointed skip).
+pub fn declareRunner(language: []const u8) ?DeclareRunner {
+    for (DECLARE_RUNNERS) |row| {
+        if (std.mem.eql(u8, row.language, language)) return row;
+    }
+    return null;
+}
 
 /// Test seam: absolute path of a prebuilt declare tool. When set, the
 /// build-and-locate step is skipped entirely and this binary is exec'd
@@ -102,11 +161,15 @@ pub const DECLARE_LANGUAGE = "lua";
 pub threadlocal var declare_tool_override: ?[]const u8 = null;
 
 // In-process cache of the last tool built (see the exec-slice doc above):
-// the package dir it was built from and the resulting binary path. Fixed
-// buffers, not allocator-owned — the cache outlives any single generate
-// call's allocator (and test allocators must not see it as a leak).
+// the package dir it was built from, the runner STEP it was built for
+// (two rows share one package — a lua build must never satisfy a ruby
+// lookup), and the resulting binary path. Fixed buffers, not
+// allocator-owned — the cache outlives any single generate call's
+// allocator (and test allocators must not see it as a leak).
 threadlocal var cached_pkg: [std.fs.max_path_bytes]u8 = undefined;
 threadlocal var cached_pkg_len: usize = 0;
+threadlocal var cached_step: [64]u8 = undefined;
+threadlocal var cached_step_len: usize = 0;
 threadlocal var cached_tool: [std.fs.max_path_bytes]u8 = undefined;
 threadlocal var cached_tool_len: usize = 0;
 
@@ -685,42 +748,50 @@ const ToolPaths = struct {
     }
 };
 
-fn declareToolPaths(allocator: std.mem.Allocator, output_dir: []const u8) !ToolPaths {
+fn declareToolPaths(allocator: std.mem.Allocator, output_dir: []const u8, runner: DeclareRunner) !ToolPaths {
     const output_abs = try std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), output_dir, allocator);
     defer allocator.free(output_abs);
     const prefix = try std.fs.path.join(allocator, &.{ output_abs, "declare-tool" });
     errdefer allocator.free(prefix);
     const zig_cache = try std.fs.path.join(allocator, &.{ prefix, "zig-cache" });
     errdefer allocator.free(zig_cache);
-    const exe_name = if (builtin.os.tag == .windows) "labelle-declare.exe" else "labelle-declare";
+    var exe_buf: [96]u8 = undefined;
+    const exe_name = if (builtin.os.tag == .windows)
+        std.fmt.bufPrint(&exe_buf, "{s}.exe", .{runner.step_name}) catch return error.NameTooLong
+    else
+        runner.step_name;
     const tool_path = try std.fs.path.join(allocator, &.{ prefix, "bin", exe_name });
     return .{ .prefix = prefix, .zig_cache = zig_cache, .tool_path = tool_path };
 }
 
-/// Resolve (building if needed) the declare tool for the scripting plugin
-/// package at `pkg_dir`, installing under `<output_dir>/declare-tool/`.
-/// Returns a path valid for the rest of the process (override, or the
-/// threadlocal cache buffer). See the module doc's exec-slice section for
-/// the build+cache mechanics.
-fn ensureDeclareTool(allocator: std.mem.Allocator, pkg_dir: []const u8, output_dir: []const u8) ![]const u8 {
+/// Resolve (building if needed) `runner`'s declare tool for the scripting
+/// plugin package at `pkg_dir`, installing under `<output_dir>/declare-tool/`
+/// (one shared prefix — the per-row exes coexist by name). Returns a path
+/// valid for the rest of the process (override, or the threadlocal cache
+/// buffer). See the module doc's exec-slice section for the build+cache
+/// mechanics.
+fn ensureDeclareTool(allocator: std.mem.Allocator, pkg_dir: []const u8, output_dir: []const u8, runner: DeclareRunner) ![]const u8 {
     if (declare_tool_override) |p| return p;
 
-    // Capability probe. The declare tool lives in the plugin package's
-    // `tools/declare/` (in labelle-scripting's `.paths` from v0.2.0 on);
-    // an older pinned plugin simply doesn't ship it — and that must stay
-    // a WORKING project (scripts run, none declare), not a generate
-    // failure, or upgrading the assembler breaks every existing scripting
-    // pin. runPhase turns this error into a note + phase skip.
+    // Capability probe, per row. The runner lives in the plugin package's
+    // `runner.tool_dir` (labelle-scripting ships `tools/declare` from
+    // v0.2.0, `tools/declare-ruby` from v0.9.0 — each in `.paths`); an
+    // older pinned plugin simply doesn't ship the row's dir — and that
+    // must stay a WORKING project (scripts run, none declare), not a
+    // generate failure, or upgrading the assembler breaks every existing
+    // scripting pin. runPhase turns this error into a note + phase skip.
     //
     // A RELATIVE `pkg_dir` is fine here (unlike `output_dir` below): the
     // probe and the spawn's `.cwd` are both resolved against OUR cwd, so
-    // every consumer of the spelling agrees.
-    const marker = try std.fs.path.join(allocator, &.{ pkg_dir, "tools", "declare" });
+    // every consumer of the spelling agrees. (`tool_dir` keeps its `/` on
+    // Windows — the `CONTRACT_DTS_REL` precedent in the transpile phase.)
+    const marker = try std.fs.path.join(allocator, &.{ pkg_dir, runner.tool_dir });
     defer allocator.free(marker);
     if (!cache.dirExists(marker)) return error.DeclareToolAbsent;
 
     if (cached_tool_len > 0 and
         std.mem.eql(u8, cached_pkg[0..cached_pkg_len], pkg_dir) and
+        std.mem.eql(u8, cached_step[0..cached_step_len], runner.step_name) and
         cache.dirExists(cached_tool[0..cached_tool_len]))
     {
         return cached_tool[0..cached_tool_len];
@@ -730,7 +801,7 @@ fn ensureDeclareTool(allocator: std.mem.Allocator, pkg_dir: []const u8, output_d
     // copy — this is what makes re-generates warm; see the module doc.
     // Absolute (never output_dir-relative): the child's cwd is `pkg_dir`,
     // not ours — see `declareToolPaths`.
-    const paths = declareToolPaths(allocator, output_dir) catch |err| switch (err) {
+    const paths = declareToolPaths(allocator, output_dir, runner) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             diag("could not resolve the declare-tool install dir under {s}: {s}", .{ output_dir, @errorName(err) });
@@ -741,10 +812,10 @@ fn ensureDeclareTool(allocator: std.mem.Allocator, pkg_dir: []const u8, output_d
 
     const io = config.globalIo();
     const result = std.process.run(allocator, io, .{
-        .argv = &.{ "zig", "build", "labelle-declare", "--cache-dir", paths.zig_cache, "--prefix", paths.prefix },
+        .argv = &.{ "zig", "build", runner.step_name, "--cache-dir", paths.zig_cache, "--prefix", paths.prefix },
         .cwd = .{ .path = pkg_dir },
     }) catch |err| {
-        diag("could not run `zig build labelle-declare` in {s}: {s}", .{ pkg_dir, @errorName(err) });
+        diag("could not run `zig build {s}` in {s}: {s}", .{ runner.step_name, pkg_dir, @errorName(err) });
         return error.DeclareToolBuildFailed;
     };
     defer allocator.free(result.stdout);
@@ -752,24 +823,26 @@ fn ensureDeclareTool(allocator: std.mem.Allocator, pkg_dir: []const u8, output_d
     switch (result.term) {
         .exited => |code| if (code != 0) {
             relayChildStderr(result.stderr);
-            diag("`zig build labelle-declare` failed (exit {d}) in {s}", .{ code, pkg_dir });
+            diag("`zig build {s}` failed (exit {d}) in {s}", .{ runner.step_name, code, pkg_dir });
             return error.DeclareToolBuildFailed;
         },
         else => {
             relayChildStderr(result.stderr);
-            diag("`zig build labelle-declare` terminated abnormally in {s}", .{pkg_dir});
+            diag("`zig build {s}` terminated abnormally in {s}", .{ runner.step_name, pkg_dir });
             return error.DeclareToolBuildFailed;
         },
     }
 
     if (!cache.dirExists(paths.tool_path)) {
-        diag("`zig build labelle-declare` succeeded but {s} is missing", .{paths.tool_path});
+        diag("`zig build {s}` succeeded but {s} is missing", .{ runner.step_name, paths.tool_path });
         return error.DeclareToolBuildFailed;
     }
-    if (pkg_dir.len > cached_pkg.len or paths.tool_path.len > cached_tool.len)
+    if (pkg_dir.len > cached_pkg.len or paths.tool_path.len > cached_tool.len or runner.step_name.len > cached_step.len)
         return error.NameTooLong;
     @memcpy(cached_pkg[0..pkg_dir.len], pkg_dir);
     cached_pkg_len = pkg_dir.len;
+    @memcpy(cached_step[0..runner.step_name.len], runner.step_name);
+    cached_step_len = runner.step_name.len;
     @memcpy(cached_tool[0..paths.tool_path.len], paths.tool_path);
     cached_tool_len = paths.tool_path.len;
     return cached_tool[0..cached_tool_len];
@@ -803,15 +876,17 @@ pub fn resolvePluginPackageDir(
     return error.DeclareToolBuildFailed;
 }
 
-/// Exec the declare tool over the copied script-dir sources and parse
+/// Exec the declare tool over the collected language sources and parse
 /// its stdout as the schema. A nonzero exit relays the tool's stderr (the
 /// file-and-name-bearing declaration error) and fails generation.
 ///
-/// `dir` is the splice's RESOLVED script dir (`scripts/` — the #237
-/// convention — or the deprecated legacy dir on the grace fallback) and
-/// `script_files` the dir-relative filenames the collection produced; the
-/// argv paths join `target_dir/<dir>/<file>` directly, so ordering-prefix
-/// stripping in the registered stems never desyncs the tool's input.
+/// `script_files` are the collection's TARGET-RELATIVE paths (the
+/// `EmbedScript.file` column — `components/hunger.rb` declarations first,
+/// then the script dir's files); the argv joins `target_dir/<file>`
+/// directly, so ordering-prefix stripping in the registered stems never
+/// desyncs the tool's input. The runner handles multi-file input and
+/// duplicate detection with first-declared-in attribution — BOTH sources
+/// feed one schema.
 ///
 /// Relative-path audit (PR #598 finding 1): unlike the tool BUILD, this
 /// spawn sets no `.cwd` — the child inherits OURS — so a relative
@@ -821,7 +896,6 @@ fn runDeclareTool(
     allocator: std.mem.Allocator,
     tool_path: []const u8,
     target_dir: []const u8,
-    dir: []const u8,
     script_files: []const []const u8,
 ) !Schema {
     var argv: std.ArrayList([]const u8) = .empty;
@@ -834,7 +908,7 @@ fn runDeclareTool(
     try argv.ensureTotalCapacity(allocator, script_files.len + 1);
     argv.appendAssumeCapacity(tool_path);
     for (script_files) |file_name| {
-        const p = try std.fs.path.join(allocator, &.{ target_dir, dir, file_name });
+        const p = try std.fs.path.join(allocator, &.{ target_dir, file_name });
         argv.appendAssumeCapacity(p);
     }
 
@@ -867,13 +941,11 @@ pub const PhaseOptions = struct {
     plugins: []const config.PluginDep,
     plugin_name: []const u8,
     language: []const u8,
-    /// The splice's RESOLVED script dir (`scripts/`, or the deprecated
-    /// legacy dir on the one-release grace fallback) — where the runner
-    /// finds the copied sources under `target_dir`.
-    dir: []const u8,
-    /// Dir-relative script filenames (extension included, subdir paths
-    /// joined with `/` for legacy-dir collections) — the collection's
-    /// `EmbedScript.file` column.
+    /// TARGET-RELATIVE collected language files (extension included) —
+    /// the collection's `EmbedScript.file` column: `components/*.<ext>`
+    /// declarations FIRST, then the script dir's files (subdir paths
+    /// joined with `/` for legacy-dir collections). Both feed the runner
+    /// — in-script chunk-scope declarations remain legal.
     script_files: []const []const u8,
     output_dir: []const u8,
     target_dir: []const u8,
@@ -884,13 +956,14 @@ pub const PhaseOptions = struct {
     pack_scans: []const scan.PackScan,
 };
 
-/// Run the whole declare phase for an active scripting splice: build (or
-/// reuse) the runner, extract the schema, gate collisions, and write the
-/// generated `scripting_components.zig` into the target. Returns the
-/// owned Schema when at least one component was declared (the caller
-/// threads `schema.components` onto the splice and keeps the Schema alive
-/// through main.zig emission), null for every no-op shape (no scripts at
-/// all; a non-`DECLARE_LANGUAGE` splice — typescript; scripts but no
+/// Run the whole declare phase for an active scripting splice: select the
+/// language's runner row (`DECLARE_RUNNERS`), build (or reuse) it, extract
+/// the schema, gate collisions, and write the generated
+/// `scripting_components.zig` into the target. Returns the owned Schema
+/// when at least one component was declared (the caller threads
+/// `schema.components` onto the splice and keeps the Schema alive through
+/// main.zig emission), null for every no-op shape (no collected files at
+/// all; a language without a runner row — typescript; files but no
 /// declarations). Every no-op shape also deletes a stale generated file
 /// left by a previously-declaring project state.
 pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
@@ -899,19 +972,19 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
         return null;
     }
 
-    // Language gate (see `DECLARE_LANGUAGE`): the phase is lua-only in v1
-    // — for any other splice language (typescript today) it must SKIP, not
-    // run the lua runner over foreign sources. Note-level stderr line +
-    // the same stale-file cleanup as the other no-op shapes, so a project
-    // switching lua→typescript leaves no orphaned generated file.
-    if (!std.mem.eql(u8, opts.language, DECLARE_LANGUAGE)) {
+    // Runner-row gate (see `DECLARE_RUNNERS`): a language without a
+    // declare runner must SKIP, not run another language's runner over
+    // foreign sources. Note-level stderr line + the same stale-file
+    // cleanup as the other no-op shapes, so a project switching languages
+    // leaves no orphaned generated file.
+    const runner = declareRunner(opts.language) orelse {
         diag(
-            "script-declared components are lua-only today — skipping the declare phase for \"{s}\" scripts (they still run, they just can't declare components yet)",
-            .{opts.language},
+            "script-declared components are not yet supported for \"{s}\" — skipping the declare phase ({s} scripts still run, they just can't declare components)",
+            .{ opts.language, opts.language },
         );
         removeStaleGeneratedFile(allocator, opts.target_dir);
         return null;
-    }
+    };
 
     const pkg_dir = try resolvePluginPackageDir(
         allocator,
@@ -922,9 +995,12 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     );
     defer allocator.free(pkg_dir);
 
-    const tool_path = ensureDeclareTool(allocator, pkg_dir, opts.output_dir) catch |err| switch (err) {
+    const tool_path = ensureDeclareTool(allocator, pkg_dir, opts.output_dir, runner) catch |err| switch (err) {
         error.DeclareToolAbsent => {
-            diag("the pinned scripting plugin ships no declare tool (no tools/declare in the package) — script-declared components are disabled this generate; pin labelle-scripting >= 0.2.0 to use labelle.component declarations", .{});
+            diag(
+                "the pinned scripting plugin ships no {s} declare tool (no {s} in the package) — script-declared components are disabled this generate; pin labelle-scripting >= {s} to use component declarations",
+                .{ opts.language, runner.tool_dir, runner.min_pin },
+            );
             removeStaleGeneratedFile(allocator, opts.target_dir);
             return null;
         },
@@ -934,7 +1010,6 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
         allocator,
         tool_path,
         opts.target_dir,
-        opts.dir,
         opts.script_files,
     );
     errdefer schema.deinit();
@@ -1230,7 +1305,7 @@ test "declareToolPaths: a RELATIVE output dir absolutizes against OUR cwd (never
     var rel_buf: [64]u8 = undefined;
     const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
 
-    const paths = try declareToolPaths(testing.allocator, rel);
+    const paths = try declareToolPaths(testing.allocator, rel, declareRunner("lua").?);
     defer paths.deinit(testing.allocator);
 
     try testing.expect(std.fs.path.isAbsolute(paths.prefix));
@@ -1248,6 +1323,13 @@ test "declareToolPaths: a RELATIVE output dir absolutizes against OUR cwd (never
     try testing.expectEqualStrings(expected_cache, paths.zig_cache);
     try testing.expect(std.mem.startsWith(u8, paths.tool_path, expected_prefix));
     try testing.expect(std.mem.indexOf(u8, paths.tool_path, "labelle-declare") != null);
+
+    // The per-row exe name lands in the path — ruby's binary is its OWN,
+    // in the SAME shared prefix (the rows coexist by name).
+    const ruby_paths = try declareToolPaths(testing.allocator, rel, declareRunner("ruby").?);
+    defer ruby_paths.deinit(testing.allocator);
+    try testing.expectEqualStrings(expected_prefix, ruby_paths.prefix);
+    try testing.expect(std.mem.indexOf(u8, ruby_paths.tool_path, "labelle-declare-ruby") != null);
 }
 
 test "checkCollisions: game components, packs, and the VideoComponent built-in all gate" {
@@ -1283,14 +1365,49 @@ test "checkCollisions: game components, packs, and the VideoComponent built-in a
     );
 }
 
-test "runPhase: a non-lua splice (typescript) skips cleanly — null, stale file dropped, tool machinery untouched" {
+test "DECLARE_RUNNERS: row selection — lua + ruby rows with their step/tool/extension; non-listed languages have none" {
+    const lua = declareRunner("lua").?;
+    try testing.expectEqualStrings("labelle-declare", lua.step_name);
+    try testing.expectEqualStrings("tools/declare", lua.tool_dir);
+    try testing.expectEqualStrings(".lua", lua.extension);
+    try testing.expectEqualStrings("0.2.0", lua.min_pin);
+
+    // ruby (labelle-scripting PR #21 / v0.9.0): its OWN exe + step so the
+    // capability probe stays per-row filesystem presence and a unified
+    // exe never compiles both VMs into every generate.
+    const ruby = declareRunner("ruby").?;
+    try testing.expectEqualStrings("labelle-declare-ruby", ruby.step_name);
+    try testing.expectEqualStrings("tools/declare-ruby", ruby.tool_dir);
+    try testing.expectEqualStrings(".rb", ruby.extension);
+    try testing.expectEqualStrings("0.9.0", ruby.min_pin);
+
+    // Non-listed languages: runPhase's pointed skip (typescript's
+    // declarations arrive later via a d.ts-side runner; go/csharp have no
+    // scripting integration rows at all).
+    try testing.expect(declareRunner("typescript") == null);
+    try testing.expect(declareRunner("go") == null);
+    try testing.expect(declareRunner("cobol") == null);
+
+    // Distinct step names + tool dirs across rows (two rows share one
+    // plugin package and one install prefix — collisions would alias the
+    // built binaries and the capability probes).
+    for (DECLARE_RUNNERS, 0..) |a, i| {
+        for (DECLARE_RUNNERS[i + 1 ..]) |b| {
+            try testing.expect(!std.mem.eql(u8, a.step_name, b.step_name));
+            try testing.expect(!std.mem.eql(u8, a.tool_dir, b.tool_dir));
+            try testing.expect(!std.mem.eql(u8, a.extension, b.extension));
+        }
+    }
+}
+
+test "runPhase: a splice without a runner row (typescript) skips cleanly — null, stale file dropped, tool machinery untouched" {
     const allocator = testing.allocator;
     const tio = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A stale generated file from a previous lua project state: the skip
-    // must clean it up exactly like the other no-op shapes.
+    // A stale generated file from a previous declaring project state: the
+    // skip must clean it up exactly like the other no-op shapes.
     try tmp.dir.createDirPath(tio, "target");
     {
         var f = try tmp.dir.createFile(tio, "target/" ++ GENERATED_FILENAME, .{});
@@ -1305,13 +1422,13 @@ test "runPhase: a non-lua splice (typescript) skips cleanly — null, stale file
     // Deliberately hostile opts: an EMPTY plugin list, no override, no
     // staged deps — every step past the gate would error. The gate fires
     // BEFORE `resolvePluginPackageDir`, so typescript returns null without
-    // touching any of it (and without spawning a lua runner over .js).
+    // touching any of it (and without spawning another language's runner
+    // over .js).
     var opts = PhaseOptions{
         .plugins = &.{},
         .plugin_name = "scripting",
         .language = "typescript",
-        .dir = "scripts",
-        .script_files = &.{"behavior.js"},
+        .script_files = &.{"scripts/behavior.js"},
         .output_dir = root,
         .target_dir = target,
         .project_dir = root,
@@ -1324,11 +1441,60 @@ test "runPhase: a non-lua splice (typescript) skips cleanly — null, stale file
         tmp.dir.access(tio, "target/" ++ GENERATED_FILENAME, .{}),
     );
 
-    // Negative control: the SAME opts with language "lua" sail past the
-    // gate into the tool machinery (package resolution fails on the empty
-    // plugin list) — the skip above is the language gate, not an accident
-    // of the hostile opts.
-    opts.language = DECLARE_LANGUAGE;
-    opts.script_files = &.{"behavior.lua"};
+    // Negative controls: the SAME opts with a RUNNER-ROW language sail
+    // past the gate into the tool machinery (package resolution fails on
+    // the empty plugin list) — the skip above is the row gate, not an
+    // accident of the hostile opts. Both rows, so ruby's selection is
+    // pinned end-to-start too.
+    opts.language = "lua";
+    opts.script_files = &.{"scripts/behavior.lua"};
     try testing.expectError(error.DeclareToolBuildFailed, runPhase(allocator, opts));
+    opts.language = "ruby";
+    opts.script_files = &.{"components/hunger.rb"};
+    try testing.expectError(error.DeclareToolBuildFailed, runPhase(allocator, opts));
+}
+
+test "DECLARE_RUNNERS: per-row capability probe — the ruby tool dir arms ruby only; lua stays gated by tools/declare" {
+    // ensureDeclareTool's probe is filesystem presence of the ROW's
+    // tool_dir. A package shipping ONLY tools/declare-ruby (hypothetical
+    // future pin shape) must not arm the lua runner, and vice versa —
+    // exercised through runPhase against a staged package dir, stopping
+    // at the step AFTER the probe (the `zig build` spawn fails in this
+    // build.zig-less fixture, proving the probe PASSED; DeclareToolAbsent
+    // proving it failed).
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Stage the package where resolvePluginPackageDir looks first: the
+    // output's deps copy (out/deps/labelle-scripting).
+    try tmp.dir.createDirPath(tio, "out/deps/labelle-scripting/tools/declare-ruby");
+    try tmp.dir.createDirPath(tio, "target");
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", allocator);
+    defer allocator.free(root);
+    const out = try tmp.dir.realPathFileAlloc(tio, "out", allocator);
+    defer allocator.free(out);
+    const target = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target);
+
+    var opts = PhaseOptions{
+        .plugins = &.{},
+        .plugin_name = "scripting",
+        .language = "ruby",
+        .script_files = &.{"components/hunger.rb"},
+        .output_dir = out,
+        .target_dir = target,
+        .project_dir = root,
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+    // ruby: probe PASSES (tools/declare-ruby exists) → the build attempt
+    // is next, and fails in this build.zig-less package. NOT a skip.
+    try testing.expectError(error.DeclareToolBuildFailed, runPhase(allocator, opts));
+
+    // lua against the SAME package: tools/declare is absent → graceful
+    // skip (null), exactly the old-pin path.
+    opts.language = "lua";
+    opts.script_files = &.{"scripts/behavior.lua"};
+    try testing.expect((try runPhase(allocator, opts)) == null);
 }

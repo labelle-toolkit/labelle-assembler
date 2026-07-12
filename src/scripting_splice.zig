@@ -115,9 +115,8 @@ const EmbedLanguage = struct {
 pub const EMBED_LANGUAGES = [_]EmbedLanguage{
     .{ .language = "lua", .extension = ".lua" },
     // ruby (labelle-scripting v0.3.0, mruby 3.4.0) embeds `.rb` sources —
-    // no transpile row (ruby is what the VM runs) and no declare mode yet
-    // (`scripting_declare.DECLARE_LANGUAGE` gates that phase to lua;
-    // `Component.ref` views resolve at runtime against real components).
+    // no transpile row (ruby is what the VM runs); declare mode via
+    // `tools/declare-ruby` (v0.9.0 — `scripting_declare.DECLARE_RUNNERS`).
     .{ .language = "ruby", .extension = ".rb" },
     .{ .language = "typescript", .extension = ".js", .transpile = .{
         .source_extension = ".ts",
@@ -225,19 +224,25 @@ pub fn transpileSource(language: []const u8) ?TranspileSource {
 pub const Family = enum { embed, native };
 
 /// One collected embed script: what `registerScript` registers it AS and
-/// which file (relative to the splice's `dir`) `@embedFile` reads. Split
-/// because the `scripts/` convention strips numeric ordering prefixes from
-/// the registered stem (`10_spawner.rb` registers as "spawner") — the stem
-/// alone can no longer reconstruct the embed path.
+/// which file `@embedFile` reads. Split because the `scripts/` convention
+/// strips numeric ordering prefixes from the registered stem
+/// (`10_spawner.rb` registers as "spawner") — the stem alone can no longer
+/// reconstruct the embed path.
 pub const EmbedScript = struct {
     /// Registered stem: ordering prefix + extension stripped, exactly as
     /// the Zig script scanner strips them (`script_scanner.stripPrefixAndExt`).
     /// Legacy-dir scripts keep the pre-#237 plain stem (no prefix
     /// stripping; subdirs joined with `/`) so unmigrated projects stay
-    /// byte-identical through the grace release.
+    /// byte-identical through the grace release. Component-dir entries
+    /// (`collectComponentEmbeds`) use the plain rel stem too — ordering
+    /// prefixes are a scripts/-only convention.
     name: []const u8,
-    /// Path relative to the splice's `dir` — the `@embedFile("<dir>/<file>")`
-    /// tail. Top-level filename for `scripts/`-collected entries.
+    /// TARGET-RELATIVE path — the whole `@embedFile("<file>")` argument
+    /// (`scripts/10_spawner.rb`, `components/hunger.rb`, legacy
+    /// `ts/ai/guard.js`). Target-relative because entries span TWO
+    /// convention dirs now (labelle-engine#237's refinement: component
+    /// declarations live in `components/`, scripts in the script dir) and
+    /// because the declare runner's argv joins `<target>/<file>` directly.
     file: []const u8,
 };
 
@@ -586,7 +591,10 @@ fn collectMatchingFiles(
 ///   Legacy dir (grace): the pre-#237 behavior VERBATIM —
 ///   `scanner.linkAndScan` (recursive, plain sorted stems, subdirs joined
 ///   with `/`, no prefix stripping), stems doubling as names with
-///   `file = stem ++ extension`. Unmigrated projects stay byte-identical.
+///   `file = <dir>/<stem><ext>`. Unmigrated projects stay byte-identical.
+///
+/// SCRIPT-DIR entries only — `components/` language files are collected by
+/// `collectComponentEmbeds` and concatenated FIRST by root.zig.
 ///
 /// Returns owned entries (both strings allocated); free with
 /// `freeEmbedScripts`. A missing dir collects empty (the plugin wires,
@@ -600,7 +608,7 @@ pub fn collectEmbedScripts(
     if (splice.legacy) {
         const stems = try scanner.linkAndScan(allocator, game_dir, target_dir, splice.dir, splice.extension);
         defer scanner.freeNames(allocator, stems);
-        return embedScriptsFromStems(allocator, stems, splice.extension);
+        return embedScriptsFromStems(allocator, stems, splice.dir, splice.extension);
     }
 
     // The convention dir: link (idempotent — root.zig already linked it
@@ -611,6 +619,141 @@ pub fn collectEmbedScripts(
     const dir_path = try std.fs.path.join(allocator, &.{ game_dir, splice.dir });
     defer allocator.free(dir_path);
     return collectOrderedTopLevelAbs(allocator, dir_path, splice);
+}
+
+/// Collect the game's `components/` LANGUAGE files for an `.embed` splice
+/// (labelle-engine#237's refinement: declaration files live where their
+/// KIND lives — `components/hunger.rb` next to `components/worker.zig`).
+/// Extension-keyed coexistence exactly like the script dir: the Zig
+/// component scan keeps `.zig`, this collects only `splice.extension`.
+///
+/// Entries register BEFORE the script-dir entries (root.zig concatenates
+/// components-first) so the view constants a declaration defines exist by
+/// the time scripts load. Order: plain alphabetical by rel path, names =
+/// plain rel stems (subdirs joined with `/` — components/ subdirs are
+/// organizational, mirroring the Zig component scan) — NO ordering-prefix
+/// machinery; numeric prefixes are a scripts/-only convention.
+///
+/// For a transpile-row language (typescript), authoring-extension sources
+/// in `components/` are a pointed error (`error.ComponentsDirNeedsTranspile`)
+/// — the transpile phase materializes only the SCRIPT dir, so a
+/// `components/foo.ts` would silently never run (`.d.ts` declaration
+/// files exempt, as everywhere). Runnable `components/*.js` embeds fine.
+///
+/// The target's `components/` link is root.zig's existing
+/// `linkAndScan(components, ".zig")` — the whole dir is exposed, so the
+/// `@embedFile("components/<rel>")` paths resolve with no extra placement.
+/// A missing dir collects empty. Free with `freeEmbedScripts`.
+pub fn collectComponentEmbeds(
+    allocator: std.mem.Allocator,
+    game_dir: []const u8,
+    splice: ScriptingSplice,
+) ![]EmbedScript {
+    const io = config.globalIo();
+    const dir_path = try std.fs.path.join(allocator, &.{ game_dir, "components" });
+    defer allocator.free(dir_path);
+
+    var out: std.ArrayList(EmbedScript) = .empty;
+    errdefer freeEmbedScriptList(allocator, &out);
+
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return out.toOwnedSlice(allocator),
+        else => return err,
+    };
+    defer dir.close(io);
+
+    const transpile: ?TranspileSource = if (embedRow(splice.language)) |row| row.transpile else null;
+    try collectComponentEmbedsWalk(allocator, io, dir, "", splice, transpile, &out);
+
+    // Deterministic order: plain alphabetical by target-relative file.
+    std.mem.sortUnstable(EmbedScript, out.items, {}, struct {
+        fn lessThan(_: void, a: EmbedScript, b: EmbedScript) bool {
+            return std.mem.order(u8, a.file, b.file) == .lt;
+        }
+    }.lessThan);
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn collectComponentEmbedsWalk(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    splice: ScriptingSplice,
+    transpile: ?TranspileSource,
+    out: *std.ArrayList(EmbedScript),
+) !void {
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        switch (entry.kind) {
+            .directory => {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                const sub_prefix = if (rel_prefix.len == 0)
+                    try allocator.dupe(u8, entry.name)
+                else
+                    try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, entry.name });
+                defer allocator.free(sub_prefix);
+                try collectComponentEmbedsWalk(allocator, io, sub, sub_prefix, splice, transpile, out);
+            },
+            else => {
+                // Authoring sources the assembler can't run from here: the
+                // transpile phase covers the SCRIPT dir only (the doc's
+                // pointed-error rule — never silently dead).
+                if (transpile) |t| {
+                    if (std.mem.endsWith(u8, entry.name, t.source_extension) and
+                        !std.mem.endsWith(u8, entry.name, t.declaration_suffix))
+                    {
+                        std.debug.print(
+                            "labelle-assembler: components/{s}{s}{s} is a {s} authoring source, but the transpile step covers only the script dir.\n" ++
+                                "  author runnable {s} in components/ (or keep {s} sources in {s}/).\n",
+                            .{
+                                rel_prefix,
+                                if (rel_prefix.len == 0) "" else "/",
+                                entry.name,
+                                t.source_extension,
+                                splice.extension,
+                                t.source_extension,
+                                splice.dir,
+                            },
+                        );
+                        return error.ComponentsDirNeedsTranspile;
+                    }
+                }
+                if (!std.mem.endsWith(u8, entry.name, splice.extension)) continue;
+                const rel_stem_len = entry.name.len - splice.extension.len;
+                const name = if (rel_prefix.len == 0)
+                    try allocator.dupe(u8, entry.name[0..rel_stem_len])
+                else
+                    try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, entry.name[0..rel_stem_len] });
+                errdefer allocator.free(name);
+                const file = if (rel_prefix.len == 0)
+                    try std.fmt.allocPrint(allocator, "components/{s}", .{entry.name})
+                else
+                    try std.fmt.allocPrint(allocator, "components/{s}/{s}", .{ rel_prefix, entry.name });
+                errdefer allocator.free(file);
+                try out.append(allocator, .{ .name = name, .file = file });
+            },
+        }
+    }
+}
+
+/// Concatenate two embed collections into ONE emission slice — root.zig's
+/// components-first ordering (`concat(component_embeds, script_embeds)`).
+/// SHALLOW: the result's entries borrow the inputs' strings; free the
+/// returned slice with `allocator.free` (NOT `freeEmbedScripts`) and keep
+/// freeing the inputs as before.
+pub fn concatEmbeds(
+    allocator: std.mem.Allocator,
+    first: []const EmbedScript,
+    second: []const EmbedScript,
+) ![]EmbedScript {
+    const out = try allocator.alloc(EmbedScript, first.len + second.len);
+    @memcpy(out[0..first.len], first);
+    @memcpy(out[first.len..], second);
+    return out;
 }
 
 /// The same collection over a FULLY-RESOLVED directory, no link placement
@@ -632,17 +775,19 @@ pub fn collectEmbedScriptsAbs(
     if (splice.legacy) {
         const stems = try scanner.scanDirAbs(allocator, abs_dir, splice.extension);
         defer scanner.freeNames(allocator, stems);
-        return embedScriptsFromStems(allocator, stems, splice.extension);
+        return embedScriptsFromStems(allocator, stems, splice.dir, splice.extension);
     }
     return collectOrderedTopLevelAbs(allocator, abs_dir, splice);
 }
 
 /// Legacy stems → entries: names stay the plain stems (subdirs joined
 /// with `/`, numeric prefixes KEPT — byte-identical registration through
-/// the grace release), files re-derive as `<stem><ext>`.
+/// the grace release), files re-derive as `<dir>/<stem><ext>`
+/// (target-relative, like every entry).
 fn embedScriptsFromStems(
     allocator: std.mem.Allocator,
     stems: []const []const u8,
+    dir: []const u8,
     extension: []const u8,
 ) ![]EmbedScript {
     var out: std.ArrayList(EmbedScript) = .empty;
@@ -651,7 +796,7 @@ fn embedScriptsFromStems(
     for (stems) |stem| {
         const name = try allocator.dupe(u8, stem);
         errdefer allocator.free(name);
-        const file = try std.fmt.allocPrint(allocator, "{s}{s}", .{ stem, extension });
+        const file = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ dir, stem, extension });
         errdefer allocator.free(file);
         out.appendAssumeCapacity(.{ .name = name, .file = file });
     }
@@ -693,7 +838,7 @@ fn collectOrderedTopLevelAbs(
             if (!std.mem.endsWith(u8, entry.name, splice.extension)) continue;
             const name = try allocator.dupe(u8, script_scanner.stripPrefixAndExt(entry.name, splice.extension));
             errdefer allocator.free(name);
-            const file = try allocator.dupe(u8, entry.name);
+            const file = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ splice.dir, entry.name });
             errdefer allocator.free(file);
             try entries.append(allocator, .{
                 .script = .{ .name = name, .file = file },
@@ -1385,9 +1530,9 @@ test "collectEmbedScriptsAbs: the transpile re-scan — ordering + stripping ove
     // exactly like the game-dir collection; .zig/.d.ts invisible.
     try testing.expectEqual(@as(usize, 3), scripts.len);
     try testing.expectEqualStrings("a", scripts[0].name);
-    try testing.expectEqualStrings("10_a.js", scripts[0].file);
+    try testing.expectEqualStrings("scripts/10_a.js", scripts[0].file);
     try testing.expectEqualStrings("b", scripts[1].name);
-    try testing.expectEqualStrings("20_b.js", scripts[1].file);
+    try testing.expectEqualStrings("scripts/20_b.js", scripts[1].file);
     try testing.expectEqualStrings("plain", scripts[2].name);
 
     // Duplicate orders error here exactly like the game-dir collection —
@@ -1415,9 +1560,129 @@ test "collectEmbedScriptsAbs: LEGACY re-scan keeps pre-#237 semantics — recurs
 
     try testing.expectEqual(@as(usize, 2), scripts.len);
     try testing.expectEqualStrings("10_boot", scripts[0].name);
-    try testing.expectEqualStrings("10_boot.js", scripts[0].file);
+    try testing.expectEqualStrings("ts/10_boot.js", scripts[0].file);
     try testing.expectEqualStrings("ai/guard", scripts[1].name);
-    try testing.expectEqualStrings("ai/guard.js", scripts[1].file);
+    try testing.expectEqualStrings("ts/ai/guard.js", scripts[1].file);
+}
+
+// ── collectComponentEmbeds: declarations beside the Zig components ────
+
+test "collectComponentEmbeds: components/*.<ext> collect alphabetically with plain stems — .zig invisible, subdirs organizational, no prefix machinery" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The #237 refinement shape: declarations beside the Zig components,
+    // extension-keyed. `10_zeta.rb` deliberately carries a numeric prefix
+    // — components/ has NO ordering-prefix convention, so the name keeps
+    // it and the order stays alphabetical by path.
+    try writeTestFile(tmp.dir, "components/hunger.rb", "Hunger = Labelle.component \"Hunger\", level: 0.875\n");
+    try writeTestFile(tmp.dir, "components/10_zeta.rb", "Zeta = Labelle.component \"Zeta\"\n");
+    try writeTestFile(tmp.dir, "components/needs/thirst.rb", "Thirst = Labelle.component \"Thirst\"\n");
+    try writeTestFile(tmp.dir, "components/worker.zig", "pub const Worker = struct {};\n");
+    try writeTestFile(tmp.dir, "components/.hidden.rb", "ignored\n");
+    try writeTestFile(tmp.dir, "components/README.md", "# not a source\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const splice = ScriptingSplice{
+        .plugin_name = "scripting",
+        .language = "ruby",
+        .dir = "scripts",
+        .extension = ".rb",
+    };
+    const embeds = try collectComponentEmbeds(allocator, root, splice);
+    defer freeEmbedScripts(allocator, embeds);
+
+    try testing.expectEqual(@as(usize, 3), embeds.len);
+    // Alphabetical by target-relative file; names are PLAIN rel stems.
+    try testing.expectEqualStrings("10_zeta", embeds[0].name);
+    try testing.expectEqualStrings("components/10_zeta.rb", embeds[0].file);
+    try testing.expectEqualStrings("hunger", embeds[1].name);
+    try testing.expectEqualStrings("components/hunger.rb", embeds[1].file);
+    try testing.expectEqualStrings("needs/thirst", embeds[2].name);
+    try testing.expectEqualStrings("components/needs/thirst.rb", embeds[2].file);
+
+    // Missing dir collects empty (negative control).
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    const root2 = try tmp2.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root2);
+    const none = try collectComponentEmbeds(allocator, root2, splice);
+    defer freeEmbedScripts(allocator, none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "collectComponentEmbeds: a typescript authoring source in components/ is a pointed error; runnable .js and .d.ts pass" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Runnable .js + a declaration file: both fine (the .d.ts is not a
+    // script anywhere; the .js embeds like any component-dir language
+    // file).
+    try writeTestFile(tmp.dir, "components/glue.js", "export const GLUE = 1;\n");
+    try writeTestFile(tmp.dir, "components/labelle.d.ts", "declare const labelle: any;\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const embeds = try collectComponentEmbeds(allocator, root, ts_splice_fixture);
+    defer freeEmbedScripts(allocator, embeds);
+    try testing.expectEqual(@as(usize, 1), embeds.len);
+    try testing.expectEqualStrings("glue", embeds[0].name);
+    try testing.expectEqualStrings("components/glue.js", embeds[0].file);
+
+    // An authoring .ts source would be silently dead (the transpile
+    // phase materializes only the SCRIPT dir) — pointed error instead.
+    try writeTestFile(tmp.dir, "components/shape.ts", "export type Shape = { w: number };\n");
+    try testing.expectError(
+        error.ComponentsDirNeedsTranspile,
+        collectComponentEmbeds(allocator, root, ts_splice_fixture),
+    );
+
+    // Gap-less languages never trip the guard — a stray .ts in a lua
+    // project's components/ is the POLICY scan's business, not this one's
+    // (negative control mirroring the scripts/-side rule).
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try writeTestFile(tmp2.dir, "components/notes.ts", "// not a lua source\n");
+    const root2 = try tmp2.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root2);
+    const lua_splice = ScriptingSplice{
+        .plugin_name = "scripting",
+        .language = "lua",
+        .dir = "scripts",
+        .extension = ".lua",
+    };
+    const none = try collectComponentEmbeds(allocator, root2, lua_splice);
+    defer freeEmbedScripts(allocator, none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "concatEmbeds: components-first emission order — shallow result, inputs keep ownership" {
+    const allocator = testing.allocator;
+    const comps = [_]EmbedScript{
+        .{ .name = "hunger", .file = "components/hunger.rb" },
+    };
+    const scripts = [_]EmbedScript{
+        .{ .name = "spawner", .file = "scripts/10_spawner.rb" },
+        .{ .name = "feed", .file = "scripts/feed.rb" },
+    };
+    const combined = try concatEmbeds(allocator, &comps, &scripts);
+    defer allocator.free(combined);
+
+    try testing.expectEqual(@as(usize, 3), combined.len);
+    try testing.expectEqualStrings("hunger", combined[0].name);
+    try testing.expectEqualStrings("spawner", combined[1].name);
+    try testing.expectEqualStrings("feed", combined[2].name);
+    // Shallow: the entries alias the inputs' strings.
+    try testing.expectEqual(comps[0].file.ptr, combined[0].file.ptr);
+
+    // Either side empty passes through (the zero-scripts /
+    // zero-declarations shapes).
+    const none = try concatEmbeds(allocator, &.{}, &scripts);
+    defer allocator.free(none);
+    try testing.expectEqual(@as(usize, 2), none.len);
 }
 
 // ── collectEmbedScripts: ordering, coexistence, legacy verbatim ───────
@@ -1452,11 +1717,11 @@ test "collectEmbedScripts: numeric prefixes order first and strip from the stem 
 
     try testing.expectEqual(@as(usize, 5), scripts.len);
     try testing.expectEqualStrings("boot", scripts[0].name);
-    try testing.expectEqualStrings("02_boot.rb", scripts[0].file);
+    try testing.expectEqualStrings("scripts/02_boot.rb", scripts[0].file);
     try testing.expectEqualStrings("spawner", scripts[1].name);
-    try testing.expectEqualStrings("10_spawner.rb", scripts[1].file);
+    try testing.expectEqualStrings("scripts/10_spawner.rb", scripts[1].file);
     try testing.expectEqualStrings("hunger", scripts[2].name);
-    try testing.expectEqualStrings("20_hunger.rb", scripts[2].file);
+    try testing.expectEqualStrings("scripts/20_hunger.rb", scripts[2].file);
     try testing.expectEqualStrings("alpha", scripts[3].name);
     try testing.expectEqualStrings("zeta", scripts[4].name);
 
@@ -1546,7 +1811,7 @@ test "collectEmbedScripts + ScriptScanner: one mixed scripts/ dir, two scanners,
     defer freeEmbedScripts(allocator, lua_scripts);
     try testing.expectEqual(@as(usize, 2), lua_scripts.len);
     try testing.expectEqualStrings("spawner", lua_scripts[0].name);
-    try testing.expectEqualStrings("01_spawner.lua", lua_scripts[0].file);
+    try testing.expectEqualStrings("scripts/01_spawner.lua", lua_scripts[0].file);
     try testing.expectEqualStrings("hunger", lua_scripts[1].name);
 
     // And the shared target link exists once, serving both layers.
@@ -1582,9 +1847,9 @@ test "collectEmbedScripts: legacy dir keeps the pre-#237 behavior verbatim — r
 
     try testing.expectEqual(@as(usize, 2), scripts.len);
     try testing.expectEqualStrings("10_ball", scripts[0].name);
-    try testing.expectEqualStrings("10_ball.rb", scripts[0].file);
+    try testing.expectEqualStrings("ruby/10_ball.rb", scripts[0].file);
     try testing.expectEqualStrings("npc/vendor", scripts[1].name);
-    try testing.expectEqualStrings("npc/vendor.rb", scripts[1].file);
+    try testing.expectEqualStrings("ruby/npc/vendor.rb", scripts[1].file);
 
     // linkAndScan placed the legacy dir's target link.
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;

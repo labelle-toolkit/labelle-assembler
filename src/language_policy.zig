@@ -15,15 +15,17 @@
 //!      with `depends_on_resources`) must match the project's declared
 //!      language — a Lua-scripted pack fails loudly in a Rust project,
 //!      naming both sides.
-//!   3. **Script-dir scan** (`scanUnitLanguageDirs`): script-language files
-//!      live in the `scripts/` convention dir — the SAME structure Zig
-//!      scripts use (`SCRIPTS_DIR`; the extension selects the language,
-//!      labelle-engine#237). The scan polices `scripts/` by EXTENSION
-//!      (`scriptExtensions`): files of a language OTHER than the declared
-//!      one are a hard error listing up to `MAX_LISTED_FILES` offenders;
-//!      language files with NO scripting plugin declared error with the
-//!      attach hint (`.zig` belongs to no script language — the Zig script
-//!      scanner owns it, so Zig + script-language files coexist in one dir).
+//!   3. **Shared-dir scan** (`scanUnitLanguageDirs`): script-language files
+//!      live in the SAME structure Zig files use (labelle-engine#237) —
+//!      scripts in `scripts/` (`SCRIPTS_DIR`), component DECLARATIONS in
+//!      `components/` (the #237 refinement: files live where their kind
+//!      lives), the extension selecting the language in both. The scan
+//!      polices BOTH dirs by EXTENSION (`scriptExtensions`): files of a
+//!      language OTHER than the declared one are a hard error listing up
+//!      to `MAX_LISTED_FILES` offenders; language files with NO scripting
+//!      plugin declared error with the attach hint (`.zig` belongs to no
+//!      script language — the Zig scanners own it, so Zig + script-language
+//!      files coexist in one dir).
 //!      The old per-language dirs (`lua/ ts/ ruby/ rust/ crystal/ go/
 //!      csharp/` — `legacyDir`) are DEPRECATED but still policed the old
 //!      way for the one-release grace window: foreign-language legacy dirs
@@ -301,12 +303,13 @@ fn walkCollect(
 /// generate-time layer, re-homed on the `scripts/` convention —
 /// labelle-engine#237):
 ///
-///   `scripts/` (the convention dir — policed by EXTENSION, since the
-///   extension is the language selector there; `.zig` belongs to no script
-///   language and is invisible to this scan):
+///   `scripts/` and `components/` (the shared convention dirs — policed by
+///   EXTENSION, since the extension is the language selector there; `.zig`
+///   belongs to no script language and is invisible to this scan):
 ///   - the DECLARED language's files → fine, skipped entirely (the
 ///     scripting splice consumes them and owns the deeper checks — the
-///     state-subdir gate, the .ts transpile gate);
+///     state-subdir gate, the transpile machinery, the components/
+///     authoring-source guard);
 ///   - another language's files → `error.ScriptLanguageMismatch`, listing
 ///     up to `MAX_LISTED_FILES` offenders + the fix;
 ///   - language files but NO declared language →
@@ -416,27 +419,31 @@ pub fn scanUnitLanguageDirs(
         return error.MissingScriptingPlugin;
     }
 
-    try scanScriptsDirLanguages(allocator, unit_root, unit_label, declared);
+    try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, SCRIPTS_DIR);
+    try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, "components");
 }
 
-/// The `scripts/`-content half of `scanUnitLanguageDirs`: walk
-/// `<unit_root>/scripts/` once, bucket every file by the language its
-/// extension belongs to (`scriptExtensions`; unmatched extensions — `.zig`,
-/// `.md`, editor droppings — are invisible), and enforce the same two rules
-/// the legacy dirs get: foreign language → mismatch, no declared language →
-/// attach hint. The DECLARED language's files are never collected — the
-/// scripting splice owns them (top-level collection, state-subdir gate,
-/// ordering). Buckets error in `SUPPORTED_LANGUAGES` order so diagnostics
-/// are deterministic.
-fn scanScriptsDirLanguages(
+/// The shared-convention-dir half of `scanUnitLanguageDirs`: walk ONE
+/// extension-keyed shared dir (`scripts/` — and, since labelle-engine#237's
+/// refinement, `components/`, where the declared language's DECLARATION
+/// files live beside the Zig components) once, bucket every file by the
+/// language its extension belongs to (`scriptExtensions`; unmatched
+/// extensions — `.zig`, `.md`, editor droppings — are invisible), and
+/// enforce the same two rules the legacy dirs get: foreign language →
+/// mismatch, no declared language → attach hint. The DECLARED language's
+/// files are never collected — the scripting splice owns them (collection,
+/// state-subdir gate, ordering, the components/ transpile guard). Buckets
+/// error in `SUPPORTED_LANGUAGES` order so diagnostics are deterministic.
+fn scanSharedDirLanguages(
     allocator: std.mem.Allocator,
     unit_root: []const u8,
     unit_label: []const u8,
     declared: ?DeclaredLanguage,
+    shared_dir: []const u8,
 ) !void {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
-    const dir_path = try std.fs.path.join(allocator, &.{ unit_root, SCRIPTS_DIR });
+    const dir_path = try std.fs.path.join(allocator, &.{ unit_root, shared_dir });
     defer allocator.free(dir_path);
     var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return,
@@ -446,7 +453,7 @@ fn scanScriptsDirLanguages(
 
     var buckets: [SUPPORTED_LANGUAGES.len]LanguageBucket = @splat(.{});
     defer for (&buckets) |*b| b.deinit(allocator);
-    try walkScriptsCollect(allocator, io, dir, SCRIPTS_DIR, declared, &buckets);
+    try walkSharedCollect(allocator, io, dir, shared_dir, declared, &buckets);
 
     for (SUPPORTED_LANGUAGES, &buckets) |lang, *bucket| {
         if (bucket.total == 0) continue;
@@ -454,8 +461,8 @@ fn scanScriptsDirLanguages(
 
         if (declared) |d| {
             std.debug.print(
-                "labelle-assembler: {s} {s}/ contains {s} scripts but the project's script language is \"{s}\" (plugin '{s}'):\n",
-                .{ unit_label, SCRIPTS_DIR, lang, d.language, d.plugin_name },
+                "labelle-assembler: {s} {s}/ contains {s} files but the project's script language is \"{s}\" (plugin '{s}'):\n",
+                .{ unit_label, shared_dir, lang, d.language, d.plugin_name },
             );
             printListed(scanned);
             std.debug.print(
@@ -466,8 +473,8 @@ fn scanScriptsDirLanguages(
         }
 
         std.debug.print(
-            "labelle-assembler: {s} {s}/ contains {s} scripts but no scripting plugin is declared:\n",
-            .{ unit_label, SCRIPTS_DIR, lang },
+            "labelle-assembler: {s} {s}/ contains {s} files but no scripting plugin is declared:\n",
+            .{ unit_label, shared_dir, lang },
         );
         printListed(scanned);
         std.debug.print(
@@ -490,11 +497,12 @@ const LanguageBucket = struct {
     }
 };
 
-/// One recursive walk of `scripts/`, bucketing files by extension-owning
-/// language. Dot-entries skipped (same rule as `walkCollect`); the declared
-/// language's files are skipped entirely — its policing belongs to the
+/// One recursive walk of a shared convention dir (`scripts/`,
+/// `components/`), bucketing files by extension-owning language.
+/// Dot-entries skipped (same rule as `walkCollect`); the declared
+/// language's files are skipped entirely — their policing belongs to the
 /// scripting splice.
-fn walkScriptsCollect(
+fn walkSharedCollect(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
@@ -511,7 +519,7 @@ fn walkScriptsCollect(
                 defer sub.close(io);
                 const sub_prefix = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
                 defer allocator.free(sub_prefix);
-                try walkScriptsCollect(allocator, io, sub, sub_prefix, declared, buckets);
+                try walkSharedCollect(allocator, io, sub, sub_prefix, declared, buckets);
             },
             else => {
                 for (SUPPORTED_LANGUAGES, buckets) |lang, *bucket| {
@@ -967,6 +975,55 @@ test "scanUnitLanguageDirs: a Zig-only scripts/ is invisible to the language sca
     try writeTestFile(tmp.dir, "scripts/playing/02_hud.zig", "pub fn tick() void {}\n");
     try writeTestFile(tmp.dir, "scripts/README.md", "# scripts\n");
     try writeTestFile(tmp.dir, "scripts/.gitkeep", "");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    try scanUnitLanguageDirs(allocator, root, "project root", null);
+    const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
+    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+}
+
+test "scanUnitLanguageDirs: components/ is policed like scripts/ — declared-language declarations pass, foreign extensions error (#237 refinement)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The canonical declare-mode shape: a ruby declaration beside the Zig
+    // components — the declared language's own files pass.
+    try writeTestFile(tmp.dir, "components/hunger.rb", "Hunger = Labelle.component \"Hunger\"\n");
+    try writeTestFile(tmp.dir, "components/worker.zig", "pub const Worker = struct {};\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const ruby_declared = DeclaredLanguage{ .language = "ruby", .plugin_name = "scripting" };
+    try scanUnitLanguageDirs(allocator, root, "project root", ruby_declared);
+
+    // A FOREIGN language's file in components/ errors exactly like in
+    // scripts/ (nothing would ever read it — the silent-death class).
+    const lua_declared = DeclaredLanguage{ .language = "lua", .plugin_name = "scripting" };
+    try testing.expectError(
+        error.ScriptLanguageMismatch,
+        scanUnitLanguageDirs(allocator, root, "project root", lua_declared),
+    );
+
+    // No scripting plugin at all → the attach hint.
+    try testing.expectError(
+        error.MissingScriptingPlugin,
+        scanUnitLanguageDirs(allocator, root, "project root", null),
+    );
+}
+
+test "scanUnitLanguageDirs: a Zig-only components/ is invisible to the language scan (coexistence negative control)" {
+    // Every existing game has components/*.zig and no scripting plugin —
+    // the extension-keyed scan must never see them (the scripts/-side
+    // control's components twin).
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "components/worker.zig", "pub const Worker = struct {};\n");
+    try writeTestFile(tmp.dir, "components/needs/hunger.zig", "pub const Hunger = struct {};\n");
+    try writeTestFile(tmp.dir, "components/.gitkeep", "");
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
 

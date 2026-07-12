@@ -36,7 +36,8 @@
 //! ── The phase (embed splice, typescript row only) ────────────────────
 //! Ordered after the declare phase (deps are staged, `{package}` paths
 //! resolve; script-declared components — none for typescript today, the
-//! declare phase is lua-only — are already threaded). Every path below is
+//! declare phase has no typescript runner row — are already threaded).
+//! Every path below is
 //! rooted at the splice's RESOLVED script dir (`splice.dir` — `scripts/`,
 //! the #237 convention, or the deprecated legacy `ts/` on the one-release
 //! grace fallback; `resolveScriptDir` decided which at detect, and a
@@ -834,9 +835,9 @@ pub const PhaseOptions = struct {
     component_names: []const []const u8,
     /// Pack scans (d.ts providers, `<pack>__<Pascal>` keys).
     pack_scans: []const scan.PackScan,
-    /// Script-declared components (empty for typescript today — the
-    /// declare phase is lua-only — but wired so a ts-capable declare
-    /// runner feeds the same map).
+    /// Script-declared components (empty for typescript today — no
+    /// typescript row in `DECLARE_RUNNERS` — but wired so a ts-capable
+    /// declare runner feeds the same map).
     declared_components: []const scripting_declare.DeclaredComponent = &.{},
 };
 

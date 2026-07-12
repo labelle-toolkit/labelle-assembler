@@ -262,8 +262,11 @@ pub fn Mixin(comptime Self: type) type {
             // registration is the plugin's boot seam (labelle-scripting
             // `registerScript`). Entries carry the registered stem
             // (ordering prefix stripped, Zig-scanner style) AND the
-            // dir-relative file, pre-ordered by the root.zig collection
-            // (numeric prefixes first) so the emission is byte-stable.
+            // TARGET-RELATIVE file, pre-ordered by the root.zig collection
+            // — `components/` declaration files FIRST (their view
+            // constants must exist when scripts load — #237 refinement),
+            // then the script dir's entries (numeric prefixes first) — so
+            // the emission is byte-stable.
             // No-op for splice-less projects. EMBED family only
             // (labelle-engine#741): a native-compiled splice links its
             // scripts as a staticlib — no registerScript, no @embedFile.
@@ -275,7 +278,7 @@ pub fn Mixin(comptime Self: type) type {
                     try w.print("    // Embedded {s} scripts (via @embedFile) — registered with the\n", .{s.language});
                     try w.writeAll("    // scripting plugin before PluginControllers.setup boots the VM.\n");
                     for (s.scripts) |script| {
-                        try w.print("    scripting.registerScript(\"{s}\", @embedFile(\"{s}/{s}\"));\n", .{ script.name, s.dir, script.file });
+                        try w.print("    scripting.registerScript(\"{s}\", @embedFile(\"{s}\"));\n", .{ script.name, script.file });
                     }
                     try w.writeByte('\n');
                 }

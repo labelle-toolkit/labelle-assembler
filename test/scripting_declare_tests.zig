@@ -59,7 +59,7 @@ const lua_splice = generate.scripting_splice.ScriptingSplice{
     .language = "lua",
     .dir = "scripts",
     .extension = ".lua",
-    .scripts = &.{.{ .name = "hunger", .file = "hunger.lua" }},
+    .scripts = &.{.{ .name = "hunger", .file = "scripts/hunger.lua" }},
 };
 
 const scripting_plugins = [_]generate.PluginDep{
@@ -259,7 +259,28 @@ const StagedProject = struct {
         return self.tmp.dir.realPathFileAlloc(io, "fake-declare", allocator);
     }
 
-    fn config(self: *StagedProject, backend_repo: []const u8) generate.ProjectConfig {
+    /// The argv-RECORDING flavor: writes every script path it was invoked
+    /// with (one per line) to `recorded-args.txt` beside the fixture, then
+    /// prints the schema. Pins WHICH files reach the runner and in WHAT
+    /// order — the components-first union contract.
+    fn stageRecordingFakeRunner(self: *StagedProject, allocator: std.mem.Allocator, schema_json: []const u8) ![:0]const u8 {
+        const args_abs = try self.tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(args_abs);
+        const body = try std.fmt.allocPrint(
+            allocator,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{s}/recorded-args.txt\"\necho '{s}'\n",
+            .{ args_abs, schema_json },
+        );
+        defer allocator.free(body);
+        var f = try self.tmp.dir.createFile(io, "fake-declare", .{ .permissions = .executable_file });
+        defer f.close(io);
+        try f.writeStreamingAll(io, body);
+        return self.tmp.dir.realPathFileAlloc(io, "fake-declare", allocator);
+    }
+
+    /// `language` is COMPTIME so the anonymous `.plugins` array literal is
+    /// a static constant (the native suite's dangling-frame lesson).
+    fn configWithLanguage(self: *StagedProject, backend_repo: []const u8, comptime language: []const u8) generate.ProjectConfig {
         _ = self;
         return .{
             .name = "declare-game",
@@ -267,9 +288,13 @@ const StagedProject = struct {
             .backend_package = .{ .name = "sokol", .repo = backend_repo },
             .ecs = .mock,
             .plugins = &.{
-                .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "lua" } },
+                .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = language } },
             },
         };
+    }
+
+    fn config(self: *StagedProject, backend_repo: []const u8) generate.ProjectConfig {
+        return self.configWithLanguage(backend_repo, "lua");
     }
 };
 
@@ -514,5 +539,152 @@ pub const DECLARE_PHASE_E2E = struct {
             error.ScriptDeclarationFailed,
             generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = true }),
         );
+    }
+
+    test "collection union: components/*.lua + in-script chunk-scope declarations BOTH reach the runner — components first (argv pin)" {
+        // The #237 refinement's collection contract: `components/extra.lua`
+        // (the canonical home) and `scripts/hunger.lua` (the shipped
+        // in-script mechanism, still legal) feed ONE runner invocation, in
+        // components-first order — the runner owns duplicate detection
+        // with first-declared-in attribution across the two sources; the
+        // assembler's half is exactly this argv.
+        const allocator = std.testing.allocator;
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game.close(io);
+        try writeFileIn(game, "components/extra.lua",
+            \\local Extra = labelle.component("Extra", { n = 1 })
+        );
+        // A Zig component beside it — invisible to the collection.
+        try writeFileIn(game, "components/worker.zig", "pub const Worker = struct { id: u32 = 0 };\n");
+
+        const fake = try staged.stageRecordingFakeRunner(allocator, hunger_schema);
+        defer allocator.free(fake);
+        generate.scripting_declare.declare_tool_override = fake;
+        defer generate.scripting_declare.declare_tool_override = null;
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = true });
+
+        const args = try staged.tmp.dir.readFileAlloc(io, "recorded-args.txt", allocator, .limited(1 << 16));
+        defer allocator.free(args);
+        // Both sources present, components/ first, the Zig files absent.
+        const comp_arg = std.mem.indexOf(u8, args, "components/extra.lua") orelse return error.MissingComponentsArg;
+        const script_arg = std.mem.indexOf(u8, args, "scripts/hunger.lua") orelse return error.MissingScriptArg;
+        try std.testing.expect(comp_arg < script_arg);
+        // The coexisting ZIG files never reach the runner (the argv paths
+        // themselves live under .zig-cache/, so pin the FILENAMES).
+        try std.testing.expect(std.mem.indexOf(u8, args, "worker.zig") == null);
+        try std.testing.expect(std.mem.indexOf(u8, args, "01_move.zig") == null);
+        // And the phase consumed the schema as usual.
+        try staged.tmp.dir.access(io, "out/sokol_desktop/scripting_components.zig", .{});
+    }
+
+    test "RUBY declare e2e: components/hunger.rb declares through tools/declare-ruby — generated file, registry, registered BEFORE scripts" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game.close(io);
+        // Re-shape the staged game for ruby: the lua sources out, the
+        // canonical ruby pair in — a components/ declaration and a plain
+        // behavior script (feed_watcher-style).
+        try game.deleteFile(io, "scripts/hunger.lua");
+        try writeFileIn(game, "components/hunger.rb",
+            \\Hunger = Labelle.component "Hunger", level: 0.875, starving: false
+        );
+        try writeFileIn(game, "scripts/feed.rb",
+            \\def update(dt)
+            \\end
+        );
+        // The per-row capability marker (labelle-scripting >= 0.9.0 ships
+        // tools/declare-ruby): with it present, the override below is what
+        // keeps the REAL `zig build labelle-declare-ruby` from running in
+        // this build.zig-less fixture — the probe itself is exercised for
+        // real by its absence twin below.
+        try writeFileIn(game, "plugins/scripting/tools/declare-ruby/main.zig", "// ruby declare runner (fixture marker)\n");
+        // The exe target emits main.zig (the registration-order surface) —
+        // stage the engine template fixture (the sidecar test's pattern).
+        try writeFileIn(game, "engine-fixture/codegen/main.zig.template", engine_template);
+
+        const fake = try staged.stageRecordingFakeRunner(allocator, hunger_schema);
+        defer allocator.free(fake);
+        generate.scripting_declare.declare_tool_override = fake;
+        defer generate.scripting_declare.declare_tool_override = null;
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        var cfg = staged.configWithLanguage(backend_repo, "ruby");
+        cfg.engine_version = "local:engine-fixture";
+        cfg.y_axis = .up;
+        try generate.generate(allocator, cfg, staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        // The declaration reached the runner (components-first argv) and
+        // codegen'd the component like the lua path does.
+        const args = try staged.tmp.dir.readFileAlloc(io, "recorded-args.txt", allocator, .limited(1 << 16));
+        defer allocator.free(args);
+        const comp_arg = std.mem.indexOf(u8, args, "components/hunger.rb") orelse return error.MissingComponentsArg;
+        const script_arg = std.mem.indexOf(u8, args, "scripts/feed.rb") orelse return error.MissingScriptArg;
+        try std.testing.expect(comp_arg < script_arg);
+
+        const gen_src = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/scripting_components.zig", allocator, .limited(64 * 1024));
+        defer allocator.free(gen_src);
+        _ = try indexOfOrFail(gen_src, "pub const Hunger = struct {");
+        // The staged fake prints `hunger_schema` (level 1.0) — the REAL
+        // ruby runner's 0.875 parity is the scripting repo's golden.
+        _ = try indexOfOrFail(gen_src, "level: f32 = 1,");
+
+        // The generated main: registry field + THE RUNTIME ORDERING PIN —
+        // the components/ declaration registers BEFORE the script, so the
+        // view constant exists when the script loads (ruby constants are
+        // VM-global; per-script isolation deliberately scopes hooks, not
+        // constants).
+        const main_zig = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
+        defer allocator.free(main_zig);
+        _ = try indexOfOrFail(main_zig, ".Hunger = @import(\"scripting_components.zig\").Hunger,");
+        const reg_comp = try indexOfOrFail(main_zig, "scripting.registerScript(\"hunger\", @embedFile(\"components/hunger.rb\"));");
+        const reg_script = try indexOfOrFail(main_zig, "scripting.registerScript(\"feed\", @embedFile(\"scripts/feed.rb\"));");
+        const controllers_setup = try indexOfOrFail(main_zig, "PluginControllers.setup(&g)");
+        try std.testing.expect(reg_comp < reg_script);
+        try std.testing.expect(reg_script < controllers_setup);
+    }
+
+    test "RUBY old-pin path: a scripting pin WITHOUT tools/declare-ruby skips declare gracefully — scripts still register" {
+        // The generalization of the lua "no tools/declare skips" pin: the
+        // capability probe is PER ROW, so a v0.3.0-era ruby pin (embed
+        // support, no declare runner) keeps generating — components/*.rb
+        // still embed + register (the runtime consumes the declaration),
+        // nothing codegens. NO override: the probe runs for real.
+        const allocator = std.testing.allocator;
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game.close(io);
+        try game.deleteFile(io, "scripts/hunger.lua");
+        try writeFileIn(game, "components/hunger.rb",
+            \\Hunger = Labelle.component "Hunger", level: 0.875, starving: false
+        );
+        try writeFileIn(game, "scripts/feed.rb",
+            \\def update(dt)
+            \\end
+        );
+        // Deliberately NO tools/declare-ruby in the plugin fixture.
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.configWithLanguage(backend_repo, "ruby"), staged.out_abs, staged.game_abs, .{ .is_tests_target = true });
+
+        // Skipped means skipped: no generated component file...
+        try std.testing.expectError(
+            error.FileNotFound,
+            staged.tmp.dir.access(io, "out/sokol_desktop/scripting_components.zig", .{}),
+        );
+        // ...and the embeds still landed in the target through the links
+        // (the tests target emits no main.zig; the link resolution is the
+        // load-bearing half here).
+        try staged.tmp.dir.access(io, "out/sokol_desktop/components/hunger.rb", .{});
+        try staged.tmp.dir.access(io, "out/sokol_desktop/scripts/feed.rb", .{});
     }
 };
