@@ -222,6 +222,9 @@ pub const TRANSPILE_E2E = struct {
         // The game carries its OWN contract copy — the package's must
         // then stay OUT of the tsconfig (duplicate globals).
         try writeFileIn(game_root, "scripts/labelle.d.ts", "declare const labelle: any;\n");
+        // A components-dir language file (#237 refinement): must survive
+        // the transpile swap and stay registered FIRST.
+        try writeFileIn(game_root, "components/glue.js", "export const GLUE = 1;\n");
 
         const fake = try staged.stageFakeTsc(allocator, happy_fake_tsc);
         defer allocator.free(fake);
@@ -264,6 +267,11 @@ pub const TRANSPILE_E2E = struct {
         const reg_enemy = try indexOfOrFail(main_zig, "scripting.registerScript(\"enemy\", @embedFile(\"scripts/enemy.js\"));");
         try std.testing.expect(reg_behavior < reg_enemy);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".ts\")") == null);
+        // The components-dir entry SURVIVED the post-transpile swap (the
+        // re-collection replaces only the script-dir entries) and keeps
+        // the components-first registration slot.
+        const reg_glue = try indexOfOrFail(main_zig, "scripting.registerScript(\"glue\", @embedFile(\"components/glue.js\"));");
+        try std.testing.expect(reg_glue < reg_behavior);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript(\"move\"") == null);
         // The generated declarations are typecheck INPUT, never a script:
         // no registration mentions them (their .d.ts suffix can't match

@@ -53,8 +53,8 @@ const lua_splice = generate.scripting_splice.ScriptingSplice{
     .dir = "scripts",
     .extension = ".lua",
     .scripts = &.{
-        .{ .name = "guard", .file = "01_guard.lua" },
-        .{ .name = "player_ai", .file = "player_ai.lua" },
+        .{ .name = "guard", .file = "scripts/01_guard.lua" },
+        .{ .name = "player_ai", .file = "scripts/player_ai.lua" },
     },
 };
 
@@ -68,8 +68,8 @@ const lua_legacy_splice = generate.scripting_splice.ScriptingSplice{
     .legacy = true,
     .extension = ".lua",
     .scripts = &.{
-        .{ .name = "ai/guard", .file = "ai/guard.lua" },
-        .{ .name = "player_ai", .file = "player_ai.lua" },
+        .{ .name = "ai/guard", .file = "lua/ai/guard.lua" },
+        .{ .name = "player_ai", .file = "lua/player_ai.lua" },
     },
 };
 
@@ -82,8 +82,8 @@ const ts_splice = generate.scripting_splice.ScriptingSplice{
     .dir = "scripts",
     .extension = ".js",
     .scripts = &.{
-        .{ .name = "behavior", .file = "behavior.js" },
-        .{ .name = "guard", .file = "guard.js" },
+        .{ .name = "behavior", .file = "scripts/behavior.js" },
+        .{ .name = "guard", .file = "scripts/guard.js" },
     },
 };
 
@@ -96,8 +96,8 @@ const ruby_splice = generate.scripting_splice.ScriptingSplice{
     .dir = "scripts",
     .extension = ".rb",
     .scripts = &.{
-        .{ .name = "spawner", .file = "10_spawner.rb" },
-        .{ .name = "hunger", .file = "20_hunger.rb" },
+        .{ .name = "spawner", .file = "scripts/10_spawner.rb" },
+        .{ .name = "hunger", .file = "scripts/20_hunger.rb" },
     },
 };
 
@@ -482,7 +482,8 @@ pub const SCRIPTING_BUILD_WIRING = struct {
 //
 // The declare-phase e2e harness shape (`test/scripting_declare_tests.zig`
 // StagedProject), typescript-flavored. Hermetic on the HAPPY path: the
-// lua-only declare gate returns before any tool build, so no `zig` child
+// runner-row declare gate (no typescript row) returns before any tool
+// build, so no `zig` child
 // process and no network — which is itself the pin: the staged plugin
 // fixture SHIPS a `tools/declare/` dir (the capability probe would pass),
 // so if the language gate were removed, generate would charge into
@@ -521,8 +522,9 @@ const StagedTsProject = struct {
             \\.{ .name = "scripting", .manifest_version = 1 }
         );
         // The declare-tool capability marker (labelle-scripting >= 0.2.0
-        // ships tools/declare): with it present, ONLY the lua-only
-        // language gate keeps the phase from building the runner here.
+        // ships tools/declare): with it present, ONLY the runner-row gate
+        // (typescript has no DECLARE_RUNNERS row) keeps the phase from
+        // building the runner here.
         try writeFileIn(game_root, "plugins/scripting/tools/declare/declare.lua", "-- lua declare runner (fixture marker)\n");
         try writeFileIn(game_root, "scripts/behavior.js",
             \\// @ts-check
@@ -602,7 +604,7 @@ pub const TYPESCRIPT_SPLICE_E2E = struct {
         defer allocator.free(build_zig);
         _ = try indexOfOrFail(build_zig, "const plugin_scripting_dep = b.dependency(\"labelle_scripting\", .{ .target = target, .optimize = optimize, .language = .typescript });");
 
-        // Declare phase SKIPPED without error (lua-only v1): no generated
+        // Declare phase SKIPPED without error (no typescript runner row): no generated
         // component file — even though the plugin fixture ships the
         // tools/declare capability marker, which is what makes this line a
         // real pin on the language gate (see the block comment above).
