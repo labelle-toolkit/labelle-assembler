@@ -2,7 +2,7 @@
 
 Showcase game #3 for [labelle-toolkit#607](https://github.com/labelle-toolkit/labelle-assembler/issues/607)
 — the ticket's Ruby seed candidate, and the Ruby counterpart of the
-in-repo Lua `scripting-smoke`. A single `ruby/orbit.rb` script drives the
+in-repo Lua `scripting-smoke`. A single `scripts/orbit.rb` script drives the
 REAL engine through the Script Runtime Contract (labelle-engine#749),
 headless over the null backend.
 
@@ -13,7 +13,7 @@ The **Ruby scripting** cell of the showcase grid via `labelle-scripting`:
 - A plain-hooks Ruby script (`init` / `update` / `deinit`) that creates
   an entity, writes/reads its `Position` through the contract each frame,
   and reacts to the engine's own `engine__tick` event.
-- The assembler's scripting splice: `ruby/*.rb` is embedded and
+- The assembler's scripting splice: `scripts/*.rb` is embedded and
   `registerScript`-ed into the generated `main`, the null backend's
   `script_contract.bind` touchpoint boots the mruby VM, and per-frame
   `Controller.tick` + `drainEvents` run the script over the live engine.
@@ -68,4 +68,4 @@ Each `X` value is only reachable through the previous tick's persisted
 `Position` write, so the sequence pins ECS round-tripping through the
 real engine, not just liveness. `RUBY_ENGINE_TICK_SEEN` lands on tick 3
 because event subscriptions activate at a drain boundary (one-tick
-latency) — see `ruby/orbit.rb` for the frame-by-frame timeline.
+latency) — see `scripts/orbit.rb` for the frame-by-frame timeline.

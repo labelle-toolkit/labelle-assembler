@@ -8,10 +8,12 @@
 //!
 //!   1. `generateMainZigFromTemplate` with `main_template.scripting_splice`
 //!      set (the scoped threadlocal root.zig threads) — registration calls
-//!      present + sorted + before `PluginControllers.setup`, embed paths
-//!      rooted at the copied `<language>/` dir, the module-scope
-//!      `scripting` alias + `scripting_enabled` flag (the generated half of
-//!      the backend templates' double-`@hasDecl` gate), and the per-frame
+//!      present + collection-ordered + before `PluginControllers.setup`,
+//!      embed paths rooted at the `scripts/` convention dir (#237; the
+//!      deprecated legacy dir on the grace fallback), ordering-prefix
+//!      stems stripped, the module-scope `scripting` alias +
+//!      `scripting_enabled` flag (the generated half of the backend
+//!      templates' double-`@hasDecl` gate), and the per-frame
 //!      `script_contract.drainEvents` tap between the plugin ticks and
 //!      `g.dispatchEvents()` — on BOTH the loop and callback lifecycles.
 //!   2. `generateBuildZig` with `BuildZigOptions.scripting` set — the
@@ -41,38 +43,62 @@ test {
     zspec.runAll(@This());
 }
 
-/// The splice fixture root.zig would thread for a two-script lua project:
-/// stems pre-sorted (the `scanner.linkAndScan` contract), one nested subdir
-/// so the `/`-joined name shape is exercised.
+/// The splice fixture root.zig would thread for a two-script lua project
+/// on the `scripts/` convention (labelle-engine#237): entries pre-ordered
+/// by the collection (numeric prefixes first, stripped from the registered
+/// stem — `01_guard.lua` registers as "guard").
 const lua_splice = generate.scripting_splice.ScriptingSplice{
     .plugin_name = "scripting",
     .language = "lua",
-    .dir = "lua",
+    .dir = "scripts",
     .extension = ".lua",
-    .script_names = &.{ "ai/guard", "player_ai" },
+    .scripts = &.{
+        .{ .name = "guard", .file = "01_guard.lua" },
+        .{ .name = "player_ai", .file = "player_ai.lua" },
+    },
 };
 
-/// The typescript twin (labelle-scripting v0.3.0, quickjs-ng): language ≠
-/// dir — scripts live in `ts/` and embed as PLAIN `.js` (the TS→JS
-/// transpile hook is the #586 gap). Same nested-subdir shape as the lua
-/// fixture so the `/`-joined stems ride the identical builders.
+/// The one-release grace twin: detect resolved the DEPRECATED lua/ dir —
+/// pre-#237 semantics verbatim (recursive scan, plain sorted stems, no
+/// prefix stripping, nested subdir joined with `/`).
+const lua_legacy_splice = generate.scripting_splice.ScriptingSplice{
+    .plugin_name = "scripting",
+    .language = "lua",
+    .dir = "lua",
+    .legacy = true,
+    .extension = ".lua",
+    .scripts = &.{
+        .{ .name = "ai/guard", .file = "ai/guard.lua" },
+        .{ .name = "player_ai", .file = "player_ai.lua" },
+    },
+};
+
+/// The typescript twin (labelle-scripting v0.3.0, quickjs-ng): same
+/// scripts/ home as every language now (`ts/` is only the legacy grace
+/// dir), embedding PLAIN `.js` (the TS→JS transpile hook is the #586 gap).
 const ts_splice = generate.scripting_splice.ScriptingSplice{
     .plugin_name = "scripting",
     .language = "typescript",
-    .dir = "ts",
+    .dir = "scripts",
     .extension = ".js",
-    .script_names = &.{ "ai/guard", "behavior" },
+    .scripts = &.{
+        .{ .name = "behavior", .file = "behavior.js" },
+        .{ .name = "guard", .file = "guard.js" },
+    },
 };
 
-/// The ruby twin (labelle-scripting v0.3.0, mruby 3.4.0): language == dir
-/// (`ruby/`), sources embed as `.rb` verbatim — no transpile gap. Same
-/// nested-subdir shape so the `/`-joined stems ride the identical builders.
+/// The ruby twin (labelle-scripting v0.3.0, mruby 3.4.0), carrying the
+/// ticket's ordering example: `10_spawner.rb` before `20_hunger.rb`, stems
+/// "spawner"/"hunger" — prefix ordering + stripping ride the emission.
 const ruby_splice = generate.scripting_splice.ScriptingSplice{
     .plugin_name = "scripting",
     .language = "ruby",
-    .dir = "ruby",
+    .dir = "scripts",
     .extension = ".rb",
-    .script_names = &.{ "10_ball", "npc/vendor" },
+    .scripts = &.{
+        .{ .name = "spawner", .file = "10_spawner.rb" },
+        .{ .name = "hunger", .file = "20_hunger.rb" },
+    },
 };
 
 /// A project.labelle plugin list carrying THE scripting plugin plus an
@@ -156,7 +182,7 @@ const loop_lifecycle =
 ;
 
 pub const SCRIPTING_MAIN_SPLICE = struct {
-    test "loop lifecycle: registrations sorted + before plugin setup, alias/flag emitted, drain between tick and dispatch" {
+    test "loop lifecycle: registrations ordered + before plugin setup, alias/flag emitted, drain between tick and dispatch" {
         generate.main_template.scripting_splice = lua_splice;
         defer generate.main_template.scripting_splice = null;
 
@@ -175,10 +201,12 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         _ = try indexOfOrFail(main_zig, "const scripting = @import(\"scripting\");");
         _ = try indexOfOrFail(main_zig, "const scripting_enabled = true;");
 
-        // Registrations: sorted stems, `<language>/`-rooted embed paths, and
-        // strictly BEFORE PluginControllers.setup boots the VM.
-        const reg_guard = try indexOfOrFail(main_zig, "scripting.registerScript(\"ai/guard\", @embedFile(\"lua/ai/guard.lua\"));");
-        const reg_player = try indexOfOrFail(main_zig, "scripting.registerScript(\"player_ai\", @embedFile(\"lua/player_ai.lua\"));");
+        // Registrations: collection-ordered entries, `scripts/`-rooted
+        // embed paths (the FILE keeps its ordering prefix, the registered
+        // stem drops it), and strictly BEFORE PluginControllers.setup
+        // boots the VM.
+        const reg_guard = try indexOfOrFail(main_zig, "scripting.registerScript(\"guard\", @embedFile(\"scripts/01_guard.lua\"));");
+        const reg_player = try indexOfOrFail(main_zig, "scripting.registerScript(\"player_ai\", @embedFile(\"scripts/player_ai.lua\"));");
         const controllers_setup = try indexOfOrFail(main_zig, "PluginControllers.setup(&g)");
         try std.testing.expect(reg_guard < reg_player);
         try std.testing.expect(reg_player < controllers_setup);
@@ -232,8 +260,8 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         _ = try indexOfOrFail(main_zig, "const scripting = @import(\"scripting\");");
         _ = try indexOfOrFail(main_zig, "const scripting_enabled = true;");
 
-        const reg_guard = try indexOfOrFail(main_zig, "scripting.registerScript(\"ai/guard\", @embedFile(\"lua/ai/guard.lua\"));");
-        const reg_player = try indexOfOrFail(main_zig, "scripting.registerScript(\"player_ai\", @embedFile(\"lua/player_ai.lua\"));");
+        const reg_guard = try indexOfOrFail(main_zig, "scripting.registerScript(\"guard\", @embedFile(\"scripts/01_guard.lua\"));");
+        const reg_player = try indexOfOrFail(main_zig, "scripting.registerScript(\"player_ai\", @embedFile(\"scripts/player_ai.lua\"));");
         const controllers_setup = try indexOfOrFail(main_zig, "PluginControllers.setup(&g)");
         try std.testing.expect(reg_guard < reg_player);
         try std.testing.expect(reg_player < controllers_setup);
@@ -247,7 +275,7 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         try expectAstGenOk(main_zig);
     }
 
-    test "typescript loop lifecycle: ts/-rooted .js embeds ride the same builders (never typescript/, never .ts)" {
+    test "typescript loop lifecycle: scripts/-rooted .js embeds ride the same builders (never typescript/, never .ts)" {
         generate.main_template.scripting_splice = ts_splice;
         defer generate.main_template.scripting_splice = null;
 
@@ -263,27 +291,28 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         _ = try indexOfOrFail(main_zig, "const scripting = @import(\"scripting\");");
         _ = try indexOfOrFail(main_zig, "const scripting_enabled = true;");
 
-        // Embed paths root at the `ts/` convention dir (the splice's `dir`
-        // — language and dir DIFFER for typescript) with the `.js` runtime
-        // extension; sorted; strictly before PluginControllers.setup.
-        const reg_guard = try indexOfOrFail(main_zig, "scripting.registerScript(\"ai/guard\", @embedFile(\"ts/ai/guard.js\"));");
-        const reg_behavior = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"ts/behavior.js\"));");
+        // Embed paths root at the shared `scripts/` convention dir with
+        // the `.js` runtime extension; collection-ordered; strictly before
+        // PluginControllers.setup.
+        const reg_behavior = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"scripts/behavior.js\"));");
+        const reg_guard = try indexOfOrFail(main_zig, "scripting.registerScript(\"guard\", @embedFile(\"scripts/guard.js\"));");
         const controllers_setup = try indexOfOrFail(main_zig, "PluginControllers.setup(&g)");
-        try std.testing.expect(reg_guard < reg_behavior);
-        try std.testing.expect(reg_behavior < controllers_setup);
+        try std.testing.expect(reg_behavior < reg_guard);
+        try std.testing.expect(reg_guard < controllers_setup);
 
         // The language-keyed halves are untouched: VM tick + drain tap.
         _ = try indexOfOrFail(main_zig, "scripting.Controller.tick(&g, scaled_dt);");
         _ = try indexOfOrFail(main_zig, "engine.script_contract.drainEvents(&g);");
 
-        // No `typescript/`-rooted or `.ts` embed can appear anywhere.
+        // No `typescript/`- or `ts/`-rooted, no `.ts` embed anywhere.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"typescript/") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"ts/") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, ".ts\")") == null);
 
         try expectAstGenOk(main_zig);
     }
 
-    test "ruby loop lifecycle: ruby/-rooted .rb embeds ride the same builders" {
+    test "ruby loop lifecycle: the ordering-prefix pin — 10_spawner before 20_hunger, stems stripped (scripts/ convention)" {
         generate.main_template.scripting_splice = ruby_splice;
         defer generate.main_template.scripting_splice = null;
 
@@ -299,14 +328,15 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         _ = try indexOfOrFail(main_zig, "const scripting = @import(\"scripting\");");
         _ = try indexOfOrFail(main_zig, "const scripting_enabled = true;");
 
-        // Embed paths root at the `ruby/` convention dir (language == dir
-        // for ruby) with the `.rb` extension; sorted; strictly before
-        // PluginControllers.setup.
-        const reg_ball = try indexOfOrFail(main_zig, "scripting.registerScript(\"10_ball\", @embedFile(\"ruby/10_ball.rb\"));");
-        const reg_vendor = try indexOfOrFail(main_zig, "scripting.registerScript(\"npc/vendor\", @embedFile(\"ruby/npc/vendor.rb\"));");
+        // The ticket's exact wording: scripts/10_spawner.rb registers
+        // BEFORE scripts/20_hunger.rb, with stems "spawner"/"hunger" —
+        // the prefix orders and is stripped from the name, never from the
+        // embed path.
+        const reg_spawner = try indexOfOrFail(main_zig, "scripting.registerScript(\"spawner\", @embedFile(\"scripts/10_spawner.rb\"));");
+        const reg_hunger = try indexOfOrFail(main_zig, "scripting.registerScript(\"hunger\", @embedFile(\"scripts/20_hunger.rb\"));");
         const controllers_setup = try indexOfOrFail(main_zig, "PluginControllers.setup(&g)");
-        try std.testing.expect(reg_ball < reg_vendor);
-        try std.testing.expect(reg_vendor < controllers_setup);
+        try std.testing.expect(reg_spawner < reg_hunger);
+        try std.testing.expect(reg_hunger < controllers_setup);
 
         // The language-keyed halves are untouched: VM tick + drain tap.
         _ = try indexOfOrFail(main_zig, "scripting.Controller.tick(&g, scaled_dt);");
@@ -315,12 +345,35 @@ pub const SCRIPTING_MAIN_SPLICE = struct {
         try expectAstGenOk(main_zig);
     }
 
+    test "LEGACY lua/ splice (one release of grace): pre-#237 emission verbatim — lua/-rooted paths, plain stems" {
+        generate.main_template.scripting_splice = lua_legacy_splice;
+        defer generate.main_template.scripting_splice = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &scripting_plugins,
+        }, loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // Byte-identical to the pre-migration emission: nested stems keep
+        // their `/`-joined names, nothing is prefix-stripped, and the
+        // embed paths root at the deprecated dir.
+        const reg_guard = try indexOfOrFail(main_zig, "scripting.registerScript(\"ai/guard\", @embedFile(\"lua/ai/guard.lua\"));");
+        const reg_player = try indexOfOrFail(main_zig, "scripting.registerScript(\"player_ai\", @embedFile(\"lua/player_ai.lua\"));");
+        try std.testing.expect(reg_guard < reg_player);
+
+        try expectAstGenOk(main_zig);
+    }
+
     test "an EMPTY script set still wires the plugin: alias + flag + drain, but no registerScript" {
-        // Empty `lua/` dir (or none): the plugin is attached and the VM
+        // Empty scripts/ (or none): the plugin is attached and the VM
         // boots, so the flag/alias/drain must be present — only the
         // registration block is elided.
         var empty_scripts = lua_splice;
-        empty_scripts.script_names = &.{};
+        empty_scripts.scripts = &.{};
         generate.main_template.scripting_splice = empty_scripts;
         defer generate.main_template.scripting_splice = null;
 
@@ -446,11 +499,12 @@ fn writeFileIn(dir: std.Io.Dir, rel: []const u8, body: []const u8) !void {
 }
 
 /// A staged tmp typescript game project: `game/` with a manifest-bearing
-/// scripting plugin (plus its declare-tool marker), a `ts/` dir holding a
-/// runnable `.js` script AND the copied `labelle.d.ts` authoring companion
-/// (the documented `// @ts-check` workflow — pinning that declaration
-/// files never trip the transpile gate), the engine template fixture (exe
-/// main.zig emission), and `out/`.
+/// scripting plugin (plus its declare-tool marker), a `scripts/` dir
+/// holding a runnable `.js` script AND the copied `labelle.d.ts` authoring
+/// companion (the documented `// @ts-check` workflow — pinning that
+/// declaration files never trip the transpile gate) beside a Zig script
+/// (the #237 coexistence), the engine template fixture (exe main.zig
+/// emission), and `out/`.
 const StagedTsProject = struct {
     tmp: std.testing.TmpDir,
     game_abs: [:0]const u8,
@@ -470,11 +524,14 @@ const StagedTsProject = struct {
         // ships tools/declare): with it present, ONLY the lua-only
         // language gate keeps the phase from building the runner here.
         try writeFileIn(game_root, "plugins/scripting/tools/declare/declare.lua", "-- lua declare runner (fixture marker)\n");
-        try writeFileIn(game_root, "ts/behavior.js",
+        try writeFileIn(game_root, "scripts/behavior.js",
             \\// @ts-check
             \\export function update(dt) {}
         );
-        try writeFileIn(game_root, "ts/labelle.d.ts", "declare const labelle: any;\n");
+        try writeFileIn(game_root, "scripts/labelle.d.ts", "declare const labelle: any;\n");
+        // A Zig script sharing the dir — the ZIG scanner's file, invisible
+        // to the language collection (extension-keyed coexistence).
+        try writeFileIn(game_root, "scripts/01_move.zig", "pub fn tick() void {}\n");
         // Exe main.zig emission loads the engine's codegen template — the
         // unit-test fixture template staged as a `local:` engine package.
         try writeFileIn(game_root, "engine-fixture/codegen/main.zig.template", engine_template);
@@ -515,7 +572,7 @@ fn sokolFixtureRepoAbs(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 pub const TYPESCRIPT_SPLICE_E2E = struct {
-    test "a ts/behavior.js project generates end to end: ts/-rooted embed, .typescript dep language, declare skipped" {
+    test "a scripts/behavior.js project generates end to end: scripts/-rooted embed, .typescript dep language, declare skipped" {
         const allocator = std.testing.allocator;
         var staged = try StagedTsProject.init(allocator);
         defer staged.deinit(allocator);
@@ -524,17 +581,21 @@ pub const TYPESCRIPT_SPLICE_E2E = struct {
         defer allocator.free(backend_repo);
         try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
 
-        // Generated main: the registration embeds the copied ts/ source
-        // (the linked dir must actually resolve the embed path), plus the
-        // module-scope alias + backend-gate flag.
+        // Generated main: the registration embeds the linked scripts/
+        // source (the SAME link the Zig scanner uses must resolve the
+        // embed path), plus the module-scope alias + backend-gate flag.
         const main_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
         defer allocator.free(main_zig);
-        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"ts/behavior.js\"));");
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"scripts/behavior.js\"));");
         _ = try indexOfOrFail(main_zig, "const scripting = @import(\"scripting\");");
         _ = try indexOfOrFail(main_zig, "const scripting_enabled = true;");
-        try staged.tmp.dir.access(e2e_io, "out/sokol_desktop/ts/behavior.js", .{});
+        try staged.tmp.dir.access(e2e_io, "out/sokol_desktop/scripts/behavior.js", .{});
         // The d.ts authoring companion is NOT a script: no registration.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle.d") == null);
+        // The coexisting ZIG script never leaks into the language layer:
+        // no registration for it (it rides the Zig scripts pipeline).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript(\"move\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript(\"01_move\"") == null);
 
         // Generated build: the plugin dep selects the typescript sub-module.
         const build_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
@@ -554,9 +615,75 @@ pub const TYPESCRIPT_SPLICE_E2E = struct {
     // The old `.ts fails generate with ScriptNeedsTranspile` pin lived
     // here while transpile was the #586 gap. The gate flipped to the real
     // TS 7 check+emit path (labelle-engine#745): every `.ts` shape —
-    // transpile-and-embed, type-error relay, stem collisions, the
-    // js-only no-fetch skip — is pinned in
-    // `test/scripting_transpile_tests.zig`. The happy test above stays
-    // THE pin that a `.js`-only project's splice layout is byte-identical
-    // to the pre-#745 one.
+    // transpile-and-embed (scripts/ AND the legacy grace dir), ordering
+    // through emission, type-error relay, stem collisions, the js-only
+    // no-fetch skip — is pinned in `test/scripting_transpile_tests.zig`.
+    // The happy test above stays THE pin that a `.js`-only project's
+    // splice layout is byte-identical to the pre-#745 one.
+
+    test "LEGACY grace through the REAL generate: ts/ scripts still work — ts/-rooted embed (deprecation-note release)" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTsProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(e2e_io, "game", .{});
+        defer game_root.close(e2e_io);
+        // Unmigrate the fixture: language files move back to ts/ (the
+        // d.ts companion too — a scripts/-side d.ts is probe-exempt and
+        // would be fine, but the pure legacy shape is the point here);
+        // the Zig script stays in scripts/, as every real project's does.
+        try game_root.deleteFile(e2e_io, "scripts/behavior.js");
+        try game_root.deleteFile(e2e_io, "scripts/labelle.d.ts");
+        try writeFileIn(game_root, "ts/behavior.js", "// @ts-check\nexport function update(dt) {}\n");
+        try writeFileIn(game_root, "ts/labelle.d.ts", "declare const labelle: any;\n");
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        const main_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
+        defer allocator.free(main_zig);
+        // Pre-#237 emission verbatim: ts/-rooted embed, plain stem.
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"behavior\", @embedFile(\"ts/behavior.js\"));");
+        try staged.tmp.dir.access(e2e_io, "out/sokol_desktop/ts/behavior.js", .{});
+    }
+
+    test "BOTH scripts/ and ts/ populated fails generate with the pointed conflict (no silent merge)" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTsProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(e2e_io, "game", .{});
+        defer game_root.close(e2e_io);
+        // scripts/behavior.js is already staged; add a legacy straggler.
+        try writeFileIn(game_root, "ts/old_behavior.js", "export function update(dt) {}\n");
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try std.testing.expectError(
+            error.LegacyScriptDirConflict,
+            generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false }),
+        );
+    }
+
+    test "a language file in scripts/<state>/ fails generate pointedly (state subdirs are Zig-only for now)" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTsProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(e2e_io, "game", .{});
+        defer game_root.close(e2e_io);
+        try writeFileIn(game_root, "scripts/playing/10_boss.js", "export function update(dt) {}\n");
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try std.testing.expectError(
+            error.ScriptInStateSubdir,
+            generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false }),
+        );
+
+        // Negative control: the same file as a ZIG script is the Zig
+        // scanner's normal state-scoped shape — generate succeeds.
+        try game_root.deleteFile(e2e_io, "scripts/playing/10_boss.js");
+        try writeFileIn(game_root, "scripts/playing/10_boss.zig", "pub fn tick() void {}\n");
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+        try staged.tmp.dir.access(e2e_io, "out/sokol_desktop/main.zig", .{});
+    }
 };

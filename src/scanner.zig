@@ -281,7 +281,7 @@ pub fn linkDir(
 
 /// `linkDir` over two fully-resolved paths (the `copyAndScanAbs`
 /// precedent: source and destination need not share a last segment —
-/// the native scripting splice links the game's `rust/` at the staged
+/// the native scripting splice links the game's `scripts/` at the staged
 /// plugin package's `native/src/game`). Same semantics as the wrapper:
 /// idempotent reconcile, relative link text, missing-source skip, and
 /// the Windows copy fallback.

@@ -220,19 +220,21 @@ pub fn Mixin(comptime Self: type) type {
             try w.writeAll("    runner.setup(&g);\n");
 
             // Embedded language scripts (labelle-assembler#593) — mirrors the
-            // loop-path emission in `loop.zig`: register every copied
-            // convention-dir source (`lua/`, `ts/` — the splice's `dir`)
-            // with the scripting plugin BEFORE `PluginControllers.setup`
-            // below boots the VM. Pre-sorted stems, byte-stable; no-op for
-            // splice-less projects. EMBED family only (labelle-engine#741):
+            // loop-path emission in `loop.zig`: register every collected
+            // script-dir source (`scripts/`, or the deprecated legacy dir
+            // on the grace fallback — the splice's `dir`) with the
+            // scripting plugin BEFORE `PluginControllers.setup` below boots
+            // the VM. Pre-ordered entries (numeric prefixes first, stems
+            // prefix-stripped), byte-stable; no-op for splice-less
+            // projects. EMBED family only (labelle-engine#741):
             // native-compiled splices link, never embed — see loop.zig.
             if (self.scripting) |s| {
-                if (s.family == .embed and s.script_names.len > 0) {
+                if (s.family == .embed and s.scripts.len > 0) {
                     try w.writeByte('\n');
                     try w.print("    // Embedded {s} scripts (via @embedFile) — registered with the\n", .{s.language});
                     try w.writeAll("    // scripting plugin before PluginControllers.setup boots the VM.\n");
-                    for (s.script_names) |name| {
-                        try w.print("    scripting.registerScript(\"{s}\", @embedFile(\"{s}/{s}{s}\"));\n", .{ name, s.dir, name, s.extension });
+                    for (s.scripts) |script| {
+                        try w.print("    scripting.registerScript(\"{s}\", @embedFile(\"{s}/{s}\"));\n", .{ script.name, s.dir, script.file });
                     }
                     try w.writeByte('\n');
                 }

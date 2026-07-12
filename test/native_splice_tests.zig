@@ -8,34 +8,38 @@
 //! `plugin.labelle` carries `.language_builds` with a `zig build-lib`
 //! step (always present via the build-options `zig_exe` — the #586
 //! trick) producing a staticlib named through `{staticlib:NAME}`, plus
-//! the shipped `native/src/game/mod.rs` placeholder the game's `rust/`
-//! dir is staged over. The REAL cargo path is the scripting repo's CI.
+//! the shipped `native/src/game/mod.rs` placeholder the game's `scripts/`
+//! sources (the #237 convention; legacy `rust/` rides the grace fallback)
+//! are staged over. The REAL cargo path is the scripting repo's CI.
 //!
 //! What only the production entry points can prove:
 //!
 //!   1. THE ACCEPTANCE: a rust project generates end to end — the
 //!      generated main carries the family-shared touchpoints (alias +
 //!      `scripting_enabled` flag, `Controller.tick`, drainEvents tap) and
-//!      NONE of the embed ones (no registerScript, no @embedFile, no
-//!      copied `rust/` in the target); the generated build.zig carries
-//!      `.language = .rust` + the `.language_builds` step wiring
-//!      (staticlib b.fmt artifact, per-OS system-libs switch); the game's
-//!      `rust/` dir is LINKED over the staged package's placeholder
-//!      (the linkAndScan primitive — scanner.linkDirAbs); the declare
-//!      phase never ran. Then the #586 splice-run: the EMITTED wiring
+//!      NONE of the embed ones (no registerScript, no @embedFile); the
+//!      generated build.zig carries `.language = .rust` + the
+//!      `.language_builds` step wiring (staticlib b.fmt artifact, per-OS
+//!      system-libs switch); the game's `scripts/` dir is LINKED over the
+//!      staged package's placeholder (the linkAndScan primitive —
+//!      scanner.linkDirAbs; `scripts/mod.rs` becomes the crate's
+//!      game-module root). Then the #586 splice-run: the EMITTED wiring
 //!      lines, spliced into a minimal build.zig, run the command,
 //!      expand `{staticlib:NAME}` for the host OS, link the artifact, and
 //!      the binary reaches the symbol.
-//!   2. THE EDIT LOOP IS LIVE (codex P2): a `rust/*.rs` edit after
+//!   2. THE EDIT LOOP IS LIVE (codex P2): a `scripts/*.rs` edit after
 //!      generate reaches the staged crate with no re-generate — the pin
 //!      a copy-based staging fails.
 //!   3. `.build` + `.language_builds` coexist: one chained sequence per
 //!      plugin, language steps strictly AFTER plain steps.
-//!   4. Zero-scripts shape: no `rust/` dir → the plugin still wires
-//!      (flag/tick/tap), the placeholder survives, generate succeeds.
-//!   5. The staging gates fire through generate: an empty `rust/` dir is
-//!      a pointed error; a `desktop`-allowlisted language step still
-//!      passes a desktop generate while an android-only one fails it.
+//!   4. Zero-scripts shape: a Zig-only `scripts/` (or none) → the plugin
+//!      still wires (flag/tick/tap), the placeholder survives, generate
+//!      succeeds.
+//!   5. The staging gates fire through generate: an empty LEGACY `rust/`
+//!      dir is a pointed error (grace keeps the old semantics; the legacy
+//!      dir with sources also stages verbatim); a `desktop`-allowlisted
+//!      language step still passes a desktop generate while an
+//!      android-only one fails it.
 //!   6. Negative controls: no declared language → `.language_builds` is
 //!      inert (no markers, no staging); a lua project over a rust-only
 //!      list is equally inert (wrong-language ignored) while the lua
@@ -117,8 +121,9 @@ const placeholder_mod_rs =
 
 /// A staged tmp rust game project mirroring `StagedTsProject`: the
 /// manifest-bearing scripting plugin (with its `native/` crate, shipped
-/// placeholder, and the declare-tool capability marker), a game `rust/`
-/// dir, the engine template fixture, and `out/`.
+/// placeholder, and the declare-tool capability marker), game `scripts/`
+/// sources (`scripts/mod.rs` — the #237 convention), the engine template
+/// fixture, and `out/`.
 const StagedRustProject = struct {
     tmp: std.testing.TmpDir,
     game_abs: [:0]const u8,
@@ -149,7 +154,7 @@ const StagedRustProject = struct {
         }
         // The plugin's native crate: the zig stand-in for PR #17's cargo
         // crate — lib.zig is what the declared step compiles; game/mod.rs
-        // is the placeholder the game's rust/ replaces.
+        // is the placeholder the game's scripts/ sources replace.
         try writeFileIn(game_root, "plugins/scripting/native/src/lib.zig",
             \\export fn labelle_rs_e2e_add(a: i32, b: i32) i32 {
             \\    return a + b;
@@ -157,7 +162,7 @@ const StagedRustProject = struct {
         );
         try writeFileIn(game_root, "plugins/scripting/native/src/game/mod.rs", placeholder_mod_rs);
         // The declare-tool capability marker (labelle-scripting >= 0.2.0):
-        // with it present, only the native family's empty `script_names`
+        // with it present, only the native family's empty script set
         // keeps the declare phase from building the runner — the pin that
         // the declare skip is real, not an accident of a bare fixture.
         if (opts.with_declare_marker) {
@@ -165,14 +170,18 @@ const StagedRustProject = struct {
         }
 
         if (opts.with_rust_dir) {
-            try writeFileIn(game_root, "rust/mod.rs",
+            // The #237 convention: scripts/ holds the .rs sources at its
+            // TOP LEVEL (subdir .rs is the resolve-time state-subdir
+            // error), scripts/mod.rs is the crate's game-module root, and
+            // a Zig script coexists in the same dir (extension-keyed).
+            try writeFileIn(game_root, "scripts/mod.rs",
                 \\mod player;
                 \\use crate::labelle::Scripts;
                 \\pub fn register(scripts: &mut Scripts) { let _ = scripts; }
                 \\
             );
-            try writeFileIn(game_root, "rust/player.rs", "pub struct Player;\n");
-            try writeFileIn(game_root, "rust/ai/brain.rs", "pub fn think() {}\n");
+            try writeFileIn(game_root, "scripts/player.rs", "pub struct Player;\n");
+            try writeFileIn(game_root, "scripts/01_move.zig", "pub fn tick() void {}\n");
         }
 
         try writeFileIn(game_root, "engine-fixture/codegen/main.zig.template", h.engine_template);
@@ -235,12 +244,11 @@ pub const NATIVE_SPLICE_E2E = struct {
         _ = try indexOfOrFail(main_zig, "engine.script_contract.drainEvents(&g);");
         // …and NONE of the embed ones: nothing registers, nothing embeds.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript") == null);
+        // Nothing embeds from the shared scripts/ dir either (the dir IS
+        // linked in the target — for the ZIG scanner — but no language
+        // embed path may reference it).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"scripts/") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"rust/") == null);
-        // The embed copy never ran either — no rust/ link in the target.
-        try std.testing.expectError(
-            error.FileNotFound,
-            staged.tmp.dir.access(io, "out/sokol_desktop/rust", .{}),
-        );
 
         // ── Generated build.zig: dep language + the language-build step ──
         const build_zig = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
@@ -274,9 +282,11 @@ pub const NATIVE_SPLICE_E2E = struct {
         try std.testing.expect(std.mem.indexOf(u8, staged_mod, "REPLACED AT GENERATE") == null);
         _ = try indexOfOrFail(staged_mod, "mod player;");
         try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native/src/game/player.rs", .{});
-        try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native/src/game/ai/brain.rs", .{});
+        // The coexisting Zig script rides the link too — benign, rustc
+        // compiles only what mod.rs declares (stageNativeSources doc).
+        try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native/src/game/01_move.zig", .{});
         // The GAME tree is untouched (staging links, never moves).
-        try staged.tmp.dir.access(io, "game/rust/mod.rs", .{});
+        try staged.tmp.dir.access(io, "game/scripts/mod.rs", .{});
 
         // ── Declare phase skipped (native family embeds nothing) ──
         try std.testing.expectError(
@@ -367,13 +377,13 @@ pub const NATIVE_SPLICE_E2E = struct {
         }
     }
 
-    test "the edit loop is live: a rust/*.rs edit AFTER generate reaches the staged crate without re-generating" {
+    test "the edit loop is live: a scripts/*.rs edit AFTER generate reaches the staged crate without re-generating" {
         // The codex P2 pin: the staged package's native/src/game is the
         // linkAndScan primitive (a dir link back into the game), NOT a
-        // generate-time copy — so `edit rust/player.rs; zig build` runs
-        // cargo over the CURRENT sources, exactly like editing lua/*.lua
-        // flows through the linked embed script dir. A copy design goes
-        // silently stale here until the next generate.
+        // generate-time copy — so `edit scripts/player.rs; zig build` runs
+        // cargo over the CURRENT sources, exactly like editing
+        // scripts/*.lua flows through the linked embed script dir. A copy
+        // design goes silently stale here until the next generate.
         const allocator = std.testing.allocator;
         var staged = try StagedRustProject.init(allocator, .{});
         defer staged.deinit(allocator);
@@ -385,7 +395,7 @@ pub const NATIVE_SPLICE_E2E = struct {
         // Post-generate edit — no second generate follows.
         var game_root = try staged.tmp.dir.openDir(io, "game", .{});
         defer game_root.close(io);
-        try writeFileIn(game_root, "rust/player.rs", "pub struct Player { edited_after_generate: bool }\n");
+        try writeFileIn(game_root, "scripts/player.rs", "pub struct Player { edited_after_generate: bool }\n");
 
         const staged_player = try staged.tmp.dir.readFileAlloc(io, "out/deps/labelle-scripting/native/src/game/player.rs", allocator, .limited(4096));
         defer allocator.free(staged_player);
@@ -393,7 +403,7 @@ pub const NATIVE_SPLICE_E2E = struct {
 
         // A brand-new script file appears in the staged crate too (the
         // link exposes the dir, not a snapshot of its file list).
-        try writeFileIn(game_root, "rust/enemy.rs", "pub struct Enemy;\n");
+        try writeFileIn(game_root, "scripts/enemy.rs", "pub struct Enemy;\n");
         try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native/src/game/enemy.rs", .{});
     }
 
@@ -442,10 +452,16 @@ pub const NATIVE_SPLICE_E2E = struct {
         _ = try indexOfOrFail(build_zig, "exe.root_module.addObjectFile(plugin_scripting_build_artifact_1);");
     }
 
-    test "no rust/ dir at all: the plugin still wires (zero scripts), the shipped placeholder survives" {
+    test "zero native scripts (Zig-only scripts/): the plugin still wires, the shipped placeholder survives" {
         const allocator = std.testing.allocator;
         var staged = try StagedRustProject.init(allocator, .{ .with_rust_dir = false });
         defer staged.deinit(allocator);
+        // scripts/ EXISTS but is Zig-only — every plain Zig game's state;
+        // must behave exactly like a missing dir for the native family
+        // (no-op, no pointed error — that stays legacy-dir-only).
+        var game_root = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game_root.close(io);
+        try writeFileIn(game_root, "scripts/01_move.zig", "pub fn tick() void {}\n");
 
         const backend_repo = try sokolFixtureRepoAbs(allocator);
         defer allocator.free(backend_repo);
@@ -463,7 +479,7 @@ pub const NATIVE_SPLICE_E2E = struct {
         _ = try indexOfOrFail(staged_mod, "REPLACED AT GENERATE");
     }
 
-    test "an empty rust/ dir fails generate pointedly (unlike a missing one)" {
+    test "an empty LEGACY rust/ dir fails generate pointedly (unlike a missing one — grace keeps the old error)" {
         const allocator = std.testing.allocator;
         var staged = try StagedRustProject.init(allocator, .{ .with_rust_dir = false });
         defer staged.deinit(allocator);
@@ -477,6 +493,35 @@ pub const NATIVE_SPLICE_E2E = struct {
             error.NativeScriptDirEmpty,
             generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false }),
         );
+    }
+
+    test "LEGACY rust/ sources stage verbatim through the REAL generate (one release of grace, nested modules kept)" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedRustProject.init(allocator, .{ .with_rust_dir = false });
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game_root.close(io);
+        // The unmigrated layout, nested module dir included (legal in the
+        // legacy dir; the scripts/ convention gates it at resolve).
+        try writeFileIn(game_root, "rust/mod.rs",
+            \\mod player;
+            \\mod ai;
+            \\use crate::labelle::Scripts;
+            \\pub fn register(scripts: &mut Scripts) { let _ = scripts; }
+            \\
+        );
+        try writeFileIn(game_root, "rust/player.rs", "pub struct Player;\n");
+        try writeFileIn(game_root, "rust/ai/brain.rs", "pub fn think() {}\n");
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        // Staged over the placeholder, subtree intact — pre-#237 verbatim.
+        const staged_mod = try staged.tmp.dir.readFileAlloc(io, "out/deps/labelle-scripting/native/src/game/mod.rs", allocator, .limited(4096));
+        defer allocator.free(staged_mod);
+        try std.testing.expect(std.mem.indexOf(u8, staged_mod, "REPLACED AT GENERATE") == null);
+        try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native/src/game/ai/brain.rs", .{});
     }
 
     test "a .language_builds step allowlisting only android fails a desktop generate (the #586 gate, labeled)" {

@@ -15,13 +15,20 @@
 //!      with `depends_on_resources`) must match the project's declared
 //!      language — a Lua-scripted pack fails loudly in a Rust project,
 //!      naming both sides.
-//!   3. **Script-dir scan** (`scanUnitLanguageDirs`): every language
-//!      convention dir (`lua/ ts/ ruby/ rust/ crystal/ go/ csharp/` — see
-//!      `conventionDir`) in the game root AND in every pack dir is walked.
-//!      Files in a dir belonging to a language OTHER than the declared one
-//!      are a hard error listing up to `MAX_LISTED_FILES` offenders; files
-//!      with NO scripting plugin declared error with the attach hint; EMPTY
-//!      language dirs are warn-only. Dir-presence detection is a
+//!   3. **Script-dir scan** (`scanUnitLanguageDirs`): script-language files
+//!      live in the `scripts/` convention dir — the SAME structure Zig
+//!      scripts use (`SCRIPTS_DIR`; the extension selects the language,
+//!      labelle-engine#237). The scan polices `scripts/` by EXTENSION
+//!      (`scriptExtensions`): files of a language OTHER than the declared
+//!      one are a hard error listing up to `MAX_LISTED_FILES` offenders;
+//!      language files with NO scripting plugin declared error with the
+//!      attach hint (`.zig` belongs to no script language — the Zig script
+//!      scanner owns it, so Zig + script-language files coexist in one dir).
+//!      The old per-language dirs (`lua/ ts/ ruby/ rust/ crystal/ go/
+//!      csharp/` — `legacyDir`) are DEPRECATED but still policed the old
+//!      way for the one-release grace window: foreign-language legacy dirs
+//!      with files are a hard error, no-plugin files get the attach hint,
+//!      EMPTY legacy dirs are warn-only. Dir/extension detection is a
 //!      cross-check, not the selector (RFC rev 8) — the declared
 //!      `.params.language` is authoritative.
 //!
@@ -37,12 +44,11 @@ const std = @import("std");
 const config = @import("config.zig");
 
 /// The closed set of script languages the toolkit recognizes
-/// (RFC-LANGUAGE-PLUGINS §2/§3 — the `labelle-scripting` sub-modules). Each
-/// name usually doubles as the language's convention-dir name (`lua/`,
-/// `rust/`, …) — `conventionDir` is the mapping's single source of truth
-/// (typescript's dir is `ts/`). Widening this table is additive; validation
-/// everywhere goes through `isSupportedLanguage` so there is exactly one
-/// vocabulary.
+/// (RFC-LANGUAGE-PLUGINS §2/§3 — the `labelle-scripting` sub-modules).
+/// Widening this table is additive; validation everywhere goes through
+/// `isSupportedLanguage` so there is exactly one vocabulary. Each language
+/// carries an extension set (`scriptExtensions`) and a deprecated legacy
+/// dir name (`legacyDir`); the scripts themselves live in `SCRIPTS_DIR`.
 pub const SUPPORTED_LANGUAGES = [_][]const u8{
     "lua",
     "typescript",
@@ -53,18 +59,49 @@ pub const SUPPORTED_LANGUAGES = [_][]const u8{
     "csharp",
 };
 
-/// The convention-dir name for a language's scripts — labelle-scripting's
-/// documented layout ("Drop scripts in your language's convention dir
-/// (`lua/`, `ruby/`, `ts/`, …)"). Every language's dir is its
-/// `SUPPORTED_LANGUAGES` name except typescript, whose dir is `ts/` (the
-/// plugin README + `@embedFile("ts/player.js")` examples; the ecosystem
-/// short form). This helper is the ONLY place the mapping lives: the
-/// script-dir scan below and the scripting splice's copy/embed
-/// (`scripting_splice.detect`) both consume it, so policy and codegen can
-/// never police/embed different dirs.
-pub fn conventionDir(language: []const u8) []const u8 {
+/// The convention dir script-language files live in — the SAME `scripts/`
+/// structure Zig scripts use (labelle-engine#237's convention decision):
+/// `scripts/hunger.rb` sits exactly where `scripts/hunger.zig` would, the
+/// extension selects the language, and Zig + script-language files coexist
+/// in one dir (the two-layer architecture in one structure). The Zig
+/// conventions apply cross-language where the runtime supports them:
+/// numeric ordering prefixes immediately; state-scoped subdirs
+/// (`scripts/<state>/`) stay Zig-ONLY until the scripting Controller grows
+/// state awareness.
+pub const SCRIPTS_DIR: []const u8 = "scripts";
+
+/// The DEPRECATED per-language dir a language's scripts used to live in
+/// (`lua/`, `ruby/`, `rust/`, … — typescript's was `ts/`, the ecosystem
+/// short form). Kept working for ONE release of grace: when `scripts/`
+/// holds no language files and the legacy dir does, the scripting splice
+/// consumes the legacy dir with a pointed deprecation note
+/// (`scripting_splice.detect`); both populated is a hard error (never
+/// merged). This helper is the ONLY place the mapping lives — the
+/// legacy-dir policing below and the splice's grace fallback both consume
+/// it, so policy and codegen can never police/read different dirs.
+pub fn legacyDir(language: []const u8) []const u8 {
     if (std.mem.eql(u8, language, "typescript")) return "ts";
     return language;
+}
+
+/// The file extensions that identify `language`'s sources inside the shared
+/// `scripts/` dir — the extension IS the language selector now
+/// (labelle-engine#237). Includes authoring extensions the assembler can't
+/// run yet (typescript's `.ts`, gated separately by the #586 transpile
+/// check) so misplaced sources are attributed to their language rather
+/// than silently unmatched. `.zig` deliberately belongs to NO script
+/// language: the Zig script scanner owns it. The scripting splice's
+/// embed/native rows each use one of these extensions — a test in
+/// `scripting_splice.zig` pins the two tables' agreement.
+pub fn scriptExtensions(language: []const u8) []const []const u8 {
+    if (std.mem.eql(u8, language, "lua")) return &.{".lua"};
+    if (std.mem.eql(u8, language, "typescript")) return &.{ ".js", ".ts" };
+    if (std.mem.eql(u8, language, "ruby")) return &.{".rb"};
+    if (std.mem.eql(u8, language, "rust")) return &.{".rs"};
+    if (std.mem.eql(u8, language, "crystal")) return &.{".cr"};
+    if (std.mem.eql(u8, language, "go")) return &.{".go"};
+    if (std.mem.eql(u8, language, "csharp")) return &.{".cs"};
+    return &.{};
 }
 
 /// Comma-joined display form of `SUPPORTED_LANGUAGES` for diagnostics.
@@ -259,24 +296,40 @@ fn walkCollect(
     }
 }
 
-/// Scan ONE unit root (the game root, or a pack's source dir) for language
-/// convention dirs and enforce the policy (RFC rev 8's generate-time layer):
+/// Scan ONE unit root (the game root, or a pack's source dir) for
+/// script-language sources and enforce the policy (RFC rev 8's
+/// generate-time layer, re-homed on the `scripts/` convention —
+/// labelle-engine#237):
 ///
-///   - the DECLARED language's convention dir → fine, skipped entirely;
-///   - another language's convention dir WITH files →
-///     `error.ScriptLanguageMismatch`, listing up to `MAX_LISTED_FILES`
-///     offenders + the fix;
-///   - any convention dir WITH files but NO declared language →
-///     `error.MissingScriptingPlugin`, with the attach hint;
-///   - an EMPTY language dir → warn-only (a placeholder never fails a build);
-///   - a language-NAME dir that is NOT the convention dir (`typescript/`,
-///     whose convention dir is `ts/` — `conventionDir`) WITH files →
-///     `error.MisplacedLanguageDir`. NOTHING ever consumes such a dir, so
-///     scripts dropped there (an easy guess from the language vocabulary)
-///     would otherwise be silently dead — fail loudly naming the real home.
+///   `scripts/` (the convention dir — policed by EXTENSION, since the
+///   extension is the language selector there; `.zig` belongs to no script
+///   language and is invisible to this scan):
+///   - the DECLARED language's files → fine, skipped entirely (the
+///     scripting splice consumes them and owns the deeper checks — the
+///     state-subdir gate, the .ts transpile gate);
+///   - another language's files → `error.ScriptLanguageMismatch`, listing
+///     up to `MAX_LISTED_FILES` offenders + the fix;
+///   - language files but NO declared language →
+///     `error.MissingScriptingPlugin`, with the attach hint.
+///
+///   Legacy per-language dirs (`lua/`, `ts/`, … — `legacyDir`; one release
+///   of grace, the splice prints the deprecation note when it consumes one):
+///   - the DECLARED language's legacy dir → skipped (the splice's grace
+///     fallback owns it, including the both-populated conflict);
+///   - another language's legacy dir WITH files →
+///     `error.ScriptLanguageMismatch`;
+///   - any legacy dir WITH files but NO declared language →
+///     `error.MissingScriptingPlugin`;
+///   - an EMPTY legacy dir → warn-only (a placeholder never fails a build);
+///   - a language-NAME dir that never was a convention dir (`typescript/` —
+///     its legacy dir is `ts/`) WITH files → `error.MisplacedLanguageDir`.
+///     NOTHING ever consumed such a dir, so scripts dropped there would be
+///     silently dead — fail loudly naming the real home (`scripts/`).
 ///
 /// `unit_label` names the scanned unit in diagnostics — `"project root"` or
-/// `"pack 'sky'"`.
+/// `"pack 'sky'"`. (Pack `scripts/` language sources aren't consumed yet —
+/// the splice reads only the game root — but the same policing keeps them
+/// honest for when they are.)
 pub fn scanUnitLanguageDirs(
     allocator: std.mem.Allocator,
     unit_root: []const u8,
@@ -284,38 +337,38 @@ pub fn scanUnitLanguageDirs(
     declared: ?DeclaredLanguage,
 ) !void {
     for (SUPPORTED_LANGUAGES) |lang| {
-        const dir = conventionDir(lang);
+        const dir = legacyDir(lang);
 
-        // The language-name-≠-convention-dir trap (typescript/ vs ts/):
-        // policed for EVERY language declaration state, because no
-        // declaration state makes the dir meaningful.
+        // The language-name-≠-dir trap (typescript/ vs ts/): policed for
+        // EVERY language declaration state, because no declaration state
+        // makes the dir meaningful.
         if (!std.mem.eql(u8, dir, lang)) {
             var maybe_misplaced = try collectLanguageDirFiles(allocator, unit_root, lang);
             if (maybe_misplaced) |*misplaced| {
                 defer misplaced.deinit(allocator);
                 if (misplaced.total > 0) {
                     std.debug.print(
-                        "labelle-assembler: {s} contains {s}/ files, but the {s} script convention dir is {s}/:\n",
-                        .{ unit_label, lang, lang, dir },
+                        "labelle-assembler: {s} contains {s}/ files, but script-language files live in the {s}/ convention dir:\n",
+                        .{ unit_label, lang, SCRIPTS_DIR },
                     );
                     printListed(misplaced.*);
                     std.debug.print(
                         "  nothing reads {s}/ — move the scripts to {s}/ (or remove the directory).\n",
-                        .{ lang, dir },
+                        .{ lang, SCRIPTS_DIR },
                     );
                     return error.MisplacedLanguageDir;
                 }
                 std.log.warn(
-                    "labelle: {s} has an empty '{s}/' dir; ignoring it (the {s} script convention dir is '{s}/')",
-                    .{ unit_label, lang, lang, dir },
+                    "labelle: {s} has an empty '{s}/' dir; ignoring it (script-language files live in '{s}/')",
+                    .{ unit_label, lang, SCRIPTS_DIR },
                 );
             }
         }
 
         if (declared) |d| {
-            // The declared language's own dir is the legal home of the
-            // project's scripts — nothing to police there in this ticket
-            // (the scripting plugin consumes it, separately).
+            // The declared language's own legacy dir is grace-tolerated for
+            // one release — the scripting splice consumes it (with the
+            // deprecation note) and errors when scripts/ is ALSO populated.
             if (std.mem.eql(u8, d.language, lang)) continue;
         }
         var scanned = (try collectLanguageDirFiles(allocator, unit_root, dir)) orelse continue;
@@ -357,10 +410,128 @@ pub fn scanUnitLanguageDirs(
         std.debug.print(
             "  attach the scripting plugin in project.labelle to run them, e.g.\n" ++
                 "    .plugins = .{{ .{{ .name = \"labelle-scripting\", .version = \"...\", .params = .{{ .language = \"{s}\" }} }} }}\n" ++
-                "  or remove the {s}/ directory.\n",
-            .{ lang, dir },
+                "  and move them to {s}/ ({s}/ is deprecated), or remove the {s}/ directory.\n",
+            .{ lang, SCRIPTS_DIR, dir, dir },
         );
         return error.MissingScriptingPlugin;
+    }
+
+    try scanScriptsDirLanguages(allocator, unit_root, unit_label, declared);
+}
+
+/// The `scripts/`-content half of `scanUnitLanguageDirs`: walk
+/// `<unit_root>/scripts/` once, bucket every file by the language its
+/// extension belongs to (`scriptExtensions`; unmatched extensions — `.zig`,
+/// `.md`, editor droppings — are invisible), and enforce the same two rules
+/// the legacy dirs get: foreign language → mismatch, no declared language →
+/// attach hint. The DECLARED language's files are never collected — the
+/// scripting splice owns them (top-level collection, state-subdir gate,
+/// ordering). Buckets error in `SUPPORTED_LANGUAGES` order so diagnostics
+/// are deterministic.
+fn scanScriptsDirLanguages(
+    allocator: std.mem.Allocator,
+    unit_root: []const u8,
+    unit_label: []const u8,
+    declared: ?DeclaredLanguage,
+) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const dir_path = try std.fs.path.join(allocator, &.{ unit_root, SCRIPTS_DIR });
+    defer allocator.free(dir_path);
+    var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var buckets: [SUPPORTED_LANGUAGES.len]LanguageBucket = @splat(.{});
+    defer for (&buckets) |*b| b.deinit(allocator);
+    try walkScriptsCollect(allocator, io, dir, SCRIPTS_DIR, declared, &buckets);
+
+    for (SUPPORTED_LANGUAGES, &buckets) |lang, *bucket| {
+        if (bucket.total == 0) continue;
+        const scanned = LanguageDirScan{ .listed = bucket.listed.items, .total = bucket.total };
+
+        if (declared) |d| {
+            std.debug.print(
+                "labelle-assembler: {s} {s}/ contains {s} scripts but the project's script language is \"{s}\" (plugin '{s}'):\n",
+                .{ unit_label, SCRIPTS_DIR, lang, d.language, d.plugin_name },
+            );
+            printListed(scanned);
+            std.debug.print(
+                "  one script language per project (RFC-LANGUAGE-PLUGINS): remove these files or change the scripting plugin's `.params.language`.\n",
+                .{},
+            );
+            return error.ScriptLanguageMismatch;
+        }
+
+        std.debug.print(
+            "labelle-assembler: {s} {s}/ contains {s} scripts but no scripting plugin is declared:\n",
+            .{ unit_label, SCRIPTS_DIR, lang },
+        );
+        printListed(scanned);
+        std.debug.print(
+            "  attach the scripting plugin in project.labelle to run them, e.g.\n" ++
+                "    .plugins = .{{ .{{ .name = \"labelle-scripting\", .version = \"...\", .params = .{{ .language = \"{s}\" }} }} }}\n" ++
+                "  or remove the files.\n",
+            .{lang},
+        );
+        return error.MissingScriptingPlugin;
+    }
+}
+
+const LanguageBucket = struct {
+    listed: std.ArrayList([]const u8) = .empty,
+    total: usize = 0,
+
+    fn deinit(self: *LanguageBucket, allocator: std.mem.Allocator) void {
+        for (self.listed.items) |p| allocator.free(p);
+        self.listed.deinit(allocator);
+    }
+};
+
+/// One recursive walk of `scripts/`, bucketing files by extension-owning
+/// language. Dot-entries skipped (same rule as `walkCollect`); the declared
+/// language's files are skipped entirely — its policing belongs to the
+/// scripting splice.
+fn walkScriptsCollect(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    declared: ?DeclaredLanguage,
+    buckets: *[SUPPORTED_LANGUAGES.len]LanguageBucket,
+) !void {
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        switch (entry.kind) {
+            .directory => {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                const sub_prefix = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
+                defer allocator.free(sub_prefix);
+                try walkScriptsCollect(allocator, io, sub, sub_prefix, declared, buckets);
+            },
+            else => {
+                for (SUPPORTED_LANGUAGES, buckets) |lang, *bucket| {
+                    if (declared) |d| {
+                        if (std.mem.eql(u8, d.language, lang)) continue;
+                    }
+                    const matches = for (scriptExtensions(lang)) |ext| {
+                        if (std.mem.endsWith(u8, entry.name, ext)) break true;
+                    } else false;
+                    if (!matches) continue;
+                    bucket.total += 1;
+                    if (bucket.listed.items.len < MAX_LISTED_FILES) {
+                        const rel = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
+                        errdefer allocator.free(rel);
+                        try bucket.listed.append(allocator, rel);
+                    }
+                    break; // extensions are disjoint across languages
+                }
+            },
+        }
     }
 }
 
@@ -393,11 +564,41 @@ test "SUPPORTED_LANGUAGES_LIST: comma-joined display form" {
     );
 }
 
-test "conventionDir: typescript maps to ts/; every other language dirs under its own name" {
-    try testing.expectEqualStrings("ts", conventionDir("typescript"));
+test "legacyDir: typescript maps to ts/; every other language's legacy dir is its own name; none is scripts/" {
+    try testing.expectEqualStrings("ts", legacyDir("typescript"));
     for (SUPPORTED_LANGUAGES) |lang| {
         if (std.mem.eql(u8, lang, "typescript")) continue;
-        try testing.expectEqualStrings(lang, conventionDir(lang));
+        try testing.expectEqualStrings(lang, legacyDir(lang));
+    }
+    // The grace fallback keys on legacy ≠ convention — no language's legacy
+    // dir may ever collide with the scripts/ home.
+    for (SUPPORTED_LANGUAGES) |lang| {
+        try testing.expect(!std.mem.eql(u8, legacyDir(lang), SCRIPTS_DIR));
+    }
+}
+
+test "scriptExtensions: every language owns at least one extension; extensions are disjoint across languages; .zig belongs to none" {
+    for (SUPPORTED_LANGUAGES) |lang| {
+        try testing.expect(scriptExtensions(lang).len > 0);
+    }
+    try testing.expectEqual(@as(usize, 0), scriptExtensions("cobol").len);
+
+    // Disjointness is what lets the scripts/ scan attribute a file to ONE
+    // language (and lets two scanners share the dir without contention).
+    for (SUPPORTED_LANGUAGES, 0..) |a, i| {
+        for (SUPPORTED_LANGUAGES[i + 1 ..]) |b| {
+            for (scriptExtensions(a)) |ea| {
+                for (scriptExtensions(b)) |eb| {
+                    try testing.expect(!std.mem.eql(u8, ea, eb));
+                }
+            }
+        }
+    }
+    // .zig is the ZIG script scanner's — never a script-language extension.
+    for (SUPPORTED_LANGUAGES) |lang| {
+        for (scriptExtensions(lang)) |ext| {
+            try testing.expect(!std.mem.eql(u8, ext, ".zig"));
+        }
     }
 }
 
@@ -614,7 +815,7 @@ test "scanUnitLanguageDirs: an EMPTY foreign language dir is warn-only" {
     try scanUnitLanguageDirs(allocator, root, "project root", null);
 }
 
-test "scanUnitLanguageDirs: typescript scripts live in ts/ — skipped when declared, mismatch/attach errors otherwise" {
+test "scanUnitLanguageDirs: legacy ts/ scripts — skipped when declared (grace), mismatch/attach errors otherwise" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -623,8 +824,9 @@ test "scanUnitLanguageDirs: typescript scripts live in ts/ — skipped when decl
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
 
-    // Declared typescript → ts/ is the legal home (the conventionDir keys
-    // the declared-language skip, or the scan would reject its own scripts).
+    // Declared typescript → ts/ is the grace-tolerated legacy home (the
+    // legacyDir keys the declared-language skip; the splice owns the
+    // deprecation note + both-populated conflict).
     const ts_declared = DeclaredLanguage{ .language = "typescript", .plugin_name = "scripting" };
     try scanUnitLanguageDirs(allocator, root, "project root", ts_declared);
 
@@ -644,10 +846,11 @@ test "scanUnitLanguageDirs: typescript scripts live in ts/ — skipped when decl
 }
 
 test "scanUnitLanguageDirs: a typescript/ dir with files is a MISPLACED-dir error in every declaration state" {
-    // `typescript/` is the language NAME, not its convention dir (`ts/` —
-    // conventionDir); nothing ever reads it, so scripts dropped there would
-    // be silently dead. Loud in all three states — including declared
-    // typescript, where the declared-language skip must NOT excuse it.
+    // `typescript/` is the language NAME — never a convention dir, never a
+    // legacy dir (`ts/` — legacyDir); nothing ever reads it, so scripts
+    // dropped there would be silently dead. Loud in all three states —
+    // including declared typescript, where the declared-language skip must
+    // NOT excuse it. The message now names scripts/ as the real home.
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -686,4 +889,109 @@ test "scanUnitLanguageDirs: no language dirs at all is a clean pass" {
     try scanUnitLanguageDirs(allocator, root, "project root", null);
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
     try scanUnitLanguageDirs(allocator, root, "project root", declared);
+}
+
+// ── scripts/-content policing (the shared convention dir, #237) ──────
+
+test "scanUnitLanguageDirs: a foreign-extension file in scripts/ is a hard error (extension-keyed mismatch)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The old rust/-dir-in-a-lua-project protection, re-homed: a .rs in
+    // the shared scripts/ dir would be silently dead (neither the Zig
+    // scanner nor the lua splice reads it) — same silent-death class,
+    // same error. Nested placement is caught too (the walk is recursive).
+    try writeTestFile(tmp.dir, "scripts/enemy.rs", "pub struct Enemy;\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
+    try testing.expectError(
+        error.ScriptLanguageMismatch,
+        scanUnitLanguageDirs(allocator, root, "project root", declared),
+    );
+
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try writeTestFile(tmp2.dir, "scripts/playing/enemy.rb", "class Enemy; end\n");
+    const root2 = try tmp2.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root2);
+    try testing.expectError(
+        error.ScriptLanguageMismatch,
+        scanUnitLanguageDirs(allocator, root2, "project root", declared),
+    );
+}
+
+test "scanUnitLanguageDirs: language files in scripts/ with NO scripting plugin error with the attach hint" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "scripts/player_ai.lua", "return {}\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    try testing.expectError(
+        error.MissingScriptingPlugin,
+        scanUnitLanguageDirs(allocator, root, "project root", null),
+    );
+}
+
+test "scanUnitLanguageDirs: the declared language's scripts/ files pass — the splice owns them" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "scripts/player_ai.lua", "return {}\n");
+    // Even in a state subdir: the policy skips declared-language files
+    // entirely — the state-subdir gate is the SPLICE's pointed error
+    // (scripting_splice.detect), not a policy mismatch.
+    try writeTestFile(tmp.dir, "scripts/playing/boss.lua", "return {}\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
+    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+}
+
+test "scanUnitLanguageDirs: a Zig-only scripts/ is invisible to the language scan (coexistence negative control)" {
+    // THE back-compat pin: every existing Zig game (and pack) has
+    // scripts/*.zig and NO scripting plugin — the extension-keyed scan
+    // must never see them. Same for non-language files (.md, dotfiles).
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "scripts/01_move.zig", "pub fn tick() void {}\n");
+    try writeTestFile(tmp.dir, "scripts/playing/02_hud.zig", "pub fn tick() void {}\n");
+    try writeTestFile(tmp.dir, "scripts/README.md", "# scripts\n");
+    try writeTestFile(tmp.dir, "scripts/.gitkeep", "");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    try scanUnitLanguageDirs(allocator, root, "project root", null);
+    const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
+    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+}
+
+test "scanUnitLanguageDirs: mixed scripts/ — declared-language + zig files coexist; ONE foreign file still errors" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "scripts/01_move.zig", "pub fn tick() void {}\n");
+    try writeTestFile(tmp.dir, "scripts/behavior.lua", "return {}\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
+    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+
+    // Drop one ruby file into the same dir → mismatch (extension-keyed).
+    try writeTestFile(tmp.dir, "scripts/feed.rb", "class Feed; end\n");
+    try testing.expectError(
+        error.ScriptLanguageMismatch,
+        scanUnitLanguageDirs(allocator, root, "project root", declared),
+    );
 }

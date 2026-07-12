@@ -17,8 +17,10 @@
 //!   1. THE ACCEPTANCE: a crystal project generates end to end — the
 //!      family-shared touchpoints (alias + flag, Controller.tick, drain
 //!      tap) with NONE of the embed ones; `.language = .crystal` on the
-//!      plugin dep; the game's `crystal/` linked over the staged
-//!      `native-crystal/src/game` placeholder; declare skipped; exactly
+//!      plugin dep; the game's `scripts/` sources linked over the staged
+//!      `native-crystal/src/game` placeholder (`scripts/game.cr` is the
+//!      module root — #237; legacy `crystal/` rides the grace fallback);
+//!      declare skipped; exactly
 //!      ONE per-OS localization step emitted (the host's); artifact-less
 //!      chaining; resolved library paths. Then the #586 splice-run: the
 //!      EMITTED two-step chain runs (build-obj → objcopy), the object
@@ -131,8 +133,9 @@ const placeholder_game_cr =
 
 /// A staged tmp crystal game project mirroring `StagedRustProject`: the
 /// manifest-bearing scripting plugin (with its `native-crystal/` crate,
-/// shipped placeholder, and the declare-tool capability marker), a game
-/// `crystal/` dir, the engine template fixture, and `out/`.
+/// shipped placeholder, and the declare-tool capability marker), game
+/// `scripts/` sources (`scripts/game.cr` — the #237 convention), the
+/// engine template fixture, and `out/`.
 const StagedCrystalProject = struct {
     tmp: std.testing.TmpDir,
     game_abs: [:0]const u8,
@@ -158,7 +161,7 @@ const StagedCrystalProject = struct {
         }
         // The plugin's native-crystal crate: main.zig is the zig stand-in
         // for main.cr (what the build-obj step compiles); game/game.cr is
-        // the placeholder the game's crystal/ replaces.
+        // the placeholder the game's scripts/ sources replace.
         try writeFileIn(game_root, "plugins/scripting/native-crystal/src/main.zig",
             \\export fn labelle_cr_e2e_add(a: i32, b: i32) i32 {
             \\    return a + b;
@@ -171,8 +174,11 @@ const StagedCrystalProject = struct {
         try writeFileIn(game_root, "plugins/scripting/tools/declare/declare.lua", "-- lua declare runner (fixture marker)\n");
 
         if (opts.with_crystal_dir) {
-            try writeFileIn(game_root, "crystal/game.cr",
-                \\require "./scripts/player"
+            // The #237 convention: top-level .cr sources in the shared
+            // scripts/ dir, scripts/game.cr as the crate's game-module
+            // root, a Zig script coexisting (extension-keyed).
+            try writeFileIn(game_root, "scripts/game.cr",
+                \\require "./player"
                 \\module Labelle
                 \\  module Game
                 \\    def self.register(scripts)
@@ -181,7 +187,8 @@ const StagedCrystalProject = struct {
                 \\end
                 \\
             );
-            try writeFileIn(game_root, "crystal/scripts/player.cr", "class Player\nend\n");
+            try writeFileIn(game_root, "scripts/player.cr", "class Player\nend\n");
+            try writeFileIn(game_root, "scripts/01_move.zig", "pub fn tick() void {}\n");
         }
 
         try writeFileIn(game_root, "engine-fixture/codegen/main.zig.template", h.engine_template);
@@ -237,7 +244,7 @@ const other_localize_name = switch (builtin.os.tag) {
 };
 
 pub const CRYSTAL_SPLICE_E2E = struct {
-    test "acceptance: crystal generate — shared touchpoints, .language = .crystal, live-linked game.cr, one per-OS step, chained artifact-less build, resolved library paths, runnable" {
+    test "acceptance: crystal generate — shared touchpoints, .language = .crystal, live-linked scripts/game.cr, one per-OS step, chained artifact-less build, resolved library paths, runnable" {
         const allocator = std.testing.allocator;
         var staged = try StagedCrystalProject.init(allocator, .{});
         defer staged.deinit(allocator);
@@ -261,6 +268,7 @@ pub const CRYSTAL_SPLICE_E2E = struct {
         _ = try indexOfOrFail(main_zig, "engine.script_contract.drainEvents(&g);");
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerScript") == null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"crystal/") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"scripts/") == null);
 
         // ── Generated build.zig ──
         const build_zig = try staged.tmp.dir.readFileAlloc(io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
@@ -293,13 +301,13 @@ pub const CRYSTAL_SPLICE_E2E = struct {
         const staged_game_cr = try staged.tmp.dir.readFileAlloc(io, "out/deps/labelle-scripting/native-crystal/src/game/game.cr", allocator, .limited(4096));
         defer allocator.free(staged_game_cr);
         try std.testing.expect(std.mem.indexOf(u8, staged_game_cr, "REPLACED AT GENERATE") == null);
-        _ = try indexOfOrFail(staged_game_cr, "require \"./scripts/player\"");
-        try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native-crystal/src/game/scripts/player.cr", .{});
+        _ = try indexOfOrFail(staged_game_cr, "require \"./player\"");
+        try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native-crystal/src/game/player.cr", .{});
         // Live view (the rust suite's staleness pin, crystal twin).
         var game_root = try staged.tmp.dir.openDir(io, "game", .{});
         defer game_root.close(io);
-        try writeFileIn(game_root, "crystal/scripts/player.cr", "class Player\n  # edited_after_generate\nend\n");
-        const staged_player = try staged.tmp.dir.readFileAlloc(io, "out/deps/labelle-scripting/native-crystal/src/game/scripts/player.cr", allocator, .limited(4096));
+        try writeFileIn(game_root, "scripts/player.cr", "class Player\n  # edited_after_generate\nend\n");
+        const staged_player = try staged.tmp.dir.readFileAlloc(io, "out/deps/labelle-scripting/native-crystal/src/game/player.cr", allocator, .limited(4096));
         defer allocator.free(staged_player);
         try std.testing.expect(std.mem.indexOf(u8, staged_player, "edited_after_generate") != null);
 
@@ -411,6 +419,30 @@ pub const CRYSTAL_SPLICE_E2E = struct {
             _ = try indexOfOrFail(build_zig, "// .build step 'localize-main-linux' of plugin 'scripting'");
             try std.testing.expect(std.mem.indexOf(u8, build_zig, "localize-main-macos") == null);
         }
+    }
+
+    test "LEGACY crystal/ sources stage verbatim through the REAL generate (grace) — nested subdir kept, game.cr root" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedCrystalProject.init(allocator, .{ .with_crystal_dir = false });
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(io, "game", .{});
+        defer game_root.close(io);
+        // The unmigrated layout: crystal/game.cr requiring a NESTED
+        // organizational subdir (legal in the legacy dir; under scripts/
+        // that nesting is the resolve-time state-subdir error).
+        try writeFileIn(game_root, "crystal/game.cr", "require \"./scripts/player\"\nmodule Labelle\n  module Game\n    def self.register(scripts)\n    end\n  end\nend\n");
+        try writeFileIn(game_root, "crystal/scripts/player.cr", "class Player\nend\n");
+        generate.plugin_build_steps.crystal_env_output_override = "/fake/liba\n";
+        defer generate.plugin_build_steps.crystal_env_output_override = null;
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        const staged_game_cr = try staged.tmp.dir.readFileAlloc(io, "out/deps/labelle-scripting/native-crystal/src/game/game.cr", allocator, .limited(4096));
+        defer allocator.free(staged_game_cr);
+        try std.testing.expect(std.mem.indexOf(u8, staged_game_cr, "REPLACED AT GENERATE") == null);
+        try staged.tmp.dir.access(io, "out/deps/labelle-scripting/native-crystal/src/game/scripts/player.cr", .{});
     }
 
     test "a windows generate fails pointedly: all-gated → NoStepsForOs; ungated intermediate → NoArtifactForOs (never an artifact-less chain)" {

@@ -255,24 +255,27 @@ pub fn Mixin(comptime Self: type) type {
             try w.writeAll("    runner.setup(&g);\n");
 
             // Embedded language scripts (labelle-assembler#593): register
-            // every copied convention-dir source (`lua/`, `ts/` — the
-            // splice's `dir`) with the scripting plugin BEFORE
-            // `PluginControllers.setup` below boots the VM — registration is
-            // the plugin's boot seam (labelle-scripting `registerScript`).
-            // Names are the stems relative to the script dir (subdirs
-            // joined with `/`), pre-sorted by the root.zig scan so the
-            // emission is byte-stable. No-op for splice-less projects.
-            // EMBED family only (labelle-engine#741): a native-compiled
-            // splice links its scripts as a staticlib — no registerScript,
-            // no @embedFile. `script_names` is empty for natives anyway;
-            // the family gate keeps that invariant explicit here.
+            // every collected script-dir source (`scripts/` — the #237
+            // convention; or the deprecated legacy dir on the grace
+            // fallback — the splice's `dir`) with the scripting plugin
+            // BEFORE `PluginControllers.setup` below boots the VM —
+            // registration is the plugin's boot seam (labelle-scripting
+            // `registerScript`). Entries carry the registered stem
+            // (ordering prefix stripped, Zig-scanner style) AND the
+            // dir-relative file, pre-ordered by the root.zig collection
+            // (numeric prefixes first) so the emission is byte-stable.
+            // No-op for splice-less projects. EMBED family only
+            // (labelle-engine#741): a native-compiled splice links its
+            // scripts as a staticlib — no registerScript, no @embedFile.
+            // `scripts` is empty for natives anyway; the family gate keeps
+            // that invariant explicit here.
             if (self.scripting) |s| {
-                if (s.family == .embed and s.script_names.len > 0) {
+                if (s.family == .embed and s.scripts.len > 0) {
                     try w.writeByte('\n');
                     try w.print("    // Embedded {s} scripts (via @embedFile) — registered with the\n", .{s.language});
                     try w.writeAll("    // scripting plugin before PluginControllers.setup boots the VM.\n");
-                    for (s.script_names) |name| {
-                        try w.print("    scripting.registerScript(\"{s}\", @embedFile(\"{s}/{s}{s}\"));\n", .{ name, s.dir, name, s.extension });
+                    for (s.scripts) |script| {
+                        try w.print("    scripting.registerScript(\"{s}\", @embedFile(\"{s}/{s}\"));\n", .{ script.name, s.dir, script.file });
                     }
                     try w.writeByte('\n');
                 }

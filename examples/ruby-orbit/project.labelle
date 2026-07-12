@@ -1,6 +1,7 @@
 // Showcase game #3 for labelle-toolkit#607 — the RUBY scripting cell of
 // the grid, the ticket's seed candidate #3. The Ruby counterpart of the
-// in-repo Lua `scripting-smoke`: a `ruby/orbit.rb` script drives the REAL
+// in-repo Lua `scripting-smoke`: a `scripts/orbit.rb` script (the scripts/
+// convention — the same dir Zig scripts use) drives the REAL
 // engine through the Script Runtime Contract (labelle-engine#749) from
 // the assembler's generated main — create an entity, move its Position
 // each frame, and react to the engine's own `engine__tick` — all headless

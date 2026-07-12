@@ -662,6 +662,15 @@ pub fn extractSortOrder(filename: []const u8) ?u32 {
 
 /// Strip numeric prefix and .zig extension: "01_foo.zig" -> "foo", "bar.zig" -> "bar".
 pub fn stripPrefixAndExtension(filename: []const u8) []const u8 {
+    return stripPrefixAndExt(filename, ".zig");
+}
+
+/// `stripPrefixAndExtension` generalized over the extension — the ordering
+/// convention is shared with script-LANGUAGE files in `scripts/`
+/// (labelle-engine#237: `10_spawner.rb` registers as "spawner"), so the
+/// scripting splice strips through THIS function and the two scanners can
+/// never disagree on what a prefix is.
+pub fn stripPrefixAndExt(filename: []const u8, ext: []const u8) []const u8 {
     var start: usize = 0;
 
     // Strip numeric prefix + underscore
@@ -674,10 +683,10 @@ pub fn stripPrefixAndExtension(filename: []const u8) []const u8 {
         start = 0; // not a valid prefix, keep everything
     }
 
-    // Strip .zig extension
+    // Strip the extension
     var end = filename.len;
-    if (std.mem.endsWith(u8, filename, ".zig")) {
-        end = filename.len - 4;
+    if (std.mem.endsWith(u8, filename, ext)) {
+        end = filename.len - ext.len;
     }
 
     return filename[start..end];

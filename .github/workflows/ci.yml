@@ -370,7 +370,8 @@ jobs:
       #
       #   project.labelle `.params.language = "lua"` on the labelle-scripting
       #   plugin (fetched from GitHub at v0.2.0) → splice embeds
-      #   lua/behavior.lua + registers it pre-VM-boot → labelle-null's
+      #   scripts/behavior.lua (the scripts/ convention — labelle-engine#237)
+      #   + registers it pre-VM-boot → labelle-null's
       #   headless template binds `engine.script_contract` → per-frame
       #   `scripting.Controller.tick` runs the VM → `drainEvents` taps the
       #   engine event bus → the behavior creates an entity, moves its
@@ -380,7 +381,7 @@ jobs:
       # v0.2.0 also ships the declare tool, so this run exercises DECLARE
       # MODE (#585/#598) end-to-end against the real thing: generate builds
       # `labelle-declare` from the resolved dep (`zig build labelle-declare`),
-      # runs it over lua/, and codegens the behavior's chunk-scope
+      # runs it over the collected scripts/ sources, and codegens the behavior's chunk-scope
       # `labelle.component("Hunger", ...)` into `scripting_components.zig` +
       # the registry — and the running game then writes/reads the declared
       # component through the contract (the LUA_DECLARED_LEVEL_0.875 token,
@@ -407,7 +408,7 @@ jobs:
           # if a regression drops it.
           M=.labelle/null_desktop/main.zig
           # Splice: embedded script registered before the VM boots.
-          grep -qF 'scripting.registerScript("behavior", @embedFile("lua/behavior.lua"));' $M
+          grep -qF 'scripting.registerScript("behavior", @embedFile("scripts/behavior.lua"));' $M
           # Splice: the generated flag half of the templates' double-gate.
           grep -qF 'const scripting_enabled = true;' $M
           # labelle-null template: the bind touchpoint (proves the sibling
@@ -457,7 +458,7 @@ jobs:
           # the script-declared Hunger component read back through the real
           # ECS — the char class includes '.' for exactly that token), so
           # token extraction pins behavior, not just liveness. See
-          # lua/behavior.lua for the frame-by-frame timeline.
+          # scripts/behavior.lua for the frame-by-frame timeline.
           grep -oE 'LUA_[A-Z0-9_.]+' run.log > actual.txt || true
           cat > expected.txt <<'END'
           LUA_INIT
