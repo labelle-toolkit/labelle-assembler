@@ -12,6 +12,7 @@ const script_scanner = @import("../script_scanner.zig");
 const scan = @import("../codegen/scan.zig");
 const plugin_manifest = @import("../plugin_manifest.zig");
 const scripting_declare = @import("../scripting_declare.zig");
+const idents = @import("../codegen/idents.zig");
 const parse = @import("parse.zig");
 const json = @import("json.zig");
 
@@ -51,6 +52,7 @@ pub fn emitManifestSidecar(
     target_dir: []const u8,
     component_names: []const []const u8,
     declared_components: []const scripting_declare.DeclaredComponent,
+    declared_events: []const scripting_declare.DeclaredEvent,
     prefab_names: []const []const u8,
     enum_names: []const []const u8,
     event_names: []const []const u8,
@@ -66,7 +68,37 @@ pub fn emitManifestSidecar(
 
     // ── Game-realm detail (AST-parsed from the realm we author) ──────
     var components = try parse.parseStructDir(aa, game_dir, "components", component_names);
-    const game_events = try parse.parseStructDir(aa, game_dir, "events", event_names);
+    var game_events = try parse.parseStructDir(aa, game_dir, "events", event_names);
+
+    // ── Script-declared events (labelle-engine#772) ──────────────────
+    // One GameEvents union variant each, exactly like `events/*.zig`, so
+    // the game realm lists them too. Converted straight from the typed
+    // schema (the same no-drift rationale as declared components below):
+    // struct name = the Pascal transform codegen emits
+    // (`idents.pathToPascal`), fields through `zigFieldTypeName`, no save
+    // policy (events are never saved — the same null an AST-parsed
+    // events/*.zig yields). Appended AFTER the events/ entries, mirroring
+    // the union block's emission order.
+    if (declared_events.len > 0) {
+        var list: std.ArrayList(parse.StructDecl) = .empty;
+        try list.ensureTotalCapacity(aa, game_events.len + declared_events.len);
+        list.appendSliceAssumeCapacity(game_events);
+        var pascal_buf: [128]u8 = undefined;
+        for (declared_events) |de| {
+            const fields = try aa.alloc(parse.Field, de.fields.len);
+            for (de.fields, fields) |df, *out| out.* = .{
+                .name = df.name,
+                .zig_type = scripting_declare.zigFieldTypeName(df.default),
+            };
+            list.appendAssumeCapacity(.{
+                .name = try aa.dupe(u8, idents.pathToPascal(de.name, &pascal_buf)),
+                .save = null,
+                .visibility = null,
+                .fields = fields,
+            });
+        }
+        game_events = try list.toOwnedSlice(aa);
+    }
 
     // ── Script-declared components (labelle-assembler#585) ───────────
     // The declare phase registers these into the SAME game-root registry
@@ -189,7 +221,7 @@ test "emitManifestSidecar: writes a parseable sidecar for an empty project" {
     defer aa.free(dir);
 
     const cfg = ProjectConfig{ .name = "tmp" };
-    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{});
+    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{});
 
     const path = try std.fs.path.join(aa, &.{ dir, MANIFEST_FILENAME });
     defer aa.free(path);
@@ -244,7 +276,7 @@ test "emitManifestSidecar: AST-parses a staged pack's components" {
     const cfg = ProjectConfig{ .name = "tmp", .plugins = &.{.{ .name = "citizens" }} };
     // game_dir and target_dir both point at the tmp dir; the pack files live
     // under `<target>/packs/citizens/`.
-    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &packs);
+    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &packs);
 
     const path = try std.fs.path.join(aa, &.{ dir, MANIFEST_FILENAME });
     defer aa.free(path);
@@ -298,7 +330,7 @@ test "emitManifestSidecar: lists script-declared components in the game realm (#
     };
 
     const cfg = ProjectConfig{ .name = "tmp" };
-    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{"bed"}, &declared, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{});
+    try emitManifestSidecar(aa, cfg, dir, dir, dir, &.{"bed"}, &declared, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{});
 
     const path = try std.fs.path.join(aa, &.{ dir, MANIFEST_FILENAME });
     defer aa.free(path);

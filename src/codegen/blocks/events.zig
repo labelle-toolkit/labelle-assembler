@@ -82,7 +82,11 @@ pub fn Mixin(comptime Self: type) type {
             // Pack events (Packs RFC §4, #439) are dir-scanned `events/*.zig`
             // exactly like the game root's, so they count as game events: they
             // widen `GameEvents` and fold into `AllHookPayloads` the same way.
-            const has_game_events_local = event_names.len > 0 or self.hasPackEvents();
+            // Script-DECLARED events (labelle-engine#772) count the same way —
+            // their payload structs live in the generated `scripting_events.zig`
+            // instead of `events/*.zig`, but the union rows are bus-identical.
+            const has_game_events_local = event_names.len > 0 or self.hasPackEvents() or
+                self.declaredEvents().len > 0;
 
             // The raw game-side scan keeps its v1 shape; the alias is what
             // the merge feeds on when plugins are also in play. For
@@ -103,6 +107,7 @@ pub fn Mixin(comptime Self: type) type {
                         try w.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
                     }
                     try writePackEventVariants(self, w, &pascal_buf);
+                    try writeDeclaredEventVariants(self, w, &pascal_buf);
                     try w.writeAll("};\n\n");
                 }
                 try self.writePluginEventsBlock(w);
@@ -123,6 +128,7 @@ pub fn Mixin(comptime Self: type) type {
                         try w.print("    {s}: {s}.{s},\n", .{ ident, ident, pascal });
                     }
                     try writePackEventVariants(self, w, &pascal_buf);
+                    try writeDeclaredEventVariants(self, w, &pascal_buf);
                     try w.writeAll("};\n\n");
                 } else {
                     try w.writeAll("pub const GameEvents = void;\n\n");
@@ -163,6 +169,25 @@ pub fn Mixin(comptime Self: type) type {
                     const pascal = pathToPascal(name, pascal_buf);
                     try w.print("    {s}__{s}: {s}__{s}.{s},\n", .{ prefix, ident, prefix, ident, pascal });
                 }
+            }
+        }
+
+        /// Emit `<name>: @import("scripting_events.zig").<Pascal>,` union
+        /// variants for every script-declared event (labelle-engine#772).
+        /// Bus-identical to a Zig-authored `events/<name>.zig` row — same
+        /// bare variant tag (the user's hook handler references it by
+        /// name), same PascalCase payload transform (`pathToPascal`, the
+        /// exact transform game-event rows use) — only the payload's home
+        /// differs: the declare phase's ONE generated file at the target
+        /// root, imported inline (no module-scope alias, so a game event
+        /// named anything at all can never collide with it). Collisions
+        /// with game/pack event variants were rejected at generate time by
+        /// `scripting_declare.checkEventCollisions`. Empty for every
+        /// declaration-less project — the block stays byte-identical.
+        fn writeDeclaredEventVariants(self: *Self, w: anytype, pascal_buf: *[128]u8) !void {
+            for (self.declaredEvents()) |ev| {
+                const pascal = pathToPascal(ev.name, pascal_buf);
+                try w.print("    {s}: @import(\"scripting_events.zig\").{s},\n", .{ ev.name, pascal });
             }
         }
     };

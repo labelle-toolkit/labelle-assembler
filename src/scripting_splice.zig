@@ -286,6 +286,14 @@ pub const ScriptingSplice = struct {
     /// `scripting_components.zig`. Empty (the default) for every
     /// declaration-less project — all emission sites stay byte-identical.
     declared_components: []const scripting_declare.DeclaredComponent = &.{},
+    /// Script-declared events (labelle-engine#772): the schema's events,
+    /// set by root.zig beside `declared_components` (same arena, same
+    /// lifetime). Consumed by the game-events union writers
+    /// (`blocks/events.zig` — one variant per declared event against the
+    /// generated `scripting_events.zig`) and the `AllHookPayloads` gate
+    /// (`blocks/hooks.zig`). Empty (the default) for every
+    /// declaration-less project — all emission sites stay byte-identical.
+    declared_events: []const scripting_declare.DeclaredEvent = &.{},
 };
 
 /// Detect the scripting splice for this project: the `.plugins` entry
@@ -649,8 +657,65 @@ pub fn collectComponentEmbeds(
     game_dir: []const u8,
     splice: ScriptingSplice,
 ) ![]EmbedScript {
+    return collectDeclEmbeds(allocator, game_dir, splice, .components);
+}
+
+/// Collect the game's `events/` LANGUAGE files for an `.embed` splice
+/// (labelle-engine#772: event declarations live where their kind lives —
+/// `events/hunger__feed.rb` next to `events/hunger__feed.zig`, the same
+/// #237 refinement `components/` follows). Same mechanics as
+/// `collectComponentEmbeds` in every respect — extension-keyed
+/// coexistence with the Zig event scan, alphabetical order, plain rel
+/// stems, the transpile pointed error (`error.EventsDirNeedsTranspile`),
+/// missing dir collects empty.
+///
+/// Entries register BETWEEN the component declarations and the script
+/// dir's entries (root.zig concatenates components → events → scripts) so
+/// the event-name constants a declaration defines (`HungerFeed =
+/// Labelle.event ...`) exist by the time scripts load. The target's
+/// `events/` link is root.zig's existing `linkAndScan(events, ".zig")`,
+/// so the `@embedFile("events/<rel>")` paths resolve with no extra
+/// placement. Free with `freeEmbedScripts`.
+pub fn collectEventEmbeds(
+    allocator: std.mem.Allocator,
+    game_dir: []const u8,
+    splice: ScriptingSplice,
+) ![]EmbedScript {
+    return collectDeclEmbeds(allocator, game_dir, splice, .events);
+}
+
+/// The declaration convention dirs a language may drop files into —
+/// `collectDeclEmbeds`' axis. Each carries its dir name and the
+/// dir-specific transpile-gap error.
+const DeclDir = enum {
+    components,
+    events,
+
+    fn dirName(self: DeclDir) []const u8 {
+        return switch (self) {
+            .components => "components",
+            .events => "events",
+        };
+    }
+
+    fn transpileError(self: DeclDir) anyerror {
+        return switch (self) {
+            .components => error.ComponentsDirNeedsTranspile,
+            .events => error.EventsDirNeedsTranspile,
+        };
+    }
+};
+
+/// The shared components/-and-events/ declaration-file collection (see
+/// the two public wrappers for the per-dir contracts).
+fn collectDeclEmbeds(
+    allocator: std.mem.Allocator,
+    game_dir: []const u8,
+    splice: ScriptingSplice,
+    decl_dir: DeclDir,
+) ![]EmbedScript {
     const io = config.globalIo();
-    const dir_path = try std.fs.path.join(allocator, &.{ game_dir, "components" });
+    const dir_path = try std.fs.path.join(allocator, &.{ game_dir, decl_dir.dirName() });
     defer allocator.free(dir_path);
 
     var out: std.ArrayList(EmbedScript) = .empty;
@@ -663,7 +728,7 @@ pub fn collectComponentEmbeds(
     defer dir.close(io);
 
     const transpile: ?TranspileSource = if (embedRow(splice.language)) |row| row.transpile else null;
-    try collectComponentEmbedsWalk(allocator, io, dir, "", splice, transpile, &out);
+    try collectDeclEmbedsWalk(allocator, io, dir, "", splice, transpile, decl_dir, &out);
 
     // Deterministic order: plain alphabetical by target-relative file.
     std.mem.sortUnstable(EmbedScript, out.items, {}, struct {
@@ -675,13 +740,14 @@ pub fn collectComponentEmbeds(
     return out.toOwnedSlice(allocator);
 }
 
-fn collectComponentEmbedsWalk(
+fn collectDeclEmbedsWalk(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
     rel_prefix: []const u8,
     splice: ScriptingSplice,
     transpile: ?TranspileSource,
+    decl_dir: DeclDir,
     out: *std.ArrayList(EmbedScript),
 ) !void {
     var iter = dir.iterate();
@@ -696,7 +762,7 @@ fn collectComponentEmbedsWalk(
                 else
                     try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, entry.name });
                 defer allocator.free(sub_prefix);
-                try collectComponentEmbedsWalk(allocator, io, sub, sub_prefix, splice, transpile, out);
+                try collectDeclEmbedsWalk(allocator, io, sub, sub_prefix, splice, transpile, decl_dir, out);
             },
             else => {
                 // Authoring sources the assembler can't run from here: the
@@ -707,19 +773,21 @@ fn collectComponentEmbedsWalk(
                         !std.mem.endsWith(u8, entry.name, t.declaration_suffix))
                     {
                         std.debug.print(
-                            "labelle-assembler: components/{s}{s}{s} is a {s} authoring source, but the transpile step covers only the script dir.\n" ++
-                                "  author runnable {s} in components/ (or keep {s} sources in {s}/).\n",
+                            "labelle-assembler: {s}/{s}{s}{s} is a {s} authoring source, but the transpile step covers only the script dir.\n" ++
+                                "  author runnable {s} in {s}/ (or keep {s} sources in {s}/).\n",
                             .{
+                                decl_dir.dirName(),
                                 rel_prefix,
                                 if (rel_prefix.len == 0) "" else "/",
                                 entry.name,
                                 t.source_extension,
                                 splice.extension,
+                                decl_dir.dirName(),
                                 t.source_extension,
                                 splice.dir,
                             },
                         );
-                        return error.ComponentsDirNeedsTranspile;
+                        return decl_dir.transpileError();
                     }
                 }
                 if (!std.mem.endsWith(u8, entry.name, splice.extension)) continue;
@@ -730,14 +798,33 @@ fn collectComponentEmbedsWalk(
                     try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, entry.name[0..rel_stem_len] });
                 errdefer allocator.free(name);
                 const file = if (rel_prefix.len == 0)
-                    try std.fmt.allocPrint(allocator, "components/{s}", .{entry.name})
+                    try std.fmt.allocPrint(allocator, "{s}/{s}", .{ decl_dir.dirName(), entry.name })
                 else
-                    try std.fmt.allocPrint(allocator, "components/{s}/{s}", .{ rel_prefix, entry.name });
+                    try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ decl_dir.dirName(), rel_prefix, entry.name });
                 errdefer allocator.free(file);
                 try out.append(allocator, .{ .name = name, .file = file });
             },
         }
     }
+}
+
+/// Three-way `concatEmbeds` — root.zig's registration order: component
+/// declarations → EVENT declarations (labelle-engine#772: their name
+/// constants must exist when scripts load, and component view constants
+/// before those) → the script dir's entries. Same shallow contract as
+/// `concatEmbeds`: free the result with `allocator.free`, inputs keep
+/// ownership.
+pub fn concatEmbeds3(
+    allocator: std.mem.Allocator,
+    first: []const EmbedScript,
+    second: []const EmbedScript,
+    third: []const EmbedScript,
+) ![]EmbedScript {
+    const out = try allocator.alloc(EmbedScript, first.len + second.len + third.len);
+    @memcpy(out[0..first.len], first);
+    @memcpy(out[first.len..][0..second.len], second);
+    @memcpy(out[first.len + second.len ..], third);
+    return out;
 }
 
 /// Concatenate two embed collections into ONE emission slice — root.zig's
@@ -2162,4 +2249,105 @@ test "stageNativeSources: an embed-family splice is a no-op (family gate)" {
         .extension = ".lua",
     };
     try stageNativeSources(allocator, fx.game_abs, fx.out_abs, lua_splice);
+}
+
+// ── collectEventEmbeds: declarations beside the Zig events (#772) ─────
+
+test "collectEventEmbeds: events/*.<ext> collect alphabetically with plain stems — .zig invisible, extension-keyed (the v0.85.0 rule)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The #772 shape: event declarations beside the Zig events,
+    // extension-keyed — the Zig scan keeps .zig, this collects only the
+    // splice's extension. The stray .lua under a RUBY splice is the
+    // non-selected-language forward-compat rule: ignored, exactly like
+    // scripts/.
+    try writeTestFile(tmp.dir, "events/hunger__feed.rb", "HungerFeed = Labelle.event \"hunger__feed\", entity: Labelle.id, amount: 0.5\n");
+    try writeTestFile(tmp.dir, "events/combat/hit.rb", "Hit = Labelle.event \"combat__hit\", damage: 1\n");
+    try writeTestFile(tmp.dir, "events/door_opened.zig", "pub const DoorOpened = struct {};\n");
+    try writeTestFile(tmp.dir, "events/wave.lua", "Wave = labelle.event(\"wave\", {})\n");
+    try writeTestFile(tmp.dir, "events/.hidden.rb", "ignored\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const splice = ScriptingSplice{
+        .plugin_name = "scripting",
+        .language = "ruby",
+        .dir = "scripts",
+        .extension = ".rb",
+    };
+    const embeds = try collectEventEmbeds(allocator, root, splice);
+    defer freeEmbedScripts(allocator, embeds);
+
+    try testing.expectEqual(@as(usize, 2), embeds.len);
+    // Alphabetical by target-relative file; names are PLAIN rel stems.
+    try testing.expectEqualStrings("combat/hit", embeds[0].name);
+    try testing.expectEqualStrings("events/combat/hit.rb", embeds[0].file);
+    try testing.expectEqualStrings("hunger__feed", embeds[1].name);
+    try testing.expectEqualStrings("events/hunger__feed.rb", embeds[1].file);
+
+    // Missing events/ collects empty (negative control).
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    const root2 = try tmp2.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root2);
+    const none = try collectEventEmbeds(allocator, root2, splice);
+    defer freeEmbedScripts(allocator, none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "collectEventEmbeds: a typescript authoring source in events/ is its own pointed error; .d.ts exempt" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "events/labelle.d.ts", "declare const labelle: any;\n");
+    try writeTestFile(tmp.dir, "events/hit.ts", "export type Hit = { damage: number };\n");
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    try testing.expectError(
+        error.EventsDirNeedsTranspile,
+        collectEventEmbeds(allocator, root, ts_splice_fixture),
+    );
+}
+
+test "concatEmbeds3: components -> events -> scripts registration order (the #772 order pin) — shallow, inputs keep ownership" {
+    const allocator = testing.allocator;
+    const comps = [_]EmbedScript{
+        .{ .name = "hunger", .file = "components/hunger.rb" },
+    };
+    const events = [_]EmbedScript{
+        .{ .name = "hunger__feed", .file = "events/hunger__feed.rb" },
+    };
+    const scripts = [_]EmbedScript{
+        .{ .name = "spawner", .file = "scripts/10_spawner.rb" },
+        .{ .name = "feed_watcher", .file = "scripts/feed_watcher.rb" },
+    };
+    const combined = try concatEmbeds3(allocator, &comps, &events, &scripts);
+    defer allocator.free(combined);
+
+    // The ORDER is the contract (each layer's constants must exist when
+    // the next loads): components, then events, then the script dir.
+    try testing.expectEqual(@as(usize, 4), combined.len);
+    try testing.expectEqualStrings("hunger", combined[0].name);
+    try testing.expectEqualStrings("hunger__feed", combined[1].name);
+    try testing.expectEqualStrings("components/hunger.rb", combined[0].file);
+    try testing.expectEqualStrings("events/hunger__feed.rb", combined[1].file);
+    try testing.expectEqualStrings("scripts/10_spawner.rb", combined[2].file);
+    try testing.expectEqualStrings("scripts/feed_watcher.rb", combined[3].file);
+
+    // Shallow: the result borrows the inputs' strings.
+    try testing.expectEqual(comps[0].name.ptr, combined[0].name.ptr);
+    try testing.expectEqual(events[0].name.ptr, combined[1].name.ptr);
+    try testing.expectEqual(scripts[0].name.ptr, combined[2].name.ptr);
+
+    // Empty middle (no event declarations) degrades to the pre-#772
+    // two-way shape byte-for-byte.
+    const no_events = try concatEmbeds3(allocator, &comps, &.{}, &scripts);
+    defer allocator.free(no_events);
+    try testing.expectEqual(@as(usize, 3), no_events.len);
+    try testing.expectEqualStrings("hunger", no_events[0].name);
+    try testing.expectEqualStrings("spawner", no_events[1].name);
 }

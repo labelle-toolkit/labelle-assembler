@@ -1,6 +1,6 @@
-//! Script-declared components — declare-mode extraction + Zig codegen
-//! (labelle-assembler#585; RFC-LANGUAGE-PLUGINS revs 6-7, epic
-//! labelle-engine#237).
+//! Script-declared components AND events — declare-mode extraction + Zig
+//! codegen (labelle-assembler#585 components, labelle-engine#772 events;
+//! RFC-LANGUAGE-PLUGINS revs 6-7, epic labelle-engine#237).
 //!
 //! Scripts declare components natively in their own language — canonically
 //! in `components/*.<ext>` beside the Zig components (labelle-engine#237's
@@ -22,14 +22,37 @@
 //!     "fields":[{"name":"level","type":"f32","default":1.0},
 //!               {"name":"starving","type":"bool","default":false}]}]}
 //!
-//! Types v1: f32 i32 u32 bool str vec2 entity ("persist": "persistent"
-//! [default] | "transient"; enums land LATER and are rejected with a clear
-//! error). From that schema the phase codegens `scripting_components.zig`
-//! into the target — one real Zig struct per component, `Saveable`-decl'd
-//! exactly like a hand-written `components/*.zig` — and the registry block
-//! registers each by its declared name. Scenes, prefabs, save buckets,
-//! typed Zig queries and the script contract's by-name dispatch all reach
-//! them with zero further wiring.
+//! Types v1: f32 i32 u32 u64 bool str vec2 entity ("persist":
+//! "persistent" [default] | "transient"; enums land LATER and are
+//! rejected with a clear error; u64 is scripting v0.10.0's `Labelle.id`
+//! sentinel — legal in components and events alike). From that schema the
+//! phase codegens `scripting_components.zig` into the target — one real
+//! Zig struct per component, `Saveable`-decl'd exactly like a
+//! hand-written `components/*.zig` — and the registry block registers
+//! each by its declared name. Scenes, prefabs, save buckets, typed Zig
+//! queries and the script contract's by-name dispatch all reach them with
+//! zero further wiring.
+//!
+//! Events (labelle-engine#772, scripting v0.10.0): the same schema
+//! carries a top-level `"events":[{name, fields}]` array — present ONLY
+//! when non-empty (compat by construction: older schemas are
+//! byte-identical), no persist key (events are never saved). Declarations
+//! live in `events/*.<ext>` beside the Zig events (the #237 "where their
+//! kind lives" convention — `HungerFeed = Labelle.event "hunger__feed",
+//! entity: Labelle.id, amount: 0.5`), collected + embedded by root.zig
+//! between the component declarations and the script dir's files. The
+//! phase codegens ALL declared events into ONE `scripting_events.zig` at
+//! the target root (beside `scripting_components.zig`) — the staged
+//! `events/` dir is a whole-dir SYMLINK into the game tree
+//! (`scanner.linkDir`), so per-event `events/<name>.zig` materialization
+//! would write THROUGH into the game's sources. The game-events union
+//! block then emits one variant per declared event
+//! (`hunger__feed: @import("scripting_events.zig").HungerFeed`) — same
+//! bus row an `events/hunger__feed.zig` would get, so script `emit`/`on`
+//! by name and native hook methods (`pub fn hunger__feed(self, feed:
+//! anytype)`) reach it with zero further wiring. (A native hook consuming
+//! a DECLARED event spells its payload param `anytype` — the generated
+//! file doesn't exist in the game tree for an in-tree typed import.)
 //!
 //! No-op guarantee: no scripts, or scripts with no declarations, emit
 //! nothing — no file, no registry entries, byte-identical output (the
@@ -91,6 +114,12 @@ const idents = @import("codegen/idents.zig");
 /// The registry block imports it verbatim (`@import("scripting_components.zig")`).
 pub const GENERATED_FILENAME = "scripting_components.zig";
 
+/// The generated EVENTS file name (labelle-engine#772), written beside
+/// `main.zig` in the target dir. The game-events union block imports it
+/// verbatim (`@import("scripting_events.zig")`) — one `pub const
+/// <Pascal>` payload struct per declared event.
+pub const GENERATED_EVENTS_FILENAME = "scripting_events.zig";
+
 /// One declare-capable language: the plugin-shipped runner that extracts
 /// its declarations (each runner IS an interpreter for its language —
 /// pointing it at another language's sources would "run" them as the
@@ -118,6 +147,16 @@ pub const DeclareRunner = struct {
     /// The labelle-scripting release that first shipped the runner — the
     /// absent-tool note's pointed pin hint.
     min_pin: []const u8,
+    /// The labelle-scripting release whose declare tool AND runtime
+    /// prelude first know `Labelle.event`/`Labelle.id`
+    /// (labelle-engine#772). Unlike `min_pin` this floor is enforced as a
+    /// hard generate error when `events/*.<ext>` declaration files exist:
+    /// the capability probe can't see it (the tool DIR predates it), and
+    /// an old runtime prelude would only fail at game BOOT with a
+    /// missing-method error — far from the declaration. Local pins (and
+    /// non-semver refs) satisfy the floor, exactly like the capability
+    /// probes treat them — the tree is the authority there.
+    events_min_pin: []const u8,
 };
 
 /// The declare-capable languages (labelle-engine#237; ruby via
@@ -134,6 +173,7 @@ pub const DECLARE_RUNNERS = [_]DeclareRunner{
         .tool_dir = "tools/declare",
         .extension = ".lua",
         .min_pin = "0.2.0",
+        .events_min_pin = "0.10.0",
     },
     .{
         .language = "ruby",
@@ -141,6 +181,7 @@ pub const DECLARE_RUNNERS = [_]DeclareRunner{
         .tool_dir = "tools/declare-ruby",
         .extension = ".rb",
         .min_pin = "0.9.0",
+        .events_min_pin = "0.10.0",
     },
 };
 
@@ -179,8 +220,10 @@ pub const Persist = enum { persistent, transient };
 
 /// v1 field-type vocabulary. `enum`-typed fields are a known LATER —
 /// `parseSchema` rejects them (and any other unknown type string) with a
-/// clear error naming the component and field.
-pub const FieldType = enum { f32, i32, u32, bool, str, vec2, entity };
+/// clear error naming the declaration and field. `u64` is scripting
+/// v0.10.0's `Labelle.id` marker (labelle-engine#772) — event payloads
+/// carry entity ids, and components may use it too.
+pub const FieldType = enum { f32, i32, u32, u64, bool, str, vec2, entity };
 
 pub const Vec2Default = struct { x: f64, y: f64 };
 
@@ -190,6 +233,7 @@ pub const Default = union(FieldType) {
     f32: f64,
     i32: i32,
     u32: u32,
+    u64: u64,
     bool: bool,
     str: []const u8,
     vec2: Vec2Default,
@@ -207,17 +251,32 @@ pub const DeclaredComponent = struct {
     fields: []const DeclaredField,
 };
 
-/// A parsed schema. Owns every slice reachable from `components` via its
-/// arena; `deinit` releases the lot.
+/// One script-declared event (labelle-engine#772): the schema's
+/// `"events":[{name, fields}]` row. No persist — events are never saved.
+/// `name` is the bus/union-variant name (`hunger__feed`); the generated
+/// payload struct is `idents.pathToPascal(name)` (`HungerFeed`) — the
+/// SAME transform a Zig `events/hunger__feed.zig` follows by convention.
+pub const DeclaredEvent = struct {
+    name: []const u8,
+    fields: []const DeclaredField,
+};
+
+/// A parsed schema. Owns every slice reachable from `components`/`events`
+/// via its arena; `deinit` releases the lot.
 pub const Schema = struct {
     arena: *std.heap.ArenaAllocator,
     components: []const DeclaredComponent,
+    /// Script-declared events (labelle-engine#772). Empty for every
+    /// schema without a top-level "events" key — including every schema
+    /// a pre-v0.10.0 runner emits.
+    events: []const DeclaredEvent,
 
     pub fn deinit(self: *Schema) void {
         const child = self.arena.child_allocator;
         self.arena.deinit();
         child.destroy(self.arena);
         self.components = &.{};
+        self.events = &.{};
     }
 };
 
@@ -242,6 +301,17 @@ fn relayChildStderr(text: []const u8) void {
     std.Io.File.stderr().writeStreamingAll(io, text) catch {};
     if (text[text.len - 1] != '\n')
         std.Io.File.stderr().writeStreamingAll(io, "\n") catch {};
+}
+
+/// Print an indented file list under a `diag` headline (the events gates
+/// name every offending `events/*.<ext>` file). Best-effort, like `diag`.
+fn diagFileList(files: []const []const u8) void {
+    const io = config.globalIo();
+    for (files) |f| {
+        var buf: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "  {s}\n", .{f}) catch continue;
+        std.Io.File.stderr().writeStreamingAll(io, line) catch {};
+    }
 }
 
 // ── Schema parsing ───────────────────────────────────────────────────
@@ -281,13 +351,30 @@ fn isZigPrimitive(s: []const u8) bool {
 
 /// Member decls EVERY rendered component struct carries (see
 /// `renderComponentsFile`) — a field with one of these names would collide
-/// with its own struct's generated decl.
+/// with its own struct's generated decl. Events render NO member decls
+/// (`renderEventsFile` — no Saveable, events aren't saved), so the check
+/// is component-only.
 const generated_member_decls = [_][]const u8{"save"};
 
-/// Parse + validate one schema JSON document into typed components.
-/// Validation is deliberately re-done here even though the lua runner
-/// already validated: the schema is a CONTRACT — future runners (other
-/// languages) feed the same seam, and a generate-time error beats
+/// Which declaration kind a shared parse/validation helper is speaking
+/// about — the diagnostics name the right kind, and the one
+/// component-only rule (`generated_member_decls`) gates on it.
+const DeclKind = enum {
+    component,
+    event,
+
+    fn label(self: DeclKind) []const u8 {
+        return switch (self) {
+            .component => "component",
+            .event => "event",
+        };
+    }
+};
+
+/// Parse + validate one schema JSON document into typed components +
+/// events. Validation is deliberately re-done here even though the lua
+/// runner already validated: the schema is a CONTRACT — future runners
+/// (other languages) feed the same seam, and a generate-time error beats
 /// generated code that doesn't compile.
 pub fn parseSchema(gpa: std.mem.Allocator, json_text: []const u8) !Schema {
     const arena = try gpa.create(std.heap.ArenaAllocator);
@@ -335,7 +422,70 @@ pub fn parseSchema(gpa: std.mem.Allocator, json_text: []const u8) !Schema {
         }
     }
 
-    return .{ .arena = arena, .components = components };
+    // Events (labelle-engine#772): the key is emitted ONLY when at least
+    // one event was declared — absent means none (every pre-v0.10.0
+    // schema). A SEPARATE namespace from components (an event may share a
+    // component's name; the two never meet in generated code), so dups
+    // are checked per kind only.
+    var events: []DeclaredEvent = &.{};
+    if (root_obj.get("events")) |events_val| {
+        const events_arr = switch (events_val) {
+            .array => |arr| arr,
+            else => {
+                diag("script event schema: \"events\" must be an array", .{});
+                return error.ScriptSchemaInvalid;
+            },
+        };
+        events = try a.alloc(DeclaredEvent, events_arr.items.len);
+        for (events_arr.items, 0..) |event_val, i| {
+            events[i] = try parseEvent(a, event_val);
+            // A duplicate would emit two identical union variants. The
+            // tool already rejects same-run dups; the schema is a
+            // contract, so guard here too.
+            for (events[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name, events[i].name)) {
+                    diag("script event schema declares '{s}' twice", .{prev.name});
+                    return error.ScriptSchemaInvalid;
+                }
+            }
+        }
+        try checkEventStructNames(events);
+    }
+
+    return .{ .arena = arena, .components = components, .events = events };
+}
+
+/// The generated `scripting_events.zig` names each payload struct
+/// `pathToPascal(event.name)` — a transform that COLLAPSES underscores,
+/// so two distinct event names can fold to one struct (`a__b` and `a_b`
+/// both render `pub const AB`). Reject the fold-collisions (and a Pascal
+/// that lands on a Zig keyword/primitive or the reserved `Vec2` backing
+/// decl) here, where the message can still name both declaration lines.
+fn checkEventStructNames(events: []const DeclaredEvent) !void {
+    var pascal_buf: [128]u8 = undefined;
+    var prev_buf: [128]u8 = undefined;
+    for (events, 0..) |ev, i| {
+        const pascal = idents.pathToPascal(ev.name, &pascal_buf);
+        if (pascal.len == 0) {
+            diag("script-declared event '{s}': the name has no alphanumeric characters — the generated payload struct would have no name", .{ev.name});
+            return error.ScriptSchemaInvalid;
+        }
+        if (isZigKeyword(pascal) or isZigPrimitive(pascal)) {
+            diag("script-declared event '{s}': the generated payload struct name '{s}' is a Zig keyword or primitive — `pub const {s} = struct` would not compile; pick another name", .{ ev.name, pascal, pascal });
+            return error.ScriptSchemaInvalid;
+        }
+        if (std.mem.eql(u8, pascal, "Vec2")) {
+            diag("script-declared event '{s}': the generated payload struct name 'Vec2' is reserved by the generated file (the vec2-field backing struct)", .{ev.name});
+            return error.ScriptSchemaInvalid;
+        }
+        for (events[0..i]) |prev| {
+            const prev_pascal = idents.pathToPascal(prev.name, &prev_buf);
+            if (std.mem.eql(u8, prev_pascal, pascal)) {
+                diag("script-declared events '{s}' and '{s}' both generate the payload struct '{s}' (underscores collapse in the PascalCase transform) — rename one", .{ prev.name, ev.name, pascal });
+                return error.ScriptSchemaInvalid;
+            }
+        }
+    }
 }
 
 fn parseComponent(a: std.mem.Allocator, val: std.json.Value) !DeclaredComponent {
@@ -392,26 +542,7 @@ fn parseComponent(a: std.mem.Allocator, val: std.json.Value) !DeclaredComponent 
         };
     }
 
-    var fields: []DeclaredField = &.{};
-    if (obj.get("fields")) |f_val| {
-        const f_arr = switch (f_val) {
-            .array => |arr| arr,
-            else => {
-                diag("script-declared component '{s}': \"fields\" must be an array", .{name});
-                return error.ScriptSchemaInvalid;
-            },
-        };
-        fields = try a.alloc(DeclaredField, f_arr.items.len);
-        for (f_arr.items, 0..) |field_val, i| {
-            fields[i] = try parseField(a, name, field_val);
-            for (fields[0..i]) |prev| {
-                if (std.mem.eql(u8, prev.name, fields[i].name)) {
-                    diag("script-declared component '{s}' declares field '{s}' twice", .{ name, prev.name });
-                    return error.ScriptSchemaInvalid;
-                }
-            }
-        }
-    }
+    const fields = try parseFields(a, .component, name, obj);
 
     return .{
         .name = try a.dupe(u8, name),
@@ -420,104 +551,188 @@ fn parseComponent(a: std.mem.Allocator, val: std.json.Value) !DeclaredComponent 
     };
 }
 
-fn parseField(a: std.mem.Allocator, comp_name: []const u8, val: std.json.Value) !DeclaredField {
+/// Parse one `events[]` entry (labelle-engine#772). The name lands in
+/// TWO generated positions — the bare union variant (`hunger__feed:`)
+/// and, PascalCased, the payload struct decl — so it carries the same
+/// keyword/primitive gates a component name does. No persist key, no
+/// options: events are never saved (the tool enforces it; the schema
+/// simply has no field to parse).
+fn parseEvent(a: std.mem.Allocator, val: std.json.Value) !DeclaredEvent {
     const obj = switch (val) {
         .object => |o| o,
         else => {
-            diag("script-declared component '{s}': each fields[] entry must be an object", .{comp_name});
+            diag("script event schema: each events[] entry must be an object", .{});
+            return error.ScriptSchemaInvalid;
+        },
+    };
+
+    const name_val = obj.get("name") orelse {
+        diag("script event schema: an event is missing its \"name\"", .{});
+        return error.ScriptSchemaInvalid;
+    };
+    const name = switch (name_val) {
+        .string => |s| s,
+        else => {
+            diag("script event schema: an event \"name\" must be a string", .{});
+            return error.ScriptSchemaInvalid;
+        },
+    };
+    if (!isIdentifier(name)) {
+        diag("script-declared event '{s}' is not a valid identifier", .{name});
+        return error.ScriptSchemaInvalid;
+    }
+    if (isZigKeyword(name)) {
+        diag("script-declared event '{s}': the name is a Zig keyword — the generated `{s}: ...` union variant would not compile; pick another name", .{ name, name });
+        return error.ScriptSchemaInvalid;
+    }
+    if (isZigPrimitive(name)) {
+        diag("script-declared event '{s}': the name shadows a Zig primitive — reserved so the union variant and hook handler names stay spellable bare; pick another name", .{name});
+        return error.ScriptSchemaInvalid;
+    }
+
+    const fields = try parseFields(a, .event, name, obj);
+
+    return .{
+        .name = try a.dupe(u8, name),
+        .fields = fields,
+    };
+}
+
+/// The shared `"fields"` walk — components and events carry the same
+/// {name, type, default} rows (one vocabulary, one validation matrix);
+/// only the diagnostics' kind label and the component-only
+/// `generated_member_decls` rule differ.
+fn parseFields(a: std.mem.Allocator, kind: DeclKind, owner: []const u8, obj: std.json.ObjectMap) ![]DeclaredField {
+    var fields: []DeclaredField = &.{};
+    if (obj.get("fields")) |f_val| {
+        const f_arr = switch (f_val) {
+            .array => |arr| arr,
+            else => {
+                diag("script-declared {s} '{s}': \"fields\" must be an array", .{ kind.label(), owner });
+                return error.ScriptSchemaInvalid;
+            },
+        };
+        fields = try a.alloc(DeclaredField, f_arr.items.len);
+        for (f_arr.items, 0..) |field_val, i| {
+            fields[i] = try parseField(a, kind, owner, field_val);
+            for (fields[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name, fields[i].name)) {
+                    diag("script-declared {s} '{s}' declares field '{s}' twice", .{ kind.label(), owner, prev.name });
+                    return error.ScriptSchemaInvalid;
+                }
+            }
+        }
+    }
+    return fields;
+}
+
+fn parseField(a: std.mem.Allocator, kind: DeclKind, owner: []const u8, val: std.json.Value) !DeclaredField {
+    const obj = switch (val) {
+        .object => |o| o,
+        else => {
+            diag("script-declared {s} '{s}': each fields[] entry must be an object", .{ kind.label(), owner });
             return error.ScriptSchemaInvalid;
         },
     };
     const name = switch (obj.get("name") orelse .null) {
         .string => |s| s,
         else => {
-            diag("script-declared component '{s}': a field is missing its \"name\" string", .{comp_name});
+            diag("script-declared {s} '{s}': a field is missing its \"name\" string", .{ kind.label(), owner });
             return error.ScriptSchemaInvalid;
         },
     };
     if (!isIdentifier(name)) {
-        diag("script-declared component '{s}' field '{s}' is not a valid identifier", .{ comp_name, name });
+        diag("script-declared {s} '{s}' field '{s}' is not a valid identifier", .{ kind.label(), owner, name });
         return error.ScriptSchemaInvalid;
     }
     if (isZigKeyword(name)) {
-        diag("script-declared component '{s}' field '{s}': the name is a Zig keyword — the generated `{s}: <type> = ...` field would not compile; pick another name", .{ comp_name, name, name });
+        diag("script-declared {s} '{s}' field '{s}': the name is a Zig keyword — the generated `{s}: <type> = ...` field would not compile; pick another name", .{ kind.label(), owner, name, name });
         return error.ScriptSchemaInvalid;
     }
     if (isZigPrimitive(name)) {
-        diag("script-declared component '{s}' field '{s}': the name is a Zig primitive type/value name — reserved so generated code can always spell the field bare; pick another name", .{ comp_name, name });
+        diag("script-declared {s} '{s}' field '{s}': the name is a Zig primitive type/value name — reserved so generated code can always spell the field bare; pick another name", .{ kind.label(), owner, name });
         return error.ScriptSchemaInvalid;
     }
-    for (generated_member_decls) |decl| {
-        if (std.mem.eql(u8, name, decl)) {
-            diag("script-declared component '{s}' field '{s}': the name collides with the `{s}` decl every generated component struct carries — pick another name", .{ comp_name, name, decl });
-            return error.ScriptSchemaInvalid;
+    if (kind == .component) {
+        // Component-only: events render NO member decls (no Saveable —
+        // events are never saved), so an event field may spell `save`.
+        for (generated_member_decls) |decl| {
+            if (std.mem.eql(u8, name, decl)) {
+                diag("script-declared component '{s}' field '{s}': the name collides with the `{s}` decl every generated component struct carries — pick another name", .{ owner, name, decl });
+                return error.ScriptSchemaInvalid;
+            }
         }
     }
     const type_str = switch (obj.get("type") orelse .null) {
         .string => |s| s,
         else => {
-            diag("script-declared component '{s}' field '{s}': missing \"type\" string", .{ comp_name, name });
+            diag("script-declared {s} '{s}' field '{s}': missing \"type\" string", .{ kind.label(), owner, name });
             return error.ScriptSchemaInvalid;
         },
     };
     const field_type = std.meta.stringToEnum(FieldType, type_str) orelse {
         if (std.mem.eql(u8, type_str, "enum")) {
-            diag("script-declared component '{s}' field '{s}': enum fields are not supported yet (schema v1 types: f32 i32 u32 bool str vec2 entity)", .{ comp_name, name });
+            diag("script-declared {s} '{s}' field '{s}': enum fields are not supported yet (schema v1 types: f32 i32 u32 u64 bool str vec2 entity)", .{ kind.label(), owner, name });
         } else {
-            diag("script-declared component '{s}' field '{s}': unknown type \"{s}\" (schema v1 types: f32 i32 u32 bool str vec2 entity)", .{ comp_name, name, type_str });
+            diag("script-declared {s} '{s}' field '{s}': unknown type \"{s}\" (schema v1 types: f32 i32 u32 u64 bool str vec2 entity)", .{ kind.label(), owner, name, type_str });
         }
         return error.ScriptSchemaInvalid;
     };
     const default_val = obj.get("default") orelse {
-        diag("script-declared component '{s}' field '{s}': missing \"default\"", .{ comp_name, name });
+        diag("script-declared {s} '{s}' field '{s}': missing \"default\"", .{ kind.label(), owner, name });
         return error.ScriptSchemaInvalid;
     };
 
     const default: Default = switch (field_type) {
-        .f32 => .{ .f32 = try expectF32(comp_name, name, default_val) },
-        .i32 => .{ .i32 = std.math.cast(i32, try expectInteger(comp_name, name, default_val)) orelse
-            return failRange(comp_name, name, "i32") },
-        .u32 => .{ .u32 = std.math.cast(u32, try expectInteger(comp_name, name, default_val)) orelse
-            return failRange(comp_name, name, "u32") },
+        .f32 => .{ .f32 = try expectF32(kind, owner, name, default_val) },
+        .i32 => .{ .i32 = std.math.cast(i32, try expectInteger(kind, owner, name, default_val)) orelse
+            return failRange(kind, owner, name, "i32") },
+        .u32 => .{ .u32 = std.math.cast(u32, try expectInteger(kind, owner, name, default_val)) orelse
+            return failRange(kind, owner, name, "u32") },
+        // `Labelle.id` (scripting v0.10.0, labelle-engine#772) — the
+        // entity-id marker classifies as {"type":"u64","default":0} in
+        // components AND events.
+        .u64 => .{ .u64 = std.math.cast(u64, try expectInteger(kind, owner, name, default_val)) orelse
+            return failRange(kind, owner, name, "u64") },
         .bool => switch (default_val) {
             .bool => |b| .{ .bool = b },
             else => {
-                diag("script-declared component '{s}' field '{s}': bool default must be true/false", .{ comp_name, name });
+                diag("script-declared {s} '{s}' field '{s}': bool default must be true/false", .{ kind.label(), owner, name });
                 return error.ScriptSchemaInvalid;
             },
         },
         .str => switch (default_val) {
             .string => |s| .{ .str = try a.dupe(u8, s) },
             else => {
-                diag("script-declared component '{s}' field '{s}': str default must be a string", .{ comp_name, name });
+                diag("script-declared {s} '{s}' field '{s}': str default must be a string", .{ kind.label(), owner, name });
                 return error.ScriptSchemaInvalid;
             },
         },
         .vec2 => switch (default_val) {
             .object => |vo| blk: {
-                if (vo.count() != 2) return failVec2(comp_name, name);
-                const x = vo.get("x") orelse return failVec2(comp_name, name);
-                const y = vo.get("y") orelse return failVec2(comp_name, name);
+                if (vo.count() != 2) return failVec2(kind, owner, name);
+                const x = vo.get("x") orelse return failVec2(kind, owner, name);
+                const y = vo.get("y") orelse return failVec2(kind, owner, name);
                 break :blk .{ .vec2 = .{
-                    .x = try expectF32(comp_name, name, x),
-                    .y = try expectF32(comp_name, name, y),
+                    .x = try expectF32(kind, owner, name, x),
+                    .y = try expectF32(kind, owner, name, y),
                 } };
             },
-            else => return failVec2(comp_name, name),
+            else => return failVec2(kind, owner, name),
         },
-        .entity => .{ .entity = std.math.cast(u64, try expectInteger(comp_name, name, default_val)) orelse
-            return failRange(comp_name, name, "entity (u64)") },
+        .entity => .{ .entity = std.math.cast(u64, try expectInteger(kind, owner, name, default_val)) orelse
+            return failRange(kind, owner, name, "entity (u64)") },
     };
 
     return .{ .name = try a.dupe(u8, name), .default = default };
 }
 
-fn expectNumber(comp_name: []const u8, field_name: []const u8, val: std.json.Value) !f64 {
+fn expectNumber(kind: DeclKind, owner: []const u8, field_name: []const u8, val: std.json.Value) !f64 {
     return switch (val) {
         .integer => |n| @floatFromInt(n),
         .float => |f| f,
         else => {
-            diag("script-declared component '{s}' field '{s}': default must be a number", .{ comp_name, field_name });
+            diag("script-declared {s} '{s}' field '{s}': default must be a number", .{ kind.label(), owner, field_name });
             return error.ScriptSchemaInvalid;
         },
     };
@@ -534,32 +749,32 @@ const f32_max: f64 = 3.4028235e38;
 /// generated `level: f32 = 1e100` — far from the declaration. Finite-only
 /// (non-finite handling is unchanged; the tool rejects nan/inf on its
 /// side), so the beyond-max check mirrors the tool's semantics exactly.
-fn expectF32(comp_name: []const u8, field_name: []const u8, val: std.json.Value) !f64 {
-    const v = try expectNumber(comp_name, field_name, val);
+fn expectF32(kind: DeclKind, owner: []const u8, field_name: []const u8, val: std.json.Value) !f64 {
+    const v = try expectNumber(kind, owner, field_name, val);
     if (std.math.isFinite(v) and @abs(v) > f32_max) {
-        diag("script-declared component '{s}' field '{s}': default {e} is outside f32 range (magnitude must not exceed 3.4028235e38)", .{ comp_name, field_name, v });
+        diag("script-declared {s} '{s}' field '{s}': default {e} is outside f32 range (magnitude must not exceed 3.4028235e38)", .{ kind.label(), owner, field_name, v });
         return error.ScriptSchemaInvalid;
     }
     return v;
 }
 
-fn expectInteger(comp_name: []const u8, field_name: []const u8, val: std.json.Value) !i64 {
+fn expectInteger(kind: DeclKind, owner: []const u8, field_name: []const u8, val: std.json.Value) !i64 {
     return switch (val) {
         .integer => |n| n,
         else => {
-            diag("script-declared component '{s}' field '{s}': default must be an integer", .{ comp_name, field_name });
+            diag("script-declared {s} '{s}' field '{s}': default must be an integer", .{ kind.label(), owner, field_name });
             return error.ScriptSchemaInvalid;
         },
     };
 }
 
-fn failRange(comp_name: []const u8, field_name: []const u8, comptime what: []const u8) error{ScriptSchemaInvalid} {
-    diag("script-declared component '{s}' field '{s}': default out of " ++ what ++ " range", .{ comp_name, field_name });
+fn failRange(kind: DeclKind, owner: []const u8, field_name: []const u8, comptime what: []const u8) error{ScriptSchemaInvalid} {
+    diag("script-declared {s} '{s}' field '{s}': default out of " ++ what ++ " range", .{ kind.label(), owner, field_name });
     return error.ScriptSchemaInvalid;
 }
 
-fn failVec2(comp_name: []const u8, field_name: []const u8) error{ScriptSchemaInvalid} {
-    diag("script-declared component '{s}' field '{s}': vec2 default must be {{\"x\":<number>,\"y\":<number>}}", .{ comp_name, field_name });
+fn failVec2(kind: DeclKind, owner: []const u8, field_name: []const u8) error{ScriptSchemaInvalid} {
+    diag("script-declared {s} '{s}' field '{s}': vec2 default must be {{\"x\":<number>,\"y\":<number>}}", .{ kind.label(), owner, field_name });
     return error.ScriptSchemaInvalid;
 }
 
@@ -590,6 +805,7 @@ pub fn zigFieldTypeName(default: Default) []const u8 {
         .f32 => "f32",
         .i32 => "i32",
         .u32 => "u32",
+        .u64 => "u64",
         .bool => "bool",
         .str => "[]const u8",
         .vec2 => "Vec2",
@@ -659,17 +875,79 @@ pub fn renderComponentsFile(components: []const DeclaredComponent, w: anytype) !
 
         if (comp.fields.len > 0) try w.writeAll("\n");
         for (comp.fields) |field| {
-            try w.print("    {s}: {s} = ", .{ field.name, zigFieldTypeName(field.default) });
-            switch (field.default) {
-                .f32 => |v| try w.print("{d}", .{v}),
-                .i32 => |v| try w.print("{d}", .{v}),
-                .u32 => |v| try w.print("{d}", .{v}),
-                .bool => |v| try w.print("{}", .{v}),
-                .str => |v| try w.print("\"{f}\"", .{std.zig.fmtString(v)}),
-                .vec2 => |v| try w.print(".{{ .x = {d}, .y = {d} }}", .{ v.x, v.y }),
-                .entity => |v| try w.print("{d}", .{v}),
-            }
-            try w.writeAll(",\n");
+            try writeFieldLine(w, field);
+        }
+        try w.writeAll("};\n\n");
+    }
+}
+
+/// One defaulted struct-field line (`    level: f32 = 0.875,\n`) — shared
+/// between `renderComponentsFile` and `renderEventsFile` so the two
+/// generated files can never drift on the type/default spelling.
+fn writeFieldLine(w: anytype, field: DeclaredField) !void {
+    try w.print("    {s}: {s} = ", .{ field.name, zigFieldTypeName(field.default) });
+    switch (field.default) {
+        .f32 => |v| try w.print("{d}", .{v}),
+        .i32 => |v| try w.print("{d}", .{v}),
+        .u32 => |v| try w.print("{d}", .{v}),
+        .u64 => |v| try w.print("{d}", .{v}),
+        .bool => |v| try w.print("{}", .{v}),
+        .str => |v| try w.print("\"{f}\"", .{std.zig.fmtString(v)}),
+        .vec2 => |v| try w.print(".{{ .x = {d}, .y = {d} }}", .{ v.x, v.y }),
+        .entity => |v| try w.print("{d}", .{v}),
+    }
+    try w.writeAll(",\n");
+}
+
+/// Render the generated `scripting_events.zig` for `events`
+/// (labelle-engine#772): one plain payload struct per declared event,
+/// named `pathToPascal(event.name)` — the shape an authored
+/// `events/<name>.zig` carries by convention (see the ruby example's
+/// `events/hunger__feed.zig`). NO `Saveable` decl and no options: events
+/// are never saved. The game-events union block references each as
+/// `@import("scripting_events.zig").<Pascal>`.
+pub fn renderEventsFile(events: []const DeclaredEvent, w: anytype) !void {
+    try w.writeAll(
+        \\//! Script-declared events (labelle-engine#772,
+        \\//! RFC-LANGUAGE-PLUGINS). GENERATED from the declare-mode schema —
+        \\//! do not edit; change the `Labelle.event(...)` declarations in the
+        \\//! game's events/*.<ext> files instead. Each struct backs one
+        \\//! GameEvents union variant exactly like an events/*.zig payload:
+        \\//! scripts reach it by name through emit/on, native hooks through a
+        \\//! method named after the variant (spell the payload parameter
+        \\//! `anytype` — this file only exists in the generated tree).
+        \\
+        \\
+    );
+
+    var any_vec2 = false;
+    for (events) |ev| {
+        for (ev.fields) |field| {
+            if (field.default == .vec2) any_vec2 = true;
+        }
+    }
+    if (any_vec2) {
+        try w.writeAll(
+            \\/// Plain {x,y} pair backing `vec2` schema fields (no core Vec2
+            \\/// export exists; the bus JSON bridge reflects nested structs fine).
+            \\pub const Vec2 = struct { x: f32 = 0, y: f32 = 0 };
+            \\
+            \\
+        );
+    }
+
+    var pascal_buf: [128]u8 = undefined;
+    for (events) |ev| {
+        const pascal = idents.pathToPascal(ev.name, &pascal_buf);
+        if (ev.fields.len == 0) {
+            // Payloadless event — the `pub const WaveSpawned = struct {};`
+            // one-liner zig fmt itself writes for an empty struct.
+            try w.print("pub const {s} = struct {{}};\n\n", .{pascal});
+            continue;
+        }
+        try w.print("pub const {s} = struct {{\n", .{pascal});
+        for (ev.fields) |field| {
+            try writeFieldLine(w, field);
         }
         try w.writeAll("};\n\n");
     }
@@ -713,6 +991,43 @@ pub fn checkCollisions(
                 if (std.mem.eql(u8, full, comp.name)) {
                     diag("script-declared component '{s}' collides with pack '{s}' component {s}.zig — rename one", .{ comp.name, pack.name, name });
                     return error.ScriptComponentCollision;
+                }
+            }
+        }
+    }
+}
+
+/// Reject a declared EVENT whose GameEvents union variant is already
+/// taken — by a game `events/*.zig` (whose variant is the file BASENAME,
+/// `idents.eventVariantName`) or a pack's namespaced `<pack>__<ident>`
+/// variant. The error names BOTH providers, mirroring `checkCollisions`.
+/// Components are a SEPARATE namespace (a `Hunger` component and a
+/// `hunger` event coexist — the ticket's contract), so they don't gate
+/// here. Names come from the same derivations the game-events block
+/// emits (`writeGameEventsBlock` / `writePackEventVariants`), so the
+/// check matches the generated variant set exactly.
+pub fn checkEventCollisions(
+    declared: []const DeclaredEvent,
+    event_names: []const []const u8,
+    pack_scans: []const scan.PackScan,
+) !void {
+    var prefix_buf: [128]u8 = undefined;
+    var full_buf: [280]u8 = undefined;
+
+    for (declared) |ev| {
+        for (event_names) |stem| {
+            if (std.mem.eql(u8, idents.eventVariantName(stem), ev.name)) {
+                diag("script-declared event '{s}' collides with the game event events/{s}.zig — rename one (script declarations and events/ share one bus namespace)", .{ ev.name, stem });
+                return error.ScriptEventCollision;
+            }
+        }
+        for (pack_scans) |pack| {
+            const prefix = scan.packNamespacePrefix(pack.name, &prefix_buf);
+            for (pack.event_names) |stem| {
+                const full = std.fmt.bufPrint(&full_buf, "{s}__{s}", .{ prefix, idents.eventVariantName(stem) }) catch continue;
+                if (std.mem.eql(u8, full, ev.name)) {
+                    diag("script-declared event '{s}' collides with pack '{s}' event {s}.zig — rename one", .{ ev.name, pack.name, stem });
+                    return error.ScriptEventCollision;
                 }
             }
         }
@@ -943,32 +1258,56 @@ pub const PhaseOptions = struct {
     language: []const u8,
     /// TARGET-RELATIVE collected language files (extension included) —
     /// the collection's `EmbedScript.file` column: `components/*.<ext>`
-    /// declarations FIRST, then the script dir's files (subdir paths
-    /// joined with `/` for legacy-dir collections). Both feed the runner
-    /// — in-script chunk-scope declarations remain legal.
+    /// declarations FIRST, then `events/*.<ext>` declarations, then the
+    /// script dir's files (subdir paths joined with `/` for legacy-dir
+    /// collections). All feed the runner — in-script chunk-scope
+    /// declarations remain legal.
     script_files: []const []const u8,
+    /// The `events/*.<ext>` declaration files (labelle-engine#772) — a
+    /// SUBSET of `script_files` (already in the runner argv), carried
+    /// separately so the events gates can fire up front and point at
+    /// them: the `events_min_pin` floor, the no-runner-row hard error,
+    /// and the declares-nothing error. Empty when the project has no
+    /// events-dir language files (every gate is then a no-op).
+    event_files: []const []const u8 = &.{},
     output_dir: []const u8,
     target_dir: []const u8,
     project_dir: []const u8,
     /// Game-root component stems (collision gate).
     component_names: []const []const u8,
-    /// Pack scans (collision gate against `<pack>__<Pascal>` fields).
+    /// Game-root event stems — `events/*.zig` scan (event collision gate).
+    event_names: []const []const u8 = &.{},
+    /// Pack scans (collision gates against `<pack>__<Pascal>` component
+    /// fields and `<pack>__<ident>` event variants).
     pack_scans: []const scan.PackScan,
 };
 
 /// Run the whole declare phase for an active scripting splice: select the
-/// language's runner row (`DECLARE_RUNNERS`), build (or reuse) it, extract
-/// the schema, gate collisions, and write the generated
-/// `scripting_components.zig` into the target. Returns the owned Schema
-/// when at least one component was declared (the caller threads
-/// `schema.components` onto the splice and keeps the Schema alive through
-/// main.zig emission), null for every no-op shape (no collected files at
-/// all; a language without a runner row — typescript; files but no
-/// declarations). Every no-op shape also deletes a stale generated file
-/// left by a previously-declaring project state.
+/// language's runner row (`DECLARE_RUNNERS`), gate the events floor
+/// (labelle-engine#772), build (or reuse) the runner, extract the schema,
+/// gate collisions, and write the generated `scripting_components.zig` /
+/// `scripting_events.zig` into the target. Returns the owned Schema when
+/// at least one component OR event was declared (the caller threads
+/// `schema.components`/`schema.events` onto the splice and keeps the
+/// Schema alive through main.zig emission), null for every no-op shape
+/// (no collected files at all; a language without a runner row —
+/// typescript; files but no declarations). Every no-op shape also deletes
+/// stale generated files left by a previously-declaring project state.
+///
+/// The events GATES are hard errors, never skips — `events/*.<ext>` files
+/// exist only to declare events, so every shape that can't deliver them
+/// must fail generate pointing at the files (the runtime alternative is a
+/// missing-method error at game boot, far from the cause):
+///   - no runner row for the language (typescript) → the files can never
+///     declare anything;
+///   - resolved pin below the row's `events_min_pin` (or the whole tool
+///     dir absent) → the preludes predate `Labelle.event`;
+///   - the runner ran but the schema carries no events → the files
+///     declare nothing (almost certainly an authoring mistake — the
+///     v0.10.0+ preludes always record `Labelle.event`).
 pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     if (opts.script_files.len == 0) {
-        removeStaleGeneratedFile(allocator, opts.target_dir);
+        removeStaleGeneratedFiles(allocator, opts.target_dir);
         return null;
     }
 
@@ -976,15 +1315,43 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     // declare runner must SKIP, not run another language's runner over
     // foreign sources. Note-level stderr line + the same stale-file
     // cleanup as the other no-op shapes, so a project switching languages
-    // leaves no orphaned generated file.
+    // leaves no orphaned generated file. Events-dir files flip the skip
+    // into the hard error documented above.
     const runner = declareRunner(opts.language) orelse {
+        if (opts.event_files.len > 0) {
+            diag(
+                "script-declared events are not supported for \"{s}\" — no declare runner exists for it, so these events/ files can never declare a game event (keep Zig events/*.zig for this language):",
+                .{opts.language},
+            );
+            diagFileList(opts.event_files);
+            return error.ScriptEventsUnsupported;
+        }
         diag(
             "script-declared components are not yet supported for \"{s}\" — skipping the declare phase ({s} scripts still run, they just can't declare components)",
             .{ opts.language, opts.language },
         );
-        removeStaleGeneratedFile(allocator, opts.target_dir);
+        removeStaleGeneratedFiles(allocator, opts.target_dir);
         return null;
     };
+
+    // Events floor (labelle-engine#772): a resolved pin BELOW the row's
+    // `events_min_pin` ships preludes that predate `Labelle.event` — the
+    // declare tool would silently record nothing and the game would fail
+    // at BOOT with a missing-method error. Fail up front, before the tool
+    // build, naming the floor and the files. Local pins and non-semver
+    // refs satisfy the floor (see `DeclareRunner.events_min_pin`).
+    if (opts.event_files.len > 0) {
+        if (pluginDep(opts.plugins, opts.plugin_name)) |dep| {
+            if (!dep.isLocal() and semverBelow(dep.version, runner.events_min_pin)) {
+                diag(
+                    "events/*{s} declaration files need labelle-scripting >= {s} (`Labelle.event`), but the project pins {s} — bump the pin or remove the files:",
+                    .{ runner.extension, runner.events_min_pin, dep.version },
+                );
+                diagFileList(opts.event_files);
+                return error.ScriptEventsPinTooOld;
+            }
+        }
+    }
 
     const pkg_dir = try resolvePluginPackageDir(
         allocator,
@@ -997,11 +1364,19 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
 
     const tool_path = ensureDeclareTool(allocator, pkg_dir, opts.output_dir, runner) catch |err| switch (err) {
         error.DeclareToolAbsent => {
+            if (opts.event_files.len > 0) {
+                diag(
+                    "the pinned scripting plugin ships no {s} declare tool (no {s} in the package), but the project declares events in events/ files — script-declared events need labelle-scripting >= {s}:",
+                    .{ opts.language, runner.tool_dir, runner.events_min_pin },
+                );
+                diagFileList(opts.event_files);
+                return error.ScriptEventsPinTooOld;
+            }
             diag(
                 "the pinned scripting plugin ships no {s} declare tool (no {s} in the package) — script-declared components are disabled this generate; pin labelle-scripting >= {s} to use component declarations",
                 .{ opts.language, runner.tool_dir, runner.min_pin },
             );
-            removeStaleGeneratedFile(allocator, opts.target_dir);
+            removeStaleGeneratedFiles(allocator, opts.target_dir);
             return null;
         },
         else => return err,
@@ -1014,28 +1389,87 @@ pub fn runPhase(allocator: std.mem.Allocator, opts: PhaseOptions) !?Schema {
     );
     errdefer schema.deinit();
 
-    if (schema.components.len == 0) {
+    // events/ files that declare NOTHING are a pointed error, not a
+    // silent no-op: the dir exists to declare events, and the v0.10.0+
+    // preludes record every `Labelle.event` — an empty yield means the
+    // author wrote something else (or nothing) into a declarations file.
+    // AGGREGATE over the events dir, deliberately not per-file: the
+    // schema carries no file attribution, and re-running the tool
+    // per-file to get one would false-fail legitimate projects (chunks
+    // share one VM — an events file may reference a constant an earlier
+    // components/events file defined, and alone it raises NameError).
+    if (opts.event_files.len > 0 and schema.events.len == 0) {
+        diag(
+            "the project's events/*{s} file(s) declare no events — `HungerFeed = Labelle.event \"hunger__feed\", entity: Labelle.id, ...` is the declaration shape; a declaration-less events file is almost certainly a mistake:",
+            .{runner.extension},
+        );
+        diagFileList(opts.event_files);
+        return error.ScriptEventsNoneDeclared;
+    }
+
+    if (schema.components.len == 0 and schema.events.len == 0) {
         schema.deinit();
-        removeStaleGeneratedFile(allocator, opts.target_dir);
+        removeStaleGeneratedFiles(allocator, opts.target_dir);
         return null;
     }
 
     try checkCollisions(schema.components, opts.component_names, opts.pack_scans);
+    try checkEventCollisions(schema.events, opts.event_names, opts.pack_scans);
 
-    var rendered: std.Io.Writer.Allocating = .init(allocator);
-    defer rendered.deinit();
-    try renderComponentsFile(schema.components, &rendered.writer);
-    try scanner.writeFile(opts.target_dir, GENERATED_FILENAME, rendered.writer.buffered());
+    if (schema.components.len > 0) {
+        var rendered: std.Io.Writer.Allocating = .init(allocator);
+        defer rendered.deinit();
+        try renderComponentsFile(schema.components, &rendered.writer);
+        try scanner.writeFile(opts.target_dir, GENERATED_FILENAME, rendered.writer.buffered());
+    } else {
+        // Events-only project state: a stale components file from a
+        // previously component-declaring state must not linger.
+        removeStaleFile(allocator, opts.target_dir, GENERATED_FILENAME);
+    }
+
+    if (schema.events.len > 0) {
+        var rendered: std.Io.Writer.Allocating = .init(allocator);
+        defer rendered.deinit();
+        try renderEventsFile(schema.events, &rendered.writer);
+        try scanner.writeFile(opts.target_dir, GENERATED_EVENTS_FILENAME, rendered.writer.buffered());
+    } else {
+        removeStaleFile(allocator, opts.target_dir, GENERATED_EVENTS_FILENAME);
+    }
 
     return schema;
 }
 
-/// Best-effort cleanup of a stale `scripting_components.zig` (a project
-/// whose declarations were all removed): nothing imports it anymore, but
-/// a lingering generated file misleads readers of the target dir.
-fn removeStaleGeneratedFile(allocator: std.mem.Allocator, target_dir: []const u8) void {
+/// The project's `plugins` entry named `plugin_name`, or null. The events
+/// floor gate reads its pin (`version` + `isLocal`).
+fn pluginDep(plugins: []const config.PluginDep, plugin_name: []const u8) ?config.PluginDep {
+    for (plugins) |p| {
+        if (std.mem.eql(u8, p.name, plugin_name)) return p;
+    }
+    return null;
+}
+
+/// True when `version` is a parseable semver STRICTLY below `floor`.
+/// Anything unparseable — branch refs, an empty version (registry
+/// default), local paths — returns false: for those the capability
+/// probes / the tool itself are the only authority, exactly how the
+/// existing `min_pin` handling treats them.
+fn semverBelow(version: []const u8, floor: []const u8) bool {
+    const v = std.SemanticVersion.parse(version) catch return false;
+    const f = std.SemanticVersion.parse(floor) catch return false;
+    return v.order(f) == .lt;
+}
+
+/// Best-effort cleanup of BOTH stale generated files (a project whose
+/// declarations were all removed): nothing imports them anymore, but a
+/// lingering generated file misleads readers of the target dir.
+fn removeStaleGeneratedFiles(allocator: std.mem.Allocator, target_dir: []const u8) void {
+    removeStaleFile(allocator, target_dir, GENERATED_FILENAME);
+    removeStaleFile(allocator, target_dir, GENERATED_EVENTS_FILENAME);
+}
+
+fn removeStaleFile(allocator: std.mem.Allocator, target_dir: []const u8, filename: []const u8) void {
     const io = config.globalIo();
-    const path = std.fs.path.join(allocator, &.{ target_dir, GENERATED_FILENAME }) catch return;
+    const path = std.fs.path.join(allocator, &.{ target_dir, filename }) catch return;
     defer allocator.free(path);
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
@@ -1371,6 +1805,9 @@ test "DECLARE_RUNNERS: row selection — lua + ruby rows with their step/tool/ex
     try testing.expectEqualStrings("tools/declare", lua.tool_dir);
     try testing.expectEqualStrings(".lua", lua.extension);
     try testing.expectEqualStrings("0.2.0", lua.min_pin);
+    // `Labelle.event`/`Labelle.id` shipped in scripting v0.10.0 for BOTH
+    // rows (one release, one contract — labelle-engine#772 slice 1).
+    try testing.expectEqualStrings("0.10.0", lua.events_min_pin);
 
     // ruby (labelle-scripting PR #21 / v0.9.0): its OWN exe + step so the
     // capability probe stays per-row filesystem presence and a unified
@@ -1380,6 +1817,7 @@ test "DECLARE_RUNNERS: row selection — lua + ruby rows with their step/tool/ex
     try testing.expectEqualStrings("tools/declare-ruby", ruby.tool_dir);
     try testing.expectEqualStrings(".rb", ruby.extension);
     try testing.expectEqualStrings("0.9.0", ruby.min_pin);
+    try testing.expectEqualStrings("0.10.0", ruby.events_min_pin);
 
     // Non-listed languages: runPhase's pointed skip (typescript's
     // declarations arrive later via a d.ts-side runner; go/csharp have no
@@ -1497,4 +1935,413 @@ test "DECLARE_RUNNERS: per-row capability probe — the ruby tool dir arms ruby 
     opts.language = "lua";
     opts.script_files = &.{"scripts/behavior.lua"};
     try testing.expect((try runPhase(allocator, opts)) == null);
+}
+
+// ── Events (labelle-engine#772) ──────────────────────────────────────
+
+/// The cross-runner golden's events shape (labelle-scripting PR #25,
+/// v0.10.0): fields tool-sorted, u64 from `Labelle.id`, a payloadless
+/// event, NO persist key.
+const events_schema =
+    \\{"components":[{"name":"Hunger","persist":"persistent","fields":[
+    \\   {"name":"level","type":"f32","default":0.875},
+    \\   {"name":"owner","type":"u64","default":0}]}],
+    \\ "events":[
+    \\   {"name":"hunger__feed","fields":[
+    \\     {"name":"amount","type":"f32","default":0.5},
+    \\     {"name":"at","type":"vec2","default":{"x":-1.5,"y":3}},
+    \\     {"name":"entity","type":"u64","default":0},
+    \\     {"name":"reason","type":"str","default":"why \"now\""},
+    \\     {"name":"urgent","type":"bool","default":false}]},
+    \\   {"name":"wave__spawned","fields":[]}]}
+;
+
+test "parseSchema: the v0.10.0 events array parses — u64 (Labelle.id) lands in components AND events; absent key is empty" {
+    var schema = try parseSchema(testing.allocator, events_schema);
+    defer schema.deinit();
+
+    // u64 in a COMPONENT field (Labelle.id is legal there too — without
+    // the FieldType row, every v0.10.0 component schema carrying it
+    // would fail generate).
+    try testing.expectEqual(@as(usize, 1), schema.components.len);
+    try testing.expectEqual(@as(u64, 0), schema.components[0].fields[1].default.u64);
+    try testing.expectEqualStrings("u64", zigFieldTypeName(schema.components[0].fields[1].default));
+
+    try testing.expectEqual(@as(usize, 2), schema.events.len);
+    const feed = schema.events[0];
+    try testing.expectEqualStrings("hunger__feed", feed.name);
+    try testing.expectEqual(@as(usize, 5), feed.fields.len);
+    try testing.expectEqualStrings("amount", feed.fields[0].name);
+    try testing.expectEqual(@as(f64, 0.5), feed.fields[0].default.f32);
+    try testing.expectEqual(@as(u64, 0), feed.fields[2].default.u64);
+    try testing.expectEqualStrings("why \"now\"", feed.fields[3].default.str);
+    // Payloadless event: legal (a pure signal).
+    try testing.expectEqualStrings("wave__spawned", schema.events[1].name);
+    try testing.expectEqual(@as(usize, 0), schema.events[1].fields.len);
+
+    // Absent "events" key (every pre-v0.10.0 schema) → empty, no error.
+    var old = try parseSchema(testing.allocator, example_schema);
+    defer old.deinit();
+    try testing.expectEqual(@as(usize, 0), old.events.len);
+}
+
+test "parseSchema: event rejections — dups, bad names, keyword names, Pascal fold-collisions, reserved Vec2" {
+    const bad_cases = [_][]const u8{
+        // Duplicate event names.
+        \\{"components":[],"events":[{"name":"hit","fields":[]},{"name":"hit","fields":[]}]}
+        ,
+        // Not an identifier.
+        \\{"components":[],"events":[{"name":"has space","fields":[]}]}
+        ,
+        // Zig keyword as the union variant.
+        \\{"components":[],"events":[{"name":"error","fields":[]}]}
+        ,
+        // Zig primitive.
+        \\{"components":[],"events":[{"name":"u32","fields":[]}]}
+        ,
+        // Pascal fold-collision: a__b and a_b both render `pub const AB`.
+        \\{"components":[],"events":[{"name":"a__b","fields":[]},{"name":"a_b","fields":[]}]}
+        ,
+        // Pascal lands on the reserved Vec2 backing decl.
+        \\{"components":[],"events":[{"name":"vec_2","fields":[]}]}
+        ,
+        // All-underscore name → empty Pascal (no struct name).
+        \\{"components":[],"events":[{"name":"__","fields":[]}]}
+        ,
+        // Event field named a keyword.
+        \\{"components":[],"events":[{"name":"hit","fields":[{"name":"error","type":"i32","default":0}]}]}
+        ,
+        // Event field u64 default must be a non-negative integer.
+        \\{"components":[],"events":[{"name":"hit","fields":[{"name":"who","type":"u64","default":-1}]}]}
+        ,
+        // "events" must be an array.
+        \\{"components":[],"events":{}}
+        ,
+        // Duplicate event FIELDS.
+        \\{"components":[],"events":[{"name":"hit","fields":[{"name":"x","type":"i32","default":1},{"name":"x","type":"i32","default":2}]}]}
+        ,
+    };
+    for (bad_cases) |case| {
+        try testing.expectError(error.ScriptSchemaInvalid, parseSchema(testing.allocator, case));
+    }
+
+    // Controls: an event may share a COMPONENT's name (separate
+    // namespaces — the ticket's contract), and an event field may spell
+    // `save` (events render no member decls, unlike components).
+    var schema = try parseSchema(testing.allocator,
+        \\{"components":[{"name":"Hunger","fields":[]}],
+        \\ "events":[{"name":"Hunger","fields":[{"name":"save","type":"bool","default":false}]}]}
+    );
+    schema.deinit();
+}
+
+test "renderEventsFile: golden (ticket example, fields tool-sorted) + payloadless + vec2 backing + AstGen" {
+    var schema = try parseSchema(testing.allocator, events_schema);
+    defer schema.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try renderEventsFile(schema.events, &aw.writer);
+    const got = aw.writer.buffered();
+
+    // The ticket's event, byte-exact rows: plain struct, NO Saveable
+    // (events are never saved), u64 id field, escaped str default.
+    try testing.expect(std.mem.indexOf(u8, got, "pub const HungerFeed = struct {\n" ++
+        "    amount: f32 = 0.5,\n" ++
+        "    at: Vec2 = .{ .x = -1.5, .y = 3 },\n" ++
+        "    entity: u64 = 0,\n" ++
+        "    reason: []const u8 = \"why \\\"now\\\"\",\n" ++
+        "    urgent: bool = false,\n" ++
+        "};\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "Saveable") == null);
+    // Payloadless event → the one-line empty struct zig fmt writes.
+    try testing.expect(std.mem.indexOf(u8, got, "pub const WaveSpawned = struct {};\n") != null);
+    // vec2 fields ride the emitted-once backing struct.
+    try testing.expect(std.mem.indexOf(u8, got, "pub const Vec2 = struct { x: f32 = 0, y: f32 = 0 };") != null);
+    try expectAstGenOk(got);
+
+    // No vec2 anywhere → no backing decl (the emission stays minimal).
+    var lean = try parseSchema(testing.allocator,
+        \\{"components":[],"events":[{"name":"ping","fields":[{"name":"n","type":"u32","default":1}]}]}
+    );
+    defer lean.deinit();
+    var lean_aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer lean_aw.deinit();
+    try renderEventsFile(lean.events, &lean_aw.writer);
+    try testing.expect(std.mem.indexOf(u8, lean_aw.writer.buffered(), "Vec2") == null);
+    try expectAstGenOk(lean_aw.writer.buffered());
+}
+
+test "renderComponentsFile: a u64 (Labelle.id) component field renders `u64 = <default>` + AstGen" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"components":[{"name":"Ship","fields":[{"name":"pilot","type":"u64","default":7}]}]}
+    );
+    defer schema.deinit();
+    const got = try renderForTest(schema.components);
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "    pilot: u64 = 7,\n") != null);
+    // Unlike `entity`, a plain u64 is NOT an entity ref — no save remap.
+    try testing.expect(std.mem.indexOf(u8, got, "entity_refs") == null);
+    try expectAstGenOk(got);
+}
+
+test "checkEventCollisions: game events (variant = file basename) and pack events gate; components don't" {
+    const declared = [_]DeclaredEvent{
+        .{ .name = "hunger__feed", .fields = &.{} },
+    };
+    // Clean set: no collision.
+    try checkEventCollisions(&declared, &.{ "door_opened", "combat/hit" }, &.{});
+    // Game events/hunger__feed.zig — same variant name.
+    try testing.expectError(
+        error.ScriptEventCollision,
+        checkEventCollisions(&declared, &.{"hunger__feed"}, &.{}),
+    );
+    // Subdir stems collide on their BASENAME (that's the variant the
+    // union emits — `writeEventImportsBlock`'s eventVariantName).
+    try testing.expectError(
+        error.ScriptEventCollision,
+        checkEventCollisions(&declared, &.{"gameplay/hunger__feed"}, &.{}),
+    );
+    // Pack event: citizens pack's feed.zig → citizens__feed.
+    const packish = [_]DeclaredEvent{
+        .{ .name = "citizens__feed", .fields = &.{} },
+    };
+    const pack = scan.PackScan{
+        .name = "citizens",
+        .import_prefix = "packs/citizens",
+        .component_names = &.{},
+        .event_names = &.{"feed"},
+        .prefab_names = &.{},
+    };
+    try testing.expectError(
+        error.ScriptEventCollision,
+        checkEventCollisions(&packish, &.{}, &.{pack}),
+    );
+    // An event sharing a COMPONENT's registry name is legal — different
+    // namespaces; `checkEventCollisions` never sees component names.
+    try checkEventCollisions(&declared, &.{}, &.{pack});
+}
+
+test "semverBelow: parseable pins compare against the floor; local/branch/empty pins satisfy it" {
+    try testing.expect(semverBelow("0.9.0", "0.10.0"));
+    try testing.expect(semverBelow("0.9.9", "0.10.0"));
+    try testing.expect(!semverBelow("0.10.0", "0.10.0"));
+    try testing.expect(!semverBelow("0.11.2", "0.10.0"));
+    try testing.expect(!semverBelow("1.0.0", "0.10.0"));
+    // Unparseable pins (branch refs, the empty registry default) never
+    // trip the floor — the capability probes stay the authority, exactly
+    // like `min_pin`.
+    try testing.expect(!semverBelow("main", "0.10.0"));
+    try testing.expect(!semverBelow("", "0.10.0"));
+}
+
+test "runPhase events gates: no-runner language and below-floor pins are HARD errors naming the files; floor pins pass the gate" {
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Stage the package where resolvePluginPackageDir looks first so the
+    // at-floor CONTROL below sails past the gate into the tool machinery
+    // (probe passes, the build fails in this build.zig-less fixture).
+    try tmp.dir.createDirPath(tio, "out/deps/labelle-scripting/tools/declare-ruby");
+    try tmp.dir.createDirPath(tio, "target");
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", allocator);
+    defer allocator.free(root);
+    const out = try tmp.dir.realPathFileAlloc(tio, "out", allocator);
+    defer allocator.free(out);
+    const target = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target);
+
+    const old_pin = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "github.com/labelle-toolkit/labelle-scripting", .version = "0.9.0" },
+    };
+    var opts = PhaseOptions{
+        .plugins = &old_pin,
+        .plugin_name = "scripting",
+        .language = "ruby",
+        .script_files = &.{"events/hunger__feed.rb"},
+        .event_files = &.{"events/hunger__feed.rb"},
+        .output_dir = out,
+        .target_dir = target,
+        .project_dir = root,
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+    // Below the 0.10.0 floor → pointed error BEFORE any tool machinery
+    // (the staged package above is never consulted — a build attempt
+    // would have failed with DeclareToolBuildFailed instead).
+    try testing.expectError(error.ScriptEventsPinTooOld, runPhase(allocator, opts));
+
+    // At the floor → the gate passes and the phase proceeds into the
+    // tool build (which fails in this build.zig-less fixture) — proving
+    // the error above came from the version gate, not the machinery.
+    const floor_pin = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "github.com/labelle-toolkit/labelle-scripting", .version = "0.10.0" },
+    };
+    opts.plugins = &floor_pin;
+    try testing.expectError(error.DeclareToolBuildFailed, runPhase(allocator, opts));
+
+    // A LOCAL pin satisfies the floor the same way (the tree is the
+    // authority): same downstream DeclareToolBuildFailed, never the
+    // pin error.
+    const local_pin = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:../labelle-scripting", .version = "0.9.0" },
+    };
+    opts.plugins = &local_pin;
+    try testing.expectError(error.DeclareToolBuildFailed, runPhase(allocator, opts));
+
+    // The whole tool dir absent (pin < 0.9.0 shapes) — the components
+    // path degrades to a skip, but events files make it the SAME hard
+    // pin error (an events/*.rb can never work on that pin).
+    const lua_absent = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:../labelle-scripting" },
+    };
+    opts.plugins = &lua_absent;
+    opts.language = "lua";
+    opts.script_files = &.{"events/hunger__feed.lua"};
+    opts.event_files = &.{"events/hunger__feed.lua"};
+    try testing.expectError(error.ScriptEventsPinTooOld, runPhase(allocator, opts));
+
+    // No runner row at all (typescript): events files are a pointed
+    // UNSUPPORTED error, not the components-style silent skip.
+    opts.language = "typescript";
+    opts.script_files = &.{"events/hunger__feed.js"};
+    opts.event_files = &.{"events/hunger__feed.js"};
+    try testing.expectError(error.ScriptEventsUnsupported, runPhase(allocator, opts));
+}
+
+/// Write a fake declare tool (a POSIX sh script echoing `schema_json`)
+/// and return its absolute path. CI runs ubuntu+macos only — the same
+/// posture as the transpile tests' `#!/bin/sh` fixtures.
+fn writeFakeDeclareTool(
+    allocator: std.mem.Allocator,
+    tmp: *testing.TmpDir,
+    schema_json: []const u8,
+) ![]const u8 {
+    const tio = testing.io;
+    {
+        var f = try tmp.dir.createFile(tio, "fake-declare.sh", .{});
+        defer f.close(tio);
+        var buf: [2048]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "#!/bin/sh\nprintf '%s' '{s}'\n", .{schema_json});
+        try f.writeStreamingAll(tio, body);
+        try f.setPermissions(tio, .executable_file);
+    }
+    // realPathFileAlloc returns [:0]u8 — dupe to plain []u8 so the caller
+    // can `allocator.free` without the sentinel-byte size mismatch (the
+    // `resolveLocalPath` precedent).
+    const p = try tmp.dir.realPathFileAlloc(tio, "fake-declare.sh", allocator);
+    defer allocator.free(p);
+    return allocator.dupe(u8, p);
+}
+
+test "runPhase: events-dir files that declare NO events are a pointed error (fake tool, components-only schema)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "target");
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target);
+
+    const tool = try writeFakeDeclareTool(allocator, &tmp, "{\"components\":[]}");
+    defer allocator.free(tool);
+    declare_tool_override = tool;
+    defer declare_tool_override = null;
+
+    const local_pin = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:../labelle-scripting" },
+    };
+    const opts = PhaseOptions{
+        .plugins = &local_pin,
+        .plugin_name = "scripting",
+        .language = "ruby",
+        .script_files = &.{"events/empty.rb"},
+        .event_files = &.{"events/empty.rb"},
+        .output_dir = root,
+        .target_dir = target,
+        .project_dir = root,
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+    try testing.expectError(error.ScriptEventsNoneDeclared, runPhase(allocator, opts));
+}
+
+test "runPhase: declared events land in the Schema + scripting_events.zig; collisions with events/*.zig gate; stale cleanup" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "target");
+    const root = try tmp.dir.realPathFileAlloc(tio, ".", allocator);
+    defer allocator.free(root);
+    const target = try tmp.dir.realPathFileAlloc(tio, "target", allocator);
+    defer allocator.free(target);
+
+    const tool = try writeFakeDeclareTool(
+        allocator,
+        &tmp,
+        "{\"components\":[],\"events\":[{\"name\":\"hunger__feed\",\"fields\":[{\"name\":\"amount\",\"type\":\"f32\",\"default\":0.5},{\"name\":\"entity\",\"type\":\"u64\",\"default\":0}]}]}",
+    );
+    defer allocator.free(tool);
+    declare_tool_override = tool;
+    defer declare_tool_override = null;
+
+    const local_pin = [_]config.PluginDep{
+        .{ .name = "scripting", .repo = "local:../labelle-scripting" },
+    };
+    var opts = PhaseOptions{
+        .plugins = &local_pin,
+        .plugin_name = "scripting",
+        .language = "ruby",
+        .script_files = &.{"events/hunger__feed.rb"},
+        .event_files = &.{"events/hunger__feed.rb"},
+        .output_dir = root,
+        .target_dir = target,
+        .project_dir = root,
+        .component_names = &.{},
+        .pack_scans = &.{},
+    };
+
+    var schema = (try runPhase(allocator, opts)) orelse return error.TestExpectedSchema;
+    // Components empty, ONE event — the events-only project state. The
+    // caller (root.zig) threads `schema.events` onto the splice.
+    try testing.expectEqual(@as(usize, 0), schema.components.len);
+    try testing.expectEqual(@as(usize, 1), schema.events.len);
+    try testing.expectEqualStrings("hunger__feed", schema.events[0].name);
+
+    // The generated events file landed at the target root; the
+    // components file did NOT (nothing declared one).
+    const generated = try tmp.dir.readFileAlloc(tio, "target/" ++ GENERATED_EVENTS_FILENAME, allocator, .limited(1 << 20));
+    defer allocator.free(generated);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const HungerFeed = struct {\n" ++
+        "    amount: f32 = 0.5,\n" ++
+        "    entity: u64 = 0,\n" ++
+        "};\n") != null);
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(tio, "target/" ++ GENERATED_FILENAME, .{}),
+    );
+    schema.deinit();
+
+    // A Zig events/hunger__feed.zig with the SAME variant name → the
+    // collision gate fires (both would emit the `hunger__feed` union
+    // row).
+    opts.event_names = &.{"hunger__feed"};
+    try testing.expectError(error.ScriptEventCollision, runPhase(allocator, opts));
+    opts.event_names = &.{};
+
+    // Declarations all removed (no collected files at all) → the no-op
+    // shape drops the stale generated events file.
+    opts.script_files = &.{};
+    opts.event_files = &.{};
+    try testing.expect((try runPhase(allocator, opts)) == null);
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(tio, "target/" ++ GENERATED_EVENTS_FILENAME, .{}),
+    );
 }

@@ -36,6 +36,7 @@ const script_scanner = @import("../script_scanner.zig");
 const scene_manifest = @import("../scene_manifest.zig");
 const tilemap_scan = @import("../tilemap_scan.zig");
 const scripting_splice = @import("../scripting_splice.zig");
+const scripting_declare = @import("../scripting_declare.zig");
 const scan = @import("scan.zig");
 const manifest_v2 = @import("manifest_v2.zig");
 
@@ -233,6 +234,16 @@ pub const Codegen = struct {
             if (p.event_names.len > 0) return true;
         }
         return false;
+    }
+
+    /// Script-declared events (labelle-engine#772) — the declare phase's
+    /// schema threaded through the splice. Emitted as GameEvents union
+    /// variants against the generated `scripting_events.zig`, so they
+    /// count as game events in the SAME gates as `event_names` /
+    /// `hasPackEvents` (union emission + `AllHookPayloads` folding).
+    pub fn declaredEvents(self: *const Self) []const scripting_declare.DeclaredEvent {
+        if (self.scripting) |s| return s.declared_events;
+        return &.{};
     }
 
     /// True iff any pack contributed at least one `prefabs/*.jsonc`. Gates
