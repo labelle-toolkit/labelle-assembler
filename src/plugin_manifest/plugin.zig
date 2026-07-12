@@ -53,6 +53,48 @@ pub const ConventionDir = struct {
     mode: ConventionDirMode,
 };
 
+/// How a language's game sources reach the built binary
+/// (RFC-LANGUAGE-PLUGINS rev 17 §7). `.embedded` = an in-process VM
+/// (`@embedFile` + registerScript: lua, ruby, typescript); `.native` =
+/// compiled and linked (rust, crystal). The declare phase reads it only
+/// for messaging — the declare MECHANISM is the same for both (see
+/// `DeclareCapability`).
+pub const LanguageKind = enum { embedded, native };
+
+/// A language's declare-tool capability (RFC-LANGUAGE-PLUGINS rev 17 §7).
+/// IDENTICAL shape for embedded and native languages — no per-mechanism
+/// discriminant: the assembler builds `tool` via `zig build <tool>` in the
+/// plugin package, runs it passing the declaration files + a persistent
+/// per-project cache dir, and reads schema JSON from stdout. What the tool
+/// does with the cache dir is opaque (an embedded VM ignores it; a native
+/// probe uses it as a cargo target-dir). `dir` is the tool's source
+/// directory — its presence in the resolved pin gates the capability
+/// (older pins without it skip gracefully). `events` is the self-describing
+/// capability that replaces the assembler's `events_min_pin` table: present
+/// and true ⇒ the tool records `events/*` declarations.
+pub const DeclareCapability = struct {
+    tool: []const u8,
+    dir: []const u8,
+    events: bool = false,
+};
+
+/// One row of the manifest `.languages` capability table
+/// (RFC-LANGUAGE-PLUGINS rev 17 §7). Everything the assembler knows per
+/// language: name, source extensions, embed `kind`, the native crate's
+/// module root (native only), and — when the language supports declared
+/// components/events — a `declare` capability. The assembler reads these
+/// GENERICALLY (it never learns "rust"/"cargo"); a language that omits
+/// `.declare` simply has no declare phase. Unknown row keys (e.g. a future
+/// `.transpile`) are tolerated by the manifest-wide `ignore_unknown_fields`
+/// parse, so a new capability never breaks a bystander assembler.
+pub const LanguageRow = struct {
+    name: []const u8,
+    extensions: []const []const u8 = &.{},
+    kind: LanguageKind,
+    module_root: ?[]const u8 = null,
+    declare: ?DeclareCapability = null,
+};
+
 /// Parsed and validated `plugin.labelle` manifest.
 ///
 /// Ownership: every string field (`name`, each `ConventionDir.name`
@@ -122,10 +164,28 @@ pub const PluginManifest = struct {
     /// `labelle plugins`. Optional.
     author: ?[]const u8 = null,
 
+    /// Per-language capability rows (RFC-LANGUAGE-PLUGINS rev 17 §7,
+    /// labelle-engine#619/#774). The assembler reads these generically for
+    /// the declare phase: a row with a `.declare` capability names the tool
+    /// to build + run over the language's declaration files. Empty/absent =
+    /// the plugin declares no `.languages` (every plugin before rev 17, and
+    /// languages still on the assembler's hardcoded runner table) →
+    /// byte-identical output.
+    languages: []const LanguageRow = &.{},
+
     /// Allocator that owns the parsed strings and slice. Stored on
     /// the manifest so the caller doesn't have to remember to pass
     /// the right allocator to deinit.
     allocator: std.mem.Allocator,
+
+    /// The `.languages` row for `language`, or null. The declare phase reads
+    /// `row.declare` to drive the generic invocation contract.
+    pub fn languageRow(self: *const PluginManifest, language: []const u8) ?LanguageRow {
+        for (self.languages) |row| {
+            if (std.mem.eql(u8, row.name, language)) return row;
+        }
+        return null;
+    }
 
     pub fn deinit(self: *PluginManifest) void {
         // Free every heap-allocated field individually.
@@ -141,6 +201,7 @@ pub const PluginManifest = struct {
         std.zon.parse.free(self.allocator, self.requires_language);
         std.zon.parse.free(self.allocator, self.license);
         std.zon.parse.free(self.allocator, self.author);
+        std.zon.parse.free(self.allocator, self.languages);
         // Not parser-allocated (the strict schema walk owns its copies) but
         // shape-compatible; freed through its own helper for symmetry.
         plugin_params.freeSchema(self.allocator, self.params_schema);
@@ -375,6 +436,7 @@ pub fn loadFromDir(
         .params_schema = params_schema,
         .license = parsed.license,
         .author = parsed.author,
+        .languages = parsed.languages,
         .allocator = allocator,
     };
 }
@@ -397,6 +459,10 @@ const ZonManifest = struct {
     // Language plugins P1 (#584). Optional/additive — absent parses to the
     // byte-identical null default.
     requires_language: ?[]const u8 = null,
+    // Language plugins rev 17 (#619/#774). Optional/additive — absent parses
+    // to the byte-identical empty default. Unknown row keys (a future
+    // `.transpile`) ride the manifest-wide `ignore_unknown_fields`.
+    languages: []const LanguageRow = &.{},
 };
 
 // ============================================================================
@@ -471,6 +537,73 @@ test "ZonManifest: parses manifest with no convention_dirs" {
 
     try testing.expectEqualStrings("marker_only", parsed.name);
     try testing.expectEqual(@as(usize, 0), parsed.convention_dirs.len);
+}
+
+test "ZonManifest: parses a .languages row with a declare capability (rev 17)" {
+    const src =
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "rust", .extensions = .{"rs"}, .kind = .native,
+        \\           .module_root = "mod.rs",
+        \\           .declare = .{ .tool = "labelle-declare-rs", .dir = "tools/declare-rs", .events = true } },
+        \\    },
+        \\}
+    ;
+    const src_z = try testing.allocator.dupeZ(u8, src);
+    defer testing.allocator.free(src_z);
+
+    const parsed = try std.zon.parse.fromSliceAlloc(ZonManifest, testing.allocator, src_z, null, .{});
+    defer std.zon.parse.free(testing.allocator, parsed);
+
+    try testing.expectEqual(@as(usize, 1), parsed.languages.len);
+    const row = parsed.languages[0];
+    try testing.expectEqualStrings("rust", row.name);
+    try testing.expectEqual(LanguageKind.native, row.kind);
+    try testing.expectEqual(@as(usize, 1), row.extensions.len);
+    try testing.expectEqualStrings("rs", row.extensions[0]);
+    try testing.expectEqualStrings("mod.rs", row.module_root.?);
+    try testing.expect(row.declare != null);
+    try testing.expectEqualStrings("labelle-declare-rs", row.declare.?.tool);
+    try testing.expectEqualStrings("tools/declare-rs", row.declare.?.dir);
+    try testing.expect(row.declare.?.events);
+}
+
+test "ZonManifest: a .languages row tolerates unknown keys under ignore_unknown_fields (forward-compat)" {
+    // A future row key (e.g. `.transpile`) must not break a bystander
+    // assembler: the manifest-wide `ignore_unknown_fields` (loadFromDir's
+    // parse mode) must reach nested rows too. A `.declare`-less row (an
+    // embedded language not yet on this table) parses to a null capability.
+    const src =
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "typescript", .extensions = .{"ts"}, .kind = .embedded,
+        \\           .transpile = .{ .emits = "js", .toolchain = "tsc" },
+        \\           .declare = .{ .tool = "labelle-declare-ts", .dir = "tools/declare-ts", .events = true } },
+        \\        .{ .name = "lua", .extensions = .{"lua"}, .kind = .embedded },
+        \\    },
+        \\}
+    ;
+    const src_z = try testing.allocator.dupeZ(u8, src);
+    defer testing.allocator.free(src_z);
+
+    const parsed = try std.zon.parse.fromSliceAlloc(
+        ZonManifest,
+        testing.allocator,
+        src_z,
+        null,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer std.zon.parse.free(testing.allocator, parsed);
+
+    try testing.expectEqual(@as(usize, 2), parsed.languages.len);
+    try testing.expectEqualStrings("labelle-declare-ts", parsed.languages[0].declare.?.tool);
+    // The `.declare`-less lua row → null capability, no events.
+    try testing.expect(parsed.languages[1].declare == null);
+    try testing.expect(parsed.languages[1].module_root == null);
 }
 
 test "ZonManifest: parses ship_from_plugin mode with extension" {
