@@ -1854,6 +1854,16 @@ pub fn generateTestsTarget(
     output_dir: []const u8,
     game_dir: []const u8,
 ) !void {
+    try generate(allocator, testsTargetConfig(cfg_in), output_dir, game_dir, .{
+        .target_name_override = "tests",
+        .is_tests_target = true,
+    });
+}
+
+/// The project config as seen by the `.labelle/tests/` target — the exe
+/// config with the tests-target overrides applied. Extracted (and unit-tested
+/// below) so the override set is auditable in one place.
+fn testsTargetConfig(cfg_in: ProjectConfig) ProjectConfig {
     var cfg = cfg_in;
     cfg.backend = .null;
     // Force the host platform too. For wasm/ios/android projects, leaving
@@ -1863,10 +1873,32 @@ pub fn generateTestsTarget(
     // tests target is meant to run on the developer's host regardless of
     // what the exe target ships as.
     cfg.platform = .desktop;
-    try generate(allocator, cfg, output_dir, game_dir, .{
-        .target_name_override = "tests",
-        .is_tests_target = true,
-    });
+    // No gamepad — and therefore no SDL — in the tests target, ever. Tests
+    // exercise game logic, not controllers. Without this pin, the `.backend =
+    // .null` swap above defeats `effectiveGamepad()`'s backend-aware default
+    // (assembler#533): a bgfx project with `.gamepad` omitted resolves `.none`
+    // for its GAME targets, but the tests target sees backend `.null` → `.auto`
+    // → the staged backend dep gets `gamepad_enabled = true` and links SDL2 —
+    // failing `zig build test` on any host without libsdl2 (bit FP's CI).
+    // Applies to every backend: raylib/sokol tests shouldn't link SDL either.
+    cfg.gamepad = .none;
+    return cfg;
+}
+
+test "testsTargetConfig: never resolves gamepad .auto — tests must not link SDL (any backend)" {
+    // bgfx (defaults .none) AND raylib/sokol (default .auto) all pin to .none
+    // for the tests target; an explicit project-level .auto is overridden too.
+    const backends = [_]config.Backend{ .bgfx, .raylib, .sokol };
+    for (backends) |b| {
+        const implicit = testsTargetConfig(.{ .name = "g", .backend = b });
+        try std.testing.expectEqual(config.GamepadSource.none, implicit.effectiveGamepad());
+        const explicit_auto = testsTargetConfig(.{ .name = "g", .backend = b, .gamepad = .auto });
+        try std.testing.expectEqual(config.GamepadSource.none, explicit_auto.effectiveGamepad());
+    }
+    // And the other overrides hold: null backend, host platform.
+    const c = testsTargetConfig(.{ .name = "g", .backend = .bgfx, .platform = .android });
+    try std.testing.expectEqual(config.Backend.null, c.backend);
+    try std.testing.expectEqual(config.Platform.desktop, c.platform);
 }
 
 /// Build the body of `__tests_root.zig`. One `_ = @import("tests/<stem>.zig");`
