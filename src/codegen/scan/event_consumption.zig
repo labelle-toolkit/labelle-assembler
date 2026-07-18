@@ -43,6 +43,25 @@
 //! Files above `max_file_size` are skipped (an event subscription lives
 //! in source files, not megabyte blobs). Unreadable files/dirs are
 //! skipped silently; only OOM propagates.
+//!
+//! ── Excluded dependency roots (#631 review) ──────────────────────────
+//!
+//! `excluded_roots` carries the resolved source dirs of IN-TREE
+//! dependencies (`local:plugins/box2d`, `@libs/box2d`, a `local:`
+//! engine/core/gfx override — the forms `cache/resolve.zig` keeps under
+//! the project tree). A dependency's own source names its event tags at
+//! the emit sites (`box2d__collision_begin` appears at every
+//! `emitGameEvent` call), so scanning it would mark all its events
+//! consumed and void the filter for exactly the local-plugin-heavy
+//! projects. Exclusion is by CANONICAL path equality — `realpath` on
+//! both sides, so it is symlink- and path-separator-robust (no raw
+//! string comparison of joined paths with mixed separators): a walked
+//! directory whose canonical path equals an excluded root is skipped
+//! with its whole subtree. Deliberate asymmetry: a local plugin's
+//! hooks/scripts STAGED into `<target>/scripts` / `<target>/packs` are
+//! still scanned, so cross-plugin consumption via shipped scripts keeps
+//! working — only the plugin's own module source is excluded, exactly
+//! like a published plugin (whose cache dir was never a scan root).
 
 const std = @import("std");
 const config = @import("../../config.zig");
@@ -124,12 +143,23 @@ pub const EventConsumption = struct {
 /// silently). `mode == .all` short-circuits: everything is kept, nothing
 /// is scanned — the pre-#630 unconditional folding.
 ///
+/// `excluded_roots`: resolved source dirs of in-tree dependencies
+/// (`local:`/`@libs` plugins, local framework overrides) — see the file
+/// header. Compared by canonical path (`realpath` both sides), so
+/// symlinked layouts and Windows separators are handled; entries that
+/// don't resolve (e.g. a dep outside the scanned trees that was already
+/// unreachable) are ignored. The dependency's staged hooks/scripts under
+/// `<target>/scripts` / `<target>/packs` are NOT excluded — cross-plugin
+/// consumption via shipped scripts keeps working; only the module source
+/// is skipped, same as a published plugin's cache dir.
+///
 /// The returned struct borrows the entry STRINGS from `entries` (see
 /// `EventConsumption`); the caller keeps ownership of the source list.
 pub fn filterConsumedEvents(
     allocator: std.mem.Allocator,
     entries: []const PluginEvent,
     scan_roots: []const []const u8,
+    excluded_roots: []const []const u8,
     mode: config.PluginEventsMode,
 ) !EventConsumption {
     if (mode == .all or entries.len == 0) {
@@ -138,6 +168,30 @@ pub fn filterConsumedEvents(
         const elided = try allocator.alloc(PluginEvent, 0);
         return .{ .kept = kept, .elided = elided, .allocator = allocator };
     }
+
+    // Canonicalize the exclusion set once up front; the walk then
+    // canonicalizes each visited directory and compares for equality.
+    // Roots that don't resolve are dropped (nothing on disk to exclude).
+    const io = config.globalIo();
+    const excluded = try allocator.alloc([]const u8, excluded_roots.len);
+    var excluded_len: usize = 0;
+    defer {
+        for (excluded[0..excluded_len]) |p| allocator.free(p);
+        allocator.free(excluded);
+    }
+    for (excluded_roots) |root| {
+        // Dupe the [:0]u8 realpath to a plain []u8 so the free above
+        // doesn't hit the sentinel-byte size mismatch (same pattern as
+        // `cache/resolve.zig`).
+        const canon_z = std.Io.Dir.cwd().realPathFileAlloc(io, root, allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        defer allocator.free(canon_z);
+        excluded[excluded_len] = try allocator.dupe(u8, canon_z);
+        excluded_len += 1;
+    }
+    const excluded_canon = excluded[0..excluded_len];
 
     // Precompute both needles per entry once — the scan is
     // O(files × unconsumed entries).
@@ -169,7 +223,8 @@ pub fn filterConsumedEvents(
     var remaining: usize = entries.len;
     for (scan_roots) |root| {
         if (remaining == 0) break;
-        try scanDir(allocator, root, needles, consumed, &remaining);
+        if (try isExcludedDir(allocator, root, excluded_canon)) continue;
+        try scanDir(allocator, root, needles, consumed, &remaining, excluded_canon);
     }
 
     var kept: std.ArrayList(PluginEvent) = .empty;
@@ -202,6 +257,7 @@ fn scanDir(
     needles: anytype,
     consumed: []bool,
     remaining: *usize,
+    excluded_canon: []const []const u8,
 ) !void {
     const io = config.globalIo();
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
@@ -215,7 +271,8 @@ fn scanDir(
                 if (isSkippedDir(entry.name)) continue;
                 const child = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
                 defer allocator.free(child);
-                try scanDir(allocator, child, needles, consumed, remaining);
+                if (try isExcludedDir(allocator, child, excluded_canon)) continue;
+                try scanDir(allocator, child, needles, consumed, remaining, excluded_canon);
             },
             .file, .sym_link => {
                 if (!hasScannedExtension(entry.name)) continue;
@@ -242,6 +299,29 @@ fn scanDir(
     }
 }
 
+/// Whether `dir_path` names one of the canonicalized excluded roots.
+/// Both sides go through `realpath` so a symlinked layout (or Windows
+/// separators in the joined walk path) can't dodge the comparison. A
+/// directory that fails to canonicalize is NOT excluded — `openDir`
+/// will fail on it anyway, and treating it as excluded could silently
+/// widen the exclusion. Only OOM propagates.
+fn isExcludedDir(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    excluded_canon: []const []const u8,
+) !bool {
+    if (excluded_canon.len == 0) return false;
+    const canon = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), dir_path, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer allocator.free(canon);
+    for (excluded_canon) |ex| {
+        if (std.mem.eql(u8, canon, ex)) return true;
+    }
+    return false;
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════
@@ -266,7 +346,26 @@ fn filterTmp(tmp: *testing.TmpDir, mode: config.PluginEventsMode) !EventConsumpt
     const allocator = testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
-    return filterConsumedEvents(allocator, &test_entries, &.{root}, mode);
+    return filterConsumedEvents(allocator, &test_entries, &.{root}, &.{}, mode);
+}
+
+/// Same as `filterTmp` but with `sub_paths` (relative to the tmp root)
+/// resolved and passed as excluded dependency roots — the in-tree
+/// local-plugin shape (`@libs/box2d`) from the #631 review.
+fn filterTmpExcluding(tmp: *testing.TmpDir, sub_paths: []const []const u8) !EventConsumption {
+    const allocator = testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    var excluded_buf: [4][]const u8 = undefined;
+    std.debug.assert(sub_paths.len <= excluded_buf.len);
+    var n: usize = 0;
+    defer for (excluded_buf[0..n]) |p| allocator.free(p);
+    for (sub_paths) |sub| {
+        excluded_buf[n] = try std.fs.path.join(allocator, &.{ root, sub });
+        n += 1;
+    }
+    return filterConsumedEvents(allocator, &test_entries, &.{root}, excluded_buf[0..n], .consumed);
 }
 
 test "filterConsumedEvents: qualified tag in a .zig hook keeps the event; unreferenced sibling is elided" {
@@ -405,12 +504,77 @@ test "filterConsumedEvents: engine-pass entry matches the dotted `engine.<event>
     const allocator = testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
-    var result = try filterConsumedEvents(allocator, &engine_entries, &.{root}, .consumed);
+    var result = try filterConsumedEvents(allocator, &engine_entries, &.{root}, &.{}, .consumed);
     defer result.deinit();
     try testing.expectEqual(@as(usize, 1), result.kept.len);
     try testing.expectEqualStrings("tick", result.kept[0].event_name);
     try testing.expectEqual(@as(usize, 1), result.elided.len);
     try testing.expectEqualStrings("game_init", result.elided[0].event_name);
+}
+
+/// The `emitGameEvent` call-site shape an in-tree plugin's own source
+/// carries — it names the qualified tag textually, which is exactly why
+/// dependency sources must be excluded from the consumer scan.
+const in_tree_plugin_src =
+    \\pub const Events = struct {
+    \\    pub const collision_begin = struct { a: u32, b: u32 };
+    \\    pub const collision_end = struct { a: u32, b: u32 };
+    \\};
+    \\pub fn emitContacts(game: anytype) void {
+    \\    if (@hasField(@TypeOf(game.*).GameEvents, "box2d__collision_begin")) {
+    \\        game.emit(.{ .box2d__collision_begin = .{ .a = 1, .b = 2 } });
+    \\    }
+    \\}
+;
+
+test "filterConsumedEvents: an in-tree plugin's own emit site does not count as consumption (#631 review)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `@libs/box2d`-shaped layout: the plugin source lives UNDER the
+    // game dir and names its own tag at the emit site. With the resolved
+    // dir excluded, no event may survive on the emit site's account.
+    try tmp.dir.createDirPath(io, "libs/box2d/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "libs/box2d/src/root.zig",
+        .data = in_tree_plugin_src,
+    });
+
+    var result = try filterTmpExcluding(&tmp, &.{"libs/box2d"});
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.kept.len);
+    try testing.expectEqual(@as(usize, 2), result.elided.len);
+}
+
+test "filterConsumedEvents: a real consumer outside the excluded in-tree plugin still keeps the event (#631 review)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "libs/box2d/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "libs/box2d/src/root.zig",
+        .data = in_tree_plugin_src,
+    });
+    // A genuine consumer in the game's own scripts.
+    try tmp.dir.createDirPath(io, "scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/contact.zig",
+        .data =
+        \\pub fn onEvent(game: anytype, event: anytype) void {
+        \\    switch (event) {
+        \\        .box2d__collision_begin => |e| game.handle(e),
+        \\        else => {},
+        \\    }
+        \\}
+        ,
+    });
+
+    var result = try filterTmpExcluding(&tmp, &.{"libs/box2d"});
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
+    try testing.expectEqual(@as(usize, 1), result.elided.len);
+    try testing.expectEqualStrings("collision_end", result.elided[0].event_name);
 }
 
 test "filterConsumedEvents: missing scan root is skipped silently" {
@@ -419,6 +583,7 @@ test "filterConsumedEvents: missing scan root is skipped silently" {
         allocator,
         &test_entries,
         &.{"/definitely/not/a/real/path/for/this/test"},
+        &.{},
         .consumed,
     );
     defer result.deinit();

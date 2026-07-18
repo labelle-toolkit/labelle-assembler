@@ -1647,12 +1647,56 @@ pub fn generate(
     // the `// elided (no consumer): <tag>` debug comments. Struct-copy
     // semantics: both lists borrow their strings from
     // `plugin_events.entries` (deinited once, above), so no double free.
+    //
+    // IN-TREE dependency sources are excluded from the walk (#631
+    // review): a `local:plugins/box2d` / `@libs/box2d` plugin (or a
+    // `local:` core/engine/gfx override) resolves UNDER the game dir,
+    // and its own source names its event tags at the emit sites — left
+    // in the corpus it would mark all its events consumed and void the
+    // filter for exactly the local-plugin-heavy projects. Resolving
+    // through the same `cache` paths discovery uses keeps the exclusion
+    // in lockstep with what was discovered; a dep outside the game tree
+    // is a harmless no-op exclude. The dependency's STAGED hooks/scripts
+    // (`<target>/scripts/.plugin_*`, `<target>/packs`) stay in the
+    // corpus, so cross-plugin consumption via shipped scripts keeps
+    // working — local plugins end up symmetric with published ones
+    // (whose cache dirs were never scanned).
+    var excluded_dep_roots: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (excluded_dep_roots.items) |p| allocator.free(p);
+        excluded_dep_roots.deinit(allocator);
+    }
+    for (cfg.plugins) |plugin| {
+        if (!plugin.isLocal()) continue;
+        const dep_dir = cache.resolvePlugin(allocator, plugin, game_dir) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        errdefer allocator.free(dep_dir);
+        try excluded_dep_roots.append(allocator, dep_dir);
+    }
+    const local_framework_versions = [_]struct { name: []const u8, version: []const u8 }{
+        .{ .name = "core", .version = cfg.core_version },
+        .{ .name = "engine", .version = cfg.engine_version },
+        .{ .name = "gfx", .version = cfg.gfx_version },
+    };
+    for (local_framework_versions) |fw| {
+        if (!config.isLocalVersion(fw.version)) continue;
+        const dep_dir = cache.resolveFrameworkPackage(allocator, fw.name, fw.version, game_dir) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        errdefer allocator.free(dep_dir);
+        try excluded_dep_roots.append(allocator, dep_dir);
+    }
+
     const packs_target = try std.fs.path.join(allocator, &.{ target_dir, "packs" });
     defer allocator.free(packs_target);
     var event_consumption = try main_zig.filterConsumedEvents(
         allocator,
         plugin_events.entries,
         &.{ game_dir, scripts_target, packs_target },
+        excluded_dep_roots.items,
         cfg.plugin_events,
     );
     defer event_consumption.deinit();
