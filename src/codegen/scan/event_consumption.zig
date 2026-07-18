@@ -714,6 +714,55 @@ test "filterConsumedEvents: a stale generated file in a non-default output dir c
     try testing.expectEqual(@as(usize, 2), result.elided.len);
 }
 
+test "filterConsumedEvents: a tag referenced only in tests/ is elided for the production target (tests/ excluded) (#631 codex)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // tests/ feeds the separate `__tests_root.zig` target only — a
+    // production build has no consumer here. root.zig excludes
+    // `<game_dir>/tests` for non-tests targets.
+    try tmp.dir.createDirPath(io, "tests");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "tests/contact_test.zig",
+        .data =
+        \\test "contact" {
+        \\    const e = .{ .box2d__collision_begin = .{ .a = 1, .b = 2 } };
+        \\    _ = e;
+        \\}
+        ,
+    });
+
+    var result = try filterTmpExcluding(&tmp, &.{"tests"});
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.kept.len);
+    try testing.expectEqual(@as(usize, 2), result.elided.len);
+}
+
+test "filterConsumedEvents: the TESTS-target pass keeps scanning tests/ so the referenced variant survives (#631 codex)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Same fixture, no tests/ exclusion (root.zig only adds it when
+    // `!is_tests_target`): the tests target must keep the variant so
+    // the test file's reference compiles against its own GameEvents.
+    try tmp.dir.createDirPath(io, "tests");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "tests/contact_test.zig",
+        .data =
+        \\test "contact" {
+        \\    const e = .{ .box2d__collision_begin = .{ .a = 1, .b = 2 } };
+        \\    _ = e;
+        \\}
+        ,
+    });
+
+    var result = try filterTmp(&tmp, .consumed);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
+    try testing.expectEqual(@as(usize, 1), result.elided.len);
+}
+
 test "filterConsumedEvents: missing scan root is skipped silently" {
     const allocator = testing.allocator;
     var result = try filterConsumedEvents(

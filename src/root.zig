@@ -1629,6 +1629,18 @@ pub fn generate(
         try scripting_declare.checkEventPluginCollisions(s.declared_events, plugin_events.entries);
     }
 
+    // Same gate for Zig/pack GAME events whose generated variant name
+    // spells a plugin tag (`events/box2d__collision_begin.zig` vs
+    // box2d's `collision_begin` — #631 codex). Must run BEFORE the
+    // consumption filter below, on the FULL discovery list: pre-#630
+    // the duplicate always reached `MergeHookPayloads`' comptime
+    // duplicate-field check, but an UNREFERENCED plugin entry would now
+    // be elided first — the collision silently vanishes and the
+    // plugin's `@hasField` emit gate turns on against the game's
+    // same-named payload. Collision behavior must be
+    // consumption-independent.
+    try scripting_declare.checkGameEventPluginCollisions(event_names, pack_scans.items, plugin_events.entries);
+
     // Consumption filter (labelle-assembler#630): fold only CONSUMED
     // events into the generated `PluginEvents` union. Runs AFTER the
     // collision gate above (which must keep seeing the FULL discovery
@@ -1684,6 +1696,23 @@ pub fn generate(
         const out_dup = try allocator.dupe(u8, output_dir);
         errdefer allocator.free(out_dup);
         try excluded_dep_roots.append(allocator, out_dup);
+    }
+    // `tests/` is a TESTS-TARGET consumer surface, not a production one
+    // (#631 codex): test files feed the separate `__tests_root.zig`
+    // target only, so a tag referenced NOWHERE but a test must not keep
+    // the variant in the production GameEvents. Exclude exactly
+    // `<game_dir>/tests` (canonical-root exclusion — NOT a blanket
+    // basename skip, which would eat e.g. a pack's `tests/` fixtures) —
+    // and ONLY for non-tests targets: the tests-target pass keeps
+    // scanning it so a test referencing a variant gets that variant in
+    // its OWN GameEvents and compiles. Per-target divergence is the
+    // tests target's normal shape (cf. `testsTargetConfig`'s backend
+    // `.null` / platform overrides): production elides what only tests
+    // reference; the tests target keeps it.
+    if (!is_tests_target) {
+        const tests_dup = try std.fs.path.join(allocator, &.{ game_dir, "tests" });
+        errdefer allocator.free(tests_dup);
+        try excluded_dep_roots.append(allocator, tests_dup);
     }
     for (cfg.plugins) |plugin| {
         if (!plugin.isLocal()) continue;

@@ -1082,6 +1082,86 @@ pub fn checkEventPluginCollisions(
     }
 }
 
+/// Reject a Zig GAME event (`events/*.zig`, variant name
+/// `idents.eventVariantName(stem)`) or PACK event (variant name
+/// `<pack>__<ident>`) whose generated union variant spells a PLUGIN
+/// event's qualified tag (`<plugin_sanitized>__<event>`). Pre-#630 this
+/// collision ALWAYS reached `MergeHookPayloads`' comptime
+/// duplicate-field check because every discovered plugin event was
+/// folded unconditionally; with consumption filtering (#630) an
+/// UNREFERENCED plugin entry is elided first, the duplicate silently
+/// vanishes, and the plugin's `@hasField(GameEvents, tag)` emit gate
+/// turns ON against the game's same-named payload — the wrong payload
+/// type, or a confusing missing-field compile error at the emit helper,
+/// instead of a namespace-collision diagnostic. Narrow corner: any REAL
+/// consumer of the colliding tag keeps the plugin entry and restores
+/// the old loud comptime error — this gate closes the
+/// dead-declaration case too, with the declare-phase's pointed voice.
+/// root.zig calls it beside `checkEventPluginCollisions`, BEFORE the
+/// filter, on the FULL discovery list (collision behavior must be
+/// consumption-independent).
+pub fn checkGameEventPluginCollisions(
+    event_names: []const []const u8,
+    pack_scans: []const scan.PackScan,
+    plugin_events: []const scan.PluginEvent,
+) !void {
+    var prefix_buf: [128]u8 = undefined;
+    for (plugin_events) |pe| {
+        for (event_names) |stem| {
+            // The game variant is a single materialized string — peel
+            // the plugin prefix slice-wise, same pattern as the gates
+            // above (no format buffer, no silent skip).
+            const variant = idents.eventVariantName(stem);
+            if (!std.mem.startsWith(u8, variant, pe.plugin_sanitized)) continue;
+            const rest = variant[pe.plugin_sanitized.len..];
+            if (!std.mem.startsWith(u8, rest, "__")) continue;
+            if (!std.mem.eql(u8, rest[2..], pe.event_name)) continue;
+            diag("game event events/{s}.zig collides with plugin '{s}' event {s} — rename the event file (plugin events already own the '{s}__' prefix)", .{ stem, pe.plugin_import_name, pe.event_name, pe.plugin_sanitized });
+            return error.GameEventPluginCollision;
+        }
+        for (pack_scans) |pack| {
+            const prefix = scan.packNamespacePrefix(pack.name, &prefix_buf);
+            for (pack.event_names) |stem| {
+                // Neither side is materialized here (`<prefix>__<ident>`
+                // vs `<sanitized>__<event>`), and a naive component-wise
+                // compare would miss `__`-misaligned equal joins — use
+                // the virtual-concatenation comparator so the check
+                // matches exactly what `MergeHookPayloads` would see.
+                if (!qualifiedTagEql(prefix, idents.eventVariantName(stem), pe.plugin_sanitized, pe.event_name)) continue;
+                diag("pack '{s}' event {s}.zig collides with plugin '{s}' event {s} — rename one (plugin events already own the '{s}__' prefix)", .{ pack.name, stem, pe.plugin_import_name, pe.event_name, pe.plugin_sanitized });
+                return error.GameEventPluginCollision;
+            }
+        }
+    }
+}
+
+/// `a_prefix ++ "__" ++ a_name == b_prefix ++ "__" ++ b_name`, computed
+/// over the VIRTUAL concatenations — no allocation, no fixed-size
+/// format buffer (the silent-skip-on-overflow trap PR #618 flagged),
+/// and exact even when a `__` inside one side's prefix aligns the join
+/// differently (`a` + `b__c` vs `a__b` + `c` both spell `a__b__c`).
+fn qualifiedTagEql(
+    a_prefix: []const u8,
+    a_name: []const u8,
+    b_prefix: []const u8,
+    b_name: []const u8,
+) bool {
+    const total = a_prefix.len + 2 + a_name.len;
+    if (total != b_prefix.len + 2 + b_name.len) return false;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        if (joinedAt(a_prefix, a_name, i) != joinedAt(b_prefix, b_name, i)) return false;
+    }
+    return true;
+}
+
+/// Byte `i` of the virtual string `prefix ++ "__" ++ name`.
+fn joinedAt(prefix: []const u8, name: []const u8, i: usize) u8 {
+    if (i < prefix.len) return prefix[i];
+    if (i < prefix.len + 2) return '_';
+    return name[i - prefix.len - 2];
+}
+
 // ── The exec slice ───────────────────────────────────────────────────
 
 /// The three paths the tool build uses — the install prefix, its zig
@@ -2573,6 +2653,75 @@ test "checkEventPluginCollisions: a declared event spelling a plugin's qualified
     try checkEventPluginCollisions(&clean, &entries);
     // No plugin events discovered → nothing can collide.
     try checkEventPluginCollisions(&declared, &.{});
+}
+
+test "checkGameEventPluginCollisions: a game/pack event spelling a plugin tag gates BEFORE the #630 filter; near misses pass" {
+    const entries = [_]scan.PluginEvent{
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
+        .{ .plugin_import_name = "engine", .plugin_sanitized = "engine", .event_name = "tick" },
+    };
+
+    // The motivating case (#631 codex): `events/box2d__collision_begin.zig`
+    // — with no consumer anywhere the plugin entry would be elided and
+    // the collision silently vanish; this gate fires on the FULL list.
+    try testing.expectError(
+        error.GameEventPluginCollision,
+        checkGameEventPluginCollisions(&.{"box2d__collision_begin"}, &.{}, &entries),
+    );
+    // Engine tags gate identically, and a subdir stem's variant
+    // (`eventVariantName` = basename slice) is what's compared.
+    try testing.expectError(
+        error.GameEventPluginCollision,
+        checkGameEventPluginCollisions(&.{"combat/engine__tick"}, &.{}, &entries),
+    );
+
+    // Pack event whose namespaced variant spells the tag: a pack that
+    // sanitizes to `box2d` shipping `collision_begin.zig` produces the
+    // exact `box2d__collision_begin` union variant.
+    const pack = scan.PackScan{
+        .name = "box2d",
+        .import_prefix = "packs/box2d",
+        .component_names = &.{},
+        .event_names = &.{"collision_begin"},
+        .prefab_names = &.{},
+    };
+    try testing.expectError(
+        error.GameEventPluginCollision,
+        checkGameEventPluginCollisions(&.{}, &.{pack}, &entries),
+    );
+
+    // Misaligned `__` join (virtual-concat comparator): pack `box2d__x`
+    // + event `y` spells `box2d__x__y`, the same variant as a plugin
+    // `box2d` event `x__y` — component-wise comparison would miss it.
+    const misaligned_entries = [_]scan.PluginEvent{
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "x__y" },
+    };
+    const misaligned_pack = scan.PackScan{
+        .name = "box2d__x",
+        .import_prefix = "packs/box2d__x",
+        .component_names = &.{},
+        .event_names = &.{"y"},
+        .prefab_names = &.{},
+    };
+    try testing.expectError(
+        error.GameEventPluginCollision,
+        checkGameEventPluginCollisions(&.{}, &.{misaligned_pack}, &misaligned_entries),
+    );
+
+    // Near misses pass: bare name, single-underscore join, truncation,
+    // different prefix, and a pack with a same-name EVENT under a
+    // different pack prefix.
+    try checkGameEventPluginCollisions(&.{ "collision_begin", "box2d_collision_begin", "box2d__collision", "box3d__collision_begin" }, &.{}, &entries);
+    const other_pack = scan.PackScan{
+        .name = "physics",
+        .import_prefix = "packs/physics",
+        .component_names = &.{},
+        .event_names = &.{"collision_begin"},
+        .prefab_names = &.{},
+    };
+    try checkGameEventPluginCollisions(&.{}, &.{other_pack}, &entries);
+    // Empty discovery → nothing can collide.
+    try checkGameEventPluginCollisions(&.{"box2d__collision_begin"}, &.{}, &.{});
 }
 
 test "semverBelow: parseable pins compare against the floor; local/branch/empty pins satisfy it" {
