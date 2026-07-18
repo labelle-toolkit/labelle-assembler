@@ -1277,6 +1277,27 @@ test "parseProjectConfig: heterogeneous bag parses; bag attached; other fields i
     try testing.expect(cfg.plugins[0].params.?.language == null);
 }
 
+test "parseProjectConfig: `.plugin_events = .all` parses; omitted defaults to .consumed (#630)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const src_all: [:0]const u8 =
+        \\.{
+        \\    .name = "all-events-game",
+        \\    .plugin_events = .all,
+        \\}
+    ;
+    const cfg_all = try parseProjectConfig(arena.allocator(), src_all);
+    try testing.expectEqual(config.PluginEventsMode.all, cfg_all.plugin_events);
+
+    // Omitted key → the consumption filter is the default.
+    const src_default: [:0]const u8 =
+        \\.{ .name = "default-events-game" }
+    ;
+    const cfg_default = try parseProjectConfig(arena.allocator(), src_default);
+    try testing.expectEqual(config.PluginEventsMode.consumed, cfg_default.plugin_events);
+}
+
 test "parseProjectConfig: the legacy `.language` bag keeps its typed spelling AND rides the bag (#589 compat)" {
     const src: [:0]const u8 =
         \\.{

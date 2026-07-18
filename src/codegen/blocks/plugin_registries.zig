@@ -146,6 +146,17 @@ pub fn Mixin(comptime Self: type) type {
             try bw.writeAll("// builtin's zero-field result is uninstantiable in std.ArrayList).\n");
             try bw.writeAll("// Variant tag = `<plugin>__<event>` so a flow's dotted name\n");
             try bw.writeAll("// (`box2d.collision_begin`) maps to a Zig identifier.\n");
+            // Consumption filter (labelle-assembler#630): discovered
+            // events nothing in the project references were elided
+            // upstream (`scan.filterConsumedEvents`), so the plugins'
+            // comptime `@hasField(GameEvents, tag)` emit gates fold the
+            // whole emit path away. One comment line per elided event so
+            // a missing variant is diagnosable from the generated file;
+            // set `.plugin_events = .all` in project.labelle to restore
+            // unconditional folding.
+            for (self.plugin_events_elided) |e| {
+                try bw.print("// elided (no consumer): {s}__{s}\n", .{ e.plugin_sanitized, e.event_name });
+            }
             if (plugin_events.len == 0) {
                 // No plugin contributed an `Events` decl — emit `void` and let
                 // `has_events = GameEvents != void` elide the event buffer.

@@ -39,6 +39,7 @@ const sanitize = @import("scan/sanitize.zig");
 const pack_refs = @import("scan/pack_refs.zig");
 const pack_hooks = @import("scan/pack_hooks.zig");
 const plugin_events = @import("scan/plugin_events.zig");
+const event_consumption = @import("scan/event_consumption.zig");
 const flow_decls = @import("scan/flow_decls.zig");
 const promote = @import("scan/promote.zig");
 
@@ -61,6 +62,10 @@ pub const PluginEvent = plugin_events.PluginEvent;
 pub const PluginEvents = plugin_events.PluginEvents;
 pub const discoverPluginEvents = plugin_events.discoverPluginEvents;
 
+// ── Plugin-event consumption filter (scan/event_consumption.zig) ─────
+pub const EventConsumption = event_consumption.EventConsumption;
+pub const filterConsumedEvents = event_consumption.filterConsumedEvents;
+
 // ── FlowNodes / PinStyles / Coercions discovery (scan/flow_decls.zig) ─
 pub const PluginFlowNode = flow_decls.PluginFlowNode;
 pub const PluginPinStyle = flow_decls.PluginPinStyle;
@@ -82,6 +87,7 @@ test {
     _ = pack_refs;
     _ = pack_hooks;
     _ = plugin_events;
+    _ = event_consumption;
     _ = flow_decls;
     _ = promote;
 }

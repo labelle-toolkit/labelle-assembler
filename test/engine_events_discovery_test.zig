@@ -198,3 +198,104 @@ test "engine + plugin events merge under their respective prefixes" {
     try std.testing.expectEqualStrings("fake_box2d", events.entries[1].plugin_import_name);
     try std.testing.expectEqualStrings("collision_begin", events.entries[1].event_name);
 }
+
+// ── Consumption filter emission (labelle-assembler#630) ──────────────
+//
+// `writePluginEventsBlock` folds only the CONSUMED entries
+// (`ctx.plugin_events`) into the union and emits one
+// `// elided (no consumer): <tag>` comment per dropped entry
+// (`ctx.plugin_events_elided`) so a missing variant is diagnosable from
+// the generated file.
+
+/// Minimal `Codegen` over a kept/elided pair — the same shape
+/// `root.zig` threads after `filterConsumedEvents` partitions the
+/// discovery list.
+fn eventsCtx(
+    allocator: std.mem.Allocator,
+    kept: []const generator.main_zig.PluginEvent,
+    elided: []const generator.main_zig.PluginEvent,
+) generator.main_zig.Codegen {
+    return .{
+        .allocator = allocator,
+        .cfg = .{ .name = "test-game", .ecs = .mock, .y_axis = .up },
+        .script_entries = &.{},
+        .prefab_names = &.{},
+        .jsonc_scene_names = &.{},
+        .scene_manifests = &.{},
+        .component_names = &.{},
+        .hook_names = &.{},
+        .event_names = &.{},
+        .enum_names = &.{},
+        .view_names = &.{},
+        .gizmo_names = &.{},
+        .animation_names = &.{},
+        .plugin_events = kept,
+        .plugin_flow_nodes = &.{},
+        .plugin_pin_styles = &.{},
+        .plugin_coercions = &.{},
+        .plugin_events_elided = elided,
+    };
+}
+
+test "writePluginEventsBlock emits an elided comment for dropped events and omits their variants (#630)" {
+    const allocator = std.testing.allocator;
+
+    const kept = [_]generator.main_zig.PluginEvent{
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
+    };
+    const elided = [_]generator.main_zig.PluginEvent{
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_end" },
+    };
+
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer alloc_writer.deinit();
+    var ctx = eventsCtx(allocator, &kept, &elided);
+    try ctx.writePluginEventsBlock(&alloc_writer.writer);
+    const out = alloc_writer.writer.buffer[0..alloc_writer.writer.end];
+
+    // Kept variant folded as before.
+    try std.testing.expect(std.mem.indexOf(u8, out, "box2d__collision_begin: @import(\"box2d\").Events.collision_begin,") != null);
+    // Elided variant: comment line present, union variant absent.
+    try std.testing.expect(std.mem.indexOf(u8, out, "// elided (no consumer): box2d__collision_end") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "box2d__collision_end:") == null);
+}
+
+test "writePluginEventsBlock with everything elided emits PluginEvents = void plus the comments (#630)" {
+    const allocator = std.testing.allocator;
+
+    const elided = [_]generator.main_zig.PluginEvent{
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
+        .{ .plugin_import_name = "engine", .plugin_sanitized = "engine", .event_name = "tick" },
+    };
+
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer alloc_writer.deinit();
+    var ctx = eventsCtx(allocator, &.{}, &elided);
+    try ctx.writePluginEventsBlock(&alloc_writer.writer);
+    const out = alloc_writer.writer.buffer[0..alloc_writer.writer.end];
+
+    // The empty-discovery path kicks in: `void`, no union literal — the
+    // engine's `has_events = GameEvents != void` gate elides the event
+    // buffer entirely.
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub const PluginEvents = void;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "union(enum)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "// elided (no consumer): box2d__collision_begin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "// elided (no consumer): engine__tick") != null);
+}
+
+test "writePluginEventsBlock with no elided entries emits no elision comments (byte-identical default)" {
+    const allocator = std.testing.allocator;
+
+    const kept = [_]generator.main_zig.PluginEvent{
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
+    };
+
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer alloc_writer.deinit();
+    var ctx = eventsCtx(allocator, &kept, &.{});
+    try ctx.writePluginEventsBlock(&alloc_writer.writer);
+    const out = alloc_writer.writer.buffer[0..alloc_writer.writer.end];
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "elided (no consumer)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "box2d__collision_begin") != null);
+}

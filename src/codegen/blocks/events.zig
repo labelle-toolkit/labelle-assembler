@@ -118,7 +118,17 @@ pub fn Mixin(comptime Self: type) type {
                 }
             } else {
                 // No plugins — the v1 emission verbatim, every shipped
-                // pre-RFC game keeps its exact shape.
+                // pre-RFC game keeps its exact shape. One exception
+                // (labelle-assembler#630): when discovery DID find plugin
+                // events but the consumption filter elided every one of
+                // them, this branch is also taken (no `PluginEvents` decl,
+                // `GameEvents` keeps the v1 shape and the engine's
+                // `has_events` gate elides the event buffer) — emit the
+                // per-event elision comments here so the generated file
+                // still explains where the variants went.
+                for (self.plugin_events_elided) |e| {
+                    try w.print("// elided (no consumer): {s}__{s}\n", .{ e.plugin_sanitized, e.event_name });
+                }
                 if (has_game_events_local) {
                     try w.writeAll("pub const GameEvents = union(enum) {\n");
                     var pascal_buf: [128]u8 = undefined;

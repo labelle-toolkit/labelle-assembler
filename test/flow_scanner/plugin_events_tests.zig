@@ -479,4 +479,60 @@ pub const PluginEvents = struct {
         const merge_str = "engine.core.MergeHookPayloads(.{ engine.HookPayload(EcsBackend.Entity), GameEvents })";
         try std.testing.expect(std.mem.indexOf(u8, main_zig, merge_str) != null);
     }
+
+    test "every plugin event elided (#630): v1 shape kept, elision comments emitted, no PluginEvents decl" {
+        const allocator = std.testing.allocator;
+
+        const cfg: generator.ProjectConfig = .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &.{
+                .{ .name = "box2d", .repo = "" },
+            },
+        };
+
+        // The consumption filter partitioned the whole discovery list
+        // into `elided` — the codegen sees an EMPTY consumed list plus
+        // the elided remainder through the scoped threadlocal (the same
+        // wiring `root.zig` uses).
+        const elided = [_]generator.main_zig.PluginEvent{
+            .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
+        };
+        defer generator.main_zig.main_template.plugin_events_elided = &.{};
+        generator.main_zig.main_template.plugin_events_elided = &elided;
+
+        const main_zig = try generator.generateMainZigFromTemplate(
+            allocator,
+            tiny_template_with_events,
+            cfg,
+            tiny_lifecycle_events,
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{}, // event_names — no game events either
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{}, // plugin_events — everything was filtered out
+            &.{}, // plugin_flow_nodes
+            &.{}, // plugin_pin_styles
+            &.{}, // plugin_coercions
+        );
+        defer allocator.free(main_zig);
+
+        // The v1 no-plugin-events shape: `GameEvents = void` (the
+        // engine's `has_events` gate elides the event buffer), the
+        // legacy single-payload `AllHookPayloads`, and NO `PluginEvents`
+        // decl anywhere.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const GameEvents = void;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const AllHookPayloads = engine.HookPayload(EcsBackend.Entity);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "pub const PluginEvents") == null);
+        // …but the generated file still explains where the variant went.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "// elided (no consumer): box2d__collision_begin") != null);
+    }
 };

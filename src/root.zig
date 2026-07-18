@@ -1629,6 +1629,165 @@ pub fn generate(
         try scripting_declare.checkEventPluginCollisions(s.declared_events, plugin_events.entries);
     }
 
+    // Same gate for Zig/pack GAME events whose generated variant name
+    // spells a plugin tag (`events/box2d__collision_begin.zig` vs
+    // box2d's `collision_begin` — #631 codex). Must run BEFORE the
+    // consumption filter below, on the FULL discovery list: pre-#630
+    // the duplicate always reached `MergeHookPayloads`' comptime
+    // duplicate-field check, but an UNREFERENCED plugin entry would now
+    // be elided first — the collision silently vanishes and the
+    // plugin's `@hasField` emit gate turns on against the game's
+    // same-named payload. Collision behavior must be
+    // consumption-independent.
+    try scripting_declare.checkGameEventPluginCollisions(event_names, pack_scans.items, plugin_events.entries);
+
+    // Two providers whose sanitized names collide on the same event
+    // (`foo-bar` + `foo_bar`, both declaring `hit` → `foo_bar__hit`
+    // twice — #631 codex): pre-#630 the duplicate union field failed
+    // loudly at the decl; under filtering a source naming only one
+    // dotted form keeps one entry, elides the other, and the elided
+    // plugin's emit gate turns on against the kept plugin's payload.
+    // Gate on the FULL list before the filter, in every mode (`.all`
+    // included — the pointed message beats the raw duplicate-field
+    // compile error it replaces).
+    try scripting_declare.checkDuplicatePluginTags(plugin_events.entries);
+
+    // Consumption filter (labelle-assembler#630): fold only CONSUMED
+    // events into the generated `PluginEvents` union. Runs AFTER the
+    // collision gate above (which must keep seeing the FULL discovery
+    // list so error behavior is consumption-independent) and BEFORE the
+    // shim + main.zig emission below (both consume the same filtered
+    // list). Scan roots: the game dir (hooks, scripts, flows — both the
+    // `.flow.jsonc` sources' dotted refs and any committed generated
+    // sidecars' qualified tags), plus the staged `<target>/scripts`
+    // (plugin-shipped scripts, copied above — a symlink to the game's
+    // `scripts/` on POSIX, a real copy on Windows) and `<target>/packs`
+    // (staged pack hooks/components from published packs that don't
+    // live in the game tree). The staged deps tree is deliberately NOT
+    // scanned — plugin/engine SOURCE mentions its own tags at the emit
+    // sites, which would mark everything consumed and void the filter.
+    // The elided remainder is threaded to `writePluginEventsBlock` for
+    // the `// elided (no consumer): <tag>` debug comments. Struct-copy
+    // semantics: both lists borrow their strings from
+    // `plugin_events.entries` (deinited once, above), so no double free.
+    //
+    // IN-TREE dependency sources are excluded from the walk (#631
+    // review): a `local:plugins/box2d` / `@libs/box2d` plugin (or a
+    // `local:` core/engine/gfx override) resolves UNDER the game dir,
+    // and its own source names its event tags at the emit sites — left
+    // in the corpus it would mark all its events consumed and void the
+    // filter for exactly the local-plugin-heavy projects. Resolving
+    // through the same `cache` paths discovery uses keeps the exclusion
+    // in lockstep with what was discovered; a dep outside the game tree
+    // is a harmless no-op exclude. The dependency's STAGED hooks/scripts
+    // (`<target>/scripts/.plugin_*`, `<target>/packs`) stay in the
+    // corpus, so cross-plugin consumption via shipped scripts keeps
+    // working — local plugins end up symmetric with published ones
+    // (whose cache dirs were never scanned).
+    var excluded_dep_roots: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (excluded_dep_roots.items) |p| allocator.free(p);
+        excluded_dep_roots.deinit(allocator);
+    }
+    // The OUTPUT dir is excluded as a whole (CodeRabbit on 6ed5fef): the
+    // `.labelle` basename skip only covers the DEFAULT output name — a
+    // caller-configured in-tree output dir would otherwise be scanned,
+    // and stale generated files retain every previously known tag: a
+    // stale main.zig names each kept variant, and even the
+    // `// elided (no consumer): <tag>` comments spell the qualified tag,
+    // so every once-discovered event would be falsely retained forever
+    // (a self-perpetuating ratchet). Excluding the output ROOT also
+    // covers `deps/` (staged dependency sources) and stale sibling
+    // target dirs under a non-default output name. The explicit
+    // `<target>/scripts` / `<target>/packs` scan roots are unaffected:
+    // exclusion is equality-per-directory, and those roots are passed
+    // directly, not reached by descent. The `.labelle` basename skip
+    // stays too (belt and suspenders for nested stale outputs).
+    {
+        const out_dup = try allocator.dupe(u8, output_dir);
+        errdefer allocator.free(out_dup);
+        try excluded_dep_roots.append(allocator, out_dup);
+    }
+    // `tests/` is a TESTS-TARGET consumer surface, not a production one
+    // (#631 codex): test files feed the separate `__tests_root.zig`
+    // target only, so a tag referenced NOWHERE but a test must not keep
+    // the variant in the production GameEvents. Exclude exactly
+    // `<game_dir>/tests` (canonical-root exclusion — NOT a blanket
+    // basename skip, which would eat e.g. a pack's `tests/` fixtures) —
+    // and ONLY for non-tests targets: the tests-target pass keeps
+    // scanning it so a test referencing a variant gets that variant in
+    // its OWN GameEvents and compiles. Per-target divergence is the
+    // tests target's normal shape (cf. `testsTargetConfig`'s backend
+    // `.null` / platform overrides): production elides what only tests
+    // reference; the tests target keeps it.
+    if (!is_tests_target) {
+        const tests_dup = try std.fs.path.join(allocator, &.{ game_dir, "tests" });
+        errdefer allocator.free(tests_dup);
+        try excluded_dep_roots.append(allocator, tests_dup);
+    }
+    for (cfg.plugins) |plugin| {
+        if (!plugin.isLocal()) continue;
+        const dep_dir = cache.resolvePlugin(allocator, plugin, game_dir) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        errdefer allocator.free(dep_dir);
+        try excluded_dep_roots.append(allocator, dep_dir);
+    }
+    const local_framework_versions = [_]struct { name: []const u8, version: []const u8 }{
+        .{ .name = "core", .version = cfg.core_version },
+        .{ .name = "engine", .version = cfg.engine_version },
+        .{ .name = "gfx", .version = cfg.gfx_version },
+    };
+    for (local_framework_versions) |fw| {
+        if (!config.isLocalVersion(fw.version)) continue;
+        const dep_dir = cache.resolveFrameworkPackage(allocator, fw.name, fw.version, game_dir) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        errdefer allocator.free(dep_dir);
+        try excluded_dep_roots.append(allocator, dep_dir);
+    }
+
+    // Force-kept RUNTIME channels (#631 codex): tags whose consumers
+    // register at runtime rather than in authored text, so the scan
+    // structurally cannot prove non-consumption. Survey result (engine
+    // origin/main + assembler codegen seams): exactly ONE such channel
+    // exists today —
+    //
+    //   `engine__editor_plugin_command` (labelle-engine#729, editor-
+    //   contract v1.7 / bridge v1.8, script contract v1.2): the studio's
+    //   panel actions and script-language `labelle_plugin_call` wrappers
+    //   dispatch through the engine's `editor_plugin_command` bridge
+    //   export, which `emitSync`s this variant
+    //   (`src/game/editor_command_mixin.zig` in labelle-engine).
+    //   Handlers register by RUNTIME subscription (script-contract subs)
+    //   or by plugin hooks whose module source this scan deliberately
+    //   excludes as a dependency emit-site — no game-authored text need
+    //   ever name the tag. Force-kept UNCONDITIONALLY (not just for
+    //   editor-preview builds): the script `plugin_call` channel works
+    //   on every platform, presence-detection of panels/handlers at
+    //   generate time is unreliable, and one kept `emitSync`-only
+    //   variant has zero steady-state cost — vs silently dead studio
+    //   panels. Every other engine event (input/lifecycle families) is
+    //   delivered to authored hooks/flows/scripts and stays under the
+    //   text scan.
+    const force_consumed_tags = [_][]const u8{
+        "engine__editor_plugin_command",
+    };
+
+    const packs_target = try std.fs.path.join(allocator, &.{ target_dir, "packs" });
+    defer allocator.free(packs_target);
+    var event_consumption = try main_zig.filterConsumedEvents(
+        allocator,
+        plugin_events.entries,
+        &.{ game_dir, scripts_target, packs_target },
+        excluded_dep_roots.items,
+        &force_consumed_tags,
+        cfg.plugin_events,
+    );
+    defer event_consumption.deinit();
+
     // Emit the `game.zig` shim — a tiny re-export module that surfaces
     // `Game` and `EntityId` so generated flow files at
     // `scripts/flows/*.zig` can `@import("game")`. See
@@ -1642,9 +1801,10 @@ pub fn generate(
     // `plugin_flow_decls.flow_nodes` was discovered ABOVE the flow scan
     // (root.zig §flow discovery). Thread it in so the shim's
     // `PluginFlowNodes` block (Gap 1) matches the one main.zig emits.
-    const game_shim = try generateGameShim(allocator, plugin_events.entries, plugin_flow_decls.flow_nodes, .{
+    const game_shim = try generateGameShim(allocator, event_consumption.kept, plugin_flow_decls.flow_nodes, .{
         .is_tests_target = is_tests_target,
         .ecs = cfg.ecs,
+        .plugin_events_elided = event_consumption.elided,
     });
     defer allocator.free(game_shim);
     try scanner.writeFile(target_dir, "game.zig", game_shim);
@@ -1757,6 +1917,10 @@ pub fn generate(
             hook_names,
             merged_entries,
             plugin_flow_decls.flow_nodes,
+            // FULL discovery list, not the #630-filtered subset: the
+            // sidecar is a discoverability catalog ("what exists to
+            // subscribe to") — an agent adding the FIRST consumer of an
+            // event must still be able to find it here.
             plugin_events.entries,
             manifest_packs,
         ) catch |err| {
@@ -1817,6 +1981,16 @@ pub fn generate(
         defer main_zig.main_template.scripting_splice = null;
         main_zig.main_template.scripting_splice = maybe_scripting;
 
+        // Elided plugin events (#630) — same scoped pattern. The
+        // positional `plugin_events` arg below carries only the CONSUMED
+        // entries (`event_consumption.kept`); this threads the elided
+        // remainder so `writePluginEventsBlock` emits its per-variant
+        // `// elided (no consumer)` comments. Empty for `.all`-mode
+        // projects and projects whose events are all consumed, so their
+        // main.zig is byte-identical.
+        defer main_zig.main_template.plugin_events_elided = &.{};
+        main_zig.main_template.plugin_events_elided = event_consumption.elided;
+
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,
             engine_template,
@@ -1837,7 +2011,9 @@ pub fn generate(
             view_names,
             gizmo_names,
             animation_names,
-            plugin_events.entries,
+            // Consumed subset only (#630) — the full discovery list stays
+            // with the collision gate + manifest sidecar above.
+            event_consumption.kept,
             plugin_flow_decls.flow_nodes,
             plugin_flow_decls.pin_styles,
             plugin_flow_decls.coercions,
