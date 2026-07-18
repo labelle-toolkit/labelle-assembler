@@ -66,13 +66,15 @@
 //! the emit sites (`box2d__collision_begin` appears at every
 //! `emitGameEvent` call), so scanning it would mark all its events
 //! consumed and void the filter for exactly the local-plugin-heavy
-//! projects. Exclusion is the closed-form "is or is under an excluded
-//! root" predicate over CANONICAL paths — `realpath` on both sides, so
-//! it is symlink- and path-separator-robust (no raw string comparison
-//! of joined paths with mixed separators): a walked directory whose
-//! canonical path equals an excluded root, or is a strict descendant of
-//! one (a symlink can jump into the MIDDLE of an excluded tree), is
-//! skipped with its whole subtree. Deliberate asymmetry: a local plugin's
+//! projects. Exclusion is a closed-form longest-match allow/deny
+//! predicate over CANONICAL paths (`exclusionVerdict`) — `realpath` on
+//! both sides, so it is symlink- and path-separator-robust (no raw
+//! string comparison of joined paths with mixed separators): a walked
+//! directory equal to or under an excluded root is skipped with its
+//! whole subtree (a symlink can jump into the MIDDLE of an excluded
+//! tree), UNLESS a deeper scan root re-allows it — the staged
+//! `<target>/scripts` / `<target>/packs` roots live inside the excluded
+//! output dir by design. Deliberate asymmetry: a local plugin's
 //! hooks/scripts STAGED into `<target>/scripts` / `<target>/packs` are
 //! still scanned, so cross-plugin consumption via shipped scripts keeps
 //! working — only the plugin's own module source is excluded, exactly
@@ -149,6 +151,12 @@ const Walk = struct {
     /// Count of not-yet-consumed entries — the walk early-exits at 0.
     remaining: usize,
     excluded_canon: []const []const u8,
+    /// Canonicalized SCAN roots — the allow half of the longest-match
+    /// allow/deny predicate (`exclusionVerdict`). The explicit staged
+    /// roots (`<target>/scripts`, `<target>/packs`) live INSIDE the
+    /// excluded output dir; being deeper (more specific) than the
+    /// output-dir deny rule, they and their subtrees stay scanned.
+    allowed_canon: []const []const u8,
     /// Canonical path of every directory already entered. Cycle
     /// protection for FOLLOWED directory symlinks (#631 codex — a
     /// symlink loop must terminate), and a harmless dedupe of the POSIX
@@ -235,6 +243,27 @@ pub fn filterConsumedEvents(
     }
     const excluded_canon = excluded[0..excluded_len];
 
+    // Canonicalize the scan roots the same way — they are the ALLOW half
+    // of the longest-match predicate (see `exclusionVerdict`). A root
+    // that doesn't resolve contributes nothing (it won't be walked
+    // either — missing roots are skipped silently).
+    const allowed = try allocator.alloc([]const u8, scan_roots.len);
+    var allowed_len: usize = 0;
+    defer {
+        for (allowed[0..allowed_len]) |p| allocator.free(p);
+        allocator.free(allowed);
+    }
+    for (scan_roots) |root| {
+        const canon_z = std.Io.Dir.cwd().realPathFileAlloc(io, root, allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        defer allocator.free(canon_z);
+        allowed[allowed_len] = try allocator.dupe(u8, canon_z);
+        allowed_len += 1;
+    }
+    const allowed_canon = allowed[0..allowed_len];
+
     // Precompute both needles per entry once — the scan is
     // O(files × unconsumed entries).
     const needles = try allocator.alloc(Needles, entries.len);
@@ -264,6 +293,7 @@ pub fn filterConsumedEvents(
         .consumed = consumed,
         .remaining = entries.len,
         .excluded_canon = excluded_canon,
+        .allowed_canon = allowed_canon,
     };
     defer {
         for (walk.visited.keys()) |k| allocator.free(k);
@@ -294,10 +324,11 @@ pub fn filterConsumedEvents(
 
 /// Gatekeeper for descending into a directory — a real one, a scan
 /// root, or a FOLLOWED directory symlink. Canonicalizes the path once
-/// and, against the RESOLVED path: applies the "is or is under an
-/// excluded root" predicate (`isUnderExcludedRoot` — a symlink pointing
-/// INTO an excluded dependency dir, or at any CHILD of one, must not
-/// smuggle it back into the corpus), then the visited set
+/// and, against the RESOLVED path: applies the longest-match allow/deny
+/// predicate (`exclusionVerdict` — a symlink pointing INTO an excluded
+/// dependency dir, or at any CHILD of one, must not smuggle it back
+/// into the corpus, while the staged scan roots INSIDE the excluded
+/// output dir stay scanned), then the visited set
 /// (symlink-cycle protection — and a harmless dedupe of the POSIX
 /// `<target>/scripts` double-scan). A path that fails to canonicalize
 /// because nothing is there (missing root, dangling link, loop) is
@@ -315,7 +346,7 @@ fn enterDir(walk: *Walk, dir_path: []const u8) anyerror!void {
     };
     defer allocator.free(canon_z);
 
-    if (isUnderExcludedRoot(canon_z, walk.excluded_canon)) return;
+    if (exclusionVerdict(canon_z, walk.excluded_canon, walk.allowed_canon)) return;
     if (walk.visited.contains(canon_z)) return;
     {
         // The map owns its keys (freed by `filterConsumedEvents`) —
@@ -328,34 +359,62 @@ fn enterDir(walk: *Walk, dir_path: []const u8) anyerror!void {
     try scanDir(walk, dir_path);
 }
 
-/// The closed-form exclusion predicate: `canon` is excluded when it
-/// EQUALS an excluded root or is a strict DESCENDANT of one (prefix
-/// match with an explicit path-separator boundary check, so
-/// `/a/libs/box2d2` does not match an excluded `/a/libs/box2d`). Both
-/// sides are canonical (`realpath`), so the compare — including the
-/// `std.fs.path.sep` boundary byte — stays correct on Windows, where
-/// canonical paths use backslashes.
+/// The closed-form exclusion predicate, longest-match allow/deny over
+/// CANONICAL paths: `canon` is excluded when its most specific (longest)
+/// matching EXCLUDED root is deeper than its most specific matching
+/// SCAN root. "Matching" means equals-or-is-under with an explicit
+/// path-separator boundary (`isOrUnder`), so `/a/libs/box2d2` does not
+/// match an excluded `/a/libs/box2d`; both sides went through
+/// `realpath`, so the compare — including the `std.fs.path.sep`
+/// boundary byte — stays correct on Windows, where canonical paths use
+/// backslashes.
 ///
-/// Why descendants must be covered (#631 codex): the walk itself stops
-/// AT an excluded root (the equality half), so a descendant can only be
-/// reached by a symlink jumping into the middle of the excluded tree
-/// (`vendored_src` → `libs/box2d/src`, `generated` → `out/raylib`) —
-/// which canonicalizes to the CHILD path and would match no root under
-/// exact equality, re-admitting plugin emit sites or stale generated
-/// output. The ancestor-aware form subsumes the equality check and
-/// closes that hole.
-fn isUnderExcludedRoot(canon: []const u8, excluded_canon: []const []const u8) bool {
-    for (excluded_canon) |ex| {
-        if (!std.mem.startsWith(u8, canon, ex)) continue;
-        if (canon.len == ex.len) return true;
-        // Boundary: the next byte after the root prefix must be a
-        // separator (or the root itself ends in one — the filesystem
-        // root), otherwise a sibling sharing the name prefix would
-        // false-match.
-        if (ex.len > 0 and ex[ex.len - 1] == std.fs.path.sep) return true;
-        if (canon[ex.len] == std.fs.path.sep) return true;
+/// Why descendants must be covered at all (#631 codex): the walk stops
+/// AT an excluded root, so a descendant can only be reached by a
+/// symlink jumping into the middle of the excluded tree (`vendored_src`
+/// → `libs/box2d/src`, `generated` → `out/raylib`) — which
+/// canonicalizes to the CHILD path and would match no root under exact
+/// equality, re-admitting plugin emit sites or stale generated output.
+///
+/// Why the ALLOW half exists: the explicit staged scan roots
+/// (`<target>/scripts`, `<target>/packs`) are themselves strict
+/// descendants of the excluded OUTPUT dir — a plain is-or-under deny
+/// would swallow the staged corpus (published packs' hooks live ONLY
+/// there, and on Windows the copied plugin scripts do too). Deeper
+/// rule wins, so the staged roots and their subtrees stay scanned
+/// while the rest of the output dir (stale main.zig, deps/, stale
+/// sibling targets) stays out; within the game dir, a dependency root
+/// (deeper than the game-dir scan root) still denies its subtree.
+fn exclusionVerdict(
+    canon: []const u8,
+    excluded_canon: []const []const u8,
+    allowed_canon: []const []const u8,
+) bool {
+    const ex = longestMatch(canon, excluded_canon) orelse return false;
+    const al = longestMatch(canon, allowed_canon) orelse return true;
+    return ex > al;
+}
+
+/// Length of the longest root in `roots` that `canon` equals or sits
+/// under (separator-boundary checked), or null when none matches.
+fn longestMatch(canon: []const u8, roots: []const []const u8) ?usize {
+    var best: ?usize = null;
+    for (roots) |root| {
+        if (!isOrUnder(canon, root)) continue;
+        if (best == null or root.len > best.?) best = root.len;
     }
-    return false;
+    return best;
+}
+
+/// Whether `canon` equals `root` or is a strict descendant of it. The
+/// byte after the root prefix must be a separator (or the root itself
+/// ends in one — the filesystem root), otherwise a sibling sharing the
+/// name prefix would false-match.
+fn isOrUnder(canon: []const u8, root: []const u8) bool {
+    if (!std.mem.startsWith(u8, canon, root)) return false;
+    if (canon.len == root.len) return true;
+    if (root.len > 0 and root[root.len - 1] == std.fs.path.sep) return true;
+    return canon[root.len] == std.fs.path.sep;
 }
 
 /// Recursive walk of one directory (callers go through `enterDir`,
@@ -987,6 +1046,51 @@ test "filterConsumedEvents: a sibling sharing the excluded root's name prefix is
     try testing.expectEqual(@as(usize, 1), result.kept.len);
     try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
     try testing.expectEqual(@as(usize, 1), result.elided.len);
+}
+
+test "filterConsumedEvents: an explicit scan root INSIDE the excluded output dir is still scanned (staged corpus) (#631 regression)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The staged-pack shape: the output dir `out` is excluded (stale
+    // generated files), but `out/target/packs` is an explicit scan root
+    // — for published packs it is the ONLY place their hooks exist. The
+    // longest-match predicate must let the deeper scan root win over
+    // the shallower output-dir deny.
+    try tmp.dir.createDirPath(io, "out/target/packs/fakepack/hooks");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "out/target/packs/fakepack/hooks/contact.zig",
+        .data = "// subscribes: box2d__collision_begin\n",
+    });
+    // Stale generated output BESIDE the staged root stays excluded.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "out/target/main.zig",
+        .data = "// elided (no consumer): box2d__collision_end\n",
+    });
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const out_dir = try std.fs.path.join(allocator, &.{ root, "out" });
+    defer allocator.free(out_dir);
+    const packs_root = try std.fs.path.join(allocator, &.{ root, "out", "target", "packs" });
+    defer allocator.free(packs_root);
+
+    var result = try filterConsumedEvents(
+        allocator,
+        &test_entries,
+        &.{ root, packs_root },
+        &.{out_dir},
+        .consumed,
+    );
+    defer result.deinit();
+    // The staged hook keeps collision_begin; the stale main.zig outside
+    // the allowed root cannot ratchet collision_end back.
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
+    try testing.expectEqual(@as(usize, 1), result.elided.len);
+    try testing.expectEqualStrings("collision_end", result.elided[0].event_name);
 }
 
 test "filterConsumedEvents: missing scan root is skipped silently" {
