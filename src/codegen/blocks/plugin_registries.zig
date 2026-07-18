@@ -157,6 +157,16 @@ pub fn Mixin(comptime Self: type) type {
             for (self.plugin_events_elided) |e| {
                 try bw.print("// elided (no consumer): {s}__{s}\n", .{ e.plugin_sanitized, e.event_name });
             }
+            // Ungated-emit force-keeps (#630 follow-up): these variants
+            // are in `plugin_events` below, but only because their
+            // provider emits them with a raw union literal
+            // (`game.emit(.{ .<tag> = ... })`) — eliding them would
+            // break the provider's own compile. One comment per entry
+            // so an unconsumed-but-kept variant is explainable from the
+            // generated file.
+            for (self.plugin_events_force_kept) |e| {
+                try bw.print("// force-kept (provider emits ungated): {s}__{s}\n", .{ e.plugin_sanitized, e.event_name });
+            }
             if (plugin_events.len == 0) {
                 // No plugin contributed an `Events` decl — emit `void` and let
                 // `has_events = GameEvents != void` elide the event buffer.

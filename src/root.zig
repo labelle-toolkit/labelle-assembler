@@ -1772,9 +1772,94 @@ pub fn generate(
     //   panels. Every other engine event (input/lifecycle families) is
     //   delivered to authored hooks/flows/scripts and stays under the
     //   text scan.
-    const force_consumed_tags = [_][]const u8{
+    const static_force_consumed_tags = [_][]const u8{
         "engine__editor_plugin_command",
     };
+
+    // Ungated-emit force-keep (#630 follow-up — the flying-platform
+    // v0.93.0 breakage): a provider that emits with raw anonymous
+    // union literals (labelle-pathfinding's
+    // `game.emit(.{ .pathfinder__node_removed = .{ ... } })`) instead
+    // of a `@hasField`-gated helper does not tolerate elision — the
+    // PLUGIN SOURCE stops compiling ("no field named ... in union")
+    // and `labelle build` breaks for the whole game. Scan each
+    // provider's own resolved module dir (the same dirs
+    // `discoverPluginEvents` walked) for its OWN tags in dot-prefixed
+    // form and force-keep the matches via the same `force_consumed`
+    // mechanism as the runtime channels above. See
+    // `scan.detectUngatedEmits` for the discriminator + heuristic risk
+    // profile (over-match force-keeps → safe; under-match = today's
+    // loud compile error, no new failure mode). Skipped for
+    // `.plugin_events = .all` (nothing is elided there anyway).
+    var provider_dirs: std.ArrayList(main_zig.ProviderDir) = .empty;
+    defer {
+        for (provider_dirs.items) |p| allocator.free(p.dir);
+        provider_dirs.deinit(allocator);
+    }
+    if (cfg.plugin_events != .all and plugin_events.entries.len > 0) {
+        // Mirror discovery's resolution exactly (`discoverPluginEvents`
+        // resolves the engine package + each `cfg_modules` plugin dir),
+        // but only for providers that actually contributed entries —
+        // needle-less walks would be pure I/O waste.
+        var saw_engine = false;
+        for (plugin_events.entries) |e| {
+            if (std.mem.eql(u8, e.plugin_import_name, "engine")) {
+                saw_engine = true;
+                break;
+            }
+        }
+        if (saw_engine) blk: {
+            const dir = cache.resolveFrameworkPackage(allocator, "engine", cfg_modules.engine_version, game_dir) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => break :blk,
+            };
+            errdefer allocator.free(dir);
+            try provider_dirs.append(allocator, .{ .import_name = "engine", .dir = dir });
+        }
+        for (cfg_modules.plugins) |plugin| {
+            var has_entry = false;
+            for (plugin_events.entries) |e| {
+                if (std.mem.eql(u8, e.plugin_import_name, plugin.name)) {
+                    has_entry = true;
+                    break;
+                }
+            }
+            if (!has_entry) continue;
+            const dir = cache.resolvePlugin(allocator, plugin, game_dir) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            errdefer allocator.free(dir);
+            try provider_dirs.append(allocator, .{ .import_name = plugin.name, .dir = dir });
+        }
+    }
+    const ungated_flags = try main_zig.detectUngatedEmits(allocator, plugin_events.entries, provider_dirs.items);
+    defer allocator.free(ungated_flags);
+
+    // Full force set = the static runtime channels + every ungated-emit
+    // tag; plus the struct-copy subset for the
+    // `// force-kept (provider emits ungated): <tag>` codegen comments
+    // (entries borrow their strings from `plugin_events`, same
+    // semantics as the kept/elided lists).
+    var force_consumed_tags: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (force_consumed_tags.items) |t| allocator.free(t);
+        force_consumed_tags.deinit(allocator);
+    }
+    for (static_force_consumed_tags) |tag| {
+        const dup = try allocator.dupe(u8, tag);
+        errdefer allocator.free(dup);
+        try force_consumed_tags.append(allocator, dup);
+    }
+    var force_kept_ungated: std.ArrayList(main_zig.PluginEvent) = .empty;
+    defer force_kept_ungated.deinit(allocator);
+    for (plugin_events.entries, ungated_flags) |e, is_ungated| {
+        if (!is_ungated) continue;
+        const tag = try std.fmt.allocPrint(allocator, "{s}__{s}", .{ e.plugin_sanitized, e.event_name });
+        errdefer allocator.free(tag);
+        try force_consumed_tags.append(allocator, tag);
+        try force_kept_ungated.append(allocator, e);
+    }
 
     const packs_target = try std.fs.path.join(allocator, &.{ target_dir, "packs" });
     defer allocator.free(packs_target);
@@ -1783,7 +1868,7 @@ pub fn generate(
         plugin_events.entries,
         &.{ game_dir, scripts_target, packs_target },
         excluded_dep_roots.items,
-        &force_consumed_tags,
+        force_consumed_tags.items,
         cfg.plugin_events,
     );
     defer event_consumption.deinit();
@@ -1805,6 +1890,7 @@ pub fn generate(
         .is_tests_target = is_tests_target,
         .ecs = cfg.ecs,
         .plugin_events_elided = event_consumption.elided,
+        .plugin_events_force_kept = force_kept_ungated.items,
     });
     defer allocator.free(game_shim);
     try scanner.writeFile(target_dir, "game.zig", game_shim);
@@ -1990,6 +2076,15 @@ pub fn generate(
         // main.zig is byte-identical.
         defer main_zig.main_template.plugin_events_elided = &.{};
         main_zig.main_template.plugin_events_elided = event_consumption.elided;
+
+        // Force-kept ungated-emit events (#630 follow-up) — same scoped
+        // pattern; threads the annotation subset so
+        // `writePluginEventsBlock` emits its per-variant
+        // `// force-kept (provider emits ungated)` comments. Empty for
+        // `.all`-mode projects and projects with only gated providers,
+        // so their main.zig is byte-identical.
+        defer main_zig.main_template.plugin_events_force_kept = &.{};
+        main_zig.main_template.plugin_events_force_kept = force_kept_ungated.items;
 
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,

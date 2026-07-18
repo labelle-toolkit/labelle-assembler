@@ -181,6 +181,13 @@ pub const GameShimOptions = struct {
     /// (including the `// elided (no consumer): <tag>` comments).
     /// Defaults empty for callers that never filter.
     plugin_events_elided: []const main_zig.PluginEvent = &.{},
+    /// Force-kept ungated-emit plugin events (#630 follow-up) — subset
+    /// of the kept `plugin_events` whose provider emits with raw union
+    /// literals (`scan.detectUngatedEmits`), threaded so the shim's
+    /// `// force-kept (provider emits ungated): <tag>` comments stay
+    /// byte-identical to main.zig's. Defaults empty for callers that
+    /// never filter.
+    plugin_events_force_kept: []const main_zig.PluginEvent = &.{},
 };
 
 pub fn generateGameShim(
@@ -249,6 +256,7 @@ pub fn generateGameShim(
             .plugin_pin_styles = &.{},
             .plugin_coercions = &.{},
             .plugin_events_elided = opts.plugin_events_elided,
+            .plugin_events_force_kept = opts.plugin_events_force_kept,
         };
         if (plugin_events.len > 0) try ctx.writePluginEventsBlock(w);
         // Gap 1 — surface `PluginFlowNodes` so flow files'
