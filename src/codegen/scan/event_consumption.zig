@@ -66,11 +66,13 @@
 //! the emit sites (`box2d__collision_begin` appears at every
 //! `emitGameEvent` call), so scanning it would mark all its events
 //! consumed and void the filter for exactly the local-plugin-heavy
-//! projects. Exclusion is by CANONICAL path equality — `realpath` on
-//! both sides, so it is symlink- and path-separator-robust (no raw
-//! string comparison of joined paths with mixed separators): a walked
-//! directory whose canonical path equals an excluded root is skipped
-//! with its whole subtree. Deliberate asymmetry: a local plugin's
+//! projects. Exclusion is the closed-form "is or is under an excluded
+//! root" predicate over CANONICAL paths — `realpath` on both sides, so
+//! it is symlink- and path-separator-robust (no raw string comparison
+//! of joined paths with mixed separators): a walked directory whose
+//! canonical path equals an excluded root, or is a strict descendant of
+//! one (a symlink can jump into the MIDDLE of an excluded tree), is
+//! skipped with its whole subtree. Deliberate asymmetry: a local plugin's
 //! hooks/scripts STAGED into `<target>/scripts` / `<target>/packs` are
 //! still scanned, so cross-plugin consumption via shipped scripts keeps
 //! working — only the plugin's own module source is excluded, exactly
@@ -292,14 +294,15 @@ pub fn filterConsumedEvents(
 
 /// Gatekeeper for descending into a directory — a real one, a scan
 /// root, or a FOLLOWED directory symlink. Canonicalizes the path once
-/// and, against the RESOLVED path: applies the excluded-roots check (a
-/// symlink pointing INTO an excluded dependency dir must not smuggle it
-/// back into the corpus), then the visited set (symlink-cycle
-/// protection — and a harmless dedupe of the POSIX `<target>/scripts`
-/// double-scan). A path that fails to canonicalize because nothing is
-/// there (missing root, dangling link, loop) is skipped silently —
-/// provably no content; other failures are loud per the file-header
-/// error policy.
+/// and, against the RESOLVED path: applies the "is or is under an
+/// excluded root" predicate (`isUnderExcludedRoot` — a symlink pointing
+/// INTO an excluded dependency dir, or at any CHILD of one, must not
+/// smuggle it back into the corpus), then the visited set
+/// (symlink-cycle protection — and a harmless dedupe of the POSIX
+/// `<target>/scripts` double-scan). A path that fails to canonicalize
+/// because nothing is there (missing root, dangling link, loop) is
+/// skipped silently — provably no content; other failures are loud per
+/// the file-header error policy.
 fn enterDir(walk: *Walk, dir_path: []const u8) anyerror!void {
     // `anyerror`: enterDir ⇄ scanDir are mutually recursive (a followed
     // dir symlink re-enters the gate), so one of the pair must break
@@ -312,9 +315,7 @@ fn enterDir(walk: *Walk, dir_path: []const u8) anyerror!void {
     };
     defer allocator.free(canon_z);
 
-    for (walk.excluded_canon) |ex| {
-        if (std.mem.eql(u8, canon_z, ex)) return;
-    }
+    if (isUnderExcludedRoot(canon_z, walk.excluded_canon)) return;
     if (walk.visited.contains(canon_z)) return;
     {
         // The map owns its keys (freed by `filterConsumedEvents`) —
@@ -325,6 +326,36 @@ fn enterDir(walk: *Walk, dir_path: []const u8) anyerror!void {
         try walk.visited.put(allocator, key, {});
     }
     try scanDir(walk, dir_path);
+}
+
+/// The closed-form exclusion predicate: `canon` is excluded when it
+/// EQUALS an excluded root or is a strict DESCENDANT of one (prefix
+/// match with an explicit path-separator boundary check, so
+/// `/a/libs/box2d2` does not match an excluded `/a/libs/box2d`). Both
+/// sides are canonical (`realpath`), so the compare — including the
+/// `std.fs.path.sep` boundary byte — stays correct on Windows, where
+/// canonical paths use backslashes.
+///
+/// Why descendants must be covered (#631 codex): the walk itself stops
+/// AT an excluded root (the equality half), so a descendant can only be
+/// reached by a symlink jumping into the middle of the excluded tree
+/// (`vendored_src` → `libs/box2d/src`, `generated` → `out/raylib`) —
+/// which canonicalizes to the CHILD path and would match no root under
+/// exact equality, re-admitting plugin emit sites or stale generated
+/// output. The ancestor-aware form subsumes the equality check and
+/// closes that hole.
+fn isUnderExcludedRoot(canon: []const u8, excluded_canon: []const []const u8) bool {
+    for (excluded_canon) |ex| {
+        if (!std.mem.startsWith(u8, canon, ex)) continue;
+        if (canon.len == ex.len) return true;
+        // Boundary: the next byte after the root prefix must be a
+        // separator (or the root itself ends in one — the filesystem
+        // root), otherwise a sibling sharing the name prefix would
+        // false-match.
+        if (ex.len > 0 and ex[ex.len - 1] == std.fs.path.sep) return true;
+        if (canon[ex.len] == std.fs.path.sep) return true;
+    }
+    return false;
 }
 
 /// Recursive walk of one directory (callers go through `enterDir`,
@@ -904,6 +935,58 @@ test "filterConsumedEvents: a symlink INTO an excluded dependency root cannot sm
     defer result.deinit();
     try testing.expectEqual(@as(usize, 0), result.kept.len);
     try testing.expectEqual(@as(usize, 2), result.elided.len);
+}
+
+test "filterConsumedEvents: a symlink to a CHILD of an excluded root cannot smuggle it back in (ancestor-aware exclusion) (#631 codex)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The excluded root is `libs/box2d`; the game carries a symlink to
+    // its CHILD `libs/box2d/src`. `realpath` resolves the link to the
+    // child path, which matches no root under exact equality — the
+    // ancestor-aware predicate must still keep the emit-site source out.
+    try tmp.dir.createDirPath(io, "libs/box2d/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "libs/box2d/src/root.zig",
+        .data = in_tree_plugin_src,
+    });
+    const child_abs = try tmp.dir.realPathFileAlloc(io, "libs/box2d/src", allocator);
+    defer allocator.free(child_abs);
+    try tmp.dir.symLink(io, child_abs, "vendored_src", .{ .is_directory = true });
+
+    var result = try filterTmpExcluding(&tmp, &.{"libs/box2d"});
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.kept.len);
+    try testing.expectEqual(@as(usize, 2), result.elided.len);
+}
+
+test "filterConsumedEvents: a sibling sharing the excluded root's name prefix is scanned normally (boundary check) (#631 codex)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `libs/box2d2` is NOT under excluded `libs/box2d` — a bare prefix
+    // match without the separator-boundary check would false-exclude it
+    // and elide its genuine consumer.
+    try tmp.dir.createDirPath(io, "libs/box2d/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "libs/box2d/src/root.zig",
+        .data = in_tree_plugin_src,
+    });
+    try tmp.dir.createDirPath(io, "libs/box2d2");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "libs/box2d2/consumer.zig",
+        .data = "// subscribes: box2d__collision_begin\n",
+    });
+
+    var result = try filterTmpExcluding(&tmp, &.{"libs/box2d"});
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
+    try testing.expectEqual(@as(usize, 1), result.elided.len);
 }
 
 test "filterConsumedEvents: missing scan root is skipped silently" {
