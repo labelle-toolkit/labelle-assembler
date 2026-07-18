@@ -1666,6 +1666,25 @@ pub fn generate(
         for (excluded_dep_roots.items) |p| allocator.free(p);
         excluded_dep_roots.deinit(allocator);
     }
+    // The OUTPUT dir is excluded as a whole (CodeRabbit on 6ed5fef): the
+    // `.labelle` basename skip only covers the DEFAULT output name — a
+    // caller-configured in-tree output dir would otherwise be scanned,
+    // and stale generated files retain every previously known tag: a
+    // stale main.zig names each kept variant, and even the
+    // `// elided (no consumer): <tag>` comments spell the qualified tag,
+    // so every once-discovered event would be falsely retained forever
+    // (a self-perpetuating ratchet). Excluding the output ROOT also
+    // covers `deps/` (staged dependency sources) and stale sibling
+    // target dirs under a non-default output name. The explicit
+    // `<target>/scripts` / `<target>/packs` scan roots are unaffected:
+    // exclusion is equality-per-directory, and those roots are passed
+    // directly, not reached by descent. The `.labelle` basename skip
+    // stays too (belt and suspenders for nested stale outputs).
+    {
+        const out_dup = try allocator.dupe(u8, output_dir);
+        errdefer allocator.free(out_dup);
+        try excluded_dep_roots.append(allocator, out_dup);
+    }
     for (cfg.plugins) |plugin| {
         if (!plugin.isLocal()) continue;
         const dep_dir = cache.resolvePlugin(allocator, plugin, game_dir) catch |err| switch (err) {

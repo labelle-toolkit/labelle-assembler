@@ -40,9 +40,22 @@
 //! skipped by basename (`.labelle` — the assembler output dir, whose
 //! stale generated `main.zig` would otherwise keep every variant alive
 //! forever — plus `.zig-cache`, `zig-out`, `.git`, `node_modules`).
-//! Files above `max_file_size` are skipped (an event subscription lives
-//! in source files, not megabyte blobs). Unreadable files/dirs are
-//! skipped silently; only OOM propagates.
+//!
+//! Files of ANY size are scanned — large ones stream through a
+//! fixed-size chunk buffer with a needle-length overlap so a tag
+//! straddling a chunk boundary still matches (skipping oversized files
+//! would turn a consumer living in a big generated `.json` into a
+//! silent false negative, the one unacceptable failure mode).
+//!
+//! Error policy (CodeRabbit review on 6ed5fef): an incomplete scan must
+//! never masquerade as "no consumer". A scan ROOT that doesn't exist is
+//! skipped silently (the `<target>/packs` root is legitimately absent
+//! for pack-less projects), and a dangling symlink / entry deleted
+//! mid-walk is skipped because a nonexistent file provably contains no
+//! consumer. Every OTHER I/O failure (permissions, hardware, iterator
+//! errors) fails `generate` loudly — the same trees are read elsewhere
+//! in the generate pass, so an unreadable file is a real problem, and
+//! `.plugin_events = .all` covers pathological setups.
 //!
 //! ── Excluded dependency roots (#631 review) ──────────────────────────
 //!
@@ -70,10 +83,13 @@ const plugin_events_mod = @import("plugin_events.zig");
 
 pub const PluginEvent = plugin_events_mod.PluginEvent;
 
-/// Per-file read cap. Real consumers (hooks, scripts, flows) are small
-/// source files; anything larger is almost certainly generated data or
-/// an asset that wandered into the tree.
-const max_file_size: usize = 2 * 1024 * 1024;
+/// Chunk size for the streaming file scan. Files are searched through a
+/// buffer of `scan_chunk_size + overlap` bytes, where the overlap is one
+/// byte short of the longest needle — so a tag straddling a chunk
+/// boundary is always fully contained in some window. There is no file
+/// size cap: capping would turn a consumer inside a big generated
+/// `.json` into a silent false negative.
+const scan_chunk_size: usize = 256 * 1024;
 
 /// Directory basenames never descended into. Compared against the raw
 /// directory entry name (never a joined path), so this is
@@ -245,12 +261,12 @@ pub fn filterConsumedEvents(
     return .{ .kept = kept_slice, .elided = elided_slice, .allocator = allocator };
 }
 
-/// Recursive walk of one root. Unreadable dirs/files are skipped
-/// silently (conservative in the safe direction only for files that
-/// don't exist — the roots we scan are the same trees the rest of the
-/// generate pass reads, so a transiently unreadable file is the rare
-/// case, and the escape hatch `.plugin_events = .all` covers pathological
-/// setups). Only OOM propagates.
+/// Recursive walk of one root. Error policy (see file header): a
+/// missing directory (root that doesn't exist, dangling symlink, entry
+/// deleted mid-walk) is skipped silently — nothing on disk means no
+/// consumer to miss. Every OTHER I/O failure propagates loudly with a
+/// pointed diagnostic: an incomplete scan silently treated as "no
+/// consumer" would elide a live subscription and break event delivery.
 fn scanDir(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
@@ -260,11 +276,17 @@ fn scanDir(
     excluded_canon: []const []const u8,
 ) !void {
     const io = config.globalIo();
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        // Missing root / dangling symlink / mid-walk deletion — no
+        // content, no possible false negative. `NotDir` covers a root
+        // path that names a file.
+        error.FileNotFound, error.NotDir => return,
+        else => return scanFailure(dir_path, err),
+    };
     defer dir.close(io);
 
     var it = dir.iterate();
-    while (it.next(io) catch return) |entry| {
+    while (it.next(io) catch |err| return scanFailure(dir_path, err)) |entry| {
         if (remaining.* == 0) return;
         switch (entry.kind) {
             .directory => {
@@ -278,24 +300,81 @@ fn scanDir(
                 if (!hasScannedExtension(entry.name)) continue;
                 const child = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
                 defer allocator.free(child);
-                const src = std.Io.Dir.cwd().readFileAlloc(io, child, allocator, .limited(max_file_size)) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    // Oversized or unreadable — skip (see fn doc).
-                    else => continue,
-                };
-                defer allocator.free(src);
-                for (needles, consumed) |n, *c| {
-                    if (c.*) continue;
-                    if (std.mem.indexOf(u8, src, n.qualified) != null or
-                        std.mem.indexOf(u8, src, n.dotted) != null)
-                    {
-                        c.* = true;
-                        remaining.* -= 1;
-                    }
-                }
+                try scanFile(allocator, child, needles, consumed, remaining);
             },
             else => {},
         }
+    }
+}
+
+/// Print the pointed loud-failure diagnostic and propagate `err`. The
+/// message names the path and the escape hatch so a failing `generate`
+/// is actionable without reading assembler source.
+fn scanFailure(path: []const u8, err: anyerror) anyerror {
+    std.debug.print(
+        "labelle-assembler: plugin-event consumption scan failed on '{s}': {s}\n" ++
+            "  an unreadable file cannot be proven consumer-free; fix it or set `.plugin_events = .all` in project.labelle\n",
+        .{ path, @errorName(err) },
+    );
+    return err;
+}
+
+/// Stream-search one file for the not-yet-consumed needles. Chunked
+/// (`scan_chunk_size`) with an overlap of (longest needle − 1) bytes
+/// carried between windows, so a tag straddling a chunk boundary still
+/// matches — no file size cap (see the file header). A file that no
+/// longer exists (dangling symlink, deleted mid-walk) is skipped:
+/// provably no content to miss. Other open/read failures propagate
+/// loudly via `scanFailure`.
+fn scanFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    needles: anytype,
+    consumed: []bool,
+    remaining: *usize,
+) !void {
+    const io = config.globalIo();
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return scanFailure(path, err),
+    };
+    defer file.close(io);
+
+    // Overlap = longest needle − 1: any needle crossing the junction
+    // between two reads is fully contained in the window that holds the
+    // carried tail plus the new bytes.
+    var max_needle: usize = 0;
+    for (needles) |n| max_needle = @max(max_needle, @max(n.qualified.len, n.dotted.len));
+    if (max_needle == 0) return;
+    const overlap = max_needle - 1;
+
+    const buf = try allocator.alloc(u8, scan_chunk_size + overlap);
+    defer allocator.free(buf);
+
+    var carry: usize = 0;
+    while (true) {
+        const n = file.readStreaming(io, &.{buf[carry..]}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return scanFailure(path, err),
+        };
+        // Blocking Io: 0 bytes without EndOfStream also means the
+        // stream is drained.
+        if (n == 0) break;
+        const window = buf[0 .. carry + n];
+        for (needles, consumed) |needle, *c| {
+            if (c.*) continue;
+            if (std.mem.indexOf(u8, window, needle.qualified) != null or
+                std.mem.indexOf(u8, window, needle.dotted) != null)
+            {
+                c.* = true;
+                remaining.* -= 1;
+            }
+        }
+        if (remaining.* == 0) return;
+        // Carry the tail into the next window. `copyForwards` is safe:
+        // the destination starts at 0, at or before the source start.
+        carry = @min(overlap, window.len);
+        std.mem.copyForwards(u8, buf[0..carry], window[window.len - carry ..]);
     }
 }
 
@@ -575,6 +654,64 @@ test "filterConsumedEvents: a real consumer outside the excluded in-tree plugin 
     try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
     try testing.expectEqual(@as(usize, 1), result.elided.len);
     try testing.expectEqualStrings("collision_end", result.elided[0].event_name);
+}
+
+test "filterConsumedEvents: tags in a file larger than the scan chunk are found (window-boundary straddle + tail) (#631 CodeRabbit)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "scripts");
+
+    // ~600 KB file — more than two scan chunks. One tag placed to
+    // straddle the first full-read window boundary (window 0 ends at
+    // `scan_chunk_size + overlap` when reads fill the buffer; any
+    // shorter read pattern is covered by the same overlap carry), one
+    // tag at the very end of the file. The old 2 MB-skip behavior (or a
+    // dropped overlap carry) would elide these — a silent
+    // event-delivery break.
+    const tag_straddle = "box2d__collision_begin"; // the longest needle
+    const tag_tail = "box2d.collision_end";
+    const overlap = tag_straddle.len - 1;
+    const content = try allocator.alloc(u8, 600 * 1024);
+    defer allocator.free(content);
+    @memset(content, 'A');
+    const straddle_pos = scan_chunk_size + overlap - 7; // 7 bytes before the window edge
+    @memcpy(content[straddle_pos..][0..tag_straddle.len], tag_straddle);
+    @memcpy(content[content.len - tag_tail.len ..], tag_tail);
+    try tmp.dir.writeFile(io, .{ .sub_path = "scripts/huge_generated.json", .data = content });
+
+    var result = try filterTmp(&tmp, .consumed);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), result.kept.len);
+    try testing.expectEqual(@as(usize, 0), result.elided.len);
+}
+
+test "filterConsumedEvents: a stale generated file in a non-default output dir cannot ratchet events back (#631 CodeRabbit)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Output dir named `out` — NOT `.labelle`, so the basename skip
+    // doesn't catch it. Its stale generated main.zig names one tag as a
+    // kept variant and one inside an elision comment; with the output
+    // dir in the exclusion set (root.zig always adds it now), neither
+    // may count as consumption — otherwise every once-discovered event
+    // is retained forever (self-perpetuating ratchet).
+    try tmp.dir.createDirPath(io, "out/null_desktop");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "out/null_desktop/main.zig",
+        .data =
+        \\pub const PluginEvents = union(enum) {
+        \\    box2d__collision_begin: @import("box2d").Events.collision_begin,
+        \\};
+        \\// elided (no consumer): box2d__collision_end
+        ,
+    });
+
+    var result = try filterTmpExcluding(&tmp, &.{"out"});
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.kept.len);
+    try testing.expectEqual(@as(usize, 2), result.elided.len);
 }
 
 test "filterConsumedEvents: missing scan root is skipped silently" {

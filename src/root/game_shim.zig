@@ -212,6 +212,17 @@ pub fn generateGameShim(
         try w.writeAll(game_shim_prelude);
     }
 
+    if (plugin_events.len == 0 and opts.plugin_events_elided.len > 0) {
+        // Every discovered plugin event was elided (#630, CodeRabbit on
+        // 6ed5fef): no `PluginEvents` decl — matching main.zig's v1
+        // path — but keep the per-event diagnostics so the shim, like
+        // main.zig, explains where the variants went.
+        for (opts.plugin_events_elided) |e| {
+            try w.print("// elided (no consumer): {s}__{s}\n", .{ e.plugin_sanitized, e.event_name });
+        }
+        try w.writeAll("\n");
+    }
+
     if (plugin_events.len > 0 or plugin_flow_nodes.len > 0) {
         // Dispatch through a minimal `Codegen` context so the shim's
         // emission path matches the orchestrator's — `writePluginEventsBlock`
@@ -297,4 +308,23 @@ test "generateGameShim: no allocator leak at any OOM point" {
         }
         try std.testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
     }
+}
+
+test "generateGameShim: all-elided events emit the elision comments without a PluginEvents decl (#630)" {
+    const allocator = std.testing.allocator;
+    const elided = [_]main_zig.PluginEvent{
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
+        .{ .plugin_import_name = "engine", .plugin_sanitized = "engine", .event_name = "tick" },
+    };
+    const shim = try generateGameShim(allocator, &.{}, &.{}, .{
+        .plugin_events_elided = &elided,
+    });
+    defer allocator.free(shim);
+
+    // Diagnostics survive the all-elided case (CodeRabbit on 6ed5fef)…
+    try std.testing.expect(std.mem.indexOf(u8, shim, "// elided (no consumer): box2d__collision_begin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shim, "// elided (no consumer): engine__tick") != null);
+    // …without introducing a PluginEvents decl (matches main.zig's v1
+    // path when every event is elided).
+    try std.testing.expect(std.mem.indexOf(u8, shim, "pub const PluginEvents") == null);
 }
