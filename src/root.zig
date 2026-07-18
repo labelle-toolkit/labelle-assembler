@@ -1855,10 +1855,20 @@ pub fn generate(
     defer force_kept_ungated.deinit(allocator);
     for (plugin_events.entries, ungated_flags) |e, is_ungated| {
         if (!is_ungated) continue;
+        // Order matters (PR #634 review — gemini/codex double-free):
+        // `force_kept_ungated` holds borrowed struct copies (no owned
+        // strings), so append it FIRST. The owned `tag` then has exactly
+        // one owner at every point — the errdefer until its append
+        // succeeds, the `force_consumed_tags` cleanup after. With the
+        // appends in the opposite order, a failing second append would
+        // unwind through BOTH the still-armed errdefer and the list
+        // cleanup: a double free under allocator pressure. (No
+        // FailingAllocator test: the loop lives inline in `generate`,
+        // which can't be driven with an injected allocator.)
+        try force_kept_ungated.append(allocator, e);
         const tag = try std.fmt.allocPrint(allocator, "{s}__{s}", .{ e.plugin_sanitized, e.event_name });
         errdefer allocator.free(tag);
         try force_consumed_tags.append(allocator, tag);
-        try force_kept_ungated.append(allocator, e);
     }
 
     const packs_target = try std.fs.path.join(allocator, &.{ target_dir, "packs" });

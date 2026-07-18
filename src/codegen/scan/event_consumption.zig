@@ -409,6 +409,20 @@ pub const ProviderDir = struct {
 ///   - over-match (the tag written `.tag` in a doc comment) → the
 ///     event is force-kept → safe false positive: one extra kept
 ///     variant, i.e. the pre-#630 behavior for that event;
+///   - over-match, GATED anonymous-literal style (PR #634 review):
+///     `if (@hasField(GameEvents, "prov__ev")) {
+///         game.emit(.{ .prov__ev = ... });
+///     }` also matches — the dot-prefixed literal sits inside a
+///     comptime-false branch Zig never analyzes when the variant is
+///     absent, so this shape WOULD be safely elidable. Same safe
+///     direction: force-kept, i.e. only the elision optimization is
+///     lost for that event. Distinguishing it needs real comptime-flow
+///     analysis (whether the guard's condition dominates the emit),
+///     which is exactly the AST/semantic cleverness this scan
+///     deliberately avoids; no shipped plugin uses the style (box2d
+///     gates via string tags inside its `emitGameEvent` helper — the
+///     dot form never appears). The `in_tree_plugin_src` test fixture
+///     below spells this exact shape;
 ///   - under-match → the exact same loud "no field in union" compile
 ///     error the bug produces today — no NEW failure mode.
 ///
