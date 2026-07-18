@@ -82,13 +82,14 @@ jobs:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           VERSION="${RELEASE_TAG#v}"
+          # Stamp ONLY the assembler's own version (the tag). The cli/core/
+          # engine/gfx scaffold defaults come from build.zig's curated set —
+          # stamping the assembler tag into them scaffolded projects pinned to
+          # nonsense versions like `core_version = "0.91.0"` (labelle-cli#322).
           zig build \
             -Dtarget=${{ matrix.target }} \
             -Doptimize=ReleaseSafe \
-            -Dcli_version="$VERSION" \
-            -Dcore_version="$VERSION" \
-            -Dengine_version="$VERSION" \
-            -Dgfx_version="$VERSION"
+            -Dassembler_version="$VERSION"
 
       - name: Rename binary
         # Windows targets produce `labelle-assembler.exe`; every other target

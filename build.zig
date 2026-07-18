@@ -4,24 +4,27 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const cli_version: []const u8 = b.option([]const u8, "cli_version", "CLI version string") orelse "dev";
+    // CLI version stamped into a freshly scaffolded project.labelle's
+    // `.labelle_version`. Curated WITH the framework trio below (bump
+    // together): it must be a real released CLI version — the release
+    // workflow used to stamp the ASSEMBLER tag into this (and the trio),
+    // scaffolding nonsense pins like `labelle_version = "0.91.0"`
+    // (labelle-cli#322); release builds no longer override any of these.
+    const cli_version: []const u8 = b.option([]const u8, "cli_version", "CLI version string") orelse "1.57.0";
     // Framework version defaults stamped into a freshly scaffolded
     // project.labelle by `init`. These MUST be real, fetchable release
     // versions — a fresh project has to build out of the box. They used to
     // fall back to `cli_version` ("dev" in a non-release build), which the
-    // fetcher then mapped to a bogus `vdev` git ref (issue #159). A release
-    // build of the CLI overrides each with `-D<pkg>_version=`.
+    // fetcher then mapped to a bogus `vdev` git ref (issue #159).
     // Keep this trio a MUTUALLY COMPATIBLE set: a fresh `labelle init` resolves
     // these defaults, so a mismatch fails `labelle build` before any user code.
-    // engine 1.78.0 pins gfx v1.23.0 (test-only) and floors core at v1.24.0;
-    // gfx v1.23.0 in turn pins core v1.24.0 — read straight from those tags'
-    // build.zig.zon. Bump all three together when moving the engine default.
-    // (engine 1.78.0 = current T3 engine; consumes the same
-    // `addEmbeddedTilemapAsset` API T3 prefab tilemaps (assembler#561/#562)
-    // embed against.)
-    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.24.0";
-    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "1.78.0";
-    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.23.0";
+    // Set verified end-to-end (init → generate → full compile) for
+    // core 1.26.0 / engine 2.5.0 / gfx 1.28.1 with cli 1.57.0 (labelle-cli#322).
+    // Bump all three together when moving the engine default (their
+    // build.zig.zon pins/floors must agree — read them from the tags).
+    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.26.0";
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.5.0";
+    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.28.1";
     // Version this assembler binary stamps into a freshly scaffolded
     // project.labelle's `assembler_version` field. Defaults to the
     // package version from build.zig.zon so a release binary pins itself.
