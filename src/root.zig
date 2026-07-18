@@ -464,12 +464,31 @@ pub fn generate(
     // inference below consume the pack atlases unchanged. Additive: with no
     // pack `.resources`, the merged list is byte-identical to the game's, so a
     // project without asset-bearing packs generates identical output. The astc/
-    // rgba texture-path swaps above already ran on the game resources (their
-    // `.astc`/`.rgba` siblings live in the game tree); pack resources ship
-    // prebuilt and ride the plain `.png` path.
+    // rgba texture-path swaps above ran on the game resources only, so the
+    // swaps run AGAIN on the merged list below to cover pack resources —
+    // idempotent for the already-swapped game entries (their `.texture` no
+    // longer ends in `.png`, so both swaps skip them).
     var merged_resources = try pack_resources.mergePackResources(allocator, mutable_resources, resource_entries.items);
     defer merged_resources.deinit();
     cfg.resources = merged_resources.resources;
+
+    // Compression parity for pack-shipped atlases (labelle-cli#315): `labelle
+    // astc` converts pack-declared atlases to co-located `.astc` siblings in
+    // the pack's own assets/ dir (which `processPackAssets` copies wholesale),
+    // so the same existence-checked swap applies — a pack resource rides the
+    // identical compressed path as a game resource. Without this, an ASTC
+    // target embedded pack atlases as raw PNG (cold-start decode cost the
+    // compression epic exists to remove — bit FP's sky pack, FP#618).
+    var pack_astc_allocs = try generate_phases.swapAstcTexturePaths(allocator, io, cfg, merged_resources.resources, game_dir);
+    defer {
+        for (pack_astc_allocs.items) |s| allocator.free(s);
+        pack_astc_allocs.deinit(allocator);
+    }
+    var pack_rgba_allocs = try generate_phases.swapRgbaTexturePaths(allocator, io, merged_resources.resources, game_dir);
+    defer {
+        for (pack_rgba_allocs.items) |s| allocator.free(s);
+        pack_rgba_allocs.deinit(allocator);
+    }
 
     try cwd.createDirPath(io, target_dir);
 
