@@ -131,6 +131,30 @@ fn isSkippedDir(name: []const u8) bool {
     return false;
 }
 
+/// One discovery entry's two search needles, precomputed once per
+/// filter run.
+const Needles = struct {
+    qualified: []const u8, // box2d__collision_begin
+    dotted: []const u8, // box2d.collision_begin
+};
+
+/// Shared state for one `filterConsumedEvents` walk, threaded through
+/// `enterDir` / `scanDir` / `scanFile` instead of six positional params.
+const Walk = struct {
+    allocator: std.mem.Allocator,
+    needles: []const Needles,
+    consumed: []bool,
+    /// Count of not-yet-consumed entries — the walk early-exits at 0.
+    remaining: usize,
+    excluded_canon: []const []const u8,
+    /// Canonical path of every directory already entered. Cycle
+    /// protection for FOLLOWED directory symlinks (#631 codex — a
+    /// symlink loop must terminate), and a harmless dedupe of the POSIX
+    /// `<target>/scripts`-symlink double-scan. Keys are walk-owned
+    /// dupes, freed by `filterConsumedEvents`.
+    visited: std.StringArrayHashMapUnmanaged(void) = .empty,
+};
+
 /// Result of `filterConsumedEvents`. `kept` / `elided` are struct
 /// copies of the caller's entries — the STRINGS inside are still owned
 /// by the source `PluginEvents` list (which must outlive this struct
@@ -211,10 +235,6 @@ pub fn filterConsumedEvents(
 
     // Precompute both needles per entry once — the scan is
     // O(files × unconsumed entries).
-    const Needles = struct {
-        qualified: []const u8, // box2d__collision_begin
-        dotted: []const u8, // box2d.collision_begin
-    };
     const needles = try allocator.alloc(Needles, entries.len);
     var needles_built: usize = 0;
     defer {
@@ -236,11 +256,20 @@ pub fn filterConsumedEvents(
     defer allocator.free(consumed);
     @memset(consumed, false);
 
-    var remaining: usize = entries.len;
+    var walk: Walk = .{
+        .allocator = allocator,
+        .needles = needles,
+        .consumed = consumed,
+        .remaining = entries.len,
+        .excluded_canon = excluded_canon,
+    };
+    defer {
+        for (walk.visited.keys()) |k| allocator.free(k);
+        walk.visited.deinit(allocator);
+    }
     for (scan_roots) |root| {
-        if (remaining == 0) break;
-        if (try isExcludedDir(allocator, root, excluded_canon)) continue;
-        try scanDir(allocator, root, needles, consumed, &remaining, excluded_canon);
+        if (walk.remaining == 0) break;
+        try enterDir(&walk, root);
     }
 
     var kept: std.ArrayList(PluginEvent) = .empty;
@@ -261,25 +290,56 @@ pub fn filterConsumedEvents(
     return .{ .kept = kept_slice, .elided = elided_slice, .allocator = allocator };
 }
 
-/// Recursive walk of one root. Error policy (see file header): a
-/// missing directory (root that doesn't exist, dangling symlink, entry
-/// deleted mid-walk) is skipped silently — nothing on disk means no
-/// consumer to miss. Every OTHER I/O failure propagates loudly with a
-/// pointed diagnostic: an incomplete scan silently treated as "no
-/// consumer" would elide a live subscription and break event delivery.
-fn scanDir(
-    allocator: std.mem.Allocator,
-    dir_path: []const u8,
-    needles: anytype,
-    consumed: []bool,
-    remaining: *usize,
-    excluded_canon: []const []const u8,
-) !void {
+/// Gatekeeper for descending into a directory — a real one, a scan
+/// root, or a FOLLOWED directory symlink. Canonicalizes the path once
+/// and, against the RESOLVED path: applies the excluded-roots check (a
+/// symlink pointing INTO an excluded dependency dir must not smuggle it
+/// back into the corpus), then the visited set (symlink-cycle
+/// protection — and a harmless dedupe of the POSIX `<target>/scripts`
+/// double-scan). A path that fails to canonicalize because nothing is
+/// there (missing root, dangling link, loop) is skipped silently —
+/// provably no content; other failures are loud per the file-header
+/// error policy.
+fn enterDir(walk: *Walk, dir_path: []const u8) anyerror!void {
+    // `anyerror`: enterDir ⇄ scanDir are mutually recursive (a followed
+    // dir symlink re-enters the gate), so one of the pair must break
+    // the inferred-error-set dependency loop with an explicit set.
+    const allocator = walk.allocator;
+    const canon_z = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), dir_path, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FileNotFound, error.NotDir, error.SymLinkLoop => return,
+        else => return scanFailure(dir_path, err),
+    };
+    defer allocator.free(canon_z);
+
+    for (walk.excluded_canon) |ex| {
+        if (std.mem.eql(u8, canon_z, ex)) return;
+    }
+    if (walk.visited.contains(canon_z)) return;
+    {
+        // The map owns its keys (freed by `filterConsumedEvents`) —
+        // dupe to a plain []u8 so the free doesn't hit the [:0]
+        // sentinel-byte size mismatch.
+        const key = try allocator.dupe(u8, canon_z);
+        errdefer allocator.free(key);
+        try walk.visited.put(allocator, key, {});
+    }
+    try scanDir(walk, dir_path);
+}
+
+/// Recursive walk of one directory (callers go through `enterDir`,
+/// which owns the canonical-path gating). Error policy (see file
+/// header): a missing directory (dangling symlink, entry deleted
+/// mid-walk) is skipped silently — nothing on disk means no consumer to
+/// miss. Every OTHER I/O failure propagates loudly with a pointed
+/// diagnostic: an incomplete scan silently treated as "no consumer"
+/// would elide a live subscription and break event delivery.
+fn scanDir(walk: *Walk, dir_path: []const u8) !void {
+    const allocator = walk.allocator;
     const io = config.globalIo();
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        // Missing root / dangling symlink / mid-walk deletion — no
-        // content, no possible false negative. `NotDir` covers a root
-        // path that names a file.
+        // Mid-walk deletion (`enterDir` already screened the path) — no
+        // content, no possible false negative.
         error.FileNotFound, error.NotDir => return,
         else => return scanFailure(dir_path, err),
     };
@@ -287,20 +347,47 @@ fn scanDir(
 
     var it = dir.iterate();
     while (it.next(io) catch |err| return scanFailure(dir_path, err)) |entry| {
-        if (remaining.* == 0) return;
+        if (walk.remaining == 0) return;
         switch (entry.kind) {
             .directory => {
                 if (isSkippedDir(entry.name)) continue;
                 const child = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
                 defer allocator.free(child);
-                if (try isExcludedDir(allocator, child, excluded_canon)) continue;
-                try scanDir(allocator, child, needles, consumed, remaining, excluded_canon);
+                try enterDir(walk, child);
             },
-            .file, .sym_link => {
+            .sym_link => {
+                // A symlinked convention dir (`hooks/` → a real dir
+                // elsewhere) is a fully compiled part of the build —
+                // `scanner.linkAndScan` follows it — so the consumption
+                // walk must follow it too (#631 codex): treating every
+                // symlink as a FILE made such a dir's consumers
+                // invisible and silently elided their events. Resolve
+                // the target's kind and dispatch; `enterDir` re-applies
+                // the excluded-roots check on the RESOLVED path and the
+                // visited set breaks symlink cycles.
+                if (isSkippedDir(entry.name)) continue;
+                const child = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+                defer allocator.free(child);
+                const st = std.Io.Dir.cwd().statFile(io, child, .{}) catch |err| switch (err) {
+                    // Dangling or self-looping link — no reachable
+                    // content, provably no consumer.
+                    error.FileNotFound, error.NotDir, error.SymLinkLoop => continue,
+                    else => return scanFailure(child, err),
+                };
+                switch (st.kind) {
+                    .directory => try enterDir(walk, child),
+                    .file => {
+                        if (!hasScannedExtension(entry.name)) continue;
+                        try scanFile(walk, child);
+                    },
+                    else => {},
+                }
+            },
+            .file => {
                 if (!hasScannedExtension(entry.name)) continue;
                 const child = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
                 defer allocator.free(child);
-                try scanFile(allocator, child, needles, consumed, remaining);
+                try scanFile(walk, child);
             },
             else => {},
         }
@@ -323,19 +410,14 @@ fn scanFailure(path: []const u8, err: anyerror) anyerror {
 /// (`scan_chunk_size`) with an overlap of (longest needle − 1) bytes
 /// carried between windows, so a tag straddling a chunk boundary still
 /// matches — no file size cap (see the file header). A file that no
-/// longer exists (dangling symlink, deleted mid-walk) is skipped:
-/// provably no content to miss. Other open/read failures propagate
-/// loudly via `scanFailure`.
-fn scanFile(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    needles: anytype,
-    consumed: []bool,
-    remaining: *usize,
-) !void {
+/// longer exists (dangling symlink, deleted mid-walk) or self-loops is
+/// skipped: provably no content to miss. Other open/read failures
+/// propagate loudly via `scanFailure`.
+fn scanFile(walk: *Walk, path: []const u8) !void {
+    const allocator = walk.allocator;
     const io = config.globalIo();
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound, error.SymLinkLoop => return,
         else => return scanFailure(path, err),
     };
     defer file.close(io);
@@ -344,7 +426,7 @@ fn scanFile(
     // between two reads is fully contained in the window that holds the
     // carried tail plus the new bytes.
     var max_needle: usize = 0;
-    for (needles) |n| max_needle = @max(max_needle, @max(n.qualified.len, n.dotted.len));
+    for (walk.needles) |n| max_needle = @max(max_needle, @max(n.qualified.len, n.dotted.len));
     if (max_needle == 0) return;
     const overlap = max_needle - 1;
 
@@ -361,44 +443,21 @@ fn scanFile(
         // stream is drained.
         if (n == 0) break;
         const window = buf[0 .. carry + n];
-        for (needles, consumed) |needle, *c| {
+        for (walk.needles, walk.consumed) |needle, *c| {
             if (c.*) continue;
             if (std.mem.indexOf(u8, window, needle.qualified) != null or
                 std.mem.indexOf(u8, window, needle.dotted) != null)
             {
                 c.* = true;
-                remaining.* -= 1;
+                walk.remaining -= 1;
             }
         }
-        if (remaining.* == 0) return;
+        if (walk.remaining == 0) return;
         // Carry the tail into the next window. `copyForwards` is safe:
         // the destination starts at 0, at or before the source start.
         carry = @min(overlap, window.len);
         std.mem.copyForwards(u8, buf[0..carry], window[window.len - carry ..]);
     }
-}
-
-/// Whether `dir_path` names one of the canonicalized excluded roots.
-/// Both sides go through `realpath` so a symlinked layout (or Windows
-/// separators in the joined walk path) can't dodge the comparison. A
-/// directory that fails to canonicalize is NOT excluded — `openDir`
-/// will fail on it anyway, and treating it as excluded could silently
-/// widen the exclusion. Only OOM propagates.
-fn isExcludedDir(
-    allocator: std.mem.Allocator,
-    dir_path: []const u8,
-    excluded_canon: []const []const u8,
-) !bool {
-    if (excluded_canon.len == 0) return false;
-    const canon = std.Io.Dir.cwd().realPathFileAlloc(config.globalIo(), dir_path, allocator) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    defer allocator.free(canon);
-    for (excluded_canon) |ex| {
-        if (std.mem.eql(u8, canon, ex)) return true;
-    }
-    return false;
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -761,6 +820,90 @@ test "filterConsumedEvents: the TESTS-target pass keeps scanning tests/ so the r
     try testing.expectEqual(@as(usize, 1), result.kept.len);
     try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
     try testing.expectEqual(@as(usize, 1), result.elided.len);
+}
+
+test "filterConsumedEvents: a consumer inside a SYMLINKED convention dir is found (dir symlinks followed) (#631 codex)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The game keeps `hooks/` as a symlink to a real dir elsewhere —
+    // `scanner.linkAndScan` follows it and compiles the hook, so the
+    // consumption walk must see the consumer too. Pre-fix the `.sym_link`
+    // entry was treated as a FILE and never descended into.
+    try tmp.dir.createDirPath(io, "real_hooks");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "real_hooks/contact.zig",
+        .data =
+        \\pub fn onEvent(game: anytype, event: anytype) void {
+        \\    switch (event) {
+        \\        .box2d__collision_begin => |e| game.handle(e),
+        \\        else => {},
+        \\    }
+        \\}
+        ,
+    });
+    const real_abs = try tmp.dir.realPathFileAlloc(io, "real_hooks", allocator);
+    defer allocator.free(real_abs);
+    try tmp.dir.symLink(io, real_abs, "hooks", .{ .is_directory = true });
+
+    var result = try filterTmp(&tmp, .consumed);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
+}
+
+test "filterConsumedEvents: a directory-symlink loop terminates (visited-set cycle protection) (#631 codex)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // a/loop → tmp root: following it revisits the root — without the
+    // canonical-path visited set the walk would recurse forever.
+    try tmp.dir.createDirPath(io, "a");
+    const root_abs = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_abs);
+    try tmp.dir.symLink(io, root_abs, "a/loop", .{ .is_directory = true });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "a/consumer.zig",
+        .data = "// subscribes: box2d__collision_end\n",
+    });
+
+    var result = try filterTmp(&tmp, .consumed);
+    defer result.deinit();
+    // Terminates AND still finds the real consumer next to the loop.
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("collision_end", result.kept[0].event_name);
+}
+
+test "filterConsumedEvents: a symlink INTO an excluded dependency root cannot smuggle it back in (#631 codex)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // In-tree plugin source (excluded) with its emit-site tag; the game
+    // also carries `vendored/` → that same plugin dir. The exclusion is
+    // checked against the RESOLVED canonical path, so following the
+    // symlink must not re-admit the dependency source.
+    try tmp.dir.createDirPath(io, "libs/box2d/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "libs/box2d/src/root.zig",
+        .data = in_tree_plugin_src,
+    });
+    const dep_abs = try tmp.dir.realPathFileAlloc(io, "libs/box2d", allocator);
+    defer allocator.free(dep_abs);
+    try tmp.dir.symLink(io, dep_abs, "vendored", .{ .is_directory = true });
+
+    var result = try filterTmpExcluding(&tmp, &.{"libs/box2d"});
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.kept.len);
+    try testing.expectEqual(@as(usize, 2), result.elided.len);
 }
 
 test "filterConsumedEvents: missing scan root is skipped silently" {

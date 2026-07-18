@@ -1641,6 +1641,17 @@ pub fn generate(
     // consumption-independent.
     try scripting_declare.checkGameEventPluginCollisions(event_names, pack_scans.items, plugin_events.entries);
 
+    // Two providers whose sanitized names collide on the same event
+    // (`foo-bar` + `foo_bar`, both declaring `hit` → `foo_bar__hit`
+    // twice — #631 codex): pre-#630 the duplicate union field failed
+    // loudly at the decl; under filtering a source naming only one
+    // dotted form keeps one entry, elides the other, and the elided
+    // plugin's emit gate turns on against the kept plugin's payload.
+    // Gate on the FULL list before the filter, in every mode (`.all`
+    // included — the pointed message beats the raw duplicate-field
+    // compile error it replaces).
+    try scripting_declare.checkDuplicatePluginTags(plugin_events.entries);
+
     // Consumption filter (labelle-assembler#630): fold only CONSUMED
     // events into the generated `PluginEvents` union. Runs AFTER the
     // collision gate above (which must keep seeing the FULL discovery

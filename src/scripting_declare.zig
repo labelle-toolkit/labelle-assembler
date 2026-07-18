@@ -1135,6 +1135,30 @@ pub fn checkGameEventPluginCollisions(
     }
 }
 
+/// Reject two DISCOVERED plugin events that produce the SAME qualified
+/// union tag — two providers whose sanitized names collide (`foo-bar` +
+/// `foo_bar`, both declaring `hit`, → `foo_bar__hit` twice). Pre-#630
+/// both entries always reached the emitted union and Zig rejected the
+/// duplicate field loudly at the decl; with consumption filtering a
+/// source naming only ONE dotted form (`foo-bar.hit`) keeps one entry
+/// and elides the other — no duplicate, no error, and the elided
+/// plugin's `@hasField` emit gate turns ON against the kept plugin's
+/// payload. root.zig runs this on the FULL discovery list BEFORE the
+/// filter, in EVERY mode (`.all` included — the pointed diagnostic is
+/// strictly better than the raw duplicate-field compile error it
+/// replaces). Same virtual-concatenation comparator as the game-event
+/// gate, so `__`-misaligned equal joins (`foo` + `bar__hit` vs
+/// `foo__bar` + `hit`) are caught too.
+pub fn checkDuplicatePluginTags(plugin_events: []const scan.PluginEvent) !void {
+    for (plugin_events, 0..) |a, i| {
+        for (plugin_events[i + 1 ..]) |b| {
+            if (!qualifiedTagEql(a.plugin_sanitized, a.event_name, b.plugin_sanitized, b.event_name)) continue;
+            diag("plugins '{s}' and '{s}' both produce event tag '{s}__{s}' — rename one; sanitized plugin names must be unique", .{ a.plugin_import_name, b.plugin_import_name, a.plugin_sanitized, a.event_name });
+            return error.DuplicatePluginEventTag;
+        }
+    }
+}
+
 /// `a_prefix ++ "__" ++ a_name == b_prefix ++ "__" ++ b_name`, computed
 /// over the VIRTUAL concatenations — no allocation, no fixed-size
 /// format buffer (the silent-skip-on-overflow trap PR #618 flagged),
@@ -2722,6 +2746,45 @@ test "checkGameEventPluginCollisions: a game/pack event spelling a plugin tag ga
     try checkGameEventPluginCollisions(&.{}, &.{other_pack}, &entries);
     // Empty discovery → nothing can collide.
     try checkGameEventPluginCollisions(&.{"box2d__collision_begin"}, &.{}, &.{});
+}
+
+test "checkDuplicatePluginTags: sanitized-name collisions on the same event gate; distinct prefixes with the same event pass" {
+    // The motivating pair (#631 codex): `foo-bar` and `foo_bar` both
+    // sanitize to `foo_bar`, both declare `hit` → identical qualified
+    // tag `foo_bar__hit`. Under filtering, one consumed dotted form
+    // would keep one entry and silently elide the other.
+    const colliding = [_]scan.PluginEvent{
+        .{ .plugin_import_name = "foo-bar", .plugin_sanitized = "foo_bar", .event_name = "hit" },
+        .{ .plugin_import_name = "foo_bar", .plugin_sanitized = "foo_bar", .event_name = "hit" },
+    };
+    try testing.expectError(
+        error.DuplicatePluginEventTag,
+        checkDuplicatePluginTags(&colliding),
+    );
+
+    // Misaligned `__` join: plugin `foo` event `bar__hit` vs plugin
+    // `foo-bar` event `hit` — both spell `foo__bar__hit`. The
+    // virtual-concat comparator catches what a component-wise compare
+    // would miss.
+    const misaligned = [_]scan.PluginEvent{
+        .{ .plugin_import_name = "foo", .plugin_sanitized = "foo", .event_name = "bar__hit" },
+        .{ .plugin_import_name = "foo-bar", .plugin_sanitized = "foo__bar", .event_name = "hit" },
+    };
+    try testing.expectError(
+        error.DuplicatePluginEventTag,
+        checkDuplicatePluginTags(&misaligned),
+    );
+
+    // Same EVENT name under distinct sanitized prefixes is the normal,
+    // legal shape (box2d.hit + physics.hit) — no gate.
+    const distinct = [_]scan.PluginEvent{
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "hit" },
+        .{ .plugin_import_name = "physics", .plugin_sanitized = "physics", .event_name = "hit" },
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "miss" },
+    };
+    try checkDuplicatePluginTags(&distinct);
+    // Empty / single-entry lists trivially pass.
+    try checkDuplicatePluginTags(&.{});
 }
 
 test "semverBelow: parseable pins compare against the floor; local/branch/empty pins satisfy it" {
