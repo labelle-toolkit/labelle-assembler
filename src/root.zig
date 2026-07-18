@@ -464,12 +464,31 @@ pub fn generate(
     // inference below consume the pack atlases unchanged. Additive: with no
     // pack `.resources`, the merged list is byte-identical to the game's, so a
     // project without asset-bearing packs generates identical output. The astc/
-    // rgba texture-path swaps above already ran on the game resources (their
-    // `.astc`/`.rgba` siblings live in the game tree); pack resources ship
-    // prebuilt and ride the plain `.png` path.
+    // rgba texture-path swaps above ran on the game resources only; pack
+    // resources get the same sibling preference right after the merge, probed
+    // against each pack's own SOURCE dir (`preferCompressedPackTextures`).
     var merged_resources = try pack_resources.mergePackResources(allocator, mutable_resources, resource_entries.items);
     defer merged_resources.deinit();
     cfg.resources = merged_resources.resources;
+
+    // Compression parity for pack-shipped atlases (labelle-cli#315): `labelle
+    // astc` converts pack-declared atlases to co-located siblings in the
+    // pack's own assets/ dir, which `processPackAssets` copies wholesale into
+    // the target — so preferring an existing sibling here always yields a
+    // resolvable `@embedFile` path. Probes each pack's SOURCE dir (not
+    // game_dir: `@libs/…`, `local:…` and cached external packs live outside
+    // the game tree). Without this, an ASTC target embedded pack atlases as
+    // raw PNG — the cold-start decode cost the compression epic exists to
+    // remove (bit FP's sky pack, FP#618).
+    try pack_resources.preferCompressedPackTextures(
+        allocator,
+        io,
+        &merged_resources,
+        mutable_resources.len,
+        resource_entries.items,
+        game_dir,
+        cfg.asset_compression.formatFor(cfg.platform) == .astc,
+    );
 
     try cwd.createDirPath(io, target_dir);
 
