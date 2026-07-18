@@ -78,6 +78,16 @@ pub threadlocal var pack_scans: []const scan.PackScan = &.{};
 /// `.plugin_events = .all` projects).
 pub threadlocal var plugin_events_elided: []const scan.PluginEvent = &.{};
 
+/// Force-kept ungated-emit plugin events (#630 follow-up) — subset of
+/// the kept `plugin_events` whose provider emits with raw union
+/// literals (`scan.detectUngatedEmits`), threaded the same
+/// scoped-threadlocal way as `plugin_events_elided` so
+/// `writePluginEventsBlock` can emit one
+/// `// force-kept (provider emits ungated): <tag>` comment per entry.
+/// Empty (the default) → byte-identical emission for every caller that
+/// never filters.
+pub threadlocal var plugin_events_force_kept: []const scan.PluginEvent = &.{};
+
 /// Embedded-tilemap registrations (T2 Phase 4, tilemap epic). Each entry
 /// becomes one `addEmbeddedTilemapAsset("<key>", @embedFile("<embed_path>"))`
 /// call in the generated `init()` — the scene-referenced `.tmx` documents
@@ -240,6 +250,9 @@ pub fn generateMainZigFromTemplate(
         // set by root.zig. Empty for every caller that never filters, so
         // those emit no elision comments (byte-identical output).
         .plugin_events_elided = plugin_events_elided,
+        // Force-kept ungated-emit events (#630 follow-up) — same
+        // module-level-var threading as the elided list above.
+        .plugin_events_force_kept = plugin_events_force_kept,
         // Packs (RFC §4, #439) — read from the module-level var set by
         // root.zig. Defaults to empty so every existing call site (tests,
         // preview) keeps its exact pre-pack emission.

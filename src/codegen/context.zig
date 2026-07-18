@@ -99,6 +99,17 @@ pub const Codegen = struct {
     // emits byte-identical output.
     plugin_events_elided: []const PluginEvent = &.{},
 
+    // Force-kept ungated-emit plugin events (#630 follow-up). A subset
+    // of `plugin_events` (force-kept entries are always kept): entries
+    // whose PROVIDER emits the tag with a raw union literal
+    // (`scan.detectUngatedEmits`), so eliding it would break the
+    // provider's own compile. `writePluginEventsBlock` emits one
+    // `// force-kept (provider emits ungated): <tag>` comment per entry
+    // so an unconsumed-but-kept variant is explainable from the
+    // generated file. Borrowed; empty by default (byte-identical output
+    // for every caller that never filters).
+    plugin_events_force_kept: []const PluginEvent = &.{},
+
     // Pack dir-scan results (Packs RFC §4, labelle-assembler#439). Borrowed;
     // owned by `root.zig`. Empty by default so every caller that never sets
     // it (tests, preview) keeps its exact pre-pack registry emission. The

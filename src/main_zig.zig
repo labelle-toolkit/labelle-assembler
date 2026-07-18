@@ -62,6 +62,12 @@ pub const discoverPluginEvents = scan.discoverPluginEvents;
 /// `PluginEvents`) and elided (no consumer found) entries.
 pub const EventConsumption = scan.EventConsumption;
 pub const filterConsumedEvents = scan.filterConsumedEvents;
+/// Ungated-emit force-keep (#630 follow-up): providers that emit with
+/// raw union literals (labelle-pathfinding) break when their tag is
+/// elided — detect them and feed `filterConsumedEvents`'s
+/// `force_consumed` set.
+pub const ProviderDir = scan.ProviderDir;
+pub const detectUngatedEmits = scan.detectUngatedEmits;
 pub const discoverPluginFlowDecls = scan.discoverPluginFlowDecls;
 pub const collectPromotedScripts = scan.collectPromotedScripts;
 pub const freePromotedScripts = scan.freePromotedScripts;

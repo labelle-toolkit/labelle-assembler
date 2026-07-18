@@ -65,6 +65,8 @@ pub const discoverPluginEvents = plugin_events.discoverPluginEvents;
 // ── Plugin-event consumption filter (scan/event_consumption.zig) ─────
 pub const EventConsumption = event_consumption.EventConsumption;
 pub const filterConsumedEvents = event_consumption.filterConsumedEvents;
+pub const ProviderDir = event_consumption.ProviderDir;
+pub const detectUngatedEmits = event_consumption.detectUngatedEmits;
 
 // ── FlowNodes / PinStyles / Coercions discovery (scan/flow_decls.zig) ─
 pub const PluginFlowNode = flow_decls.PluginFlowNode;

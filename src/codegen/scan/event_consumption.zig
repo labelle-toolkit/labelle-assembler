@@ -79,6 +79,16 @@
 //! still scanned, so cross-plugin consumption via shipped scripts keeps
 //! working — only the plugin's own module source is excluded, exactly
 //! like a published plugin (whose cache dir was never a scan root).
+//!
+//! ── Ungated-emit force-keep (#630 follow-up) ─────────────────────────
+//!
+//! A provider that emits with raw union literals
+//! (`game.emit(.{ .pathfinder__node_removed = ... })`) instead of a
+//! `@hasField`-gated helper does not tolerate elision: its own source
+//! stops compiling (`no field named ... in union`). `detectUngatedEmits`
+//! scans each provider's own dir for its own tags in dot-prefixed form;
+//! the caller feeds the matches into `force_consumed` so they are never
+//! elided (see the fn docs for the discriminator + risk profile).
 
 const std = @import("std");
 const config = @import("../../config.zig");
@@ -136,7 +146,11 @@ fn isSkippedDir(name: []const u8) bool {
 }
 
 /// One discovery entry's two search needles, precomputed once per
-/// filter run.
+/// filter run. Either field may be EMPTY, meaning that form is skipped
+/// (`scanFile` guards on `.len != 0` — `std.mem.indexOf` of "" would
+/// match everywhere). The consumer pass fills both; the ungated-emit
+/// provider pass (`detectUngatedEmits`) fills only `qualified` with the
+/// dot-prefixed form (`.box2d__collision_begin`).
 const Needles = struct {
     qualified: []const u8, // box2d__collision_begin
     dotted: []const u8, // box2d.collision_begin
@@ -355,6 +369,137 @@ pub fn filterConsumedEvents(
     errdefer allocator.free(kept_slice);
     const elided_slice = try elided.toOwnedSlice(allocator);
     return .{ .kept = kept_slice, .elided = elided_slice, .allocator = allocator };
+}
+
+/// One event PROVIDER's resolved module directory, input to
+/// `detectUngatedEmits`. `import_name` is the key discovery stamped on
+/// its entries (`PluginEvent.plugin_import_name` — the `project.labelle`
+/// plugin name, or the literal `engine` for the engine pass); `dir` is
+/// the resolved package/module root `discoverPluginEvents` walked.
+pub const ProviderDir = struct {
+    import_name: []const u8,
+    dir: []const u8,
+};
+
+/// Detect which discovered events their own PROVIDER emits *ungated*
+/// (labelle-assembler#630 follow-up — the flying-platform breakage on
+/// v0.93.0).
+///
+/// #631's consumption filter assumed every plugin emits through a
+/// comptime-gated helper (`@hasField(GameEvents, "<tag>")` — box2d's
+/// `emitGameEvent`, the engine's `emitEngineEvent`) where an elided
+/// variant folds the emit to a no-op. labelle-pathfinding instead
+/// emits with raw anonymous union literals —
+/// `game.emit(.{ .pathfinder__node_removed = .{ ... } })` — so eliding
+/// the variant makes the PLUGIN SOURCE itself fail to compile
+/// (`no field named 'pathfinder__node_removed' in union`) and breaks
+/// `labelle build` for the whole game. Such tags must never be elided:
+/// the caller feeds them into `filterConsumedEvents`'s
+/// `force_consumed` set.
+///
+/// Discriminator: scan each provider's own resolved dir for the
+/// provider's OWN qualified tags in DOT-PREFIXED form — the needle is
+/// `"." ++ "<plugin>__<event>"`. The ungated union/enum-literal form
+/// always spells that (`.pathfinder__node_removed`); the gated form
+/// names the tag only inside string literals
+/// (`"box2d__collision_begin"`), never with a leading dot.
+///
+/// Heuristic risk profile (a byte-before check, deliberately NOT a
+/// tokenizer or AST walk):
+///   - over-match (the tag written `.tag` in a doc comment) → the
+///     event is force-kept → safe false positive: one extra kept
+///     variant, i.e. the pre-#630 behavior for that event;
+///   - over-match, GATED anonymous-literal style (PR #634 review):
+///     `if (@hasField(GameEvents, "prov__ev")) {
+///         game.emit(.{ .prov__ev = ... });
+///     }` also matches — the dot-prefixed literal sits inside a
+///     comptime-false branch Zig never analyzes when the variant is
+///     absent, so this shape WOULD be safely elidable. Same safe
+///     direction: force-kept, i.e. only the elision optimization is
+///     lost for that event. Distinguishing it needs real comptime-flow
+///     analysis (whether the guard's condition dominates the emit),
+///     which is exactly the AST/semantic cleverness this scan
+///     deliberately avoids; no shipped plugin uses the style (box2d
+///     gates via string tags inside its `emitGameEvent` helper — the
+///     dot form never appears). The `in_tree_plugin_src` test fixture
+///     below spells this exact shape;
+///   - under-match → the exact same loud "no field in union" compile
+///     error the bug produces today — no NEW failure mode.
+///
+/// Per-provider scoping: provider A's dir is searched for A's tags
+/// only. Another provider's tags appearing there (cross-plugin
+/// consumers, docs) must NOT force-keep those — that would recreate
+/// the emit-site false-consumption problem #631's dependency-root
+/// exclusion fixed.
+///
+/// Same walk machinery, eligible-extension set, skipped-dir list, and
+/// streamed chunk scan as the consumer pass; the needle carries its
+/// leading dot, so the chunk-overlap math (longest needle − 1) covers
+/// the dot-prefix check with no special case. Each provider dir is
+/// walked once with only that provider's needles. A dir that doesn't
+/// resolve/exist contributes nothing (same tolerance as discovery).
+///
+/// Returns a caller-owned bool slice parallel to `entries`: `true` =
+/// the provider emits this tag ungated.
+pub fn detectUngatedEmits(
+    allocator: std.mem.Allocator,
+    entries: []const PluginEvent,
+    providers: []const ProviderDir,
+) ![]bool {
+    const ungated = try allocator.alloc(bool, entries.len);
+    errdefer allocator.free(ungated);
+    @memset(ungated, false);
+
+    for (providers) |provider| {
+        // This provider's own entries (usually all contiguous, but keep
+        // it order-independent).
+        var idxs: std.ArrayList(usize) = .empty;
+        defer idxs.deinit(allocator);
+        for (entries, 0..) |e, i| {
+            if (std.mem.eql(u8, e.plugin_import_name, provider.import_name)) {
+                try idxs.append(allocator, i);
+            }
+        }
+        if (idxs.items.len == 0) continue;
+
+        // One dot-prefixed needle per entry; `dotted` stays empty (the
+        // consumer pass's dotted form has no meaning at an emit site).
+        const needles = try allocator.alloc(Needles, idxs.items.len);
+        var needles_built: usize = 0;
+        defer {
+            for (needles[0..needles_built]) |n| allocator.free(n.qualified);
+            allocator.free(needles);
+        }
+        for (idxs.items, 0..) |entry_idx, j| {
+            const e = entries[entry_idx];
+            const dot_tag = try std.fmt.allocPrint(allocator, ".{s}__{s}", .{ e.plugin_sanitized, e.event_name });
+            needles[j] = .{ .qualified = dot_tag, .dotted = "" };
+            needles_built = j + 1;
+        }
+
+        const found = try allocator.alloc(bool, idxs.items.len);
+        defer allocator.free(found);
+        @memset(found, false);
+
+        var walk: Walk = .{
+            .allocator = allocator,
+            .needles = needles,
+            .consumed = found,
+            .remaining = idxs.items.len,
+            .excluded_canon = &.{},
+            .allowed_canon = &.{},
+        };
+        defer {
+            for (walk.visited.keys()) |k| allocator.free(k);
+            walk.visited.deinit(allocator);
+        }
+        try enterDir(&walk, provider.dir, false);
+
+        for (idxs.items, found) |entry_idx, f| {
+            if (f) ungated[entry_idx] = true;
+        }
+    }
+    return ungated;
 }
 
 /// Gatekeeper for descending into a directory — a real one, a scan
@@ -607,8 +752,10 @@ fn scanFile(walk: *Walk, path: []const u8) !void {
         const window = buf[0 .. carry + n];
         for (walk.needles, walk.consumed) |needle, *c| {
             if (c.*) continue;
-            if (std.mem.indexOf(u8, window, needle.qualified) != null or
-                std.mem.indexOf(u8, window, needle.dotted) != null)
+            // Empty needle = that form is unused for this entry (the
+            // ungated-emit pass has no dotted form) — never a match.
+            if ((needle.qualified.len != 0 and std.mem.indexOf(u8, window, needle.qualified) != null) or
+                (needle.dotted.len != 0 and std.mem.indexOf(u8, window, needle.dotted) != null))
             {
                 c.* = true;
                 walk.remaining -= 1;
@@ -1256,4 +1403,214 @@ test "filterConsumedEvents: missing scan root is skipped silently" {
     defer result.deinit();
     try testing.expectEqual(@as(usize, 0), result.kept.len);
     try testing.expectEqual(@as(usize, 2), result.elided.len);
+}
+
+// ── Ungated-emit force-keep (#630 follow-up) ─────────────────────────
+
+/// Two-event provider list for the `detectUngatedEmits` fixtures.
+const ungated_test_entries = [_]PluginEvent{
+    .{ .plugin_import_name = "prov", .plugin_sanitized = "prov", .event_name = "ev" },
+    .{ .plugin_import_name = "prov", .plugin_sanitized = "prov", .event_name = "other" },
+};
+
+fn detectTmp(tmp: *testing.TmpDir, providers: []const struct { name: []const u8, sub: []const u8 }, entries: []const PluginEvent) ![]bool {
+    const allocator = testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    var dirs_buf: [4]ProviderDir = undefined;
+    std.debug.assert(providers.len <= dirs_buf.len);
+    var n: usize = 0;
+    defer for (dirs_buf[0..n]) |p| allocator.free(p.dir);
+    for (providers) |p| {
+        dirs_buf[n] = .{
+            .import_name = p.name,
+            .dir = try std.fs.path.join(allocator, &.{ root, p.sub }),
+        };
+        n += 1;
+    }
+    return detectUngatedEmits(allocator, entries, dirs_buf[0..n]);
+}
+
+test "detectUngatedEmits: dot-prefixed union-literal emit in the provider's own source flags the tag (#630 follow-up)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The pathfinder shape: a raw anonymous union literal, no
+    // `@hasField` gate — eliding `prov__ev` would break this compile.
+    try tmp.dir.createDirPath(io, "prov/src/nav");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "prov/src/nav/controller.zig",
+        .data =
+        \\pub fn removeNode(game: anytype, node_id: u32) void {
+        \\    game.emit(.{ .prov__ev = .{ .node_id = node_id } });
+        \\}
+        ,
+    });
+
+    const flags = try detectTmp(&tmp, &.{.{ .name = "prov", .sub = "prov" }}, &ungated_test_entries);
+    defer testing.allocator.free(flags);
+    try testing.expectEqual(true, flags[0]);
+    try testing.expectEqual(false, flags[1]);
+}
+
+test "detectUngatedEmits: string-literal (gated) reference does not flag — box2d-style elision benefit preserved" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The gated shape: the tag appears only inside string literals
+    // (`@hasField` / `@unionInit`), never dot-prefixed. Elision stays
+    // available for it.
+    try tmp.dir.createDirPath(io, "prov/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "prov/src/root.zig",
+        .data =
+        \\pub fn emitEv(game: anytype, payload: anytype) void {
+        \\    if (@hasField(@TypeOf(game.*).GameEvents, "prov__ev")) {
+        \\        game.emit(@unionInit(@TypeOf(game.*).GameEvents, "prov__ev", payload));
+        \\    }
+        \\}
+        ,
+    });
+
+    const flags = try detectTmp(&tmp, &.{.{ .name = "prov", .sub = "prov" }}, &ungated_test_entries);
+    defer testing.allocator.free(flags);
+    try testing.expectEqual(false, flags[0]);
+    try testing.expectEqual(false, flags[1]);
+}
+
+test "detectUngatedEmits: dot-prefixed occurrence inside a doc comment flags (documented safe over-match)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Byte-before-is-'.' is deliberately not a tokenizer: a doc comment
+    // spelling `.prov__ev` over-matches, which force-KEEPS the variant —
+    // the safe direction (pre-#630 behavior for that one event).
+    try tmp.dir.createDirPath(io, "prov/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "prov/src/root.zig",
+        .data =
+        \\/// Fires `.prov__ev` when a node vanishes.
+        \\pub fn removeNode() void {}
+        ,
+    });
+
+    const flags = try detectTmp(&tmp, &.{.{ .name = "prov", .sub = "prov" }}, &ungated_test_entries);
+    defer testing.allocator.free(flags);
+    try testing.expectEqual(true, flags[0]);
+    try testing.expectEqual(false, flags[1]);
+}
+
+test "detectUngatedEmits: another provider's tag in the dir does not flag it (per-provider scoping)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Provider A's source references provider B's tag dot-prefixed (a
+    // cross-plugin consumer/emit site). B's dir has no such reference.
+    // Only A's OWN tags may be flagged from A's dir — anything else
+    // recreates the #631 emit-site false-consumption problem.
+    try tmp.dir.createDirPath(io, "prova/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "prova/src/root.zig",
+        .data =
+        \\pub fn onEvent(game: anytype, event: anytype) void {
+        \\    switch (event) {
+        \\        .provb__ev => |e| game.handle(e),
+        \\        else => {},
+        \\    }
+        \\}
+        ,
+    });
+    try tmp.dir.createDirPath(io, "provb/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "provb/src/root.zig",
+        .data = "pub const Events = struct { pub const ev = struct {} };",
+    });
+
+    const entries = [_]PluginEvent{
+        .{ .plugin_import_name = "prova", .plugin_sanitized = "prova", .event_name = "ev" },
+        .{ .plugin_import_name = "provb", .plugin_sanitized = "provb", .event_name = "ev" },
+    };
+    const flags = try detectTmp(&tmp, &.{
+        .{ .name = "prova", .sub = "prova" },
+        .{ .name = "provb", .sub = "provb" },
+    }, &entries);
+    defer testing.allocator.free(flags);
+    try testing.expectEqual(false, flags[0]);
+    try testing.expectEqual(false, flags[1]);
+}
+
+test "detectUngatedEmits: missing provider dir contributes nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const flags = try detectTmp(&tmp, &.{.{ .name = "prov", .sub = "does_not_exist" }}, &ungated_test_entries);
+    defer testing.allocator.free(flags);
+    try testing.expectEqual(false, flags[0]);
+    try testing.expectEqual(false, flags[1]);
+}
+
+test "detectUngatedEmits + filterConsumedEvents: ungated tag with no consumer anywhere is force-kept end-to-end (#630 follow-up)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // In-tree provider emitting `prov__ev` ungated; the game itself
+    // never names either tag. `prov__ev` must survive via the force
+    // set; `prov__other` (declared, never referenced) is still elided —
+    // the box2d-style benefit is preserved for gated/unused tags.
+    try tmp.dir.createDirPath(io, "libs/prov/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "libs/prov/src/root.zig",
+        .data =
+        \\pub fn removeNode(game: anytype, node_id: u32) void {
+        \\    game.emit(.{ .prov__ev = .{ .node_id = node_id } });
+        \\}
+        ,
+    });
+    try tmp.dir.createDirPath(io, "scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/idle.zig",
+        .data = "pub fn idle() void {}",
+    });
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const prov_dir = try std.fs.path.join(allocator, &.{ root, "libs", "prov" });
+    defer allocator.free(prov_dir);
+
+    const flags = try detectUngatedEmits(
+        allocator,
+        &ungated_test_entries,
+        &.{.{ .import_name = "prov", .dir = prov_dir }},
+    );
+    defer allocator.free(flags);
+
+    var force_tags: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (force_tags.items) |t| allocator.free(t);
+        force_tags.deinit(allocator);
+    }
+    for (ungated_test_entries, flags) |e, is_ungated| {
+        if (!is_ungated) continue;
+        const tag = try std.fmt.allocPrint(allocator, "{s}__{s}", .{ e.plugin_sanitized, e.event_name });
+        errdefer allocator.free(tag);
+        try force_tags.append(allocator, tag);
+    }
+
+    // The provider dir is an excluded dependency root, exactly like the
+    // real wiring — the force set, not the text scan, must carry it.
+    var result = try filterConsumedEvents(
+        allocator,
+        &ungated_test_entries,
+        &.{root},
+        &.{prov_dir},
+        force_tags.items,
+        .consumed,
+    );
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("ev", result.kept[0].event_name);
+    try testing.expectEqual(@as(usize, 1), result.elided.len);
+    try testing.expectEqualStrings("other", result.elided[0].event_name);
 }
