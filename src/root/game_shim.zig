@@ -174,6 +174,13 @@ pub const GameShimOptions = struct {
     /// `is_tests_target` is set, to pick `@import("ecs_backend")` (real
     /// adapter) vs `engine.MockEcsBackend(u32)`.
     ecs: config.EcsChoice = .mock,
+    /// Discovered-but-unconsumed plugin events (labelle-assembler#630).
+    /// The `plugin_events` positional arg carries only the CONSUMED
+    /// entries; this list carries the elided remainder so the shim's
+    /// `PluginEvents` block stays byte-identical to main.zig's
+    /// (including the `// elided (no consumer): <tag>` comments).
+    /// Defaults empty for callers that never filter.
+    plugin_events_elided: []const main_zig.PluginEvent = &.{},
 };
 
 pub fn generateGameShim(
@@ -230,6 +237,7 @@ pub fn generateGameShim(
             .plugin_flow_nodes = plugin_flow_nodes,
             .plugin_pin_styles = &.{},
             .plugin_coercions = &.{},
+            .plugin_events_elided = opts.plugin_events_elided,
         };
         if (plugin_events.len > 0) try ctx.writePluginEventsBlock(w);
         // Gap 1 — surface `PluginFlowNodes` so flow files'

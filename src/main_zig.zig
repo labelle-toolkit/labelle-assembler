@@ -57,6 +57,11 @@ pub const PromotedScript = scan.PromotedScript;
 /// pack's components/events/prefabs into the unified game-root registries.
 pub const PackScan = scan.PackScan;
 pub const discoverPluginEvents = scan.discoverPluginEvents;
+/// Consumption filter for discovered plugin events (labelle-assembler#630):
+/// partitions the discovery list into consumed (folded into the generated
+/// `PluginEvents`) and elided (no consumer found) entries.
+pub const EventConsumption = scan.EventConsumption;
+pub const filterConsumedEvents = scan.filterConsumedEvents;
 pub const discoverPluginFlowDecls = scan.discoverPluginFlowDecls;
 pub const collectPromotedScripts = scan.collectPromotedScripts;
 pub const freePromotedScripts = scan.freePromotedScripts;

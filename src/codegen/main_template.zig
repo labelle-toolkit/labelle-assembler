@@ -66,6 +66,18 @@ pub threadlocal var lifecycle_override: ?manifest_v2.BackendManifestV2.PlatformE
 /// every registry block emits its exact pre-pack shape.
 pub threadlocal var pack_scans: []const scan.PackScan = &.{};
 
+/// Discovered-but-unconsumed plugin events (labelle-assembler#630). The
+/// `plugin_events` positional arg carries only the CONSUMED entries;
+/// this list carries the elided remainder so `writePluginEventsBlock`
+/// emits one `// elided (no consumer): <tag>` comment per dropped
+/// variant. `root.zig` sets this immediately before the
+/// `generateMainZigFromTemplate` call and clears it after — same
+/// scoped-threadlocal pattern as `pack_scans`, kept off the ~19-arg
+/// generator signature. Empty (the default) → byte-identical emission
+/// for every caller that never filters (tests, preview,
+/// `.plugin_events = .all` projects).
+pub threadlocal var plugin_events_elided: []const scan.PluginEvent = &.{};
+
 /// Embedded-tilemap registrations (T2 Phase 4, tilemap epic). Each entry
 /// becomes one `addEmbeddedTilemapAsset("<key>", @embedFile("<embed_path>"))`
 /// call in the generated `init()` — the scene-referenced `.tmx` documents
@@ -224,6 +236,10 @@ pub fn generateMainZigFromTemplate(
         .plugin_flow_nodes = plugin_flow_nodes,
         .plugin_pin_styles = plugin_pin_styles,
         .plugin_coercions = plugin_coercions,
+        // Elided plugin events (#630) — read from the module-level var
+        // set by root.zig. Empty for every caller that never filters, so
+        // those emit no elision comments (byte-identical output).
+        .plugin_events_elided = plugin_events_elided,
         // Packs (RFC §4, #439) — read from the module-level var set by
         // root.zig. Defaults to empty so every existing call site (tests,
         // preview) keeps its exact pre-pack emission.

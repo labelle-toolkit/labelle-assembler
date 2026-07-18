@@ -88,6 +88,17 @@ pub const Codegen = struct {
     plugin_pin_styles: []const PluginPinStyle,
     plugin_coercions: []const PluginCoercion,
 
+    // Discovered-but-unconsumed plugin events (labelle-assembler#630).
+    // `plugin_events` above carries only the CONSUMED entries (the
+    // filter in `root.zig:generate` runs `scan.filterConsumedEvents`
+    // before codegen); this list carries the elided remainder so
+    // `writePluginEventsBlock` can emit one
+    // `// elided (no consumer): <tag>` comment per dropped variant for
+    // debuggability. Borrowed; empty by default so every caller that
+    // never filters (tests, preview, `.plugin_events = .all` projects)
+    // emits byte-identical output.
+    plugin_events_elided: []const PluginEvent = &.{},
+
     // Pack dir-scan results (Packs RFC §4, labelle-assembler#439). Borrowed;
     // owned by `root.zig`. Empty by default so every caller that never sets
     // it (tests, preview) keeps its exact pre-pack registry emission. The

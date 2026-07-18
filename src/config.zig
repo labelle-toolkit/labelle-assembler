@@ -174,6 +174,21 @@ pub const AssetCompression = struct {
 pub const GamepadSource = enum { auto, none };
 pub const EcsChoice = enum { mock, zig_ecs, zflecs, mr_ecs };
 
+/// Plugin-event folding policy (labelle-assembler#630).
+///
+/// - `.consumed` (default): fold a discovered `<plugin>__<event>` variant
+///   into the generated `PluginEvents` union only when something in the
+///   project actually references it (see
+///   `scan.filterConsumedEvents` — conservative text scan over game
+///   sources, flows, and staged plugin/pack files). Unconsumed variants
+///   are elided, flipping the plugins' comptime `@hasField(GameEvents,
+///   tag)` emit gates to zero-cost-when-unused.
+/// - `.all`: restore the unconditional pre-#630 folding — every
+///   discovered event becomes a variant whether or not anything
+///   subscribes. Escape hatch for projects that reference event tags in
+///   ways the text scan cannot see (e.g. runtime-built strings).
+pub const PluginEventsMode = enum { consumed, all };
+
 /// CLI version — injected from root build.zig via build options.
 pub const CLI_VERSION = @import("build_options").cli_version;
 
@@ -698,6 +713,10 @@ pub const ProjectConfig = struct {
     /// no hitch. Set `true` only when you need Switch raw-HID decode and accept
     /// the connect stall. No effect when `gamepad = .none`.
     gamepad_hidapi: bool = false,
+    /// Plugin-event folding policy (labelle-assembler#630). `.consumed`
+    /// (default) folds only events something in the project references —
+    /// see `PluginEventsMode`; `.all` restores unconditional folding.
+    plugin_events: PluginEventsMode = .consumed,
     /// GUI plugin reference — parsed from project.labelle.
     /// null means no GUI (StubGui injected).
     gui: ?GuiPlugin = null,

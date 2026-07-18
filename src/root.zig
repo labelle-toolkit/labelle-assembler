@@ -1629,6 +1629,34 @@ pub fn generate(
         try scripting_declare.checkEventPluginCollisions(s.declared_events, plugin_events.entries);
     }
 
+    // Consumption filter (labelle-assembler#630): fold only CONSUMED
+    // events into the generated `PluginEvents` union. Runs AFTER the
+    // collision gate above (which must keep seeing the FULL discovery
+    // list so error behavior is consumption-independent) and BEFORE the
+    // shim + main.zig emission below (both consume the same filtered
+    // list). Scan roots: the game dir (hooks, scripts, flows — both the
+    // `.flow.jsonc` sources' dotted refs and any committed generated
+    // sidecars' qualified tags), plus the staged `<target>/scripts`
+    // (plugin-shipped scripts, copied above — a symlink to the game's
+    // `scripts/` on POSIX, a real copy on Windows) and `<target>/packs`
+    // (staged pack hooks/components from published packs that don't
+    // live in the game tree). The staged deps tree is deliberately NOT
+    // scanned — plugin/engine SOURCE mentions its own tags at the emit
+    // sites, which would mark everything consumed and void the filter.
+    // The elided remainder is threaded to `writePluginEventsBlock` for
+    // the `// elided (no consumer): <tag>` debug comments. Struct-copy
+    // semantics: both lists borrow their strings from
+    // `plugin_events.entries` (deinited once, above), so no double free.
+    const packs_target = try std.fs.path.join(allocator, &.{ target_dir, "packs" });
+    defer allocator.free(packs_target);
+    var event_consumption = try main_zig.filterConsumedEvents(
+        allocator,
+        plugin_events.entries,
+        &.{ game_dir, scripts_target, packs_target },
+        cfg.plugin_events,
+    );
+    defer event_consumption.deinit();
+
     // Emit the `game.zig` shim — a tiny re-export module that surfaces
     // `Game` and `EntityId` so generated flow files at
     // `scripts/flows/*.zig` can `@import("game")`. See
@@ -1642,9 +1670,10 @@ pub fn generate(
     // `plugin_flow_decls.flow_nodes` was discovered ABOVE the flow scan
     // (root.zig §flow discovery). Thread it in so the shim's
     // `PluginFlowNodes` block (Gap 1) matches the one main.zig emits.
-    const game_shim = try generateGameShim(allocator, plugin_events.entries, plugin_flow_decls.flow_nodes, .{
+    const game_shim = try generateGameShim(allocator, event_consumption.kept, plugin_flow_decls.flow_nodes, .{
         .is_tests_target = is_tests_target,
         .ecs = cfg.ecs,
+        .plugin_events_elided = event_consumption.elided,
     });
     defer allocator.free(game_shim);
     try scanner.writeFile(target_dir, "game.zig", game_shim);
@@ -1757,6 +1786,10 @@ pub fn generate(
             hook_names,
             merged_entries,
             plugin_flow_decls.flow_nodes,
+            // FULL discovery list, not the #630-filtered subset: the
+            // sidecar is a discoverability catalog ("what exists to
+            // subscribe to") — an agent adding the FIRST consumer of an
+            // event must still be able to find it here.
             plugin_events.entries,
             manifest_packs,
         ) catch |err| {
@@ -1817,6 +1850,16 @@ pub fn generate(
         defer main_zig.main_template.scripting_splice = null;
         main_zig.main_template.scripting_splice = maybe_scripting;
 
+        // Elided plugin events (#630) — same scoped pattern. The
+        // positional `plugin_events` arg below carries only the CONSUMED
+        // entries (`event_consumption.kept`); this threads the elided
+        // remainder so `writePluginEventsBlock` emits its per-variant
+        // `// elided (no consumer)` comments. Empty for `.all`-mode
+        // projects and projects whose events are all consumed, so their
+        // main.zig is byte-identical.
+        defer main_zig.main_template.plugin_events_elided = &.{};
+        main_zig.main_template.plugin_events_elided = event_consumption.elided;
+
         const main_zig_content = try main_zig.generateMainZigFromTemplate(
             allocator,
             engine_template,
@@ -1837,7 +1880,9 @@ pub fn generate(
             view_names,
             gizmo_names,
             animation_names,
-            plugin_events.entries,
+            // Consumed subset only (#630) — the full discovery list stays
+            // with the collision gate + manifest sidecar above.
+            event_consumption.kept,
             plugin_flow_decls.flow_nodes,
             plugin_flow_decls.pin_styles,
             plugin_flow_decls.coercions,
