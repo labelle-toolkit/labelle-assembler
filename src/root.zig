@@ -1749,6 +1749,33 @@ pub fn generate(
         try excluded_dep_roots.append(allocator, dep_dir);
     }
 
+    // Force-kept RUNTIME channels (#631 codex): tags whose consumers
+    // register at runtime rather than in authored text, so the scan
+    // structurally cannot prove non-consumption. Survey result (engine
+    // origin/main + assembler codegen seams): exactly ONE such channel
+    // exists today —
+    //
+    //   `engine__editor_plugin_command` (labelle-engine#729, editor-
+    //   contract v1.7 / bridge v1.8, script contract v1.2): the studio's
+    //   panel actions and script-language `labelle_plugin_call` wrappers
+    //   dispatch through the engine's `editor_plugin_command` bridge
+    //   export, which `emitSync`s this variant
+    //   (`src/game/editor_command_mixin.zig` in labelle-engine).
+    //   Handlers register by RUNTIME subscription (script-contract subs)
+    //   or by plugin hooks whose module source this scan deliberately
+    //   excludes as a dependency emit-site — no game-authored text need
+    //   ever name the tag. Force-kept UNCONDITIONALLY (not just for
+    //   editor-preview builds): the script `plugin_call` channel works
+    //   on every platform, presence-detection of panels/handlers at
+    //   generate time is unreliable, and one kept `emitSync`-only
+    //   variant has zero steady-state cost — vs silently dead studio
+    //   panels. Every other engine event (input/lifecycle families) is
+    //   delivered to authored hooks/flows/scripts and stays under the
+    //   text scan.
+    const force_consumed_tags = [_][]const u8{
+        "engine__editor_plugin_command",
+    };
+
     const packs_target = try std.fs.path.join(allocator, &.{ target_dir, "packs" });
     defer allocator.free(packs_target);
     var event_consumption = try main_zig.filterConsumedEvents(
@@ -1756,6 +1783,7 @@ pub fn generate(
         plugin_events.entries,
         &.{ game_dir, scripts_target, packs_target },
         excluded_dep_roots.items,
+        &force_consumed_tags,
         cfg.plugin_events,
     );
     defer event_consumption.deinit();

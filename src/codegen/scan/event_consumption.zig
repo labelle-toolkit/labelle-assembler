@@ -165,6 +165,15 @@ const Walk = struct {
     visited: std.StringArrayHashMapUnmanaged(void) = .empty,
 };
 
+/// Whether `tag` spells exactly `e.plugin_sanitized ++ "__" ++
+/// e.event_name` — slice-wise, no format buffer.
+fn entryHasQualifiedTag(e: PluginEvent, tag: []const u8) bool {
+    if (tag.len != e.plugin_sanitized.len + 2 + e.event_name.len) return false;
+    if (!std.mem.startsWith(u8, tag, e.plugin_sanitized)) return false;
+    if (tag[e.plugin_sanitized.len] != '_' or tag[e.plugin_sanitized.len + 1] != '_') return false;
+    return std.mem.eql(u8, tag[e.plugin_sanitized.len + 2 ..], e.event_name);
+}
+
 /// Result of `filterConsumedEvents`. `kept` / `elided` are struct
 /// copies of the caller's entries — the STRINGS inside are still owned
 /// by the source `PluginEvents` list (which must outlive this struct
@@ -203,6 +212,16 @@ pub const EventConsumption = struct {
 /// consumption via shipped scripts keeps working; only the module source
 /// is skipped, same as a published plugin's cache dir.
 ///
+/// `force_consumed`: qualified tags (`engine__editor_plugin_command`)
+/// that are ALWAYS treated as consumed, regardless of what the text
+/// scan finds. These are the RUNTIME-subscribed channels (#631 codex):
+/// their handlers register at runtime (script-contract subscriptions,
+/// plugin comptime hooks whose module source is deliberately excluded
+/// as an emit-site), so no authored game text need ever name the tag —
+/// the scan structurally cannot prove non-consumption for them. Each
+/// entry in the caller's list documents where the runtime subscription
+/// lives.
+///
 /// The returned struct borrows the entry STRINGS from `entries` (see
 /// `EventConsumption`); the caller keeps ownership of the source list.
 pub fn filterConsumedEvents(
@@ -210,6 +229,7 @@ pub fn filterConsumedEvents(
     entries: []const PluginEvent,
     scan_roots: []const []const u8,
     excluded_roots: []const []const u8,
+    force_consumed: []const []const u8,
     mode: config.PluginEventsMode,
 ) !EventConsumption {
     if (mode == .all or entries.len == 0) {
@@ -287,11 +307,24 @@ pub fn filterConsumedEvents(
     defer allocator.free(consumed);
     @memset(consumed, false);
 
+    // Force-kept runtime channels are consumed before the walk starts —
+    // and when they cover the whole discovery list the walk is skipped
+    // entirely (`remaining == 0`).
+    var remaining: usize = entries.len;
+    for (entries, consumed) |e, *c| {
+        for (force_consumed) |tag| {
+            if (!entryHasQualifiedTag(e, tag)) continue;
+            c.* = true;
+            remaining -= 1;
+            break;
+        }
+    }
+
     var walk: Walk = .{
         .allocator = allocator,
         .needles = needles,
         .consumed = consumed,
-        .remaining = entries.len,
+        .remaining = remaining,
         .excluded_canon = excluded_canon,
         .allowed_canon = allowed_canon,
     };
@@ -301,7 +334,9 @@ pub fn filterConsumedEvents(
     }
     for (scan_roots) |root| {
         if (walk.remaining == 0) break;
-        try enterDir(&walk, root);
+        // Scan roots are never themselves `scripts/flows` (they are the
+        // game dir and the staged `<target>/scripts` / `<target>/packs`).
+        try enterDir(&walk, root, false);
     }
 
     var kept: std.ArrayList(PluginEvent) = .empty;
@@ -334,7 +369,7 @@ pub fn filterConsumedEvents(
 /// because nothing is there (missing root, dangling link, loop) is
 /// skipped silently — provably no content; other failures are loud per
 /// the file-header error policy.
-fn enterDir(walk: *Walk, dir_path: []const u8) anyerror!void {
+fn enterDir(walk: *Walk, dir_path: []const u8, in_flows: bool) anyerror!void {
     // `anyerror`: enterDir ⇄ scanDir are mutually recursive (a followed
     // dir symlink re-enters the gate), so one of the pair must break
     // the inferred-error-set dependency loop with an explicit set.
@@ -356,7 +391,7 @@ fn enterDir(walk: *Walk, dir_path: []const u8) anyerror!void {
         errdefer allocator.free(key);
         try walk.visited.put(allocator, key, {});
     }
-    try scanDir(walk, dir_path);
+    try scanDir(walk, dir_path, in_flows);
 }
 
 /// The closed-form exclusion predicate, longest-match allow/deny over
@@ -424,7 +459,7 @@ fn isOrUnder(canon: []const u8, root: []const u8) bool {
 /// miss. Every OTHER I/O failure propagates loudly with a pointed
 /// diagnostic: an incomplete scan silently treated as "no consumer"
 /// would elide a live subscription and break event delivery.
-fn scanDir(walk: *Walk, dir_path: []const u8) !void {
+fn scanDir(walk: *Walk, dir_path: []const u8, in_flows: bool) !void {
     const allocator = walk.allocator;
     const io = config.globalIo();
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -443,7 +478,7 @@ fn scanDir(walk: *Walk, dir_path: []const u8) !void {
                 if (isSkippedDir(entry.name)) continue;
                 const child = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
                 defer allocator.free(child);
-                try enterDir(walk, child);
+                try enterDir(walk, child, in_flows or isFlowsDir(dir_path, entry.name));
             },
             .sym_link => {
                 // A symlinked convention dir (`hooks/` → a real dir
@@ -465,9 +500,10 @@ fn scanDir(walk: *Walk, dir_path: []const u8) !void {
                     else => return scanFailure(child, err),
                 };
                 switch (st.kind) {
-                    .directory => try enterDir(walk, child),
+                    .directory => try enterDir(walk, child, in_flows or isFlowsDir(dir_path, entry.name)),
                     .file => {
                         if (!hasScannedExtension(entry.name)) continue;
+                        if (in_flows and try isOrphanFlowSidecar(allocator, dir_path, entry.name)) continue;
                         try scanFile(walk, child);
                     },
                     else => {},
@@ -475,6 +511,7 @@ fn scanDir(walk: *Walk, dir_path: []const u8) !void {
             },
             .file => {
                 if (!hasScannedExtension(entry.name)) continue;
+                if (in_flows and try isOrphanFlowSidecar(allocator, dir_path, entry.name)) continue;
                 const child = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
                 defer allocator.free(child);
                 try scanFile(walk, child);
@@ -482,6 +519,41 @@ fn scanDir(walk: *Walk, dir_path: []const u8) !void {
             else => {},
         }
     }
+}
+
+/// Whether descending from `parent_dir` into child dir `child_name`
+/// enters the flow-sidecar convention dir — `scripts/flows` (RFC
+/// FLOWS-JSONC §5). Basename comparisons only, so this is
+/// path-separator agnostic; matches both the game dir's `scripts/flows`
+/// and the staged `<target>/scripts` root's `flows` child (that root's
+/// basename is `scripts`).
+fn isFlowsDir(parent_dir: []const u8, child_name: []const u8) bool {
+    return std.mem.eql(u8, child_name, "flows") and
+        std.mem.eql(u8, std.fs.path.basename(parent_dir), "scripts");
+}
+
+/// Orphan-sidecar rule (#631 codex): inside `scripts/flows/**`, a
+/// `<stem>.zig` is the GENERATED sidecar of `<stem>.flow.jsonc`
+/// (`flow_scanner.scanAndEmit` writes `<rel_stem>.zig` next to its
+/// source and never prunes) — so a `.zig` with NO sibling
+/// `<stem>.flow.jsonc` is a stale leftover of a removed/renamed flow,
+/// and its qualified tags would keep DEAD events alive forever. Skip
+/// it. Paired sidecars stay in the corpus (harmless — their tags are
+/// redundant with the source's dotted `OnEvent` refs). By the RFC
+/// FLOWS-JSONC §5 convention `scripts/flows` holds only flow sources
+/// and their emitted sidecars (authors .gitignore the emitted files),
+/// so an unpaired `.zig` there is a stale sidecar, not a hand-authored
+/// consumer. Flow-scanner-side pruning of orphans is a known adjacent
+/// gap, tracked separately.
+fn isOrphanFlowSidecar(allocator: std.mem.Allocator, dir_path: []const u8, file_name: []const u8) !bool {
+    if (!std.mem.endsWith(u8, file_name, ".zig")) return false;
+    const stem = file_name[0 .. file_name.len - ".zig".len];
+    const source_name = try std.fmt.allocPrint(allocator, "{s}.flow.jsonc", .{stem});
+    defer allocator.free(source_name);
+    const source_path = try std.fs.path.join(allocator, &.{ dir_path, source_name });
+    defer allocator.free(source_path);
+    std.Io.Dir.cwd().access(config.globalIo(), source_path, .{}) catch return true;
+    return false;
 }
 
 /// Print the pointed loud-failure diagnostic and propagate `err`. The
@@ -574,7 +646,7 @@ fn filterTmp(tmp: *testing.TmpDir, mode: config.PluginEventsMode) !EventConsumpt
     const allocator = testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
-    return filterConsumedEvents(allocator, &test_entries, &.{root}, &.{}, mode);
+    return filterConsumedEvents(allocator, &test_entries, &.{root}, &.{}, &.{}, mode);
 }
 
 /// Same as `filterTmp` but with `sub_paths` (relative to the tmp root)
@@ -593,7 +665,7 @@ fn filterTmpExcluding(tmp: *testing.TmpDir, sub_paths: []const []const u8) !Even
         excluded_buf[n] = try std.fs.path.join(allocator, &.{ root, sub });
         n += 1;
     }
-    return filterConsumedEvents(allocator, &test_entries, &.{root}, excluded_buf[0..n], .consumed);
+    return filterConsumedEvents(allocator, &test_entries, &.{root}, excluded_buf[0..n], &.{}, .consumed);
 }
 
 test "filterConsumedEvents: qualified tag in a .zig hook keeps the event; unreferenced sibling is elided" {
@@ -732,7 +804,7 @@ test "filterConsumedEvents: engine-pass entry matches the dotted `engine.<event>
     const allocator = testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
-    var result = try filterConsumedEvents(allocator, &engine_entries, &.{root}, &.{}, .consumed);
+    var result = try filterConsumedEvents(allocator, &engine_entries, &.{root}, &.{}, &.{}, .consumed);
     defer result.deinit();
     try testing.expectEqual(@as(usize, 1), result.kept.len);
     try testing.expectEqualStrings("tick", result.kept[0].event_name);
@@ -1082,6 +1154,7 @@ test "filterConsumedEvents: an explicit scan root INSIDE the excluded output dir
         &test_entries,
         &.{ root, packs_root },
         &.{out_dir},
+        &.{},
         .consumed,
     );
     defer result.deinit();
@@ -1093,12 +1166,90 @@ test "filterConsumedEvents: an explicit scan root INSIDE the excluded output dir
     try testing.expectEqualStrings("collision_end", result.elided[0].event_name);
 }
 
+test "filterConsumedEvents: a force-kept runtime channel survives with NO textual mention anywhere (#631 codex)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Panel-bearing shape: nothing in the project names the tag — the
+    // handler registers at RUNTIME (script-contract sub / plugin hook in
+    // an excluded module source). The force list must keep it.
+    try tmp.dir.createDirPath(io, "scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/idle.zig",
+        .data = "pub fn idle() void {}",
+    });
+
+    const entries = [_]PluginEvent{
+        .{ .plugin_import_name = "engine", .plugin_sanitized = "engine", .event_name = "editor_plugin_command" },
+        .{ .plugin_import_name = "engine", .plugin_sanitized = "engine", .event_name = "tick" },
+    };
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var result = try filterConsumedEvents(
+        allocator,
+        &entries,
+        &.{root},
+        &.{},
+        &.{"engine__editor_plugin_command"},
+        .consumed,
+    );
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("editor_plugin_command", result.kept[0].event_name);
+    try testing.expectEqual(@as(usize, 1), result.elided.len);
+    try testing.expectEqualStrings("tick", result.elided[0].event_name);
+}
+
+test "filterConsumedEvents: an ORPHANED flow sidecar (no sibling .flow.jsonc) cannot ratchet dead events (#631 codex)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `scripts/flows/dead.zig` is the stale generated sidecar of a
+    // removed flow — no `dead.flow.jsonc` beside it. Its qualified tag
+    // must not count as consumption.
+    try tmp.dir.createDirPath(io, "scripts/flows");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/flows/dead.zig",
+        .data = "// generated flow handler for box2d__collision_begin\n",
+    });
+
+    var result = try filterTmp(&tmp, .consumed);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.kept.len);
+    try testing.expectEqual(@as(usize, 2), result.elided.len);
+}
+
+test "filterConsumedEvents: a PAIRED flow sidecar stays in the corpus (#631 codex)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `live.zig` has its `live.flow.jsonc` source beside it — a current
+    // sidecar. The tag lives ONLY in the sidecar here (the source uses
+    // no Event node reference) to isolate the pairing rule.
+    try tmp.dir.createDirPath(io, "scripts/flows");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/flows/live.flow.jsonc",
+        .data = "{ \"nodes\": [] }",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/flows/live.zig",
+        .data = "// generated flow handler for box2d__collision_end\n",
+    });
+
+    var result = try filterTmp(&tmp, .consumed);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("collision_end", result.kept[0].event_name);
+}
+
 test "filterConsumedEvents: missing scan root is skipped silently" {
     const allocator = testing.allocator;
     var result = try filterConsumedEvents(
         allocator,
         &test_entries,
         &.{"/definitely/not/a/real/path/for/this/test"},
+        &.{},
         &.{},
         .consumed,
     );
