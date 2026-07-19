@@ -133,14 +133,20 @@ pub fn isSupportedLanguage(name: []const u8) bool {
 }
 
 /// Shape check for a script-language NAME (labelle-assembler#619): a plain
-/// lowercase identifier — `[a-z][a-z0-9_]*`. This is the one constraint the
-/// assembler's codegen genuinely imposes on ANY language, row-declared or
-/// built-in: the generated build.zig passes the language to the plugin as an
-/// enum literal (`.language = .<name>` — `build_files/build_zig.zig`), so
-/// the name must be a valid bare Zig identifier. Manifest-load `requires_
-/// language` validation and `resolveProjectLanguage` reject on SHAPE only;
-/// the real vocabulary check (frozen set ∪ manifest rows) runs where the
-/// declaring plugin's manifest is in hand (`validateDeclaredLanguage`).
+/// lowercase identifier — `[a-z][a-z0-9_]*` — that is ALSO a valid bare Zig
+/// enum-literal spelling. This is the one constraint the assembler's codegen
+/// genuinely imposes on ANY language, row-declared or built-in: the
+/// generated build.zig passes the language to the plugin as an enum literal
+/// (`.language = .<name>` — `build_files/build_zig.zig`), so a name that is
+/// a Zig KEYWORD (`error`, `fn`, `test`, `and`, …) passes the char-class
+/// check yet renders `.language = .error` — a syntax error in the generated
+/// build. Rejecting keywords HERE turns that downstream compile failure into
+/// a pointed generate/manifest-load diagnostic (codex #643 P2). (Primitives
+/// like `i32` need NOT be rejected: `.i32` is a legal enum literal — only
+/// keywords break the syntax.) Manifest-load `requires_language`/row-name
+/// validation and `resolveProjectLanguage` reject on this SHAPE; the real
+/// vocabulary check (frozen set ∪ manifest rows) runs where the declaring
+/// plugin's manifest is in hand (`validateDeclaredLanguage`).
 pub fn isLanguageIdentifier(name: []const u8) bool {
     if (name.len == 0) return false;
     if (name[0] < 'a' or name[0] > 'z') return false;
@@ -150,6 +156,9 @@ pub fn isLanguageIdentifier(name: []const u8) bool {
             else => return false,
         }
     }
+    // A keyword spells an invalid enum literal (`.error`, `.fn`) — the
+    // compiler's own tokenizer table, so it can never drift.
+    if (std.zig.Token.keywords.has(name)) return false;
     return true;
 }
 
@@ -193,6 +202,17 @@ pub const Vocabulary = struct {
     /// row must not brick every consumer of the manifest — the selected
     /// language's row still fails loudly through `validateDeclaredLanguage`
     /// when it was the skipped one). Extensions are dot-normalized copies.
+    ///
+    /// SHADOW-MERGE (codex #643 P2): when a row names a FROZEN built-in
+    /// (a migrated manifest carrying, say, a `typescript` row), the built-in
+    /// metadata is not dropped — the frozen `scriptExtensions` set is UNIONED
+    /// into the row's extensions (row extensions first, deduped) so a
+    /// typescript row declaring authored `.ts` keeps the frozen `.js` (the
+    /// emitted extension the scan must still see). Row fields win where
+    /// present; the built-in fills the rest. (The full splice/declare/
+    /// transpile metadata — `TSC_PLATFORMS`, staging geometry — is read
+    /// directly from the manifest `LanguageRow` by the splice, not through
+    /// this policy-side projection.)
     pub fn build(allocator: std.mem.Allocator, inputs: []const RowInput) !Vocabulary {
         var rows: std.ArrayList(RowLanguage) = .empty;
         errdefer {
@@ -202,27 +222,43 @@ pub const Vocabulary = struct {
         for (inputs) |in| {
             if (!isLanguageIdentifier(in.name)) {
                 std.log.warn(
-                    "labelle: ignoring manifest .languages row \"{s}\" — not a plain lowercase identifier",
+                    "labelle: ignoring manifest .languages row \"{s}\" — not a plain lowercase identifier (or a reserved word)",
                     .{in.name},
                 );
                 continue;
             }
             const name = try allocator.dupe(u8, in.name);
             errdefer allocator.free(name);
-            var exts = try allocator.alloc([]const u8, in.extensions.len);
-            var ext_len: usize = 0;
+
+            // The frozen built-in's extensions, unioned in when this row
+            // shadows a built-in — so a migrated row never LOSES a
+            // built-in-known extension (typescript's emitted `.js`).
+            const frozen: []const []const u8 =
+                if (isSupportedLanguage(in.name)) scriptExtensions(in.name) else &.{};
+
+            var exts: std.ArrayList([]const u8) = .empty;
             errdefer {
-                for (exts[0..ext_len]) |e| allocator.free(e);
-                allocator.free(exts);
+                for (exts.items) |e| allocator.free(e);
+                exts.deinit(allocator);
             }
+            // Row extensions first (authoritative order), then any frozen
+            // extension the row didn't already list (deduped).
             for (in.extensions) |ext| {
-                exts[ext_len] = if (ext.len > 0 and ext[0] == '.')
+                const dotted = if (ext.len > 0 and ext[0] == '.')
                     try allocator.dupe(u8, ext)
                 else
                     try std.fmt.allocPrint(allocator, ".{s}", .{ext});
-                ext_len += 1;
+                errdefer allocator.free(dotted);
+                try exts.append(allocator, dotted);
             }
-            try rows.append(allocator, .{ .name = name, .extensions = exts });
+            for (frozen) |ext| {
+                const already = for (exts.items) |have| {
+                    if (std.mem.eql(u8, have, ext)) break true;
+                } else false;
+                if (already) continue;
+                try exts.append(allocator, try allocator.dupe(u8, ext));
+            }
+            try rows.append(allocator, .{ .name = name, .extensions = try exts.toOwnedSlice(allocator) });
         }
         return .{ .rows = try rows.toOwnedSlice(allocator), .allocator = allocator };
     }
@@ -512,24 +548,25 @@ pub fn scanUnitLanguageDirs(
     declared: ?DeclaredLanguage,
     vocab: *const Vocabulary,
 ) !void {
-    // The policing set (#619): the frozen built-ins (a manifest row naming
-    // a frozen language SHADOWS it — rows are primary, so the row's
-    // extension set polices) followed by the manifest rows. Row languages
-    // never had a legacy per-language dir (they postdate the scripts/
-    // convention), so their `dir` is their own name — which the
-    // misplaced-dir trap below skips (dir == name) and the legacy walk
-    // treats exactly like every language whose legacy dir is its name.
+    // The policing set (#619): every frozen built-in (KEEPING its legacy-dir
+    // mapping — `legacyDir`; a manifest row that SHADOWS a built-in is not
+    // dropped, its extensions are already unioned into `vocab.extensionsOf`,
+    // so typescript keeps `.js`+`.ts` AND its `ts/` legacy dir), followed by
+    // the PURE-row languages (those the frozen tables never heard of). Row
+    // languages postdate the scripts/ convention, so their `dir` is their own
+    // name — the misplaced-dir trap below skips it (dir == name) and the
+    // legacy walk treats it like any language whose legacy dir is its name.
     var langs: std.ArrayList(ScanLang) = .empty;
     defer langs.deinit(allocator);
     for (SUPPORTED_LANGUAGES) |lang| {
-        if (vocab.rowFor(lang) != null) continue;
         try langs.append(allocator, .{
             .name = lang,
-            .extensions = scriptExtensions(lang),
+            .extensions = vocab.extensionsOf(lang), // union when shadowed
             .dir = legacyDir(lang),
         });
     }
     for (vocab.rows) |r| {
+        if (isSupportedLanguage(r.name)) continue; // already covered as a built-in above
         try langs.append(allocator, .{ .name = r.name, .extensions = r.extensions, .dir = r.name });
     }
 
@@ -922,7 +959,7 @@ test "Vocabulary.build: dot-normalizes extensions, rows shadow frozen names, sha
     try testing.expect(vocab.isKnown("lua"));
 }
 
-test "isLanguageIdentifier: lowercase identifier shape" {
+test "isLanguageIdentifier: lowercase identifier shape, keywords rejected (#643 P2)" {
     try testing.expect(isLanguageIdentifier("python"));
     try testing.expect(isLanguageIdentifier("csharp2"));
     try testing.expect(isLanguageIdentifier("my_lang"));
@@ -932,6 +969,45 @@ test "isLanguageIdentifier: lowercase identifier shape" {
     try testing.expect(!isLanguageIdentifier("_priv"));
     try testing.expect(!isLanguageIdentifier("c-sharp"));
     try testing.expect(!isLanguageIdentifier("c sharp"));
+    // Zig keywords spell invalid enum literals (`.language = .error`), so
+    // they are rejected up front, not left to a downstream build failure.
+    try testing.expect(!isLanguageIdentifier("error"));
+    try testing.expect(!isLanguageIdentifier("fn"));
+    try testing.expect(!isLanguageIdentifier("test"));
+    try testing.expect(!isLanguageIdentifier("and"));
+    try testing.expect(!isLanguageIdentifier("comptime"));
+    // A primitive is NOT a keyword — `.i32` is a legal enum literal, so it
+    // stays admissible (only keywords break the syntax).
+    try testing.expect(isLanguageIdentifier("i32"));
+}
+
+test "Vocabulary.build: a row shadowing a built-in UNIONS the frozen extensions — built-in metadata is not dropped (#643 P2)" {
+    const allocator = testing.allocator;
+    // typescript's frozen extensions are `.js` (emitted) + `.ts` (authored).
+    // A migrated manifest declares only the authored `.ts`; the frozen `.js`
+    // must survive so the scan still sees emitted sources.
+    var vocab = try Vocabulary.build(allocator, &.{
+        .{ .name = "typescript", .extensions = &.{".ts"} },
+    });
+    defer vocab.deinit();
+
+    const exts = vocab.extensionsOf("typescript");
+    var has_ts = false;
+    var has_js = false;
+    for (exts) |e| {
+        if (std.mem.eql(u8, e, ".ts")) has_ts = true;
+        if (std.mem.eql(u8, e, ".js")) has_js = true;
+    }
+    try testing.expect(has_ts); // row's authored ext
+    try testing.expect(has_js); // frozen ext preserved (the metadata #643 flagged)
+    // Row order is authoritative: the declared `.ts` comes first.
+    try testing.expectEqualStrings(".ts", exts[0]);
+    // No duplication when the row already lists a frozen ext.
+    var vocab2 = try Vocabulary.build(allocator, &.{
+        .{ .name = "typescript", .extensions = &.{ ".ts", ".js" } },
+    });
+    defer vocab2.deinit();
+    try testing.expectEqual(@as(usize, 2), vocab2.extensionsOf("typescript").len);
 }
 
 test "resolveProjectLanguage: the enum-literal bag spelling (.lua) resolves — and its vocabulary is checked (#591 P2)" {

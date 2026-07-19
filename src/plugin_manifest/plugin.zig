@@ -493,6 +493,40 @@ pub fn loadFromDir(
         }
     }
 
+    // ── Validate `.languages` capability rows (#619) ──
+    // Structural floor every row must meet, checked at LOAD with the plugin
+    // named (not a downstream compile/silent-elision failure — codex #643
+    // P2). This is NOT the forward-compat "only the selected row validates
+    // strictly" rule: that governs unknown capability KEYS (handled by the
+    // manifest-wide `ignore_unknown_fields`); `.name` safety and a non-empty
+    // `.extensions` are REQUIRED fields of the row shape itself.
+    //   1. `.name` — a valid enum-literal language identifier: the generated
+    //      build.zig emits `.language = .<name>`, so a Zig keyword (`error`)
+    //      or a non-`[a-z][a-z0-9_]*` name would render invalid code.
+    //   2. `.extensions` — non-empty: the shared-dir + plugin-event
+    //      consumption scans find a language's sources BY EXTENSION, so an
+    //      extensionless row would silently elide every source it declares.
+    for (parsed.languages) |row| {
+        if (!language_policy.isLanguageIdentifier(row.name)) {
+            std.debug.print(
+                "labelle: plugin '{s}' declares a `.languages` row named \"{s}\"\n" ++
+                    "  which is not a valid language identifier ([a-z][a-z0-9_]*, and not a Zig keyword)\n" ++
+                    "  — it would emit an invalid `.language = .{s}` in the generated build.\n  at {s}\n",
+                .{ expected_name, row.name, row.name, manifest_path },
+            );
+            return error.PluginManifestInvalidLanguageRow;
+        }
+        if (row.extensions.len == 0) {
+            std.debug.print(
+                "labelle: plugin '{s}' declares a `.languages` row for \"{s}\" with no `.extensions`\n" ++
+                    "  — the assembler finds a language's sources by extension, so an extensionless\n" ++
+                    "  row would silently ignore every file it declares. Add at least one, e.g. .extensions = .{{ \".{s}\" }}.\n  at {s}\n",
+                .{ expected_name, row.name, row.name, manifest_path },
+            );
+            return error.PluginManifestInvalidLanguageRow;
+        }
+    }
+
     // ── Parse + validate `.params_schema` (#591) ──
     // A dedicated STRICT walk over the raw source: the typed parse above
     // deliberately ignores the key (manifest-wide forward compat — an older
@@ -1218,6 +1252,82 @@ test "loadFromDir: parses .consumes_events (#633)" {
     try testing.expectEqual(@as(usize, 2), manifest.consumes_events.len);
     try testing.expectEqualStrings("pathfinding.path_found", manifest.consumes_events[0]);
     try testing.expectEqualStrings("box2d__collision_begin", manifest.consumes_events[1]);
+}
+
+test "loadFromDir: a .languages row named after a Zig keyword is rejected at load (#619/#643 P2)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `error` is a valid `[a-z]+` shape but a Zig keyword — the generated
+    // `.language = .error` would be a syntax error, so reject at load with
+    // the plugin named, not as a downstream compile failure.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "error", .extensions = .{".err"}, .kind = .embedded },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    try testing.expectError(
+        error.PluginManifestInvalidLanguageRow,
+        loadFromDir(testing.allocator, tmp_path, "scripting"),
+    );
+}
+
+test "loadFromDir: a .languages row with no .extensions is rejected at load (#619/#643 P2)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // An extensionless row would silently elide every source it declares
+    // (the scans find sources by extension) — reject at load with a pointed
+    // diagnostic.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "ruby", .kind = .embedded },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    try testing.expectError(
+        error.PluginManifestInvalidLanguageRow,
+        loadFromDir(testing.allocator, tmp_path, "scripting"),
+    );
+}
+
+test "loadFromDir: a well-formed .languages row (safe name + extensions) loads (#619)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "zephyr", .extensions = .{".zy"}, .kind = .embedded },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "scripting")).?;
+    defer manifest.deinit();
+    try testing.expectEqual(@as(usize, 1), manifest.languages.len);
+    try testing.expectEqualStrings("zephyr", manifest.languages[0].name);
+    try testing.expectEqualStrings(".zy", manifest.languages[0].extensions[0]);
 }
 
 test "loadFromDir: parses requires_language (#584)" {
