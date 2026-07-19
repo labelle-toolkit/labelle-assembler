@@ -153,6 +153,29 @@ pub const LanguageRow = struct {
     stage_subdir: ?[]const u8 = null,
     declare: ?DeclareCapability = null,
     transpile: ?TranspileCapability = null,
+    /// RUNTIME-OUTPUT capability (labelle-assembler#619, migrated from
+    /// #644's `language == "csharp"` decision): true when this language's
+    /// link-less `.language_builds` outputs ARE the runtime payload — a
+    /// host LOADS them at runtime (the CoreCLR/hostfxr contract), nothing is
+    /// linked. When set (and the plugin is the scripting plugin, and every
+    /// step is link-less), the generated build.zig stages the publish
+    /// `{cache}` beside the installed exe and points the run step's
+    /// assembly-dir env at it (`scripting_csharp.stagesRuntimeOutputs` +
+    /// `build_zig.zig`). A future runtime-loaded language declares this in
+    /// its row — zero assembler changes. Frozen fallback: csharp
+    /// (`scripting_csharp.frozenRuntimeOutput`), for the shipped csharp
+    /// manifest that predates this capability. Default false → byte-identical.
+    runtime_output: bool = false,
+    /// TOOLCHAIN-PROBE opt-in (labelle-assembler#619, migrated from #644's
+    /// csharp-scoped `ensureStepToolsOnPath` call): true when the assembler
+    /// should PATH-probe this language's selected `.language_builds` argv[0]s
+    /// at generate and fail pointedly on a missing tool (a `dotnet`/SDK
+    /// absence surfaces here, not as an opaque child-spawn error mid-`zig
+    /// build`). Opt-IN because rust/crystal steps predate the probe and the
+    /// cross-generate `.os` seam can legitimately select a host-absent tool.
+    /// Frozen fallback: csharp (`scripting_csharp.frozenProbeTools`). Default
+    /// false → byte-identical (no probe).
+    probe_tools: bool = false,
 };
 
 /// Parsed and validated `plugin.labelle` manifest.
@@ -654,6 +677,55 @@ test "ZonManifest: parses manifest with no convention_dirs" {
 
     try testing.expectEqualStrings("marker_only", parsed.name);
     try testing.expectEqual(@as(usize, 0), parsed.convention_dirs.len);
+}
+
+test "ZonManifest: parses a .languages row with runtime_output + probe_tools capabilities (#619, migrated from #644 csharp)" {
+    // A native row that DECLARES the runtime-output-staging + toolchain-probe
+    // capabilities — the row-driven replacement for #644's `language ==
+    // "csharp"` decisions. A future runtime-loaded language ships exactly
+    // this shape and stages with zero assembler changes.
+    const src =
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "csharp", .extensions = .{".cs"}, .kind = .native,
+        \\           .module_root = "Game.cs", .stage_subdir = "native-csharp/src/game",
+        \\           .runtime_output = true, .probe_tools = true },
+        \\    },
+        \\}
+    ;
+    const src_z = try testing.allocator.dupeZ(u8, src);
+    defer testing.allocator.free(src_z);
+
+    const parsed = try std.zon.parse.fromSliceAlloc(ZonManifest, testing.allocator, src_z, null, .{});
+    defer std.zon.parse.free(testing.allocator, parsed);
+
+    const row = parsed.languages[0];
+    try testing.expect(row.runtime_output);
+    try testing.expect(row.probe_tools);
+    // Absence defaults to false (byte-identical for every row-less language).
+    try testing.expectEqual(LanguageKind.native, row.kind);
+}
+
+test "ZonManifest: a .languages row omitting runtime_output/probe_tools defaults them false (#619)" {
+    const src =
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "lua", .extensions = .{".lua"}, .kind = .embedded },
+        \\    },
+        \\}
+    ;
+    const src_z = try testing.allocator.dupeZ(u8, src);
+    defer testing.allocator.free(src_z);
+
+    const parsed = try std.zon.parse.fromSliceAlloc(ZonManifest, testing.allocator, src_z, null, .{});
+    defer std.zon.parse.free(testing.allocator, parsed);
+
+    try testing.expect(!parsed.languages[0].runtime_output);
+    try testing.expect(!parsed.languages[0].probe_tools);
 }
 
 test "ZonManifest: parses a .languages row with a declare capability (rev 17)" {

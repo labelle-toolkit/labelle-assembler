@@ -54,6 +54,7 @@ const plugin_manifest = @import("plugin_manifest.zig");
 const scanner = @import("scanner.zig");
 const script_scanner = @import("script_scanner.zig");
 const scripting_declare = @import("scripting_declare.zig");
+const scripting_csharp = @import("scripting_csharp.zig");
 
 /// The resolved `plugin.labelle` name that identifies THE scripting plugin
 /// (labelle-toolkit/labelle-scripting ships `.name = "scripting"`). Manifest
@@ -325,6 +326,26 @@ pub const ScriptingSplice = struct {
     /// `stageNativeSources` reads them instead of a frozen-table lookup.
     module_root: ?[]const u8 = null,
     stage_subdir: ?[]const u8 = null,
+    /// Runtime-output-staging CAPABILITY of the resolved language
+    /// (labelle-assembler#619, migrated from #644's `language == "csharp"`
+    /// decision): true when this language's link-less `.language_builds`
+    /// outputs ARE the runtime payload (the CoreCLR/hostfxr contract) — the
+    /// generated build.zig stages the publish dir beside the binary + sets
+    /// the run-step assembly-dir env. Resolved once by `detect`: the
+    /// manifest row's `.runtime_output` (PRIMARY) OR the frozen csharp
+    /// fallback (`scripting_csharp.frozenRuntimeOutput`). Consumed at the
+    /// build-steps wiring (`scripting_csharp.stagesRuntimeOutputs`, which
+    /// ANDs it with the link-less + scripting-plugin-ownership checks). A
+    /// plain bool — no ownership. Default false → byte-identical.
+    runtime_output: bool = false,
+    /// Toolchain-probe opt-in CAPABILITY (labelle-assembler#619, migrated
+    /// from #644's csharp-scoped `ensureStepToolsOnPath` call): true when the
+    /// assembler should PATH-probe this language's selected `.language_builds`
+    /// argv[0]s at generate and fail pointedly on a missing tool. Resolved by
+    /// `detect`: the row's `.probe_tools` (PRIMARY) OR the frozen csharp
+    /// fallback (`scripting_csharp.frozenProbeTools`). Default false (no
+    /// probe) → byte-identical; rust/crystal deliberately opt out.
+    probe_tools: bool = false,
     /// Embed-only authoring→embed transpile source (typescript `.ts`/
     /// `.d.ts`), resolved once by `detect` from the row's `.transpile`
     /// capability (PRIMARY) or the frozen `EMBED_LANGUAGES` table (fallback).
@@ -444,6 +465,19 @@ pub fn detect(
         // a semver compare) and what it gates.
         const hot_reload_capable = probeHotReload(allocator, plugin, game_dir);
 
+        // Runtime-output + toolchain-probe capabilities (labelle-assembler
+        // #619, migrated from #644's `language == "csharp"` decisions): the
+        // manifest row's `.runtime_output`/`.probe_tools` (PRIMARY) OR the
+        // frozen csharp fallback (`scripting_csharp.frozen*`, the demoted
+        // hardcode — the shipped csharp manifest predates these). Resolved
+        // once here and applied to every returned splice, so a future
+        // runtime-loaded language rides its row with zero assembler changes.
+        const lang_row = pmani.languageRow(declared.language);
+        const runtime_output = (if (lang_row) |r| r.runtime_output else false) or
+            scripting_csharp.frozenRuntimeOutput(declared.language);
+        const probe_tools = (if (lang_row) |r| r.probe_tools else false) or
+            scripting_csharp.frozenProbeTools(declared.language);
+
         // PRIMARY (rev 19): the manifest `.languages` capability row drives
         // the splice — `.kind` → family, `.extensions`/`.transpile` → the
         // embed extension + transpile source (embedded), `.module_root` +
@@ -453,10 +487,12 @@ pub fn detect(
         // an incomplete NATIVE geometry (missing `.module_root`/
         // `.stage_subdir`) is not drivable → falls through to the frozen
         // table (rust/crystal covered there) or the integration-gap warning.
-        if (pmani.languageRow(declared.language)) |row| {
+        if (lang_row) |row| {
             if (try spliceFromRow(allocator, plugin.name, declared.language, game_dir, row)) |s| {
                 var out = s;
                 out.hot_reload_capable = hot_reload_capable;
+                out.runtime_output = runtime_output;
+                out.probe_tools = probe_tools;
                 return out;
             }
         }
@@ -475,6 +511,8 @@ pub fn detect(
                 .family = .embed,
                 .transpile = row.transpile,
                 .hot_reload_capable = hot_reload_capable,
+                .runtime_output = runtime_output,
+                .probe_tools = probe_tools,
             };
         }
         if (nativeRow(declared.language)) |row| {
@@ -490,6 +528,8 @@ pub fn detect(
                 .family = .native,
                 .module_root = row.module_root,
                 .stage_subdir = row.stage_subdir,
+                .runtime_output = runtime_output,
+                .probe_tools = probe_tools,
             };
         }
         std.log.warn(
