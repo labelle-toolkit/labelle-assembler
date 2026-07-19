@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     // workflow used to stamp the ASSEMBLER tag into this (and the trio),
     // scaffolding nonsense pins like `labelle_version = "0.91.0"`
     // (labelle-cli#322); release builds no longer override any of these.
-    const cli_version: []const u8 = b.option([]const u8, "cli_version", "CLI version string") orelse "1.57.0";
+    const cli_version: []const u8 = b.option([]const u8, "cli_version", "CLI version string") orelse "1.59.0";
     // Framework version defaults stamped into a freshly scaffolded
     // project.labelle by `init`. These MUST be real, fetchable release
     // versions — a fresh project has to build out of the box. They used to
@@ -19,12 +19,14 @@ pub fn build(b: *std.Build) void {
     // Keep this trio a MUTUALLY COMPATIBLE set: a fresh `labelle init` resolves
     // these defaults, so a mismatch fails `labelle build` before any user code.
     // Set verified end-to-end (init → generate → full compile) for
-    // core 1.26.0 / engine 2.5.0 / gfx 1.28.1 with cli 1.57.0 (labelle-cli#322).
+    // core 1.26.0 / engine 2.7.0 / gfx 1.28.2 with cli 1.59.0 (v0.95.0 release
+    // wave, labelle-assembler#646). engine v2.7.0 floors core >= 1.24.0 and
+    // gfx >= 1.28.0; gfx v1.28.2 pins core v1.26.0 — the trio agrees.
     // Bump all three together when moving the engine default (their
     // build.zig.zon pins/floors must agree — read them from the tags).
     const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.26.0";
-    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.5.0";
-    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.28.1";
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.7.0";
+    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.28.2";
     // Version this assembler binary stamps into a freshly scaffolded
     // project.labelle's `assembler_version` field. Defaults to the
     // package version from build.zig.zon so a release binary pins itself.
