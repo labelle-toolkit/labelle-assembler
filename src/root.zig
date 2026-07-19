@@ -675,6 +675,15 @@ pub fn generate(
 
     const scripts_target = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
     defer allocator.free(scripts_target);
+
+    // Prune stale generated flow sidecars (#632) BEFORE script discovery.
+    // A removed/renamed flow leaves an orphan `scripts/flows/<name>.zig`;
+    // if a project also declares a state named `flows`, `scanDir` below
+    // would bind that orphan as a `flows`-state script and the generated
+    // game would import a file the later `flow_scanner.scanAndEmit` pass
+    // deletes. Pruning up front keeps discovery from ever seeing it.
+    try flow_scanner.pruneStaleSidecars(allocator, game_dir);
+
     var script_scan = script_scanner.ScriptScanner.init(allocator, cfg.states);
     defer script_scan.deinit();
     try script_scan.scanDir(scripts_target);
