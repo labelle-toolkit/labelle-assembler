@@ -476,16 +476,18 @@ pub fn loadFromDir(
         }
     }
 
-    // ── Validate `requires_language` vocabulary (#584) ──
-    // The value must come from the closed language table. The MATCH against
-    // the project's declared `.params.language` needs project context and runs in
-    // the generate-time policy gate (`language_policy.checkRequiresLanguage`);
-    // this load-time check rejects typos at the source with the manifest named.
+    // ── Validate `requires_language` shape (#584, opened by #619) ──
+    // Load-time validation is SHAPE-only now (a plain lowercase
+    // identifier): the vocabulary is no longer closed — a language may be
+    // declared by a `.languages` capability row in the scripting plugin's
+    // manifest (RFC-LANGUAGE-PLUGINS §7), which THIS manifest cannot see.
+    // The real vocabulary + MATCH checks run in the generate-time policy
+    // gate (`language_policy.checkRequiresLanguage`, against frozen ∪ rows).
     if (parsed.requires_language) |req| {
-        if (!language_policy.isSupportedLanguage(req)) {
+        if (!language_policy.isLanguageIdentifier(req)) {
             std.debug.print(
-                "labelle: plugin '{s}' declares requires_language \"{s}\"\n  which is not a supported script language ({s})\n  at {s}\n",
-                .{ expected_name, req, language_policy.SUPPORTED_LANGUAGES_LIST, manifest_path },
+                "labelle: plugin '{s}' declares requires_language \"{s}\"\n  which is not a plain lowercase language identifier ([a-z][a-z0-9_]*)\n  at {s}\n",
+                .{ expected_name, req, manifest_path },
             );
             return error.PluginManifestUnknownLanguage;
         }
@@ -1242,15 +1244,16 @@ test "loadFromDir: parses requires_language (#584)" {
     try testing.expectEqualStrings("lua", manifest.requires_language.?);
 }
 
-test "loadFromDir: rejects an unknown requires_language (#584)" {
+test "loadFromDir: rejects a shape-invalid requires_language; identifier-shaped unknowns load (#584, opened by #619)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // Not a lowercase identifier → rejected at load with the manifest named.
     try writeManifestFile(tmp.dir,
         \\.{
         \\    .name = "lua_toolkit",
         \\    .manifest_version = 1,
-        \\    .requires_language = "cobol",
+        \\    .requires_language = "Not-A-Language",
         \\}
     );
 
@@ -1259,6 +1262,21 @@ test "loadFromDir: rejects an unknown requires_language (#584)" {
 
     const result = loadFromDir(testing.allocator, tmp_path, "lua_toolkit");
     try testing.expectError(error.PluginManifestUnknownLanguage, result);
+
+    // "cobol" is identifier-shaped: the vocabulary is OPEN now (#619 — a
+    // language may be declared by a scripting-plugin `.languages` row this
+    // manifest cannot see), so it LOADS; the generate-time policy gate
+    // (`checkRequiresLanguage` against frozen ∪ rows) owns the rejection.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "lua_toolkit",
+        \\    .manifest_version = 1,
+        \\    .requires_language = "cobol",
+        \\}
+    );
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "lua_toolkit")).?;
+    defer manifest.deinit();
+    try testing.expectEqualStrings("cobol", manifest.requires_language.?);
 }
 
 test "loadFromDir: rejects a nested pack name that escapes the plugin dir (#576)" {

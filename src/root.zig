@@ -2078,12 +2078,29 @@ pub fn generate(
 
     const packs_target = try std.fs.path.join(allocator, &.{ target_dir, "packs" });
     defer allocator.free(packs_target);
+    // The active splice's script extensions join the consumption scan
+    // (#619): the comptime `scanned_extensions` list covers only the
+    // FROZEN built-in languages, so a manifest-row language's sources
+    // (the litmus `.py`) would otherwise be invisible and their
+    // subscriptions silently elided. Frozen-language splices contribute
+    // duplicates of already-scanned extensions — harmless.
+    var script_ext_buf: [2][]const u8 = undefined;
+    var script_ext_len: usize = 0;
+    if (maybe_scripting) |s| {
+        script_ext_buf[script_ext_len] = s.extension;
+        script_ext_len += 1;
+        if (s.transpile) |t| {
+            script_ext_buf[script_ext_len] = t.source_extension;
+            script_ext_len += 1;
+        }
+    }
     var event_consumption = try main_zig.filterConsumedEvents(
         allocator,
         plugin_events.entries,
         &.{ game_dir, scripts_target, packs_target },
         excluded_dep_roots.items,
         force_consumed_tags.items,
+        script_ext_buf[0..script_ext_len],
         cfg.plugin_events,
     );
     defer event_consumption.deinit();

@@ -204,17 +204,17 @@ pub fn loadPackFromDir(
         return error.PackManifestUnknownVersion;
     }
 
-    // ── Validate `requires_language` vocabulary (#584) ──
-    // Same closed table as the plugin manifest / the project's
-    // `.params.language`. The MATCH against the project's declared language
-    // runs in the generate-time policy gate
-    // (`language_policy.checkRequiresLanguage`) — this load-time check
-    // rejects typos at the source with the manifest named.
+    // ── Validate `requires_language` shape (#584, opened by #619) ──
+    // Same SHAPE-only rule as the plugin manifest: the vocabulary is open
+    // (frozen built-ins ∪ the scripting plugin's `.languages` rows, which
+    // THIS manifest cannot see), so load-time rejects only non-identifier
+    // names. The vocabulary + MATCH checks run in the generate-time policy
+    // gate (`language_policy.checkRequiresLanguage`).
     if (parsed.requires_language) |req| {
-        if (!language_policy.isSupportedLanguage(req)) {
+        if (!language_policy.isLanguageIdentifier(req)) {
             std.log.warn(
-                "labelle: pack '{s}' declares requires_language \"{s}\"\n  which is not a supported script language ({s})\n  at {s}\n",
-                .{ expected_name, req, language_policy.SUPPORTED_LANGUAGES_LIST, manifest_path },
+                "labelle: pack '{s}' declares requires_language \"{s}\"\n  which is not a plain lowercase language identifier ([a-z][a-z0-9_]*)\n  at {s}\n",
+                .{ expected_name, req, manifest_path },
             );
             return error.PackManifestUnknownLanguage;
         }
@@ -493,15 +493,16 @@ test "loadPackFromDir: parses requires_language (#584)" {
     try testing.expectEqualStrings("ruby", manifest.requires_language.?);
 }
 
-test "loadPackFromDir: rejects an unknown requires_language (#584)" {
+test "loadPackFromDir: rejects a shape-invalid requires_language; identifier-shaped unknowns load (#584, opened by #619)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // Not a lowercase identifier → rejected at load.
     try writePackManifestFile(tmp.dir,
         \\.{
         \\    .name = "dungeon",
         \\    .manifest_version = 1,
-        \\    .requires_language = "brainfuck",
+        \\    .requires_language = "Brain-Fuck",
         \\}
     );
 
@@ -510,6 +511,19 @@ test "loadPackFromDir: rejects an unknown requires_language (#584)" {
 
     const result = loadPackFromDir(testing.allocator, tmp_path, "dungeon");
     try testing.expectError(error.PackManifestUnknownLanguage, result);
+
+    // Identifier-shaped "brainfuck" LOADS (open vocabulary, #619); the
+    // generate-time policy gate owns the vocabulary rejection.
+    try writePackManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "dungeon",
+        \\    .manifest_version = 1,
+        \\    .requires_language = "brainfuck",
+        \\}
+    );
+    var manifest = (try loadPackFromDir(testing.allocator, tmp_path, "dungeon")).?;
+    defer manifest.deinit();
+    try testing.expectEqualStrings("brainfuck", manifest.requires_language.?);
 }
 
 test "loadPackFromDir: exposes/depends_on absent → null/empty (#441)" {

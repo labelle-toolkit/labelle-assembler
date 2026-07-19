@@ -736,8 +736,9 @@ pub const BuildZigOptions = struct {
     /// `.language = .<language>` appended to its `b.dependency` args, driving
     /// labelle-scripting's `-Dlanguage` build option (which language
     /// sub-module + vendored VM the plugin embeds). `language` comes from the
-    /// validated `.params.language` (a `language_policy.SUPPORTED_LANGUAGES`
-    /// member, so always a valid enum-literal spelling). Defaults to null —
+    /// validated `.params.language` — a frozen built-in OR a manifest
+    /// `.languages` row (#619), always `isLanguageIdentifier`-shaped so it is
+    /// a valid enum-literal spelling. Defaults to null —
     /// splice-less projects keep a byte-identical build.zig.
     scripting: ?ScriptingDep = null,
     /// Schema-declared plugin params (labelle-assembler#591): one entry per
@@ -955,9 +956,12 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // option, selecting which language sub-module (and vendored VM) the
         // plugin embeds. Empty for every other plugin — and for every
         // project without the splice — so existing dep args stay
-        // byte-identical. The language vocabulary is closed
-        // (`language_policy.SUPPORTED_LANGUAGES`, all short identifiers), so
-        // the fixed buffer cannot overflow. Dev-mode hot reload (#637): a
+        // byte-identical. The language is emitted as an ENUM LITERAL
+        // (`.language = .<name>`), so `language_policy.isLanguageIdentifier`
+        // gates every declared language (frozen built-in OR manifest
+        // `.languages` row — #619) to a bare `[a-z][a-z0-9_]*` identifier
+        // that both spells a valid enum literal and cannot overflow the
+        // fixed buffer. Dev-mode hot reload (#637): a
         // capable splice additionally passes `.hot_reload = optimize ==
         // .Debug` — the plugin's watcher/pump compile into Debug builds
         // (`labelle run`'s default) and stay at the off default for release;

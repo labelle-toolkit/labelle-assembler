@@ -45,12 +45,16 @@
 const std = @import("std");
 const config = @import("config.zig");
 
-/// The closed set of script languages the toolkit recognizes
-/// (RFC-LANGUAGE-PLUGINS §2/§3 — the `labelle-scripting` sub-modules).
-/// Widening this table is additive; validation everywhere goes through
-/// `isSupportedLanguage` so there is exactly one vocabulary. Each language
-/// carries an extension set (`scriptExtensions`) and a deprecated legacy
-/// dir name (`legacyDir`); the scripts themselves live in `SCRIPTS_DIR`.
+/// The FROZEN built-in set of script languages the assembler recognizes
+/// without a manifest capability row (RFC-LANGUAGE-PLUGINS §7 "Migration":
+/// the built-in tables are fallback defaults for manifests predating
+/// `.languages` rows — resolved pins of today's releases keep working
+/// unchanged; NEW languages come via manifest rows only, this table is
+/// never extended again). The OPEN vocabulary a project validates against
+/// is `Vocabulary` — this frozen set ∪ the declaring plugin's manifest
+/// `.languages` rows. Each frozen language carries an extension set
+/// (`scriptExtensions`) and a deprecated legacy dir name (`legacyDir`);
+/// the scripts themselves live in `SCRIPTS_DIR`.
 pub const SUPPORTED_LANGUAGES = [_][]const u8{
     "lua",
     "typescript",
@@ -128,6 +132,165 @@ pub fn isSupportedLanguage(name: []const u8) bool {
     return false;
 }
 
+/// Shape check for a script-language NAME (labelle-assembler#619): a plain
+/// lowercase identifier — `[a-z][a-z0-9_]*`. This is the one constraint the
+/// assembler's codegen genuinely imposes on ANY language, row-declared or
+/// built-in: the generated build.zig passes the language to the plugin as an
+/// enum literal (`.language = .<name>` — `build_files/build_zig.zig`), so
+/// the name must be a valid bare Zig identifier. Manifest-load `requires_
+/// language` validation and `resolveProjectLanguage` reject on SHAPE only;
+/// the real vocabulary check (frozen set ∪ manifest rows) runs where the
+/// declaring plugin's manifest is in hand (`validateDeclaredLanguage`).
+pub fn isLanguageIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] < 'a' or name[0] > 'z') return false;
+    for (name[1..]) |c| {
+        switch (c) {
+            'a'...'z', '0'...'9', '_' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// One manifest-declared language for VOCABULARY purposes (name + authored
+/// extensions) — the policy-side projection of a `plugin.labelle`
+/// `.languages` capability row (RFC-LANGUAGE-PLUGINS §7, #619). Built by
+/// `Vocabulary.build` from the DECLARING plugin's manifest; strings are
+/// owned by the `Vocabulary`.
+pub const RowLanguage = struct {
+    name: []const u8,
+    /// Authored source extensions, dot-normalized (`.py`).
+    extensions: []const []const u8,
+};
+
+/// The input shape `Vocabulary.build` consumes — mirrors the manifest row's
+/// `{ .name, .extensions }` without importing `plugin_manifest` (the caller
+/// maps `LanguageRow` fields in). Extensions may be dot-spelled or dotless
+/// (both manifest spellings are legal — `scripting_splice.dupDotExtension`'s
+/// tolerance); `build` normalizes to leading-dot.
+pub const RowInput = struct {
+    name: []const u8,
+    extensions: []const []const u8,
+};
+
+/// The OPEN language vocabulary of one project (labelle-assembler#619):
+/// the frozen `SUPPORTED_LANGUAGES` built-ins ∪ the declaring scripting
+/// plugin's manifest `.languages` rows. Rows are PRIMARY — a row naming a
+/// frozen language shadows the frozen extension set — and a row language
+/// the frozen tables never heard of (the RFC's "python") is exactly as
+/// legal as a built-in: `isKnown` accepts it, the dir policing buckets it,
+/// and `validateDeclaredLanguage` admits it. `EMPTY` (no rows) reproduces
+/// the pre-#619 closed-vocabulary behavior bit for bit.
+pub const Vocabulary = struct {
+    rows: []const RowLanguage = &.{},
+    allocator: ?std.mem.Allocator = null,
+
+    pub const EMPTY = Vocabulary{};
+
+    /// Build a vocabulary from the declaring plugin's manifest rows. Rows
+    /// with a shape-invalid name are SKIPPED with a warning (a malformed
+    /// row must not brick every consumer of the manifest — the selected
+    /// language's row still fails loudly through `validateDeclaredLanguage`
+    /// when it was the skipped one). Extensions are dot-normalized copies.
+    pub fn build(allocator: std.mem.Allocator, inputs: []const RowInput) !Vocabulary {
+        var rows: std.ArrayList(RowLanguage) = .empty;
+        errdefer {
+            for (rows.items) |r| freeRow(allocator, r);
+            rows.deinit(allocator);
+        }
+        for (inputs) |in| {
+            if (!isLanguageIdentifier(in.name)) {
+                std.log.warn(
+                    "labelle: ignoring manifest .languages row \"{s}\" — not a plain lowercase identifier",
+                    .{in.name},
+                );
+                continue;
+            }
+            const name = try allocator.dupe(u8, in.name);
+            errdefer allocator.free(name);
+            var exts = try allocator.alloc([]const u8, in.extensions.len);
+            var ext_len: usize = 0;
+            errdefer {
+                for (exts[0..ext_len]) |e| allocator.free(e);
+                allocator.free(exts);
+            }
+            for (in.extensions) |ext| {
+                exts[ext_len] = if (ext.len > 0 and ext[0] == '.')
+                    try allocator.dupe(u8, ext)
+                else
+                    try std.fmt.allocPrint(allocator, ".{s}", .{ext});
+                ext_len += 1;
+            }
+            try rows.append(allocator, .{ .name = name, .extensions = exts });
+        }
+        return .{ .rows = try rows.toOwnedSlice(allocator), .allocator = allocator };
+    }
+
+    fn freeRow(allocator: std.mem.Allocator, row: RowLanguage) void {
+        allocator.free(row.name);
+        for (row.extensions) |e| allocator.free(e);
+        allocator.free(row.extensions);
+    }
+
+    pub fn deinit(self: *Vocabulary) void {
+        const allocator = self.allocator orelse return;
+        for (self.rows) |r| freeRow(allocator, r);
+        allocator.free(self.rows);
+        self.* = .{};
+    }
+
+    /// The manifest row for `name`, or null.
+    pub fn rowFor(self: *const Vocabulary, name: []const u8) ?RowLanguage {
+        for (self.rows) |r| {
+            if (std.mem.eql(u8, r.name, name)) return r;
+        }
+        return null;
+    }
+
+    /// Frozen built-in OR manifest row — the open-vocabulary membership.
+    pub fn isKnown(self: *const Vocabulary, name: []const u8) bool {
+        return self.rowFor(name) != null or isSupportedLanguage(name);
+    }
+
+    /// The extension set identifying `name`'s sources — the manifest row's
+    /// (rows PRIMARY) or the frozen `scriptExtensions` table's.
+    pub fn extensionsOf(self: *const Vocabulary, name: []const u8) []const []const u8 {
+        if (self.rowFor(name)) |r| return r.extensions;
+        return scriptExtensions(name);
+    }
+};
+
+/// Validate the DECLARED language against the open vocabulary (the check
+/// `resolveProjectLanguage` used to make against the closed frozen table,
+/// re-homed where the declaring plugin's manifest rows are in hand —
+/// `generate_phases.validateLanguagePolicy`). A language that is neither a
+/// frozen built-in nor a manifest `.languages` row fails with a pointed
+/// error naming BOTH vocabularies and the pin fix (RFC-LANGUAGE-PLUGINS §7:
+/// self-describing capabilities — the resolved pin's own manifest declares
+/// what it supports, no version compare).
+pub fn validateDeclaredLanguage(
+    declared: DeclaredLanguage,
+    vocab: *const Vocabulary,
+) error{UnknownScriptLanguage}!void {
+    if (vocab.isKnown(declared.language)) return;
+    std.debug.print(
+        "labelle-assembler: plugin '{s}' declares script language \"{s}\", which is neither a built-in language ({s})\n" ++
+            "  nor declared by a `.languages` row in the plugin's plugin.labelle manifest",
+        .{ declared.plugin_name, declared.language, SUPPORTED_LANGUAGES_LIST },
+    );
+    if (vocab.rows.len > 0) {
+        std.debug.print(" (manifest rows:", .{});
+        for (vocab.rows) |r| std.debug.print(" \"{s}\"", .{r.name});
+        std.debug.print(")", .{});
+    }
+    std.debug.print(
+        ".\n  fix the `.params.language` spelling, or pin a plugin version whose plugin.labelle carries a `.languages` row named \"{s}\" (RFC-LANGUAGE-PLUGINS §7).\n",
+        .{declared.language},
+    );
+    return error.UnknownScriptLanguage;
+}
+
 /// The project's declared script language plus the `.plugins` entry that
 /// declared it (for diagnostics). Borrows both strings from the parsed
 /// `ProjectConfig` — owns nothing.
@@ -143,8 +306,13 @@ pub const DeclaredLanguage = struct {
 /// Returns `null` when no plugin declares `.params.language` (a script-less
 /// project — the overwhelmingly common case; a `.params` bag WITHOUT
 /// `.language` counts as no declaration too). Errors on:
-///   - `error.UnknownScriptLanguage` — a `.params.language` outside
-///     `SUPPORTED_LANGUAGES`.
+///   - `error.UnknownScriptLanguage` — a `.params.language` that is not a
+///     plain lowercase identifier (`isLanguageIdentifier` — the SHAPE
+///     constraint the generated `.language = .<name>` enum literal imposes).
+///     The VOCABULARY check (frozen built-ins ∪ manifest `.languages` rows,
+///     #619) runs separately in `validateDeclaredLanguage`, where the
+///     declaring plugin's manifest is in hand — this fn has only the parsed
+///     config.
 ///   - `error.MultipleLanguagePlugins` — two `.plugins` entries both declare
 ///     `.params.language` (one script language per project; mixing is banned).
 pub fn resolveProjectLanguage(
@@ -157,10 +325,10 @@ pub fn resolveProjectLanguage(
         // generic `params_bag` (#591's tolerant parse) — the policy sees the
         // declaration no matter which parse produced the config.
         const lang = p.declaredLanguage() orelse continue;
-        if (!isSupportedLanguage(lang)) {
+        if (!isLanguageIdentifier(lang)) {
             std.debug.print(
-                "labelle-assembler: plugin '{s}' declares unknown script language \"{s}\".\n" ++
-                    "  supported languages: {s}.\n",
+                "labelle-assembler: plugin '{s}' declares script language \"{s}\", which is not a plain lowercase identifier.\n" ++
+                    "  language names are `[a-z][a-z0-9_]*` (built-ins: {s}; new languages ride the plugin manifest's `.languages` rows).\n",
                 .{ p.name, lang, SUPPORTED_LANGUAGES_LIST },
             );
             return error.UnknownScriptLanguage;
@@ -187,9 +355,11 @@ pub fn resolveProjectLanguage(
 /// ships no language scripts).
 ///
 /// Errors on:
-///   - `error.UnknownScriptLanguage` — the requirement names a language
-///     outside `SUPPORTED_LANGUAGES` (also rejected at manifest load; this
-///     re-check keeps hand-built manifests in tests honest).
+///   - `error.UnknownScriptLanguage` — the requirement names a language in
+///     neither the frozen built-ins nor the project vocabulary's manifest
+///     rows (`vocab` — #619; the manifest load already rejected
+///     shape-invalid names, this keeps hand-built manifests in tests
+///     honest and catches spelled-fine-but-nonexistent names).
 ///   - `error.LanguageRequirementMismatch` — the requirement doesn't match
 ///     the project's declared language (including "project declares none").
 pub fn checkRequiresLanguage(
@@ -197,12 +367,13 @@ pub fn checkRequiresLanguage(
     unit_name: []const u8,
     requires: ?[]const u8,
     declared: ?DeclaredLanguage,
+    vocab: *const Vocabulary,
 ) error{ UnknownScriptLanguage, LanguageRequirementMismatch }!void {
     const req = requires orelse return;
-    if (!isSupportedLanguage(req)) {
+    if (!vocab.isKnown(req)) {
         std.debug.print(
-            "labelle-assembler: {s} '{s}' declares requires_language \"{s}\", which is not a supported script language.\n" ++
-                "  supported languages: {s}.\n",
+            "labelle-assembler: {s} '{s}' declares requires_language \"{s}\", which is not a known script language.\n" ++
+                "  built-in languages: {s}; new languages are declared by `.languages` rows in the scripting plugin's manifest.\n",
             .{ unit_kind, unit_name, req, SUPPORTED_LANGUAGES_LIST },
         );
         return error.UnknownScriptLanguage;
@@ -339,9 +510,32 @@ pub fn scanUnitLanguageDirs(
     unit_root: []const u8,
     unit_label: []const u8,
     declared: ?DeclaredLanguage,
+    vocab: *const Vocabulary,
 ) !void {
+    // The policing set (#619): the frozen built-ins (a manifest row naming
+    // a frozen language SHADOWS it — rows are primary, so the row's
+    // extension set polices) followed by the manifest rows. Row languages
+    // never had a legacy per-language dir (they postdate the scripts/
+    // convention), so their `dir` is their own name — which the
+    // misplaced-dir trap below skips (dir == name) and the legacy walk
+    // treats exactly like every language whose legacy dir is its name.
+    var langs: std.ArrayList(ScanLang) = .empty;
+    defer langs.deinit(allocator);
     for (SUPPORTED_LANGUAGES) |lang| {
-        const dir = legacyDir(lang);
+        if (vocab.rowFor(lang) != null) continue;
+        try langs.append(allocator, .{
+            .name = lang,
+            .extensions = scriptExtensions(lang),
+            .dir = legacyDir(lang),
+        });
+    }
+    for (vocab.rows) |r| {
+        try langs.append(allocator, .{ .name = r.name, .extensions = r.extensions, .dir = r.name });
+    }
+
+    for (langs.items) |entry| {
+        const lang = entry.name;
+        const dir = entry.dir;
 
         // The language-name-≠-dir trap (typescript/ vs ts/): policed for
         // EVERY language declaration state, because no declaration state
@@ -420,10 +614,20 @@ pub fn scanUnitLanguageDirs(
         return error.MissingScriptingPlugin;
     }
 
-    try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, SCRIPTS_DIR);
-    try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, "components");
-    try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, "events");
+    try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, SCRIPTS_DIR, langs.items);
+    try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, "components", langs.items);
+    try scanSharedDirLanguages(allocator, unit_root, unit_label, declared, "events", langs.items);
 }
+
+/// One entry of the policing set `scanUnitLanguageDirs` builds: a frozen
+/// built-in (extensions from `scriptExtensions`, legacy dir from
+/// `legacyDir`) or a manifest `.languages` row (extensions from the row,
+/// dir = name). Borrows — the vocabulary/static tables own the strings.
+const ScanLang = struct {
+    name: []const u8,
+    extensions: []const []const u8,
+    dir: []const u8,
+};
 
 /// The shared-convention-dir half of `scanUnitLanguageDirs`: walk ONE
 /// extension-keyed shared dir (`scripts/` — and, per labelle-engine#237's
@@ -446,6 +650,7 @@ fn scanSharedDirLanguages(
     unit_label: []const u8,
     declared: ?DeclaredLanguage,
     shared_dir: []const u8,
+    langs: []const ScanLang,
 ) !void {
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -457,11 +662,16 @@ fn scanSharedDirLanguages(
     };
     defer dir.close(io);
 
-    var buckets: [SUPPORTED_LANGUAGES.len]LanguageBucket = @splat(.{});
-    defer for (&buckets) |*b| b.deinit(allocator);
-    try walkSharedCollect(allocator, io, dir, shared_dir, declared, &buckets);
+    const buckets = try allocator.alloc(LanguageBucket, langs.len);
+    for (buckets) |*b| b.* = .{};
+    defer {
+        for (buckets) |*b| b.deinit(allocator);
+        allocator.free(buckets);
+    }
+    try walkSharedCollect(allocator, io, dir, shared_dir, declared, langs, buckets);
 
-    for (SUPPORTED_LANGUAGES, &buckets) |lang, *bucket| {
+    for (langs, buckets) |entry, *bucket| {
+        const lang = entry.name;
         if (bucket.total == 0) continue;
         const scanned = LanguageDirScan{ .listed = bucket.listed.items, .total = bucket.total };
 
@@ -514,7 +724,8 @@ fn walkSharedCollect(
     dir: std.Io.Dir,
     rel_prefix: []const u8,
     declared: ?DeclaredLanguage,
-    buckets: *[SUPPORTED_LANGUAGES.len]LanguageBucket,
+    langs: []const ScanLang,
+    buckets: []LanguageBucket,
 ) !void {
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
@@ -525,14 +736,15 @@ fn walkSharedCollect(
                 defer sub.close(io);
                 const sub_prefix = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
                 defer allocator.free(sub_prefix);
-                try walkSharedCollect(allocator, io, sub, sub_prefix, declared, buckets);
+                try walkSharedCollect(allocator, io, sub, sub_prefix, declared, langs, buckets);
             },
             else => {
-                for (SUPPORTED_LANGUAGES, buckets) |lang, *bucket| {
+                for (langs, buckets) |lang_entry, *bucket| {
+                    const lang = lang_entry.name;
                     if (declared) |d| {
                         if (std.mem.eql(u8, d.language, lang)) continue;
                     }
-                    const matches = for (scriptExtensions(lang)) |ext| {
+                    const matches = for (lang_entry.extensions) |ext| {
                         if (std.mem.endsWith(u8, entry.name, ext)) break true;
                     } else false;
                     if (!matches) continue;
@@ -644,11 +856,82 @@ test "resolveProjectLanguage: one valid declaration → language + owning plugin
     try testing.expectEqualStrings("labelle-scripting", declared.plugin_name);
 }
 
-test "resolveProjectLanguage: unknown vocabulary errors (#584)" {
+test "resolveProjectLanguage: shape-invalid names error; identifier-shaped unknowns resolve (vocabulary moved to validateDeclaredLanguage, #619)" {
+    // The SHAPE gate stays in resolve (the `.language = .<name>` enum
+    // literal the generated build.zig emits demands a bare identifier).
+    const bad_shape = [_]config.PluginDep{
+        .{ .name = "labelle-scripting", .params = .{ .language = "not a lang!" } },
+    };
+    try testing.expectError(error.UnknownScriptLanguage, resolveProjectLanguage(&bad_shape));
+    const upper = [_]config.PluginDep{
+        .{ .name = "labelle-scripting", .params = .{ .language = "Lua" } },
+    };
+    try testing.expectError(error.UnknownScriptLanguage, resolveProjectLanguage(&upper));
+
+    // "cobol" is identifier-shaped: it RESOLVES here (#619 — the closed
+    // frozen-table check dissolved), and the VOCABULARY check now runs in
+    // `validateDeclaredLanguage` against frozen ∪ manifest rows.
     const plugins = [_]config.PluginDep{
         .{ .name = "labelle-scripting", .params = .{ .language = "cobol" } },
     };
-    try testing.expectError(error.UnknownScriptLanguage, resolveProjectLanguage(&plugins));
+    const declared = (try resolveProjectLanguage(&plugins)).?;
+    try testing.expectEqualStrings("cobol", declared.language);
+    try testing.expectError(
+        error.UnknownScriptLanguage,
+        validateDeclaredLanguage(declared, &Vocabulary.EMPTY),
+    );
+}
+
+test "validateDeclaredLanguage: frozen built-ins pass on the EMPTY vocabulary; a manifest row admits a language the tables never heard of (#619)" {
+    const allocator = testing.allocator;
+    const frozen = DeclaredLanguage{ .language = "lua", .plugin_name = "scripting" };
+    try validateDeclaredLanguage(frozen, &Vocabulary.EMPTY);
+
+    const python = DeclaredLanguage{ .language = "python", .plugin_name = "scripting" };
+    try testing.expectError(
+        error.UnknownScriptLanguage,
+        validateDeclaredLanguage(python, &Vocabulary.EMPTY),
+    );
+
+    var vocab = try Vocabulary.build(allocator, &.{
+        .{ .name = "python", .extensions = &.{".py"} },
+    });
+    defer vocab.deinit();
+    try validateDeclaredLanguage(python, &vocab);
+    // The row does not close the frozen set — built-ins still pass.
+    try validateDeclaredLanguage(frozen, &vocab);
+}
+
+test "Vocabulary.build: dot-normalizes extensions, rows shadow frozen names, shape-invalid rows are skipped" {
+    const allocator = testing.allocator;
+    var vocab = try Vocabulary.build(allocator, &.{
+        .{ .name = "python", .extensions = &.{"py"} }, // dotless manifest spelling
+        .{ .name = "ruby", .extensions = &.{".ruby_row"} }, // shadows the frozen entry
+        .{ .name = "NotAnIdentifier", .extensions = &.{".x"} }, // skipped (warn)
+    });
+    defer vocab.deinit();
+
+    try testing.expectEqual(@as(usize, 2), vocab.rows.len);
+    try testing.expectEqualStrings(".py", vocab.rowFor("python").?.extensions[0]);
+    try testing.expect(vocab.isKnown("python"));
+    try testing.expect(!vocab.isKnown("NotAnIdentifier"));
+    // Rows are PRIMARY: the shadowing row's extensions win…
+    try testing.expectEqualStrings(".ruby_row", vocab.extensionsOf("ruby")[0]);
+    // …while an unshadowed frozen language keeps the frozen extensions.
+    try testing.expectEqualStrings(".lua", vocab.extensionsOf("lua")[0]);
+    try testing.expect(vocab.isKnown("lua"));
+}
+
+test "isLanguageIdentifier: lowercase identifier shape" {
+    try testing.expect(isLanguageIdentifier("python"));
+    try testing.expect(isLanguageIdentifier("csharp2"));
+    try testing.expect(isLanguageIdentifier("my_lang"));
+    try testing.expect(!isLanguageIdentifier(""));
+    try testing.expect(!isLanguageIdentifier("Lua"));
+    try testing.expect(!isLanguageIdentifier("2fast"));
+    try testing.expect(!isLanguageIdentifier("_priv"));
+    try testing.expect(!isLanguageIdentifier("c-sharp"));
+    try testing.expect(!isLanguageIdentifier("c sharp"));
 }
 
 test "resolveProjectLanguage: the enum-literal bag spelling (.lua) resolves — and its vocabulary is checked (#591 P2)" {
@@ -666,8 +949,10 @@ test "resolveProjectLanguage: the enum-literal bag spelling (.lua) resolves — 
     try testing.expectEqualStrings("lua", declared.language);
     try testing.expectEqualStrings("scripting", declared.plugin_name);
 
-    // The closed-vocabulary check applies to the enum spelling too.
-    const bad_bag = [_]Param{.{ .name = "language", .value = .{ .enum_tag = "cobol" } }};
+    // The SHAPE check applies to the enum spelling too (a hand-built bag
+    // can still carry a non-lowercase tag); identifier-shaped unknowns
+    // ("cobol") resolve here and fail in `validateDeclaredLanguage` (#619).
+    const bad_bag = [_]Param{.{ .name = "language", .value = .{ .enum_tag = "Cobol" } }};
     const bad = [_]config.PluginDep{.{ .name = "scripting", .params_bag = &bad_bag }};
     try testing.expectError(error.UnknownScriptLanguage, resolveProjectLanguage(&bad));
 }
@@ -690,24 +975,24 @@ test "resolveProjectLanguage: two `.params.language` declarations error (#584)" 
 
 test "checkRequiresLanguage: absent requirement and exact match both pass" {
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
-    try checkRequiresLanguage("pack", "dungeon", null, declared);
-    try checkRequiresLanguage("pack", "dungeon", "lua", declared);
+    try checkRequiresLanguage("pack", "dungeon", null, declared, &Vocabulary.EMPTY);
+    try checkRequiresLanguage("pack", "dungeon", "lua", declared, &Vocabulary.EMPTY);
     // Absent requirement also passes on a project with NO declared language.
-    try checkRequiresLanguage("plugin", "physics", null, null);
+    try checkRequiresLanguage("plugin", "physics", null, null, &Vocabulary.EMPTY);
 }
 
 test "checkRequiresLanguage: mismatch errors naming both sides (#584)" {
     const declared = DeclaredLanguage{ .language = "rust", .plugin_name = "labelle-scripting" };
     try testing.expectError(
         error.LanguageRequirementMismatch,
-        checkRequiresLanguage("pack", "dungeon", "lua", declared),
+        checkRequiresLanguage("pack", "dungeon", "lua", declared, &Vocabulary.EMPTY),
     );
 }
 
 test "checkRequiresLanguage: requirement with no declared language errors" {
     try testing.expectError(
         error.LanguageRequirementMismatch,
-        checkRequiresLanguage("pack", "dungeon", "ruby", null),
+        checkRequiresLanguage("pack", "dungeon", "ruby", null, &Vocabulary.EMPTY),
     );
 }
 
@@ -715,7 +1000,7 @@ test "checkRequiresLanguage: unknown vocabulary errors" {
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
     try testing.expectError(
         error.UnknownScriptLanguage,
-        checkRequiresLanguage("pack", "dungeon", "cobol", declared),
+        checkRequiresLanguage("pack", "dungeon", "cobol", declared, &Vocabulary.EMPTY),
     );
 }
 
@@ -778,7 +1063,7 @@ test "scanUnitLanguageDirs: a rust/ file in a lua project is a hard error (#584)
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
     try testing.expectError(
         error.ScriptLanguageMismatch,
-        scanUnitLanguageDirs(allocator, root, "project root", declared),
+        scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY),
     );
 }
 
@@ -793,7 +1078,7 @@ test "scanUnitLanguageDirs: language files with NO scripting plugin error with t
 
     try testing.expectError(
         error.MissingScriptingPlugin,
-        scanUnitLanguageDirs(allocator, root, "project root", null),
+        scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY),
     );
 }
 
@@ -807,7 +1092,7 @@ test "scanUnitLanguageDirs: the declared language's own dir passes" {
     defer allocator.free(root);
 
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY);
 }
 
 test "scanUnitLanguageDirs: an EMPTY foreign language dir is warn-only" {
@@ -824,9 +1109,9 @@ test "scanUnitLanguageDirs: an EMPTY foreign language dir is warn-only" {
     defer allocator.free(root);
 
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY);
     // Same for a project with no scripting plugin at all.
-    try scanUnitLanguageDirs(allocator, root, "project root", null);
+    try scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY);
 }
 
 test "scanUnitLanguageDirs: legacy ts/ scripts — skipped when declared (grace), mismatch/attach errors otherwise" {
@@ -842,20 +1127,20 @@ test "scanUnitLanguageDirs: legacy ts/ scripts — skipped when declared (grace)
     // legacyDir keys the declared-language skip; the splice owns the
     // deprecation note + both-populated conflict).
     const ts_declared = DeclaredLanguage{ .language = "typescript", .plugin_name = "scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", ts_declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", ts_declared, &Vocabulary.EMPTY);
 
     // Declared lua → ts/ files are a foreign language, hard error.
     const lua_declared = DeclaredLanguage{ .language = "lua", .plugin_name = "scripting" };
     try testing.expectError(
         error.ScriptLanguageMismatch,
-        scanUnitLanguageDirs(allocator, root, "project root", lua_declared),
+        scanUnitLanguageDirs(allocator, root, "project root", lua_declared, &Vocabulary.EMPTY),
     );
 
     // No plugin at all → the attach hint (spelling the POLICY vocabulary
     // "typescript", not the dir name).
     try testing.expectError(
         error.MissingScriptingPlugin,
-        scanUnitLanguageDirs(allocator, root, "project root", null),
+        scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY),
     );
 }
 
@@ -875,9 +1160,9 @@ test "scanUnitLanguageDirs: a typescript/ dir with files is a MISPLACED-dir erro
 
     const ts_declared = DeclaredLanguage{ .language = "typescript", .plugin_name = "scripting" };
     const lua_declared = DeclaredLanguage{ .language = "lua", .plugin_name = "scripting" };
-    try testing.expectError(error.MisplacedLanguageDir, scanUnitLanguageDirs(allocator, root, "project root", ts_declared));
-    try testing.expectError(error.MisplacedLanguageDir, scanUnitLanguageDirs(allocator, root, "project root", lua_declared));
-    try testing.expectError(error.MisplacedLanguageDir, scanUnitLanguageDirs(allocator, root, "project root", null));
+    try testing.expectError(error.MisplacedLanguageDir, scanUnitLanguageDirs(allocator, root, "project root", ts_declared, &Vocabulary.EMPTY));
+    try testing.expectError(error.MisplacedLanguageDir, scanUnitLanguageDirs(allocator, root, "project root", lua_declared, &Vocabulary.EMPTY));
+    try testing.expectError(error.MisplacedLanguageDir, scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY));
 }
 
 test "scanUnitLanguageDirs: an EMPTY typescript/ dir is warn-only, like every empty language dir" {
@@ -889,9 +1174,9 @@ test "scanUnitLanguageDirs: an EMPTY typescript/ dir is warn-only, like every em
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
 
-    try scanUnitLanguageDirs(allocator, root, "project root", null);
+    try scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY);
     const ts_declared = DeclaredLanguage{ .language = "typescript", .plugin_name = "scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", ts_declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", ts_declared, &Vocabulary.EMPTY);
 }
 
 test "scanUnitLanguageDirs: no language dirs at all is a clean pass" {
@@ -900,9 +1185,9 @@ test "scanUnitLanguageDirs: no language dirs at all is a clean pass" {
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
-    try scanUnitLanguageDirs(allocator, root, "project root", null);
+    try scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY);
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY);
 }
 
 // ── scripts/-content policing (the shared convention dir, #237) ──────
@@ -923,7 +1208,7 @@ test "scanUnitLanguageDirs: a foreign-extension file in scripts/ is a hard error
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
     try testing.expectError(
         error.ScriptLanguageMismatch,
-        scanUnitLanguageDirs(allocator, root, "project root", declared),
+        scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY),
     );
 
     var tmp2 = testing.tmpDir(.{});
@@ -933,7 +1218,7 @@ test "scanUnitLanguageDirs: a foreign-extension file in scripts/ is a hard error
     defer allocator.free(root2);
     try testing.expectError(
         error.ScriptLanguageMismatch,
-        scanUnitLanguageDirs(allocator, root2, "project root", declared),
+        scanUnitLanguageDirs(allocator, root2, "project root", declared, &Vocabulary.EMPTY),
     );
 }
 
@@ -948,7 +1233,7 @@ test "scanUnitLanguageDirs: language files in scripts/ with NO scripting plugin 
 
     try testing.expectError(
         error.MissingScriptingPlugin,
-        scanUnitLanguageDirs(allocator, root, "project root", null),
+        scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY),
     );
 }
 
@@ -966,7 +1251,7 @@ test "scanUnitLanguageDirs: the declared language's scripts/ files pass — the 
     defer allocator.free(root);
 
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY);
 }
 
 test "scanUnitLanguageDirs: a Zig-only scripts/ is invisible to the language scan (coexistence negative control)" {
@@ -984,9 +1269,9 @@ test "scanUnitLanguageDirs: a Zig-only scripts/ is invisible to the language sca
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
 
-    try scanUnitLanguageDirs(allocator, root, "project root", null);
+    try scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY);
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY);
 }
 
 test "scanUnitLanguageDirs: components/ is policed like scripts/ — declared-language declarations pass, foreign extensions error (#237 refinement)" {
@@ -1002,20 +1287,20 @@ test "scanUnitLanguageDirs: components/ is policed like scripts/ — declared-la
     defer allocator.free(root);
 
     const ruby_declared = DeclaredLanguage{ .language = "ruby", .plugin_name = "scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", ruby_declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", ruby_declared, &Vocabulary.EMPTY);
 
     // A FOREIGN language's file in components/ errors exactly like in
     // scripts/ (nothing would ever read it — the silent-death class).
     const lua_declared = DeclaredLanguage{ .language = "lua", .plugin_name = "scripting" };
     try testing.expectError(
         error.ScriptLanguageMismatch,
-        scanUnitLanguageDirs(allocator, root, "project root", lua_declared),
+        scanUnitLanguageDirs(allocator, root, "project root", lua_declared, &Vocabulary.EMPTY),
     );
 
     // No scripting plugin at all → the attach hint.
     try testing.expectError(
         error.MissingScriptingPlugin,
-        scanUnitLanguageDirs(allocator, root, "project root", null),
+        scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY),
     );
 }
 
@@ -1033,9 +1318,9 @@ test "scanUnitLanguageDirs: a Zig-only components/ is invisible to the language 
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
 
-    try scanUnitLanguageDirs(allocator, root, "project root", null);
+    try scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY);
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY);
 }
 
 test "scanUnitLanguageDirs: events/ is policed like scripts/ — declared-language declarations pass, foreign extensions error (labelle-engine#772)" {
@@ -1051,7 +1336,7 @@ test "scanUnitLanguageDirs: events/ is policed like scripts/ — declared-langua
     defer allocator.free(root);
 
     const ruby_declared = DeclaredLanguage{ .language = "ruby", .plugin_name = "scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", ruby_declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", ruby_declared, &Vocabulary.EMPTY);
 
     // A FOREIGN language's file in events/ errors exactly like in
     // scripts/ — `collectEventEmbeds` reads only the ACTIVE extension,
@@ -1060,13 +1345,13 @@ test "scanUnitLanguageDirs: events/ is policed like scripts/ — declared-langua
     const lua_declared = DeclaredLanguage{ .language = "lua", .plugin_name = "scripting" };
     try testing.expectError(
         error.ScriptLanguageMismatch,
-        scanUnitLanguageDirs(allocator, root, "project root", lua_declared),
+        scanUnitLanguageDirs(allocator, root, "project root", lua_declared, &Vocabulary.EMPTY),
     );
 
     // No scripting plugin at all → the attach hint.
     try testing.expectError(
         error.MissingScriptingPlugin,
-        scanUnitLanguageDirs(allocator, root, "project root", null),
+        scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY),
     );
 }
 
@@ -1084,9 +1369,9 @@ test "scanUnitLanguageDirs: a Zig-only events/ is invisible to the language scan
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
 
-    try scanUnitLanguageDirs(allocator, root, "project root", null);
+    try scanUnitLanguageDirs(allocator, root, "project root", null, &Vocabulary.EMPTY);
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY);
 }
 
 test "scanUnitLanguageDirs: mixed scripts/ — declared-language + zig files coexist; ONE foreign file still errors" {
@@ -1100,12 +1385,12 @@ test "scanUnitLanguageDirs: mixed scripts/ — declared-language + zig files coe
     defer allocator.free(root);
 
     const declared = DeclaredLanguage{ .language = "lua", .plugin_name = "labelle-scripting" };
-    try scanUnitLanguageDirs(allocator, root, "project root", declared);
+    try scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY);
 
     // Drop one ruby file into the same dir → mismatch (extension-keyed).
     try writeTestFile(tmp.dir, "scripts/feed.rb", "class Feed; end\n");
     try testing.expectError(
         error.ScriptLanguageMismatch,
-        scanUnitLanguageDirs(allocator, root, "project root", declared),
+        scanUnitLanguageDirs(allocator, root, "project root", declared, &Vocabulary.EMPTY),
     );
 }

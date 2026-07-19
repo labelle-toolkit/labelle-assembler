@@ -453,29 +453,58 @@ pub fn validateLanguagePolicy(
 ) !void {
     const declared = try language_policy.resolveProjectLanguage(plugins);
 
+    // The project's OPEN language vocabulary (#619): the frozen built-ins ∪
+    // the DECLARING plugin's manifest `.languages` capability rows
+    // (RFC-LANGUAGE-PLUGINS §7 — a resolved pin's own manifest declares
+    // what it supports; a language the frozen tables never heard of is
+    // admitted by its row alone, with zero assembler changes). A declaring
+    // plugin without a manifest (or without rows) yields the EMPTY
+    // vocabulary — bit-identical to the pre-#619 closed-table behavior.
+    var vocab = language_policy.Vocabulary.EMPTY;
+    defer vocab.deinit();
+    if (declared) |d| {
+        for (plugins) |plugin| {
+            if (!std.mem.eql(u8, plugin.name, d.plugin_name)) continue;
+            var pmani = (try plugin_manifest.loadOptional(allocator, plugin, game_dir)) orelse break;
+            defer pmani.deinit();
+            const inputs = try allocator.alloc(language_policy.RowInput, pmani.languages.len);
+            defer allocator.free(inputs);
+            for (pmani.languages, inputs) |row, *in| {
+                in.* = .{ .name = row.name, .extensions = row.extensions };
+            }
+            vocab = try language_policy.Vocabulary.build(allocator, inputs);
+            break;
+        }
+        // The vocabulary gate: the declared language must be a frozen
+        // built-in or a manifest row (the check `resolveProjectLanguage`
+        // used to make against the closed table, re-homed here where the
+        // manifest is in hand).
+        try language_policy.validateDeclaredLanguage(d, &vocab);
+    }
+
     // requires_language on every attached plugin manifest (decl-module
     // plugins; a light pack ships no plugin.labelle so loadOptional is null
     // for it — its manifest is covered by the pack loop below).
     for (plugins) |plugin| {
         var pmani = (try plugin_manifest.loadOptional(allocator, plugin, game_dir)) orelse continue;
         defer pmani.deinit();
-        try language_policy.checkRequiresLanguage("plugin", plugin.name, pmani.requires_language, declared);
+        try language_policy.checkRequiresLanguage("plugin", plugin.name, pmani.requires_language, declared, &vocab);
     }
 
     // requires_language on every pack manifest — game-local packs AND packs
     // bundled inside plugins (Phase-2 nested entries) ride the same list.
     for (pack_entries) |e| {
-        try language_policy.checkRequiresLanguage("pack", e.manifest.name, e.manifest.requires_language, declared);
+        try language_policy.checkRequiresLanguage("pack", e.manifest.name, e.manifest.requires_language, declared, &vocab);
     }
 
     // Script-dir scan: the game root, then every pack's SOURCE dir.
-    try language_policy.scanUnitLanguageDirs(allocator, game_dir, "project root", declared);
+    try language_policy.scanUnitLanguageDirs(allocator, game_dir, "project root", declared, &vocab);
     for (pack_entries) |e| {
         const pack_src_dir = try e.resolveSrcDir(allocator, game_dir);
         defer allocator.free(pack_src_dir);
         const label = try std.fmt.allocPrint(allocator, "pack '{s}'", .{e.manifest.name});
         defer allocator.free(label);
-        try language_policy.scanUnitLanguageDirs(allocator, pack_src_dir, label, declared);
+        try language_policy.scanUnitLanguageDirs(allocator, pack_src_dir, label, declared, &vocab);
     }
 }
 
