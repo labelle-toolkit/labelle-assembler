@@ -197,42 +197,60 @@ fn drawPerfTables(game: anytype, comptime Gui: type) void {
 
     if (comptime @hasDecl(Game, "scriptProfileRows")) {
         var count: usize = 0;
-        for (game.scriptProfileRows()) |r| insertTopRow(&rows_buf, &count, .{
-            .name = r.name,
-            .setup_ns = phaseNs(r, "setup"),
-            .tick_ns = phaseNs(r, "tick"),
-            .gui_ns = phaseNs(r, "draw_gui"),
-        });
-        drawPerfGroup(Gui, "Scripts", rows_buf[0..count], false);
+        var full_total_ns: u64 = 0;
+        var full_count: usize = 0;
+        for (game.scriptProfileRows()) |r| {
+            const row: PerfRow = .{
+                .name = r.name,
+                .setup_ns = phaseNs(r, "setup"),
+                .tick_ns = phaseNs(r, "tick"),
+                .gui_ns = phaseNs(r, "draw_gui"),
+            };
+            // Total must cover EVERY unit, even those truncated off the
+            // top-N display list (#380 review round 2) — accumulate here,
+            // before the cap, so the footer isn't an undercount.
+            full_total_ns += row.frameNs();
+            full_count += 1;
+            insertTopRow(&rows_buf, &count, row);
+        }
+        drawPerfGroup(Gui, "Scripts", rows_buf[0..count], false, full_total_ns, full_count);
     }
     if (comptime @hasDecl(Game, "pluginProfileRows")) {
         var count: usize = 0;
-        for (game.pluginProfileRows()) |r| insertTopRow(&rows_buf, &count, .{
-            .name = r.name,
-            .setup_ns = phaseNs(r, "setup"),
-            .tick_ns = phaseNs(r, "tick"),
-            .post_ns = phaseNs(r, "post_tick"),
-            .gui_ns = phaseNs(r, "draw_gui"),
-        });
-        drawPerfGroup(Gui, "Plugins", rows_buf[0..count], true);
+        var full_total_ns: u64 = 0;
+        var full_count: usize = 0;
+        for (game.pluginProfileRows()) |r| {
+            const row: PerfRow = .{
+                .name = r.name,
+                .setup_ns = phaseNs(r, "setup"),
+                .tick_ns = phaseNs(r, "tick"),
+                .post_ns = phaseNs(r, "post_tick"),
+                .gui_ns = phaseNs(r, "draw_gui"),
+            };
+            full_total_ns += row.frameNs();
+            full_count += 1;
+            insertTopRow(&rows_buf, &count, row);
+        }
+        drawPerfGroup(Gui, "Plugins", rows_buf[0..count], true, full_total_ns, full_count);
     }
 }
 
 /// One table: header, rows sorted by per-frame cost (desc), total footer.
+///
+/// `rows` is the (already top-N-capped) display set; `full_total_ns` and
+/// `full_count` describe the ENTIRE unit set the caller collected from,
+/// so the footer total reflects every unit even when only the priciest
+/// `rows.len` are shown.
 fn drawPerfGroup(
     comptime Gui: type,
     comptime title: [:0]const u8,
     rows: []PerfRow,
     comptime show_post: bool,
+    full_total_ns: u64,
+    full_count: usize,
 ) void {
-    if (rows.len == 0) return;
+    if (full_count == 0) return;
     std.mem.sort(PerfRow, rows, {}, perfRowDesc);
-
-    // Sum the total UNCONDITIONALLY, before the table-render branch —
-    // if `beginTable` returns false (collapsed / clipped) the row loop
-    // is skipped, and a total computed inside it would print stale/zero.
-    var total_ns: u64 = 0;
-    for (rows) |r| total_ns += r.frameNs();
 
     Gui.spacing();
     Gui.label(title ++ " (ms, last frame; * >1ms, ! >5ms):");
@@ -271,8 +289,14 @@ fn drawPerfGroup(
         }
         Gui.endTable();
     }
-    var total_buf: [64]u8 = undefined;
-    Gui.label(std.fmt.bufPrintZ(&total_buf, "Total {s}: {d:.2}ms", .{ title, nsToMs(total_ns) }) catch "?");
+    var total_buf: [96]u8 = undefined;
+    if (full_count > rows.len) {
+        // Truncated: total still covers all `full_count` units, but only
+        // the priciest `rows.len` are listed above.
+        Gui.label(std.fmt.bufPrintZ(&total_buf, "Total {s}: {d:.2}ms (top {d} of {d})", .{ title, nsToMs(full_total_ns), rows.len, full_count }) catch "?");
+    } else {
+        Gui.label(std.fmt.bufPrintZ(&total_buf, "Total {s}: {d:.2}ms", .{ title, nsToMs(full_total_ns) }) catch "?");
+    }
 }
 
 pub const Systems = struct {
@@ -852,6 +876,40 @@ test "insertTopRow keeps the priciest N even when a hot row is beyond the cap" {
     try testing.expectEqualStrings("priciest", buf[0].name); // late hot rows kept
     try testing.expectEqualStrings("second", buf[1].name);
     try testing.expectEqualStrings("cheap", buf[count - 1].name); // smallest evicted
+}
+
+test "perf total sums ALL units, not just the displayed top-N" {
+    // MAX_PERF_ROWS + extra units, each with equal recurring cost. This
+    // mirrors drawPerfTables: accumulate the FULL total across every unit
+    // while only the top-N survive insertTopRow for display. The footer
+    // total must reflect all units, not the capped display set.
+    const extra: usize = 10;
+    var buf: [MAX_PERF_ROWS]PerfRow = undefined;
+    var count: usize = 0;
+    var full_total_ns: u64 = 0;
+    var full_count: usize = 0;
+
+    var i: usize = 0;
+    while (i < MAX_PERF_ROWS + extra) : (i += 1) {
+        const row = PerfRow{ .name = "u", .tick_ns = 1_000 };
+        full_total_ns += row.frameNs(); // accumulate BEFORE the cap
+        full_count += 1;
+        insertTopRow(&buf, &count, row);
+    }
+
+    // Display set is capped; full accounting is not.
+    try testing.expectEqual(MAX_PERF_ROWS, count);
+    try testing.expectEqual(MAX_PERF_ROWS + extra, full_count);
+
+    // The footer total (full_total_ns) covers every unit …
+    try testing.expectEqual(@as(u64, (MAX_PERF_ROWS + extra) * 1_000), full_total_ns);
+
+    // … and strictly exceeds the sum of only the displayed top-N, which
+    // is exactly the undercount the fix avoids.
+    var top_n_ns: u64 = 0;
+    for (buf[0..count]) |r| top_n_ns += r.frameNs();
+    try testing.expectEqual(@as(u64, MAX_PERF_ROWS * 1_000), top_n_ns);
+    try testing.expect(full_total_ns > top_n_ns);
 }
 
 test "insertTopRow leaves rows sorted descending by frame cost" {
