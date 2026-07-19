@@ -117,7 +117,7 @@ pub fn ensureStepToolsOnPath(
         if (step.command.len == 0) continue;
         const tool = step.command[0];
         if (!isPathResolvedTool(tool)) continue;
-        if (try toolOnPath(allocator, path_value, tool)) continue;
+        if (toolOnPath(path_value, tool)) continue;
 
         std.debug.print(
             "labelle-assembler: plugin '{s}' \"{s}\" build step '{s}' needs '{s}', which was not found on PATH.\n",
@@ -167,20 +167,23 @@ fn isPathResolvedTool(tool: []const u8) bool {
 /// (platform delimiter; on Windows the conventional executable
 /// extensions are probed too). Existence-only — no spawn: the probe must
 /// stay assumption-free about tool CLIs (`--version` is not universal)
-/// and add no per-generate child-process latency.
-fn toolOnPath(allocator: std.mem.Allocator, path_value: []const u8, tool: []const u8) !bool {
+/// and add no per-generate child-process latency. Allocation-free (gemini
+/// #644): candidate paths are formatted into one stack buffer — a PATH
+/// with hundreds of dirs must not mean hundreds of heap allocations. A
+/// candidate longer than the buffer can't name a real file, so an
+/// over-long dir is simply skipped (`bufPrint … catch continue`).
+fn toolOnPath(path_value: []const u8, tool: []const u8) bool {
     var it = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
         if (builtin.os.tag == .windows) {
             for ([_][]const u8{ ".exe", ".cmd", ".bat", "" }) |ext| {
-                const candidate = try std.fmt.allocPrint(allocator, "{s}{c}{s}{s}", .{ dir, std.fs.path.sep, tool, ext });
-                defer allocator.free(candidate);
+                const candidate = std.fmt.bufPrint(&buf, "{s}{c}{s}{s}", .{ dir, std.fs.path.sep, tool, ext }) catch continue;
                 if (cache.dirExists(candidate)) return true;
             }
         } else {
-            const candidate = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ dir, std.fs.path.sep, tool });
-            defer allocator.free(candidate);
+            const candidate = std.fmt.bufPrint(&buf, "{s}{c}{s}", .{ dir, std.fs.path.sep, tool }) catch continue;
             if (cache.dirExists(candidate)) return true;
         }
     }
