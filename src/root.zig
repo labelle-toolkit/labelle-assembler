@@ -452,18 +452,18 @@ pub fn generate(
     // for them.
     var watch_dir_rel: ?[]u8 = null;
     defer if (watch_dir_rel) |p| allocator.free(p);
-    // Local pack script dirs (labelle-scripting#51): the same computation
-    // for every `local:`/`@`-pinned pack whose SOURCE tree ships a
-    // `scripts/` dir — in-tree packs are just as editable in the dev loop
-    // as the game's scripts. Published/cached packs are excluded (their
-    // cache copy is not the tree anyone edits), and nested plugin-bundled
-    // pack entries carry an empty `.repo` (never `isLocal`), so they ride
-    // their plugin rather than watch a cache path. The splice's emission
-    // comptime-gates the watchDir calls on the plugin's multi-root watch
-    // layer — see `emitHotReloadWatch`.
-    var pack_watch_dirs: std.ArrayList([]u8) = .empty;
+    // Local pack script dirs (labelle-scripting#51) are collected LATER —
+    // after `s.scripts` is populated (below), because the co-watch is
+    // gated on the pack actually contributing a REGISTERED script (codex
+    // P2 #642). This storage is declared here so its cleanup `defer` spans
+    // the whole function; the population loop lives beside the `s.scripts`
+    // assignment.
+    var pack_watch_dirs: std.ArrayList(scripting_splice.PackWatchDir) = .empty;
     defer {
-        for (pack_watch_dirs.items) |p| allocator.free(p);
+        for (pack_watch_dirs.items) |p| {
+            allocator.free(p.from_target);
+            allocator.free(p.from_root);
+        }
         pack_watch_dirs.deinit(allocator);
     }
     if (maybe_scripting) |*s| {
@@ -477,17 +477,6 @@ pub fn generate(
                 watch_dir_rel = rel;
                 s.watch_dir_from_target = rel;
             } else |_| {}
-
-            for (pack_entries.items) |*e| {
-                if (!e.plugin.isLocal()) continue;
-                const pack_src = e.resolveSrcDir(allocator, game_dir) catch continue;
-                defer allocator.free(pack_src);
-                if (try scripting_splice.packWatchDirFromTarget(allocator, target_dir, pack_src)) |rel| {
-                    errdefer allocator.free(rel);
-                    try pack_watch_dirs.append(allocator, rel);
-                }
-            }
-            s.pack_watch_dirs = pack_watch_dirs.items;
         }
     }
 
@@ -685,6 +674,34 @@ pub fn generate(
             script_embeds = try scripting_splice.collectEmbedScripts(allocator, game_dir, target_dir, s.*);
             combined_embeds = try scripting_splice.concatEmbeds3(allocator, component_embeds.?, event_embeds.?, script_embeds.?);
             s.scripts = combined_embeds.?;
+
+            // Local pack script dirs to co-watch (labelle-scripting#51):
+            // now that `s.scripts` (the REGISTERED set) is known, collect
+            // the co-watch pair for every `local:`/`@`-pinned pack that
+            // ships a `scripts/` SOURCE dir AND contributes at least one
+            // registered script (codex P2 #642 — a pack the assembler
+            // never embedded has no reload target). Published/cached packs
+            // and nested plugin-bundled packs (empty `.repo`, not
+            // `isLocal`) are excluded. Each pair carries the same
+            // primary/fallback candidates the game-dir watch uses
+            // (coderabbit #642). OutOfMemory propagates (gemini #642);
+            // only a genuinely-absent `scripts/` dir degrades to skip.
+            if (s.hot_reload_capable and !s.legacy) {
+                for (pack_entries.items) |*e| {
+                    if (!e.plugin.isLocal()) continue;
+                    if (!scripting_splice.packHasRegisteredScript(s.scripts, e.manifest.name)) continue;
+                    const pack_src = try e.resolveSrcDir(allocator, game_dir);
+                    defer allocator.free(pack_src);
+                    if (try scripting_splice.packWatchDirs(allocator, game_dir, target_dir, pack_src)) |pair| {
+                        errdefer {
+                            allocator.free(pair.from_target);
+                            allocator.free(pair.from_root);
+                        }
+                        try pack_watch_dirs.append(allocator, pair);
+                    }
+                }
+                s.pack_watch_dirs = pack_watch_dirs.items;
+            }
         } else {
             // Native family (rust): collect ONLY the declaration files. The
             // Zig `components/`/`events/` links (below) expose them in the

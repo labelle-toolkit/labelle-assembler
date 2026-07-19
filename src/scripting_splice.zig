@@ -228,6 +228,20 @@ pub const Family = enum { embed, native };
 /// strips numeric ordering prefixes from the registered stem
 /// (`10_spawner.rb` registers as "spawner") — the stem alone can no longer
 /// reconstruct the embed path.
+/// One local pack's co-watched script dir (labelle-scripting#51), with
+/// the same primary/fallback candidate pair the game-dir watch emits so
+/// hot reload works regardless of the binary's launch cwd.
+pub const PackWatchDir = struct {
+    /// SOURCE `scripts/` dir relative to the generated TARGET dir (the
+    /// game's cwd under `labelle run` → `zig build run` in
+    /// `.labelle/<target>/`). Forward-slash normalized.
+    from_target: []const u8,
+    /// SOURCE `scripts/` dir relative to the PROJECT ROOT (a binary
+    /// launched from the project root itself — the game-dir watch's
+    /// fallback, applied per pack). Forward-slash normalized.
+    from_root: []const u8,
+};
+
 pub const EmbedScript = struct {
     /// Registered stem: ordering prefix + extension stripped, exactly as
     /// the Zig script scanner strips them (`script_scanner.stripPrefixAndExt`).
@@ -339,17 +353,23 @@ pub const ScriptingSplice = struct {
     /// Null → the emission falls back to the cwd-relative `dir` alone.
     /// Borrowed (root.zig owns and frees it), like `scripts`.
     watch_dir_from_target: ?[]const u8 = null,
-    /// LOCAL pack script source dirs (labelle-scripting#51), as seen
-    /// from the generated target dir (`../../packs/sky/scripts` style),
-    /// forward-slash normalized — computed by root.zig beside
-    /// `watch_dir_from_target` for every `local:`/`@`-pinned pack whose
-    /// SOURCE tree ships a `scripts/` dir. Published/cached packs are
-    /// never included (their cache copy is not the tree anyone edits),
-    /// and nested plugin-bundled packs ride their plugin (not `isLocal`).
-    /// Consumed by `emitHotReloadWatch`, which wraps the emitted
-    /// `watchDir` calls in the comptime multi-root capability gate (see
-    /// there). Borrowed (root.zig owns and frees), like `scripts`.
-    pack_watch_dirs: []const []const u8 = &.{},
+    /// LOCAL pack script source dirs to co-watch (labelle-scripting#51) —
+    /// each carries the SAME primary/fallback pair the game-dir watch
+    /// uses (`from_target` = SOURCE dir relative to the generated target
+    /// dir, the game's cwd under `labelle run`; `from_root` = relative to
+    /// the PROJECT ROOT, for a binary launched from there). Computed by
+    /// root.zig for every `local:`/`@`-pinned pack that (a) ships a
+    /// `scripts/` SOURCE dir AND (b) actually contributes at least one
+    /// REGISTERED script to `scripts` (codex P2 #642: a pack the assembler
+    /// never collected into the registered set has no reload target, so
+    /// watching it would inject an unregistered script into the running
+    /// VM on save). Published/cached packs are excluded (their cache copy
+    /// is not the tree anyone edits), and nested plugin-bundled packs ride
+    /// their plugin (empty `.repo`, never `isLocal`). Consumed by
+    /// `emitHotReloadWatch`, which wraps the emitted `watchDir` calls in
+    /// the comptime multi-root capability gate (see there). Borrowed
+    /// (root.zig owns and frees both strings), like `scripts`.
+    pack_watch_dirs: []const PackWatchDir = &.{},
     /// Did the transpile phase ACTUALLY check+emit into the target's
     /// materialized script dir this generate (`scripting_transpile
     /// .runPhase` returned non-null)? Set by root.zig right after the
@@ -604,29 +624,59 @@ fn skipZigWs(src: []const u8, start: usize) usize {
     return i;
 }
 
-/// Compute one LOCAL pack's watch dir for the dev splice
-/// (labelle-scripting#51): `<pack_src_dir>/scripts` as seen from the
-/// generated target dir, forward-slash normalized (the same
-/// separator-safe emitted-literal rule as `watch_dir_from_target`).
-/// Null when the pack ships no `scripts/` dir (nothing to watch — the
-/// splice never registers a dir that would fail to open at boot) or the
-/// relative-path math fails (cross-drive on Windows): dev-mode wiring
-/// degrades, it never fails a generate. Caller owns the returned string.
-pub fn packWatchDirFromTarget(
+/// Compute one LOCAL pack's co-watch dirs for the dev splice
+/// (labelle-scripting#51): the pack's `<pack_src_dir>/scripts` as seen
+/// both from the generated TARGET dir (primary) and from the PROJECT
+/// ROOT (`game_dir`, fallback) — the same primary/fallback pair the
+/// game-dir watch emits (coderabbit #642), forward-slash normalized (the
+/// separator-safe emitted-literal rule). Null when the pack ships no
+/// `scripts/` dir (nothing to watch — the splice never registers a dir
+/// that would fail to open at boot). OutOfMemory PROPAGATES (gemini #642:
+/// the other resolution helpers in root.zig do — a real OOM must not be
+/// silently mistaken for an absent dir); only the genuinely-absent
+/// `openDir` cases (`FileNotFound`/`NotDir`) degrade to null. Caller owns
+/// both returned strings.
+pub fn packWatchDirs(
     allocator: std.mem.Allocator,
+    game_dir: []const u8,
     target_dir: []const u8,
     pack_src_dir: []const u8,
-) !?[]u8 {
+) !?PackWatchDir {
     const scripts_abs = try std.fs.path.join(allocator, &.{ pack_src_dir, "scripts" });
     defer allocator.free(scripts_abs);
     const io = config.globalIo();
-    var probe = std.Io.Dir.cwd().openDir(io, scripts_abs, .{}) catch return null;
+    var probe = std.Io.Dir.cwd().openDir(io, scripts_abs, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
     probe.close(io);
-    const rel = std.fs.path.relative(allocator, "", null, target_dir, scripts_abs) catch return null;
-    for (rel) |*ch| {
+
+    const from_target = try std.fs.path.relative(allocator, "", null, target_dir, scripts_abs);
+    errdefer allocator.free(from_target);
+    for (from_target) |*ch| {
         if (ch.* == '\\') ch.* = '/';
     }
-    return rel;
+    const from_root = try std.fs.path.relative(allocator, "", null, game_dir, scripts_abs);
+    errdefer allocator.free(from_root);
+    for (from_root) |*ch| {
+        if (ch.* == '\\') ch.* = '/';
+    }
+    return .{ .from_target = from_target, .from_root = from_root };
+}
+
+/// Does any REGISTERED embed script (`scripts`) come from the pack
+/// `pack_name`'s copied tree (`packs/<pack_name>/…` target-relative
+/// `file`)? The gate `emitHotReloadWatch`/root.zig use so a pack with no
+/// registered script gets no watch (codex P2 #642). A `[128]u8` prefix
+/// buffer covers every real pack name; longer names conservatively fail
+/// the match (no watch) rather than truncate into a false positive.
+pub fn packHasRegisteredScript(scripts: []const EmbedScript, pack_name: []const u8) bool {
+    var buf: [128]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&buf, "packs/{s}/", .{pack_name}) catch return false;
+    for (scripts) |sc| {
+        if (std.mem.startsWith(u8, sc.file, prefix)) return true;
+    }
+    return false;
 }
 
 /// Should the generated build.zig pass `.hot_reload = optimize == .Debug`
@@ -805,9 +855,17 @@ pub fn emitHotReloadWatch(w: anytype, splice: ScriptingSplice) !void {
                 "        // game-dir watch above — these fold away against such a plugin.\n" ++
                 "        if (comptime @hasDecl(scripting.hot_reload, \"watchedRootCount\")) {\n",
         );
-        for (splice.pack_watch_dirs) |pack_dir| {
-            try w.print("            scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"{s}\") catch |pack_watch_err| {{\n", .{pack_dir});
-            try w.print("                std.debug.print(\"labelle: pack script dir '{s}' not watched: {{s}}\\n\", .{{@errorName(pack_watch_err)}});\n", .{pack_dir});
+        for (splice.pack_watch_dirs) |pack| {
+            // Same primary/fallback pair the game-dir watch above uses:
+            // try the target-relative SOURCE dir first (the game's cwd
+            // under `labelle run`), then the project-root-relative one
+            // (a binary launched from the project root). Per-pack failure
+            // just prints — it must never `break :hot_reload` out and drop
+            // the game-dir watch.
+            try w.print("            scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"{s}\") catch {{\n", .{pack.from_target});
+            try w.print("                scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"{s}\") catch |pack_watch_err| {{\n", .{pack.from_root});
+            try w.print("                    std.debug.print(\"labelle: pack script dir '{s}' not watched: {{s}}\\n\", .{{@errorName(pack_watch_err)}});\n", .{pack.from_root});
+            try w.writeAll("                };\n");
             try w.writeAll("            };\n");
         }
         try w.writeAll("        }\n");
@@ -3475,7 +3533,7 @@ test "emitHotReloadWatch: a TRANSPILED splice watches the target's own emitted d
     try testing.expect(std.mem.indexOf(u8, out, "TRANSPILED") != null);
 }
 
-test "emitHotReloadWatch: local pack script dirs emit inside the multi-root @hasDecl gate, after the game watch (#51)" {
+test "emitHotReloadWatch: local pack dirs emit dual candidates inside the multi-root gate, after the game watch (#51/#642)" {
     const allocator = testing.allocator;
     const splice = ScriptingSplice{
         .plugin_name = "scripting",
@@ -3484,7 +3542,10 @@ test "emitHotReloadWatch: local pack script dirs emit inside the multi-root @has
         .extension = ".rb",
         .hot_reload_capable = true,
         .watch_dir_from_target = "../../scripts",
-        .pack_watch_dirs = &.{ "../../packs/sky/scripts", "../../packs/colony/scripts" },
+        .pack_watch_dirs = &.{
+            .{ .from_target = "../../packs/sky/scripts", .from_root = "packs/sky/scripts" },
+            .{ .from_target = "../../libs/colony/scripts", .from_root = "libs/colony/scripts" },
+        },
     };
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -3497,24 +3558,30 @@ test "emitHotReloadWatch: local pack script dirs emit inside the multi-root @has
     // the game-dir watch.
     const gate = std.mem.indexOf(u8, out,
         "if (comptime @hasDecl(scripting.hot_reload, \"watchedRootCount\"))").?;
-    const sky = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../packs/sky/scripts\") catch |pack_watch_err| {").?;
-    const colony = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../packs/colony/scripts\") catch |pack_watch_err| {").?;
-    // Game dir watched FIRST (primary + fallback), pack dirs after, both
-    // inside the gate; failure degrades per pack (no break out of the
-    // hot_reload block — a bad pack dir must not kill the game watch).
+    // Dual candidate per pack (coderabbit #642): target-relative primary,
+    // project-root-relative fallback — mirroring the game-dir watch so hot
+    // reload works regardless of the binary's launch cwd.
+    const sky_primary = std.mem.indexOf(u8, out,
+        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../packs/sky/scripts\") catch {").?;
+    const sky_fallback = std.mem.indexOf(u8, out,
+        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"packs/sky/scripts\") catch |pack_watch_err| {").?;
+    const colony_primary = std.mem.indexOf(u8, out,
+        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../libs/colony/scripts\") catch {").?;
+    const colony_fallback = std.mem.indexOf(u8, out,
+        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"libs/colony/scripts\") catch |pack_watch_err| {").?;
+    // Game dir watched FIRST (primary + fallback), then each pack's
+    // primary before its fallback, both inside the gate.
     const game_primary = std.mem.indexOf(u8, out,
         "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../scripts\") catch {").?;
     try testing.expect(game_primary < gate);
-    try testing.expect(gate < sky and sky < colony);
+    try testing.expect(gate < sky_primary and sky_primary < sky_fallback);
+    try testing.expect(sky_fallback < colony_primary and colony_primary < colony_fallback);
     try testing.expect(std.mem.indexOf(u8, out, "not watched") != null);
-    // Pack watch failure degrades per pack — no `break :hot_reload` after
-    // the gate (a bad pack dir must not kill the game watch).
+    // Per-pack failure degrades: the last `break :hot_reload` is the game
+    // watch's own fallback, BEFORE the gate — no pack path breaks out.
     try testing.expect(std.mem.lastIndexOf(u8, out, "break :hot_reload;").? < gate);
-    // 2 game watches (primary + fallback) + 2 pack watches (count the
-    // precise call form — the explanatory comment mentions watchDir too).
-    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, out, ".watchDir(hot_reload_io"));
+    // 2 game watches (primary + fallback) + 2 dual pack watches = 6.
+    try testing.expectEqual(@as(usize, 6), std.mem.count(u8, out, ".watchDir(hot_reload_io"));
 }
 
 test "emitHotReloadWatch: no pack dirs -> no gate; transpile-emitted ignores pack dirs (#51)" {
@@ -3543,7 +3610,7 @@ test "emitHotReloadWatch: no pack dirs -> no gate; transpile-emitted ignores pac
     ts.extension = ".js";
     ts.transpile = .{ .source_extension = ".ts", .declaration_suffix = ".d.ts" };
     ts.transpile_emitted = true;
-    ts.pack_watch_dirs = &.{"../../packs/sky/scripts"};
+    ts.pack_watch_dirs = &.{.{ .from_target = "../../packs/sky/scripts", .from_root = "packs/sky/scripts" }};
     var aw2: std.Io.Writer.Allocating = .init(allocator);
     defer aw2.deinit();
     try emitHotReloadWatch(&aw2.writer, ts);
@@ -3555,36 +3622,58 @@ test "emitHotReloadWatch: no pack dirs -> no gate; transpile-emitted ignores pac
     // dirs set (the existing gates run first).
     var incapable = no_packs;
     incapable.hot_reload_capable = false;
-    incapable.pack_watch_dirs = &.{"../../packs/sky/scripts"};
+    incapable.pack_watch_dirs = &.{.{ .from_target = "../../packs/sky/scripts", .from_root = "packs/sky/scripts" }};
     var aw3: std.Io.Writer.Allocating = .init(allocator);
     defer aw3.deinit();
     try emitHotReloadWatch(&aw3.writer, incapable);
     try testing.expectEqual(@as(usize, 0), aw3.written().len);
 }
 
-test "packWatchDirFromTarget: scripts/ present -> target-relative normalized path; absent -> null (#51)" {
+test "packWatchDirs: scripts/ present -> dual target/root-relative paths; absent -> null (#51/#642)" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(testing.io, "game/.labelle/desktop");
-    try tmp.dir.createDirPath(testing.io, "game/packs/sky/scripts");
-    try tmp.dir.createDirPath(testing.io, "game/packs/bare"); // no scripts/
+    try tmp.dir.createDirPath(testing.io, "game/libs/sky/scripts");
+    try tmp.dir.createDirPath(testing.io, "game/libs/bare"); // no scripts/
 
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
+    const game_dir = try std.fs.path.join(allocator, &.{ root, "game" });
+    defer allocator.free(game_dir);
     const target_dir = try std.fs.path.join(allocator, &.{ root, "game", ".labelle", "desktop" });
     defer allocator.free(target_dir);
-    const sky = try std.fs.path.join(allocator, &.{ root, "game", "packs", "sky" });
+    const sky = try std.fs.path.join(allocator, &.{ root, "game", "libs", "sky" });
     defer allocator.free(sky);
-    const bare = try std.fs.path.join(allocator, &.{ root, "game", "packs", "bare" });
+    const bare = try std.fs.path.join(allocator, &.{ root, "game", "libs", "bare" });
     defer allocator.free(bare);
 
-    const rel = (try packWatchDirFromTarget(allocator, target_dir, sky)).?;
-    defer allocator.free(rel);
-    try testing.expectEqualStrings("../../packs/sky/scripts", rel);
-    // No scripts/ dir -> nothing to watch (the splice never registers a
-    // dir that would fail to open at boot).
-    try testing.expectEqual(@as(?[]u8, null), try packWatchDirFromTarget(allocator, target_dir, bare));
+    const pair = (try packWatchDirs(allocator, game_dir, target_dir, sky)).?;
+    defer allocator.free(pair.from_target);
+    defer allocator.free(pair.from_root);
+    // Primary is relative to the target dir (cwd under `labelle run`);
+    // fallback is relative to the project root (a root-launched binary).
+    try testing.expectEqualStrings("../../libs/sky/scripts", pair.from_target);
+    try testing.expectEqualStrings("libs/sky/scripts", pair.from_root);
+    // No scripts/ dir -> nothing to watch.
+    try testing.expectEqual(@as(?PackWatchDir, null), try packWatchDirs(allocator, game_dir, target_dir, bare));
+}
+
+test "packHasRegisteredScript: matches only packs contributing a registered embed (#642)" {
+    const scripts = [_]EmbedScript{
+        .{ .name = "spawner", .file = "scripts/10_spawner.rb" },
+        .{ .name = "count", .file = "packs/sky/scripts/10_count.rb" },
+        .{ .name = "hunger", .file = "components/hunger.rb" },
+    };
+    // A pack with a registered embed script matches; one with none (its
+    // scripts were never collected into the registered set) does not — so
+    // it gets no watch (codex P2 #642).
+    try testing.expect(packHasRegisteredScript(&scripts, "sky"));
+    try testing.expect(!packHasRegisteredScript(&scripts, "colony"));
+    // A prefix that is not a full pack-dir segment must not false-match
+    // (`packs/sk/` vs `packs/sky/`).
+    try testing.expect(!packHasRegisteredScript(&scripts, "sk"));
+    try testing.expect(!packHasRegisteredScript(&.{}, "sky"));
 }
 
 test "blankCommentsForProbe: comments blank, string-embedded // survives, multiline-string lines blank" {
