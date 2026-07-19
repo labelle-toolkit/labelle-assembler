@@ -31,54 +31,300 @@ var component_filters: [MAX_COMPONENTS]bool = [_]bool{false} ** MAX_COMPONENTS;
 const STATE_FILE = "debug_state.ini";
 var state_dirty: bool = false;
 
-// FPS tracking
-const FPS_HISTORY: usize = 120;
-var frame_times: [FPS_HISTORY]f32 = [_]f32{0} ** FPS_HISTORY;
-var frame_index: usize = 0;
-var last_time: ?i64 = null;
-var fps_avg: f32 = 0;
-var fps_min: f32 = 0;
-var fps_max: f32 = 0;
-var frame_ms: f32 = 0;
+// ── Performance section (labelle-engine#380) ─────────────────────────
+//
+// FPS/frame-time comes from the engine's always-on FrameProfiler
+// (`game.frameStats()` / `game.frameHistory()`); per-script and
+// per-plugin timings come from the engine's dispatch profiler
+// (`game.scriptProfileRows()` / `game.pluginProfileRows()`). The plugin
+// arms live capture via `game.setProfilingCapture(true)` while the
+// Performance section is visible and hands the gate back to the
+// LABELLE_PROFILE env var (`null`) when it closes, so an env-enabled
+// headless dump keeps running. Engine reads are `@hasDecl`/`@hasField`
+// gated: against an engine without the API the section degrades to a
+// hint label instead of breaking the build.
 
-fn updateFpsTracking() void {
-    // std.time.milliTimestamp removed in 0.16. FPS tracking is debug-only;
-    // stub to a monotonically increasing counter so the histogram still updates.
-    const S = struct { var counter: i64 = 0; };
-    S.counter += 16;
-    const now: i64 = S.counter;
-    if (last_time) |prev| {
-        const delta_ms: f32 = @floatFromInt(now - prev);
-        frame_times[frame_index] = delta_ms;
-        frame_index = (frame_index + 1) % FPS_HISTORY;
-        frame_ms = delta_ms;
+/// Whether we currently hold the engine's capture override.
+var capture_armed: bool = false;
 
-        // Compute stats from history
-        var sum: f32 = 0;
-        var min: f32 = 9999;
-        var max: f32 = 0;
-        var count: usize = 0;
-        for (frame_times) |t| {
-            if (t > 0) {
-                sum += t;
-                if (t < min) min = t;
-                if (t > max) max = t;
-                count += 1;
+/// One render-ready profiler table row, ns per lifecycle phase. Pure
+/// data (no engine types) so sorting/formatting stay unit-testable.
+const PerfRow = struct {
+    name: []const u8,
+    setup_ns: u64 = 0,
+    tick_ns: u64 = 0,
+    post_ns: u64 = 0,
+    gui_ns: u64 = 0,
+
+    /// Recurring per-frame cost — the sort key. Boot-time `setup` is
+    /// deliberately excluded.
+    fn frameNs(self: PerfRow) u64 {
+        return self.tick_ns + self.post_ns + self.gui_ns;
+    }
+};
+
+/// Upper bound on displayed rows per group (scripts / plugins).
+const MAX_PERF_ROWS: usize = 64;
+
+fn perfRowDesc(_: void, a: PerfRow, b: PerfRow) bool {
+    return a.frameNs() > b.frameNs();
+}
+
+/// Insert `row` into `buf[0..count.*]`, keeping the buffer sorted by
+/// per-frame cost (descending) and capped at `buf.len`. This gives
+/// sort-then-truncate semantics in one streaming pass: with more units
+/// than `buf.len`, the priciest rows survive REGARDLESS of their source
+/// order (fixing the "truncate-before-sort drops late-registered hot
+/// scripts" bug). `count` is updated in place; the top `count.*` rows
+/// are left sorted so the renderer can emit them directly.
+fn insertTopRow(buf: []PerfRow, count: *usize, row: PerfRow) void {
+    const cost = row.frameNs();
+    if (count.* < buf.len) {
+        // Room left: shift the smaller tail right and drop `row` in.
+        var i: usize = count.*;
+        while (i > 0 and buf[i - 1].frameNs() < cost) : (i -= 1) buf[i] = buf[i - 1];
+        buf[i] = row;
+        count.* += 1;
+    } else if (buf.len > 0 and buf[buf.len - 1].frameNs() < cost) {
+        // Full: replace the current smallest only if `row` beats it.
+        var i: usize = buf.len - 1;
+        while (i > 0 and buf[i - 1].frameNs() < cost) : (i -= 1) buf[i] = buf[i - 1];
+        buf[i] = row;
+    }
+}
+
+/// Severity marker mirroring the engine's traffic light (green < 1ms,
+/// yellow 1-5ms, red > 5ms). Text markers because the GuiInterface has
+/// no colored-label API yet (follow-up).
+fn severityMark(ns: u64) []const u8 {
+    if (ns >= 5_000_000) return "!";
+    if (ns >= 1_000_000) return "*";
+    return "";
+}
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+
+/// Format one phase cell: "0.45" / "1.20*" / "6.00!" (ms + severity
+/// marker), or "-" when the phase cost is zero (never ran / below
+/// clock resolution).
+fn fmtPhase(buf: []u8, ns: u64) [:0]const u8 {
+    if (ns == 0) return std.fmt.bufPrintZ(buf, "-", .{}) catch "?";
+    return std.fmt.bufPrintZ(buf, "{d:.2}{s}", .{ nsToMs(ns), severityMark(ns) }) catch "?";
+}
+
+/// Read a phase Stat's live ns from an engine profile row, tolerating
+/// older engines whose rows lack the phase field (e.g. `setup` /
+/// plugin `draw_gui` pre-2.5): missing fields read as 0.
+fn phaseNs(row: anytype, comptime phase: []const u8) u64 {
+    if (comptime !@hasField(@TypeOf(row), phase)) return 0;
+    return @field(row, phase).last_ns;
+}
+
+/// True when env var `name` is set and non-empty. Desktop/libc only
+/// (same constraint as the engine's profiler gate); wasm and no-libc
+/// builds always report false.
+fn envTruthy(comptime name: [*:0]const u8) bool {
+    const builtin = @import("builtin");
+    if (comptime builtin.cpu.arch == .wasm32 or builtin.os.tag == .emscripten) return false;
+    if (comptime !builtin.link_libc) return false;
+    const raw = std.c.getenv(name) orelse return false;
+    return std.mem.span(raw).len > 0;
+}
+
+/// Arm/disarm the engine's live per-unit capture to track panel
+/// visibility. Disarming passes `null` (not `false`) so a user-set
+/// LABELLE_PROFILE keeps its headless dump.
+fn syncProfilingCapture(game: anytype, want: bool) void {
+    const Game = @TypeOf(game.*);
+    if (comptime !@hasDecl(Game, "setProfilingCapture")) return;
+    if (want == capture_armed) return;
+    game.setProfilingCapture(if (want) true else null);
+    capture_armed = want;
+}
+
+/// FPS header + (when Show Performance is on) min/avg/max and the
+/// frame-time mini-graph, all fed by the engine's FrameProfiler.
+fn drawFpsHeader(game: anytype, comptime Gui: type) void {
+    const Game = @TypeOf(game.*);
+    // Both accessors are gated under one capability check — an engine
+    // exposing frameStats but not frameTimeMs must still compile.
+    if (comptime !(@hasDecl(Game, "frameStats") and @hasDecl(Game, "frameTimeMs"))) {
+        Gui.label("FPS: n/a (engine lacks frameStats)");
+        return;
+    }
+    const st = game.frameStats();
+    var fps_buf: [64]u8 = undefined;
+    Gui.label(std.fmt.bufPrintZ(&fps_buf, "FPS: {d:.0} | Frame: {d:.1}ms", .{ st.fps, game.frameTimeMs() }) catch "?");
+
+    if (!show_perf) return;
+
+    var mm_buf: [96]u8 = undefined;
+    Gui.label(std.fmt.bufPrintZ(&mm_buf, "min {d:.1} / avg {d:.1} / max {d:.1} ms", .{ st.min_ms, st.avg_ms, st.max_ms }) catch "?");
+
+    if (comptime @hasDecl(Game, "frameHistory")) {
+        // Mini graph: newest 40 frames, one char each, full bar = 33.3ms
+        // (30 FPS). Keep the buffer one byte larger than the bar so the
+        // null terminator doesn't clobber the last char.
+        const bar_len: usize = 40;
+        var hist_buf: [bar_len]f32 = undefined;
+        const hist = game.frameHistory(&hist_buf);
+        if (hist.len > 0) {
+            var bar: [bar_len + 1]u8 = undefined;
+            const full_ms: f32 = 33.3;
+            for (hist, 0..) |ms, i| {
+                const ratio = @min(ms / full_ms, 1.0);
+                bar[i] = if (ratio > 0.8) '!' else if (ratio > 0.5) '#' else if (ratio > 0.2) '=' else '.';
             }
-        }
-        if (count > 0) {
-            const avg = sum / @as(f32, @floatFromInt(count));
-            fps_avg = if (avg > 0) 1000.0 / avg else 0;
-            fps_min = if (max > 0) 1000.0 / max else 0;
-            fps_max = if (min > 0) 1000.0 / min else 0;
+            bar[hist.len] = 0;
+            var graph_buf: [64]u8 = undefined;
+            Gui.label(std.fmt.bufPrintZ(&graph_buf, "[{s}]", .{bar[0..hist.len :0]}) catch "?");
         }
     }
-    last_time = now;
+}
+
+/// Sorted per-unit timing tables (scripts, then plugin systems).
+///
+/// Each block collects the top `MAX_PERF_ROWS` by per-frame cost via a
+/// streaming inserter, so with more units than the cap the priciest
+/// survive regardless of source order. The scripts and plugins accessors
+/// are gated INDEPENDENTLY (`@hasDecl`) so an engine exposing only one
+/// still compiles.
+fn drawPerfTables(game: anytype, comptime Gui: type) void {
+    const Game = @TypeOf(game.*);
+
+    // The tables are only meaningful when per-unit capture is genuinely
+    // ARMABLE and ACTIVE. An engine can expose `scriptProfileRows` /
+    // `pluginProfileRows` (>= 2.4) yet lack `setProfilingCapture`
+    // (< 2.6): then `syncProfilingCapture` is a no-op, nothing enables
+    // recording, and every row reads back 0 — the table would render a
+    // wall of `-` / `0.00ms` and read as a broken panel. Gate on the
+    // capture-control API being present AND capture being live, and
+    // otherwise print one honest line instead of the empty tables.
+    if (comptime !@hasDecl(Game, "setProfilingCapture") or !@hasDecl(Game, "profilingCaptureActive")) {
+        Gui.label("profiling capture unavailable - requires engine >= 2.6.0");
+        return;
+    }
+    if (!game.profilingCaptureActive()) {
+        // Capture-capable engine, but recording is off right now (e.g.
+        // arming hasn't taken effect) - don't show stale zero rows.
+        Gui.label("profiling capture inactive");
+        return;
+    }
+
+    var rows_buf: [MAX_PERF_ROWS]PerfRow = undefined;
+
+    if (comptime @hasDecl(Game, "scriptProfileRows")) {
+        var count: usize = 0;
+        var full_total_ns: u64 = 0;
+        var full_count: usize = 0;
+        for (game.scriptProfileRows()) |r| {
+            const row: PerfRow = .{
+                .name = r.name,
+                .setup_ns = phaseNs(r, "setup"),
+                .tick_ns = phaseNs(r, "tick"),
+                .gui_ns = phaseNs(r, "draw_gui"),
+            };
+            // Total must cover EVERY unit, even those truncated off the
+            // top-N display list (#380 review round 2) — accumulate here,
+            // before the cap, so the footer isn't an undercount.
+            full_total_ns += row.frameNs();
+            full_count += 1;
+            insertTopRow(&rows_buf, &count, row);
+        }
+        drawPerfGroup(Gui, "Scripts", rows_buf[0..count], false, full_total_ns, full_count);
+    }
+    if (comptime @hasDecl(Game, "pluginProfileRows")) {
+        var count: usize = 0;
+        var full_total_ns: u64 = 0;
+        var full_count: usize = 0;
+        for (game.pluginProfileRows()) |r| {
+            const row: PerfRow = .{
+                .name = r.name,
+                .setup_ns = phaseNs(r, "setup"),
+                .tick_ns = phaseNs(r, "tick"),
+                .post_ns = phaseNs(r, "post_tick"),
+                .gui_ns = phaseNs(r, "draw_gui"),
+            };
+            full_total_ns += row.frameNs();
+            full_count += 1;
+            insertTopRow(&rows_buf, &count, row);
+        }
+        drawPerfGroup(Gui, "Plugins", rows_buf[0..count], true, full_total_ns, full_count);
+    }
+}
+
+/// One table: header, rows sorted by per-frame cost (desc), total footer.
+///
+/// `rows` is the (already top-N-capped) display set; `full_total_ns` and
+/// `full_count` describe the ENTIRE unit set the caller collected from,
+/// so the footer total reflects every unit even when only the priciest
+/// `rows.len` are shown.
+fn drawPerfGroup(
+    comptime Gui: type,
+    comptime title: [:0]const u8,
+    rows: []PerfRow,
+    comptime show_post: bool,
+    full_total_ns: u64,
+    full_count: usize,
+) void {
+    if (full_count == 0) return;
+    std.mem.sort(PerfRow, rows, {}, perfRowDesc);
+
+    Gui.spacing();
+    Gui.label(title ++ " (ms, last frame; * >1ms, ! >5ms):");
+    const cols: i32 = if (show_post) 5 else 4;
+    if (Gui.beginTable(title, cols)) {
+        Gui.tableNextRow();
+        _ = Gui.tableNextColumn();
+        Gui.label("name");
+        _ = Gui.tableNextColumn();
+        Gui.label("tick");
+        if (show_post) {
+            _ = Gui.tableNextColumn();
+            Gui.label("post");
+        }
+        _ = Gui.tableNextColumn();
+        Gui.label("gui");
+        _ = Gui.tableNextColumn();
+        Gui.label("setup");
+
+        for (rows) |r| {
+            Gui.tableNextRow();
+            var name_buf: [96]u8 = undefined;
+            _ = Gui.tableNextColumn();
+            Gui.label(std.fmt.bufPrintZ(&name_buf, "{s}", .{r.name}) catch "?");
+            var cell: [24]u8 = undefined;
+            _ = Gui.tableNextColumn();
+            Gui.label(fmtPhase(&cell, r.tick_ns));
+            if (show_post) {
+                _ = Gui.tableNextColumn();
+                Gui.label(fmtPhase(&cell, r.post_ns));
+            }
+            _ = Gui.tableNextColumn();
+            Gui.label(fmtPhase(&cell, r.gui_ns));
+            _ = Gui.tableNextColumn();
+            Gui.label(fmtPhase(&cell, r.setup_ns));
+        }
+        Gui.endTable();
+    }
+    var total_buf: [96]u8 = undefined;
+    if (full_count > rows.len) {
+        // Truncated: total still covers all `full_count` units, but only
+        // the priciest `rows.len` are listed above.
+        Gui.label(std.fmt.bufPrintZ(&total_buf, "Total {s}: {d:.2}ms (top {d} of {d})", .{ title, nsToMs(full_total_ns), rows.len, full_count }) catch "?");
+    } else {
+        Gui.label(std.fmt.bufPrintZ(&total_buf, "Total {s}: {d:.2}ms", .{ title, nsToMs(full_total_ns) }) catch "?");
+    }
 }
 
 pub const Systems = struct {
     pub fn setup(game: anytype) void {
         loadDebugState(game);
+        // Open the inspector at boot when LABELLE_DEBUG_OPEN is set —
+        // skips the F12 for headless screenshot runs and quick triage.
+        if (envTruthy("LABELLE_DEBUG_OPEN")) debug_visible = true;
     }
 
     pub fn drawGui(game: anytype) void {
@@ -95,8 +341,9 @@ pub const Systems = struct {
             dirty = true;
         }
 
-        // Always track FPS even when hidden
-        updateFpsTracking();
+        // Keep the engine's live per-unit capture in step with panel
+        // visibility (runs even when hidden, so closing disarms it).
+        syncProfilingCapture(game, debug_visible and show_perf);
 
         // Save before early return so F12-to-hide is persisted
         if (dirty and !debug_visible) {
@@ -107,65 +354,9 @@ pub const Systems = struct {
         if (!debug_visible) return;
 
         if (Gui.beginWindow("Debug Inspector")) {
-            // ── FPS (always visible) ──
-            var fps_buf: [64]u8 = undefined;
-            Gui.label(std.fmt.bufPrintZ(&fps_buf, "FPS: {d:.0} | Frame: {d:.1}ms", .{ fps_avg, frame_ms }) catch "?");
-
-            if (show_perf) {
-                var perf_buf: [64]u8 = undefined;
-                Gui.label(std.fmt.bufPrintZ(&perf_buf, "Min: {d:.0} Avg: {d:.0} Max: {d:.0}", .{ fps_min, fps_avg, fps_max }) catch "?");
-
-                // Mini frame time graph via text bars. Keep the
-                // buffer one byte larger than the visible width so
-                // the null terminator doesn't clobber the last bar
-                // — the pre-fix version wrote 40 bar chars, then
-                // overwrote index 39 with 0 and only rendered 39.
-                var graph_buf: [64]u8 = undefined;
-                const bar_len: usize = 40;
-                var bar: [bar_len + 1]u8 = undefined;
-                const max_ms: f32 = 33.3; // 30 FPS = one full bar
-                for (0..bar_len) |i| {
-                    const idx = (frame_index + FPS_HISTORY - bar_len + i) % FPS_HISTORY;
-                    const t = frame_times[idx];
-                    const ratio = @min(t / max_ms, 1.0);
-                    bar[i] = if (ratio > 0.8) '!' else if (ratio > 0.5) '#' else if (ratio > 0.2) '=' else '.';
-                }
-                bar[bar_len] = 0;
-                Gui.label(std.fmt.bufPrintZ(&graph_buf, "[{s}]", .{bar[0..bar_len :0]}) catch "?");
-            }
-            // Script profiling (debug builds only)
-            if (game.script_profile_ptr) |ptr| {
-                const ProfileEntry = struct { name: []const u8, tick_ns: u64, draw_gui_ns: u64 };
-                const entries: [*]const ProfileEntry = @ptrCast(@alignCast(ptr));
-                const count = game.script_profile_count;
-
-                Gui.spacing();
-                Gui.label("Scripts:");
-                for (0..count) |i| {
-                    const e = entries[i];
-                    const tick_us = @as(f64, @floatFromInt(e.tick_ns)) / 1000.0;
-                    const gui_us = @as(f64, @floatFromInt(e.draw_gui_ns)) / 1000.0;
-                    var sbuf: [96]u8 = undefined;
-                    Gui.label(std.fmt.bufPrintZ(&sbuf, "  {s}: tick={d:.0}us gui={d:.0}us", .{ e.name, tick_us, gui_us }) catch "?");
-                }
-            }
-
-            if (game.plugin_profile_ptr) |ptr| {
-                const PluginEntry = struct { name: []const u8, tick_ns: u64, post_tick_ns: u64, draw_gui_ns: u64 };
-                const entries: [*]const PluginEntry = @ptrCast(@alignCast(ptr));
-                const count = game.plugin_profile_count;
-
-                Gui.spacing();
-                Gui.label("Plugins:");
-                for (0..count) |i| {
-                    const e = entries[i];
-                    const tick_us = @as(f64, @floatFromInt(e.tick_ns)) / 1000.0;
-                    const post_us = @as(f64, @floatFromInt(e.post_tick_ns)) / 1000.0;
-                    const gui_us = @as(f64, @floatFromInt(e.draw_gui_ns)) / 1000.0;
-                    var sbuf: [128]u8 = undefined;
-                    Gui.label(std.fmt.bufPrintZ(&sbuf, "  {s}: tick={d:.0}us post={d:.0}us gui={d:.0}us", .{ e.name, tick_us, post_us, gui_us }) catch "?");
-                }
-            }
+            // ── FPS + performance (engine-fed, labelle-engine#380) ──
+            drawFpsHeader(game, Gui);
+            if (show_perf) drawPerfTables(game, Gui);
 
             {
                 const prev = show_perf;
@@ -668,4 +859,202 @@ fn formatField(buf: []u8, name: []const u8, comptime T: type, value: T) ![:0]u8 
         .@"enum" => std.fmt.bufPrintZ(buf, "{s}: {s}", .{ name, @tagName(value) }),
         else => std.fmt.bufPrintZ(buf, "{s}: ({s})", .{ name, @typeName(T) }),
     };
+}
+
+test "perf rows sort by per-frame cost, setup excluded" {
+    var rows = [_]PerfRow{
+        .{ .name = "cheap", .tick_ns = 50_000, .setup_ns = 900_000_000 },
+        .{ .name = "hot", .tick_ns = 1_200_000, .post_ns = 300_000 },
+        .{ .name = "mid", .tick_ns = 220_000, .gui_ns = 400_000 },
+    };
+    std.mem.sort(PerfRow, &rows, {}, perfRowDesc);
+    try testing.expectEqualStrings("hot", rows[0].name);
+    try testing.expectEqualStrings("mid", rows[1].name);
+    // 900ms of setup must NOT outrank recurring cost.
+    try testing.expectEqualStrings("cheap", rows[2].name);
+    try testing.expectEqual(@as(u64, 1_500_000), rows[0].frameNs());
+}
+
+test "insertTopRow keeps the priciest N even when a hot row is beyond the cap" {
+    // MAX_PERF_ROWS+ units where the PRICIEST rows are registered LAST
+    // (indices past the cap) — exactly what truncate-before-sort drops.
+    // The streaming inserter must still land them in the top-N.
+    var buf: [MAX_PERF_ROWS]PerfRow = undefined;
+    var count: usize = 0;
+
+    var i: usize = 0;
+    while (i < MAX_PERF_ROWS) : (i += 1) {
+        insertTopRow(&buf, &count, .{ .name = "cheap", .tick_ns = 1_000 });
+    }
+    try testing.expectEqual(MAX_PERF_ROWS, count);
+
+    // Expensive rows arriving AFTER the buffer is already full.
+    insertTopRow(&buf, &count, .{ .name = "priciest", .tick_ns = 9_000_000 });
+    insertTopRow(&buf, &count, .{ .name = "second", .tick_ns = 2_000_000 });
+
+    try testing.expectEqual(MAX_PERF_ROWS, count); // never exceeds the cap
+    try testing.expectEqualStrings("priciest", buf[0].name); // late hot rows kept
+    try testing.expectEqualStrings("second", buf[1].name);
+    try testing.expectEqualStrings("cheap", buf[count - 1].name); // smallest evicted
+}
+
+test "drawPerfTables gates on capture armability" {
+    // Label-capturing stub Gui: records every label; table/row calls are
+    // no-ops. Lets us assert what the perf section emits without a real
+    // backend.
+    const CapGui = struct {
+        var labels: [16][]const u8 = undefined;
+        var n: usize = 0;
+        fn reset() void {
+            n = 0;
+        }
+        fn saw(needle: []const u8) bool {
+            for (labels[0..n]) |l| {
+                if (std.mem.indexOf(u8, l, needle) != null) return true;
+            }
+            return false;
+        }
+        pub fn label(s: [*:0]const u8) void {
+            if (n < labels.len) {
+                labels[n] = std.mem.span(s);
+                n += 1;
+            }
+        }
+        pub fn spacing() void {}
+        pub fn beginTable(_: [*:0]const u8, _: i32) bool {
+            return false;
+        }
+        pub fn endTable() void {}
+        pub fn tableNextRow() void {}
+        pub fn tableNextColumn() bool {
+            return false;
+        }
+    };
+    const Stat = struct { last_ns: u64 = 0 };
+    const Row = struct { name: []const u8, tick: Stat = .{}, draw_gui: Stat = .{} };
+
+    // Engine WITHOUT the capture-control API (>= 2.4 rows, < 2.6): must
+    // show the "unavailable" hint, not empty tables.
+    const OldEngineGame = struct {
+        pub fn scriptProfileRows(_: *const @This()) []const Row {
+            return &.{};
+        }
+        pub fn pluginProfileRows(_: *const @This()) []const Row {
+            return &.{};
+        }
+    };
+    CapGui.reset();
+    var old = OldEngineGame{};
+    drawPerfTables(&old, CapGui);
+    try testing.expect(CapGui.saw("unavailable"));
+
+    // Capture-capable engine with recording ACTIVE: renders the tables
+    // (Scripts header), no "unavailable" hint.
+    const NewEngineGame = struct {
+        pub fn scriptProfileRows(_: *const @This()) []const Row {
+            return &.{.{ .name = "physics", .tick = .{ .last_ns = 450_000 } }};
+        }
+        pub fn pluginProfileRows(_: *const @This()) []const Row {
+            return &.{};
+        }
+        pub fn setProfilingCapture(_: *const @This(), _: ?bool) void {}
+        pub fn profilingCaptureActive(_: *const @This()) bool {
+            return true;
+        }
+    };
+    CapGui.reset();
+    var new_g = NewEngineGame{};
+    drawPerfTables(&new_g, CapGui);
+    try testing.expect(!CapGui.saw("unavailable"));
+    try testing.expect(CapGui.saw("Scripts"));
+
+    // Capture-capable but recording OFF: honest "inactive" line, no tables.
+    const IdleEngineGame = struct {
+        pub fn scriptProfileRows(_: *const @This()) []const Row {
+            return &.{};
+        }
+        pub fn pluginProfileRows(_: *const @This()) []const Row {
+            return &.{};
+        }
+        pub fn setProfilingCapture(_: *const @This(), _: ?bool) void {}
+        pub fn profilingCaptureActive(_: *const @This()) bool {
+            return false;
+        }
+    };
+    CapGui.reset();
+    var idle = IdleEngineGame{};
+    drawPerfTables(&idle, CapGui);
+    try testing.expect(CapGui.saw("inactive"));
+    try testing.expect(!CapGui.saw("Scripts"));
+}
+
+test "perf total sums ALL units, not just the displayed top-N" {
+    // MAX_PERF_ROWS + extra units, each with equal recurring cost. This
+    // mirrors drawPerfTables: accumulate the FULL total across every unit
+    // while only the top-N survive insertTopRow for display. The footer
+    // total must reflect all units, not the capped display set.
+    const extra: usize = 10;
+    var buf: [MAX_PERF_ROWS]PerfRow = undefined;
+    var count: usize = 0;
+    var full_total_ns: u64 = 0;
+    var full_count: usize = 0;
+
+    var i: usize = 0;
+    while (i < MAX_PERF_ROWS + extra) : (i += 1) {
+        const row = PerfRow{ .name = "u", .tick_ns = 1_000 };
+        full_total_ns += row.frameNs(); // accumulate BEFORE the cap
+        full_count += 1;
+        insertTopRow(&buf, &count, row);
+    }
+
+    // Display set is capped; full accounting is not.
+    try testing.expectEqual(MAX_PERF_ROWS, count);
+    try testing.expectEqual(MAX_PERF_ROWS + extra, full_count);
+
+    // The footer total (full_total_ns) covers every unit …
+    try testing.expectEqual(@as(u64, (MAX_PERF_ROWS + extra) * 1_000), full_total_ns);
+
+    // … and strictly exceeds the sum of only the displayed top-N, which
+    // is exactly the undercount the fix avoids.
+    var top_n_ns: u64 = 0;
+    for (buf[0..count]) |r| top_n_ns += r.frameNs();
+    try testing.expectEqual(@as(u64, MAX_PERF_ROWS * 1_000), top_n_ns);
+    try testing.expect(full_total_ns > top_n_ns);
+}
+
+test "insertTopRow leaves rows sorted descending by frame cost" {
+    var buf: [4]PerfRow = undefined;
+    var count: usize = 0;
+    insertTopRow(&buf, &count, .{ .name = "b", .tick_ns = 500 });
+    insertTopRow(&buf, &count, .{ .name = "d", .tick_ns = 100 });
+    insertTopRow(&buf, &count, .{ .name = "a", .tick_ns = 900 });
+    insertTopRow(&buf, &count, .{ .name = "c", .tick_ns = 300 });
+    try testing.expectEqual(@as(usize, 4), count);
+    try testing.expectEqualStrings("a", buf[0].name);
+    try testing.expectEqualStrings("b", buf[1].name);
+    try testing.expectEqualStrings("c", buf[2].name);
+    try testing.expectEqualStrings("d", buf[3].name);
+}
+
+test "severity marks: green blank, yellow *, red !" {
+    try testing.expectEqualStrings("", severityMark(0));
+    try testing.expectEqualStrings("", severityMark(999_999));
+    try testing.expectEqualStrings("*", severityMark(1_000_000));
+    try testing.expectEqualStrings("*", severityMark(4_999_999));
+    try testing.expectEqualStrings("!", severityMark(5_000_000));
+}
+
+test "fmtPhase renders ms with marker, dash for zero" {
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("-", fmtPhase(&buf, 0));
+    try testing.expectEqualStrings("0.45", fmtPhase(&buf, 450_000));
+    try testing.expectEqualStrings("1.20*", fmtPhase(&buf, 1_200_000));
+    try testing.expectEqualStrings("6.00!", fmtPhase(&buf, 6_000_000));
+}
+
+test "phaseNs tolerates rows without the phase field" {
+    const Old = struct { name: []const u8, tick: struct { last_ns: u64 } };
+    const r = Old{ .name = "x", .tick = .{ .last_ns = 42 } };
+    try testing.expectEqual(@as(u64, 42), phaseNs(r, "tick"));
+    try testing.expectEqual(@as(u64, 0), phaseNs(r, "setup"));
 }
