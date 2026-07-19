@@ -1927,6 +1927,32 @@ pub fn generate(
         try force_consumed_tags.append(allocator, tag);
     }
 
+    // Declared plugin-to-plugin consumption (#633): a plugin that
+    // consumes ANOTHER plugin's events from inside its own module
+    // source is invisible to the text scan — dependency sources are
+    // deliberately excluded above as emit-sites — so if no game-side
+    // consumer names the tag either, the event would be elided and the
+    // plugin-to-plugin delivery silently stops. The declared escape:
+    // `.consumes_events = .{ "pathfinding.path_found" }` in the
+    // consuming plugin's plugin.labelle feeds those events into the
+    // same `force_consumed` set (dotted or qualified spelling — the
+    // resolution mirrors the scanner's needles). An entry matching NO
+    // discovered event fails generation loudly
+    // (`resolveDeclaredConsume`'s pointed diagnostic) — a typo'd
+    // declaration must not silently deliver nothing. Runs in every
+    // mode, `.all` included: validation is consumption-independent,
+    // like the collision gates above.
+    for (cfg.plugins) |plugin| {
+        var pmani = (try plugin_manifest.loadOptional(allocator, plugin, game_dir)) orelse continue;
+        defer pmani.deinit();
+        for (pmani.consumes_events) |ref| {
+            const matched = try main_zig.resolveDeclaredConsume(plugin_events.entries, plugin.name, ref);
+            const tag = try std.fmt.allocPrint(allocator, "{s}__{s}", .{ matched.plugin_sanitized, matched.event_name });
+            errdefer allocator.free(tag);
+            try force_consumed_tags.append(allocator, tag);
+        }
+    }
+
     const packs_target = try std.fs.path.join(allocator, &.{ target_dir, "packs" });
     defer allocator.free(packs_target);
     var event_consumption = try main_zig.filterConsumedEvents(

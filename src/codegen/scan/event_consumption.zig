@@ -88,12 +88,29 @@
 //! stops compiling (`no field named ... in union`). `detectUngatedEmits`
 //! scans each provider's own dir for its own tags in dot-prefixed form;
 //! the caller feeds the matches into `force_consumed` so they are never
-//! elided (see the fn docs for the discriminator + risk profile).
+//! elided (see the fn docs for the discriminator + risk profile,
+//! including the #635 gated-literal downgrade: a file that also names
+//! the tag QUOTED is treated as comptime-gated and stays elidable).
+//!
+//! ── Declared plugin-to-plugin consumption (#633) ─────────────────────
+//!
+//! A plugin that consumes ANOTHER plugin's events from inside its own
+//! module source is invisible to the consumer scan (dependency sources
+//! are excluded as emit-sites, see above) — if no game-side consumer
+//! names the tag either, the event is elided and the plugin-to-plugin
+//! delivery silently stops. The declared escape: the consuming plugin
+//! lists the foreign events in its `plugin.labelle` as
+//! `.consumes_events = .{ "pathfinding.path_found", ... }` (dotted or
+//! qualified spelling — the same two forms the scanner's needles use);
+//! `resolveDeclaredConsume` maps each entry to its discovered event so
+//! the caller can feed the qualified tag into `force_consumed`. An
+//! entry matching NO discovered event fails generation loudly.
 
 const std = @import("std");
 const config = @import("../../config.zig");
 const language_policy = @import("../../language_policy.zig");
 const plugin_events_mod = @import("plugin_events.zig");
+const scripting_splice = @import("../../scripting_splice.zig");
 
 pub const PluginEvent = plugin_events_mod.PluginEvent;
 
@@ -145,15 +162,18 @@ fn isSkippedDir(name: []const u8) bool {
     return false;
 }
 
-/// One discovery entry's two search needles, precomputed once per
-/// filter run. Either field may be EMPTY, meaning that form is skipped
+/// One discovery entry's search needles, precomputed once per filter
+/// run. Any field may be EMPTY, meaning that form is skipped
 /// (`scanFile` guards on `.len != 0` — `std.mem.indexOf` of "" would
-/// match everywhere). The consumer pass fills both; the ungated-emit
-/// provider pass (`detectUngatedEmits`) fills only `qualified` with the
-/// dot-prefixed form (`.box2d__collision_begin`).
+/// match everywhere). The consumer pass fills `qualified` + `dotted`;
+/// the ungated-emit provider pass (`detectUngatedEmits`) fills
+/// `qualified` with the dot-prefixed form (`.box2d__collision_begin`)
+/// and `quoted` with the quoted form (`"box2d__collision_begin"` —
+/// the #635 gated-literal downgrade probe).
 const Needles = struct {
     qualified: []const u8, // box2d__collision_begin
     dotted: []const u8, // box2d.collision_begin
+    quoted: []const u8 = "", // "box2d__collision_begin" (ungated pass only)
 };
 
 /// Shared state for one `filterConsumedEvents` walk, threaded through
@@ -177,6 +197,12 @@ const Walk = struct {
     /// `<target>/scripts`-symlink double-scan. Keys are walk-owned
     /// dupes, freed by `filterConsumedEvents`.
     visited: std.StringArrayHashMapUnmanaged(void) = .empty,
+    /// Gated-literal downgrade mode (#635, ungated-emit pass only): a
+    /// dot-prefixed match counts only when the SAME FILE does not also
+    /// contain the tag's `quoted` needle in live (comment-blanked)
+    /// text. `scanFile` switches to per-file accumulation and marks
+    /// `consumed` at file end instead of per-window.
+    gated_downgrade: bool = false,
 };
 
 /// Whether `tag` spells exactly `e.plugin_sanitized ++ "__" ++
@@ -186,6 +212,53 @@ fn entryHasQualifiedTag(e: PluginEvent, tag: []const u8) bool {
     if (!std.mem.startsWith(u8, tag, e.plugin_sanitized)) return false;
     if (tag[e.plugin_sanitized.len] != '_' or tag[e.plugin_sanitized.len + 1] != '_') return false;
     return std.mem.eql(u8, tag[e.plugin_sanitized.len + 2 ..], e.event_name);
+}
+
+/// Whether `ref` spells exactly `e.plugin_import_name ++ "." ++
+/// e.event_name` — the dotted form the consumer scan's needles use.
+/// Slice-wise, no format buffer.
+fn entryHasDottedRef(e: PluginEvent, ref: []const u8) bool {
+    if (ref.len != e.plugin_import_name.len + 1 + e.event_name.len) return false;
+    if (!std.mem.startsWith(u8, ref, e.plugin_import_name)) return false;
+    if (ref[e.plugin_import_name.len] != '.') return false;
+    return std.mem.eql(u8, ref[e.plugin_import_name.len + 1 ..], e.event_name);
+}
+
+/// Resolve one `plugin.labelle` `.consumes_events` entry against the
+/// discovered plugin/engine event list (labelle-assembler#633).
+///
+/// A plugin that consumes another plugin's events from its OWN module
+/// source is invisible to the consumer scan — dependency sources are
+/// deliberately excluded as emit-sites — so the consuming plugin
+/// DECLARES the foreign events instead, and the caller feeds each
+/// resolved entry's qualified tag into `filterConsumedEvents`'s
+/// `force_consumed` set. `ref` accepts exactly the two spellings the
+/// scanner's needles use: the dotted form
+/// (`<plugin_import_name>.<event>` — `pathfinding.path_found`) or the
+/// qualified union tag (`<plugin_sanitized>__<event>` —
+/// `pathfinding__path_found`). `declaring_plugin` is the manifest's
+/// owner, named in the diagnostic.
+///
+/// An entry matching NO discovered event fails loudly
+/// (`error.UnknownConsumedEvent`): a typo'd declaration — or one naming
+/// a provider absent from `project.labelle` — would otherwise keep
+/// nothing and silently deliver nothing, exactly the failure mode the
+/// declaration exists to close. Same pointed-diagnostic voice as
+/// `scripting_declare.checkEventPluginCollisions`.
+pub fn resolveDeclaredConsume(
+    entries: []const PluginEvent,
+    declaring_plugin: []const u8,
+    ref: []const u8,
+) error{UnknownConsumedEvent}!PluginEvent {
+    for (entries) |e| {
+        if (entryHasDottedRef(e, ref) or entryHasQualifiedTag(e, ref)) return e;
+    }
+    std.debug.print(
+        "labelle-assembler: plugin '{s}' declares .consumes_events entry \"{s}\" — but no discovered plugin/engine event matches it\n" ++
+            "  spell the provider's event as \"<plugin>.<event>\" (dotted) or \"<plugin>__<event>\" (qualified), and check the provider plugin is listed in project.labelle\n",
+        .{ declaring_plugin, ref },
+    );
+    return error.UnknownConsumedEvent;
 }
 
 /// Result of `filterConsumedEvents`. `kept` / `elided` are struct
@@ -404,25 +477,35 @@ pub const ProviderDir = struct {
 /// names the tag only inside string literals
 /// (`"box2d__collision_begin"`), never with a leading dot.
 ///
-/// Heuristic risk profile (a byte-before check, deliberately NOT a
+/// Gated-literal downgrade (#635, the PR #634 over-match): a
+/// COMPTIME-GATED anonymous-literal emit —
+/// `if (@hasField(GameEvents, "prov__ev")) {
+///     game.emit(.{ .prov__ev = ... });
+/// }` — spells the dot-prefixed needle too, yet Zig never semantically
+/// analyzes the comptime-false branch, so the shape is safe to elide.
+/// Cheap heuristic, still no AST: a dot-prefixed match is downgraded to
+/// GATED (not flagged) when the SAME FILE also contains the tag QUOTED
+/// (`"prov__ev"` — the `@hasField`/string-literal form). The quoted
+/// probe runs over comment-BLANKED text
+/// (`scripting_splice.blankCommentsForProbe`, the same blanking the
+/// hot-reload capability probe uses), so a tag quoted only in a comment
+/// cannot mis-downgrade a genuinely ungated emit. Per-FILE scoping: a
+/// quoted mention in one file never downgrades a dot-literal in
+/// another.
+///
+/// Heuristic risk profile (byte-level checks, deliberately NOT a
 /// tokenizer or AST walk):
-///   - over-match (the tag written `.tag` in a doc comment) → the
-///     event is force-kept → safe false positive: one extra kept
-///     variant, i.e. the pre-#630 behavior for that event;
-///   - over-match, GATED anonymous-literal style (PR #634 review):
-///     `if (@hasField(GameEvents, "prov__ev")) {
-///         game.emit(.{ .prov__ev = ... });
-///     }` also matches — the dot-prefixed literal sits inside a
-///     comptime-false branch Zig never analyzes when the variant is
-///     absent, so this shape WOULD be safely elidable. Same safe
-///     direction: force-kept, i.e. only the elision optimization is
-///     lost for that event. Distinguishing it needs real comptime-flow
-///     analysis (whether the guard's condition dominates the emit),
-///     which is exactly the AST/semantic cleverness this scan
-///     deliberately avoids; no shipped plugin uses the style (box2d
-///     gates via string tags inside its `emitGameEvent` helper — the
-///     dot form never appears). The `in_tree_plugin_src` test fixture
-///     below spells this exact shape;
+///   - over-match (the tag written `.tag` in a doc comment, no quoted
+///     form in that file) → the event is force-kept → safe false
+///     positive: one extra kept variant, i.e. the pre-#630 behavior
+///     for that event;
+///   - mis-downgrade (#635 — a file quoting the tag for some OTHER
+///     purpose beside a genuinely ungated dot-literal emit) → the
+///     event is elided → the same loud "no field in union" compile
+///     error the pre-#634 bug produced, never a silent delivery break;
+///   - mis-keep (#635 — quoted form split across a chunk boundary or a
+///     comment straddling one, so the blanking misses it) → force-kept
+///     → status quo, only the elision optimization is lost;
 ///   - under-match → the exact same loud "no field in union" compile
 ///     error the bug produces today — no NEW failure mode.
 ///
@@ -462,18 +545,25 @@ pub fn detectUngatedEmits(
         }
         if (idxs.items.len == 0) continue;
 
-        // One dot-prefixed needle per entry; `dotted` stays empty (the
-        // consumer pass's dotted form has no meaning at an emit site).
+        // One dot-prefixed needle per entry plus its quoted form (#635
+        // — the gated-literal downgrade probe); `dotted` stays empty
+        // (the consumer pass's dotted form has no meaning at an emit
+        // site).
         const needles = try allocator.alloc(Needles, idxs.items.len);
         var needles_built: usize = 0;
         defer {
-            for (needles[0..needles_built]) |n| allocator.free(n.qualified);
+            for (needles[0..needles_built]) |n| {
+                allocator.free(n.qualified);
+                allocator.free(n.quoted);
+            }
             allocator.free(needles);
         }
         for (idxs.items, 0..) |entry_idx, j| {
             const e = entries[entry_idx];
             const dot_tag = try std.fmt.allocPrint(allocator, ".{s}__{s}", .{ e.plugin_sanitized, e.event_name });
-            needles[j] = .{ .qualified = dot_tag, .dotted = "" };
+            errdefer allocator.free(dot_tag);
+            const quoted_tag = try std.fmt.allocPrint(allocator, "\"{s}__{s}\"", .{ e.plugin_sanitized, e.event_name });
+            needles[j] = .{ .qualified = dot_tag, .dotted = "", .quoted = quoted_tag };
             needles_built = j + 1;
         }
 
@@ -488,6 +578,7 @@ pub fn detectUngatedEmits(
             .remaining = idxs.items.len,
             .excluded_canon = &.{},
             .allowed_canon = &.{},
+            .gated_downgrade = true,
         };
         defer {
             for (walk.visited.keys()) |k| allocator.free(k);
@@ -720,6 +811,19 @@ fn scanFailure(path: []const u8, err: anyerror) anyerror {
 /// longer exists (dangling symlink, deleted mid-walk) or self-loops is
 /// skipped: provably no content to miss. Other open/read failures
 /// propagate loudly via `scanFailure`.
+///
+/// In `gated_downgrade` mode (#635, the ungated-emit pass) the search
+/// is per-FILE, two-needle: the dot-prefixed `qualified` form is
+/// searched in the RAW window (a dot-literal in a comment stays a safe
+/// over-match, unchanged), the `quoted` form in a comment-BLANKED copy
+/// (`scripting_splice.blankCommentsForProbe` — a tag quoted only in a
+/// comment must not read as a live `@hasField` gate). An entry is
+/// marked only at file end, when the file contained the dot form but
+/// NOT the live quoted form. The blanking is window-local, so a
+/// comment (or quoted tag) straddling a chunk boundary can escape it —
+/// which mis-DOWNGRADES (loud compile error) or mis-KEEPS (status
+/// quo), never silently breaks delivery; see `detectUngatedEmits`'
+/// risk profile.
 fn scanFile(walk: *Walk, path: []const u8) !void {
     const allocator = walk.allocator;
     const io = config.globalIo();
@@ -733,12 +837,31 @@ fn scanFile(walk: *Walk, path: []const u8) !void {
     // between two reads is fully contained in the window that holds the
     // carried tail plus the new bytes.
     var max_needle: usize = 0;
-    for (walk.needles) |n| max_needle = @max(max_needle, @max(n.qualified.len, n.dotted.len));
+    for (walk.needles) |n| max_needle = @max(max_needle, @max(n.qualified.len, @max(n.dotted.len, n.quoted.len)));
     if (max_needle == 0) return;
     const overlap = max_needle - 1;
 
     const buf = try allocator.alloc(u8, scan_chunk_size + overlap);
     defer allocator.free(buf);
+
+    // Gated-downgrade scratch: per-file accumulators + the blanked copy
+    // of each window the quoted probe runs over. Freeing an empty slice
+    // is a no-op, so the defer is safe on the non-downgrade path too.
+    var found_dot: []bool = &.{};
+    var found_quoted: []bool = &.{};
+    var blank_buf: []u8 = &.{};
+    defer {
+        allocator.free(found_dot);
+        allocator.free(found_quoted);
+        allocator.free(blank_buf);
+    }
+    if (walk.gated_downgrade) {
+        found_dot = try allocator.alloc(bool, walk.needles.len);
+        @memset(found_dot, false);
+        found_quoted = try allocator.alloc(bool, walk.needles.len);
+        @memset(found_quoted, false);
+        blank_buf = try allocator.alloc(u8, scan_chunk_size + overlap);
+    }
 
     var carry: usize = 0;
     while (true) {
@@ -750,22 +873,49 @@ fn scanFile(walk: *Walk, path: []const u8) !void {
         // stream is drained.
         if (n == 0) break;
         const window = buf[0 .. carry + n];
-        for (walk.needles, walk.consumed) |needle, *c| {
-            if (c.*) continue;
-            // Empty needle = that form is unused for this entry (the
-            // ungated-emit pass has no dotted form) — never a match.
-            if ((needle.qualified.len != 0 and std.mem.indexOf(u8, window, needle.qualified) != null) or
-                (needle.dotted.len != 0 and std.mem.indexOf(u8, window, needle.dotted) != null))
-            {
-                c.* = true;
-                walk.remaining -= 1;
+        if (walk.gated_downgrade) {
+            const blanked = blank_buf[0..window.len];
+            @memcpy(blanked, window);
+            scripting_splice.blankCommentsForProbe(blanked);
+            for (walk.needles, walk.consumed, found_dot, found_quoted) |needle, c, *fd, *fq| {
+                // Already flagged by an earlier file — a quoted mention
+                // here is per-file scoped and cannot un-flag it.
+                if (c) continue;
+                if (!fd.* and needle.qualified.len != 0 and std.mem.indexOf(u8, window, needle.qualified) != null)
+                    fd.* = true;
+                if (!fq.* and needle.quoted.len != 0 and std.mem.indexOf(u8, blanked, needle.quoted) != null)
+                    fq.* = true;
             }
+            // No early exit mid-file: a quoted downgrade may still
+            // arrive in a later window of this same file.
+        } else {
+            for (walk.needles, walk.consumed) |needle, *c| {
+                if (c.*) continue;
+                // Empty needle = that form is unused for this entry —
+                // never a match.
+                if ((needle.qualified.len != 0 and std.mem.indexOf(u8, window, needle.qualified) != null) or
+                    (needle.dotted.len != 0 and std.mem.indexOf(u8, window, needle.dotted) != null))
+                {
+                    c.* = true;
+                    walk.remaining -= 1;
+                }
+            }
+            if (walk.remaining == 0) return;
         }
-        if (walk.remaining == 0) return;
         // Carry the tail into the next window. `copyForwards` is safe:
         // the destination starts at 0, at or before the source start.
         carry = @min(overlap, window.len);
         std.mem.copyForwards(u8, buf[0..carry], window[window.len - carry ..]);
+    }
+
+    if (walk.gated_downgrade) {
+        for (walk.consumed, found_dot, found_quoted) |*c, fd, fq| {
+            if (c.*) continue;
+            if (fd and !fq) {
+                c.* = true;
+                walk.remaining -= 1;
+            }
+        }
     }
 }
 
@@ -1454,6 +1604,138 @@ test "detectUngatedEmits: dot-prefixed union-literal emit in the provider's own 
     try testing.expectEqual(false, flags[1]);
 }
 
+test "detectUngatedEmits: gated anonymous-literal emit (quoted tag in the same file) downgrades to gated (#635)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The PR #634 over-match, now a downgrade: the dot-literal emit
+    // sits inside a `@hasField` guard whose condition QUOTES the tag in
+    // the same file — Zig never analyzes the comptime-false branch, so
+    // the variant is safely elidable.
+    try tmp.dir.createDirPath(io, "prov/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "prov/src/root.zig",
+        .data =
+        \\pub fn emitEv(game: anytype) void {
+        \\    if (@hasField(@TypeOf(game.*).GameEvents, "prov__ev")) {
+        \\        game.emit(.{ .prov__ev = .{ .a = 1 } });
+        \\    }
+        \\}
+        ,
+    });
+
+    const flags = try detectTmp(&tmp, &.{.{ .name = "prov", .sub = "prov" }}, &ungated_test_entries);
+    defer testing.allocator.free(flags);
+    try testing.expectEqual(false, flags[0]);
+    try testing.expectEqual(false, flags[1]);
+}
+
+test "detectUngatedEmits: a quoted tag in a DIFFERENT file does not downgrade — per-file scoping (#635)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The ungated emit lives in one file; another file quotes the same
+    // tag (a helper, a test, docs). The downgrade is per-FILE — the
+    // emit file itself has no quoted form, so the tag stays force-kept
+    // (eliding it would break exactly that file's compile).
+    try tmp.dir.createDirPath(io, "prov/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "prov/src/emit.zig",
+        .data =
+        \\pub fn removeNode(game: anytype, node_id: u32) void {
+        \\    game.emit(.{ .prov__ev = .{ .node_id = node_id } });
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "prov/src/helper.zig",
+        .data =
+        \\pub fn hasEv(game: anytype) bool {
+        \\    return @hasField(@TypeOf(game.*).GameEvents, "prov__ev");
+        \\}
+        ,
+    });
+
+    const flags = try detectTmp(&tmp, &.{.{ .name = "prov", .sub = "prov" }}, &ungated_test_entries);
+    defer testing.allocator.free(flags);
+    try testing.expectEqual(true, flags[0]);
+    try testing.expectEqual(false, flags[1]);
+}
+
+test "detectUngatedEmits: a quoted tag only inside a COMMENT does not downgrade — comment blanking respected (#635)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A truly ungated emit beside a comment that merely quotes the tag:
+    // the quoted probe runs over comment-blanked text
+    // (`blankCommentsForProbe`), so the comment cannot mis-downgrade —
+    // eliding here WOULD break the compile.
+    try tmp.dir.createDirPath(io, "prov/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "prov/src/root.zig",
+        .data =
+        \\// TODO: gate this behind @hasField(GameEvents, "prov__ev") someday.
+        \\pub fn removeNode(game: anytype, node_id: u32) void {
+        \\    game.emit(.{ .prov__ev = .{ .node_id = node_id } });
+        \\}
+        ,
+    });
+
+    const flags = try detectTmp(&tmp, &.{.{ .name = "prov", .sub = "prov" }}, &ungated_test_entries);
+    defer testing.allocator.free(flags);
+    try testing.expectEqual(true, flags[0]);
+    try testing.expectEqual(false, flags[1]);
+}
+
+test "detectUngatedEmits + filterConsumedEvents: the gated-literal shape elides end-to-end when unconsumed (#635)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The `in_tree_plugin_src` fixture shape (#631 review / PR #634
+    // risk-profile docs): a gated anonymous-literal emit in the
+    // provider's own source, and NO consumer anywhere in the game.
+    // Pre-#635 the dot-literal force-kept `box2d__collision_begin`;
+    // with the quoted-tag downgrade both events elide.
+    try tmp.dir.createDirPath(io, "libs/box2d/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "libs/box2d/src/root.zig",
+        .data = in_tree_plugin_src,
+    });
+    try tmp.dir.createDirPath(io, "scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/idle.zig",
+        .data = "pub fn idle() void {}",
+    });
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const prov_dir = try std.fs.path.join(allocator, &.{ root, "libs", "box2d" });
+    defer allocator.free(prov_dir);
+
+    const flags = try detectUngatedEmits(
+        allocator,
+        &test_entries,
+        &.{.{ .import_name = "box2d", .dir = prov_dir }},
+    );
+    defer allocator.free(flags);
+    try testing.expectEqual(false, flags[0]);
+    try testing.expectEqual(false, flags[1]);
+
+    var result = try filterConsumedEvents(
+        allocator,
+        &test_entries,
+        &.{root},
+        &.{prov_dir},
+        &.{},
+        .consumed,
+    );
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.kept.len);
+    try testing.expectEqual(@as(usize, 2), result.elided.len);
+}
+
 test "detectUngatedEmits: string-literal (gated) reference does not flag — box2d-style elision benefit preserved" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -1613,4 +1895,79 @@ test "detectUngatedEmits + filterConsumedEvents: ungated tag with no consumer an
     try testing.expectEqualStrings("ev", result.kept[0].event_name);
     try testing.expectEqual(@as(usize, 1), result.elided.len);
     try testing.expectEqualStrings("other", result.elided[0].event_name);
+}
+
+// ── Declared plugin-to-plugin consumption (#633) ─────────────────────
+
+test "resolveDeclaredConsume: dotted and qualified spellings both resolve (#633)" {
+    // The same two forms the consumer scan's needles use — a hyphenated
+    // plugin name diverges between them (import name keeps the hyphen,
+    // the sanitized tag uses '_').
+    const entries = [_]PluginEvent{
+        .{ .plugin_import_name = "labelle-pathfinding", .plugin_sanitized = "labelle_pathfinding", .event_name = "path_found" },
+        .{ .plugin_import_name = "box2d", .plugin_sanitized = "box2d", .event_name = "collision_begin" },
+    };
+
+    const dotted = try resolveDeclaredConsume(&entries, "consumer", "labelle-pathfinding.path_found");
+    try testing.expectEqualStrings("path_found", dotted.event_name);
+    const qualified = try resolveDeclaredConsume(&entries, "consumer", "labelle_pathfinding__path_found");
+    try testing.expectEqualStrings("path_found", qualified.event_name);
+    const sibling = try resolveDeclaredConsume(&entries, "consumer", "box2d.collision_begin");
+    try testing.expectEqualStrings("collision_begin", sibling.event_name);
+}
+
+test "resolveDeclaredConsume: an entry matching no discovered event fails loudly (#633)" {
+    // Typo'd event, absent provider, and a near-miss separator — each
+    // must reject with the pointed diagnostic instead of silently
+    // keeping nothing (the exact silent-delivery-stop the declaration
+    // exists to close).
+    try testing.expectError(
+        error.UnknownConsumedEvent,
+        resolveDeclaredConsume(&test_entries, "consumer", "box2d.collision_beginn"),
+    );
+    try testing.expectError(
+        error.UnknownConsumedEvent,
+        resolveDeclaredConsume(&test_entries, "consumer", "pathfinding.path_found"),
+    );
+    try testing.expectError(
+        error.UnknownConsumedEvent,
+        resolveDeclaredConsume(&test_entries, "consumer", "box2d_collision_begin"),
+    );
+}
+
+test "resolveDeclaredConsume + filterConsumedEvents: a declared consume keeps the foreign event; the undeclared sibling stays elidable (#633)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The #633 shape: NOTHING in the game's authored text names either
+    // tag (the consuming plugin's module source — where the real
+    // consumption lives — is excluded as an emit-site). The declared
+    // entry must carry `collision_begin` through the force set;
+    // `collision_end`, undeclared and unreferenced, still elides.
+    try tmp.dir.createDirPath(io, "scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/idle.zig",
+        .data = "pub fn idle() void {}",
+    });
+
+    const matched = try resolveDeclaredConsume(&test_entries, "consumer", "box2d.collision_begin");
+    const tag = try std.fmt.allocPrint(allocator, "{s}__{s}", .{ matched.plugin_sanitized, matched.event_name });
+    defer allocator.free(tag);
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var result = try filterConsumedEvents(
+        allocator,
+        &test_entries,
+        &.{root},
+        &.{},
+        &.{tag},
+        .consumed,
+    );
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
+    try testing.expectEqual(@as(usize, 1), result.elided.len);
+    try testing.expectEqualStrings("collision_end", result.elided[0].event_name);
 }
