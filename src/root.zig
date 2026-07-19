@@ -440,18 +440,20 @@ pub fn generate(
     // degrades to null — the emission then falls back to the cwd-relative
     // dir alone.
     //
-    // DIRECT-RUN languages only (`transpile == null`): a transpiled
-    // language's runnable output (`.js`) is materialized into the TARGET's
-    // own script dir by the transpile phase, and the plugin's watcher
-    // filters the embed extension — the source `.ts` would never match. So
-    // TS splices skip this and watch their target dir instead (see
-    // `emitHotReloadWatch`, the codex P1 on PR #638). Legacy dirs never
-    // splice at all (`buildDepHotReload`'s legacy rationale), so no path
-    // is computed for them either.
+    // Computed for every capable embed splice — INCLUDING typescript: a
+    // js-only TS project (the `// @ts-check` workflow) never transpiles,
+    // so its authored `.js` sources are the runnable files and it watches
+    // the source tree exactly like ruby/lua (round-3 codex, PR #638). If
+    // the transpile phase later ACTUALLY materializes output (`runPhase`
+    // non-null, below), the path is cleared again and the watch moves to
+    // the target's own dir — the discriminator is emitted-output-present,
+    // never the language. Legacy dirs never splice at all
+    // (`buildDepHotReload`'s legacy rationale), so no path is computed
+    // for them.
     var watch_dir_rel: ?[]u8 = null;
     defer if (watch_dir_rel) |p| allocator.free(p);
     if (maybe_scripting) |*s| {
-        if (s.family == .embed and s.hot_reload_capable and s.transpile == null and !s.legacy) {
+        if (s.family == .embed and s.hot_reload_capable and !s.legacy) {
             const src_scripts_abs = try std.fs.path.join(allocator, &.{ game_dir, s.dir });
             defer allocator.free(src_scripts_abs);
             if (std.fs.path.relative(allocator, "", null, target_dir, src_scripts_abs)) |rel| {
@@ -1146,6 +1148,14 @@ pub fn generate(
             if (combined_embeds) |cb| allocator.free(cb);
             combined_embeds = recombined;
             s.scripts = recombined;
+            // Dev-mode hot reload (#637, round-3 codex): output was REALLY
+            // materialized, so the watch moves to the target's own dir —
+            // the source `.ts` can never match the watcher's `.js` filter.
+            // Clear the source-relative path computed above; the emission
+            // keys on `transpile_emitted` (js-only TS projects never reach
+            // here and keep the ruby/lua-style source watch).
+            s.transpile_emitted = true;
+            s.watch_dir_from_target = null;
         }
     }
 

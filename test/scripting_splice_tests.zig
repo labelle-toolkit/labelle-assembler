@@ -491,16 +491,29 @@ const ruby_hot_reload_splice = blk: {
     break :blk s;
 };
 
-/// The transpiled twin (codex P1, PR #638): typescript's runnable `.js`
-/// is materialized into the TARGET's script dir by the transpile phase,
-/// and the plugin's watcher filters `.js` — so the splice must watch the
-/// target's own dir, never the `.ts` source tree. root.zig computes no
-/// relative path for transpiled splices (`watch_dir_from_target` stays
-/// null).
+/// The transpile-EMITTED twin (codex P1, PR #638): `.ts` sources were
+/// really check+emitted this generate (`transpile_emitted` — root.zig's
+/// runPhase seam), so the runnable `.js` lives in the TARGET's
+/// materialized script dir and the watch targets it (the plugin's
+/// watcher filters `.js` — the source `.ts` tree could never match).
 const ts_hot_reload_splice = blk: {
     var s = ts_splice;
     s.hot_reload_capable = true;
     s.transpile = .{ .source_extension = ".ts", .declaration_suffix = ".d.ts" };
+    s.transpile_emitted = true;
+    break :blk s;
+};
+
+/// The JS-ONLY typescript twin (round-3 codex, PR #638): the language
+/// carries a transpile ROW, but nothing transpiled this generate
+/// (`transpile_emitted` false — the documented `// @ts-check` workflow,
+/// authored `.js` IS the runnable file). Watches the SOURCE tree exactly
+/// like ruby/lua — on Windows the staged copy would never see a save.
+const ts_jsonly_hot_reload_splice = blk: {
+    var s = ts_splice;
+    s.hot_reload_capable = true;
+    s.transpile = .{ .source_extension = ".ts", .declaration_suffix = ".d.ts" };
+    s.watch_dir_from_target = "../../scripts";
     break :blk s;
 };
 
@@ -581,7 +594,7 @@ pub const HOT_RELOAD_SPLICE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "hot_reload.watchDir") == null);
     }
 
-    test "TYPESCRIPT loop lifecycle: the watch targets the generated dir's emitted .js, never the .ts source tree (codex P1)" {
+    test "TRANSPILED typescript loop lifecycle: the watch targets the generated dir's emitted .js, never the .ts source tree (codex P1)" {
         generate.main_template.scripting_splice = ts_hot_reload_splice;
         defer generate.main_template.scripting_splice = null;
 
@@ -605,6 +618,35 @@ pub const HOT_RELOAD_SPLICE = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "../../scripts") == null);
         _ = try indexOfOrFail(main_zig,
             "edit the generated scripts/*.js (emitted output; re-run generate for authored-source changes) and save");
+
+        try expectAstGenOk(main_zig);
+    }
+
+    test "JS-ONLY typescript loop lifecycle: no emitted output → SOURCE-tree watch like ruby/lua (round-3 codex)" {
+        generate.main_template.scripting_splice = ts_jsonly_hot_reload_splice;
+        defer generate.main_template.scripting_splice = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &ts_scripting_plugins,
+        }, loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // The discriminator is emitted-output-present, never the language:
+        // with no transpile output, the authored `.js` sources ARE the
+        // runnable files, so the watch is the ruby/lua source-tree shape
+        // (primary ../../scripts, cwd fallback) — the reload model reads
+        // the watched SOURCE file, Windows-correct where staging copies.
+        const primary = try indexOfOrFail(main_zig,
+            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../scripts\") catch {");
+        const fallback = try indexOfOrFail(main_zig,
+            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {");
+        try std.testing.expect(primary < fallback);
+        _ = try indexOfOrFail(main_zig, "edit scripts/*.js and save");
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "emitted output") == null);
 
         try expectAstGenOk(main_zig);
     }
@@ -903,7 +945,7 @@ pub const TYPESCRIPT_SPLICE_E2E = struct {
 // probe on through the real `detect` → `generate` path.
 
 pub const HOT_RELOAD_E2E = struct {
-    test "a capable TS plugin watches the TARGET's emitted-js dir + rides the Debug-gated dep option (codex P1)" {
+    test "a capable JS-ONLY TS plugin watches the SOURCE tree through the REAL generate (round-3 codex)" {
         const allocator = std.testing.allocator;
         var staged = try StagedTsProject.init(allocator);
         defer staged.deinit(allocator);
@@ -917,22 +959,28 @@ pub const HOT_RELOAD_E2E = struct {
         defer allocator.free(backend_repo);
         try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
 
-        // Generated main (sokol desktop = the callback lifecycle):
-        // typescript is a TRANSPILED splice, so the watch targets the
-        // generated dir's own `scripts/` — where the runnable `.js` lives
-        // and the watcher's `.js` filter can match — NEVER a
-        // source-relative path (the `.ts` tree is invisible to the
-        // watcher; codex P1 on PR #638).
+        // Generated main (sokol desktop = the callback lifecycle): this
+        // fixture authors ONLY `.js` (the `// @ts-check` workflow), so
+        // `scripting_transpile.runPhase` returns null — no output was
+        // materialized, the authored `.js` ARE the runnable files, and
+        // the watch is the ruby/lua SOURCE-tree shape (primary
+        // ../../game/scripts computed from the real dirs, cwd fallback) —
+        // NOT the target dir, whose Windows staging can be a real copy
+        // that never sees a save (round-3 codex on PR #638). The
+        // transpile-EMITTED target-dir shape is pinned by the unit +
+        // loop-codegen tests (a real-`.ts` e2e would fetch the tsc
+        // toolchain — the transpile suite owns that path).
         const main_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
         defer allocator.free(main_zig);
         _ = try indexOfOrFail(main_zig,
             "if (comptime (@import(\"builtin\").mode == .Debug and @hasDecl(scripting, \"hot_reload\")))");
-        _ = try indexOfOrFail(main_zig,
+        const primary = try indexOfOrFail(main_zig,
+            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../game/scripts\") catch {");
+        const fallback = try indexOfOrFail(main_zig,
             "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {");
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "watchDir"));
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "../../game/scripts") == null);
-        _ = try indexOfOrFail(main_zig,
-            "edit the generated scripts/*.js (emitted output; re-run generate for authored-source changes) and save");
+        try std.testing.expect(primary < fallback);
+        _ = try indexOfOrFail(main_zig, "edit scripts/*.js and save");
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "emitted output") == null);
 
         // Generated build: the dep rides `-Dhot_reload` as the Debug proxy.
         const build_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
