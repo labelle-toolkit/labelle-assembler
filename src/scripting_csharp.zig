@@ -76,14 +76,32 @@ pub const RUNTIME_ASSEMBLY_DIR_ENV = "LABELLE_CS_ASSEMBLY_DIR";
 /// .declare_tool_override`.
 pub threadlocal var path_override: ?[]const u8 = null;
 
-/// Whether the SELECTED language's build steps publish RUNTIME-LOADED
-/// outputs into `{cache}` (the C# CoreCLR-host contract): language
-/// `csharp`, at least one step, and NO step links an artifact — a linked
-/// artifact would mean `{cache}` also holds intermediates that must not
-/// be shipped beside the binary. Drives `PluginBuildStepsWiring
+/// Whether THIS plugin's SELECTED language build steps publish
+/// RUNTIME-LOADED outputs into `{cache}` (the C# CoreCLR-host contract):
+///   * language `csharp`;
+///   * `plugin_name` IS the project's scripting plugin (the one whose
+///     `src/csharp/vm.zig` hostfxr-loads the assembly) — codex #644 round
+///     2: another plugin that coincidentally declares a link-less csharp
+///     `.language_builds` entry, ORDERED BEFORE scripting, must never
+///     capture the InstallDir staging or `LABELLE_CS_ASSEMBLY_DIR`; the
+///     runtime payload is specifically the scripting plugin's published
+///     `labelle_csharp_scripts.dll`, not the first link-less csharp build
+///     encountered;
+///   * at least one step, and NO step links an artifact — a linked
+///     artifact would mean `{cache}` also holds intermediates that must
+///     not be shipped beside the binary.
+/// `scripting_plugin_name` is null when no scripting splice was detected
+/// (then nothing stages). Drives `PluginBuildStepsWiring
 /// .stage_runtime_outputs` (root.zig → build_zig.zig emission).
-pub fn stagesRuntimeOutputs(language: []const u8, steps: []const plugin_build_steps.Step) bool {
+pub fn stagesRuntimeOutputs(
+    language: []const u8,
+    plugin_name: []const u8,
+    scripting_plugin_name: ?[]const u8,
+    steps: []const plugin_build_steps.Step,
+) bool {
     if (!std.mem.eql(u8, language, "csharp")) return false;
+    const owner = scripting_plugin_name orelse return false;
+    if (!std.mem.eql(u8, plugin_name, owner)) return false;
     if (steps.len == 0) return false;
     for (steps) |s| {
         if (s.link != .none) return false;
@@ -211,17 +229,31 @@ fn stepNamed(comptime link: plugin_build_steps.LinkMode, comptime argv0: []const
     };
 }
 
-test "stagesRuntimeOutputs: csharp with only link-less steps fires; a linked step, another language, or zero steps do not" {
-    // The csharp shape — one link-less dotnet-publish step: `{cache}` IS the
-    // runtime payload, staged beside the binary.
-    try testing.expect(stagesRuntimeOutputs("csharp", &.{stepNamed(.none, "dotnet")}));
+test "stagesRuntimeOutputs: the scripting plugin's csharp link-less steps fire; a linked step, another language, or zero steps do not" {
+    // The csharp shape — one link-less dotnet-publish step on the SCRIPTING
+    // plugin: `{cache}` IS the runtime payload, staged beside the binary.
+    try testing.expect(stagesRuntimeOutputs("csharp", "scripting", "scripting", &.{stepNamed(.none, "dotnet")}));
     // A linked artifact means {cache} holds intermediates — never shipped.
-    try testing.expect(!stagesRuntimeOutputs("csharp", &.{ stepNamed(.none, "dotnet"), stepNamed(.object, "ld") }));
+    try testing.expect(!stagesRuntimeOutputs("csharp", "scripting", "scripting", &.{ stepNamed(.none, "dotnet"), stepNamed(.object, "ld") }));
     // The rust/crystal native rows keep their link wiring, no staging.
-    try testing.expect(!stagesRuntimeOutputs("rust", &.{stepNamed(.none, "cargo")}));
-    try testing.expect(!stagesRuntimeOutputs("crystal", &.{stepNamed(.none, "crystal")}));
+    try testing.expect(!stagesRuntimeOutputs("rust", "scripting", "scripting", &.{stepNamed(.none, "cargo")}));
+    try testing.expect(!stagesRuntimeOutputs("crystal", "scripting", "scripting", &.{stepNamed(.none, "crystal")}));
     // Steps-less never fires (nothing would produce the payload).
-    try testing.expect(!stagesRuntimeOutputs("csharp", &.{}));
+    try testing.expect(!stagesRuntimeOutputs("csharp", "scripting", "scripting", &.{}));
+}
+
+test "stagesRuntimeOutputs: only the SCRIPTING plugin's csharp payload stages (codex #644 round 2)" {
+    // The regression: a NON-scripting plugin ("helper") that coincidentally
+    // declares a link-less csharp `.language_builds` entry must NOT be
+    // flagged — even ordered before scripting, it can't capture the
+    // InstallDir staging or LABELLE_CS_ASSEMBLY_DIR. The runtime payload is
+    // specifically the scripting plugin's published labelle_csharp_scripts.dll.
+    const steps = &.{stepNamed(.none, "dotnet")};
+    try testing.expect(!stagesRuntimeOutputs("csharp", "helper", "scripting", steps));
+    // The scripting plugin itself DOES stage.
+    try testing.expect(stagesRuntimeOutputs("csharp", "scripting", "scripting", steps));
+    // No scripting splice detected → nothing stages (null owner).
+    try testing.expect(!stagesRuntimeOutputs("csharp", "scripting", null, steps));
 }
 
 test "ensureStepToolsOnPath: a present tool passes, a missing one fails pointedly, path-shaped argv0s are skipped" {

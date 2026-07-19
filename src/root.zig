@@ -1621,12 +1621,22 @@ pub fn generate(
                 // link-less `dotnet publish` step makes `{cache}` the
                 // runtime payload (the managed assembly the hostfxr vm
                 // loads) — stage it beside the binary + point the run
-                // step's env at it. Keyed on the SELECTED language row
-                // (false for every other language/plugin — byte-identity).
+                // step's env at it. Keyed on the SELECTED language row AND
+                // on this being the SCRIPTING plugin (codex #644 round 2):
+                // a non-scripting plugin with a link-less csharp
+                // `.language_builds`, ordered before scripting, must not
+                // capture the staging / LABELLE_CS_ASSEMBLY_DIR — the
+                // runtime payload is the scripting plugin's published DLL.
+                // False for every other language/plugin — byte-identity.
                 // Captured, not `.?` (gemini #644): false unless BOTH a
                 // language entry loaded AND the project declared a language.
                 .stage_runtime_outputs = if (maybe_lang != null)
-                    if (declared_language) |dl| scripting_csharp.stagesRuntimeOutputs(dl, lang_steps_slice) else false
+                    if (declared_language) |dl| scripting_csharp.stagesRuntimeOutputs(
+                        dl,
+                        plugin.name,
+                        if (maybe_scripting) |s| s.plugin_name else null,
+                        lang_steps_slice,
+                    ) else false
                 else
                     false,
             });

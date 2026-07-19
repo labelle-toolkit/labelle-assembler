@@ -1813,3 +1813,56 @@ test "runtimeOutputsEntry: picks the flagged entry, none when absent (footer env
     try testing.expect(runtimeOutputsEntry(&.{plain}) == null);
     try testing.expect(runtimeOutputsEntry(&.{}) == null);
 }
+
+test "generateBuildZig footer (codex #644 round 2): the C# run env + InstallDir bind to the SCRIPTING plugin even when a link-less non-scripting plugin is ordered first" {
+    // The regression scenario at the emission layer: a non-scripting
+    // "helper" whose link-less build is ordered FIRST (stage_runtime_outputs
+    // = false, as root.zig now flags a non-scripting plugin) and the
+    // scripting csharp publish SECOND (stage = true). The footer must point
+    // LABELLE_CS_ASSEMBLY_DIR at the SCRIPTING plugin's publish cache — never
+    // the helper's, which merely happens to build first. (root.zig's DECISION
+    // to flag only the scripting plugin is covered by
+    // `scripting_csharp.stagesRuntimeOutputs`'s unit test; this pins the
+    // emission honors the flag regardless of plugin order.)
+    const allocator = testing.allocator;
+    const helper: PluginBuildStepsWiring = .{
+        .plugin_name = "helper",
+        .package_abs = "/abs/deps/labelle-helper",
+        .cache_rel = "plugin-build/helper",
+        .stage_runtime_outputs = false,
+        .steps = &.{.{ .name = "helper-build", .command = &.{ "dotnet", "publish", "-o", "{cache}" } }},
+    };
+    const scripting: PluginBuildStepsWiring = .{
+        .plugin_name = "scripting",
+        .package_abs = "/abs/deps/labelle-scripting",
+        .cache_rel = "plugin-build/scripting",
+        .stage_runtime_outputs = true,
+        .steps = &.{.{ .name = "dotnet-publish-scripts", .command = &.{ "dotnet", "publish", "-o", "{cache}" } }},
+    };
+    // Desktop exe path against the in-tree sokol v2 fixture (cwd = repo root
+    // under `zig build test`); is_tests_target = false so the run footer is
+    // emitted. generateBuildZig emits only build.zig, so no engine template
+    // is needed (same shape as the helpers' `genSokolBuildZigV2`).
+    const cfg = ProjectConfig{
+        .name = "two-plugin-game",
+        .backend_package = .{ .name = "sokol", .repo = "local:backends/sokol" },
+        .ecs = .mock,
+    };
+    const out = try generateBuildZig(allocator, cfg, .{
+        .is_tests_target = false,
+        .project_dir = ".",
+        .backend_manifest_name = "backend.manifest.v2.zon",
+        .plugin_build_steps = &.{ helper, scripting },
+    });
+    defer allocator.free(out);
+
+    // The run env binds the CoreCLR host to the SCRIPTING cache…
+    try testing.expect(std.mem.indexOf(u8, out, "run_cmd.setEnvironmentVariable(\"LABELLE_CS_ASSEMBLY_DIR\", plugin_scripting_build_cache);") != null);
+    // …never the helper's (which builds first).
+    try testing.expect(std.mem.indexOf(u8, out, "LABELLE_CS_ASSEMBLY_DIR\", plugin_helper_build_cache") == null);
+    // Only the scripting plugin stages runtime outputs beside the exe.
+    try testing.expect(std.mem.indexOf(u8, out, "plugin_scripting_runtime_outputs") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "plugin_helper_runtime_outputs") == null);
+    // The helper's own build step still emits — it just doesn't stage/capture.
+    try testing.expect(std.mem.indexOf(u8, out, "plugin_helper_build_step_0") != null);
+}
