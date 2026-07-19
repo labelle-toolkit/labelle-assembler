@@ -463,6 +463,7 @@ pub fn generate(
         for (pack_watch_dirs.items) |p| {
             allocator.free(p.from_target);
             allocator.free(p.from_root);
+            allocator.free(p.name_prefix);
         }
         pack_watch_dirs.deinit(allocator);
     }
@@ -689,13 +690,29 @@ pub fn generate(
             if (s.hot_reload_capable and !s.legacy) {
                 for (pack_entries.items) |*e| {
                     if (!e.plugin.isLocal()) continue;
+                    // Gate on the ACTUAL registered set (`s.scripts`), not a
+                    // directory scan (codex round-2 #642): watch a pack only
+                    // when it contributes an embed the generated main
+                    // `registerScript`s. Pack LANGUAGE scripts are not
+                    // collected into `s.scripts` yet (see the note below), so
+                    // this is currently always false — the watch activates
+                    // automatically once that collection lands.
                     if (!scripting_splice.packHasRegisteredScript(s.scripts, e.manifest.name)) continue;
                     const pack_src = try e.resolveSrcDir(allocator, game_dir);
                     defer allocator.free(pack_src);
-                    if (try scripting_splice.packWatchDirs(allocator, game_dir, target_dir, pack_src)) |pair| {
+                    // The reload namespace the pack's scripts register under
+                    // (`<pack>__`) — emitted as the `watchDirNamed` prefix so
+                    // the watcher keys each reload onto the pack's namespaced
+                    // registration, never the game's same-stem script.
+                    var pfx_buf: [128]u8 = undefined;
+                    const sanitized = scan.packNamespacePrefix(e.manifest.name, &pfx_buf);
+                    var pfx_full_buf: [160]u8 = undefined;
+                    const name_prefix = std.fmt.bufPrint(&pfx_full_buf, "{s}__", .{sanitized}) catch continue;
+                    if (try scripting_splice.packWatchDirs(allocator, game_dir, target_dir, pack_src, name_prefix)) |pair| {
                         errdefer {
                             allocator.free(pair.from_target);
                             allocator.free(pair.from_root);
+                            allocator.free(pair.name_prefix);
                         }
                         try pack_watch_dirs.append(allocator, pair);
                     }
