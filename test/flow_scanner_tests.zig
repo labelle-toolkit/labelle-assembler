@@ -39,3 +39,6 @@ pub const FlowDeclsDiscovery = flow_decls.FlowDeclsDiscovery;
 
 const coercions = @import("flow_scanner/coercions_tests.zig");
 pub const PluginCoercionsDiscovery = coercions.PluginCoercionsDiscovery;
+
+const prune = @import("flow_scanner/prune_tests.zig");
+pub const FlowSidecarPrune = prune.FlowSidecarPrune;
