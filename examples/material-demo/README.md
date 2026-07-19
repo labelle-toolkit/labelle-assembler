@@ -51,8 +51,9 @@ which is wired end-to-end for games in the released engine (2.6.0). The
 released engine `2.6.0` exposes **no game-facing authoring surface** for
 it — there is no `Sprite.material` field and no `setMaterial` on the game,
 so a game cannot drive per-entity materials yet. That engine bridge is the
-tracked follow-up (see the PR); when it lands, this demo grows a second
-scene that flashes / dissolves individual orbs.
+tracked follow-up ([labelle-engine#789](https://github.com/labelle-toolkit/labelle-engine/issues/789));
+when it lands, this demo grows a second scene that flashes / dissolves
+individual orbs.
 
 Files:
 

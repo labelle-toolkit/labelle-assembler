@@ -103,8 +103,8 @@ Two precise findings surfaced by proving the released path:
   `setPostFx`); its per-entity material half (`palette_swap`/`flash`/
   `dissolve`/`outline`) is plumbed in core+gfx (`SpriteVisual.material`)
   but the engine exposes no `Sprite.material`/`setMaterial`. `material-demo`
-  therefore exercises the post-fx half; the material half is a tracked
-  engine follow-up.
+  therefore exercises the post-fx half; the material half is tracked as
+  labelle-engine#789.
 
 > **`+null-sib`** = the scripting games pin the backend to a
 > `labelle-null` SIBLING checkout (not the registry `.null` shorthand),
