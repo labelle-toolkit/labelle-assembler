@@ -1,0 +1,71 @@
+{
+    // One 480x270 screen of side-scroller: ground strips, the runner,
+    // three coins, two clouds. Every sprite resolves from the single
+    // `runner` atlas; the coins' spin and the bot's run cycle are
+    // attached/driven by scripts/playing/10_run.zig.
+    "name": "main",
+    "children": [
+        {
+            "name": "ground_left",
+            "components": {
+                "Position": { "x": 120, "y": 258 },
+                "Sprite": { "sprite_name": "ground.png", "pivot": "center", "layer": "world" }
+            }
+        },
+        {
+            "name": "ground_right",
+            "components": {
+                "Position": { "x": 360, "y": 258 },
+                "Sprite": { "sprite_name": "ground.png", "pivot": "center", "layer": "world" }
+            }
+        },
+        {
+            "name": "runner",
+            "components": {
+                "Position": { "x": 60, "y": 234 },
+                "Sprite": { "sprite_name": "idle/bot_0001.png", "pivot": "center", "layer": "world", "z_index": 5 },
+                "Runner": {}
+            }
+        },
+        {
+            "name": "coin_a",
+            "components": {
+                "Position": { "x": 200, "y": 216 },
+                "Sprite": { "sprite_name": "coin_0001.png", "pivot": "center", "layer": "world", "z_index": 4 },
+                "Coin": {}
+            }
+        },
+        {
+            "name": "coin_b",
+            "components": {
+                "Position": { "x": 320, "y": 216 },
+                "Sprite": { "sprite_name": "coin_0001.png", "pivot": "center", "layer": "world", "z_index": 4 },
+                "Coin": {}
+            }
+        },
+        {
+            "name": "coin_c",
+            "components": {
+                "Position": { "x": 440, "y": 216 },
+                "Sprite": { "sprite_name": "coin_0001.png", "pivot": "center", "layer": "world", "z_index": 4 },
+                "Coin": {}
+            }
+        },
+        {
+            "name": "cloud_high",
+            "components": {
+                "Position": { "x": 140, "y": 56 },
+                "Sprite": { "sprite_name": "cloud.png", "pivot": "center", "layer": "world", "z_index": 1 },
+                "Cloud": { "drift": 12.0 }
+            }
+        },
+        {
+            "name": "cloud_low",
+            "components": {
+                "Position": { "x": 360, "y": 96 },
+                "Sprite": { "sprite_name": "cloud.png", "pivot": "center", "layer": "world", "z_index": 1 },
+                "Cloud": { "drift": 7.0 }
+            }
+        }
+    ]
+}

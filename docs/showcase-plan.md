@@ -68,16 +68,43 @@ backend-selectable; the headless ones also run in CI).
 | 3 | **ruby-orbit**      | Ruby gameplay script via `labelle-scripting` | `.null`+null-sib | transcript (`RUBY_*`) | **scaffolded + verified** (this repo, ticket seed) |
 | 4 | **coin-collector**  | full gameplay loop: queries, homing, collision, `destroyEntity`, win | `.null` (→ raylib/bgfx) | transcript (`score`/`cleared`) | **scaffolded + verified** (this repo) |
 | 5 | **event-relay**     | game event bus + game-root `events/`+`hooks/` (pure Zig) | `.null` (→ any) | transcript (`emit`/`pulse`) | **scaffolded + verified** (this repo) |
-| 6 | **pack-city**       | packs wall as a real game (bgfx-wasm)    | bgfx-wasm  | build + screenshot      | ticket seed — packs validation game|
-| 7 | **sprite-runner**   | sprite atlas + `AnimationDef` animation  | sokol      | screenshot              | derives from asset-streaming-smoke |
-| 8 | **tile-explorer**   | `.tmx` tilemap + camera follow           | raylib     | screenshot              | uses T2 Phase 4 tilemap embedding  |
-| 9 | **material-demo**   | materials / shaders                      | bgfx/wgpu  | screenshot              | **deferred** — blocked on gfx#305  |
+| 6 | **pack-city**       | packs wall as a real game                | bgfx       | generate + build (+ screenshot) | **scaffolded + verified** (#611)   |
+| 7 | **sprite-runner**   | sprite atlas + `AnimationDef` + `SpriteAnimation` | sokol | generate + build (+ screenshot) | **scaffolded + verified** (#611)   |
+| 8 | **tile-explorer**   | `.tmx` tilemap + camera follow           | raylib     | generate + build (+ screenshot) | **scaffolded + verified** (#611)   |
+| 9 | **material-demo**   | post-fx set (bloom/vignette/color_grade/crt) | bgfx   | generate + build (+ screenshot) | **scaffolded + verified** (#611)   |
 
 Games 1–5 are scaffolded + verified end-to-end in this repo (generate →
 `zig build` → deterministic headless run). 2 and 3 are the ticket's
 explicit scripting seed candidates (Lua + Ruby). 6 is the ticket's packs
-seed. 7–8 round out the sprite/animation and tilemap surfaces; 9 is
-deferred until gfx#305 lands.
+seed. 7–8 round out the sprite/animation and tilemap surfaces; 9 landed
+once gfx#305 shipped (post-fx half — see below).
+
+### Games 6–9 (labelle-assembler#611) — the RELEASED-pin cohort
+
+Unlike games 1–5 (which pin `local:` siblings to gate assembler HEAD),
+games 6–9 pin the **released** package set (core 1.26.0 / engine 2.6.0 /
+gfx 1.28.1 / cli 1.58.0 / assembler 0.94.0) to prove the released path.
+All four `generate` + `zig build` green; the raylib + sokol builds run in
+CI (`examples-integration`), the two bgfx builds are covered locally.
+
+Two precise findings surfaced by proving the released path:
+
+- **sokol-desktop material-seam fix (fixed in #611).** The gfx#305
+  material seam gave the sokol backend's gfx module a direct
+  `labelle-core` import; assembler 0.94.0's sokol-desktop *byte-anchor*
+  codegen never unified it onto the app core, so a distinct
+  `MaterialEffect` type failed sema. #611 unrolls the `backend_gfx`
+  core-diamond edge into the anchor (matching the generic desktop path
+  bgfx/raylib already used). Released 0.94.0 cannot build a sokol-desktop
+  game against any gfx#305-era backend until the next assembler release
+  carries this fix; bgfx/raylib were never affected.
+- **per-entity materials have no game authoring surface yet (engine
+  2.6.0).** gfx#305's post-fx half is game-wired (`.post_fx` seed →
+  `setPostFx`); its per-entity material half (`palette_swap`/`flash`/
+  `dissolve`/`outline`) is plumbed in core+gfx (`SpriteVisual.material`)
+  but the engine exposes no `Sprite.material`/`setMaterial`. `material-demo`
+  therefore exercises the post-fx half; the material half is a tracked
+  engine follow-up.
 
 > **`+null-sib`** = the scripting games pin the backend to a
 > `labelle-null` SIBLING checkout (not the registry `.null` shorthand),

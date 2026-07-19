@@ -1,0 +1,65 @@
+// Showcase game (#611, docs/showcase-plan.md row 9) — the just-shipped
+// post-fx set (labelle-gfx#305) on bgfx, the backend that ships all four
+// full-screen shader passes.
+//
+// The `.post_fx` block below is the WHOLE feature surface: the assembler
+// emits it as a `g.setPostFx(...)` seed (src/codegen/blocks/post_fx.zig),
+// the engine forwards it to gfx's `PostFxDriver` (post_fx_mixin.zig, gated
+// on gfx >= 1.28), and bgfx 0.13.1 renders each pass from its
+// `.post_fx_passes = .{ .bloom, .vignette, .color_grade, .crt }` manifest.
+// A handful of bright radial orbs bob in the dark so the bloom threshold
+// catches their cores, the vignette frames the scene, color-grade lifts
+// it, and the CRT pass lays down scanlines + a curve — post-fx you can see
+// in a single screenshot.
+//
+// SCOPE NOTE (precise): gfx#305 has TWO halves. This demo exercises the
+// POST-FX half, which is wired end-to-end for games in the released engine
+// (2.6.0). The PER-ENTITY MATERIAL half (palette_swap / flash / dissolve /
+// outline) is plumbed through core + gfx (`SpriteVisual.material`) but the
+// released engine 2.6.0 exposes NO game-facing authoring surface for it
+// (no `Sprite.material`, no `setMaterial`) — so a game cannot drive
+// per-entity materials yet. Tracked as the material-demo follow-up; see
+// README.md.
+//
+// VERSION PINS: released set, not `local:` siblings — showcase games prove
+// the released path end-to-end (see tile-explorer's note). bgfx is pinned
+// explicitly to the current release (0.13.1), which carries the post-fx
+// shaders; the registry enum default predates them.
+.{
+    .name = "material_demo",
+    .title = "LaBelle — Post-FX Showcase",
+    .width = 480,
+    .height = 270,
+    .target_fps = 60,
+    .backend = .bgfx,
+    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.13.1" },
+    .y_axis = .down,
+    .ecs = .zig_ecs,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .resources = .{
+        .{ .name = "glow", .json = "assets/glow.json", .texture = "assets/glow.png" },
+    },
+    .layers = .{
+        .{ .name = "world", .order = 0, .space = .world },
+    },
+    // The initial post-fx stack, seeded at startup. Each entry is validated
+    // against the bgfx manifest's advertised passes at generate time
+    // (capabilities.warnUnsupportedPostFx) — declare a pass the backend
+    // lacks and the assembler warns instead of silently dropping it.
+    .post_fx = .{
+        // Glow: pixels brighter than `threshold` bleed into their neighbors.
+        .{ .bloom = .{ .threshold = 0.55, .intensity = 1.1, .radius = 1.0 } },
+        // Cinematic edge darkening toward a cool tint.
+        .{ .vignette = .{ .intensity = 0.55, .radius = 0.85, .softness = 0.45, .tint = .{ 0.02, 0.02, 0.06 } } },
+        // Gentle overall grade lift.
+        .{ .color_grade = .{ .strength = 0.35, .lut = 0 } },
+        // Subtle CRT: slight curve + scanlines + shadow mask.
+        .{ .crt = .{ .curvature = 0.08, .scanline = 0.35, .mask = 0.25, .aberration = 0.12 } },
+    },
+    .core_version = "1.26.0",
+    .engine_version = "2.6.0",
+    .gfx_version = "1.28.1",
+    .labelle_version = "1.58.0",
+    .assembler_version = "0.94.0",
+}

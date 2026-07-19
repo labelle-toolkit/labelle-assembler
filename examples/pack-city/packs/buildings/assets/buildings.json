@@ -1,0 +1,64 @@
+{
+ "frames": {
+  "house.png": {
+   "frame": {
+    "x": 0,
+    "y": 32,
+    "w": 40,
+    "h": 32
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 40,
+    "h": 32
+   },
+   "sourceSize": {
+    "w": 40,
+    "h": 32
+   }
+  },
+  "tower.png": {
+   "frame": {
+    "x": 48,
+    "y": 0,
+    "w": 24,
+    "h": 64
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 64
+   },
+   "sourceSize": {
+    "w": 24,
+    "h": 64
+   }
+  },
+  "shop.png": {
+   "frame": {
+    "x": 80,
+    "y": 40,
+    "w": 32,
+    "h": 24
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 32,
+    "h": 24
+   },
+   "sourceSize": {
+    "w": 32,
+    "h": 24
+   }
+  }
+ }
+}

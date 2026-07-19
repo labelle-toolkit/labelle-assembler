@@ -1,0 +1,6 @@
+// Corner shop prefab — striped awning, lowest capacity.
+{
+    "Position": { "x": 0, "y": 0 },
+    "Sprite": { "sprite_name": "shop.png", "pivot": "bottom_center", "layer": "world", "z_index": 2 },
+    "Building": { "capacity": 1 }
+}

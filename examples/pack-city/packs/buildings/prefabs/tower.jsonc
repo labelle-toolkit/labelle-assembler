@@ -1,0 +1,6 @@
+// Office tower prefab — tallest silhouette on the skyline.
+{
+    "Position": { "x": 0, "y": 0 },
+    "Sprite": { "sprite_name": "tower.png", "pivot": "bottom_center", "layer": "world", "z_index": 2 },
+    "Building": { "capacity": 12 }
+}

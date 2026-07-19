@@ -1,0 +1,13 @@
+// The consuming pack: cars that drive the street. Declares its dependency
+// on `buildings` and reaches it ONLY through the exposed `count` query
+// (docs/packs.md). Anything else — buildings' files, its component, the
+// `game` shim — is a compile error behind the wall.
+.{
+    .name = "traffic",
+    .manifest_version = 1,
+    .convention_dirs = .copy_and_scan,
+    .resources = .{
+        .{ .name = "atlas", .json = "assets/traffic.json", .texture = "assets/traffic.png" },
+    },
+    .depends_on = .{"buildings"},
+}

@@ -1,0 +1,34 @@
+{
+    // The city street. Root-atlas sprites (`road`, `sun` from the `city`
+    // atlas) sit next to the two packs' NAMESPACED prefabs — the scene
+    // composes both packs by name (`buildings__house`, `traffic__car_red`),
+    // and referencing a pack prefab auto-wires that pack's atlas into this
+    // scene (assembler#579). Scenes are data: the pack wall does nothing to
+    // them, only to code (docs/packs.md).
+    "name": "main",
+    "children": [
+        {
+            "name": "sky",
+            "components": {
+                "Position": { "x": 420, "y": 40 },
+                "Sprite": { "sprite_name": "sun.png", "pivot": "center", "layer": "world", "z_index": 0 }
+            }
+        },
+        {
+            "name": "street",
+            "components": {
+                "Position": { "x": 0, "y": 210 },
+                "Sprite": { "sprite_name": "road.png", "pivot": "top_left", "layer": "world", "z_index": 1 }
+            }
+        },
+
+        { "prefab": "buildings__tower", "Position": { "x": 70, "y": 210 } },
+        { "prefab": "buildings__house", "Position": { "x": 150, "y": 210 } },
+        { "prefab": "buildings__shop", "Position": { "x": 250, "y": 210 } },
+        { "prefab": "buildings__house", "Position": { "x": 330, "y": 210 } },
+        { "prefab": "buildings__tower", "Position": { "x": 420, "y": 210 } },
+
+        { "prefab": "traffic__car_red", "Position": { "x": 120, "y": 232 } },
+        { "prefab": "traffic__car_blue", "Position": { "x": 300, "y": 232 } }
+    ]
+}

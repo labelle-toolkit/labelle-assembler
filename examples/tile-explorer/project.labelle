@@ -1,0 +1,43 @@
+// Showcase game (#611, docs/showcase-plan.md row 8) — `.tmx` tilemap +
+// camera follow on raylib. An explorer sprite walks a path loop around a
+// procedurally-authored island tilemap while the camera tracks it,
+// clamped to the map bounds.
+//
+// What this pins that no other example does: the engine BUILT-IN `Tilemap`
+// component (T2 Phase 4, engine#560 — `assets/island.tmx` embedded via
+// @embedFile, inline tileset, CSV layers) rendered through the same camera
+// transform as sprites, plus the camera-prefabs seed component
+// (engine#714: `Camera` seeds zoom/center once; the gameplay script drives
+// the follow — "soft ownership").
+//
+// VERSION PINS: unlike the sibling fixtures (which pin `local:` sibling
+// checkouts to gate assembler HEAD), the showcase games pin the RELEASED
+// package set — they exist to prove the released path end-to-end
+// (cli#322 lesson: local-override tests hide released-path rot). The
+// backend resolves through the `.raylib` enum shorthand to the registry's
+// current labelle-raylib release.
+.{
+    .name = "tile_explorer",
+    .title = "LaBelle — Tile Explorer Showcase",
+    .width = 640,
+    .height = 360,
+    .target_fps = 60,
+    .backend = .raylib,
+    // Screen-native Y (y=0 at the top, +Y down) — tile row 0 is the top
+    // of the .tmx, so map coords and world coords read identically.
+    .y_axis = .down,
+    .ecs = .zig_ecs,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .resources = .{
+        .{ .name = "explorer", .json = "assets/explorer.json", .texture = "assets/explorer.png" },
+    },
+    .layers = .{
+        .{ .name = "world", .order = 0, .space = .world },
+    },
+    .core_version = "1.26.0",
+    .engine_version = "2.6.0",
+    .gfx_version = "1.28.1",
+    .labelle_version = "1.58.0",
+    .assembler_version = "0.94.0",
+}
