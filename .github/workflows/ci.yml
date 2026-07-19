@@ -824,3 +824,167 @@ jobs:
           ( cd labelle-assembler/examples/sprite-runner/.labelle/sokol_desktop && fix_and_build )
 
           echo "PASS: #611 showcase games — 4 generated on released pins, raylib+sokol built"
+
+  # C# EMBED-path end-to-end (labelle-assembler#617). The csharp
+  # counterpart of the rust/crystal native-language splices: proves THIS
+  # assembler compiles a csharp game's scripts/*.cs into the managed
+  # assembly at generate/build and stages it where hostfxr loads it — with
+  # NO manual dotnet step and NO manual LABELLE_CS_ASSEMBLY_DIR export.
+  #
+  # It drives labelle-scripting's real `examples/csharp-game` (its plugin
+  # pin `local:../..` resolves to the sibling checkout, backend
+  # `local:../../../labelle-null` to the null sibling) through the
+  # assembler binary built from THIS checkout — so the splice, the
+  # `.language_builds` dotnet-publish wiring, the runtime-output InstallDir
+  # staging and the run-step env injection under review are exactly what
+  # runs. Unlike labelle-scripting's own csharp-example job (which pins a
+  # RELEASED assembler and therefore hand-locates the published DLL +
+  # exports the env), this job does NEITHER: the assembly must arrive
+  # beside the installed binary and `zig build run` must point the CoreCLR
+  # host at it on its own. That delta IS the #617 acceptance.
+  #
+  # Linux only (the examples-integration lane's constraint) + setup-dotnet
+  # 7.0.x (the example's net7.0 target — the SDK builds it and provides the
+  # runtime hostfxr loads).
+  csharp-example:
+    name: C# example (EMBED path) end-to-end
+    runs-on: ubuntu-latest
+    # Cold toolkit fetch + one engine compile + one dotnet publish; 30
+    # bounds a wedged runner far under GitHub's 6h default.
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      # The scripting plugin under test — its `examples/csharp-game` is the
+      # fixture, its `native-csharp/` crate + `src/csharp/vm.zig` are what
+      # dotnet publishes and hostfxr loads. Track main (the csharp row +
+      # native-csharp crate are unreleased at the assembler floor here).
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-scripting
+          ref: main
+          path: labelle-scripting
+
+      # The null backend — the example pins it `local:` and needs the
+      # `script_contract.bind` touchpoint that lives on main (unreleased),
+      # same reason the scripting rust/crystal/csharp jobs clone it.
+      - name: Checkout labelle-null (bind touchpoint is unreleased)
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-null.git labelle-null
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The .NET SDK must exist before GENERATE (the declare phase runs
+      # labelle-declare-csharp, a `dotnet build` probe) AND build (the
+      # `.language_builds` `dotnet publish`). >= 7 for the [LibraryImport]
+      # source generator (Glue.cs); it also provides the runtime hostfxr
+      # loads (framework-dependent publish).
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "7.0.x"
+
+      - name: Install sokol/null system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libxext-dev libxfixes-dev \
+            libwayland-dev libxkbcommon-dev libasound2-dev
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Generate + build + run examples/csharp-game (no manual dotnet step)
+        run: |
+          set -o pipefail
+          # Fresh HOME so the assembler's ~/.labelle cache + NuGet caches
+          # never leak the runner's real one.
+          export HOME="$RUNNER_TEMP/labelle-home"
+          mkdir -p "$HOME"
+
+          ASM="$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler"
+          cd labelle-scripting/examples/csharp-game
+
+          "$ASM" install --project-root . || true   # engine/core/gfx fetch
+          "$ASM" generate --project-root . 2>&1 | tee generate.log
+          if grep -q 'generate failed' generate.log; then
+            echo "E: generate reported failure"; exit 1
+          fi
+
+          B=.labelle/null_desktop/build.zig
+          # THE #617 wiring: the link-less dotnet-publish step…
+          grep -qF 'b.addSystemCommand(&.{ "dotnet", "publish"' "$B"
+          # …no addObjectFile (a CoreCLR host LOADS the assembly)…
+          if grep -q 'addObjectFile(plugin_scripting_build_artifact' "$B"; then
+            echo "E: a link artifact was wired for a runtime-loaded language"; exit 1
+          fi
+          # …the runtime-output InstallDir staging beside the exe…
+          grep -qF 'const plugin_scripting_runtime_outputs = b.addInstallDirectory(.{' "$B"
+          grep -qF 'b.getInstallStep().dependOn(&plugin_scripting_runtime_outputs.step);' "$B"
+          # …and the run-step env pointing at the publish dir.
+          grep -qF 'run_cmd.setEnvironmentVariable("LABELLE_CS_ASSEMBLY_DIR", plugin_scripting_build_cache);' "$B"
+
+          cd .labelle/null_desktop
+          # labelle-cli-equivalent fixFingerprint dance; `zig build` also
+          # runs the plugin's dotnet-publish step + stages the assembly.
+          set +e
+          ERR=$(zig build 2>&1)
+          set -e
+          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          fi
+          zig build
+
+          # THE ACCEPTANCE: `zig build` alone put the managed assembly
+          # BESIDE the binary — no manual dotnet, no manual copy.
+          test -f zig-out/bin/labelle_csharp_scripts.dll
+          test -f zig-out/bin/labelle_csharp_scripts.runtimeconfig.json
+          test -f zig-out/bin/labelle_csharp_scripts.deps.json
+
+          # `zig build run` (what `labelle run` invokes) runs the CACHED
+          # binary and auto-sets LABELLE_CS_ASSEMBLY_DIR — hostfxr resolves
+          # the assembly with NO env exported by hand. Pin the exact ordered
+          # transcript (token-for-token the rust/crystal shape).
+          LABELLE_NULL_FRAMES=5 zig build run > run.log 2>&1
+          grep -oE 'CS_[A-Z0-9_.]+' run.log > actual.txt || true
+          cat > expected.txt <<'END'
+          CS_INIT
+          CS_CTRL_READY
+          CS_LEVEL_0.625
+          CS_FEED_SENT
+          CS_LEVEL_0.375
+          CS_ENGINE_TICK_SEEN
+          CS_FED_LEVEL_0.875
+          CS_WATCHER_SAW_0.5
+          CS_LEVEL_0.625
+          CS_LEVEL_0.375
+          CS_LEVEL_0.125
+          CS_STARVING
+          CS_BATCH_OK_3_13.5
+          CS_CTRL_DONE
+          CS_DEINIT
+          END
+          sed -i 's/^          //' expected.txt
+          if ! diff -u expected.txt actual.txt; then
+            echo "E: csharp-example milestone sequence mismatch"
+            echo "--- full captured output ---"; cat run.log
+            exit 1
+          fi
+          echo "PASS: C# scripts compiled by zig build (dotnet publish), staged beside the binary + loaded through hostfxr with NO manual dotnet step or env export — 15 ordered milestones over 5 headless frames"

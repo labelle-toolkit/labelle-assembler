@@ -8,6 +8,7 @@ const tpl = @import("../template.zig");
 const config = @import("../config.zig");
 const plugin_params = @import("../plugin_params.zig");
 const plugin_build_steps = @import("../plugin_build_steps.zig");
+const scripting_csharp = @import("../scripting_csharp.zig");
 const backend_registry = @import("../backend_registry.zig");
 const capabilities = @import("../capabilities.zig");
 const scan = @import("../codegen/scan.zig");
@@ -352,6 +353,19 @@ pub const PluginBuildStepsWiring = struct {
     /// order). Each becomes one `addLibraryPath` on the artifact's root
     /// module. Empty for every pre-crystal plugin — byte-identity holds.
     library_paths: []const []const u8 = &.{},
+    /// The steps publish RUNTIME-LOADED outputs into `{cache}` — the C#
+    /// CoreCLR-host contract (labelle-assembler#617): the link-less
+    /// `dotnet publish` step's output dir IS the runtime payload (the
+    /// managed assembly + its runtimeconfig/deps.json), so the emission
+    /// additionally stages it where the plugin's hostfxr vm resolves the
+    /// assembly — an InstallDir step copying `{cache}` beside the
+    /// installed exe (`emitPluginBuildSteps`), plus the `run` step's
+    /// `LABELLE_CS_ASSEMBLY_DIR` env pointing at `{cache}` (the desktop
+    /// footer — `zig build run` executes the CACHED binary, which has no
+    /// assembly beside it). Decided by root.zig via
+    /// `scripting_csharp.stagesRuntimeOutputs`; default false keeps every
+    /// other project's build.zig byte-identical.
+    stage_runtime_outputs: bool = false,
 };
 
 /// Emit one declared argv element as generated build.zig source.
@@ -532,8 +546,10 @@ fn emitPluginBuildSteps(
 
     for (entries) |e| {
         // The {cache} const: per plugin, only when an arg references it
-        // (artifact paths use b.path directly and never need the const).
-        var wants_cache = false;
+        // (artifact paths use b.path directly and never need the const) —
+        // or when the runtime-output staging references it (#617: the
+        // InstallDir source + the run step's env var below).
+        var wants_cache = e.stage_runtime_outputs;
         for (e.steps) |s| {
             for (s.command) |arg| {
                 if (plugin_build_steps.containsPlaceholder(arg, plugin_build_steps.PLACEHOLDER_CACHE)) wants_cache = true;
@@ -632,7 +648,38 @@ fn emitPluginBuildSteps(
         // The game artifact waits for the plugin's LAST step; the chain
         // orders everything before it.
         try w.print("    {s}.step.dependOn(&plugin_{s}_build_step_{d}.step);\n", .{ artifact, e.plugin_name, e.steps.len - 1 });
+
+        // Runtime outputs beside the binary (labelle-assembler#617): the
+        // link-less steps publish runtime-LOADED artifacts (the C# managed
+        // assembly + its runtimeconfig/deps.json) into `{cache}` — install
+        // that dir's contents next to the exe so the plugin's hostfxr host
+        // resolves the assembly beside the shipped binary, and `zig build`
+        // alone yields a complete, deployable game dir. Desktop-exe only:
+        // the csharp steps are desktop-allowlisted, and only the exe target
+        // installs a runnable binary.
+        if (e.stage_runtime_outputs and std.mem.eql(u8, artifact, "exe")) {
+            try w.print("    // Runtime outputs of plugin '{s}' (labelle-assembler#617): stage the\n", .{e.plugin_name});
+            try w.writeAll("    // published managed assembly (+ runtimeconfig/deps.json) beside the exe.\n");
+            try w.print("    const plugin_{s}_runtime_outputs = b.addInstallDirectory(.{{\n", .{e.plugin_name});
+            try w.print("        .source_dir = .{{ .cwd_relative = plugin_{s}_build_cache }},\n", .{e.plugin_name});
+            try w.writeAll("        .install_dir = .bin,\n");
+            try w.writeAll("        .install_subdir = \"\",\n");
+            try w.writeAll("    });\n");
+            try w.print("    plugin_{s}_runtime_outputs.step.dependOn(&plugin_{s}_build_step_{d}.step);\n", .{ e.plugin_name, e.plugin_name, e.steps.len - 1 });
+            try w.print("    b.getInstallStep().dependOn(&plugin_{s}_runtime_outputs.step);\n", .{e.plugin_name});
+        }
     }
+}
+
+/// The (single) wiring entry whose steps publish runtime-loaded outputs
+/// (labelle-assembler#617), if any — drives the desktop footer's
+/// `run_cmd` env injection. One scripting plugin per project is already
+/// policy-enforced (#584), so first-match is exhaustive.
+fn runtimeOutputsEntry(entries: []const PluginBuildStepsWiring) ?PluginBuildStepsWiring {
+    for (entries) |e| {
+        if (e.stage_runtime_outputs) return e;
+    }
+    return null;
 }
 
 pub const BuildZigOptions = struct {
@@ -1359,11 +1406,22 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         // Test-only target (issue #83): close the build function without
         // installing/running the exe. Otherwise emit the regular footer
-        // that wires `b.installArtifact(exe)` and the `run` step.
+        // that wires `b.installArtifact(exe)` and the `run` step — split
+        // into install-run/close halves (byte-identical concatenation)
+        // so a runtime-outputs plugin (#617, the C# managed assembly) can
+        // point the run step's env at the publish dir: `zig build run`
+        // executes the CACHED binary, which has no assembly beside it,
+        // so the hostfxr host resolves it via its documented override.
         if (opts.is_tests_target) {
             try tpl.writeSection(build_zig_tmpl, "tests_only_footer", w);
         } else {
-            try tpl.writeSection(build_zig_tmpl, "footer", w);
+            try tpl.writeSection(build_zig_tmpl, "footer_install_run", w);
+            if (runtimeOutputsEntry(opts.plugin_build_steps)) |e| {
+                try w.print("    // The run step executes the cached (uninstalled) binary — point the\n" ++
+                    "    // CoreCLR host's documented override at the publish dir (#617).\n" ++
+                    "    run_cmd.setEnvironmentVariable(\"{s}\", plugin_{s}_build_cache);\n", .{ scripting_csharp.RUNTIME_ASSEMBLY_DIR_ENV, e.plugin_name });
+            }
+            try tpl.writeSection(build_zig_tmpl, "footer_close", w);
         }
 
         // manifest-v2 GENERIC desktop (PR 8) emits the generic `unifyCoreDiamond`
@@ -1669,4 +1727,89 @@ test "emitPluginBuildSteps: the crystal shape — {crystal_target} const, artifa
 
     // The per-OS system libs ride the existing switch emission.
     try testing.expect(std.mem.indexOf(u8, out, "            exe.root_module.linkSystemLibrary(\"iconv\", .{});\n") != null);
+
+    // No runtime-output staging for a linked-artifact language (crystal):
+    // the #617 install wiring is csharp's alone.
+    try testing.expect(std.mem.indexOf(u8, out, "runtime_outputs") == null);
+}
+
+test "emitPluginBuildSteps: the csharp shape (#617) — link-less dotnet publish, runtime outputs installed beside the exe (golden)" {
+    // The csharp `.language_builds` entry as root.zig wires it: ONE
+    // link-less `dotnet publish -o {cache}` step with
+    // `stage_runtime_outputs` decided true (scripting_csharp
+    // .stagesRuntimeOutputs). The publish dir IS the runtime payload, so
+    // the emission adds the InstallDir step staging it beside the exe.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try emitPluginBuildSteps(testing.allocator, &aw.writer, "exe", &.{.{
+        .plugin_name = "scripting",
+        .package_abs = "/abs/deps/labelle-scripting",
+        .cache_rel = "plugin-build/scripting",
+        .stage_runtime_outputs = true,
+        .steps = &.{.{
+            .name = "dotnet-publish-scripts",
+            .command = &.{ "dotnet", "publish", "{package}/native-csharp/LabelleScripts.csproj", "-c", "Release", "--self-contained", "false", "-o", "{cache}" },
+        }},
+    }});
+    const out = aw.written();
+
+    // The cache const is FORCED (the -o arg also references it here, but
+    // the install wiring must not depend on that) and the command emits.
+    try testing.expect(std.mem.indexOf(u8, out, "    const plugin_scripting_build_cache = b.pathFromRoot(\"plugin-build/scripting\");\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "b.addSystemCommand(&.{ \"dotnet\", \"publish\"") != null);
+
+    // Link-less: nothing is linked, the exe just depends on the step.
+    try testing.expect(std.mem.indexOf(u8, out, "addObjectFile") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "    exe.step.dependOn(&plugin_scripting_build_step_0.step);\n") != null);
+
+    // THE #617 wiring: an InstallDir step copies {cache} (the publish
+    // output) into the exe's install dir, ordered after the publish and
+    // reached from the default install step — `zig build` alone yields
+    // the assembly beside the binary.
+    try testing.expect(std.mem.indexOf(u8, out,
+        "    const plugin_scripting_runtime_outputs = b.addInstallDirectory(.{\n" ++
+            "        .source_dir = .{ .cwd_relative = plugin_scripting_build_cache },\n" ++
+            "        .install_dir = .bin,\n" ++
+            "        .install_subdir = \"\",\n" ++
+            "    });\n" ++
+            "    plugin_scripting_runtime_outputs.step.dependOn(&plugin_scripting_build_step_0.step);\n" ++
+            "    b.getInstallStep().dependOn(&plugin_scripting_runtime_outputs.step);\n") != null);
+}
+
+test "emitPluginBuildSteps: runtime outputs stage on the exe target only (never wasm/lib)" {
+    // The csharp steps are desktop-allowlisted and only the desktop exe
+    // installs a runnable binary — the lib/wasm emissions must stay free
+    // of the InstallDir wiring even if a wiring entry carried the flag.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try emitPluginBuildSteps(testing.allocator, &aw.writer, "lib", &.{.{
+        .plugin_name = "scripting",
+        .package_abs = "/abs/deps/labelle-scripting",
+        .cache_rel = "plugin-build/scripting",
+        .stage_runtime_outputs = true,
+        .steps = &.{.{ .name = "dotnet-publish-scripts", .command = &.{ "dotnet", "publish", "-o", "{cache}" } }},
+    }});
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "runtime_outputs") == null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "    lib.step.dependOn(&plugin_scripting_build_step_0.step);\n") != null);
+}
+
+test "runtimeOutputsEntry: picks the flagged entry, none when absent (footer env gate)" {
+    const flagged = PluginBuildStepsWiring{
+        .plugin_name = "scripting",
+        .package_abs = "/abs",
+        .cache_rel = "plugin-build/scripting",
+        .stage_runtime_outputs = true,
+        .steps = &.{},
+    };
+    const plain = PluginBuildStepsWiring{
+        .plugin_name = "physics",
+        .package_abs = "/abs",
+        .cache_rel = "plugin-build/physics",
+        .steps = &.{},
+    };
+    try testing.expect(runtimeOutputsEntry(&.{ plain, flagged }) != null);
+    try testing.expectEqualStrings("scripting", runtimeOutputsEntry(&.{ plain, flagged }).?.plugin_name);
+    try testing.expect(runtimeOutputsEntry(&.{plain}) == null);
+    try testing.expect(runtimeOutputsEntry(&.{}) == null);
 }

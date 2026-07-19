@@ -385,11 +385,12 @@ fn unifyGfxSubpackageCore(gfx_mod: *std.Build.Module, core_mod: *std.Build.Modul
     }
 }
 
-.footer
+.footer_install_run
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
+.footer_close
     const run_step = b.step("run", "Run the game");
     run_step.dependOn(&run_cmd.step);
 }

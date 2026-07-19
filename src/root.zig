@@ -30,6 +30,7 @@ pub const plugin_params = @import("plugin_params.zig");
 pub const scripting_splice = @import("scripting_splice.zig");
 pub const scripting_declare = @import("scripting_declare.zig");
 pub const scripting_transpile = @import("scripting_transpile.zig");
+pub const scripting_csharp = @import("scripting_csharp.zig");
 pub const pack_validate = @import("pack_validate.zig");
 pub const panel_validate = @import("panel_validate.zig");
 const scene_name_lint = @import("scene_name_lint.zig");
@@ -75,6 +76,7 @@ test {
     _ = @import("scripting_splice.zig");
     _ = @import("scripting_declare.zig");
     _ = @import("scripting_transpile.zig");
+    _ = @import("scripting_csharp.zig");
     _ = @import("panel_validate.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
@@ -1462,6 +1464,24 @@ pub fn generate(
                     );
                     return error.PluginBuildNoArtifactForOs;
                 }
+
+                // Toolchain probe (labelle-assembler#617): the C# publish
+                // step runs inside the user's next `zig build` — a missing
+                // .NET SDK there surfaces as an opaque child-spawn failure
+                // far from the cause. Probe the emitted step's argv[0] on
+                // PATH NOW and fail pointedly (tool + install hint) — a
+                // csharp generate without dotnet dies here, not mid-build.
+                // Same up-front posture as the platform/cwd gates around
+                // this block. Scoped to csharp deliberately: rust/crystal's
+                // steps predate this probe and their tests never declared a
+                // toolchain-present precondition; the cross-generate `.os`
+                // seam can also legitimately select a tool absent from the
+                // HOST PATH (linux `objcopy` on a macOS host). The generic
+                // `ensureStepToolsOnPath` machinery is ready for #619 to
+                // widen via a capability row; the CALL stays csharp-scoped.
+                if (std.mem.eql(u8, declared_language.?, "csharp")) {
+                    try scripting_csharp.ensureStepToolsOnPath(allocator, plugin.name, declared_language.?, lang_steps_slice);
+                }
             }
 
             // ONE wiring entry per plugin: `.build` steps first, the
@@ -1592,6 +1612,14 @@ pub fn generate(
                 .cache_rel = cache_rel,
                 .steps = combined,
                 .library_paths = lib_paths_owned,
+                // C# EMBED path (labelle-assembler#617): the csharp entry's
+                // link-less `dotnet publish` step makes `{cache}` the
+                // runtime payload (the managed assembly the hostfxr vm
+                // loads) — stage it beside the binary + point the run
+                // step's env at it. Keyed on the SELECTED language row
+                // (false for every other language/plugin — byte-identity).
+                .stage_runtime_outputs = maybe_lang != null and
+                    scripting_csharp.stagesRuntimeOutputs(declared_language.?, lang_steps_slice),
             });
             // Hand the parse trees over to their lifetime lists and disarm
             // the errdefers (assume-capacity appends cannot fail between
