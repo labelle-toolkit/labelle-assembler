@@ -68,6 +68,10 @@ pub const filterConsumedEvents = scan.filterConsumedEvents;
 /// `force_consumed` set.
 pub const ProviderDir = scan.ProviderDir;
 pub const detectUngatedEmits = scan.detectUngatedEmits;
+/// Declared plugin-to-plugin consumption (#633): resolve one
+/// `plugin.labelle` `.consumes_events` entry to its discovered event so
+/// the qualified tag can join the `force_consumed` set.
+pub const resolveDeclaredConsume = scan.resolveDeclaredConsume;
 pub const discoverPluginFlowDecls = scan.discoverPluginFlowDecls;
 pub const collectPromotedScripts = scan.collectPromotedScripts;
 pub const freePromotedScripts = scan.freePromotedScripts;

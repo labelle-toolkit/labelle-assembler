@@ -233,6 +233,22 @@ pub const PluginManifest = struct {
     /// byte-identical output.
     languages: []const LanguageRow = &.{},
 
+    /// Foreign plugin/engine events this plugin CONSUMES from inside its own
+    /// module source (labelle-assembler#633) — e.g.
+    /// `.consumes_events = .{ "pathfinding.path_found" }`. The consumption
+    /// filter (#630) excludes dependency sources from its consumer scan (a
+    /// plugin's own source names its tags at every emit site), so
+    /// plugin-to-plugin consumption living in module source is invisible to
+    /// it; declaring the events here force-keeps them in the generated
+    /// `PluginEvents` union. Entries use the dotted
+    /// (`<plugin>.<event>`) or qualified (`<plugin>__<event>`) spelling —
+    /// the same two forms the scanner's needles match — and are resolved
+    /// against the discovered event list at generate
+    /// (`scan.resolveDeclaredConsume`; an unmatched entry fails generation
+    /// loudly). Empty/absent = the plugin consumes nothing cross-plugin from
+    /// module source (every plugin before #633) → byte-identical output.
+    consumes_events: []const []const u8 = &.{},
+
     /// Allocator that owns the parsed strings and slice. Stored on
     /// the manifest so the caller doesn't have to remember to pass
     /// the right allocator to deinit.
@@ -262,6 +278,7 @@ pub const PluginManifest = struct {
         std.zon.parse.free(self.allocator, self.license);
         std.zon.parse.free(self.allocator, self.author);
         std.zon.parse.free(self.allocator, self.languages);
+        std.zon.parse.free(self.allocator, self.consumes_events);
         // Not parser-allocated (the strict schema walk owns its copies) but
         // shape-compatible; freed through its own helper for symmetry.
         plugin_params.freeSchema(self.allocator, self.params_schema);
@@ -497,6 +514,7 @@ pub fn loadFromDir(
         .license = parsed.license,
         .author = parsed.author,
         .languages = parsed.languages,
+        .consumes_events = parsed.consumes_events,
         .allocator = allocator,
     };
 }
@@ -523,6 +541,9 @@ const ZonManifest = struct {
     // to the byte-identical empty default. Unknown row keys (a future
     // `.transpile`) ride the manifest-wide `ignore_unknown_fields`.
     languages: []const LanguageRow = &.{},
+    // Declared plugin-to-plugin event consumption (#633). Optional/additive —
+    // absent parses to the byte-identical empty default.
+    consumes_events: []const []const u8 = &.{},
 };
 
 // ============================================================================
@@ -1164,6 +1185,37 @@ test "loadFromDir: Phase-2 fields absent → empty/null (byte-identity default)"
     try testing.expect(manifest.license == null);
     try testing.expect(manifest.author == null);
     try testing.expect(manifest.requires_language == null); // #584
+    try testing.expectEqual(@as(usize, 0), manifest.consumes_events.len); // #633
+}
+
+test "loadFromDir: parses .consumes_events (#633)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A plugin declaring the foreign events its own module source consumes
+    // — dotted and qualified spellings both legal (resolution against the
+    // discovered event list happens at generate, in
+    // `scan.resolveDeclaredConsume`).
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "walker",
+        \\    .manifest_version = 1,
+        \\    .consumes_events = .{
+        \\        "pathfinding.path_found",
+        \\        "box2d__collision_begin",
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "walker")).?;
+    defer manifest.deinit();
+
+    try testing.expectEqual(@as(usize, 2), manifest.consumes_events.len);
+    try testing.expectEqualStrings("pathfinding.path_found", manifest.consumes_events[0]);
+    try testing.expectEqualStrings("box2d__collision_begin", manifest.consumes_events[1]);
 }
 
 test "loadFromDir: parses requires_language (#584)" {

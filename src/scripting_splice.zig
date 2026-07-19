@@ -527,7 +527,12 @@ pub fn probeHotReloadAt(allocator: std.mem.Allocator, plugin_dir: []const u8) bo
 /// safe direction) and does not occur in build.zig convention. Offsets
 /// are preserved (blank, never splice) so the matcher's cross-line scan
 /// runs over the same buffer.
-fn blankCommentsForProbe(buf: []u8) void {
+///
+/// Public because the plugin-event consumption scan's gated-literal
+/// downgrade probe (`scan/event_consumption.zig`, #635) reuses the same
+/// blanking before searching for a quoted tag — a tag mentioned only in
+/// a comment must not read as a live `@hasField` gate.
+pub fn blankCommentsForProbe(buf: []u8) void {
     var i: usize = 0;
     while (i < buf.len) {
         const line_end = std.mem.indexOfScalarPos(u8, buf, i, '\n') orelse buf.len;
