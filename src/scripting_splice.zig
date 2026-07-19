@@ -458,15 +458,18 @@ pub fn detect(
 // ── Dev-mode hot reload (labelle-assembler#637) ───────────────────────
 
 /// Probe the resolved scripting package for the dev-mode hot-reload
-/// surface: does its build.zig declare the `"hot_reload"` build option
+/// surface: does its build.zig declare the `hot_reload` build option
 /// (labelle-scripting ≥ v0.12.0, labelle-scripting#47)? Content probe by
 /// design — a semver compare would misclassify `local:` pins (no version)
 /// and re-grow exactly the assembler-side version tables the manifest
-/// `.languages` rows dissolved. Quoted spelling (`"hot_reload"`) matches
-/// the `b.option(bool, "hot_reload", …)` declaration, not a stray comment
-/// mention. Any resolution/read failure degrades to `false` (splice-less
-/// dev mode) — the probe must never fail a generate that would otherwise
-/// succeed.
+/// `.languages` rows dissolved. Anchored to the DECLARATION form
+/// (`…option(bool, "hot_reload"`, whitespace-tolerant — see
+/// `containsHotReloadOptionDecl`), never any quoted mention: a comment or
+/// diagnostic string spelling `"hot_reload"` must not flip capability on,
+/// because the generated build.zig would then pass an option the plugin
+/// never declared — a hard `zig build` error (codex, PR #638). Any
+/// resolution/read failure degrades to `false` (splice-less dev mode) —
+/// the probe must never fail a generate that would otherwise succeed.
 pub fn probeHotReload(
     allocator: std.mem.Allocator,
     plugin: config.PluginDep,
@@ -488,7 +491,42 @@ pub fn probeHotReloadAt(allocator: std.mem.Allocator, plugin_dir: []const u8) bo
         .limited(1024 * 1024),
     ) catch return false;
     defer allocator.free(bytes);
-    return std.mem.indexOf(u8, bytes, "\"hot_reload\"") != null;
+    return containsHotReloadOptionDecl(bytes);
+}
+
+/// True when `src` contains the option DECLARATION
+/// `option(bool, "hot_reload"` — whitespace/newline-tolerant between the
+/// tokens, so both the single-line spelling and labelle-scripting's
+/// multi-line `b.option(\n    bool,\n    "hot_reload",\n    …)` match.
+/// Anchors on `option(` (receiver-agnostic — `b.option`, a renamed
+/// builder) followed by exactly `bool` `,` `"hot_reload"`; a quoted
+/// mention in a comment or diagnostic never has that shape, so it cannot
+/// over-match (the codex P2 on PR #638).
+fn containsHotReloadOptionDecl(src: []const u8) bool {
+    const anchor = "option(";
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, src, search, anchor)) |at| {
+        search = at + anchor.len;
+        var i = skipZigWs(src, search);
+        if (!std.mem.startsWith(u8, src[i..], "bool")) continue;
+        i = skipZigWs(src, i + "bool".len);
+        if (i >= src.len or src[i] != ',') continue;
+        i = skipZigWs(src, i + 1);
+        if (std.mem.startsWith(u8, src[i..], "\"hot_reload\"")) return true;
+    }
+    return false;
+}
+
+/// Index of the first non-whitespace byte at or after `start`.
+fn skipZigWs(src: []const u8, start: usize) usize {
+    var i = start;
+    while (i < src.len) : (i += 1) {
+        switch (src[i]) {
+            ' ', '\t', '\r', '\n' => {},
+            else => break,
+        }
+    }
+    return i;
 }
 
 /// Should the generated build.zig pass `.hot_reload = optimize == .Debug`
@@ -504,7 +542,14 @@ pub fn probeHotReloadAt(allocator: std.mem.Allocator, plugin_dir: []const u8) bo
 ///     loop, and must not compile the watcher in (the explicit pin the
 ///     tests target carries for gamepad/backend too, assembler#627);
 ///   - desktop only — wasm/android/ios have no editable source tree to
-///     poll next to the running game.
+///     poll next to the running game;
+///   - NOT the deprecated legacy per-language dir (`lua/`, `ts/` — the
+///     one-release grace fallback): its recursive collection registers
+///     subdir-joined stems (`ai/guard`) the plugin's FLAT-dir watcher can
+///     never report (watch.zig maps plain filenames through the scripts/
+///     stem rule), so reloads would target the wrong (or no) registration
+///     — the codex P2 on PR #638. Migrating to `scripts/` turns hot
+///     reload on; the deprecation carrot.
 pub fn buildDepHotReload(
     splice: ScriptingSplice,
     is_tests_target: bool,
@@ -512,6 +557,7 @@ pub fn buildDepHotReload(
 ) bool {
     return splice.family == .embed and
         splice.hot_reload_capable and
+        !splice.legacy and
         !is_tests_target and
         platform == .desktop;
 }
@@ -533,30 +579,67 @@ pub fn buildDepHotReload(
 ///     plugin/assembler skew: with an older scripting the splice is a
 ///     comptime no-op, never a compile error.
 ///
-/// Watch-path strategy: primary = `watch_dir_from_target` (the SOURCE tree
-/// relative to the generated target dir, where the game's cwd normally is
-/// — see that field's doc for the Windows staged-COPY trap), fallback =
-/// the project-root-relative `dir` for a binary launched from the project
-/// root itself. Failure to open either logs and degrades — dev-mode
-/// wiring must never take the game down.
+/// Watch-path strategy, by language shape:
+///   - Direct-run languages (lua, ruby — authored IS runnable): primary =
+///     `watch_dir_from_target` (the SOURCE tree relative to the generated
+///     target dir, where the game's cwd normally is — see that field's doc
+///     for the Windows staged-COPY trap), fallback = the project-root-
+///     relative `dir` for a binary launched from the project root itself.
+///   - Transpiled languages (typescript): the watcher filters the EMBED
+///     extension (`.js` — the plugin's comptime `scriptExtension`), and
+///     the runnable `.js` lives in the generated target's materialized
+///     script dir (`scripting_transpile.runPhase` deletes the staging link
+///     and copies+emits there) — the SOURCE `.ts` would never match. So
+///     the watch registers the target's own dir (cwd-relative `dir`), and
+///     live TS dev edits the emitted `.js` (or re-runs generate for `.ts`
+///     changes) — labelle-scripting#47's documented v1 limitation
+///     ("TS hot reload watches emitted .js — no in-process tsc");
+///     incremental transpile-on-watch belongs with the TS7 transpile work
+///     (labelle-engine#745 follow-ups). Windows-correct by construction:
+///     the emitted `.js` is generated OUTPUT (the only runnable copy),
+///     not a staged mirror of source, so watching it never hits the
+///     staged-copy trap.
+/// Failure to open logs and degrades — dev-mode wiring must never take
+/// the game down.
 ///
 /// Caller gates: emitted only for desktop targets (both lifecycle paths
 /// pass their platform check first); this helper self-gates on the embed
-/// family + the capability probe, so every existing fixture stays
-/// byte-identical.
+/// family, the capability probe, AND the non-legacy dir (see
+/// `buildDepHotReload`'s legacy rationale — recursive legacy stems can
+/// never match the flat-dir watcher's reports), so every existing fixture
+/// stays byte-identical.
 pub fn emitHotReloadWatch(w: anytype, splice: ScriptingSplice) !void {
-    if (splice.family != .embed or !splice.hot_reload_capable) return;
+    if (splice.family != .embed or !splice.hot_reload_capable or splice.legacy) return;
 
+    if (splice.transpile != null) {
+        try w.writeAll(
+            "\n" ++
+                "    // Dev-mode script hot reload (labelle-assembler#637): Debug builds\n" ++
+                "    // only — the comptime gate folds this out of release binaries, and\n" ++
+                "    // the @hasDecl probe no-ops it against a scripting plugin predating\n" ++
+                "    // the hot-reload surface (labelle-scripting v0.12.0). TRANSPILED\n" ++
+                "    // language: the watcher filters the EMBED extension, so it watches\n" ++
+                "    // this generated target's own script dir — where the transpile\n" ++
+                "    // phase materialized the runnable output (generated OUTPUT, the\n" ++
+                "    // only runnable copy — never a staged mirror of source, so this is\n" ++
+                "    // Windows-correct by construction). v1 limitation (labelle-\n" ++
+                "    // scripting#47): live-edit the emitted file here directly, or\n" ++
+                "    // re-run `labelle generate` for authored-source changes.\n",
+        );
+    } else {
+        try w.writeAll(
+            "\n" ++
+                "    // Dev-mode script hot reload (labelle-assembler#637): Debug builds\n" ++
+                "    // only — the comptime gate folds this out of release binaries, and\n" ++
+                "    // the @hasDecl probe no-ops it against a scripting plugin predating\n" ++
+                "    // the hot-reload surface (labelle-scripting v0.12.0). Watches the\n" ++
+                "    // SOURCE script dir (the tree the developer edits): staging is a\n" ++
+                "    // symlink on POSIX but can be a real COPY on Windows, where the\n" ++
+                "    // staged dir would never see an edit.\n",
+        );
+    }
     try w.writeAll(
-        "\n" ++
-            "    // Dev-mode script hot reload (labelle-assembler#637): Debug builds\n" ++
-            "    // only — the comptime gate folds this out of release binaries, and\n" ++
-            "    // the @hasDecl probe no-ops it against a scripting plugin predating\n" ++
-            "    // the hot-reload surface (labelle-scripting v0.12.0). Watches the\n" ++
-            "    // SOURCE script dir (the tree the developer edits): staging is a\n" ++
-            "    // symlink on POSIX but can be a real COPY on Windows, where the\n" ++
-            "    // staged dir would never see an edit.\n" ++
-            "    if (comptime (@import(\"builtin\").mode == .Debug and @hasDecl(scripting, \"hot_reload\"))) hot_reload: {\n" ++
+        "    if (comptime (@import(\"builtin\").mode == .Debug and @hasDecl(scripting, \"hot_reload\"))) hot_reload: {\n" ++
             "        const HotReloadIo = struct {\n" ++
             "            var threaded: std.Io.Threaded = undefined;\n" ++
             "        };\n" ++
@@ -566,7 +649,9 @@ pub fn emitHotReloadWatch(w: anytype, splice: ScriptingSplice) !void {
             "        HotReloadIo.threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});\n" ++
             "        const hot_reload_io = HotReloadIo.threaded.io();\n",
     );
-    if (splice.watch_dir_from_target) |primary| {
+    const watch_source = splice.transpile == null;
+    if (watch_source and splice.watch_dir_from_target != null) {
+        const primary = splice.watch_dir_from_target.?;
         try w.print("        scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"{s}\") catch {{\n", .{primary});
         try w.writeAll(
             "            // cwd is normally `.labelle/<target>/` (`labelle run` invokes\n" ++
@@ -581,6 +666,9 @@ pub fn emitHotReloadWatch(w: anytype, splice: ScriptingSplice) !void {
                 "        };\n",
         );
     } else {
+        // Transpiled: the target's own materialized dir, cwd-relative (the
+        // game runs with cwd = the target dir). Direct-run without a
+        // computed relative path degrades to the same single watch.
         try w.print("        scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"{s}\") catch |watch_err| {{\n", .{splice.dir});
         try w.print("            std.debug.print(\"labelle: script hot reload disabled — could not open '{s}': {{s}}\\n\", .{{@errorName(watch_err)}});\n", .{splice.dir});
         try w.writeAll(
@@ -588,7 +676,11 @@ pub fn emitHotReloadWatch(w: anytype, splice: ScriptingSplice) !void {
                 "        };\n",
         );
     }
-    try w.print("        std.debug.print(\"labelle: script hot reload active — edit {s}/*{s} and save\\n\", .{{}});\n", .{ splice.dir, splice.extension });
+    if (splice.transpile != null) {
+        try w.print("        std.debug.print(\"labelle: script hot reload active — edit the generated {s}/*{s} (emitted output; re-run generate for authored-source changes) and save\\n\", .{{}});\n", .{ splice.dir, splice.extension });
+    } else {
+        try w.print("        std.debug.print(\"labelle: script hot reload active — edit {s}/*{s} and save\\n\", .{{}});\n", .{ splice.dir, splice.extension });
+    }
     try w.writeAll("    }\n");
 }
 
@@ -2992,12 +3084,12 @@ test "renderCsharpDevProject: globs the in-place convention dirs + refs the reso
 
 // ── Dev-mode hot reload (labelle-assembler#637) — probe + gate tests ──
 
-test "probeHotReloadAt: true only when the package build.zig declares the quoted hot_reload option" {
+test "probeHotReloadAt: true only when the package build.zig DECLARES the hot_reload option" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // v0.12.0 shape: the option declaration is present.
+    // v0.12.0 shape: the multi-line option declaration is present.
     try writeTestFile(tmp.dir, "capable/build.zig",
         \\const hot_reload = b.option(
         \\    bool,
@@ -3012,6 +3104,13 @@ test "probeHotReloadAt: true only when the package build.zig declares the quoted
         \\// TODO: hot_reload support lands in a later release
         \\const language = b.option([]const u8, "language", "…");
     );
+    // The codex-P2 shape (PR #638): a QUOTED mention outside a declaration
+    // — comment or diagnostic string — must not flip capability on either.
+    try writeTestFile(tmp.dir, "mention/build.zig",
+        \\// mentions "hot_reload" in a comment
+        \\const msg = "pass \"hot_reload\" once the plugin supports it";
+        \\const language = b.option([]const u8, "language", "…");
+    );
 
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
@@ -3019,13 +3118,43 @@ test "probeHotReloadAt: true only when the package build.zig declares the quoted
     defer allocator.free(capable);
     const older = try std.fs.path.join(allocator, &.{ root, "older" });
     defer allocator.free(older);
+    const mention = try std.fs.path.join(allocator, &.{ root, "mention" });
+    defer allocator.free(mention);
     const missing = try std.fs.path.join(allocator, &.{ root, "no-such-plugin" });
     defer allocator.free(missing);
 
     try testing.expect(probeHotReloadAt(allocator, capable));
     try testing.expect(!probeHotReloadAt(allocator, older));
+    try testing.expect(!probeHotReloadAt(allocator, mention));
     // Resolution/read failures degrade to false, never error.
     try testing.expect(!probeHotReloadAt(allocator, missing));
+}
+
+test "containsHotReloadOptionDecl: declaration forms match; non-declaration spellings never do" {
+    // Single-line and multi-line declarations, any receiver name.
+    try testing.expect(containsHotReloadOptionDecl(
+        "const hot_reload = b.option(bool, \"hot_reload\", \"…\") orelse false;",
+    ));
+    try testing.expect(containsHotReloadOptionDecl(
+        "const hot_reload = builder.option(\n    bool,\n    \"hot_reload\",\n    \"…\",\n) orelse false;",
+    ));
+    // A quoted mention with no declaration shape around it.
+    try testing.expect(!containsHotReloadOptionDecl(
+        "// the \"hot_reload\" option is not declared here",
+    ));
+    // A declaration of a DIFFERENT type/name never matches.
+    try testing.expect(!containsHotReloadOptionDecl(
+        "const x = b.option([]const u8, \"hot_reload\", \"…\");",
+    ));
+    try testing.expect(!containsHotReloadOptionDecl(
+        "const x = b.option(bool, \"hot_reload_extra\", \"…\");",
+    ));
+    // …and `"hot_reload_extra"` starts with the quoted name — make sure the
+    // exact-name positive still holds beside it in one source.
+    try testing.expect(containsHotReloadOptionDecl(
+        "const a = b.option(bool, \"hot_reload_extra\", \"…\");\n" ++
+            "const b_ = b.option(bool, \"hot_reload\", \"…\");",
+    ));
 }
 
 test "detect: a local scripting plugin with the hot_reload option probes capable; one without stays incapable" {
@@ -3079,6 +3208,13 @@ test "buildDepHotReload: embed+capable+exe+desktop only — tests target, native
     var native = capable;
     native.family = .native;
     try testing.expect(!buildDepHotReload(native, false, .desktop));
+
+    // The deprecated legacy per-language dir never gets hot reload: its
+    // recursive subdir-joined stems (`ai/guard`) can't match the plugin's
+    // flat-dir watcher reports (codex P2, PR #638).
+    var legacy = capable;
+    legacy.legacy = true;
+    try testing.expect(!buildDepHotReload(legacy, false, .desktop));
 }
 
 test "emitHotReloadWatch: capable embed splice emits the Debug-gated source-tree watch with the cwd fallback" {
@@ -3142,4 +3278,49 @@ test "emitHotReloadWatch: no relative path → single cwd-relative watch; incapa
     no_rel.family = .native;
     try emitHotReloadWatch(&aw3.writer, no_rel);
     try testing.expectEqual(@as(usize, 0), aw3.written().len);
+}
+
+test "emitHotReloadWatch: a LEGACY-dir splice emits nothing even when capable (codex P2, PR #638)" {
+    const allocator = testing.allocator;
+    const legacy = ScriptingSplice{
+        .plugin_name = "scripting",
+        .language = "lua",
+        .dir = "lua",
+        .legacy = true,
+        .extension = ".lua",
+        .hot_reload_capable = true,
+    };
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try emitHotReloadWatch(&aw.writer, legacy);
+    try testing.expectEqual(@as(usize, 0), aw.written().len);
+}
+
+test "emitHotReloadWatch: a TRANSPILED splice watches the target's own emitted dir, never a source-relative path (codex P1, PR #638)" {
+    const allocator = testing.allocator;
+    const ts = ScriptingSplice{
+        .plugin_name = "scripting",
+        .language = "typescript",
+        .dir = "scripts",
+        .extension = ".js",
+        .hot_reload_capable = true,
+        .transpile = .{ .source_extension = ".ts", .declaration_suffix = ".d.ts" },
+        // Even a (mistakenly) computed source-relative path must be ignored:
+        // the watcher filters `.js` and the runnable output lives in the
+        // TARGET's materialized dir, not the source tree.
+        .watch_dir_from_target = "../../scripts",
+    };
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try emitHotReloadWatch(&aw.writer, ts);
+    const out = aw.written();
+
+    // Single watch of the cwd-relative target dir (cwd = the target).
+    try testing.expect(std.mem.indexOf(u8, out,
+        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "watchDir"));
+    try testing.expect(std.mem.indexOf(u8, out, "../../scripts") == null);
+    // The v1-limitation messaging: live-edit the emitted output.
+    try testing.expect(std.mem.indexOf(u8, out, "edit the generated scripts/*.js (emitted output; re-run generate for authored-source changes) and save") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "TRANSPILED") != null);
 }

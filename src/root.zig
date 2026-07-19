@@ -439,10 +439,19 @@ pub fn generate(
     // separator-safe on Windows (its file APIs accept `/`). Any failure
     // degrades to null — the emission then falls back to the cwd-relative
     // dir alone.
+    //
+    // DIRECT-RUN languages only (`transpile == null`): a transpiled
+    // language's runnable output (`.js`) is materialized into the TARGET's
+    // own script dir by the transpile phase, and the plugin's watcher
+    // filters the embed extension — the source `.ts` would never match. So
+    // TS splices skip this and watch their target dir instead (see
+    // `emitHotReloadWatch`, the codex P1 on PR #638). Legacy dirs never
+    // splice at all (`buildDepHotReload`'s legacy rationale), so no path
+    // is computed for them either.
     var watch_dir_rel: ?[]u8 = null;
     defer if (watch_dir_rel) |p| allocator.free(p);
     if (maybe_scripting) |*s| {
-        if (s.family == .embed and s.hot_reload_capable) {
+        if (s.family == .embed and s.hot_reload_capable and s.transpile == null and !s.legacy) {
             const src_scripts_abs = try std.fs.path.join(allocator, &.{ game_dir, s.dir });
             defer allocator.free(src_scripts_abs);
             if (std.fs.path.relative(allocator, "", null, target_dir, src_scripts_abs)) |rel| {

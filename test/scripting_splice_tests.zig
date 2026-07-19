@@ -491,6 +491,29 @@ const ruby_hot_reload_splice = blk: {
     break :blk s;
 };
 
+/// The transpiled twin (codex P1, PR #638): typescript's runnable `.js`
+/// is materialized into the TARGET's script dir by the transpile phase,
+/// and the plugin's watcher filters `.js` — so the splice must watch the
+/// target's own dir, never the `.ts` source tree. root.zig computes no
+/// relative path for transpiled splices (`watch_dir_from_target` stays
+/// null).
+const ts_hot_reload_splice = blk: {
+    var s = ts_splice;
+    s.hot_reload_capable = true;
+    s.transpile = .{ .source_extension = ".ts", .declaration_suffix = ".d.ts" };
+    break :blk s;
+};
+
+/// The legacy-dir twin (codex P2, PR #638): the deprecated recursive
+/// per-language dir registers subdir-joined stems the flat-dir watcher
+/// can never report — hot reload stays OFF for legacy projects even when
+/// the plugin is capable (migrating to `scripts/` turns it on).
+const lua_legacy_hot_reload_splice = blk: {
+    var s = lua_legacy_splice;
+    s.hot_reload_capable = true;
+    break :blk s;
+};
+
 pub const HOT_RELOAD_SPLICE = struct {
     test "loop lifecycle: a capable splice emits the Debug-gated SOURCE-tree watch after PluginControllers.setup" {
         generate.main_template.scripting_splice = ruby_hot_reload_splice;
@@ -556,6 +579,57 @@ pub const HOT_RELOAD_SPLICE = struct {
         // watcher — there is no editable source tree beside a mobile binary.
         _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"spawner\", @embedFile(\"scripts/10_spawner.rb\"));");
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "hot_reload.watchDir") == null);
+    }
+
+    test "TYPESCRIPT loop lifecycle: the watch targets the generated dir's emitted .js, never the .ts source tree (codex P1)" {
+        generate.main_template.scripting_splice = ts_hot_reload_splice;
+        defer generate.main_template.scripting_splice = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &ts_scripting_plugins,
+        }, loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // Single watch of the target's OWN script dir (cwd-relative; the
+        // transpile phase materialized the runnable .js there) — the
+        // watcher filters `.js`, so the `.ts` source tree would never
+        // match. labelle-scripting#47's documented v1 limitation: live TS
+        // dev edits the emitted .js (or re-runs generate for .ts changes).
+        _ = try indexOfOrFail(main_zig,
+            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {");
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "watchDir"));
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "../../scripts") == null);
+        _ = try indexOfOrFail(main_zig,
+            "edit the generated scripts/*.js (emitted output; re-run generate for authored-source changes) and save");
+
+        try expectAstGenOk(main_zig);
+    }
+
+    test "LEGACY-dir splice emits no watch even when capable (codex P2 — flat-dir watcher can't match recursive stems)" {
+        generate.main_template.scripting_splice = lua_legacy_hot_reload_splice;
+        defer generate.main_template.scripting_splice = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &scripting_plugins,
+        }, loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // The legacy registrations still ride (subdir-joined stems, the
+        // pre-#237 grace semantics), but no watcher: those stems can never
+        // match the flat-dir watcher's reports, so a reload would target
+        // the wrong (or no) registration. Migrating to scripts/ turns hot
+        // reload on — the deprecation carrot.
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"ai/guard\", @embedFile(\"lua/ai/guard.lua\"));");
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "hot_reload.watchDir") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "HotReloadIo") == null);
     }
 
     test "an INCAPABLE splice (pre-v0.12.0 plugin) emits no watch on the loop lifecycle" {
@@ -829,7 +903,7 @@ pub const TYPESCRIPT_SPLICE_E2E = struct {
 // probe on through the real `detect` → `generate` path.
 
 pub const HOT_RELOAD_E2E = struct {
-    test "a capable plugin generates the watch splice with the COMPUTED source-tree path + the Debug-gated dep option" {
+    test "a capable TS plugin watches the TARGET's emitted-js dir + rides the Debug-gated dep option (codex P1)" {
         const allocator = std.testing.allocator;
         var staged = try StagedTsProject.init(allocator);
         defer staged.deinit(allocator);
@@ -843,25 +917,73 @@ pub const HOT_RELOAD_E2E = struct {
         defer allocator.free(backend_repo);
         try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
 
-        // Generated main (sokol desktop = the callback lifecycle): the
-        // Debug-gated watch registers the SOURCE tree via the path root.zig
-        // computed from the REAL dirs — out/sokol_desktop → ../../game/scripts
-        // (this staged layout's out/ is a sibling of game/, proving the
-        // computation is geometric, not a hardcoded `.labelle` assumption).
+        // Generated main (sokol desktop = the callback lifecycle):
+        // typescript is a TRANSPILED splice, so the watch targets the
+        // generated dir's own `scripts/` — where the runnable `.js` lives
+        // and the watcher's `.js` filter can match — NEVER a
+        // source-relative path (the `.ts` tree is invisible to the
+        // watcher; codex P1 on PR #638).
         const main_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
         defer allocator.free(main_zig);
         _ = try indexOfOrFail(main_zig,
             "if (comptime (@import(\"builtin\").mode == .Debug and @hasDecl(scripting, \"hot_reload\")))");
         _ = try indexOfOrFail(main_zig,
-            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../game/scripts\") catch {");
-        _ = try indexOfOrFail(main_zig,
             "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {");
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, main_zig, "watchDir"));
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "../../game/scripts") == null);
+        _ = try indexOfOrFail(main_zig,
+            "edit the generated scripts/*.js (emitted output; re-run generate for authored-source changes) and save");
 
         // Generated build: the dep rides `-Dhot_reload` as the Debug proxy.
         const build_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
         defer allocator.free(build_zig);
         _ = try indexOfOrFail(build_zig,
             "const plugin_scripting_dep = b.dependency(\"labelle_scripting\", .{ .target = target, .optimize = optimize, .language = .typescript, .hot_reload = optimize == .Debug });");
+    }
+
+    test "a capable LUA (direct-run) plugin watches the COMPUTED source-tree path with the cwd fallback" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTsProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(e2e_io, "game", .{});
+        defer game_root.close(e2e_io);
+        // Re-flavor the staged fixture lua: drop the ts sources AND the
+        // declare-tool marker (lua HAS a declare runner row — leaving the
+        // marker would send generate off to `zig build labelle-declare`
+        // inside the build.zig-less fixture), then author a lua script.
+        try game_root.deleteFile(e2e_io, "scripts/behavior.js");
+        try game_root.deleteFile(e2e_io, "scripts/labelle.d.ts");
+        try game_root.deleteTree(e2e_io, "plugins/scripting/tools");
+        try writeFileIn(game_root, "scripts/behavior.lua", "function update(dt) end\n");
+        try writeFileIn(game_root, "plugins/scripting/build.zig",
+            \\const hot_reload = b.option(bool, "hot_reload", "dev-mode script hot reload") orelse false;
+        );
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        var cfg = staged.config(backend_repo);
+        cfg.plugins = &.{
+            .{ .name = "scripting", .repo = "local:plugins/scripting", .params = .{ .language = "lua" } },
+        };
+        try generate.generate(allocator, cfg, staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        // Direct-run language: the Debug-gated watch registers the SOURCE
+        // tree via the path root.zig computed from the REAL dirs —
+        // out/sokol_desktop → ../../game/scripts (this staged layout's
+        // out/ is a sibling of game/, proving the computation is
+        // geometric, not a hardcoded `.labelle` assumption) — with the
+        // project-root-relative fallback.
+        const main_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
+        defer allocator.free(main_zig);
+        _ = try indexOfOrFail(main_zig,
+            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../game/scripts\") catch {");
+        _ = try indexOfOrFail(main_zig,
+            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {");
+
+        const build_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
+        defer allocator.free(build_zig);
+        _ = try indexOfOrFail(build_zig,
+            "const plugin_scripting_dep = b.dependency(\"labelle_scripting\", .{ .target = target, .optimize = optimize, .language = .lua, .hot_reload = optimize == .Debug });");
     }
 
     test "the TESTS target of the same capable project never compiles the watcher in" {
