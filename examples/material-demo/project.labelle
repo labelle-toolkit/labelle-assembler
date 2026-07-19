@@ -21,10 +21,14 @@
 // per-entity materials yet. Tracked as the material-demo follow-up; see
 // README.md.
 //
-// VERSION PINS: released set, not `local:` siblings — showcase games prove
-// the released path end-to-end (see tile-explorer's note). bgfx is pinned
-// explicitly to the current release (0.13.1), which carries the post-fx
-// shaders; the registry enum default predates them.
+// VERSION PINS: the RUNTIME packages (core/engine/gfx/cli) + the backend
+// pin the RELEASED set — this game proves the released runtime path (see
+// tile-explorer's note). bgfx is pinned explicitly to 0.13.1, which
+// carries the post-fx shaders (the registry enum default predates them).
+// The ASSEMBLER is `local:../../` (in-tree source, the examples
+// convention). On the fully-RELEASED `labelle` path this game builds on
+// assembler 0.94.0 — bgfx takes the generic desktop `unifyCoreDiamond`
+// codegen, unaffected by the sokol-desktop byte-anchor gap #611 fixes.
 .{
     .name = "material_demo",
     .title = "LaBelle — Post-FX Showcase",
@@ -61,5 +65,6 @@
     .engine_version = "2.6.0",
     .gfx_version = "1.28.1",
     .labelle_version = "1.58.0",
-    .assembler_version = "0.94.0",
+    // In-tree assembler (examples convention). Fully-released path: 0.94.0.
+    .assembler_version = "local:../../",
 }

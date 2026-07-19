@@ -39,26 +39,33 @@ Files:
 
 ## Version pins — the released path & the sokol caveat
 
-The showcase games pin the **released** package set (see the released-path
-note in `tile-explorer/README.md`):
+The **runtime** packages pin the released set; the **assembler** is
+`local:../../` (the in-tree source, matching every sibling example — see
+the pins note in `tile-explorer/README.md`):
 
 ```zig
 .core_version = "1.26.0", .engine_version = "2.6.0", .gfx_version = "1.28.1",
-.labelle_version = "1.58.0", .assembler_version = "0.94.0",
+.labelle_version = "1.58.0", .assembler_version = "local:../../",
 .backend_package = .{ .name = "sokol", … .version = "0.5.0" },
 ```
 
-**Caveat (assembler#611):** released assembler `0.94.0` does NOT build
-this game on **sokol desktop**. The gfx#305 material seam gave the sokol
+**Caveat (assembler#611) — why the assembler is in-tree, and the released
+requirement:** the current released assembler `0.94.0` does NOT build this
+game on **sokol desktop**. The gfx#305 material seam gave the sokol
 backend's gfx module a direct `labelle-core` import, and 0.94.0's
 sokol-desktop byte-anchor codegen never unified it onto the app core — so
 the two core instances yield distinct `MaterialEffect` types and sema
-fails (`expected MaterialEffect, found MaterialEffect`). **This PR fixes
-that** (the byte-anchor now unrolls the `backend_gfx` core-diamond edge,
-matching the generic desktop path bgfx/raylib already use); the game
-builds on the fixed assembler and on the next release carrying it. bgfx
-and raylib were never affected (they take the generic `unifyCoreDiamond`
-walk).
+fails (`expected MaterialEffect, found MaterialEffect`). **This PR (#611)
+fixes that** (the byte-anchor now unrolls the `backend_gfx` core-diamond
+edge, matching the generic desktop path bgfx/raylib already use). The
+assembler pin is `local:../../` so the game builds against the fixed,
+in-tree assembler (and its bundled `ecs/zig-ecs` adapter) — which is also
+the examples convention. On the fully-released `labelle` path this game
+requires assembler **≥ 0.95.0** (the release carrying #611's fix, cut once
+this PR merges + tags); there is no released assembler that builds it
+today. bgfx and raylib were never affected (they take the generic
+`unifyCoreDiamond` walk), so their showcase games build on the released
+`0.94.0`.
 
 ## Build & run
 

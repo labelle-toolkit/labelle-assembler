@@ -10,12 +10,27 @@
 // (engine#714: `Camera` seeds zoom/center once; the gameplay script drives
 // the follow — "soft ownership").
 //
-// VERSION PINS: unlike the sibling fixtures (which pin `local:` sibling
-// checkouts to gate assembler HEAD), the showcase games pin the RELEASED
-// package set — they exist to prove the released path end-to-end
+// VERSION PINS: the RUNTIME packages (core/engine/gfx/cli) + the backend
+// pin the RELEASED set — this game proves the released runtime path
 // (cli#322 lesson: local-override tests hide released-path rot). The
-// backend resolves through the `.raylib` enum shorthand to the registry's
-// current labelle-raylib release.
+// ASSEMBLER is `local:../../` (the in-tree source), matching every sibling
+// example: examples/ validate the assembler *under test*, and a numbered
+// pin would also need that assembler version's source tree cached under
+// ~/.labelle/packages/assembler/<ver>/ (only a released assembler
+// populates it), which the assembler-repo CI does not do. On the
+// fully-RELEASED `labelle` path this game builds on assembler 0.94.0:
+// raylib takes the generic desktop `unifyCoreDiamond` codegen and is NOT
+// affected by the sokol-desktop byte-anchor gap #611 fixes.
+//
+// TILEMAP RENDERING IS BACKEND-GENERIC — so `labelle-raylib` 0.3.0 renders
+// the `.tmx` even though it ships no tilemap code of its own. The tile
+// draw pass lives in labelle-gfx (`tilemap` sub-package,
+// `TileMapRendererWith(B)`, wired by the RetainedEngine) and draws each
+// tile through the standard `drawTexturePro` call every backend
+// implements (raylib: `src/gfx.zig`). The tilemap capability is therefore
+// pinned by `.gfx_version = "1.28.1"` below, NOT by the backend — the
+// backend is pinned explicitly to the current release only for
+// reproducibility.
 .{
     .name = "tile_explorer",
     .title = "LaBelle — Tile Explorer Showcase",
@@ -23,6 +38,9 @@
     .height = 360,
     .target_fps = 60,
     .backend = .raylib,
+    // Explicit backend pin (matches the sokol/bgfx showcase games) so the
+    // resolved raylib version is visible, not just the enum default.
+    .backend_package = .{ .name = "raylib", .repo = "github.com/labelle-toolkit/labelle-raylib", .version = "0.3.0" },
     // Screen-native Y (y=0 at the top, +Y down) — tile row 0 is the top
     // of the .tmx, so map coords and world coords read identically.
     .y_axis = .down,
@@ -39,5 +57,6 @@
     .engine_version = "2.6.0",
     .gfx_version = "1.28.1",
     .labelle_version = "1.58.0",
-    .assembler_version = "0.94.0",
+    // In-tree assembler (examples convention). Fully-released path: 0.94.0.
+    .assembler_version = "local:../../",
 }

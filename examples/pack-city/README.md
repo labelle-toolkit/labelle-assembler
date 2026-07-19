@@ -44,18 +44,23 @@ The drive script logs the cross-pack result once —
 `[city] buildings standing: 5` — so a transcript shows the two packs
 cooperating.
 
-## Version pins — the released path
+## Version pins
 
-The showcase games pin the **released** package set (see the released-path
-note in `tile-explorer/README.md`). bgfx is pinned explicitly to the
-current release, which carries the material/post-fx work; the registry
-enum default predates it:
+The **runtime** packages + bgfx backend pin the **released** set; the
+**assembler** is `local:../../` (in-tree source, the examples convention —
+see the pins note in `tile-explorer/README.md`). bgfx is pinned explicitly
+to the current release, which carries the material/post-fx work; the
+registry enum default predates it:
 
 ```zig
 .core_version = "1.26.0", .engine_version = "2.6.0", .gfx_version = "1.28.1",
-.labelle_version = "1.58.0", .assembler_version = "0.94.0",
+.labelle_version = "1.58.0", .assembler_version = "local:../../",
 .backend_package = .{ .name = "bgfx", … .version = "0.13.1" },
 ```
+
+On the fully-released `labelle` path this game builds on assembler
+`0.94.0` (bgfx takes the generic desktop `unifyCoreDiamond` codegen,
+unaffected by the sokol-desktop gap #611 fixes).
 
 ## Build & run
 

@@ -13,10 +13,24 @@
 //     advanced by the ENGINE (`setDriveSpriteAnimations(true)`), no
 //     per-frame game code.
 //
-// VERSION PINS: released set, not `local:` siblings — showcase games
-// prove the released path end-to-end (see tile-explorer's note). The
-// registry default for sokol predates the screenshot/material work, so
-// the backend is pinned explicitly to the current labelle-sokol release.
+// VERSION PINS — read this, the assembler pin is deliberate:
+//   * RUNTIME packages (core/engine/gfx/cli) + the backend pin the
+//     RELEASED set — this game proves the released RUNTIME path.
+//   * The ASSEMBLER is `local:../../` (the in-tree source), matching every
+//     sibling example in this repo: examples/ validate the assembler *under
+//     test*, and — for THIS game specifically — the released assembler
+//     0.94.0 cannot build it at all. gfx#305's material seam gave the sokol
+//     backend's gfx module a direct `labelle-core` import; 0.94.0's
+//     sokol-desktop byte-anchor codegen never unified it onto the app core,
+//     so two `MaterialEffect` instances fail sema (see README.md). #611
+//     fixes that. On the fully-RELEASED `labelle` path this game therefore
+//     needs assembler >= 0.95.0 (the release carrying #611's fix, unreleased
+//     until this PR merges + tags); bgfx/raylib were never affected and
+//     their showcase games build on the released 0.94.0.
+// The `local:` assembler ALSO keeps the ecs adapter resolvable in CI: a
+// numbered pin stages `ecs/zig-ecs` from ~/.labelle/packages/assembler/
+// <ver>/, which is only populated by a released assembler — an unreleased
+// 0.95.0 has no such cache, so `local:` is the honest, buildable pin today.
 .{
     .name = "sprite_runner",
     .title = "LaBelle — Sprite Runner Showcase",
@@ -39,5 +53,8 @@
     .engine_version = "2.6.0",
     .gfx_version = "1.28.1",
     .labelle_version = "1.58.0",
-    .assembler_version = "0.94.0",
+    // In-tree assembler (see the ASSEMBLER PIN note above): the sokol fix
+    // this game needs ships in #611 and is unreleased. On the released
+    // `labelle` path this game requires assembler >= 0.95.0 (post-#611).
+    .assembler_version = "local:../../",
 }

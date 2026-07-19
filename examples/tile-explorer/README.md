@@ -37,20 +37,32 @@ Files:
 - `scripts/playing/10_explore.zig` — path-loop walk + clamped camera follow.
 - `assets/island.tmx` + `tileset.png` — the embedded map and its tiles.
 
-## Version pins — the released path
+## Version pins
 
-Unlike the in-tree fixture examples (which pin `local:` sibling checkouts
-to gate assembler HEAD), the showcase games pin the **released** package
-set — they exist to prove the released path end-to-end (the `cli#322`
-lesson: local-override tests hide released-path rot):
+The **runtime** packages (core/engine/gfx/cli) + the raylib backend pin
+the **released** set — this game proves the released runtime path (the
+`cli#322` lesson: local-override tests hide released-path rot). The
+**assembler** is `local:../../` (the in-tree source), matching every
+sibling example: `examples/` validate the assembler *under test*, and a
+numbered pin would also need that version's source tree cached under
+`~/.labelle/packages/assembler/<ver>/` (only a released `labelle`
+populates it — the assembler-repo CI does not).
 
 ```zig
 .core_version = "1.26.0", .engine_version = "2.6.0", .gfx_version = "1.28.1",
-.labelle_version = "1.58.0", .assembler_version = "0.94.0",
+.labelle_version = "1.58.0", .assembler_version = "local:../../",
+.backend_package = .{ .name = "raylib", … .version = "0.3.0" },
 ```
 
-The backend resolves through the `.raylib` enum shorthand to the current
-`labelle-raylib` release.
+**Tilemap render is backend-generic** — `labelle-raylib` 0.3.0 ships no
+tilemap code, yet renders the map: the tile draw pass lives in
+`labelle-gfx` (`TileMapRendererWith(B)`) and draws each tile through the
+standard `drawTexturePro` call every backend implements. The tilemap
+capability is pinned by **gfx 1.28.1**, not the backend.
+
+On the fully-released `labelle` path this game builds on assembler
+`0.94.0` (raylib takes the generic desktop `unifyCoreDiamond` codegen,
+unaffected by the sokol-desktop gap #611 fixes).
 
 ## Build & run
 

@@ -68,10 +68,10 @@ backend-selectable; the headless ones also run in CI).
 | 3 | **ruby-orbit**      | Ruby gameplay script via `labelle-scripting` | `.null`+null-sib | transcript (`RUBY_*`) | **scaffolded + verified** (this repo, ticket seed) |
 | 4 | **coin-collector**  | full gameplay loop: queries, homing, collision, `destroyEntity`, win | `.null` (→ raylib/bgfx) | transcript (`score`/`cleared`) | **scaffolded + verified** (this repo) |
 | 5 | **event-relay**     | game event bus + game-root `events/`+`hooks/` (pure Zig) | `.null` (→ any) | transcript (`emit`/`pulse`) | **scaffolded + verified** (this repo) |
-| 6 | **pack-city**       | packs wall as a real game                | bgfx       | generate + build (+ screenshot) | **scaffolded + verified** (#611)   |
-| 7 | **sprite-runner**   | sprite atlas + `AnimationDef` + `SpriteAnimation` | sokol | generate + build (+ screenshot) | **scaffolded + verified** (#611)   |
-| 8 | **tile-explorer**   | `.tmx` tilemap + camera follow           | raylib     | generate + build (+ screenshot) | **scaffolded + verified** (#611)   |
-| 9 | **material-demo**   | post-fx set (bloom/vignette/color_grade/crt) | bgfx   | generate + build (+ screenshot) | **scaffolded + verified** (#611)   |
+| 6 | **pack-city**       | packs wall as a real game                | bgfx       | generate + build (CI) | **scaffolded + verified** (#611)   |
+| 7 | **sprite-runner**   | sprite atlas + `AnimationDef` + `SpriteAnimation` | sokol | generate + build (CI) | **scaffolded + verified** (#611)   |
+| 8 | **tile-explorer**   | `.tmx` tilemap + camera follow           | raylib     | generate + build (CI) | **scaffolded + verified** (#611)   |
+| 9 | **material-demo**   | post-fx set (bloom/vignette/color_grade/crt) | bgfx   | generate + build (CI) | **scaffolded + verified** (#611)   |
 
 Games 1–5 are scaffolded + verified end-to-end in this repo (generate →
 `zig build` → deterministic headless run). 2 and 3 are the ticket's
@@ -79,15 +79,53 @@ explicit scripting seed candidates (Lua + Ruby). 6 is the ticket's packs
 seed. 7–8 round out the sprite/animation and tilemap surfaces; 9 landed
 once gfx#305 shipped (post-fx half — see below).
 
-### Games 6–9 (labelle-assembler#611) — the RELEASED-pin cohort
+Each of games 6–9 ships a committed `preview.png` — a **deterministic
+still of the authored scene**, composed from the game's real
+atlases/`.tmx` (not an engine frame, not captured in CI). The true engine
+screenshot is captured manually with `labelle run --screenshot=` /
+`LABELLE_SCREENSHOT_PATH` (documented in each README); a windowed backend
+needs a GUI session (or `xvfb` on Linux CI), so it is not part of the
+generate+build CI assertion above.
 
-Unlike games 1–5 (which pin `local:` siblings to gate assembler HEAD),
-games 6–9 pin the **released** package set (core 1.26.0 / engine 2.6.0 /
-gfx 1.28.1 / cli 1.58.0 / assembler 0.94.0) to prove the released path.
-All four `generate` + `zig build` green; the raylib + sokol builds run in
-CI (`examples-integration`), the two bgfx builds are covered locally.
+### Games 6–9 (labelle-assembler#611) — released runtime, in-tree assembler
 
-Two precise findings surfaced by proving the released path:
+Games 6–9 pin the **released RUNTIME** package set (core 1.26.0 / engine
+2.6.0 / gfx 1.28.1 / cli 1.58.0) + released backends, but — like every
+sibling example in this repo — pin the **assembler at `local:../../`** (the
+in-tree source). Two reasons the assembler is in-tree, not a release
+number:
+
+1. `examples/` exist to validate the assembler *under test*. Numbered
+   assembler pins would also require that version's source tree cached
+   under `~/.labelle/packages/assembler/<ver>/` (for `ecs/zig-ecs` etc.) —
+   only a released `labelle` populates it, which the assembler-repo CI does
+   not; `local:` resolves those from the in-tree tree.
+2. sokol (sprite-runner) genuinely CANNOT build on any released assembler
+   yet — it needs the fix in *this PR* (see below).
+
+Tilemap rendering (tile-explorer) is backend-generic — the gfx
+`TileMapRendererWith(B)` draws tiles through the standard `drawTexturePro`
+call every backend implements — so it is pinned by **gfx 1.28.1**, not the
+backend; released `labelle-raylib` 0.3.0 renders the map.
+
+**Fully-released `labelle`-path compatibility (what a user gets), verified
+locally:**
+
+- **bgfx + raylib (pack-city, material-demo, tile-explorer) build on the
+  released assembler `0.94.0`** — they take the generic desktop
+  `unifyCoreDiamond` codegen, unaffected by the sokol gap below. Swap
+  `.assembler_version = "local:../../"` → `"0.94.0"` and they build.
+- **sokol (sprite-runner) needs assembler ≥ `0.95.0`** — the byte-anchor
+  fix that ships in *this PR* (#611), cut once it merges + tags. It cannot
+  build on any currently-released assembler; that is the whole point of the
+  fix.
+
+CI (`examples-integration`) generates all four on the released runtime pins
+with the **in-tree assembler** (which carries the #611 fix) and builds the
+raylib + sokol games (sprite-runner is the regression guard for the fix);
+the two bgfx builds are covered locally.
+
+The two precise findings this cohort surfaced:
 
 - **sokol-desktop material-seam fix (fixed in #611).** The gfx#305
   material seam gave the sokol backend's gfx module a direct
@@ -96,8 +134,8 @@ Two precise findings surfaced by proving the released path:
   `MaterialEffect` type failed sema. #611 unrolls the `backend_gfx`
   core-diamond edge into the anchor (matching the generic desktop path
   bgfx/raylib already used). Released 0.94.0 cannot build a sokol-desktop
-  game against any gfx#305-era backend until the next assembler release
-  carries this fix; bgfx/raylib were never affected.
+  game against any gfx#305-era backend until `0.95.0` carries this fix;
+  bgfx/raylib were never affected.
 - **per-entity materials have no game authoring surface yet (engine
   2.6.0).** gfx#305's post-fx half is game-wired (`.post_fx` seed →
   `setPostFx`); its per-entity material half (`palette_swap`/`flash`/

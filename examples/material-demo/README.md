@@ -63,16 +63,21 @@ Files:
 - `scenes/main.jsonc` — three hued orbs + a star, on a dark field.
 - `assets/glow.{png,json}` — radial-gradient orbs + a star core.
 
-## Version pins — the released path
+## Version pins
 
-The showcase games pin the **released** package set (see the released-path
-note in `tile-explorer/README.md`):
+The **runtime** packages + bgfx backend pin the **released** set; the
+**assembler** is `local:../../` (in-tree source, the examples convention —
+see the pins note in `tile-explorer/README.md`):
 
 ```zig
 .core_version = "1.26.0", .engine_version = "2.6.0", .gfx_version = "1.28.1",
-.labelle_version = "1.58.0", .assembler_version = "0.94.0",
+.labelle_version = "1.58.0", .assembler_version = "local:../../",
 .backend_package = .{ .name = "bgfx", … .version = "0.13.1" },
 ```
+
+On the fully-released `labelle` path this game builds on assembler
+`0.94.0` (bgfx takes the generic desktop `unifyCoreDiamond` codegen,
+unaffected by the sokol-desktop gap #611 fixes).
 
 ## Build & run
 

@@ -770,22 +770,28 @@ jobs:
           echo "PASS: fantasy-dungeon built + ran headless; pack generator fired"
 
       # Showcase games (labelle-assembler#611, docs/showcase-plan.md rows 6-9).
-      # UNLIKE every step above — which pin `local:` sibling checkouts to gate
-      # assembler HEAD — the showcase games pin the RELEASED package set
-      # (core 1.26.0 / engine 2.6.0 / gfx 1.28.1 / cli 1.58.0 / assembler
-      # 0.94.0). They exist to prove the RELEASED path end-to-end, so this step
-      # fetches the published tarballs (`install`) and generates against them
-      # with the in-tree assembler binary (which carries the #611 sokol
-      # backend_gfx core-unify fix — released 0.94.0 does not, see below).
+      # These pin the RELEASED RUNTIME package set (core 1.26.0 / engine 2.6.0 /
+      # gfx 1.28.1 / cli 1.58.0) + released backends, and — like every sibling
+      # example — pin the ASSEMBLER at `local:../../` (in-tree source). So this
+      # step fetches the published runtime tarballs (`install`) and generates
+      # against them with the in-tree assembler binary, which (a) carries the
+      # #611 sokol backend_gfx core-unify fix that released 0.94.0 lacks, and
+      # (b) provides the bundled `ecs/zig-ecs` adapter a numbered assembler pin
+      # would instead stage from ~/.labelle/packages/assembler/<ver>/ (only a
+      # released `labelle` populates that; this CI does not). On the
+      # fully-released `labelle` path the bgfx/raylib games build on assembler
+      # 0.94.0 and the sokol game needs >= 0.95.0 (post-#611) — see the READMEs.
       #
-      # generate is run for all four (proves the released-pin codegen path);
-      # zig build is run for the raylib + sokol games (their system libs are
-      # installed above, and sprite-runner is the regression guard for the
-      # #611 sokol-desktop material-seam fix). The two bgfx games (pack-city,
+      # generate is run for all four (the released-runtime codegen path); zig
+      # build is run for the raylib + sokol games (their system libs are
+      # installed above, and sprite-runner is the regression guard for the #611
+      # sokol-desktop material-seam fix). The two bgfx games (pack-city,
       # material-demo) are generate-only here — the bgfx desktop C++ compile is
-      # heavy and its full build is covered locally; wiring it into CI is a
-      # follow-up. See each game's README.
-      - name: Generate + build the #611 showcase games (released pins)
+      # heavy and their full build is covered locally; wiring it into CI is a
+      # follow-up. Screenshots are NOT part of CI: each game ships a committed
+      # deterministic preview.png and documents manual `--screenshot` capture
+      # (windowed backends need a GUI session / xvfb). See each game's README.
+      - name: Generate + build the #611 showcase games (released runtime pins)
         run: |
           ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
 
