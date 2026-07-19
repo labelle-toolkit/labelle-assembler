@@ -1422,7 +1422,12 @@ pub fn generate(
                 }
                 break :blk lang_steps_all;
             };
-            if (maybe_lang != null) {
+            // Captured, not `.?`-unwrapped (gemini #644): `maybe_lang` is only
+            // ever set when the project declared a language (the loop above),
+            // so this capture is total — but binding it keeps the diagnostics
+            // and the csharp probe off a `.?` a future logic change could
+            // panic through.
+            if (maybe_lang != null) if (declared_language) |dl| {
                 const declared_os_union = blk: {
                     var list: std.ArrayList([]const u8) = .empty;
                     errdefer list.deinit(allocator);
@@ -1444,7 +1449,7 @@ pub fn generate(
                     std.debug.print(
                         "labelle: plugin '{s}' .language_builds entry \"{s}\" has no build steps for OS '{s}' (steps declare .os: {s})\n" ++
                             "  {s} games build on those OSes only today — generate on one of them, or switch script language.\n",
-                        .{ plugin.name, declared_language.?, @tagName(step_os), os_list, declared_language.? },
+                        .{ plugin.name, dl, @tagName(step_os), os_list, dl },
                     );
                     return error.PluginBuildNoStepsForOs;
                 }
@@ -1460,7 +1465,7 @@ pub fn generate(
                     std.debug.print(
                         "labelle: plugin '{s}' .language_builds entry \"{s}\" produces no linked artifact on OS '{s}' (artifact steps declare .os: {s})\n" ++
                             "  the {s} scripts object would never link — generate on a supported OS, or switch script language.\n",
-                        .{ plugin.name, declared_language.?, @tagName(step_os), os_list, declared_language.? },
+                        .{ plugin.name, dl, @tagName(step_os), os_list, dl },
                     );
                     return error.PluginBuildNoArtifactForOs;
                 }
@@ -1479,10 +1484,10 @@ pub fn generate(
                 // HOST PATH (linux `objcopy` on a macOS host). The generic
                 // `ensureStepToolsOnPath` machinery is ready for #619 to
                 // widen via a capability row; the CALL stays csharp-scoped.
-                if (std.mem.eql(u8, declared_language.?, "csharp")) {
-                    try scripting_csharp.ensureStepToolsOnPath(allocator, plugin.name, declared_language.?, lang_steps_slice);
+                if (std.mem.eql(u8, dl, "csharp")) {
+                    try scripting_csharp.ensureStepToolsOnPath(allocator, plugin.name, dl, lang_steps_slice);
                 }
-            }
+            };
 
             // ONE wiring entry per plugin: `.build` steps first, the
             // matched language's steps AFTER them (documented ordering —
@@ -1618,8 +1623,12 @@ pub fn generate(
                 // loads) — stage it beside the binary + point the run
                 // step's env at it. Keyed on the SELECTED language row
                 // (false for every other language/plugin — byte-identity).
-                .stage_runtime_outputs = maybe_lang != null and
-                    scripting_csharp.stagesRuntimeOutputs(declared_language.?, lang_steps_slice),
+                // Captured, not `.?` (gemini #644): false unless BOTH a
+                // language entry loaded AND the project declared a language.
+                .stage_runtime_outputs = if (maybe_lang != null)
+                    if (declared_language) |dl| scripting_csharp.stagesRuntimeOutputs(dl, lang_steps_slice) else false
+                else
+                    false,
             });
             // Hand the parse trees over to their lifetime lists and disarm
             // the errdefers (assume-capacity appends cannot fail between

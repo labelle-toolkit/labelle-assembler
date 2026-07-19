@@ -111,7 +111,7 @@ pub fn ensureStepToolsOnPath(
         const v = env.getAlloc(allocator, "PATH") catch break :blk .{ "", false };
         break :blk .{ v, true };
     };
-    defer if (owned) allocator.free(@constCast(path_value));
+    defer if (owned) allocator.free(path_value);
 
     for (steps) |step| {
         if (step.command.len == 0) continue;
