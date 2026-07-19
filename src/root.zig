@@ -30,6 +30,7 @@ pub const plugin_params = @import("plugin_params.zig");
 pub const scripting_splice = @import("scripting_splice.zig");
 pub const scripting_declare = @import("scripting_declare.zig");
 pub const scripting_transpile = @import("scripting_transpile.zig");
+pub const scripting_csharp = @import("scripting_csharp.zig");
 pub const pack_validate = @import("pack_validate.zig");
 pub const panel_validate = @import("panel_validate.zig");
 const scene_name_lint = @import("scene_name_lint.zig");
@@ -75,6 +76,7 @@ test {
     _ = @import("scripting_splice.zig");
     _ = @import("scripting_declare.zig");
     _ = @import("scripting_transpile.zig");
+    _ = @import("scripting_csharp.zig");
     _ = @import("panel_validate.zig");
     _ = @import("lazy_inference.zig");
     _ = @import("cache.zig");
@@ -1420,7 +1422,12 @@ pub fn generate(
                 }
                 break :blk lang_steps_all;
             };
-            if (maybe_lang != null) {
+            // Captured, not `.?`-unwrapped (gemini #644): `maybe_lang` is only
+            // ever set when the project declared a language (the loop above),
+            // so this capture is total — but binding it keeps the diagnostics
+            // and the csharp probe off a `.?` a future logic change could
+            // panic through.
+            if (maybe_lang != null) if (declared_language) |dl| {
                 const declared_os_union = blk: {
                     var list: std.ArrayList([]const u8) = .empty;
                     errdefer list.deinit(allocator);
@@ -1442,7 +1449,7 @@ pub fn generate(
                     std.debug.print(
                         "labelle: plugin '{s}' .language_builds entry \"{s}\" has no build steps for OS '{s}' (steps declare .os: {s})\n" ++
                             "  {s} games build on those OSes only today — generate on one of them, or switch script language.\n",
-                        .{ plugin.name, declared_language.?, @tagName(step_os), os_list, declared_language.? },
+                        .{ plugin.name, dl, @tagName(step_os), os_list, dl },
                     );
                     return error.PluginBuildNoStepsForOs;
                 }
@@ -1458,11 +1465,29 @@ pub fn generate(
                     std.debug.print(
                         "labelle: plugin '{s}' .language_builds entry \"{s}\" produces no linked artifact on OS '{s}' (artifact steps declare .os: {s})\n" ++
                             "  the {s} scripts object would never link — generate on a supported OS, or switch script language.\n",
-                        .{ plugin.name, declared_language.?, @tagName(step_os), os_list, declared_language.? },
+                        .{ plugin.name, dl, @tagName(step_os), os_list, dl },
                     );
                     return error.PluginBuildNoArtifactForOs;
                 }
-            }
+
+                // Toolchain probe (labelle-assembler#617): the C# publish
+                // step runs inside the user's next `zig build` — a missing
+                // .NET SDK there surfaces as an opaque child-spawn failure
+                // far from the cause. Probe the emitted step's argv[0] on
+                // PATH NOW and fail pointedly (tool + install hint) — a
+                // csharp generate without dotnet dies here, not mid-build.
+                // Same up-front posture as the platform/cwd gates around
+                // this block. Scoped to csharp deliberately: rust/crystal's
+                // steps predate this probe and their tests never declared a
+                // toolchain-present precondition; the cross-generate `.os`
+                // seam can also legitimately select a tool absent from the
+                // HOST PATH (linux `objcopy` on a macOS host). The generic
+                // `ensureStepToolsOnPath` machinery is ready for #619 to
+                // widen via a capability row; the CALL stays csharp-scoped.
+                if (std.mem.eql(u8, dl, "csharp")) {
+                    try scripting_csharp.ensureStepToolsOnPath(allocator, plugin.name, dl, lang_steps_slice);
+                }
+            };
 
             // ONE wiring entry per plugin: `.build` steps first, the
             // matched language's steps AFTER them (documented ordering —
@@ -1592,6 +1617,28 @@ pub fn generate(
                 .cache_rel = cache_rel,
                 .steps = combined,
                 .library_paths = lib_paths_owned,
+                // C# EMBED path (labelle-assembler#617): the csharp entry's
+                // link-less `dotnet publish` step makes `{cache}` the
+                // runtime payload (the managed assembly the hostfxr vm
+                // loads) — stage it beside the binary + point the run
+                // step's env at it. Keyed on the SELECTED language row AND
+                // on this being the SCRIPTING plugin (codex #644 round 2):
+                // a non-scripting plugin with a link-less csharp
+                // `.language_builds`, ordered before scripting, must not
+                // capture the staging / LABELLE_CS_ASSEMBLY_DIR — the
+                // runtime payload is the scripting plugin's published DLL.
+                // False for every other language/plugin — byte-identity.
+                // Captured, not `.?` (gemini #644): false unless BOTH a
+                // language entry loaded AND the project declared a language.
+                .stage_runtime_outputs = if (maybe_lang != null)
+                    if (declared_language) |dl| scripting_csharp.stagesRuntimeOutputs(
+                        dl,
+                        plugin.name,
+                        if (maybe_scripting) |s| s.plugin_name else null,
+                        lang_steps_slice,
+                    ) else false
+                else
+                    false,
             });
             // Hand the parse trees over to their lifetime lists and disarm
             // the errdefers (assume-capacity appends cannot fail between

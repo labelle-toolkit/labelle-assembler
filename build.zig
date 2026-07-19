@@ -198,6 +198,12 @@ pub fn build(b: *std.Build) void {
         // .library_paths, and the forward-compat pin (non-selected
         // entries with unknown keys never re-break released assemblers).
         "test/crystal_splice_tests.zig",
+        // C# EMBED path (labelle-assembler#617): the csharp native-family
+        // splice through the real `generate` — link-less dotnet-publish
+        // step, the runtime-output InstallDir staging beside the exe + the
+        // run-step LABELLE_CS_ASSEMBLY_DIR env, a runnable publish-stand-in
+        // splice, and the .NET-SDK-missing toolchain probe failure.
+        "test/csharp_splice_tests.zig",
     };
 
     for (test_files) |test_file| {
