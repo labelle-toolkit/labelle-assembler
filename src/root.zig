@@ -452,6 +452,20 @@ pub fn generate(
     // for them.
     var watch_dir_rel: ?[]u8 = null;
     defer if (watch_dir_rel) |p| allocator.free(p);
+    // Local pack script dirs (labelle-scripting#51): the same computation
+    // for every `local:`/`@`-pinned pack whose SOURCE tree ships a
+    // `scripts/` dir — in-tree packs are just as editable in the dev loop
+    // as the game's scripts. Published/cached packs are excluded (their
+    // cache copy is not the tree anyone edits), and nested plugin-bundled
+    // pack entries carry an empty `.repo` (never `isLocal`), so they ride
+    // their plugin rather than watch a cache path. The splice's emission
+    // comptime-gates the watchDir calls on the plugin's multi-root watch
+    // layer — see `emitHotReloadWatch`.
+    var pack_watch_dirs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (pack_watch_dirs.items) |p| allocator.free(p);
+        pack_watch_dirs.deinit(allocator);
+    }
     if (maybe_scripting) |*s| {
         if (s.family == .embed and s.hot_reload_capable and !s.legacy) {
             const src_scripts_abs = try std.fs.path.join(allocator, &.{ game_dir, s.dir });
@@ -463,6 +477,17 @@ pub fn generate(
                 watch_dir_rel = rel;
                 s.watch_dir_from_target = rel;
             } else |_| {}
+
+            for (pack_entries.items) |*e| {
+                if (!e.plugin.isLocal()) continue;
+                const pack_src = e.resolveSrcDir(allocator, game_dir) catch continue;
+                defer allocator.free(pack_src);
+                if (try scripting_splice.packWatchDirFromTarget(allocator, target_dir, pack_src)) |rel| {
+                    errdefer allocator.free(rel);
+                    try pack_watch_dirs.append(allocator, rel);
+                }
+            }
+            s.pack_watch_dirs = pack_watch_dirs.items;
         }
     }
 

@@ -277,8 +277,35 @@ pub fn Mixin(comptime Self: type) type {
                 "            g.plugin_profile_ptr = @ptrCast(@alignCast(&PluginSystems.plugin_profile));\n" ++
                 "            g.plugin_profile_count = PluginSystems.plugin_system_count;\n" ++
                 "        }\n";
+            // Dev-mode hot-reload wall-clock pump (labelle-scripting#51):
+            // emitted BEFORE (and outside) the `scaled_dt > 0` gate — the
+            // gate is exactly why hot reload froze on a paused game: at
+            // `time_scale == 0` the plugin's `Controller.tick` (whose
+            // internal pump was the only pump) is never called at all.
+            // `pumpFrame` is wall-clock throttled inside the plugin (~4 Hz
+            // of REAL time), so calling it every frame is cheap. Triple
+            // comptime gate: Debug-only (the same dev-vs-ship signal as the
+            // watch splice), `hot_reload` present (plugin >= v0.12.0), and
+            // `pumpFrame` present (plugin >= v0.13.0 — on older plugins the
+            // line folds away and the tick-counted pump inside
+            // Controller.tick keeps the pre-#51 behavior). Desktop only,
+            // mirroring the watch splice's platform gate — no other
+            // platform ever registers a watch root.
+            const scripting_pump =
+                "        // Dev-mode hot-reload pump (labelle-scripting#51): OUTSIDE the\n" ++
+                "        // scaled_dt gate so live-editing while paused (time_scale == 0)\n" ++
+                "        // still reloads; wall-clock throttled inside the plugin. Folds\n" ++
+                "        // out of release builds and away on plugins predating pumpFrame.\n" ++
+                "        if (comptime (@import(\"builtin\").mode == .Debug and @hasDecl(scripting, \"hot_reload\") and @hasDecl(scripting.hot_reload, \"pumpFrame\"))) {\n" ++
+                "            _ = scripting.hot_reload.pumpFrame();\n" ++
+                "        }\n";
+            const scripting_tick_code =
+                plugins_tick_gate_open ++ scripting_vm_tick ++ plugins_tick_gate_close ++ scripting_drain ++ plugins_tick_tail;
             const tick_code: []const u8 = if (cfg.plugins.len > 0 and self.scripting != null)
-                plugins_tick_gate_open ++ scripting_vm_tick ++ plugins_tick_gate_close ++ scripting_drain ++ plugins_tick_tail
+                (if (cfg.platform == .desktop)
+                    scripting_pump ++ scripting_tick_code
+                else
+                    scripting_tick_code)
             else if (cfg.plugins.len > 0)
                 plugins_tick_head ++ plugins_tick_tail
             else
