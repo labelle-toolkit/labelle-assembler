@@ -40,6 +40,7 @@ const asset_wiring = @import("../blocks/asset_wiring.zig");
 const resource_loader = @import("../blocks/resource_loader.zig");
 const tilemap_assets = @import("../blocks/tilemap_assets.zig");
 const post_fx_block = @import("../blocks/post_fx.zig");
+const scripting_splice = @import("../../scripting_splice.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -247,6 +248,16 @@ pub fn Mixin(comptime Self: type) type {
                 // `buildCallbackCleanupCode` since callback backends don't share
                 // the `defer` scope of init. RFC-plugin-controllers §2.
                 try w.writeAll("    PluginControllers.setup(&g) catch @panic(\"plugin controller setup failed\");\n");
+            }
+
+            // Dev-mode script hot reload (labelle-assembler#637) — mirrors the
+            // loop-path emission in `loop.zig` (see the rationale there):
+            // desktop only, embed family + v0.12.0 capability self-gated,
+            // comptime Debug-gated in the emitted code. The callback family's
+            // only desktop member is sokol-desktop; wasm/android/ios never see
+            // this (no editable source tree beside the binary).
+            if (cfg.platform == .desktop) {
+                if (self.scripting) |s| try scripting_splice.emitHotReloadWatch(w, s);
             }
 
             // ── Android immersive mode ──────────────────────────────────────
