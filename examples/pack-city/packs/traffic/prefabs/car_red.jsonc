@@ -1,0 +1,7 @@
+// Red car prefab — `car_red.png` from this pack's own atlas (rewritten to
+// the namespaced `traffic/car_red.png` at copy time).
+{
+    "Position": { "x": 0, "y": 0 },
+    "Sprite": { "sprite_name": "car_red.png", "pivot": "center", "layer": "world", "z_index": 5 },
+    "Car": { "speed": 80.0 }
+}

@@ -1,0 +1,41 @@
+{
+    // Three bright radial orbs (one per hue in the `glow` atlas) plus a
+    // small star, on a dark background so the post-fx reads clearly. The
+    // orbs bob via scripts/playing/10_bob.zig; the post-fx stack declared
+    // in project.labelle does the rest at the framebuffer.
+    "name": "main",
+    "children": [
+        {
+            "name": "orb_cyan",
+            "components": {
+                "Position": { "x": 120, "y": 150 },
+                "Sprite": { "sprite_name": "orb_cyan.png", "pivot": "center", "layer": "world", "scale_x": 2.0, "scale_y": 2.0 },
+                "Orb": { "amplitude": 16.0, "phase": 0.0 }
+            }
+        },
+        {
+            "name": "orb_magenta",
+            "components": {
+                "Position": { "x": 240, "y": 135 },
+                "Sprite": { "sprite_name": "orb_magenta.png", "pivot": "center", "layer": "world", "scale_x": 2.4, "scale_y": 2.4 },
+                "Orb": { "amplitude": 20.0, "phase": 2.1 }
+            }
+        },
+        {
+            "name": "orb_amber",
+            "components": {
+                "Position": { "x": 360, "y": 150 },
+                "Sprite": { "sprite_name": "orb_amber.png", "pivot": "center", "layer": "world", "scale_x": 2.0, "scale_y": 2.0 },
+                "Orb": { "amplitude": 16.0, "phase": 4.2 }
+            }
+        },
+        {
+            "name": "star",
+            "components": {
+                "Position": { "x": 240, "y": 60 },
+                "Sprite": { "sprite_name": "star.png", "pivot": "center", "layer": "world", "scale_x": 1.5, "scale_y": 1.5 },
+                "Orb": { "amplitude": 6.0, "phase": 1.0 }
+            }
+        }
+    ]
+}

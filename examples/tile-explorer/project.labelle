@@ -1,0 +1,62 @@
+// Showcase game (#611, docs/showcase-plan.md row 8) — `.tmx` tilemap +
+// camera follow on raylib. An explorer sprite walks a path loop around a
+// procedurally-authored island tilemap while the camera tracks it,
+// clamped to the map bounds.
+//
+// What this pins that no other example does: the engine BUILT-IN `Tilemap`
+// component (T2 Phase 4, engine#560 — `assets/island.tmx` embedded via
+// @embedFile, inline tileset, CSV layers) rendered through the same camera
+// transform as sprites, plus the camera-prefabs seed component
+// (engine#714: `Camera` seeds zoom/center once; the gameplay script drives
+// the follow — "soft ownership").
+//
+// VERSION PINS: the RUNTIME packages (core/engine/gfx/cli) + the backend
+// pin the RELEASED set — this game proves the released runtime path
+// (cli#322 lesson: local-override tests hide released-path rot). The
+// ASSEMBLER is `local:../../` (the in-tree source), matching every sibling
+// example: examples/ validate the assembler *under test*, and a numbered
+// pin would also need that assembler version's source tree cached under
+// ~/.labelle/packages/assembler/<ver>/ (only a released assembler
+// populates it), which the assembler-repo CI does not do. On the
+// fully-RELEASED `labelle` path this game builds on assembler 0.94.0:
+// raylib takes the generic desktop `unifyCoreDiamond` codegen and is NOT
+// affected by the sokol-desktop byte-anchor gap #611 fixes.
+//
+// TILEMAP RENDERING IS BACKEND-GENERIC — so `labelle-raylib` 0.3.0 renders
+// the `.tmx` even though it ships no tilemap code of its own. The tile
+// draw pass lives in labelle-gfx (`tilemap` sub-package,
+// `TileMapRendererWith(B)`, wired by the RetainedEngine) and draws each
+// tile through the standard `drawTexturePro` call every backend
+// implements (raylib: `src/gfx.zig`). The tilemap capability is therefore
+// pinned by `.gfx_version = "1.28.1"` below, NOT by the backend — the
+// backend is pinned explicitly to the current release only for
+// reproducibility.
+.{
+    .name = "tile_explorer",
+    .title = "LaBelle — Tile Explorer Showcase",
+    .width = 640,
+    .height = 360,
+    .target_fps = 60,
+    .backend = .raylib,
+    // Explicit backend pin (matches the sokol/bgfx showcase games) so the
+    // resolved raylib version is visible, not just the enum default.
+    .backend_package = .{ .name = "raylib", .repo = "github.com/labelle-toolkit/labelle-raylib", .version = "0.3.0" },
+    // Screen-native Y (y=0 at the top, +Y down) — tile row 0 is the top
+    // of the .tmx, so map coords and world coords read identically.
+    .y_axis = .down,
+    .ecs = .zig_ecs,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .resources = .{
+        .{ .name = "explorer", .json = "assets/explorer.json", .texture = "assets/explorer.png" },
+    },
+    .layers = .{
+        .{ .name = "world", .order = 0, .space = .world },
+    },
+    .core_version = "1.26.0",
+    .engine_version = "2.6.0",
+    .gfx_version = "1.28.1",
+    .labelle_version = "1.58.0",
+    // In-tree assembler (examples convention). Fully-released path: 0.94.0.
+    .assembler_version = "local:../../",
+}

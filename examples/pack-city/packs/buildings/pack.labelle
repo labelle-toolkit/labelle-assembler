@@ -1,0 +1,13 @@
+// The providing pack: the city skyline as a self-contained unit — its own
+// atlas, a component, three prefabs, and exactly ONE exposed query.
+// Everything else (file paths, non-exposed helpers) is invisible behind
+// the pack wall (docs/packs.md).
+.{
+    .name = "buildings",
+    .manifest_version = 1,
+    .convention_dirs = .copy_and_scan,
+    .resources = .{
+        .{ .name = "atlas", .json = "assets/buildings.json", .texture = "assets/buildings.png" },
+    },
+    .exposes = .{ .queries = .{"count"} },
+}

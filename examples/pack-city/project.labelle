@@ -1,0 +1,49 @@
+// Showcase game (#611, docs/showcase-plan.md row 6) — the packs wall as a
+// real game, on bgfx. A little city street: the `buildings` pack ships the
+// skyline (component + prefabs + atlas + ONE exposed query), the `traffic`
+// pack ships the cars that drive past and consumes buildings ONLY through
+// that exposed surface (`@import("buildings").queries.count`). The scene
+// composes both packs by their NAMESPACED names (`buildings__house`,
+// `traffic__car_red`) next to game-root sprites from the `city` atlas.
+//
+// Contrast with the `packs-demo` fixture: that one probes the wall's
+// isolation guarantees headlessly; this one is the same conventions
+// (docs/packs.md) rendering an actual scene on a real backend.
+//
+// VERSION PINS: the RUNTIME packages (core/engine/gfx/cli) + the backend
+// pin the RELEASED set — this game proves the released runtime path (see
+// tile-explorer's note). bgfx is pinned explicitly (the registry default
+// 0.6.6 long predates the current backend train). The ASSEMBLER is
+// `local:../../` (in-tree source, the examples convention). On the
+// fully-RELEASED `labelle` path this game builds on assembler 0.94.0 —
+// bgfx takes the generic desktop `unifyCoreDiamond` codegen, unaffected by
+// the sokol-desktop byte-anchor gap #611 fixes.
+.{
+    .name = "pack_city",
+    .title = "LaBelle — Pack City Showcase",
+    .width = 480,
+    .height = 270,
+    .target_fps = 60,
+    .backend = .bgfx,
+    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.13.1" },
+    .y_axis = .down,
+    .ecs = .zig_ecs,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .resources = .{
+        .{ .name = "city", .json = "assets/city.json", .texture = "assets/city.png" },
+    },
+    .layers = .{
+        .{ .name = "world", .order = 0, .space = .world },
+    },
+    .plugins = .{
+        .{ .name = "buildings", .repo = "@packs/buildings" },
+        .{ .name = "traffic", .repo = "@packs/traffic" },
+    },
+    .core_version = "1.26.0",
+    .engine_version = "2.6.0",
+    .gfx_version = "1.28.1",
+    .labelle_version = "1.58.0",
+    // In-tree assembler (examples convention). Fully-released path: 0.94.0.
+    .assembler_version = "local:../../",
+}

@@ -768,3 +768,59 @@ jobs:
           grep -q '\[fantasy-dungeon:tiles\] generate row 0: ####' run.log
           grep -q '\[fantasy-dungeon:tiles\] generate row 3: ####' run.log
           echo "PASS: fantasy-dungeon built + ran headless; pack generator fired"
+
+      # Showcase games (labelle-assembler#611, docs/showcase-plan.md rows 6-9).
+      # These pin the RELEASED RUNTIME package set (core 1.26.0 / engine 2.6.0 /
+      # gfx 1.28.1 / cli 1.58.0) + released backends, and — like every sibling
+      # example — pin the ASSEMBLER at `local:../../` (in-tree source). So this
+      # step fetches the published runtime tarballs (`install`) and generates
+      # against them with the in-tree assembler binary, which (a) carries the
+      # #611 sokol backend_gfx core-unify fix that released 0.94.0 lacks, and
+      # (b) provides the bundled `ecs/zig-ecs` adapter a numbered assembler pin
+      # would instead stage from ~/.labelle/packages/assembler/<ver>/ (only a
+      # released `labelle` populates that; this CI does not). On the
+      # fully-released `labelle` path the bgfx/raylib games build on assembler
+      # 0.94.0 and the sokol game needs >= 0.95.0 (post-#611) — see the READMEs.
+      #
+      # generate is run for all four (the released-runtime codegen path); zig
+      # build is run for the raylib + sokol games (their system libs are
+      # installed above, and sprite-runner is the regression guard for the #611
+      # sokol-desktop material-seam fix). The two bgfx games (pack-city,
+      # material-demo) are generate-only here — the bgfx desktop C++ compile is
+      # heavy and their full build is covered locally; wiring it into CI is a
+      # follow-up. Screenshots are NOT part of CI: each game ships a committed
+      # deterministic preview.png and documents manual `--screenshot` capture
+      # (windowed backends need a GUI session / xvfb). See each game's README.
+      - name: Generate + build the #611 showcase games (released runtime pins)
+        run: |
+          ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
+
+          fix_and_build () {
+            # labelle-cli-equivalent fixFingerprint dance, then build.
+            set +e
+            ERR=$(zig build 2>&1)
+            set -e
+            BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+            GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+            if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+              sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+            fi
+            zig build
+          }
+
+          # generate-only for all four (released-pin codegen path).
+          for g in tile-explorer sprite-runner pack-city material-demo; do
+            echo "== $g: install + generate (released pins) =="
+            ( cd labelle-assembler/examples/$g
+              $ASM install  --project-root .
+              $ASM generate --project-root . )
+          done
+
+          # Full build for the raylib + sokol games (libs present above).
+          echo "== tile-explorer: zig build (raylib) =="
+          ( cd labelle-assembler/examples/tile-explorer/.labelle/raylib_desktop && fix_and_build )
+
+          echo "== sprite-runner: zig build (sokol; #611 backend_gfx fix regression guard) =="
+          ( cd labelle-assembler/examples/sprite-runner/.labelle/sokol_desktop && fix_and_build )
+
+          echo "PASS: #611 showcase games — 4 generated on released pins, raylib+sokol built"

@@ -1,0 +1,38 @@
+{
+    // Two entities: the island terrain and the explorer that walks it.
+    //
+    // `Tilemap` and `Camera` are engine BUILT-INS (like `Position`) — no
+    // components/ file and no registry entry. `Tilemap.asset_name`
+    // resolves to `assets/island.tmx` (embedded at build time, inline
+    // tileset + CSV layers); its two .tmx layers (`ground`, `decor`) are
+    // unbound, so they draw as background under the sprite pass, through
+    // the same camera transform sprites use.
+    //
+    // `Camera` on the explorer seeds the view centered on it at 2x zoom
+    // (camera-prefabs MVP, engine#714). The component is a seed, not a
+    // leash — scripts/playing/10_explore.zig re-centers the camera every
+    // frame as the explorer moves (clamped to the island's edges).
+    "name": "main",
+    "children": [
+        {
+            "name": "terrain",
+            "components": {
+                "Position": { "x": 0, "y": 0 },
+                "Tilemap": { "asset_name": "island" }
+            }
+        },
+        {
+            "name": "explorer",
+            "components": {
+                "Position": { "x": 152, "y": 120 },
+                "Sprite": {
+                    "sprite_name": "explorer.png",
+                    "pivot": "center",
+                    "layer": "world"
+                },
+                "Camera": { "zoom": 2.0 },
+                "Explorer": {}
+            }
+        }
+    ]
+}

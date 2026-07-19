@@ -54,6 +54,19 @@ pub fn build(b: *std.Build) void {
     const backend_window = backend_dep.module("window");
     const sokol_clib = backend_dep.artifact("sokol_clib");
 
+    // Unify the app core onto the sokol `gfx` module. The material seam
+    // (labelle-gfx#305) gave the backend's gfx module a DIRECT `labelle-core`
+    // import for the contract's `MaterialEffect` / `PostPassKind` value types;
+    // without unifying it onto the app core the two core instances yield
+    // distinct `MaterialEffect` types and sema fails ("expected MaterialEffect,
+    // found MaterialEffect"). This is the byte-anchor unroll of the generic
+    // desktop path's `unifyCoreDiamond(backend_gfx, …)` edge. `if` guard: the
+    // import only exists on a material-seam-carrying backend, so an older gfx
+    // module is a harmless no-op. See labelle-assembler#611.
+    if (backend_gfx.import_table.get("labelle-core")) |_| {
+        overrideImport(backend_gfx, "labelle-core", core_mod);
+    }
+
     // Unify the app core onto the transitive `sdl_gamepad` desktop gamepad
     // source — same diamond as `.backend_raylib` (see the note there). The
     // sokol `input` module reaches `GamepadEvent` through `sdl_gamepad`

@@ -1,0 +1,6 @@
+// Blue car prefab — slower than the red one.
+{
+    "Position": { "x": 0, "y": 0 },
+    "Sprite": { "sprite_name": "car_blue.png", "pivot": "center", "layer": "world", "z_index": 5 },
+    "Car": { "speed": 55.0 }
+}

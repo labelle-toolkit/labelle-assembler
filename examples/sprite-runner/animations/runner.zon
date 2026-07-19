@@ -1,0 +1,12 @@
+// Character rig for the runner bot (engine `AnimationDef` — comptime
+// clip×variant sprite-name table). Frame names resolve against the
+// `runner` atlas as `<folder>/<variant>_<NNNN>.png`, e.g. the third run
+// frame of the `bot` variant is `run/bot_0003.png`.
+.{
+    .variants = .{"bot"},
+    .clips = .{
+        .idle = .{ .frames = 1, .mode = .static },
+        // ~12 fps time-driven cycle; folder defaults to the clip name.
+        .run = .{ .frames = 6, .mode = .time, .speed = 12.0 },
+    },
+}

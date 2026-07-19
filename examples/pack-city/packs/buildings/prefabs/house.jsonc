@@ -1,0 +1,8 @@
+// House prefab — `house.png` from this pack's own atlas (rewritten to the
+// namespaced `buildings/house.png` at copy time). `bottom_center` pivot so
+// scenes place it by its street-level footprint.
+{
+    "Position": { "x": 0, "y": 0 },
+    "Sprite": { "sprite_name": "house.png", "pivot": "bottom_center", "layer": "world", "z_index": 2 },
+    "Building": { "capacity": 4 }
+}
