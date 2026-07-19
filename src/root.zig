@@ -586,6 +586,22 @@ pub fn generate(
     // collects only `.zig`, the splice collection below only the
     // language's extension, so the two layers share one structure without
     // ever seeing each other's files.
+    //
+    // Prune stale generated flow sidecars (#632) FIRST — against the
+    // SOURCE tree, before `linkDir` stages `scripts/`. A removed/renamed
+    // flow leaves an orphan `scripts/flows/<name>.zig`; if a project also
+    // declares a state named `flows`, `script_scan.scanDir` below would
+    // bind that orphan as a `flows`-state script and the generated game
+    // would import a file the later `flow_scanner.scanAndEmit` pass
+    // deletes. Pruning here — before staging — is the single correct
+    // point: on the symlink path the staged `scripts/` is a symlink back
+    // to the source so the delete is visible either way, but on the
+    // Windows / no-symlink fallback `linkDir` COPIES the tree
+    // (`scanner.copyDirRecursiveAbs`), so the orphan must be gone from the
+    // source before the copy or it survives in the staged target (codex
+    // #639 review).
+    try flow_scanner.pruneStaleSidecars(allocator, game_dir);
+
     try scanner.linkDir(allocator, game_dir, target_dir, "scripts");
 
     // ── Scripting splice: collect the language sources (#593/#237) ─────
@@ -675,14 +691,6 @@ pub fn generate(
 
     const scripts_target = try std.fs.path.join(allocator, &.{ target_dir, "scripts" });
     defer allocator.free(scripts_target);
-
-    // Prune stale generated flow sidecars (#632) BEFORE script discovery.
-    // A removed/renamed flow leaves an orphan `scripts/flows/<name>.zig`;
-    // if a project also declares a state named `flows`, `scanDir` below
-    // would bind that orphan as a `flows`-state script and the generated
-    // game would import a file the later `flow_scanner.scanAndEmit` pass
-    // deletes. Pruning up front keeps discovery from ever seeing it.
-    try flow_scanner.pruneStaleSidecars(allocator, game_dir);
 
     var script_scan = script_scanner.ScriptScanner.init(allocator, cfg.states);
     defer script_scan.deinit();
