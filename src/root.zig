@@ -428,6 +428,33 @@ pub fn generate(
     // first.
     defer if (maybe_scripting) |*s| s.deinit();
 
+    // Dev-mode hot-reload watch path (labelle-assembler#637): the SOURCE
+    // script dir as seen from the generated target dir — the generated
+    // game's runtime cwd (`labelle run` → `zig build run` in
+    // `.labelle/<target>/`). The watcher must poll the SOURCE tree the
+    // developer edits, not the staged view (a real COPY on Windows without
+    // symlink privileges — `scanner.linkDirAbs`'s fallback). Relative on
+    // purpose so the embedded path survives moving the project;
+    // forward-slash normalized so the emitted Zig string literal is
+    // separator-safe on Windows (its file APIs accept `/`). Any failure
+    // degrades to null — the emission then falls back to the cwd-relative
+    // dir alone.
+    var watch_dir_rel: ?[]u8 = null;
+    defer if (watch_dir_rel) |p| allocator.free(p);
+    if (maybe_scripting) |*s| {
+        if (s.family == .embed and s.hot_reload_capable) {
+            const src_scripts_abs = try std.fs.path.join(allocator, &.{ game_dir, s.dir });
+            defer allocator.free(src_scripts_abs);
+            if (std.fs.path.relative(allocator, "", null, target_dir, src_scripts_abs)) |rel| {
+                for (rel) |*ch| {
+                    if (ch.* == '\\') ch.* = '/';
+                }
+                watch_dir_rel = rel;
+                s.watch_dir_from_target = rel;
+            } else |_| {}
+        }
+    }
+
     // ── Asset-Plugins Phase 3: studio panel descriptors (#577) ─────────
     // Validate every `studio/*.panel.jsonc` a plugin (or a pack it bundles)
     // ships, BEFORE any target is written — a malformed panel is a
@@ -1570,8 +1597,18 @@ pub fn generate(
         .backend_manifest_name = backend_manifest_name,
         // Scripting splice (labelle-assembler#593): thread the declared
         // language into the scripting plugin's `b.dependency` args
-        // (`-Dlanguage`). Null → byte-identical dep args.
-        .scripting = if (maybe_scripting) |s| .{ .plugin_name = s.plugin_name, .language = s.language } else null,
+        // (`-Dlanguage`). Null → byte-identical dep args. Dev-mode hot
+        // reload (#637): `.hot_reload` additionally passes the plugin's
+        // `-Dhot_reload` as `optimize == .Debug` — gate set audited in
+        // `scripting_splice.buildDepHotReload` (embed family + capability
+        // probe + NEVER the tests target + desktop only; the tests target
+        // must not compile the watcher in, the same explicit pin
+        // `testsTargetConfig` carries for gamepad/backend).
+        .scripting = if (maybe_scripting) |s| .{
+            .plugin_name = s.plugin_name,
+            .language = s.language,
+            .hot_reload = scripting_splice.buildDepHotReload(s, is_tests_target, cfg.platform),
+        } else null,
         // Schema-declared plugin params (#591): each entry emits the
         // `plugin_<name>_params_mod` createModule + the `overrideImport`
         // that injects it into the plugin as `@import("plugin_params")`.

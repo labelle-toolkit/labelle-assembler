@@ -706,6 +706,17 @@ pub const BuildZigOptions = struct {
     pub const ScriptingDep = struct {
         plugin_name: []const u8,
         language: []const u8,
+        /// Dev-mode hot reload (labelle-assembler#637): when true, the
+        /// scripting plugin's dep args also gain
+        /// `.hot_reload = optimize == .Debug` — Debug builds compile the
+        /// plugin's disk watcher + tick pump in (`labelle run`'s default),
+        /// release builds keep the option at its off default, so nothing
+        /// ships. Set from `scripting_splice.buildDepHotReload` (embed
+        /// family + capability probe + never-tests-target + desktop);
+        /// MUST stay false for a plugin predating the option — an unknown
+        /// dependency option is a hard `zig build` error. Default false
+        /// keeps every existing caller byte-identical.
+        hot_reload: bool = false,
     };
 };
 
@@ -899,12 +910,17 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // project without the splice — so existing dep args stay
         // byte-identical. The language vocabulary is closed
         // (`language_policy.SUPPORTED_LANGUAGES`, all short identifiers), so
-        // the fixed buffer cannot overflow.
-        var scripting_lang_buf: [64]u8 = undefined;
+        // the fixed buffer cannot overflow. Dev-mode hot reload (#637): a
+        // capable splice additionally passes `.hot_reload = optimize ==
+        // .Debug` — the plugin's watcher/pump compile into Debug builds
+        // (`labelle run`'s default) and stay at the off default for release;
+        // see `ScriptingDep.hot_reload` for the gate set.
+        var scripting_lang_buf: [96]u8 = undefined;
         const scripting_lang_arg: []const u8 = blk: {
             const s = opts.scripting orelse break :blk "";
             if (!std.mem.eql(u8, s.plugin_name, plugin.name)) break :blk "";
-            break :blk std.fmt.bufPrint(&scripting_lang_buf, ", .language = .{s}", .{s.language}) catch unreachable;
+            const hot: []const u8 = if (s.hot_reload) ", .hot_reload = optimize == .Debug" else "";
+            break :blk std.fmt.bufPrint(&scripting_lang_buf, ", .language = .{s}{s}", .{ s.language, hot }) catch unreachable;
         };
         if (cfg.platform == .ios) {
             // Pass iOS SDK path to plugins so C dependencies can find system headers

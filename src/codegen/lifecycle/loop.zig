@@ -26,6 +26,7 @@ const asset_wiring = @import("../blocks/asset_wiring.zig");
 const resource_loader = @import("../blocks/resource_loader.zig");
 const tilemap_assets = @import("../blocks/tilemap_assets.zig");
 const post_fx_block = @import("../blocks/post_fx.zig");
+const scripting_splice = @import("../../scripting_splice.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const ResourceDef = config.ResourceDef;
@@ -294,6 +295,20 @@ pub fn Mixin(comptime Self: type) type {
                 // registered systems. `defer` mirrors PluginSystems.deinit ordering.
                 try w.writeAll("    try PluginControllers.setup(&g);\n");
                 try w.writeAll("    defer PluginControllers.deinit(&g);\n");
+            }
+
+            // Dev-mode script hot reload (labelle-assembler#637): register the
+            // SOURCE script dir with the plugin's disk watcher AFTER
+            // `PluginControllers.setup` booted the VM (the plugin's documented
+            // call site). Desktop only — there is no editable source tree next
+            // to a wasm/mobile binary. Self-gates on the embed family + the
+            // v0.12.0 capability probe, and the emitted block is comptime
+            // Debug-gated besides — see `emitHotReloadWatch`. The pump rides
+            // the already-spliced `scripting.Controller.tick` (labelle-
+            // scripting pumps internally when built with `-Dhot_reload=true`),
+            // so no tick-loop emission is needed here.
+            if (cfg.platform == .desktop) {
+                if (self.scripting) |s| try scripting_splice.emitHotReloadWatch(w, s);
             }
 
             // ── No Android immersive-mode call here (intentional) ────────────

@@ -478,6 +478,137 @@ pub const SCRIPTING_BUILD_WIRING = struct {
     }
 };
 
+// ── Dev-mode hot reload (labelle-assembler#637) ───────────────────────
+
+/// The #637 dev-mode twin of `ruby_splice`: the resolved plugin probed
+/// hot-reload capable (its build.zig declares the `"hot_reload"` option —
+/// labelle-scripting ≥ v0.12.0) and root.zig computed the SOURCE-tree
+/// watch path relative to the generated target dir.
+const ruby_hot_reload_splice = blk: {
+    var s = ruby_splice;
+    s.hot_reload_capable = true;
+    s.watch_dir_from_target = "../../scripts";
+    break :blk s;
+};
+
+pub const HOT_RELOAD_SPLICE = struct {
+    test "loop lifecycle: a capable splice emits the Debug-gated SOURCE-tree watch after PluginControllers.setup" {
+        generate.main_template.scripting_splice = ruby_hot_reload_splice;
+        defer generate.main_template.scripting_splice = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &ruby_scripting_plugins,
+        }, loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // The double comptime gate: Debug-only (run/build share generated
+        // output — the optimize mode IS the dev signal, so release builds
+        // fold the whole block out) + the @hasDecl version probe (older
+        // scripting → comptime no-op, never a compile error).
+        const gate = try indexOfOrFail(main_zig,
+            "if (comptime (@import(\"builtin\").mode == .Debug and @hasDecl(scripting, \"hot_reload\")))");
+
+        // After the VM boot (the plugin's documented watchDir call site).
+        const controllers_setup = try indexOfOrFail(main_zig, "PluginControllers.setup(&g)");
+        try std.testing.expect(controllers_setup < gate);
+
+        // Primary = the SOURCE tree relative to the target dir (the game's
+        // cwd under `labelle run`); fallback = the project-root-relative
+        // dir. NEVER the staged copy — on Windows staging can be a real
+        // COPY where edits would go unseen.
+        const primary = try indexOfOrFail(main_zig,
+            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../scripts\") catch {");
+        const fallback = try indexOfOrFail(main_zig,
+            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {");
+        try std.testing.expect(gate < primary);
+        try std.testing.expect(primary < fallback);
+
+        // No pump emission: the plugin pumps internally from
+        // `Controller.tick` (already spliced by #593) when built with
+        // `-Dhot_reload=true`.
+        _ = try indexOfOrFail(main_zig, "scripting.Controller.tick(&g, scaled_dt);");
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "hot_reload.pump()") == null);
+
+        try expectAstGenOk(main_zig);
+    }
+
+    test "callback lifecycle on a NON-desktop platform emits no watch (bgfx-android shape)" {
+        h.setBgfxAndroidLifecycle();
+        defer h.clearLifecycleOverrides();
+        generate.main_template.scripting_splice = ruby_hot_reload_splice;
+        defer generate.main_template.scripting_splice = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .ecs = .mock,
+            .plugins = &ruby_scripting_plugins,
+        }, h.bgfx_android_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // The rest of the splice still rides (registrations, tick), but no
+        // watcher — there is no editable source tree beside a mobile binary.
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"spawner\", @embedFile(\"scripts/10_spawner.rb\"));");
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "hot_reload.watchDir") == null);
+    }
+
+    test "an INCAPABLE splice (pre-v0.12.0 plugin) emits no watch on the loop lifecycle" {
+        generate.main_template.scripting_splice = ruby_splice; // hot_reload_capable = false
+        defer generate.main_template.scripting_splice = null;
+
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .plugins = &ruby_scripting_plugins,
+        }, loop_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        _ = try indexOfOrFail(main_zig, "scripting.registerScript(\"spawner\", @embedFile(\"scripts/10_spawner.rb\"));");
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "hot_reload.watchDir") == null);
+        // (No `std.Io.Threaded`-absence assertion: the preview-mode setup
+        // legitimately declares one in every desktop main.)
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "HotReloadIo") == null);
+    }
+
+    test "build wiring: a capable dep passes .hot_reload = optimize == .Debug; siblings + the incapable shape stay untouched" {
+        const build_zig = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = &ruby_scripting_plugins,
+        }, .{
+            .scripting = .{ .plugin_name = "scripting", .language = "ruby", .hot_reload = true },
+        });
+        defer std.testing.allocator.free(build_zig);
+
+        // Debug builds (labelle run's default) compile the watcher in;
+        // release builds leave the plugin option at its off default.
+        _ = try indexOfOrFail(build_zig, "const plugin_scripting_dep = b.dependency(\"labelle_scripting\", .{ .target = target, .optimize = optimize, .language = .ruby, .hot_reload = optimize == .Debug });");
+        _ = try indexOfOrFail(build_zig, "const plugin_pathfinding_dep = b.dependency(\"labelle_pathfinding\", .{ .target = target, .optimize = optimize });");
+
+        // The incapable twin (default false — pre-v0.12.0 plugins, where an
+        // unknown dep option would be a hard `zig build` error).
+        const build_zig_old = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = &ruby_scripting_plugins,
+        }, .{
+            .scripting = .{ .plugin_name = "scripting", .language = "ruby" },
+        });
+        defer std.testing.allocator.free(build_zig_old);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig_old, "hot_reload") == null);
+    }
+};
+
 // ── typescript e2e: the REAL generate over a staged project ───────────
 //
 // The declare-phase e2e harness shape (`test/scripting_declare_tests.zig`
@@ -687,5 +818,97 @@ pub const TYPESCRIPT_SPLICE_E2E = struct {
         try writeFileIn(game_root, "scripts/playing/10_boss.zig", "pub fn tick() void {}\n");
         try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
         try staged.tmp.dir.access(e2e_io, "out/sokol_desktop/main.zig", .{});
+    }
+};
+
+// ── Dev-mode hot reload e2e: the REAL generate over a staged project ──
+//
+// Reuses the `StagedTsProject` harness with one addition: the staged
+// plugin fixture gains a build.zig DECLARING the `"hot_reload"` option
+// (the labelle-scripting ≥ v0.12.0 shape), flipping the #637 capability
+// probe on through the real `detect` → `generate` path.
+
+pub const HOT_RELOAD_E2E = struct {
+    test "a capable plugin generates the watch splice with the COMPUTED source-tree path + the Debug-gated dep option" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTsProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(e2e_io, "game", .{});
+        defer game_root.close(e2e_io);
+        try writeFileIn(game_root, "plugins/scripting/build.zig",
+            \\const hot_reload = b.option(bool, "hot_reload", "dev-mode script hot reload") orelse false;
+        );
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        // Generated main (sokol desktop = the callback lifecycle): the
+        // Debug-gated watch registers the SOURCE tree via the path root.zig
+        // computed from the REAL dirs — out/sokol_desktop → ../../game/scripts
+        // (this staged layout's out/ is a sibling of game/, proving the
+        // computation is geometric, not a hardcoded `.labelle` assumption).
+        const main_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
+        defer allocator.free(main_zig);
+        _ = try indexOfOrFail(main_zig,
+            "if (comptime (@import(\"builtin\").mode == .Debug and @hasDecl(scripting, \"hot_reload\")))");
+        _ = try indexOfOrFail(main_zig,
+            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../game/scripts\") catch {");
+        _ = try indexOfOrFail(main_zig,
+            "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {");
+
+        // Generated build: the dep rides `-Dhot_reload` as the Debug proxy.
+        const build_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
+        defer allocator.free(build_zig);
+        _ = try indexOfOrFail(build_zig,
+            "const plugin_scripting_dep = b.dependency(\"labelle_scripting\", .{ .target = target, .optimize = optimize, .language = .typescript, .hot_reload = optimize == .Debug });");
+    }
+
+    test "the TESTS target of the same capable project never compiles the watcher in" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTsProject.init(allocator);
+        defer staged.deinit(allocator);
+        var game_root = try staged.tmp.dir.openDir(e2e_io, "game", .{});
+        defer game_root.close(e2e_io);
+        try writeFileIn(game_root, "plugins/scripting/build.zig",
+            \\const hot_reload = b.option(bool, "hot_reload", "dev-mode script hot reload") orelse false;
+        );
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{
+            .target_name_override = "tests",
+            .is_tests_target = true,
+        });
+
+        // The tests-target build.zig keeps the language selection but MUST
+        // NOT pass `.hot_reload` — the explicit tests-target pin (the
+        // gamepad/backend precedent, assembler#627): tests exercise game
+        // logic, never the dev loop's disk watcher.
+        const build_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/tests/build.zig", allocator, .limited(1 << 20));
+        defer allocator.free(build_zig);
+        _ = try indexOfOrFail(build_zig, ".language = .typescript");
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "hot_reload") == null);
+    }
+
+    test "a plugin WITHOUT the option (pre-v0.12.0) generates neither the watch nor the dep option" {
+        const allocator = std.testing.allocator;
+        var staged = try StagedTsProject.init(allocator);
+        defer staged.deinit(allocator);
+        // No plugins/scripting/build.zig staged at all — the probe reads
+        // nothing and degrades to incapable.
+
+        const backend_repo = try sokolFixtureRepoAbs(allocator);
+        defer allocator.free(backend_repo);
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+
+        const main_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/main.zig", allocator, .limited(1 << 20));
+        defer allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "hot_reload.watchDir") == null);
+
+        const build_zig = try staged.tmp.dir.readFileAlloc(e2e_io, "out/sokol_desktop/build.zig", allocator, .limited(1 << 20));
+        defer allocator.free(build_zig);
+        _ = try indexOfOrFail(build_zig, ".language = .typescript");
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "hot_reload") == null);
     }
 };
