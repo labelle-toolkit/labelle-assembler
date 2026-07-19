@@ -779,8 +779,10 @@ fn isFlowsDir(parent_dir: []const u8, child_name: []const u8) bool {
 /// FLOWS-JSONC §5 convention `scripts/flows` holds only flow sources
 /// and their emitted sidecars (authors .gitignore the emitted files),
 /// so an unpaired `.zig` there is a stale sidecar, not a hand-authored
-/// consumer. Flow-scanner-side pruning of orphans is a known adjacent
-/// gap, tracked separately.
+/// consumer. `flow_scanner.pruneStaleSidecars` (#632) deletes such
+/// orphans at generate time using this same pairing rule (plus a
+/// generated-header check); the skip here stays as defence in depth —
+/// this scan can run against trees no flow scan has cleaned yet.
 fn isOrphanFlowSidecar(allocator: std.mem.Allocator, dir_path: []const u8, file_name: []const u8) !bool {
     if (!std.mem.endsWith(u8, file_name, ".zig")) return false;
     const stem = file_name[0 .. file_name.len - ".zig".len];
