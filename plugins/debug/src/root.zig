@@ -70,6 +70,29 @@ fn perfRowDesc(_: void, a: PerfRow, b: PerfRow) bool {
     return a.frameNs() > b.frameNs();
 }
 
+/// Insert `row` into `buf[0..count.*]`, keeping the buffer sorted by
+/// per-frame cost (descending) and capped at `buf.len`. This gives
+/// sort-then-truncate semantics in one streaming pass: with more units
+/// than `buf.len`, the priciest rows survive REGARDLESS of their source
+/// order (fixing the "truncate-before-sort drops late-registered hot
+/// scripts" bug). `count` is updated in place; the top `count.*` rows
+/// are left sorted so the renderer can emit them directly.
+fn insertTopRow(buf: []PerfRow, count: *usize, row: PerfRow) void {
+    const cost = row.frameNs();
+    if (count.* < buf.len) {
+        // Room left: shift the smaller tail right and drop `row` in.
+        var i: usize = count.*;
+        while (i > 0 and buf[i - 1].frameNs() < cost) : (i -= 1) buf[i] = buf[i - 1];
+        buf[i] = row;
+        count.* += 1;
+    } else if (buf.len > 0 and buf[buf.len - 1].frameNs() < cost) {
+        // Full: replace the current smallest only if `row` beats it.
+        var i: usize = buf.len - 1;
+        while (i > 0 and buf[i - 1].frameNs() < cost) : (i -= 1) buf[i] = buf[i - 1];
+        buf[i] = row;
+    }
+}
+
 /// Severity marker mirroring the engine's traffic light (green < 1ms,
 /// yellow 1-5ms, red > 5ms). Text markers because the GuiInterface has
 /// no colored-label API yet (follow-up).
@@ -125,7 +148,9 @@ fn syncProfilingCapture(game: anytype, want: bool) void {
 /// frame-time mini-graph, all fed by the engine's FrameProfiler.
 fn drawFpsHeader(game: anytype, comptime Gui: type) void {
     const Game = @TypeOf(game.*);
-    if (comptime !@hasDecl(Game, "frameStats")) {
+    // Both accessors are gated under one capability check — an engine
+    // exposing frameStats but not frameTimeMs must still compile.
+    if (comptime !(@hasDecl(Game, "frameStats") and @hasDecl(Game, "frameTimeMs"))) {
         Gui.label("FPS: n/a (engine lacks frameStats)");
         return;
     }
@@ -160,34 +185,36 @@ fn drawFpsHeader(game: anytype, comptime Gui: type) void {
 }
 
 /// Sorted per-unit timing tables (scripts, then plugin systems).
+///
+/// Each block collects the top `MAX_PERF_ROWS` by per-frame cost via a
+/// streaming inserter, so with more units than the cap the priciest
+/// survive regardless of source order. The scripts and plugins accessors
+/// are gated INDEPENDENTLY (`@hasDecl`) so an engine exposing only one
+/// still compiles.
 fn drawPerfTables(game: anytype, comptime Gui: type) void {
     const Game = @TypeOf(game.*);
-    if (comptime !@hasDecl(Game, "scriptProfileRows")) return;
-
     var rows_buf: [MAX_PERF_ROWS]PerfRow = undefined;
 
-    {
-        const src = game.scriptProfileRows();
-        const n = @min(src.len, MAX_PERF_ROWS);
-        for (src[0..n], 0..) |r, i| rows_buf[i] = .{
+    if (comptime @hasDecl(Game, "scriptProfileRows")) {
+        var count: usize = 0;
+        for (game.scriptProfileRows()) |r| insertTopRow(&rows_buf, &count, .{
             .name = r.name,
             .setup_ns = phaseNs(r, "setup"),
             .tick_ns = phaseNs(r, "tick"),
             .gui_ns = phaseNs(r, "draw_gui"),
-        };
-        drawPerfGroup(Gui, "Scripts", rows_buf[0..n], false);
+        });
+        drawPerfGroup(Gui, "Scripts", rows_buf[0..count], false);
     }
-    {
-        const src = game.pluginProfileRows();
-        const n = @min(src.len, MAX_PERF_ROWS);
-        for (src[0..n], 0..) |r, i| rows_buf[i] = .{
+    if (comptime @hasDecl(Game, "pluginProfileRows")) {
+        var count: usize = 0;
+        for (game.pluginProfileRows()) |r| insertTopRow(&rows_buf, &count, .{
             .name = r.name,
             .setup_ns = phaseNs(r, "setup"),
             .tick_ns = phaseNs(r, "tick"),
             .post_ns = phaseNs(r, "post_tick"),
             .gui_ns = phaseNs(r, "draw_gui"),
-        };
-        drawPerfGroup(Gui, "Plugins", rows_buf[0..n], true);
+        });
+        drawPerfGroup(Gui, "Plugins", rows_buf[0..count], true);
     }
 }
 
@@ -201,10 +228,15 @@ fn drawPerfGroup(
     if (rows.len == 0) return;
     std.mem.sort(PerfRow, rows, {}, perfRowDesc);
 
+    // Sum the total UNCONDITIONALLY, before the table-render branch —
+    // if `beginTable` returns false (collapsed / clipped) the row loop
+    // is skipped, and a total computed inside it would print stale/zero.
+    var total_ns: u64 = 0;
+    for (rows) |r| total_ns += r.frameNs();
+
     Gui.spacing();
     Gui.label(title ++ " (ms, last frame; * >1ms, ! >5ms):");
     const cols: i32 = if (show_post) 5 else 4;
-    var total_ns: u64 = 0;
     if (Gui.beginTable(title, cols)) {
         Gui.tableNextRow();
         _ = Gui.tableNextColumn();
@@ -221,7 +253,6 @@ fn drawPerfGroup(
         Gui.label("setup");
 
         for (rows) |r| {
-            total_ns += r.frameNs();
             Gui.tableNextRow();
             var name_buf: [96]u8 = undefined;
             _ = Gui.tableNextColumn();
@@ -798,6 +829,43 @@ test "perf rows sort by per-frame cost, setup excluded" {
     // 900ms of setup must NOT outrank recurring cost.
     try testing.expectEqualStrings("cheap", rows[2].name);
     try testing.expectEqual(@as(u64, 1_500_000), rows[0].frameNs());
+}
+
+test "insertTopRow keeps the priciest N even when a hot row is beyond the cap" {
+    // MAX_PERF_ROWS+ units where the PRICIEST rows are registered LAST
+    // (indices past the cap) — exactly what truncate-before-sort drops.
+    // The streaming inserter must still land them in the top-N.
+    var buf: [MAX_PERF_ROWS]PerfRow = undefined;
+    var count: usize = 0;
+
+    var i: usize = 0;
+    while (i < MAX_PERF_ROWS) : (i += 1) {
+        insertTopRow(&buf, &count, .{ .name = "cheap", .tick_ns = 1_000 });
+    }
+    try testing.expectEqual(MAX_PERF_ROWS, count);
+
+    // Expensive rows arriving AFTER the buffer is already full.
+    insertTopRow(&buf, &count, .{ .name = "priciest", .tick_ns = 9_000_000 });
+    insertTopRow(&buf, &count, .{ .name = "second", .tick_ns = 2_000_000 });
+
+    try testing.expectEqual(MAX_PERF_ROWS, count); // never exceeds the cap
+    try testing.expectEqualStrings("priciest", buf[0].name); // late hot rows kept
+    try testing.expectEqualStrings("second", buf[1].name);
+    try testing.expectEqualStrings("cheap", buf[count - 1].name); // smallest evicted
+}
+
+test "insertTopRow leaves rows sorted descending by frame cost" {
+    var buf: [4]PerfRow = undefined;
+    var count: usize = 0;
+    insertTopRow(&buf, &count, .{ .name = "b", .tick_ns = 500 });
+    insertTopRow(&buf, &count, .{ .name = "d", .tick_ns = 100 });
+    insertTopRow(&buf, &count, .{ .name = "a", .tick_ns = 900 });
+    insertTopRow(&buf, &count, .{ .name = "c", .tick_ns = 300 });
+    try testing.expectEqual(@as(usize, 4), count);
+    try testing.expectEqualStrings("a", buf[0].name);
+    try testing.expectEqualStrings("b", buf[1].name);
+    try testing.expectEqualStrings("c", buf[2].name);
+    try testing.expectEqualStrings("d", buf[3].name);
 }
 
 test "severity marks: green blank, yellow *, red !" {
