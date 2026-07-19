@@ -31,54 +31,225 @@ var component_filters: [MAX_COMPONENTS]bool = [_]bool{false} ** MAX_COMPONENTS;
 const STATE_FILE = "debug_state.ini";
 var state_dirty: bool = false;
 
-// FPS tracking
-const FPS_HISTORY: usize = 120;
-var frame_times: [FPS_HISTORY]f32 = [_]f32{0} ** FPS_HISTORY;
-var frame_index: usize = 0;
-var last_time: ?i64 = null;
-var fps_avg: f32 = 0;
-var fps_min: f32 = 0;
-var fps_max: f32 = 0;
-var frame_ms: f32 = 0;
+// ── Performance section (labelle-engine#380) ─────────────────────────
+//
+// FPS/frame-time comes from the engine's always-on FrameProfiler
+// (`game.frameStats()` / `game.frameHistory()`); per-script and
+// per-plugin timings come from the engine's dispatch profiler
+// (`game.scriptProfileRows()` / `game.pluginProfileRows()`). The plugin
+// arms live capture via `game.setProfilingCapture(true)` while the
+// Performance section is visible and hands the gate back to the
+// LABELLE_PROFILE env var (`null`) when it closes, so an env-enabled
+// headless dump keeps running. Engine reads are `@hasDecl`/`@hasField`
+// gated: against an engine without the API the section degrades to a
+// hint label instead of breaking the build.
 
-fn updateFpsTracking() void {
-    // std.time.milliTimestamp removed in 0.16. FPS tracking is debug-only;
-    // stub to a monotonically increasing counter so the histogram still updates.
-    const S = struct { var counter: i64 = 0; };
-    S.counter += 16;
-    const now: i64 = S.counter;
-    if (last_time) |prev| {
-        const delta_ms: f32 = @floatFromInt(now - prev);
-        frame_times[frame_index] = delta_ms;
-        frame_index = (frame_index + 1) % FPS_HISTORY;
-        frame_ms = delta_ms;
+/// Whether we currently hold the engine's capture override.
+var capture_armed: bool = false;
 
-        // Compute stats from history
-        var sum: f32 = 0;
-        var min: f32 = 9999;
-        var max: f32 = 0;
-        var count: usize = 0;
-        for (frame_times) |t| {
-            if (t > 0) {
-                sum += t;
-                if (t < min) min = t;
-                if (t > max) max = t;
-                count += 1;
+/// One render-ready profiler table row, ns per lifecycle phase. Pure
+/// data (no engine types) so sorting/formatting stay unit-testable.
+const PerfRow = struct {
+    name: []const u8,
+    setup_ns: u64 = 0,
+    tick_ns: u64 = 0,
+    post_ns: u64 = 0,
+    gui_ns: u64 = 0,
+
+    /// Recurring per-frame cost — the sort key. Boot-time `setup` is
+    /// deliberately excluded.
+    fn frameNs(self: PerfRow) u64 {
+        return self.tick_ns + self.post_ns + self.gui_ns;
+    }
+};
+
+/// Upper bound on displayed rows per group (scripts / plugins).
+const MAX_PERF_ROWS: usize = 64;
+
+fn perfRowDesc(_: void, a: PerfRow, b: PerfRow) bool {
+    return a.frameNs() > b.frameNs();
+}
+
+/// Severity marker mirroring the engine's traffic light (green < 1ms,
+/// yellow 1-5ms, red > 5ms). Text markers because the GuiInterface has
+/// no colored-label API yet (follow-up).
+fn severityMark(ns: u64) []const u8 {
+    if (ns >= 5_000_000) return "!";
+    if (ns >= 1_000_000) return "*";
+    return "";
+}
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+
+/// Format one phase cell: "0.45" / "1.20*" / "6.00!" (ms + severity
+/// marker), or "-" when the phase cost is zero (never ran / below
+/// clock resolution).
+fn fmtPhase(buf: []u8, ns: u64) [:0]const u8 {
+    if (ns == 0) return std.fmt.bufPrintZ(buf, "-", .{}) catch "?";
+    return std.fmt.bufPrintZ(buf, "{d:.2}{s}", .{ nsToMs(ns), severityMark(ns) }) catch "?";
+}
+
+/// Read a phase Stat's live ns from an engine profile row, tolerating
+/// older engines whose rows lack the phase field (e.g. `setup` /
+/// plugin `draw_gui` pre-2.5): missing fields read as 0.
+fn phaseNs(row: anytype, comptime phase: []const u8) u64 {
+    if (comptime !@hasField(@TypeOf(row), phase)) return 0;
+    return @field(row, phase).last_ns;
+}
+
+/// True when env var `name` is set and non-empty. Desktop/libc only
+/// (same constraint as the engine's profiler gate); wasm and no-libc
+/// builds always report false.
+fn envTruthy(comptime name: [*:0]const u8) bool {
+    const builtin = @import("builtin");
+    if (comptime builtin.cpu.arch == .wasm32 or builtin.os.tag == .emscripten) return false;
+    if (comptime !builtin.link_libc) return false;
+    const raw = std.c.getenv(name) orelse return false;
+    return std.mem.span(raw).len > 0;
+}
+
+/// Arm/disarm the engine's live per-unit capture to track panel
+/// visibility. Disarming passes `null` (not `false`) so a user-set
+/// LABELLE_PROFILE keeps its headless dump.
+fn syncProfilingCapture(game: anytype, want: bool) void {
+    const Game = @TypeOf(game.*);
+    if (comptime !@hasDecl(Game, "setProfilingCapture")) return;
+    if (want == capture_armed) return;
+    game.setProfilingCapture(if (want) true else null);
+    capture_armed = want;
+}
+
+/// FPS header + (when Show Performance is on) min/avg/max and the
+/// frame-time mini-graph, all fed by the engine's FrameProfiler.
+fn drawFpsHeader(game: anytype, comptime Gui: type) void {
+    const Game = @TypeOf(game.*);
+    if (comptime !@hasDecl(Game, "frameStats")) {
+        Gui.label("FPS: n/a (engine lacks frameStats)");
+        return;
+    }
+    const st = game.frameStats();
+    var fps_buf: [64]u8 = undefined;
+    Gui.label(std.fmt.bufPrintZ(&fps_buf, "FPS: {d:.0} | Frame: {d:.1}ms", .{ st.fps, game.frameTimeMs() }) catch "?");
+
+    if (!show_perf) return;
+
+    var mm_buf: [96]u8 = undefined;
+    Gui.label(std.fmt.bufPrintZ(&mm_buf, "min {d:.1} / avg {d:.1} / max {d:.1} ms", .{ st.min_ms, st.avg_ms, st.max_ms }) catch "?");
+
+    if (comptime @hasDecl(Game, "frameHistory")) {
+        // Mini graph: newest 40 frames, one char each, full bar = 33.3ms
+        // (30 FPS). Keep the buffer one byte larger than the bar so the
+        // null terminator doesn't clobber the last char.
+        const bar_len: usize = 40;
+        var hist_buf: [bar_len]f32 = undefined;
+        const hist = game.frameHistory(&hist_buf);
+        if (hist.len > 0) {
+            var bar: [bar_len + 1]u8 = undefined;
+            const full_ms: f32 = 33.3;
+            for (hist, 0..) |ms, i| {
+                const ratio = @min(ms / full_ms, 1.0);
+                bar[i] = if (ratio > 0.8) '!' else if (ratio > 0.5) '#' else if (ratio > 0.2) '=' else '.';
             }
-        }
-        if (count > 0) {
-            const avg = sum / @as(f32, @floatFromInt(count));
-            fps_avg = if (avg > 0) 1000.0 / avg else 0;
-            fps_min = if (max > 0) 1000.0 / max else 0;
-            fps_max = if (min > 0) 1000.0 / min else 0;
+            bar[hist.len] = 0;
+            var graph_buf: [64]u8 = undefined;
+            Gui.label(std.fmt.bufPrintZ(&graph_buf, "[{s}]", .{bar[0..hist.len :0]}) catch "?");
         }
     }
-    last_time = now;
+}
+
+/// Sorted per-unit timing tables (scripts, then plugin systems).
+fn drawPerfTables(game: anytype, comptime Gui: type) void {
+    const Game = @TypeOf(game.*);
+    if (comptime !@hasDecl(Game, "scriptProfileRows")) return;
+
+    var rows_buf: [MAX_PERF_ROWS]PerfRow = undefined;
+
+    {
+        const src = game.scriptProfileRows();
+        const n = @min(src.len, MAX_PERF_ROWS);
+        for (src[0..n], 0..) |r, i| rows_buf[i] = .{
+            .name = r.name,
+            .setup_ns = phaseNs(r, "setup"),
+            .tick_ns = phaseNs(r, "tick"),
+            .gui_ns = phaseNs(r, "draw_gui"),
+        };
+        drawPerfGroup(Gui, "Scripts", rows_buf[0..n], false);
+    }
+    {
+        const src = game.pluginProfileRows();
+        const n = @min(src.len, MAX_PERF_ROWS);
+        for (src[0..n], 0..) |r, i| rows_buf[i] = .{
+            .name = r.name,
+            .setup_ns = phaseNs(r, "setup"),
+            .tick_ns = phaseNs(r, "tick"),
+            .post_ns = phaseNs(r, "post_tick"),
+            .gui_ns = phaseNs(r, "draw_gui"),
+        };
+        drawPerfGroup(Gui, "Plugins", rows_buf[0..n], true);
+    }
+}
+
+/// One table: header, rows sorted by per-frame cost (desc), total footer.
+fn drawPerfGroup(
+    comptime Gui: type,
+    comptime title: [:0]const u8,
+    rows: []PerfRow,
+    comptime show_post: bool,
+) void {
+    if (rows.len == 0) return;
+    std.mem.sort(PerfRow, rows, {}, perfRowDesc);
+
+    Gui.spacing();
+    Gui.label(title ++ " (ms, last frame; * >1ms, ! >5ms):");
+    const cols: i32 = if (show_post) 5 else 4;
+    var total_ns: u64 = 0;
+    if (Gui.beginTable(title, cols)) {
+        Gui.tableNextRow();
+        _ = Gui.tableNextColumn();
+        Gui.label("name");
+        _ = Gui.tableNextColumn();
+        Gui.label("tick");
+        if (show_post) {
+            _ = Gui.tableNextColumn();
+            Gui.label("post");
+        }
+        _ = Gui.tableNextColumn();
+        Gui.label("gui");
+        _ = Gui.tableNextColumn();
+        Gui.label("setup");
+
+        for (rows) |r| {
+            total_ns += r.frameNs();
+            Gui.tableNextRow();
+            var name_buf: [96]u8 = undefined;
+            _ = Gui.tableNextColumn();
+            Gui.label(std.fmt.bufPrintZ(&name_buf, "{s}", .{r.name}) catch "?");
+            var cell: [24]u8 = undefined;
+            _ = Gui.tableNextColumn();
+            Gui.label(fmtPhase(&cell, r.tick_ns));
+            if (show_post) {
+                _ = Gui.tableNextColumn();
+                Gui.label(fmtPhase(&cell, r.post_ns));
+            }
+            _ = Gui.tableNextColumn();
+            Gui.label(fmtPhase(&cell, r.gui_ns));
+            _ = Gui.tableNextColumn();
+            Gui.label(fmtPhase(&cell, r.setup_ns));
+        }
+        Gui.endTable();
+    }
+    var total_buf: [64]u8 = undefined;
+    Gui.label(std.fmt.bufPrintZ(&total_buf, "Total {s}: {d:.2}ms", .{ title, nsToMs(total_ns) }) catch "?");
 }
 
 pub const Systems = struct {
     pub fn setup(game: anytype) void {
         loadDebugState(game);
+        // Open the inspector at boot when LABELLE_DEBUG_OPEN is set —
+        // skips the F12 for headless screenshot runs and quick triage.
+        if (envTruthy("LABELLE_DEBUG_OPEN")) debug_visible = true;
     }
 
     pub fn drawGui(game: anytype) void {
@@ -95,8 +266,9 @@ pub const Systems = struct {
             dirty = true;
         }
 
-        // Always track FPS even when hidden
-        updateFpsTracking();
+        // Keep the engine's live per-unit capture in step with panel
+        // visibility (runs even when hidden, so closing disarms it).
+        syncProfilingCapture(game, debug_visible and show_perf);
 
         // Save before early return so F12-to-hide is persisted
         if (dirty and !debug_visible) {
@@ -107,65 +279,9 @@ pub const Systems = struct {
         if (!debug_visible) return;
 
         if (Gui.beginWindow("Debug Inspector")) {
-            // ── FPS (always visible) ──
-            var fps_buf: [64]u8 = undefined;
-            Gui.label(std.fmt.bufPrintZ(&fps_buf, "FPS: {d:.0} | Frame: {d:.1}ms", .{ fps_avg, frame_ms }) catch "?");
-
-            if (show_perf) {
-                var perf_buf: [64]u8 = undefined;
-                Gui.label(std.fmt.bufPrintZ(&perf_buf, "Min: {d:.0} Avg: {d:.0} Max: {d:.0}", .{ fps_min, fps_avg, fps_max }) catch "?");
-
-                // Mini frame time graph via text bars. Keep the
-                // buffer one byte larger than the visible width so
-                // the null terminator doesn't clobber the last bar
-                // — the pre-fix version wrote 40 bar chars, then
-                // overwrote index 39 with 0 and only rendered 39.
-                var graph_buf: [64]u8 = undefined;
-                const bar_len: usize = 40;
-                var bar: [bar_len + 1]u8 = undefined;
-                const max_ms: f32 = 33.3; // 30 FPS = one full bar
-                for (0..bar_len) |i| {
-                    const idx = (frame_index + FPS_HISTORY - bar_len + i) % FPS_HISTORY;
-                    const t = frame_times[idx];
-                    const ratio = @min(t / max_ms, 1.0);
-                    bar[i] = if (ratio > 0.8) '!' else if (ratio > 0.5) '#' else if (ratio > 0.2) '=' else '.';
-                }
-                bar[bar_len] = 0;
-                Gui.label(std.fmt.bufPrintZ(&graph_buf, "[{s}]", .{bar[0..bar_len :0]}) catch "?");
-            }
-            // Script profiling (debug builds only)
-            if (game.script_profile_ptr) |ptr| {
-                const ProfileEntry = struct { name: []const u8, tick_ns: u64, draw_gui_ns: u64 };
-                const entries: [*]const ProfileEntry = @ptrCast(@alignCast(ptr));
-                const count = game.script_profile_count;
-
-                Gui.spacing();
-                Gui.label("Scripts:");
-                for (0..count) |i| {
-                    const e = entries[i];
-                    const tick_us = @as(f64, @floatFromInt(e.tick_ns)) / 1000.0;
-                    const gui_us = @as(f64, @floatFromInt(e.draw_gui_ns)) / 1000.0;
-                    var sbuf: [96]u8 = undefined;
-                    Gui.label(std.fmt.bufPrintZ(&sbuf, "  {s}: tick={d:.0}us gui={d:.0}us", .{ e.name, tick_us, gui_us }) catch "?");
-                }
-            }
-
-            if (game.plugin_profile_ptr) |ptr| {
-                const PluginEntry = struct { name: []const u8, tick_ns: u64, post_tick_ns: u64, draw_gui_ns: u64 };
-                const entries: [*]const PluginEntry = @ptrCast(@alignCast(ptr));
-                const count = game.plugin_profile_count;
-
-                Gui.spacing();
-                Gui.label("Plugins:");
-                for (0..count) |i| {
-                    const e = entries[i];
-                    const tick_us = @as(f64, @floatFromInt(e.tick_ns)) / 1000.0;
-                    const post_us = @as(f64, @floatFromInt(e.post_tick_ns)) / 1000.0;
-                    const gui_us = @as(f64, @floatFromInt(e.draw_gui_ns)) / 1000.0;
-                    var sbuf: [128]u8 = undefined;
-                    Gui.label(std.fmt.bufPrintZ(&sbuf, "  {s}: tick={d:.0}us post={d:.0}us gui={d:.0}us", .{ e.name, tick_us, post_us, gui_us }) catch "?");
-                }
-            }
+            // ── FPS + performance (engine-fed, labelle-engine#380) ──
+            drawFpsHeader(game, Gui);
+            if (show_perf) drawPerfTables(game, Gui);
 
             {
                 const prev = show_perf;
@@ -668,4 +784,41 @@ fn formatField(buf: []u8, name: []const u8, comptime T: type, value: T) ![:0]u8 
         .@"enum" => std.fmt.bufPrintZ(buf, "{s}: {s}", .{ name, @tagName(value) }),
         else => std.fmt.bufPrintZ(buf, "{s}: ({s})", .{ name, @typeName(T) }),
     };
+}
+
+test "perf rows sort by per-frame cost, setup excluded" {
+    var rows = [_]PerfRow{
+        .{ .name = "cheap", .tick_ns = 50_000, .setup_ns = 900_000_000 },
+        .{ .name = "hot", .tick_ns = 1_200_000, .post_ns = 300_000 },
+        .{ .name = "mid", .tick_ns = 220_000, .gui_ns = 400_000 },
+    };
+    std.mem.sort(PerfRow, &rows, {}, perfRowDesc);
+    try testing.expectEqualStrings("hot", rows[0].name);
+    try testing.expectEqualStrings("mid", rows[1].name);
+    // 900ms of setup must NOT outrank recurring cost.
+    try testing.expectEqualStrings("cheap", rows[2].name);
+    try testing.expectEqual(@as(u64, 1_500_000), rows[0].frameNs());
+}
+
+test "severity marks: green blank, yellow *, red !" {
+    try testing.expectEqualStrings("", severityMark(0));
+    try testing.expectEqualStrings("", severityMark(999_999));
+    try testing.expectEqualStrings("*", severityMark(1_000_000));
+    try testing.expectEqualStrings("*", severityMark(4_999_999));
+    try testing.expectEqualStrings("!", severityMark(5_000_000));
+}
+
+test "fmtPhase renders ms with marker, dash for zero" {
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("-", fmtPhase(&buf, 0));
+    try testing.expectEqualStrings("0.45", fmtPhase(&buf, 450_000));
+    try testing.expectEqualStrings("1.20*", fmtPhase(&buf, 1_200_000));
+    try testing.expectEqualStrings("6.00!", fmtPhase(&buf, 6_000_000));
+}
+
+test "phaseNs tolerates rows without the phase field" {
+    const Old = struct { name: []const u8, tick: struct { last_ns: u64 } };
+    const r = Old{ .name = "x", .tick = .{ .last_ns = 42 } };
+    try testing.expectEqual(@as(u64, 42), phaseNs(r, "tick"));
+    try testing.expectEqual(@as(u64, 0), phaseNs(r, "setup"));
 }
