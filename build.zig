@@ -204,6 +204,13 @@ pub fn build(b: *std.Build) void {
         // run-step LABELLE_CS_ASSEMBLY_DIR env, a runnable publish-stand-in
         // splice, and the .NET-SDK-missing toolchain probe failure.
         "test/csharp_splice_tests.zig",
+        // The PYTHON LITMUS (labelle-assembler#619, RFC-LANGUAGE-PLUGINS
+        // §7): a fake "quokka" embedded language the assembler learns
+        // ENTIRELY from a manifest `.languages` row generates end-to-end,
+        // plus the META agnosticism proof that "quokka"/".qk" appear in no
+        // src/**/*.zig — the acceptance that a language plugin is addable
+        // with zero assembler changes.
+        "test/quokka_litmus_tests.zig",
     };
 
     for (test_files) |test_file| {

@@ -1536,14 +1536,15 @@ pub fn generate(
                 // PATH NOW and fail pointedly (tool + install hint) — a
                 // csharp generate without dotnet dies here, not mid-build.
                 // Same up-front posture as the platform/cwd gates around
-                // this block. Scoped to csharp deliberately: rust/crystal's
-                // steps predate this probe and their tests never declared a
-                // toolchain-present precondition; the cross-generate `.os`
-                // seam can also legitimately select a tool absent from the
-                // HOST PATH (linux `objcopy` on a macOS host). The generic
-                // `ensureStepToolsOnPath` machinery is ready for #619 to
-                // widen via a capability row; the CALL stays csharp-scoped.
-                if (std.mem.eql(u8, dl, "csharp")) {
+                // this block. Gated on the `probe_tools` CAPABILITY now
+                // (labelle-assembler#619, migrated from #644's `dl ==
+                // "csharp"`): the resolved language row's `.probe_tools`, OR
+                // the frozen csharp fallback (`frozenProbeTools`). rust/
+                // crystal deliberately opt out — their steps predate the
+                // probe and the cross-generate `.os` seam can legitimately
+                // select a tool absent from the HOST PATH (linux `objcopy`
+                // on a macOS host). A future language opts in via its row.
+                if (if (maybe_scripting) |s| s.probe_tools else false) {
                     try scripting_csharp.ensureStepToolsOnPath(allocator, plugin.name, dl, lang_steps_slice);
                 }
             };
@@ -1676,26 +1677,28 @@ pub fn generate(
                 .cache_rel = cache_rel,
                 .steps = combined,
                 .library_paths = lib_paths_owned,
-                // C# EMBED path (labelle-assembler#617): the csharp entry's
-                // link-less `dotnet publish` step makes `{cache}` the
-                // runtime payload (the managed assembly the hostfxr vm
-                // loads) — stage it beside the binary + point the run
-                // step's env at it. Keyed on the SELECTED language row AND
-                // on this being the SCRIPTING plugin (codex #644 round 2):
-                // a non-scripting plugin with a link-less csharp
+                // Runtime-output staging (labelle-assembler#617, decision
+                // row-ified in #619): a language whose link-less
+                // `.language_builds` outputs ARE the runtime payload (the
+                // managed assembly the hostfxr vm loads) stages `{cache}`
+                // beside the binary + points the run step's env at it. Keyed
+                // on the resolved `runtime_output` CAPABILITY (the language
+                // row's `.runtime_output` ∪ frozen csharp fallback) AND on
+                // this being the SCRIPTING plugin (codex #644 round 2): a
+                // non-scripting plugin with a link-less runtime
                 // `.language_builds`, ordered before scripting, must not
-                // capture the staging / LABELLE_CS_ASSEMBLY_DIR — the
-                // runtime payload is the scripting plugin's published DLL.
-                // False for every other language/plugin — byte-identity.
+                // capture the staging / LABELLE_CS_ASSEMBLY_DIR — the runtime
+                // payload is the scripting plugin's published DLL. False for
+                // every non-runtime language/plugin — byte-identity.
                 // Captured, not `.?` (gemini #644): false unless BOTH a
                 // language entry loaded AND the project declared a language.
-                .stage_runtime_outputs = if (maybe_lang != null)
-                    if (declared_language) |dl| scripting_csharp.stagesRuntimeOutputs(
-                        dl,
+                .stage_runtime_outputs = if (maybe_lang != null and declared_language != null)
+                    scripting_csharp.stagesRuntimeOutputs(
+                        if (maybe_scripting) |s| s.runtime_output else false,
                         plugin.name,
                         if (maybe_scripting) |s| s.plugin_name else null,
                         lang_steps_slice,
-                    ) else false
+                    )
                 else
                     false,
             });
@@ -2078,12 +2081,29 @@ pub fn generate(
 
     const packs_target = try std.fs.path.join(allocator, &.{ target_dir, "packs" });
     defer allocator.free(packs_target);
+    // The active splice's script extensions join the consumption scan
+    // (#619): the comptime `scanned_extensions` list covers only the
+    // FROZEN built-in languages, so a manifest-row language's sources
+    // (the litmus `.py`) would otherwise be invisible and their
+    // subscriptions silently elided. Frozen-language splices contribute
+    // duplicates of already-scanned extensions — harmless.
+    var script_ext_buf: [2][]const u8 = undefined;
+    var script_ext_len: usize = 0;
+    if (maybe_scripting) |s| {
+        script_ext_buf[script_ext_len] = s.extension;
+        script_ext_len += 1;
+        if (s.transpile) |t| {
+            script_ext_buf[script_ext_len] = t.source_extension;
+            script_ext_len += 1;
+        }
+    }
     var event_consumption = try main_zig.filterConsumedEvents(
         allocator,
         plugin_events.entries,
         &.{ game_dir, scripts_target, packs_target },
         excluded_dep_roots.items,
         force_consumed_tags.items,
+        script_ext_buf[0..script_ext_len],
         cfg.plugin_events,
     );
     defer event_consumption.deinit();

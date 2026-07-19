@@ -203,6 +203,22 @@ const Walk = struct {
     /// text. `scanFile` switches to per-file accumulation and marks
     /// `consumed` at file end instead of per-window.
     gated_downgrade: bool = false,
+    /// Extra file extensions to scan BEYOND `scanned_extensions` — the
+    /// active manifest `.languages` row's authored extensions (#619). The
+    /// comptime `scanned_extensions` list covers only the FROZEN
+    /// built-ins; a row-declared language's sources (the litmus `.py`)
+    /// would otherwise be invisible to the consumption scan and its
+    /// subscriptions silently elided. Duplicates of frozen extensions are
+    /// harmless (first match wins).
+    extra_extensions: []const []const u8 = &.{},
+
+    fn isScannedFile(self: *const Walk, name: []const u8) bool {
+        if (hasScannedExtension(name)) return true;
+        for (self.extra_extensions) |ext| {
+            if (std.mem.endsWith(u8, name, ext)) return true;
+        }
+        return false;
+    }
 };
 
 /// Whether `tag` spells exactly `e.plugin_sanitized ++ "__" ++
@@ -317,6 +333,7 @@ pub fn filterConsumedEvents(
     scan_roots: []const []const u8,
     excluded_roots: []const []const u8,
     force_consumed: []const []const u8,
+    extra_extensions: []const []const u8,
     mode: config.PluginEventsMode,
 ) !EventConsumption {
     if (mode == .all or entries.len == 0) {
@@ -414,6 +431,7 @@ pub fn filterConsumedEvents(
         .remaining = remaining,
         .excluded_canon = excluded_canon,
         .allowed_canon = allowed_canon,
+        .extra_extensions = extra_extensions,
     };
     defer {
         for (walk.visited.keys()) |k| allocator.free(k);
@@ -738,7 +756,7 @@ fn scanDir(walk: *Walk, dir_path: []const u8, in_flows: bool) !void {
                 switch (st.kind) {
                     .directory => try enterDir(walk, child, in_flows or isFlowsDir(dir_path, entry.name)),
                     .file => {
-                        if (!hasScannedExtension(entry.name)) continue;
+                        if (!walk.isScannedFile(entry.name)) continue;
                         if (in_flows and try isOrphanFlowSidecar(allocator, dir_path, entry.name)) continue;
                         try scanFile(walk, child);
                     },
@@ -746,7 +764,7 @@ fn scanDir(walk: *Walk, dir_path: []const u8, in_flows: bool) !void {
                 }
             },
             .file => {
-                if (!hasScannedExtension(entry.name)) continue;
+                if (!walk.isScannedFile(entry.name)) continue;
                 if (in_flows and try isOrphanFlowSidecar(allocator, dir_path, entry.name)) continue;
                 const child = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
                 defer allocator.free(child);
@@ -945,7 +963,7 @@ fn filterTmp(tmp: *testing.TmpDir, mode: config.PluginEventsMode) !EventConsumpt
     const allocator = testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(root);
-    return filterConsumedEvents(allocator, &test_entries, &.{root}, &.{}, &.{}, mode);
+    return filterConsumedEvents(allocator, &test_entries, &.{root}, &.{}, &.{}, &.{}, mode);
 }
 
 /// Same as `filterTmp` but with `sub_paths` (relative to the tmp root)
@@ -964,7 +982,7 @@ fn filterTmpExcluding(tmp: *testing.TmpDir, sub_paths: []const []const u8) !Even
         excluded_buf[n] = try std.fs.path.join(allocator, &.{ root, sub });
         n += 1;
     }
-    return filterConsumedEvents(allocator, &test_entries, &.{root}, excluded_buf[0..n], &.{}, .consumed);
+    return filterConsumedEvents(allocator, &test_entries, &.{root}, excluded_buf[0..n], &.{}, &.{}, .consumed);
 }
 
 test "filterConsumedEvents: qualified tag in a .zig hook keeps the event; unreferenced sibling is elided" {
@@ -1103,7 +1121,7 @@ test "filterConsumedEvents: engine-pass entry matches the dotted `engine.<event>
     const allocator = testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
-    var result = try filterConsumedEvents(allocator, &engine_entries, &.{root}, &.{}, &.{}, .consumed);
+    var result = try filterConsumedEvents(allocator, &engine_entries, &.{root}, &.{}, &.{}, &.{}, .consumed);
     defer result.deinit();
     try testing.expectEqual(@as(usize, 1), result.kept.len);
     try testing.expectEqualStrings("tick", result.kept[0].event_name);
@@ -1454,6 +1472,7 @@ test "filterConsumedEvents: an explicit scan root INSIDE the excluded output dir
         &.{ root, packs_root },
         &.{out_dir},
         &.{},
+        &.{},
         .consumed,
     );
     defer result.deinit();
@@ -1491,6 +1510,7 @@ test "filterConsumedEvents: a force-kept runtime channel survives with NO textua
         &.{root},
         &.{},
         &.{"engine__editor_plugin_command"},
+        &.{},
         .consumed,
     );
     defer result.deinit();
@@ -1548,6 +1568,7 @@ test "filterConsumedEvents: missing scan root is skipped silently" {
         allocator,
         &test_entries,
         &.{"/definitely/not/a/real/path/for/this/test"},
+        &.{},
         &.{},
         &.{},
         .consumed,
@@ -1731,6 +1752,7 @@ test "detectUngatedEmits + filterConsumedEvents: the gated-literal shape elides 
         &.{root},
         &.{prov_dir},
         &.{},
+        &.{},
         .consumed,
     );
     defer result.deinit();
@@ -1890,6 +1912,7 @@ test "detectUngatedEmits + filterConsumedEvents: ungated tag with no consumer an
         &.{root},
         &.{prov_dir},
         force_tags.items,
+        &.{},
         .consumed,
     );
     defer result.deinit();
@@ -1965,6 +1988,7 @@ test "resolveDeclaredConsume + filterConsumedEvents: a declared consume keeps th
         &.{root},
         &.{},
         &.{tag},
+        &.{},
         .consumed,
     );
     defer result.deinit();

@@ -153,6 +153,29 @@ pub const LanguageRow = struct {
     stage_subdir: ?[]const u8 = null,
     declare: ?DeclareCapability = null,
     transpile: ?TranspileCapability = null,
+    /// RUNTIME-OUTPUT capability (labelle-assembler#619, migrated from
+    /// #644's `language == "csharp"` decision): true when this language's
+    /// link-less `.language_builds` outputs ARE the runtime payload — a
+    /// host LOADS them at runtime (the CoreCLR/hostfxr contract), nothing is
+    /// linked. When set (and the plugin is the scripting plugin, and every
+    /// step is link-less), the generated build.zig stages the publish
+    /// `{cache}` beside the installed exe and points the run step's
+    /// assembly-dir env at it (`scripting_csharp.stagesRuntimeOutputs` +
+    /// `build_zig.zig`). A future runtime-loaded language declares this in
+    /// its row — zero assembler changes. Frozen fallback: csharp
+    /// (`scripting_csharp.frozenRuntimeOutput`), for the shipped csharp
+    /// manifest that predates this capability. Default false → byte-identical.
+    runtime_output: bool = false,
+    /// TOOLCHAIN-PROBE opt-in (labelle-assembler#619, migrated from #644's
+    /// csharp-scoped `ensureStepToolsOnPath` call): true when the assembler
+    /// should PATH-probe this language's selected `.language_builds` argv[0]s
+    /// at generate and fail pointedly on a missing tool (a `dotnet`/SDK
+    /// absence surfaces here, not as an opaque child-spawn error mid-`zig
+    /// build`). Opt-IN because rust/crystal steps predate the probe and the
+    /// cross-generate `.os` seam can legitimately select a host-absent tool.
+    /// Frozen fallback: csharp (`scripting_csharp.frozenProbeTools`). Default
+    /// false → byte-identical (no probe).
+    probe_tools: bool = false,
 };
 
 /// Parsed and validated `plugin.labelle` manifest.
@@ -476,18 +499,54 @@ pub fn loadFromDir(
         }
     }
 
-    // ── Validate `requires_language` vocabulary (#584) ──
-    // The value must come from the closed language table. The MATCH against
-    // the project's declared `.params.language` needs project context and runs in
-    // the generate-time policy gate (`language_policy.checkRequiresLanguage`);
-    // this load-time check rejects typos at the source with the manifest named.
+    // ── Validate `requires_language` shape (#584, opened by #619) ──
+    // Load-time validation is SHAPE-only now (a plain lowercase
+    // identifier): the vocabulary is no longer closed — a language may be
+    // declared by a `.languages` capability row in the scripting plugin's
+    // manifest (RFC-LANGUAGE-PLUGINS §7), which THIS manifest cannot see.
+    // The real vocabulary + MATCH checks run in the generate-time policy
+    // gate (`language_policy.checkRequiresLanguage`, against frozen ∪ rows).
     if (parsed.requires_language) |req| {
-        if (!language_policy.isSupportedLanguage(req)) {
+        if (!language_policy.isLanguageIdentifier(req)) {
             std.debug.print(
-                "labelle: plugin '{s}' declares requires_language \"{s}\"\n  which is not a supported script language ({s})\n  at {s}\n",
-                .{ expected_name, req, language_policy.SUPPORTED_LANGUAGES_LIST, manifest_path },
+                "labelle: plugin '{s}' declares requires_language \"{s}\"\n  which is not a plain lowercase language identifier ([a-z][a-z0-9_]*)\n  at {s}\n",
+                .{ expected_name, req, manifest_path },
             );
             return error.PluginManifestUnknownLanguage;
+        }
+    }
+
+    // ── Validate `.languages` capability rows (#619) ──
+    // Structural floor every row must meet, checked at LOAD with the plugin
+    // named (not a downstream compile/silent-elision failure — codex #643
+    // P2). This is NOT the forward-compat "only the selected row validates
+    // strictly" rule: that governs unknown capability KEYS (handled by the
+    // manifest-wide `ignore_unknown_fields`); `.name` safety and a non-empty
+    // `.extensions` are REQUIRED fields of the row shape itself.
+    //   1. `.name` — a valid enum-literal language identifier: the generated
+    //      build.zig emits `.language = .<name>`, so a Zig keyword (`error`)
+    //      or a non-`[a-z][a-z0-9_]*` name would render invalid code.
+    //   2. `.extensions` — non-empty: the shared-dir + plugin-event
+    //      consumption scans find a language's sources BY EXTENSION, so an
+    //      extensionless row would silently elide every source it declares.
+    for (parsed.languages) |row| {
+        if (!language_policy.isLanguageIdentifier(row.name)) {
+            std.debug.print(
+                "labelle: plugin '{s}' declares a `.languages` row named \"{s}\"\n" ++
+                    "  which is not a valid language identifier ([a-z][a-z0-9_]*, and not a Zig keyword)\n" ++
+                    "  — it would emit an invalid `.language = .{s}` in the generated build.\n  at {s}\n",
+                .{ expected_name, row.name, row.name, manifest_path },
+            );
+            return error.PluginManifestInvalidLanguageRow;
+        }
+        if (row.extensions.len == 0) {
+            std.debug.print(
+                "labelle: plugin '{s}' declares a `.languages` row for \"{s}\" with no `.extensions`\n" ++
+                    "  — the assembler finds a language's sources by extension, so an extensionless\n" ++
+                    "  row would silently ignore every file it declares. Add at least one, e.g. .extensions = .{{ \".{s}\" }}.\n  at {s}\n",
+                .{ expected_name, row.name, row.name, manifest_path },
+            );
+            return error.PluginManifestInvalidLanguageRow;
         }
     }
 
@@ -618,6 +677,55 @@ test "ZonManifest: parses manifest with no convention_dirs" {
 
     try testing.expectEqualStrings("marker_only", parsed.name);
     try testing.expectEqual(@as(usize, 0), parsed.convention_dirs.len);
+}
+
+test "ZonManifest: parses a .languages row with runtime_output + probe_tools capabilities (#619, migrated from #644 csharp)" {
+    // A native row that DECLARES the runtime-output-staging + toolchain-probe
+    // capabilities — the row-driven replacement for #644's `language ==
+    // "csharp"` decisions. A future runtime-loaded language ships exactly
+    // this shape and stages with zero assembler changes.
+    const src =
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "csharp", .extensions = .{".cs"}, .kind = .native,
+        \\           .module_root = "Game.cs", .stage_subdir = "native-csharp/src/game",
+        \\           .runtime_output = true, .probe_tools = true },
+        \\    },
+        \\}
+    ;
+    const src_z = try testing.allocator.dupeZ(u8, src);
+    defer testing.allocator.free(src_z);
+
+    const parsed = try std.zon.parse.fromSliceAlloc(ZonManifest, testing.allocator, src_z, null, .{});
+    defer std.zon.parse.free(testing.allocator, parsed);
+
+    const row = parsed.languages[0];
+    try testing.expect(row.runtime_output);
+    try testing.expect(row.probe_tools);
+    // Absence defaults to false (byte-identical for every row-less language).
+    try testing.expectEqual(LanguageKind.native, row.kind);
+}
+
+test "ZonManifest: a .languages row omitting runtime_output/probe_tools defaults them false (#619)" {
+    const src =
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "lua", .extensions = .{".lua"}, .kind = .embedded },
+        \\    },
+        \\}
+    ;
+    const src_z = try testing.allocator.dupeZ(u8, src);
+    defer testing.allocator.free(src_z);
+
+    const parsed = try std.zon.parse.fromSliceAlloc(ZonManifest, testing.allocator, src_z, null, .{});
+    defer std.zon.parse.free(testing.allocator, parsed);
+
+    try testing.expect(!parsed.languages[0].runtime_output);
+    try testing.expect(!parsed.languages[0].probe_tools);
 }
 
 test "ZonManifest: parses a .languages row with a declare capability (rev 17)" {
@@ -1218,6 +1326,82 @@ test "loadFromDir: parses .consumes_events (#633)" {
     try testing.expectEqualStrings("box2d__collision_begin", manifest.consumes_events[1]);
 }
 
+test "loadFromDir: a .languages row named after a Zig keyword is rejected at load (#619/#643 P2)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `error` is a valid `[a-z]+` shape but a Zig keyword — the generated
+    // `.language = .error` would be a syntax error, so reject at load with
+    // the plugin named, not as a downstream compile failure.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "error", .extensions = .{".err"}, .kind = .embedded },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    try testing.expectError(
+        error.PluginManifestInvalidLanguageRow,
+        loadFromDir(testing.allocator, tmp_path, "scripting"),
+    );
+}
+
+test "loadFromDir: a .languages row with no .extensions is rejected at load (#619/#643 P2)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // An extensionless row would silently elide every source it declares
+    // (the scans find sources by extension) — reject at load with a pointed
+    // diagnostic.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "ruby", .kind = .embedded },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    try testing.expectError(
+        error.PluginManifestInvalidLanguageRow,
+        loadFromDir(testing.allocator, tmp_path, "scripting"),
+    );
+}
+
+test "loadFromDir: a well-formed .languages row (safe name + extensions) loads (#619)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "scripting",
+        \\    .manifest_version = 1,
+        \\    .languages = .{
+        \\        .{ .name = "zephyr", .extensions = .{".zy"}, .kind = .embedded },
+        \\    },
+        \\}
+    );
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "scripting")).?;
+    defer manifest.deinit();
+    try testing.expectEqual(@as(usize, 1), manifest.languages.len);
+    try testing.expectEqualStrings("zephyr", manifest.languages[0].name);
+    try testing.expectEqualStrings(".zy", manifest.languages[0].extensions[0]);
+}
+
 test "loadFromDir: parses requires_language (#584)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1242,15 +1426,16 @@ test "loadFromDir: parses requires_language (#584)" {
     try testing.expectEqualStrings("lua", manifest.requires_language.?);
 }
 
-test "loadFromDir: rejects an unknown requires_language (#584)" {
+test "loadFromDir: rejects a shape-invalid requires_language; identifier-shaped unknowns load (#584, opened by #619)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // Not a lowercase identifier → rejected at load with the manifest named.
     try writeManifestFile(tmp.dir,
         \\.{
         \\    .name = "lua_toolkit",
         \\    .manifest_version = 1,
-        \\    .requires_language = "cobol",
+        \\    .requires_language = "Not-A-Language",
         \\}
     );
 
@@ -1259,6 +1444,21 @@ test "loadFromDir: rejects an unknown requires_language (#584)" {
 
     const result = loadFromDir(testing.allocator, tmp_path, "lua_toolkit");
     try testing.expectError(error.PluginManifestUnknownLanguage, result);
+
+    // "cobol" is identifier-shaped: the vocabulary is OPEN now (#619 — a
+    // language may be declared by a scripting-plugin `.languages` row this
+    // manifest cannot see), so it LOADS; the generate-time policy gate
+    // (`checkRequiresLanguage` against frozen ∪ rows) owns the rejection.
+    try writeManifestFile(tmp.dir,
+        \\.{
+        \\    .name = "lua_toolkit",
+        \\    .manifest_version = 1,
+        \\    .requires_language = "cobol",
+        \\}
+    );
+    var manifest = (try loadFromDir(testing.allocator, tmp_path, "lua_toolkit")).?;
+    defer manifest.deinit();
+    try testing.expectEqualStrings("cobol", manifest.requires_language.?);
 }
 
 test "loadFromDir: rejects a nested pack name that escapes the plugin dir (#576)" {

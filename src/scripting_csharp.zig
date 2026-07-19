@@ -47,17 +47,32 @@
 //!      (argv[0] PATH lookup, a small hint table): a missing `cargo` or
 //!      `crystal` gets the same early, pointed error.
 //!
-//! ── Why csharp-keyed, and the #619 migration path ────────────────────
-//! `stagesRuntimeOutputs` keys on the language NAME, exactly like the
-//! dev-`.csproj` emission precedent in root.zig (#617's first half): the
-//! "publish dir is the runtime payload" semantic is a property of the
-//! csharp row's contract with its vm, not derivable from the generic
-//! step schema (a future language could legitimately keep build junk in
-//! `{cache}` beside a linked artifact). When the language-capability-rows
-//! framework (#619) lands, this predicate collapses into a manifest
-//! capability on the csharp row; the emission halves in build_zig.zig
-//! are already keyed off the generic `stage_runtime_outputs` wiring flag,
-//! so the migration only moves the DECISION, not the codegen.
+//! ── #619 migration: the DECISION rides a capability row ───────────────
+//! (labelle-assembler#619, RFC-LANGUAGE-PLUGINS §7.) The two decisions this
+//! module owns are no longer keyed on the language NAME:
+//!   * `stagesRuntimeOutputs` consults a `runtime_output` CAPABILITY (the
+//!     resolved `LanguageRow.runtime_output`, threaded onto the splice) —
+//!     "the publish dir is the runtime payload" is now a property the
+//!     language DECLARES, not a hardcoded `== "csharp"`. A future
+//!     runtime-loaded language sets `.runtime_output = true` in its row and
+//!     stages with ZERO assembler changes.
+//!   * the toolchain probe rides a `probe_tools` capability (opt-in, since
+//!     rust/crystal steps predate it and the cross-generate `.os` seam can
+//!     select a host-absent tool).
+//! The csharp knowledge is DEMOTED to a FROZEN FALLBACK (`frozenRuntimeOutput`
+//! / `frozenProbeTools`), the same #619 pattern the `DECLARE_RUNNERS` /
+//! `EMBED_LANGUAGES` / `NATIVE_LANGUAGES` tables use: it keeps the shipped
+//! csharp manifest (which predates these capabilities) working byte-for-byte
+//! while new languages ride their row alone. The build_zig.zig emission
+//! halves were already keyed off the generic `stage_runtime_outputs` wiring
+//! flag, so the migration moved only the DECISION, not the codegen.
+//!
+//! Residue (RFC "honest boundary", documented): the runtime assembly-dir env
+//! var NAME (`RUNTIME_ASSEMBLY_DIR_ENV`) stays an assembler-owned constant —
+//! a vm-contract string the generated run step sets — analogous to the
+//! assembler-owned tsconfig/dev-`.csproj` codegen. Carrying it in the row
+//! is a clean follow-up; it is not needed for the language-agnostic litmus
+//! (which adds an EMBEDDED language, not a runtime-loaded native one).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -78,14 +93,18 @@ pub threadlocal var path_override: ?[]const u8 = null;
 
 /// Whether THIS plugin's SELECTED language build steps publish
 /// RUNTIME-LOADED outputs into `{cache}` (the C# CoreCLR-host contract):
-///   * language `csharp`;
+///   * `runtime_output` — the resolved language's runtime-output CAPABILITY
+///     (`LanguageRow.runtime_output`, row PRIMARY ∪ `frozenRuntimeOutput`
+///     fallback for csharp), threaded onto the splice. #619 replaced the
+///     hardcoded `language == "csharp"` here; a future runtime-loaded
+///     language declares the capability and stages with no assembler change;
 ///   * `plugin_name` IS the project's scripting plugin (the one whose
 ///     `src/csharp/vm.zig` hostfxr-loads the assembly) — codex #644 round
-///     2: another plugin that coincidentally declares a link-less csharp
+///     2: another plugin that coincidentally declares a link-less runtime
 ///     `.language_builds` entry, ORDERED BEFORE scripting, must never
 ///     capture the InstallDir staging or `LABELLE_CS_ASSEMBLY_DIR`; the
 ///     runtime payload is specifically the scripting plugin's published
-///     `labelle_csharp_scripts.dll`, not the first link-less csharp build
+///     `labelle_csharp_scripts.dll`, not the first link-less build
 ///     encountered;
 ///   * at least one step, and NO step links an artifact — a linked
 ///     artifact would mean `{cache}` also holds intermediates that must
@@ -94,12 +113,12 @@ pub threadlocal var path_override: ?[]const u8 = null;
 /// (then nothing stages). Drives `PluginBuildStepsWiring
 /// .stage_runtime_outputs` (root.zig → build_zig.zig emission).
 pub fn stagesRuntimeOutputs(
-    language: []const u8,
+    runtime_output: bool,
     plugin_name: []const u8,
     scripting_plugin_name: ?[]const u8,
     steps: []const plugin_build_steps.Step,
 ) bool {
-    if (!std.mem.eql(u8, language, "csharp")) return false;
+    if (!runtime_output) return false;
     const owner = scripting_plugin_name orelse return false;
     if (!std.mem.eql(u8, plugin_name, owner)) return false;
     if (steps.len == 0) return false;
@@ -107,6 +126,27 @@ pub fn stagesRuntimeOutputs(
         if (s.link != .none) return false;
     }
     return true;
+}
+
+/// FROZEN FALLBACK for the `runtime_output` capability (labelle-assembler
+/// #619 Migration): the demoted `language == "csharp"` knowledge. csharp's
+/// SHIPPED manifest row predates the capability, so the assembler supplies
+/// the default here — exactly as the frozen `NATIVE_LANGUAGES`/`EMBED_
+/// LANGUAGES` tables default the staging/embed metadata for row-less
+/// manifests. Never extended again: a NEW runtime-loaded language declares
+/// `.runtime_output = true` in its row instead.
+pub fn frozenRuntimeOutput(language: []const u8) bool {
+    return std.mem.eql(u8, language, "csharp");
+}
+
+/// FROZEN FALLBACK for the `probe_tools` capability (#619 Migration): the
+/// demoted csharp-scoped `ensureStepToolsOnPath` call gate. csharp opts into
+/// the generate-time PATH probe (a missing .NET SDK fails pointedly); the
+/// shipped csharp manifest predates the capability, so the default lives
+/// here. rust/crystal deliberately do NOT (their steps predate the probe and
+/// the cross-generate `.os` seam can select a host-absent tool).
+pub fn frozenProbeTools(language: []const u8) bool {
+    return std.mem.eql(u8, language, "csharp");
 }
 
 /// Probe every step's `command[0]` on PATH at generate time, failing
@@ -229,17 +269,23 @@ fn stepNamed(comptime link: plugin_build_steps.LinkMode, comptime argv0: []const
     };
 }
 
-test "stagesRuntimeOutputs: the scripting plugin's csharp link-less steps fire; a linked step, another language, or zero steps do not" {
+test "stagesRuntimeOutputs: a runtime-output language's link-less steps fire; a linked step, a non-runtime language, or zero steps do not (#619 capability)" {
+    // The decision now rides the `runtime_output` CAPABILITY (frozen csharp
+    // → true; rust/crystal → false), not a hardcoded language name.
+    const csharp_rt = frozenRuntimeOutput("csharp"); // true
+    const rust_rt = frozenRuntimeOutput("rust"); // false
+    const crystal_rt = frozenRuntimeOutput("crystal"); // false
     // The csharp shape — one link-less dotnet-publish step on the SCRIPTING
     // plugin: `{cache}` IS the runtime payload, staged beside the binary.
-    try testing.expect(stagesRuntimeOutputs("csharp", "scripting", "scripting", &.{stepNamed(.none, "dotnet")}));
+    try testing.expect(stagesRuntimeOutputs(csharp_rt, "scripting", "scripting", &.{stepNamed(.none, "dotnet")}));
     // A linked artifact means {cache} holds intermediates — never shipped.
-    try testing.expect(!stagesRuntimeOutputs("csharp", "scripting", "scripting", &.{ stepNamed(.none, "dotnet"), stepNamed(.object, "ld") }));
-    // The rust/crystal native rows keep their link wiring, no staging.
-    try testing.expect(!stagesRuntimeOutputs("rust", "scripting", "scripting", &.{stepNamed(.none, "cargo")}));
-    try testing.expect(!stagesRuntimeOutputs("crystal", "scripting", "scripting", &.{stepNamed(.none, "crystal")}));
+    try testing.expect(!stagesRuntimeOutputs(csharp_rt, "scripting", "scripting", &.{ stepNamed(.none, "dotnet"), stepNamed(.object, "ld") }));
+    // The rust/crystal native rows keep their link wiring, no staging (the
+    // capability is false for them).
+    try testing.expect(!stagesRuntimeOutputs(rust_rt, "scripting", "scripting", &.{stepNamed(.none, "cargo")}));
+    try testing.expect(!stagesRuntimeOutputs(crystal_rt, "scripting", "scripting", &.{stepNamed(.none, "crystal")}));
     // Steps-less never fires (nothing would produce the payload).
-    try testing.expect(!stagesRuntimeOutputs("csharp", "scripting", "scripting", &.{}));
+    try testing.expect(!stagesRuntimeOutputs(csharp_rt, "scripting", "scripting", &.{}));
 }
 
 test "stagesRuntimeOutputs: only the SCRIPTING plugin's csharp payload stages (codex #644 round 2)" {
@@ -249,11 +295,21 @@ test "stagesRuntimeOutputs: only the SCRIPTING plugin's csharp payload stages (c
     // InstallDir staging or LABELLE_CS_ASSEMBLY_DIR. The runtime payload is
     // specifically the scripting plugin's published labelle_csharp_scripts.dll.
     const steps = &.{stepNamed(.none, "dotnet")};
-    try testing.expect(!stagesRuntimeOutputs("csharp", "helper", "scripting", steps));
+    const rt = frozenRuntimeOutput("csharp"); // true
+    try testing.expect(!stagesRuntimeOutputs(rt, "helper", "scripting", steps));
     // The scripting plugin itself DOES stage.
-    try testing.expect(stagesRuntimeOutputs("csharp", "scripting", "scripting", steps));
+    try testing.expect(stagesRuntimeOutputs(rt, "scripting", "scripting", steps));
     // No scripting splice detected → nothing stages (null owner).
-    try testing.expect(!stagesRuntimeOutputs("csharp", "scripting", null, steps));
+    try testing.expect(!stagesRuntimeOutputs(rt, "scripting", null, steps));
+}
+
+test "frozenRuntimeOutput / frozenProbeTools: csharp opts in, other languages do not (the demoted #644 hardcode, #619)" {
+    try testing.expect(frozenRuntimeOutput("csharp"));
+    try testing.expect(frozenProbeTools("csharp"));
+    for ([_][]const u8{ "lua", "ruby", "typescript", "rust", "crystal", "go" }) |lang| {
+        try testing.expect(!frozenRuntimeOutput(lang));
+        try testing.expect(!frozenProbeTools(lang));
+    }
 }
 
 test "ensureStepToolsOnPath: a present tool passes, a missing one fails pointedly, path-shaped argv0s are skipped" {
