@@ -193,6 +193,26 @@ fn drawFpsHeader(game: anytype, comptime Gui: type) void {
 /// still compiles.
 fn drawPerfTables(game: anytype, comptime Gui: type) void {
     const Game = @TypeOf(game.*);
+
+    // The tables are only meaningful when per-unit capture is genuinely
+    // ARMABLE and ACTIVE. An engine can expose `scriptProfileRows` /
+    // `pluginProfileRows` (>= 2.4) yet lack `setProfilingCapture`
+    // (< 2.6): then `syncProfilingCapture` is a no-op, nothing enables
+    // recording, and every row reads back 0 — the table would render a
+    // wall of `-` / `0.00ms` and read as a broken panel. Gate on the
+    // capture-control API being present AND capture being live, and
+    // otherwise print one honest line instead of the empty tables.
+    if (comptime !@hasDecl(Game, "setProfilingCapture") or !@hasDecl(Game, "profilingCaptureActive")) {
+        Gui.label("profiling capture unavailable - requires engine >= 2.6.0");
+        return;
+    }
+    if (!game.profilingCaptureActive()) {
+        // Capture-capable engine, but recording is off right now (e.g.
+        // arming hasn't taken effect) - don't show stale zero rows.
+        Gui.label("profiling capture inactive");
+        return;
+    }
+
     var rows_buf: [MAX_PERF_ROWS]PerfRow = undefined;
 
     if (comptime @hasDecl(Game, "scriptProfileRows")) {
@@ -876,6 +896,96 @@ test "insertTopRow keeps the priciest N even when a hot row is beyond the cap" {
     try testing.expectEqualStrings("priciest", buf[0].name); // late hot rows kept
     try testing.expectEqualStrings("second", buf[1].name);
     try testing.expectEqualStrings("cheap", buf[count - 1].name); // smallest evicted
+}
+
+test "drawPerfTables gates on capture armability" {
+    // Label-capturing stub Gui: records every label; table/row calls are
+    // no-ops. Lets us assert what the perf section emits without a real
+    // backend.
+    const CapGui = struct {
+        var labels: [16][]const u8 = undefined;
+        var n: usize = 0;
+        fn reset() void {
+            n = 0;
+        }
+        fn saw(needle: []const u8) bool {
+            for (labels[0..n]) |l| {
+                if (std.mem.indexOf(u8, l, needle) != null) return true;
+            }
+            return false;
+        }
+        pub fn label(s: [*:0]const u8) void {
+            if (n < labels.len) {
+                labels[n] = std.mem.span(s);
+                n += 1;
+            }
+        }
+        pub fn spacing() void {}
+        pub fn beginTable(_: [*:0]const u8, _: i32) bool {
+            return false;
+        }
+        pub fn endTable() void {}
+        pub fn tableNextRow() void {}
+        pub fn tableNextColumn() bool {
+            return false;
+        }
+    };
+    const Stat = struct { last_ns: u64 = 0 };
+    const Row = struct { name: []const u8, tick: Stat = .{}, draw_gui: Stat = .{} };
+
+    // Engine WITHOUT the capture-control API (>= 2.4 rows, < 2.6): must
+    // show the "unavailable" hint, not empty tables.
+    const OldEngineGame = struct {
+        pub fn scriptProfileRows(_: *const @This()) []const Row {
+            return &.{};
+        }
+        pub fn pluginProfileRows(_: *const @This()) []const Row {
+            return &.{};
+        }
+    };
+    CapGui.reset();
+    var old = OldEngineGame{};
+    drawPerfTables(&old, CapGui);
+    try testing.expect(CapGui.saw("unavailable"));
+
+    // Capture-capable engine with recording ACTIVE: renders the tables
+    // (Scripts header), no "unavailable" hint.
+    const NewEngineGame = struct {
+        pub fn scriptProfileRows(_: *const @This()) []const Row {
+            return &.{.{ .name = "physics", .tick = .{ .last_ns = 450_000 } }};
+        }
+        pub fn pluginProfileRows(_: *const @This()) []const Row {
+            return &.{};
+        }
+        pub fn setProfilingCapture(_: *const @This(), _: ?bool) void {}
+        pub fn profilingCaptureActive(_: *const @This()) bool {
+            return true;
+        }
+    };
+    CapGui.reset();
+    var new_g = NewEngineGame{};
+    drawPerfTables(&new_g, CapGui);
+    try testing.expect(!CapGui.saw("unavailable"));
+    try testing.expect(CapGui.saw("Scripts"));
+
+    // Capture-capable but recording OFF: honest "inactive" line, no tables.
+    const IdleEngineGame = struct {
+        pub fn scriptProfileRows(_: *const @This()) []const Row {
+            return &.{};
+        }
+        pub fn pluginProfileRows(_: *const @This()) []const Row {
+            return &.{};
+        }
+        pub fn setProfilingCapture(_: *const @This(), _: ?bool) void {}
+        pub fn profilingCaptureActive(_: *const @This()) bool {
+            return false;
+        }
+    };
+    CapGui.reset();
+    var idle = IdleEngineGame{};
+    drawPerfTables(&idle, CapGui);
+    try testing.expect(CapGui.saw("inactive"));
+    try testing.expect(!CapGui.saw("Scripts"));
 }
 
 test "perf total sums ALL units, not just the displayed top-N" {
