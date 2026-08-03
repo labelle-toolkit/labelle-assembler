@@ -579,20 +579,21 @@ pub fn generate(
         var hit: ?[]const u8 =
             try scene_manifest.findTargetKeyUsage(allocator, scenes_target, jsonc_scene_names) orelse
             try scene_manifest.findTargetKeyUsage(allocator, prefabs_target, prefab_names);
-        // Pack sources too: pack prefabs/scenes are not staged until
+        // Pack sources too: pack prefabs are not staged until
         // `loadPackScans` later in generate, so scan each pack's SOURCE
-        // tree here — a light pack shipping an `@` override would
-        // otherwise slip past the gate (codex P1 / CodeRabbit on #650).
+        // prefab tree here — a light pack shipping an `@` override
+        // would otherwise slip past the gate (codex P1 / CodeRabbit on
+        // #650). Prefabs ONLY: `scanPack` stages components/events/
+        // prefabs/hooks and never a pack's `scenes/`, so an example or
+        // fixture scene must not impose an engine-version requirement
+        // on the game (codex P2, round 2).
         if (hit == null) {
             for (pack_entries.items) |entry| {
                 const src_dir = try entry.resolveSrcDir(allocator, game_dir);
                 defer allocator.free(src_dir);
-                for ([_][]const u8{ "prefabs", "scenes" }) |sub| {
-                    const sub_dir = try std.fs.path.join(allocator, &.{ src_dir, sub });
-                    defer allocator.free(sub_dir);
-                    hit = try scene_manifest.findTargetKeyUsageInTree(allocator, sub_dir);
-                    if (hit != null) break;
-                }
+                const sub_dir = try std.fs.path.join(allocator, &.{ src_dir, "prefabs" });
+                defer allocator.free(sub_dir);
+                hit = try scene_manifest.findTargetKeyUsageInTree(allocator, sub_dir);
                 if (hit != null) break;
             }
         }

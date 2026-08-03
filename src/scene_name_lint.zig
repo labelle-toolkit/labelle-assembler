@@ -143,7 +143,7 @@ pub fn sourceUsesTargetKeys(src: []const u8) bool {
             if (is_key) {
                 const scope = if (sp > 0) stack_buf[sp - 1] else .entity;
                 if (scope == .entity or scope == .component_map) {
-                    if (isTargetKey(content) or isEscapedTargetKey(content)) return true;
+                    if (isTargetKey(content)) return true;
                 }
                 pending_key = content;
             } else {
@@ -253,7 +253,10 @@ fn isPascalCase(key: []const u8) bool {
 /// `"@<ref>"` target-override key (labelle-engine#801) — patch structure,
 /// not a component reference; its VALUE is a component map.
 fn isTargetKey(key: []const u8) bool {
-    return key.len > 1 and key[0] == '@';
+    if (key.len > 1 and key[0] == '@') return true;
+    // Raw JSON-escaped spelling — same rule as
+    // `pack_refs/common.isTargetKey` (codex P2 on #650).
+    return key.len > 6 and std.mem.startsWith(u8, key, "\\u0040");
 }
 
 /// True iff the next significant byte at/after `from` (skipping whitespace

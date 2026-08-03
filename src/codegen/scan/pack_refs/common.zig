@@ -144,7 +144,15 @@ pub fn isPascalCase(name: []const u8) bool {
 /// must open a component map for their values, or the copy's shape drifts
 /// from the author's meaning.
 pub fn isTargetKey(name: []const u8) bool {
-    return name.len > 1 and name[0] == '@';
+    if (name.len > 1 and name[0] == '@') return true;
+    // The JSON-escaped spelling decodes to `@` at engine load. These
+    // walkers classify RAW bytes, so recognize it here too — otherwise
+    // pass 1 leaves an escaped target outside the synthesized wrapper
+    // and pass 2 treats its value as opaque payload, silently losing
+    // the pack-namespace rewrite on a supported engine (codex P2 on
+    // #650). The PascalCase analog (`\u0057orker`) is the broader
+    // pre-existing class tracked in #651.
+    return name.len > 6 and std.mem.startsWith(u8, name, "\\u0040");
 }
 
 /// A flat patch-content key at entity scope: PascalCase component

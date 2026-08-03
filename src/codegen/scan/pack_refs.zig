@@ -944,3 +944,29 @@ test "wrapFlatEntityComponents: a flat @ pair moves into the synthesized wrapper
     try std.testing.expect(target_at > wrapper_at);
     try std.testing.expect(std.mem.indexOf(u8, out, "citizens__Worker") != null);
 }
+
+test "rewritePackLocalRefs: the JSON-escaped @ spelling opens a component map too (labelle-engine#801)" {
+    const allocator = std.testing.allocator;
+    // `"\u0040slot"` decodes to `@slot` at engine load — the raw-byte
+    // walkers must treat it as a target key or the pack rewrite is
+    // silently lost on a supported engine (codex round 2 on #650).
+    const src =
+        \\{ "prefab": "base", "overrides": { "\u0040slot": { "Worker": { "hp": 9 } } } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"Worker"}, &.{}, "citizens");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"citizens__Worker\": { \"hp\": 9 }") != null);
+}
+
+test "wrapFlatEntityComponents: a flat escaped-@ pair rides into the wrapper (labelle-engine#801)" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{ "prefab": "base", "Worker": { "hp": 1 }, "\u0040slot": { "Position": { "x": 1 } } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"Worker"}, &.{}, "citizens");
+    defer allocator.free(out);
+    const wrapper_at = std.mem.indexOf(u8, out, "\"overrides\": {").?;
+    const target_at = std.mem.indexOf(u8, out, "\"\\u0040slot\":").?;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\"overrides\": {"));
+    try std.testing.expect(target_at > wrapper_at);
+}
