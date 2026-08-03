@@ -253,6 +253,11 @@ fn childScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
                 if (std.mem.eql(u8, k, "components") or std.mem.eql(u8, k, "overrides")) {
                     break :blk .component_map;
                 }
+                // A flat `@` target's value is a component map
+                // (labelle-engine#801) — its keys must be rewritten like
+                // any other component reference, or a pack-local name
+                // under `@` silently misses the namespace rewrite.
+                if (common.isTargetKey(k)) break :blk .component_map;
             }
             // Any other object field on an entity (`meta`, etc.) is opaque.
             break :blk .payload;
@@ -264,8 +269,17 @@ fn childScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
         // duplicate later `"root"` member lands here and stays dead-data
         // verbatim (CodeRabbit on #521).
         .file_container => .payload,
-        // A component's value, or anything already inside payload, stays opaque.
-        .component_map, .payload, .array_other => .payload,
+        // Inside a component map, a `@` target's value is ANOTHER
+        // component map (labelle-engine#801); a component's value is
+        // opaque payload.
+        .component_map => blk: {
+            if (pending_key) |k| {
+                if (common.isTargetKey(k)) break :blk .component_map;
+            }
+            break :blk .payload;
+        },
+        // Anything already inside payload stays opaque.
+        .payload, .array_other => .payload,
     };
 }
 

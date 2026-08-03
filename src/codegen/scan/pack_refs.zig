@@ -897,3 +897,50 @@ test "bundleHeaderLegacyEntitiesOffset: dead entities on a header are flagged, n
     try std.testing.expect(std.mem.indexOf(u8, out, "\"components\": { \"sky__SkyBody\": { \"role\": \"sun\" }") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "sky__SkyBody"));
 }
+
+test "rewritePackLocalRefs: component keys inside a wrapped @ target patch are rewritten (labelle-engine#801)" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{ "prefab": "base", "overrides": { "@slot": { "Worker": { "hp": 9 } } } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"Worker"}, &.{}, "citizens");
+    defer allocator.free(out);
+
+    // The `@` key itself is structure — never namespaced …
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"@slot\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__@slot") == null);
+    // … but the pack component key INSIDE the target patch is.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"citizens__Worker\": { \"hp\": 9 }") != null);
+}
+
+test "rewritePackLocalRefs: component keys inside a flat @ target patch are rewritten (labelle-engine#801)" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{ "prefab": "base", "@slot": { "Worker": { "hp": 9 } } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"Worker"}, &.{}, "citizens");
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__Worker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__@slot") == null);
+}
+
+test "wrapFlatEntityComponents: a flat @ pair moves into the synthesized wrapper (labelle-engine#801)" {
+    const allocator = std.testing.allocator;
+    // The flat pack-local `Worker` triggers the wrap; the `@slot` pair must
+    // ride into the SAME synthesized `overrides` wrapper — leaving it
+    // outside would manufacture a hybrid entry the author never wrote, and
+    // the engine would then warn wrapper-wins and DROP the target.
+    const src =
+        \\{ "prefab": "base", "Worker": { "hp": 1 }, "@slot": { "Position": { "x": 1 } } }
+    ;
+    const out = try rewritePackLocalRefs(allocator, src, &.{"Worker"}, &.{}, "citizens");
+    defer allocator.free(out);
+
+    const wrapper_at = std.mem.indexOf(u8, out, "\"overrides\": {").?;
+    const target_at = std.mem.indexOf(u8, out, "\"@slot\":").?;
+    // Exactly one wrapper, with the @ pair inside it.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\"overrides\": {"));
+    try std.testing.expect(target_at > wrapper_at);
+    try std.testing.expect(std.mem.indexOf(u8, out, "citizens__Worker") != null);
+}

@@ -136,6 +136,23 @@ pub fn isPascalCase(name: []const u8) bool {
     return name[0] >= 'A' and name[0] <= 'Z';
 }
 
+/// Byte-parity twin of the engine's `unified_format.zig` `isTargetKey`
+/// (labelle-engine#801): `"@<ref>"` on a prefab reference's override map
+/// targets a ref-named entity inside the referenced prefab's body. Like
+/// PascalCase component keys, `@` keys are flat patch CONTENT at entity
+/// scope — pass 1 must move them into the synthesized wrapper and pass 2
+/// must open a component map for their values, or the copy's shape drifts
+/// from the author's meaning.
+pub fn isTargetKey(name: []const u8) bool {
+    return name.len > 1 and name[0] == '@';
+}
+
+/// A flat patch-content key at entity scope: PascalCase component
+/// (RFC #596 axis 2) or `@` target (labelle-engine#801).
+pub fn isFlatComponentKey(name: []const u8) bool {
+    return isPascalCase(name) or isTargetKey(name);
+}
+
 /// The two array-valued entity-list keys the engine walks (`children` on any
 /// entity scope, legacy `entities` at file level). Shared between pass 2's
 /// `childArrayScope` and pass 1's flat-wrap recursion so the two walks can
@@ -181,7 +198,7 @@ pub fn isOnlyMetaHeaderObject(src: []const u8, open: usize) bool {
             std.mem.eql(u8, key, "components") or
             std.mem.eql(u8, key, "overrides") or
             std.mem.eql(u8, key, "ref") or
-            isPascalCase(key))
+            isFlatComponentKey(key))
         {
             // Any entity-shape key disqualifies — this is an entity that
             // happens to carry a `meta` field, not a file header.

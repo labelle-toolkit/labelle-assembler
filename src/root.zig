@@ -564,6 +564,33 @@ pub fn generate(
     const scene_manifests = try scene_manifest.parseSceneDir(allocator, scenes_target, jsonc_scene_names);
     defer scene_manifest.freeManifests(allocator, scene_manifests);
 
+    // ── `@` target-override version gate (labelle-engine#801) ──────────
+    // Compat checking is MAJOR-only (labelle-cli#269), so "new assembler +
+    // old engine pin" is a legal combo — and an engine older than the
+    // feature silently DROPS `@` keys, which is the exact silent no-op
+    // #801 exists to kill, reintroduced through the side door. Hard-error
+    // at generate instead. Covers scenes AND prefabs (a prefab body can
+    // use `@` on its own ref-array entries). Unparseable pins (`local:`
+    // dev overrides, branch pins) pass — see
+    // `engineSupportsTargetOverrides`.
+    if (!scene_manifest.engineSupportsTargetOverrides(cfg.engine_version)) {
+        const prefabs_target = try std.fs.path.join(allocator, &.{ target_dir, "prefabs" });
+        defer allocator.free(prefabs_target);
+        const hit: ?[]const u8 =
+            try scene_manifest.findTargetKeyUsage(allocator, scenes_target, jsonc_scene_names) orelse
+            try scene_manifest.findTargetKeyUsage(allocator, prefabs_target, prefab_names);
+        if (hit) |offender| {
+            defer allocator.free(offender);
+            std.debug.print(
+                "labelle-assembler: '{s}' uses \"@<ref>\" target-override keys (labelle-engine#801), but the pinned engine v{s} predates them (needs >= v{s}).\n" ++
+                    "  An older engine silently DROPS `@` keys — the exact failure this syntax replaces.\n" ++
+                    "  Bump `engine_version` in project.labelle, or remove the `@` overrides.\n",
+                .{ offender, cfg.engine_version, scene_manifest.MIN_ENGINE_FOR_TARGET_OVERRIDES },
+            );
+            return error.EngineTooOldForTargetOverrides;
+        }
+    }
+
     // ── Asset-Plugins Phase 1: scene auto-wiring (#575) ────────────────
     // A scene that instantiates any prefab from a pack gets that pack's
     // non-lazy resources auto-added to its asset manifest, so a scene using

@@ -113,10 +113,22 @@ fn childScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
                     break :blk .component_map;
                 }
                 if (std.mem.eql(u8, k, "root")) break :blk .entity;
+                // A flat `@` target's value is a component map
+                // (labelle-engine#801).
+                if (isTargetKey(k)) break :blk .component_map;
             }
             break :blk .payload;
         },
-        .component_map, .payload, .array_other => .payload,
+        // Inside a component map, a `@` target's value is ANOTHER
+        // component map (labelle-engine#801); a component's value is
+        // opaque payload.
+        .component_map => blk: {
+            if (pending_key) |k| {
+                if (isTargetKey(k)) break :blk .component_map;
+            }
+            break :blk .payload;
+        },
+        .payload, .array_other => .payload,
     };
 }
 
@@ -140,6 +152,12 @@ fn childArrayScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
 /// PascalCase convention RFC #596 axis 2 uses to mark component keys.
 fn isPascalCase(key: []const u8) bool {
     return key.len > 0 and key[0] >= 'A' and key[0] <= 'Z';
+}
+
+/// `"@<ref>"` target-override key (labelle-engine#801) — patch structure,
+/// not a component reference; its VALUE is a component map.
+fn isTargetKey(key: []const u8) bool {
+    return key.len > 1 and key[0] == '@';
 }
 
 /// True iff the next significant byte at/after `from` (skipping whitespace
@@ -249,8 +267,10 @@ pub fn collectComponentRefs(arena: std.mem.Allocator, src: []const u8) ![]CompRe
             if (is_key) {
                 const scope = topScope(scope_stack.items) orelse .entity;
                 const is_ref = switch (scope) {
-                    // Every key in a component map is a component name.
-                    .component_map => true,
+                    // Every key in a component map is a component name —
+                    // except a `@` target (labelle-engine#801), whose
+                    // value opens another component map instead.
+                    .component_map => !isTargetKey(content),
                     // A flat-form PascalCase key on an entity is a component.
                     .entity => isPascalCase(content),
                     else => false,
@@ -710,4 +730,30 @@ test "findBareLocalRefs: covers bundle and root-wrapper containers (#516)" {
         \\{ "root": { "SkyBody": {} } }
     , &.{"SkyBody"});
     try testing.expectEqual(@as(usize, 1), wrapper_refs.len);
+}
+
+test "collectComponentRefs: a @ target key is structure, its contents are refs (labelle-engine#801)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        \\{ "prefab": "x", "overrides": { "@slot": { "Worker": {} } } }
+    ;
+    const refs = try collectComponentRefs(arena, src);
+    try std.testing.expectEqual(@as(usize, 1), refs.len);
+    try std.testing.expectEqualStrings("Worker", refs[0].name);
+}
+
+test "collectComponentRefs: flat @ target contents are refs (labelle-engine#801)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        \\{ "prefab": "x", "@slot": { "Worker": {} } }
+    ;
+    const refs = try collectComponentRefs(arena, src);
+    try std.testing.expectEqual(@as(usize, 1), refs.len);
+    try std.testing.expectEqualStrings("Worker", refs[0].name);
 }

@@ -127,6 +127,13 @@ fn isPascalCase(key: []const u8) bool {
     return c >= 'A' and c <= 'Z';
 }
 
+/// `"@<ref>"` target-override key (labelle-engine#801). Rides the flat
+/// shape exactly like a PascalCase component key: it is patch CONTENT, so
+/// it participates in flat-form detection and the hybrid-form gate.
+fn isTargetKey(key: []const u8) bool {
+    return key.len > 1 and key[0] == '@';
+}
+
 fn isAllowedTopLevelKey(key: []const u8) bool {
     // RFC #596 axis 2: PascalCase keys at the file's top level are
     // component declarations on the flat-form root entity. The audit
@@ -135,6 +142,10 @@ fn isAllowedTopLevelKey(key: []const u8) bool {
     // here, so we accept any PascalCase key and rely on the loader's
     // warn-once path. This matches the audit's option C resolution.
     if (isPascalCase(key)) return true;
+    // `@` target-override keys on a flat-form reference root
+    // (labelle-engine#801) — content, not structure; the engine
+    // validates the ref names at load.
+    if (isTargetKey(key)) return true;
     for (ALLOWED_TOP_LEVEL_KEYS) |allowed| {
         if (std.mem.eql(u8, key, allowed)) return true;
     }
@@ -290,6 +301,7 @@ fn hasFlatEntityShapeKey(obj: std.json.ObjectMap) bool {
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
         if (isPascalCase(key)) return true;
+        if (isTargetKey(key)) return true;
         if (std.mem.eql(u8, key, "components")) return true;
         if (std.mem.eql(u8, key, "children")) return true;
         if (std.mem.eql(u8, key, "prefab")) return true;
@@ -322,7 +334,7 @@ pub fn checkHybridForm(obj: std.json.ObjectMap) ?[]const u8 {
     var iter = obj.iterator();
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
-        if (isPascalCase(key)) {
+        if (isPascalCase(key) or isTargetKey(key)) {
             has_pascal = true;
         } else if (std.mem.eql(u8, key, "overrides")) {
             has_overrides = true;
@@ -924,6 +936,112 @@ pub fn freeManifests(allocator: std.mem.Allocator, manifests: []const SceneManif
     for (manifests) |m| freeManifest(allocator, m);
     allocator.free(manifests);
 }
+
+// ── `@` target-override version gate (labelle-engine#801) ───────────────
+
+/// True iff `src` uses a `"@<ref>":` object KEY anywhere — the flat or
+/// wrapped `@` target-override syntax (labelle-engine#801). Textual scan
+/// with colon lookahead so `"@name"` VALUES (the `@ref` value syntax) never
+/// count. Conservative on malformed input: an unterminated string ends the
+/// scan with "not used".
+pub fn sourceUsesTargetKeys(src: []const u8) bool {
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            i = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+            const close = std.mem.indexOfPos(u8, src, i + 2, "*/");
+            i = if (close) |q| q + 2 else src.len;
+            continue;
+        }
+        if (c == '"') {
+            const content_start = i + 1;
+            var j = content_start;
+            while (j < src.len) : (j += 1) {
+                if (src[j] == '\\' and j + 1 < src.len) {
+                    j += 1;
+                    continue;
+                }
+                if (src[j] == '"') break;
+            }
+            if (j >= src.len) return false; // unterminated — stop
+            const content = src[content_start..j];
+            if (isTargetKey(content) and nextSignificantIsColonAt(src, j + 1)) return true;
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// Colon lookahead for `sourceUsesTargetKeys` — true iff the next
+/// significant byte (skipping whitespace/JSONC comments) is `:`, i.e. the
+/// preceding string literal was an object key.
+fn nextSignificantIsColonAt(src: []const u8, from: usize) bool {
+    var i = from;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            i = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+            const close = std.mem.indexOfPos(u8, src, i + 2, "*/");
+            i = if (close) |q| q + 2 else src.len;
+            continue;
+        }
+        return c == ':';
+    }
+    return false;
+}
+
+/// First engine release that understands `@` target-override keys
+/// (labelle-engine#801). Bump ONLY if the engine-side feature slips to a
+/// later minor.
+pub const MIN_ENGINE_FOR_TARGET_OVERRIDES = "2.11.0";
+
+/// True iff the pinned engine version understands `@` target overrides.
+/// PERMISSIVE on anything unparseable (`local:` overrides, branch pins):
+/// the gate exists to catch the "new assembler, old engine pin" skew where
+/// an old engine silently drops `@` keys — a pin we cannot parse is a
+/// deliberate dev setup, not that trap. Compat checking is MAJOR-only
+/// (labelle-cli#269), so this per-feature minimum is the only guard.
+pub fn engineSupportsTargetOverrides(engine_version: []const u8) bool {
+    const min = std.SemanticVersion.parse(MIN_ENGINE_FOR_TARGET_OVERRIDES) catch unreachable;
+    const pin = std.SemanticVersion.parse(engine_version) catch return true;
+    return pin.order(min) != .lt;
+}
+
+/// Scan every `<name>.jsonc` under `dir` for `@` target-override keys;
+/// returns the first file (allocator-owned name) that uses them, or null.
+/// Missing/unreadable files are skipped — this is a version gate, not a
+/// file validator (the real parse reports real errors).
+pub fn findTargetKeyUsage(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    names: []const []const u8,
+) !?[]const u8 {
+    for (names) |name| {
+        const rel = try std.fmt.allocPrint(allocator, "{s}/{s}.jsonc", .{ dir, name });
+        const source = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), rel, allocator, .limited(1024 * 1024)) catch {
+            allocator.free(rel);
+            continue;
+        };
+        defer allocator.free(source);
+        if (sourceUsesTargetKeys(source)) return rel;
+        allocator.free(rel);
+    }
+    return null;
+}
+
 
 /// Read every `<scenes_dir>/<name>.jsonc` (where `name` is one of `scene_names`,
 /// possibly with subfolder slashes), parse it, and return the manifest list in

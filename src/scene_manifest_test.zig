@@ -1108,3 +1108,64 @@ test "rfc596: file-header `{meta}` with extra keys is treated as an entity (posi
     const result = parseSceneSource(std.testing.allocator, "bad_header", "scenes/bad_header.jsonc", src);
     try std.testing.expectError(error.InvalidEntityShape, result);
 }
+
+// ── `@` target-override keys (labelle-engine#801) ────────────────────────
+
+test "801: @ keys at a flat reference root parse cleanly" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{ "prefab": "machine", "@slot": { "Storage": { "capacity": 12 } } }
+    ;
+    const m = try parseSceneSource(allocator, "s", "s.jsonc", src);
+    defer freeManifest(allocator, m);
+}
+
+test "801: @ key mixed with an overrides wrapper is HybridForm" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\{ "prefab": "machine", "@slot": { "Storage": {} }, "overrides": { "Position": { "x": 1 } } }
+    ;
+    const result = parseSceneSource(allocator, "s", "s.jsonc", src);
+    try std.testing.expectError(error.HybridForm, result);
+}
+
+test "801: checkHybridForm counts a @ key on the flat side" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{ "prefab": "x", "@slot": {}, "overrides": {} }
+    , .{});
+    defer parsed.deinit();
+    const conflict = checkHybridForm(parsed.value.object);
+    try std.testing.expect(conflict != null);
+    try std.testing.expectEqualStrings("overrides", conflict.?);
+}
+
+test "801: sourceUsesTargetKeys detects @ KEYS but not @ values" {
+    // Wrapped-form key.
+    try std.testing.expect(scene_manifest.sourceUsesTargetKeys(
+        \\{ "prefab": "m", "overrides": { "@slot": { "Storage": {} } } }
+    ));
+    // Flat-form key.
+    try std.testing.expect(scene_manifest.sourceUsesTargetKeys(
+        \\{ "prefab": "m", "@slot": { "Storage": {} } }
+    ));
+    // `@ref` VALUE syntax must NOT count — it predates #801 by years.
+    try std.testing.expect(!scene_manifest.sourceUsesTargetKeys(
+        \\{ "components": { "Worker": { "target": "@storage" } } }
+    ));
+    // A commented-out @ key must not count either.
+    try std.testing.expect(!scene_manifest.sourceUsesTargetKeys(
+        \\{ "prefab": "m" } // "@slot": { }
+    ));
+}
+
+test "801: engineSupportsTargetOverrides gates on 2.11.0, permissive on unparseable pins" {
+    const supports = scene_manifest.engineSupportsTargetOverrides;
+    try std.testing.expect(!supports("2.10.0"));
+    try std.testing.expect(supports("2.11.0"));
+    try std.testing.expect(supports("2.12.3"));
+    try std.testing.expect(supports("3.0.0"));
+    // `local:` dev overrides and branch pins cannot be compared — pass.
+    try std.testing.expect(supports("local:../labelle-engine"));
+    try std.testing.expect(supports("main"));
+}
