@@ -68,6 +68,102 @@ pub const builtin_component_names = [_][]const u8{
     "VideoComponent",
 };
 
+
+// ── `@` target-override usage detection (labelle-engine#801) ──────────────
+
+/// True iff `src` uses `@` target-override syntax (labelle-engine#801): a
+/// `"@<ref>"` (or JSON-escaped `"\u0040<ref>"`) object KEY at an entity or
+/// component-map scope. Scope-tracked with the same `childScope` model as
+/// `collectComponentRefs`, so `@`-keys inside opaque component PAYLOAD
+/// (`{ "Config": { "@id": "x" } }`) never count — payload keys are ordinary
+/// data, and a false positive here would spuriously hard-fail the
+/// assembler's engine-version gate (codex P2 on #650). `@ref` VALUES
+/// (`"target": "@storage"`) never count either (colon lookahead).
+///
+/// Allocation-free: the scope stack is a fixed 256-frame buffer; deeper
+/// nesting (not a real scene file) bails conservatively with `false` — the
+/// real parse rejects such a file long before the gate matters.
+pub fn sourceUsesTargetKeys(src: []const u8) bool {
+    var stack_buf: [256]Scope = undefined;
+    var sp: usize = 0;
+    var pending_key: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            i = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+            const close = std.mem.indexOfPos(u8, src, i + 2, "*/");
+            i = if (close) |q| q + 2 else src.len;
+            continue;
+        }
+        if (c == '{') {
+            if (sp >= stack_buf.len) return false; // pathological nesting
+            stack_buf[sp] = childScope(if (sp > 0) stack_buf[sp - 1] else null, pending_key);
+            sp += 1;
+            pending_key = null;
+            i += 1;
+            continue;
+        }
+        if (c == '[') {
+            if (sp >= stack_buf.len) return false;
+            stack_buf[sp] = childArrayScope(if (sp > 0) stack_buf[sp - 1] else null, pending_key);
+            sp += 1;
+            pending_key = null;
+            i += 1;
+            continue;
+        }
+        if (c == '}' or c == ']') {
+            if (sp > 0) sp -= 1;
+            pending_key = null;
+            i += 1;
+            continue;
+        }
+        if (c == ',') {
+            pending_key = null;
+            i += 1;
+            continue;
+        }
+        if (c == '"') {
+            const content_start = i + 1;
+            var j = content_start;
+            while (j < src.len) : (j += 1) {
+                if (src[j] == '\\' and j + 1 < src.len) {
+                    j += 1;
+                    continue;
+                }
+                if (src[j] == '"') break;
+            }
+            if (j >= src.len) return false; // unterminated — stop
+            const content = src[content_start..j];
+            const is_key = nextSignificantIsColon(src, j + 1);
+            if (is_key) {
+                const scope = if (sp > 0) stack_buf[sp - 1] else .entity;
+                if (scope == .entity or scope == .component_map) {
+                    if (isTargetKey(content) or isEscapedTargetKey(content)) return true;
+                }
+                pending_key = content;
+            } else {
+                pending_key = null;
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// A `"\u0040<ref>"` key — the JSON-escaped spelling of `@` that decodes
+/// to a target key at engine load (CodeRabbit on #650). Raw-byte check:
+/// backslash, `u0040`, then at least one ref character.
+fn isEscapedTargetKey(content: []const u8) bool {
+    return content.len > 6 and std.mem.startsWith(u8, content, "\\u0040");
+}
+
 // ── Component-reference collection ─────────────────────────────────────────
 
 /// One component-declaration reference found in a scene/prefab source: the

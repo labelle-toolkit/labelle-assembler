@@ -1169,3 +1169,28 @@ test "801: engineSupportsTargetOverrides gates on 2.11.0, permissive on unparsea
     try std.testing.expect(supports("local:../labelle-engine"));
     try std.testing.expect(supports("main"));
 }
+
+test "801: payload @ keys do not trip the gate (scope-aware detection)" {
+    // `@id` is ordinary component DATA — hard-failing generate on it
+    // would be a false positive (codex P2 on #650).
+    try std.testing.expect(!scene_manifest.sourceUsesTargetKeys(
+        \\{ "components": { "Config": { "@id": "x" } } }
+    ));
+    // Same shape one level deeper (payload stays payload).
+    try std.testing.expect(!scene_manifest.sourceUsesTargetKeys(
+        \\{ "prefab": "m", "overrides": { "Config": { "opts": { "@mode": 1 } } } }
+    ));
+}
+
+test "801: the JSON-escaped @ spelling still trips the gate" {
+    // `"@slot"` decodes to `@slot` at engine load — the gate must
+    // see through the escape or an old pin silently drops the override
+    // (CodeRabbit on #650).
+    try std.testing.expect(scene_manifest.sourceUsesTargetKeys(
+        \\{ "prefab": "m", "\u0040slot": { "Storage": {} } }
+    ));
+    // Escaped spelling inside an overrides wrapper too.
+    try std.testing.expect(scene_manifest.sourceUsesTargetKeys(
+        \\{ "prefab": "m", "overrides": { "\u0040slot": { "Storage": {} } } }
+    ));
+}

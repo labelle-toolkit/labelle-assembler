@@ -939,68 +939,13 @@ pub fn freeManifests(allocator: std.mem.Allocator, manifests: []const SceneManif
 
 // ── `@` target-override version gate (labelle-engine#801) ───────────────
 
-/// True iff `src` uses a `"@<ref>":` object KEY anywhere — the flat or
-/// wrapped `@` target-override syntax (labelle-engine#801). Textual scan
-/// with colon lookahead so `"@name"` VALUES (the `@ref` value syntax) never
-/// count. Conservative on malformed input: an unterminated string ends the
-/// scan with "not used".
+/// True iff `src` uses `@` target-override syntax (labelle-engine#801).
+/// Delegates to `scene_name_lint.sourceUsesTargetKeys` — the scope-aware
+/// walker — so opaque component-payload keys (`{ "Config": { "@id": … } }`)
+/// and `@ref` VALUES never count, while flat/wrapped `@` keys (including
+/// the JSON-escaped `"\u0040…"` spelling) do.
 pub fn sourceUsesTargetKeys(src: []const u8) bool {
-    var i: usize = 0;
-    while (i < src.len) {
-        const c = src[i];
-        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
-            i = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
-            continue;
-        }
-        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
-            const close = std.mem.indexOfPos(u8, src, i + 2, "*/");
-            i = if (close) |q| q + 2 else src.len;
-            continue;
-        }
-        if (c == '"') {
-            const content_start = i + 1;
-            var j = content_start;
-            while (j < src.len) : (j += 1) {
-                if (src[j] == '\\' and j + 1 < src.len) {
-                    j += 1;
-                    continue;
-                }
-                if (src[j] == '"') break;
-            }
-            if (j >= src.len) return false; // unterminated — stop
-            const content = src[content_start..j];
-            if (isTargetKey(content) and nextSignificantIsColonAt(src, j + 1)) return true;
-            i = j + 1;
-            continue;
-        }
-        i += 1;
-    }
-    return false;
-}
-
-/// Colon lookahead for `sourceUsesTargetKeys` — true iff the next
-/// significant byte (skipping whitespace/JSONC comments) is `:`, i.e. the
-/// preceding string literal was an object key.
-fn nextSignificantIsColonAt(src: []const u8, from: usize) bool {
-    var i = from;
-    while (i < src.len) {
-        const c = src[i];
-        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
-            i += 1;
-            continue;
-        }
-        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
-            i = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
-            continue;
-        }
-        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
-            const close = std.mem.indexOfPos(u8, src, i + 2, "*/");
-            i = if (close) |q| q + 2 else src.len;
-            continue;
-        }
-        return c == ':';
-    }
-    return false;
+    return @import("scene_name_lint.zig").sourceUsesTargetKeys(src);
 }
 
 /// First engine release that understands `@` target-override keys
@@ -1023,7 +968,12 @@ pub fn engineSupportsTargetOverrides(engine_version: []const u8) bool {
 /// Scan every `<name>.jsonc` under `dir` for `@` target-override keys;
 /// returns the first file (allocator-owned name) that uses them, or null.
 /// Missing/unreadable files are skipped — this is a version gate, not a
-/// file validator (the real parse reports real errors).
+/// file validator (the real parse reports real errors) — EXCEPT an
+/// oversized file (`error.StreamTooLong`): a file too big to scan may
+/// contain the keys the gate exists to catch, so skipping it would bypass
+/// the gate (CodeRabbit on #650). The 16 MiB ceiling is far above any
+/// real scene/prefab; each buffer is freed before the next file is read
+/// so peak memory stays one file, not the sum (codex P2 on #650).
 pub fn findTargetKeyUsage(
     allocator: std.mem.Allocator,
     dir: []const u8,
@@ -1031,13 +981,73 @@ pub fn findTargetKeyUsage(
 ) !?[]const u8 {
     for (names) |name| {
         const rel = try std.fmt.allocPrint(allocator, "{s}/{s}.jsonc", .{ dir, name });
-        const source = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), rel, allocator, .limited(1024 * 1024)) catch {
-            allocator.free(rel);
-            continue;
+        errdefer allocator.free(rel);
+        const source = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), rel, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+            error.StreamTooLong => {
+                stderrPrint(
+                    "labelle-assembler: '{s}' exceeds the 16 MiB scan ceiling for the target-override version gate — cannot verify it is free of `@` keys.\n",
+                    .{rel},
+                );
+                return err;
+            },
+            else => {
+                allocator.free(rel);
+                continue;
+            },
         };
-        defer allocator.free(source);
-        if (sourceUsesTargetKeys(source)) return rel;
+        const used = sourceUsesTargetKeys(source);
+        allocator.free(source);
+        if (used) return rel;
         allocator.free(rel);
+    }
+    return null;
+}
+
+/// `findTargetKeyUsage` over every `.jsonc` in a directory TREE — used for
+/// pack source dirs, whose file lists are not staged yet when the gate
+/// runs (codex P1 / CodeRabbit on #650). A missing directory is fine
+/// (packs need not ship prefabs or scenes). Returns the first offending
+/// path (allocator-owned), or null.
+pub fn findTargetKeyUsageInTree(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+) !?[]const u8 {
+    const io = config.globalIo();
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    var iter = dir.iterate();
+    while (iter.next(io) catch return null) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                const sub = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+                defer allocator.free(sub);
+                if (try findTargetKeyUsageInTree(allocator, sub)) |hit| return hit;
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".jsonc")) continue;
+                const rel = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+                errdefer allocator.free(rel);
+                const source = std.Io.Dir.cwd().readFileAlloc(io, rel, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+                    error.StreamTooLong => {
+                        stderrPrint(
+                            "labelle-assembler: '{s}' exceeds the 16 MiB scan ceiling for the target-override version gate — cannot verify it is free of `@` keys.\n",
+                            .{rel},
+                        );
+                        return err;
+                    },
+                    else => {
+                        allocator.free(rel);
+                        continue;
+                    },
+                };
+                const used = sourceUsesTargetKeys(source);
+                allocator.free(source);
+                if (used) return rel;
+                allocator.free(rel);
+            },
+            else => {},
+        }
     }
     return null;
 }
