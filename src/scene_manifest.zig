@@ -960,6 +960,14 @@ pub const MIN_ENGINE_FOR_TARGET_OVERRIDES = "2.11.0";
 /// deliberate dev setup, not that trap. Compat checking is MAJOR-only
 /// (labelle-cli#269), so this per-feature minimum is the only guard.
 pub fn engineSupportsTargetOverrides(engine_version: []const u8) bool {
+    // Classify with the repo's own release predicate FIRST: a
+    // digit-leading branch pin like `2.10.0-feature` is resolved
+    // verbatim as a git ref by `versionToGitRef`, yet
+    // `SemanticVersion.parse` would happily read it as a prerelease
+    // below the minimum and hard-reject a dev branch that may well
+    // carry the feature (codex round 3 on #650). Only true release
+    // pins are compared; everything else is permissive.
+    if (!config.isSemverVersion(engine_version)) return true;
     const min = std.SemanticVersion.parse(MIN_ENGINE_FOR_TARGET_OVERRIDES) catch unreachable;
     const pin = std.SemanticVersion.parse(engine_version) catch return true;
     return pin.order(min) != .lt;

@@ -1194,3 +1194,25 @@ test "801: the JSON-escaped @ spelling still trips the gate" {
         \\{ "prefab": "m", "overrides": { "\u0040slot": { "Storage": {} } } }
     ));
 }
+
+test "801: digit-leading branch pins stay permissive; deep nesting fails closed" {
+    const supports = scene_manifest.engineSupportsTargetOverrides;
+    // `2.10.0-feature` is a BRANCH ref (isSemverVersion=false), not a
+    // release below the minimum — permissive (codex round 3).
+    try std.testing.expect(supports("2.10.0-feature"));
+    try std.testing.expect(!supports("2.10.0"));
+
+    // A file too deeply nested to scan must count as "uses" so the
+    // gate cannot be bypassed by pathological payload (codex round 3).
+    const allocator = std.testing.allocator;
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(allocator);
+    try deep.appendSlice(allocator, "{ \"components\": { \"Config\": ");
+    var i: usize = 0;
+    while (i < 300) : (i += 1) try deep.appendSlice(allocator, "{ \"x\": ");
+    try deep.appendSlice(allocator, "1");
+    i = 0;
+    while (i < 300) : (i += 1) try deep.appendSlice(allocator, " }");
+    try deep.appendSlice(allocator, " } }");
+    try std.testing.expect(scene_manifest.sourceUsesTargetKeys(deep.items));
+}

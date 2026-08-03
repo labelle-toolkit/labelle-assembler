@@ -80,9 +80,13 @@ pub const builtin_component_names = [_][]const u8{
 /// assembler's engine-version gate (codex P2 on #650). `@ref` VALUES
 /// (`"target": "@storage"`) never count either (colon lookahead).
 ///
-/// Allocation-free: the scope stack is a fixed 256-frame buffer; deeper
-/// nesting (not a real scene file) bails conservatively with `false` — the
-/// real parse rejects such a file long before the gate matters.
+/// Allocation-free: the scope stack is a fixed 256-frame buffer. Deeper
+/// nesting fails CLOSED (`true`): the caller is a version gate, and
+/// returning `false` on an unscannable file would let an unexamined
+/// `@` key slip past onto an engine that silently drops it — the exact
+/// bypass the gate exists to prevent (codex round 3 on #650). A false
+/// positive here costs one loud generate error naming the file; 256
+/// levels of nesting is not a real scene either way.
 pub fn sourceUsesTargetKeys(src: []const u8) bool {
     var stack_buf: [256]Scope = undefined;
     var sp: usize = 0;
@@ -101,7 +105,7 @@ pub fn sourceUsesTargetKeys(src: []const u8) bool {
             continue;
         }
         if (c == '{') {
-            if (sp >= stack_buf.len) return false; // pathological nesting
+            if (sp >= stack_buf.len) return true; // fail closed — see doc
             stack_buf[sp] = childScope(if (sp > 0) stack_buf[sp - 1] else null, pending_key);
             sp += 1;
             pending_key = null;
@@ -109,7 +113,7 @@ pub fn sourceUsesTargetKeys(src: []const u8) bool {
             continue;
         }
         if (c == '[') {
-            if (sp >= stack_buf.len) return false;
+            if (sp >= stack_buf.len) return true; // fail closed — see doc
             stack_buf[sp] = childArrayScope(if (sp > 0) stack_buf[sp - 1] else null, pending_key);
             sp += 1;
             pending_key = null;
