@@ -969,7 +969,17 @@ pub fn engineSupportsTargetOverrides(engine_version: []const u8) bool {
     // pins are compared; everything else is permissive.
     if (!config.isSemverVersion(engine_version)) return true;
     const min = std.SemanticVersion.parse(MIN_ENGINE_FOR_TARGET_OVERRIDES) catch unreachable;
-    const pin = std.SemanticVersion.parse(engine_version) catch return true;
+    // A release-shaped pin that SemanticVersion cannot parse is the
+    // abbreviated `X.Y` form (isSemverVersion admits digits+dots with
+    // ≥1 dot) — normalize by appending `.0` and retry. Still
+    // unparsable (e.g. `1.2.3.4`) → FAIL CLOSED: once the release
+    // predicate matched, treating parse failure as a branch pin would
+    // let an old-release pin bypass the gate (codex round 4 on #650).
+    const pin = std.SemanticVersion.parse(engine_version) catch blk: {
+        var buf: [64]u8 = undefined;
+        const padded = std.fmt.bufPrint(&buf, "{s}.0", .{engine_version}) catch return false;
+        break :blk std.SemanticVersion.parse(padded) catch return false;
+    };
     return pin.order(min) != .lt;
 }
 

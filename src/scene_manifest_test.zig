@@ -1216,3 +1216,13 @@ test "801: digit-leading branch pins stay permissive; deep nesting fails closed"
     try deep.appendSlice(allocator, " } }");
     try std.testing.expect(scene_manifest.sourceUsesTargetKeys(deep.items));
 }
+
+test "801: abbreviated release pins normalize; release-shaped unparsables fail closed" {
+    const supports = scene_manifest.engineSupportsTargetOverrides;
+    // `2.10` is release-shaped → normalized to 2.10.0 → below minimum.
+    try std.testing.expect(!supports("2.10"));
+    // `2.11` normalizes to 2.11.0 → supported.
+    try std.testing.expect(supports("2.11"));
+    // Release-shaped but unparsable even padded → fail closed.
+    try std.testing.expect(!supports("1.2.3.4"));
+}
