@@ -225,17 +225,22 @@ const FlatWrap = struct {
         var emitted_any = false;
         var wrapper_done = false;
         for (obj.pairs) |p| {
-            if (wrap and common.isPascalCase(p.key)) {
-                // Every Pascal pair moves into the single wrapper, emitted
-                // at the FIRST Pascal pair's position (with its leading
-                // trivia); later Pascal pairs were already emitted inside.
+            if (wrap and common.isFlatComponentKey(p.key)) {
+                // Every flat patch-content pair (PascalCase component or
+                // `@` target, labelle-engine#801) moves into the single
+                // wrapper, emitted at the FIRST such pair's position (with
+                // its leading trivia); later ones were already emitted
+                // inside. Leaving an `@` pair OUTSIDE the synthesized
+                // wrapper would manufacture a hybrid entry the author never
+                // wrote — and the engine would then warn wrapper-wins and
+                // drop the target.
                 if (wrapper_done) continue;
                 if (emitted_any) try out.append(allocator, ',');
                 try out.appendSlice(allocator, s[p.lead_start..p.key_start]);
                 try out.appendSlice(allocator, if (is_reference) "\"overrides\": {" else "\"components\": {");
                 var first = true;
                 for (obj.pairs) |q| {
-                    if (!common.isPascalCase(q.key)) continue;
+                    if (!common.isFlatComponentKey(q.key)) continue;
                     if (!first) try out.append(allocator, ',');
                     if (first) {
                         // Its original lead was spent on the wrapper key.

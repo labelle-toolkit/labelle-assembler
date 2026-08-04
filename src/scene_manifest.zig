@@ -127,6 +127,13 @@ fn isPascalCase(key: []const u8) bool {
     return c >= 'A' and c <= 'Z';
 }
 
+/// `"@<ref>"` target-override key (labelle-engine#801). Rides the flat
+/// shape exactly like a PascalCase component key: it is patch CONTENT, so
+/// it participates in flat-form detection and the hybrid-form gate.
+fn isTargetKey(key: []const u8) bool {
+    return key.len > 1 and key[0] == '@';
+}
+
 fn isAllowedTopLevelKey(key: []const u8) bool {
     // RFC #596 axis 2: PascalCase keys at the file's top level are
     // component declarations on the flat-form root entity. The audit
@@ -135,6 +142,10 @@ fn isAllowedTopLevelKey(key: []const u8) bool {
     // here, so we accept any PascalCase key and rely on the loader's
     // warn-once path. This matches the audit's option C resolution.
     if (isPascalCase(key)) return true;
+    // `@` target-override keys on a flat-form reference root
+    // (labelle-engine#801) — content, not structure; the engine
+    // validates the ref names at load.
+    if (isTargetKey(key)) return true;
     for (ALLOWED_TOP_LEVEL_KEYS) |allowed| {
         if (std.mem.eql(u8, key, allowed)) return true;
     }
@@ -290,6 +301,7 @@ fn hasFlatEntityShapeKey(obj: std.json.ObjectMap) bool {
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
         if (isPascalCase(key)) return true;
+        if (isTargetKey(key)) return true;
         if (std.mem.eql(u8, key, "components")) return true;
         if (std.mem.eql(u8, key, "children")) return true;
         if (std.mem.eql(u8, key, "prefab")) return true;
@@ -322,7 +334,7 @@ pub fn checkHybridForm(obj: std.json.ObjectMap) ?[]const u8 {
     var iter = obj.iterator();
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
-        if (isPascalCase(key)) {
+        if (isPascalCase(key) or isTargetKey(key)) {
             has_pascal = true;
         } else if (std.mem.eql(u8, key, "overrides")) {
             has_overrides = true;
@@ -924,6 +936,140 @@ pub fn freeManifests(allocator: std.mem.Allocator, manifests: []const SceneManif
     for (manifests) |m| freeManifest(allocator, m);
     allocator.free(manifests);
 }
+
+// ── `@` target-override version gate (labelle-engine#801) ───────────────
+
+/// True iff `src` uses `@` target-override syntax (labelle-engine#801).
+/// Delegates to `scene_name_lint.sourceUsesTargetKeys` — the scope-aware
+/// walker — so opaque component-payload keys (`{ "Config": { "@id": … } }`)
+/// and `@ref` VALUES never count, while flat/wrapped `@` keys (including
+/// the JSON-escaped `"\u0040…"` spelling) do.
+pub fn sourceUsesTargetKeys(src: []const u8) bool {
+    return @import("scene_name_lint.zig").sourceUsesTargetKeys(src);
+}
+
+/// First engine release that understands `@` target-override keys
+/// (labelle-engine#801). Bump ONLY if the engine-side feature slips to a
+/// later minor.
+pub const MIN_ENGINE_FOR_TARGET_OVERRIDES = "2.11.0";
+
+/// True iff the pinned engine version understands `@` target overrides.
+/// PERMISSIVE on anything unparseable (`local:` overrides, branch pins):
+/// the gate exists to catch the "new assembler, old engine pin" skew where
+/// an old engine silently drops `@` keys — a pin we cannot parse is a
+/// deliberate dev setup, not that trap. Compat checking is MAJOR-only
+/// (labelle-cli#269), so this per-feature minimum is the only guard.
+pub fn engineSupportsTargetOverrides(engine_version: []const u8) bool {
+    // Classify with the repo's own release predicate FIRST: a
+    // digit-leading branch pin like `2.10.0-feature` is resolved
+    // verbatim as a git ref by `versionToGitRef`, yet
+    // `SemanticVersion.parse` would happily read it as a prerelease
+    // below the minimum and hard-reject a dev branch that may well
+    // carry the feature (codex round 3 on #650). Only true release
+    // pins are compared; everything else is permissive.
+    if (!config.isSemverVersion(engine_version)) return true;
+    const min = std.SemanticVersion.parse(MIN_ENGINE_FOR_TARGET_OVERRIDES) catch unreachable;
+    // A release-shaped pin that SemanticVersion cannot parse is the
+    // abbreviated `X.Y` form (isSemverVersion admits digits+dots with
+    // ≥1 dot) — normalize by appending `.0` and retry. Still
+    // unparsable (e.g. `1.2.3.4`) → FAIL CLOSED: once the release
+    // predicate matched, treating parse failure as a branch pin would
+    // let an old-release pin bypass the gate (codex round 4 on #650).
+    const pin = std.SemanticVersion.parse(engine_version) catch blk: {
+        var buf: [64]u8 = undefined;
+        const padded = std.fmt.bufPrint(&buf, "{s}.0", .{engine_version}) catch return false;
+        break :blk std.SemanticVersion.parse(padded) catch return false;
+    };
+    return pin.order(min) != .lt;
+}
+
+/// Scan every `<name>.jsonc` under `dir` for `@` target-override keys;
+/// returns the first file (allocator-owned name) that uses them, or null.
+/// Missing/unreadable files are skipped — this is a version gate, not a
+/// file validator (the real parse reports real errors) — EXCEPT an
+/// oversized file (`error.StreamTooLong`): a file too big to scan may
+/// contain the keys the gate exists to catch, so skipping it would bypass
+/// the gate (CodeRabbit on #650). The 16 MiB ceiling is far above any
+/// real scene/prefab; each buffer is freed before the next file is read
+/// so peak memory stays one file, not the sum (codex P2 on #650).
+pub fn findTargetKeyUsage(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    names: []const []const u8,
+) !?[]const u8 {
+    for (names) |name| {
+        const rel = try std.fmt.allocPrint(allocator, "{s}/{s}.jsonc", .{ dir, name });
+        errdefer allocator.free(rel);
+        const source = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), rel, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+            error.StreamTooLong => {
+                stderrPrint(
+                    "labelle-assembler: '{s}' exceeds the 16 MiB scan ceiling for the target-override version gate — cannot verify it is free of `@` keys.\n",
+                    .{rel},
+                );
+                return err;
+            },
+            else => {
+                allocator.free(rel);
+                continue;
+            },
+        };
+        const used = sourceUsesTargetKeys(source);
+        allocator.free(source);
+        if (used) return rel;
+        allocator.free(rel);
+    }
+    return null;
+}
+
+/// `findTargetKeyUsage` over every `.jsonc` in a directory TREE — used for
+/// pack source dirs, whose file lists are not staged yet when the gate
+/// runs (codex P1 / CodeRabbit on #650). A missing directory is fine
+/// (packs need not ship prefabs or scenes). Returns the first offending
+/// path (allocator-owned), or null.
+pub fn findTargetKeyUsageInTree(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+) !?[]const u8 {
+    const io = config.globalIo();
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    var iter = dir.iterate();
+    while (iter.next(io) catch return null) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                const sub = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+                defer allocator.free(sub);
+                if (try findTargetKeyUsageInTree(allocator, sub)) |hit| return hit;
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".jsonc")) continue;
+                const rel = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+                errdefer allocator.free(rel);
+                const source = std.Io.Dir.cwd().readFileAlloc(io, rel, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+                    error.StreamTooLong => {
+                        stderrPrint(
+                            "labelle-assembler: '{s}' exceeds the 16 MiB scan ceiling for the target-override version gate — cannot verify it is free of `@` keys.\n",
+                            .{rel},
+                        );
+                        return err;
+                    },
+                    else => {
+                        allocator.free(rel);
+                        continue;
+                    },
+                };
+                const used = sourceUsesTargetKeys(source);
+                allocator.free(source);
+                if (used) return rel;
+                allocator.free(rel);
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 
 /// Read every `<scenes_dir>/<name>.jsonc` (where `name` is one of `scene_names`,
 /// possibly with subfolder slashes), parse it, and return the manifest list in

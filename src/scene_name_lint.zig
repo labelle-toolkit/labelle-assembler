@@ -68,6 +68,106 @@ pub const builtin_component_names = [_][]const u8{
     "VideoComponent",
 };
 
+
+// ── `@` target-override usage detection (labelle-engine#801) ──────────────
+
+/// True iff `src` uses `@` target-override syntax (labelle-engine#801): a
+/// `"@<ref>"` (or JSON-escaped `"\u0040<ref>"`) object KEY at an entity or
+/// component-map scope. Scope-tracked with the same `childScope` model as
+/// `collectComponentRefs`, so `@`-keys inside opaque component PAYLOAD
+/// (`{ "Config": { "@id": "x" } }`) never count — payload keys are ordinary
+/// data, and a false positive here would spuriously hard-fail the
+/// assembler's engine-version gate (codex P2 on #650). `@ref` VALUES
+/// (`"target": "@storage"`) never count either (colon lookahead).
+///
+/// Allocation-free: the scope stack is a fixed 256-frame buffer. Deeper
+/// nesting fails CLOSED (`true`): the caller is a version gate, and
+/// returning `false` on an unscannable file would let an unexamined
+/// `@` key slip past onto an engine that silently drops it — the exact
+/// bypass the gate exists to prevent (codex round 3 on #650). A false
+/// positive here costs one loud generate error naming the file; 256
+/// levels of nesting is not a real scene either way.
+pub fn sourceUsesTargetKeys(src: []const u8) bool {
+    var stack_buf: [256]Scope = undefined;
+    var sp: usize = 0;
+    var pending_key: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            i = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+            const close = std.mem.indexOfPos(u8, src, i + 2, "*/");
+            i = if (close) |q| q + 2 else src.len;
+            continue;
+        }
+        if (c == '{') {
+            if (sp >= stack_buf.len) return true; // fail closed — see doc
+            stack_buf[sp] = childScope(if (sp > 0) stack_buf[sp - 1] else null, pending_key);
+            sp += 1;
+            pending_key = null;
+            i += 1;
+            continue;
+        }
+        if (c == '[') {
+            if (sp >= stack_buf.len) return true; // fail closed — see doc
+            stack_buf[sp] = childArrayScope(if (sp > 0) stack_buf[sp - 1] else null, pending_key);
+            sp += 1;
+            pending_key = null;
+            i += 1;
+            continue;
+        }
+        if (c == '}' or c == ']') {
+            if (sp > 0) sp -= 1;
+            pending_key = null;
+            i += 1;
+            continue;
+        }
+        if (c == ',') {
+            pending_key = null;
+            i += 1;
+            continue;
+        }
+        if (c == '"') {
+            const content_start = i + 1;
+            var j = content_start;
+            while (j < src.len) : (j += 1) {
+                if (src[j] == '\\' and j + 1 < src.len) {
+                    j += 1;
+                    continue;
+                }
+                if (src[j] == '"') break;
+            }
+            if (j >= src.len) return false; // unterminated — stop
+            const content = src[content_start..j];
+            const is_key = nextSignificantIsColon(src, j + 1);
+            if (is_key) {
+                const scope = if (sp > 0) stack_buf[sp - 1] else .entity;
+                if (scope == .entity or scope == .component_map) {
+                    if (isTargetKey(content)) return true;
+                }
+                pending_key = content;
+            } else {
+                pending_key = null;
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// A `"\u0040<ref>"` key — the JSON-escaped spelling of `@` that decodes
+/// to a target key at engine load (CodeRabbit on #650). Raw-byte check:
+/// backslash, `u0040`, then at least one ref character.
+fn isEscapedTargetKey(content: []const u8) bool {
+    return content.len > 6 and std.mem.startsWith(u8, content, "\\u0040");
+}
+
 // ── Component-reference collection ─────────────────────────────────────────
 
 /// One component-declaration reference found in a scene/prefab source: the
@@ -113,10 +213,22 @@ fn childScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
                     break :blk .component_map;
                 }
                 if (std.mem.eql(u8, k, "root")) break :blk .entity;
+                // A flat `@` target's value is a component map
+                // (labelle-engine#801).
+                if (isTargetKey(k)) break :blk .component_map;
             }
             break :blk .payload;
         },
-        .component_map, .payload, .array_other => .payload,
+        // Inside a component map, a `@` target's value is ANOTHER
+        // component map (labelle-engine#801); a component's value is
+        // opaque payload.
+        .component_map => blk: {
+            if (pending_key) |k| {
+                if (isTargetKey(k)) break :blk .component_map;
+            }
+            break :blk .payload;
+        },
+        .payload, .array_other => .payload,
     };
 }
 
@@ -140,6 +252,15 @@ fn childArrayScope(parent: ?Scope, pending_key: ?[]const u8) Scope {
 /// PascalCase convention RFC #596 axis 2 uses to mark component keys.
 fn isPascalCase(key: []const u8) bool {
     return key.len > 0 and key[0] >= 'A' and key[0] <= 'Z';
+}
+
+/// `"@<ref>"` target-override key (labelle-engine#801) — patch structure,
+/// not a component reference; its VALUE is a component map.
+fn isTargetKey(key: []const u8) bool {
+    if (key.len > 1 and key[0] == '@') return true;
+    // Raw JSON-escaped spelling — same rule as
+    // `pack_refs/common.isTargetKey` (codex P2 on #650).
+    return key.len > 6 and std.mem.startsWith(u8, key, "\\u0040");
 }
 
 /// True iff the next significant byte at/after `from` (skipping whitespace
@@ -249,8 +370,10 @@ pub fn collectComponentRefs(arena: std.mem.Allocator, src: []const u8) ![]CompRe
             if (is_key) {
                 const scope = topScope(scope_stack.items) orelse .entity;
                 const is_ref = switch (scope) {
-                    // Every key in a component map is a component name.
-                    .component_map => true,
+                    // Every key in a component map is a component name —
+                    // except a `@` target (labelle-engine#801), whose
+                    // value opens another component map instead.
+                    .component_map => !isTargetKey(content),
                     // A flat-form PascalCase key on an entity is a component.
                     .entity => isPascalCase(content),
                     else => false,
@@ -710,4 +833,30 @@ test "findBareLocalRefs: covers bundle and root-wrapper containers (#516)" {
         \\{ "root": { "SkyBody": {} } }
     , &.{"SkyBody"});
     try testing.expectEqual(@as(usize, 1), wrapper_refs.len);
+}
+
+test "collectComponentRefs: a @ target key is structure, its contents are refs (labelle-engine#801)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        \\{ "prefab": "x", "overrides": { "@slot": { "Worker": {} } } }
+    ;
+    const refs = try collectComponentRefs(arena, src);
+    try std.testing.expectEqual(@as(usize, 1), refs.len);
+    try std.testing.expectEqualStrings("Worker", refs[0].name);
+}
+
+test "collectComponentRefs: flat @ target contents are refs (labelle-engine#801)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        \\{ "prefab": "x", "@slot": { "Worker": {} } }
+    ;
+    const refs = try collectComponentRefs(arena, src);
+    try std.testing.expectEqual(@as(usize, 1), refs.len);
+    try std.testing.expectEqualStrings("Worker", refs[0].name);
 }
