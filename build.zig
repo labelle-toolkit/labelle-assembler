@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
     // Bump all three together when moving the engine default (their
     // build.zig.zon pins/floors must agree — read them from the tags).
     const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.26.0";
-    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.7.0";
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.11.0";
     const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.28.2";
     // Version this assembler binary stamps into a freshly scaffolded
     // project.labelle's `assembler_version` field. Defaults to the
