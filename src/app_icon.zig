@@ -5,7 +5,7 @@
 /// stock Android launcher icon on the home screen — a poor first
 /// impression for `labelle run`.
 ///
-/// To fix that, the assembler ships a bundled "Labelle" branded PNG and
+/// To fix that, the assembler ships a bundled "labelle" branded PNG and
 /// injects it into the generated build tree whenever the project does
 /// NOT declare its own icon. A project that sets `app_icon` suppresses
 /// the default entirely — no behavior change for games that already
@@ -17,9 +17,20 @@ const ProjectConfig = config.ProjectConfig;
 
 /// The bundled default icon, embedded into the assembler binary so a
 /// `labelle` install stays self-contained (no separate asset download).
-/// 512×512 RGBA PNG — the "Labelle" branded logo. Stored under `src/`
-/// because `@embedFile` only reaches files inside the module's package
-/// path (the assembler's root source file lives in `src/`).
+/// 512×512 opaque RGB PNG — the "labelle" branded logo. Stored under
+/// `src/` because `@embedFile` only reaches files inside the module's
+/// package path (the assembler's root source file lives in `src/`).
+///
+/// RGB, not RGBA: the art is fully opaque, so an alpha plane would be a
+/// constant 255 costing ~60KB of embedded binary for nothing. Consumers
+/// that need four channels should ask their decoder for RGBA (stb_image
+/// takes a desired-channel count).
+///
+/// 512 is the largest size any current consumer needs (Android's
+/// xxxhdpi launcher mipmap is 192). Regenerate this — and any future
+/// higher-density or iOS 1024 variant — from the 2048×2048 master at
+/// `assets/default_icon_master.png`, which is the source of truth and
+/// deliberately NOT under `src/` so it never lands in the binary.
 pub const default_icon_bytes = @embedFile("assets/default_icon.png");
 
 /// Path, relative to the generated target dir, where the default icon
@@ -111,6 +122,27 @@ test "default_icon_bytes: is a non-empty PNG" {
     try std.testing.expect(default_icon_bytes.len > 8);
     const png_magic = [_]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
     try std.testing.expectEqualSlices(u8, &png_magic, default_icon_bytes[0..8]);
+}
+
+test "default_icon_bytes: is a 512x512 opaque-RGB PNG" {
+    // Guards the documented contract against a careless art swap: the
+    // packaging layer scales this into launcher mipmaps, so a wrong size
+    // or a surprise alpha plane would surface as a bad icon on-device
+    // rather than a build failure.
+    //
+    // IHDR is the mandatory first chunk: 8-byte magic, 4-byte length,
+    // 4-byte type, then width/height as big-endian u32.
+    try std.testing.expect(default_icon_bytes.len > 26);
+    try std.testing.expectEqualSlices(u8, "IHDR", default_icon_bytes[12..16]);
+
+    const width = std.mem.readInt(u32, default_icon_bytes[16..20], .big);
+    const height = std.mem.readInt(u32, default_icon_bytes[20..24], .big);
+    try std.testing.expectEqual(@as(u32, 512), width);
+    try std.testing.expectEqual(@as(u32, 512), height);
+
+    // Color type 2 = truecolour (RGB, no alpha) at 8 bits per channel.
+    try std.testing.expectEqual(@as(u8, 8), default_icon_bytes[24]);
+    try std.testing.expectEqual(@as(u8, 2), default_icon_bytes[25]);
 }
 
 test "injectDefaultIcon: writes the default into a fresh target without app_icon" {
