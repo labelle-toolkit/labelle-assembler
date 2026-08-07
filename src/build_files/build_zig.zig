@@ -166,6 +166,26 @@ fn emitConstantsImport(w: anytype, artifact: []const u8, constants: bool) !void 
     try w.print("    {s}.root_module.addImport(\"constants\", constants_mod);\n", .{artifact});
 }
 
+/// The i18n module (RFC-I18N phase 1), mirroring the constants wiring: a
+/// self-contained generated module (it imports only std), overrideImport into
+/// game_mod, addImport per artifact via emitI18nImport.
+fn emitI18nModule(w: anytype, i18n: bool) !void {
+    if (!i18n) return;
+    try w.writeByte('\n');
+    try w.writeAll("    // i18n (RFC-I18N phase 1): generated from locales/*.jsonc.\n");
+    try w.writeAll("    const i18n_mod = b.createModule(.{\n");
+    try w.writeAll("        .root_source_file = b.path(\"i18n.zig\"),\n");
+    try w.writeAll("        .target = target,\n");
+    try w.writeAll("        .optimize = optimize,\n");
+    try w.writeAll("    });\n");
+    try w.writeAll("    overrideImport(game_mod, \"i18n\", i18n_mod);\n");
+}
+
+fn emitI18nImport(w: anytype, artifact: []const u8, i18n: bool) !void {
+    if (!i18n) return;
+    try w.print("    {s}.root_module.addImport(\"i18n\", i18n_mod);\n", .{artifact});
+}
+
 /// Emit one `const pack__<prefix>_mod = b.createModule(...)` per light pack
 /// (assembler#498 PR 2, "wire the wall"), rooted at the generated
 /// `packs/<name>/__pack_root.zig`.
@@ -717,6 +737,10 @@ pub const BuildZigOptions = struct {
     /// project with no `constants/` directory keeps a byte-identical
     /// build.zig, the invariant every optional feature holds.
     constants: bool = false,
+    /// i18n (RFC-I18N phase 1): when true, the phase emitted i18n.zig and
+    /// every artifact gains an `i18n` module -- `@import("i18n").t(K.menu.play)`.
+    /// Defaults to false: locale-less projects keep a byte-identical build.zig.
+    i18n: bool = false,
     /// Game scripts promoted to NAMED build-system modules because they
     /// export `pub const FlowNodes` (labelle-assembler#240 Gap 2). Each
     /// gets a `b.createModule` decl wired into BOTH the exe/root and
@@ -1126,6 +1150,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // is path-imported by the root module.
     try emitPromotedScriptModules(w, cfg, opts.promoted_scripts);
     try emitConstantsModule(w, opts.constants);
+    try emitI18nModule(w, opts.i18n);
 
     // Per-pack modules (assembler#498 PR 2) — declared beside the promoted
     // script modules, before any target artifact that imports them.
@@ -1156,6 +1181,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → wasm root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "wasm", opts.promoted_scripts);
         try emitConstantsImport(w, "wasm", opts.constants);
+        try emitI18nImport(w, "wasm", opts.i18n);
         try emitPackImports(w, "wasm", opts.pack_modules);
 
         // Plugin native build hooks (#518).
@@ -1225,6 +1251,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → iOS exe root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
         try emitConstantsImport(w, "exe", opts.constants);
+        try emitI18nImport(w, "exe", opts.i18n);
         try emitPackImports(w, "exe", opts.pack_modules);
 
         // Plugin native build hooks (#518).
@@ -1290,6 +1317,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → Android lib root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "lib", opts.promoted_scripts);
         try emitConstantsImport(w, "lib", opts.constants);
+        try emitI18nImport(w, "lib", opts.i18n);
         try emitPackImports(w, "lib", opts.pack_modules);
 
         // Plugin native build hooks (#518).
@@ -1354,6 +1382,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // `@import("<named>")` (labelle-assembler#240 Gap 2).
             try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
             try emitConstantsImport(w, "exe", opts.constants);
+            try emitI18nImport(w, "exe", opts.i18n);
             try emitPackImports(w, "exe", opts.pack_modules);
 
             // Plugin native build hooks (#518): let a plugin contribute C/C++
@@ -1402,6 +1431,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // `__tests_root.zig` reaches the same named modules.
         try emitPromotedScriptImports(w, "test_root", opts.promoted_scripts);
         try emitConstantsImport(w, "test_root", opts.constants);
+        try emitI18nImport(w, "test_root", opts.i18n);
         try emitPackImports(w, "test_root", opts.pack_modules);
 
         // manifest-v2 GENERIC desktop (PR 8): mirror the native linkage

@@ -19,6 +19,7 @@ pub const flow_catalog = @import("flow_catalog.zig");
 pub const pack_manifest = @import("manifest.zig");
 const build_files = @import("build_files.zig");
 const constants_phase = @import("constants_phase.zig");
+const i18n_phase = @import("i18n_phase.zig");
 const plugin_build_hook = @import("plugin_build_hook.zig");
 pub const plugin_build_steps = @import("plugin_build_steps.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
@@ -65,6 +66,7 @@ test {
     // goldens were dormant until this reference.
     _ = @import("build_files.zig");
     _ = @import("constants_phase.zig"); // covers constants_yaml too
+    _ = @import("i18n_phase.zig"); // covers i18n_locales + usage_scan too
     _ = @import("pack_validate.zig");
     _ = @import("check.zig");
     _ = @import("scene_name_lint.zig");
@@ -564,6 +566,17 @@ pub fn generate(
         try pack_consts.append(allocator, .{ .name = e.plugin.name, .src_dir = src });
     }
     const has_constants = try constants_phase.runPhase(allocator, game_dir, target_dir, pack_consts.items);
+
+    // i18n (RFC-I18N phase 1, labelle-engine#811): scan locales/*.jsonc and
+    // emit the i18n module -- Key, K, the baked table, t()/setLocale. Same
+    // no-op invariant as constants: no locales/ -> nothing emitted,
+    // byte-identical build.zig.
+    const has_i18n = try i18n_phase.runPhase(
+        allocator,
+        game_dir,
+        target_dir,
+        if (cfg.i18n) |ic| .{ .default = ic.default, .reference = ic.reference, .strict = ic.strict } else null,
+    );
 
     // Copy game folders into target dir and scan file stems in one pass.
     // Folders that need scanning use copyAndScan; assets is copy-only.
@@ -1789,6 +1802,7 @@ pub fn generate(
     const build_zig = try build_files.generateBuildZig(allocator, cfg_modules, .{
         .is_tests_target = is_tests_target,
         .constants = has_constants,
+        .i18n = has_i18n,
         .promoted_scripts = promoted_scripts,
         .pack_modules = pack_modules.items,
         .plugin_hooks = plugin_hooks,
