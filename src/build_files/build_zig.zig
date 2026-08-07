@@ -143,6 +143,29 @@ fn emitPromotedScriptImports(
     }
 }
 
+/// Emit the `constants` module (RFC-CONSTANTS phase 1): a pure-data module
+/// rooted at the generated `constants.zig`. No imports of its own -- it is
+/// nested `pub const` declarations and nothing else -- which is why this is
+/// one createModule and not a mirror of a script's import surface. Wired into
+/// `game_mod` here; each artifact's root module picks it up via
+/// `emitConstantsImport` after its creation.
+fn emitConstantsModule(w: anytype, constants: bool) !void {
+    if (!constants) return;
+    try w.writeByte('\n');
+    try w.writeAll("    // Game constants (RFC-CONSTANTS phase 1): generated from constants/*.yaml.\n");
+    try w.writeAll("    const constants_mod = b.createModule(.{\n");
+    try w.writeAll("        .root_source_file = b.path(\"constants.zig\"),\n");
+    try w.writeAll("        .target = target,\n");
+    try w.writeAll("        .optimize = optimize,\n");
+    try w.writeAll("    });\n");
+    try w.writeAll("    overrideImport(game_mod, \"constants\", constants_mod);\n");
+}
+
+fn emitConstantsImport(w: anytype, artifact: []const u8, constants: bool) !void {
+    if (!constants) return;
+    try w.print("    {s}.root_module.addImport(\"constants\", constants_mod);\n", .{artifact});
+}
+
 /// Emit one `const pack__<prefix>_mod = b.createModule(...)` per light pack
 /// (assembler#498 PR 2, "wire the wall"), rooted at the generated
 /// `packs/<name>/__pack_root.zig`.
@@ -687,6 +710,13 @@ pub const BuildZigOptions = struct {
     /// and the backend artifact link. Used by `generateTestsTarget`
     /// in root.zig for `.labelle/tests/build.zig` (issue #83).
     is_tests_target: bool = false,
+    /// Game constants (RFC-CONSTANTS phase 1, labelle-engine#811): when
+    /// true, the phase emitted `constants.zig` into the target dir and every
+    /// artifact gains a `constants` module so game code reaches
+    /// `@import("constants").C.<domain>.<name>`. Defaults to false -- a
+    /// project with no `constants/` directory keeps a byte-identical
+    /// build.zig, the invariant every optional feature holds.
+    constants: bool = false,
     /// Game scripts promoted to NAMED build-system modules because they
     /// export `pub const FlowNodes` (labelle-assembler#240 Gap 2). Each
     /// gets a `b.createModule` decl wired into BOTH the exe/root and
@@ -1095,6 +1125,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // / `@import("<plugin>")` resolve exactly as they do when the file
     // is path-imported by the root module.
     try emitPromotedScriptModules(w, cfg, opts.promoted_scripts);
+    try emitConstantsModule(w, opts.constants);
 
     // Per-pack modules (assembler#498 PR 2) — declared beside the promoted
     // script modules, before any target artifact that imports them.
@@ -1124,6 +1155,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         // Promoted game-script modules → wasm root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "wasm", opts.promoted_scripts);
+        try emitConstantsImport(w, "wasm", opts.constants);
         try emitPackImports(w, "wasm", opts.pack_modules);
 
         // Plugin native build hooks (#518).
@@ -1192,6 +1224,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         // Promoted game-script modules → iOS exe root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
+        try emitConstantsImport(w, "exe", opts.constants);
         try emitPackImports(w, "exe", opts.pack_modules);
 
         // Plugin native build hooks (#518).
@@ -1256,6 +1289,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         // Promoted game-script modules → Android lib root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "lib", opts.promoted_scripts);
+        try emitConstantsImport(w, "lib", opts.constants);
         try emitPackImports(w, "lib", opts.pack_modules);
 
         // Plugin native build hooks (#518).
@@ -1319,6 +1353,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // module so main.zig's `AllScripts` + `PluginFlowNodes` can
             // `@import("<named>")` (labelle-assembler#240 Gap 2).
             try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
+            try emitConstantsImport(w, "exe", opts.constants);
             try emitPackImports(w, "exe", opts.pack_modules);
 
             // Plugin native build hooks (#518): let a plugin contribute C/C++
@@ -1366,6 +1401,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // tests target (issue #83) shares this codepath, so its
         // `__tests_root.zig` reaches the same named modules.
         try emitPromotedScriptImports(w, "test_root", opts.promoted_scripts);
+        try emitConstantsImport(w, "test_root", opts.constants);
         try emitPackImports(w, "test_root", opts.pack_modules);
 
         // manifest-v2 GENERIC desktop (PR 8): mirror the native linkage

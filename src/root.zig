@@ -18,6 +18,7 @@ pub const flow_scanner = @import("flow_scanner.zig");
 pub const flow_catalog = @import("flow_catalog.zig");
 pub const pack_manifest = @import("manifest.zig");
 const build_files = @import("build_files.zig");
+const constants_phase = @import("constants_phase.zig");
 const plugin_build_hook = @import("plugin_build_hook.zig");
 pub const plugin_build_steps = @import("plugin_build_steps.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
@@ -63,6 +64,7 @@ test {
     // the #518 emitPluginBuildHooks pins and the #586 emitPluginBuildSteps
     // goldens were dormant until this reference.
     _ = @import("build_files.zig");
+    _ = @import("constants_phase.zig"); // covers constants_yaml too
     _ = @import("pack_validate.zig");
     _ = @import("check.zig");
     _ = @import("scene_name_lint.zig");
@@ -546,6 +548,13 @@ pub fn generate(
     );
 
     try cwd.createDirPath(io, target_dir);
+
+    // Game constants (RFC-CONSTANTS phase 1, labelle-engine#811): scan
+    // `constants/*.yaml` through the strict subset and emit `constants.zig`
+    // beside the other generated files. False -- the common case, no
+    // `constants/` directory -- emits nothing and the build.zig stays
+    // byte-identical; the flag drives the module wiring below.
+    const has_constants = try constants_phase.runPhase(allocator, game_dir, target_dir);
 
     // Copy game folders into target dir and scan file stems in one pass.
     // Folders that need scanning use copyAndScan; assets is copy-only.
@@ -1770,6 +1779,7 @@ pub fn generate(
     // `cfg.plugins`.
     const build_zig = try build_files.generateBuildZig(allocator, cfg_modules, .{
         .is_tests_target = is_tests_target,
+        .constants = has_constants,
         .promoted_scripts = promoted_scripts,
         .pack_modules = pack_modules.items,
         .plugin_hooks = plugin_hooks,
