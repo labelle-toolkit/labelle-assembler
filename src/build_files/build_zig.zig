@@ -92,6 +92,8 @@ fn emitPromotedScriptModules(
     w: anytype,
     cfg: ProjectConfig,
     promoted_scripts: []const scan.PromotedScript,
+    constants: bool,
+    i18n: bool,
 ) !void {
     if (promoted_scripts.len == 0) return;
     try w.writeByte('\n');
@@ -118,6 +120,8 @@ fn emitPromotedScriptModules(
         for (cfg.plugins) |plugin| {
             try w.print("            .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
         }
+        if (constants) try w.writeAll("            .{ .name = \"constants\", .module = constants_mod },\n");
+        if (i18n) try w.writeAll("            .{ .name = \"i18n\", .module = i18n_mod },\n");
         try w.writeAll("        },\n");
         try w.writeAll("    });\n");
         // The `game` module (shim) reaches the script via the named import
@@ -141,6 +145,49 @@ fn emitPromotedScriptImports(
     for (promoted_scripts) |s| {
         try w.print("    {s}.root_module.addImport(\"{s}\", {s}_mod);\n", .{ artifact, s.module_name, s.module_name });
     }
+}
+
+/// Emit the `constants` module (RFC-CONSTANTS phase 1): a pure-data module
+/// rooted at the generated `constants.zig`. No imports of its own -- it is
+/// nested `pub const` declarations and nothing else -- which is why this is
+/// one createModule and not a mirror of a script's import surface. Wired into
+/// `game_mod` here; each artifact's root module picks it up via
+/// `emitConstantsImport` after its creation.
+fn emitConstantsModule(w: anytype, constants: bool) !void {
+    if (!constants) return;
+    try w.writeByte('\n');
+    try w.writeAll("    // Game constants (RFC-CONSTANTS phase 1): generated from constants/*.yaml.\n");
+    try w.writeAll("    const constants_mod = b.createModule(.{\n");
+    try w.writeAll("        .root_source_file = b.path(\"constants.zig\"),\n");
+    try w.writeAll("        .target = target,\n");
+    try w.writeAll("        .optimize = optimize,\n");
+    try w.writeAll("    });\n");
+    try w.writeAll("    overrideImport(game_mod, \"constants\", constants_mod);\n");
+}
+
+fn emitConstantsImport(w: anytype, artifact: []const u8, constants: bool) !void {
+    if (!constants) return;
+    try w.print("    {s}.root_module.addImport(\"constants\", constants_mod);\n", .{artifact});
+}
+
+/// The i18n module (RFC-I18N phase 1), mirroring the constants wiring: a
+/// self-contained generated module (it imports only std), overrideImport into
+/// game_mod, addImport per artifact via emitI18nImport.
+fn emitI18nModule(w: anytype, i18n: bool) !void {
+    if (!i18n) return;
+    try w.writeByte('\n');
+    try w.writeAll("    // i18n (RFC-I18N phase 1): generated from locales/*.jsonc.\n");
+    try w.writeAll("    const i18n_mod = b.createModule(.{\n");
+    try w.writeAll("        .root_source_file = b.path(\"i18n.zig\"),\n");
+    try w.writeAll("        .target = target,\n");
+    try w.writeAll("        .optimize = optimize,\n");
+    try w.writeAll("    });\n");
+    try w.writeAll("    overrideImport(game_mod, \"i18n\", i18n_mod);\n");
+}
+
+fn emitI18nImport(w: anytype, artifact: []const u8, i18n: bool) !void {
+    if (!i18n) return;
+    try w.print("    {s}.root_module.addImport(\"i18n\", i18n_mod);\n", .{artifact});
 }
 
 /// Emit one `const pack__<prefix>_mod = b.createModule(...)` per light pack
@@ -168,6 +215,8 @@ fn emitPackModules(
     w: anytype,
     cfg: ProjectConfig,
     pack_modules: []const pack_root.PackModule,
+    constants: bool,
+    i18n: bool,
 ) !void {
     if (pack_modules.len == 0) return;
     try w.writeByte('\n');
@@ -196,6 +245,12 @@ fn emitPackModules(
         for (cfg.plugins) |plugin| {
             try w.print("            .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
         }
+        // Generated data modules: a pack's own scripts are the likeliest
+        // readers of its own constants/strings (which is why the usage
+        // scanner covers pack sources), and this isolated table is the only
+        // way `@import("constants")` resolves for them.
+        if (constants) try w.writeAll("            .{ .name = \"constants\", .module = constants_mod },\n");
+        if (i18n) try w.writeAll("            .{ .name = \"i18n\", .module = i18n_mod },\n");
         try w.writeAll("        },\n");
         try w.writeAll("    });\n");
         // Self-import (#498 PR 3): pack code reaches its own module root —
@@ -687,6 +742,17 @@ pub const BuildZigOptions = struct {
     /// and the backend artifact link. Used by `generateTestsTarget`
     /// in root.zig for `.labelle/tests/build.zig` (issue #83).
     is_tests_target: bool = false,
+    /// Game constants (RFC-CONSTANTS phase 1, labelle-engine#811): when
+    /// true, the phase emitted `constants.zig` into the target dir and every
+    /// artifact gains a `constants` module so game code reaches
+    /// `@import("constants").C.<domain>.<name>`. Defaults to false -- a
+    /// project with no `constants/` directory keeps a byte-identical
+    /// build.zig, the invariant every optional feature holds.
+    constants: bool = false,
+    /// i18n (RFC-I18N phase 1): when true, the phase emitted i18n.zig and
+    /// every artifact gains an `i18n` module -- `@import("i18n").t(K.menu.play)`.
+    /// Defaults to false: locale-less projects keep a byte-identical build.zig.
+    i18n: bool = false,
     /// Game scripts promoted to NAMED build-system modules because they
     /// export `pub const FlowNodes` (labelle-assembler#240 Gap 2). Each
     /// gets a `b.createModule` decl wired into BOTH the exe/root and
@@ -904,7 +970,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // decls AND by `emitPromotedScriptModules` (`.target = target`). Emit the
         // alias whenever ANY consumer needs it — including promoted scripts on an
         // otherwise plugin/ECS/GUI-free game (PR #466 Finding 1).
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0 or
+            opts.constants or opts.i18n or opts.pack_modules.len > 0)
+        {
             try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
         }
         // manifest-v2 ios: emit the core/gfx/engine dep decls WITHOUT the unrolled
@@ -918,7 +986,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // promoted-scripts condition so `target` is defined whenever any consumer
         // needs it — a promoted-scripts + no-plugin/ECS/GUI android game previously
         // emitted an undefined `target` (PR #466 Finding 1).
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0 or
+            opts.constants or opts.i18n or opts.pack_modules.len > 0)
+        {
             try tpl.writeSection(build_zig_tmpl, "android_target_alias", w);
         }
         // manifest-v2 android: emit the core/gfx/engine dep decls WITHOUT the
@@ -1094,11 +1164,19 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // ecs/gui backends) so the script's own `@import("labelle-engine")`
     // / `@import("<plugin>")` resolve exactly as they do when the file
     // is path-imported by the root module.
-    try emitPromotedScriptModules(w, cfg, opts.promoted_scripts);
+    // Generated data modules FIRST: promoted-script and pack modules import
+    // them, so `constants_mod` / `i18n_mod` must already be in scope. A
+    // FlowNodes-bearing script or a pack script reading its own constants
+    // compiles under its own module, whose import table does not inherit
+    // game_mod's -- without these entries, valid `@import("constants")` in
+    // exactly the sources the usage scanner covers failed to resolve.
+    try emitConstantsModule(w, opts.constants);
+    try emitI18nModule(w, opts.i18n);
+    try emitPromotedScriptModules(w, cfg, opts.promoted_scripts, opts.constants, opts.i18n);
 
     // Per-pack modules (assembler#498 PR 2) — declared beside the promoted
     // script modules, before any target artifact that imports them.
-    try emitPackModules(w, cfg, opts.pack_modules);
+    try emitPackModules(w, cfg, opts.pack_modules, opts.constants, opts.i18n);
 
     if (cfg.platform == .wasm) {
         // manifest-v2 wasm: no emsdk-helper import in the generated build.zig — the
@@ -1124,6 +1202,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         // Promoted game-script modules → wasm root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "wasm", opts.promoted_scripts);
+        try emitConstantsImport(w, "wasm", opts.constants);
+        try emitI18nImport(w, "wasm", opts.i18n);
         try emitPackImports(w, "wasm", opts.pack_modules);
 
         // Plugin native build hooks (#518).
@@ -1192,6 +1272,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         // Promoted game-script modules → iOS exe root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
+        try emitConstantsImport(w, "exe", opts.constants);
+        try emitI18nImport(w, "exe", opts.i18n);
         try emitPackImports(w, "exe", opts.pack_modules);
 
         // Plugin native build hooks (#518).
@@ -1256,6 +1338,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
 
         // Promoted game-script modules → Android lib root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "lib", opts.promoted_scripts);
+        try emitConstantsImport(w, "lib", opts.constants);
+        try emitI18nImport(w, "lib", opts.i18n);
         try emitPackImports(w, "lib", opts.pack_modules);
 
         // Plugin native build hooks (#518).
@@ -1319,6 +1403,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // module so main.zig's `AllScripts` + `PluginFlowNodes` can
             // `@import("<named>")` (labelle-assembler#240 Gap 2).
             try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
+            try emitConstantsImport(w, "exe", opts.constants);
+            try emitI18nImport(w, "exe", opts.i18n);
             try emitPackImports(w, "exe", opts.pack_modules);
 
             // Plugin native build hooks (#518): let a plugin contribute C/C++
@@ -1366,6 +1452,8 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // tests target (issue #83) shares this codepath, so its
         // `__tests_root.zig` reaches the same named modules.
         try emitPromotedScriptImports(w, "test_root", opts.promoted_scripts);
+        try emitConstantsImport(w, "test_root", opts.constants);
+        try emitI18nImport(w, "test_root", opts.i18n);
         try emitPackImports(w, "test_root", opts.pack_modules);
 
         // manifest-v2 GENERIC desktop (PR 8): mirror the native linkage
@@ -1771,14 +1859,13 @@ test "emitPluginBuildSteps: the csharp shape (#617) — link-less dotnet publish
     // output) into the exe's install dir, ordered after the publish and
     // reached from the default install step — `zig build` alone yields
     // the assembly beside the binary.
-    try testing.expect(std.mem.indexOf(u8, out,
-        "    const plugin_scripting_runtime_outputs = b.addInstallDirectory(.{\n" ++
-            "        .source_dir = .{ .cwd_relative = plugin_scripting_build_cache },\n" ++
-            "        .install_dir = .bin,\n" ++
-            "        .install_subdir = \"\",\n" ++
-            "    });\n" ++
-            "    plugin_scripting_runtime_outputs.step.dependOn(&plugin_scripting_build_step_0.step);\n" ++
-            "    b.getInstallStep().dependOn(&plugin_scripting_runtime_outputs.step);\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    const plugin_scripting_runtime_outputs = b.addInstallDirectory(.{\n" ++
+        "        .source_dir = .{ .cwd_relative = plugin_scripting_build_cache },\n" ++
+        "        .install_dir = .bin,\n" ++
+        "        .install_subdir = \"\",\n" ++
+        "    });\n" ++
+        "    plugin_scripting_runtime_outputs.step.dependOn(&plugin_scripting_build_step_0.step);\n" ++
+        "    b.getInstallStep().dependOn(&plugin_scripting_runtime_outputs.step);\n") != null);
 }
 
 test "emitPluginBuildSteps: runtime outputs stage on the exe target only (never wasm/lib)" {

@@ -323,6 +323,21 @@ pub const IosConfig = struct {
 
 // ── Android Configuration ──────────────────────────────────────────
 
+/// RFC-I18N §8. `.default` is what the player sees at first launch;
+/// `.reference` is which locale defines the canonical key set and is the
+/// backfill source for gaps. They coincide for most games, which is why
+/// `.reference` falls back to `.default` — they come apart when a studio
+/// authors keys in English but ships Portuguese first.
+pub const I18nConfig = struct {
+    /// REQUIRED — the locale the game starts in. No implicit "en".
+    default: []const u8,
+    /// The locale keys are authored in. Defaults to `.default`.
+    reference: ?[]const u8 = null,
+    /// Promote coverage warnings (a used key missing from a locale) to build
+    /// errors — the setting a release build turns on.
+    strict: bool = false,
+};
+
 pub const AndroidConfig = struct {
     app_name: []const u8 = "",
     package_name: []const u8 = "", // e.g. "com.labelle.mygame"
@@ -785,6 +800,12 @@ pub const ProjectConfig = struct {
 
     /// Android configuration — parsed from project.labelle `.android` section.
     android: ?AndroidConfig = null,
+
+    /// i18n configuration — parsed from project.labelle `.i18n` section
+    /// (RFC-I18N §8, labelle-engine#811). Mandatory whenever `locales/`
+    /// exists: a game's shipping language is a product decision, not
+    /// something the build should guess from a filename.
+    i18n: ?I18nConfig = null,
 
     /// Pinned assembler version (Phase 3 of RFC #122).
     /// When set, the CLI resolves the assembler binary from the cache at

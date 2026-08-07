@@ -94,6 +94,14 @@ pub const PackManifest = struct {
     /// loudly in a Rust project, naming both sides). Absent = the pack ships
     /// no language scripts (every pack before this ticket) → byte-identical.
     requires_language: ?[]const u8 = null,
+    /// The locale this pack's keys are authored in (RFC-I18N §2.2,
+    /// labelle-engine#811) — the backfill source for the pack's own gaps.
+    /// The chain is locale → pack reference → project reference: a pack
+    /// shipping en+fr in a game authored in pt still backfills its keys from
+    /// its own English, not from a project reference that never contained
+    /// them. Absent = the project's reference, which is correct for in-tree
+    /// packs authored alongside the game.
+    i18n_reference: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PackManifest) void {
