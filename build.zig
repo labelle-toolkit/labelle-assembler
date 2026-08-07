@@ -19,12 +19,14 @@ pub fn build(b: *std.Build) void {
     // Keep this trio a MUTUALLY COMPATIBLE set: a fresh `labelle init` resolves
     // these defaults, so a mismatch fails `labelle build` before any user code.
     // Set verified end-to-end (init → generate → full compile) for
-    // core 1.26.0 / engine 2.7.0 / gfx 1.28.2 with cli 1.59.0 (v0.95.0 release
-    // wave, labelle-assembler#646). engine v2.7.0 floors core >= 1.24.0 and
-    // gfx >= 1.28.0; gfx v1.28.2 pins core v1.26.0 — the trio agrees.
+    // core 1.27.0 / engine 2.11.0 / gfx 1.28.2 with cli 1.59.0. engine
+    // v2.11.0 floors core >= 1.27.0 (core's `ChildrenComponent` went
+    // allocator-taking, labelle-core#65/#66) and gfx >= 1.28.0 — the trio
+    // agrees. (v0.96.0 bumped engine 2.7.0 → 2.11.0 while leaving core at
+    // 1.26.0, so every fresh `labelle init` scaffold failed to compile.)
     // Bump all three together when moving the engine default (their
     // build.zig.zon pins/floors must agree — read them from the tags).
-    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.26.0";
+    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.27.0";
     const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.11.0";
     const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.28.2";
     // Version this assembler binary stamps into a freshly scaffolded
