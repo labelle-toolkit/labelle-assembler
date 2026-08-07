@@ -1,0 +1,10 @@
+# No line-ending translation, anywhere. The committed blobs are LF.
+#
+# Why this matters here more than in most repos: src/templates/*.txt are
+# @embedFile'd into the assembler and test/goldens/* are byte-compared against
+# generator output. With core.autocrlf=true (the Windows default), checkout
+# hands the embed CRLF while the writer emits LF, so every golden test fails
+# on a CLEAN checkout -- 49 of them -- for one platform and nobody else. A
+# red that reproduces only for one developer teaches everyone that red is
+# normal, which is worse than a real failure.
+* -text
