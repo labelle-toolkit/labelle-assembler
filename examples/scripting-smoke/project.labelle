@@ -32,7 +32,7 @@
     // THE consumer path under test: the scripting plugin fetched from its
     // real repo at a real tag, with the one-language-per-project param
     // (#584/#589) that arms the assembler's scripting splice (#593).
-    // v0.2.0 ships the declare tool (`tools/declare`), so the capability
+    // v0.2.1 ships the declare tool (`tools/declare`), so the capability
     // probe (#598) passes and generate ALSO runs declare mode (#585) for
     // real: the chunk-scope `labelle.component("Hunger", ...)` in
     // scripts/behavior.lua becomes a codegen'd `scripting_components.zig`

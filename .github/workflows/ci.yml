@@ -369,7 +369,7 @@ jobs:
       # The REAL consumer chain, nothing mocked:
       #
       #   project.labelle `.params.language = "lua"` on the labelle-scripting
-      #   plugin (fetched from GitHub at v0.2.0) → splice embeds
+      #   plugin (fetched from GitHub at v0.2.1) → splice embeds
       #   scripts/behavior.lua (the scripts/ convention — labelle-engine#237)
       #   + registers it pre-VM-boot → labelle-null's
       #   headless template binds `engine.script_contract` → per-frame
@@ -378,7 +378,7 @@ jobs:
       #   Position, emits a custom `lua_ping` event AND receives it back,
       #   plus the engine's own `engine__tick`.
       #
-      # v0.2.0 also ships the declare tool, so this run exercises DECLARE
+      # v0.2.1 also ships the declare tool, so this run exercises DECLARE
       # MODE (#585/#598) end-to-end against the real thing: generate builds
       # `labelle-declare` from the resolved dep (`zig build labelle-declare`),
       # runs it over the collected scripts/ sources, and codegens the behavior's chunk-scope
@@ -399,7 +399,7 @@ jobs:
           # cache. The backend needs no fetch — `backend_package` pins the
           # sibling labelle-null checkout (see the clone step above).
           # generate then ALSO builds + runs the dep's real declare tool
-          # (fetching its lua.org dep on first build) — see the step
+          # (fetching its Lua dep -- the GitHub-hosted mirror since v0.2.1 -- on first build) — see the step
           # comment above.
           $ASM install --project-root .
           $ASM generate --project-root .
@@ -421,7 +421,7 @@ jobs:
           # Build wiring: the plugin's -Dlanguage option.
           grep -qF '.language = .lua' .labelle/null_desktop/build.zig
           # Declare mode (#585/#598): the REAL labelle-declare tool ran from
-          # the resolved v0.2.0 dep and codegened the script-declared
+          # the resolved v0.2.1 dep and codegened the script-declared
           # component into the target...
           C=.labelle/null_desktop/scripting_components.zig
           grep -qF 'pub const Hunger = struct' $C
