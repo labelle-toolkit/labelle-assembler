@@ -18,6 +18,8 @@ pub const flow_scanner = @import("flow_scanner.zig");
 pub const flow_catalog = @import("flow_catalog.zig");
 pub const pack_manifest = @import("manifest.zig");
 const build_files = @import("build_files.zig");
+const constants_phase = @import("constants_phase.zig");
+const i18n_phase = @import("i18n_phase.zig");
 const plugin_build_hook = @import("plugin_build_hook.zig");
 pub const plugin_build_steps = @import("plugin_build_steps.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");
@@ -63,6 +65,8 @@ test {
     // the #518 emitPluginBuildHooks pins and the #586 emitPluginBuildSteps
     // goldens were dormant until this reference.
     _ = @import("build_files.zig");
+    _ = @import("constants_phase.zig"); // covers constants_yaml too
+    _ = @import("i18n_phase.zig"); // covers i18n_locales + usage_scan too
     _ = @import("pack_validate.zig");
     _ = @import("check.zig");
     _ = @import("scene_name_lint.zig");
@@ -546,6 +550,56 @@ pub fn generate(
     );
 
     try cwd.createDirPath(io, target_dir);
+
+    // Game constants (RFC-CONSTANTS phase 1, labelle-engine#811): scan
+    // `constants/*.yaml` through the strict subset and emit `constants.zig`
+    // beside the other generated files. False -- the common case, no
+    // `constants/` directory -- emits nothing and the build.zig stays
+    // byte-identical; the flag drives the module wiring below.
+    var pack_consts: std.ArrayList(constants_phase.PackConstants) = .empty;
+    defer {
+        for (pack_consts.items) |pc| allocator.free(pc.src_dir);
+        pack_consts.deinit(allocator);
+    }
+    for (pack_entries.items) |e| {
+        const src = try e.resolveSrcDir(allocator, game_dir);
+        try pack_consts.append(allocator, .{ .name = e.plugin.name, .src_dir = src });
+    }
+    // A plugin named like a generated data module would be silently replaced by
+    // the overrideImport wiring; refuse the collision by name.
+    for (cfg.plugins) |plugin| {
+        if (std.mem.eql(u8, plugin.name, "constants") or std.mem.eql(u8, plugin.name, "i18n")) {
+            std.log.err("plugin name '{s}' collides with the generated {s} module (RFC in labelle-engine#811); rename the plugin", .{ plugin.name, plugin.name });
+            return error.ReservedPluginName;
+        }
+    }
+
+    const has_constants = try constants_phase.runPhase(allocator, game_dir, target_dir, pack_consts.items, !is_tests_target);
+
+    // i18n (RFC-I18N phase 1, labelle-engine#811): scan locales/*.jsonc and
+    // emit the i18n module -- Key, K, the baked table, t()/setLocale. Same
+    // no-op invariant as constants: no locales/ -> nothing emitted,
+    // byte-identical build.zig.
+    // Pack locales (phase 3) ride the same resolved src dirs as pack
+    // constants; the per-pack reference comes from pack.labelle's
+    // `.i18n_reference` (RFC-I18N §2.2).
+    var pack_locs: std.ArrayList(i18n_phase.PackLocales) = .empty;
+    defer pack_locs.deinit(allocator);
+    for (pack_entries.items, 0..) |e, pi| {
+        try pack_locs.append(allocator, .{
+            .name = e.plugin.name,
+            .src_dir = pack_consts.items[pi].src_dir,
+            .reference = e.manifest.i18n_reference,
+        });
+    }
+    const has_i18n = try i18n_phase.runPhase(
+        allocator,
+        game_dir,
+        target_dir,
+        if (cfg.i18n) |ic| .{ .default = ic.default, .reference = ic.reference, .strict = ic.strict } else null,
+        pack_locs.items,
+        !is_tests_target,
+    );
 
     // Copy game folders into target dir and scan file stems in one pass.
     // Folders that need scanning use copyAndScan; assets is copy-only.
@@ -1770,6 +1824,8 @@ pub fn generate(
     // `cfg.plugins`.
     const build_zig = try build_files.generateBuildZig(allocator, cfg_modules, .{
         .is_tests_target = is_tests_target,
+        .constants = has_constants,
+        .i18n = has_i18n,
         .promoted_scripts = promoted_scripts,
         .pack_modules = pack_modules.items,
         .plugin_hooks = plugin_hooks,
