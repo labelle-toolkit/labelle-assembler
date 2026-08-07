@@ -669,12 +669,38 @@ fn emitModule(
     try w.writeAll("};\n\n");
 
     try w.writeAll(
-        \\/// The translated string for a key, in the active locale. Zero-cost:
-        \\/// a table lookup with a comptime index, no allocation, no failure
-        \\/// path. The sentinel means it hands directly to cimgui.
+        \\// ---- LABELLE_LOCALE (RFC-I18N section 8, startup resolution) --------
+        \\// The dev/CI override is applied by the module itself, lazily, on the
+        \\// first lookup -- no generated-main wiring, and it works identically
+        \\// under every lifecycle style. An explicit setLocale() before the
+        \\// first lookup wins over the env var: a live choice outranks a dev
+        \\// knob. Same getenv pattern as labelle-engine's runtime_env.zig --
+        \\// comptime-guarded so libc-less targets (wasm/wasi) compile the
+        \\// return-early branch only.
+        \\var env_checked = false;
+        \\
+        \\fn ensureEnvLocale() void {
+        \\    if (env_checked) return;
+        \\    env_checked = true;
+        \\    if (comptime builtin.os.tag == .wasi or !builtin.link_libc) return;
+        \\    const raw = std.c.getenv("LABELLE_LOCALE") orelse return;
+        \\    const val = std.mem.span(raw);
+        \\    if (val.len == 0) return;
+        \\    // Unknown tags are ignored, never an error: a leaked dev var must
+        \\    // not be able to break a player's run.
+        \\    for (tags, 0..) |t_, i| {
+        \\        if (std.mem.eql(u8, t_, val)) active = i;
+        \\    }
+        \\}
+        \\
+        \\/// The translated string for a key, in the active locale. Zero-cost
+        \\/// after the first call: a table lookup with a comptime index, no
+        \\/// allocation, no failure path. The sentinel means it hands directly
+        \\/// to cimgui.
         \\pub fn t(comptime key: Key) [:0]const u8 {
         \\    comptime if (interp_names[@intFromEnum(key)] != null)
         \\        @compileError("this key has placeholders; use tf(key, .{...})");
+        \\    ensureEnvLocale();
         \\    return table[active][@intFromEnum(key)];
         \\}
         \\
@@ -688,6 +714,7 @@ fn emitModule(
         \\/// component. Call resetFrameArena() once per frame to make the
         \\/// lifetime exact.
         \\pub fn tf(comptime key: Key, args: anytype) [:0]const u8 {
+        \\    ensureEnvLocale();
         \\    const idx = comptime @intFromEnum(key);
         \\    const arg_names = comptime (interp_names[idx] orelse
         \\        @compileError("this key has no placeholders; use t(key)"));
@@ -787,8 +814,11 @@ fn emitModule(
         \\}
         \\
         \\/// Switches the active locale. Returns false (and changes nothing)
-        \\/// for a tag no locale file declared.
+        \\/// for a tag no locale file declared. An explicit call also settles
+        \\/// the LABELLE_LOCALE question: a live choice outranks the dev knob,
+        \\/// so the lazy env check will not overwrite this later.
         \\pub fn setLocale(tag: []const u8) bool {
+        \\    env_checked = true;
         \\    for (tags, 0..) |t_, i| {
         \\        if (std.mem.eql(u8, t_, tag)) {
         \\            active = i;
@@ -799,6 +829,7 @@ fn emitModule(
         \\}
         \\
         \\pub fn activeLocale() [:0]const u8 {
+        \\    ensureEnvLocale();
         \\    return tags[active];
         \\}
         \\
@@ -807,15 +838,17 @@ fn emitModule(
         \\    return &tags;
         \\}
         \\
-        \\/// Startup hook for the LABELLE_LOCALE dev/CI override (RFC-I18N
-        \\/// section 8): pass the env var's value, or null. An unknown tag is
-        \\/// ignored -- it must not be able to break a player's run if it leaks
-        \\/// into a shipped environment.
+        \\/// Manual override hook: pass a tag (or null) to apply an externally
+        \\/// read LABELLE_LOCALE value. Rarely needed now that the module reads
+        \\/// the env var itself (ensureEnvLocale); kept for hosts without libc
+        \\/// where the game reads its environment some other way. Unknown tags
+        \\/// are ignored -- a leaked dev var must not break a player's run.
         \\pub fn initFromEnvValue(v: ?[]const u8) void {
         \\    if (v) |tag| _ = setLocale(tag);
         \\}
         \\
         \\const std = @import("std");
+        \\const builtin = @import("builtin");
         \\
     );
 }
