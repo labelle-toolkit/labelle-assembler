@@ -76,21 +76,34 @@ pub const Marks = struct {
 pub fn scanSource(marks: *Marks, cfg: Config, source: []const u8) Allocator.Error!void {
     const arena = marks.arena;
 
-    // Names bound to the root namespace ("C-roots"). Discovered top-down,
-    // which matches how Zig files read.
+    // Names bound to the root namespace ("C-roots"). Zig declarations are
+    // order-independent -- a function above the file-level
+    // `const C = @import(...)` may use C -- so the file is scanned twice:
+    // the first pass exists only to discover root bindings, the second marks
+    // uses with the full table in hand. Marks are sets, so anything the
+    // discovery pass already recorded is recorded again harmlessly.
     var roots = std.StringHashMap(void).init(arena);
+    var discovery = Marks.init(arena);
+    try scanPass(&discovery, cfg, source, &roots);
+    // An escape seen in pass one is real regardless of binding order.
+    if (discovery.all) marks.all = true;
+    try scanPass(marks, cfg, source, &roots);
+}
+
+fn scanPass(marks: *Marks, cfg: Config, source: []const u8, roots: *std.StringHashMap(void)) Allocator.Error!void {
+    const arena = marks.arena;
 
     var it = Tokenizer{ .source = source };
     while (it.next()) |tok| {
         // `@import("<mod>")` — classify what follows.
         if (tok.kind == .import and std.mem.eql(u8, tok.text, cfg.module_name)) {
-            try consumeAfterModule(marks, cfg, &it, arena, &roots);
+            try consumeAfterModule(marks, cfg, &it, arena, roots);
             continue;
         }
         if (tok.kind != .ident) continue;
 
         if (roots.contains(tok.text)) {
-            try consumeChainOrBinding(marks, &it, arena, &roots);
+            try consumeChainOrBinding(marks, &it, arena, roots);
             continue;
         }
 
@@ -284,13 +297,24 @@ const Tokenizer = struct {
     }
 
     fn matchImport(self: *Tokenizer) ?[]const u8 {
-        const rest = self.source[self.i..];
-        const prefix = "@import(\"";
-        if (!std.mem.startsWith(u8, rest, prefix)) return null;
-        const name_start = self.i + prefix.len;
+        // Tolerates whitespace around the parens (`@import ("x")`) -- legal
+        // Zig even if zig fmt would collapse it, and a scanner that requires
+        // formatted source under-marks, the forbidden direction.
+        var j = self.i;
+        const kw = "@import";
+        if (!std.mem.startsWith(u8, self.source[j..], kw)) return null;
+        j += kw.len;
+        while (j < self.source.len and (self.source[j] == ' ' or self.source[j] == '\t' or self.source[j] == '\n' or self.source[j] == '\r')) j += 1;
+        if (j >= self.source.len or self.source[j] != '(') return null;
+        j += 1;
+        while (j < self.source.len and (self.source[j] == ' ' or self.source[j] == '\t' or self.source[j] == '\n' or self.source[j] == '\r')) j += 1;
+        if (j >= self.source.len or self.source[j] != '"') return null;
+        const name_start = j + 1;
         const end = std.mem.indexOfScalarPos(u8, self.source, name_start, '"') orelse return null;
-        if (end + 1 >= self.source.len or self.source[end + 1] != ')') return null;
-        self.i = end + 2;
+        var k = end + 1;
+        while (k < self.source.len and (self.source[k] == ' ' or self.source[k] == '\t' or self.source[k] == '\n' or self.source[k] == '\r')) k += 1;
+        if (k >= self.source.len or self.source[k] != ')') return null;
+        self.i = k + 1;
         return self.source[name_start..end];
     }
 
@@ -458,6 +482,27 @@ test "other imports and other symbols on the module are ignored" {
     );
     try testing.expect(!m.all);
     try testing.expect(!m.covers("decay"));
+}
+
+test "use above the binding still counts -- declarations are order-independent" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const m = try scanned(arena_state.allocator(),
+        \\pub fn early() f32 { return C.decay.hunger.rate; }
+        \\const C = @import("constants").C;
+    );
+    try testing.expect(m.covers("decay.hunger.rate"));
+    try testing.expect(!m.all);
+}
+
+test "whitespace inside the import call is tolerated" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const m = try scanned(arena_state.allocator(),
+        \\const C = @import ( "constants" ).C;
+        \\pub fn f() f32 { return C.decay.rate; }
+    );
+    try testing.expect(m.covers("decay.rate"));
 }
 
 test "no import, no marks" {

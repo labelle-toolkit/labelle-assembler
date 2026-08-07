@@ -565,7 +565,16 @@ pub fn generate(
         const src = try e.resolveSrcDir(allocator, game_dir);
         try pack_consts.append(allocator, .{ .name = e.plugin.name, .src_dir = src });
     }
-    const has_constants = try constants_phase.runPhase(allocator, game_dir, target_dir, pack_consts.items);
+    // A plugin named like a generated data module would be silently replaced by
+    // the overrideImport wiring; refuse the collision by name.
+    for (cfg.plugins) |plugin| {
+        if (std.mem.eql(u8, plugin.name, "constants") or std.mem.eql(u8, plugin.name, "i18n")) {
+            std.log.err("plugin name '{s}' collides with the generated {s} module (RFC in labelle-engine#811); rename the plugin", .{ plugin.name, plugin.name });
+            return error.ReservedPluginName;
+        }
+    }
+
+    const has_constants = try constants_phase.runPhase(allocator, game_dir, target_dir, pack_consts.items, !is_tests_target);
 
     // i18n (RFC-I18N phase 1, labelle-engine#811): scan locales/*.jsonc and
     // emit the i18n module -- Key, K, the baked table, t()/setLocale. Same
@@ -589,6 +598,7 @@ pub fn generate(
         target_dir,
         if (cfg.i18n) |ic| .{ .default = ic.default, .reference = ic.reference, .strict = ic.strict } else null,
         pack_locs.items,
+        !is_tests_target,
     );
 
     // Copy game folders into target dir and scan file stems in one pass.

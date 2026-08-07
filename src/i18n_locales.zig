@@ -42,7 +42,11 @@ pub const ParseResult = union(enum) {
 
 /// Parses one locale file. Arena-owned, like constants_yaml.parse.
 pub fn parse(arena: Allocator, source: []const u8) Allocator.Error!ParseResult {
-    const stripped = try stripJsonc(arena, source);
+    const stripped_r = try stripJsonc(arena, source);
+    if (stripped_r.unterminated_comment) {
+        return .{ .fail = .{ .msg = try arena.dupe(u8, "unterminated /* comment") } };
+    }
+    const stripped = stripped_r.text;
 
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, stripped, .{}) catch {
         return .{ .fail = .{ .msg = try arena.dupe(u8, "not valid JSON (after comment stripping)") } };
@@ -103,8 +107,11 @@ fn flatten(
 /// Strips `//` and `/* */` comments outside string literals, plus trailing
 /// commas before `}` / `]` (JSONC's two liberties the std parser lacks).
 /// Comment bytes become spaces so any offsets std.json reports still line up.
-pub fn stripJsonc(arena: Allocator, source: []const u8) Allocator.Error![]u8 {
+pub const Stripped = struct { text: []u8, unterminated_comment: bool };
+
+pub fn stripJsonc(arena: Allocator, source: []const u8) Allocator.Error!Stripped {
     const out = try arena.dupe(u8, source);
+    var unterminated = false;
 
     // Pass 1: comments -> spaces (newlines kept, so offsets stay plausible).
     var i: usize = 0;
@@ -126,10 +133,21 @@ pub fn stripJsonc(arena: Allocator, source: []const u8) Allocator.Error![]u8 {
                     while (i < out.len and out[i] != '\n') : (i += 1) out[i] = ' ';
                     if (i < out.len) i -= 1;
                 } else if (i + 1 < out.len and out[i + 1] == '*') {
-                    while (i + 1 < out.len and !(out[i] == '*' and out[i + 1] == '/')) : (i += 1) {
+                    var closed = false;
+                    while (i + 1 < out.len) : (i += 1) {
+                        if (out[i] == '*' and out[i + 1] == '/') {
+                            closed = true;
+                            break;
+                        }
                         if (out[i] != '\n') out[i] = ' ';
                     }
-                    if (i + 1 < out.len) {
+                    if (!closed) {
+                        // EOF without */. Blanking silently would ACCEPT the
+                        // malformed file; record it so parse can refuse.
+                        unterminated = true;
+                        if (i < out.len and out[i] != '\n') out[i] = ' ';
+                    }
+                    if (closed) {
                         out[i] = ' ';
                         out[i + 1] = ' ';
                         i += 1;
@@ -164,7 +182,7 @@ pub fn stripJsonc(arena: Allocator, source: []const u8) Allocator.Error![]u8 {
             else => {},
         }
     }
-    return out;
+    return .{ .text = out, .unterminated_comment = unterminated };
 }
 
 fn isIdentifier(s: []const u8) bool {
@@ -248,6 +266,17 @@ test "a non-identifier key segment is an error naming the path" {
     )) {
         .ok => return error.TestUnexpectedResult,
         .fail => |e| try testing.expect(std.mem.indexOf(u8, e.msg, "menu.new-game") != null),
+    }
+}
+
+test "an unterminated block comment is refused, not silently accepted" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    switch (try parse(arena_state.allocator(),
+        \\{ "menu": { "play": "Play" } } /* forgot to close
+    )) {
+        .ok => return error.TestUnexpectedResult,
+        .fail => |e| try testing.expect(std.mem.indexOf(u8, e.msg, "unterminated") != null),
     }
 }
 

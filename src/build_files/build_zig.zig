@@ -92,6 +92,8 @@ fn emitPromotedScriptModules(
     w: anytype,
     cfg: ProjectConfig,
     promoted_scripts: []const scan.PromotedScript,
+    constants: bool,
+    i18n: bool,
 ) !void {
     if (promoted_scripts.len == 0) return;
     try w.writeByte('\n');
@@ -118,6 +120,8 @@ fn emitPromotedScriptModules(
         for (cfg.plugins) |plugin| {
             try w.print("            .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
         }
+        if (constants) try w.writeAll("            .{ .name = \"constants\", .module = constants_mod },\n");
+        if (i18n) try w.writeAll("            .{ .name = \"i18n\", .module = i18n_mod },\n");
         try w.writeAll("        },\n");
         try w.writeAll("    });\n");
         // The `game` module (shim) reaches the script via the named import
@@ -211,6 +215,8 @@ fn emitPackModules(
     w: anytype,
     cfg: ProjectConfig,
     pack_modules: []const pack_root.PackModule,
+    constants: bool,
+    i18n: bool,
 ) !void {
     if (pack_modules.len == 0) return;
     try w.writeByte('\n');
@@ -239,6 +245,12 @@ fn emitPackModules(
         for (cfg.plugins) |plugin| {
             try w.print("            .{{ .name = \"{s}\", .module = plugin_{s}_mod }},\n", .{ plugin.name, plugin.name });
         }
+        // Generated data modules: a pack's own scripts are the likeliest
+        // readers of its own constants/strings (which is why the usage
+        // scanner covers pack sources), and this isolated table is the only
+        // way `@import("constants")` resolves for them.
+        if (constants) try w.writeAll("            .{ .name = \"constants\", .module = constants_mod },\n");
+        if (i18n) try w.writeAll("            .{ .name = \"i18n\", .module = i18n_mod },\n");
         try w.writeAll("        },\n");
         try w.writeAll("    });\n");
         // Self-import (#498 PR 3): pack code reaches its own module root —
@@ -958,7 +970,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // decls AND by `emitPromotedScriptModules` (`.target = target`). Emit the
         // alias whenever ANY consumer needs it — including promoted scripts on an
         // otherwise plugin/ECS/GUI-free game (PR #466 Finding 1).
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0 or
+            opts.constants or opts.i18n or opts.pack_modules.len > 0)
+        {
             try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
         }
         // manifest-v2 ios: emit the core/gfx/engine dep decls WITHOUT the unrolled
@@ -972,7 +986,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // promoted-scripts condition so `target` is defined whenever any consumer
         // needs it — a promoted-scripts + no-plugin/ECS/GUI android game previously
         // emitted an undefined `target` (PR #466 Finding 1).
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0) {
+        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0 or
+            opts.constants or opts.i18n or opts.pack_modules.len > 0)
+        {
             try tpl.writeSection(build_zig_tmpl, "android_target_alias", w);
         }
         // manifest-v2 android: emit the core/gfx/engine dep decls WITHOUT the
@@ -1148,13 +1164,19 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // ecs/gui backends) so the script's own `@import("labelle-engine")`
     // / `@import("<plugin>")` resolve exactly as they do when the file
     // is path-imported by the root module.
-    try emitPromotedScriptModules(w, cfg, opts.promoted_scripts);
+    // Generated data modules FIRST: promoted-script and pack modules import
+    // them, so `constants_mod` / `i18n_mod` must already be in scope. A
+    // FlowNodes-bearing script or a pack script reading its own constants
+    // compiles under its own module, whose import table does not inherit
+    // game_mod's -- without these entries, valid `@import("constants")` in
+    // exactly the sources the usage scanner covers failed to resolve.
     try emitConstantsModule(w, opts.constants);
     try emitI18nModule(w, opts.i18n);
+    try emitPromotedScriptModules(w, cfg, opts.promoted_scripts, opts.constants, opts.i18n);
 
     // Per-pack modules (assembler#498 PR 2) — declared beside the promoted
     // script modules, before any target artifact that imports them.
-    try emitPackModules(w, cfg, opts.pack_modules);
+    try emitPackModules(w, cfg, opts.pack_modules, opts.constants, opts.i18n);
 
     if (cfg.platform == .wasm) {
         // manifest-v2 wasm: no emsdk-helper import in the generated build.zig — the

@@ -76,6 +76,8 @@ pub fn runPhase(
     target_dir: []const u8,
     settings: ?Settings,
     packs: []const PackLocales,
+    /// False for the tests target, so per-generation diagnostics print once.
+    diagnostics: bool,
 ) !bool {
     const io = phaseIo();
     const cwd = std.Io.Dir.cwd();
@@ -95,14 +97,24 @@ pub fn runPhase(
     };
     defer src_dir.close(io);
 
-    // Tags, from filenames, sorted for determinism.
+    // Tags, from filenames, sorted for determinism. The filename is a BCP-47
+    // declaration, so a stem that is not one -- `en_US`, `english`, "" -- is
+    // an error here rather than a tag that interoperates with nothing later.
     var tags: std.ArrayList([]const u8) = .empty;
+    var bad_tag = false;
     var iter = src_dir.iterate();
-    while (iter.next(io) catch null) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonc")) continue;
-        try tags.append(arena, try arena.dupe(u8, entry.name[0 .. entry.name.len - ".jsonc".len]));
+        const stem = entry.name[0 .. entry.name.len - ".jsonc".len];
+        if (!isBcp47ish(stem)) {
+            std.debug.print("locales/{s}: '{s}' is not a BCP-47 tag (expected e.g. en, pt-BR). Underscores are the classic typo: pt_BR should be pt-BR\n", .{ entry.name, stem });
+            bad_tag = true;
+            continue;
+        }
+        try tags.append(arena, try arena.dupe(u8, stem));
     }
+    if (bad_tag) return error.I18nInvalid;
     std.mem.sort([]const u8, tags.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
@@ -184,6 +196,14 @@ pub fn runPhase(
         std.debug.print("i18n: {d} keys exceeds the u16 key space\n", .{reference.entries.len});
         return error.I18nInvalid;
     }
+    for (reference.entries) |re| {
+        // The codegen walks segments through fixed [16] stacks; a deeper key
+        // would write past them. 12 leaves margin, and no sane key needs it.
+        if (std.mem.count(u8, re.key, ".") >= 12) {
+            std.debug.print("i18n: key '{s}' nests deeper than 12 levels\n", .{re.key});
+            return error.I18nInvalid;
+        }
+    }
 
     // §3 row 3: a key in L that the reference lacks is a build error -- it
     // catches renames that updated one file only.
@@ -202,8 +222,21 @@ pub fn runPhase(
     // with root K; a used key missing from a locale warns (or errors under
     // strict), naming every locale missing it. Unused gaps stay silent --
     // they are the normal state mid-feature.
+    //
+    // `diagnostics` gates the warnings: generate runs once per target, and
+    // without the gate every warning printed twice. Strict errors run
+    // regardless -- a broken build must break both targets.
     var marks = usage.Marks.init(arena);
     try collectMarks(arena, &marks, game_dir);
+
+    // When the scanner widened to all-used (a module alias it cannot follow),
+    // "used" stops being evidence: promoting EVERY untranslated key to a
+    // strict error would fail builds over keys nothing renders, which is the
+    // opposite of the usage-aware contract. Fall back to warnings and say so.
+    const strict_effective = cfg.strict and !marks.all;
+    if (cfg.strict and marks.all and diagnostics) {
+        std.debug.print("note: i18n.strict: usage could not be tracked precisely (a module alias widened the scan), so coverage gaps warn instead of failing this build\n", .{});
+    }
 
     for (reference.entries) |re| {
         if (!marks.covers(re.key)) continue;
@@ -214,10 +247,10 @@ pub fn runPhase(
         }
         if (missing.items.len == 0) continue;
         const list = try std.mem.join(arena, ", ", missing.items);
-        if (cfg.strict) {
+        if (strict_effective) {
             std.debug.print("error: i18n: K.{s} is used but missing from: {s} (strict)\n", .{ re.key, list });
             had_error = true;
-        } else {
+        } else if (diagnostics) {
             std.debug.print("warning: i18n: K.{s} is used but missing from: {s} (backfilled with {s})\n", .{ re.key, list, reference_tag });
         }
     }
@@ -268,10 +301,30 @@ pub fn runPhase(
     // Emit.
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
-    try emitModule(w, tags.items, parsed, reference, reference_idx, default_idx, interps);
+    try emitModule(arena, w, tags.items, parsed, reference, reference_idx, default_idx, interps);
 
     const dst = try std.fs.path.join(arena, &.{ target_dir, GENERATED_FILENAME });
     try cwd.writeFile(io, .{ .sub_path = dst, .data = out.writer.buffered() });
+    return true;
+}
+
+/// A pragmatic BCP-47 shape check: 2-3 letter primary subtag, then optional
+/// `-` separated alphanumeric subtags of 1-8 chars. Not a registry lookup --
+/// it exists to catch `en_US`, `english` and "" at build time, not to police
+/// the IANA registry.
+fn isBcp47ish(s: []const u8) bool {
+    var it = std.mem.splitScalar(u8, s, '-');
+    const primary = it.next() orelse return false;
+    if (primary.len < 2 or primary.len > 3) return false;
+    for (primary) |c| {
+        if (!std.ascii.isAlphabetic(c)) return false;
+    }
+    while (it.next()) |sub| {
+        if (sub.len < 1 or sub.len > 8) return false;
+        for (sub) |c| {
+            if (!std.ascii.isAlphanumeric(c)) return false;
+        }
+    }
     return true;
 }
 
@@ -323,18 +376,21 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
 
     for (in.packs) |pk| {
         const ldir_path = try std.fs.path.join(arena, &.{ pk.src_dir, "locales" });
-        var ldir = cwd.openDir(io, ldir_path, .{ .iterate = true }) catch continue;
+        var ldir = cwd.openDir(io, ldir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => continue, // ships no locales
+            else => return err, // silently dropping a pack's strings is worse
+        };
         defer ldir.close(io);
 
         // Scan the pack's tags and parse each file.
         var ptags: std.ArrayList([]const u8) = .empty;
         var pparsed: std.ArrayList(locales_mod.Locale) = .empty;
         var iter = ldir.iterate();
-        while (iter.next(io) catch null) |entry| {
+        while (try iter.next(io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".jsonc")) continue;
             const tag = try arena.dupe(u8, entry.name[0 .. entry.name.len - ".jsonc".len]);
-            const source = ldir.readFileAlloc(io, entry.name, arena, .limited(4 * 1024 * 1024)) catch continue;
+            const source = try ldir.readFileAlloc(io, entry.name, arena, .limited(4 * 1024 * 1024));
             switch (try locales_mod.parse(arena, source)) {
                 .fail => |e| {
                     std.debug.print("packs/{s}/locales/{s}.jsonc: {s}\n", .{ pk.name, tag, e.msg });
@@ -477,6 +533,7 @@ const KeyInterp = struct {
 };
 
 fn emitModule(
+    arena: Allocator,
     w: *std.Io.Writer,
     tags: []const []const u8,
     parsed: []const locales_mod.Locale,
@@ -511,15 +568,34 @@ fn emitModule(
     try w.writeAll("};\n\n");
 
     // The rectangular table: [locale][key], reference string where a locale
-    // has no translation.
+    // has no translation. Plain keys emit the DECODED text -- a string like
+    // "Set {{name}}" carries escaped braces that t() would otherwise show
+    // doubled; the parsed segments already resolved them, and a plain key's
+    // segments are all literals. Interpolated keys keep the raw string: t()
+    // refuses them at comptime and tf() reads segments, so their table rows
+    // are inert.
     try w.print("const table = [{d}][{d}][:0]const u8{{\n", .{ tags.len, reference.entries.len });
     for (tags, 0..) |tag, li| {
         try w.print("    // {s}\n", .{tag});
         try w.writeAll("    .{\n");
-        for (reference.entries) |re| {
-            const s = parsed[li].get(re.key) orelse re.value;
+        for (reference.entries, 0..) |re, ki| {
             try w.writeAll("        \"");
-            try writeEscaped(w, s);
+            if (interps[ki] == null) {
+                // Decoded: concatenate the literal segments of this locale's
+                // own string (or the reference's, for a backfilled slot).
+                const raw = parsed[li].get(re.key) orelse re.value;
+                switch (try interp.parse(arena, raw)) {
+                    // Validated earlier; a parse failure here cannot happen.
+                    .fail => try writeEscaped(w, raw),
+                    .ok => |segs| for (segs) |seg| switch (seg) {
+                        .lit => |l| try writeEscaped(w, l),
+                        .arg => {},
+                    },
+                }
+            } else {
+                const s = parsed[li].get(re.key) orelse re.value;
+                try writeEscaped(w, s);
+            }
             try w.writeAll("\",\n");
         }
         try w.writeAll("    },\n");
@@ -633,6 +709,10 @@ fn emitModule(
         \\        }
         \\    }
         \\    const segs = interp_segs[idx].?[active];
+        \\    // Wrap only BETWEEN results. Wrapping mid-result would invalidate
+        \\    // the captured start -- a reversed slice at best, bytes of some
+        \\    // unrelated earlier string at worst.
+        \\    if (frame_buf.len - frame_len < WRAP_RESERVE) frame_len = 0;
         \\    const start = frame_len;
         \\    for (segs) |seg| switch (seg) {
         \\        .lit => |l| appendBytes(l),
@@ -642,30 +722,33 @@ fn emitModule(
         \\            }
         \\        },
         \\    };
-        \\    appendBytes(&.{0});
-        \\    return frame_buf[start .. frame_len - 1 :0];
+        \\    // appendBytes never writes the last byte, so the sentinel always
+        \\    // has a home and frame_len never moves backwards mid-result.
+        \\    frame_buf[frame_len] = 0;
+        \\    const result = frame_buf[start..frame_len :0];
+        \\    frame_len += 1;
+        \\    return result;
         \\}
         \\
         \\// ---- the ring the tf results live in --------------------------------
         \\// Module-owned, so no wiring is required to use tf; resetFrameArena()
         \\// exists for the engine's frame loop to make the lifetime exact
         \\// (RFC-I18N Open Question 1 -- resolved as module-owned for now).
-        \\// A string that would overflow what remains is truncated, never an
-        \\// error: UI text is consumed the same frame, and a cut label beats a
-        \\// crashed game.
+        \\// A result that outgrows the remaining space is TRUNCATED, never
+        \\// wrapped and never an error: UI text is consumed the same frame, and
+        \\// a cut label beats a crashed game.
         \\var frame_buf: [16384]u8 = undefined;
         \\var frame_len: usize = 0;
+        \\const WRAP_RESERVE = 1024;
         \\
         \\pub fn resetFrameArena() void {
         \\    frame_len = 0;
         \\}
         \\
         \\fn appendBytes(bytes: []const u8) void {
-        \\    if (frame_len + bytes.len > frame_buf.len) {
-        \\        // Wrap: older results are sacrificed for the new one.
-        \\        frame_len = 0;
-        \\    }
-        \\    const n = @min(bytes.len, frame_buf.len - frame_len);
+        \\    // Truncating copy; the last byte stays free for tf's sentinel.
+        \\    const room = frame_buf.len - 1 - frame_len;
+        \\    const n = @min(bytes.len, room);
         \\    @memcpy(frame_buf[frame_len..][0..n], bytes[0..n]);
         \\    frame_len += n;
         \\}
@@ -677,12 +760,12 @@ fn emitModule(
         \\        appendBytes(v);
         \\    } else switch (info) {
         \\        .int, .comptime_int => {
-        \\            var buf: [24]u8 = undefined;
-        \\            appendBytes(std.fmt.bufPrint(&buf, "{d}", .{v}) catch return);
+        \\            var buf: [48]u8 = undefined; // i128 needs 40 digits
+        \\            appendBytes(std.fmt.bufPrint(&buf, "{d}", .{v}) catch "?");
         \\        },
         \\        .float, .comptime_float => {
-        \\            var buf: [48]u8 = undefined;
-        \\            appendBytes(std.fmt.bufPrint(&buf, "{d}", .{v}) catch return);
+        \\            var buf: [64]u8 = undefined;
+        \\            appendBytes(std.fmt.bufPrint(&buf, "{d}", .{v}) catch "?");
         \\        },
         \\        .bool => appendBytes(if (v) "true" else "false"),
         \\        .@"enum" => appendBytes(@tagName(v)),
@@ -795,7 +878,16 @@ fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
         '\n' => try w.writeAll("\\n"),
         '\t' => try w.writeAll("\\t"),
         '\r' => try w.writeAll("\\r"),
-        else => try w.writeByte(c),
+        else => {
+            // JSON's backslash-u escapes decode to raw control bytes, which
+            // cannot sit inside a Zig string literal (and a NUL would corrupt
+            // the [:0] sentinel). \xNN keeps the generated file compiling.
+            if (c < 0x20 or c == 0x7F) {
+                try w.print("\\x{x:0>2}", .{c});
+            } else {
+                try w.writeByte(c);
+            }
+        },
     };
 }
 
@@ -810,7 +902,10 @@ fn collectMarks(arena: Allocator, marks: *usage.Marks, dir_path: []const u8) !vo
     defer dir.close(io);
 
     var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
+    while (iter.next(io) catch blk: {
+        marks.all = true; // aborted iteration may hide uses; widen, never warn falsely
+        break :blk null;
+    }) |entry| {
         switch (entry.kind) {
             .directory => {
                 var skip = false;
@@ -823,7 +918,10 @@ fn collectMarks(arena: Allocator, marks: *usage.Marks, dir_path: []const u8) !vo
             },
             .file => {
                 if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
-                const source = dir.readFileAlloc(io, entry.name, arena, .limited(4 * 1024 * 1024)) catch continue;
+                const source = dir.readFileAlloc(io, entry.name, arena, .limited(4 * 1024 * 1024)) catch {
+                    marks.all = true; // unreadable file may hold uses; widen
+                    continue;
+                };
                 try usage.scanSource(marks, .{ .module_name = "i18n", .root_symbol = "K" }, source);
             },
             else => {},
@@ -858,7 +956,7 @@ test "no locales dir: nothing emitted, stale file cleaned" {
     defer testing.allocator.free(p.game);
     defer testing.allocator.free(p.target);
 
-    try testing.expectEqual(false, try runPhase(testing.allocator, p.game, p.target, null, &.{}));
+    try testing.expectEqual(false, try runPhase(testing.allocator, p.game, p.target, null, &.{}, true));
     try testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "target/" ++ GENERATED_FILENAME, .{}));
 }
 
@@ -874,7 +972,7 @@ test "locales without .i18n.default is an error" {
     defer testing.allocator.free(p.game);
     defer testing.allocator.free(p.target);
 
-    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, null, &.{}));
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, null, &.{}, true));
 }
 
 test "default naming no file is an error; a key absent from the reference is an error" {
@@ -891,9 +989,9 @@ test "default naming no file is an error; a key absent from the reference is an 
     defer testing.allocator.free(p.target);
 
     // BCP-47 typo shape: pt_BR for a file that does not exist.
-    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "pt_BR" }, &.{}));
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "pt_BR" }, &.{}, true));
     // pt has menu.quit which en (the reference) lacks -- the rename catch.
-    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}));
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
 }
 
 test "emission: K tree, rectangular backfilled table, default index" {
@@ -910,7 +1008,7 @@ test "emission: K tree, rectangular backfilled table, default index" {
     defer testing.allocator.free(p.game);
     defer testing.allocator.free(p.target);
 
-    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "pt-BR", .reference = "en" }, &.{}));
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "pt-BR", .reference = "en" }, &.{}, true));
 
     const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
     defer testing.allocator.free(generated);
@@ -947,7 +1045,7 @@ test "phase 2: reordered placeholders pass parity and emit per-locale segments" 
     defer testing.allocator.free(p.game);
     defer testing.allocator.free(p.target);
 
-    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}));
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
 
     const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
     defer testing.allocator.free(generated);
@@ -978,7 +1076,7 @@ test "phase 2: a differing placeholder set is a build error showing both sets" {
     defer testing.allocator.free(p.game);
     defer testing.allocator.free(p.target);
 
-    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}));
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
 }
 
 test "phase 2: a brace-syntax error in any locale names the locale and key" {
@@ -993,7 +1091,7 @@ test "phase 2: a brace-syntax error in any locale names the locale and key" {
     defer testing.allocator.free(p.game);
     defer testing.allocator.free(p.target);
 
-    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}));
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
 }
 
 test "phase 3: pack keys surface prefixed; the game overrides and adds; backfill is the pack's reference" {
@@ -1020,7 +1118,7 @@ test "phase 3: pack keys surface prefixed; the game overrides and adds; backfill
     defer testing.allocator.free(pack_dir);
 
     const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir }};
-    try testing.expectEqual(true, try runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs));
+    try testing.expectEqual(true, try runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
 
     const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
     defer testing.allocator.free(generated);
@@ -1066,7 +1164,7 @@ test "phase 3: writing under a pack namespace asserts the key exists" {
     defer testing.allocator.free(pack_dir);
 
     const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir }};
-    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs));
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
 }
 
 test "phase 3: a declared pack reference with no file is an error; a pack-locale key outside its reference is an error" {
@@ -1090,12 +1188,12 @@ test "phase 3: a declared pack reference with no file is an error; a pack-locale
 
     // Declared reference "de" has no file in the pack.
     const bad_ref = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir, .reference = "de" }};
-    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &bad_ref));
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &bad_ref, true));
 
     // A pack fr key its own reference lacks: per-realm rename catch.
     try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/fr.jsonc", .data = "{ \"hunger\": { \"renamed_key\": \"x\" } }" });
     const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir }};
-    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs));
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
 }
 
 test "strict: a used key missing from a locale fails the build" {
@@ -1118,7 +1216,7 @@ test "strict: a used key missing from a locale fails the build" {
     defer testing.allocator.free(p.target);
 
     // Non-strict: warns, emits.
-    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}));
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
     // Strict: the same gap is a build error.
-    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en", .strict = true }, &.{}));
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en", .strict = true }, &.{}, true));
 }

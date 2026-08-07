@@ -64,6 +64,9 @@ pub fn runPhase(
     game_dir: []const u8,
     target_dir: []const u8,
     packs: []const PackConstants,
+    /// False for the tests target: generate runs once per target, and the
+    /// usage warnings would otherwise print twice and scan the tree twice.
+    diagnostics: bool,
 ) !bool {
     const io = phaseIo();
     const cwd = std.Io.Dir.cwd();
@@ -82,14 +85,17 @@ pub fn runPhase(
     //    C.<pack>__<stem>.*.
     for (packs) |pk| {
         const pdir_path = try std.fs.path.join(arena, &.{ pk.src_dir, "constants" });
-        var pdir = cwd.openDir(io, pdir_path, .{ .iterate = true }) catch continue;
+        var pdir = cwd.openDir(io, pdir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => continue, // ships no constants
+            else => return err, // permissions/I-O: silently dropping a pack is worse
+        };
         defer pdir.close(io);
         const pfiles = try listYaml(arena, io, &pdir);
         for (pfiles) |name| {
             const stem = name[0 .. name.len - ".yaml".len];
             const display = try std.fmt.allocPrint(arena, "packs/{s}/constants/{s}", .{ pk.name, name });
-            if (!isIdentifier(stem) or !isIdentifier(pk.name)) {
-                std.debug.print("{s}: pack and file names must be Zig identifiers (they become the C.{s}__{s} namespace)\n", .{ display, pk.name, stem });
+            if (!isIdentifier(stem)) {
+                std.debug.print("{s}: filename must be a Zig identifier (it becomes part of the C namespace)\n", .{display});
                 had_error = true;
                 continue;
             }
@@ -107,7 +113,19 @@ pub fn runPhase(
                     had_error = true;
                 },
                 .root => |root| {
-                    const ns = try std.fmt.allocPrint(arena, "{s}__{s}", .{ pk.name, stem });
+                    var pfx_buf: [128]u8 = undefined;
+                    const pfx = sanitizePackIdent(pk.name, &pfx_buf);
+                    const ns = try std.fmt.allocPrint(arena, "{s}__{s}", .{ pfx, stem });
+                    // Composite collisions are possible with valid inputs:
+                    // pack `a` + file `b__c.yaml` and pack `a__b` + file
+                    // `c.yaml` both compose `a__b__c`. Two declarations of one
+                    // namespace would not compile, and an override would apply
+                    // to whichever the lookup found first.
+                    if (reg.find(ns)) |existing| {
+                        std.debug.print("{s}: namespace C.{s} is already defined by {s}\n", .{ display, ns, existing.file });
+                        had_error = true;
+                        continue;
+                    }
                     const stored = try arena.create(yaml.Mapping);
                     stored.* = root;
                     try reg.entries.append(arena, .{ .ns = ns, .file = display, .tree = stored });
@@ -170,6 +188,11 @@ pub fn runPhase(
             };
             if (!try mergeOverride(arena, display, target.tree, &parsed, "")) had_error = true;
         } else {
+            if (reg.find(stem)) |existing| {
+                std.debug.print("{s}: namespace C.{s} is already defined by {s}\n", .{ display, stem, existing.file });
+                had_error = true;
+                continue;
+            }
             const stored = try arena.create(yaml.Mapping);
             stored.* = parsed;
             try reg.entries.append(arena, .{ .ns = stem, .file = display, .tree = stored });
@@ -192,7 +215,7 @@ pub fn runPhase(
         "//! Values are emitted verbatim, so 5.0 is comptime_float and 5 is\n" ++
         "//! comptime_int; they coerce at the use site (RFC-CONSTANTS " ++ [_]u8{0xc2} ++ [_]u8{0xa7} ++ "3).\n\npub const C = struct {\n");
     for (reg.entries.items) |e| {
-        try w.print("    pub const {s} = struct {{\n", .{e.ns});
+        try w.print("    pub const @\"{s}\" = struct {{\n", .{e.ns});
         try emitMapping(w, e.tree, 2);
         try w.writeAll("    };\n");
         try collectLeaves(arena, &leaves, e.file, e.ns, e.tree);
@@ -207,7 +230,7 @@ pub fn runPhase(
     // Phase 2: usage warnings. Never fails the build -- a warning that can be
     // wrong teaches people to ignore it, so the scan errs toward "used" and
     // this errs toward silence on any I/O trouble.
-    warnUnused(arena, game_dir, packs, leaves.items) catch {};
+    if (diagnostics) warnUnused(arena, game_dir, packs, leaves.items) catch {};
     return true;
 }
 
@@ -233,7 +256,7 @@ const Registry = struct {
 fn listYaml(arena: Allocator, io: std.Io, dir: *std.Io.Dir) ![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
     var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".yaml")) continue;
         try names.append(arena, try arena.dupe(u8, entry.name));
@@ -288,7 +311,12 @@ fn mergeOverride(
                         std.debug.print("{s}:{d}: '{s}' changes kind from {s} to {s} -- values are untyped and coerce at the use site, so an int-for-float override can change behaviour without changing the number. Keep the kind: write {s}\n", .{ display, os.line, path, @tagName(bs.kind), @tagName(os.kind), exampleOfKind(bs.kind) });
                         ok = false;
                     } else {
-                        be.node = .{ .scalar = os };
+                        // Carry the overriding file, so an unused warning for
+                        // this leaf points at the game's line in the game's
+                        // file rather than the game's line in the pack's file.
+                        var replaced = os;
+                        replaced.src = display;
+                        be.node = .{ .scalar = replaced };
                     }
                 },
             },
@@ -333,7 +361,7 @@ fn collectLeaves(
         const path = try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, e.key });
         switch (e.node) {
             .mapping => |child| try collectLeaves(arena, leaves, file, path, child),
-            .scalar => |sc| try leaves.append(arena, .{ .path = path, .file = file, .line = sc.line }),
+            .scalar => |sc| try leaves.append(arena, .{ .path = path, .file = sc.src orelse file, .line = sc.line }),
         }
     }
 }
@@ -347,14 +375,14 @@ fn warnUnused(arena: Allocator, game_dir: []const u8, packs: []const PackConstan
     // the likeliest readers of its own constants -- not scanning them would
     // fire false "unused" warnings, the direction the design forbids.
     for (packs) |pk| {
-        if (!std.mem.startsWith(u8, pk.src_dir, game_dir)) {
+        if (!isUnderDir(pk.src_dir, game_dir)) {
             try collectMarks(arena, &marks, pk.src_dir);
         }
     }
 
     for (leaves) |leaf| {
         if (!marks.covers(leaf.path)) {
-            std.debug.print("warning: constants/{s}:{d}: C.{s} is never read\n", .{ leaf.file, leaf.line, leaf.path });
+            std.debug.print("warning: {s}:{d}: C.{s} is never read\n", .{ leaf.file, leaf.line, leaf.path });
         }
     }
 }
@@ -369,7 +397,12 @@ fn collectMarks(arena: Allocator, marks: *usage.Marks, dir_path: []const u8) !vo
     defer dir.close(io);
 
     var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
+    while (iter.next(io) catch blk: {
+        // An aborted iteration may have hidden uses; widen rather than warn
+        // falsely.
+        marks.all = true;
+        break :blk null;
+    }) |entry| {
         switch (entry.kind) {
             .directory => {
                 var skip = false;
@@ -382,7 +415,13 @@ fn collectMarks(arena: Allocator, marks: *usage.Marks, dir_path: []const u8) !vo
             },
             .file => {
                 if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
-                const source = dir.readFileAlloc(io, entry.name, arena, .limited(4 * 1024 * 1024)) catch continue;
+                // An unreadable file could contain uses. Missing them fires
+                // false "unused" warnings -- the forbidden direction -- so
+                // widen instead of skipping silently.
+                const source = dir.readFileAlloc(io, entry.name, arena, .limited(4 * 1024 * 1024)) catch {
+                    marks.all = true;
+                    continue;
+                };
                 try usage.scanSource(marks, .{}, source);
             },
             else => {},
@@ -395,7 +434,11 @@ fn emitMapping(w: *std.Io.Writer, m: *const yaml.Mapping, depth: usize) std.Io.W
         try writeIndent(w, depth);
         switch (e.node) {
             .mapping => |child| {
-                try w.print("pub const {s} = struct {{\n", .{e.key});
+                // @""-quoted: a key named like a Zig keyword or primitive
+                // ("fn", "type", "bool") would otherwise emit a declaration
+                // that does not compile. The generated name is identical for
+                // ordinary keys; call sites for awkward ones use C.a.@"fn".
+                try w.print("pub const @\"{s}\" = struct {{\n", .{e.key});
                 try emitMapping(w, child, depth + 1);
                 try writeIndent(w, depth);
                 try w.writeAll("};\n");
@@ -403,9 +446,9 @@ fn emitMapping(w: *std.Io.Writer, m: *const yaml.Mapping, depth: usize) std.Io.W
             .scalar => |sc| switch (sc.kind) {
                 // Verbatim: the emitted literal is the YAML text, which is
                 // what keeps int/float distinct and `1.20` printing as 1.20.
-                .int, .float, .bool => try w.print("pub const {s} = {s};\n", .{ e.key, sc.text }),
+                .int, .float, .bool => try w.print("pub const @\"{s}\" = {s};\n", .{ e.key, sc.text }),
                 .string => {
-                    try w.print("pub const {s} = \"", .{e.key});
+                    try w.print("pub const @\"{s}\" = \"", .{e.key});
                     try writeEscaped(w, sc.text);
                     try w.writeAll("\";\n");
                 },
@@ -426,8 +469,48 @@ fn writeEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
         '\n' => try w.writeAll("\\n"),
         '\t' => try w.writeAll("\\t"),
         '\r' => try w.writeAll("\\r"),
-        else => try w.writeByte(c),
+        else => {
+            // Remaining control bytes would land raw inside a Zig string
+            // literal, which does not compile. \xNN keeps the generated file
+            // parseable whatever the YAML carried.
+            if (c < 0x20 or c == 0x7F) {
+                try w.print("\\x{x:0>2}", .{c});
+            } else {
+                try w.writeByte(c);
+            }
+        },
     };
+}
+
+/// Prefix containment on a path-component boundary. A bare prefix test calls
+/// `<root>/game-pack` a child of `<root>/game` and then skips scanning it,
+/// which produces false "unused" warnings for that pack's constants.
+fn isUnderDir(child: []const u8, parent: []const u8) bool {
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child.len == parent.len) return true;
+    const c = child[parent.len];
+    return c == '/' or c == '\\';
+}
+
+/// Mirror of codegen/scan/sanitize.zig's sanitizePluginIdent, which cannot be
+/// imported here without dragging build_options in. A pack named `my-pack`
+/// already surfaces as `my_pack__*` everywhere else in the pipeline; constants
+/// must agree or a valid pack is rejected the moment it ships a tuning value.
+fn sanitizePackIdent(name: []const u8, buf: *[128]u8) []const u8 {
+    var i: usize = 0;
+    if (name.len > 0 and std.ascii.isDigit(name[0])) {
+        buf[i] = '_';
+        i += 1;
+    }
+    for (name) |c| {
+        if (i >= buf.len) break;
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '_' => buf[i] = c,
+            else => buf[i] = '_',
+        }
+        i += 1;
+    }
+    return buf[0..i];
 }
 
 fn isIdentifier(s: []const u8) bool {
@@ -462,7 +545,7 @@ test "runPhase: no constants dir emits nothing and cleans a stale file" {
     const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
     defer testing.allocator.free(target);
 
-    try testing.expectEqual(false, try runPhase(testing.allocator, game, target, &.{}));
+    try testing.expectEqual(false, try runPhase(testing.allocator, game, target, &.{}, true));
     // The stale file is gone.
     try testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "target/" ++ GENERATED_FILENAME, .{}));
 }
@@ -498,21 +581,21 @@ test "runPhase: files become namespaces, values stay verbatim, order is by filen
     const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
     defer testing.allocator.free(target);
 
-    try testing.expectEqual(true, try runPhase(testing.allocator, game, target, &.{}));
+    try testing.expectEqual(true, try runPhase(testing.allocator, game, target, &.{}, true));
 
     const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(64 * 1024));
     defer testing.allocator.free(generated);
 
     // construction sorts before decay, so namespaces come in that order.
-    const c_at = std.mem.indexOf(u8, generated, "pub const construction = struct {").?;
-    const d_at = std.mem.indexOf(u8, generated, "pub const decay = struct {").?;
+    const c_at = std.mem.indexOf(u8, generated, "pub const @\"construction\" = struct {").?;
+    const d_at = std.mem.indexOf(u8, generated, "pub const @\"decay\" = struct {").?;
     try testing.expect(c_at < d_at);
 
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const build_time = 5.0;") != null);
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const max_workers = 4;") != null);
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const site_label = \"em obras\";") != null);
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const enabled = true;") != null);
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const drain_rate = 0.0;") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"build_time\" = 5.0;") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"max_workers\" = 4;") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"site_label\" = \"em obras\";") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"enabled\" = true;") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"drain_rate\" = 0.0;") != null);
 
     // And the generated file is real Zig with the values reachable: compile it.
     // (The ast-check is cheap and catches emitter breakage structurally.)
@@ -539,7 +622,7 @@ test "runPhase: a bad value names the file and line and fails the phase" {
     const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
     defer testing.allocator.free(target);
 
-    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, game, target, &.{}));
+    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, game, target, &.{}, true));
     // Nothing half-written.
     try testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "target/" ++ GENERATED_FILENAME, .{}));
 }
@@ -560,7 +643,7 @@ test "runPhase: a non-identifier filename is rejected" {
     const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
     defer testing.allocator.free(target);
 
-    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, game, target, &.{}));
+    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, game, target, &.{}, true));
 }
 
 test "collectMarks walks the game tree and skips generated dirs" {
@@ -633,16 +716,16 @@ test "phase 3: pack constants surface namespaced, game override wins, kind kept"
     defer testing.allocator.free(pack_dir);
 
     const packs = [_]PackConstants{.{ .name = "citizens", .src_dir = pack_dir }};
-    try testing.expectEqual(true, try runPhase(testing.allocator, paths.game, paths.target, &packs));
+    try testing.expectEqual(true, try runPhase(testing.allocator, paths.game, paths.target, &packs, true));
 
     const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(64 * 1024));
     defer testing.allocator.free(generated);
 
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const citizens__hunger = struct {") != null);
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const rate = 0.05;") != null); // overridden
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const limit = 4;") != null); // pack default rides
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const deep = 2.5;") != null); // deep override
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const ui = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"citizens__hunger\" = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"rate\" = 0.05;") != null); // overridden
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"limit\" = 4;") != null); // pack default rides
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"deep\" = 2.5;") != null); // deep override
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"ui\" = struct {") != null);
     try testing.expect(std.mem.indexOf(u8, generated, "0.02") == null); // the pack value is gone
 }
 
@@ -666,7 +749,7 @@ test "phase 3: an override matching nothing is an error" {
     defer testing.allocator.free(pack_dir);
 
     const packs = [_]PackConstants{.{ .name = "citizens", .src_dir = pack_dir }};
-    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, paths.game, paths.target, &packs));
+    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, paths.game, paths.target, &packs, true));
 }
 
 test "phase 3: an override changing scalar kind is an error" {
@@ -688,7 +771,7 @@ test "phase 3: an override changing scalar kind is an error" {
     defer testing.allocator.free(pack_dir);
 
     const packs = [_]PackConstants{.{ .name = "citizens", .src_dir = pack_dir }};
-    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, paths.game, paths.target, &packs));
+    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, paths.game, paths.target, &packs, true));
 }
 
 test "phase 3: an override file for a namespace no pack defines is an error" {
@@ -705,7 +788,7 @@ test "phase 3: an override file for a namespace no pack defines is an error" {
     defer testing.allocator.free(paths.target);
     defer testing.allocator.free(paths.root);
 
-    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, paths.game, paths.target, &.{}));
+    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, paths.game, paths.target, &.{}, true));
 }
 
 test "phase 3: pack constants alone (no game constants dir) still emit" {
@@ -726,10 +809,10 @@ test "phase 3: pack constants alone (no game constants dir) still emit" {
     defer testing.allocator.free(pack_dir);
 
     const packs = [_]PackConstants{.{ .name = "transport", .src_dir = pack_dir }};
-    try testing.expectEqual(true, try runPhase(testing.allocator, paths.game, paths.target, &packs));
+    try testing.expectEqual(true, try runPhase(testing.allocator, paths.game, paths.target, &packs, true));
 
     const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(64 * 1024));
     defer testing.allocator.free(generated);
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const transport__ship = struct {") != null);
-    try testing.expect(std.mem.indexOf(u8, generated, "pub const speed = 280;") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"transport__ship\" = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"speed\" = 280;") != null);
 }

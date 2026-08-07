@@ -26,6 +26,10 @@ pub const Scalar = struct {
     /// For string: the *unquoted, unescaped* content.
     text: []const u8,
     line: usize,
+    /// Set when a game override replaced this scalar: the overriding file,
+    /// so an unused-constant warning points at the line someone actually
+    /// wrote. Null = the value is from its own file.
+    src: ?[]const u8 = null,
 };
 
 pub const Node = union(enum) {
@@ -201,7 +205,7 @@ const Parser = struct {
                 // caller cannot misread: handled by rejecting here through a
                 // scalar-shaped error is not possible, so tabs surface as an
                 // impossible indent instead.
-                return .{ .indent = std.math.maxInt(usize) - 1, .content = "\t", .no = self.line_no };
+                return .{ .indent = indent, .content = raw[indent..], .no = self.line_no, .has_tab = true };
             }
 
             const stripped = stripComment(raw[indent..]);
@@ -222,12 +226,24 @@ const Parser = struct {
             }
         }.f;
 
-        // Quoted → string, content unescaped (double) or verbatim (single).
+        // Quoted → string, content unescaped (double) or '' -> ' (single,
+        // YAML's one single-quote escape). A value that STARTS with a quote
+        // but does not close it is an authoring typo, not a bare string --
+        // accepting it would ship the quote as data.
         if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
-            return .{ .ok = .{ .kind = .string, .text = try unescapeDouble(self.arena, text[1 .. text.len - 1]), .line = line } };
+            switch (try unescapeDouble(self.arena, text[1 .. text.len - 1], line)) {
+                .ok => |s| return .{ .ok = .{ .kind = .string, .text = s, .line = line } },
+                .err => |e| return .{ .err = e },
+            }
         }
         if (text.len >= 2 and text[0] == '\'' and text[text.len - 1] == '\'') {
-            return .{ .ok = .{ .kind = .string, .text = try self.arena.dupe(u8, text[1 .. text.len - 1]), .line = line } };
+            const inner = text[1 .. text.len - 1];
+            // `''` inside single quotes is YAML's escaped apostrophe.
+            const decoded = try std.mem.replaceOwned(u8, self.arena, inner, "''", "'");
+            return .{ .ok = .{ .kind = .string, .text = decoded, .line = line } };
+        }
+        if (text[0] == '"' or text[0] == '\'') {
+            return failc(self.arena, line, "unterminated quoted string", .{});
         }
 
         // The named rejections, before anything can be misread.
@@ -239,6 +255,12 @@ const Parser = struct {
         }
         if (text[0] == '{' or text[0] == '[') {
             return failc(self.arena, line, "flow collections ('{{…}}', '[…]') are not supported in constants files", .{});
+        }
+        if (text[0] == '|' or text[0] == '>') {
+            return failc(self.arena, line, "block scalars ('|', '>') are not supported in constants files; use a quoted string", .{});
+        }
+        if (isForbiddenNull(text)) {
+            return failc(self.arena, line, "'{s}' is YAML's null, and constants have no null kind. Quote it if the text is meant: \"{s}\"", .{ text, text });
         }
         if (isForbiddenBool(text)) {
             return failc(self.arena, line, "'{s}' is ambiguous in YAML (1.1 reads it as a boolean). Write true/false, or quote it: \"{s}\"", .{ text, text });
@@ -258,9 +280,11 @@ const Parser = struct {
         if (looksNumeric(text)) {
             return failc(self.arena, line, "'{s}' is not an accepted numeric literal (-?digits or -?digits.digits, optional e-exponent). Quote it if it is meant as a string", .{text});
         }
-        // A bare scalar with YAML-active characters somewhere inside is more
-        // likely a mistake than a string; require quotes.
-        if (std.mem.indexOfAny(u8, text, ":#") != null) {
+        // A bare scalar with a colon inside is more likely a mistake (the
+        // 12:30 shape) than a string; require quotes. '#' is NOT in this
+        // guard: without preceding whitespace it is ordinary data
+        // (icon#selected), and with it the comment stripper already cut it.
+        if (std.mem.indexOfScalar(u8, text, ':') != null) {
             return failc(self.arena, line, "'{s}' contains YAML syntax characters; quote it if it is meant as a string", .{text});
         }
         return .{ .ok = .{ .kind = .string, .text = try self.arena.dupe(u8, text), .line = line } };
@@ -280,7 +304,10 @@ fn stripComment(s: []const u8) []const u8 {
         } else switch (c) {
             '"' => in_double = true,
             '\'' => in_single = true,
-            '#' => return s[0..i],
+            // YAML starts a comment only when '#' begins the line or follows
+            // whitespace. `id: icon#selected` is a value with a hash in it,
+            // not a comment -- cutting there silently truncated the value.
+            '#' => if (i == 0 or s[i - 1] == ' ' or s[i - 1] == '\t') return s[0..i],
             else => {},
         }
     }
@@ -314,10 +341,31 @@ fn matchInt(s: []const u8) bool {
     return true;
 }
 
+fn isForbiddenNull(s: []const u8) bool {
+    const forbidden = [_][]const u8{ "null", "Null", "NULL", "~" };
+    for (forbidden) |f| {
+        if (std.mem.eql(u8, s, f)) return true;
+    }
+    return false;
+}
+
 fn matchFloat(s: []const u8) bool {
     var t = s;
     if (t.len > 0 and t[0] == '-') t = t[1..];
-    const dot = std.mem.indexOfScalar(u8, t, '.') orelse return false;
+    const dot = std.mem.indexOfScalar(u8, t, '.') orelse {
+        // Exponent-only spelling: digits[eE][+-]digits, no dot. `1e3` is a
+        // float by any reading, and the diagnostic already advertises an
+        // optional exponent.
+        const e = std.mem.indexOfAny(u8, t, "eE") orelse return false;
+        const mant = t[0..e];
+        if (mant.len == 0 or (mant.len > 1 and mant[0] == '0')) return false;
+        for (mant) |c| if (!std.ascii.isDigit(c)) return false;
+        var exp = t[e + 1 ..];
+        if (exp.len > 0 and (exp[0] == '+' or exp[0] == '-')) exp = exp[1..];
+        if (exp.len == 0) return false;
+        for (exp) |ec| if (!std.ascii.isDigit(ec)) return false;
+        return true;
+    };
     const int_part = t[0..dot];
     var frac = t[dot + 1 ..];
     if (int_part.len == 0 or frac.len == 0) return false;
@@ -345,30 +393,39 @@ fn matchFloat(s: []const u8) bool {
 }
 
 fn looksNumeric(s: []const u8) bool {
+    // A sign or dot may precede more sign/dot before the first digit
+    // (`-.5`, `+.5`): strip up to two of them so those spellings hit the
+    // numeric-literal error rather than silently becoming strings.
     var t = s;
-    if (t.len > 0 and (t[0] == '-' or t[0] == '+' or t[0] == '.')) t = t[1..];
+    var strip: usize = 0;
+    while (strip < 2 and t.len > 0 and (t[0] == '-' or t[0] == '+' or t[0] == '.')) : (strip += 1) t = t[1..];
     return t.len > 0 and std.ascii.isDigit(t[0]);
 }
 
-fn unescapeDouble(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
+const Unescaped = union(enum) { ok: []const u8, err: Error };
+
+fn unescapeDouble(arena: Allocator, s: []const u8, line: usize) Allocator.Error!Unescaped {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         if (s[i] == '\\' and i + 1 < s.len) {
             i += 1;
-            try out.append(arena, switch (s[i]) {
+            const decoded: u8 = switch (s[i]) {
                 'n' => '\n',
                 't' => '\t',
                 'r' => '\r',
                 '\\' => '\\',
                 '"' => '"',
-                else => s[i], // unknown escape: keep the char, drop the slash
-            });
+                // Anything else (\u, \0, \x...) would be silently corrupted by
+                // dropping the slash -- `"é"` became `u00e9`. Loud.
+                else => return .{ .err = .{ .line = line, .msg = try std.fmt.allocPrint(arena, "unsupported escape '\\{c}' -- this subset knows \\n \\t \\r \\\\ \\\". Write the character directly", .{s[i]}) } },
+            };
+            try out.append(arena, decoded);
         } else {
             try out.append(arena, s[i]);
         }
     }
-    return out.toOwnedSlice(arena);
+    return .{ .ok = try out.toOwnedSlice(arena) };
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +579,53 @@ test "deeper nesting and dedent back to root" {
     try testing.expectEqualStrings("1", b.get("c").?.scalar.text);
     try testing.expectEqualStrings("2", m.get("a").?.mapping.get("d").?.scalar.text);
     try testing.expectEqualStrings("3", m.get("e").?.scalar.text);
+}
+
+test "review findings: the silent-corruption cases are loud now" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    { // a hash inside a value is data, not a comment (needs whitespace before #)
+        const m = try parseOk(a, "id: icon#selected\nnote: value # real comment\n");
+        try testing.expectEqualStrings("icon#selected", m.get("id").?.scalar.text);
+        try testing.expectEqualStrings("value", m.get("note").?.scalar.text);
+    }
+    { // tab in indentation names itself
+        const e = try parseErr(a, "a:\n\tb: 1\n");
+        try testing.expect(std.mem.indexOf(u8, e.msg, "tab") != null);
+    }
+    { // unterminated quote is a typo, not a string
+        const e = try parseErr(a, "label: \"ready\n");
+        try testing.expect(std.mem.indexOf(u8, e.msg, "unterminated") != null);
+    }
+    { // null spellings have no kind here
+        const e = try parseErr(a, "target: null\n");
+        try testing.expect(std.mem.indexOf(u8, e.msg, "null") != null);
+        const e2 = try parseErr(a, "target: ~\n");
+        try testing.expect(std.mem.indexOf(u8, e2.msg, "null") != null);
+    }
+    { // '' decodes to a single apostrophe
+        const m = try parseOk(a, "label: 'it''s ready'\n");
+        try testing.expectEqualStrings("it's ready", m.get("label").?.scalar.text);
+    }
+    { // unknown double-quote escapes refuse instead of corrupting
+        const e = try parseErr(a, "label: \"caf\\u00e9\"\n");
+        try testing.expect(std.mem.indexOf(u8, e.msg, "unsupported escape") != null);
+    }
+    { // exponent-only floats are floats
+        const m = try parseOk(a, "rate: 1e3\nsmall: 2E-2\n");
+        try testing.expectEqual(ScalarKind.float, m.get("rate").?.scalar.kind);
+        try testing.expectEqual(ScalarKind.float, m.get("small").?.scalar.kind);
+    }
+    { // signed leading-dot numerics hit the numeric error, not the string path
+        const e = try parseErr(a, "x: -.5\n");
+        try testing.expect(std.mem.indexOf(u8, e.msg, "numeric literal") != null);
+    }
+    { // block scalar indicators are named
+        const e = try parseErr(a, "message: |\n");
+        try testing.expect(std.mem.indexOf(u8, e.msg, "block scalars") != null);
+    }
 }
 
 test "negative numbers and exponents" {
