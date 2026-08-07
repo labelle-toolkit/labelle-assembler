@@ -11,12 +11,15 @@
 //! generated `constants.zig` is deleted when the directory goes away, so a
 //! stale module cannot shadow the feature being turned off.
 //!
-//! Phase 2 (usage warnings, conservative alias widening) and phase 3 (pack
-//! constants, game-over-pack precedence) are deliberately absent; see the
-//! phasing table in RFC-CONSTANTS.
+//! Phase 2 lives here too: after a successful emit, the game's .zig sources
+//! are scanned (usage_scan.zig -- conservative alias widening, warnings only)
+//! and every constant nothing reads is named with its yaml file and line.
+//! Phase 3 (pack constants, game-over-pack precedence) is deliberately
+//! absent; see the phasing table in RFC-CONSTANTS.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const yaml = @import("constants_yaml.zig");
+const usage = @import("usage_scan.zig");
 
 // Not config.globalIo(): config.zig pulls in build_options, which would make
 // this file untestable standalone (`zig test src/constants_phase.zig`) for the
@@ -88,6 +91,7 @@ pub fn runPhase(
         return false;
     }
 
+    var leaves: std.ArrayList(Leaf) = .empty;
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
     try w.writeAll(
@@ -126,6 +130,7 @@ pub fn runPhase(
                 try w.print("    pub const {s} = struct {{\n", .{stem});
                 try emitMapping(w, &root, 2);
                 try w.writeAll("    };\n");
+                try collectLeaves(arena, &leaves, name, stem, &root);
             },
         }
     }
@@ -135,7 +140,81 @@ pub fn runPhase(
 
     const dst = try std.fs.path.join(arena, &.{ target_dir, GENERATED_FILENAME });
     try cwd.writeFile(io, .{ .sub_path = dst, .data = out.writer.buffered() });
+
+    // Phase 2: usage warnings. Never fails the build -- a warning that can be
+    // wrong teaches people to ignore it, so the scan errs toward "used" and
+    // this errs toward silence on any I/O trouble.
+    warnUnused(arena, game_dir, leaves.items) catch {};
     return true;
+}
+
+/// One emitted constant: where it can be addressed from code, and where it
+/// was written, so the warning points at the yaml rather than at nothing.
+const Leaf = struct {
+    /// Root-relative dotted path, domain first: "decay.hunger.rate".
+    path: []const u8,
+    file: []const u8,
+    line: usize,
+};
+
+fn collectLeaves(
+    arena: Allocator,
+    leaves: *std.ArrayList(Leaf),
+    file: []const u8,
+    prefix: []const u8,
+    m: *const yaml.Mapping,
+) Allocator.Error!void {
+    for (m.entries.items) |e| {
+        const path = try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, e.key });
+        switch (e.node) {
+            .mapping => |child| try collectLeaves(arena, leaves, file, path, child),
+            .scalar => |sc| try leaves.append(arena, .{ .path = path, .file = file, .line = sc.line }),
+        }
+    }
+}
+
+/// Scans every .zig file under the game dir (skipping generated and vendored
+/// trees) and prints one warning per constant nothing reads.
+fn warnUnused(arena: Allocator, game_dir: []const u8, leaves: []const Leaf) !void {
+    var marks = usage.Marks.init(arena);
+    try collectMarks(arena, &marks, game_dir);
+
+    for (leaves) |leaf| {
+        if (!marks.covers(leaf.path)) {
+            std.debug.print("warning: constants/{s}:{d}: C.{s} is never read\n", .{ leaf.file, leaf.line, leaf.path });
+        }
+    }
+}
+
+/// Skipped wholesale: generated output, vendored deps, caches, VCS.
+const skip_dirs = [_][]const u8{ ".labelle", ".git", "deps", "zig-out", "zig-cache", ".zig-cache" };
+
+fn collectMarks(arena: Allocator, marks: *usage.Marks, dir_path: []const u8) !void {
+    const io = phaseIo();
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                var skip = false;
+                for (skip_dirs) |d| {
+                    if (std.mem.eql(u8, entry.name, d)) skip = true;
+                }
+                if (skip) continue;
+                const sub = try std.fs.path.join(arena, &.{ dir_path, entry.name });
+                try collectMarks(arena, marks, sub);
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+                const source = dir.readFileAlloc(io, entry.name, arena, .limited(4 * 1024 * 1024)) catch continue;
+                try usage.scanSource(marks, .{}, source);
+            },
+            else => {},
+        }
+    }
 }
 
 fn emitMapping(w: *std.Io.Writer, m: *const yaml.Mapping, depth: usize) std.Io.Writer.Error!void {
@@ -309,4 +388,42 @@ test "runPhase: a non-identifier filename is rejected" {
     defer testing.allocator.free(target);
 
     try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, game, target));
+}
+
+test "collectMarks walks the game tree and skips generated dirs" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "game/scripts/playing");
+    try tmp.dir.createDirPath(io, "game/libs/needs");
+    try tmp.dir.createDirPath(io, "game/.labelle/target");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "game/scripts/playing/10_decay.zig",
+        .data = "const C = @import(\"constants\").C;\nconst cfg = C.decay.hunger;\npub fn tick() f32 { return cfg.rate; }\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "game/libs/needs/config.zig",
+        .data = "const C = @import(\"constants\").C;\npub const t = C.construction.build_time;\n",
+    });
+    // A use inside generated output must NOT count -- it is our own emission.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "game/.labelle/target/main.zig",
+        .data = "const C = @import(\"constants\").C;\npub const x = C.construction.max_workers;\n",
+    });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var marks = usage.Marks.init(arena_state.allocator());
+    try collectMarks(arena_state.allocator(), &marks, game);
+
+    try testing.expect(marks.covers("decay.hunger.rate")); // via the alias subtree
+    try testing.expect(marks.covers("construction.build_time")); // direct, from libs/
+    try testing.expect(!marks.covers("construction.max_workers")); // only in .labelle
+    try testing.expect(!marks.covers("decay.health.drain_rate"));
 }
