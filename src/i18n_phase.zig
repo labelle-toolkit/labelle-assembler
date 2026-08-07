@@ -410,7 +410,7 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
         const pref_tag = pk.reference orelse in.reference_tag;
         var pref: ?locales_mod.Locale = null;
         for (ptags.items, 0..) |t, i| {
-            if (std.mem.eql(u8, t, pref_tag)) pref = pparsed.items[i];
+            if (std.ascii.eqlIgnoreCase(t, pref_tag)) pref = pparsed.items[i];
         }
         const pack_ref = pref orelse {
             std.debug.print("packs/{s}/locales/: reference locale '{s}' has no file. A pack's reference defines its key space; declare .i18n_reference in pack.labelle if the pack is not authored in the project's reference language\n", .{ pk.name, pref_tag });
@@ -420,7 +420,7 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
 
         // Per-realm rename catch: a pack locale key its own reference lacks.
         for (ptags.items, 0..) |t, i| {
-            if (std.mem.eql(u8, t, pref_tag)) continue;
+            if (std.ascii.eqlIgnoreCase(t, pref_tag)) continue;
             for (pparsed.items[i].entries) |e| {
                 if (pack_ref.get(e.key) == null) {
                     std.debug.print("packs/{s}/locales/{s}.jsonc: key '{s}' is absent from the pack's reference ({s})\n", .{ pk.name, t, e.key, pref_tag });
@@ -435,7 +435,9 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
         for (ptags.items, 0..) |t, i| {
             var placed = false;
             for (in.game_tags, 0..) |gt, gi| {
-                if (std.mem.eql(u8, t, gt)) {
+                // Case-insensitive, like the generated runtime: a pack's
+                // pt-br.jsonc maps onto the game's pt-BR.
+                if (std.ascii.eqlIgnoreCase(t, gt)) {
                     by_tag[gi] = pparsed.items[i];
                     placed = true;
                 }

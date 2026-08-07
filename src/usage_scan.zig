@@ -307,7 +307,18 @@ const Tokenizer = struct {
 
     fn nextIdent(self: *Tokenizer) ?[]const u8 {
         self.skipIgnorable();
-        if (self.i >= self.source.len or !isIdentStart(self.source[self.i])) return null;
+        if (self.i >= self.source.len) return null;
+        // Quoted identifiers: keys named like Zig keywords generate as
+        // @"error", and call sites write K.menu.@"error". Truncating the
+        // chain here recorded "menu" as an interior stop, widening the whole
+        // subtree -- which under strict flags untranslated SIBLINGS as used.
+        if (self.source[self.i] == '@' and self.i + 1 < self.source.len and self.source[self.i + 1] == '"') {
+            const name_start = self.i + 2;
+            const end = std.mem.indexOfScalarPos(u8, self.source, name_start, '"') orelse return null;
+            self.i = end + 1;
+            return self.source[name_start..end];
+        }
+        if (!isIdentStart(self.source[self.i])) return null;
         const start = self.i;
         self.i = endOfIdent(self.source, start);
         return self.source[start..self.i];
@@ -520,6 +531,18 @@ test "whitespace inside the import call is tolerated" {
         \\pub fn f() f32 { return C.decay.rate; }
     );
     try testing.expect(m.covers("decay.rate"));
+}
+
+test "quoted identifier segments continue the chain -- no false widening" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const m = try scanned(arena_state.allocator(),
+        \\const K = @import("constants").C;
+        \\pub fn f() void { _ = K.menu.@"error"; }
+    );
+    // The exact leaf, not the whole menu subtree.
+    try testing.expect(m.covers("menu.error"));
+    try testing.expect(!m.covers("menu.help"));
 }
 
 test "a pub re-export of the root is a cross-file escape" {
