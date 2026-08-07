@@ -395,7 +395,7 @@ jobs:
           cd labelle-assembler/examples/scripting-smoke
           ASM=$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler
 
-          # Fetch the scripting plugin (GitHub, v0.2.0) into the package
+          # Fetch the scripting plugin (GitHub, v0.2.1) into the package
           # cache. The backend needs no fetch — `backend_package` pins the
           # sibling labelle-null checkout (see the clone step above).
           # generate then ALSO builds + runs the dep's real declare tool
