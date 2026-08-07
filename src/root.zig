@@ -571,11 +571,24 @@ pub fn generate(
     // emit the i18n module -- Key, K, the baked table, t()/setLocale. Same
     // no-op invariant as constants: no locales/ -> nothing emitted,
     // byte-identical build.zig.
+    // Pack locales (phase 3) ride the same resolved src dirs as pack
+    // constants; the per-pack reference comes from pack.labelle's
+    // `.i18n_reference` (RFC-I18N §2.2).
+    var pack_locs: std.ArrayList(i18n_phase.PackLocales) = .empty;
+    defer pack_locs.deinit(allocator);
+    for (pack_entries.items, 0..) |e, pi| {
+        try pack_locs.append(allocator, .{
+            .name = e.plugin.name,
+            .src_dir = pack_consts.items[pi].src_dir,
+            .reference = e.manifest.i18n_reference,
+        });
+    }
     const has_i18n = try i18n_phase.runPhase(
         allocator,
         game_dir,
         target_dir,
         if (cfg.i18n) |ic| .{ .default = ic.default, .reference = ic.reference, .strict = ic.strict } else null,
+        pack_locs.items,
     );
 
     // Copy game folders into target dir and scan file stems in one pass.
