@@ -554,7 +554,16 @@ pub fn generate(
     // beside the other generated files. False -- the common case, no
     // `constants/` directory -- emits nothing and the build.zig stays
     // byte-identical; the flag drives the module wiring below.
-    const has_constants = try constants_phase.runPhase(allocator, game_dir, target_dir);
+    var pack_consts: std.ArrayList(constants_phase.PackConstants) = .empty;
+    defer {
+        for (pack_consts.items) |pc| allocator.free(pc.src_dir);
+        pack_consts.deinit(allocator);
+    }
+    for (pack_entries.items) |e| {
+        const src = try e.resolveSrcDir(allocator, game_dir);
+        try pack_consts.append(allocator, .{ .name = e.plugin.name, .src_dir = src });
+    }
+    const has_constants = try constants_phase.runPhase(allocator, game_dir, target_dir, pack_consts.items);
 
     // Copy game folders into target dir and scan file stems in one pass.
     // Folders that need scanning use copyAndScan; assets is copy-only.

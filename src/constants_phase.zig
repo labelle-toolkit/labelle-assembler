@@ -14,8 +14,8 @@
 //! Phase 2 lives here too: after a successful emit, the game's .zig sources
 //! are scanned (usage_scan.zig -- conservative alias widening, warnings only)
 //! and every constant nothing reads is named with its yaml file and line.
-//! Phase 3 (pack constants, game-over-pack precedence) is deliberately
-//! absent; see the phasing table in RFC-CONSTANTS.
+//! Phase 3: packs ship their own constants, namespaced <pack>__<file>, and
+//! the game overrides them by filename -- see runPhase.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const yaml = @import("constants_yaml.zig");
@@ -39,8 +39,22 @@ fn phaseIo() std.Io {
 
 pub const GENERATED_FILENAME = "constants.zig";
 
+/// A pack that may ship constants: its declared name and resolved source dir.
+pub const PackConstants = struct {
+    name: []const u8,
+    src_dir: []const u8,
+};
+
 /// Runs the phase. Returns true when a `constants.zig` was emitted (the build
-/// wiring keys off this), false when the game has no `constants/` directory.
+/// wiring keys off this), false when neither the game nor any pack ships a
+/// `constants/` directory.
+///
+/// Phase 3 (RFC-CONSTANTS section 1.1): packs bring their own, namespaced
+/// `<pack>__<file>`, and the game overrides by carrying the prefixed name as
+/// a filename -- `constants/citizens__hunger.yaml` retunes the citizens
+/// pack's hunger domain. Every write under a pack's namespace is an override:
+/// one that matches nothing the pack defines is an error, and an override
+/// must keep the scalar kind it replaces. The game takes precedence.
 ///
 /// Validation failures print `file:line: message` to stderr and return
 /// `error.ConstantsInvalid`, matching the tone of the other phases: the value
@@ -49,6 +63,7 @@ pub fn runPhase(
     allocator: Allocator,
     game_dir: []const u8,
     target_dir: []const u8,
+    packs: []const PackConstants,
 ) !bool {
     const io = phaseIo();
     const cwd = std.Io.Dir.cwd();
@@ -57,82 +72,130 @@ pub fn runPhase(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const src_path = try std.fs.path.join(arena, &.{ game_dir, "constants" });
+    // Namespace registry: namespace ident -> (tree, defining file). Packs
+    // load first, so a game override file finds its target already present;
+    // everything then emits in one sorted pass.
+    var reg: Registry = .{};
+    var had_error = false;
 
-    var src_dir = cwd.openDir(io, src_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => {
-            // No constants/ -- remove any stale generated file and emit nothing.
-            const stale = try std.fs.path.join(arena, &.{ target_dir, GENERATED_FILENAME });
-            cwd.deleteFile(io, stale) catch {};
-            return false;
-        },
+    // 1. Pack constants (phase 3): packs ship their own, surfacing as
+    //    C.<pack>__<stem>.*.
+    for (packs) |pk| {
+        const pdir_path = try std.fs.path.join(arena, &.{ pk.src_dir, "constants" });
+        var pdir = cwd.openDir(io, pdir_path, .{ .iterate = true }) catch continue;
+        defer pdir.close(io);
+        const pfiles = try listYaml(arena, io, &pdir);
+        for (pfiles) |name| {
+            const stem = name[0 .. name.len - ".yaml".len];
+            const display = try std.fmt.allocPrint(arena, "packs/{s}/constants/{s}", .{ pk.name, name });
+            if (!isIdentifier(stem) or !isIdentifier(pk.name)) {
+                std.debug.print("{s}: pack and file names must be Zig identifiers (they become the C.{s}__{s} namespace)\n", .{ display, pk.name, stem });
+                had_error = true;
+                continue;
+            }
+            const source = pdir.readFileAlloc(io, name, arena, .limited(1024 * 1024)) catch |err| switch (err) {
+                error.StreamTooLong => {
+                    std.debug.print("{s}: file exceeds 1 MiB\n", .{display});
+                    had_error = true;
+                    continue;
+                },
+                else => return err,
+            };
+            switch (try yaml.parse(arena, source)) {
+                .fail => |e| {
+                    std.debug.print("{s}:{d}: {s}\n", .{ display, e.line, e.msg });
+                    had_error = true;
+                },
+                .root => |root| {
+                    const ns = try std.fmt.allocPrint(arena, "{s}__{s}", .{ pk.name, stem });
+                    const stored = try arena.create(yaml.Mapping);
+                    stored.* = root;
+                    try reg.entries.append(arena, .{ .ns = ns, .file = display, .tree = stored });
+                },
+            }
+        }
+    }
+
+    // 2. Game constants: plain domains define; `<pack>__<domain>` filenames
+    //    override, and the game takes precedence (RFC-CONSTANTS section 1.1).
+    const src_path = try std.fs.path.join(arena, &.{ game_dir, "constants" });
+    var game_files: []const []const u8 = &.{};
+    var src_dir_opt: ?std.Io.Dir = cwd.openDir(io, src_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => null,
         else => return err,
     };
-    defer src_dir.close(io);
+    defer if (src_dir_opt) |*d| d.close(io);
+    if (src_dir_opt) |*d| game_files = try listYaml(arena, io, d);
 
-    // Collect *.yaml, sorted, so the generated file is deterministic under
-    // directory-iteration order differences between filesystems.
-    var names: std.ArrayList([]const u8) = .empty;
-    var iter = src_dir.iterate();
-    while (iter.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".yaml")) continue;
-        try names.append(arena, try arena.dupe(u8, entry.name));
-    }
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lessThan);
-
-    if (names.items.len == 0) {
+    if (reg.entries.items.len == 0 and game_files.len == 0) {
         const stale = try std.fs.path.join(arena, &.{ target_dir, GENERATED_FILENAME });
         cwd.deleteFile(io, stale) catch {};
         return false;
     }
 
-    var leaves: std.ArrayList(Leaf) = .empty;
-    var out: std.Io.Writer.Allocating = .init(arena);
-    const w = &out.writer;
-    try w.writeAll(
-        \\//! Generated by labelle-assembler from constants/*.yaml — do not edit.
-        \\//! Values are emitted verbatim, so 5.0 is comptime_float and 5 is
-        \\//! comptime_int; they coerce at the use site (RFC-CONSTANTS §3).
-        \\
-        \\pub const C = struct {
-        \\
-    );
-
-    var had_error = false;
-    for (names.items) |name| {
+    for (game_files) |name| {
         const stem = name[0 .. name.len - ".yaml".len];
+        const display = try std.fmt.allocPrint(arena, "constants/{s}", .{name});
         if (!isIdentifier(stem)) {
-            std.debug.print("constants/{s}: filename must be a Zig identifier (it becomes the C.{s} namespace)\n", .{ name, stem });
+            std.debug.print("{s}: filename must be a Zig identifier (it becomes the C.{s} namespace)\n", .{ display, stem });
             had_error = true;
             continue;
         }
-
-        const source = src_dir.readFileAlloc(io, name, arena, .limited(1024 * 1024)) catch |err| switch (err) {
+        const source = src_dir_opt.?.readFileAlloc(io, name, arena, .limited(1024 * 1024)) catch |err| switch (err) {
             error.StreamTooLong => {
-                std.debug.print("constants/{s}: file exceeds 1 MiB, which no constants file should\n", .{name});
+                std.debug.print("{s}: file exceeds 1 MiB\n", .{display});
                 had_error = true;
                 continue;
             },
             else => return err,
         };
-
+        var parsed: yaml.Mapping = undefined;
         switch (try yaml.parse(arena, source)) {
             .fail => |e| {
-                std.debug.print("constants/{s}:{d}: {s}\n", .{ name, e.line, e.msg });
+                std.debug.print("{s}:{d}: {s}\n", .{ display, e.line, e.msg });
                 had_error = true;
+                continue;
             },
-            .root => |root| {
-                try w.print("    pub const {s} = struct {{\n", .{stem});
-                try emitMapping(w, &root, 2);
-                try w.writeAll("    };\n");
-                try collectLeaves(arena, &leaves, name, stem, &root);
-            },
+            .root => |root| parsed = root,
         }
+
+        if (std.mem.indexOf(u8, stem, "__") != null) {
+            // Every write under a pack namespace is an override, and one that
+            // matches nothing is an error -- a silent create here is exactly
+            // the tuning-reverts-on-upgrade failure the rule prevents.
+            const target = reg.find(stem) orelse {
+                std.debug.print("{s}: overrides C.{s}, but no pack defines that namespace\n", .{ display, stem });
+                had_error = true;
+                continue;
+            };
+            if (!try mergeOverride(arena, display, target.tree, &parsed, "")) had_error = true;
+        } else {
+            const stored = try arena.create(yaml.Mapping);
+            stored.* = parsed;
+            try reg.entries.append(arena, .{ .ns = stem, .file = display, .tree = stored });
+        }
+    }
+
+    if (had_error) return error.ConstantsInvalid;
+
+    // 3. Emit, sorted by namespace for determinism.
+    std.mem.sort(Registry.Entry, reg.entries.items, {}, struct {
+        fn lessThan(_: void, a: Registry.Entry, b: Registry.Entry) bool {
+            return std.mem.order(u8, a.ns, b.ns) == .lt;
+        }
+    }.lessThan);
+
+    var leaves: std.ArrayList(Leaf) = .empty;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try w.writeAll("//! Generated by labelle-assembler from constants/*.yaml " ++ [_]u8{0xe2} ++ [_]u8{0x80} ++ [_]u8{0x94} ++ " do not edit.\n" ++
+        "//! Values are emitted verbatim, so 5.0 is comptime_float and 5 is\n" ++
+        "//! comptime_int; they coerce at the use site (RFC-CONSTANTS " ++ [_]u8{0xc2} ++ [_]u8{0xa7} ++ "3).\n\npub const C = struct {\n");
+    for (reg.entries.items) |e| {
+        try w.print("    pub const {s} = struct {{\n", .{e.ns});
+        try emitMapping(w, e.tree, 2);
+        try w.writeAll("    };\n");
+        try collectLeaves(arena, &leaves, e.file, e.ns, e.tree);
     }
     try w.writeAll("};\n");
 
@@ -144,8 +207,110 @@ pub fn runPhase(
     // Phase 2: usage warnings. Never fails the build -- a warning that can be
     // wrong teaches people to ignore it, so the scan errs toward "used" and
     // this errs toward silence on any I/O trouble.
-    warnUnused(arena, game_dir, leaves.items) catch {};
+    warnUnused(arena, game_dir, packs, leaves.items) catch {};
     return true;
+}
+
+/// Namespaces awaiting emission, insertion-ordered until the final sort.
+const Registry = struct {
+    entries: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct {
+        ns: []const u8,
+        file: []const u8,
+        tree: *yaml.Mapping,
+    };
+
+    fn find(self: *const Registry, ns: []const u8) ?*Entry {
+        for (self.entries.items) |*e| {
+            if (std.mem.eql(u8, e.ns, ns)) return e;
+        }
+        return null;
+    }
+};
+
+/// Sorted `*.yaml` names in a directory.
+fn listYaml(arena: Allocator, io: std.Io, dir: *std.Io.Dir) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".yaml")) continue;
+        try names.append(arena, try arena.dupe(u8, entry.name));
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    return names.items;
+}
+
+/// Applies a game override file onto a pack's tree, in place. Returns false
+/// (after printing) on any violation of the two rules: every key must match
+/// one the pack defines, and a scalar keeps its kind.
+fn mergeOverride(
+    arena: Allocator,
+    display: []const u8,
+    base: *yaml.Mapping,
+    override: *const yaml.Mapping,
+    prefix: []const u8,
+) Allocator.Error!bool {
+    var ok = true;
+    for (override.entries.items) |oe| {
+        const path = if (prefix.len == 0)
+            oe.key
+        else
+            try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, oe.key });
+
+        const be = findEntry(base, oe.key) orelse {
+            std.debug.print("{s}:{d}: '{s}' overrides nothing -- the pack does not define it. A typo here, or a key the pack renamed, would otherwise silently keep the pack's value\n", .{ display, oe.line, path });
+            ok = false;
+            continue;
+        };
+        switch (oe.node) {
+            .mapping => |om| switch (be.node) {
+                .mapping => |bm| {
+                    if (!try mergeOverride(arena, display, bm, om, path)) ok = false;
+                },
+                .scalar => {
+                    std.debug.print("{s}:{d}: '{s}' is a value in the pack, not a block\n", .{ display, oe.line, path });
+                    ok = false;
+                },
+            },
+            .scalar => |os| switch (be.node) {
+                .mapping => {
+                    std.debug.print("{s}:{d}: '{s}' is a block in the pack, not a value\n", .{ display, oe.line, path });
+                    ok = false;
+                },
+                .scalar => |bs| {
+                    if (os.kind != bs.kind) {
+                        std.debug.print("{s}:{d}: '{s}' changes kind from {s} to {s} -- values are untyped and coerce at the use site, so an int-for-float override can change behaviour without changing the number. Keep the kind: write {s}\n", .{ display, os.line, path, @tagName(bs.kind), @tagName(os.kind), exampleOfKind(bs.kind) });
+                        ok = false;
+                    } else {
+                        be.node = .{ .scalar = os };
+                    }
+                },
+            },
+        }
+    }
+    return ok;
+}
+
+fn findEntry(m: *yaml.Mapping, key: []const u8) ?*yaml.Mapping.Entry {
+    for (m.entries.items) |*e| {
+        if (std.mem.eql(u8, e.key, key)) return e;
+    }
+    return null;
+}
+
+fn exampleOfKind(kind: yaml.ScalarKind) []const u8 {
+    return switch (kind) {
+        .int => "5, not 5.0",
+        .float => "5.0, not 5",
+        .bool => "true or false",
+        .string => "a quoted string",
+    };
 }
 
 /// One emitted constant: where it can be addressed from code, and where it
@@ -175,9 +340,17 @@ fn collectLeaves(
 
 /// Scans every .zig file under the game dir (skipping generated and vendored
 /// trees) and prints one warning per constant nothing reads.
-fn warnUnused(arena: Allocator, game_dir: []const u8, leaves: []const Leaf) !void {
+fn warnUnused(arena: Allocator, game_dir: []const u8, packs: []const PackConstants, leaves: []const Leaf) !void {
     var marks = usage.Marks.init(arena);
     try collectMarks(arena, &marks, game_dir);
+    // A cached pack's sources live outside the game tree, and its scripts are
+    // the likeliest readers of its own constants -- not scanning them would
+    // fire false "unused" warnings, the direction the design forbids.
+    for (packs) |pk| {
+        if (!std.mem.startsWith(u8, pk.src_dir, game_dir)) {
+            try collectMarks(arena, &marks, pk.src_dir);
+        }
+    }
 
     for (leaves) |leaf| {
         if (!marks.covers(leaf.path)) {
@@ -289,7 +462,7 @@ test "runPhase: no constants dir emits nothing and cleans a stale file" {
     const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
     defer testing.allocator.free(target);
 
-    try testing.expectEqual(false, try runPhase(testing.allocator, game, target));
+    try testing.expectEqual(false, try runPhase(testing.allocator, game, target, &.{}));
     // The stale file is gone.
     try testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "target/" ++ GENERATED_FILENAME, .{}));
 }
@@ -325,7 +498,7 @@ test "runPhase: files become namespaces, values stay verbatim, order is by filen
     const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
     defer testing.allocator.free(target);
 
-    try testing.expectEqual(true, try runPhase(testing.allocator, game, target));
+    try testing.expectEqual(true, try runPhase(testing.allocator, game, target, &.{}));
 
     const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(64 * 1024));
     defer testing.allocator.free(generated);
@@ -366,7 +539,7 @@ test "runPhase: a bad value names the file and line and fails the phase" {
     const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
     defer testing.allocator.free(target);
 
-    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, game, target));
+    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, game, target, &.{}));
     // Nothing half-written.
     try testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "target/" ++ GENERATED_FILENAME, .{}));
 }
@@ -387,7 +560,7 @@ test "runPhase: a non-identifier filename is rejected" {
     const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
     defer testing.allocator.free(target);
 
-    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, game, target));
+    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, game, target, &.{}));
 }
 
 test "collectMarks walks the game tree and skips generated dirs" {
@@ -426,4 +599,137 @@ test "collectMarks walks the game tree and skips generated dirs" {
     try testing.expect(marks.covers("construction.build_time")); // direct, from libs/
     try testing.expect(!marks.covers("construction.max_workers")); // only in .labelle
     try testing.expect(!marks.covers("decay.health.drain_rate"));
+}
+
+fn tmpPaths(tmp: *std.testing.TmpDir, alloc: Allocator) !struct { game: []const u8, target: []const u8, root: []const u8 } {
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    return .{
+        .game = try std.fs.path.join(alloc, &.{ rel, "game" }),
+        .target = try std.fs.path.join(alloc, &.{ rel, "target" }),
+        .root = try alloc.dupe(u8, rel),
+    };
+}
+
+test "phase 3: pack constants surface namespaced, game override wins, kind kept" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "game/constants");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.createDirPath(io, "thepack/constants");
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/constants/hunger.yaml", .data = "rate: 0.02\nlimit: 4\nnested:\n  deep: 1.5\n" });
+    // The game retunes rate and the nested value; limit rides through.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/constants/citizens__hunger.yaml", .data = "rate: 0.05\nnested:\n  deep: 2.5\n" });
+    // And ships a plain domain of its own.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/constants/ui.yaml", .data = "margin: 8\n" });
+
+    const paths = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(paths.game);
+    defer testing.allocator.free(paths.target);
+    defer testing.allocator.free(paths.root);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ paths.root, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackConstants{.{ .name = "citizens", .src_dir = pack_dir }};
+    try testing.expectEqual(true, try runPhase(testing.allocator, paths.game, paths.target, &packs));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(generated);
+
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const citizens__hunger = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const rate = 0.05;") != null); // overridden
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const limit = 4;") != null); // pack default rides
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const deep = 2.5;") != null); // deep override
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const ui = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "0.02") == null); // the pack value is gone
+}
+
+test "phase 3: an override matching nothing is an error" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "game/constants");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.createDirPath(io, "thepack/constants");
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/constants/hunger.yaml", .data = "rate: 0.02\n" });
+    // 'rte' is the RFC's own typo example.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/constants/citizens__hunger.yaml", .data = "rte: 0.05\n" });
+
+    const paths = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(paths.game);
+    defer testing.allocator.free(paths.target);
+    defer testing.allocator.free(paths.root);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ paths.root, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackConstants{.{ .name = "citizens", .src_dir = pack_dir }};
+    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, paths.game, paths.target, &packs));
+}
+
+test "phase 3: an override changing scalar kind is an error" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "game/constants");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.createDirPath(io, "thepack/constants");
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/constants/hunger.yaml", .data = "rate: 0.02\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/constants/citizens__hunger.yaml", .data = "rate: 5\n" });
+
+    const paths = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(paths.game);
+    defer testing.allocator.free(paths.target);
+    defer testing.allocator.free(paths.root);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ paths.root, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackConstants{.{ .name = "citizens", .src_dir = pack_dir }};
+    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, paths.game, paths.target, &packs));
+}
+
+test "phase 3: an override file for a namespace no pack defines is an error" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "game/constants");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/constants/citizens__hunger.yaml", .data = "rate: 0.05\n" });
+
+    const paths = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(paths.game);
+    defer testing.allocator.free(paths.target);
+    defer testing.allocator.free(paths.root);
+
+    try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, paths.game, paths.target, &.{}));
+}
+
+test "phase 3: pack constants alone (no game constants dir) still emit" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "game");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.createDirPath(io, "thepack/constants");
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/constants/ship.yaml", .data = "speed: 280\n" });
+
+    const paths = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(paths.game);
+    defer testing.allocator.free(paths.target);
+    defer testing.allocator.free(paths.root);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ paths.root, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackConstants{.{ .name = "transport", .src_dir = pack_dir }};
+    try testing.expectEqual(true, try runPhase(testing.allocator, paths.game, paths.target, &packs));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(generated);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const transport__ship = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const speed = 280;") != null);
 }

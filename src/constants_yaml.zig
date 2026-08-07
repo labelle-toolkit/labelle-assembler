@@ -458,8 +458,8 @@ test "the YAML 1.1 traps are named errors, not silent values" {
         try testing.expect(std.mem.indexOf(u8, e.msg, "numeric literal") != null);
     }
     { // version-number float truncation trap: 1.20 is a fine float literal for
-      // us (emitted verbatim), so this parses — the trap YAML has does not
-      // exist when the text is preserved.
+        // us (emitted verbatim), so this parses — the trap YAML has does not
+        // exist when the text is preserved.
         const m = try parseOk(a, "version: 1.20\n");
         try testing.expectEqualStrings("1.20", m.get("version").?.scalar.text);
     }

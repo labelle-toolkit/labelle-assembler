@@ -1807,14 +1807,13 @@ test "emitPluginBuildSteps: the csharp shape (#617) — link-less dotnet publish
     // output) into the exe's install dir, ordered after the publish and
     // reached from the default install step — `zig build` alone yields
     // the assembly beside the binary.
-    try testing.expect(std.mem.indexOf(u8, out,
-        "    const plugin_scripting_runtime_outputs = b.addInstallDirectory(.{\n" ++
-            "        .source_dir = .{ .cwd_relative = plugin_scripting_build_cache },\n" ++
-            "        .install_dir = .bin,\n" ++
-            "        .install_subdir = \"\",\n" ++
-            "    });\n" ++
-            "    plugin_scripting_runtime_outputs.step.dependOn(&plugin_scripting_build_step_0.step);\n" ++
-            "    b.getInstallStep().dependOn(&plugin_scripting_runtime_outputs.step);\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    const plugin_scripting_runtime_outputs = b.addInstallDirectory(.{\n" ++
+        "        .source_dir = .{ .cwd_relative = plugin_scripting_build_cache },\n" ++
+        "        .install_dir = .bin,\n" ++
+        "        .install_subdir = \"\",\n" ++
+        "    });\n" ++
+        "    plugin_scripting_runtime_outputs.step.dependOn(&plugin_scripting_build_step_0.step);\n" ++
+        "    b.getInstallStep().dependOn(&plugin_scripting_runtime_outputs.step);\n") != null);
 }
 
 test "emitPluginBuildSteps: runtime outputs stage on the exe target only (never wasm/lib)" {
