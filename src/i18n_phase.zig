@@ -687,9 +687,10 @@ fn emitModule(
         \\    const val = std.mem.span(raw);
         \\    if (val.len == 0) return;
         \\    // Unknown tags are ignored, never an error: a leaked dev var must
-        \\    // not be able to break a player's run.
+        \\    // not be able to break a player's run. BCP-47 tags are
+        \\    // case-insensitive, so pt-br finds pt-BR.
         \\    for (tags, 0..) |t_, i| {
-        \\        if (std.mem.eql(u8, t_, val)) active = i;
+        \\        if (std.ascii.eqlIgnoreCase(t_, val)) active = i;
         \\    }
         \\}
         \\
@@ -818,10 +819,14 @@ fn emitModule(
         \\/// the LABELLE_LOCALE question: a live choice outranks the dev knob,
         \\/// so the lazy env check will not overwrite this later.
         \\pub fn setLocale(tag: []const u8) bool {
-        \\    env_checked = true;
+        \\    // BCP-47 tags are case-insensitive: pt-br switches to pt-BR.
         \\    for (tags, 0..) |t_, i| {
-        \\        if (std.mem.eql(u8, t_, tag)) {
+        \\        if (std.ascii.eqlIgnoreCase(t_, tag)) {
         \\            active = i;
+        \\            // Only a SUCCESSFUL explicit choice settles the env
+        \\            // question -- a rejected tag "changes nothing", and that
+        \\            // must include not eating the LABELLE_LOCALE fallback.
+        \\            env_checked = true;
         \\            return true;
         \\        }
         \\    }
@@ -931,7 +936,13 @@ const skip_dirs = [_][]const u8{ ".labelle", ".git", "deps", "zig-out", "zig-cac
 fn collectMarks(arena: Allocator, marks: *usage.Marks, dir_path: []const u8) !void {
     const io = phaseIo();
     const cwd = std.Io.Dir.cwd();
-    var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch return;
+    var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch {
+        // An unopenable tree could hold uses. An empty mark set here means
+        // every key reads as unused (warning spam, or missed strict
+        // coverage) -- widen instead, the one safe direction.
+        marks.all = true;
+        return;
+    };
     defer dir.close(io);
 
     var iter = dir.iterate();

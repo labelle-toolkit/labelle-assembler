@@ -110,10 +110,17 @@ fn scanPass(marks: *Marks, cfg: Config, source: []const u8, roots: *std.StringHa
         // `const X =` — remember the name so the RHS handlers above can bind
         // it. We peek rather than track state: when the RHS is one of ours,
         // the handler needs the name, so stash the most recent binding target.
+        if (std.mem.eql(u8, tok.text, "pub")) {
+            it.saw_pub = true;
+            continue;
+        }
         if (std.mem.eql(u8, tok.text, "const") or std.mem.eql(u8, tok.text, "var")) {
+            const was_pub = it.saw_pub;
+            it.saw_pub = false;
             if (it.nextIdent()) |name| {
                 if (it.consumeEquals()) {
                     it.pending_binding = name;
+                    it.pending_is_pub = was_pub;
                     // The RHS handlers above consume this. Any identifier that
                     // arrives first (a function call, another variable) breaks
                     // the direct-binding shape and clears it below -- which is
@@ -127,6 +134,7 @@ fn scanPass(marks: *Marks, cfg: Config, source: []const u8, roots: *std.StringHa
 
         // Any other identifier between `=` and a root breaks the binding shape.
         it.pending_binding = null;
+        it.saw_pub = false;
     }
 }
 
@@ -182,8 +190,11 @@ fn consumeChainOrBinding(
     }
 
     if (parts.items.len == 0) {
-        // Bare root. `const X = C;` re-roots the whole namespace under X.
+        // Bare root. `const X = C;` re-roots the whole namespace under X --
+        // but `pub const X = C;` re-exports it to files this per-file scan
+        // cannot see into, so a pub re-export is a cross-file escape: widen.
         if (it.takePendingBinding()) |name| {
+            if (it.pending_is_pub) marks.all = true;
             try roots.put(try arena.dupe(u8, name), {});
         } else {
             marks.all = true; // passed as a value / unparseable
@@ -219,6 +230,12 @@ const Tokenizer = struct {
     /// Set when `const <name> =` was just seen; consumed by the first
     /// RHS handler that wants it.
     pending_binding: ?[]const u8 = null,
+    /// Whether that binding was `pub` -- a pub re-export of the root is
+    /// visible to OTHER files this per-file scanner cannot see into.
+    pending_is_pub: bool = false,
+    /// Set when the last returned identifier was `pub`, so the following
+    /// const/var can record visibility.
+    saw_pub: bool = false,
 
     const Token = struct {
         kind: enum { ident, import },
@@ -502,6 +519,28 @@ test "whitespace inside the import call is tolerated" {
         \\const C = @import ( "constants" ).C;
         \\pub fn f() f32 { return C.decay.rate; }
     );
+    try testing.expect(m.covers("decay.rate"));
+}
+
+test "a pub re-export of the root is a cross-file escape" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // Another file may `@import` this helper and use K through it; this
+    // per-file scan cannot see that, so it must widen.
+    const m = try scanned(arena_state.allocator(),
+        \\pub const K = @import("constants").C;
+    );
+    try testing.expect(m.all);
+}
+
+test "a private root alias does not widen" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const m = try scanned(arena_state.allocator(),
+        \\const C = @import("constants").C;
+        \\pub fn f() f32 { return C.decay.rate; }
+    );
+    try testing.expect(!m.all);
     try testing.expect(m.covers("decay.rate"));
 }
 

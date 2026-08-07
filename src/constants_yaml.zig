@@ -143,7 +143,7 @@ const Parser = struct {
             const colon = std.mem.indexOfScalar(u8, ln.content, ':') orelse {
                 return self.fail(ln.no, "expected 'key:' or 'key: value', found '{s}'", .{ln.content});
             };
-            const key = std.mem.trim(u8, ln.content[0..colon], " ");
+            const key = std.mem.trim(u8, ln.content[0..colon], " \t");
             if (!isIdentifier(key)) {
                 return self.fail(ln.no, "'{s}' is not a valid constant name: names become Zig identifiers ([A-Za-z_][A-Za-z0-9_]*)", .{key});
             }
@@ -152,7 +152,9 @@ const Parser = struct {
             }
             const key_owned = try self.arena.dupe(u8, key);
 
-            const rest = std.mem.trim(u8, ln.content[colon + 1 ..], " ");
+            // Tabs are forbidden in indentation but valid SEPARATION after
+            // the colon; trimming only spaces shipped a literal tab in the value.
+            const rest = std.mem.trim(u8, ln.content[colon + 1 ..], " \t");
             if (rest.len == 0) {
                 // Opens a nested mapping. The child lives behind a stable
                 // pointer in the arena; the entry's node references it, so a
@@ -259,6 +261,9 @@ const Parser = struct {
         if (text[0] == '|' or text[0] == '>') {
             return failc(self.arena, line, "block scalars ('|', '>') are not supported in constants files; use a quoted string", .{});
         }
+        if (isForbiddenSpecialFloat(text)) {
+            return failc(self.arena, line, "'{s}' is YAML's infinity/NaN spelling, which no constant kind carries. Quote it if the text is meant", .{text});
+        }
         if (isForbiddenNull(text)) {
             return failc(self.arena, line, "'{s}' is YAML's null, and constants have no null kind. Quote it if the text is meant: \"{s}\"", .{ text, text });
         }
@@ -339,6 +344,16 @@ fn matchInt(s: []const u8) bool {
     if (t.len > 1 and t[0] == '0') return false;
     for (t) |c| if (!std.ascii.isDigit(c)) return false;
     return true;
+}
+
+fn isForbiddenSpecialFloat(s: []const u8) bool {
+    var t = s;
+    if (t.len > 0 and (t[0] == '-' or t[0] == '+')) t = t[1..];
+    const forbidden = [_][]const u8{ ".inf", ".Inf", ".INF", ".nan", ".NaN", ".NAN" };
+    for (forbidden) |f| {
+        if (std.mem.eql(u8, t, f)) return true;
+    }
+    return false;
 }
 
 fn isForbiddenNull(s: []const u8) bool {
@@ -625,6 +640,18 @@ test "review findings: the silent-corruption cases are loud now" {
     { // block scalar indicators are named
         const e = try parseErr(a, "message: |\n");
         try testing.expect(std.mem.indexOf(u8, e.msg, "block scalars") != null);
+    }
+    { // a tab AFTER the colon is separation, not value content
+        const m = try parseOk(a, "label:\tready\n");
+        try testing.expectEqualStrings("ready", m.get("label").?.scalar.text);
+    }
+    { // YAML's infinity/NaN spellings have no kind here
+        const e = try parseErr(a, "x: .inf\n");
+        try testing.expect(std.mem.indexOf(u8, e.msg, "infinity") != null);
+        const e2 = try parseErr(a, "y: -.Inf\n");
+        try testing.expect(std.mem.indexOf(u8, e2.msg, "infinity") != null);
+        const e3 = try parseErr(a, "z: .nan\n");
+        try testing.expect(std.mem.indexOf(u8, e3.msg, "infinity") != null);
     }
 }
 

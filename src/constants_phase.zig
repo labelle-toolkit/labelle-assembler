@@ -393,7 +393,13 @@ const skip_dirs = [_][]const u8{ ".labelle", ".git", "deps", "zig-out", "zig-cac
 fn collectMarks(arena: Allocator, marks: *usage.Marks, dir_path: []const u8) !void {
     const io = phaseIo();
     const cwd = std.Io.Dir.cwd();
-    var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch return;
+    var dir = cwd.openDir(io, dir_path, .{ .iterate = true }) catch {
+        // An unopenable tree could hold uses. An empty mark set here means
+        // every key reads as unused (warning spam, or missed strict
+        // coverage) -- widen instead, the one safe direction.
+        marks.all = true;
+        return;
+    };
     defer dir.close(io);
 
     var iter = dir.iterate();
