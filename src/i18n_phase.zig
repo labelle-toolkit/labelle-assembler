@@ -32,6 +32,7 @@ const Allocator = std.mem.Allocator;
 const locales_mod = @import("i18n_locales.zig");
 const usage = @import("usage_scan.zig");
 const interp = @import("i18n_interp.zig");
+const zig_keywords = @import("zig_keywords.zig");
 const plurals = @import("i18n_plurals.zig");
 
 // Same local io as constants_phase, for the same reason: config.zig pulls in
@@ -176,6 +177,23 @@ pub fn runPhase(
     }
     if (had_error) return error.I18nInvalid;
 
+    // Keyword-key lint (flying-platform#786 friction #2). A segment named
+    // like a Zig keyword GENERATES fine -- every K declaration is @""-quoted
+    // -- but each call site must then write K.pause.@"resume", which is the
+    // ergonomic trap FP hit. Warn against the reference locale (the key
+    // space, so one warning per key however many files carry it) and show
+    // the cheap rename. Never an error: the @"" path works.
+    if (diagnostics) {
+        for (try keywordKeyLints(arena, parsed[reference_idx].entries)) |l| {
+            // A key under a pack's namespace is the pack's: a game write
+            // there must name a key the pack defines, and the pack-side lint
+            // in mergePacks already covers the pack's key space -- warning
+            // here too would say everything twice.
+            if (isPackNamespaced(packs, l.key)) continue;
+            std.debug.print("warning: i18n: locales/{s}.jsonc: key '{s}': segment '{s}' is a Zig keyword, so call sites read K.{s} -- consider renaming the segment to '{s}_'\n", .{ reference_tag, l.key, l.seg, try zig_keywords.quoteDottedPath(arena, l.key), l.seg });
+        }
+    }
+
     // Phase 3: pack locales. Everything below folds the packs into ONE merged
     // key space and merged per-tag locales, then the whole existing pipeline
     // -- the rename catch, coverage, placeholder parity, emission -- runs on
@@ -188,6 +206,7 @@ pub fn runPhase(
             .reference_idx = reference_idx,
             .reference_tag = reference_tag,
             .packs = packs,
+            .diagnostics = diagnostics,
         }) catch |err| switch (err) {
             error.I18nInvalid => return error.I18nInvalid,
             else => return err,
@@ -506,7 +525,38 @@ const MergeInput = struct {
     reference_idx: usize,
     reference_tag: []const u8,
     packs: []const PackLocales,
+    diagnostics: bool,
 };
+
+/// One keyword-key finding (flying-platform#786 friction #2): the dotted key
+/// and its first offending segment. A pure collector so the firing set is
+/// unit-testable without capturing stderr; runPhase owns the printing.
+const KeywordLint = struct {
+    key: []const u8,
+    seg: []const u8,
+};
+
+fn keywordKeyLints(arena: Allocator, entries: []const locales_mod.Entry) Allocator.Error![]const KeywordLint {
+    var out: std.ArrayList(KeywordLint) = .empty;
+    for (entries) |e| {
+        if (zig_keywords.firstKeywordSegment(e.key)) |seg| {
+            try out.append(arena, .{ .key = e.key, .seg = seg });
+        }
+    }
+    return out.items;
+}
+
+/// True when `key` writes under the namespace of a pack that ships locales
+/// (the same raw-name `<pack>__` prefixing mergePacks uses). Such keys are
+/// overrides of the pack's key space, which gets its own lint pass.
+fn isPackNamespaced(packs: []const PackLocales, key: []const u8) bool {
+    const sep = std.mem.indexOf(u8, key, "__") orelse return false;
+    const prefix = key[0..sep];
+    for (packs) |pk| {
+        if (std.mem.eql(u8, pk.name, prefix)) return true;
+    }
+    return false;
+}
 
 /// Folds pack locales into the game's, returning merged per-tag locales over
 /// the GAME's tag set. The game's tag set is deliberately authoritative: what
@@ -603,6 +653,15 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
                     std.debug.print("packs/{s}/locales/{s}.jsonc: key '{s}': placeholder set {{{s}}} differs from the pack reference's {{{s}}} (for plural keys, {{count}} is implicit and never counted)\n", .{ pk.name, t, e.key, try std.mem.join(arena, ", ", l_names), try std.mem.join(arena, ", ", r_names) });
                     had_error = true;
                 }
+            }
+        }
+
+        // Keyword-key lint over the pack's key space (its reference), with
+        // the surfaced K.<pack>__<key> path a game call site would read.
+        if (in.diagnostics) {
+            for (try keywordKeyLints(arena, pack_ref.entries)) |l| {
+                const surfaced = try std.fmt.allocPrint(arena, "{s}__{s}", .{ pk.name, l.key });
+                std.debug.print("warning: i18n: packs/{s}/locales/{s}.jsonc: key '{s}': segment '{s}' is a Zig keyword, so call sites read K.{s} -- consider renaming the segment to '{s}_'\n", .{ pk.name, pref_tag, l.key, l.seg, try zig_keywords.quoteDottedPath(arena, surfaced), l.seg });
             }
         }
 
@@ -1732,6 +1791,7 @@ test "phase 3: writing under a pack namespace asserts the key exists" {
     try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
 }
 
+
 test "phase 3: a declared pack reference with no file is an error; a pack-locale key outside its reference is an error" {
     const io = phaseIo();
     var tmp = std.testing.tmpDir(.{});
@@ -2108,4 +2168,95 @@ test "strict: a used key missing from a locale fails the build" {
     try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
     // Strict: the same gap is a build error.
     try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en", .strict = true }, &.{}, true));
+}
+
+test "keyword-key lint: fires on keyword segments, silent on clean and @''-renamed keys" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const entries = [_]locales_mod.Entry{
+        .{ .key = "error.title", .value = .{ .str = "Oops" } },
+        .{ .key = "hud.gold", .value = .{ .str = "Gold" } },
+        .{ .key = "menu.new_game", .value = .{ .str = "New Game" } },
+        .{ .key = "pause.resume", .value = .{ .str = "Resume" } },
+        // The rename the lint suggests, and FP's actual fix: both clean.
+        .{ .key = "pause.resume_", .value = .{ .str = "Resume" } },
+        .{ .key = "pause.resume_game", .value = .{ .str = "Resume" } },
+    };
+    const lints = try keywordKeyLints(arena, &entries);
+    try testing.expectEqual(@as(usize, 2), lints.len);
+    try testing.expectEqualStrings("error.title", lints[0].key);
+    try testing.expectEqualStrings("error", lints[0].seg);
+    try testing.expectEqualStrings("pause.resume", lints[1].key);
+    try testing.expectEqualStrings("resume", lints[1].seg);
+}
+
+test "keyword-key lint: a game override under a pack namespace is the pack's to warn about" {
+    // The pack-side pass in mergePacks lints the pack's key space, so the
+    // game-side pass skips pack-namespaced keys -- one warning per surfaced
+    // key, not one per realm that carries it.
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = "unused" }};
+    try testing.expect(isPackNamespaced(&packs, "citizens__hunger.resume"));
+    try testing.expect(!isPackNamespaced(&packs, "pause.resume"));
+    // A different (or unknown) prefix is not the pack's namespace.
+    try testing.expect(!isPackNamespaced(&packs, "villagers__hunger.resume"));
+    try testing.expect(!isPackNamespaced(&.{}, "citizens__hunger.resume"));
+}
+
+test "a keyword key warns but still generates, @\"\"-quoted" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "target");
+    // FP's exact friction shape: pause.resume (flying-platform#786 #2).
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"pause\": { \"resume\": \"Resume\" } }" });
+
+    const p = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(p.game);
+    defer testing.allocator.free(p.target);
+
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
+    defer testing.allocator.free(generated);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"resume\": Key = @enumFromInt(0);") != null);
+
+    const src_z = try testing.allocator.dupeZ(u8, generated);
+    defer testing.allocator.free(src_z);
+    var ast = try std.zig.Ast.parse(testing.allocator, src_z, .zig);
+    defer ast.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), ast.errors.len);
+}
+
+test "t/tf keep the [:0] sentinel contract (flying-platform#786 friction #3)" {
+    // The cimgui hand-off: call sites pass t(...).ptr / tf(...).ptr straight
+    // to C, so the emitted signatures and table type must stay sentinel-
+    // terminated. #656 shipped this; the asserts pin it. The compile-and-run
+    // proof lives in test/i18n_sentinel_tests.zig -- this is the cheap
+    // text-level lock next to the emitter it guards.
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"menu\": { \"play\": \"Play\" }, \"hud\": { \"stock\": \"{count} of {max}\" } }" });
+
+    const p = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(p.game);
+    defer testing.allocator.free(p.target);
+
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
+    defer testing.allocator.free(generated);
+
+    try testing.expect(std.mem.indexOf(u8, generated, "pub fn t(comptime key: Key) [:0]const u8 {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub fn tf(comptime key: Key, args: anytype) [:0]const u8 {") != null);
+    // The static table is sentinel-typed (string literals carry the NUL)...
+    try testing.expect(std.mem.indexOf(u8, generated, "const table = [1][2][:0]const u8{") != null);
+    // ...and the tf ring writes one before handing the slice out.
+    try testing.expect(std.mem.indexOf(u8, generated, "frame_buf[frame_len] = 0;") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "frame_buf[start..frame_len :0]") != null);
 }

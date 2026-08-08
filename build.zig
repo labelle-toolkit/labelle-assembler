@@ -215,6 +215,11 @@ pub fn build(b: *std.Build) void {
         // src/**/*.zig — the acceptance that a language plugin is addable
         // with zero assembler changes.
         "test/quokka_litmus_tests.zig",
+        // i18n sentinel contract (flying-platform#786 friction #3): the
+        // generated module is COMPILED AND RUN (`zig test` via the #586
+        // zig_exe seam) against comptime @TypeOf asserts + runtime
+        // .ptr[len]==0 probes, so a `[:0]` regression in t/tf cannot land.
+        "test/i18n_sentinel_tests.zig",
     };
 
     for (test_files) |test_file| {
