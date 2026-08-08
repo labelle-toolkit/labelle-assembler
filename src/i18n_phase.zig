@@ -17,6 +17,13 @@
 //!    it; an unused untranslated key is silent. `strict` promotes the warning
 //!    to a build error. The used-set comes from usage_scan.zig -- the same
 //!    conservative alias-widening scanner constants use, with root `K`.
+//!  - plurals (phase 4) are a nested key convention: an object of CLDR
+//!    category strings with `other` present becomes ONE key, served by
+//!    `tp(key, count)` / `tpf(key, count, args)` with `{count}` implicit.
+//!    Every (locale, category) slot is resolved at build time through
+//!    variant -> own `other` -> reference variant -> reference `other`, so
+//!    the no-runtime-failure guarantee holds unchanged; a project with no
+//!    plural keys emits a byte-identical module.
 //!
 //! A project with no `locales/` emits nothing and keeps a byte-identical
 //! build.zig; a stale generated file is deleted, mirroring constants_phase.
@@ -25,6 +32,7 @@ const Allocator = std.mem.Allocator;
 const locales_mod = @import("i18n_locales.zig");
 const usage = @import("usage_scan.zig");
 const interp = @import("i18n_interp.zig");
+const plurals = @import("i18n_plurals.zig");
 
 // Same local io as constants_phase, for the same reason: config.zig pulls in
 // build_options and would make this file untestable standalone.
@@ -206,12 +214,21 @@ pub fn runPhase(
     }
 
     // §3 row 3: a key in L that the reference lacks is a build error -- it
-    // catches renames that updated one file only.
+    // catches renames that updated one file only. Phase 4 adds the kind
+    // check in the same pass: a key plural in the reference and a plain
+    // string in L (or the reverse) is drift of the same severity -- the call
+    // site compiles against ONE of tp/t, so a mismatched locale could never
+    // be rendered through the other shape.
     for (tags.items, 0..) |tag, i| {
         if (i == reference_idx) continue;
         for (parsed[i].entries) |e| {
-            if (reference.get(e.key) == null) {
+            const ref_value = reference.get(e.key) orelse {
                 std.debug.print("locales/{s}.jsonc: key '{s}' is absent from the reference locale ({s}) -- a rename that updated one file only?\n", .{ tag, e.key, reference_tag });
+                had_error = true;
+                continue;
+            };
+            if (std.meta.activeTag(ref_value) != std.meta.activeTag(e.value)) {
+                std.debug.print("locales/{s}.jsonc: key '{s}' is {s} here but {s} in the reference locale ({s}) -- a key keeps one shape across every locale\n", .{ tag, e.key, valueShapeName(e.value), valueShapeName(ref_value), reference_tag });
                 had_error = true;
             }
         }
@@ -256,14 +273,103 @@ pub fn runPhase(
     }
     if (had_error) return error.I18nInvalid;
 
+    // Phase 4 coverage, one level deeper: inside a plural key a locale DOES
+    // define, the variants its own rule can select are the player-visible
+    // surface -- a ru file with only one/other renders its 'other' for 2..4
+    // (few) items. Same usage-aware policy as key coverage: silent when the
+    // key is unused, a warning when used, an error under strict. A locale
+    // missing the whole key already warned above; repeating it per variant
+    // would be noise, so only defined keys are checked (the reference
+    // included -- a gap in the shipping language's own rule set is the most
+    // visible hole of all). Variants a rule can never select stay silent:
+    // an 'en' file carrying 'few' is harmless.
+    for (reference.entries) |re| {
+        const ref_set = switch (re.value) {
+            .plural => |p| p,
+            .str => continue,
+        };
+        if (!marks.covers(re.key)) continue;
+        for (tags.items, 0..) |tag, i| {
+            const set: locales_mod.PluralSet = if (i == reference_idx)
+                ref_set
+            else switch (parsed[i].get(re.key) orelse continue) {
+                .plural => |p| p,
+                .str => continue, // kind mismatch already errored above
+            };
+            const reach = plurals.reachable(plurals.ruleForTag(tag));
+            var missing_cats: std.ArrayList([]const u8) = .empty;
+            for (reach, 0..) |needed, ci| {
+                if (needed and set[ci] == null) {
+                    try missing_cats.append(arena, @tagName(@as(plurals.Category, @enumFromInt(ci))));
+                }
+            }
+            if (missing_cats.items.len == 0) continue;
+            const cat_list = try std.mem.join(arena, ", ", missing_cats.items);
+            if (strict_effective) {
+                std.debug.print("error: i18n: K.{s} is used but locale {s} lacks plural variant(s) its rule needs: {s} (strict)\n", .{ re.key, tag, cat_list });
+                had_error = true;
+            } else if (diagnostics) {
+                std.debug.print("warning: i18n: K.{s} is used but locale {s} lacks plural variant(s) its rule needs: {s} (backfilled from its 'other')\n", .{ re.key, tag, cat_list });
+            }
+        }
+    }
+    if (had_error) return error.I18nInvalid;
+
     // Phase 2 (§4): placeholders. Every string in every locale is parsed --
     // a syntax error names the locale and key. Parity compares placeholder
     // *sets* between the reference and each locale that defines the key:
     // order is legitimate translation (word order is the thing translation
     // changes), a differing set is drift.
+    //
+    // Phase 4 runs the same validation per plural VARIANT, with {count}
+    // implicit. The parity set there is the UNION of non-count placeholders
+    // across a locale's variants, not per-variant equality: variants
+    // legitimately differ within one locale ("an item" carries no {count},
+    // "{count} of {max} items" does), while a locale-wide dropped {max} is
+    // still drift. Each (locale, category) slot resolves at build time
+    // through variant -> own 'other' -> reference variant -> reference
+    // 'other' -- a locale's own language in its own 'other' beats the
+    // reference's foreign text with the right grammar, and detection
+    // guarantees 'other' exists wherever the key does, so the chain always
+    // lands.
     const interps = try arena.alloc(?KeyInterp, reference.entries.len);
+    const plural_of = try arena.alloc(?u16, reference.entries.len);
+    var plural_list: std.ArrayList(KeyPlural) = .empty;
     for (reference.entries, 0..) |re, ki| {
-        const ref_segs = switch (try interp.parse(arena, re.value)) {
+        plural_of[ki] = null;
+        const ref_raw = switch (re.value) {
+            .plural => |ref_set| {
+                interps[ki] = null;
+                plural_of[ki] = @intCast(plural_list.items.len);
+                const ref_var_segs = try parsePluralVariants(arena, ref_set, reference_tag, re.key, &had_error);
+                const ref_extra = try pluralExtraNames(arena, ref_var_segs);
+                const other_i = @intFromEnum(plurals.Category.other);
+
+                const per_locale = try arena.alloc([plurals.Category.count][]const interp.Segment, tags.items.len);
+                for (tags.items, 0..) |tag, li| {
+                    const own_set: ?locales_mod.PluralSet = if (parsed[li].get(re.key)) |v| v.plural else null;
+                    const own_segs = if (own_set) |s|
+                        try parsePluralVariants(arena, s, tag, re.key, &had_error)
+                    else
+                        [_]?[]const interp.Segment{null} ** plurals.Category.count;
+                    if (own_set != null and li != reference_idx) {
+                        const l_extra = try pluralExtraNames(arena, own_segs);
+                        if (!interp.sameNames(ref_extra, l_extra)) {
+                            std.debug.print("locales/{s}.jsonc: key '{s}': plural placeholder set {{{s}}} differs from the reference's {{{s}}} ({{count}} is implicit and never counted)\n", .{ tag, re.key, try std.mem.join(arena, ", ", l_extra), try std.mem.join(arena, ", ", ref_extra) });
+                            had_error = true;
+                        }
+                    }
+                    for (0..plurals.Category.count) |ci| {
+                        per_locale[li][ci] = own_segs[ci] orelse own_segs[other_i] orelse
+                            ref_var_segs[ci] orelse ref_var_segs[other_i] orelse empty_segs;
+                    }
+                }
+                try plural_list.append(arena, .{ .arg_names = ref_extra, .segs = per_locale });
+                continue;
+            },
+            .str => |raw| raw,
+        };
+        const ref_segs = switch (try interp.parse(arena, ref_raw)) {
             .fail => |msg| {
                 std.debug.print("locales/{s}.jsonc: key '{s}': {s}\n", .{ reference_tag, re.key, msg });
                 had_error = true;
@@ -276,7 +382,7 @@ pub fn runPhase(
 
         const per_locale = try arena.alloc([]const interp.Segment, tags.items.len);
         for (tags.items, 0..) |tag, li| {
-            const own = parsed[li].get(re.key);
+            const own: ?[]const u8 = if (parsed[li].get(re.key)) |v| v.str else null;
             const segs = if (own) |s| switch (try interp.parse(arena, s)) {
                 .fail => |msg| blk: {
                     std.debug.print("locales/{s}.jsonc: key '{s}': {s}\n", .{ tag, re.key, msg });
@@ -301,7 +407,7 @@ pub fn runPhase(
     // Emit.
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
-    try emitModule(arena, w, tags.items, parsed, reference, reference_idx, default_idx, interps);
+    try emitModule(arena, w, tags.items, parsed, reference, reference_idx, default_idx, interps, plural_of, plural_list.items);
 
     const dst = try std.fs.path.join(arena, &.{ target_dir, GENERATED_FILENAME });
     try cwd.writeFile(io, .{ .sub_path = dst, .data = out.writer.buffered() });
@@ -326,6 +432,57 @@ fn isBcp47ish(s: []const u8) bool {
         }
     }
     return true;
+}
+
+/// How a Value's shape reads in an error message. Kind mismatches name both
+/// sides with this, everywhere they are caught.
+fn valueShapeName(v: locales_mod.Value) []const u8 {
+    return switch (v) {
+        .str => "a plain string",
+        .plural => "a plural set",
+    };
+}
+
+/// The sorted placeholder-name set that defines a value's argument
+/// contract: the full name set for a plain string, the non-count union
+/// across variants for a plural set. Null when anything fails to parse --
+/// the downstream per-locale pass reports the syntax error with a better
+/// site, so callers skip the comparison instead of double-reporting.
+fn valueArgNames(arena: Allocator, v: locales_mod.Value) Allocator.Error!?[]const []const u8 {
+    switch (v) {
+        .str => |s| switch (try interp.parse(arena, s)) {
+            .fail => return null,
+            .ok => |segs| return try interp.names(arena, segs),
+        },
+        .plural => |set| {
+            var var_segs: [plurals.Category.count]?[]const interp.Segment = @splat(null);
+            for (set, 0..) |maybe_raw, ci| {
+                const raw = maybe_raw orelse continue;
+                switch (try interp.parse(arena, raw)) {
+                    .fail => return null,
+                    .ok => |segs| var_segs[ci] = segs,
+                }
+            }
+            return try pluralExtraNames(arena, var_segs);
+        },
+    }
+}
+
+/// Whether two same-kind values agree on that contract. True when either
+/// side is unparseable (see valueArgNames). Out-params carry the sets for
+/// the error message.
+fn sameArgContract(
+    arena: Allocator,
+    a: locales_mod.Value,
+    b: locales_mod.Value,
+    a_names: *[]const []const u8,
+    b_names: *[]const []const u8,
+) Allocator.Error!bool {
+    const an = (try valueArgNames(arena, a)) orelse return true;
+    const bn = (try valueArgNames(arena, b)) orelse return true;
+    a_names.* = an;
+    b_names.* = bn;
+    return interp.sameNames(an, bn);
 }
 
 fn indexOfTag(tags: []const []const u8, tag: []const u8) ?usize {
@@ -419,11 +576,31 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
         };
 
         // Per-realm rename catch: a pack locale key its own reference lacks.
+        // Kind drift is caught in the same pass -- checking it only on the
+        // merged data would miss the case where a pack locale's flipped
+        // shape BECOMES the merged reference (a one-locale game whose
+        // reference is a tag the pack translates but does not author in).
         for (ptags.items, 0..) |t, i| {
             if (std.ascii.eqlIgnoreCase(t, pref_tag)) continue;
             for (pparsed.items[i].entries) |e| {
-                if (pack_ref.get(e.key) == null) {
+                const rv = pack_ref.get(e.key) orelse {
                     std.debug.print("packs/{s}/locales/{s}.jsonc: key '{s}' is absent from the pack's reference ({s})\n", .{ pk.name, t, e.key, pref_tag });
+                    had_error = true;
+                    continue;
+                };
+                if (std.meta.activeTag(rv) != std.meta.activeTag(e.value)) {
+                    std.debug.print("packs/{s}/locales/{s}.jsonc: key '{s}' is {s} here but {s} in the pack's reference ({s}) -- a key keeps one shape across every locale\n", .{ pk.name, t, e.key, valueShapeName(e.value), valueShapeName(rv), pref_tag });
+                    had_error = true;
+                    continue;
+                }
+                // The argument contract too, for the same reason as the
+                // kind: a pack translation that drops {name} could become
+                // the merged reference in a one-locale game, and downstream
+                // parity would then compare it against itself.
+                var l_names: []const []const u8 = &.{};
+                var r_names: []const []const u8 = &.{};
+                if (!try sameArgContract(arena, e.value, rv, &l_names, &r_names)) {
+                    std.debug.print("packs/{s}/locales/{s}.jsonc: key '{s}': placeholder set {{{s}}} differs from the pack reference's {{{s}}} (for plural keys, {{count}} is implicit and never counted)\n", .{ pk.name, t, e.key, try std.mem.join(arena, ", ", l_names), try std.mem.join(arena, ", ", r_names) });
                     had_error = true;
                 }
             }
@@ -467,8 +644,30 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
                 had_error = true;
                 continue;
             };
-            if (pd.reference.get(rest) == null) {
+            const pack_value = pd.reference.get(rest) orelse {
                 std.debug.print("locales/{s}.jsonc: key '{s}' overrides nothing -- pack '{s}' does not define '{s}'. A typo here, or a key the pack renamed, would otherwise silently keep the pack's string\n", .{ gt, e.key, pack_name, rest });
+                had_error = true;
+                continue;
+            };
+            // An override must keep the pack's kind. The general
+            // reference-vs-locale check cannot be relied on here: a game
+            // shipping only its reference locale has no second locale to
+            // disagree with, and the pack's own shape was just suppressed
+            // by the override -- yet every call site the pack authored
+            // compiles against the pack's shape.
+            if (std.meta.activeTag(pack_value) != std.meta.activeTag(e.value)) {
+                std.debug.print("locales/{s}.jsonc: key '{s}' overrides pack '{s}' with {s}, but the pack defines '{s}' as {s} -- the pack's call sites compile against that shape\n", .{ gt, e.key, pack_name, valueShapeName(e.value), rest, valueShapeName(pack_value) });
+                had_error = true;
+                continue;
+            }
+            // And the argument contract: an override that drops or renames
+            // a placeholder would, in a one-locale game, BECOME the merged
+            // reference -- no other locale left to disagree -- and generate
+            // an Args type the pack-authored tf/tpf calls cannot satisfy.
+            var g_names: []const []const u8 = &.{};
+            var p_names: []const []const u8 = &.{};
+            if (!try sameArgContract(arena, e.value, pack_value, &g_names, &p_names)) {
+                std.debug.print("locales/{s}.jsonc: key '{s}': placeholder set {{{s}}} differs from pack '{s}''s {{{s}}} -- the pack's call sites pass that argument set (for plural keys, {{count}} is implicit and never counted)\n", .{ gt, e.key, try std.mem.join(arena, ", ", g_names), pack_name, try std.mem.join(arena, ", ", p_names) });
                 had_error = true;
             }
         }
@@ -534,6 +733,72 @@ const KeyInterp = struct {
     segs: []const []const interp.Segment,
 };
 
+/// One plural key's build-time data: the sorted union of non-count
+/// placeholder names across the reference's variants, and per locale a fully
+/// resolved category-indexed segment table -- every slot filled through
+/// variant -> own 'other' -> reference variant -> reference 'other', so the
+/// generated tables are total and tp/tpf can never miss.
+const KeyPlural = struct {
+    arg_names: []const []const u8,
+    segs: []const [plurals.Category.count][]const interp.Segment,
+};
+
+const empty_segs: []const interp.Segment = &.{};
+
+/// Parses every present variant of one plural set. A syntax error names the
+/// locale, key and variant; the slot stays null so the fallback chain covers
+/// it (moot -- had_error aborts the phase after this pass).
+fn parsePluralVariants(
+    arena: Allocator,
+    set: locales_mod.PluralSet,
+    tag: []const u8,
+    key: []const u8,
+    had_error: *bool,
+) Allocator.Error![plurals.Category.count]?[]const interp.Segment {
+    var out = [_]?[]const interp.Segment{null} ** plurals.Category.count;
+    for (set, 0..) |maybe_raw, ci| {
+        const raw = maybe_raw orelse continue;
+        switch (try interp.parse(arena, raw)) {
+            .fail => |msg| {
+                std.debug.print("locales/{s}.jsonc: key '{s}' plural variant '{s}': {s}\n", .{ tag, key, @tagName(@as(plurals.Category, @enumFromInt(ci))), msg });
+                had_error.* = true;
+            },
+            .ok => |segs| out[ci] = segs,
+        }
+    }
+    return out;
+}
+
+/// The sorted, deduplicated placeholder-name union across a plural set's
+/// parsed variants, with the implicit `count` excluded -- the parity set and
+/// the generated per-key Args contract.
+fn pluralExtraNames(
+    arena: Allocator,
+    var_segs: [plurals.Category.count]?[]const interp.Segment,
+) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (var_segs) |maybe| {
+        const segs = maybe orelse continue;
+        for (segs) |seg| switch (seg) {
+            .arg => |n| {
+                if (std.mem.eql(u8, n, "count")) continue;
+                var seen = false;
+                for (out.items) |existing| {
+                    if (std.mem.eql(u8, existing, n)) seen = true;
+                }
+                if (!seen) try out.append(arena, n);
+            },
+            .lit => {},
+        };
+    }
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    return out.items;
+}
+
 fn emitModule(
     arena: Allocator,
     w: *std.Io.Writer,
@@ -543,8 +808,11 @@ fn emitModule(
     reference_idx: usize,
     default_idx: usize,
     interps: []const ?KeyInterp,
+    plural_of: []const ?u16,
+    plural_data: []const KeyPlural,
 ) !void {
     _ = reference_idx;
+    const has_plurals = plural_data.len > 0;
     try w.writeAll("//! Generated by labelle-assembler from locales/*.jsonc -- do not edit.\n");
     try w.writeAll("//! The table is rectangular: gaps are backfilled with the reference\n");
     try w.writeAll("//! locale's string at build time, so no runtime path can fail and no\n");
@@ -582,21 +850,35 @@ fn emitModule(
         try w.writeAll("    .{\n");
         for (reference.entries, 0..) |re, ki| {
             try w.writeAll("        \"");
-            if (interps[ki] == null) {
-                // Decoded: concatenate the literal segments of this locale's
-                // own string (or the reference's, for a backfilled slot).
-                const raw = parsed[li].get(re.key) orelse re.value;
-                switch (try interp.parse(arena, raw)) {
-                    // Validated earlier; a parse failure here cannot happen.
-                    .fail => try writeEscaped(w, raw),
-                    .ok => |segs| for (segs) |seg| switch (seg) {
-                        .lit => |l| try writeEscaped(w, l),
-                        .arg => {},
-                    },
-                }
-            } else {
-                const s = parsed[li].get(re.key) orelse re.value;
-                try writeEscaped(w, s);
+            switch (re.value) {
+                .plural => |ref_set| {
+                    // Inert slot -- t()/tf() refuse plural keys at comptime
+                    // and tp()/tpf() read plural_segs. Carry the resolved raw
+                    // 'other' so the row stays meaningful to a human reading
+                    // the generated file. Detection guarantees 'other'.
+                    const other_i = @intFromEnum(plurals.Category.other);
+                    const raw = if (parsed[li].get(re.key)) |v| v.plural[other_i].? else ref_set[other_i].?;
+                    try writeEscaped(w, raw);
+                },
+                .str => |ref_raw| {
+                    const own: ?[]const u8 = if (parsed[li].get(re.key)) |v| v.str else null;
+                    if (interps[ki] == null) {
+                        // Decoded: concatenate the literal segments of this
+                        // locale's own string (or the reference's, for a
+                        // backfilled slot).
+                        const raw = own orelse ref_raw;
+                        switch (try interp.parse(arena, raw)) {
+                            // Validated earlier; a parse failure here cannot happen.
+                            .fail => try writeEscaped(w, raw),
+                            .ok => |segs| for (segs) |seg| switch (seg) {
+                                .lit => |l| try writeEscaped(w, l),
+                                .arg => {},
+                            },
+                        }
+                    } else {
+                        try writeEscaped(w, own orelse ref_raw);
+                    }
+                },
             }
             try w.writeAll("\",\n");
         }
@@ -670,6 +952,96 @@ fn emitModule(
     }
     try w.writeAll("};\n\n");
 
+    // Plurals (phase 4). Everything below -- data, rules, tp/tpf -- exists
+    // only when a plural key does, so a project without plurals keeps a
+    // byte-identical generated module.
+    if (has_plurals) {
+        try w.writeAll(
+            \\// Plural data (RFC-I18N phase 4): CLDR categories as a nested key
+            \\// convention. Every (key, locale, category) slot was resolved at
+            \\// build time (variant -> own 'other' -> reference variant ->
+            \\// reference 'other'), so selection below can never miss.
+            \\const PluralCat = enum(u3) { zero, one, two, few, many, other };
+            \\const PluralRule = enum { other_only, one_other, one_from_zero, one_other_millions, east_slavic, polish, czech_slovak, arabic };
+            \\
+            \\
+        );
+
+        // The active locale's rule, decided at build time from the primary
+        // language subtag (pt and pt-BR pluralise alike).
+        try w.print("const locale_rules = [{d}]PluralRule{{ ", .{tags.len});
+        for (tags, 0..) |t, i| {
+            if (i != 0) try w.writeAll(", ");
+            try w.print(".{s}", .{@tagName(plurals.ruleForTag(t))});
+        }
+        try w.writeAll(" };\n\n");
+
+        try w.print("const plural_idx = [{d}]?u16{{\n", .{reference.entries.len});
+        for (plural_of) |maybe| {
+            if (maybe) |p| {
+                try w.print("    {d},\n", .{p});
+            } else {
+                try w.writeAll("    null,\n");
+            }
+        }
+        try w.writeAll("};\n\n");
+
+        // Per plural key: the non-count placeholder names (the tpf Args
+        // contract; {count} is implicit and never listed).
+        try w.print("const plural_extra = [{d}][]const []const u8{{\n", .{plural_data.len});
+        for (plural_data) |pd| {
+            try w.writeAll("    &[_][]const u8{");
+            for (pd.arg_names, 0..) |n, i| {
+                if (i != 0) try w.writeAll(",");
+                try w.writeAll(" \"");
+                try writeEscaped(w, n);
+                try w.writeAll("\"");
+            }
+            try w.writeAll(" },\n");
+        }
+        try w.writeAll("};\n\n");
+
+        for (plural_data, 0..) |pd, p| {
+            for (pd.segs, 0..) |cats, li| {
+                for (cats, 0..) |segs, ci| {
+                    try w.print("const psegs_{d}_{d}_{d} = [_]Seg{{", .{ p, li, ci });
+                    for (segs, 0..) |seg, si| {
+                        try w.writeAll(if (si != 0) ", " else " ");
+                        switch (seg) {
+                            .lit => |l| {
+                                try w.writeAll(".{ .lit = \"");
+                                try writeEscaped(w, l);
+                                try w.writeAll("\" }");
+                            },
+                            .arg => |n| {
+                                try w.writeAll(".{ .arg = \"");
+                                try writeEscaped(w, n);
+                                try w.writeAll("\" }");
+                            },
+                        }
+                    }
+                    try w.writeAll(" };\n");
+                }
+            }
+        }
+        try w.writeByte('\n');
+
+        try w.print("const plural_segs = [{d}][{d}][{d}][]const Seg{{\n", .{ plural_data.len, tags.len, plurals.Category.count });
+        for (plural_data, 0..) |pd, p| {
+            try w.writeAll("    .{\n");
+            for (pd.segs, 0..) |_, li| {
+                try w.writeAll("        .{ ");
+                for (0..plurals.Category.count) |ci| {
+                    if (ci != 0) try w.writeAll(", ");
+                    try w.print("&psegs_{d}_{d}_{d}", .{ p, li, ci });
+                }
+                try w.writeAll(" },\n");
+            }
+            try w.writeAll("    },\n");
+        }
+        try w.writeAll("};\n\n");
+    }
+
     try w.writeAll(
         \\// ---- LABELLE_LOCALE (RFC-I18N section 8, startup resolution) --------
         \\// The dev/CI override is applied by the module itself, lazily, on the
@@ -703,6 +1075,16 @@ fn emitModule(
         \\pub fn t(comptime key: Key) [:0]const u8 {
         \\    comptime if (interp_names[@intFromEnum(key)] != null)
         \\        @compileError("this key has placeholders; use tf(key, .{...})");
+        \\
+    );
+    if (has_plurals) {
+        try w.writeAll(
+            \\    comptime if (plural_idx[@intFromEnum(key)] != null)
+            \\        @compileError("this key is plural; use tp(key, count)");
+            \\
+        );
+    }
+    try w.writeAll(
         \\    ensureEnvLocale();
         \\    return table[active][@intFromEnum(key)];
         \\}
@@ -717,6 +1099,16 @@ fn emitModule(
         \\/// component. Call resetFrameArena() once per frame to make the
         \\/// lifetime exact.
         \\pub fn tf(comptime key: Key, args: anytype) [:0]const u8 {
+        \\
+    );
+    if (has_plurals) {
+        try w.writeAll(
+            \\    comptime if (plural_idx[@intFromEnum(key)] != null)
+            \\        @compileError("this key is plural; use tpf(key, count, .{...})");
+            \\
+        );
+    }
+    try w.writeAll(
         \\    ensureEnvLocale();
         \\    const idx = comptime @intFromEnum(key);
         \\    const arg_names = comptime (interp_names[idx] orelse
@@ -858,6 +1250,133 @@ fn emitModule(
         \\const builtin = @import("builtin");
         \\
     );
+
+    if (has_plurals) {
+        try w.writeAll(
+            \\
+            \\// ---- plurals (RFC-I18N phase 4) -------------------------------------
+            \\
+            \\/// The plural form of a key for a count. The count binds the
+            \\/// implicit {count} placeholder; the CLDR category is selected by
+            \\/// the ACTIVE locale's rule, so ru picks few/many where en picks
+            \\/// one/other. Keys with placeholders beyond {count} use tpf. The
+            \\/// result shares tf's ring-buffer lifetime: render it this frame,
+            \\/// never store it in a component.
+            \\pub fn tp(comptime key: Key, count: anytype) [:0]const u8 {
+            \\    const idx = comptime @intFromEnum(key);
+            \\    const p = comptime (plural_idx[idx] orelse
+            \\        @compileError("this key is not plural; use t(key) / tf(key, args)"));
+            \\    comptime if (plural_extra[p].len != 0)
+            \\        @compileError("this key has placeholders besides {count}; use tpf(key, count, .{...})");
+            \\    return pluralFormat(p, count, .{});
+            \\}
+            \\
+            \\/// tp with extra placeholders: the argument struct is checked at
+            \\/// compile time against the key's non-count placeholder set,
+            \\/// exactly like tf. The count stays a parameter -- passing .count
+            \\/// as an argument is a compile error, not a silent shadow.
+            \\pub fn tpf(comptime key: Key, count: anytype, args: anytype) [:0]const u8 {
+            \\    const idx = comptime @intFromEnum(key);
+            \\    const p = comptime (plural_idx[idx] orelse
+            \\        @compileError("this key is not plural; use t(key) / tf(key, args)"));
+            \\    const extra = comptime plural_extra[p];
+            \\    comptime if (extra.len == 0)
+            \\        @compileError("this key's only placeholder is {count}; use tp(key, count)");
+            \\    comptime {
+            \\        const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
+            \\        for (fields) |f| {
+            \\            if (std.mem.eql(u8, f.name, "count"))
+            \\                @compileError("tpf: {count} is implicit -- pass the count parameter, not a .count argument");
+            \\        }
+            \\        for (extra) |n| {
+            \\            var found = false;
+            \\            for (fields) |f| {
+            \\                if (std.mem.eql(u8, f.name, n)) found = true;
+            \\            }
+            \\            if (!found) @compileError("tpf: missing argument '" ++ n ++ "'");
+            \\        }
+            \\        for (fields) |f| {
+            \\            var found = false;
+            \\            for (extra) |n| {
+            \\                if (std.mem.eql(u8, n, f.name)) found = true;
+            \\            }
+            \\            if (!found) @compileError("tpf: no placeholder named '" ++ f.name ++ "'");
+            \\        }
+            \\    }
+            \\    return pluralFormat(p, count, args);
+            \\}
+            \\
+            \\fn pluralFormat(comptime p: u16, count: anytype, args: anytype) [:0]const u8 {
+            \\    comptime switch (@typeInfo(@TypeOf(count))) {
+            \\        .int, .comptime_int => {},
+            \\        else => @compileError("tp/tpf: count must be an integer, got " ++ @typeName(@TypeOf(count))),
+            \\    };
+            \\    ensureEnvLocale();
+            \\    // CLDR rules classify the absolute value; the rendered {count}
+            \\    // keeps the caller's sign.
+            \\    const n: u64 = @abs(count);
+            \\    const cat = selectCat(locale_rules[active], n);
+            \\    const segs = plural_segs[p][active][@intFromEnum(cat)];
+            \\    // Same ring discipline as tf: wrap only BETWEEN results.
+            \\    if (frame_buf.len - frame_len < WRAP_RESERVE) frame_len = 0;
+            \\    const start = frame_len;
+            \\    for (segs) |seg| switch (seg) {
+            \\        .lit => |l| appendBytes(l),
+            \\        .arg => |name| {
+            \\            if (std.mem.eql(u8, name, "count")) {
+            \\                appendValue(count);
+            \\            } else {
+            \\                inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |f| {
+            \\                    if (std.mem.eql(u8, f.name, name)) appendValue(@field(args, f.name));
+            \\                }
+            \\            }
+            \\        },
+            \\    };
+            \\    frame_buf[frame_len] = 0;
+            \\    const result = frame_buf[start..frame_len :0];
+            \\    frame_len += 1;
+            \\    return result;
+            \\}
+            \\
+            \\/// The category for an absolute integer count under a rule. The
+            \\/// build-time twin lives in the assembler's i18n_plurals.zig; the
+            \\/// two must stay in lockstep (its unit tests are the spec for
+            \\/// both).
+            \\fn selectCat(rule: PluralRule, n: u64) PluralCat {
+            \\    return switch (rule) {
+            \\        .other_only => .other,
+            \\        .one_other => if (n == 1) .one else .other,
+            \\        .one_from_zero => if (n <= 1) .one else if (n % 1_000_000 == 0) .many else .other,
+            \\        .one_other_millions => if (n == 1) .one else if (n != 0 and n % 1_000_000 == 0) .many else .other,
+            \\        .east_slavic => blk: {
+            \\            const m10 = n % 10;
+            \\            const m100 = n % 100;
+            \\            if (m10 == 1 and m100 != 11) break :blk .one;
+            \\            if (m10 >= 2 and m10 <= 4 and !(m100 >= 12 and m100 <= 14)) break :blk .few;
+            \\            break :blk .many;
+            \\        },
+            \\        .polish => blk: {
+            \\            if (n == 1) break :blk .one;
+            \\            const m10 = n % 10;
+            \\            const m100 = n % 100;
+            \\            if (m10 >= 2 and m10 <= 4 and !(m100 >= 12 and m100 <= 14)) break :blk .few;
+            \\            break :blk .many;
+            \\        },
+            \\        .czech_slovak => if (n == 1) .one else if (n >= 2 and n <= 4) .few else .other,
+            \\        .arabic => blk: {
+            \\            if (n == 0) break :blk .zero;
+            \\            if (n == 1) break :blk .one;
+            \\            if (n == 2) break :blk .two;
+            \\            const m100 = n % 100;
+            \\            if (m100 >= 3 and m100 <= 10) break :blk .few;
+            \\            if (m100 >= 11 and m100 <= 99) break :blk .many;
+            \\            break :blk .other;
+            \\        },
+            \\    };
+            \\}
+            \\
+        );
+    }
 }
 
 /// Emits the nested K namespaces. Entries are sorted by dotted key, which
@@ -1240,6 +1759,330 @@ test "phase 3: a declared pack reference with no file is an error; a pack-locale
     try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/fr.jsonc", .data = "{ \"hunger\": { \"renamed_key\": \"x\" } }" });
     const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir }};
     try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
+}
+
+test "phase 4: plural keys emit one Key, per-locale rules, resolved category tables and tp/tpf" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "target");
+    // en 'one' legitimately drops {count} -- within one locale, variants may
+    // differ; the parity set is the union of NON-count placeholders.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"an item\", \"other\": \"{count} items\" }, \"title\": \"Stock\" } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/ru.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"{count} predmet\", \"few\": \"{count} predmeta\", \"many\": \"{count} predmetov\", \"other\": \"{count} predmeta\" }, \"title\": \"Sklad\" } }" });
+
+    const p = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(p.game);
+    defer testing.allocator.free(p.target);
+
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
+    defer testing.allocator.free(generated);
+
+    // ONE key, not one per variant: sorted keys are hud.items=0, hud.title=1.
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"items\": Key = @enumFromInt(0);") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"one\"") == null);
+    // Per-locale rules from the primary subtag, in sorted-tag order (en, ru).
+    try testing.expect(std.mem.indexOf(u8, generated, "const locale_rules = [2]PluralRule{ .one_other, .east_slavic };") != null);
+    // ru's own variants land in its category slots (few = index 3, li = 1).
+    try testing.expect(std.mem.indexOf(u8, generated, "const psegs_0_1_3 = [_]Seg{ .{ .arg = \"count\" }, .{ .lit = \" predmeta\" } };") != null);
+    // en's unreachable 'few' slot resolves through en's 'other' -- total table.
+    try testing.expect(std.mem.indexOf(u8, generated, "const psegs_0_0_3 = [_]Seg{ .{ .arg = \"count\" }, .{ .lit = \" items\" } };") != null);
+    // The API and the t/tf guards exist.
+    try testing.expect(std.mem.indexOf(u8, generated, "pub fn tp(") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub fn tpf(") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "this key is plural; use tp(key, count)") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "this key is plural; use tpf(key, count, .{...})") != null);
+
+    const src_z = try testing.allocator.dupeZ(u8, generated);
+    defer testing.allocator.free(src_z);
+    var ast = try std.zig.Ast.parse(testing.allocator, src_z, .zig);
+    defer ast.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), ast.errors.len);
+}
+
+test "phase 4: pt-PT rides the full-tag override -- region-aware rule in locale_rules" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"{count} item\", \"other\": \"{count} items\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/pt-PT.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"{count} item\", \"many\": \"{count} milhoes de itens\", \"other\": \"{count} itens\" } } }" });
+
+    const p = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(p.game);
+    defer testing.allocator.free(p.target);
+
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
+    defer testing.allocator.free(generated);
+
+    // Sorted tags: en, pt-PT. European Portuguese is NOT .one_from_zero.
+    try testing.expect(std.mem.indexOf(u8, generated, "const locale_rules = [2]PluralRule{ .one_other, .one_other_millions };") != null);
+    // The emitted rule enum knows the variant locale_rules names.
+    try testing.expect(std.mem.indexOf(u8, generated, "one_other_millions,") != null);
+}
+
+test "phase 4: a project without plural keys emits a plural-free module -- zero cost" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"menu\": { \"play\": \"Play\" }, \"hud\": { \"stock\": \"{count} of {max}\" } }" });
+
+    const p = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(p.game);
+    defer testing.allocator.free(p.target);
+
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
+    defer testing.allocator.free(generated);
+
+    // Not one byte of plural machinery -- the opt-in promise.
+    try testing.expect(std.mem.indexOf(u8, generated, "plural") == null);
+    try testing.expect(std.mem.indexOf(u8, generated, "PluralCat") == null);
+    try testing.expect(std.mem.indexOf(u8, generated, "tp(") == null);
+}
+
+test "phase 4: a locale's missing variant backfills from its OWN other, not the reference" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"{count} item\", \"other\": \"{count} items\" } } }" });
+    // ru ships only one/other; its reachable few/many must resolve to ru's
+    // own 'other' (right language, approximate grammar), never en's text.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/ru.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"{count} predmet\", \"other\": \"{count} predmeta\" } } }" });
+
+    const p = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(p.game);
+    defer testing.allocator.free(p.target);
+
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
+    defer testing.allocator.free(generated);
+
+    // few (3) and many (4) for ru (li=1): ru's other, " predmeta".
+    try testing.expect(std.mem.indexOf(u8, generated, "const psegs_0_1_3 = [_]Seg{ .{ .arg = \"count\" }, .{ .lit = \" predmeta\" } };") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "const psegs_0_1_4 = [_]Seg{ .{ .arg = \"count\" }, .{ .lit = \" predmeta\" } };") != null);
+}
+
+test "phase 4: a key keeps one shape across locales -- plural vs string is an error" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"{count} item\", \"other\": \"{count} items\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/pt.jsonc", .data = "{ \"hud\": { \"items\": \"{count} itens\" } }" });
+
+    const p = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(p.game);
+    defer testing.allocator.free(p.target);
+
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
+}
+
+test "phase 4: the plural parity set is the non-count union -- dropping a name is drift" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"hud\": { \"stock\": { \"one\": \"{count} {kind} item\", \"other\": \"{count} {kind} items\" } } }" });
+    // pt drops {kind} from every variant -- drift, not translation.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/pt.jsonc", .data = "{ \"hud\": { \"stock\": { \"one\": \"{count} item\", \"other\": \"{count} itens\" } } }" });
+
+    const p = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(p.game);
+    defer testing.allocator.free(p.target);
+
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
+}
+
+test "phase 4: the game overrides a pack's plural key; pack plurals surface prefixed" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "thepack/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"menu\": { \"play\": \"Play\" }, \"citizens__hunger\": { \"meals\": { \"one\": \"{count} feast\", \"other\": \"{count} feasts\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/en.jsonc", .data = "{ \"hunger\": { \"meals\": { \"one\": \"{count} meal\", \"other\": \"{count} meals\" }, \"snacks\": { \"one\": \"{count} snack\", \"other\": \"{count} snacks\" } } }" });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+    const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
+    defer testing.allocator.free(target);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ rel, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir }};
+    try testing.expectEqual(true, try runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
+    defer testing.allocator.free(generated);
+
+    // The pack's plural key namespace exists, prefixed, one Key per plural.
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"citizens__hunger\" = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"meals\": Key") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"snacks\": Key") != null);
+    // The game's override wins, variants included; the pack's string is gone.
+    try testing.expect(std.mem.indexOf(u8, generated, "feasts") != null);
+    try testing.expect(std.mem.indexOf(u8, generated, "{count} meals") == null);
+    // The un-overridden pack plural survives untouched.
+    try testing.expect(std.mem.indexOf(u8, generated, "snacks\" }") != null);
+
+    const src_z = try testing.allocator.dupeZ(u8, generated);
+    defer testing.allocator.free(src_z);
+    var ast = try std.zig.Ast.parse(testing.allocator, src_z, .zig);
+    defer ast.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), ast.errors.len);
+}
+
+test "phase 4: a game override must keep the pack's kind -- even in a one-locale game" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "thepack/locales");
+    try tmp.dir.createDirPath(io, "target");
+    // One locale only: no second locale exists to disagree with the merged
+    // reference, so the general kind check cannot catch this -- the
+    // override-site check must.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"citizens__hunger\": { \"meals\": \"dinner\" } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/en.jsonc", .data = "{ \"hunger\": { \"meals\": { \"one\": \"{count} meal\", \"other\": \"{count} meals\" } } }" });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+    const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
+    defer testing.allocator.free(target);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ rel, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir }};
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
+}
+
+test "phase 4: kind drift inside a pack's own locales is an error" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "thepack/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"menu\": { \"play\": \"Play\" } }" });
+    // The pack's own reference is de; its en translation flips the key's
+    // shape. If en were the merged reference this would silently become the
+    // key space, so it fails at the pack, not downstream.
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/de.jsonc", .data = "{ \"hunger\": { \"meals\": { \"one\": \"{count} Mahl\", \"other\": \"{count} Mahle\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/en.jsonc", .data = "{ \"hunger\": { \"meals\": \"meals\" } }" });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+    const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
+    defer testing.allocator.free(target);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ rel, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir, .reference = "de" }};
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
+}
+
+test "phase 4: a pack translation must keep the pack reference's argument contract" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "thepack/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"menu\": { \"play\": \"Play\" } }" });
+    // The pack's reference (de) uses {name}; its en translation drops it.
+    // In this en-only game the en translation would become the merged
+    // reference, so downstream parity would compare it against itself --
+    // the pack-level check must refuse it first.
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/de.jsonc", .data = "{ \"hunger\": { \"gift\": { \"one\": \"{count} Geschenk fur {name}\", \"other\": \"{count} Geschenke fur {name}\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/en.jsonc", .data = "{ \"hunger\": { \"gift\": { \"one\": \"{count} gift\", \"other\": \"{count} gifts\" } } }" });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+    const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
+    defer testing.allocator.free(target);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ rel, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir, .reference = "de" }};
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
+}
+
+test "phase 4: a game override must keep the pack's argument contract" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "thepack/locales");
+    try tmp.dir.createDirPath(io, "target");
+    // One locale: the override becomes the merged reference, so only the
+    // override-site check can see the dropped {name}. The pack's tpf call
+    // sites pass .name -- an Args type without it breaks them.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"citizens__hunger\": { \"gift\": { \"one\": \"{count} present\", \"other\": \"{count} presents\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/en.jsonc", .data = "{ \"hunger\": { \"gift\": { \"one\": \"{count} gift for {name}\", \"other\": \"{count} gifts for {name}\" } } }" });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+    const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
+    defer testing.allocator.free(target);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ rel, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir }};
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
+}
+
+test "phase 4 strict: a USED plural key missing a reachable variant fails; unused stays silent" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "game/scripts");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"{count} item\", \"other\": \"{count} items\" } } }" });
+    // ru defines the key but not the few/many its rule reaches.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/ru.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"{count} predmet\", \"other\": \"{count} predmeta\" } } }" });
+
+    const p = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(p.game);
+    defer testing.allocator.free(p.target);
+
+    // Unused: strict has nothing to say -- the usage-aware contract.
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en", .strict = true }, &.{}, true));
+
+    // The same gap on a key the game renders is a strict error (and only a
+    // warning without strict).
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "game/scripts/ui.zig",
+        .data = "const K = @import(\"i18n\").K;\npub fn f() void { _ = K.hud.items; }\n",
+    });
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, p.game, p.target, .{ .default = "en", .strict = true }, &.{}, true));
 }
 
 test "strict: a used key missing from a locale fails the build" {

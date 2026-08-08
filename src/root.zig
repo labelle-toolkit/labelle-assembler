@@ -66,7 +66,7 @@ test {
     // goldens were dormant until this reference.
     _ = @import("build_files.zig");
     _ = @import("constants_phase.zig"); // covers constants_yaml too
-    _ = @import("i18n_phase.zig"); // covers i18n_locales + usage_scan too
+    _ = @import("i18n_phase.zig"); // covers i18n_locales + i18n_plurals + usage_scan too
     _ = @import("pack_validate.zig");
     _ = @import("check.zig");
     _ = @import("scene_name_lint.zig");

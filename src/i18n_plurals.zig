@@ -1,0 +1,369 @@
+//! Plural categories and per-locale plural rules for RFC-I18N phase 4.
+//!
+//! The RFC's phase table says: "Plurals — CLDR categories
+//! (`zero`/`one`/`two`/`few`/`many`/`other`) as a nested key convention with
+//! per-locale category sets." This file is the CLDR side of that sentence:
+//! the category vocabulary, the per-language rule table, and which categories
+//! each rule can actually select for a cardinal integer count.
+//!
+//! Scope is deliberately minimal (the RFC names no languages): a handful of
+//! rule families covering the common shapes, an easily extended tag table,
+//! and `one`/`other` as the default for languages the table does not know.
+//! CLDR's own root default is `other`-only, but nearly every language a game
+//! ships that CLDR-root would cover is CJK-family and listed explicitly here;
+//! for everything else `one`/`other` is right far more often than not, and a
+//! wrong guess degrades to grammar, never to a missing string (the fallback
+//! chain in i18n_phase backfills every slot).
+//!
+//! Rules classify the ABSOLUTE INTEGER value of the count. Fractional counts
+//! are out of scope -- `tp`/`tpf` take integers, matching the RFC's non-goal
+//! of locale-aware number formatting.
+//!
+//! NOTE: `select` here and `selectCat` in the emitted module
+//! (i18n_phase.emitPluralRuntime) implement the same rules and must stay in
+//! lockstep -- the unit tests below are the executable spec for both.
+const std = @import("std");
+
+/// The six CLDR plural categories, in CLDR's canonical order. The integer
+/// value is the per-key variant-table index in the generated module.
+pub const Category = enum(u3) {
+    zero,
+    one,
+    two,
+    few,
+    many,
+    other,
+
+    pub const count = 6;
+
+    pub fn fromName(name: []const u8) ?Category {
+        inline for (@typeInfo(Category).@"enum".fields) |f| {
+            if (std.mem.eql(u8, name, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
+/// A rule family: the function from a cardinal integer count to a category.
+/// One enum value per distinct CLDR rule SHAPE this ships, not per language
+/// -- languages sharing a shape share a rule (en/de/es... are all .one_other).
+pub const Rule = enum {
+    /// No plural distinction: ja, zh, ko, th, vi, id, ms.
+    other_only,
+    /// one at exactly 1: en, de, nl, sv, ... (and the default).
+    one_other,
+    /// one at 0 and 1 (CLDR: i = 0..1), many at nonzero whole millions
+    /// (CLDR: e = 0 and i % 1000000 = 0, integer counts): fr, pt.
+    one_from_zero,
+    /// one at exactly 1, many at nonzero whole millions: es, it, and pt-PT
+    /// (European Portuguese classifies 0 as plural, unlike base pt).
+    one_other_millions,
+    /// ru/uk/be: one (n%10=1, n%100!=11), few (n%10=2..4, n%100!=12..14),
+    /// many (the rest, 0 included). CLDR's `other` is fraction-only there,
+    /// unreachable for integer counts.
+    east_slavic,
+    /// pl: like east_slavic but `one` is exactly 1.
+    polish,
+    /// cs/sk: one (1), few (2..4), other (the rest). CLDR's `many` is
+    /// fraction-only there, unreachable for integer counts.
+    czech_slovak,
+    /// ar: all six categories.
+    arabic,
+};
+
+/// Language+region overrides, consulted before the primary-subtag rows:
+/// regional varieties whose plural rule differs from the base language's.
+/// European Portuguese is the motivating case -- CLDR pt-PT has `one` at
+/// exactly 1 (zero is plural), unlike base/Brazilian pt where 0..1 -> one --
+/// while keeping the pt/fr whole-million `many`. Keyed by (language, region)
+/// rather than the whole tag so composed forms (pt-Latn-PT,
+/// pt-PT-u-nu-latn) resolve too. Just this one row, not CLDR inheritance.
+const region_rules = [_]struct { lang: []const u8, region: []const u8, rule: Rule }{
+    .{ .lang = "pt", .region = "PT", .rule = .one_other_millions },
+};
+
+/// Language (primary subtag) -> rule. Extend by adding a row; anything
+/// unlisted is `.one_other` (see the module doc for why not CLDR-root).
+const tag_rules = [_]struct { lang: []const u8, rule: Rule }{
+    .{ .lang = "ja", .rule = .other_only },
+    .{ .lang = "zh", .rule = .other_only },
+    .{ .lang = "ko", .rule = .other_only },
+    .{ .lang = "th", .rule = .other_only },
+    .{ .lang = "vi", .rule = .other_only },
+    .{ .lang = "id", .rule = .other_only },
+    .{ .lang = "ms", .rule = .other_only },
+    .{ .lang = "fr", .rule = .one_from_zero },
+    .{ .lang = "pt", .rule = .one_from_zero },
+    .{ .lang = "es", .rule = .one_other_millions },
+    .{ .lang = "it", .rule = .one_other_millions },
+    .{ .lang = "ru", .rule = .east_slavic },
+    .{ .lang = "uk", .rule = .east_slavic },
+    .{ .lang = "be", .rule = .east_slavic },
+    .{ .lang = "pl", .rule = .polish },
+    .{ .lang = "cs", .rule = .czech_slovak },
+    .{ .lang = "sk", .rule = .czech_slovak },
+    .{ .lang = "ar", .rule = .arabic },
+};
+
+/// The rule for a BCP-47 tag. A (language, region) override wins (pt-PT,
+/// including composed forms like pt-Latn-PT); otherwise the primary
+/// language subtag decides -- pt and pt-BR pluralise alike -- and every
+/// match is case-insensitive, like every other tag comparison in the i18n
+/// pipeline.
+pub fn ruleForTag(tag: []const u8) Rule {
+    const dash = std.mem.indexOfScalar(u8, tag, '-') orelse tag.len;
+    const lang = tag[0..dash];
+    if (regionSubtag(tag)) |region| {
+        for (region_rules) |row| {
+            if (std.ascii.eqlIgnoreCase(row.lang, lang) and std.ascii.eqlIgnoreCase(row.region, region)) {
+                return row.rule;
+            }
+        }
+    }
+    for (tag_rules) |row| {
+        if (std.ascii.eqlIgnoreCase(row.lang, lang)) return row.rule;
+    }
+    return .one_other;
+}
+
+/// The region subtag of a BCP-47 tag, if any. Per RFC 5646 the region --
+/// two letters or three digits -- follows the primary language and an
+/// optional four-letter script subtag, and precedes variants, extensions
+/// and private use; the scan therefore stops at the first subtag that can
+/// be none of those three shapes (a singleton starts an extension chain,
+/// so nothing after it is a region either). Extended-language subtags are
+/// not modelled -- they are vestigial in practice and none of the
+/// override rows needs one.
+fn regionSubtag(tag: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, tag, '-');
+    _ = it.next(); // the primary language subtag
+    while (it.next()) |sub| {
+        if (sub.len == 4 and allAlpha(sub)) continue; // script
+        if (sub.len == 2 and allAlpha(sub)) return sub;
+        if (sub.len == 3 and allDigits(sub)) return sub;
+        return null; // variant, extension singleton, or garbage
+    }
+    return null;
+}
+
+fn allAlpha(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isAlphabetic(c)) return false;
+    }
+    return true;
+}
+
+fn allDigits(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+/// Which categories `rule` can select for some integer count -- the
+/// "per-locale category set" of the RFC's phasing line. Coverage warnings
+/// use this: a locale missing a REACHABLE variant has a player-visible gap;
+/// providing an unreachable one is harmless and stays silent.
+pub fn reachable(rule: Rule) [Category.count]bool {
+    var r = [_]bool{false} ** Category.count;
+    switch (rule) {
+        .other_only => r[@intFromEnum(Category.other)] = true,
+        .one_other => {
+            r[@intFromEnum(Category.one)] = true;
+            r[@intFromEnum(Category.other)] = true;
+        },
+        .one_from_zero, .one_other_millions => {
+            r[@intFromEnum(Category.one)] = true;
+            r[@intFromEnum(Category.many)] = true;
+            r[@intFromEnum(Category.other)] = true;
+        },
+        .east_slavic, .polish => {
+            r[@intFromEnum(Category.one)] = true;
+            r[@intFromEnum(Category.few)] = true;
+            r[@intFromEnum(Category.many)] = true;
+        },
+        .czech_slovak => {
+            r[@intFromEnum(Category.one)] = true;
+            r[@intFromEnum(Category.few)] = true;
+            r[@intFromEnum(Category.other)] = true;
+        },
+        .arabic => r = [_]bool{true} ** Category.count,
+    }
+    return r;
+}
+
+/// The category for an absolute integer count under `rule`. The build-time
+/// twin of the generated module's `selectCat`; the tests below pin both.
+pub fn select(rule: Rule, n: u64) Category {
+    return switch (rule) {
+        .other_only => .other,
+        .one_other => if (n == 1) .one else .other,
+        .one_from_zero => if (n <= 1) .one else if (n % 1_000_000 == 0) .many else .other,
+        .one_other_millions => if (n == 1) .one else if (n != 0 and n % 1_000_000 == 0) .many else .other,
+        .east_slavic => blk: {
+            const m10 = n % 10;
+            const m100 = n % 100;
+            if (m10 == 1 and m100 != 11) break :blk .one;
+            if (m10 >= 2 and m10 <= 4 and !(m100 >= 12 and m100 <= 14)) break :blk .few;
+            break :blk .many;
+        },
+        .polish => blk: {
+            if (n == 1) break :blk .one;
+            const m10 = n % 10;
+            const m100 = n % 100;
+            if (m10 >= 2 and m10 <= 4 and !(m100 >= 12 and m100 <= 14)) break :blk .few;
+            break :blk .many;
+        },
+        .czech_slovak => if (n == 1) .one else if (n >= 2 and n <= 4) .few else .other,
+        .arabic => blk: {
+            if (n == 0) break :blk .zero;
+            if (n == 1) break :blk .one;
+            if (n == 2) break :blk .two;
+            const m100 = n % 100;
+            if (m100 >= 3 and m100 <= 10) break :blk .few;
+            if (m100 >= 11 and m100 <= 99) break :blk .many;
+            break :blk .other;
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "the primary subtag decides the rule; unknown languages default to one/other" {
+    try testing.expectEqual(Rule.one_other, ruleForTag("en"));
+    try testing.expectEqual(Rule.one_other, ruleForTag("de-AT"));
+    // es/it carry CLDR's whole-million many (same shape as pt-PT).
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("es"));
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("es-419"));
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("it-IT"));
+    try testing.expectEqual(Rule.one_from_zero, ruleForTag("pt-BR"));
+    try testing.expectEqual(Rule.one_from_zero, ruleForTag("fr"));
+    try testing.expectEqual(Rule.east_slavic, ruleForTag("ru"));
+    try testing.expectEqual(Rule.other_only, ruleForTag("ja"));
+    try testing.expectEqual(Rule.arabic, ruleForTag("ar-EG"));
+    // Case-insensitive, like every other tag comparison in the pipeline.
+    try testing.expectEqual(Rule.one_from_zero, ruleForTag("PT-br"));
+    // Unlisted: the documented default.
+    try testing.expectEqual(Rule.one_other, ruleForTag("eo"));
+    // The (language, region) override: European Portuguese departs from
+    // base pt -- and survives composed BCP-47 forms (script subtag,
+    // extension chain), since the REGION is what carries the meaning.
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("pt-PT"));
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("PT-pt"));
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("pt-Latn-PT"));
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("pt-PT-u-nu-latn"));
+    // Other pt regions keep the base rule, both alpha-2 and numeric-3.
+    try testing.expectEqual(Rule.one_from_zero, ruleForTag("pt-Latn-BR"));
+    try testing.expectEqual(Rule.one_from_zero, ruleForTag("pt-419"));
+}
+
+test "one_other and one_from_zero -- the western European shapes" {
+    try testing.expectEqual(Category.one, select(.one_other, 1));
+    try testing.expectEqual(Category.other, select(.one_other, 0));
+    try testing.expectEqual(Category.other, select(.one_other, 2));
+    try testing.expectEqual(Category.other, select(.one_other, 21));
+
+    try testing.expectEqual(Category.one, select(.one_from_zero, 0));
+    try testing.expectEqual(Category.one, select(.one_from_zero, 1));
+    try testing.expectEqual(Category.other, select(.one_from_zero, 2));
+    // CLDR fr/pt: nonzero whole millions are `many`.
+    try testing.expectEqual(Category.many, select(.one_from_zero, 1_000_000));
+    try testing.expectEqual(Category.many, select(.one_from_zero, 2_000_000));
+    try testing.expectEqual(Category.other, select(.one_from_zero, 999_999));
+    try testing.expectEqual(Category.other, select(.one_from_zero, 1_000_001));
+}
+
+test "one_other_millions -- pt-PT: zero is plural, whole millions are many" {
+    try testing.expectEqual(Category.other, select(.one_other_millions, 0));
+    try testing.expectEqual(Category.one, select(.one_other_millions, 1));
+    try testing.expectEqual(Category.other, select(.one_other_millions, 2));
+    try testing.expectEqual(Category.many, select(.one_other_millions, 1_000_000));
+    try testing.expectEqual(Category.many, select(.one_other_millions, 2_000_000));
+    try testing.expectEqual(Category.other, select(.one_other_millions, 1_000_001));
+}
+
+test "other_only never distinguishes" {
+    try testing.expectEqual(Category.other, select(.other_only, 0));
+    try testing.expectEqual(Category.other, select(.other_only, 1));
+    try testing.expectEqual(Category.other, select(.other_only, 7));
+}
+
+test "east_slavic -- the ru/uk/be teens and tens" {
+    try testing.expectEqual(Category.one, select(.east_slavic, 1));
+    try testing.expectEqual(Category.one, select(.east_slavic, 21));
+    try testing.expectEqual(Category.one, select(.east_slavic, 101));
+    try testing.expectEqual(Category.many, select(.east_slavic, 11));
+    try testing.expectEqual(Category.few, select(.east_slavic, 2));
+    try testing.expectEqual(Category.few, select(.east_slavic, 24));
+    try testing.expectEqual(Category.many, select(.east_slavic, 12));
+    try testing.expectEqual(Category.many, select(.east_slavic, 14));
+    try testing.expectEqual(Category.many, select(.east_slavic, 0));
+    try testing.expectEqual(Category.many, select(.east_slavic, 5));
+    try testing.expectEqual(Category.many, select(.east_slavic, 100));
+}
+
+test "polish -- one is exactly 1, few/many follow the slavic bands" {
+    try testing.expectEqual(Category.one, select(.polish, 1));
+    try testing.expectEqual(Category.many, select(.polish, 21));
+    try testing.expectEqual(Category.few, select(.polish, 22));
+    try testing.expectEqual(Category.few, select(.polish, 2));
+    try testing.expectEqual(Category.many, select(.polish, 12));
+    try testing.expectEqual(Category.many, select(.polish, 0));
+    try testing.expectEqual(Category.many, select(.polish, 5));
+}
+
+test "czech_slovak -- few is 2..4, the rest is other" {
+    try testing.expectEqual(Category.one, select(.czech_slovak, 1));
+    try testing.expectEqual(Category.few, select(.czech_slovak, 2));
+    try testing.expectEqual(Category.few, select(.czech_slovak, 4));
+    try testing.expectEqual(Category.other, select(.czech_slovak, 5));
+    try testing.expectEqual(Category.other, select(.czech_slovak, 0));
+    try testing.expectEqual(Category.other, select(.czech_slovak, 22));
+}
+
+test "arabic -- all six categories" {
+    try testing.expectEqual(Category.zero, select(.arabic, 0));
+    try testing.expectEqual(Category.one, select(.arabic, 1));
+    try testing.expectEqual(Category.two, select(.arabic, 2));
+    try testing.expectEqual(Category.few, select(.arabic, 3));
+    try testing.expectEqual(Category.few, select(.arabic, 103));
+    try testing.expectEqual(Category.many, select(.arabic, 11));
+    try testing.expectEqual(Category.many, select(.arabic, 99));
+    try testing.expectEqual(Category.other, select(.arabic, 100));
+    try testing.expectEqual(Category.other, select(.arabic, 102));
+}
+
+test "reachable matches what select can produce" {
+    // Brute-force the contract: every category select returns is reachable,
+    // and every reachable category is hit. Dense 0..500 covers the small-n
+    // bands; the extras cover the whole-million `many` band.
+    const extras = [_]u64{ 999_999, 1_000_000, 1_000_001, 2_000_000, 123_000_000 };
+    inline for (@typeInfo(Rule).@"enum".fields) |rf| {
+        const rule: Rule = @enumFromInt(rf.value);
+        const r = reachable(rule);
+        var hit = [_]bool{false} ** Category.count;
+        var n: u64 = 0;
+        while (n <= 500) : (n += 1) {
+            const c = select(rule, n);
+            try testing.expect(r[@intFromEnum(c)]);
+            hit[@intFromEnum(c)] = true;
+        }
+        for (extras) |e| {
+            const c = select(rule, e);
+            try testing.expect(r[@intFromEnum(c)]);
+            hit[@intFromEnum(c)] = true;
+        }
+        try testing.expectEqualSlices(bool, &r, &hit);
+    }
+}
+
+test "category names round-trip; non-categories do not" {
+    try testing.expectEqual(Category.few, Category.fromName("few").?);
+    try testing.expectEqual(Category.other, Category.fromName("other").?);
+    try testing.expectEqual(@as(?Category, null), Category.fromName("others"));
+    try testing.expectEqual(@as(?Category, null), Category.fromName(""));
+}
