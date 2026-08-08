@@ -28,8 +28,12 @@ pub fn firstKeywordSegment(key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// `key` with every keyword segment @""-quoted -- exactly what a call site
-/// has to type, for the warning to show: `pause.resume` -> `pause.@"resume"`.
+/// `key` with every segment a call site could not write bare @""-quoted --
+/// exactly what the call site has to type, for the warning to show:
+/// `pause.resume` -> `pause.@"resume"`. Quoting keys off std.zig.isValidId,
+/// not just isKeyword: i18n composes pack-surfaced paths from the RAW pack
+/// name, so a segment like `my-pack__hunger` needs @"" for shape, not
+/// keyword-ness.
 pub fn quoteDottedPath(arena: Allocator, key: []const u8) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var it = std.mem.splitScalar(u8, key, '.');
@@ -37,12 +41,12 @@ pub fn quoteDottedPath(arena: Allocator, key: []const u8) Allocator.Error![]cons
     while (it.next()) |seg| {
         if (!first) try out.append(arena, '.');
         first = false;
-        if (isKeyword(seg)) {
+        if (std.zig.isValidId(seg)) {
+            try out.appendSlice(arena, seg);
+        } else {
             try out.appendSlice(arena, "@\"");
             try out.appendSlice(arena, seg);
             try out.appendSlice(arena, "\"");
-        } else {
-            try out.appendSlice(arena, seg);
         }
     }
     return out.items;
@@ -76,11 +80,14 @@ test "firstKeywordSegment walks dotted keys" {
     try testing.expect(firstKeywordSegment("menu.new_game") == null);
 }
 
-test "quoteDottedPath quotes exactly the keyword segments" {
+test "quoteDottedPath quotes exactly the segments a call site cannot write bare" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try testing.expectEqualStrings("pause.@\"resume\"", try quoteDottedPath(arena, "pause.resume"));
     try testing.expectEqualStrings("@\"error\".title", try quoteDottedPath(arena, "error.title"));
     try testing.expectEqualStrings("menu.new_game", try quoteDottedPath(arena, "menu.new_game"));
+    // A raw pack name composes non-identifier segments into surfaced paths:
+    // shape needs @"" as much as keyword-ness does.
+    try testing.expectEqualStrings("@\"my-pack__hunger\".@\"resume\"", try quoteDottedPath(arena, "my-pack__hunger.resume"));
 }

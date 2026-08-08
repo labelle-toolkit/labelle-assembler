@@ -177,6 +177,11 @@ pub fn runPhase(
     // the cheap rename. Never an error: the @"" path works.
     if (diagnostics) {
         for (try keywordKeyLints(arena, parsed[reference_idx].entries)) |l| {
+            // A key under a pack's namespace is the pack's: a game write
+            // there must name a key the pack defines, and the pack-side lint
+            // in mergePacks already covers the pack's key space -- warning
+            // here too would say everything twice.
+            if (isPackNamespaced(packs, l.key)) continue;
             std.debug.print("warning: i18n: locales/{s}.jsonc: key '{s}': segment '{s}' is a Zig keyword, so call sites read K.{s} -- consider renaming the segment to '{s}_'\n", .{ reference_tag, l.key, l.seg, try zig_keywords.quoteDottedPath(arena, l.key), l.seg });
         }
     }
@@ -382,6 +387,18 @@ fn keywordKeyLints(arena: Allocator, entries: []const locales_mod.Entry) Allocat
         }
     }
     return out.items;
+}
+
+/// True when `key` writes under the namespace of a pack that ships locales
+/// (the same raw-name `<pack>__` prefixing mergePacks uses). Such keys are
+/// overrides of the pack's key space, which gets its own lint pass.
+fn isPackNamespaced(packs: []const PackLocales, key: []const u8) bool {
+    const sep = std.mem.indexOf(u8, key, "__") orelse return false;
+    const prefix = key[0..sep];
+    for (packs) |pk| {
+        if (std.mem.eql(u8, pk.name, prefix)) return true;
+    }
+    return false;
 }
 
 /// Folds pack locales into the game's, returning merged per-tag locales over
@@ -1304,6 +1321,18 @@ test "keyword-key lint: fires on keyword segments, silent on clean and @''-renam
     try testing.expectEqualStrings("error", lints[0].seg);
     try testing.expectEqualStrings("pause.resume", lints[1].key);
     try testing.expectEqualStrings("resume", lints[1].seg);
+}
+
+test "keyword-key lint: a game override under a pack namespace is the pack's to warn about" {
+    // The pack-side pass in mergePacks lints the pack's key space, so the
+    // game-side pass skips pack-namespaced keys -- one warning per surfaced
+    // key, not one per realm that carries it.
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = "unused" }};
+    try testing.expect(isPackNamespaced(&packs, "citizens__hunger.resume"));
+    try testing.expect(!isPackNamespaced(&packs, "pause.resume"));
+    // A different (or unknown) prefix is not the pack's namespace.
+    try testing.expect(!isPackNamespaced(&packs, "villagers__hunger.resume"));
+    try testing.expect(!isPackNamespaced(&.{}, "citizens__hunger.resume"));
 }
 
 test "a keyword key warns but still generates, @\"\"-quoted" {
