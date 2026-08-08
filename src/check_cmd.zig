@@ -9,6 +9,30 @@
 //! resolving each pack's on-disk directory, and turning the parsed
 //! `depends_on` DAG into the per-pack "who is higher than me" set the
 //! event-direction rule needs.
+//!
+//! ## The allowlist — `.labelle-check-allow`
+//!
+//! A migration in progress carries KNOWN violations with a plan attached
+//! (flying-platform's packs migration keeps a per-phase ledger of exactly
+//! this shape), and enforcement that cries wolf on every run teaches
+//! people to grep past it — which is how a NEW violation slips through
+//! 26 known ones. The project root may therefore carry a
+//! `.labelle-check-allow` file: one entry per line,
+//!
+//!     <rule-slug> <file-path> [message-substring]
+//!
+//! (`#` comments and blank lines ignored). A finding is suppressed when
+//! its rule matches, the entry path is a `/`-boundary suffix of the
+//! finding's file (both sides slash-normalized, so entries stay portable
+//! across OSes), and — when given — the substring occurs in the finding
+//! message (this is how one file allows `citizens__Worker` reads while
+//! still flagging a newly-added foreign name). Line numbers are
+//! deliberately NOT part of an entry: they drift on every edit and a
+//! stale allowlist is worse than none.
+//!
+//! Suppression is never silent: the report counts what the allowlist ate,
+//! and an entry that matched nothing is called out so the ledger shrinks
+//! as a migration progresses instead of fossilizing.
 
 const std = @import("std");
 const config = @import("config.zig");
@@ -77,9 +101,154 @@ pub fn cmdCheck(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
         return;
     }
 
-    try report(arena, io, result);
+    const entries = loadAllowlist(arena, io, root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // A missing allowlist is the normal case; an unreadable one must
+        // not turn the lint off — run unfiltered and say nothing.
+        else => &.{},
+    };
+    const filtered = try applyAllowlist(arena, result.findings, entries);
 
-    if (result.findings.len > 0) std.process.exit(1);
+    try report(arena, io, .{ .findings = filtered.kept, .pack_count = result.pack_count });
+
+    if (filtered.suppressed > 0) {
+        const msg = try std.fmt.allocPrint(arena, "labelle check: {d} known finding(s) suppressed by {s}\n", .{ filtered.suppressed, ALLOWLIST_BASENAME });
+        writeStdout(io, msg);
+    }
+    for (filtered.stale) |e| {
+        const msg = try std.fmt.allocPrint(arena, "labelle check: warning: {s}:{d} matched no finding — remove the stale entry: '{s}'\n", .{ ALLOWLIST_BASENAME, e.line_no, e.raw });
+        writeStderr(io, msg);
+    }
+
+    if (filtered.kept.len > 0) std.process.exit(1);
+}
+
+// ── Allowlist ────────────────────────────────────────────────────────────
+
+pub const ALLOWLIST_BASENAME = ".labelle-check-allow";
+
+/// One parsed allowlist line. Strings borrow from the file text in the
+/// arena. `needle == null` means "any finding of this rule in this file".
+pub const AllowEntry = struct {
+    rule_slug: []const u8,
+    /// Slash-normalized at parse time.
+    path: []const u8,
+    needle: ?[]const u8,
+    /// 1-based source line, for the stale-entry warning.
+    line_no: usize,
+    raw: []const u8,
+};
+
+pub const AllowResult = struct {
+    kept: []const check.Finding,
+    suppressed: usize,
+    /// Entries that matched no finding this run — stale, or a typo'd rule
+    /// slug / path; either way the ledger should lose the line.
+    stale: []const AllowEntry,
+};
+
+/// Read `<root>/.labelle-check-allow`. Missing file → empty set (the
+/// caller treats every read error the same way; only OOM propagates).
+fn loadAllowlist(arena: std.mem.Allocator, io: std.Io, root: []const u8) ![]const AllowEntry {
+    const path = try std.fs.path.join(arena, &.{ root, ALLOWLIST_BASENAME });
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024));
+    return parseAllowlist(arena, text);
+}
+
+/// Pure line parser: `<rule-slug> <path> [message-substring]`, `#` to
+/// end-of-line comments only when the line STARTS with `#` (a `#` inside a
+/// message substring stays literal), blank lines skipped.
+pub fn parseAllowlist(arena: std.mem.Allocator, text: []const u8) ![]const AllowEntry {
+    var out: std.ArrayList(AllowEntry) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var line_no: usize = 0;
+    while (it.next()) |raw_line| {
+        line_no += 1;
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const slug_end = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
+        const slug = line[0..slug_end];
+        const after_slug = std.mem.trimStart(u8, line[slug_end..], " \t");
+        if (after_slug.len == 0) {
+            // Rule with no path — unmatchable as written; keep it so the
+            // stale warning surfaces the malformed line instead of the
+            // file silently shrinking.
+            try out.append(arena, .{ .rule_slug = slug, .path = "", .needle = null, .line_no = line_no, .raw = line });
+            continue;
+        }
+        const path_end = std.mem.indexOfAny(u8, after_slug, " \t") orelse after_slug.len;
+        const needle = std.mem.trimStart(u8, after_slug[path_end..], " \t");
+        try out.append(arena, .{
+            .rule_slug = slug,
+            .path = try normalizeSlashes(arena, after_slug[0..path_end]),
+            .needle = if (needle.len == 0) null else needle,
+            .line_no = line_no,
+            .raw = line,
+        });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn normalizeSlashes(arena: std.mem.Allocator, p: []const u8) ![]const u8 {
+    const out = try arena.dupe(u8, p);
+    for (out) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return out;
+}
+
+/// Split findings into kept / suppressed and flag entries that never
+/// matched. Pure over its inputs.
+pub fn applyAllowlist(arena: std.mem.Allocator, findings: []const check.Finding, entries: []const AllowEntry) !AllowResult {
+    if (entries.len == 0) return .{ .kept = findings, .suppressed = 0, .stale = &.{} };
+
+    const used = try arena.alloc(bool, entries.len);
+    @memset(used, false);
+    var kept: std.ArrayList(check.Finding) = .empty;
+    var suppressed: usize = 0;
+
+    for (findings) |f| {
+        const norm_file = try normalizeSlashes(arena, f.file);
+        var matched = false;
+        for (entries, 0..) |e, i| {
+            if (!entryMatches(e, f, norm_file)) continue;
+            // No break: one finding may satisfy several entries, and every
+            // one of them has earned its keep — otherwise a broad entry
+            // shadows a narrow one into a false "stale" warning.
+            used[i] = true;
+            matched = true;
+        }
+        if (matched) suppressed += 1 else try kept.append(arena, f);
+    }
+
+    var stale: std.ArrayList(AllowEntry) = .empty;
+    for (entries, 0..) |e, i| {
+        if (!used[i]) try stale.append(arena, e);
+    }
+    return .{
+        .kept = try kept.toOwnedSlice(arena),
+        .suppressed = suppressed,
+        .stale = try stale.toOwnedSlice(arena),
+    };
+}
+
+fn entryMatches(e: AllowEntry, f: check.Finding, norm_file: []const u8) bool {
+    if (!std.mem.eql(u8, e.rule_slug, f.rule.slug())) return false;
+    if (!pathSuffixMatches(norm_file, e.path)) return false;
+    if (e.needle) |n| {
+        if (std.mem.indexOf(u8, f.message, n) == null) return false;
+    }
+    return true;
+}
+
+/// True iff `entry_path` equals `file` or is a suffix of it starting at a
+/// `/` boundary — so `s/foo.zig` cannot claim `packs/foo.zig`, and a
+/// repo-relative entry matches the absolute path the walker reports.
+fn pathSuffixMatches(file: []const u8, entry_path: []const u8) bool {
+    if (entry_path.len == 0 or entry_path.len > file.len) return false;
+    if (!std.mem.endsWith(u8, file, entry_path)) return false;
+    if (entry_path.len == file.len) return true;
+    return file[file.len - entry_path.len - 1] == '/';
 }
 
 /// Run the lint over the project at `root` and return the findings without
@@ -823,4 +992,118 @@ test "runLint: a game-root scene using the namespaced key is silent (#490)" {
     for (result.findings) |f| {
         try testing.expect(f.rule != .scene_bare_pack_component);
     }
+}
+
+test "parseAllowlist: comments, blanks, needles, and a pathless line" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const entries = try parseAllowlist(arena,
+        \\# ledger header comment
+        \\
+        \\cross-pack-registry-access packs\combat\scripts\playing\14_guard_system.zig
+        \\cross-pack-registry-access packs/rooms/scripts/playing/40_repair_progress.zig citizens__Worker
+        \\event-direction-inversion
+    );
+    try testing.expectEqual(@as(usize, 3), entries.len);
+    // Backslash entry paths normalize so one ledger serves every OS.
+    try testing.expectEqualStrings("packs/combat/scripts/playing/14_guard_system.zig", entries[0].path);
+    try testing.expect(entries[0].needle == null);
+    try testing.expectEqualStrings("citizens__Worker", entries[1].needle.?);
+    try testing.expectEqual(@as(usize, 4), entries[1].line_no);
+    // The pathless line parses (unmatchable) so the stale warning names it.
+    try testing.expectEqualStrings("", entries[2].path);
+}
+
+test "applyAllowlist: suffix boundary, needle narrowing, stale detection" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const findings = [_]check.Finding{
+        .{ .rule = .cross_pack_registry_access, .file = "C:\\work\\game\\packs\\combat\\scripts\\a.zig", .line = 3, .col = 1, .message = "reads foreign registry name \"citizens__Worker\"" },
+        .{ .rule = .cross_pack_registry_access, .file = "C:\\work\\game\\packs\\combat\\scripts\\a.zig", .line = 9, .col = 1, .message = "reads foreign registry name \"rooms__GuardRoom\"" },
+        .{ .rule = .raw_global_facet_write, .file = "C:\\work\\game\\packs\\rooms\\scripts\\b.zig", .line = 1, .col = 1, .message = "constructs Locked directly" },
+    };
+
+    // Needle-narrowed entry: eats the Worker read, NOT the GuardRoom one.
+    // Boundary probe: `s/b.zig` must not claim `scripts/b.zig`.
+    const entries = try parseAllowlist(arena,
+        \\cross-pack-registry-access packs/combat/scripts/a.zig citizens__Worker
+        \\raw-global-facet-write s/b.zig
+        \\cross-pack-registry-access packs/gone/c.zig
+    );
+    const result = try applyAllowlist(arena, &findings, entries);
+
+    try testing.expectEqual(@as(usize, 1), result.suppressed);
+    try testing.expectEqual(@as(usize, 2), result.kept.len);
+    try testing.expectEqual(check.Rule.cross_pack_registry_access, result.kept[0].rule);
+    try testing.expect(std.mem.indexOf(u8, result.kept[0].message, "GuardRoom") != null);
+    try testing.expectEqual(check.Rule.raw_global_facet_write, result.kept[1].rule);
+    // Stale: the boundary-failed entry AND the gone-file entry.
+    try testing.expectEqual(@as(usize, 2), result.stale.len);
+    try testing.expectEqualStrings("s/b.zig", result.stale[0].path);
+    try testing.expectEqualStrings("packs/gone/c.zig", result.stale[1].path);
+}
+
+test "applyAllowlist: full-path equality and empty allowlist passthrough" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const findings = [_]check.Finding{
+        .{ .rule = .cross_pack_import, .file = "packs/sky/scripts/x.zig", .line = 1, .col = 1, .message = "imports foreign file" },
+    };
+
+    const empty = try applyAllowlist(arena, &findings, &.{});
+    try testing.expectEqual(@as(usize, 1), empty.kept.len);
+    try testing.expectEqual(@as(usize, 0), empty.suppressed);
+
+    const entries = try parseAllowlist(arena, "cross-pack-import packs/sky/scripts/x.zig");
+    const result = try applyAllowlist(arena, &findings, entries);
+    try testing.expectEqual(@as(usize, 0), result.kept.len);
+    try testing.expectEqual(@as(usize, 1), result.suppressed);
+    try testing.expectEqual(@as(usize, 0), result.stale.len);
+}
+
+test "allowlist end-to-end: the three-rule fixture drains to zero and a stale entry is flagged" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try scaffoldFixture(io, tmp.dir);
+    try writeFile(io, tmp.dir, "packs/production/scripts/00_work.zig",
+        \\pub fn work(game: anytype, e: u64) void {
+        \\    _ = game.getType("citizens__Worker");
+        \\    game.addComponent(e, Locked{ .owner = 1 });
+        \\}
+    );
+    try writeFile(io, tmp.dir, "packs/citizens/scripts/00_decay.zig",
+        \\pub fn on_event(ev: anytype) void {
+        \\    switch (ev) { .production__item_produced => {}, else => {} }
+        \\}
+    );
+    try writeFile(io, tmp.dir, ALLOWLIST_BASENAME,
+        \\# migration ledger — see docs
+        \\cross-pack-registry-access packs/production/scripts/00_work.zig
+        \\raw-global-facet-write packs/production/scripts/00_work.zig
+        \\event-direction-inversion packs/citizens/scripts/00_decay.zig
+        \\cross-pack-registry-access packs/citizens/scripts/00_decay.zig
+    );
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const result = try runLint(arena, io, root);
+    try testing.expectEqual(@as(usize, 3), result.findings.len);
+
+    const entries = try loadAllowlist(arena, io, root);
+    const filtered = try applyAllowlist(arena, result.findings, entries);
+    try testing.expectEqual(@as(usize, 0), filtered.kept.len);
+    try testing.expectEqual(@as(usize, 3), filtered.suppressed);
+    // The fourth entry names a rule/file pair with no finding: stale.
+    try testing.expectEqual(@as(usize, 5), filtered.stale[0].line_no);
+    try testing.expectEqual(@as(usize, 1), filtered.stale.len);
 }
