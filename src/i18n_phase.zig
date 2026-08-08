@@ -228,15 +228,7 @@ pub fn runPhase(
                 continue;
             };
             if (std.meta.activeTag(ref_value) != std.meta.activeTag(e.value)) {
-                const shape = struct {
-                    fn name(v: locales_mod.Value) []const u8 {
-                        return switch (v) {
-                            .str => "a plain string",
-                            .plural => "a plural set",
-                        };
-                    }
-                };
-                std.debug.print("locales/{s}.jsonc: key '{s}' is {s} here but {s} in the reference locale ({s}) -- a key keeps one shape across every locale\n", .{ tag, e.key, shape.name(e.value), shape.name(ref_value), reference_tag });
+                std.debug.print("locales/{s}.jsonc: key '{s}' is {s} here but {s} in the reference locale ({s}) -- a key keeps one shape across every locale\n", .{ tag, e.key, valueShapeName(e.value), valueShapeName(ref_value), reference_tag });
                 had_error = true;
             }
         }
@@ -442,6 +434,15 @@ fn isBcp47ish(s: []const u8) bool {
     return true;
 }
 
+/// How a Value's shape reads in an error message. Kind mismatches name both
+/// sides with this, everywhere they are caught.
+fn valueShapeName(v: locales_mod.Value) []const u8 {
+    return switch (v) {
+        .str => "a plain string",
+        .plural => "a plural set",
+    };
+}
+
 fn indexOfTag(tags: []const []const u8, tag: []const u8) ?usize {
     for (tags, 0..) |t, i| {
         if (std.mem.eql(u8, t, tag)) return i;
@@ -533,11 +534,20 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
         };
 
         // Per-realm rename catch: a pack locale key its own reference lacks.
+        // Kind drift is caught in the same pass -- checking it only on the
+        // merged data would miss the case where a pack locale's flipped
+        // shape BECOMES the merged reference (a one-locale game whose
+        // reference is a tag the pack translates but does not author in).
         for (ptags.items, 0..) |t, i| {
             if (std.ascii.eqlIgnoreCase(t, pref_tag)) continue;
             for (pparsed.items[i].entries) |e| {
-                if (pack_ref.get(e.key) == null) {
+                const rv = pack_ref.get(e.key) orelse {
                     std.debug.print("packs/{s}/locales/{s}.jsonc: key '{s}' is absent from the pack's reference ({s})\n", .{ pk.name, t, e.key, pref_tag });
+                    had_error = true;
+                    continue;
+                };
+                if (std.meta.activeTag(rv) != std.meta.activeTag(e.value)) {
+                    std.debug.print("packs/{s}/locales/{s}.jsonc: key '{s}' is {s} here but {s} in the pack's reference ({s}) -- a key keeps one shape across every locale\n", .{ pk.name, t, e.key, valueShapeName(e.value), valueShapeName(rv), pref_tag });
                     had_error = true;
                 }
             }
@@ -581,8 +591,19 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
                 had_error = true;
                 continue;
             };
-            if (pd.reference.get(rest) == null) {
+            const pack_value = pd.reference.get(rest) orelse {
                 std.debug.print("locales/{s}.jsonc: key '{s}' overrides nothing -- pack '{s}' does not define '{s}'. A typo here, or a key the pack renamed, would otherwise silently keep the pack's string\n", .{ gt, e.key, pack_name, rest });
+                had_error = true;
+                continue;
+            };
+            // An override must keep the pack's kind. The general
+            // reference-vs-locale check cannot be relied on here: a game
+            // shipping only its reference locale has no second locale to
+            // disagree with, and the pack's own shape was just suppressed
+            // by the override -- yet every call site the pack authored
+            // compiles against the pack's shape.
+            if (std.meta.activeTag(pack_value) != std.meta.activeTag(e.value)) {
+                std.debug.print("locales/{s}.jsonc: key '{s}' overrides pack '{s}' with {s}, but the pack defines '{s}' as {s} -- the pack's call sites compile against that shape\n", .{ gt, e.key, pack_name, valueShapeName(e.value), rest, valueShapeName(pack_value) });
                 had_error = true;
             }
         }
@@ -1863,6 +1884,59 @@ test "phase 4: the game overrides a pack's plural key; pack plurals surface pref
     var ast = try std.zig.Ast.parse(testing.allocator, src_z, .zig);
     defer ast.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), ast.errors.len);
+}
+
+test "phase 4: a game override must keep the pack's kind -- even in a one-locale game" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "thepack/locales");
+    try tmp.dir.createDirPath(io, "target");
+    // One locale only: no second locale exists to disagree with the merged
+    // reference, so the general kind check cannot catch this -- the
+    // override-site check must.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"citizens__hunger\": { \"meals\": \"dinner\" } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/en.jsonc", .data = "{ \"hunger\": { \"meals\": { \"one\": \"{count} meal\", \"other\": \"{count} meals\" } } }" });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+    const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
+    defer testing.allocator.free(target);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ rel, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir }};
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
+}
+
+test "phase 4: kind drift inside a pack's own locales is an error" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "thepack/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"menu\": { \"play\": \"Play\" } }" });
+    // The pack's own reference is de; its en translation flips the key's
+    // shape. If en were the merged reference this would silently become the
+    // key space, so it fails at the pack, not downstream.
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/de.jsonc", .data = "{ \"hunger\": { \"meals\": { \"one\": \"{count} Mahl\", \"other\": \"{count} Mahle\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/en.jsonc", .data = "{ \"hunger\": { \"meals\": \"meals\" } }" });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+    const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
+    defer testing.allocator.free(target);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ rel, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir, .reference = "de" }};
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
 }
 
 test "phase 4 strict: a USED plural key missing a reachable variant fails; unused stays silent" {

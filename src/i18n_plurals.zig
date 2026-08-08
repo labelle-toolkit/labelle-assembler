@@ -50,13 +50,13 @@ pub const Category = enum(u3) {
 pub const Rule = enum {
     /// No plural distinction: ja, zh, ko, th, vi, id, ms.
     other_only,
-    /// one at exactly 1: en, de, es, it, nl, sv, ... (and the default).
+    /// one at exactly 1: en, de, nl, sv, ... (and the default).
     one_other,
     /// one at 0 and 1 (CLDR: i = 0..1), many at nonzero whole millions
-    /// (CLDR fr/pt: e = 0 and i % 1000000 = 0, integer counts): fr, pt.
+    /// (CLDR: e = 0 and i % 1000000 = 0, integer counts): fr, pt.
     one_from_zero,
-    /// one at exactly 1, many at nonzero whole millions: pt-PT (European
-    /// Portuguese classifies 0 as plural, unlike base/Brazilian pt).
+    /// one at exactly 1, many at nonzero whole millions: es, it, and pt-PT
+    /// (European Portuguese classifies 0 as plural, unlike base pt).
     one_other_millions,
     /// ru/uk/be: one (n%10=1, n%100!=11), few (n%10=2..4, n%100!=12..14),
     /// many (the rest, 0 included). CLDR's `other` is fraction-only there,
@@ -94,6 +94,8 @@ const tag_rules = [_]struct { lang: []const u8, rule: Rule }{
     .{ .lang = "ms", .rule = .other_only },
     .{ .lang = "fr", .rule = .one_from_zero },
     .{ .lang = "pt", .rule = .one_from_zero },
+    .{ .lang = "es", .rule = .one_other_millions },
+    .{ .lang = "it", .rule = .one_other_millions },
     .{ .lang = "ru", .rule = .east_slavic },
     .{ .lang = "uk", .rule = .east_slavic },
     .{ .lang = "be", .rule = .east_slavic },
@@ -234,6 +236,10 @@ const testing = std.testing;
 test "the primary subtag decides the rule; unknown languages default to one/other" {
     try testing.expectEqual(Rule.one_other, ruleForTag("en"));
     try testing.expectEqual(Rule.one_other, ruleForTag("de-AT"));
+    // es/it carry CLDR's whole-million many (same shape as pt-PT).
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("es"));
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("es-419"));
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("it-IT"));
     try testing.expectEqual(Rule.one_from_zero, ruleForTag("pt-BR"));
     try testing.expectEqual(Rule.one_from_zero, ruleForTag("fr"));
     try testing.expectEqual(Rule.east_slavic, ruleForTag("ru"));
