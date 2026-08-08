@@ -40,6 +40,16 @@ fn inProjectLibDir(plugin: config.PluginDep) ?[]const u8 {
     if (!std.mem.startsWith(u8, plugin.repo, "@")) return null;
     const path = plugin.localPath();
     if (!std.mem.startsWith(u8, path, "libs/")) return null;
+    // The prefix test alone is nominal: `@libs/../../shared` normalizes to a
+    // path OUTSIDE libs/, so a `.`/`..`/empty component (or a `\` smuggling
+    // one on Windows) must not classify as in-project (PR #662 review). The
+    // in-project privileges keyed off this — test-step chaining (#82) and the
+    // generated-data injection — are for libs the project tree actually owns.
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |comp| {
+        if (comp.len == 0 or std.mem.eql(u8, comp, ".") or std.mem.eql(u8, comp, "..")) return null;
+        if (std.mem.indexOfScalar(u8, comp, '\\') != null) return null;
+    }
     return path;
 }
 
@@ -1617,6 +1627,9 @@ test "emitLibPluginDataImports: @libs/ plugins get constants+i18n, external/loca
             .{ .name = "needs_machine", .repo = "@libs/needs_machine" },
             .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "2.6.0" },
             .{ .name = "shared", .repo = "local:../shared-plugin" },
+            // Nominal-containment escape (PR #662 review): normalizes outside
+            // libs/, so it must classify — and wire — as out-of-project.
+            .{ .name = "escape", .repo = "@libs/../../shared" },
         },
     };
     try emitLibPluginDataImports(&aw.writer, cfg, true, true);
@@ -1628,6 +1641,21 @@ test "emitLibPluginDataImports: @libs/ plugins get constants+i18n, external/loca
             "    overrideImport(plugin_needs_machine_mod, \"i18n\", i18n_mod);\n",
         aw.written(),
     );
+}
+
+test "inProjectLibDir: traversal and degenerate components do not classify as in-project (#662 review)" {
+    // `libs/` is a PREFIX test on the unnormalized path; without the component
+    // walk, `@libs/../../shared` would collect in-project privileges (test-step
+    // chaining #82, generated-data injection) while living outside the tree.
+    try testing.expectEqualStrings("libs/needs_machine", inProjectLibDir(.{ .name = "n", .repo = "@libs/needs_machine" }).?);
+    try testing.expectEqualStrings("libs/a/b", inProjectLibDir(.{ .name = "n", .repo = "@libs/a/b" }).?);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs/../../shared" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs/a/../b" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs/./a" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs/a\\..\\b" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs//a" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs/a/" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "local:libs/a" }) == null);
 }
 
 test "emitLibPluginDataImports: each flag gates its own line" {
