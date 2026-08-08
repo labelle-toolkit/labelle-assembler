@@ -443,6 +443,48 @@ fn valueShapeName(v: locales_mod.Value) []const u8 {
     };
 }
 
+/// The sorted placeholder-name set that defines a value's argument
+/// contract: the full name set for a plain string, the non-count union
+/// across variants for a plural set. Null when anything fails to parse --
+/// the downstream per-locale pass reports the syntax error with a better
+/// site, so callers skip the comparison instead of double-reporting.
+fn valueArgNames(arena: Allocator, v: locales_mod.Value) Allocator.Error!?[]const []const u8 {
+    switch (v) {
+        .str => |s| switch (try interp.parse(arena, s)) {
+            .fail => return null,
+            .ok => |segs| return try interp.names(arena, segs),
+        },
+        .plural => |set| {
+            var var_segs: [plurals.Category.count]?[]const interp.Segment = @splat(null);
+            for (set, 0..) |maybe_raw, ci| {
+                const raw = maybe_raw orelse continue;
+                switch (try interp.parse(arena, raw)) {
+                    .fail => return null,
+                    .ok => |segs| var_segs[ci] = segs,
+                }
+            }
+            return try pluralExtraNames(arena, var_segs);
+        },
+    }
+}
+
+/// Whether two same-kind values agree on that contract. True when either
+/// side is unparseable (see valueArgNames). Out-params carry the sets for
+/// the error message.
+fn sameArgContract(
+    arena: Allocator,
+    a: locales_mod.Value,
+    b: locales_mod.Value,
+    a_names: *[]const []const u8,
+    b_names: *[]const []const u8,
+) Allocator.Error!bool {
+    const an = (try valueArgNames(arena, a)) orelse return true;
+    const bn = (try valueArgNames(arena, b)) orelse return true;
+    a_names.* = an;
+    b_names.* = bn;
+    return interp.sameNames(an, bn);
+}
+
 fn indexOfTag(tags: []const []const u8, tag: []const u8) ?usize {
     for (tags, 0..) |t, i| {
         if (std.mem.eql(u8, t, tag)) return i;
@@ -549,6 +591,17 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
                 if (std.meta.activeTag(rv) != std.meta.activeTag(e.value)) {
                     std.debug.print("packs/{s}/locales/{s}.jsonc: key '{s}' is {s} here but {s} in the pack's reference ({s}) -- a key keeps one shape across every locale\n", .{ pk.name, t, e.key, valueShapeName(e.value), valueShapeName(rv), pref_tag });
                     had_error = true;
+                    continue;
+                }
+                // The argument contract too, for the same reason as the
+                // kind: a pack translation that drops {name} could become
+                // the merged reference in a one-locale game, and downstream
+                // parity would then compare it against itself.
+                var l_names: []const []const u8 = &.{};
+                var r_names: []const []const u8 = &.{};
+                if (!try sameArgContract(arena, e.value, rv, &l_names, &r_names)) {
+                    std.debug.print("packs/{s}/locales/{s}.jsonc: key '{s}': placeholder set {{{s}}} differs from the pack reference's {{{s}}} (for plural keys, {{count}} is implicit and never counted)\n", .{ pk.name, t, e.key, try std.mem.join(arena, ", ", l_names), try std.mem.join(arena, ", ", r_names) });
+                    had_error = true;
                 }
             }
         }
@@ -604,6 +657,17 @@ fn mergePacks(arena: Allocator, io: std.Io, in: MergeInput) ![]locales_mod.Local
             // compiles against the pack's shape.
             if (std.meta.activeTag(pack_value) != std.meta.activeTag(e.value)) {
                 std.debug.print("locales/{s}.jsonc: key '{s}' overrides pack '{s}' with {s}, but the pack defines '{s}' as {s} -- the pack's call sites compile against that shape\n", .{ gt, e.key, pack_name, valueShapeName(e.value), rest, valueShapeName(pack_value) });
+                had_error = true;
+                continue;
+            }
+            // And the argument contract: an override that drops or renames
+            // a placeholder would, in a one-locale game, BECOME the merged
+            // reference -- no other locale left to disagree -- and generate
+            // an Args type the pack-authored tf/tpf calls cannot satisfy.
+            var g_names: []const []const u8 = &.{};
+            var p_names: []const []const u8 = &.{};
+            if (!try sameArgContract(arena, e.value, pack_value, &g_names, &p_names)) {
+                std.debug.print("locales/{s}.jsonc: key '{s}': placeholder set {{{s}}} differs from pack '{s}''s {{{s}}} -- the pack's call sites pass that argument set (for plural keys, {{count}} is implicit and never counted)\n", .{ gt, e.key, try std.mem.join(arena, ", ", g_names), pack_name, try std.mem.join(arena, ", ", p_names) });
                 had_error = true;
             }
         }
@@ -1936,6 +2000,60 @@ test "phase 4: kind drift inside a pack's own locales is an error" {
     defer testing.allocator.free(pack_dir);
 
     const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir, .reference = "de" }};
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
+}
+
+test "phase 4: a pack translation must keep the pack reference's argument contract" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "thepack/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"menu\": { \"play\": \"Play\" } }" });
+    // The pack's reference (de) uses {name}; its en translation drops it.
+    // In this en-only game the en translation would become the merged
+    // reference, so downstream parity would compare it against itself --
+    // the pack-level check must refuse it first.
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/de.jsonc", .data = "{ \"hunger\": { \"gift\": { \"one\": \"{count} Geschenk fur {name}\", \"other\": \"{count} Geschenke fur {name}\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/en.jsonc", .data = "{ \"hunger\": { \"gift\": { \"one\": \"{count} gift\", \"other\": \"{count} gifts\" } } }" });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+    const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
+    defer testing.allocator.free(target);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ rel, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir, .reference = "de" }};
+    try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
+}
+
+test "phase 4: a game override must keep the pack's argument contract" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "thepack/locales");
+    try tmp.dir.createDirPath(io, "target");
+    // One locale: the override becomes the merged reference, so only the
+    // override-site check can see the dropped {name}. The pack's tpf call
+    // sites pass .name -- an Args type without it breaks them.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"citizens__hunger\": { \"gift\": { \"one\": \"{count} present\", \"other\": \"{count} presents\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "thepack/locales/en.jsonc", .data = "{ \"hunger\": { \"gift\": { \"one\": \"{count} gift for {name}\", \"other\": \"{count} gifts for {name}\" } } }" });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+    const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
+    defer testing.allocator.free(target);
+    const pack_dir = try std.fs.path.join(testing.allocator, &.{ rel, "thepack" });
+    defer testing.allocator.free(pack_dir);
+
+    const packs = [_]PackLocales{.{ .name = "citizens", .src_dir = pack_dir }};
     try testing.expectError(error.I18nInvalid, runPhase(testing.allocator, game, target, .{ .default = "en" }, &packs, true));
 }
 
