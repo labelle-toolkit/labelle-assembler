@@ -4,22 +4,38 @@
 //! comments allowed (translator notes are genuinely useful). The filename is
 //! the BCP-47 tag and the only place a locale is declared.
 //!
-//! The output is a flat, sorted map of dotted key -> string. Sorted here, once,
+//! The output is a flat, sorted map of dotted key -> value. Sorted here, once,
 //! because key order is index order in the generated table and OQ3 (key type
 //! stability) wants that deterministic regardless of file layout.
+//!
+//! Phase 4 (plurals): a leaf is either a plain string or a PLURAL SET -- an
+//! object whose children are all string leaves named from the CLDR category
+//! set (zero/one/two/few/many/other) with `other` among them. That is the
+//! RFC's "nested key convention": no new syntax, just a shape the flattener
+//! recognises. Anything else stays a namespace and flattens through.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const plurals = @import("i18n_plurals.zig");
+
+/// A plural set: one optional string per CLDR category, indexed by
+/// `plurals.Category`. `other` is always present (detection requires it).
+pub const PluralSet = [plurals.Category.count]?[]const u8;
+
+pub const Value = union(enum) {
+    str: []const u8,
+    plural: PluralSet,
+};
 
 pub const Entry = struct {
     /// Dotted path, e.g. "menu.new_game". Every segment is a Zig identifier.
     key: []const u8,
-    value: []const u8,
+    value: Value,
 };
 
 pub const Locale = struct {
     entries: []Entry,
 
-    pub fn get(self: *const Locale, key: []const u8) ?[]const u8 {
+    pub fn get(self: *const Locale, key: []const u8) ?Value {
         // Sorted, so this could bisect; locale files are small enough that
         // linear is clearer and the assembler runs this once per build.
         for (self.entries) |e| {
@@ -91,10 +107,16 @@ fn flatten(
 
         switch (kv.value_ptr.*) {
             .object => |child| {
-                if (try flatten(arena, entries, child, path)) |e| return e;
+                switch (try classifyObject(arena, child, path)) {
+                    .plural => |set| try entries.append(arena, .{ .key = path, .value = .{ .plural = set } }),
+                    .namespace => {
+                        if (try flatten(arena, entries, child, path)) |e| return e;
+                    },
+                    .fail => |e| return e,
+                }
             },
             .string => |s| {
-                try entries.append(arena, .{ .key = path, .value = try arena.dupe(u8, s) });
+                try entries.append(arena, .{ .key = path, .value = .{ .str = try arena.dupe(u8, s) } });
             },
             else => {
                 return .{ .msg = try std.fmt.allocPrint(arena, "key '{s}': locale values are strings; found {s}. Numbers belong in constants/ (RFC-CONSTANTS)", .{ path, @tagName(kv.value_ptr.*) }) };
@@ -102,6 +124,55 @@ fn flatten(
         }
     }
     return null;
+}
+
+const Classified = union(enum) {
+    plural: PluralSet,
+    namespace,
+    fail: Error,
+};
+
+/// The phase-4 convention: an object is a plural key iff every child is a
+/// string leaf named from the CLDR category set AND `other` is among them
+/// (`other` is the universal fallback every rule can reach; a plural set
+/// without it could not be made total). Everything else is a namespace --
+/// including an object mixing category names with other keys, so a
+/// `difficulty: { easy, normal, other }` screen never misdetects.
+///
+/// The one guarded footgun: an object whose children are ALL category-named
+/// strings but lack `other` is far more likely a plural set missing its
+/// fallback than a namespace that happens to spell `one`/`few`, so with two
+/// or more such children it is an error rather than a silent namespace. A
+/// single category-named child (`level: { one: "Level One" }`) is too weak a
+/// signal and stays a namespace.
+fn classifyObject(arena: Allocator, obj: std.json.ObjectMap, path: []const u8) Allocator.Error!Classified {
+    var all_cat_strings = true;
+    var has_other = false;
+    var n_children: usize = 0;
+
+    var it = obj.iterator();
+    while (it.next()) |kv| {
+        n_children += 1;
+        const is_cat_string = kv.value_ptr.* == .string and plurals.Category.fromName(kv.key_ptr.*) != null;
+        if (!is_cat_string) all_cat_strings = false;
+        if (is_cat_string and std.mem.eql(u8, kv.key_ptr.*, "other")) has_other = true;
+    }
+
+    if (!all_cat_strings or n_children == 0) return .namespace;
+    if (!has_other) {
+        if (n_children >= 2) {
+            return .{ .fail = .{ .msg = try std.fmt.allocPrint(arena, "key '{s}': the children are all CLDR plural categories but 'other' is missing. A plural key needs 'other' (the universal fallback); if this was meant as a namespace, rename a child", .{path}) } };
+        }
+        return .namespace;
+    }
+
+    var set: PluralSet = @splat(null);
+    it = obj.iterator();
+    while (it.next()) |kv| {
+        const cat = plurals.Category.fromName(kv.key_ptr.*).?;
+        set[@intFromEnum(cat)] = try arena.dupe(u8, kv.value_ptr.string);
+    }
+    return .{ .plural = set };
 }
 
 /// Strips `//` and `/* */` comments outside string literals, plus trailing
@@ -227,7 +298,7 @@ test "nested objects flatten to sorted dotted keys" {
     try testing.expectEqualStrings("hud.stock", l.entries[0].key);
     try testing.expectEqualStrings("menu.exit", l.entries[1].key);
     try testing.expectEqualStrings("menu.new_game", l.entries[2].key);
-    try testing.expectEqualStrings("Novo Jogo", l.get("menu.new_game").?);
+    try testing.expectEqualStrings("Novo Jogo", l.get("menu.new_game").?.str);
 }
 
 test "comments and trailing commas are JSONC, and survive" {
@@ -241,7 +312,7 @@ test "comments and trailing commas are JSONC, and survive" {
         \\  },
         \\}
     );
-    try testing.expectEqualStrings("Opções", l.get("menu.options").?);
+    try testing.expectEqualStrings("Opções", l.get("menu.options").?.str);
 }
 
 test "a non-string leaf is an error that points at constants" {
@@ -286,5 +357,69 @@ test "comment markers inside strings are content, not comments" {
     const l = try parseOk(arena_state.allocator(),
         \\{ "help": { "url_hint": "see https://example.com // docs" } }
     );
-    try testing.expectEqualStrings("see https://example.com // docs", l.get("help.url_hint").?);
+    try testing.expectEqualStrings("see https://example.com // docs", l.get("help.url_hint").?.str);
+}
+
+test "phase 4: a category-shaped object with 'other' is one plural key" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const l = try parseOk(arena_state.allocator(),
+        \\{
+        \\  "hud": {
+        \\    "items": { "one": "{count} item", "other": "{count} items" },
+        \\    "title": "Inventory",
+        \\  },
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 2), l.entries.len);
+    const set = l.get("hud.items").?.plural;
+    try testing.expectEqualStrings("{count} item", set[@intFromEnum(plurals.Category.one)].?);
+    try testing.expectEqualStrings("{count} items", set[@intFromEnum(plurals.Category.other)].?);
+    try testing.expectEqual(@as(?[]const u8, null), set[@intFromEnum(plurals.Category.few)]);
+    try testing.expectEqualStrings("Inventory", l.get("hud.title").?.str);
+}
+
+test "phase 4: a lone 'other' is a plural key; all six categories parse" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const l = try parseOk(arena_state.allocator(),
+        \\{
+        \\  "hud": { "fish": { "other": "{count} sakana" } },
+        \\  "days": { "zero": "z", "one": "o", "two": "t", "few": "f", "many": "m", "other": "x" },
+        \\}
+    );
+    try testing.expectEqualStrings("{count} sakana", l.get("hud.fish").?.plural[@intFromEnum(plurals.Category.other)].?);
+    const days = l.get("days").?.plural;
+    for (days) |v| try testing.expect(v != null);
+}
+
+test "phase 4: category names mixed with other keys stay a namespace" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // `difficulty` has an `other` child but also non-category children --
+    // an ordinary screen namespace, never a plural set.
+    const l = try parseOk(arena_state.allocator(),
+        \\{ "difficulty": { "easy": "Easy", "normal": "Normal", "other": "Other" } }
+    );
+    try testing.expectEqualStrings("Easy", l.get("difficulty.easy").?.str);
+    try testing.expectEqualStrings("Other", l.get("difficulty.other").?.str);
+}
+
+test "phase 4: all-category children without 'other' is the guarded footgun" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    switch (try parse(arena_state.allocator(),
+        \\{ "hud": { "items": { "one": "{count} item", "few": "{count} items" } } }
+    )) {
+        .ok => return error.TestUnexpectedResult,
+        .fail => |e| {
+            try testing.expect(std.mem.indexOf(u8, e.msg, "hud.items") != null);
+            try testing.expect(std.mem.indexOf(u8, e.msg, "'other' is missing") != null);
+        },
+    }
+    // A single category-named child is too weak a signal: namespace.
+    const l = try parseOk(arena_state.allocator(),
+        \\{ "level": { "one": "Level One" } }
+    );
+    try testing.expectEqualStrings("Level One", l.get("level.one").?.str);
 }

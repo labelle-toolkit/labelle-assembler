@@ -2176,13 +2176,13 @@ test "keyword-key lint: fires on keyword segments, silent on clean and @''-renam
     const arena = arena_state.allocator();
 
     const entries = [_]locales_mod.Entry{
-        .{ .key = "error.title", .value = "Oops" },
-        .{ .key = "hud.gold", .value = "Gold" },
-        .{ .key = "menu.new_game", .value = "New Game" },
-        .{ .key = "pause.resume", .value = "Resume" },
+        .{ .key = "error.title", .value = .{ .str = "Oops" } },
+        .{ .key = "hud.gold", .value = .{ .str = "Gold" } },
+        .{ .key = "menu.new_game", .value = .{ .str = "New Game" } },
+        .{ .key = "pause.resume", .value = .{ .str = "Resume" } },
         // The rename the lint suggests, and FP's actual fix: both clean.
-        .{ .key = "pause.resume_", .value = "Resume" },
-        .{ .key = "pause.resume_game", .value = "Resume" },
+        .{ .key = "pause.resume_", .value = .{ .str = "Resume" } },
+        .{ .key = "pause.resume_game", .value = .{ .str = "Resume" } },
     };
     const lints = try keywordKeyLints(arena, &entries);
     try testing.expectEqual(@as(usize, 2), lints.len);
