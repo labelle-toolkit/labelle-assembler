@@ -231,6 +231,16 @@ pub fn isInProjectLib(allocator: std.mem.Allocator, plugin: config.PluginDep, pr
     if (!std.mem.startsWith(u8, plugin.repo, "@")) return false;
     const rel = plugin.localPath();
     if (!std.mem.startsWith(u8, rel, "libs/")) return false;
+    // Canonical SPELLINGS only, before any realpath: `@libs/foo/../bar` may
+    // well resolve inside libs/, but the lexical classifier the generated
+    // test-step chaining uses (build_zig.zig's inProjectLibDir) rejects such
+    // spellings, and the two must agree on the accept set — a plugin either
+    // has full in-project standing or none.
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |comp| {
+        if (comp.len == 0 or std.mem.eql(u8, comp, ".") or std.mem.eql(u8, comp, "..")) return false;
+        if (std.mem.indexOfScalar(u8, comp, '\\') != null) return false;
+    }
     return canonicallyUnderLibs(allocator, rel, project_dir) catch false;
 }
 
@@ -737,6 +747,29 @@ test "isInProjectLib: traversal that resolves outside libs/ classifies external 
     // A sibling whose name merely EXTENDS "libs" must not prefix-match.
     try tmp.dir.createDirPath(io, "proj/libs-extra/foo");
     try std.testing.expect(!isInProjectLib(alloc, .{ .name = "foo", .repo = "@libs/../libs-extra/foo" }, proj_abs));
+}
+
+test "isInProjectLib: non-canonical spellings classify external even when they RESOLVE inside libs/ (#662)" {
+    // `@libs/foo/../bar` canonicalizes to libs/bar — in-project by location —
+    // but the lexical #82 classifier rejects the spelling, and the accept
+    // sets must agree: a plugin either has full in-project standing or none.
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "proj/libs/foo");
+    try tmp.dir.createDirPath(io, "proj/libs/bar");
+    const proj_abs = try tmp.dir.realPathFileAlloc(io, "proj", alloc);
+    defer alloc.free(proj_abs);
+
+    // The canonical spelling stays in — the control for every case below.
+    try std.testing.expect(isInProjectLib(alloc, .{ .name = "bar", .repo = "@libs/bar" }, proj_abs));
+    try std.testing.expect(!isInProjectLib(alloc, .{ .name = "bar", .repo = "@libs/foo/../bar" }, proj_abs));
+    try std.testing.expect(!isInProjectLib(alloc, .{ .name = "bar", .repo = "@libs/./bar" }, proj_abs));
+    try std.testing.expect(!isInProjectLib(alloc, .{ .name = "bar", .repo = "@libs//bar" }, proj_abs));
+    try std.testing.expect(!isInProjectLib(alloc, .{ .name = "bar", .repo = "@libs/foo\\..\\bar" }, proj_abs));
 }
 
 test "isInProjectLib: a libs/ entry that is a symlink to an out-of-project dir classifies external (#662)" {
