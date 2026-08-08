@@ -41,6 +41,7 @@ pub const resolveFrameworkPackage = resolve.resolveFrameworkPackage;
 pub const resolveAssemblerPackage = resolve.resolveAssemblerPackage;
 pub const resolveBundledPackage = resolve.resolveBundledPackage;
 pub const resolvePlugin = resolve.resolvePlugin;
+pub const isInProjectLib = resolve.isInProjectLib;
 pub const resolveGuiPackage = resolve.resolveGuiPackage;
 pub const resolveGuiUrl = resolve.resolveGuiUrl;
 pub const toMainCheckoutPath = resolve.toMainCheckoutPath;

@@ -40,6 +40,18 @@ fn inProjectLibDir(plugin: config.PluginDep) ?[]const u8 {
     if (!std.mem.startsWith(u8, plugin.repo, "@")) return null;
     const path = plugin.localPath();
     if (!std.mem.startsWith(u8, path, "libs/")) return null;
+    // The prefix test alone is nominal: `@libs/../../shared` normalizes to a
+    // path OUTSIDE libs/, so a `.`/`..`/empty component (or a `\` smuggling
+    // one on Windows) must not classify as in-project (PR #662 review). This
+    // stays LEXICAL — it derives the literal `../../<path>` cwd the emitted
+    // test step runs in, and shelling a lib's own `zig build test` mutates no
+    // import table; the generated-data injection uses the resolver's CANONICAL
+    // classification instead (`cache.isInProjectLib` → `lib_plugin_names`).
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |comp| {
+        if (comp.len == 0 or std.mem.eql(u8, comp, ".") or std.mem.eql(u8, comp, "..")) return null;
+        if (std.mem.indexOfScalar(u8, comp, '\\') != null) return null;
+    }
     return path;
 }
 
@@ -188,6 +200,38 @@ fn emitI18nModule(w: anytype, i18n: bool) !void {
 fn emitI18nImport(w: anytype, artifact: []const u8, i18n: bool) !void {
     if (!i18n) return;
     try w.print("    {s}.root_module.addImport(\"i18n\", i18n_mod);\n", .{artifact});
+}
+
+/// Wire the generated data modules into every in-project `libs/` plugin
+/// module (flying-platform#786 friction #1). A lib under `libs/` is
+/// game-local code — RFC-CONSTANTS' headline example, `health_drain_rate`,
+/// lives in one — so its `@import("constants")` must resolve exactly as a
+/// game script's does. External and out-of-project `local:` plugin packages
+/// are deliberately NOT wired: a package meant to build standalone and serve
+/// many games cannot depend on one game's generated data, and the
+/// overrideImport would silently REPLACE a `constants`/`i18n` module such a
+/// package declares for itself.
+///
+/// `lib_plugin_names` carries the RESOLVER's canonical classification
+/// (`cache.isInProjectLib`, PR #662 reviews): each name's `@libs/...` path
+/// realpath-resolves inside the project's own `libs/` dir, so a `libs/foo`
+/// that is really a symlink/junction to an external package never lands
+/// here — the lexical spelling is not re-derived at emission.
+///
+/// Must be called AFTER `emitConstantsModule`/`emitI18nModule` put
+/// `constants_mod`/`i18n_mod` in scope. Emits nothing when the project has
+/// no constants/i18n or no in-project libs — byte-identical build.zig, the
+/// invariant every optional feature holds.
+fn emitLibPluginDataImports(w: anytype, lib_plugin_names: []const []const u8, constants: bool, i18n: bool) !void {
+    if (!constants and !i18n) return;
+    for (lib_plugin_names, 0..) |name, i| {
+        if (i == 0) {
+            try w.writeAll("    // In-project libs read the game's constants/strings too (the libs/\n");
+            try w.writeAll("    // gap, flying-platform#786): resolve their generated-data imports.\n");
+        }
+        if (constants) try w.print("    overrideImport(plugin_{s}_mod, \"constants\", constants_mod);\n", .{name});
+        if (i18n) try w.print("    overrideImport(plugin_{s}_mod, \"i18n\", i18n_mod);\n", .{name});
+    }
 }
 
 /// Emit one `const pack__<prefix>_mod = b.createModule(...)` per light pack
@@ -753,6 +797,15 @@ pub const BuildZigOptions = struct {
     /// every artifact gains an `i18n` module -- `@import("i18n").t(K.menu.play)`.
     /// Defaults to false: locale-less projects keep a byte-identical build.zig.
     i18n: bool = false,
+    /// Plugins classified by the RESOLVER as in-project `libs/` libraries
+    /// (`cache.isInProjectLib` -- canonical realpath containment under the
+    /// project's `libs/`, so symlink/junction escapes stay external; PR #662
+    /// reviews). Each name matches a `cfg.plugins` entry and gets the
+    /// generated `constants`/`i18n` modules overrideImport-ed into its
+    /// module. Defaults to empty -- projects without in-project libs (or
+    /// without constants/i18n, which is when root.zig even computes this)
+    /// keep a byte-identical build.zig.
+    lib_plugin_names: []const []const u8 = &.{},
     /// Game scripts promoted to NAMED build-system modules because they
     /// export `pub const FlowNodes` (labelle-assembler#240 Gap 2). Each
     /// gets a `b.createModule` decl wired into BOTH the exe/root and
@@ -1172,6 +1225,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // exactly the sources the usage scanner covers failed to resolve.
     try emitConstantsModule(w, opts.constants);
     try emitI18nModule(w, opts.i18n);
+    // In-project lib plugin modules pick the data modules up here — after
+    // the decls above, before any artifact builds the plugins (#786 friction 1).
+    try emitLibPluginDataImports(w, opts.lib_plugin_names, opts.constants, opts.i18n);
     try emitPromotedScriptModules(w, cfg, opts.promoted_scripts, opts.constants, opts.i18n);
 
     // Per-pack modules (assembler#498 PR 2) — declared beside the promoted
@@ -1567,6 +1623,59 @@ test "emitPluginBuildHooks: threads the given artifact name (wasm/lib/exe)" {
     defer aw.deinit();
     try emitPluginBuildHooks(&aw.writer, "lib", &.{.{ .plugin_name = "spine" }});
     try testing.expect(std.mem.indexOf(u8, aw.written(), ".artifact = lib,\n") != null);
+}
+
+test "emitLibPluginDataImports: resolver-classified libs get constants+i18n (byte pin)" {
+    // The libs/ gap (flying-platform#786 friction #1): only plugins the
+    // RESOLVER classified as in-project (`cache.isInProjectLib` — canonical
+    // containment, so lexical `@libs/` claims and symlink escapes never land
+    // in this slice) receive the generated data modules; a fetched or
+    // out-of-project package must keep building standalone and may declare a
+    // `constants` module of its own.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try emitLibPluginDataImports(&aw.writer, &.{"needs_machine"}, true, true);
+
+    try testing.expectEqualStrings(
+        "    // In-project libs read the game's constants/strings too (the libs/\n" ++
+            "    // gap, flying-platform#786): resolve their generated-data imports.\n" ++
+            "    overrideImport(plugin_needs_machine_mod, \"constants\", constants_mod);\n" ++
+            "    overrideImport(plugin_needs_machine_mod, \"i18n\", i18n_mod);\n",
+        aw.written(),
+    );
+}
+
+test "inProjectLibDir: traversal and degenerate components do not classify as in-project (#662 review)" {
+    // `libs/` is a PREFIX test on the unnormalized path; without the component
+    // walk, `@libs/../../shared` would chain a test step (#82) with a cwd
+    // outside the tree. (The generated-data injection no longer consults this
+    // — it rides the resolver's canonical `lib_plugin_names`.)
+    try testing.expectEqualStrings("libs/needs_machine", inProjectLibDir(.{ .name = "n", .repo = "@libs/needs_machine" }).?);
+    try testing.expectEqualStrings("libs/a/b", inProjectLibDir(.{ .name = "n", .repo = "@libs/a/b" }).?);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs/../../shared" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs/a/../b" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs/./a" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs/a\\..\\b" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs//a" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "@libs/a/" }) == null);
+    try testing.expect(inProjectLibDir(.{ .name = "n", .repo = "local:libs/a" }) == null);
+}
+
+test "emitLibPluginDataImports: each flag gates its own line" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try emitLibPluginDataImports(&aw.writer, &.{"needs_machine"}, true, false);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"constants\"") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"i18n\"") == null);
+}
+
+test "emitLibPluginDataImports: constants/i18n off, or no lib plugins, emits nothing (byte-identical build.zig)" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try emitLibPluginDataImports(&aw.writer, &.{"needs_machine"}, false, false);
+    try emitLibPluginDataImports(&aw.writer, &.{}, true, true);
+    try testing.expectEqualStrings("", aw.written());
 }
 
 test "emitPluginBuildHooks: no hooks emits nothing (byte-identical build.zig)" {
