@@ -71,14 +71,15 @@ pub const Rule = enum {
     arabic,
 };
 
-/// Full-tag overrides, consulted before the primary-subtag rows: regional
-/// varieties whose plural rule differs from the base language's. European
-/// Portuguese is the motivating case -- CLDR pt-PT has `one` at exactly 1
-/// (zero is plural), unlike base/Brazilian pt where 0..1 -> one -- while
-/// keeping the pt/fr whole-million `many`. Just this one row, not CLDR
-/// locale inheritance.
-const full_tag_rules = [_]struct { tag: []const u8, rule: Rule }{
-    .{ .tag = "pt-PT", .rule = .one_other_millions },
+/// Language+region overrides, consulted before the primary-subtag rows:
+/// regional varieties whose plural rule differs from the base language's.
+/// European Portuguese is the motivating case -- CLDR pt-PT has `one` at
+/// exactly 1 (zero is plural), unlike base/Brazilian pt where 0..1 -> one --
+/// while keeping the pt/fr whole-million `many`. Keyed by (language, region)
+/// rather than the whole tag so composed forms (pt-Latn-PT,
+/// pt-PT-u-nu-latn) resolve too. Just this one row, not CLDR inheritance.
+const region_rules = [_]struct { lang: []const u8, region: []const u8, rule: Rule }{
+    .{ .lang = "pt", .region = "PT", .rule = .one_other_millions },
 };
 
 /// Language (primary subtag) -> rule. Extend by adding a row; anything
@@ -102,20 +103,59 @@ const tag_rules = [_]struct { lang: []const u8, rule: Rule }{
     .{ .lang = "ar", .rule = .arabic },
 };
 
-/// The rule for a BCP-47 tag. A full-tag override wins (pt-PT); otherwise
-/// the primary language subtag decides -- pt and pt-BR pluralise alike --
-/// and every match is case-insensitive, like every other tag comparison in
-/// the i18n pipeline.
+/// The rule for a BCP-47 tag. A (language, region) override wins (pt-PT,
+/// including composed forms like pt-Latn-PT); otherwise the primary
+/// language subtag decides -- pt and pt-BR pluralise alike -- and every
+/// match is case-insensitive, like every other tag comparison in the i18n
+/// pipeline.
 pub fn ruleForTag(tag: []const u8) Rule {
-    for (full_tag_rules) |row| {
-        if (std.ascii.eqlIgnoreCase(row.tag, tag)) return row.rule;
-    }
     const dash = std.mem.indexOfScalar(u8, tag, '-') orelse tag.len;
     const lang = tag[0..dash];
+    if (regionSubtag(tag)) |region| {
+        for (region_rules) |row| {
+            if (std.ascii.eqlIgnoreCase(row.lang, lang) and std.ascii.eqlIgnoreCase(row.region, region)) {
+                return row.rule;
+            }
+        }
+    }
     for (tag_rules) |row| {
         if (std.ascii.eqlIgnoreCase(row.lang, lang)) return row.rule;
     }
     return .one_other;
+}
+
+/// The region subtag of a BCP-47 tag, if any. Per RFC 5646 the region --
+/// two letters or three digits -- follows the primary language and an
+/// optional four-letter script subtag, and precedes variants, extensions
+/// and private use; the scan therefore stops at the first subtag that can
+/// be none of those three shapes (a singleton starts an extension chain,
+/// so nothing after it is a region either). Extended-language subtags are
+/// not modelled -- they are vestigial in practice and none of the
+/// override rows needs one.
+fn regionSubtag(tag: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, tag, '-');
+    _ = it.next(); // the primary language subtag
+    while (it.next()) |sub| {
+        if (sub.len == 4 and allAlpha(sub)) continue; // script
+        if (sub.len == 2 and allAlpha(sub)) return sub;
+        if (sub.len == 3 and allDigits(sub)) return sub;
+        return null; // variant, extension singleton, or garbage
+    }
+    return null;
+}
+
+fn allAlpha(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isAlphabetic(c)) return false;
+    }
+    return true;
+}
+
+fn allDigits(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
 }
 
 /// Which categories `rule` can select for some integer count -- the
@@ -203,9 +243,16 @@ test "the primary subtag decides the rule; unknown languages default to one/othe
     try testing.expectEqual(Rule.one_from_zero, ruleForTag("PT-br"));
     // Unlisted: the documented default.
     try testing.expectEqual(Rule.one_other, ruleForTag("eo"));
-    // The full-tag override: European Portuguese departs from base pt.
+    // The (language, region) override: European Portuguese departs from
+    // base pt -- and survives composed BCP-47 forms (script subtag,
+    // extension chain), since the REGION is what carries the meaning.
     try testing.expectEqual(Rule.one_other_millions, ruleForTag("pt-PT"));
     try testing.expectEqual(Rule.one_other_millions, ruleForTag("PT-pt"));
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("pt-Latn-PT"));
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("pt-PT-u-nu-latn"));
+    // Other pt regions keep the base rule, both alpha-2 and numeric-3.
+    try testing.expectEqual(Rule.one_from_zero, ruleForTag("pt-Latn-BR"));
+    try testing.expectEqual(Rule.one_from_zero, ruleForTag("pt-419"));
 }
 
 test "one_other and one_from_zero -- the western European shapes" {
