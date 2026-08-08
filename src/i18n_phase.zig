@@ -877,7 +877,7 @@ fn emitModule(
             \\// build time (variant -> own 'other' -> reference variant ->
             \\// reference 'other'), so selection below can never miss.
             \\const PluralCat = enum(u3) { zero, one, two, few, many, other };
-            \\const PluralRule = enum { other_only, one_other, one_from_zero, east_slavic, polish, czech_slovak, arabic };
+            \\const PluralRule = enum { other_only, one_other, one_from_zero, one_other_millions, east_slavic, polish, czech_slovak, arabic };
             \\
             \\
         );
@@ -1261,7 +1261,8 @@ fn emitModule(
             \\    return switch (rule) {
             \\        .other_only => .other,
             \\        .one_other => if (n == 1) .one else .other,
-            \\        .one_from_zero => if (n <= 1) .one else .other,
+            \\        .one_from_zero => if (n <= 1) .one else if (n % 1_000_000 == 0) .many else .other,
+            \\        .one_other_millions => if (n == 1) .one else if (n != 0 and n % 1_000_000 == 0) .many else .other,
             \\        .east_slavic => blk: {
             \\            const m10 = n % 10;
             \\            const m100 = n % 100;
@@ -1715,6 +1716,30 @@ test "phase 4: plural keys emit one Key, per-locale rules, resolved category tab
     var ast = try std.zig.Ast.parse(testing.allocator, src_z, .zig);
     defer ast.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), ast.errors.len);
+}
+
+test "phase 4: pt-PT rides the full-tag override -- region-aware rule in locale_rules" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "game/locales");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/en.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"{count} item\", \"other\": \"{count} items\" } } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/locales/pt-PT.jsonc", .data = "{ \"hud\": { \"items\": { \"one\": \"{count} item\", \"many\": \"{count} milhoes de itens\", \"other\": \"{count} itens\" } } }" });
+
+    const p = try tmpPaths(&tmp, testing.allocator);
+    defer testing.allocator.free(p.game);
+    defer testing.allocator.free(p.target);
+
+    try testing.expectEqual(true, try runPhase(testing.allocator, p.game, p.target, .{ .default = "en" }, &.{}, true));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(256 * 1024));
+    defer testing.allocator.free(generated);
+
+    // Sorted tags: en, pt-PT. European Portuguese is NOT .one_from_zero.
+    try testing.expect(std.mem.indexOf(u8, generated, "const locale_rules = [2]PluralRule{ .one_other, .one_other_millions };") != null);
+    // The emitted rule enum knows the variant locale_rules names.
+    try testing.expect(std.mem.indexOf(u8, generated, "one_other_millions,") != null);
 }
 
 test "phase 4: a project without plural keys emits a plural-free module -- zero cost" {

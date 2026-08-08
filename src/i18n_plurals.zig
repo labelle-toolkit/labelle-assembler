@@ -52,8 +52,12 @@ pub const Rule = enum {
     other_only,
     /// one at exactly 1: en, de, es, it, nl, sv, ... (and the default).
     one_other,
-    /// one at 0 and 1: fr, pt (CLDR: i = 0..1).
+    /// one at 0 and 1 (CLDR: i = 0..1), many at nonzero whole millions
+    /// (CLDR fr/pt: e = 0 and i % 1000000 = 0, integer counts): fr, pt.
     one_from_zero,
+    /// one at exactly 1, many at nonzero whole millions: pt-PT (European
+    /// Portuguese classifies 0 as plural, unlike base/Brazilian pt).
+    one_other_millions,
     /// ru/uk/be: one (n%10=1, n%100!=11), few (n%10=2..4, n%100!=12..14),
     /// many (the rest, 0 included). CLDR's `other` is fraction-only there,
     /// unreachable for integer counts.
@@ -65,6 +69,16 @@ pub const Rule = enum {
     czech_slovak,
     /// ar: all six categories.
     arabic,
+};
+
+/// Full-tag overrides, consulted before the primary-subtag rows: regional
+/// varieties whose plural rule differs from the base language's. European
+/// Portuguese is the motivating case -- CLDR pt-PT has `one` at exactly 1
+/// (zero is plural), unlike base/Brazilian pt where 0..1 -> one -- while
+/// keeping the pt/fr whole-million `many`. Just this one row, not CLDR
+/// locale inheritance.
+const full_tag_rules = [_]struct { tag: []const u8, rule: Rule }{
+    .{ .tag = "pt-PT", .rule = .one_other_millions },
 };
 
 /// Language (primary subtag) -> rule. Extend by adding a row; anything
@@ -88,10 +102,14 @@ const tag_rules = [_]struct { lang: []const u8, rule: Rule }{
     .{ .lang = "ar", .rule = .arabic },
 };
 
-/// The rule for a BCP-47 tag. Only the primary language subtag decides --
-/// pt and pt-BR pluralise alike -- and the match is case-insensitive, like
-/// every other tag comparison in the i18n pipeline.
+/// The rule for a BCP-47 tag. A full-tag override wins (pt-PT); otherwise
+/// the primary language subtag decides -- pt and pt-BR pluralise alike --
+/// and every match is case-insensitive, like every other tag comparison in
+/// the i18n pipeline.
 pub fn ruleForTag(tag: []const u8) Rule {
+    for (full_tag_rules) |row| {
+        if (std.ascii.eqlIgnoreCase(row.tag, tag)) return row.rule;
+    }
     const dash = std.mem.indexOfScalar(u8, tag, '-') orelse tag.len;
     const lang = tag[0..dash];
     for (tag_rules) |row| {
@@ -108,8 +126,13 @@ pub fn reachable(rule: Rule) [Category.count]bool {
     var r = [_]bool{false} ** Category.count;
     switch (rule) {
         .other_only => r[@intFromEnum(Category.other)] = true,
-        .one_other, .one_from_zero => {
+        .one_other => {
             r[@intFromEnum(Category.one)] = true;
+            r[@intFromEnum(Category.other)] = true;
+        },
+        .one_from_zero, .one_other_millions => {
+            r[@intFromEnum(Category.one)] = true;
+            r[@intFromEnum(Category.many)] = true;
             r[@intFromEnum(Category.other)] = true;
         },
         .east_slavic, .polish => {
@@ -133,7 +156,8 @@ pub fn select(rule: Rule, n: u64) Category {
     return switch (rule) {
         .other_only => .other,
         .one_other => if (n == 1) .one else .other,
-        .one_from_zero => if (n <= 1) .one else .other,
+        .one_from_zero => if (n <= 1) .one else if (n % 1_000_000 == 0) .many else .other,
+        .one_other_millions => if (n == 1) .one else if (n != 0 and n % 1_000_000 == 0) .many else .other,
         .east_slavic => blk: {
             const m10 = n % 10;
             const m100 = n % 100;
@@ -179,6 +203,9 @@ test "the primary subtag decides the rule; unknown languages default to one/othe
     try testing.expectEqual(Rule.one_from_zero, ruleForTag("PT-br"));
     // Unlisted: the documented default.
     try testing.expectEqual(Rule.one_other, ruleForTag("eo"));
+    // The full-tag override: European Portuguese departs from base pt.
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("pt-PT"));
+    try testing.expectEqual(Rule.one_other_millions, ruleForTag("PT-pt"));
 }
 
 test "one_other and one_from_zero -- the western European shapes" {
@@ -190,6 +217,20 @@ test "one_other and one_from_zero -- the western European shapes" {
     try testing.expectEqual(Category.one, select(.one_from_zero, 0));
     try testing.expectEqual(Category.one, select(.one_from_zero, 1));
     try testing.expectEqual(Category.other, select(.one_from_zero, 2));
+    // CLDR fr/pt: nonzero whole millions are `many`.
+    try testing.expectEqual(Category.many, select(.one_from_zero, 1_000_000));
+    try testing.expectEqual(Category.many, select(.one_from_zero, 2_000_000));
+    try testing.expectEqual(Category.other, select(.one_from_zero, 999_999));
+    try testing.expectEqual(Category.other, select(.one_from_zero, 1_000_001));
+}
+
+test "one_other_millions -- pt-PT: zero is plural, whole millions are many" {
+    try testing.expectEqual(Category.other, select(.one_other_millions, 0));
+    try testing.expectEqual(Category.one, select(.one_other_millions, 1));
+    try testing.expectEqual(Category.other, select(.one_other_millions, 2));
+    try testing.expectEqual(Category.many, select(.one_other_millions, 1_000_000));
+    try testing.expectEqual(Category.many, select(.one_other_millions, 2_000_000));
+    try testing.expectEqual(Category.other, select(.one_other_millions, 1_000_001));
 }
 
 test "other_only never distinguishes" {
@@ -244,8 +285,10 @@ test "arabic -- all six categories" {
 }
 
 test "reachable matches what select can produce" {
-    // Brute-force the contract over a dense range: every category select
-    // returns is reachable, and every reachable category is hit.
+    // Brute-force the contract: every category select returns is reachable,
+    // and every reachable category is hit. Dense 0..500 covers the small-n
+    // bands; the extras cover the whole-million `many` band.
+    const extras = [_]u64{ 999_999, 1_000_000, 1_000_001, 2_000_000, 123_000_000 };
     inline for (@typeInfo(Rule).@"enum".fields) |rf| {
         const rule: Rule = @enumFromInt(rf.value);
         const r = reachable(rule);
@@ -253,6 +296,11 @@ test "reachable matches what select can produce" {
         var n: u64 = 0;
         while (n <= 500) : (n += 1) {
             const c = select(rule, n);
+            try testing.expect(r[@intFromEnum(c)]);
+            hit[@intFromEnum(c)] = true;
+        }
+        for (extras) |e| {
+            const c = select(rule, e);
             try testing.expect(r[@intFromEnum(c)]);
             hit[@intFromEnum(c)] = true;
         }
