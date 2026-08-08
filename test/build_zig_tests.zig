@@ -2067,3 +2067,97 @@ pub const MANIFEST_V2_BGFX_WASM_GOLDEN = struct {
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
     }
 };
+
+// ── Plugin modules receive constants/i18n — the libs/ gap (flying-platform#786
+// friction #1) ─────────────────────────────────────────────────────────────
+// RFC-CONSTANTS' headline example (`health_drain_rate`) lives in FP's
+// `libs/needs_machine/src/config.zig` — an in-project `@libs/` plugin — but the
+// v0.97.0 wiring (#656) reached only game_mod, the artifacts, promoted scripts
+// and packs, so `@import("constants")` inside a lib never resolved. These pin
+// the closure: `@libs/` plugin modules get the data modules overrideImport-ed;
+// external/`local:` packages (which must build standalone and may declare their
+// own `constants`) deliberately do not.
+pub const LIBS_CONSTANTS_WIRING = struct {
+    const libs_plugins: []const generate.PluginDep = &.{
+        .{ .name = "needs_machine", .repo = "@libs/needs_machine" },
+        .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "2.6.0" },
+    };
+
+    test "@libs/ plugin module gets constants + i18n; external plugin does not" {
+        const out = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "fp-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = libs_plugins,
+        }, .{ .constants = true, .i18n = true });
+        defer std.testing.allocator.free(out);
+
+        try std.testing.expect(std.mem.indexOf(u8, out, "overrideImport(plugin_needs_machine_mod, \"constants\", constants_mod);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "overrideImport(plugin_needs_machine_mod, \"i18n\", i18n_mod);") != null);
+        // The fetched package keeps its standalone import surface.
+        try std.testing.expect(std.mem.indexOf(u8, out, "overrideImport(plugin_pathfinding_mod, \"constants\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "overrideImport(plugin_pathfinding_mod, \"i18n\"") == null);
+
+        // Ordering: the module decls come first, the lib wiring next, all of it
+        // before the exe assembles the plugins.
+        const decl_at = std.mem.indexOf(u8, out, "const constants_mod = b.createModule(").?;
+        const wire_at = std.mem.indexOf(u8, out, "overrideImport(plugin_needs_machine_mod, \"constants\"").?;
+        const exe_at = std.mem.indexOf(u8, out, "addExecutable").?;
+        try std.testing.expect(decl_at < wire_at);
+        try std.testing.expect(wire_at < exe_at);
+
+        // Still syntactically valid Zig.
+        const dup = try std.testing.allocator.dupeZ(u8, out);
+        defer std.testing.allocator.free(dup);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, dup, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    }
+
+    test "no constants/i18n: a @libs/ project stays byte-free of the wiring" {
+        // The additive invariant at the generateBuildZig level: flags off means
+        // not a byte of constants/i18n text anywhere, even with `@libs/`
+        // plugins present. (The committed desktop goldens already lock the
+        // plugin-less cells byte-for-byte.)
+        const out = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "fp-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = libs_plugins,
+        }, .{});
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "constants") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "i18n") == null);
+    }
+
+    test "tests target wires the lib's constants too (zig build test covers lib reads)" {
+        // The tests target compiles plugin modules into the test binary via the
+        // same shared injection region, so a lib file reading C.* must resolve
+        // there as well — otherwise migrating a lib constant breaks `labelle test`.
+        const out = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "fp-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .plugins = libs_plugins,
+        }, .{ .is_tests_target = true, .constants = true });
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "overrideImport(plugin_needs_machine_mod, \"constants\", constants_mod);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.addImport(\"constants\", constants_mod);") != null);
+    }
+
+    test "cross-compile targets share the wiring (android)" {
+        // The emission sits in the platform-shared region between the module
+        // decls and the artifact branches, so android/ios/wasm get it from the
+        // same line of code — pin one cross target to keep it that way.
+        const out = try h.genSokolBuildZigV2(std.testing.allocator, .{
+            .name = "fp-game",
+            .backend = .sokol,
+            .platform = .android,
+            .ecs = .mock,
+            .plugins = libs_plugins,
+        }, .{ .constants = true, .i18n = true });
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "overrideImport(plugin_needs_machine_mod, \"constants\", constants_mod);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.addImport(\"constants\", constants_mod);") != null);
+    }
+};

@@ -190,6 +190,36 @@ fn emitI18nImport(w: anytype, artifact: []const u8, i18n: bool) !void {
     try w.print("    {s}.root_module.addImport(\"i18n\", i18n_mod);\n", .{artifact});
 }
 
+/// Wire the generated data modules into every in-project `@libs/` plugin
+/// module (flying-platform#786 friction #1). A lib under `libs/` is
+/// game-local code — RFC-CONSTANTS' headline example, `health_drain_rate`,
+/// lives in one — so its `@import("constants")` must resolve exactly as a
+/// game script's does. External and out-of-project `local:` plugin packages
+/// are deliberately NOT wired: a package meant to build standalone and serve
+/// many games cannot depend on one game's generated data, and the
+/// overrideImport would silently REPLACE a `constants`/`i18n` module such a
+/// package declares for itself. Scope matches `inProjectLibDir` — the same
+/// line the test-step chaining draws.
+///
+/// Must be called AFTER `emitConstantsModule`/`emitI18nModule` put
+/// `constants_mod`/`i18n_mod` in scope. Emits nothing when the project has
+/// no constants/i18n or no `@libs/` plugins — byte-identical build.zig, the
+/// invariant every optional feature holds.
+fn emitLibPluginDataImports(w: anytype, cfg: ProjectConfig, constants: bool, i18n: bool) !void {
+    if (!constants and !i18n) return;
+    var any = false;
+    for (cfg.plugins) |plugin| {
+        if (inProjectLibDir(plugin) == null) continue;
+        if (!any) {
+            try w.writeAll("    // In-project libs read the game's constants/strings too (the libs/\n");
+            try w.writeAll("    // gap, flying-platform#786): resolve their generated-data imports.\n");
+            any = true;
+        }
+        if (constants) try w.print("    overrideImport(plugin_{s}_mod, \"constants\", constants_mod);\n", .{plugin.name});
+        if (i18n) try w.print("    overrideImport(plugin_{s}_mod, \"i18n\", i18n_mod);\n", .{plugin.name});
+    }
+}
+
 /// Emit one `const pack__<prefix>_mod = b.createModule(...)` per light pack
 /// (assembler#498 PR 2, "wire the wall"), rooted at the generated
 /// `packs/<name>/__pack_root.zig`.
@@ -1172,6 +1202,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // exactly the sources the usage scanner covers failed to resolve.
     try emitConstantsModule(w, opts.constants);
     try emitI18nModule(w, opts.i18n);
+    // In-project `@libs/` plugin modules pick the data modules up here — after
+    // the decls above, before any artifact builds the plugins (#786 friction 1).
+    try emitLibPluginDataImports(w, cfg, opts.constants, opts.i18n);
     try emitPromotedScriptModules(w, cfg, opts.promoted_scripts, opts.constants, opts.i18n);
 
     // Per-pack modules (assembler#498 PR 2) — declared beside the promoted
@@ -1567,6 +1600,65 @@ test "emitPluginBuildHooks: threads the given artifact name (wasm/lib/exe)" {
     defer aw.deinit();
     try emitPluginBuildHooks(&aw.writer, "lib", &.{.{ .plugin_name = "spine" }});
     try testing.expect(std.mem.indexOf(u8, aw.written(), ".artifact = lib,\n") != null);
+}
+
+test "emitLibPluginDataImports: @libs/ plugins get constants+i18n, external/local: do not (byte pin)" {
+    // The libs/ gap (flying-platform#786 friction #1): only IN-PROJECT
+    // `@libs/` plugins are game-local enough to receive the generated data
+    // modules; a fetched or out-of-project package must keep building
+    // standalone and may declare a `constants` module of its own.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    const cfg = ProjectConfig{
+        .name = "fp",
+        .ecs = .mock,
+        .plugins = &.{
+            .{ .name = "needs_machine", .repo = "@libs/needs_machine" },
+            .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "2.6.0" },
+            .{ .name = "shared", .repo = "local:../shared-plugin" },
+        },
+    };
+    try emitLibPluginDataImports(&aw.writer, cfg, true, true);
+
+    try testing.expectEqualStrings(
+        "    // In-project libs read the game's constants/strings too (the libs/\n" ++
+            "    // gap, flying-platform#786): resolve their generated-data imports.\n" ++
+            "    overrideImport(plugin_needs_machine_mod, \"constants\", constants_mod);\n" ++
+            "    overrideImport(plugin_needs_machine_mod, \"i18n\", i18n_mod);\n",
+        aw.written(),
+    );
+}
+
+test "emitLibPluginDataImports: each flag gates its own line" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    const cfg = ProjectConfig{
+        .name = "fp",
+        .ecs = .mock,
+        .plugins = &.{.{ .name = "needs_machine", .repo = "@libs/needs_machine" }},
+    };
+    try emitLibPluginDataImports(&aw.writer, cfg, true, false);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"constants\"") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"i18n\"") == null);
+}
+
+test "emitLibPluginDataImports: constants/i18n off, or no @libs/ plugins, emits nothing (byte-identical build.zig)" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    const libs_cfg = ProjectConfig{
+        .name = "fp",
+        .ecs = .mock,
+        .plugins = &.{.{ .name = "needs_machine", .repo = "@libs/needs_machine" }},
+    };
+    try emitLibPluginDataImports(&aw.writer, libs_cfg, false, false);
+    const external_cfg = ProjectConfig{
+        .name = "fp",
+        .ecs = .mock,
+        .plugins = &.{.{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "2.6.0" }},
+    };
+    try emitLibPluginDataImports(&aw.writer, external_cfg, true, true);
+    try testing.expectEqualStrings("", aw.written());
 }
 
 test "emitPluginBuildHooks: no hooks emits nothing (byte-identical build.zig)" {
