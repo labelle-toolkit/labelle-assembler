@@ -19,7 +19,9 @@ pub const flow_catalog = @import("flow_catalog.zig");
 pub const pack_manifest = @import("manifest.zig");
 const build_files = @import("build_files.zig");
 const constants_phase = @import("constants_phase.zig");
-const i18n_phase = @import("i18n_phase.zig");
+// pub: test/i18n_sentinel_tests.zig drives runPhase directly to compile-check
+// the generated module's [:0] contract (flying-platform#786 friction #3).
+pub const i18n_phase = @import("i18n_phase.zig");
 const plugin_build_hook = @import("plugin_build_hook.zig");
 pub const plugin_build_steps = @import("plugin_build_steps.zig");
 const manifest_splice = @import("codegen/manifest_splice.zig");

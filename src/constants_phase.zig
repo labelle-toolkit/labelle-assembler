@@ -20,6 +20,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const yaml = @import("constants_yaml.zig");
 const usage = @import("usage_scan.zig");
+const zig_keywords = @import("zig_keywords.zig");
 
 // Not config.globalIo(): config.zig pulls in build_options, which would make
 // this file untestable standalone (`zig test src/constants_phase.zig`) for the
@@ -129,6 +130,10 @@ pub fn runPhase(
                     const stored = try arena.create(yaml.Mapping);
                     stored.* = root;
                     try reg.entries.append(arena, .{ .ns = ns, .file = display, .tree = stored });
+                    // Keyword-key lint (flying-platform#786 friction #2): the
+                    // composed <pack>__<stem> namespace is never a keyword,
+                    // but the pack's nested keys can be.
+                    if (diagnostics) try warnKeywordKeys(arena, display, ns, stored);
                 },
             }
         }
@@ -196,6 +201,10 @@ pub fn runPhase(
             const stored = try arena.create(yaml.Mapping);
             stored.* = parsed;
             try reg.entries.append(arena, .{ .ns = stem, .file = display, .tree = stored });
+            // Keyword-key lint (flying-platform#786 friction #2): defining
+            // files only -- an override's keys were already linted when the
+            // pack's own file defined them.
+            if (diagnostics) try warnKeywordKeys(arena, display, stem, stored);
         }
     }
 
@@ -323,6 +332,54 @@ fn mergeOverride(
         }
     }
     return ok;
+}
+
+/// One keyword-key finding (flying-platform#786 friction #2, constants
+/// flavour): the dotted path under the namespace, the offending key, and the
+/// yaml line. A pure collector so the firing set is unit-testable without
+/// capturing stderr; runPhase owns the printing.
+const KeywordLint = struct {
+    path: []const u8,
+    seg: []const u8,
+    line: usize,
+};
+
+fn collectKeywordLints(
+    arena: Allocator,
+    out: *std.ArrayList(KeywordLint),
+    prefix: []const u8,
+    m: *const yaml.Mapping,
+) Allocator.Error!void {
+    for (m.entries.items) |e| {
+        const path = if (prefix.len == 0)
+            e.key
+        else
+            try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, e.key });
+        if (zig_keywords.isKeyword(e.key)) {
+            try out.append(arena, .{ .path = path, .seg = e.key, .line = e.line });
+        }
+        switch (e.node) {
+            .mapping => |child| try collectKeywordLints(arena, out, path, child),
+            .scalar => {},
+        }
+    }
+}
+
+/// Keyword-key lint for one defining file (game domain or pack). A key named
+/// like a Zig keyword still generates -- every emitted declaration is
+/// @""-quoted -- but call sites then read C.a.@"fn", so warn and suggest the
+/// rename. Override files are skipped: their keys must match ones the pack
+/// defined, which already warned here when the pack's file was read.
+fn warnKeywordKeys(arena: Allocator, display: []const u8, ns: []const u8, tree: *const yaml.Mapping) Allocator.Error!void {
+    if (zig_keywords.isKeyword(ns)) {
+        std.debug.print("warning: {s}: filename namespace '{s}' is a Zig keyword, so call sites read C.@\"{s}\" -- consider renaming the file to {s}_.yaml\n", .{ display, ns, ns, ns });
+    }
+    var lints: std.ArrayList(KeywordLint) = .empty;
+    try collectKeywordLints(arena, &lints, "", tree);
+    for (lints.items) |l| {
+        const full = try std.fmt.allocPrint(arena, "{s}.{s}", .{ ns, l.path });
+        std.debug.print("warning: {s}:{d}: key '{s}' is a Zig keyword, so call sites read C.{s} -- consider renaming it to '{s}_'\n", .{ display, l.line, l.path, try zig_keywords.quoteDottedPath(arena, full), l.seg });
+    }
 }
 
 fn findEntry(m: *yaml.Mapping, key: []const u8) ?*yaml.Mapping.Entry {
@@ -650,6 +707,56 @@ test "runPhase: a non-identifier filename is rejected" {
     defer testing.allocator.free(target);
 
     try testing.expectError(error.ConstantsInvalid, runPhase(testing.allocator, game, target, &.{}, true));
+}
+
+test "keyword-key lint collector: fires at any depth, silent on clean keys" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root = switch (try yaml.parse(arena,
+        \\resume: 1
+        \\nested:
+        \\  error: 2
+        \\  rate: 0.5
+        \\resume_game: 3
+        \\
+    )) {
+        .fail => return error.TestUnexpectedResult,
+        .root => |r| r,
+    };
+
+    var lints: std.ArrayList(KeywordLint) = .empty;
+    try collectKeywordLints(arena, &lints, "", &root);
+    try testing.expectEqual(@as(usize, 2), lints.items.len);
+    try testing.expectEqualStrings("resume", lints.items[0].path);
+    try testing.expectEqual(@as(usize, 1), lints.items[0].line);
+    try testing.expectEqualStrings("nested.error", lints.items[1].path);
+    try testing.expectEqualStrings("error", lints.items[1].seg);
+    try testing.expectEqual(@as(usize, 3), lints.items[1].line);
+}
+
+test "a keyword key warns but still generates, @\"\"-quoted" {
+    const io = phaseIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "game/constants");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "game/constants/state.yaml", .data = "resume: 1\n" });
+
+    var rel_buf: [96]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const game = try std.fs.path.join(testing.allocator, &.{ rel, "game" });
+    defer testing.allocator.free(game);
+    const target = try std.fs.path.join(testing.allocator, &.{ rel, "target" });
+    defer testing.allocator.free(target);
+
+    try testing.expectEqual(true, try runPhase(testing.allocator, game, target, &.{}, true));
+
+    const generated = try tmp.dir.readFileAlloc(io, "target/" ++ GENERATED_FILENAME, testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(generated);
+    try testing.expect(std.mem.indexOf(u8, generated, "pub const @\"resume\" = 1;") != null);
 }
 
 test "collectMarks walks the game tree and skips generated dirs" {
