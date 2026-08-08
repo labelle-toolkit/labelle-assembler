@@ -216,6 +216,47 @@ fn resolveProjectRoot(allocator: std.mem.Allocator, project_dir: []const u8) ![]
     return try allocator.dupe(u8, resolved);
 }
 
+/// Canonical in-project-library classification (assembler#662 reviews,
+/// rounds 2-3). True only when the plugin's `@libs/...` path RESOLVES —
+/// symlinks and Windows junctions followed by `realpath` — to a directory
+/// strictly inside the project's own canonical `libs/` directory. The
+/// lexical `@libs/` spelling is a claim, not a location: a `libs/foo` that
+/// is really a link to an out-of-project package must classify EXTERNAL, or
+/// the generated-data wiring (constants/i18n) would clobber that package's
+/// own `constants`/`i18n` import surface.
+///
+/// Unresolvable paths classify false — a lib that does not exist on disk
+/// gets no injection, and the build names the missing dir on its own.
+pub fn isInProjectLib(allocator: std.mem.Allocator, plugin: config.PluginDep, project_dir: []const u8) bool {
+    if (!std.mem.startsWith(u8, plugin.repo, "@")) return false;
+    const rel = plugin.localPath();
+    if (!std.mem.startsWith(u8, rel, "libs/")) return false;
+    return canonicallyUnderLibs(allocator, rel, project_dir) catch false;
+}
+
+fn canonicallyUnderLibs(allocator: std.mem.Allocator, rel: []const u8, project_dir: []const u8) !bool {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const libs_path = try std.fs.path.join(allocator, &.{ project_dir, "libs" });
+    defer allocator.free(libs_path);
+    const canon_libs = try cwd.realPathFileAlloc(io, libs_path, allocator);
+    defer allocator.free(canon_libs);
+
+    const plugin_path = try std.fs.path.join(allocator, &.{ project_dir, rel });
+    defer allocator.free(plugin_path);
+    const canon_plugin = try cwd.realPathFileAlloc(io, plugin_path, allocator);
+    defer allocator.free(canon_plugin);
+
+    // Containment on a path-component boundary — a bare prefix test would
+    // call `<root>/libs-extra` a child of `<root>/libs`. `libs/` itself is
+    // not a lib.
+    if (!std.mem.startsWith(u8, canon_plugin, canon_libs)) return false;
+    if (canon_plugin.len == canon_libs.len) return false;
+    const sep = canon_plugin[canon_libs.len];
+    return sep == '/' or sep == '\\';
+}
+
 /// Resolve a GUI `.package` reference to its cached path.
 /// `package` is a repo-style host/path string (e.g.
 /// `github.com/labelle-toolkit/labelle-imgui`); `version` is a release
@@ -657,6 +698,81 @@ test "pathEscapesProject: classifies paths correctly" {
     try std.testing.expect(!pathEscapesProject("./foo"));
     try std.testing.expect(!pathEscapesProject("libs/foo"));
     try std.testing.expect(!pathEscapesProject(""));
+}
+
+test "isInProjectLib: a real libs/ dir classifies in-project; local:/missing/libs-itself do not" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "proj/libs/needs_machine");
+    const proj_abs = try tmp.dir.realPathFileAlloc(io, "proj", alloc);
+    defer alloc.free(proj_abs);
+
+    try std.testing.expect(isInProjectLib(alloc, .{ .name = "needs_machine", .repo = "@libs/needs_machine" }, proj_abs));
+    // Out-of-project spellings never classify, canonical or not.
+    try std.testing.expect(!isInProjectLib(alloc, .{ .name = "shared", .repo = "local:libs/needs_machine" }, proj_abs));
+    try std.testing.expect(!isInProjectLib(alloc, .{ .name = "gone", .repo = "@libs/does_not_exist" }, proj_abs));
+    // `libs/` itself is not a lib (localPath "libs/" fails the boundary walk).
+    try std.testing.expect(!isInProjectLib(alloc, .{ .name = "libs", .repo = "@libs/" }, proj_abs));
+}
+
+test "isInProjectLib: traversal that resolves outside libs/ classifies external (#662)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `@libs/../../shared` canonicalizes to tmp/shared — a REAL dir, so the
+    // realpath succeeds and only the containment check can reject it.
+    try tmp.dir.createDirPath(io, "proj/libs");
+    try tmp.dir.createDirPath(io, "shared");
+    const proj_abs = try tmp.dir.realPathFileAlloc(io, "proj", alloc);
+    defer alloc.free(proj_abs);
+
+    try std.testing.expect(!isInProjectLib(alloc, .{ .name = "escape", .repo = "@libs/../../shared" }, proj_abs));
+    // A sibling whose name merely EXTENDS "libs" must not prefix-match.
+    try tmp.dir.createDirPath(io, "proj/libs-extra/foo");
+    try std.testing.expect(!isInProjectLib(alloc, .{ .name = "foo", .repo = "@libs/../libs-extra/foo" }, proj_abs));
+}
+
+test "isInProjectLib: a libs/ entry that is a symlink to an out-of-project dir classifies external (#662)" {
+    // The round-3 review case: `libs/foo` EXISTS but is a link whose target
+    // lives outside the project. The lexical spelling is in-project; the
+    // canonical location is not — and the canonical location is what the
+    // generated-data wiring must trust. Symlink creation needs privileges
+    // on some Windows setups; an unprivileged failure skips (the containment
+    // math it would exercise is identical on every OS and covered above via
+    // the traversal case).
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "proj/libs");
+    try tmp.dir.createDirPath(io, "external-pkg");
+    const proj_abs = try tmp.dir.realPathFileAlloc(io, "proj", alloc);
+    defer alloc.free(proj_abs);
+    const external_abs = try tmp.dir.realPathFileAlloc(io, "external-pkg", alloc);
+    defer alloc.free(external_abs);
+
+    tmp.dir.symLink(io, external_abs, "proj/libs/foo", .{ .is_directory = true }) catch
+        return error.SkipZigTest;
+
+    try std.testing.expect(!isInProjectLib(alloc, .{ .name = "foo", .repo = "@libs/foo" }, proj_abs));
+
+    // And a symlink whose target IS inside libs/ stays in-project — the
+    // classifier keys on the resolved location, not on link-ness.
+    try tmp.dir.createDirPath(io, "proj/libs/real");
+    const real_abs = try tmp.dir.realPathFileAlloc(io, "proj/libs/real", alloc);
+    defer alloc.free(real_abs);
+    tmp.dir.symLink(io, real_abs, "proj/libs/alias", .{ .is_directory = true }) catch
+        return error.SkipZigTest;
+    try std.testing.expect(isInProjectLib(alloc, .{ .name = "alias", .repo = "@libs/alias" }, proj_abs));
 }
 
 test "resolveProjectRoot: submodule .git linkfile returns project_dir unchanged" {

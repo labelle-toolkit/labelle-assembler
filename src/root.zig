@@ -1815,6 +1815,23 @@ pub fn generate(
         }
     }
 
+    // In-project lib classification for the generated-data wiring (#662
+    // reviews): CANONICAL — `cache.isInProjectLib` realpath-resolves each
+    // `@libs/...` path and checks containment under the project's own libs/,
+    // so a `libs/foo` symlinked to an external package never receives the
+    // game's `constants`/`i18n` (which would clobber the package's own).
+    // Only computed when a data module exists — no path I/O, and byte-for-
+    // byte no wiring, for every other project.
+    var lib_plugin_names: std.ArrayList([]const u8) = .empty;
+    defer lib_plugin_names.deinit(allocator);
+    if (has_constants or has_i18n) {
+        for (cfg_modules.plugins) |plugin| {
+            if (cache.isInProjectLib(allocator, plugin, game_dir)) {
+                try lib_plugin_names.append(allocator, plugin.name);
+            }
+        }
+    }
+
     // Generate build.zig
     // `cfg_modules` (not `cfg`): light packs get no `b.dependency` /
     // `overrideImport` module wiring — their contribution is dir-scan
@@ -1826,6 +1843,7 @@ pub fn generate(
         .is_tests_target = is_tests_target,
         .constants = has_constants,
         .i18n = has_i18n,
+        .lib_plugin_names = lib_plugin_names.items,
         .promoted_scripts = promoted_scripts,
         .pack_modules = pack_modules.items,
         .plugin_hooks = plugin_hooks,

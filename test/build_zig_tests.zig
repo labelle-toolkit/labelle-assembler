@@ -2074,22 +2074,28 @@ pub const MANIFEST_V2_BGFX_WASM_GOLDEN = struct {
 // `libs/needs_machine/src/config.zig` — an in-project `@libs/` plugin — but the
 // v0.97.0 wiring (#656) reached only game_mod, the artifacts, promoted scripts
 // and packs, so `@import("constants")` inside a lib never resolved. These pin
-// the closure: `@libs/` plugin modules get the data modules overrideImport-ed;
-// external/`local:` packages (which must build standalone and may declare their
-// own `constants`) deliberately do not.
+// the closure: plugin modules the RESOLVER classified as in-project libs
+// (`cache.isInProjectLib` — canonical realpath containment, threaded through
+// `opts.lib_plugin_names`; classification tests live in src/cache/resolve.zig)
+// get the data modules overrideImport-ed; external/`local:` packages (which
+// must build standalone and may declare their own `constants`) deliberately
+// do not.
 pub const LIBS_CONSTANTS_WIRING = struct {
     const libs_plugins: []const generate.PluginDep = &.{
         .{ .name = "needs_machine", .repo = "@libs/needs_machine" },
         .{ .name = "pathfinding", .repo = "github:labelle-toolkit/labelle-pathfinding", .version = "2.6.0" },
     };
+    // What root.zig computes for this project: only the lib the resolver
+    // proved canonically under libs/ — never the fetched package.
+    const lib_names: []const []const u8 = &.{"needs_machine"};
 
-    test "@libs/ plugin module gets constants + i18n; external plugin does not" {
+    test "resolver-classified lib module gets constants + i18n; external plugin does not" {
         const out = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "fp-game",
             .backend = .sokol,
             .ecs = .mock,
             .plugins = libs_plugins,
-        }, .{ .constants = true, .i18n = true });
+        }, .{ .constants = true, .i18n = true, .lib_plugin_names = lib_names });
         defer std.testing.allocator.free(out);
 
         try std.testing.expect(std.mem.indexOf(u8, out, "overrideImport(plugin_needs_machine_mod, \"constants\", constants_mod);") != null);
@@ -2117,14 +2123,16 @@ pub const LIBS_CONSTANTS_WIRING = struct {
     test "no constants/i18n: a @libs/ project stays byte-free of the wiring" {
         // The additive invariant at the generateBuildZig level: flags off means
         // not a byte of constants/i18n text anywhere, even with `@libs/`
-        // plugins present. (The committed desktop goldens already lock the
-        // plugin-less cells byte-for-byte.)
+        // plugins present AND classified names threaded (root.zig only computes
+        // the names when a data module exists, but the emission must gate on
+        // the flags regardless). The committed desktop goldens already lock
+        // the plugin-less cells byte-for-byte.
         const out = try h.genSokolBuildZigV2(std.testing.allocator, .{
             .name = "fp-game",
             .backend = .sokol,
             .ecs = .mock,
             .plugins = libs_plugins,
-        }, .{});
+        }, .{ .lib_plugin_names = lib_names });
         defer std.testing.allocator.free(out);
         try std.testing.expect(std.mem.indexOf(u8, out, "constants") == null);
         try std.testing.expect(std.mem.indexOf(u8, out, "i18n") == null);
@@ -2139,7 +2147,7 @@ pub const LIBS_CONSTANTS_WIRING = struct {
             .backend = .sokol,
             .ecs = .mock,
             .plugins = libs_plugins,
-        }, .{ .is_tests_target = true, .constants = true });
+        }, .{ .is_tests_target = true, .constants = true, .lib_plugin_names = lib_names });
         defer std.testing.allocator.free(out);
         try std.testing.expect(std.mem.indexOf(u8, out, "overrideImport(plugin_needs_machine_mod, \"constants\", constants_mod);") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "test_root.root_module.addImport(\"constants\", constants_mod);") != null);
@@ -2155,7 +2163,7 @@ pub const LIBS_CONSTANTS_WIRING = struct {
             .platform = .android,
             .ecs = .mock,
             .plugins = libs_plugins,
-        }, .{ .constants = true, .i18n = true });
+        }, .{ .constants = true, .i18n = true, .lib_plugin_names = lib_names });
         defer std.testing.allocator.free(out);
         try std.testing.expect(std.mem.indexOf(u8, out, "overrideImport(plugin_needs_machine_mod, \"constants\", constants_mod);") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.addImport(\"constants\", constants_mod);") != null);
