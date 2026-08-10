@@ -560,6 +560,21 @@ test "JSON output round-trips through std.json.parse" {
     try std.testing.expectEqual(@as(usize, 2), pins_arr.items.len);
 }
 
+// `ProjectConfig{}` leaves `engine_version` at the curated
+// `ENGINE_VERSION` default, and the engine pass in
+// `emitFlowCatalogSidecar` resolves that version out of the SHARED
+// `~/.labelle/packages` cache. So the sidecar's `plugins` array picks
+// up an `engine` group on any machine that has ever built a project
+// with the current default, and stays empty on a cold one — the tests
+// below were green in CI and red on a developer machine, purely on
+// ambient cache state.
+//
+// Pin an unresolvable version so the engine pass always takes its
+// `catch break :blk_engine` path. The tests here are about sidecar
+// emission with nothing to discover; engine discovery has its own
+// coverage and should not ride in on whatever happens to be cached.
+const NO_ENGINE = "0.0.0-unresolvable";
+
 test "emitFlowCatalogSidecar: writes a sidecar that round-trips to a parseable file" {
     const aa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -569,7 +584,7 @@ test "emitFlowCatalogSidecar: writes a sidecar that round-trips to a parseable f
     defer aa.free(target_dir);
 
     // Empty cfg, no plugins, no scripts → empty `plugins` array.
-    const cfg = ProjectConfig{ .name = "tmp" };
+    const cfg = ProjectConfig{ .name = "tmp", .engine_version = NO_ENGINE };
     const total = try emitFlowCatalogSidecar(aa, cfg, target_dir, target_dir, target_dir, &.{});
     try std.testing.expectEqual(@as(usize, 0), total);
 
@@ -616,7 +631,11 @@ test "emitFlowCatalogSidecar: no allocator leak at any failure point" {
     defer std.testing.allocator.free(target_dir_z);
     const target_dir = target_dir_z[0..target_dir_z.len];
 
-    const cfg = ProjectConfig{ .name = "tmp" };
+    // Same cache-hermeticity pin as above (see `NO_ENGINE`). It also
+    // keeps this sweep bounded: with a resolvable engine the success
+    // path reads and parses the engine's `src/root.zig`, inflating
+    // `total_allocs` and re-running the whole emission once per index.
+    const cfg = ProjectConfig{ .name = "tmp", .engine_version = NO_ENGINE };
 
     // Count the success-path allocations.
     const total_allocs = blk: {
