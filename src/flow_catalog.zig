@@ -569,11 +569,24 @@ test "JSON output round-trips through std.json.parse" {
 // below were green in CI and red on a developer machine, purely on
 // ambient cache state.
 //
-// Pin an unresolvable version so the engine pass always takes its
-// `catch break :blk_engine` path. The tests here are about sidecar
-// emission with nothing to discover; engine discovery has its own
-// coverage and should not ride in on whatever happens to be cached.
-const NO_ENGINE = "0.0.0-unresolvable";
+// Point the engine at the test's OWN temp dir so the engine pass always
+// takes its `catch break :blk_engine` path. `resolveFrameworkPackage`
+// sends `local:` versions through `resolveLocalPath` relative to
+// `project_dir` (`src/cache/resolve.zig`), which these tests pass as
+// the tmpDir — and a tmpDir has no `src/root.zig`, so the read fails
+// and the pass breaks out.
+//
+// Deliberately NOT a bogus version string like "0.0.0-unresolvable":
+// `resolveFrameworkPackage` does not validate versions, it just joins
+// `$LABELLE_HOME/packages/engine/<version>`. That would only be
+// unresolvable because nobody happens to have created that directory —
+// swapping one ambient-state dependency for another. `local:.` cannot
+// resolve to anything the test does not own.
+//
+// The tests here are about sidecar emission with nothing to discover;
+// engine discovery has its own coverage and should not ride in on
+// whatever is cached.
+const NO_ENGINE = "local:.";
 
 test "emitFlowCatalogSidecar: writes a sidecar that round-trips to a parseable file" {
     const aa = std.testing.allocator;
