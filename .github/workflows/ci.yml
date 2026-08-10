@@ -14,10 +14,18 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     # Cap the job so a hung/stuck runner can't spin for hours (GitHub's
-    # default is 6h). A normal Zig build+test here is a few minutes; 10
-    # leaves headroom while still failing fast on a wedged runner — a
+    # default is 6h), while still failing fast on a wedged runner — a
     # ubuntu runner once hung this job IN_PROGRESS for ~28 min.
-    timeout-minutes: 10
+    #
+    # Was 10, which turned out to be under the real spread rather than
+    # above it. A green macos run on main sits at ~6m30s end to end
+    # (Test alone ~4m15s), so the cap was only ~3m30s of headroom, and
+    # a slower-than-usual macos runner ate it: PR #664 was cancelled at
+    # the cap on two consecutive attempts — once mid-Test at 8m31s, once
+    # in teardown at 10m18s after every real step had already passed. A
+    # cap that fires on ordinary runner variance is a flaky gate, not a
+    # safety net. 20 still catches the ~28m hang by a wide margin.
+    timeout-minutes: 20
 
     # All steps run from inside the labelle-assembler checkout so the
     # `../labelle-gui/flow-codegen` path-dep in build.zig.zon resolves
