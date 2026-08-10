@@ -915,6 +915,24 @@ jobs:
           sed -i "s|    .assembler_version = \".*\",|    .assembler_version = \"local:$GITHUB_WORKSPACE/labelle-assembler\",|" project.labelle
           grep 'assembler_version' project.labelle
 
+      # `.null` is an EXTRACTED external backend (#386 Phase 6c): it
+      # resolves to the `labelle-null` PACKAGE rather than a bundled
+      # slot, so its `backend.manifest.zon` has to be in the package
+      # cache before `generate` can splice the codegen — otherwise
+      # generate dies with `ExternalBackendNeedsManifest`. `install`
+      # populates it. Same explicit-per-step recipe the null and
+      # external-backend example steps use.
+      #
+      # This is invisible on a developer machine, whose cache already
+      # holds `labelle-null` from any earlier build. It only shows up on
+      # a cold runner — which is precisely the environment this job is
+      # here to represent.
+      - name: Install packages (populates the null backend manifest)
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            install --project-root "$PWD/curated/curated-check"
+
       - name: Generate
         run: |
           set -euo pipefail
