@@ -182,6 +182,7 @@ export fn init() callconv(.c) void {
     // would leak those aux handles.
     const ImageBackendAdapter = struct {
         const MAX_IMAGE_ASSETS = 1024;
+        const CATALOG_ID_BASE: u32 = 1 << 24;
         var slots: [MAX_IMAGE_ASSETS]?BackendGfx.Texture = [_]?BackendGfx.Texture{null} ** MAX_IMAGE_ASSETS;
         var renderer_ref: ?*Renderer = null;
         const supports_compressed = @hasDecl(BackendGfx, "isCompressed") and @hasDecl(BackendGfx, "compressedDims") and @hasDecl(BackendGfx, "uploadCompressed");
@@ -221,15 +222,18 @@ export fn init() callconv(.c) void {
                 });
             };
             slots[handle] = tex;
-            if (renderer_ref) |r| r.registerCatalogTexture(handle, tex);
-            return handle;
+            const out_handle = handle + CATALOG_ID_BASE;
+            if (renderer_ref) |r| r.registerCatalogTexture(out_handle, tex);
+            return out_handle;
         }
     
         fn unload(texture: engine.AssetTexture) void {
-            if (texture >= MAX_IMAGE_ASSETS) return;
-            if (slots[texture]) |tex| {
+            if (texture < CATALOG_ID_BASE) return;
+            const idx = texture - CATALOG_ID_BASE;
+            if (idx >= MAX_IMAGE_ASSETS) return;
+            if (slots[idx]) |tex| {
                 BackendGfx.unloadTexture(tex);
-                slots[texture] = null;
+                slots[idx] = null;
             }
         }
     };

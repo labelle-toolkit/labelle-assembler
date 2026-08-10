@@ -57,6 +57,19 @@ pub fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}// would leak those aux handles.\n", .{indent});
     try w.print("{s}const ImageBackendAdapter = struct {{\n", .{indent});
     try w.print("{s}    const MAX_IMAGE_ASSETS = 1024;\n", .{indent});
+    // Catalog handles are a PRIVATE index into `slots`, but they are
+    // stored in the renderer's one `textures` map alongside ids minted by
+    // `loadTextureFromMemory` — which keys by the BACKEND pool id (1, 2,
+    // ...). Two allocators, one map: a catalog index and a pool id of the
+    // same value overwrite each other, and whichever loses samples the
+    // other's pixels. That is engine#813 — a game uploading a standalone
+    // texture (the `drawMesh` seam, a UI atlas) before a scene's atlases
+    // bound made its sprites render from the wrong texture.
+    //
+    // Offsetting the catalog's half out of the backend's range makes the
+    // two spaces disjoint by construction. The base is far above any
+    // plausible pool id (bgfx caps at 512 slots) and far below u32 max.
+    try w.print("{s}    const CATALOG_ID_BASE: u32 = 1 << 24;\n", .{indent});
     try w.print("{s}    var slots: [MAX_IMAGE_ASSETS]?BackendGfx.Texture = [_]?BackendGfx.Texture{{null}} ** MAX_IMAGE_ASSETS;\n", .{indent});
     // Renderer pointer for `registerCatalogTexture` — set after
     // `g` is initialized in main(). Without this the renderer's
@@ -139,15 +152,18 @@ pub fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     // registration `getTextureInfo(handle)` returns null and
     // raylib renders white quads — see
     // labelle-toolkit/labelle-gfx#248.
-    try w.print("{s}        if (renderer_ref) |r| r.registerCatalogTexture(handle, tex);\n", .{indent});
-    try w.print("{s}        return handle;\n", .{indent});
+    try w.print("{s}        const out_handle = handle + CATALOG_ID_BASE;\n", .{indent});
+    try w.print("{s}        if (renderer_ref) |r| r.registerCatalogTexture(out_handle, tex);\n", .{indent});
+    try w.print("{s}        return out_handle;\n", .{indent});
     try w.print("{s}    }}\n", .{indent});
     try w.print("{s}\n", .{indent});
     try w.print("{s}    fn unload(texture: engine.AssetTexture) void {{\n", .{indent});
-    try w.print("{s}        if (texture >= MAX_IMAGE_ASSETS) return;\n", .{indent});
-    try w.print("{s}        if (slots[texture]) |tex| {{\n", .{indent});
+    try w.print("{s}        if (texture < CATALOG_ID_BASE) return;\n", .{indent});
+    try w.print("{s}        const idx = texture - CATALOG_ID_BASE;\n", .{indent});
+    try w.print("{s}        if (idx >= MAX_IMAGE_ASSETS) return;\n", .{indent});
+    try w.print("{s}        if (slots[idx]) |tex| {{\n", .{indent});
     try w.print("{s}            BackendGfx.unloadTexture(tex);\n", .{indent});
-    try w.print("{s}            slots[texture] = null;\n", .{indent});
+    try w.print("{s}            slots[idx] = null;\n", .{indent});
     try w.print("{s}        }}\n", .{indent});
     try w.print("{s}    }}\n", .{indent});
     try w.print("{s}}};\n", .{indent});
