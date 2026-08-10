@@ -854,6 +854,128 @@ jobs:
   # Linux only (the examples-integration lane's constraint) + setup-dotnet
   # 7.0.x (the example's net7.0 target — the SDK builds it and provides the
   # runtime hostfxr loads).
+  curated-set:
+    name: Curated version set (init -> generate -> build)
+    runs-on: ubuntu-latest
+    # One cold toolkit fetch + one engine compile against the null
+    # backend. 30 bounds a wedged runner far under GitHub's 6h default,
+    # matching the sibling released-path jobs.
+    timeout-minutes: 30
+
+    # `build.zig` carries a curated trio (core / engine / gfx) that a
+    # fresh `labelle-assembler init` stamps into every new project, and
+    # the release workflow bakes into every scaffold pin. Until this job
+    # existed, NOTHING verified that set: the feature examples resolve
+    # local checkouts, and the showcase block pins its own explicit
+    # versions because it exists to test the RELEASED path. So a default
+    # could point at an unreleased or mutually-incompatible version and
+    # CI stayed green while every fresh `labelle init` failed to compile
+    # at the user's machine — exactly what shipped in v0.96.0 (engine
+    # 2.7.0 -> 2.11.0 with core left at 1.26.0). See #667.
+    #
+    # Deliberately uses the DEFAULTS: no `--core-version` / `--gfx-version`
+    # flags. Pinning anything here would test the pin, not the trio.
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Scaffold with the curated defaults
+        run: |
+          set -euo pipefail
+          mkdir -p curated && cd curated
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            init curated-check --backend=null
+          echo "== stamped pins =="
+          grep '_version' curated-check/project.labelle
+
+      # `init` stamps `assembler_version` from build.zig.zon, which on a
+      # non-release build is a stale placeholder. Point it at THIS
+      # checkout so the job tests the assembler under review rather than
+      # downloading an old release of it.
+      - name: Resolve the assembler under test
+        run: |
+          set -euo pipefail
+          cd curated/curated-check
+          sed -i "s|    .assembler_version = \".*\",|    .assembler_version = \"local:$GITHUB_WORKSPACE/labelle-assembler\",|" project.labelle
+          grep 'assembler_version' project.labelle
+
+      # `.null` is an EXTRACTED external backend (#386 Phase 6c): it
+      # resolves to the `labelle-null` PACKAGE rather than a bundled
+      # slot, so its `backend.manifest.zon` has to be in the package
+      # cache before `generate` can splice the codegen — otherwise
+      # generate dies with `ExternalBackendNeedsManifest`. `install`
+      # populates it. Same explicit-per-step recipe the null and
+      # external-backend example steps use.
+      #
+      # This is invisible on a developer machine, whose cache already
+      # holds `labelle-null` from any earlier build. It only shows up on
+      # a cold runner — which is precisely the environment this job is
+      # here to represent.
+      - name: Install packages (populates the null backend manifest)
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            install --project-root "$PWD/curated/curated-check"
+
+      - name: Generate
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler" \
+            generate --project-root "$PWD/curated/curated-check"
+
+      # Guard against the failure mode where generation "succeeds" but
+      # resolves versions other than the ones the defaults asked for — a
+      # green build would then prove nothing about the curated set.
+      #
+      # Asserted against the CACHE SLOT, whose directory name is the
+      # resolved pin, NOT against the fetched package's own
+      # `build.zig.zon` `.version`. That field drifts from the tag across
+      # this toolkit (engine v2.11.0 ships `.version = "2.10.0"`; gfx
+      # carried 1.28.1 through the v1.28.2-v1.28.5 tags), so comparing
+      # against it reports false mismatches.
+      #
+      # Exact on a cold runner, which is where this job lives: the slot
+      # can only exist because this generate fetched it.
+      - name: Assert the resolved packages match the stamped pins
+        run: |
+          set -euo pipefail
+          cd curated/curated-check
+          for pkg in core engine gfx; do
+            want=$(sed -n "s/.*\.${pkg}_version = \"\([^\"]*\)\".*/\1/p" project.labelle)
+            slot="${LABELLE_HOME:-$HOME/.labelle}/packages/${pkg}/${want}"
+            echo "${pkg}: stamped=${want}"
+            if [ ! -d "$slot" ]; then
+              echo "::error::${pkg} ${want} is the curated default but was never fetched ($slot missing)"
+              exit 1
+            fi
+            if [ ! -d ".labelle/deps/labelle-${pkg}" ]; then
+              echo "::error::${pkg} was not vendored into .labelle/deps/"
+              exit 1
+            fi
+          done
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cd curated/curated-check/.labelle/null_desktop
+          zig build
+
   csharp-example:
     name: C# example (EMBED path) end-to-end
     runs-on: ubuntu-latest
