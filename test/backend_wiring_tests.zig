@@ -196,7 +196,21 @@ pub const IMAGE_BACKEND_WIRING = struct {
         // slot) and that the upload/unload paths both go through it.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var slots: [MAX_IMAGE_ASSETS]?BackendGfx.Texture") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "slots[handle] = tex;") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (slots[texture]) |tex|") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (slots[idx]) |tex|") != null);
+
+        // engine#813: catalog handles share the renderer's `textures` map
+        // with ids minted by `loadTextureFromMemory`, which keys by the
+        // BACKEND pool id. A raw 0-based slot index collides with those,
+        // and the loser samples the other's pixels. The emitted adapter
+        // must offset its half of the space and translate back on unload.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const CATALOG_ID_BASE: u32 = 1 << 24;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const out_handle = handle + CATALOG_ID_BASE;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerCatalogTexture(out_handle, tex)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "return out_handle;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (texture < CATALOG_ID_BASE) return;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const idx = texture - CATALOG_ID_BASE;") != null);
+        // The raw index must NOT reach the renderer any more.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerCatalogTexture(handle, tex)") == null);
 
         // The exhaustion guard MUST appear before `uploadTexture` in
         // the emitted `upload` body: if the table is full and we
@@ -214,7 +228,7 @@ pub const IMAGE_BACKEND_WIRING = struct {
         // `next_id`-style counters are gone — guard against
         // regression.
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "for (slots, 0..) |slot, i|") != null);
-        try std.testing.expect(std.mem.indexOf(u8, main_zig, "slots[texture] = null;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "slots[idx] = null;") != null);
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "var next_id:") == null);
     }
 
