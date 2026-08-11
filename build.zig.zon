@@ -1,6 +1,14 @@
 .{
     .fingerprint = 0x71cf045810176ea4,
     .name = .labelle_assembler,
+    // VESTIGIAL — not the release version. Releases are identified by their
+    // git tag (v0.99.0 at time of writing); nothing reads this field, and it
+    // has drifted for dozens of releases (#670). `build.zig` no longer falls
+    // back to it for the scaffolded `assembler_version` — a dev build stamps
+    // `0.0.0-dev` instead, so an unreleased binary cannot quietly pin a
+    // scaffold to an ancient real release.
+    //
+    // Read `git tag --sort=-v:refname | head -1` for the actual version.
     .version = "0.77.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
