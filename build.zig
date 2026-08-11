@@ -30,12 +30,21 @@ pub fn build(b: *std.Build) void {
     const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.11.0";
     const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.29.0";
     // Version this assembler binary stamps into a freshly scaffolded
-    // project.labelle's `assembler_version` field. Defaults to the
-    // package version from build.zig.zon so a release binary pins itself.
-    const assembler_version: []const u8 = b.option([]const u8, "assembler_version", "Default assembler version for `init`") orelse blk: {
-        const v = @import("build.zig.zon").version;
-        break :blk v;
-    };
+    // project.labelle's `assembler_version` field.
+    //
+    // A RELEASE build gets it from the tag (`-Dassembler_version`, set by
+    // .github/workflows/release.yml). Everything else is a dev build, and
+    // says so.
+    //
+    // It used to fall back to `build.zig.zon`'s `.version`, which drifts:
+    // that field read 0.77.0 while the released tag was v0.99.0 (#670).
+    // A fresh `labelle-assembler init` therefore scaffolded
+    // `assembler_version = "0.77.0"` — a real, ancient, resolvable release,
+    // so the project built and quietly used a two-year-old assembler.
+    // A plausible-but-wrong version is worse than an obviously-fake one:
+    // `0.0.0-dev` fails to resolve loudly, which is the correct outcome for
+    // a scaffold produced by an unreleased binary.
+    const assembler_version: []const u8 = b.option([]const u8, "assembler_version", "Default assembler version for `init`") orelse "0.0.0-dev";
 
     const zspec_dep = b.dependency("zspec", .{ .target = target, .optimize = optimize });
     const flow_codegen_dep = b.dependency("flow_codegen", .{ .target = target, .optimize = optimize });
