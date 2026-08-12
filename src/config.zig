@@ -131,6 +131,23 @@ pub const YAxis = enum { up, down };
 /// at load) or `.astc` (GPU-native compressed, zero decode — see #340).
 pub const AssetFormat = enum { png, astc };
 
+/// ASTC block footprint an atlas is encoded at. Every block is a fixed 128
+/// bits, so the footprint IS the bits-per-pixel dial: `8x8` = 2 bpp, `4x4`
+/// = 8 bpp. Accepted per-resource so a detailed character/UI sheet can pay
+/// for fidelity while a large flat room sheet stays cheap.
+///
+/// Mirrors labelle-cli's `astc.BlockSize` — the CLI owns the conversion and
+/// is the only consumer; this enum exists so the strict `project.labelle`
+/// parse accepts the field. Tag names are astcenc's block arguments.
+pub const AstcBlockSize = enum {
+    @"4x4",
+    @"5x5",
+    @"6x6",
+    @"8x8",
+    @"10x10",
+    @"12x12",
+};
+
 /// Per-platform `AssetFormat` selection. ASTC support is mandatory on
 /// Android/iOS GLES/Metal and desktop GLES/Metal/Vulkan, but spotty on the web
 /// (Safari yes, desktop browsers via extensions) — so the default is `.png`
@@ -478,6 +495,18 @@ pub const ResourceDef = struct {
     /// - `true`: always lazy — generated init calls `register*FromMemory`.
     /// - `false`: always eager — generated init calls `load*FromMemory`.
     lazy: ?bool = null,
+
+    /// Per-atlas ASTC block size, consumed by labelle-cli's `labelle astc`
+    /// step.
+    ///
+    /// The ASSEMBLER does not act on it: the catalog swap is `.png` →
+    /// `.astc` by path, and an `.astc` blob records its own block size in
+    /// its header, so codegen is byte-identical whichever block was used.
+    /// The field exists here because the typed `project.labelle` parse is
+    /// strict (`ignore_unknown_fields = false`) — without it, a project
+    /// that pins a per-atlas block fails to parse at all. Keep in step
+    /// with labelle-cli's `ResourceDef.astc_block`.
+    astc_block: ?AstcBlockSize = null,
 
     /// Classify which kind of asset this resource declares, based on
     /// which path fields are populated. Returns `.invalid` for empty
