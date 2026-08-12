@@ -77,8 +77,15 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         };
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        const cfg = readProjectConfig(arena.allocator(), io, root) catch {
-            std.log.err("labelle-assembler install: failed to read project.labelle in '{s}'", .{root});
+        const cfg = readProjectConfig(arena.allocator(), io, root) catch |err| {
+            // Name the error: `error.ParseZon` (a bad/unknown key, detailed
+            // by the diagnostic `parseTyped` logs just above) reads nothing
+            // like `error.FileNotFound`, and the bare message used to make
+            // the two indistinguishable.
+            std.log.err(
+                "labelle-assembler install: failed to read project.labelle in '{s}': {s}",
+                .{ root, @errorName(err) },
+            );
             std.process.exit(1);
         };
         ensureCache(allocator, cfg) catch |err| {

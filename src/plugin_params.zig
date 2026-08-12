@@ -416,6 +416,38 @@ fn extractParamsBags(gpa: std.mem.Allocator, source: [:0]const u8) !?ExtractedBa
     return .{ .bags = bags, .sanitized = sanitized };
 }
 
+/// The typed `ProjectConfig` ZON parse, with the parser's diagnostic
+/// REPORTED rather than discarded.
+///
+/// Every caller of `parseProjectConfig` reports failure as some flavour of
+/// "failed to read project.labelle", which makes an unknown key, a typo'd
+/// key, and a missing file indistinguishable — the schema is strict
+/// (`ignore_unknown_fields = false`) precisely so a stray key is caught,
+/// and then the message threw away the only part that said WHICH key. That
+/// cost a real debugging session: a project pinning a per-atlas ASTC block
+/// against an assembler predating the field failed with no hint, and the
+/// first hypothesis was the wrong one.
+///
+/// Passing a `Diagnostics` also plugs a leak: on the `null` path the
+/// parser's owned unexpected-field note is never freed (a std.zon quirk
+/// already noted in `config.zig`'s `PluginDep` tests).
+fn parseTyped(gpa: std.mem.Allocator, source: [:0]const u8) !config.ProjectConfig {
+    // The typed ProjectConfig parse is comptime-heavy; the quota is
+    // per-function-scope, so it has to live with the parse call itself.
+    @setEvalBranchQuota(10000);
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(gpa);
+    return std.zon.parse.fromSliceAlloc(config.ProjectConfig, gpa, source, &diag, .{}) catch |err| {
+        // `warn`, not `err`: this is the DETAIL of a failure the command
+        // layer reports as an error (naming the file and the error). Logging
+        // it at `.err` here would also fail every test that deliberately
+        // parses a malformed config — Zig's test runner fails any test that
+        // logs an error.
+        std.log.warn("project.labelle: {f}", .{&diag});
+        return err;
+    };
+}
+
 /// Parse a `project.labelle` source into a `ProjectConfig`, tolerating
 /// plugin-declared `.params` keys (see the module doc, layer 1). This is
 /// THE parse every project.labelle site routes through; behavior for a
@@ -429,10 +461,10 @@ pub fn parseProjectConfig(
     // pre-#591 parse sites carried the same quota).
     @setEvalBranchQuota(10000);
     var extraction = (try extractParamsBags(gpa, source)) orelse
-        return std.zon.parse.fromSliceAlloc(config.ProjectConfig, gpa, source, null, .{});
+        return parseTyped(gpa, source);
     errdefer extraction.deinitDeep(gpa);
 
-    const cfg = try std.zon.parse.fromSliceAlloc(config.ProjectConfig, gpa, extraction.sanitized, null, .{});
+    const cfg = try parseTyped(gpa, extraction.sanitized);
 
     // Attach the extracted bags. The Zoir walk and the typed parse consumed
     // the same `.plugins` array, so the counts agree by construction.
