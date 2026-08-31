@@ -157,12 +157,34 @@ pub fn writeImageBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}        return out_handle;\n", .{indent});
     try w.print("{s}    }}\n", .{indent});
     try w.print("{s}\n", .{indent});
+    // Unload routes through the RENDERER when one is wired, so the
+    // catalog-key registry entry dies WITH the backend texture. The old
+    // bare `BackendGfx.unloadTexture` left the renderer's entry
+    // dangling; the next scene's upload recycling this slot then
+    // OVERWROTE it, and any stale holder of the old key silently
+    // sampled the wrong atlas (labelle-engine#821, the scene-reload
+    // "mob of workers" cross-wire). The renderer's `unloadTexture`
+    // removes the entry and destroys the backend texture in one call.
+    // Param type is derived from the seam's own signature (same trick
+    // as engine `atlas_mixin.normalizeHandle`) so gfx's typed
+    // `TextureId` and integer-handle backends both compile; backends
+    // whose renderer lacks the seam fall back to the bare destroy.
     try w.print("{s}    fn unload(texture: engine.AssetTexture) void {{\n", .{indent});
     try w.print("{s}        if (texture < CATALOG_ID_BASE) return;\n", .{indent});
     try w.print("{s}        const idx = texture - CATALOG_ID_BASE;\n", .{indent});
     try w.print("{s}        if (idx >= MAX_IMAGE_ASSETS) return;\n", .{indent});
     try w.print("{s}        if (slots[idx]) |tex| {{\n", .{indent});
-    try w.print("{s}            BackendGfx.unloadTexture(tex);\n", .{indent});
+    try w.print("{s}            routed: {{\n", .{indent});
+    try w.print("{s}                if (comptime @hasDecl(Renderer, \"unloadTexture\")) {{\n", .{indent});
+    try w.print("{s}                    if (renderer_ref) |r| {{\n", .{indent});
+    try w.print("{s}                        const Param = @typeInfo(@TypeOf(Renderer.unloadTexture)).@\"fn\".params[1].type.?;\n", .{indent});
+    try w.print("{s}                        const typed: Param = if (comptime @typeInfo(Param) == .@\"enum\") @enumFromInt(texture) else @intCast(texture);\n", .{indent});
+    try w.print("{s}                        r.unloadTexture(typed);\n", .{indent});
+    try w.print("{s}                        break :routed;\n", .{indent});
+    try w.print("{s}                    }}\n", .{indent});
+    try w.print("{s}                }}\n", .{indent});
+    try w.print("{s}                BackendGfx.unloadTexture(tex);\n", .{indent});
+    try w.print("{s}            }}\n", .{indent});
     try w.print("{s}            slots[idx] = null;\n", .{indent});
     try w.print("{s}        }}\n", .{indent});
     try w.print("{s}    }}\n", .{indent});
