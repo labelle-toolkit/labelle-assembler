@@ -232,7 +232,17 @@ export fn init() callconv(.c) void {
             const idx = texture - CATALOG_ID_BASE;
             if (idx >= MAX_IMAGE_ASSETS) return;
             if (slots[idx]) |tex| {
-                BackendGfx.unloadTexture(tex);
+                routed: {
+                    if (comptime @hasDecl(Renderer, "unloadTexture")) {
+                        if (renderer_ref) |r| {
+                            const Param = @typeInfo(@TypeOf(Renderer.unloadTexture)).@"fn".params[1].type.?;
+                            const typed: Param = if (comptime @typeInfo(Param) == .@"enum") @enumFromInt(texture) else @intCast(texture);
+                            r.unloadTexture(typed);
+                            break :routed;
+                        }
+                    }
+                    BackendGfx.unloadTexture(tex);
+                }
                 slots[idx] = null;
             }
         }
