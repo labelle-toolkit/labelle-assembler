@@ -425,10 +425,21 @@ pub const FontBakeParams = struct {
 /// Discriminator for `ResourceDef`. Picked by inspecting which of the
 /// resource's path fields are populated; validation rejects entries
 /// that set more than one or none. Drives the assembler's emission
-/// dispatch: atlas → `loadAtlasFromMemory`, sound →
-/// `loadSoundFromMemory`, font → `loadFontFromMemory`.
+/// dispatch: atlas → `loadAtlasFromMemory`, image →
+/// `assets.register(…, .image, …)`, sound → `loadSoundFromMemory`,
+/// font → `loadFontFromMemory`.
 pub const ResourceKind = enum {
     atlas,
+    /// A single LOOSE image file — no TexturePacker manifest, no
+    /// sub-rects. Typically a `.png`, but codegen validation accepts
+    /// any format the bundled backends' `decodeImage` handles
+    /// (`.png`/`.jpg`/`.jpeg`/`.bmp`/`.tga`) plus the toolkit's two
+    /// pre-converted containers (`.astc`, `.rgba`); the declared
+    /// extension is what the emitted `file_type` reports. Feeds the
+    /// engine's `Image` component
+    /// (`labelle-engine/src/image_component.zig`) through the
+    /// `AssetCatalog` `image` loader. See `ResourceDef.image`.
+    image,
     sound,
     font,
     invalid,
@@ -441,10 +452,13 @@ pub const ResourceValidationError = enum {
     ok,
     /// No asset-path field set — caller forgot to declare what this
     /// resource points at. Tell the user to add `.json`/`.texture`
-    /// (atlas), `.sound`, or `.font`.
+    /// (atlas), `.image`, `.sound`, or `.font`.
     no_path,
-    /// More than one of `.json`+`.texture` / `.sound` / `.font` set
-    /// on the same entry. A resource is exactly one asset kind.
+    /// More than one of `.json`+`.texture` / `.image` / `.sound` /
+    /// `.font` set on the same entry. A resource is exactly one asset
+    /// kind — in particular `.image` is the LOOSE-IMAGE form (a single
+    /// image file, no manifest) and must not be combined with the
+    /// atlas pair.
     multiple_paths,
     /// Atlas is half-declared: one of `.json` / `.texture` is set
     /// but not the other. Both are required for an atlas resource.
@@ -462,18 +476,33 @@ pub const ResourceDef = struct {
     json: []const u8 = "",
     texture: []const u8 = "",
 
+    // ── Image (#675). A LOOSE image file — one image, no TexturePacker
+    // manifest, no sub-rects. `.png` is the common case; validation
+    // also accepts `.jpg`/`.jpeg`/`.bmp`/`.tga` and the pre-converted
+    // `.astc`/`.rgba` containers. Registered straight onto the engine's
+    // `AssetCatalog` under `LoaderKind.image`, which is what the
+    // engine's `Image` component
+    // (`labelle-engine/src/image_component.zig`) resolves its `name`
+    // against. Before this field the only way to declare an image was
+    // as an `atlas`, which forced a hand-written 1-frame manifest —
+    // the exact workaround `Image` was added to remove.
+    //
+    // Mutually exclusive with `.json`/`.texture` (that pair is the
+    // atlas form of the same texture), `.sound` and `.font`.
+    image: []const u8 = "",
+
     // ── Sound (Phase 4, #447). `.wav` / `.ogg` path relative to the
-    // project root. Mutually exclusive with the atlas / font paths.
+    // project root. Mutually exclusive with the atlas / image / font paths.
     sound: []const u8 = "",
 
     // ── Font (Phase 4, #448). `.ttf` / `.otf` path. Pairs with
     // `font_params` to control the bake (pixel size + glyph ranges +
-    // atlas dimensions). Mutually exclusive with atlas / sound paths.
+    // atlas dimensions). Mutually exclusive with atlas / image / sound paths.
     font: []const u8 = "",
 
-    /// Bake parameters for font resources. Ignored on atlas/sound
+    /// Bake parameters for font resources. Ignored on atlas/image/sound
     /// entries — `validate()` reports `font_params_misplaced` if set
-    /// alongside `.json` / `.texture` / `.sound`. Default applies
+    /// alongside `.json` / `.texture` / `.image` / `.sound`. Default applies
     /// when the user omits `font_params` on a font resource: 16 px,
     /// ASCII printable, 512×512 atlas — matches the engine + gfx
     /// `FontBakeParams` defaults.
@@ -514,9 +543,14 @@ pub const ResourceDef = struct {
     /// reason.
     pub fn kind(self: ResourceDef) ResourceKind {
         const has_atlas = self.json.len > 0 or self.texture.len > 0;
+        const has_image = self.image.len > 0;
         const has_sound = self.sound.len > 0;
         const has_font = self.font.len > 0;
-        const count: u8 = @as(u8, @intFromBool(has_atlas)) + @intFromBool(has_sound) + @intFromBool(has_font);
+        // `.image` counts as its own kind, so `.image` + `.json` (or
+        // `.image` + `.texture`) is a MIXED entry and still lands on
+        // `.invalid` — the atlas pair is the manifest form of the same
+        // PNG, never a companion to the loose form.
+        const count: u8 = @as(u8, @intFromBool(has_atlas)) + @intFromBool(has_image) + @intFromBool(has_sound) + @intFromBool(has_font);
         if (count != 1) return .invalid;
         if (has_atlas) {
             // Both halves of the atlas pair must be set; one-without-
@@ -525,6 +559,7 @@ pub const ResourceDef = struct {
             if (self.json.len == 0 or self.texture.len == 0) return .invalid;
             return .atlas;
         }
+        if (has_image) return .image;
         if (has_sound) return .sound;
         return .font;
     }
@@ -534,10 +569,15 @@ pub const ResourceDef = struct {
     /// offending `name` and tell the user what to add or remove.
     pub fn validate(self: ResourceDef) ResourceValidationError {
         const has_atlas = self.json.len > 0 or self.texture.len > 0;
+        const has_image = self.image.len > 0;
         const has_sound = self.sound.len > 0;
         const has_font = self.font.len > 0;
-        const count: u8 = @as(u8, @intFromBool(has_atlas)) + @intFromBool(has_sound) + @intFromBool(has_font);
+        const count: u8 = @as(u8, @intFromBool(has_atlas)) + @intFromBool(has_image) + @intFromBool(has_sound) + @intFromBool(has_font);
         if (count == 0) return .no_path;
+        // Catches `.image` + `.json` / `.image` + `.texture` too: the
+        // atlas pair and the loose-image form are alternatives, never a
+        // pair. `multiple_paths` fires BEFORE `atlas_incomplete` so a
+        // mixed entry reports the mix rather than the half-atlas.
         if (count > 1) return .multiple_paths;
         if (has_atlas and (self.json.len == 0 or self.texture.len == 0)) return .atlas_incomplete;
         if (self.font_params != null and !has_font) return .font_params_misplaced;

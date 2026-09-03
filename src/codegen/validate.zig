@@ -59,6 +59,10 @@ pub fn hasContextEntry(entries: []const ScriptEntry) bool {
 /// after the first one — the user sees the offending resource name and
 /// what's wrong before any codegen happens. The CLI maps the structured
 /// errors from `ResourceDef.validate()` to actionable hints.
+///
+/// Two passes: per-entry shape/extension checks first, then a
+/// whole-list `checkDuplicateResourceNames` sweep for name collisions
+/// (`error.DuplicateResourceName`).
 pub fn validateResources(cfg: ProjectConfig) !void {
     const io = config.globalIo();
     for (cfg.resources) |res| {
@@ -67,13 +71,13 @@ pub fn validateResources(cfg: ProjectConfig) !void {
             .no_path => {
                 std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
                 std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' declares no asset path. Set one of `.json`+`.texture` (atlas), `.sound` (.wav/.ogg), or `.font` (.ttf/.otf).\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' declares no asset path. Set one of `.json`+`.texture` (atlas), `.image` (a loose image: .png/.jpg/.jpeg/.bmp/.tga, or a pre-converted .astc/.rgba), `.sound` (.wav/.ogg), or `.font` (.ttf/.otf).\n") catch {};
                 return error.InvalidResource;
             },
             .multiple_paths => {
                 std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
                 std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' sets more than one asset path. A resource is exactly one of atlas / sound / font.\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' sets more than one asset path. A resource is exactly one of atlas (`.json`+`.texture`) / image (`.image`) / sound (`.sound`) / font (`.font`). `.image` is the LOOSE-IMAGE form (one .png/.jpg/.jpeg/.bmp/.tga/.astc/.rgba file, no manifest) — drop `.json`/`.texture` to keep it, or drop `.image` to keep the atlas.\n") catch {};
                 return error.InvalidResource;
             },
             .atlas_incomplete => {
@@ -88,6 +92,33 @@ pub fn validateResources(cfg: ProjectConfig) !void {
                 std.Io.File.stderr().writeStreamingAll(io, "' sets `.font_params` but is not a font resource. Remove `.font_params` or change to `.font = \"...\"`.\n") catch {};
                 return error.InvalidResource;
             },
+        }
+        // Extension sanity for a loose image (#675). Mirrors the
+        // sound/font checks: the emitted `file_type` is derived from
+        // this extension and handed to the backend's `decodeImage`, so
+        // a wrong extension would otherwise only surface as a runtime
+        // `error.LoadFailed` with no hint at which resource caused it.
+        // The accepted set is what the bundled backends' `decodeImage`
+        // handles (stb_image / raylib rasters) plus the toolkit's two
+        // pre-converted containers — `.astc` (labelle astc) and `.rgba`
+        // (labelle build --bake) — so a hand-pointed compressed blob
+        // isn't rejected.
+        if (res.kind() == .image) {
+            const ext = extWithoutDot(res.image);
+            const accepted = [_][]const u8{ "png", "jpg", "jpeg", "bmp", "tga", "astc", "rgba" };
+            var ok = false;
+            for (accepted) |a| {
+                if (std.ascii.eqlIgnoreCase(ext, a)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: image resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' has unsupported extension. Expected `.png` (or .jpg/.jpeg/.bmp/.tga, or a pre-converted .astc/.rgba). For a TexturePacker sprite sheet use `.json` + `.texture` instead.\n") catch {};
+                return error.UnsupportedResourceExtension;
+            }
         }
         // Extension sanity for sound/font — surfaces obviously-wrong
         // extensions (e.g. `.font = "x.png"`) at codegen time instead
@@ -124,6 +155,68 @@ pub fn validateResources(cfg: ProjectConfig) !void {
             }
         }
     }
+    try checkDuplicateResourceNames(cfg);
+}
+
+/// Reject two resources declaring the same `name`.
+///
+/// The name is the ASSET-CATALOG KEY: it is what every generated
+/// `load*FromMemory` / `register*FromMemory` call registers under and
+/// what `assets.acquire(name)` — and the engine's `Image` component —
+/// looks the asset back up by. A collision therefore has no benign
+/// reading. Worse, it fails SILENTLY: the catalog keeps whichever
+/// entry registered first and every registration-side shim (engine
+/// `register*FromMemory`, and the `.image` arm's emitted `catch`)
+/// swallows `AssetAlreadyRegistered` to stay idempotent, so the
+/// second resource's bytes are simply dropped and every reference to
+/// that name resolves to the FIRST asset. The user sees the wrong
+/// sprite, with nothing in the build or the logs pointing at why
+/// (coderabbit review of #676).
+///
+/// Caught here, before emission, in the same stderr-diagnostic style
+/// as the rest of this module — the message names the offending name
+/// and both declared paths so the two colliding entries are findable
+/// without bisecting `project.labelle`.
+///
+/// `cfg.resources` is the MERGED list by the time codegen runs
+/// (`root.zig` assigns `mergePackResources`' output before calling
+/// the template), so this covers a game resource colliding with
+/// another game resource AND with a pack's namespaced
+/// `<pack>__<name>` entry.
+///
+/// Quadratic, like `checkBasenameCollisions` — resource lists are
+/// ~10² entries, nowhere near justifying a HashSet.
+fn checkDuplicateResourceNames(cfg: ProjectConfig) !void {
+    const io = config.globalIo();
+    for (cfg.resources, 0..) |a, i| {
+        for (cfg.resources[i + 1 ..]) |b| {
+            if (!std.mem.eql(u8, a.name, b.name)) continue;
+            std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: duplicate resource name '") catch {};
+            std.Io.File.stderr().writeStreamingAll(io, a.name) catch {};
+            std.Io.File.stderr().writeStreamingAll(io, "' (declared by '") catch {};
+            std.Io.File.stderr().writeStreamingAll(io, declaredPath(a)) catch {};
+            std.Io.File.stderr().writeStreamingAll(io, "' and '") catch {};
+            std.Io.File.stderr().writeStreamingAll(io, declaredPath(b)) catch {};
+            std.Io.File.stderr().writeStreamingAll(io, "'). A resource name is the asset-catalog key the generated loader registers and `acquire` looks up, so only the first entry would ever load — every reference to the name would silently resolve to it. Rename one entry or drop the duplicate. (Pack-shipped resources are namespaced `<pack>__<name>`; a game resource spelled that way collides with them.)\n") catch {};
+            return error.DuplicateResourceName;
+        }
+    }
+}
+
+/// The asset path to quote for `res` in a diagnostic — the atlas
+/// manifest for an atlas pair, otherwise the single populated path.
+/// `.invalid` entries never reach here (the per-entry pass in
+/// `validateResources` bails on them first), but map to a readable
+/// placeholder rather than an empty string in case a future caller
+/// reorders the passes.
+fn declaredPath(res: config.ResourceDef) []const u8 {
+    return switch (res.kind()) {
+        .atlas => if (res.json.len > 0) res.json else res.texture,
+        .image => res.image,
+        .sound => res.sound,
+        .font => res.font,
+        .invalid => "<no asset path>",
+    };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

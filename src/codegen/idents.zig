@@ -20,13 +20,37 @@
 const std = @import("std");
 
 /// Strip the leading dot from a path extension. `".wav"` → `"wav"`,
-/// `""` / `"."` → `""`. Matches the contract of
-/// `Game.registerSoundFromMemory` / `registerFontFromMemory`'s
-/// `file_type` parameter (lower-case extension without the dot).
+/// `""` / `"."` → `""`. Feeds the `file_type` parameter of
+/// `Game.registerSoundFromMemory` / `registerFontFromMemory`, whose
+/// contract is the LOWER-CASE extension without the dot — note this
+/// helper returns the path's own casing verbatim, so a caller that
+/// must honour the lower-case half of that contract goes through
+/// `lowerExtWithoutDot` instead.
 pub fn extWithoutDot(path: []const u8) []const u8 {
     const ext = std.fs.path.extension(path);
     if (ext.len <= 1) return "";
     return ext[1..];
+}
+
+/// `extWithoutDot` lower-cased into `buf` — the spelling the
+/// `file_type` contract actually calls for.
+///
+/// Resource-extension validation is case-insensitive
+/// (`std.ascii.eqlIgnoreCase` in `codegen/validate.zig`), so a file
+/// declared as `assets/Logo.PNG` is accepted; emitting its extension
+/// verbatim would then hand a backend `decodeImage` the `".PNG"` it
+/// may not match. Lower-casing at the emission site keeps the
+/// generated source aligned with the documented contract regardless
+/// of how the path was spelled on disk.
+///
+/// Allocation-free, like every helper here: the caller owns `buf`.
+/// Returns the raw (un-lowered) extension when it does not fit — every
+/// accepted extension is at most 4 characters, so a caller passing a
+/// reasonable buffer never reaches that fallback.
+pub fn lowerExtWithoutDot(buf: []u8, path: []const u8) []const u8 {
+    const ext = extWithoutDot(path);
+    if (ext.len > buf.len) return ext;
+    return std.ascii.lowerString(buf[0..ext.len], ext);
 }
 
 /// Returns true iff `name` is a valid bare Zig identifier — first
