@@ -83,6 +83,10 @@ pub fn mergePackResources(
                 .name = try std.fmt.allocPrint(a, "{s}__{s}", .{ e.plugin.name, res.name }),
                 .json = try repath(a, e.plugin.name, res.json),
                 .texture = try repath(a, e.plugin.name, res.texture),
+                // Loose-image resources (#675) repath like every other
+                // asset path — a pack shipping `.image = "assets/ui.png"`
+                // becomes `packs/<pack>/assets/ui.png`.
+                .image = try repath(a, e.plugin.name, res.image),
                 .sound = try repath(a, e.plugin.name, res.sound),
                 .font = try repath(a, e.plugin.name, res.font),
                 .font_params = res.font_params,
@@ -805,6 +809,32 @@ test "mergePackResources: pack atlas merges namespaced + repathed" {
     try testing.expectEqualStrings("packs/terrain/assets/tiles.png", merged.resources[1].texture);
     try testing.expectEqualStrings("terrain__props", merged.resources[2].name);
     try testing.expectEqual(true, merged.resources[2].lazy.?);
+}
+
+test "mergePackResources: a pack's loose `.image` repaths like any other asset (#675)" {
+    const game = [_]ResourceDef{
+        .{ .name = "portrait", .image = "assets/portrait.png" },
+    };
+    const manifest = plugin_manifest.PackManifest{
+        .name = "ui",
+        .manifest_version = 1,
+        .convention_dirs = .copy_and_scan,
+        .resources = &.{
+            .{ .name = "cursor", .image = "assets/cursor.png" },
+        },
+        .allocator = testing.allocator,
+    };
+    const entries = [_]PackEntry{.{ .plugin = .{ .name = "ui" }, .manifest = manifest }};
+
+    var merged = try mergePackResources(testing.allocator, &game, &entries);
+    defer merged.deinit();
+
+    try testing.expectEqual(@as(usize, 2), merged.resources.len);
+    // Game resource verbatim, pack resource namespaced + repathed.
+    try testing.expectEqualStrings("assets/portrait.png", merged.resources[0].image);
+    try testing.expectEqualStrings("ui__cursor", merged.resources[1].name);
+    try testing.expectEqualStrings("packs/ui/assets/cursor.png", merged.resources[1].image);
+    try testing.expectEqual(config.ResourceKind.image, merged.resources[1].kind());
 }
 
 test "preferCompressedPackTextures: probes the pack SOURCE dir, astc wins, png fallback" {

@@ -67,13 +67,13 @@ pub fn validateResources(cfg: ProjectConfig) !void {
             .no_path => {
                 std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
                 std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' declares no asset path. Set one of `.json`+`.texture` (atlas), `.sound` (.wav/.ogg), or `.font` (.ttf/.otf).\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' declares no asset path. Set one of `.json`+`.texture` (atlas), `.image` (a loose .png), `.sound` (.wav/.ogg), or `.font` (.ttf/.otf).\n") catch {};
                 return error.InvalidResource;
             },
             .multiple_paths => {
                 std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
                 std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, "' sets more than one asset path. A resource is exactly one of atlas / sound / font.\n") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' sets more than one asset path. A resource is exactly one of atlas (`.json`+`.texture`) / image (`.image`) / sound (`.sound`) / font (`.font`). `.image` is the LOOSE-PNG form — drop `.json`/`.texture` to keep it, or drop `.image` to keep the atlas.\n") catch {};
                 return error.InvalidResource;
             },
             .atlas_incomplete => {
@@ -88,6 +88,33 @@ pub fn validateResources(cfg: ProjectConfig) !void {
                 std.Io.File.stderr().writeStreamingAll(io, "' sets `.font_params` but is not a font resource. Remove `.font_params` or change to `.font = \"...\"`.\n") catch {};
                 return error.InvalidResource;
             },
+        }
+        // Extension sanity for a loose image (#675). Mirrors the
+        // sound/font checks: the emitted `file_type` is derived from
+        // this extension and handed to the backend's `decodeImage`, so
+        // a wrong extension would otherwise only surface as a runtime
+        // `error.LoadFailed` with no hint at which resource caused it.
+        // The accepted set is what the bundled backends' `decodeImage`
+        // handles (stb_image / raylib rasters) plus the toolkit's two
+        // pre-converted containers — `.astc` (labelle astc) and `.rgba`
+        // (labelle build --bake) — so a hand-pointed compressed blob
+        // isn't rejected.
+        if (res.kind() == .image) {
+            const ext = extWithoutDot(res.image);
+            const accepted = [_][]const u8{ "png", "jpg", "jpeg", "bmp", "tga", "astc", "rgba" };
+            var ok = false;
+            for (accepted) |a| {
+                if (std.ascii.eqlIgnoreCase(ext, a)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: image resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' has unsupported extension. Expected `.png` (or .jpg/.jpeg/.bmp/.tga, or a pre-converted .astc/.rgba). For a TexturePacker sprite sheet use `.json` + `.texture` instead.\n") catch {};
+                return error.UnsupportedResourceExtension;
+            }
         }
         // Extension sanity for sound/font — surfaces obviously-wrong
         // extensions (e.g. `.font = "x.png"`) at codegen time instead

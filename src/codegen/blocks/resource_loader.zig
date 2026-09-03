@@ -38,6 +38,33 @@ pub const LoadStyle = enum { try_style, catch_panic_style };
 /// `res.kind()`:
 ///
 /// - `.atlas` → `g.{load,register}AtlasFromMemory(name, json, png, ".png")`
+/// - `.image` → `g.assets.register(name, .image, ".ext", bytes)`, plus
+///   `g.assets.acquire(name)` when the resource is EAGER.
+///
+///   There is deliberately no `g.loadImageFromMemory` call: the engine
+///   ships no image-specific `Game` shim (`labelle-engine/src/game.zig`
+///   re-exports `load{Atlas,Sound,Font}FromMemory` but nothing for a
+///   loose image), and the engine's `Image` component resolves its
+///   `name` straight off the `AssetCatalog` — so the catalog
+///   registration IS the whole contract. `AssetAlreadyRegistered` is
+///   swallowed, matching every engine-side `register*FromMemory` shim,
+///   so a name some other path already registered is not a hard failure.
+///
+///   EAGER here means "start decoding at init", not "block until
+///   decoded". The engine's blocking helper (`loadAssetIfNeededInternal`)
+///   is kind-agnostic but is NOT re-exported on the `Game` type — only
+///   the kind-named `loadSoundIfNeeded` / `loadFontIfNeeded` aliases are,
+///   and `loadAtlasIfNeeded` is atlas-specific (it ends in
+///   `markPendingLoaded`, which errors `AtlasNotFound` for a loose
+///   image). Calling a sound/font-named alias on an image would be a lie
+///   in generated source, so the eager path uses the public
+///   `AssetCatalog.acquire` instead: the refcount lands exactly where the
+///   blocking helper leaves it (1, never released), the decode is
+///   enqueued at init, and the per-tick `assets.pump()` completes it.
+///   An `Image` entity simply skips rendering until then — the documented
+///   pop-in model in `labelle-engine/src/image_component.zig`. Once the
+///   engine grows `register/loadImageFromMemory` + `loadImageIfNeeded`
+///   shims, this arm can move to them for blocking parity.
 /// - `.sound` → `g.{load,register}SoundFromMemory(name, ext, bytes)`
 /// - `.font`  → emits `{name}_ranges` const array + `{name}_params`
 ///   const struct, then `g.{load,register}FontFromMemory(name, ext,
@@ -63,6 +90,35 @@ pub fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
                     "    g.{s}(\"{s}\", @embedFile(\"{s}\"), @embedFile(\"{s}\"), \".png\") catch @panic(\"failed to load atlas: {s}\");\n",
                     .{ fn_name, res.name, res.json, res.texture, res.name },
                 ),
+            }
+        },
+        .image => {
+            // Loose PNG (#675). `file_type` carries the LEADING DOT — the
+            // same spelling the atlas arm passes ("`.png`"), which is what
+            // raylib's `LoadImageFromMemory` expects and what every other
+            // backend's `decodeImage` is written against. Derived from the
+            // declared path rather than hard-coded so a `.astc` / `.rgba`
+            // sibling pointed at directly still reports its real type.
+            const ext = extWithoutDot(res.image);
+            switch (style) {
+                .try_style => {
+                    try w.print(
+                        "    g.assets.register(\"{s}\", .image, \".{s}\", @embedFile(\"{s}\")) catch |err| switch (err) {{ error.AssetAlreadyRegistered => {{}}, else => return err }};\n",
+                        .{ res.name, ext, res.image },
+                    );
+                    if (!is_lazy) {
+                        try w.print("    _ = try g.assets.acquire(\"{s}\");\n", .{res.name});
+                    }
+                },
+                .catch_panic_style => {
+                    try w.print(
+                        "    g.assets.register(\"{s}\", .image, \".{s}\", @embedFile(\"{s}\")) catch |err| switch (err) {{ error.AssetAlreadyRegistered => {{}}, else => @panic(\"failed to register image: {s}\") }};\n",
+                        .{ res.name, ext, res.image, res.name },
+                    );
+                    if (!is_lazy) {
+                        try w.print("    _ = g.assets.acquire(\"{s}\") catch @panic(\"failed to acquire image: {s}\");\n", .{ res.name, res.name });
+                    }
+                },
             }
         },
         .sound => {

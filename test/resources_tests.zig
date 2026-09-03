@@ -124,6 +124,127 @@ pub const RESOURCE_EMISSION = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "@embedFile(\"atlases/world.png\")") != null);
     }
 
+    test "image resource emits an AssetCatalog image registration + eager load (#675)" {
+        // A loose PNG has no manifest and no sub-rects, so it never goes
+        // near `loadAtlasFromMemory`. It is registered straight onto the
+        // catalog under `LoaderKind.image` — the key the engine's `Image`
+        // component resolves against — and, being eager, acquired at init
+        // so the decode is enqueued without waiting for a scene's
+        // `assets:` block to ask for it.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "portrait", .image = "assets/portrait.png", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.assets.register(\"portrait\", .image, \".png\", @embedFile(\"assets/portrait.png\"))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_ = try g.assets.acquire(\"portrait\");") != null);
+        // The whole point of #675: no 1-sprite-atlas workaround is emitted.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "AtlasFromMemory(\"portrait\"") == null);
+    }
+
+    test "lazy image resource registers only — no eager acquire (#675)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "banner", .image = "assets/banner.png", .lazy = true },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.assets.register(\"banner\", .image, \".png\", @embedFile(\"assets/banner.png\"))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.assets.acquire(\"banner\")") == null);
+    }
+
+    test "image resource on the sokol callback path panics instead of returning (#675)" {
+        // The sokol init callback has no error channel, so the emitted
+        // registration must not `return err` — same contract the other
+        // three kinds honour via `.catch_panic_style`.
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "logo", .image = "assets/logo.png", .lazy = false },
+            },
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "@panic(\"failed to register image: logo\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "_ = g.assets.acquire(\"logo\") catch @panic(\"failed to acquire image: logo\");") != null);
+    }
+
+    test "image resource keeps its real extension in the emitted file_type (#675)" {
+        // `.astc` / `.rgba` siblings carry their own container magic; the
+        // emitted `file_type` must report what the bytes actually are
+        // rather than a hard-coded ".png".
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "sky", .image = "assets/sky.astc", .lazy = true },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.assets.register(\"sky\", .image, \".astc\", @embedFile(\"assets/sky.astc\"))") != null);
+    }
+
+    test "atlas / sound / font emission is untouched by the image kind (#675)" {
+        // #675 is purely additive: a project mixing all four kinds must
+        // still emit the pre-existing three call shapes verbatim.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "world", .json = "atlases/world.json", .texture = "atlases/world.png", .lazy = false },
+                .{ .name = "portrait", .image = "assets/portrait.png", .lazy = false },
+                .{ .name = "click", .sound = "audio/click.wav", .lazy = false },
+                .{ .name = "ui_font", .font = "fonts/ui.ttf", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "try g.loadAtlasFromMemory(\"world\", @embedFile(\"atlases/world.json\"), @embedFile(\"atlases/world.png\"), \".png\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "try g.loadSoundFromMemory(\"click\", \"wav\", @embedFile(\"audio/click.wav\"));") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "try g.loadFontFromMemory(\"ui_font\", \"ttf\", @embedFile(\"fonts/ui.ttf\"), &ui_font_params);") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.assets.register(\"portrait\", .image,") != null);
+    }
+
+    test "validation rejects image resource with unsupported extension (#675)" {
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "bad", .image = "assets/portrait.wav", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        try std.testing.expectError(error.UnsupportedResourceExtension, result);
+    }
+
+    test "validation rejects `.image` mixed with the atlas pair (#675)" {
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "mixed", .image = "assets/tiles.png", .json = "assets/tiles.json" },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        try std.testing.expectError(error.InvalidResource, result);
+    }
+
     test "sound resource emits loadSoundFromMemory with extension-derived file_type" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
@@ -478,6 +599,59 @@ pub const RESOURCE_KINDS = struct {
         };
         try std.testing.expectEqual(generate.ResourceKind.atlas, atlas.kind());
         try std.testing.expectEqual(generate.ResourceValidationError.ok, atlas.validate());
+    }
+
+    test "kind: a lone `.image` classifies as image (#675)" {
+        const img: generate.ResourceDef = .{
+            .name = "portrait",
+            .image = "assets/portrait.png",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.image, img.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.ok, img.validate());
+    }
+
+    test "validate: `.image` + `.json` reports multiple_paths, not atlas_incomplete (#675)" {
+        // The atlas pair is the MANIFEST form of the same PNG, so an
+        // entry carrying both forms is a mix — reporting
+        // `atlas_incomplete` here would send the user off to write the
+        // `.texture` half they never wanted.
+        const mixed: generate.ResourceDef = .{
+            .name = "confused",
+            .image = "assets/tiles.png",
+            .json = "assets/tiles.json",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.invalid, mixed.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.multiple_paths, mixed.validate());
+    }
+
+    test "validate: `.image` + `.texture` reports multiple_paths (#675)" {
+        const mixed: generate.ResourceDef = .{
+            .name = "confused",
+            .image = "assets/tiles.png",
+            .texture = "assets/tiles.png",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.invalid, mixed.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.multiple_paths, mixed.validate());
+    }
+
+    test "validate: `.image` + `.sound` reports multiple_paths (#675)" {
+        const mixed: generate.ResourceDef = .{
+            .name = "confused",
+            .image = "assets/portrait.png",
+            .sound = "audio/click.wav",
+        };
+        try std.testing.expectEqual(generate.ResourceKind.invalid, mixed.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.multiple_paths, mixed.validate());
+    }
+
+    test "validate: font_params on an image resource reports font_params_misplaced (#675)" {
+        const misplaced: generate.ResourceDef = .{
+            .name = "typo",
+            .image = "assets/portrait.png",
+            .font_params = .{ .pixel_height = 24 },
+        };
+        try std.testing.expectEqual(generate.ResourceKind.image, misplaced.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.font_params_misplaced, misplaced.validate());
     }
 
     test "kind: sound resource classifies as sound" {
