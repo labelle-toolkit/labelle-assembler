@@ -1363,11 +1363,28 @@ test "parseProjectConfig: no `.params` in the source is the plain typed parse (b
     try testing.expect(cfg.plugins[0].params_bag == null);
 }
 
+/// Assert a `[]const []const u8` matches `want` element for element.
+///
+/// The `.prebuild` tests below exist only to pin the POSITIONAL shape the
+/// CLI writes, so spot-checking one index is the one thing they must not do
+/// — an unasserted position is exactly the drift they would miss (#682
+/// review). Checking the length and then every element makes that
+/// impossible to reintroduce by adding a step to the fixture.
+fn expectArgv(want: []const []const u8, got: []const []const u8) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}
+
 test "parseProjectConfig: a manifest carrying `.prebuild` parses; the assembler still never runs it (#677)" {
     // The field is SCHEMA ONLY on this side — execution is CLI-owned
     // (labelle-cli#361). This test pins the shape the CLI writes so the two
     // schemas cannot drift apart: a mismatch would make a manifest parse in
     // one tool and fail in the other.
+    //
+    // The other side is `labelle-cli` `src/cli/project_config.zig`'s
+    // `PrebuildStep` — re-verified field-for-field (`run`/`inputs`/`outputs`,
+    // all `[]const []const u8`, all defaulting empty, plus
+    // `prebuild: []const PrebuildStep = &.{}` on `ProjectConfig`).
     const src: [:0]const u8 =
         \\.{
         \\    .name = "prebuild-game",
@@ -1387,18 +1404,14 @@ test "parseProjectConfig: a manifest carrying `.prebuild` parses; the assembler 
     try testing.expectEqualStrings("prebuild-game", cfg.name);
     try testing.expectEqual(@as(usize, 2), cfg.prebuild.len);
 
-    try testing.expectEqual(@as(usize, 2), cfg.prebuild[0].run.len);
-    try testing.expectEqualStrings("python3", cfg.prebuild[0].run[0]);
-    try testing.expectEqualStrings("tools/gen_tiles.py", cfg.prebuild[0].run[1]);
-    try testing.expectEqual(@as(usize, 2), cfg.prebuild[0].inputs.len);
-    try testing.expectEqualStrings("tools/OverworldTileset.tsx", cfg.prebuild[0].inputs[1]);
-    try testing.expectEqual(@as(usize, 2), cfg.prebuild[0].outputs.len);
-    try testing.expectEqualStrings("scripts/tiles_data.zig", cfg.prebuild[0].outputs[1]);
+    try expectArgv(&.{ "python3", "tools/gen_tiles.py" }, cfg.prebuild[0].run);
+    try expectArgv(&.{ "tools/gen_tiles.py", "tools/OverworldTileset.tsx" }, cfg.prebuild[0].inputs);
+    try expectArgv(&.{ "assets/out.png", "scripts/tiles_data.zig" }, cfg.prebuild[0].outputs);
 
     // Every member defaults to empty — a step may declare `.run` alone.
-    try testing.expectEqualStrings("make", cfg.prebuild[1].run[0]);
-    try testing.expectEqual(@as(usize, 0), cfg.prebuild[1].inputs.len);
-    try testing.expectEqual(@as(usize, 0), cfg.prebuild[1].outputs.len);
+    try expectArgv(&.{ "make", "shaders" }, cfg.prebuild[1].run);
+    try expectArgv(&.{}, cfg.prebuild[1].inputs);
+    try expectArgv(&.{}, cfg.prebuild[1].outputs);
 }
 
 test "parseProjectConfig: a manifest WITHOUT `.prebuild` is unchanged — the field defaults empty (#677)" {
