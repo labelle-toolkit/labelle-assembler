@@ -3,15 +3,23 @@
 //!
 //! A scene entity carrying a `Tilemap` component references a `.tmx` map
 //! by `asset_name`; the assembler's `tilemap_scan` resolves that (plus the
-//! map's tileset images) into a flat list of `Registration { key,
-//! embed_path }`. This block turns each into one
+//! map's tileset images and any external `.tsx` tilesets it references)
+//! into a flat list of `Registration { key, embed_path }`. This block turns
+//! each into one
 //!
 //!   `g.addEmbeddedTilemapAsset("<key>", @embedFile("<embed_path>"))`
 //!
 //! call. The engine (≥ v1.75.0) reads that single registry to fetch the
 //! `.tmx` bytes (keyed by `asset_name`) and, after decoding, each tileset
-//! image (keyed by the verbatim `<image source="...">` string). The keys
-//! are computed by `tilemap_scan`; this module only spells the calls.
+//! image (keyed by the `<image source="...">` string gfx ends up holding).
+//!
+//! **External tilesets (#678 / gfx#336).** The same registry is what backs
+//! gfx's `LoadOptions.tsx_resolver`, whose `resolve(source)` is handed the
+//! `<tileset source="...">` attribute EXACTLY as the `.tmx` writes it. So a
+//! `.tsx` registration emitted here — key = that verbatim `source`, bytes =
+//! `@embedFile` of the resolved file — IS the resolver's table entry: no
+//! extra generated wiring is needed beyond this call. The keys are computed
+//! by `tilemap_scan`; this module only spells the calls.
 //!
 //! Emitted from BOTH lifecycle paths, differing only in failure handling
 //! — the same `LoadStyle` split `resource_loader` uses. These calls MUST

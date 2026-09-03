@@ -958,29 +958,12 @@ pub const MIN_ENGINE_FOR_TARGET_OVERRIDES = "2.11.0";
 /// the gate exists to catch the "new assembler, old engine pin" skew where
 /// an old engine silently drops `@` keys — a pin we cannot parse is a
 /// deliberate dev setup, not that trap. Compat checking is MAJOR-only
-/// (labelle-cli#269), so this per-feature minimum is the only guard.
+/// (labelle-cli#269), so this per-feature minimum is the only guard. The
+/// comparison itself (release-vs-dev classification, `X.Y` normalization,
+/// fail-closed on garbage) lives in `config.engineFeatureSupport`, shared
+/// with the external-tileset gate in `tilemap_scan`.
 pub fn engineSupportsTargetOverrides(engine_version: []const u8) bool {
-    // Classify with the repo's own release predicate FIRST: a
-    // digit-leading branch pin like `2.10.0-feature` is resolved
-    // verbatim as a git ref by `versionToGitRef`, yet
-    // `SemanticVersion.parse` would happily read it as a prerelease
-    // below the minimum and hard-reject a dev branch that may well
-    // carry the feature (codex round 3 on #650). Only true release
-    // pins are compared; everything else is permissive.
-    if (!config.isSemverVersion(engine_version)) return true;
-    const min = std.SemanticVersion.parse(MIN_ENGINE_FOR_TARGET_OVERRIDES) catch unreachable;
-    // A release-shaped pin that SemanticVersion cannot parse is the
-    // abbreviated `X.Y` form (isSemverVersion admits digits+dots with
-    // ≥1 dot) — normalize by appending `.0` and retry. Still
-    // unparsable (e.g. `1.2.3.4`) → FAIL CLOSED: once the release
-    // predicate matched, treating parse failure as a branch pin would
-    // let an old-release pin bypass the gate (codex round 4 on #650).
-    const pin = std.SemanticVersion.parse(engine_version) catch blk: {
-        var buf: [64]u8 = undefined;
-        const padded = std.fmt.bufPrint(&buf, "{s}.0", .{engine_version}) catch return false;
-        break :blk std.SemanticVersion.parse(padded) catch return false;
-    };
-    return pin.order(min) != .lt;
+    return config.engineFeatureSupport(engine_version, MIN_ENGINE_FOR_TARGET_OVERRIDES) != .no;
 }
 
 /// Scan every `<name>.jsonc` under `dir` for `@` target-override keys;
@@ -1069,7 +1052,6 @@ pub fn findTargetKeyUsageInTree(
     }
     return null;
 }
-
 
 /// Read every `<scenes_dir>/<name>.jsonc` (where `name` is one of `scene_names`,
 /// possibly with subfolder slashes), parse it, and return the manifest list in

@@ -657,6 +657,70 @@ test "versionToGitRef: non-numeric versions are used verbatim as a ref" {
     }
 }
 
+// ── Per-feature engine-version gates ────────────────────────────────────
+
+/// Whether a pinned engine version is known to carry a given feature.
+///
+/// Compat checking between the assembler and the engine is MAJOR-only
+/// (labelle-cli#269), so "new assembler + old engine pin" is a legal
+/// combination — every feature that needs a specific engine release must
+/// gate on it explicitly. `unverifiable` is the deliberate middle ground:
+/// a `local:` override or a branch pin is a dev setup that may well carry
+/// the feature, so it is never hard-rejected — but a caller whose failure
+/// mode would otherwise be SILENT can still say so out loud.
+pub const FeatureSupport = enum {
+    /// A release-shaped pin at or above the minimum.
+    yes,
+    /// Not a release pin (`local:…`, a branch ref): cannot be compared.
+    unverifiable,
+    /// A release-shaped pin below the minimum.
+    no,
+};
+
+/// Classify `engine_version` against a feature's `min` release.
+///
+/// PERMISSIVE on anything unparseable (`local:` overrides, branch pins):
+/// these gates exist to catch the "new assembler, old engine pin" skew,
+/// not to punish a deliberate dev setup — such pins come back
+/// `unverifiable`, never `no`.
+pub fn engineFeatureSupport(engine_version: []const u8, comptime min: []const u8) FeatureSupport {
+    // Classify with the repo's own release predicate FIRST: a
+    // digit-leading branch pin like `2.10.0-feature` is resolved verbatim
+    // as a git ref by `versionToGitRef`, yet `SemanticVersion.parse` would
+    // happily read it as a prerelease below the minimum and hard-reject a
+    // dev branch that may well carry the feature (codex round 3 on #650).
+    // Only true release pins are compared.
+    if (!isSemverVersion(engine_version)) return .unverifiable;
+    const min_ver = std.SemanticVersion.parse(min) catch unreachable;
+    // A release-shaped pin that SemanticVersion cannot parse is the
+    // abbreviated `X.Y` form (isSemverVersion admits digits+dots with ≥1
+    // dot) — normalize by appending `.0` and retry. Still unparsable (e.g.
+    // `1.2.3.4`) → FAIL CLOSED: once the release predicate matched,
+    // treating parse failure as a branch pin would let an old-release pin
+    // bypass the gate (codex round 4 on #650).
+    const pin = std.SemanticVersion.parse(engine_version) catch blk: {
+        var buf: [64]u8 = undefined;
+        const padded = std.fmt.bufPrint(&buf, "{s}.0", .{engine_version}) catch return .no;
+        break :blk std.SemanticVersion.parse(padded) catch return .no;
+    };
+    return if (pin.order(min_ver) != .lt) .yes else .no;
+}
+
+test "engineFeatureSupport: release pins compare, dev pins stay unverifiable" {
+    try std.testing.expectEqual(FeatureSupport.yes, engineFeatureSupport("2.11.0", "2.11.0"));
+    try std.testing.expectEqual(FeatureSupport.yes, engineFeatureSupport("2.14.1", "2.14.0"));
+    try std.testing.expectEqual(FeatureSupport.no, engineFeatureSupport("2.10.9", "2.11.0"));
+    // Abbreviated `X.Y` release pins normalize to `X.Y.0`.
+    try std.testing.expectEqual(FeatureSupport.yes, engineFeatureSupport("2.14", "2.14.0"));
+    try std.testing.expectEqual(FeatureSupport.no, engineFeatureSupport("2.13", "2.14.0"));
+    // Four-component garbage that still looks release-shaped fails closed.
+    try std.testing.expectEqual(FeatureSupport.no, engineFeatureSupport("1.2.3.4", "2.14.0"));
+    // Dev setups are never hard-rejected.
+    try std.testing.expectEqual(FeatureSupport.unverifiable, engineFeatureSupport("local:../labelle-engine", "2.14.0"));
+    try std.testing.expectEqual(FeatureSupport.unverifiable, engineFeatureSupport("main", "2.14.0"));
+    try std.testing.expectEqual(FeatureSupport.unverifiable, engineFeatureSupport("834-tsx-resolver", "2.14.0"));
+}
+
 test "isSemverVersion: classifies version strings" {
     try std.testing.expect(isSemverVersion("1.0.0"));
     try std.testing.expect(isSemverVersion("0.31.0"));

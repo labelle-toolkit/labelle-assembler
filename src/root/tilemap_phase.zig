@@ -53,9 +53,12 @@ const PackScan = scan.PackScan;
 /// key is rewritten to the namespaced `<pack>__Tilemap` when `scanPack` stages
 /// the prefab, so only genuine engine-built-in `Tilemap` refs survive the scan
 /// of a pack prefab; a pack shipping its own `Tilemap` therefore embeds no
-/// `.tmx` for it. Genuinely-unsupported cases the scanner already rejects
-/// (external `.tsx` tilesets #563, key collisions) still fail loud in
-/// `tilemap_scan.collect`.
+/// `.tmx` for it. External `.tsx` tilesets are now FOLLOWED and embedded
+/// alongside the map (#678, completing gfx#336) rather than rejected;
+/// genuinely-unsupported cases the scanner still rejects (a `.tsx` chaining to
+/// another `.tsx`, a missing `.tsx`, key collisions, or an `engine_version`
+/// pinned below `tilemap_scan.MIN_ENGINE_FOR_EXTERNAL_TILESETS`) fail loud in
+/// `tilemap_scan.collectWithOptions`.
 pub fn collectRegistrations(
     allocator: std.mem.Allocator,
     target_dir: []const u8,
@@ -64,6 +67,12 @@ pub fn collectRegistrations(
     declared_component_names: []const []const u8,
     prefab_names: []const []const u8,
     pack_scans: []const PackScan,
+    /// The project's pinned `engine_version`. Gates external `.tsx`
+    /// tilesets: the engine only grew the runtime half of that feature in
+    /// `tilemap_scan.MIN_ENGINE_FOR_EXTERNAL_TILESETS` (labelle-engine#834),
+    /// and embedding for an older pin would turn a generate-time error into
+    /// a runtime one.
+    engine_version: []const u8,
 ) ![]const tilemap_scan.Registration {
     // #562: a PROJECT-registered `Tilemap` (exact built-in name) overrides the
     // built-in — embed nothing and let the generic component dispatch route it.
@@ -72,7 +81,7 @@ pub fn collectRegistrations(
     // exactly like a `components/Tilemap.zig`.
     if (registersTilemap(component_names) or declaresTilemap(declared_component_names)) {
         std.log.info("labelle-assembler: project registers its own `Tilemap` component — skipping built-in tilemap embedding (engine C2)", .{});
-        return tilemap_scan.collect(allocator, target_dir, &.{});
+        return tilemap_scan.collectWithOptions(allocator, target_dir, &.{}, .{ .engine_version = engine_version });
     }
 
     // Aggregate the tilemap `asset_name`s across scenes AND prefabs. Scene
@@ -106,7 +115,7 @@ pub fn collectRegistrations(
     // `collect` dedups by registry key, so passing the raw (possibly repeated)
     // names across scenes + prefabs is fine. Empty → reads no files, emits
     // nothing.
-    return tilemap_scan.collect(allocator, target_dir, asset_names.items);
+    return tilemap_scan.collectWithOptions(allocator, target_dir, asset_names.items, .{ .engine_version = engine_version });
 }
 
 /// True iff a PROJECT component pascal-matches the EXACT built-in name
