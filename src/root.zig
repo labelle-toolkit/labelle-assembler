@@ -1402,7 +1402,7 @@ pub fn generate(
         break :blk names;
     };
     defer allocator.free(declared_component_names);
-    const tilemap_registrations = try tilemap_phase.collectRegistrations(allocator, target_dir, scene_manifests, component_names, declared_component_names, prefab_names, pack_scans.items);
+    const tilemap_registrations = try tilemap_phase.collectRegistrations(allocator, target_dir, scene_manifests, component_names, declared_component_names, prefab_names, pack_scans.items, cfg.engine_version);
     defer tilemap_scan.freeRegistrations(allocator, tilemap_registrations);
 
     // labelle-assembler#240 Gap 2 — game scripts exporting `FlowNodes`

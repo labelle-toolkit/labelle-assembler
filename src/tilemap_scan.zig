@@ -17,6 +17,13 @@
 //!      as written in the `.tmx`) → that `.tsx` document's raw bytes
 //!      (labelle-assembler#678, completing labelle-gfx#336).
 //!
+//! **Engine floor.** Embedding a `.tsx` is only half of external-tileset
+//! support: the engine has to hand gfx a `tsx_resolver` backed by this
+//! registry (labelle-engine#834). Until the pinned engine is new enough
+//! (`MIN_ENGINE_FOR_EXTERNAL_TILESETS`) a map with an external tileset is
+//! REJECTED at generate time, exactly as it was before #678 — a loud build
+//! error is strictly better than a map that decodes to nothing at runtime.
+//!
 //! **External tilesets (`.tsx`).** gfx#336 gave the TMX loader a
 //! `LoadOptions.tsx_resolver` seam: `resolve(source)` is called with the
 //! `source` attribute EXACTLY as written in the `.tmx` — never joined onto
@@ -86,7 +93,96 @@ pub const Error = error{
     /// A shape gfx's loader itself refuses — today: a `.tsx` whose root
     /// `<tileset>` only points at ANOTHER `.tsx`.
     ExternalTilesetUnsupported,
+    /// The pinned engine predates the runtime half of external-tileset
+    /// support (labelle-engine#834) — see `MIN_ENGINE_FOR_EXTERNAL_TILESETS`.
+    EngineTooOldForExternalTilesets,
 } || std.mem.Allocator.Error;
+
+// ── Engine-version gate (labelle-engine#834) ────────────────────────────
+
+/// First engine release whose tilemap runtime hands gfx a `tsx_resolver`
+/// backed by the embedded registry — i.e. the first release that can
+/// actually CONSUME what this module embeds for an external `.tsx`.
+///
+/// **Why a gate at all.** Embedding is only half the feature. The engine's
+/// `tilemap_runtime.initInPlace` calls
+/// `TileMap.loadFromMemoryWithBasePath(alloc, tmx_bytes, "")`, which is
+/// `loadFromMemoryWithOptions(…, .{})` — no `tsx_resolver`, and an empty
+/// `base_path` forces `read_external_from_filesystem = false`. gfx's
+/// `resolveExternalTileset` then returns `error.ExternalTilesetUnsupported`
+/// for every external reference, which `game/tilemap_mixin.zig` swallows
+/// into a `log.warn` and a missing tilemap. Without this gate, following a
+/// `.tsx` would trade a loud GENERATE-time error for a quiet RUNTIME one —
+/// strictly worse to diagnose, even though the assembler got more capable.
+///
+/// **Provisional value.** labelle-engine#834 has not shipped; the engine's
+/// latest release is v2.13.0, so v2.14.0 is the earliest it can appear in.
+/// Bump this if the engine-side change slips to a later minor — that is the
+/// only edit needed once it lands (same contract as
+/// `scene_manifest.MIN_ENGINE_FOR_TARGET_OVERRIDES`).
+pub const MIN_ENGINE_FOR_EXTERNAL_TILESETS = "2.14.0";
+
+/// Knobs for `collectWithOptions`. `collect` uses the defaults.
+pub const Options = struct {
+    /// The project's pinned `engine_version` (`project.labelle`). Decides
+    /// whether an external `<tileset source>` may be followed at all — see
+    /// `MIN_ENGINE_FOR_EXTERNAL_TILESETS`. Defaults to the curated pin so a
+    /// caller that forgets to thread it gets the conservative answer.
+    engine_version: []const u8 = config.ENGINE_VERSION,
+};
+
+/// Per-generation state for the external-tileset gate: the verdict, plus a
+/// latch so the "cannot verify" note is printed once, not once per map.
+const ExternalTilesetGate = struct {
+    support: config.FeatureSupport,
+    engine_version: []const u8,
+    noted: bool = false,
+
+    fn init(engine_version: []const u8) ExternalTilesetGate {
+        return .{
+            .support = config.engineFeatureSupport(engine_version, MIN_ENGINE_FOR_EXTERNAL_TILESETS),
+            .engine_version = engine_version,
+        };
+    }
+
+    /// Called once per map that has at least one external `<tileset source>`,
+    /// with the first such reference for the diagnostic.
+    fn check(self: *ExternalTilesetGate, asset_name: []const u8, source: []const u8) Error!void {
+        switch (self.support) {
+            .yes => {},
+            .no => {
+                stderrPrint(
+                    "labelle-assembler: tilemap '{s}' references the external tileset '{s}'\n" ++
+                        "  (<tileset source=...>), but the pinned engine v{s} cannot load one from an\n" ++
+                        "  EMBEDDED build (needs >= v{s}). Its `tilemap_runtime.initInPlace` calls gfx's\n" ++
+                        "  loader with NO `tsx_resolver` (labelle-engine#834), so the embedded `.tsx`\n" ++
+                        "  bytes would never be consulted: the map would fail to decode at RUNTIME with\n" ++
+                        "  `ExternalTilesetUnsupported`, logged as a warning and drawn as nothing.\n" ++
+                        "  Bump `engine_version` in project.labelle once #834 ships, or embed the tileset\n" ++
+                        "  into the `.tmx` in Tiled (Map > Embed Tileset).\n",
+                    .{ asset_name, source, self.engine_version, MIN_ENGINE_FOR_EXTERNAL_TILESETS },
+                );
+                return error.EngineTooOldForExternalTilesets;
+            },
+            .unverifiable => {
+                // A `local:` override or branch pin is a deliberate dev setup
+                // (quite possibly the one developing #834), so this must not
+                // hard-fail — but it must not be SILENT either: if that engine
+                // predates the resolver the failure moves to runtime.
+                if (self.noted) return;
+                self.noted = true;
+                stderrPrint(
+                    "labelle-assembler: note: tilemap '{s}' embeds the external tileset '{s}', but the\n" ++
+                        "  pinned engine '{s}' is not a release version, so the assembler cannot verify it\n" ++
+                        "  wires the embedded `.tsx` into gfx's `LoadOptions.tsx_resolver`\n" ++
+                        "  (labelle-engine#834, expected in >= v{s}). An engine without it fails to decode\n" ++
+                        "  the map at RUNTIME with `ExternalTilesetUnsupported`.\n",
+                    .{ asset_name, source, self.engine_version, MIN_ENGINE_FOR_EXTERNAL_TILESETS },
+                );
+            },
+        }
+    }
+};
 
 fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
     const io = config.globalIo();
@@ -281,6 +377,30 @@ pub fn extractExternalTilesets(allocator: std.mem.Allocator, tmx: []const u8) ![
     return out.toOwnedSlice(allocator);
 }
 
+/// Which host's `std.fs.path.dirname` the RUNTIME will use when gfx rebases
+/// a `.tsx`'s `<image source>`. gfx calls the generic `std.fs.path.dirname`,
+/// which is `dirnamePosix` (only `/` separates) or `dirnameWindows` (`/` and
+/// `\` both separate) depending on the TARGET the game is built for — a
+/// choice made at `zig build` time, i.e. AFTER generation. The assembler
+/// therefore cannot pick one; it registers under both when they differ
+/// (see `processExternalTileset`).
+pub const Separators = enum {
+    posix,
+    windows,
+
+    /// Index of the last directory separator, mirroring the corresponding
+    /// `std.fs.path.dirname` implementation's separator set. The
+    /// drive-relative `C:foo` shape (which `dirnameWindows` also splits, at
+    /// the colon) is not modelled — Tiled never writes it, and a `.tsx`
+    /// reference bound to a drive letter could not be embedded anyway.
+    fn lastSeparator(self: Separators, path: []const u8) ?usize {
+        return switch (self) {
+            .posix => std.mem.lastIndexOfScalar(u8, path, '/'),
+            .windows => std.mem.lastIndexOfAny(u8, path, "/\\"),
+        };
+    }
+};
+
 /// The registry KEY under which a `.tsx`'s own `<image source>` must be
 /// embedded — i.e. what the engine's `ImageProvider.get` will be called
 /// with for a tileset that came from an external reference.
@@ -293,17 +413,21 @@ pub fn extractExternalTilesets(allocator: std.mem.Allocator, tmx: []const u8) ![
 /// bare `source="Overworld.tsx"` has no dirname, so the image source stays
 /// exactly as the `.tsx` wrote it (`"../Sheet.png"` and all).
 ///
-/// **Separators.** gfx calls `std.fs.path.dirname`, and Tiled writes `/`
-/// in a `.tsx` reference on every host, so a `/`-only reading is faithful
-/// on the platforms that matter; a backslash-only reference has no dirname
-/// under POSIX and the raw path is kept — matching a POSIX runtime. Caller
-/// owns the result.
+/// **Separators.** Tiled writes `/` on every host, and for a `/`-only
+/// reference both `seps` modes give the same answer. They diverge only for
+/// a hand-authored / Windows-tool-authored `source="tilesets\terrain.tsx"`:
+/// a Windows runtime's `dirname` sees `tilesets` and rebases, a POSIX
+/// runtime sees no directory and keeps the raw name. Which one the game
+/// gets is decided by the build target, long after generation — so the
+/// caller asks for both and registers each (codex P2 on #684). Caller owns
+/// the result.
 pub fn tsxImageKey(
     allocator: std.mem.Allocator,
     tsx_source: []const u8,
     image_source: []const u8,
+    seps: Separators,
 ) ![]u8 {
-    const idx = std.mem.lastIndexOfScalar(u8, tsx_source, '/') orelse
+    const idx = seps.lastSeparator(tsx_source) orelse
         return allocator.dupe(u8, image_source);
     return joinRelative(allocator, tsx_source[0..idx], image_source);
 }
@@ -315,12 +439,25 @@ pub fn tsxImageKey(
 /// process cwd. A leading `..` survives; an absolute `rel` passes through.
 fn joinRelative(allocator: std.mem.Allocator, dir: []const u8, rel: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(rel)) return allocator.dupe(u8, rel);
+
+    // Tokenizing drops the leading separator, so an absolute `dir` would come
+    // back RELATIVE. Capture the root VERBATIM and put it back — on Windows
+    // that root is `C:\` or `\\server\share\`, not `/`, so rebuilding it as
+    // `/` would turn `C:\tilesets` into `/C:/tilesets` and collapse a UNC
+    // root to one slash. Mirrors gfx's `joinRelative` after its own Windows-
+    // roots fix (labelle-gfx#336) — the two must agree byte-for-byte.
     const absolute = std.fs.path.isAbsolute(dir);
+    const root: []const u8 = if (absolute) blk: {
+        var it = std.fs.path.componentIterator(dir);
+        break :blk it.root() orelse "/";
+    } else "";
 
     var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(allocator);
 
-    for ([_][]const u8{ dir, rel }) |path| {
+    // `dir` is tokenized past its root so the root's own bytes (`C:`) are not
+    // re-emitted as an ordinary component after the prefix.
+    for ([_][]const u8{ dir[root.len..], rel }) |path| {
         var it = std.mem.tokenizeAny(u8, path, "/\\");
         while (it.next()) |part| {
             if (std.mem.eql(u8, part, ".")) continue;
@@ -339,7 +476,11 @@ fn joinRelative(allocator: std.mem.Allocator, dir: []const u8, rel: []const u8) 
     const joined = try std.mem.join(allocator, "/", parts.items);
     if (!absolute) return joined;
     defer allocator.free(joined);
-    return std.mem.concat(allocator, u8, &.{ "/", joined });
+    // A root usually carries its own trailing separator (`/`, `C:\`), but a
+    // bare UNC share (`\\server\share`, what `dirname` leaves when the `.tsx`
+    // sits at the share root) does not — supply one.
+    const sep: []const u8 = if (std.fs.path.isSep(root[root.len - 1])) "" else std.fs.path.sep_str;
+    return std.mem.concat(allocator, u8, &.{ root, sep, joined });
 }
 
 /// Find the next occurrence of `needle` in `tmx` at or after `from` that is
@@ -415,9 +556,16 @@ fn isXmlSpace(c: u8) bool {
 /// gfx stores on the decoded tileset). A `.tsx` — or a tileset image — shared
 /// by two maps, or a repeated `asset_name`, emits once.
 ///
+/// Following an external tileset is GATED on the pinned engine version
+/// (`MIN_ENGINE_FOR_EXTERNAL_TILESETS`): an engine that predates
+/// labelle-engine#834 never hands gfx a `tsx_resolver`, so embedding for it
+/// would swap a generate-time error for a silent runtime one. `collect` uses
+/// the curated default pin; `collectWithOptions` takes the project's.
+///
 /// Hard errors: a `.tmx` key colliding with a tileset-asset key, or the same
 /// key resolving to two different files (`TilemapKeyCollision`); a missing
-/// `.tmx` (`TilemapAssetNotFound`); a missing `.tsx`
+/// `.tmx` (`TilemapAssetNotFound`); an external tileset under too old an
+/// engine pin (`EngineTooOldForExternalTilesets`); a missing `.tsx`
 /// (`ExternalTilesetNotFound`); a `.tsx` chaining to another `.tsx`
 /// (`ExternalTilesetUnsupported`, which gfx's loader itself refuses).
 ///
@@ -427,6 +575,20 @@ pub fn collect(
     target_dir: []const u8,
     asset_names: []const []const u8,
 ) Error![]Registration {
+    return collectWithOptions(allocator, target_dir, asset_names, .{});
+}
+
+/// `collect` with explicit `Options` — notably the project's pinned
+/// `engine_version`, which decides whether external `.tsx` tilesets may be
+/// followed (`MIN_ENGINE_FOR_EXTERNAL_TILESETS`).
+pub fn collectWithOptions(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    asset_names: []const []const u8,
+    options: Options,
+) Error![]Registration {
+    var gate: ExternalTilesetGate = .init(options.engine_version);
+
     var regs: std.ArrayList(Registration) = .empty;
     errdefer {
         for (regs.items) |r| {
@@ -466,7 +628,7 @@ pub fn collect(
         // that map — a project with many large maps never retains more than
         // one map's buffers at once. Registrations + `*_seen` keys are copied
         // into `regs` (program-lifetime) before those per-map buffers free.
-        try processMap(allocator, target_dir, io, cwd, asset_name, &regs, &tmx_seen, &asset_seen);
+        try processMap(allocator, target_dir, io, cwd, asset_name, &regs, &tmx_seen, &asset_seen, &gate);
     }
 
     return regs.toOwnedSlice(allocator);
@@ -487,6 +649,7 @@ fn processMap(
     regs: *std.ArrayList(Registration),
     tmx_seen: *std.StringHashMap(void),
     asset_seen: *std.StringHashMap([]const u8),
+    gate: *ExternalTilesetGate,
 ) Error!void {
     // Cross-space collision: a tileset asset already claimed this key.
     if (asset_seen.contains(asset_name)) {
@@ -554,6 +717,13 @@ fn processMap(
         for (sources) |s| allocator.free(s);
         allocator.free(sources);
     }
+
+    // The runtime half of this feature lives in the ENGINE: without a
+    // `tsx_resolver` the embedded `.tsx` is never consulted and the map fails
+    // to decode at runtime. Refuse (or, for an unverifiable dev pin, say so)
+    // BEFORE embedding anything, so an engine that cannot use these bytes
+    // never turns a generate-time error into a runtime warning.
+    if (sources.len > 0) try gate.check(asset_name, sources[0]);
 
     for (sources) |source| {
         // The `@embedFile` path: the reference resolved against the MAP's
@@ -625,16 +795,31 @@ fn processExternalTileset(
 
     for (images) |image_source| {
         // PATH: relative to the `.tsx`'s OWN directory (which need not be
-        // the map's — the whole point of #678 step 3).
+        // the map's — the whole point of #678 step 3). One path, however
+        // many keys point at it.
         const img_embed = try imageEmbedPath(allocator, tsx_embed, image_source);
+        defer allocator.free(img_embed);
+
         // KEY: what gfx rebases `image_source` to before the engine's
-        // `ImageProvider.get` sees it.
-        const key = tsxImageKey(allocator, source, image_source) catch |err| {
-            allocator.free(img_embed);
-            return err;
-        };
-        defer allocator.free(key);
-        _ = try registerAsset(allocator, regs, tmx_seen, asset_seen, key, img_embed, .image);
+        // `ImageProvider.get` sees it — which depends on whether the RUNTIME's
+        // `std.fs.path.dirname` treats `\` as a separator. The build target is
+        // chosen after generation, so for a backslash-bearing reference the two
+        // readings differ and BOTH are registered against the same bytes (one
+        // `@embedFile` path, so no duplicate bytes in the binary). For the `/`
+        // references Tiled actually writes they are identical and exactly one
+        // registration is emitted (codex P2 on #684).
+        const posix_key = try tsxImageKey(allocator, source, image_source, .posix);
+        defer allocator.free(posix_key);
+        const windows_key = try tsxImageKey(allocator, source, image_source, .windows);
+        defer allocator.free(windows_key);
+
+        var key_buf = [2][]const u8{ posix_key, windows_key };
+        const keys = key_buf[0..if (std.mem.eql(u8, posix_key, windows_key)) @as(usize, 1) else 2];
+        for (keys) |key| {
+            // `registerAsset` takes ownership of the path it is handed.
+            const embed_copy = try allocator.dupe(u8, img_embed);
+            _ = try registerAsset(allocator, regs, tmx_seen, asset_seen, key, embed_copy, .image);
+        }
     }
 }
 

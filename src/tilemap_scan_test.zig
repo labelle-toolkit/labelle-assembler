@@ -8,6 +8,7 @@ const std = @import("std");
 const tilemap_scan = @import("tilemap_scan.zig");
 const scene_manifest = @import("scene_manifest.zig");
 const tilemap_assets = @import("codegen/blocks/tilemap_assets.zig");
+const config = @import("config.zig");
 
 const testing = std.testing;
 
@@ -380,6 +381,19 @@ const terrain_tsx =
     \\</tileset>
 ;
 
+/// `collect` under an engine pin new enough to CONSUME an embedded `.tsx`
+/// (labelle-engine#834). The external-tileset tests are about the scan, not
+/// the version gate — the gate has its own tests below, and the curated
+/// default pin is exercised there.
+fn collectTsx(
+    target_dir: []const u8,
+    asset_names: []const []const u8,
+) tilemap_scan.Error![]tilemap_scan.Registration {
+    return tilemap_scan.collectWithOptions(testing.allocator, target_dir, asset_names, .{
+        .engine_version = tilemap_scan.MIN_ENGINE_FOR_EXTERNAL_TILESETS,
+    });
+}
+
 test "extractExternalTilesets returns every reference verbatim, in order" {
     const tmx =
         \\<map>
@@ -420,28 +434,28 @@ test "tsxImageKey mirrors gfx's joinRelative rebasing" {
 
     // No directory on the reference → gfx's `dirname` is null and the
     // `.tsx`'s image source is kept EXACTLY as written, `..` and all.
-    const bare = try tilemap_scan.tsxImageKey(alloc, "Overworld.tsx", "../Sheet.png");
+    const bare = try tilemap_scan.tsxImageKey(alloc, "Overworld.tsx", "../Sheet.png", .posix);
     defer alloc.free(bare);
     try testing.expectEqualStrings("../Sheet.png", bare);
 
     // Sibling directory: tilesets/Overworld.tsx → tilesets/img/o.png.
-    const sibling = try tilemap_scan.tsxImageKey(alloc, "tilesets/Overworld.tsx", "img/o.png");
+    const sibling = try tilemap_scan.tsxImageKey(alloc, "tilesets/Overworld.tsx", "img/o.png", .posix);
     defer alloc.free(sibling);
     try testing.expectEqualStrings("tilesets/img/o.png", sibling);
 
     // `..` collapses against the reference's directory.
-    const up = try tilemap_scan.tsxImageKey(alloc, "tilesets/Overworld.tsx", "../images/o.png");
+    const up = try tilemap_scan.tsxImageKey(alloc, "tilesets/Overworld.tsx", "../images/o.png", .posix);
     defer alloc.free(up);
     try testing.expectEqualStrings("images/o.png", up);
 
     // A leading `..` that cannot be popped survives (the `.tsx` lives above
     // the map).
-    const above = try tilemap_scan.tsxImageKey(alloc, "../shared/Overworld.tsx", "./o.png");
+    const above = try tilemap_scan.tsxImageKey(alloc, "../shared/Overworld.tsx", "./o.png", .posix);
     defer alloc.free(above);
     try testing.expectEqualStrings("../shared/o.png", above);
 
     // An absolute image path passes straight through.
-    const abs = try tilemap_scan.tsxImageKey(alloc, "tilesets/Overworld.tsx", "/abs/o.png");
+    const abs = try tilemap_scan.tsxImageKey(alloc, "tilesets/Overworld.tsx", "/abs/o.png", .posix);
     defer alloc.free(abs);
     try testing.expectEqualStrings("/abs/o.png", abs);
 }
@@ -457,7 +471,7 @@ test "collect follows an external .tsx: map + .tsx + the image the .tsx names" {
     const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(target_dir);
 
-    const regs = try tilemap_scan.collect(testing.allocator, target_dir, &.{"level"});
+    const regs = try collectTsx(target_dir, &.{"level"});
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
     try testing.expectEqual(@as(usize, 3), regs.len);
@@ -496,7 +510,7 @@ test "collect rebases a .tsx image key when the .tsx sits in its own dir" {
     const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(target_dir);
 
-    const regs = try tilemap_scan.collect(testing.allocator, target_dir, &.{"level"});
+    const regs = try collectTsx(target_dir, &.{"level"});
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
     try testing.expectEqual(@as(usize, 3), regs.len);
@@ -539,8 +553,7 @@ test "collect handles the wonderdot layout: map in Extras/, tileset in tilesets/
     const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(target_dir);
 
-    const regs = try tilemap_scan.collect(
-        testing.allocator,
+    const regs = try collectTsx(
         target_dir,
         &.{ "Extras/Scenes", "Extras/GuideExamples" },
     );
@@ -574,7 +587,7 @@ test "collect embeds a .tsx shared by several maps exactly once" {
     const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(target_dir);
 
-    const regs = try tilemap_scan.collect(testing.allocator, target_dir, &.{ "a", "b", "a" });
+    const regs = try collectTsx(target_dir, &.{ "a", "b", "a" });
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
     // a.tmx, b.tmx, terrain.tsx (once), tiles.png (once).
@@ -607,7 +620,7 @@ test "collect mixes an inline tileset and an external one in the same map" {
     const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(target_dir);
 
-    const regs = try tilemap_scan.collect(testing.allocator, target_dir, &.{"level"});
+    const regs = try collectTsx(target_dir, &.{"level"});
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
     try testing.expectEqual(@as(usize, 4), regs.len);
@@ -629,7 +642,7 @@ test "collect errors clearly when the referenced .tsx is missing" {
 
     try testing.expectError(
         error.ExternalTilesetNotFound,
-        tilemap_scan.collect(testing.allocator, target_dir, &.{"level"}),
+        collectTsx(target_dir, &.{"level"}),
     );
 }
 
@@ -652,7 +665,7 @@ test "collect hard-errors on a .tsx that chains to another .tsx" {
 
     try testing.expectError(
         error.ExternalTilesetUnsupported,
-        tilemap_scan.collect(testing.allocator, target_dir, &.{"level"}),
+        collectTsx(target_dir, &.{"level"}),
     );
 }
 
@@ -673,7 +686,7 @@ test "collect hard-errors when one .tsx key resolves to two different files" {
 
     try testing.expectError(
         error.TilemapKeyCollision,
-        tilemap_scan.collect(testing.allocator, target_dir, &.{ "maps/a", "other/b" }),
+        collectTsx(target_dir, &.{ "maps/a", "other/b" }),
     );
 }
 
@@ -693,8 +706,146 @@ test "collect hard-errors when a .tmx asset_name collides with a .tsx key" {
 
     try testing.expectError(
         error.TilemapKeyCollision,
-        tilemap_scan.collect(testing.allocator, target_dir, &.{ "level", "terrain.tsx" }),
+        collectTsx(target_dir, &.{ "level", "terrain.tsx" }),
     );
+}
+
+// ── Engine-version gate (labelle-engine#834) ─────────────────────────────
+
+test "collect REJECTS an external .tsx under an engine that cannot resolve one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Everything is on disk and scannable — the ONLY reason to refuse is the
+    // pinned engine. Its `tilemap_runtime.initInPlace` calls gfx with no
+    // `tsx_resolver`, so the embedded `.tsx` would never be consulted and the
+    // map would fail to decode at RUNTIME (a warn line, and nothing drawn).
+    // A generate-time error is the strictly better failure.
+    try writeFileAbs(tmp.dir, "assets/level.tmx", external_tmx);
+    try writeFileAbs(tmp.dir, "assets/terrain.tsx", terrain_tsx);
+    try writeFileAbs(tmp.dir, "assets/tiles.png", fake_png);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    try testing.expectError(
+        error.EngineTooOldForExternalTilesets,
+        tilemap_scan.collectWithOptions(testing.allocator, target_dir, &.{"level"}, .{
+            .engine_version = "2.11.0",
+        }),
+    );
+
+    // Plain `collect` defaults to the curated pin, so it must refuse too
+    // until that pin reaches MIN_ENGINE_FOR_EXTERNAL_TILESETS — a caller that
+    // forgets to thread `engine_version` gets the safe answer, not silence.
+    if (config.engineFeatureSupport(config.ENGINE_VERSION, tilemap_scan.MIN_ENGINE_FOR_EXTERNAL_TILESETS) == .no) {
+        try testing.expectError(
+            error.EngineTooOldForExternalTilesets,
+            tilemap_scan.collect(testing.allocator, target_dir, &.{"level"}),
+        );
+    }
+}
+
+test "the engine gate leaves INLINE-tileset maps alone" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The gate is about external references only: a map whose tilesets are
+    // inline decodes on every engine that ever supported embedded tilemaps.
+    try writeFileAbs(tmp.dir, "assets/level.tmx", minimal_tmx);
+    try writeFileAbs(tmp.dir, "assets/tiles.png", fake_png);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_scan.collectWithOptions(testing.allocator, target_dir, &.{"level"}, .{
+        .engine_version = "1.75.0",
+    });
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+    try testing.expectEqual(@as(usize, 2), regs.len);
+}
+
+test "the engine gate passes a non-release pin (dev override) through" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A `local:` path or branch pin is a deliberate dev setup — quite possibly
+    // the one developing labelle-engine#834 — so it must not be hard-rejected
+    // (it does get a loud "cannot verify" note on stderr).
+    try writeFileAbs(tmp.dir, "assets/level.tmx", external_tmx);
+    try writeFileAbs(tmp.dir, "assets/terrain.tsx", terrain_tsx);
+    try writeFileAbs(tmp.dir, "assets/tiles.png", fake_png);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_scan.collectWithOptions(testing.allocator, target_dir, &.{"level"}, .{
+        .engine_version = "local:../labelle-engine",
+    });
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+    try testing.expectEqual(@as(usize, 3), regs.len);
+}
+
+// ── Windows separators (codex P2 on #684) ────────────────────────────────
+
+test "tsxImageKey reads `\\` as a separator only in windows mode" {
+    const alloc = testing.allocator;
+
+    // gfx calls `std.fs.path.dirname`, which is separator-set-dependent:
+    // `dirnameWindows` sees `tilesets`, `dirnamePosix` sees no directory at
+    // all and gfx then leaves the `.tsx`'s image source untouched.
+    const win = try tilemap_scan.tsxImageKey(alloc, "tilesets\\terrain.tsx", "tiles.png", .windows);
+    defer alloc.free(win);
+    try testing.expectEqualStrings("tilesets/tiles.png", win);
+
+    const posix = try tilemap_scan.tsxImageKey(alloc, "tilesets\\terrain.tsx", "tiles.png", .posix);
+    defer alloc.free(posix);
+    try testing.expectEqualStrings("tiles.png", posix);
+
+    // A `/` reference — what Tiled actually writes — reads identically in
+    // both modes, so the common case never produces a second key.
+    const fwd_win = try tilemap_scan.tsxImageKey(alloc, "tilesets/terrain.tsx", "tiles.png", .windows);
+    defer alloc.free(fwd_win);
+    const fwd_posix = try tilemap_scan.tsxImageKey(alloc, "tilesets/terrain.tsx", "tiles.png", .posix);
+    defer alloc.free(fwd_posix);
+    try testing.expectEqualStrings("tilesets/tiles.png", fwd_win);
+    try testing.expectEqualStrings("tilesets/tiles.png", fwd_posix);
+}
+
+test "collect registers BOTH readings of a backslash .tsx reference" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A Windows-authored map. Which key the engine's `ImageProvider.get` asks
+    // for depends on the BUILD TARGET's `std.fs.path.dirname` — chosen after
+    // generation — so both readings are registered against the same bytes.
+    const tmx =
+        \\<map version="1.10" width="3" height="2" tilewidth="16" tileheight="16">
+        \\ <tileset firstgid="1" source="tilesets\terrain.tsx"/>
+        \\</map>
+    ;
+    try writeFileAbs(tmp.dir, "assets/level.tmx", tmx);
+    try writeFileAbs(tmp.dir, "assets/tilesets/terrain.tsx", terrain_tsx);
+    try writeFileAbs(tmp.dir, "assets/tilesets/tiles.png", fake_png);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try collectTsx(target_dir, &.{"level"});
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    try testing.expectEqual(@as(usize, 4), regs.len);
+    // The `.tsx` key stays VERBATIM — gfx hands `tsx_resolver.resolve` the
+    // attribute exactly as written, with no separator interpretation at all.
+    try testing.expectEqualStrings("tilesets\\terrain.tsx", regs[1].key);
+    try testing.expectEqualStrings("assets/tilesets/terrain.tsx", regs[1].embed_path);
+    // POSIX reading: no dirname, image source kept raw.
+    try testing.expectEqualStrings("tiles.png", regs[2].key);
+    // Windows reading: rebased through `tilesets`.
+    try testing.expectEqualStrings("tilesets/tiles.png", regs[3].key);
+    // One file behind both keys.
+    try testing.expectEqualStrings("assets/tilesets/tiles.png", regs[2].embed_path);
+    try testing.expectEqualStrings("assets/tilesets/tiles.png", regs[3].embed_path);
 }
 
 test "emitTilemapRegistrations spells the .tsx resolver entry like any other" {
@@ -902,6 +1053,7 @@ test "collectRegistrations embeds a GAME-ROOT prefab's Tilemap (.tmx + image)" {
         &.{}, // no script-declared components
         &.{"room"}, // game-root prefab stems
         &.{}, // no packs
+        config.ENGINE_VERSION, // curated pin; these maps are inline-tileset only
     );
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
@@ -941,6 +1093,7 @@ test "collectRegistrations embeds a PACK prefab's Tilemap" {
         &.{}, // no script-declared components
         &.{}, // no game-root prefabs
         &.{pack},
+        config.ENGINE_VERSION, // curated pin; these maps are inline-tileset only
     );
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
@@ -975,6 +1128,7 @@ test "collectRegistrations: a PROJECT `Tilemap` component skips the built-in emb
         &.{}, // no script-declared components
         &.{},
         &.{},
+        config.ENGINE_VERSION, // curated pin; these maps are inline-tileset only
     );
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
@@ -1008,6 +1162,7 @@ test "collectRegistrations: a SCRIPT-DECLARED `Tilemap` component skips the buil
         &declared_components, // script declares `Tilemap`
         &.{},
         &.{},
+        config.ENGINE_VERSION, // curated pin; these maps are inline-tileset only
     );
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
@@ -1051,6 +1206,7 @@ test "collectRegistrations: a pack's namespaced `Tilemap` does NOT suppress the 
         &.{}, // no script-declared components
         &.{},
         &.{pack}, // pack ships a (namespaced) Tilemap — must not suppress
+        config.ENGINE_VERSION, // curated pin; these maps are inline-tileset only
     );
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
@@ -1087,6 +1243,7 @@ test "collectRegistrations embeds BOTH a scene and a prefab tilemap" {
         &.{}, // no script-declared components
         &.{"room"},
         &.{},
+        config.ENGINE_VERSION, // curated pin; these maps are inline-tileset only
     );
     defer tilemap_scan.freeRegistrations(testing.allocator, regs);
 
