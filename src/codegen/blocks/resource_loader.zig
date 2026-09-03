@@ -13,16 +13,16 @@
 //! know how the underlying `Game.*FromMemory` calls are spelled.
 //!
 //! Pure emit: no allocations, no template state beyond the writer.
-//! Depends on `idents.extWithoutDot` (asset ext sans the dot, matches
-//! the engine's `file_type` contract) — `isValidZigIdentifier` is
-//! validated upstream by `validateResources`, so this module just
-//! interpolates the name into the generated source.
+//! Depends on `idents.lowerExtWithoutDot` (asset ext sans the dot,
+//! lower-cased into a caller-owned buffer — the engine's `file_type`
+//! contract) — `isValidZigIdentifier` is validated upstream by
+//! `validateResources`, so this module just interpolates the name into
+//! the generated source.
 
 const config = @import("../../config.zig");
 const idents = @import("../idents.zig");
 
 const ResourceDef = config.ResourceDef;
-const extWithoutDot = idents.extWithoutDot;
 const lowerExtWithoutDot = idents.lowerExtWithoutDot;
 
 /// Wrapper style for `emitResourceLoad`. The two callers differ only
@@ -139,7 +139,17 @@ pub fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
         },
         .sound => {
             const fn_name = if (is_lazy) "registerSoundFromMemory" else "loadSoundFromMemory";
-            const ext = extWithoutDot(res.sound);
+            // LOWER-CASED on the way out (#680). Extension validation is
+            // case-insensitive, so `audio/Track.WAV` is a legal
+            // declaration, but the `file_type` contract is the lower-case
+            // extension — and the shared decoder dispatches on it with
+            // `std.mem.eql` (`labelle-audio/src/decode.zig`), so an
+            // emitted `"WAV"` reaches the runtime as
+            // `error.AudioUnsupportedFormat`. The `@embedFile` path keeps
+            // its on-disk spelling; only the type string is normalised.
+            // 8 bytes covers every accepted extension ("wav" / "ogg").
+            var ext_buf: [8]u8 = undefined;
+            const ext = lowerExtWithoutDot(&ext_buf, res.sound);
             switch (style) {
                 .try_style => try w.print(
                     "    try g.{s}(\"{s}\", \"{s}\", @embedFile(\"{s}\"));\n",
@@ -153,7 +163,14 @@ pub fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
         },
         .font => {
             const fn_name = if (is_lazy) "registerFontFromMemory" else "loadFontFromMemory";
-            const ext = extWithoutDot(res.font);
+            // Same normalisation as the sound arm (#680): `fonts/Font.TTF`
+            // validates but must emit `"ttf"`. Both in-tree `decodeFont`
+            // implementations discard `file_type` today, so this half is
+            // contract hygiene rather than an observable runtime fix —
+            // but the generated source is the contract's only witness.
+            // 8 bytes covers "ttf" / "otf".
+            var ext_buf: [8]u8 = undefined;
+            const ext = lowerExtWithoutDot(&ext_buf, res.font);
             const params = res.font_params orelse config.FontBakeParams{};
             // Materialise FontBakeParams locally so the slice field has
             // a real address to point at. The trailing const sits in

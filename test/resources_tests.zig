@@ -401,6 +401,55 @@ pub const RESOURCE_EMISSION = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadFontFromMemory(\"default_font\", \"otf\"") != null);
     }
 
+    test "sound file_type is lower-cased regardless of the path's casing (#680)" {
+        // Extension validation is case-insensitive (`std.ascii.eqlIgnoreCase`
+        // in `codegen/validate.zig`), so `audio/Track.WAV` is a legal
+        // declaration — but the `file_type` contract is the LOWER-CASE
+        // extension. The shared decoder dispatches with
+        // `std.mem.eql(u8, file_type, "wav")` (labelle-audio
+        // `src/decode.zig`), so an emitted "WAV" fails at runtime with
+        // `error.AudioUnsupportedFormat`.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "track", .sound = "audio/Track.WAV", .lazy = false },
+                .{ .name = "shout", .sound = "audio/Shout.Ogg", .lazy = true },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // The PATH keeps its on-disk spelling — only the file_type is
+        // normalised, or the generated `@embedFile` would not resolve.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadSoundFromMemory(\"track\", \"wav\", @embedFile(\"audio/Track.WAV\"))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerSoundFromMemory(\"shout\", \"ogg\", @embedFile(\"audio/Shout.Ogg\"))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"WAV\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"Ogg\"") == null);
+    }
+
+    test "font file_type is lower-cased regardless of the path's casing (#680)" {
+        // Same contract as the sound arm. Both in-tree `decodeFont`
+        // implementations discard `file_type` today, so this one is about
+        // keeping the generated source honest to the documented contract
+        // rather than fixing an observable runtime failure.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "ui_font", .font = "fonts/Font.TTF", .lazy = false },
+                .{ .name = "alt_font", .font = "fonts/Alt.Otf", .lazy = true },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "loadFontFromMemory(\"ui_font\", \"ttf\", @embedFile(\"fonts/Font.TTF\"), &ui_font_params)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "registerFontFromMemory(\"alt_font\", \"otf\", @embedFile(\"fonts/Alt.Otf\"), &alt_font_params)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"TTF\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "\"Otf\"") == null);
+    }
+
     test "mixed resources emit one call per kind, in declared order" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
