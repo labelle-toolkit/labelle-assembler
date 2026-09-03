@@ -407,6 +407,49 @@ test "scaffold pins real fetchable framework versions — #159 regression" {
     try std.testing.expect(config.isSemverVersion(cfg.gfx_version));
 }
 
+/// `a >= b` on two semver strings, for the curated-trio floor guard below.
+/// Both sides are `build.zig` literals, so a malformed one is a bug in the
+/// pins themselves — assert rather than silently pass.
+fn pinAtLeast(pin: []const u8, floor: []const u8) bool {
+    const p = std.SemanticVersion.parse(pin) catch unreachable;
+    const f = std.SemanticVersion.parse(floor) catch unreachable;
+    return p.order(f) != .lt;
+}
+
+test "scaffold pins a MUTUALLY COMPATIBLE trio — #679 regression" {
+    // The curated core/engine/gfx defaults in `build.zig` are what every
+    // fresh `labelle init` stamps, so an incoherent trio fails `labelle
+    // build` before the user has written a line of code. The CI
+    // `curated-set` job compiles the real thing; this test is the cheap,
+    // hermetic half — it encodes the cross-package floors so a one-package
+    // bump cannot land green and be caught only on a cold user machine.
+    //
+    // #679: gfx >= 1.30.0 re-exports `core.TextureId` rather than declaring
+    // its own (labelle-gfx#328). That type landed in core 1.28.0, and the
+    // assembler unifies every package onto the project's `core_version` —
+    // so gfx 1.30.x against core < 1.28.0 dies inside the dependency with
+    // "root source file struct 'root' has no member named 'TextureId'".
+    // Engine >= 2.12.1 is the matching half (`game.nativeTextureId`
+    // compiles against the typed gfx surface, labelle-engine#813 phase 4).
+    //
+    // Earlier floors kept: engine >= 2.11.0 needs core >= 1.27.0
+    // (allocator-taking `ChildrenComponent`, labelle-core#65/#66).
+    //
+    // Read from `config.*_VERSION` (the build options), NOT from a
+    // scaffolded file, so `-Dcore_version=` overrides are checked too.
+    try std.testing.expect(config.isSemverVersion(config.CORE_VERSION));
+    try std.testing.expect(config.isSemverVersion(config.ENGINE_VERSION));
+    try std.testing.expect(config.isSemverVersion(config.GFX_VERSION));
+
+    if (pinAtLeast(config.GFX_VERSION, "1.30.0")) {
+        try std.testing.expect(pinAtLeast(config.CORE_VERSION, "1.28.0"));
+        try std.testing.expect(pinAtLeast(config.ENGINE_VERSION, "2.12.1"));
+    }
+    if (pinAtLeast(config.ENGINE_VERSION, "2.11.0")) {
+        try std.testing.expect(pinAtLeast(config.CORE_VERSION, "1.27.0"));
+    }
+}
+
 test "scaffold emits flat-form scenes — RFC #594 / engine #592 regression" {
     // Lock in "new projects start clean" for the v2.0 unified-format
     // foundation. The four legacy patterns `labelle audit unification`
