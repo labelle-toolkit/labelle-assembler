@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     // workflow used to stamp the ASSEMBLER tag into this (and the trio),
     // scaffolding nonsense pins like `labelle_version = "0.91.0"`
     // (labelle-cli#322); release builds no longer override any of these.
-    const cli_version: []const u8 = b.option([]const u8, "cli_version", "CLI version string") orelse "1.59.0";
+    const cli_version: []const u8 = b.option([]const u8, "cli_version", "CLI version string") orelse "1.61.2";
     // Framework version defaults stamped into a freshly scaffolded
     // project.labelle by `init`. These MUST be real, fetchable release
     // versions — a fresh project has to build out of the box. They used to
@@ -18,17 +18,46 @@ pub fn build(b: *std.Build) void {
     // fetcher then mapped to a bogus `vdev` git ref (issue #159).
     // Keep this trio a MUTUALLY COMPATIBLE set: a fresh `labelle init` resolves
     // these defaults, so a mismatch fails `labelle build` before any user code.
-    // Set verified end-to-end (init → generate → full compile) for
-    // core 1.27.0 / engine 2.11.0 / gfx 1.29.0 with cli 1.59.0. engine
-    // v2.11.0 floors core >= 1.27.0 (core's `ChildrenComponent` went
-    // allocator-taking, labelle-core#65/#66) and gfx >= 1.28.0 — the trio
-    // agrees. (v0.96.0 bumped engine 2.7.0 → 2.11.0 while leaving core at
-    // 1.26.0, so every fresh `labelle init` scaffold failed to compile.)
+    // Set verified end-to-end (init → install → generate → full compile, on
+    // both the raylib_desktop and null_desktop targets, against the published
+    // release tarballs) for core 1.28.0 / engine 2.12.2 / gfx 1.30.1 with
+    // cli 1.61.2 — which is exactly `labelle-cli` v1.61.2's `versions.zon`,
+    // the set its own `labelle upgrade all` writes. Keep the two in step: when
+    // they drift, `init` scaffolds a project the very next `upgrade` rewrites.
+    //
+    // The hard floor inside the trio (#679): gfx >= 1.30.0 re-exports
+    // `core.TextureId` instead of declaring its own (labelle-gfx#328,
+    // RFC-TEXTURE-ID-TYPING), and that type landed in core 1.28.0. The
+    // assembler unifies every package onto the PROJECT's `core_version`, so a
+    // gfx 1.30.x pin against core < 1.28.0 dies in the dependency itself:
+    //   labelle-gfx/src/types.zig:41:27: error: root source file struct
+    //   'root' has no member named 'TextureId'
+    // Engine >= 2.12.1 is the matching half (`game.nativeTextureId` compiles
+    // against the typed gfx surface, labelle-engine#813 phase 4).
+    //
+    // core 1.x + engine 2.x is the SUPPORTED pairing, not a mismatch: core has
+    // never published a 2.x, and engine v2.0.0 was a break in its own scene
+    // loader. See labelle-cli#358, which fixed the check that claimed
+    // otherwise. Earlier floors still hold: engine >= 2.11.0 needs
+    // core >= 1.27.0 (allocator-taking `ChildrenComponent`,
+    // labelle-core#65/#66) — a real module dependency, so an older core
+    // fails to compile — and gfx >= 1.28.0 for the post-fx driver. That
+    // second one is a CURATED floor, not a compile break: the engine takes
+    // no direct gfx dependency (the renderer arrives via `RenderImpl`) and
+    // its post-fx passthrough is `@hasDecl`-gated, so an older gfx
+    // "compiles to a no-op" (labelle-engine `src/game/post_fx_mixin.zig`)
+    // — it BUILDS, and silently drops the post-fx stack. A curated set has
+    // to be coherent, not merely compilable, so the trio test asserts it.
+    //
+    // (v0.96.0 bumped engine 2.7.0 → 2.11.0 while leaving core at 1.26.0, so
+    // every fresh `labelle init` scaffold failed to compile.)
     // Bump all three together when moving the engine default (their
-    // build.zig.zon pins/floors must agree — read them from the tags).
-    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.27.0";
-    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.11.0";
-    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.29.0";
+    // build.zig.zon pins/floors must agree — read them from the tags), and
+    // keep `src/init_cmd.zig`'s "scaffold pins a MUTUALLY COMPATIBLE trio"
+    // test satisfied — it encodes the floors below as assertions.
+    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.28.0";
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.12.2";
+    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.30.1";
     // Version this assembler binary stamps into a freshly scaffolded
     // project.labelle's `assembler_version` field.
     //
