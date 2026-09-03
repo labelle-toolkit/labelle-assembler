@@ -186,3 +186,24 @@ test "eventVariantName: takes the basename of a subdir-prefixed path" {
     try std.testing.expectEqualStrings("foo", eventVariantName("subdir/foo"));
     try std.testing.expectEqualStrings("foo", eventVariantName("a/b/foo.zig"));
 }
+
+test "lowerExtWithoutDot: lower-cases an upper-case extension" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("wav", lowerExtWithoutDot(&buf, "audio/Track.WAV"));
+    try std.testing.expectEqualStrings("ttf", lowerExtWithoutDot(&buf, "fonts/Font.TTF"));
+    try std.testing.expectEqualStrings("ogg", lowerExtWithoutDot(&buf, "audio/Shout.Ogg"));
+}
+
+test "lowerExtWithoutDot: already-lower-case and extension-less paths" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("wav", lowerExtWithoutDot(&buf, "audio/track.wav"));
+    try std.testing.expectEqualStrings("", lowerExtWithoutDot(&buf, "audio/track"));
+    try std.testing.expectEqualStrings("", lowerExtWithoutDot(&buf, "audio/track."));
+}
+
+test "lowerExtWithoutDot: falls back to the raw extension when buf is too small" {
+    // Documented escape hatch — no accepted extension is this long, so
+    // no real call site reaches it, but the helper must not overrun.
+    var buf: [2]u8 = undefined;
+    try std.testing.expectEqualStrings("JPEG", lowerExtWithoutDot(&buf, "art/Photo.JPEG"));
+}
