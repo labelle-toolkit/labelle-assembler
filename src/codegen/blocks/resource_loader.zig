@@ -23,6 +23,7 @@ const idents = @import("../idents.zig");
 
 const ResourceDef = config.ResourceDef;
 const extWithoutDot = idents.extWithoutDot;
+const lowerExtWithoutDot = idents.lowerExtWithoutDot;
 
 /// Wrapper style for `emitResourceLoad`. The two callers differ only
 /// in how they propagate load failures:
@@ -49,6 +50,12 @@ pub const LoadStyle = enum { try_style, catch_panic_style };
 ///   registration IS the whole contract. `AssetAlreadyRegistered` is
 ///   swallowed, matching every engine-side `register*FromMemory` shim,
 ///   so a name some other path already registered is not a hard failure.
+///   That suppression is only safe because the DECLARED names are proven
+///   unique first: `validateResources` rejects two resources sharing a
+///   name (`error.DuplicateResourceName`) over the MERGED game+pack list,
+///   before any emission. Without that pass a duplicate would leave the
+///   first image registered, drop the second, and silently resolve every
+///   `acquire` to the wrong asset (coderabbit, #676).
 ///
 ///   EAGER here means "start decoding at init", not "block until
 ///   decoded". The engine's blocking helper (`loadAssetIfNeededInternal`)
@@ -93,13 +100,22 @@ pub fn emitResourceLoad(w: anytype, res: ResourceDef, style: LoadStyle) !void {
             }
         },
         .image => {
-            // Loose PNG (#675). `file_type` carries the LEADING DOT — the
-            // same spelling the atlas arm passes ("`.png`"), which is what
-            // raylib's `LoadImageFromMemory` expects and what every other
-            // backend's `decodeImage` is written against. Derived from the
-            // declared path rather than hard-coded so a `.astc` / `.rgba`
-            // sibling pointed at directly still reports its real type.
-            const ext = extWithoutDot(res.image);
+            // Loose image (#675). `file_type` carries the LEADING DOT —
+            // the same spelling the atlas arm passes ("`.png`"), which is
+            // what raylib's `LoadImageFromMemory` expects and what every
+            // other backend's `decodeImage` is written against. Derived
+            // from the declared path rather than hard-coded so a `.astc` /
+            // `.rgba` sibling pointed at directly still reports its real
+            // type.
+            //
+            // LOWER-CASED on the way out: extension validation is
+            // case-insensitive, so `assets/Logo.PNG` is a legal
+            // declaration, but the `file_type` contract is the lower-case
+            // extension — emitting `".PNG"` would hand a case-sensitive
+            // `decodeImage` a type it does not recognise. 8 bytes covers
+            // every accepted extension (longest is `"jpeg"`).
+            var ext_buf: [8]u8 = undefined;
+            const ext = lowerExtWithoutDot(&ext_buf, res.image);
             switch (style) {
                 .try_style => {
                     try w.print(

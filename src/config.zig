@@ -430,9 +430,15 @@ pub const FontBakeParams = struct {
 /// font → `loadFontFromMemory`.
 pub const ResourceKind = enum {
     atlas,
-    /// Loose single PNG — no TexturePacker manifest, no sub-rects. Feeds
-    /// the engine's `Image` component (`labelle-engine/src/image_component.zig`)
-    /// through the `AssetCatalog` `image` loader. See `ResourceDef.image`.
+    /// A single LOOSE image file — no TexturePacker manifest, no
+    /// sub-rects. Typically a `.png`, but codegen validation accepts
+    /// any format the bundled backends' `decodeImage` handles
+    /// (`.png`/`.jpg`/`.jpeg`/`.bmp`/`.tga`) plus the toolkit's two
+    /// pre-converted containers (`.astc`, `.rgba`); the declared
+    /// extension is what the emitted `file_type` reports. Feeds the
+    /// engine's `Image` component
+    /// (`labelle-engine/src/image_component.zig`) through the
+    /// `AssetCatalog` `image` loader. See `ResourceDef.image`.
     image,
     sound,
     font,
@@ -450,8 +456,9 @@ pub const ResourceValidationError = enum {
     no_path,
     /// More than one of `.json`+`.texture` / `.image` / `.sound` /
     /// `.font` set on the same entry. A resource is exactly one asset
-    /// kind — in particular `.image` is the LOOSE-PNG form and must
-    /// not be combined with the atlas pair.
+    /// kind — in particular `.image` is the LOOSE-IMAGE form (a single
+    /// image file, no manifest) and must not be combined with the
+    /// atlas pair.
     multiple_paths,
     /// Atlas is half-declared: one of `.json` / `.texture` is set
     /// but not the other. Both are required for an atlas resource.
@@ -469,8 +476,10 @@ pub const ResourceDef = struct {
     json: []const u8 = "",
     texture: []const u8 = "",
 
-    // ── Image (#675). A LOOSE image file — one PNG, no TexturePacker
-    // manifest, no sub-rects. Registered straight onto the engine's
+    // ── Image (#675). A LOOSE image file — one image, no TexturePacker
+    // manifest, no sub-rects. `.png` is the common case; validation
+    // also accepts `.jpg`/`.jpeg`/`.bmp`/`.tga` and the pre-converted
+    // `.astc`/`.rgba` containers. Registered straight onto the engine's
     // `AssetCatalog` under `LoaderKind.image`, which is what the
     // engine's `Image` component
     // (`labelle-engine/src/image_component.zig`) resolves its `name`
@@ -479,7 +488,7 @@ pub const ResourceDef = struct {
     // the exact workaround `Image` was added to remove.
     //
     // Mutually exclusive with `.json`/`.texture` (that pair is the
-    // atlas form of the same PNG), `.sound` and `.font`.
+    // atlas form of the same texture), `.sound` and `.font`.
     image: []const u8 = "",
 
     // ── Sound (Phase 4, #447). `.wav` / `.ogg` path relative to the

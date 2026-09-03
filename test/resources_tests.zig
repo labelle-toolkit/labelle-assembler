@@ -233,6 +233,80 @@ pub const RESOURCE_EMISSION = struct {
         try std.testing.expectError(error.UnsupportedResourceExtension, result);
     }
 
+    test "image resource lower-cases the emitted file_type (#675, copilot #676)" {
+        // Extension validation is case-insensitive, so `Logo.PNG` is a
+        // legal declaration — but the `file_type` contract is the
+        // LOWER-CASE extension. Emitting ".PNG" would hand a
+        // case-sensitive backend `decodeImage` a type it doesn't match.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "logo", .image = "assets/Logo.PNG", .lazy = true },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.assets.register(\"logo\", .image, \".png\", @embedFile(\"assets/Logo.PNG\"))") != null);
+        // The PATH keeps its on-disk spelling — only the file_type is
+        // normalised, or the generated `@embedFile` would not resolve.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "\".PNG\"") == null);
+    }
+
+    test "validation rejects two image resources sharing a name (#675, coderabbit #676)" {
+        // The name is the asset-catalog key. The generated
+        // registration swallows `AssetAlreadyRegistered`, so a
+        // duplicate would silently keep the FIRST image and resolve
+        // every `acquire` to the wrong asset — reject before emission.
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "logo", .image = "assets/logo.png", .lazy = false },
+                .{ .name = "logo", .image = "assets/logo_alt.png", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        try std.testing.expectError(error.DuplicateResourceName, result);
+    }
+
+    test "validation rejects a duplicate name across resource kinds (#676)" {
+        // Same catalog key, different kinds — an atlas and a loose
+        // image both named "hero". Equally silent at runtime, equally
+        // rejected. Also covers the game-vs-pack shape: a merged
+        // `<pack>__<name>` entry is just another entry in this list.
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "hero", .json = "assets/hero.json", .texture = "assets/hero.png", .lazy = false },
+                .{ .name = "hero", .image = "assets/hero_portrait.png", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        try std.testing.expectError(error.DuplicateResourceName, result);
+    }
+
+    test "distinct resource names with the same path are fine (#676)" {
+        // The duplicate check keys on NAME, not path — two resources
+        // pointing at one file is unusual but harmless (two catalog
+        // entries, two registrations, no collision).
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "logo", .image = "assets/logo.png", .lazy = true },
+                .{ .name = "logo_hud", .image = "assets/logo.png", .lazy = true },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.assets.register(\"logo\", .image,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.assets.register(\"logo_hud\", .image,") != null);
+    }
+
     test "validation rejects `.image` mixed with the atlas pair (#675)" {
         const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
