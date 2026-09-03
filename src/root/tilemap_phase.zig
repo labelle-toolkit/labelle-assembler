@@ -53,8 +53,10 @@ const PackScan = scan.PackScan;
 /// key is rewritten to the namespaced `<pack>__Tilemap` when `scanPack` stages
 /// the prefab, so only genuine engine-built-in `Tilemap` refs survive the scan
 /// of a pack prefab; a pack shipping its own `Tilemap` therefore embeds no
-/// `.tmx` for it. Genuinely-unsupported cases the scanner already rejects
-/// (external `.tsx` tilesets #563, key collisions) still fail loud in
+/// `.tmx` for it. External `.tsx` tilesets are now FOLLOWED and embedded
+/// alongside the map (#678, completing gfx#336) rather than rejected;
+/// genuinely-unsupported cases the scanner still rejects (a `.tsx` chaining to
+/// another `.tsx`, a missing `.tsx`, key collisions) fail loud in
 /// `tilemap_scan.collect`.
 pub fn collectRegistrations(
     allocator: std.mem.Allocator,

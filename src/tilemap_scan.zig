@@ -8,11 +8,31 @@
 //!   `game.addEmbeddedTilemapAsset(name, bytes)`  (game/tilemap_mixin.zig)
 //!
 //! populated by the assembler-generated `init()`. The SAME registry is
-//! keyed by two kinds of name:
+//! keyed by three kinds of name:
 //!
-//!   1. the scene's `asset_name` → the raw `.tmx` document bytes, and
+//!   1. the scene's `asset_name` → the raw `.tmx` document bytes,
 //!   2. each tileset's `image_source` (the exact `<image source="...">`
-//!      string as it appears in the `.tmx`) → that image's raw bytes.
+//!      string as it appears in the `.tmx`) → that image's raw bytes, and
+//!   3. each external `<tileset source="...">` reference (the exact string
+//!      as written in the `.tmx`) → that `.tsx` document's raw bytes
+//!      (labelle-assembler#678, completing labelle-gfx#336).
+//!
+//! **External tilesets (`.tsx`).** gfx#336 gave the TMX loader a
+//! `LoadOptions.tsx_resolver` seam: `resolve(source)` is called with the
+//! `source` attribute EXACTLY as written in the `.tmx` — never joined onto
+//! a base path — and returns the `.tsx` XML bytes. The engine backs that
+//! resolver with the very registry `addEmbeddedTilemapAsset` populates, so
+//! embedding a `.tsx` under its verbatim `source` string is the whole of
+//! the wiring: the generated `init()` call IS the resolver's table entry.
+//! Get that key wrong and the resolver silently claims nothing.
+//!
+//! The `<image source>` INSIDE a `.tsx` needs a second translation. It is
+//! relative to the `.tsx`'s own directory, which need not be the map's, so
+//! gfx rebases it through `joinRelative(dirname(source), image_source)`
+//! before storing it on the decoded `Tileset` — and the engine's
+//! `ImageProvider.get` is then called with that REBASED string. The
+//! registry key for such an image is therefore the rebased value
+//! (`tsxImageKey` here), not the raw one the `.tsx` carries.
 //!
 //! The engine decodes the `.tmx` via gfx's
 //! `TileMap.loadFromMemoryWithBasePath(alloc, bytes, "")` and, for every
@@ -35,7 +55,10 @@
 //! verbatim `asset_name` — that is what the scene declares and the engine
 //! looks up. Each tileset `image_source` is resolved relative to its
 //! `.tmx`'s directory to form the `@embedFile` path, while the registry
-//! key stays the verbatim `image_source`.
+//! key stays the verbatim `image_source`. An external `<tileset source>`
+//! resolves the same way (relative to the `.tmx`) for its `@embedFile`
+//! path; the `.tsx`'s OWN `<image source>` resolves relative to the
+//! `.tsx`'s directory instead.
 
 const std = @import("std");
 const config = @import("config.zig");
@@ -56,7 +79,12 @@ pub const Registration = struct {
 
 pub const Error = error{
     TilemapAssetNotFound,
+    /// An external `<tileset source="…tsx">` named a file that is not on
+    /// disk under the linked `assets/` tree (#678).
+    ExternalTilesetNotFound,
     TilemapKeyCollision,
+    /// A shape gfx's loader itself refuses — today: a `.tsx` whose root
+    /// `<tileset>` only points at ANOTHER `.tsx`.
     ExternalTilesetUnsupported,
 } || std.mem.Allocator.Error;
 
@@ -210,8 +238,10 @@ pub fn extractImageSources(allocator: std.mem.Allocator, tmx: []const u8) ![][]c
 /// an inline `<image>` — or null when every tileset is inline. The opening
 /// `<tileset …>` tag of an inline tileset has NO `source` attribute (that
 /// lives on the inner `<image>`), so a `source` on the tileset element is
-/// the external marker. Minimal-T2 embeds inline tilesets only; `collect`
-/// fails loud on an external one (assembler#563).
+/// the external marker. `collect` now FOLLOWS external references
+/// (assembler#678); this stays as the cheap "is there any" probe, and is what
+/// detects a `.tsx` that chains to another `.tsx` (which gfx refuses).
+/// See `extractExternalTilesets` for the full, ordered list.
 pub fn firstExternalTileset(tmx: []const u8) ?[]const u8 {
     var search: usize = 0;
     while (indexOfTagSkippingComments(tmx, search, "<tileset")) |tag_start| {
@@ -222,6 +252,94 @@ pub fn firstExternalTileset(tmx: []const u8) ?[]const u8 {
         search = tag_end + 1;
     }
     return null;
+}
+
+/// Every external `<tileset ... source="...">` reference in `tmx`, in
+/// document order, as VERBATIM attribute-value bytes. This is the string
+/// gfx's `LoadOptions.tsx_resolver.resolve` is handed — the reference as
+/// written, NOT joined onto any base path — so it is the registry key the
+/// `.tsx` bytes must be embedded under. Returns owned dupes; duplicates
+/// within one map are returned as-is (`collect` dedups by key).
+pub fn extractExternalTilesets(allocator: std.mem.Allocator, tmx: []const u8) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |s| allocator.free(s);
+        out.deinit(allocator);
+    }
+
+    var search: usize = 0;
+    while (indexOfTagSkippingComments(tmx, search, "<tileset")) |tag_start| {
+        const tag_end = std.mem.indexOfPos(u8, tmx, tag_start, ">") orelse tmx.len;
+        const tag = tmx[tag_start..tag_end];
+        if (attrValue(tag, "source")) |src| {
+            try out.append(allocator, try allocator.dupe(u8, src));
+        }
+        if (tag_end >= tmx.len) break;
+        search = tag_end + 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// The registry KEY under which a `.tsx`'s own `<image source>` must be
+/// embedded — i.e. what the engine's `ImageProvider.get` will be called
+/// with for a tileset that came from an external reference.
+///
+/// This MUST mirror gfx's `resolveExternalTileset` byte-for-byte
+/// (labelle-gfx#336): after parsing the `.tsx` it rewrites
+/// `tileset.image_source` to `joinRelative(dirname(tsx_source),
+/// image_source)` — rebasing the `.tsx`-relative path onto the MAP's
+/// directory — but ONLY when the reference has a directory component. A
+/// bare `source="Overworld.tsx"` has no dirname, so the image source stays
+/// exactly as the `.tsx` wrote it (`"../Sheet.png"` and all).
+///
+/// **Separators.** gfx calls `std.fs.path.dirname`, and Tiled writes `/`
+/// in a `.tsx` reference on every host, so a `/`-only reading is faithful
+/// on the platforms that matter; a backslash-only reference has no dirname
+/// under POSIX and the raw path is kept — matching a POSIX runtime. Caller
+/// owns the result.
+pub fn tsxImageKey(
+    allocator: std.mem.Allocator,
+    tsx_source: []const u8,
+    image_source: []const u8,
+) ![]u8 {
+    const idx = std.mem.lastIndexOfScalar(u8, tsx_source, '/') orelse
+        return allocator.dupe(u8, image_source);
+    return joinRelative(allocator, tsx_source[0..idx], image_source);
+}
+
+/// Port of gfx#336's `joinRelative`: join `dir` (relative to the map) with
+/// `rel` (relative to `dir`), collapsing `.`/`..` so the result stays
+/// relative to the MAP's directory. Purely textual — the value is a
+/// catalog lookup key as much as a path, so it must not depend on the
+/// process cwd. A leading `..` survives; an absolute `rel` passes through.
+fn joinRelative(allocator: std.mem.Allocator, dir: []const u8, rel: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(rel)) return allocator.dupe(u8, rel);
+    const absolute = std.fs.path.isAbsolute(dir);
+
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(allocator);
+
+    for ([_][]const u8{ dir, rel }) |path| {
+        var it = std.mem.tokenizeAny(u8, path, "/\\");
+        while (it.next()) |part| {
+            if (std.mem.eql(u8, part, ".")) continue;
+            if (std.mem.eql(u8, part, "..")) {
+                if (parts.items.len > 0 and !std.mem.eql(u8, parts.items[parts.items.len - 1], "..")) {
+                    _ = parts.pop();
+                    continue;
+                }
+                // The root is its own parent: `/a/../..` stays `/`.
+                if (absolute) continue;
+            }
+            try parts.append(allocator, part);
+        }
+    }
+
+    const joined = try std.mem.join(allocator, "/", parts.items);
+    if (!absolute) return joined;
+    defer allocator.free(joined);
+    return std.mem.concat(allocator, u8, &.{ "/", joined });
 }
 
 /// Find the next occurrence of `needle` in `tmx` at or after `from` that is
@@ -287,12 +405,21 @@ fn isXmlSpace(c: u8) bool {
 /// For each unique `asset_name`: registers the `.tmx` (key = `asset_name`,
 /// embed = `assets/<asset_name>.tmx`), reads that `.tmx` from
 /// `<target_dir>/<embed>`, and registers each unique tileset image
-/// (key = XML-decoded `image_source`, embed = image path relative to the
-/// `.tmx`). A tileset image shared by two maps — or a repeated `asset_name`
-/// — emits once. Hard errors: a `.tmx` key colliding with an image key, or
-/// the same image key resolving to two different files (`TilemapKeyCollision`);
-/// an external `<tileset source="*.tsx">` (`ExternalTilesetUnsupported`,
-/// assembler#563); a missing `.tmx` (`TilemapAssetNotFound`).
+/// (key = verbatim `image_source`, embed = image path relative to the
+/// `.tmx`).
+///
+/// External tilesets (#678) are FOLLOWED, not rejected: each
+/// `<tileset source="X.tsx">` registers the `.tsx` bytes under the verbatim
+/// `source` (the key gfx#336's `tsx_resolver` looks up) and the image the
+/// `.tsx` names under `tsxImageKey(source, image_source)` (the rebased value
+/// gfx stores on the decoded tileset). A `.tsx` — or a tileset image — shared
+/// by two maps, or a repeated `asset_name`, emits once.
+///
+/// Hard errors: a `.tmx` key colliding with a tileset-asset key, or the same
+/// key resolving to two different files (`TilemapKeyCollision`); a missing
+/// `.tmx` (`TilemapAssetNotFound`); a missing `.tsx`
+/// (`ExternalTilesetNotFound`); a `.tsx` chaining to another `.tsx`
+/// (`ExternalTilesetUnsupported`, which gfx's loader itself refuses).
 ///
 /// Caller frees via `freeRegistrations`.
 pub fn collect(
@@ -309,22 +436,24 @@ pub fn collect(
         regs.deinit(allocator);
     }
 
-    // The `.tmx` documents and the tileset images share ONE engine registry
-    // (`addEmbeddedTilemapAsset`), so keys that collide would silently
-    // overwrite each other — the runtime would then hand the wrong bytes to
-    // whichever lost. Guard three ways:
-    //   - a `.tmx` key equal to an image key (ACROSS spaces) → hard error;
-    //   - the SAME image key resolving to DIFFERENT embed paths (e.g. two
-    //     maps in different dirs both referencing `source="tiles.png"`) →
-    //     hard error (the second would otherwise silently reuse the first's
-    //     bytes). `img_seen` therefore maps key → resolved embed path so a
-    //     same-key-DIFFERENT-path clash is caught; same-key-same-path stays
-    //     a benign dedup;
+    // The `.tmx` documents, the tileset images AND the external `.tsx`
+    // documents share ONE engine registry (`addEmbeddedTilemapAsset`), so
+    // keys that collide would silently overwrite each other — the runtime
+    // would then hand the wrong bytes to whichever lost. Guard three ways
+    // (see `registerAsset`):
+    //   - a `.tmx` key equal to a tileset-asset key (ACROSS spaces) → hard
+    //     error;
+    //   - the SAME tileset-asset key resolving to DIFFERENT embed paths (e.g.
+    //     two maps in different dirs both referencing `source="tiles.png"` or
+    //     `source="Terrain.tsx"`) → hard error. `asset_seen` therefore maps
+    //     key → resolved embed path so a same-key-DIFFERENT-path clash is
+    //     caught; same-key-same-path stays a benign dedup (which is also how
+    //     one `.tsx` shared by many maps embeds exactly once);
     //   - a repeated `.tmx` `asset_name` (SAME space) → benign dedup.
     var tmx_seen = std.StringHashMap(void).init(allocator);
     defer tmx_seen.deinit();
-    var img_seen = std.StringHashMap([]const u8).init(allocator);
-    defer img_seen.deinit();
+    var asset_seen = std.StringHashMap([]const u8).init(allocator);
+    defer asset_seen.deinit();
 
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
@@ -337,18 +466,18 @@ pub fn collect(
         // that map — a project with many large maps never retains more than
         // one map's buffers at once. Registrations + `*_seen` keys are copied
         // into `regs` (program-lifetime) before those per-map buffers free.
-        try processMap(allocator, target_dir, io, cwd, asset_name, &regs, &tmx_seen, &img_seen);
+        try processMap(allocator, target_dir, io, cwd, asset_name, &regs, &tmx_seen, &asset_seen);
     }
 
     return regs.toOwnedSlice(allocator);
 }
 
-/// Read + scan ONE `.tmx`, appending its `.tmx` + tileset-image registrations
-/// to `regs` and recording their keys in `tmx_seen` / `img_seen`. The `.tmx`
-/// byte buffer and the extracted `image_source` slice are freed on return
-/// (per-map lifetime); everything appended to `regs` is dup'd first, so it
-/// safely outlives this frame. Errors propagate to `collect`, whose errdefer
-/// frees `regs`.
+/// Read + scan ONE `.tmx`, appending its `.tmx`, tileset-image, external
+/// `.tsx` and `.tsx`-image registrations to `regs` and recording their keys
+/// in `tmx_seen` / `asset_seen`. The `.tmx` byte buffer and the extracted
+/// slices are freed on return (per-map lifetime); everything appended to
+/// `regs` is dup'd first, so it safely outlives this frame. Errors propagate
+/// to `collect`, whose errdefer frees `regs`.
 fn processMap(
     allocator: std.mem.Allocator,
     target_dir: []const u8,
@@ -357,14 +486,15 @@ fn processMap(
     asset_name: []const u8,
     regs: *std.ArrayList(Registration),
     tmx_seen: *std.StringHashMap(void),
-    img_seen: *std.StringHashMap([]const u8),
+    asset_seen: *std.StringHashMap([]const u8),
 ) Error!void {
-    // Cross-space collision: a tileset image already claimed this key.
-    if (img_seen.contains(asset_name)) {
+    // Cross-space collision: a tileset asset already claimed this key.
+    if (asset_seen.contains(asset_name)) {
         stderrPrint(
             "labelle-assembler: tilemap key collision on '{s}' — a scene's Tilemap\n" ++
-                "  `asset_name` matches a tileset `<image source>` already embedded. Both share the\n" ++
-                "  engine's single tilemap registry; rename the `.tmx` asset or the tileset image.\n",
+                "  `asset_name` matches a tileset asset (`<image source>` / `.tsx`) already\n" ++
+                "  embedded. Both share the engine's single tilemap registry; rename the `.tmx`\n" ++
+                "  asset or the tileset asset.\n",
             .{asset_name},
         );
         return error.TilemapKeyCollision;
@@ -373,40 +503,19 @@ fn processMap(
     const tmx_embed = try tmxEmbedPath(allocator, asset_name);
     // From here `tmx_embed` is freed explicitly on every failure path until
     // it is handed to `regs` — no `errdefer` (which would linger across the
-    // later image loop and double-free with the outer one).
+    // later loops and double-free with the outer one).
 
-    const disk_path = std.fs.path.join(allocator, &.{ target_dir, tmx_embed }) catch |err| {
-        allocator.free(tmx_embed);
-        return err;
-    };
-    defer allocator.free(disk_path);
-
-    const tmx_bytes = cwd.readFileAlloc(io, disk_path, allocator, .limited(8 * 1024 * 1024)) catch |err| {
+    const tmx_bytes = readAsset(allocator, io, cwd, target_dir, tmx_embed) catch |err| {
         stderrPrint(
-            "labelle-assembler: tilemap asset '{s}' -> '{s}' could not be read: {s}\n" ++
+            "labelle-assembler: tilemap asset '{s}' -> '{s}/{s}' could not be read: {s}\n" ++
                 "  A scene declares a Tilemap referencing this asset; place the map at\n" ++
                 "  '<project>/{s}' (T2 tilemap path convention).\n",
-            .{ asset_name, disk_path, @errorName(err), tmx_embed },
+            .{ asset_name, target_dir, tmx_embed, @errorName(err), tmx_embed },
         );
         allocator.free(tmx_embed);
-        return error.TilemapAssetNotFound;
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.TilemapAssetNotFound;
     };
     defer allocator.free(tmx_bytes);
-
-    // External `<tileset source="*.tsx">` isn't embedded in minimal-T2:
-    // gfx's loader returns error.ExternalTilesetUnsupported for it under
-    // the embedded base_path, so the map would fail at runtime. Fail loud
-    // now with the offending `.tsx` named (assembler#563).
-    if (firstExternalTileset(tmx_bytes)) |tsx| {
-        stderrPrint(
-            "labelle-assembler: tilemap '{s}' uses an external tileset '{s}' (<tileset source=...>),\n" ++
-                "  which is not supported yet (minimal-T2 embeds inline tilesets only). Inline the\n" ++
-                "  tileset in the .tmx, or track external-tileset support at labelle-assembler#563.\n",
-            .{ asset_name, tsx },
-        );
-        allocator.free(tmx_embed); // not yet handed to `regs`
-        return error.ExternalTilesetUnsupported;
-    }
 
     // Append the `.tmx` registration; once it is in `regs` the outer errdefer
     // owns both strings, so later failures free them exactly once.
@@ -420,64 +529,198 @@ fn processMap(
         return err;
     };
     // Store the DUPED key (owned by `regs`) in `tmx_seen`, not the borrowed
-    // `asset_name` — uniform with the image side and robust if the caller
+    // `asset_name` — uniform with the asset side and robust if the caller
     // frees `asset_names` early.
     try tmx_seen.put(tmx_key, {});
 
-    const images = try extractImageSources(allocator, tmx_bytes);
+    // ── Inline tilesets: `<image source>` relative to the `.tmx` ──
+    {
+        const images = try extractImageSources(allocator, tmx_bytes);
+        defer {
+            for (images) |s| allocator.free(s);
+            allocator.free(images);
+        }
+
+        for (images) |image_source| {
+            const img_embed = try imageEmbedPath(allocator, tmx_embed, image_source);
+            _ = try registerAsset(allocator, regs, tmx_seen, asset_seen, image_source, img_embed, .image);
+        }
+    }
+
+    // ── External tilesets: the `.tsx` bytes + the image the `.tsx` names ──
+    // (labelle-assembler#678, completing labelle-gfx#336.)
+    const sources = try extractExternalTilesets(allocator, tmx_bytes);
+    defer {
+        for (sources) |s| allocator.free(s);
+        allocator.free(sources);
+    }
+
+    for (sources) |source| {
+        // The `@embedFile` path: the reference resolved against the MAP's
+        // directory. The registry KEY stays the verbatim `source` — that is
+        // what gfx hands `tsx_resolver.resolve`.
+        const tsx_embed = try imageEmbedPath(allocator, tmx_embed, source);
+
+        // Dedup FIRST: the same `.tsx` shared by several maps (the common
+        // Tiled arrangement) must be read, scanned and embedded exactly
+        // once. A benign dedup also means its image is already registered.
+        if (!try registerAsset(allocator, regs, tmx_seen, asset_seen, source, tsx_embed, .tileset)) continue;
+        // `tsx_embed` now belongs to `regs`; the BUFFER stays put across any
+        // list growth, so borrowing it below is safe for this frame.
+
+        try processExternalTileset(allocator, target_dir, io, cwd, asset_name, source, tsx_embed, regs, tmx_seen, asset_seen);
+    }
+}
+
+/// Read the `.tsx` named by `source` (already registered by the caller) and
+/// embed the image it references. Split out of `processMap` so the `.tsx`
+/// byte buffer frees per-reference rather than accumulating across a map's
+/// tilesets.
+fn processExternalTileset(
+    allocator: std.mem.Allocator,
+    target_dir: []const u8,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    asset_name: []const u8,
+    source: []const u8,
+    /// The `@embedFile`-relative path `source` resolved to — BORROWED from
+    /// the registration `processMap` just appended.
+    tsx_embed: []const u8,
+    regs: *std.ArrayList(Registration),
+    tmx_seen: *std.StringHashMap(void),
+    asset_seen: *std.StringHashMap([]const u8),
+) Error!void {
+    const tsx_bytes = readAsset(allocator, io, cwd, target_dir, tsx_embed) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        stderrPrint(
+            "labelle-assembler: tilemap '{s}' references the external tileset '{s}', which\n" ++
+                "  resolves to '{s}/{s}' — not readable: {s}\n" ++
+                "  Tiled stores a shared tileset next to (or above) the map; copy the `.tsx`\n" ++
+                "  into the project's `assets/` tree so it can be embedded.\n",
+            .{ asset_name, source, target_dir, tsx_embed, @errorName(err) },
+        );
+        return error.ExternalTilesetNotFound;
+    };
+    defer allocator.free(tsx_bytes);
+
+    // A `.tsx` whose root `<tileset>` only points at ANOTHER `.tsx` is not
+    // something Tiled writes, and gfx#336 refuses to chase the chain
+    // (`error.ExternalTilesetUnsupported`) — so embedding the chain would
+    // ship bytes the runtime can never use. Fail loud here instead.
+    if (firstExternalTileset(tsx_bytes)) |nested| {
+        stderrPrint(
+            "labelle-assembler: external tileset '{s}' (via tilemap '{s}') itself references\n" ++
+                "  another tileset '{s}'. gfx's TMX loader does not follow a `.tsx` chain, so the\n" ++
+                "  map could not load at runtime. Point the `.tmx` at the real tileset instead.\n",
+            .{ source, asset_name, nested },
+        );
+        return error.ExternalTilesetUnsupported;
+    }
+
+    const images = try extractImageSources(allocator, tsx_bytes);
     defer {
         for (images) |s| allocator.free(s);
         allocator.free(images);
     }
 
     for (images) |image_source| {
-        // Cross-space collision: a `.tmx` already claimed this key.
-        if (tmx_seen.contains(image_source)) {
+        // PATH: relative to the `.tsx`'s OWN directory (which need not be
+        // the map's — the whole point of #678 step 3).
+        const img_embed = try imageEmbedPath(allocator, tsx_embed, image_source);
+        // KEY: what gfx rebases `image_source` to before the engine's
+        // `ImageProvider.get` sees it.
+        const key = tsxImageKey(allocator, source, image_source) catch |err| {
+            allocator.free(img_embed);
+            return err;
+        };
+        defer allocator.free(key);
+        _ = try registerAsset(allocator, regs, tmx_seen, asset_seen, key, img_embed, .image);
+    }
+}
+
+/// Read `<target_dir>/<rel>` (a `/`-separated, `@embedFile`-style path).
+fn readAsset(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: std.Io.Dir,
+    target_dir: []const u8,
+    rel: []const u8,
+) ![]u8 {
+    const disk_path = try std.fs.path.join(allocator, &.{ target_dir, rel });
+    defer allocator.free(disk_path);
+    return cwd.readFileAlloc(io, disk_path, allocator, .limited(8 * 1024 * 1024));
+}
+
+/// What a non-`.tmx` registration is, for diagnostics only.
+const AssetKind = enum { image, tileset };
+
+/// Append one tileset-side registration (`key` → `embed_path`), applying the
+/// shared-registry rules. Returns true when a NEW registration was appended,
+/// false on a benign dedup (same key, same resolved file).
+///
+/// Takes OWNERSHIP of `embed_path`: it is either handed to `regs` or freed
+/// here. `key` is BORROWED and dup'd on append.
+///
+/// Three guards, all because the `.tmx` documents, tileset images and `.tsx`
+/// documents share ONE engine registry (`addEmbeddedTilemapAsset`):
+///   - a key equal to a `.tmx` `asset_name` → hard error;
+///   - the SAME key resolving to a DIFFERENT file → hard error (the second
+///     would otherwise silently reuse the first's bytes);
+///   - the same key resolving to the SAME file → benign dedup.
+fn registerAsset(
+    allocator: std.mem.Allocator,
+    regs: *std.ArrayList(Registration),
+    tmx_seen: *std.StringHashMap(void),
+    asset_seen: *std.StringHashMap([]const u8),
+    key: []const u8,
+    embed_path: []u8,
+    kind: AssetKind,
+) Error!bool {
+    const what = switch (kind) {
+        .image => "a tileset `<image source>`",
+        .tileset => "an external `<tileset source>` (.tsx)",
+    };
+
+    // Cross-space collision: a `.tmx` already claimed this key.
+    if (tmx_seen.contains(key)) {
+        stderrPrint(
+            "labelle-assembler: tilemap key collision on '{s}' — {s} matches a scene's\n" ++
+                "  Tilemap `asset_name` already embedded. Both share the engine's single tilemap\n" ++
+                "  registry; rename the tileset asset or the `.tmx` asset.\n",
+            .{ key, what },
+        );
+        allocator.free(embed_path);
+        return error.TilemapKeyCollision;
+    }
+
+    if (asset_seen.get(key)) |existing_path| {
+        if (!std.mem.eql(u8, existing_path, embed_path)) {
             stderrPrint(
-                "labelle-assembler: tilemap key collision on '{s}' — a tileset `<image source>`\n" ++
-                    "  matches a scene's Tilemap `asset_name` already embedded. Both share the engine's\n" ++
-                    "  single tilemap registry; rename the tileset image or the `.tmx` asset.\n",
-                .{image_source},
+                "labelle-assembler: tilemap asset key collision on '{s}' — two tilesets resolve it\n" ++
+                    "  to different files ('{s}' vs '{s}'), but the engine keys {s} by the bare\n" ++
+                    "  source string. Give them distinct source names.\n",
+                .{ key, existing_path, embed_path, what },
             );
+            allocator.free(embed_path);
             return error.TilemapKeyCollision;
         }
-
-        // Resolve the embed path up front so a same-key dedup can compare
-        // the RESOLVED path, not just the key.
-        const img_embed = try imageEmbedPath(allocator, tmx_embed, image_source);
-
-        if (img_seen.get(image_source)) |existing_path| {
-            // Same registry key seen before. If it resolves to the SAME file
-            // it's a benign dedup; a DIFFERENT file under the same key would
-            // make the runtime hand the wrong bytes — hard error.
-            if (!std.mem.eql(u8, existing_path, img_embed)) {
-                stderrPrint(
-                    "labelle-assembler: tilemap image key collision on '{s}' — two tilesets resolve it\n" ++
-                        "  to different files ('{s}' vs '{s}'), but the engine keys images by the bare\n" ++
-                        "  `<image source>` string. Give the images distinct source names.\n",
-                    .{ image_source, existing_path, img_embed },
-                );
-                allocator.free(img_embed);
-                return error.TilemapKeyCollision;
-            }
-            allocator.free(img_embed);
-            continue;
-        }
-
-        const key = allocator.dupe(u8, image_source) catch |err| {
-            allocator.free(img_embed);
-            return err;
-        };
-        regs.append(allocator, .{ .key = key, .embed_path = img_embed }) catch |err| {
-            allocator.free(key);
-            allocator.free(img_embed);
-            return err;
-        };
-        // Store the DUPED key + its resolved path (both owned by `regs`) so
-        // later dedup lookups never read freed memory and can compare paths.
-        // `key` is the registration's key; `img_embed` its path.
-        try img_seen.put(key, img_embed);
+        allocator.free(embed_path);
+        return false;
     }
+
+    const owned_key = allocator.dupe(u8, key) catch |err| {
+        allocator.free(embed_path);
+        return err;
+    };
+    regs.append(allocator, .{ .key = owned_key, .embed_path = embed_path }) catch |err| {
+        allocator.free(owned_key);
+        allocator.free(embed_path);
+        return err;
+    };
+    // Store the DUPED key + its resolved path (both owned by `regs`) so later
+    // dedup lookups never read freed memory and can compare paths.
+    try asset_seen.put(owned_key, embed_path);
+    return true;
 }
 
 pub fn freeRegistrations(allocator: std.mem.Allocator, regs: []const Registration) void {
