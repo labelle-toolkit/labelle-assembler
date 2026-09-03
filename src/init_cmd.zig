@@ -252,11 +252,11 @@ pub fn scaffold(allocator: std.mem.Allocator, io: std.Io, opts: InitOptions) !vo
         cwd.writeFile(io, .{
             .sub_path = path,
             .data =
-                \\{
-                \\    "name": "main",
-                \\    "children": []
-                \\}
-                \\
+            \\{
+            \\    "name": "main",
+            \\    "children": []
+            \\}
+            \\
             ,
             .flags = .{ .exclusive = true },
         }) catch |err| switch (err) {
@@ -407,13 +407,82 @@ test "scaffold pins real fetchable framework versions — #159 regression" {
     try std.testing.expect(config.isSemverVersion(cfg.gfx_version));
 }
 
-/// `a >= b` on two semver strings, for the curated-trio floor guard below.
-/// Both sides are `build.zig` literals, so a malformed one is a bug in the
-/// pins themselves — assert rather than silently pass.
-fn pinAtLeast(pin: []const u8, floor: []const u8) bool {
-    const p = std.SemanticVersion.parse(pin) catch unreachable;
-    const f = std.SemanticVersion.parse(floor) catch unreachable;
+/// Parse a release-shaped version pin into a `std.SemanticVersion`.
+///
+/// The pins reaching `checkTrioFloors` are NOT all `build.zig` literals —
+/// `config.*_VERSION` carries any `-D*_version=` override — so this cannot
+/// assume the strict `X.Y.Z` form `std.SemanticVersion.parse` demands.
+/// `config.isSemverVersion` (digits-and-dots, >= 1 dot) also admits the
+/// abbreviated `X.Y` release form, which the rest of the version-resolution
+/// code accepts: `scene_manifest.engineSupportsTargetOverrides` normalizes
+/// it by appending `.0`, and this does the same rather than inventing a
+/// second convention.
+///
+/// A dotted string that is still unparsable after padding (`1.2.3.4`, which
+/// `isSemverVersion` also admits) returns `error.UnparsableVersionPin` with
+/// the offending value named — a readable test failure instead of the
+/// `catch unreachable` crash this used to take (#683 review).
+fn parsePin(version: []const u8) error{UnparsableVersionPin}!std.SemanticVersion {
+    if (std.SemanticVersion.parse(version)) |v| return v else |_| {}
+    var buf: [64]u8 = undefined;
+    const padded = std.fmt.bufPrint(&buf, "{s}.0", .{version}) catch {
+        std.debug.print("version pin '{s}' is too long to normalize\n", .{version});
+        return error.UnparsableVersionPin;
+    };
+    return std.SemanticVersion.parse(padded) catch {
+        std.debug.print(
+            "version pin '{s}' is not a usable release version (want `X.Y.Z` or `X.Y`)\n",
+            .{version},
+        );
+        return error.UnparsableVersionPin;
+    };
+}
+
+/// `pin >= floor` on two release-shaped version strings, for the
+/// curated-trio floor guard below.
+fn pinAtLeast(pin: []const u8, floor: []const u8) error{UnparsableVersionPin}!bool {
+    const p = try parsePin(pin);
+    const f = try parsePin(floor);
     return p.order(f) != .lt;
+}
+
+/// The cross-package floors the curated trio must satisfy, as a pure
+/// function of the three pins so the rules can be exercised against
+/// synthetic trios (see the table test below) and not only against
+/// whatever `build.zig` currently defaults to.
+///
+/// #679: gfx >= 1.30.0 re-exports `core.TextureId` rather than declaring
+/// its own (labelle-gfx#328). That type landed in core 1.28.0, and the
+/// assembler unifies every package onto the project's `core_version` — so
+/// gfx 1.30.x against core < 1.28.0 dies inside the dependency with
+/// "root source file struct 'root' has no member named 'TextureId'".
+/// Engine >= 2.12.1 is the matching half (`game.nativeTextureId` compiles
+/// against the typed gfx surface, labelle-engine#813 phase 4).
+///
+/// engine >= 2.11.0 floors core >= 1.27.0: core's `ChildrenComponent` went
+/// ArrayList-backed and `addChild` takes an allocator (labelle-core#65/#66),
+/// and the engine takes a REAL module dependency on core — an older core
+/// fails to compile.
+///
+/// engine >= 2.11.0 also floors gfx >= 1.28.0, but that one is a CURATED
+/// floor, not a compile break: the engine module takes no direct gfx
+/// dependency (the renderer arrives via `RenderImpl`), and its post-fx
+/// passthrough is `@hasDecl`-gated — labelle-engine `src/game/post_fx_mixin.zig`
+/// says in so many words that "an older gfx (< v1.28.0) … compiles to a
+/// no-op". So the pairing BUILDS; it just silently drops the post-fx stack
+/// the engine advertises. A curated set is what `labelle init` stamps and
+/// `upgrade all` writes, so it must be the coherent set, not merely one
+/// that compiles — hence the assertion, with the distinction recorded here
+/// so nobody later "fixes" a legitimate compile failure by relaxing it.
+fn checkTrioFloors(core_version: []const u8, engine_version: []const u8, gfx_version: []const u8) !void {
+    if (try pinAtLeast(gfx_version, "1.30.0")) {
+        try std.testing.expect(try pinAtLeast(core_version, "1.28.0"));
+        try std.testing.expect(try pinAtLeast(engine_version, "2.12.1"));
+    }
+    if (try pinAtLeast(engine_version, "2.11.0")) {
+        try std.testing.expect(try pinAtLeast(core_version, "1.27.0"));
+        try std.testing.expect(try pinAtLeast(gfx_version, "1.28.0"));
+    }
 }
 
 test "scaffold pins a MUTUALLY COMPATIBLE trio — #679 regression" {
@@ -424,32 +493,54 @@ test "scaffold pins a MUTUALLY COMPATIBLE trio — #679 regression" {
     // hermetic half — it encodes the cross-package floors so a one-package
     // bump cannot land green and be caught only on a cold user machine.
     //
-    // #679: gfx >= 1.30.0 re-exports `core.TextureId` rather than declaring
-    // its own (labelle-gfx#328). That type landed in core 1.28.0, and the
-    // assembler unifies every package onto the project's `core_version` —
-    // so gfx 1.30.x against core < 1.28.0 dies inside the dependency with
-    // "root source file struct 'root' has no member named 'TextureId'".
-    // Engine >= 2.12.1 is the matching half (`game.nativeTextureId`
-    // compiles against the typed gfx surface, labelle-engine#813 phase 4).
-    //
-    // Earlier floors kept: engine >= 2.11.0 needs core >= 1.27.0
-    // (allocator-taking `ChildrenComponent`, labelle-core#65/#66).
-    //
     // Read from `config.*_VERSION` (the build options), NOT from a
     // scaffolded file, so `-Dcore_version=` overrides are checked too.
+    // See `checkTrioFloors` for what each floor is and why.
     try std.testing.expect(config.isSemverVersion(config.CORE_VERSION));
     try std.testing.expect(config.isSemverVersion(config.ENGINE_VERSION));
     try std.testing.expect(config.isSemverVersion(config.GFX_VERSION));
 
-    if (pinAtLeast(config.GFX_VERSION, "1.30.0")) {
-        try std.testing.expect(pinAtLeast(config.CORE_VERSION, "1.28.0"));
-        try std.testing.expect(pinAtLeast(config.ENGINE_VERSION, "2.12.1"));
-    }
-    if (pinAtLeast(config.ENGINE_VERSION, "2.11.0")) {
-        try std.testing.expect(pinAtLeast(config.CORE_VERSION, "1.27.0"));
-    }
+    try checkTrioFloors(config.CORE_VERSION, config.ENGINE_VERSION, config.GFX_VERSION);
 }
 
+test "curated-trio floors reject each incoherent combination — #683 review" {
+    // The floors themselves, against synthetic trios: the test above can
+    // only ever see whatever `build.zig` defaults to today, so without
+    // these a floor could be silently dropped and still go green.
+    try checkTrioFloors("1.28.0", "2.12.2", "1.30.1"); // the current curated set
+
+    // gfx >= 1.30.0 needs core >= 1.28.0 and engine >= 2.12.1.
+    try std.testing.expectError(error.TestUnexpectedResult, checkTrioFloors("1.27.0", "2.12.2", "1.30.1"));
+    try std.testing.expectError(error.TestUnexpectedResult, checkTrioFloors("1.28.0", "2.12.0", "1.30.1"));
+
+    // engine >= 2.11.0 needs core >= 1.27.0 and gfx >= 1.28.0. The gfx half
+    // is the floor #683 review found missing: this trio used to pass.
+    try std.testing.expectError(error.TestUnexpectedResult, checkTrioFloors("1.26.0", "2.11.0", "1.29.0"));
+    try std.testing.expectError(error.TestUnexpectedResult, checkTrioFloors("1.27.0", "2.11.0", "1.27.0"));
+
+    // Below every floor, nothing is asserted — old coherent sets stay legal.
+    try checkTrioFloors("1.24.0", "2.7.0", "1.27.0");
+}
+
+test "pinAtLeast normalizes the abbreviated `X.Y` pin form, and names a bad one — #683 review" {
+    // `config.isSemverVersion` admits both of these, so `zig build test
+    // -Dgfx_version=1.30` used to reach `catch unreachable` and crash with
+    // no useful message.
+    try std.testing.expect(config.isSemverVersion("1.30"));
+    try std.testing.expect(try pinAtLeast("1.30", "1.30.0"));
+    try std.testing.expect(try pinAtLeast("1.30", "1.28.0"));
+    try std.testing.expect(!(try pinAtLeast("1.29", "1.30.0")));
+    try std.testing.expect(try pinAtLeast("2.12.2", "2.12"));
+
+    // The dotted non-semver form `isSemverVersion` also admits fails
+    // cleanly rather than trapping.
+    try std.testing.expect(config.isSemverVersion("1.2.3.4"));
+    try std.testing.expectError(error.UnparsableVersionPin, pinAtLeast("1.2.3.4", "1.0.0"));
+    try std.testing.expectError(error.UnparsableVersionPin, pinAtLeast("1.0.0", "1.2.3.4"));
+
+    // And an abbreviated pin flows through the real guard.
+    try checkTrioFloors("1.28", "2.13", "1.30");
+}
 test "scaffold emits flat-form scenes — RFC #594 / engine #592 regression" {
     // Lock in "new projects start clean" for the v2.0 unified-format
     // foundation. The four legacy patterns `labelle audit unification`

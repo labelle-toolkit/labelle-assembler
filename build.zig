@@ -40,13 +40,21 @@ pub fn build(b: *std.Build) void {
     // loader. See labelle-cli#358, which fixed the check that claimed
     // otherwise. Earlier floors still hold: engine >= 2.11.0 needs
     // core >= 1.27.0 (allocator-taking `ChildrenComponent`,
-    // labelle-core#65/#66) and gfx >= 1.28.0 (post-fx driver).
+    // labelle-core#65/#66) — a real module dependency, so an older core
+    // fails to compile — and gfx >= 1.28.0 for the post-fx driver. That
+    // second one is a CURATED floor, not a compile break: the engine takes
+    // no direct gfx dependency (the renderer arrives via `RenderImpl`) and
+    // its post-fx passthrough is `@hasDecl`-gated, so an older gfx
+    // "compiles to a no-op" (labelle-engine `src/game/post_fx_mixin.zig`)
+    // — it BUILDS, and silently drops the post-fx stack. A curated set has
+    // to be coherent, not merely compilable, so the trio test asserts it.
     //
     // (v0.96.0 bumped engine 2.7.0 → 2.11.0 while leaving core at 1.26.0, so
     // every fresh `labelle init` scaffold failed to compile.)
     // Bump all three together when moving the engine default (their
     // build.zig.zon pins/floors must agree — read them from the tags), and
-    // keep the `init` scaffolds a coherent trio test below satisfied.
+    // keep `src/init_cmd.zig`'s "scaffold pins a MUTUALLY COMPATIBLE trio"
+    // test satisfied — it encodes the floors below as assertions.
     const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.28.0";
     const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.12.2";
     const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.30.1";
