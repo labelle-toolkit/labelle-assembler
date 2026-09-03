@@ -1363,6 +1363,69 @@ test "parseProjectConfig: no `.params` in the source is the plain typed parse (b
     try testing.expect(cfg.plugins[0].params_bag == null);
 }
 
+test "parseProjectConfig: a manifest carrying `.prebuild` parses; the assembler still never runs it (#677)" {
+    // The field is SCHEMA ONLY on this side — execution is CLI-owned
+    // (labelle-cli#361). This test pins the shape the CLI writes so the two
+    // schemas cannot drift apart: a mismatch would make a manifest parse in
+    // one tool and fail in the other.
+    const src: [:0]const u8 =
+        \\.{
+        \\    .name = "prebuild-game",
+        \\    .prebuild = .{
+        \\        .{
+        \\            .run = .{ "python3", "tools/gen_tiles.py" },
+        \\            .inputs = .{ "tools/gen_tiles.py", "tools/OverworldTileset.tsx" },
+        \\            .outputs = .{ "assets/out.png", "scripts/tiles_data.zig" },
+        \\        },
+        \\        .{ .run = .{ "make", "shaders" } },
+        \\    },
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cfg = try parseProjectConfig(arena.allocator(), src);
+    try testing.expectEqualStrings("prebuild-game", cfg.name);
+    try testing.expectEqual(@as(usize, 2), cfg.prebuild.len);
+
+    try testing.expectEqual(@as(usize, 2), cfg.prebuild[0].run.len);
+    try testing.expectEqualStrings("python3", cfg.prebuild[0].run[0]);
+    try testing.expectEqualStrings("tools/gen_tiles.py", cfg.prebuild[0].run[1]);
+    try testing.expectEqual(@as(usize, 2), cfg.prebuild[0].inputs.len);
+    try testing.expectEqualStrings("tools/OverworldTileset.tsx", cfg.prebuild[0].inputs[1]);
+    try testing.expectEqual(@as(usize, 2), cfg.prebuild[0].outputs.len);
+    try testing.expectEqualStrings("scripts/tiles_data.zig", cfg.prebuild[0].outputs[1]);
+
+    // Every member defaults to empty — a step may declare `.run` alone.
+    try testing.expectEqualStrings("make", cfg.prebuild[1].run[0]);
+    try testing.expectEqual(@as(usize, 0), cfg.prebuild[1].inputs.len);
+    try testing.expectEqual(@as(usize, 0), cfg.prebuild[1].outputs.len);
+}
+
+test "parseProjectConfig: a manifest WITHOUT `.prebuild` is unchanged — the field defaults empty (#677)" {
+    const src: [:0]const u8 =
+        \\.{ .name = "no-prebuild-game" }
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cfg = try parseProjectConfig(arena.allocator(), src);
+    try testing.expectEqualStrings("no-prebuild-game", cfg.name);
+    try testing.expectEqual(@as(usize, 0), cfg.prebuild.len);
+}
+
+test "parseProjectConfig: `.prebuild` is strict inside — an unknown step key still hard-fails (#677)" {
+    // The addition widens the schema by exactly one field; it does not turn
+    // the manifest parse tolerant.
+    const src: [:0]const u8 =
+        \\.{
+        \\    .name = "typo-step",
+        \\    .prebuild = .{ .{ .run = .{ "make" }, .outpus = .{ "a.png" } } },
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.ParseZon, parseProjectConfig(arena.allocator(), src));
+}
+
 test "parseProjectConfig: strictness outside `.params` is untouched — a typo'd key still hard-fails" {
     const src: [:0]const u8 =
         \\.{

@@ -736,6 +736,48 @@ pub const PostFxPass = union(PostFxKind) {
     crt: struct { curvature: f32 = 0, scanline: f32 = 0, mask: f32 = 0, aberration: f32 = 0 },
 };
 
+/// One `.prebuild` entry in `project.labelle` — a command run BEFORE
+/// generation so a project can declare that an asset or a script is
+/// GENERATED rather than hand-written (sprite atlases, tilemap tables,
+/// localisation tables, shaders).
+///
+/// SCHEMA ONLY — THE ASSEMBLER NEVER READS OR EXECUTES THESE STEPS.
+/// The field exists here purely so the strict manifest parse
+/// (`plugin_params.parseProjectConfig`, `ignore_unknown_fields = false`)
+/// stops rejecting a manifest that declares it. Execution is owned by
+/// `labelle-cli` (`src/cli/prebuild.zig`, labelle-cli#361), and MUST stay
+/// there: only the CLI orchestrates the build, so only the CLI can run a
+/// step *before* it invokes this binary. If you find yourself about to
+/// "finish" this feature in the assembler, you are in the wrong process —
+/// by the time the assembler runs, the moment to regenerate the inputs has
+/// already passed. See labelle-assembler#677.
+///
+/// The shape mirrors the CLI's `PrebuildStep` field-for-field; changing it
+/// on one side only would make a manifest parse in one tool and fail in the
+/// other, which is strictly worse than today's clean rejection.
+///
+/// ```zon
+/// .prebuild = .{
+///     .{
+///         .run = .{ "python3", "tools/gen_tiles.py" },
+///         .inputs = .{ "tools/gen_tiles.py", "tools/OverworldTileset.tsx" },
+///         .outputs = .{ "assets/out.png", "scripts/tiles_data.zig" },
+///     },
+/// },
+/// ```
+pub const PrebuildStep = struct {
+    /// argv, executed verbatim by the CLI: no shell, no env expansion, no
+    /// globbing. `argv[0]` resolves on PATH or as a path relative to the
+    /// project root.
+    run: []const []const u8 = &.{},
+    /// Source files the step reads, relative to the project root. Feeds the
+    /// CLI's mtime staleness check only.
+    inputs: []const []const u8 = &.{},
+    /// Files the step writes, relative to the project root. The CLI skips a
+    /// step when every output exists and is at least as new as every input.
+    outputs: []const []const u8 = &.{},
+};
+
 pub const ProjectConfig = struct {
     name: []const u8,
     description: []const u8 = "",
@@ -829,6 +871,13 @@ pub const ProjectConfig = struct {
     initial_scene: ?[]const u8 = null,
     /// Sprite atlas resources — each entry declares a named atlas with frame data and texture.
     resources: []const ResourceDef = &.{},
+    /// Commands the CLI runs — in declared order, project root as cwd —
+    /// BEFORE it invokes this binary (labelle-cli#361 / #677). Accepted by
+    /// the schema so the strict parse admits the manifest; deliberately
+    /// UNREAD by the assembler — see `PrebuildStep` for why execution
+    /// cannot live in this process. Empty by default: a project without
+    /// `.prebuild` behaves exactly as before.
+    prebuild: []const PrebuildStep = &.{},
     /// Initial post-fx stack, seeded at startup via `g.setPostFx(...)`
     /// (labelle-gfx#305 P2 Slice C). Empty ⇒ no emission. Runtime API on the
     /// engine can still mutate the stack later.
