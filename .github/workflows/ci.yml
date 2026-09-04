@@ -1140,7 +1140,16 @@ jobs:
   # and skip on Windows outright, so a green run here is NOT evidence that
   # the copy-fallback path behaves. Closing that hole needs the tests
   # ported off PosixBlock first; this job is the prerequisite that proves
-  # the suite runs at all on the platform.
+  # the cache modules compile and their runnable tests pass on the platform.
+  #
+  # Scope: `zig build test-cache`, NOT `zig build test`. The full suite is
+  # red on Windows for ~33 PRE-EXISTING failures across the
+  # scripting-splice, panel-validate and pack-check suites — verified by
+  # running this exact job against pristine `main` (PR #698): identical
+  # failure set, 33 for 33, none caused by the cache work. Tracked
+  # separately in #699. A job that is red for unrelated reasons guards
+  # nothing, so this one runs only the modules the cache work touches
+  # (`cache.local`, `cache.disk`, `cache_cmd` — see build.zig).
   cache-windows:
     name: Cache machinery (Windows)
     runs-on: windows-latest
@@ -1172,8 +1181,8 @@ jobs:
       - name: Build
         run: zig build
 
-      - name: Test
-        run: zig build test
+      - name: Test (cache machinery only — see the scope note above)
+        run: zig build test-cache
 
       # `.exe` suffix and no `./` prefix — the POSIX spelling in
       # `build-and-test` does not resolve under PowerShell.
