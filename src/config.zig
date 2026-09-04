@@ -327,7 +327,24 @@ pub const PluginDep = struct {
 
 // ── iOS Configuration ──────────────────────────────────────────────
 
-pub const Orientation = enum { portrait, landscape, all };
+/// Screen-orientation policy for the mobile platforms.
+///
+/// The CLI maps these onto `android:screenOrientation` / the iOS
+/// `UISupportedInterfaceOrientations` plist array; this enum only has to
+/// *parse* — `project.labelle` is parsed strictly, so a value the CLI knows
+/// and the assembler doesn't fails at generate time before the CLI ever sees
+/// it. Both copies must move together (labelle-cli#341/#342).
+pub const Orientation = enum {
+    portrait,
+    /// Android: `"landscape"` — ONE landscape direction; a 180° flip does not
+    /// rotate the game. iOS: both landscape directions (the platforms differ
+    /// here by design). Kept single-direction on Android deliberately.
+    landscape,
+    /// Landscape only, but EITHER direction — Android `"sensorLandscape"`.
+    /// iOS emits the same array as `.landscape`, which already allowed both.
+    sensor_landscape,
+    all,
+};
 
 pub const IosConfig = struct {
     app_name: []const u8 = "",
@@ -1369,4 +1386,43 @@ test "effectiveGamepad: bgfx defaults to .none, other backends to .auto, explici
         try std.testing.expectEqual(GamepadSource.auto, (ProjectConfig{ .name = "g", .backend = tag, .gamepad = .auto }).effectiveGamepad());
         try std.testing.expectEqual(GamepadSource.none, (ProjectConfig{ .name = "g", .backend = tag, .gamepad = .none }).effectiveGamepad());
     }
+}
+
+test "Orientation: every value parses from ZON on BOTH the android and ios blocks (labelle-cli#341)" {
+    // The assembler parses `project.labelle` strictly, so it is the gate: a
+    // value the CLI's manifest emitter understands but this enum lacks fails
+    // at generate time, before the CLI is ever reached. Pin all four on both
+    // structs so the two copies of `Orientation` can't drift apart silently.
+    // Arena, not `std.zon.parse.free`: both structs carry `[]const u8` fields
+    // that default to a static `""`, and freeing those through the testing
+    // allocator aborts on a bad free.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    inline for (.{
+        .{ "portrait", Orientation.portrait },
+        .{ "landscape", Orientation.landscape },
+        .{ "sensor_landscape", Orientation.sensor_landscape },
+        .{ "all", Orientation.all },
+    }) |case| {
+        const src: [:0]const u8 = ".{ .orientation = ." ++ case[0] ++ " }";
+        const android = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, src, null, .{});
+        try std.testing.expectEqual(case[1], android.orientation);
+
+        const ios = try std.zon.parse.fromSliceAlloc(IosConfig, alloc, src, null, .{});
+        try std.testing.expectEqual(case[1], ios.orientation);
+    }
+}
+
+test "Orientation: defaults stay `.all` and an unknown value is a hard parse error" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(Orientation.all, (AndroidConfig{}).orientation);
+    try std.testing.expectEqual(Orientation.all, (IosConfig{}).orientation);
+
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(alloc);
+    try std.testing.expectError(
+        error.ParseZon,
+        std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .orientation = .sensorLandscape }", &diag, .{}),
+    );
 }
