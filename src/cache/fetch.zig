@@ -48,7 +48,10 @@ pub fn fetchFrameworkPackage(allocator: std.mem.Allocator, package: []const u8, 
         return error.UnknownPackage;
     }
 
-    const target = try resolve.resolveFrameworkPackage(allocator, package, version, null);
+    // #688 review: the version-named slot, NOT the context-sensitive build
+    // resolver — `archiveFetch` deletes its target, so resolving through an
+    // active local slot would extract this one release over it.
+    const target = try resolve.frameworkVersionPath(allocator, package, version);
     defer allocator.free(target);
 
     // Map version → ref: a semver version (`1.2.3`) becomes a `v`-prefixed
@@ -62,7 +65,8 @@ pub fn fetchFrameworkPackage(allocator: std.mem.Allocator, package: []const u8, 
 
 /// Fetch a plugin from its source archive at a given version.
 pub fn fetchPlugin(allocator: std.mem.Allocator, plugin: config.PluginDep) !void {
-    const target = try resolve.resolvePlugin(allocator, plugin, null);
+    // #688 review: version-named slot only — see fetchFrameworkPackage.
+    const target = try resolve.pluginVersionPath(allocator, plugin);
     defer allocator.free(target);
 
     const ref = try config.versionToGitRef(allocator, plugin.version);

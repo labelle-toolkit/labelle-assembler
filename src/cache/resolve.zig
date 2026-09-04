@@ -32,6 +32,29 @@ pub fn resolveFrameworkPackage(allocator: std.mem.Allocator, package: []const u8
     return try std.fs.path.join(allocator, &.{ packages_dir, package, version });
 }
 
+/// The version-named slot for a framework package, ignoring any active
+/// local slot.
+///
+/// Remote writers MUST use this rather than `resolveFrameworkPackage`
+/// (#688 review): `archiveFetch` DELETES its target and extracts the
+/// release into it, so handing it the context-sensitive resolver would let
+/// a single-package `install` — run inside the monorepo while an older
+/// still-valid local slot exists — overwrite the reserved slot with one
+/// release, after which every other pin resolved to that release.
+pub fn frameworkVersionPath(allocator: std.mem.Allocator, package: []const u8, version: []const u8) ![]const u8 {
+    const packages_dir = try env.getPackagesDir(allocator);
+    defer allocator.free(packages_dir);
+    return try std.fs.path.join(allocator, &.{ packages_dir, package, version });
+}
+
+/// The version-named slot for a plugin, ignoring any active local slot.
+/// Same contract as `frameworkVersionPath`.
+pub fn pluginVersionPath(allocator: std.mem.Allocator, plugin: config.PluginDep) ![]const u8 {
+    const packages_dir = try env.getPackagesDir(allocator);
+    defer allocator.free(packages_dir);
+    return try std.fs.path.join(allocator, &.{ packages_dir, "plugins", plugin.repo, plugin.version });
+}
+
 /// Resolve an assembler-bundled package (backend, ecs adapter, gui) to its cached path.
 /// Returns an absolute path like: ~/.labelle/packages/assembler/0.3.0/backends/sokol
 /// `project_dir` is used to resolve `local:` paths relative to the project (not CWD).
