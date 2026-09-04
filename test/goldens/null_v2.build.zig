@@ -62,6 +62,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Windows exe icon (labelle-cli#359): compile the assembler-written
+    // app_icon.rc (`1 ICON "app_icon.ico"`) into the binary so Explorer and
+    // the taskbar show the project's app_icon. Windows targets only.
+    if (target.result.os.tag == .windows) {
+        exe.root_module.addWin32ResourceFile(.{ .file = b.path("app_icon.rc") });
+    }
+
     // ── Test step ──────────────────────────────────────────────────
     // Single test compile unit rooted at `__tests_root.zig` (generated
     // by labelle-assembler alongside main.zig). The wrapper imports

@@ -40,6 +40,7 @@ pub const panel_validate = @import("panel_validate.zig");
 const scene_name_lint = @import("scene_name_lint.zig");
 const gui_resolve = @import("gui_resolve.zig");
 pub const app_icon = @import("app_icon.zig");
+pub const ico = @import("ico.zig");
 const scan = @import("codegen/scan.zig");
 const pack_root_gen = @import("codegen/pack_root.zig");
 const idents = @import("codegen/idents.zig");
@@ -89,6 +90,7 @@ test {
     _ = @import("deps_linker.zig");
     _ = @import("backend_registry.zig");
     _ = @import("app_icon.zig");
+    _ = @import("ico.zig");
     _ = @import("flow_catalog.zig");
     _ = @import("manifest.zig");
     _ = @import("codegen/idents.zig");
@@ -148,6 +150,9 @@ pub const main_template = main_zig.main_template;
 /// one directly and callers can name the `scanPack` return type.
 pub const PackScan = main_zig.PackScan;
 pub const generateBuildZig = build_files.generateBuildZig;
+pub const windows_icon_resource_block = build_files.windows_icon_resource_block;
+/// The gated window-icon statement the desktop loop setup emits (labelle-cli#359).
+pub const emitWindowIcon = @import("codegen/lifecycle/loop.zig").emitWindowIcon;
 pub const BuildZigOptions = build_files.BuildZigOptions;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
 pub const deps_linker = build_files.deps_linker;
@@ -892,6 +897,20 @@ pub fn generate(
     // Runs after the assets dir is linked so the default lands beside
     // the project's own copied assets.
     try app_icon.injectDefaultIcon(allocator, cfg, target_dir);
+    // Desktop icon artifacts (labelle-cli#359): stage a custom `app_icon`
+    // where `@embedFile` can reach it, and write the Windows `.ico` + `.rc`
+    // the generated build.zig compiles in on Windows targets. No-op off
+    // desktop. Fails loudly on a custom icon that is missing or not a PNG.
+    //
+    // NOT for the tests target: `testsTargetConfig` forces `.platform =
+    // .desktop`, but that target emits neither `main.zig` nor an exe, so it
+    // consumes no icon at all. Generating one there costs an ICO encode per
+    // `labelle test` and — worse — would fail the whole test run with
+    // `AppIconNotFound`/`AppIconNotPng` over an icon the tests never touch
+    // (including for a mobile project, whose real target skips this).
+    if (!is_tests_target) {
+        try app_icon.writeDesktopIconArtifacts(allocator, cfg, game_dir, target_dir);
+    }
 
     // `tests/` mirrors the project source tree (e.g. `tests/components/foo.zig`
     // tests `components/foo.zig`). Linked + scanned so the generated

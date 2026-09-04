@@ -23,6 +23,8 @@ pub const BuildZigOptions = build_zig.BuildZigOptions;
 pub const PluginHook = build_zig.PluginHook;
 pub const PluginBuildStepsWiring = build_zig.PluginBuildStepsWiring;
 pub const generateBuildZig = build_zig.generateBuildZig;
+/// Windows icon-resource block emitted after the desktop exe (labelle-cli#359).
+pub const windows_icon_resource_block = build_zig.windows_icon_resource_block;
 
 // ── build.zig.zon generator (build_files/build_zig_zon.zig) ──────────
 pub const deps_linker = build_zig_zon.deps_linker;

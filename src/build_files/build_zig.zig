@@ -36,6 +36,16 @@ const build_zig_tmpl = @embedFile("../templates/build_zig.txt");
 /// their `test` step is not part of *this* project's test surface, and
 /// their path can escape the project root. Only `@`-prefixed plugins
 /// whose resolved path lands under `libs/` qualify.
+/// The desktop exe's Windows icon-resource wiring (labelle-cli#359), emitted
+/// right after the exe declaration. Exact text — pinned by the goldens.
+pub const windows_icon_resource_block =
+    "    // Windows exe icon (labelle-cli#359): compile the assembler-written\n" ++
+    "    // app_icon.rc (`1 ICON \"app_icon.ico\"`) into the binary so Explorer and\n" ++
+    "    // the taskbar show the project's app_icon. Windows targets only.\n" ++
+    "    if (target.result.os.tag == .windows) {\n" ++
+    "        exe.root_module.addWin32ResourceFile(.{ .file = b.path(\"app_icon.rc\") });\n" ++
+    "    }\n\n";
+
 fn inProjectLibDir(plugin: config.PluginDep) ?[]const u8 {
     if (!std.mem.startsWith(u8, plugin.repo, "@")) return null;
     const path = plugin.localPath();
@@ -1454,6 +1464,14 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             try tpl.writeSection(build_zig_tmpl, "exe_game_import", w);
 
             try tpl.writeSection(build_zig_tmpl, "exe_end", w);
+
+            // Windows exe icon (labelle-cli#359): `app_icon.rc` + `app_icon.ico`
+            // are written beside this file by `app_icon.writeDesktopIconArtifacts`
+            // on every desktop generate. Gated at BUILD time on the resolved
+            // target (not here on the host): the generated build.zig serves
+            // `-Dtarget=x86_64-windows` cross-builds too, and Zig's built-in
+            // resource compiler handles the .rc from any host.
+            try w.writeAll(windows_icon_resource_block);
 
             // Wire each promoted game-script module into the exe's root
             // module so main.zig's `AllScripts` + `PluginFlowNodes` can

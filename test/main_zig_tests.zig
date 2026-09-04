@@ -1399,3 +1399,104 @@ pub const TILEMAP_EMBED = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "addEmbeddedTilemapAsset") == null);
     }
 };
+
+// ── Window icon hand-off (labelle-cli#359) ─────────────────────────────────
+// The generated desktop main embeds the assembler-staged icon and hands it to
+// the backend behind `@hasDecl(window, "setWindowIconPng")` — bgfx implements
+// it (labelle-bgfx#81); every other backend, and older bgfx releases, fold the
+// whole statement (embed included) away.
+pub const WINDOW_ICON = struct {
+    /// Zig front-end (parse → AstGen) over `src`; fails on any error. Does not
+    /// resolve `@import`/`@embedFile`, so the snippet needs no engine or icon.
+    fn expectAstGenOk(src: []const u8) !void {
+        const src_z = try std.testing.allocator.dupeZ(u8, src);
+        defer std.testing.allocator.free(src_z);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, src_z, .zig);
+        defer ast.deinit(std.testing.allocator);
+        if (ast.errors.len != 0) return error.AstGenParseError;
+        var zir = try std.zig.AstGen.generate(std.testing.allocator, ast);
+        defer zir.deinit(std.testing.allocator);
+        if (zir.hasCompileErrors()) return error.AstGenCompileError;
+    }
+
+    const icon_call_default = "if (comptime @hasDecl(window, \"setWindowIconPng\")) window.setWindowIconPng(@embedFile(\"default_icon.png\"));";
+    const icon_call_custom = "if (comptime @hasDecl(window, \"setWindowIconPng\")) window.setWindowIconPng(@embedFile(\"app_icon.png\"));";
+
+    test "desktop loop main hands the default icon to the window behind @hasDecl, before runner.setup" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .bgfx,
+            .ecs = .mock,
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        const icon_idx = std.mem.indexOf(u8, main_zig, icon_call_default) orelse return error.NotFound;
+        const setup_idx = std.mem.indexOf(u8, main_zig, "runner.setup(&g);") orelse return error.NotFound;
+        try std.testing.expect(icon_idx < setup_idx);
+        // The custom-icon spelling must NOT appear when no app_icon is set.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "app_icon.png") == null);
+    }
+
+    test "a project app_icon embeds the assembler-staged app_icon.png, not the project path" {
+        // The project path (`assets/…` or a root-level file) is NOT what gets
+        // embedded: the assembler copies it to `<target>/app_icon.png` so the
+        // embed always resolves inside the module root.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .app_icon = "branding/icon.png",
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, icon_call_custom) != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "branding/icon.png") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "default_icon.png") == null);
+    }
+
+    test "an empty app_icon is treated as unset (matches app_icon.usesDefaultIcon)" {
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .app_icon = "",
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, icon_call_default) != null);
+    }
+
+    test "non-desktop (bgfx android callback main) emits no window-icon call" {
+        h.setBgfxAndroidLifecycle();
+        defer h.clearLifecycleOverrides();
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = .android,
+            .ecs = .mock,
+        }, bgfx_android_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "setWindowIconPng") == null);
+    }
+
+    test "the emitted statement passes AstGen against a stub window (both with and without the decl)" {
+        var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        try generate.emitWindowIcon(&aw.writer, .{ .name = "g", .app_icon = "x.png" });
+        const stmt = aw.written();
+        try std.testing.expect(std.mem.indexOf(u8, stmt, icon_call_custom) != null);
+
+        // Backend WITH the decl — and one WITHOUT, where the whole `if` folds.
+        inline for (.{
+            "const window = struct { pub fn setWindowIconPng(_: []const u8) void {} };\n",
+            "const window = struct {};\n",
+        }) |stub| {
+            const unit = try std.mem.concat(std.testing.allocator, u8, &.{ stub, "pub fn setup() void {\n", stmt, "}\n" });
+            defer std.testing.allocator.free(unit);
+            try expectAstGenOk(unit);
+        }
+    }
+};
