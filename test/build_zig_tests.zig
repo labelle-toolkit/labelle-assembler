@@ -1296,8 +1296,11 @@ pub const BUILD_ZIG = struct {
         }, .{});
         defer std.testing.allocator.free(build_zig);
 
-        // Per-lib `zig build test` shelled out from the master test step.
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "addSystemCommand(&.{ \"zig\", \"build\", \"test\" })") != null);
+        // Per-lib `zig build test` shelled out from the master test step,
+        // spawned with the PARENT BUILD's compiler (`b.graph.zig_exe`) —
+        // never a PATH `zig`, which a labelle project need not have at all
+        // (#691). Execution is proven in `test/lib_test_fanout_tests.zig`.
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "addSystemCommand(&.{ b.graph.zig_exe, \"build\", \"test\", \"--summary\", \"all\" })") != null);
         // cwd points two levels up from the backend build dir into libs/.
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.path(\"../../libs/pathfinder\")") != null);
         // The lib test is wired as a dependency of the `test` step.
@@ -1319,7 +1322,7 @@ pub const BUILD_ZIG = struct {
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.path(\"../../libs/pathfinder\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.path(\"../../libs/combat\")") != null);
         // One `addSystemCommand` per lib.
-        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, build_zig, "addSystemCommand(&.{ \"zig\", \"build\", \"test\" })"));
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, build_zig, "addSystemCommand(&.{ b.graph.zig_exe, \"build\", \"test\", \"--summary\", \"all\" })"));
     }
 
     test "no @libs/ plugins emits no lib test chaining (issue #82)" {
@@ -1332,7 +1335,7 @@ pub const BUILD_ZIG = struct {
         defer std.testing.allocator.free(build_zig);
 
         // No libs → no `zig build test` fan-out at all.
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"zig\", \"build\", \"test\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.graph.zig_exe, \"build\", \"test\"") == null);
     }
 
     test "out-of-project local: plugins are not chained as libs (issue #82)" {
@@ -1348,7 +1351,7 @@ pub const BUILD_ZIG = struct {
         }, .{});
         defer std.testing.allocator.free(build_zig);
 
-        try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"zig\", \"build\", \"test\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, build_zig, "b.graph.zig_exe, \"build\", \"test\"") == null);
     }
 
     test "lib test chaining present in is_tests_target build (issue #82)" {
@@ -1814,7 +1817,6 @@ pub const PR9_STAGE_RAYLIB_HOOK = struct {
     }
 };
 
-
 // ── manifest-v2 bgfx GOLDEN cells (epic #453 item 3, PR 10, design §7) ──
 // bgfx is the LAST + HARDEST backend converted to v2 — the first needing BOTH
 // per-platform `loop_style` (desktop `.loop`, android `.callback`) AND a
@@ -1965,8 +1967,6 @@ pub const MANIFEST_V2_BGFX_ANDROID_GOLDEN = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "fn getAndroidNdkSysroot(") == null);
     }
 };
-
-
 
 // ── manifest-v2 bgfx WASM GOLDEN cell (bgfx-wasm epic labelle-bgfx#8) ──
 // The THIRD bgfx platform (after desktop PR 10 + android). wasm is the emcc

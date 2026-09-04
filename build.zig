@@ -187,6 +187,11 @@ pub fn build(b: *std.Build) void {
         "test/template_dynamic_test.zig",
         "test/scanner_symlink_tests.zig",
         "test/scanner_orphan_tests.zig",
+        // In-project `@libs/` test fan-out (#691): the EXECUTION acceptance
+        // — the emitted block is spliced into a runnable build.zig and
+        // driven with no `zig` on PATH, so a lib whose test fails fails the
+        // build and a lib whose test passes reports its counts.
+        "test/lib_test_fanout_tests.zig",
         // Packs dir-scan (RFC §4, labelle-assembler#439): scanPack copy/scan
         // + emission assertions that pack components/events/prefabs reach the
         // generated registries.

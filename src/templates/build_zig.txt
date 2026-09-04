@@ -346,11 +346,24 @@ fn unifyGfxSubpackageCore(gfx_mod: *std.Build.Module, core_mod: *std.Build.Modul
     // every in-project library. Obsoletes labelle-cli's `--no-libs`
     // workaround (#184). See labelle-assembler#82.
     {
-        const lib_test = b.addSystemCommand(&.{ "zig", "build", "test" });
+        // `b.graph.zig_exe`, never a bare "zig": labelle manages the
+        // toolchain (labelle-cli#279) and a labelle project is not
+        // required to have ANY `zig` on PATH, so `&.{ "zig", ... }`
+        // died with `failed to spawn ... FileNotFound` — and on a
+        // machine that did have one, it silently tested the lib with a
+        // DIFFERENT compiler than the one driving this build.
+        const lib_test = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "test", "--summary", "all" });
         // build.zig sits at `.labelle/<backend>_<platform>/`, so the
         // project root is two levels up.
         lib_test.setCwd(b.path("{{lib_cwd}}"));
         lib_test.setName("zig build test ({{lib_name}})");
+        // A Run step's default `.check` stdio CAPTURES the child and
+        // discards it on success, so a passing lib left no evidence it
+        // ran at all — the whole of labelle-assembler#691. `.inherit`
+        // puts the child's `--summary all` line ("N/N tests passed")
+        // in front of the operator, and also opts the step out of the
+        // run cache so the fan-out can never report a stale pass.
+        lib_test.stdio = .inherit;
         test_step.dependOn(&lib_test.step);
     }
 
