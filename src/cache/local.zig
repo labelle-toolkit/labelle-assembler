@@ -84,12 +84,19 @@ pub fn frameworkSlot(allocator: std.mem.Allocator, package: []const u8) ![]const
     return std.fs.path.join(allocator, &.{ root, package });
 }
 
-/// `~/.labelle/packages/local/plugins/<repo>` — the local slot for a plugin
-/// or external backend package.
-pub fn pluginSlot(allocator: std.mem.Allocator, repo: []const u8) ![]const u8 {
+/// `~/.labelle/packages/local/plugins/<repo>/<name>` — the local slot for a
+/// plugin or external backend package.
+///
+/// Keyed by repo AND logical name (#688 review round 4). The repo alone
+/// identifies the package, but the SOURCE is `labelle-<name>`: one project
+/// may declare two non-local deps sharing a repo under different names —
+/// an external backend and a plugin alias, say — and they are populated
+/// from different sibling checkouts. One slot for both would have them
+/// overwrite each other's link and marker on every `ensureCache`.
+pub fn pluginSlot(allocator: std.mem.Allocator, plugin: config.PluginDep) ![]const u8 {
     const root = try slotsRoot(allocator);
     defer allocator.free(root);
-    return std.fs.path.join(allocator, &.{ root, "plugins", repo });
+    return std.fs.path.join(allocator, &.{ root, "plugins", plugin.repo, plugin.name });
 }
 
 /// `~/.labelle/packages/local/assembler` — the local slot for the
@@ -270,7 +277,7 @@ pub fn activePluginSlot(allocator: std.mem.Allocator, plugin: config.PluginDep) 
     const expected = try std.fs.path.join(allocator, &.{ root, dir_name });
     defer allocator.free(expected);
 
-    const slot = try pluginSlot(allocator, plugin.repo);
+    const slot = try pluginSlot(allocator, plugin);
     return activeOrFree(allocator, slot, expected);
 }
 
@@ -1135,7 +1142,8 @@ test "activePluginSlot: a slot populated for a DIFFERENT logical name is not hon
     defer std.testing.environ = saved_environ;
 
     const repo = "github.com/labelle-toolkit/labelle-physics";
-    const slot = try pluginSlot(alloc, repo);
+    const same: config.PluginDep = .{ .name = "physics", .repo = repo, .version = "0.4.0" };
+    const slot = try pluginSlot(alloc, same);
     defer alloc.free(slot);
     try std.Io.Dir.cwd().createDirPath(config.globalIo(), std.fs.path.dirname(slot).?);
     try std.Io.Dir.cwd().symLink(std.testing.io, src, slot, .{ .is_directory = true });
@@ -1145,13 +1153,22 @@ test "activePluginSlot: a slot populated for a DIFFERENT logical name is not hon
     defer setProbeStartForTesting(null);
 
     // The dep the slot was populated for: honoured.
-    const same: config.PluginDep = .{ .name = "physics", .repo = repo, .version = "0.4.0" };
     const active = try activePluginSlot(alloc, same) orelse return error.TestUnexpectedResult;
     alloc.free(active);
 
-    // Same repo, different logical name — expects `labelle-physics2`, which
-    // exists and is a sibling too, but is NOT what the slot holds.
+    // Same repo, different logical name — its own slot, unpopulated, so
+    // nothing is served and the two never overwrite each other.
     const other: config.PluginDep = .{ .name = "physics2", .repo = repo, .version = "0.4.0" };
+    const other_slot = try pluginSlot(alloc, other);
+    defer alloc.free(other_slot);
+    try std.testing.expect(!std.mem.eql(u8, slot, other_slot));
+    try std.testing.expect(try activePluginSlot(alloc, other) == null);
+
+    // And even if that slot existed, holding the WRONG checkout, it would
+    // not be honoured: the marker must name `labelle-physics2`.
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), std.fs.path.dirname(other_slot).?);
+    try std.Io.Dir.cwd().symLink(std.testing.io, src, other_slot, .{ .is_directory = true });
+    try writeOrigin(alloc, other_slot, src, "0.4.0");
     try std.testing.expect(try activePluginSlot(alloc, other) == null);
 }
 

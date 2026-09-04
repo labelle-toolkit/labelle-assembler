@@ -746,7 +746,7 @@ fn purgeLegacyFrameworkSlot(allocator: std.mem.Allocator, package: []const u8, v
     defer allocator.free(packages_dir);
     const slot = std.fs.path.join(allocator, &.{ packages_dir, package, version }) catch return;
     defer allocator.free(slot);
-    _ = cache.purgeLegacyLocalSlot(slot);
+    _ = cache.purgeLegacyLocalSlot(allocator, slot);
 }
 
 /// Walk up from the assembler executable's directory looking for the

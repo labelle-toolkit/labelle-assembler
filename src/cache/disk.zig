@@ -68,7 +68,7 @@ pub fn populateFrameworkPackage(allocator: std.mem.Allocator, package: []const u
 /// Creates a symlink from the cache location to the source directory.
 pub fn populatePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, source_dir: []const u8) !void {
     // #685: reserved local-namespace slot, same as the framework packages.
-    const target = try local.pluginSlot(allocator, plugin.repo);
+    const target = try local.pluginSlot(allocator, plugin);
     defer allocator.free(target);
     try symlinkToCache(allocator, source_dir, target);
     try local.writeOrigin(allocator, target, source_dir, plugin.version);
@@ -109,7 +109,14 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
                 const existing = link_buf[0..existing_len];
                 if (std.mem.eql(u8, existing, abs_source)) return;
                 std.log.warn("labelle: cache entry '{s}' points to '{s}', expected '{s}'", .{ target, existing, abs_source });
-                cwd.deleteFile(io, target) catch return;
+                // NOT `catch return`: reporting success here would let the
+                // caller rewrite the provenance marker with the NEW source
+                // while the link still targets the old checkout, and
+                // `active*Slot` trusts that marker (#688 review round 4).
+                cwd.deleteFile(io, target) catch |del_err| {
+                    std.log.warn("labelle: could not replace cache entry '{s}': {any}", .{ target, del_err });
+                    return error.CachePopulationFailed;
+                };
             } else |_| {
                 // NOT a link — an earlier run took the copy fallback below (or
                 // the platform has no directory symlinks at all). That copy is
@@ -141,30 +148,83 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
 
 // ── #685 migration: legacy locally-poisoned version slots ────────────
 
-/// Remove a version-named cache slot that an older assembler symlinked at a
-/// sibling checkout. Such a slot is named `gfx/1.29.0` but contains whatever
+/// Remove a version-named cache slot that an older assembler populated with
+/// local sources. Such a slot is named `gfx/1.29.0` but contains whatever
 /// the monorepo working tree happened to hold, which is the whole of #685.
 ///
-/// Only symlinked slots are removed: nothing is lost (the source checkout is
-/// untouched) and a real, extracted release directory is never a symlink, so
-/// a genuine cached release can't be caught by this. The Windows copy
-/// fallback in `symlinkToCache` produced a real directory that is
-/// indistinguishable from an extracted release — those are NOT purged; a
-/// `labelle-assembler clean` is the remedy there.
+/// Two shapes, because `symlinkToCache` has two ways of populating:
+///
+///   * a SYMLINK — unambiguous: a genuine extracted release is never one,
+///     so the link is dropped (the source checkout is untouched); and
+///   * a real DIRECTORY, which the Windows copy fallback produces and which
+///     is indistinguishable from an extracted release by shape. Its CONTENT
+///     gives it away: a release declares its own version in `build.zig.zon`,
+///     a copied working tree declares whatever it was at. That is exactly
+///     the evidence #685 was reported with. Only a parsed version that
+///     DIFFERS from the slot name purges — a missing or unparseable
+///     `build.zig.zon` leaves the slot alone (#688 review round 4).
 ///
 /// Returns true when something was removed.
-pub fn purgeLegacyLocalSlot(slot_path: []const u8) bool {
-    if (!isSymlink(slot_path)) return false;
+pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8) bool {
     const io = config.globalIo();
-    std.Io.Dir.cwd().deleteFile(io, slot_path) catch |err| {
-        std.log.warn("labelle: could not remove locally-sourced cache slot '{s}': {any}", .{ slot_path, err });
+
+    if (isSymlink(slot_path)) {
+        std.Io.Dir.cwd().deleteFile(io, slot_path) catch |err| {
+            std.log.warn("labelle: could not remove locally-sourced cache slot '{s}': {any}", .{ slot_path, err });
+            return false;
+        };
+        std.log.warn(
+            "labelle: removed cache slot '{s}' — it was a symlink to a local checkout, not the pinned release (#685)",
+            .{slot_path},
+        );
+        return true;
+    }
+
+    if (!dirExists(slot_path)) return false;
+    const declared = declaredZonVersion(allocator, slot_path) orelse return false;
+    defer allocator.free(declared);
+    const slot_version = std.fs.path.basename(slot_path);
+    if (std.mem.eql(u8, declared, slot_version)) return false;
+
+    std.Io.Dir.cwd().deleteTree(io, slot_path) catch |err| {
+        std.log.warn("labelle: could not remove mis-versioned cache slot '{s}': {any}", .{ slot_path, err });
         return false;
     };
     std.log.warn(
-        "labelle: removed cache slot '{s}' — it was a symlink to a local checkout, not the pinned release (#685)",
-        .{slot_path},
+        "labelle: removed cache slot '{s}' — it holds {s} sources, not the {s} release (#685)",
+        .{ slot_path, declared, slot_version },
     );
     return true;
+}
+
+/// The `.version` a package's own `build.zig.zon` declares, or null when
+/// there isn't one to read. Caller owns the result.
+fn declaredZonVersion(allocator: std.mem.Allocator, dir: []const u8) ?[]const u8 {
+    const zon_path = std.fs.path.join(allocator, &.{ dir, "build.zig.zon" }) catch return null;
+    defer allocator.free(zon_path);
+
+    const content = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), zon_path, allocator, .limited(256 * 1024)) catch return null;
+    defer allocator.free(content);
+
+    const key = ".version";
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, content, search, key)) |pos| {
+        search = pos + key.len;
+        // A field, not a suffix of some longer identifier.
+        if (pos > 0 and !std.ascii.isWhitespace(content[pos - 1]) and
+            content[pos - 1] != '{' and content[pos - 1] != ',') continue;
+
+        var i = search;
+        while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
+        if (i >= content.len or content[i] != '=') continue;
+        i += 1;
+        while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
+        if (i >= content.len or content[i] != '"') continue;
+        const start = i + 1;
+        const end = std.mem.indexOfScalarPos(u8, content, start, '"') orelse return null;
+        return allocator.dupe(u8, content[start..end]) catch null;
+    }
+    return null;
 }
 
 /// Sweep every version-named slot a project's pins point at, dropping the
@@ -183,7 +243,7 @@ pub fn purgeLegacyLocalSlots(allocator: std.mem.Allocator, cfg: config.ProjectCo
         if (config.isLocalVersion(pkg.version)) continue;
         const slot = std.fs.path.join(allocator, &.{ packages_dir, pkg.name, pkg.version }) catch continue;
         defer allocator.free(slot);
-        _ = purgeLegacyLocalSlot(slot);
+        _ = purgeLegacyLocalSlot(allocator, slot);
     }
 
     // The assembler slot is a real directory whose backends/ecs/gui SUBDIRS
@@ -233,7 +293,7 @@ fn purgeLegacyPluginSlot(allocator: std.mem.Allocator, packages_dir: []const u8,
     if (plugin.isLocal() or plugin.repo.len == 0 or plugin.version.len == 0) return;
     const slot = std.fs.path.join(allocator, &.{ packages_dir, "plugins", plugin.repo, plugin.version }) catch return;
     defer allocator.free(slot);
-    _ = purgeLegacyLocalSlot(slot);
+    _ = purgeLegacyLocalSlot(allocator, slot);
 }
 
 /// Whether `path` exists and is accessible. Public so the cache
@@ -548,7 +608,7 @@ test "purgeLegacyLocalSlot: drops a version slot symlinked at a local checkout (
     try symlinkToCache(alloc, checkout, poisoned);
     try testing.expect(dirExists(poisoned));
 
-    try testing.expect(purgeLegacyLocalSlot(poisoned));
+    try testing.expect(purgeLegacyLocalSlot(alloc, poisoned));
     try testing.expect(!dirExists(poisoned));
     // The source checkout is untouched — only the link went away.
     try testing.expect(dirExists(checkout));
@@ -556,7 +616,7 @@ test "purgeLegacyLocalSlot: drops a version slot symlinked at a local checkout (
     // A genuine extracted release is left alone.
     const genuine = try std.fs.path.join(alloc, &.{ home, "packages", "core", "1.27.0" });
     defer alloc.free(genuine);
-    try testing.expect(!purgeLegacyLocalSlot(genuine));
+    try testing.expect(!purgeLegacyLocalSlot(alloc, genuine));
     try testing.expect(dirExists(genuine));
 }
 
@@ -694,4 +754,119 @@ test "symlinkToCache: a stale COPIED slot is dropped and repopulated (#688 revie
     const stamp = try readVersionStamp(alloc, slot);
     defer alloc.free(stamp);
     try testing.expectEqualStrings("1.31.0", stamp);
+}
+
+test "purgeLegacyLocalSlot: drops a COPIED version slot whose contents are a different version (#688 review)" {
+    // The gap the symlink test leaves: `symlinkToCache`'s copy fallback
+    // (Windows without symlink privileges) put local sources into the
+    // version slot as a REAL directory, which no shape test can tell from an
+    // extracted release. `labelle-assembler clean` is not the remedy either
+    // — it keeps whatever the project pins, which is exactly the affected
+    // slot. Content decides: a release declares its own version.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home/packages/gfx/1.29.0");
+    try tmp.dir.createDirPath(testing.io, "home/packages/core/1.27.0");
+    try tmp.dir.createDirPath(testing.io, "home/packages/engine/2.4.0");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+
+    // A copied working tree: the slot says 1.29.0, the sources say 1.31.0.
+    const poisoned = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
+    defer alloc.free(poisoned);
+    try writeZon(poisoned, ".{\n    .name = .labelle_gfx,\n    .version = \"1.31.0\",\n}\n");
+
+    // A genuine extracted release: slot and sources agree.
+    const genuine = try std.fs.path.join(alloc, &.{ home, "packages", "core", "1.27.0" });
+    defer alloc.free(genuine);
+    try writeZon(genuine, ".{\n    .name = .labelle_core,\n    .version = \"1.27.0\",\n}\n");
+
+    // No readable zon at all: left alone rather than guessed at.
+    const unknown = try std.fs.path.join(alloc, &.{ home, "packages", "engine", "2.4.0" });
+    defer alloc.free(unknown);
+
+    try testing.expect(purgeLegacyLocalSlot(alloc, poisoned));
+    try testing.expect(!dirExists(poisoned));
+
+    try testing.expect(!purgeLegacyLocalSlot(alloc, genuine));
+    try testing.expect(dirExists(genuine));
+    try testing.expect(!purgeLegacyLocalSlot(alloc, unknown));
+    try testing.expect(dirExists(unknown));
+}
+
+fn writeZon(dir: []const u8, body: []const u8) !void {
+    const io = config.globalIo();
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "build.zig.zon" });
+    defer testing.allocator.free(path);
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, body);
+}
+
+test "symlinkToCache: a link that cannot be replaced fails population (#688 review)" {
+    // `catch return` on the replace path reported success, so
+    // `populateFrameworkPackage` went on to rewrite the provenance marker
+    // with the NEW source while the link still targeted the old checkout —
+    // and `active*Slot` trusts that marker.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home");
+    try tmp.dir.createDirPath(testing.io, "old");
+    try tmp.dir.createDirPath(testing.io, "new");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const old_src = try tmp.dir.realPathFileAlloc(testing.io, "old", alloc);
+    defer alloc.free(old_src);
+    const new_src = try tmp.dir.realPathFileAlloc(testing.io, "new", alloc);
+    defer alloc.free(new_src);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    // A slot linked at the OLD checkout, inside a directory made read-only
+    // so the link cannot be unlinked.
+    const slot = try local.frameworkSlot(alloc, "gfx");
+    defer alloc.free(slot);
+    const parent = std.fs.path.dirname(slot).?;
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), parent);
+    try std.Io.Dir.cwd().symLink(testing.io, old_src, slot, .{ .is_directory = true });
+
+    const parent_z = try alloc.dupeZ(u8, parent);
+    defer alloc.free(parent_z);
+    if (std.c.chmod(parent_z, 0o500) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(parent_z, 0o700);
+
+    if (symlinkToCache(alloc, new_src, slot)) |_| {
+        // Reported success. That is only legitimate if the link REALLY was
+        // replaced — which happens when the test runs as root and the
+        // permission bits mean nothing. Otherwise it is the defect: success
+        // with the old link still in place, after which the caller rewrites
+        // the marker to name the new source.
+        var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const len = try std.Io.Dir.readLinkAbsolute(config.globalIo(), slot, &link_buf);
+        if (std.mem.eql(u8, link_buf[0..len], new_src)) return error.SkipZigTest;
+        std.debug.print(
+            "symlinkToCache reported success but '{s}' still points at '{s}'\n",
+            .{ slot, link_buf[0..len] },
+        );
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try testing.expectEqual(error.CachePopulationFailed, err);
+        // The link still points where it did — and, crucially, population
+        // did not get far enough to rewrite the marker.
+        var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const len = try std.Io.Dir.readLinkAbsolute(config.globalIo(), slot, &link_buf);
+        try testing.expectEqualStrings(old_src, link_buf[0..len]);
+    }
 }
