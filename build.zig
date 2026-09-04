@@ -223,6 +223,13 @@ pub fn build(b: *std.Build) void {
         // RFC §2.2 friendly-param → PostPassUniforms slot mapping.
         "test/post_fx_setup_tests.zig",
         "test/backend_wiring_tests.zig",
+        // `FontBackendAdapter` vtable conformance (#700): the EXECUTION
+        // acceptance for the font block. The emitted adapter is compiled
+        // and RUN against a stub `engine.FontBackend` + both backend
+        // shapes (font-capable and font-less), because the string pins in
+        // `backend_wiring_tests.zig` passed for the entire time declaring
+        // a `.font` resource failed to compile.
+        "test/font_backend_signature_tests.zig",
         "test/scripts_prefabs_views_layers_tests.zig",
         "test/resources_tests.zig",
         "test/window_subfolders_imgui_tests.zig",

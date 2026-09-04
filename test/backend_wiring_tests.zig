@@ -68,7 +68,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "buildSetupCode emits setBackend + adapters (raylib)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -81,7 +82,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
     test "buildCallbackInitCode emits setBackend + adapters (sokol)" {
         h.setSokolLifecycle();
         defer h.clearLifecycleOverrides();
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -97,7 +99,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
     // callback path). We still assert each variant individually so a
     // future split in the lifecycle selection can't silently drop one.
     test "buildSetupCode emits setBackend + adapters (sdl)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .sdl,
             .ecs = .mock,
@@ -108,7 +111,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "buildSetupCode emits setBackend + adapters (bgfx)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .bgfx,
             .ecs = .mock,
@@ -119,7 +123,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "buildSetupCode emits setBackend + adapters (wgpu)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .wgpu,
             .ecs = .mock,
@@ -134,7 +139,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
         const manifests = [_]SceneManifest{
             .{ .name = "menu", .assets = &[_][]const u8{} },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -164,7 +170,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
         const manifests = [_]SceneManifest{
             .{ .name = "menu", .assets = &[_][]const u8{} },
         };
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .sokol,
             .ecs = .mock,
@@ -183,7 +190,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "adapters stash the full backend Texture in a slot table (raylib)" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -233,7 +241,8 @@ pub const IMAGE_BACKEND_WIRING = struct {
     }
 
     test "adapter decode marshals engine.DecodedImage from backend DecodedImage" {
-        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
             .name = "test-game",
             .backend = .raylib,
             .ecs = .mock,
@@ -375,25 +384,40 @@ pub const FONT_BACKEND_WIRING = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, ".codepoint_index = @ptrCast(decoded.codepoint_index)") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, ".kerning = @ptrCast(decoded.kerning)") != null);
 
-        // FontBakeParams also threads through decode (RFC §7) —
-        // the `params: ?*const anyopaque` is cast back to the
-        // engine type then copied field-by-field into the
-        // backend's mirror struct before being forwarded to
-        // `BackendGfx.decodeFont`.
-        try std.testing.expect(std.mem.indexOf(u8, out, "params: ?*const anyopaque") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "*const engine.FontBakeParams") != null);
+        // FontBakeParams also threads through decode (RFC §7) — the
+        // adapter takes the engine's TYPED struct by value (which is what
+        // `engine.FontBackend.decode` has always declared) and copies it
+        // field-by-field into the backend's mirror struct before
+        // forwarding to `BackendGfx.decodeFont`.
+        //
+        // This used to pin `params: ?*const anyopaque` — the type-erased
+        // shape belongs to the catalog's `WorkRequest.params` one level
+        // up, NOT to the vtable, so the pin was locking in a signature
+        // that could never satisfy `setBackend`. #700: declaring any
+        // `.font` resource failed to compile for the whole life of the
+        // feature while this assert passed. The real acceptance now lives
+        // in `test/font_backend_signature_tests.zig`, which compiles and
+        // RUNS the emitted adapter against the vtable.
+        try std.testing.expect(std.mem.indexOf(u8, out, "params: engine.FontBakeParams") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "?*const anyopaque") == null);
         try std.testing.expect(std.mem.indexOf(u8, out, "const backend_params: BackendGfx.FontBakeParams = .{") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "return error.FontBakeParamsMissing") != null);
 
         // Field names MUST match engine.FontBakeParams / gfx FontBakeParams
         // verbatim (pixel_height / ranges / atlas_width / atlas_height).
         // Initial scaffold (#103) drifted to `codepoint_ranges` +
         // `oversample_h` / `oversample_v` which don't exist on either
         // engine or gfx — caught by Gemini reviewing #105.
-        try std.testing.expect(std.mem.indexOf(u8, out, ".pixel_height = engine_params.pixel_height") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, ".ranges = engine_params.ranges") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, ".atlas_width = engine_params.atlas_width") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, ".atlas_height = engine_params.atlas_height") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".pixel_height = params.pixel_height") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".atlas_width = params.atlas_width") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ".atlas_height = params.atlas_height") != null);
+        // `.ranges` is the one field that cannot be a plain assignment:
+        // `engine.CodepointRange` is a plain struct and the backend's is an
+        // `extern struct`, so the elements are rebuilt into a scratch
+        // buffer (freed on the way out — the slice is borrowed for the
+        // decode call only).
+        try std.testing.expect(std.mem.indexOf(u8, out, ".ranges = ranges") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "@FieldType(BackendGfx.FontBakeParams, \"ranges\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "defer alloc.free(ranges)") != null);
         // Drift guards: these are the names #103 wrongly emitted —
         // none should appear in the generated code.
         try std.testing.expect(std.mem.indexOf(u8, out, "codepoint_ranges") == null);
