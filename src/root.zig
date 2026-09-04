@@ -342,8 +342,8 @@ pub fn generate(
     // Target subfolder: .labelle/raylib_desktop/, .labelle/sokol_ios/, etc.
     // Override is used for the `.labelle/tests/` target where the name
     // shouldn't reflect the backend (issue #83). Resolved HERE — ahead of the
-    // texture swaps rather than after them — because the grid-expansion phase
-    // below writes its synthesised manifests into this dir. Pure string
+    // validation gates rather than after them — because the grid-expansion
+    // phase below writes its synthesised manifests into this dir. Pure string
     // computation, no filesystem effect, so hoisting it changes nothing else.
     const target_name = if (target_name_override) |name|
         try allocator.dupe(u8, name)
@@ -352,54 +352,6 @@ pub fn generate(
     defer allocator.free(target_name);
     const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
     defer allocator.free(target_dir);
-
-    // Expand `.grid` resources into ordinary atlases (#675). A uniform tileset
-    // is a regular grid, so the TexturePacker manifest naming every frame is
-    // derivable from the image's own pixel dimensions — the phase reads the
-    // PNG IHDR, writes a synthesised manifest into the target dir, and rewrites
-    // the entry to `.json` + `.texture`. Everything downstream (emission, lazy
-    // inference, scene wiring, the pack machinery) then sees a normal atlas.
-    //
-    // Runs BEFORE the astc/rgba swaps on purpose, in both directions: the
-    // rewritten `.texture` is a `.png`, so a tileset picks up a pre-converted
-    // sibling exactly like a hand-authored atlas — and the dimensions must be
-    // read from the source PNG, which an `.astc` sibling would no longer be.
-    //
-    // Cost of that placement: the phase has to create `target_dir` (its
-    // manifests live there) ahead of the pack-graph / language / plugin-param
-    // gates below, which the `createDirPath` further down deliberately sits
-    // after. It does so ONLY when the project actually declares a `.grid`, so
-    // every existing project's generate is byte-identical — and the earliest
-    // artifact is an empty directory, not stale generated output.
-    var grid_manifest_allocs = try generate_phases.expandGridResources(allocator, io, mutable_resources, game_dir, target_dir);
-    defer {
-        for (grid_manifest_allocs.items) |s| allocator.free(s);
-        grid_manifest_allocs.deinit(allocator);
-    }
-
-    // Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
-    // target platform opts into ASTC (`asset_compression`) and `labelle astc`
-    // produced one. The runtime detects the ASTC magic and uploads the
-    // compressed blocks with zero CPU decode (labelle-gfx#269 / #340). Done
-    // BEFORE the `.rgba` swap so ASTC wins (the bigger memory + load win); the
-    // `.rgba` swap below then skips these (they no longer end in `.png`). Falls
-    // back to the source PNG when no `.astc` sibling exists.
-    var astc_path_allocs = try generate_phases.swapAstcTexturePaths(allocator, io, cfg, mutable_resources, game_dir);
-    defer {
-        for (astc_path_allocs.items) |s| allocator.free(s);
-        astc_path_allocs.deinit(allocator);
-    }
-
-    // Swap `.texture = "...png"` to the pre-baked `.rgba` sibling
-    // when `labelle build --bake` produced one. The runtime decoder
-    // detects the LRGBA magic and skips stb_image entirely. Leaves
-    // the path untouched when no sibling exists, so fresh checkouts
-    // (and builds without `--bake`) still embed the source PNG.
-    var rgba_path_allocs = try generate_phases.swapRgbaTexturePaths(allocator, io, mutable_resources, game_dir);
-    defer {
-        for (rgba_path_allocs.items) |s| allocator.free(s);
-        rgba_path_allocs.deinit(allocator);
-    }
 
     // ── Pack manifest load + dependency-validation gate (Packs RFC §6, #441) ─
     //
@@ -529,6 +481,63 @@ pub fn generate(
     // never renders an invalid panel from a generated project. Additive: a
     // project with no panels is a no-op.
     try panel_validate.validatePluginPanels(allocator, cfg, game_dir);
+
+    // ── Resource path rewrites (grid expansion + compressed-texture swaps) ─
+    //
+    // Deliberately placed AFTER every validation-only gate above (pack graph,
+    // language policy, plugin parameters, studio panels) and BEFORE the target
+    // dir is otherwise populated. Grid expansion WRITES — it synthesises a
+    // manifest per `.grid` into the target dir — so it has to obey the same
+    // pre-mutation ordering those gates were put first for: a project rejected
+    // by one of them must not first gain a fresh `__grid_*.json` beside the
+    // stale `main.zig` of an earlier build (chatgpt-codex review, #689).
+    //
+    // Expand `.grid` resources into ordinary atlases (#675). A uniform tileset
+    // is a regular grid, so the TexturePacker manifest naming every frame is
+    // derivable from the image's own pixel dimensions — the phase reads the
+    // PNG IHDR, writes a synthesised manifest into the target dir, and rewrites
+    // the entry to `.json` + `.texture`. Everything downstream (emission, lazy
+    // inference, scene wiring, the pack machinery) then sees a normal atlas.
+    //
+    // Runs BEFORE the astc/rgba swaps on purpose, in both directions: the
+    // rewritten `.texture` is a `.png`, so a tileset picks up a pre-converted
+    // sibling exactly like a hand-authored atlas — and the dimensions must be
+    // read from the source PNG, which an `.astc` sibling would no longer be.
+    // The three phases therefore move as ONE unit; nothing between the gates
+    // above and here touches `mutable_resources`.
+    //
+    // The expansion creates `target_dir` when (and only when) the project
+    // actually declares a `.grid`; the `createDirPath` below is idempotent, and
+    // a project without grids generates byte-identically to before.
+    var grid_manifest_allocs = try generate_phases.expandGridResources(allocator, io, mutable_resources, game_dir, target_dir);
+    defer {
+        for (grid_manifest_allocs.items) |s| allocator.free(s);
+        grid_manifest_allocs.deinit(allocator);
+    }
+
+    // Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
+    // target platform opts into ASTC (`asset_compression`) and `labelle astc`
+    // produced one. The runtime detects the ASTC magic and uploads the
+    // compressed blocks with zero CPU decode (labelle-gfx#269 / #340). Done
+    // BEFORE the `.rgba` swap so ASTC wins (the bigger memory + load win); the
+    // `.rgba` swap below then skips these (they no longer end in `.png`). Falls
+    // back to the source PNG when no `.astc` sibling exists.
+    var astc_path_allocs = try generate_phases.swapAstcTexturePaths(allocator, io, cfg, mutable_resources, game_dir);
+    defer {
+        for (astc_path_allocs.items) |s| allocator.free(s);
+        astc_path_allocs.deinit(allocator);
+    }
+
+    // Swap `.texture = "...png"` to the pre-baked `.rgba` sibling
+    // when `labelle build --bake` produced one. The runtime decoder
+    // detects the LRGBA magic and skips stb_image entirely. Leaves
+    // the path untouched when no sibling exists, so fresh checkouts
+    // (and builds without `--bake`) still embed the source PNG.
+    var rgba_path_allocs = try generate_phases.swapRgbaTexturePaths(allocator, io, mutable_resources, game_dir);
+    defer {
+        for (rgba_path_allocs.items) |s| allocator.free(s);
+        rgba_path_allocs.deinit(allocator);
+    }
 
     // ── Asset-Plugins Phase 2: plugin-level `.resources` units (#576) ──
     // A decl-module plugin may declare its OWN atlases in `plugin.labelle`
