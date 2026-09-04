@@ -189,33 +189,41 @@ pub fn writeDesktopIconArtifacts(allocator: std.mem.Allocator, cfg: ProjectConfi
         };
     }
 
-    const ico_bytes = ico.buildIco(allocator, png) catch |err| switch (err) {
-        error.NotPng => {
-            var buf: [512]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &buf,
-                "labelle-assembler: app_icon {s} is not a PNG — app icons must be PNG (a square source of at least 256x256 gives the best result)\n",
-                .{effectiveIconPath(cfg)},
-            ) catch "labelle-assembler: app_icon is not a PNG\n";
-            std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
-            return error.AppIconNotPng;
-        },
-        // A real PNG this decoder cannot read (interlaced, or a broken
-        // stream) that ALSO cannot be described by an ICO directory entry —
-        // non-square, or larger than 256. The verbatim fallback would have to
-        // advertise dimensions that contradict the payload's own IHDR, so say
-        // what to change instead of shipping an icon Windows may discard.
-        error.IcoFallbackUnrepresentable => {
-            var buf: [640]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &buf,
-                "labelle-assembler: app_icon {s} could not be decoded (interlaced or damaged PNG) and its size cannot be described in a Windows .ico\n  Re-save it as a NON-INTERLACED, square PNG of at most 256x256 (512 masters are fine once they decode — only the undecodable fallback is limited).\n",
-                .{effectiveIconPath(cfg)},
-            ) catch "labelle-assembler: app_icon cannot be encoded as a Windows .ico\n";
-            std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
-            return error.AppIconNotPng;
-        },
-        else => return err,
+    // The Windows `.ico`. An icon must never be able to fail a whole desktop
+    // generate: the build does not depend on it, and a broken icon is a
+    // cosmetic problem, so anything `buildIco` cannot handle degrades to the
+    // BUNDLED DEFAULT for the exe icon — loudly, naming the file and the
+    // reason, because silently shipping the stock icon for a project that
+    // asked for its own is the bug cli#340 exists to prevent.
+    //
+    // Note the split: a MISSING or unreadable `app_icon` is still a hard error
+    // (`readIconBytes`, above) — that is a broken path in `project.labelle`,
+    // which the author must fix. This branch is only for a file that IS there
+    // and cannot be turned into an ICO: a PNG this reader declines
+    // (interlaced, damaged), one whose size no ICONDIRENTRY can state, or
+    // bytes that are not a PNG at all.
+    //
+    // Only the Windows exe icon degrades. The RUNTIME window icon still embeds
+    // the project's own file (staged above); if the backend cannot decode it
+    // either, it warns and shows no icon — it never takes the game down.
+    const ico_bytes = ico.buildIco(allocator, png) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        var buf: [768]u8 = undefined;
+        const why: []const u8 = switch (err) {
+            error.NotPng => "it is not a PNG (app icons must be PNG)",
+            error.IcoFallbackUnrepresentable => "it could not be decoded (interlaced or damaged PNG) and its size cannot be described in a Windows .ico — re-save it as a NON-INTERLACED, square PNG of at most 256x256",
+            else => "it could not be encoded as a Windows .ico",
+        };
+        const msg = std.fmt.bufPrint(
+            &buf,
+            "labelle-assembler: WARNING: using the bundled default icon for the Windows exe icon — app_icon {s}: {s} ({s})\n",
+            .{ effectiveIconPath(cfg), why, @errorName(err) },
+        ) catch "labelle-assembler: WARNING: using the bundled default icon for the Windows exe icon\n";
+        std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+        // The bundled default is a plain 8-bit PNG this encoder is tested
+        // against, so this cannot fail for a reason the project caused; if it
+        // ever does, that is an assembler bug and should surface.
+        break :blk try ico.buildIco(allocator, default_icon_bytes);
     };
     defer allocator.free(ico_bytes);
 
@@ -338,6 +346,100 @@ test "usesDefaultIcon: an empty app_icon string still gets the default" {
     // A stray `.app_icon = ""` is not a usable icon — treat it as unset.
     try std.testing.expect(usesDefaultIcon(.{ .name = "game", .app_icon = "" }));
     try std.testing.expectEqualStrings(default_icon_rel_path, effectiveIconPath(.{ .name = "game", .app_icon = "" }));
+}
+
+test "writeDesktopIconArtifacts: an undecodable custom icon degrades to the default .ico, not a failed generate" {
+    // The regression guard (Codex on #687): a project whose `app_icon` this
+    // reader cannot decode must still GENERATE. Only the Windows exe icon
+    // degrades — loudly — and everything else is written as usual.
+    const allocator = std.testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const game_dir = try std.fs.path.join(allocator, &.{ root, "game" });
+    defer allocator.free(game_dir);
+    const target_dir = try std.fs.path.join(allocator, &.{ root, "target" });
+    defer allocator.free(target_dir);
+    try cwd.createDirPath(io, game_dir);
+    try cwd.createDirPath(io, target_dir);
+
+    // A real PNG, 512x512 per its IHDR, that does not decode — the one shape
+    // `buildIco` can neither read nor describe verbatim.
+    const png = try ico.encodePng(allocator, &[_]u8{0} ** (4 * 4 * 4), 4, 4);
+    defer allocator.free(png);
+    std.mem.writeInt(u32, png[16..20], 512, .big);
+    std.mem.writeInt(u32, png[20..24], 512, .big);
+    const src_icon = try std.fs.path.join(allocator, &.{ game_dir, "icon.png" });
+    defer allocator.free(src_icon);
+    try cwd.writeFile(io, .{ .sub_path = src_icon, .data = png });
+
+    const cfg = ProjectConfig{ .name = "game", .app_icon = "icon.png" };
+    try writeDesktopIconArtifacts(allocator, cfg, game_dir, target_dir);
+
+    // The .ico is the DEFAULT's four entries (256/48/32/16), not a refusal…
+    const ico_path = try std.fs.path.join(allocator, &.{ target_dir, windows_ico_rel_path });
+    defer allocator.free(ico_path);
+    const ico_bytes = try cwd.readFileAlloc(io, ico_path, allocator, .limited(4 << 20));
+    defer allocator.free(ico_bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 1, 0, 4, 0 }, ico_bytes[0..6]);
+    const from_default = try ico.buildIco(allocator, default_icon_bytes);
+    defer allocator.free(from_default);
+    try std.testing.expectEqualSlices(u8, from_default, ico_bytes);
+
+    // …and the rest is untouched: the .rc is there, and the RUNTIME icon still
+    // embeds the project's OWN file (the backend decodes it, or warns and shows
+    // nothing — that is not the assembler's call to make).
+    const rc_path = try std.fs.path.join(allocator, &.{ target_dir, windows_rc_rel_path });
+    defer allocator.free(rc_path);
+    try cwd.access(io, rc_path, .{});
+    const staged_path = try std.fs.path.join(allocator, &.{ target_dir, custom_icon_rel_path });
+    defer allocator.free(staged_path);
+    const staged = try cwd.readFileAlloc(io, staged_path, allocator, .limited(1 << 20));
+    defer allocator.free(staged);
+    try std.testing.expectEqualSlices(u8, png, staged);
+}
+
+test "writeDesktopIconArtifacts: a palette-optimised 512 icon builds a real .ico" {
+    // The exact user-facing case from the review: a 1-bit INDEXED 512x512
+    // app_icon (what palette optimisation produces) must yield the project's
+    // OWN four entries — not the default, and not an error.
+    const allocator = std.testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir);
+
+    const edge: u32 = 512;
+    const plte = [_]u8{ 255, 0, 0, 0, 0, 255 };
+    const samples = try allocator.alloc(u8, edge * edge);
+    defer allocator.free(samples);
+    for (0..edge) |y| for (0..edge) |x| {
+        samples[y * edge + x] = if (x < edge / 2) 0 else 1;
+    };
+    const png = try ico.encodePngPackedForTest(allocator, samples, edge, edge, 1, 3, &plte);
+    defer allocator.free(png);
+    const src_icon = try std.fs.path.join(allocator, &.{ dir, "icon.png" });
+    defer allocator.free(src_icon);
+    try cwd.writeFile(io, .{ .sub_path = src_icon, .data = png });
+
+    try writeDesktopIconArtifacts(allocator, .{ .name = "game", .app_icon = "icon.png" }, dir, dir);
+
+    const ico_path = try std.fs.path.join(allocator, &.{ dir, windows_ico_rel_path });
+    defer allocator.free(ico_path);
+    const ico_bytes = try cwd.readFileAlloc(io, ico_path, allocator, .limited(4 << 20));
+    defer allocator.free(ico_bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 1, 0, 4, 0 }, ico_bytes[0..6]);
+    // Not the default: the art is this project's red/blue split.
+    const from_default = try ico.buildIco(allocator, default_icon_bytes);
+    defer allocator.free(from_default);
+    try std.testing.expect(!std.mem.eql(u8, from_default, ico_bytes));
 }
 
 test "iconEmbedPath: default_icon.png when unset, the staged app_icon.png when custom" {

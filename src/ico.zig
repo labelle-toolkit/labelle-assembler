@@ -29,9 +29,11 @@
 //! ## Decoder scope + fallback
 //!
 //! The assembler has no stb_image (the CLI and the backends do), so the
-//! decode is a small pure-Zig PNG reader: 8-bit (and 16-bit, high byte) in
-//! every colour type (grey, RGB, palette + tRNS, grey+alpha, RGBA),
-//! NON-interlaced. That covers what any icon tool emits. A PNG it cannot
+//! decode is a small pure-Zig PNG reader: every colour type (grey, RGB,
+//! palette, grey+alpha, RGBA) with tRNS, at every legal bit depth — 1/2/4
+//! sub-byte samples for grey + indexed (what palette optimisation emits),
+//! 8, and 16 (high byte) — NON-interlaced. That covers what any icon tool
+//! emits. A PNG it cannot
 //! decode (Adam7 interlace, a corrupt stream) still yields a VALID `.ico`:
 //! a single entry whose payload is the source PNG verbatim — Windows reads
 //! its dimensions from the PNG itself — so a generate does not fail over an
@@ -112,7 +114,8 @@ const ColorType = enum(u8) {
     }
 };
 
-/// Decode a non-interlaced 8/16-bit PNG of any colour type to RGBA8.
+/// Decode a non-interlaced PNG of any colour type and legal bit depth
+/// (1/2/4 for grey + indexed, 8, 16) to RGBA8.
 pub fn decodePng(allocator: std.mem.Allocator, png: []const u8) DecodeError!Rgba {
     const dims = pngDimensions(png) orelse return error.NotPng;
     if (dims.width > max_icon_edge or dims.height > max_icon_edge) return error.TooLarge;
@@ -120,9 +123,18 @@ pub fn decodePng(allocator: std.mem.Allocator, png: []const u8) DecodeError!Rgba
     const color_type = std.enums.fromInt(ColorType, png[25]) orelse return error.Unsupported;
     const interlace = png[28];
     if (interlace != 0) return error.Unsupported;
-    // Sub-byte grey/palette depths are legal PNG but no icon tool emits them.
-    if (bit_depth != 8 and bit_depth != 16) return error.Unsupported;
-    if (bit_depth == 16 and color_type == .palette) return error.Unsupported;
+    // Bit depths, per the PNG spec's colour-type table: 1/2/4 are legal for
+    // GREYSCALE and INDEXED only, 8 for everything, 16 for everything except
+    // indexed. Sub-byte depths are not exotic — palette optimisation (pngquant,
+    // ImageOptim, "export as 8-colour PNG") emits them routinely, and rejecting
+    // them here used to fail `buildIco` for a perfectly ordinary 512x512
+    // indexed `app_icon.png`, taking the whole desktop generate with it.
+    switch (bit_depth) {
+        1, 2, 4 => if (color_type != .grey and color_type != .palette) return error.Malformed,
+        8 => {},
+        16 => if (color_type == .palette) return error.Malformed,
+        else => return error.Malformed,
+    }
 
     // Walk the chunks: concatenate IDAT, remember PLTE/tRNS.
     var idat: std.ArrayList(u8) = .empty;
@@ -156,10 +168,17 @@ pub fn decodePng(allocator: std.mem.Allocator, png: []const u8) DecodeError!Rgba
     // Inflate the zlib stream into the raw filtered scanlines.
     const w: usize = dims.width;
     const h: usize = dims.height;
-    const bytes_per_sample: usize = bit_depth / 8;
-    const bpp: usize = @as(usize, color_type.channels()) * bytes_per_sample;
-    const stride = w * bpp;
+    const channels: usize = color_type.channels();
+    const bits_per_pixel: usize = channels * bit_depth;
+    // Scanlines are packed to the BIT and padded to a byte boundary, so a
+    // sub-byte row is `ceil(w * bpp_bits / 8)` — not `w * bytes`.
+    const stride = (w * bits_per_pixel + 7) / 8;
     const raw_len = (stride + 1) * h;
+    // The filter's "corresponding byte of the previous pixel" distance is
+    // `ceil(bits_per_pixel / 8)`, i.e. 1 for every sub-byte depth (the spec's
+    // bpp), which is why filtering is defined on the PACKED bytes and the
+    // unpacking below happens after.
+    const filter_bpp: usize = @max(1, bits_per_pixel / 8);
 
     var in: std.Io.Reader = .fixed(idat.items);
     const window = try allocator.alloc(u8, flate.max_window_len);
@@ -178,58 +197,108 @@ pub fn decodePng(allocator: std.mem.Allocator, png: []const u8) DecodeError!Rgba
         const row_start = y * (stride + 1);
         const filter = raw[row_start];
         const row = raw[row_start + 1 .. row_start + 1 + stride];
-        try unfilterRow(filter, row, prev_row, bpp);
+        try unfilterRow(filter, row, prev_row, filter_bpp);
         prev_row = row;
     }
 
-    // Expand to RGBA8. `trns_hi` indexes the byte of each big-endian tRNS
-    // sample that matches our 8-bit value: the low byte at 8-bit depth, the
-    // high byte at 16-bit (where we keep only the high byte of every sample).
-    const trns_hi: usize = if (bit_depth == 8) 1 else 0;
+    // Expand to RGBA8.
+    //
+    // `sampleAt` returns one sample at its NATIVE depth (0..2^depth-1), so the
+    // tRNS comparisons below are exact at every depth — tRNS stores its keys as
+    // big-endian 16-bit values in the image's own scale, not in 8-bit.
+    // `to8` then maps a sample onto 0..255: 16-bit keeps the high byte, 8-bit
+    // is already there, and a sub-byte GREY level is scaled to the full range
+    // (1-bit 1 → 255, 4-bit 10 → 170) rather than left dark. Palette indices
+    // are never scaled — they are looked up in PLTE.
+    const S = struct {
+        row: []const u8 = &.{},
+        depth: u8,
+        channels: usize,
+
+        fn sampleAt(self: @This(), x: usize, c: usize) u16 {
+            const i = x * self.channels + c;
+            return switch (self.depth) {
+                16 => (@as(u16, self.row[i * 2]) << 8) | self.row[i * 2 + 1],
+                8 => self.row[i],
+                // Sub-byte: MSB-first within each byte, per the spec.
+                else => blk: {
+                    const per_byte: usize = 8 / self.depth;
+                    const byte = self.row[i / per_byte];
+                    const shift: u3 = @intCast(8 - self.depth * @as(usize, @intCast(i % per_byte + 1)));
+                    const mask: u16 = (@as(u16, 1) << @intCast(self.depth)) - 1;
+                    break :blk (@as(u16, byte) >> shift) & mask;
+                },
+            };
+        }
+
+        // Sample -> 8-bit intensity (greyscale/colour channels only).
+        fn to8(self: @This(), v: u16) u8 {
+            return switch (self.depth) {
+                16 => @intCast(v >> 8),
+                8 => @intCast(v),
+                // Scale to full range: v * 255 / (2^depth - 1).
+                else => @intCast((@as(u32, v) * 255) / ((@as(u32, 1) << @intCast(self.depth)) - 1)),
+            };
+        }
+    };
+    var smp: S = .{ .depth = bit_depth, .channels = channels };
+
+    // The tRNS key for greyscale/RGB: a big-endian 16-bit sample in the
+    // image's own scale.
+    const trnsKey = struct {
+        fn at(t: []const u8, i: usize) u16 {
+            return (@as(u16, t[i * 2]) << 8) | t[i * 2 + 1];
+        }
+    };
+
     const out = try allocator.alloc(u8, w * h * 4);
     errdefer allocator.free(out);
     y = 0;
     while (y < h) : (y += 1) {
-        const row = raw[y * (stride + 1) + 1 ..][0..stride];
+        smp.row = raw[y * (stride + 1) + 1 ..][0..stride];
         var x: usize = 0;
         while (x < w) : (x += 1) {
-            const src = row[x * bpp ..][0..bpp];
             const dst = out[(y * w + x) * 4 ..][0..4];
-            // 16-bit: the high byte of each sample is the 8-bit value.
-            const s = struct {
-                fn at(buf: []const u8, i: usize, bps: usize) u8 {
-                    return buf[i * bps];
-                }
-            };
             switch (color_type) {
                 .grey => {
-                    const g = s.at(src, 0, bytes_per_sample);
+                    const raw_v = smp.sampleAt(x, 0);
+                    const g = smp.to8(raw_v);
                     dst.* = .{ g, g, g, 255 };
-                    // tRNS for greyscale: one big-endian 16-bit sample naming the
-                    // transparent grey level (low byte at 8-bit, high at 16-bit).
-                    if (trns) |t| if (t.len >= 2 and t[trns_hi] == g) {
+                    // tRNS for greyscale: one key naming the transparent level.
+                    if (trns) |t| if (t.len >= 2 and trnsKey.at(t, 0) == raw_v) {
                         dst[3] = 0;
                     };
                 },
                 .grey_alpha => {
-                    const g = s.at(src, 0, bytes_per_sample);
-                    dst.* = .{ g, g, g, s.at(src, 1, bytes_per_sample) };
+                    const g = smp.to8(smp.sampleAt(x, 0));
+                    dst.* = .{ g, g, g, smp.to8(smp.sampleAt(x, 1)) };
                 },
                 .rgb => {
-                    dst.* = .{ s.at(src, 0, bytes_per_sample), s.at(src, 1, bytes_per_sample), s.at(src, 2, bytes_per_sample), 255 };
-                    // tRNS for RGB: three big-endian 16-bit samples — one colour key.
+                    const r = smp.sampleAt(x, 0);
+                    const g = smp.sampleAt(x, 1);
+                    const b = smp.sampleAt(x, 2);
+                    dst.* = .{ smp.to8(r), smp.to8(g), smp.to8(b), 255 };
+                    // tRNS for RGB: three keys — one colour treated as clear.
                     if (trns) |t| if (t.len >= 6) {
-                        if (dst[0] == t[trns_hi] and dst[1] == t[2 + trns_hi] and dst[2] == t[4 + trns_hi]) dst[3] = 0;
+                        if (trnsKey.at(t, 0) == r and trnsKey.at(t, 1) == g and trnsKey.at(t, 2) == b) dst[3] = 0;
                     };
                 },
                 .rgba => {
-                    dst.* = .{ s.at(src, 0, bytes_per_sample), s.at(src, 1, bytes_per_sample), s.at(src, 2, bytes_per_sample), s.at(src, 3, bytes_per_sample) };
+                    dst.* = .{
+                        smp.to8(smp.sampleAt(x, 0)),
+                        smp.to8(smp.sampleAt(x, 1)),
+                        smp.to8(smp.sampleAt(x, 2)),
+                        smp.to8(smp.sampleAt(x, 3)),
+                    };
                 },
                 .palette => {
-                    const idx: usize = src[0];
+                    // An index is an index at every depth — never scaled.
+                    const idx: usize = smp.sampleAt(x, 0);
                     const p = plte.?;
                     if (idx * 3 + 2 >= p.len) return error.Malformed;
                     dst.* = .{ p[idx * 3], p[idx * 3 + 1], p[idx * 3 + 2], 255 };
+                    // tRNS for indexed: one alpha byte per palette entry;
+                    // entries past its end are opaque.
                     if (trns) |t| if (idx < t.len) {
                         dst[3] = t[idx];
                     };
@@ -352,6 +421,72 @@ pub fn encodePngRaw(
     try writeChunk(wr, "IEND", "");
     return out.toOwnedSlice();
 }
+
+/// Encode a 1/2/4-bit GREY or INDEXED PNG: `samples` is one byte per pixel
+/// holding a value below `2^depth`, packed MSB-first into bit-packed
+/// scanlines. Only the tests need this (real projects hand us files a paint
+/// program wrote), but the reader MUST handle these depths — palette
+/// optimisation emits them constantly — so the fixtures have to be real
+/// sub-byte PNGs rather than hand-waved bytes.
+pub fn encodePngPacked(
+    allocator: std.mem.Allocator,
+    samples: []const u8,
+    w: u32,
+    h: u32,
+    depth: u8,
+    color_type: u8,
+    plte: ?[]const u8,
+) ![]u8 {
+    std.debug.assert(depth == 1 or depth == 2 or depth == 4);
+    if (samples.len != @as(usize, w) * h) return error.InvalidDimensions;
+    const stride = (@as(usize, w) * depth + 7) / 8;
+    const per_byte: usize = 8 / depth;
+
+    const raw = try allocator.alloc(u8, (stride + 1) * h);
+    defer allocator.free(raw);
+    @memset(raw, 0);
+    for (0..h) |y| {
+        raw[y * (stride + 1)] = 0; // filter: none
+        const row = raw[y * (stride + 1) + 1 ..][0..stride];
+        for (0..w) |x| {
+            const v = samples[y * w + x];
+            const shift: u3 = @intCast(8 - depth * @as(usize, @intCast(x % per_byte + 1)));
+            row[x / per_byte] |= v << shift;
+        }
+    }
+
+    var zout: std.Io.Writer.Allocating = try .initCapacity(allocator, 4096);
+    defer zout.deinit();
+    {
+        const window = try allocator.alloc(u8, flate.max_window_len);
+        defer allocator.free(window);
+        var comp: flate.Compress = try .init(&zout.writer, window, .zlib, .default);
+        try comp.writer.writeAll(raw);
+        try comp.finish();
+    }
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const wr = &out.writer;
+    try wr.writeAll(&png_magic);
+    var ihdr: [13]u8 = undefined;
+    std.mem.writeInt(u32, ihdr[0..4], w, .big);
+    std.mem.writeInt(u32, ihdr[4..8], h, .big);
+    ihdr[8] = depth;
+    ihdr[9] = color_type;
+    ihdr[10] = 0;
+    ihdr[11] = 0;
+    ihdr[12] = 0;
+    try writeChunk(wr, "IHDR", &ihdr);
+    if (plte) |pl| try writeChunk(wr, "PLTE", pl);
+    try writeChunk(wr, "IDAT", zout.written());
+    try writeChunk(wr, "IEND", "");
+    return out.toOwnedSlice();
+}
+
+/// Test-facing alias for `encodePngPacked` (see there). Named so its purpose
+/// is unmistakable at the call site in `app_icon.zig`'s tests.
+pub const encodePngPackedForTest = encodePngPacked;
 
 /// Encode tightly packed RGBA8 as a PNG. Caller owns the bytes.
 pub fn encodePng(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) ![]u8 {
@@ -585,6 +720,24 @@ pub fn entrySizes(edge: u32, buf: *[ico_sizes.len + 1]u32) []const u32 {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// Insert `kind`/`data` as a new chunk immediately before the first IDAT.
+/// Test-only: the encoders above never emit tRNS, but the reader must honour
+/// it, so the fixtures splice one in.
+fn insertChunkBeforeIdat(allocator: std.mem.Allocator, png: []const u8, kind: *const [4]u8, data: []const u8) ![]u8 {
+    var pos: usize = 8;
+    while (pos + 12 <= png.len) {
+        const len: usize = std.mem.readInt(u32, png[pos..][0..4], .big);
+        if (std.mem.eql(u8, png[pos + 4 ..][0..4], "IDAT")) break;
+        pos += 12 + len;
+    }
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(png[0..pos]);
+    try writeChunk(&out.writer, kind, data);
+    try out.writer.writeAll(png[pos..]);
+    return out.toOwnedSlice();
+}
 
 /// Parse an `.ico` back into (size byte, payload) pairs for assertions.
 const ParsedEntry = struct { size_byte: u8, planes: u16, bit_count: u16, payload: []const u8 };
@@ -870,4 +1023,117 @@ test "downscaleBox: fractional coverage is weighted, and alpha is premultiplied"
 
 test "buildIco rejects bytes that are not a PNG" {
     try testing.expectError(error.NotPng, buildIco(testing.allocator, "just some text that is long enough to not be short"));
+}
+
+test "decodePng: sub-byte greyscale scales to the full range, indexed looks up PLTE" {
+    // 4-bit grey: level 10 of 15 is 170, not 10 — a sample must be SCALED to
+    // 8-bit, not truncated, or every palette-optimised icon comes out nearly
+    // black. 1-bit: 1 is white, 0 is black.
+    {
+        const png = try encodePngPacked(testing.allocator, &.{ 0, 10, 15 }, 3, 1, 4, 0, null);
+        defer testing.allocator.free(png);
+        const img = try decodePng(testing.allocator, png);
+        defer img.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, &.{
+            0,   0,   0,   255,
+            170, 170, 170, 255,
+            255, 255, 255, 255,
+        }, img.pixels);
+    }
+    {
+        const png = try encodePngPacked(testing.allocator, &.{ 0, 1, 1, 0, 1, 0, 0, 1, 1 }, 9, 1, 1, 0, null);
+        defer testing.allocator.free(png);
+        const img = try decodePng(testing.allocator, png);
+        defer img.deinit(testing.allocator);
+        // 9 pixels: crosses the byte boundary, so this also pins the MSB-first
+        // packing and the row's bit padding.
+        for ([_]u8{ 0, 1, 1, 0, 1, 0, 0, 1, 1 }, 0..) |bit, i| {
+            const want: u8 = if (bit == 1) 255 else 0;
+            try testing.expectEqual(want, img.pixels[i * 4]);
+        }
+    }
+    // 2-bit indexed with tRNS: index 0 transparent, 1..2 opaque palette colours.
+    {
+        const plte = [_]u8{ 9, 9, 9, 255, 0, 0, 0, 0, 255 };
+        const trns_alpha = [_]u8{0}; // entry 0 fully transparent
+        const png = try encodePngPacked(testing.allocator, &.{ 0, 1, 2, 1 }, 4, 1, 2, 3, &plte);
+        defer testing.allocator.free(png);
+        // Splice a tRNS chunk in before IDAT (chunk order is free for tRNS).
+        const with_trns = try insertChunkBeforeIdat(testing.allocator, png, "tRNS", &trns_alpha);
+        defer testing.allocator.free(with_trns);
+        const img = try decodePng(testing.allocator, with_trns);
+        defer img.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, &.{ 9, 9, 9, 0 }, img.pixels[0..4]); // transparent
+        try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, img.pixels[4..8]);
+        try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, img.pixels[8..12]);
+    }
+}
+
+test "buildIco: a 512x512 1-bit INDEXED icon produces the four real entries" {
+    // The regression this guards (Codex on #687): palette optimisation turns a
+    // normal 512 icon into a 1-bit indexed PNG. Rejecting that depth made
+    // `buildIco` fail, the >256 verbatim fallback refuse, and EVERY desktop
+    // generate for that project break on `AppIconNotPng`.
+    const edge: u32 = 512;
+    const plte = [_]u8{ 255, 0, 0, 0, 0, 255 }; // 0 = red, 1 = blue
+    const samples = try testing.allocator.alloc(u8, edge * edge);
+    defer testing.allocator.free(samples);
+    for (0..edge) |y| for (0..edge) |x| {
+        samples[y * edge + x] = if (x < edge / 2) 0 else 1;
+    };
+    const png = try encodePngPacked(testing.allocator, samples, edge, edge, 1, 3, &plte);
+    defer testing.allocator.free(png);
+
+    const ico = try buildIco(testing.allocator, png);
+    defer testing.allocator.free(ico);
+    var buf: [8]ParsedEntry = undefined;
+    const entries = try parseIco(ico, &buf);
+    try testing.expectEqual(@as(usize, 4), entries.len);
+    for (entries, [_]u32{ 256, 48, 32, 16 }) |e, want| {
+        try testing.expectEqual(dirSizeByte(want), e.size_byte);
+        const d = pngDimensions(e.payload) orelse return error.PayloadNotPng;
+        try testing.expectEqual(want, d.width);
+    }
+    // The art survived the depth expansion and the resize: left half red,
+    // right half blue, opaque, in the 16x16 entry.
+    const small = try decodePng(testing.allocator, entries[3].payload);
+    defer small.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, small.pixels[(8 * 16 + 3) * 4 ..][0..4]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, small.pixels[(8 * 16 + 12) * 4 ..][0..4]);
+}
+
+test "buildIco: a 512x512 4-bit GREYSCALE icon produces the four real entries" {
+    const edge: u32 = 512;
+    const samples = try testing.allocator.alloc(u8, edge * edge);
+    defer testing.allocator.free(samples);
+    @memset(samples, 10); // level 10 of 15 -> 170
+    const png = try encodePngPacked(testing.allocator, samples, edge, edge, 4, 0, null);
+    defer testing.allocator.free(png);
+
+    const ico = try buildIco(testing.allocator, png);
+    defer testing.allocator.free(ico);
+    var buf: [8]ParsedEntry = undefined;
+    const entries = try parseIco(ico, &buf);
+    try testing.expectEqual(@as(usize, 4), entries.len);
+    for (entries, [_]u32{ 256, 48, 32, 16 }) |e, want| {
+        try testing.expectEqual(dirSizeByte(want), e.size_byte);
+    }
+    const small = try decodePng(testing.allocator, entries[3].payload);
+    defer small.deinit(testing.allocator);
+    for (0..16 * 16) |i| {
+        try testing.expectEqualSlices(u8, &.{ 170, 170, 170, 255 }, small.pixels[i * 4 ..][0..4]);
+    }
+}
+
+test "decodePng: a bit depth the colour type forbids is Malformed, not Unsupported" {
+    // 1/2/4 are legal ONLY for grey + indexed; 16 is illegal for indexed. Those
+    // are broken files, not features we declined — the distinction matters
+    // because `buildIco`'s verbatim fallback treats both the same but the
+    // diagnostics differ.
+    var png = try encodePng(testing.allocator, &[_]u8{0} ** (2 * 2 * 4), 2, 2);
+    defer testing.allocator.free(png);
+    png[24] = 4; // 4-bit RGBA: not a thing
+    try testing.expectError(error.Malformed, decodePng(testing.allocator, png));
+    png[24] = 3; // not a depth at all
+    try testing.expectError(error.Malformed, decodePng(testing.allocator, png));
 }
