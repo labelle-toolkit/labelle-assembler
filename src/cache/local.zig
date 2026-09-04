@@ -84,19 +84,48 @@ pub fn frameworkSlot(allocator: std.mem.Allocator, package: []const u8) ![]const
     return std.fs.path.join(allocator, &.{ root, package });
 }
 
-/// `~/.labelle/packages/local/plugins/<repo>/<name>` — the local slot for a
-/// plugin or external backend package.
+/// `~/.labelle/packages/local/plugins/<key>` — the local slot for a plugin
+/// or external backend package.
 ///
-/// Keyed by repo AND logical name (#688 review round 4). The repo alone
-/// identifies the package, but the SOURCE is `labelle-<name>`: one project
-/// may declare two non-local deps sharing a repo under different names —
-/// an external backend and a plugin alias, say — and they are populated
-/// from different sibling checkouts. One slot for both would have them
-/// overwrite each other's link and marker on every `ensureCache`.
+/// The key is ONE opaque component, not the repo path (#688 review round
+/// 7). Repo strings are unconstrained, so `<repo>/<name>` pairs can nest:
+/// `{ repo = "github.com/acme/foo", name = "bar" }` and
+/// `{ repo = "github.com/acme/foo/bar/baz", name = "qux" }` put the second
+/// slot INSIDE the first — and the first is a symlink to a checkout, so
+/// populating the second would write through it into the user's source
+/// tree. A flat key cannot nest.
+///
+/// Both repo AND name go into it: the repo identifies the package, but the
+/// SOURCE is `labelle-<name>`, and one project may declare two non-local
+/// deps sharing a repo under different names (an external backend and a
+/// plugin alias), populated from different sibling checkouts.
 pub fn pluginSlot(allocator: std.mem.Allocator, plugin: config.PluginDep) ![]const u8 {
     const root = try slotsRoot(allocator);
     defer allocator.free(root);
-    return std.fs.path.join(allocator, &.{ root, "plugins", plugin.repo, plugin.name });
+
+    const key = try pluginSlotKey(allocator, plugin);
+    defer allocator.free(key);
+
+    return std.fs.path.join(allocator, &.{ root, "plugins", key });
+}
+
+/// `<readable name>-<hash of repo + name>`: legible in a diagnostic, but
+/// still a single path component that no other identity can collide with.
+fn pluginSlotKey(allocator: std.mem.Allocator, plugin: config.PluginDep) ![]const u8 {
+    var hasher = std.hash.Wyhash.init(0x1abe11e);
+    hasher.update(plugin.repo);
+    hasher.update(&[_]u8{0});
+    hasher.update(plugin.name);
+
+    var label: std.ArrayList(u8) = .empty;
+    defer label.deinit(allocator);
+    for (plugin.name) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.') {
+            if (label.items.len < 32) try label.append(allocator, c);
+        }
+    }
+    const readable = if (label.items.len == 0) "plugin" else label.items;
+    return std.fmt.allocPrint(allocator, "{s}-{x:0>16}", .{ readable, hasher.final() });
 }
 
 /// `~/.labelle/packages/local/assembler` — the local slot for the
@@ -345,13 +374,20 @@ pub fn assemblerSlotTracksSource(allocator: std.mem.Allocator, slot: []const u8)
 /// The bundled subdirectories `populateAssemblerCache` links into the slot.
 pub const ASSEMBLER_SUBDIRS = [_][]const u8{ "backends", "ecs", "gui" };
 
-/// Whether every bundled subdir the companion checkout has is present in
-/// the slot.
+/// Whether the slot's bundled subdirs MATCH the companion checkout's: every
+/// one the checkout has is present, and none the checkout has dropped is
+/// left behind. A leftover subdir is a stale copy (or a link whose target is
+/// gone) that would still be compiled (#688 review round 7).
 pub fn assemblerSlotComplete(allocator: std.mem.Allocator, slot: []const u8, companion_dir: []const u8) bool {
     for (ASSEMBLER_SUBDIRS) |subdir| {
         const src = std.fs.path.join(allocator, &.{ companion_dir, subdir }) catch return false;
         defer allocator.free(src);
-        if (!pathExists(src)) continue;
+        if (!pathExists(src)) {
+            const stale = std.fs.path.join(allocator, &.{ slot, subdir }) catch return false;
+            defer allocator.free(stale);
+            if (pathExists(stale) or isSymlinkPath(stale)) return false;
+            continue;
+        }
 
         const dst = std.fs.path.join(allocator, &.{ slot, subdir }) catch return false;
         defer allocator.free(dst);
@@ -1202,4 +1238,73 @@ test "writeOrigin: an unwritable marker fails population rather than reporting s
     try std.Io.Dir.cwd().createDirPath(config.globalIo(), marker);
 
     try std.testing.expectError(error.CachePopulationFailed, writeOrigin(alloc, slot, home, "1.29.0"));
+}
+
+test "pluginSlot: no plugin identity can nest inside another's slot (#688 review)" {
+    // Repo strings are unconstrained, so `<repo>/<name>` pairs could nest:
+    // `{repo=github.com/acme/foo, name=bar}` and
+    // `{repo=github.com/acme/foo/bar/baz, name=qux}` put the second slot
+    // INSIDE the first — which is a symlink to a checkout, so populating the
+    // second would write through it into the user's source tree.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    const home_env = "LABELLE_HOME=/c";
+    const envp = [_:null]?[*:0]const u8{home_env};
+    const saved_environ = setTestCacheHome(&envp);
+    defer std.testing.environ = saved_environ;
+
+    const outer: config.PluginDep = .{ .name = "bar", .repo = "github.com/acme/foo", .version = "1.0.0" };
+    const inner: config.PluginDep = .{ .name = "qux", .repo = "github.com/acme/foo/bar/baz", .version = "1.0.0" };
+
+    const a = try pluginSlot(alloc, outer);
+    defer alloc.free(a);
+    const b = try pluginSlot(alloc, inner);
+    defer alloc.free(b);
+
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+    try std.testing.expect(!std.mem.startsWith(u8, b, a));
+    try std.testing.expect(!std.mem.startsWith(u8, a, b));
+
+    // One flat component under `plugins/`, so nesting is impossible by shape.
+    const plugins_dir = try std.fs.path.join(alloc, &.{ "/c", "packages", SLOT_NS, "plugins" });
+    defer alloc.free(plugins_dir);
+    for ([_][]const u8{ a, b }) |slot| {
+        try std.testing.expect(std.mem.startsWith(u8, slot, plugins_dir));
+        const rel = slot[plugins_dir.len + 1 ..];
+        try std.testing.expect(std.mem.indexOfAny(u8, rel, "/\\") == null);
+    }
+
+    // Same repo, different logical name still means different slots.
+    const alias: config.PluginDep = .{ .name = "baz", .repo = outer.repo, .version = "1.0.0" };
+    const c = try pluginSlot(alloc, alias);
+    defer alloc.free(c);
+    try std.testing.expect(!std.mem.eql(u8, a, c));
+}
+
+test "assemblerSlotComplete: a subdir the checkout dropped makes the slot stale (#688 review)" {
+    // A leftover `gui/` — a stale copy, or a link whose target is gone —
+    // would otherwise survive every repopulation and still be compiled.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "slot/backends");
+    try tmp.dir.createDirPath(std.testing.io, "slot/gui");
+    try tmp.dir.createDirPath(std.testing.io, "companion/backends");
+
+    const slot = try tmp.dir.realPathFileAlloc(std.testing.io, "slot", alloc);
+    defer alloc.free(slot);
+    const companion = try tmp.dir.realPathFileAlloc(std.testing.io, "companion", alloc);
+    defer alloc.free(companion);
+
+    // The checkout has no `gui/`, the slot still does: stale.
+    try std.testing.expect(!assemblerSlotComplete(alloc, slot, companion));
+
+    // Drop it and the slot matches again.
+    const stale = try std.fs.path.join(alloc, &.{ slot, "gui" });
+    defer alloc.free(stale);
+    try std.Io.Dir.cwd().deleteTree(config.globalIo(), stale);
+    try std.testing.expect(assemblerSlotComplete(alloc, slot, companion));
 }

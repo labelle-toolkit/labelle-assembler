@@ -38,10 +38,21 @@ pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: [
         const src_path = try std.fs.path.join(allocator, &.{ companion_dir, subdir });
         defer allocator.free(src_path);
 
-        if (!dirExists(src_path)) continue;
-
         const dst_path = try std.fs.path.join(allocator, &.{ target, subdir });
         defer allocator.free(dst_path);
+
+        // The checkout dropped this subdir: drop it from the slot too, or a
+        // stale copy (or a link to a directory that no longer exists) stays
+        // behind and is still compiled (#688 review round 7).
+        if (!dirExists(src_path)) {
+            if (local.pathExists(dst_path) or local.isSymlinkPath(dst_path)) {
+                cwd.deleteTree(io, dst_path) catch |err| {
+                    std.log.warn("labelle: could not drop stale bundled '{s}': {any}", .{ dst_path, err });
+                    return error.CachePopulationFailed;
+                };
+            }
+            continue;
+        }
 
         symlinkToCache(allocator, src_path, dst_path) catch |err| {
             std.log.err("labelle: could not link '{s}' to cache: {any}", .{ src_path, err });
@@ -172,7 +183,7 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
 /// Returns true when something was removed. A removal that FAILS is an
 /// error, not a false: the poisoned slot is still there and every presence
 /// probe would accept it, so the caller must abort rather than build it.
-pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8) error{PurgeFailed}!bool {
+pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8, version: []const u8) error{PurgeFailed}!bool {
     const io = config.globalIo();
 
     // Containment, checked HERE rather than at each caller (#688 review
@@ -198,12 +209,16 @@ pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8)
     }
 
     if (!dirExists(slot_path)) return false;
-    const slot_version = std.fs.path.basename(slot_path);
-    if (!config.isSemverVersion(slot_version)) return false;
+
+    // The PIN decides, not the path's last component (#688 review round 7):
+    // `release/1.2.3` is a supported ref whose slot basename reads as semver,
+    // and its archive's manifest declares whatever that branch is at. Judging
+    // it by content would delete a valid cache on every install.
+    if (!config.isSemverVersion(version)) return false;
 
     const declared = declaredZonVersion(allocator, slot_path) orelse return false;
     defer allocator.free(declared);
-    if (std.mem.eql(u8, declared, slot_version)) return false;
+    if (std.mem.eql(u8, declared, version)) return false;
 
     std.Io.Dir.cwd().deleteTree(io, slot_path) catch |err| {
         std.log.warn("labelle: could not remove mis-versioned cache slot '{s}': {any}", .{ slot_path, err });
@@ -211,7 +226,7 @@ pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8)
     };
     std.log.warn(
         "labelle: removed cache slot '{s}' — it holds {s} sources, not the {s} release (#685)",
-        .{ slot_path, declared, slot_version },
+        .{ slot_path, declared, version },
     );
     return true;
 }
@@ -311,7 +326,7 @@ pub fn purgeLegacyLocalSlots(allocator: std.mem.Allocator, cfg: config.ProjectCo
         if (config.isLocalVersion(pkg.version)) continue;
         const slot = std.fs.path.join(allocator, &.{ packages_dir, pkg.name, pkg.version }) catch continue;
         defer allocator.free(slot);
-        _ = try purgeLegacyLocalSlot(allocator, slot);
+        _ = try purgeLegacyLocalSlot(allocator, slot, pkg.version);
     }
 
     // The assembler slot is a real directory whose backends/ecs/gui SUBDIRS
@@ -325,6 +340,14 @@ pub fn purgeLegacyLocalSlots(allocator: std.mem.Allocator, cfg: config.ProjectCo
             const sub = std.fs.path.join(allocator, &.{ slot, subdir }) catch continue;
             defer allocator.free(sub);
             if (!isSymlink(sub)) continue;
+            // Same containment the generic purge applies: `assembler_version`
+            // comes from `project.labelle` and is joined straight into this
+            // path, so an escaping pin would aim this deleteTree outside the
+            // cache (#688 review round 7).
+            if (!withinPackagesDir(allocator, slot)) {
+                std.log.warn("labelle: refusing to touch assembler slot '{s}' — it is outside the package cache", .{slot});
+                break;
+            }
             std.Io.Dir.cwd().deleteTree(config.globalIo(), slot) catch |err| {
                 std.log.warn("labelle: could not remove locally-sourced assembler slot '{s}': {any}", .{ slot, err });
                 return error.PurgeFailed;
@@ -353,7 +376,7 @@ pub fn purgeLegacyLocalSlots(allocator: std.mem.Allocator, cfg: config.ProjectCo
         if (pkg.len == 0 or ver.len == 0 or config.isLocalVersion(ver)) break :blk;
         const slot = std.fs.path.join(allocator, &.{ packages_dir, "plugins", pkg, ver }) catch break :blk;
         defer allocator.free(slot);
-        _ = try purgeLegacyLocalSlot(allocator, slot);
+        _ = try purgeLegacyLocalSlot(allocator, slot, ver);
     }
 
     // The tests target (#83) ALWAYS forces `.backend = .null`, so `validateCache`
@@ -375,7 +398,7 @@ fn purgeLegacyPluginSlot(allocator: std.mem.Allocator, packages_dir: []const u8,
     if (plugin.isLocal() or plugin.repo.len == 0 or plugin.version.len == 0) return;
     const slot = std.fs.path.join(allocator, &.{ packages_dir, "plugins", plugin.repo, plugin.version }) catch return;
     defer allocator.free(slot);
-    _ = try purgeLegacyLocalSlot(allocator, slot);
+    _ = try purgeLegacyLocalSlot(allocator, slot, plugin.version);
 }
 
 /// Whether `path` exists and is accessible. Public so the cache
@@ -696,7 +719,7 @@ test "purgeLegacyLocalSlot: drops a version slot symlinked at a local checkout (
     try symlinkToCache(alloc, checkout, poisoned);
     try testing.expect(dirExists(poisoned));
 
-    try testing.expect(try purgeLegacyLocalSlot(alloc, poisoned));
+    try testing.expect(try purgeLegacyLocalSlot(alloc, poisoned, "1.29.0"));
     try testing.expect(!dirExists(poisoned));
     // The source checkout is untouched — only the link went away.
     try testing.expect(dirExists(checkout));
@@ -704,7 +727,7 @@ test "purgeLegacyLocalSlot: drops a version slot symlinked at a local checkout (
     // A genuine extracted release is left alone.
     const genuine = try std.fs.path.join(alloc, &.{ home, "packages", "core", "1.27.0" });
     defer alloc.free(genuine);
-    try testing.expect(!try purgeLegacyLocalSlot(alloc, genuine));
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, genuine, "1.27.0"));
     try testing.expect(dirExists(genuine));
 }
 
@@ -883,12 +906,12 @@ test "purgeLegacyLocalSlot: drops a COPIED version slot whose contents are a dif
     const unknown = try std.fs.path.join(alloc, &.{ home, "packages", "engine", "2.4.0" });
     defer alloc.free(unknown);
 
-    try testing.expect(try purgeLegacyLocalSlot(alloc, poisoned));
+    try testing.expect(try purgeLegacyLocalSlot(alloc, poisoned, "1.29.0"));
     try testing.expect(!dirExists(poisoned));
 
-    try testing.expect(!try purgeLegacyLocalSlot(alloc, genuine));
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, genuine, "1.27.0"));
     try testing.expect(dirExists(genuine));
-    try testing.expect(!try purgeLegacyLocalSlot(alloc, unknown));
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, unknown, "2.4.0"));
     try testing.expect(dirExists(unknown));
 }
 
@@ -990,7 +1013,7 @@ test "purgeLegacyLocalSlot: a non-semver ref slot is never judged by its zon ver
     defer alloc.free(ref_slot);
     try writeZon(ref_slot, ".{\n    .name = .labelle_gfx,\n    .version = \"1.31.0\",\n}\n");
 
-    try testing.expect(!try purgeLegacyLocalSlot(alloc, ref_slot));
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, ref_slot, "main"));
     try testing.expect(dirExists(ref_slot));
 }
 
@@ -1096,13 +1119,80 @@ test "purgeLegacyLocalSlot: refuses a target outside the package cache (#688 rev
     try testing.expect(dirExists(victim));
 
     // Named directly …
-    try testing.expect(!try purgeLegacyLocalSlot(alloc, victim));
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, victim, "1.2.3"));
     try testing.expect(dirExists(victim));
 
     // … and reached by traversal from a path that starts inside the cache,
     // which a prefix test alone would wave through.
     const traversed = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "..", "..", "..", "outside", "1.2.3" });
     defer alloc.free(traversed);
-    try testing.expect(!try purgeLegacyLocalSlot(alloc, traversed));
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, traversed, "1.2.3"));
     try testing.expect(dirExists(victim));
+}
+
+test "purgeLegacyLocalSlot: a ref ending in a semver component is judged by the PIN (#688 review)" {
+    // `release/1.2.3` is a supported ref whose slot basename reads as semver.
+    // Judging it by content would delete a valid remote cache on every
+    // install; the pin decides, and `release/1.2.3` is not semver.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home/packages/gfx/release/1.2.3");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    const slot = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "release", "1.2.3" });
+    defer alloc.free(slot);
+    try writeZon(slot, ".{\n    .name = .labelle_gfx,\n    .version = \"1.31.0\",\n}\n");
+
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, slot, "release/1.2.3"));
+    try testing.expect(dirExists(slot));
+}
+
+test "purgeLegacyLocalSlots: an escaping assembler pin cannot aim the sweep outside the cache (#688 review)" {
+    // The assembler branch builds its path directly and deletes the whole
+    // slot, so it needs the same containment the generic purge has.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home/packages");
+    try tmp.dir.createDirPath(testing.io, "victim");
+    try tmp.dir.createDirPath(testing.io, "checkout");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const victim = try tmp.dir.realPathFileAlloc(testing.io, "victim", alloc);
+    defer alloc.free(victim);
+    const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
+    defer alloc.free(checkout);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    // The escaping pin's slot, carrying the symlinked `backends/` that makes
+    // the assembler branch delete the whole directory.
+    const escaping = "../../../victim";
+    const bait = try std.fs.path.join(alloc, &.{ victim, "backends" });
+    defer alloc.free(bait);
+    try symlinkToCache(alloc, checkout, bait);
+
+    const cfg = config.ProjectConfig{ .name = "demo", .assembler_version = escaping };
+    try purgeLegacyLocalSlots(alloc, cfg);
+
+    try testing.expect(dirExists(victim));
+    try testing.expect(dirExists(checkout));
 }

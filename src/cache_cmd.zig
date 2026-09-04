@@ -789,7 +789,7 @@ fn purgeLegacyFrameworkSlot(allocator: std.mem.Allocator, package: []const u8, v
     // NOT discarded: a purge that failed leaves the poisoned slot in place,
     // and `isFrameworkCached` would then accept it as the pinned release
     // (#688 review round 5). Abort the install instead.
-    _ = try cache.purgeLegacyLocalSlot(allocator, slot);
+    _ = try cache.purgeLegacyLocalSlot(allocator, slot, version);
 }
 
 /// Walk up from the assembler executable's directory looking for the
