@@ -115,6 +115,19 @@ pub fn createDepsLinks(
         try deps.append(allocator, .{ .zon_name = zon_name, .link_name = link_name, .abs_path = plugin_path });
     }
 
+    // The assembler-bundled packages (built-in backends, ecs adapters, gui)
+    // all come out of ONE slot, so they get ONE warning rather than one per
+    // `resolveBundledPackage` call (#688 review). Probing the slot through
+    // the same resolver the deps use keeps the two in step.
+    {
+        const asm_ver = cfg.assembler_version orelse cfg.labelle_version;
+        if (!config.isLocalVersion(asm_ver)) {
+            const bundled = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends");
+            defer allocator.free(bundled);
+            cache.warnIfLocallySourced(allocator, "assembler", asm_ver, bundled);
+        }
+    }
+
     {
         // Tight scope: `zon_name`/`link_name`/`backend_path` are MOVED into the
         // DepEntry on a successful append (then owned by `deps`, freed by
@@ -134,6 +147,14 @@ pub fn createDepsLinks(
             // the same `labelle_{name}` / `labelle-{name}` convention either way.
             const backend_path = try backend_registry.resolveBackendPackage(allocator, cfg, project_dir);
             errdefer allocator.free(backend_path);
+            // #688 review: the backend is resolved here, not in the loop above,
+            // so it needs its own warning — a version-pinned backend served
+            // from a local slot is exactly as misleading as a plugin one. An
+            // explicitly `local:` backend declares its locality in `.repo` and
+            // is skipped, matching the plugin loop.
+            if (cfg.effectiveBackendPackage()) |bp| {
+                if (!bp.isLocal()) cache.warnIfLocallySourced(allocator, bp.name, bp.version, backend_path);
+            }
             try deps.append(allocator, .{ .zon_name = backend_info.zon_name, .link_name = backend_info.link_name, .abs_path = backend_path });
         }
 

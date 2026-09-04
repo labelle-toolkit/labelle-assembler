@@ -277,6 +277,15 @@ pub fn cmdClean(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
         }
     }
 
+    // Plugins and external backends live under `packages/plugins/<repo>/…`,
+    // which the version-pruning loop above never walks — so the diagnostic
+    // that tells users `labelle-assembler clean` will drop a plugin's local
+    // slot used to be a lie, and the same implicit source stayed active
+    // (#688 review). Version pruning for plugins needs pins this command
+    // doesn't read; the reserved `local` slot needs none, so drop exactly
+    // that, wherever it sits in the repo path.
+    removed_count += cleanPluginLocalSlots(arena_alloc, io, packages_dir, dry_run);
+
     if (removed_count == 0) {
         std.log.info("  nothing to clean", .{});
     } else if (dry_run) {
@@ -284,6 +293,79 @@ pub fn cmdClean(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
     } else {
         std.log.info("  cleaned {d} old version(s)", .{removed_count});
     }
+}
+
+/// Remove every reserved `local` slot (and its provenance marker) under
+/// `packages/plugins/`. Returns how many were removed (or, under
+/// `--dry-run`, would be).
+///
+/// A plugin repo path is `<host>/<owner>/<name>`, so the slots sit at an
+/// unknown depth — walk down to a bounded depth looking for the reserved
+/// name rather than assuming one.
+fn cleanPluginLocalSlots(
+    arena_alloc: std.mem.Allocator,
+    io: std.Io,
+    packages_dir: []const u8,
+    dry_run: bool,
+) u32 {
+    const plugins_dir = std.fs.path.join(arena_alloc, &.{ packages_dir, "plugins" }) catch return 0;
+    return cleanLocalSlotsIn(arena_alloc, io, plugins_dir, "plugins", dry_run, 0);
+}
+
+fn cleanLocalSlotsIn(
+    arena_alloc: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    label: []const u8,
+    dry_run: bool,
+    depth: u8,
+) u32 {
+    // `<host>/<owner>/<name>/local` is depth 4 below `plugins/`; stop well
+    // short of walking a whole extracted checkout.
+    if (depth > 5) return 0;
+
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+
+    var removed: u32 = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory and entry.kind != .sym_link) continue;
+        const full_path = std.fs.path.join(arena_alloc, &.{ dir_path, entry.name }) catch continue;
+        const entry_label = std.fs.path.join(arena_alloc, &.{ label, entry.name }) catch continue;
+
+        if (!std.mem.eql(u8, entry.name, cache.localSlots.SLOT_NAME)) {
+            // A version slot (or an intermediate repo-path component) — the
+            // former has nothing to recurse into, and the depth bound makes
+            // descending into it cheap either way.
+            removed += cleanLocalSlotsIn(arena_alloc, io, full_path, entry_label, dry_run, depth + 1);
+            continue;
+        }
+
+        if (dry_run) {
+            std.log.info("  would remove {s}", .{entry_label});
+            removed += 1;
+            continue;
+        }
+
+        if (entry.kind == .sym_link) {
+            std.Io.Dir.cwd().deleteFile(io, full_path) catch |err| {
+                std.log.warn("  could not remove {s}: {s}", .{ entry_label, @errorName(err) });
+                continue;
+            };
+        } else {
+            std.Io.Dir.cwd().deleteTree(io, full_path) catch |err| {
+                std.log.warn("  could not remove {s}: {s}", .{ entry_label, @errorName(err) });
+                continue;
+            };
+        }
+        if (std.fs.path.join(arena_alloc, &.{ dir_path, cache.localSlots.ORIGIN_NAME })) |origin_path| {
+            std.Io.Dir.cwd().deleteFile(io, origin_path) catch {};
+        } else |_| {}
+        std.log.info("  removed {s}", .{entry_label});
+        removed += 1;
+    }
+    return removed;
 }
 
 // ── upgrade ──────────────────────────────────────────────────────────
@@ -868,4 +950,56 @@ test "findFieldAssignment tolerates extra whitespace around =" {
     ;
     const span = findFieldAssignment(content, ".core_version") orelse return error.NotFound;
     try std.testing.expectEqualStrings(".core_version   =   \"0.1.0\"", content[span.start..span.end]);
+}
+
+test "cleanPluginLocalSlots: drops a plugin's reserved local slot and its marker (#688 review)" {
+    // `warnIfLocallySourced` tells users to run `labelle-assembler clean` to
+    // drop a local slot, but `cmdClean`'s version-pruning loop only walks
+    // core/engine/gfx/cli/assembler — a plugin or external backend's slot
+    // survived it, so the same implicit source stayed active and the warning
+    // repeated forever.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = config.globalIo();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = "github.com/labelle-toolkit/labelle-physics";
+    try tmp.dir.createDirPath(std.testing.io, "packages/plugins/" ++ repo);
+    try tmp.dir.createDirPath(std.testing.io, "packages/plugins/" ++ repo ++ "/0.4.0");
+    try tmp.dir.createDirPath(std.testing.io, "checkout");
+
+    const packages_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "packages", alloc);
+    defer alloc.free(packages_dir);
+    const checkout = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout", alloc);
+    defer alloc.free(checkout);
+
+    const slot = try std.fs.path.join(alloc, &.{ packages_dir, "plugins", repo, cache.localSlots.SLOT_NAME });
+    defer alloc.free(slot);
+    try std.Io.Dir.cwd().symLink(io, checkout, slot, .{ .is_directory = true });
+    cache.localSlots.writeOrigin(alloc, slot, checkout, "0.4.0");
+
+    const marker = try cache.localSlots.originPath(alloc, slot);
+    defer alloc.free(marker);
+    try std.testing.expect(cache.localSlots.pathExists(marker));
+
+    // A dry run reports it without touching anything.
+    try std.testing.expectEqual(@as(u32, 1), cleanPluginLocalSlots(arena_alloc, io, packages_dir, true));
+    try std.testing.expect(cache.localSlots.pathExists(slot));
+
+    try std.testing.expectEqual(@as(u32, 1), cleanPluginLocalSlots(arena_alloc, io, packages_dir, false));
+    try std.testing.expect(!cache.localSlots.pathExists(slot));
+    try std.testing.expect(!cache.localSlots.pathExists(marker));
+    // The version slot beside it, and the source checkout, are untouched.
+    const release = try std.fs.path.join(alloc, &.{ packages_dir, "plugins", repo, "0.4.0" });
+    defer alloc.free(release);
+    try std.testing.expect(cache.localSlots.pathExists(release));
+    try std.testing.expect(cache.localSlots.pathExists(checkout));
+
+    // Idempotent.
+    try std.testing.expectEqual(@as(u32, 0), cleanPluginLocalSlots(arena_alloc, io, packages_dir, false));
 }
