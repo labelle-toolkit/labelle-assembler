@@ -706,7 +706,16 @@ pub fn buildIco(allocator: std.mem.Allocator, source_png: []const u8) ![]u8 {
         // Windows (or the resource compiler) discard the icon we were trying
         // to preserve. A silently-wrong entry is worse than a clear refusal,
         // so those cases are an error the caller reports with the path.
-        error.Unsupported, error.Malformed, error.TooLarge => {
+        // A CORRUPT payload is never shipped verbatim. `Malformed` means the
+        // bytes themselves are broken (truncated zlib, bad filter byte), so
+        // wrapping them would produce an .ico the resource compiler or Windows
+        // rejects — while `buildIco` reported success, denying the caller its
+        // bundled-default fallback. Propagate instead: `writeDesktopIconArtifacts`
+        // degrades to the default icon with a warning naming the file. The
+        // verbatim path is for a VALID PNG this decoder simply declines
+        // (interlaced/Adam7, or one too large to decode).
+        error.Malformed => return error.Malformed,
+        error.Unsupported, error.TooLarge => {
             if (dims.width != dims.height or dims.width > 256) return error.IcoFallbackUnrepresentable;
             const one = [_]Entry{.{ .size = dims.width, .png = source_png }};
             return writeIcoContainer(allocator, &one);
@@ -1001,14 +1010,19 @@ test "the verbatim fallback refuses to describe an undecodable 512 or non-square
     // would advertise 256x256 / 100x100 over a payload whose IHDR says
     // otherwise, and a reader that trusts the directory drops the icon.
     //
-    // Fixture: a real 4x4 PNG whose IHDR is rewritten to the target size —
-    // still a PNG (so `pngDimensions` reads it), no longer decodable (the
-    // IDAT is 4x4), which is exactly the state the fallback exists for.
+    // Fixture: a real 4x4 PNG marked INTERLACED (Adam7) with its IHDR
+    // rewritten to the target size — still a PNG (so `pngDimensions` reads
+    // it) and valid, just a form this decoder declines, which is exactly the
+    // state the verbatim fallback exists for. It must be interlaced rather
+    // than corrupt: broken bytes are `Malformed` and now propagate so the
+    // caller can reach its bundled-default fallback (see the corrupt-PNG
+    // test below), so they never get this far.
     inline for (.{ .{ 512, 512 }, .{ 100, 200 }, .{ 300, 300 } }) |dims| {
         var png = try encodePng(testing.allocator, &[_]u8{0} ** (4 * 4 * 4), 4, 4);
         defer testing.allocator.free(png);
         std.mem.writeInt(u32, png[16..20], dims[0], .big);
         std.mem.writeInt(u32, png[20..24], dims[1], .big);
+        png[28] = 1; // Adam7 → Unsupported, not Malformed
         try testing.expectEqual(@as(u32, dims[0]), pngDimensions(png).?.width);
         try testing.expectError(error.IcoFallbackUnrepresentable, buildIco(testing.allocator, png));
     }
@@ -1019,6 +1033,7 @@ test "the verbatim fallback refuses to describe an undecodable 512 or non-square
     defer testing.allocator.free(ok_png);
     std.mem.writeInt(u32, ok_png[16..20], 256, .big);
     std.mem.writeInt(u32, ok_png[20..24], 256, .big);
+    ok_png[28] = 1; // interlaced: undecodable here, but a VALID PNG
     const ico = try buildIco(testing.allocator, ok_png);
     defer testing.allocator.free(ico);
     var buf: [2]ParsedEntry = undefined;
@@ -1165,6 +1180,25 @@ test "buildIco: a 512x512 4-bit GREYSCALE icon produces the four real entries" {
     for (0..16 * 16) |i| {
         try testing.expectEqualSlices(u8, &.{ 170, 170, 170, 255 }, small.pixels[i * 4 ..][0..4]);
     }
+}
+
+test "buildIco: a CORRUPT square PNG propagates Malformed instead of shipping damaged bytes" {
+    // A square, <=256 icon whose pixel data is broken used to take the verbatim
+    // fallback: `buildIco` wrapped the damaged bytes and returned success, so
+    // `writeDesktopIconArtifacts` never reached its bundled-default path and the
+    // resource compiler got an .ico it rejects. Corruption must propagate; only a
+    // VALID-but-undecodable PNG (interlaced) is shipped whole.
+    const good = try encodePng(testing.allocator, &[_]u8{0xff} ** (4 * 4 * 4), 4, 4);
+    defer testing.allocator.free(good);
+
+    // Truncate the IDAT payload: still a PNG (IHDR intact, dimensions readable),
+    // but the zlib stream can no longer be inflated.
+    const broken = try testing.allocator.alloc(u8, good.len - 8);
+    defer testing.allocator.free(broken);
+    @memcpy(broken, good[0 .. good.len - 8]);
+
+    try testing.expect(pngDimensions(broken) != null); // recognisable as a PNG
+    try testing.expectError(error.Malformed, buildIco(testing.allocator, broken));
 }
 
 test "decodePng: a bit depth the colour type forbids is Malformed, not Unsupported" {
