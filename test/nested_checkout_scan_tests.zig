@@ -183,6 +183,35 @@ pub const NESTED_CHECKOUT_COPY_PRUNING = struct {
         try tmp.dir.access(io, "out/assets/tile.png", .{});
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/assets/upstream", .{}));
     }
+
+    test "a re-run DELETES a nested checkout an earlier copy left behind (#692)" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        // Model the two ways a stale copy exists in a generated tree: an
+        // older assembler mirrored the checkout before the skip landed, or
+        // an ordinary directory only later gained a `.git`. Either way the
+        // destination already holds it when the next generate runs.
+        try writeSample(tmp.dir, "src/pack/assets/tile.png", "PNG");
+        try writeSample(tmp.dir, "src/pack/assets/upstream/.git", "gitdir: /elsewhere\n");
+        try writeSample(tmp.dir, "src/pack/assets/upstream/huge.bin", "0000");
+        try writeSample(tmp.dir, "out/assets/upstream/huge.bin", "stale copy from an older run");
+        try writeSample(tmp.dir, "out/assets/upstream/deep/deeper.bin", "stale nested payload");
+
+        const src_base = try tmp.dir.realPathFileAlloc(io, "src/pack", allocator);
+        defer allocator.free(src_base);
+        const dst_base = try tmp.dir.realPathFileAlloc(io, "out", allocator);
+        defer allocator.free(dst_base);
+
+        try scanner.copyDirRecursive(allocator, src_base, dst_base, "assets");
+
+        // The skip must be honoured into a DIRTY destination, not just a
+        // clean one: the whole stale subtree is gone.
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/assets/upstream", .{}));
+        // Negative control: the real asset is still mirrored.
+        try tmp.dir.access(io, "out/assets/tile.png", .{});
+    }
 };
 
 /// The script scanner is a SEPARATE walk from `scanner.zig`'s, and #692's

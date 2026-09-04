@@ -566,7 +566,29 @@ pub fn copyDirRecursiveAbs(allocator: std.mem.Allocator, src_path: []const u8, d
                 // (or a Windows symlink-fallback copy of a game dir) that
                 // happens to contain a nested checkout must not be
                 // duplicated wholesale into the generated target.
-                if (isSkippableDir(src_dir, entry.name)) continue;
+                if (isSkippableDir(src_dir, entry.name)) {
+                    // Drop any copy an EARLIER run made. Without this the
+                    // `continue` leaves `dst_path/entry.name` untouched, so
+                    // a nested checkout mirrored by an older assembler — or
+                    // a directory that only later gained a `.git` — survives
+                    // regeneration even though the source is now skipped.
+                    // `copyAndScanRecursive` prunes its orphans in a
+                    // dedicated pass; this walk has none, so it must clean
+                    // up here or the skip is only honoured into a clean
+                    // destination.
+                    //
+                    // Safe to delete: the destination is generator-owned
+                    // (see the mirror contract on `copyAndScanRecursive`).
+                    var stale_parent = cwd.openDir(io, dst_path, .{}) catch |err| switch (err) {
+                        error.FileNotFound => continue,
+                        else => return err,
+                    };
+                    defer stale_parent.close(io);
+                    // `deleteTree` is already idempotent on a missing
+                    // path (no `FileNotFound` in its error set).
+                    try stale_parent.deleteTree(io, entry.name);
+                    continue;
+                }
 
                 const sub_src = try std.fs.path.join(allocator, &.{ src_path, entry.name });
                 defer allocator.free(sub_src);

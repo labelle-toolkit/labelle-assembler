@@ -33,6 +33,7 @@ const locales_mod = @import("i18n_locales.zig");
 const usage = @import("usage_scan.zig");
 const interp = @import("i18n_interp.zig");
 const zig_keywords = @import("zig_keywords.zig");
+const scanner = @import("scanner.zig");
 const plurals = @import("i18n_plurals.zig");
 
 // Same local io as constants_phase, for the same reason: config.zig pulls in
@@ -1537,6 +1538,10 @@ fn collectMarks(arena: Allocator, marks: *usage.Marks, dir_path: []const u8) !vo
                     if (std.mem.eql(u8, entry.name, d)) skip = true;
                 }
                 if (skip) continue;
+                // Never descend into a nested repository root (#692):
+                // a worktree/submodule parked in the tree is another
+                // branch's source, not this project's.
+                if (scanner.isRepoRoot(dir, entry.name)) continue;
                 const sub = try std.fs.path.join(arena, &.{ dir_path, entry.name });
                 try collectMarks(arena, marks, sub);
             },
