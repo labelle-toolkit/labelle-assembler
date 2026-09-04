@@ -355,10 +355,30 @@ pub fn writeAudioBackendWiring(w: anytype, indent: []const u8) !void {
 /// was a type error and declaring ANY `.font` resource failed to
 /// compile on every assembler + engine pairing that has shipped.
 ///
+/// ## The minted handle has to be resolvable (labelle-bgfx#85)
+///
+/// `upload` mints `engine.FontId{ .index = <slot>, .generation = 1 }`
+/// where the index is private to THIS adapter's `slots` table, and the
+/// backend's own `FontAtlas` carries no id at all. The number then
+/// travels — engine packs it into the renderer's `Text.font`
+/// (labelle-engine#849), gfx forwards `text.font.toInt()` through
+/// core's optional `drawTextWithFont` (labelle-core#75) — and lands at
+/// a backend that cannot map it back to the atlas it uploaded. The two
+/// `u32` spaces are unrelated allocators that merely coincide today.
+///
+/// So `upload` also registers the mapping on the backend through an
+/// OPTIONAL `registerCatalogFont` / `unregisterCatalogFont` pair, the
+/// font twin of the image arm's `registerCatalogTexture`. Unlike the
+/// image arm the seam is on `BackendGfx`, not on the renderer: gfx's
+/// `drawTextEntry` resolves nothing, it forwards the handle, so the
+/// backend is the party that needs the lookup.
+///
 /// Ticket: labelle-engine#448 (font loader tracking)
 /// Ticket: labelle-assembler#700 (this signature fix)
 /// Sibling: `writeAudioBackendWiring` (audio scaffolding, #447)
 /// Refs: labelle-gfx#258 (font traits on `Backend(Impl)`)
+/// Refs: labelle-gfx#248 (the image arm's identical registration)
+/// Refs: labelle-bgfx#85 (the unresolvable-handle report)
 pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}// ── Font asset backend wiring (Asset Streaming RFC, #448) ──\n", .{indent});
     try w.print("{s}// `engine.FontLoader.setBackend` installs function-pointer adapters\n", .{indent});
@@ -375,6 +395,53 @@ pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}const FontBackendAdapter = struct {{\n", .{indent});
     try w.print("{s}    const MAX_FONT_ASSETS = 1024;\n", .{indent});
     try w.print("{s}    var slots: [MAX_FONT_ASSETS]?BackendGfx.FontAtlas = [_]?BackendGfx.FontAtlas{{null}} ** MAX_FONT_ASSETS;\n", .{indent});
+    // ── Catalog font registry seam (labelle-bgfx#85) ───────────────────
+    //
+    // The font counterpart of the image arm's `registerCatalogTexture`
+    // (labelle-gfx#248), and it exists for exactly the same reason: the
+    // handle this adapter mints is a PRIVATE index into `slots` above,
+    // not anything the party that eventually draws with it can resolve.
+    //
+    // The image arm registers with the RENDERER because gfx's sprite
+    // path is what resolves a texture handle. The font path is
+    // different: gfx's `drawTextEntry` does not resolve anything — it
+    // forwards `text.font.toInt()` straight through core's optional
+    // `drawTextWithFont(..., font: ?FontHandle)` (labelle-core#75) to
+    // the graphics BACKEND, which then has to find the atlas it itself
+    // uploaded. So the registration belongs on `BackendGfx`, one hop
+    // closer to the consumer, and no labelle-gfx decl is involved.
+    //
+    // Both halves are required together (same shape as the image arm's
+    // `supports_compressed` whole-seam gate): a backend that could
+    // register but not unregister would keep resolving a destroyed
+    // atlas after a scene unload — the font-side twin of the dangling
+    // renderer entry that was labelle-engine#821.
+    //
+    // A backend declaring NEITHER (bgfx and sokol today) keeps the flag
+    // comptime-false, so every reference below is unanalysed and a
+    // font-less backend compiles exactly as it does now.
+    try w.print("{s}    const supports_catalog_font_registry = @hasDecl(BackendGfx, \"registerCatalogFont\") and @hasDecl(BackendGfx, \"unregisterCatalogFont\");\n", .{indent});
+    try w.print("{s}\n", .{indent});
+    // The wire value. `engine.FontId` is `{{ index: u16, generation: u16 }}`,
+    // but the seam that reaches the backend transports a flat `u32`
+    // (core's `FontHandle`). The engine packs it INDEX-LOW /
+    // GENERATION-HIGH on its way into the renderer's `Text.font`
+    // (labelle-engine#849 `atlas_mixin.packFontId`), and gfx hands that
+    // same number to `drawTextWithFont`. Registering under any other
+    // arithmetic would key the table on a number the draw call never
+    // produces — the failure would be silent, so this MUST agree with
+    // #849 bit for bit.
+    //
+    // Two properties fall out of that layout, both relied on here:
+    //   * `{{ .index = 0, .generation = 0 }}` packs to 0, which is gfx's
+    //     `FontId.invalid` — a default text component and an engine
+    //     `.invalid` agree without a special case, and gfx never even
+    //     reaches `drawTextWithFont` for it.
+    //   * the index is recoverable with a plain `@truncate` to `u16`,
+    //     which is what a slot-keyed backend resolver wants.
+    try w.print("{s}    fn catalogFontHandle(id: engine.FontId) u32 {{\n", .{indent});
+    try w.print("{s}        return @as(u32, id.index) | (@as(u32, id.generation) << 16);\n", .{indent});
+    try w.print("{s}    }}\n", .{indent});
     try w.print("{s}\n", .{indent});
     try w.print("{s}    fn decode(\n", .{indent});
     try w.print("{s}        file_type: [:0]const u8,\n", .{indent});
@@ -488,13 +555,33 @@ pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
     // need stale-handle detection can bump this in a follow-up
     // by tracking a per-slot generation counter incremented on
     // unload. Matches the audio adapter's v1 posture.
-    try w.print("{s}        return .{{ .index = idx, .generation = 1 }};\n", .{indent});
+    try w.print("{s}        const id: engine.FontId = .{{ .index = idx, .generation = 1 }};\n", .{indent});
+    // Hand the backend the mapping from the handle it will actually be
+    // given at draw time to the atlas it just returned. Without this the
+    // number arriving at `drawTextWithFont` indexes a table only this
+    // adapter can see, and the backend degrades to its built-in face for
+    // every font — labelle-bgfx#85. Directly analogous to the image
+    // arm's `registerCatalogTexture(out_handle, tex)` a few hundred
+    // lines up, whose absence rendered white quads (labelle-gfx#248).
+    try w.print("{s}        if (comptime supports_catalog_font_registry) {{\n", .{indent});
+    try w.print("{s}            BackendGfx.registerCatalogFont(catalogFontHandle(id), atlas);\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
+    try w.print("{s}        return id;\n", .{indent});
     try w.print("{s}    }}\n", .{indent});
     try w.print("{s}\n", .{indent});
     try w.print("{s}    fn unload(font: engine.FontId) void {{\n", .{indent});
     try w.print("{s}        if (!@hasDecl(BackendGfx, \"unloadFontAtlas\")) return;\n", .{indent});
     try w.print("{s}        if (font.index >= MAX_FONT_ASSETS) return;\n", .{indent});
     try w.print("{s}        if (slots[font.index]) |a| {{\n", .{indent});
+    // Drop the registry entry BEFORE destroying the atlas, so no draw
+    // can resolve a handle to a dead atlas in between — and so the next
+    // upload recycling this slot cannot inherit a live entry pointing at
+    // freed GPU state. That ordering is the font-side answer to
+    // labelle-engine#821, where the image path's stale renderer entry
+    // survived an unload and the recycled key sampled the wrong atlas.
+    try w.print("{s}            if (comptime supports_catalog_font_registry) {{\n", .{indent});
+    try w.print("{s}                BackendGfx.unregisterCatalogFont(catalogFontHandle(font));\n", .{indent});
+    try w.print("{s}            }}\n", .{indent});
     try w.print("{s}            BackendGfx.unloadFontAtlas(a);\n", .{indent});
     try w.print("{s}            slots[font.index] = null;\n", .{indent});
     try w.print("{s}        }}\n", .{indent});
