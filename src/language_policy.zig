@@ -44,6 +44,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const scanner = @import("scanner.zig");
 
 /// The FROZEN built-in set of script languages the assembler recognizes
 /// without a manifest capability row (RFC-LANGUAGE-PLUGINS §7 "Migration":
@@ -487,6 +488,10 @@ fn walkCollect(
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         switch (entry.kind) {
             .directory => {
+                // Never descend into a nested repository root (#692):
+                // a worktree/submodule parked in the tree is another
+                // branch's source, not this project's.
+                if (scanner.isRepoRoot(dir, entry.name)) continue;
                 var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
                 defer sub.close(io);
                 const sub_prefix = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
@@ -769,6 +774,10 @@ fn walkSharedCollect(
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         switch (entry.kind) {
             .directory => {
+                // Never descend into a nested repository root (#692):
+                // a worktree/submodule parked in the tree is another
+                // branch's source, not this project's.
+                if (scanner.isRepoRoot(dir, entry.name)) continue;
                 var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
                 defer sub.close(io);
                 const sub_prefix = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });

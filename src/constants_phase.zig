@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 const yaml = @import("constants_yaml.zig");
 const usage = @import("usage_scan.zig");
 const zig_keywords = @import("zig_keywords.zig");
+const scanner = @import("scanner.zig");
 
 // Not config.globalIo(): config.zig pulls in build_options, which would make
 // this file untestable standalone (`zig test src/constants_phase.zig`) for the
@@ -473,6 +474,10 @@ fn collectMarks(arena: Allocator, marks: *usage.Marks, dir_path: []const u8) !vo
                     if (std.mem.eql(u8, entry.name, d)) skip = true;
                 }
                 if (skip) continue;
+                // Never descend into a nested repository root (#692):
+                // a worktree/submodule parked in the tree is another
+                // branch's source, not this project's.
+                if (scanner.isRepoRoot(dir, entry.name)) continue;
                 const sub = try std.fs.path.join(arena, &.{ dir_path, entry.name });
                 try collectMarks(arena, marks, sub);
             },
