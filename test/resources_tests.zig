@@ -319,6 +319,53 @@ pub const RESOURCE_EMISSION = struct {
         try std.testing.expectError(error.InvalidResource, result);
     }
 
+    test "validation rejects a `.grid` that reached codegen unexpanded (#675)" {
+        // `expandGridResources` rewrites every game-declared `.grid` into an
+        // ordinary atlas and clears the field long before emission. A survivor
+        // therefore came from a surface the pass does not walk (a pack /
+        // plugin `.resources` entry) — emitting it as a plain loose image
+        // would silently drop every frame the grid was declared for.
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "tiles", .image = "assets/tiles.png", .grid = .{ .tile_width = 16, .tile_height = 16 } },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        try std.testing.expectError(error.GridResourceNotExpanded, result);
+    }
+
+    test "validation rejects `.grid` on a non-image resource (#675)" {
+        const result = generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "sfx", .sound = "audio/click.wav", .grid = .{ .tile_width = 16, .tile_height = 16 } },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        try std.testing.expectError(error.InvalidResource, result);
+    }
+
+    test "an EXPANDED grid emits exactly the atlas call shape (#675)" {
+        // What `expandGridResources` leaves behind: `.json` pointing at the
+        // synthesised manifest in the target dir, `.texture` at the source
+        // PNG. Emission must not be able to tell it apart from a hand-written
+        // atlas — that indistinguishability is the whole design.
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .raylib,
+            .ecs = .mock,
+            .resources = &.{
+                .{ .name = "tiles", .json = "__grid_tiles.json", .texture = "assets/overworld.png", .lazy = false },
+            },
+        }, raylib_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "try g.loadAtlasFromMemory(\"tiles\", @embedFile(\"__grid_tiles.json\"), @embedFile(\"assets/overworld.png\"), \".png\");") != null);
+    }
+
     test "sound resource emits loadSoundFromMemory with extension-derived file_type" {
         const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
             .name = "test-game",
@@ -775,6 +822,51 @@ pub const RESOURCE_KINDS = struct {
         };
         try std.testing.expectEqual(generate.ResourceKind.image, misplaced.kind());
         try std.testing.expectEqual(generate.ResourceValidationError.font_params_misplaced, misplaced.validate());
+    }
+
+    test "kind: `.image` + `.grid` is still an image until the expansion pass runs (#675)" {
+        // `.grid` is not a fifth kind: it is an instruction to REWRITE this
+        // entry into an atlas at generate time. Until `expandGridResources`
+        // has run, the entry classifies as the loose image it declares.
+        const tiles: generate.ResourceDef = .{
+            .name = "tiles",
+            .image = "assets/overworld.png",
+            .grid = .{ .tile_width = 16, .tile_height = 16 },
+        };
+        try std.testing.expectEqual(generate.ResourceKind.image, tiles.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.ok, tiles.validate());
+    }
+
+    test "validate: `.grid` on a sound resource reports grid_misplaced (#675)" {
+        const misplaced: generate.ResourceDef = .{
+            .name = "sfx",
+            .sound = "audio/click.wav",
+            .grid = .{ .tile_width = 16, .tile_height = 16 },
+        };
+        try std.testing.expectEqual(generate.ResourceKind.sound, misplaced.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.grid_misplaced, misplaced.validate());
+    }
+
+    test "validate: `.grid` next to a hand-written atlas pair reports grid_misplaced (#675)" {
+        // The atlas pair already names every frame; a `.grid` beside it would
+        // be silently inert, so say so rather than ignore it.
+        const misplaced: generate.ResourceDef = .{
+            .name = "tiles",
+            .json = "assets/tiles.json",
+            .texture = "assets/tiles.png",
+            .grid = .{ .tile_width = 16, .tile_height = 16 },
+        };
+        try std.testing.expectEqual(generate.ResourceKind.atlas, misplaced.kind());
+        try std.testing.expectEqual(generate.ResourceValidationError.grid_misplaced, misplaced.validate());
+    }
+
+    test "validate: a zero tile size reports grid_zero_tile_size (#675)" {
+        const zero: generate.ResourceDef = .{
+            .name = "tiles",
+            .image = "assets/overworld.png",
+            .grid = .{ .tile_width = 16, .tile_height = 0 },
+        };
+        try std.testing.expectEqual(generate.ResourceValidationError.grid_zero_tile_size, zero.validate());
     }
 
     test "kind: sound resource classifies as sound" {

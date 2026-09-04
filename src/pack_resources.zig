@@ -87,6 +87,13 @@ pub fn mergePackResources(
                 // asset path — a pack shipping `.image = "assets/ui.png"`
                 // becomes `packs/<pack>/assets/ui.png`.
                 .image = try repath(a, e.plugin.name, res.image),
+                // `.grid` (#675) rides through UNEXPANDED and un-repathed:
+                // `expandGridResources` runs over the game's own resources,
+                // before this merge and against `game_dir`, so a pack grid has
+                // no expansion pass. Carrying the field (rather than dropping
+                // it) is what lets `validateResources` refuse it by name —
+                // dropped, it would emit as a frameless loose image.
+                .grid = res.grid,
                 .sound = try repath(a, e.plugin.name, res.sound),
                 .font = try repath(a, e.plugin.name, res.font),
                 .font_params = res.font_params,
@@ -835,6 +842,33 @@ test "mergePackResources: a pack's loose `.image` repaths like any other asset (
     try testing.expectEqualStrings("ui__cursor", merged.resources[1].name);
     try testing.expectEqualStrings("packs/ui/assets/cursor.png", merged.resources[1].image);
     try testing.expectEqual(config.ResourceKind.image, merged.resources[1].kind());
+}
+
+test "mergePackResources: a pack's `.grid` survives the merge so codegen can refuse it (#675)" {
+    // Grid expansion runs over the GAME's resources, before this merge and
+    // against `game_dir` — a pack ships its image somewhere else entirely, so
+    // there is no expansion pass for it. Carrying the field through (rather
+    // than dropping it) is what lets `validateResources` name the resource in
+    // its refusal; dropped, the entry would emit as a frameless loose image.
+    const manifest = plugin_manifest.PackManifest{
+        .name = "terrain",
+        .manifest_version = 1,
+        .convention_dirs = .copy_and_scan,
+        .resources = &.{
+            .{ .name = "tiles", .image = "assets/tiles.png", .grid = .{ .tile_width = 16, .tile_height = 16 } },
+        },
+        .allocator = testing.allocator,
+    };
+    const entries = [_]PackEntry{.{ .plugin = .{ .name = "terrain" }, .manifest = manifest }};
+
+    var merged = try mergePackResources(testing.allocator, &.{}, &entries);
+    defer merged.deinit();
+
+    try testing.expectEqual(@as(usize, 1), merged.resources.len);
+    try testing.expectEqualStrings("terrain__tiles", merged.resources[0].name);
+    try testing.expectEqualStrings("packs/terrain/assets/tiles.png", merged.resources[0].image);
+    try testing.expect(merged.resources[0].grid != null);
+    try testing.expectEqual(@as(u32, 16), merged.resources[0].grid.?.tile_width);
 }
 
 test "preferCompressedPackTextures: probes the pack SOURCE dir, astc wins, png fallback" {

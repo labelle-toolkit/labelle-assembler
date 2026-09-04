@@ -439,6 +439,63 @@ pub const FontBakeParams = struct {
     atlas_height: u32 = 512,
 };
 
+/// Uniform tile-grid expansion for an image resource (#675).
+///
+/// A tileset PNG is a regular grid — the rects are `col * tile_width,
+/// row * tile_height` and nothing else — so hand-writing a
+/// TexturePacker manifest that names every frame is pure bookkeeping.
+/// Declaring `.grid` alongside `.image` makes the assembler synthesise
+/// that manifest at generate time; from there the entry IS an ordinary
+/// atlas, so loading, lazy inference, scene wiring and the ASTC/RGBA
+/// texture swaps all treat it like any hand-authored sprite sheet.
+///
+/// ## Frame naming — public contract
+///
+/// Frames are named **`<resource name>/<index>`**, row-major from the
+/// TOP-LEFT cell, zero-based. A resource `.name = "tiles"` on a 40 × 38
+/// grid therefore provides `tiles/0` … `tiles/1519`, where
+/// `index = row * cols + col`. Those strings are what a prefab's
+/// `sprite_name`, a script's `findSprite`, or a Tiled GID offset must
+/// spell — they are a stable, versioned part of the project format, not
+/// an implementation detail. The `<name>/` prefix namespaces the frames
+/// per resource so two tilesets cannot collide in the engine's flat
+/// sprite table (the same path-like idiom pack atlases already use).
+///
+/// ## Layout — Tiled semantics
+///
+/// `margin` is the border on ALL FOUR edges of the image; `spacing` is
+/// the gutter BETWEEN adjacent tiles (not after the last one). A cell's
+/// top-left pixel is:
+///
+/// ```
+/// x = margin + col * (tile_width  + spacing)
+/// y = margin + row * (tile_height + spacing)
+/// ```
+///
+/// which is exactly Tiled's tileset model and also how an extruded
+/// atlas is laid out. The frame COUNT is derived from the image's own
+/// pixel dimensions, never from a user-supplied count:
+///
+/// ```
+/// cols = (image_width  - 2*margin + spacing) / (tile_width  + spacing)
+/// rows = (image_height - 2*margin + spacing) / (tile_height + spacing)
+/// ```
+///
+/// A grid that does not divide the image evenly is a generate-time
+/// error, not a silent truncation — a tileset that is one pixel short
+/// otherwise loses its whole last column with nothing to point at why.
+pub const GridDef = struct {
+    /// Cell width in pixels. Must be > 0.
+    tile_width: u32,
+    /// Cell height in pixels. Must be > 0.
+    tile_height: u32,
+    /// Border on all four edges, in pixels (Tiled's `margin`).
+    margin: u32 = 0,
+    /// Gutter between adjacent cells, in pixels (Tiled's `spacing`).
+    /// Not applied after the last cell on an axis.
+    spacing: u32 = 0,
+};
+
 /// Discriminator for `ResourceDef`. Picked by inspecting which of the
 /// resource's path fields are populated; validation rejects entries
 /// that set more than one or none. Drives the assembler's emission
@@ -484,6 +541,17 @@ pub const ResourceValidationError = enum {
     /// — e.g. user meant `.font = "..."` but wrote `.font_params`
     /// on an atlas or sound entry.
     font_params_misplaced,
+    /// `.grid` set on a resource that is not a loose `.image` (#675).
+    /// The grid form expands ONE image into a synthesised atlas, so it
+    /// only means anything next to `.image`; on a `.sound` / `.font`,
+    /// or next to an already-hand-written `.json` + `.texture` pair, it
+    /// would silently do nothing.
+    grid_misplaced,
+    /// `.grid` declares a zero `tile_width` or `tile_height` (#675).
+    /// The frame count is `image_extent / tile_extent`, so a zero cell
+    /// has no defined answer — caught here rather than as a divide-by-
+    /// zero inside the expansion pass.
+    grid_zero_tile_size,
 };
 
 pub const ResourceDef = struct {
@@ -507,6 +575,26 @@ pub const ResourceDef = struct {
     // Mutually exclusive with `.json`/`.texture` (that pair is the
     // atlas form of the same texture), `.sound` and `.font`.
     image: []const u8 = "",
+
+    /// Uniform tile-grid expansion for THIS image (#675). Set it and
+    /// the assembler derives a TexturePacker manifest from the image's
+    /// own pixel dimensions at generate time, rewriting this entry into
+    /// an ordinary `atlas` before any codegen runs — so a tileset needs
+    /// no hand-written, hand-maintained frame table:
+    ///
+    /// ```zig
+    /// .{ .name = "tiles", .image = "assets/overworld.png",
+    ///    .grid = .{ .tile_width = 16, .tile_height = 16 } },
+    /// ```
+    ///
+    /// Frames are named `<name>/<index>`, row-major, zero-based —
+    /// `tiles/0`, `tiles/1`, … — see `GridDef` for the full contract
+    /// and the `margin`/`spacing` (Tiled) layout rules.
+    ///
+    /// Only valid alongside `.image`, and only for a `.png` (the pass
+    /// reads the PNG `IHDR` for the dimensions). `validate()` reports
+    /// `grid_misplaced` anywhere else.
+    grid: ?GridDef = null,
 
     // ── Sound (Phase 4, #447). `.wav` / `.ogg` path relative to the
     // project root. Mutually exclusive with the atlas / image / font paths.
@@ -598,6 +686,13 @@ pub const ResourceDef = struct {
         if (count > 1) return .multiple_paths;
         if (has_atlas and (self.json.len == 0 or self.texture.len == 0)) return .atlas_incomplete;
         if (self.font_params != null and !has_font) return .font_params_misplaced;
+        // `.grid` only means something next to `.image` (#675): the pass
+        // that expands it reads ONE image and synthesises the manifest.
+        // On any other kind it would be silently inert, so say so.
+        if (self.grid) |g| {
+            if (!has_image) return .grid_misplaced;
+            if (g.tile_width == 0 or g.tile_height == 0) return .grid_zero_tile_size;
+        }
         return .ok;
     }
 };
