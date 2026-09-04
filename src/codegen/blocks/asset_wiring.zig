@@ -334,7 +334,29 @@ pub fn writeAudioBackendWiring(w: anytype, indent: []const u8) !void {
 /// without font support gets a clean compile error pointing at
 /// `BackendGfx.decodeFont`.
 ///
+/// ## `decode`'s parameter shape (#700)
+///
+/// `engine.FontBackend.decode` takes `params: FontBakeParams` BY VALUE.
+/// It always has: `FontBackend` was introduced by labelle-engine#529
+/// (commit c7b6fcb, first released in **engine v1.36.0**) already
+/// declaring the typed struct, and every commit that has touched
+/// `src/assets/loaders/font.zig` since keeps it — verified through
+/// v2.15.0. No released engine ever declared it as `?*const anyopaque`;
+/// that type-erased shape belongs to the catalog's
+/// `WorkRequest.params`, which the engine's own `font.zig` casts back
+/// to `FontBakeParams` BEFORE calling into this adapter. Engines older
+/// than v1.36.0 have no `FontLoader.setBackend` at all, so this block
+/// cannot compile against them under any signature — v1.36.0 is the
+/// hard floor for a `.font` resource, and above it there is exactly one
+/// shape to emit.
+///
+/// The adapter emitted `?*const anyopaque` from the start, so
+/// `engine.FontLoader.setBackend(.{ .decode = FontBackendAdapter.decode })`
+/// was a type error and declaring ANY `.font` resource failed to
+/// compile on every assembler + engine pairing that has shipped.
+///
 /// Ticket: labelle-engine#448 (font loader tracking)
+/// Ticket: labelle-assembler#700 (this signature fix)
 /// Sibling: `writeAudioBackendWiring` (audio scaffolding, #447)
 /// Refs: labelle-gfx#258 (font traits on `Backend(Impl)`)
 pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
@@ -357,26 +379,57 @@ pub fn writeFontBackendWiring(w: anytype, indent: []const u8) !void {
     try w.print("{s}    fn decode(\n", .{indent});
     try w.print("{s}        file_type: [:0]const u8,\n", .{indent});
     try w.print("{s}        data: []const u8,\n", .{indent});
-    try w.print("{s}        params: ?*const anyopaque,\n", .{indent});
+    // `engine.FontBakeParams` BY VALUE — that is what `FontBackend.decode`
+    // has declared in every engine release that ships a `FontBackend`
+    // (labelle-engine v1.36.0 onward; see the header note). The
+    // type-erased `?*const anyopaque` lives one level up, on the
+    // catalog's `WorkRequest.params`: the engine's own `font.zig`
+    // `decode` casts it back to `FontBakeParams` and hands the ADAPTER
+    // the typed struct. Emitting `?*const anyopaque` here made
+    // `setBackend(.{ .decode = FontBackendAdapter.decode, ... })` a hard
+    // type error, so declaring ANY `.font` resource failed to compile
+    // (#700).
+    try w.print("{s}        params: engine.FontBakeParams,\n", .{indent});
     try w.print("{s}        alloc: std.mem.Allocator,\n", .{indent});
     try w.print("{s}    ) anyerror!engine.DecodedFont {{\n", .{indent});
     // `@hasDecl` guard: without it, games that don't actually
     // reach the font loader still fail to compile on backends
     // that haven't implemented the gfx#258 font traits yet. The
-    // guard short-circuits to a runtime error instead.
+    // guard short-circuits to a runtime error instead. The
+    // condition is comptime-known, so the whole marshal below is
+    // dead code (never analysed) on such a backend — which is why
+    // `BackendGfx.FontBakeParams` may be absent entirely.
     try w.print("{s}        if (!@hasDecl(BackendGfx, \"decodeFont\")) return error.FontBackendNotImplemented;\n", .{indent});
-    // `params` is a `?*const anyopaque` per the engine's
-    // `WorkRequest` contract; the loader casts back to the
-    // engine's `FontBakeParams` then copies field-by-field
-    // into the backend's structurally-identical-but-nominally-
-    // distinct `BackendGfx.FontBakeParams`. Same trap as the
-    // image/audio adapters' DecodedX copy.
-    try w.print("{s}        const engine_params: *const engine.FontBakeParams = @ptrCast(@alignCast(params orelse return error.FontBakeParamsMissing));\n", .{indent});
+    // The engine's `FontBakeParams` and the backend's are
+    // structurally identical but nominally distinct, so the struct is
+    // copied field-by-field — same trap as the image/audio adapters'
+    // DecodedX copy.
+    //
+    // `.ranges` needs the same treatment ONE LEVEL DEEPER: it is a
+    // slice of `engine.CodepointRange` (a plain `struct`) that has to
+    // become a slice of the backend's own range type (an `extern
+    // struct` in every in-tree backend). Neither a plain assignment
+    // nor a `@ptrCast` is legal across that boundary — the engine
+    // side carries no layout guarantee — so the elements are rebuilt
+    // into a scratch buffer. The element type is read off the
+    // backend's own field rather than assuming a `BackendGfx
+    // .CodepointRange` decl, so a backend that only re-exports
+    // `FontBakeParams` still wires up.
+    //
+    // Lifetime: `FontBakeParams.ranges` is documented as BORROWED for
+    // the duration of the decode call, so the scratch buffer is freed
+    // on the way out — `decodeFont` copies whatever it needs.
+    try w.print("{s}        const BackendRange = @typeInfo(@FieldType(BackendGfx.FontBakeParams, \"ranges\")).pointer.child;\n", .{indent});
+    try w.print("{s}        const ranges = try alloc.alloc(BackendRange, params.ranges.len);\n", .{indent});
+    try w.print("{s}        defer alloc.free(ranges);\n", .{indent});
+    try w.print("{s}        for (params.ranges, ranges) |src_range, *dst_range| {{\n", .{indent});
+    try w.print("{s}            dst_range.* = .{{ .first = src_range.first, .last = src_range.last }};\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
     try w.print("{s}        const backend_params: BackendGfx.FontBakeParams = .{{\n", .{indent});
-    try w.print("{s}            .pixel_height = engine_params.pixel_height,\n", .{indent});
-    try w.print("{s}            .ranges = engine_params.ranges,\n", .{indent});
-    try w.print("{s}            .atlas_width = engine_params.atlas_width,\n", .{indent});
-    try w.print("{s}            .atlas_height = engine_params.atlas_height,\n", .{indent});
+    try w.print("{s}            .pixel_height = params.pixel_height,\n", .{indent});
+    try w.print("{s}            .ranges = ranges,\n", .{indent});
+    try w.print("{s}            .atlas_width = params.atlas_width,\n", .{indent});
+    try w.print("{s}            .atlas_height = params.atlas_height,\n", .{indent});
     try w.print("{s}        }};\n", .{indent});
     try w.print("{s}        const d = try BackendGfx.decodeFont(file_type, data, &backend_params, alloc);\n", .{indent});
     try w.print("{s}        return .{{\n", .{indent});
