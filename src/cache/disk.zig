@@ -49,7 +49,7 @@ pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: [
         };
     }
 
-    local.writeOrigin(allocator, target, companion_dir, assembler_version);
+    try local.writeOrigin(allocator, target, companion_dir, assembler_version);
 }
 
 /// Populate a framework package (core, engine, gfx) into the cache from a source directory.
@@ -61,7 +61,7 @@ pub fn populateFrameworkPackage(allocator: std.mem.Allocator, package: []const u
     const target = try local.frameworkSlot(allocator, package);
     defer allocator.free(target);
     try symlinkToCache(allocator, source_dir, target);
-    local.writeOrigin(allocator, target, source_dir, version);
+    try local.writeOrigin(allocator, target, source_dir, version);
 }
 
 /// Populate a plugin into the cache from a source directory.
@@ -71,7 +71,7 @@ pub fn populatePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, so
     const target = try local.pluginSlot(allocator, plugin.repo);
     defer allocator.free(target);
     try symlinkToCache(allocator, source_dir, target);
-    local.writeOrigin(allocator, target, source_dir, plugin.version);
+    try local.writeOrigin(allocator, target, source_dir, plugin.version);
 }
 
 /// Create a symlink from cache target to source directory.

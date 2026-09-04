@@ -302,19 +302,24 @@ fn cleanLocalSlots(
     packages_dir: []const u8,
     dry_run: bool,
 ) u32 {
-    const slots_root = std.fs.path.join(arena_alloc, &.{ packages_dir, cache.localSlots.SLOT_NS }) catch return 0;
-    if (!cache.localSlots.pathExists(slots_root)) return 0;
+    var removed: u32 = 0;
+    for ([_][]const u8{ cache.localSlots.SLOT_NS, cache.localSlots.ORIGINS_NS }) |ns| {
+        const ns_root = std.fs.path.join(arena_alloc, &.{ packages_dir, ns }) catch continue;
+        if (!cache.localSlots.pathExists(ns_root)) continue;
 
-    if (dry_run) {
-        std.log.info("  would remove {s}/ (locally-sourced slots)", .{cache.localSlots.SLOT_NS});
-        return 1;
+        if (dry_run) {
+            std.log.info("  would remove {s}/ (locally-sourced slots)", .{ns});
+            removed += 1;
+            continue;
+        }
+        std.Io.Dir.cwd().deleteTree(io, ns_root) catch |err| {
+            std.log.warn("  could not remove {s}/: {s}", .{ ns, @errorName(err) });
+            continue;
+        };
+        std.log.info("  removed {s}/ (locally-sourced slots)", .{ns});
+        removed += 1;
     }
-    std.Io.Dir.cwd().deleteTree(io, slots_root) catch |err| {
-        std.log.warn("  could not remove {s}/: {s}", .{ cache.localSlots.SLOT_NS, @errorName(err) });
-        return 0;
-    };
-    std.log.info("  removed {s}/ (locally-sourced slots)", .{cache.localSlots.SLOT_NS});
-    return 1;
+    return removed;
 }
 
 // ── upgrade ──────────────────────────────────────────────────────────
@@ -925,26 +930,35 @@ test "cleanLocalSlots: drops the local namespace, leaving version slots alone (#
     try tmp.dir.createDirPath(std.testing.io, "packages/plugins/github.com/local/example/1.0.0");
     try tmp.dir.createDirPath(std.testing.io, "checkout");
 
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(home);
     const packages_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "packages", alloc);
     defer alloc.free(packages_dir);
     const checkout = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = std.testing.environ;
+    std.testing.environ = .{ .block = .{ .slice = &envp } };
+    defer std.testing.environ = saved_environ;
+
     const slot = try std.fs.path.join(alloc, &.{ packages_dir, cache.localSlots.SLOT_NS, "plugins", repo });
     defer alloc.free(slot);
     try std.Io.Dir.cwd().deleteTree(io, slot);
     try std.Io.Dir.cwd().symLink(io, checkout, slot, .{ .is_directory = true });
-    cache.localSlots.writeOrigin(alloc, slot, checkout, "0.4.0");
+    try cache.localSlots.writeOrigin(alloc, slot, checkout, "0.4.0");
 
     const marker = try cache.localSlots.originPath(alloc, slot);
     defer alloc.free(marker);
     try std.testing.expect(cache.localSlots.pathExists(marker));
 
-    // A dry run reports it without touching anything.
-    try std.testing.expectEqual(@as(u32, 1), cleanLocalSlots(arena_alloc, io, packages_dir, true));
+    // A dry run reports both namespaces without touching anything.
+    try std.testing.expectEqual(@as(u32, 2), cleanLocalSlots(arena_alloc, io, packages_dir, true));
     try std.testing.expect(cache.localSlots.pathExists(slot));
 
-    try std.testing.expectEqual(@as(u32, 1), cleanLocalSlots(arena_alloc, io, packages_dir, false));
+    try std.testing.expectEqual(@as(u32, 2), cleanLocalSlots(arena_alloc, io, packages_dir, false));
     try std.testing.expect(!cache.localSlots.pathExists(slot));
     try std.testing.expect(!cache.localSlots.pathExists(marker));
 

@@ -98,7 +98,7 @@ pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, pro
     }
 
     // #685: same reserved-slot rule as the framework packages.
-    if (try local.activePluginSlot(allocator, plugin.repo)) |slot| return slot;
+    if (try local.activePluginSlot(allocator, plugin)) |slot| return slot;
 
     const packages_dir = try env.getPackagesDir(allocator);
     defer allocator.free(packages_dir);
@@ -382,7 +382,7 @@ pub fn isPluginCached(allocator: std.mem.Allocator, plugin: config.PluginDep) !b
     if (plugin.isLocal()) return true;
 
     // Same staleness rule as isFrameworkCached.
-    if (try local.activePluginSlot(allocator, plugin.repo)) |slot| {
+    if (try local.activePluginSlot(allocator, plugin)) |slot| {
         defer allocator.free(slot);
         return local.slotTracksSource(slot);
     }
