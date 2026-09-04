@@ -96,6 +96,20 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         return;
     }
 
+    // Every remaining form takes a VERSION positional that is joined into a
+    // cache path — and, since the #685 migration, one that may be DELETED.
+    // A value like `../../x` would escape the package namespace entirely, so
+    // require a single, ordinary path component (#688 review round 5).
+    for (positionals.items) |arg| {
+        if (isSafePathComponent(arg)) continue;
+        std.log.err(
+            "labelle-assembler install: '{s}' is not a valid package or version name " ++
+                "(no path separators, '.' or '..')",
+            .{arg},
+        );
+        std.process.exit(2);
+    }
+
     // Reject the `assembler` package — the CLI owns binary bootstrap.
     if (std.mem.eql(u8, positionals.items[0], "assembler")) {
         std.log.err("labelle-assembler install: the 'assembler' package is managed by the labelle CLI bootstrap, not the assembler binary", .{});
@@ -108,7 +122,10 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         std.log.info("labelle-assembler: caching core/engine/gfx at version {s}", .{version});
         const packages = [_][]const u8{ "core", "engine", "gfx" };
         for (packages) |pkg| {
-            purgeLegacyFrameworkSlot(allocator, pkg, version);
+            purgeLegacyFrameworkSlot(allocator, pkg, version) catch |err| {
+                std.log.err("labelle-assembler install: could not repair the cache slot for {s} {s}: {s}", .{ pkg, version, @errorName(err) });
+                std.process.exit(1);
+            };
             if (!try cache.isFrameworkCached(allocator, pkg, version)) {
                 fetchFrameworkWithFallback(allocator, pkg, version) catch |err| {
                     std.log.err("labelle-assembler install: failed to fetch {s} {s}: {s}", .{ pkg, version, @errorName(err) });
@@ -136,7 +153,10 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         std.mem.eql(u8, pkg_name, "gfx"))
     {
         std.log.info("labelle-assembler: fetching {s} {s}", .{ pkg_name, version });
-        purgeLegacyFrameworkSlot(allocator, pkg_name, version);
+        purgeLegacyFrameworkSlot(allocator, pkg_name, version) catch |err| {
+            std.log.err("labelle-assembler install: could not repair the cache slot for {s} {s}: {s}", .{ pkg_name, version, @errorName(err) });
+            std.process.exit(1);
+        };
         fetchFrameworkWithFallback(allocator, pkg_name, version) catch |err| {
             std.log.err("labelle-assembler install: failed to fetch {s}: {s}", .{ pkg_name, @errorName(err) });
             std.process.exit(1);
@@ -557,7 +577,7 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !voi
     // poisoned slot looks cached but holds the wrong source, so it must be
     // invalidated rather than trusted. Cheap (a readlink per pinned dep) and
     // idempotent: once repaired, nothing here is a symlink any more.
-    cache.purgeLegacyLocalSlots(allocator, cfg);
+    try cache.purgeLegacyLocalSlots(allocator, cfg);
 
     const missing = try cache.validateCache(allocator, cfg);
     defer {
@@ -737,16 +757,27 @@ fn fetchBackendWithFallback(allocator: std.mem.Allocator, bp: config.PluginDep) 
     };
 }
 
+/// Whether `name` is a single, ordinary path component — safe to join into
+/// a cache path that the migration sweep may delete.
+fn isSafePathComponent(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
+    return std.mem.indexOfAny(u8, name, "/\\") == null;
+}
+
 /// #685 migration for the single-package `install` forms, which have no
 /// ProjectConfig to sweep: drop a version-named slot that an older
 /// assembler symlinked at a sibling checkout so the release is re-fetched.
-fn purgeLegacyFrameworkSlot(allocator: std.mem.Allocator, package: []const u8, version: []const u8) void {
+fn purgeLegacyFrameworkSlot(allocator: std.mem.Allocator, package: []const u8, version: []const u8) !void {
     if (config.isLocalVersion(version)) return;
     const packages_dir = cache.getPackagesDir(allocator) catch return;
     defer allocator.free(packages_dir);
     const slot = std.fs.path.join(allocator, &.{ packages_dir, package, version }) catch return;
     defer allocator.free(slot);
-    _ = cache.purgeLegacyLocalSlot(allocator, slot);
+    // NOT discarded: a purge that failed leaves the poisoned slot in place,
+    // and `isFrameworkCached` would then accept it as the pinned release
+    // (#688 review round 5). Abort the install instead.
+    _ = try cache.purgeLegacyLocalSlot(allocator, slot);
 }
 
 /// Walk up from the assembler executable's directory looking for the
