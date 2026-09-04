@@ -1118,3 +1118,66 @@ jobs:
             exit 1
           fi
           echo "PASS: C# scripts compiled by zig build (dotnet publish), staged beside the binary + loaded through hostfxr with NO manual dotnet step or env export — 15 ordered milestones over 5 headless frames"
+
+  # Windows gate for the local-slot cache machinery (#688 review).
+  #
+  # Why a dedicated job rather than `windows-latest` in the matrix above:
+  # that job installs SDL2/sokol system libs, builds the sokol + raylib +
+  # bgfx backends and the zig-ecs adapter, and verifies the binary through
+  # a POSIX `./zig-out/bin/...` path. None of that ports to a Windows
+  # runner as written, so widening the matrix would go red for reasons
+  # that have nothing to do with the cache.
+  #
+  # What this DOES cover: the assembler and its test suite compile and run
+  # on Windows. That is the platform where `symLink(.is_directory = true)`
+  # needs Developer Mode and `symlinkToCache` falls back to a COPY — the
+  # path `isFrameworkCached`/`isPluginCached`/`isAssemblerCached` treat as
+  # permanently stale, so a locally-sourced package is deleted and
+  # re-copied on every build with no fixpoint.
+  #
+  # What it does NOT cover, and this matters: the local-slot unit tests in
+  # `src/cache/local.zig` set `std.testing.environ` through a PosixBlock
+  # and skip on Windows outright, so a green run here is NOT evidence that
+  # the copy-fallback path behaves. Closing that hole needs the tests
+  # ported off PosixBlock first; this job is the prerequisite that proves
+  # the suite runs at all on the platform.
+  cache-windows:
+    name: Cache machinery (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    defaults:
+      run:
+        working-directory: labelle-assembler
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      # Same sibling-checkout layout as `build-and-test`: the
+      # `../labelle-gui/flow-codegen` path-dep in build.zig.zon resolves
+      # against this.
+      - name: Checkout labelle-gui (flow_codegen)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+      # `.exe` suffix and no `./` prefix — the POSIX spelling in
+      # `build-and-test` does not resolve under PowerShell.
+      - name: Verify binary
+        run: |
+          .\zig-out\bin\labelle-assembler.exe --protocol-version
+          .\zig-out\bin\labelle-assembler.exe --help
