@@ -214,7 +214,7 @@ pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8,
     // `release/1.2.3` is a supported ref whose slot basename reads as semver,
     // and its archive's manifest declares whatever that branch is at. Judging
     // it by content would delete a valid cache on every install.
-    if (!config.isSemverVersion(version)) return false;
+    if (!isCanonicalSemver(version)) return false;
 
     const declared = declaredZonVersion(allocator, slot_path) orelse return false;
     defer allocator.free(declared);
@@ -229,6 +229,28 @@ pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8,
         .{ slot_path, declared, version },
     );
     return true;
+}
+
+/// Whether `version` is a full `X.Y.Z` release, all three components
+/// numeric.
+///
+/// Stricter than `config.isSemverVersion`, which accepts anything starting
+/// with a digit — including the abbreviated `1.2` form, whose package
+/// legitimately declares the canonical `1.2.0` in its manifest. Comparing
+/// those two strings would classify a valid release as a copied checkout
+/// and delete it (#688 review round 8). Anything short of a canonical
+/// release is left alone.
+fn isCanonicalSemver(version: []const u8) bool {
+    var parts: usize = 0;
+    var it = std.mem.splitScalar(u8, version, '.');
+    while (it.next()) |part| {
+        parts += 1;
+        if (parts > 3 or part.len == 0) return false;
+        for (part) |c| {
+            if (!std.ascii.isDigit(c)) return false;
+        }
+    }
+    return parts == 3;
 }
 
 /// Whether `path` lies strictly inside the packages directory, with no
@@ -247,7 +269,27 @@ fn withinPackagesDir(allocator: std.mem.Allocator, path: []const u8) bool {
     while (it.next()) |component| {
         if (std.mem.eql(u8, component, "..")) return false;
     }
-    return true;
+
+    // Lexical containment is not enough (#688 review round 8): a
+    // slash-delimited pin nests, so `gfx/release/1.2.3` sits under
+    // `gfx/release` — and a legacy `gfx/release` may itself be a SYMLINK to
+    // a checkout, in which case the deletion below would land inside the
+    // user's source tree while the string still reads as inside the cache.
+    // Resolve the PARENT (the slot itself may be a link we must not follow,
+    // or may not exist yet) and re-check containment on canonical paths.
+    const parent = std.fs.path.dirname(path) orelse return false;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const canon_parent = cwd.realPathFileAlloc(io, parent, allocator) catch return false;
+    defer allocator.free(canon_parent);
+    const canon_root = cwd.realPathFileAlloc(io, packages_dir, allocator) catch return false;
+    defer allocator.free(canon_root);
+
+    if (canon_parent.len < canon_root.len) return false;
+    if (!std.mem.startsWith(u8, canon_parent, canon_root)) return false;
+    if (canon_parent.len == canon_root.len) return true;
+    return canon_parent[canon_root.len] == '/' or canon_parent[canon_root.len] == '\\';
 }
 
 /// The `.version` a package's own `build.zig.zon` declares, or null when
@@ -1195,4 +1237,86 @@ test "purgeLegacyLocalSlots: an escaping assembler pin cannot aim the sweep outs
 
     try testing.expect(dirExists(victim));
     try testing.expect(dirExists(checkout));
+}
+
+test "isCanonicalSemver: only a full X.Y.Z release authorises a content-based purge (#688 review)" {
+    // `config.isSemverVersion` accepts anything starting with a digit,
+    // including the abbreviated `1.2` whose package legitimately declares
+    // `1.2.0` — and the caller DELETES on a mismatch.
+    try testing.expect(isCanonicalSemver("1.2.3"));
+    try testing.expect(isCanonicalSemver("0.31.0"));
+
+    try testing.expect(!isCanonicalSemver("1.2"));
+    try testing.expect(!isCanonicalSemver("2"));
+    try testing.expect(!isCanonicalSemver("1.2.3.4"));
+    try testing.expect(!isCanonicalSemver("1.2.3-rc1"));
+    try testing.expect(!isCanonicalSemver("main"));
+    try testing.expect(!isCanonicalSemver("release/1.2.3"));
+    try testing.expect(!isCanonicalSemver(""));
+}
+
+test "purgeLegacyLocalSlot: an abbreviated pin never deletes a canonical release (#688 review)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home/packages/gfx/1.2");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    const slot = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.2" });
+    defer alloc.free(slot);
+    try writeZon(slot, ".{\n    .name = .labelle_gfx,\n    .version = \"1.2.0\",\n}\n");
+
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, slot, "1.2"));
+    try testing.expect(dirExists(slot));
+}
+
+test "purgeLegacyLocalSlot: a symlinked ancestor cannot smuggle a deletion out of the cache (#688 review)" {
+    // A slash-delimited pin nests, so `gfx/release/1.2.3` sits under
+    // `gfx/release` — and a legacy `gfx/release` may itself be a symlink to a
+    // checkout. The lexical containment test reads that path as inside the
+    // cache while it resolves into the user's source tree.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home/packages/gfx");
+    try tmp.dir.createDirPath(testing.io, "checkout/1.2.3");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
+    defer alloc.free(checkout);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    // `packages/gfx/release` → the checkout. The pin `release/1.2.3` then
+    // names `packages/gfx/release/1.2.3`, i.e. `checkout/1.2.3`.
+    const ancestor = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "release" });
+    defer alloc.free(ancestor);
+    try std.Io.Dir.cwd().symLink(testing.io, checkout, ancestor, .{ .is_directory = true });
+
+    const inside = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "release", "1.2.3" });
+    defer alloc.free(inside);
+    try writeZon(inside, ".{\n    .name = .labelle_gfx,\n    .version = \"9.9.9\",\n}\n");
+
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, inside, "1.2.3"));
+
+    const victim = try std.fs.path.join(alloc, &.{ checkout, "1.2.3" });
+    defer alloc.free(victim);
+    try testing.expect(dirExists(victim));
 }

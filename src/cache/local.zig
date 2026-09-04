@@ -417,6 +417,12 @@ fn activeOrFree(allocator: std.mem.Allocator, slot: []const u8, expected_source:
 fn populatedFrom(allocator: std.mem.Allocator, slot: []const u8, expected_source: []const u8) bool {
     const origin = readOrigin(allocator, slot) orelse return false;
     defer origin.deinit(allocator);
+    // The source has to still BE there (#688 review round 8). `samePath`
+    // falls back to a textual comparison when neither side canonicalises, so
+    // a deleted checkout still "matches" its own recorded path — and a
+    // COPIED slot (the Windows fallback) survives its source, staying active
+    // while the probes fetch the release it is standing in for.
+    if (!pathExists(origin.source)) return false;
     return samePath(allocator, origin.source, expected_source);
 }
 
@@ -1307,4 +1313,48 @@ test "assemblerSlotComplete: a subdir the checkout dropped makes the slot stale 
     defer alloc.free(stale);
     try std.Io.Dir.cwd().deleteTree(config.globalIo(), stale);
     try std.testing.expect(assemblerSlotComplete(alloc, slot, companion));
+}
+
+test "activeFrameworkSlot: a slot whose source checkout is gone is not honoured (#688 review)" {
+    // `samePath` falls back to a textual comparison when neither side
+    // canonicalises, so a deleted checkout still matches its own recorded
+    // path. A COPIED slot (the Windows fallback) then outlives its source and
+    // stays active while the probes fetch the release it stands in for.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/local/gfx");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-core");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-gfx");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-assembler/zig-out/bin");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-gfx", alloc);
+    defer alloc.free(src);
+    const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer std.testing.environ = saved_environ;
+
+    setProbeStartForTesting(bin);
+    defer setProbeStartForTesting(null);
+
+    // A COPIED slot (a real directory, as the Windows fallback leaves it).
+    const slot = try frameworkSlot(alloc, "gfx");
+    defer alloc.free(slot);
+    try writeOrigin(alloc, slot, src, "1.29.0");
+
+    const active = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
+    alloc.free(active);
+
+    // The checkout goes away; the copy and its marker do not.
+    try std.Io.Dir.cwd().deleteTree(std.testing.io, src);
+    try std.testing.expect(try activeFrameworkSlot(alloc, "gfx") == null);
 }
