@@ -484,6 +484,48 @@ pub fn encodePngPacked(
     return out.toOwnedSlice();
 }
 
+/// Encode a 16-bit GREYSCALE PNG (one big-endian sample per pixel). Test-only,
+/// like `encodePngPacked`: the reader must get 16-bit tRNS keys right, and that
+/// needs a real 16-bit fixture.
+fn encodePngGrey16(allocator: std.mem.Allocator, samples: []const u16, w: u32, h: u32) ![]u8 {
+    if (samples.len != @as(usize, w) * h) return error.InvalidDimensions;
+    const stride = @as(usize, w) * 2;
+    const raw = try allocator.alloc(u8, (stride + 1) * h);
+    defer allocator.free(raw);
+    for (0..h) |y| {
+        raw[y * (stride + 1)] = 0; // filter: none
+        const row = raw[y * (stride + 1) + 1 ..][0..stride];
+        for (0..w) |x| std.mem.writeInt(u16, row[x * 2 ..][0..2], samples[y * w + x], .big);
+    }
+
+    var zout: std.Io.Writer.Allocating = try .initCapacity(allocator, 1024);
+    defer zout.deinit();
+    {
+        const window = try allocator.alloc(u8, flate.max_window_len);
+        defer allocator.free(window);
+        var comp: flate.Compress = try .init(&zout.writer, window, .zlib, .default);
+        try comp.writer.writeAll(raw);
+        try comp.finish();
+    }
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const wr = &out.writer;
+    try wr.writeAll(&png_magic);
+    var ihdr: [13]u8 = undefined;
+    std.mem.writeInt(u32, ihdr[0..4], w, .big);
+    std.mem.writeInt(u32, ihdr[4..8], h, .big);
+    ihdr[8] = 16;
+    ihdr[9] = 0; // greyscale
+    ihdr[10] = 0;
+    ihdr[11] = 0;
+    ihdr[12] = 0;
+    try writeChunk(wr, "IHDR", &ihdr);
+    try writeChunk(wr, "IDAT", zout.written());
+    try writeChunk(wr, "IEND", "");
+    return out.toOwnedSlice();
+}
+
 /// Test-facing alias for `encodePngPacked` (see there). Named so its purpose
 /// is unmistakable at the call site in `app_icon.zig`'s tests.
 pub const encodePngPackedForTest = encodePngPacked;
@@ -1136,4 +1178,37 @@ test "decodePng: a bit depth the colour type forbids is Malformed, not Unsupport
     try testing.expectError(error.Malformed, decodePng(testing.allocator, png));
     png[24] = 3; // not a depth at all
     try testing.expectError(error.Malformed, decodePng(testing.allocator, png));
+}
+
+test "decodePng: a 16-bit tRNS key is matched on the FULL sample, not the high byte" {
+    // Codex on #687: comparing only the retained high byte turns every sample
+    // that merely SHARES a high byte with the key transparent — 0x12ff would
+    // vanish for a key of 0x1200, punching holes through a 16-bit icon. Both
+    // samples here reduce to the same 8-bit grey (0x12), so only a full-width
+    // comparison can tell them apart.
+    const png = try encodePngGrey16(testing.allocator, &.{ 0x1200, 0x12ff, 0x3400 }, 3, 1);
+    defer testing.allocator.free(png);
+    const trns_key = [_]u8{ 0x12, 0x00 }; // big-endian 16-bit key = 0x1200
+    const with_trns = try insertChunkBeforeIdat(testing.allocator, png, "tRNS", &trns_key);
+    defer testing.allocator.free(with_trns);
+
+    const img = try decodePng(testing.allocator, with_trns);
+    defer img.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, &.{ 0x12, 0x12, 0x12, 0 }, img.pixels[0..4]); // the key: clear
+    try testing.expectEqualSlices(u8, &.{ 0x12, 0x12, 0x12, 255 }, img.pixels[4..8]); // same high byte: OPAQUE
+    try testing.expectEqualSlices(u8, &.{ 0x34, 0x34, 0x34, 255 }, img.pixels[8..12]);
+}
+
+test "decodePng: an 8-bit tRNS key still matches (the key is big-endian in the image's scale)" {
+    // The 8-bit twin of the case above: the key is stored as a 16-bit
+    // big-endian value holding 0..255, so the byte that matters is the LOW one.
+    const png = try encodePngRaw(testing.allocator, &.{ 7, 200 }, 2, 1, 0, null);
+    defer testing.allocator.free(png);
+    const trns_key = [_]u8{ 0x00, 7 };
+    const with_trns = try insertChunkBeforeIdat(testing.allocator, png, "tRNS", &trns_key);
+    defer testing.allocator.free(with_trns);
+    const img = try decodePng(testing.allocator, with_trns);
+    defer img.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 0), img.pixels[3]);
+    try testing.expectEqual(@as(u8, 255), img.pixels[7]);
 }
