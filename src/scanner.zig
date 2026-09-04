@@ -42,9 +42,23 @@ pub fn isSkippableDir(parent: std.Io.Dir, name: []const u8) bool {
     for (skip_dir_names) |skip| {
         if (std.mem.eql(u8, name, skip)) return true;
     }
+    return isRepoRoot(parent, name);
+}
+
+/// Rule 2 of `isSkippableDir` on its own: is `parent/name` a repository
+/// root (worktree, submodule or plain nested clone)?
+///
+/// Split out because the name-list half of `isSkippableDir` is specific
+/// to the asset/source mirror, while this half must hold for EVERY walk
+/// over project source. `script_scanner` needs exactly this rule and
+/// none of `skip_dir_names`, so sharing the whole predicate would change
+/// which directories it treats as state dirs.
+pub fn isRepoRoot(parent: std.Io.Dir, name: []const u8) bool {
     const io = config.globalIo();
     var sub = parent.openDir(io, name, .{}) catch return false;
     defer sub.close(io);
+    // EXISTENCE, not kind: a worktree's / submodule's `.git` is a file
+    // holding a `gitdir:` pointer, not a directory.
     sub.access(io, ".git", .{}) catch return false;
     return true;
 }

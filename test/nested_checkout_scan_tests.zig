@@ -21,6 +21,7 @@ const std = @import("std");
 const zspec = @import("zspec");
 const generator = @import("generator");
 const scanner = generator.scanner;
+const ScriptScanner = generator.script_scanner.ScriptScanner;
 
 const io = std.testing.io;
 
@@ -181,5 +182,48 @@ pub const NESTED_CHECKOUT_COPY_PRUNING = struct {
 
         try tmp.dir.access(io, "out/assets/tile.png", .{});
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/assets/upstream", .{}));
+    }
+};
+
+/// The script scanner is a SEPARATE walk from `scanner.zig`'s, and #692's
+/// first fix pruned only the latter. A worktree parked under `scripts/`
+/// therefore still contributed that branch's scripts to the generated
+/// registry — the build compiled code the working tree does not contain.
+pub const SCRIPT_SCANNER_PRUNING = struct {
+    test "a nested checkout under scripts/ contributes no scripts (#692)" {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        // A real script in a state dir, plus a worktree parked beside it
+        // holding a script that only exists on some other branch.
+        try writeSample(tmp.dir, "proj/scripts/playing/alpha.zig", "// alpha");
+        try writeSample(tmp.dir, "proj/scripts/playing/wt/ghost.zig", "// from another branch");
+        // A worktree's `.git` is a FILE holding a gitdir: pointer.
+        try writeSample(tmp.dir, "proj/scripts/playing/wt/.git", "gitdir: /elsewhere/.git/worktrees/wt\n");
+
+        const abs = try tmp.dir.realPathFileAlloc(io, "proj", allocator);
+        defer allocator.free(abs);
+        const scripts = try std.fs.path.join(allocator, &.{ abs, "scripts" });
+        defer allocator.free(scripts);
+
+        const states = [_][]const u8{"playing"};
+        var ss = ScriptScanner.init(allocator, &states);
+        defer ss.deinit();
+        try ss.scanDir(scripts);
+
+        var saw_alpha = false;
+        for (ss.entries.items) |e| {
+            if (std.mem.indexOf(u8, e.rel_path, "alpha") != null) saw_alpha = true;
+            if (std.mem.indexOf(u8, e.rel_path, "ghost") != null) {
+                std.debug.print(
+                    "script scanner descended into a nested checkout: {s}\n",
+                    .{e.rel_path},
+                );
+                return error.NestedCheckoutScriptWasScanned;
+            }
+        }
+        // Negative control: the prune must not have eaten the real script.
+        try std.testing.expect(saw_alpha);
     }
 };

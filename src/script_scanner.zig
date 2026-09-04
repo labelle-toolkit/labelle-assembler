@@ -20,6 +20,7 @@
 ///   - Directories not matching declared states are silently ignored.
 const std = @import("std");
 const config = @import("config.zig");
+const scanner = @import("scanner.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ScriptScanner = struct {
@@ -187,6 +188,12 @@ pub const ScriptScanner = struct {
                 // handles those separately and they must not leak into the
                 // game block.
                 if (std.mem.startsWith(u8, entry.name, ".plugin_")) continue;
+
+                // Never descend into a nested repository root (#692). A
+                // worktree parked under `scripts/` otherwise contributes
+                // that branch's scripts to the generated registry —
+                // `scanner.zig`'s walks were pruned, this one was not.
+                if (scanner.isRepoRoot(dir, entry.name)) continue;
 
                 // First-level directory — parse for state binding
                 const dir_states = try self.parseDirStates(entry.name);
@@ -505,6 +512,11 @@ pub const ScriptScanner = struct {
                 errdefer self.allocator.free(rel_path);
                 try self.addEntryWithPath(name_copy, state_dir_name, states, rel_path);
             } else if (entry.kind == .directory) {
+                // Same prune as `scanDir` — a nested checkout at any
+                // depth under `scripts/` is another branch's source
+                // tree, not this project's (#692).
+                if (scanner.isRepoRoot(dir, entry.name)) continue;
+
                 const sub_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name });
                 defer self.allocator.free(sub_path);
                 const sub_rel = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_prefix, entry.name });
