@@ -19,7 +19,7 @@ const resolve = @import("resolve.zig");
 /// skipped silently so the same function works through the staged migration
 /// as more subdirs (ecs, gui) move over.
 pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: []const u8, companion_dir: []const u8) !void {
-    // #685: local sources go in the reserved `assembler/local` slot, never in
+    // #685: local sources go in the reserved `local/assembler` slot, never in
     // `assembler/<version>` — a slot named for a version must contain that
     // version.
     const target = try local.assemblerSlot(allocator);
@@ -67,7 +67,7 @@ pub fn populateFrameworkPackage(allocator: std.mem.Allocator, package: []const u
 /// Populate a plugin into the cache from a source directory.
 /// Creates a symlink from the cache location to the source directory.
 pub fn populatePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, source_dir: []const u8) !void {
-    // #685: reserved `local` slot, same as the framework packages.
+    // #685: reserved local-namespace slot, same as the framework packages.
     const target = try local.pluginSlot(allocator, plugin.repo);
     defer allocator.free(target);
     try symlinkToCache(allocator, source_dir, target);
@@ -103,16 +103,32 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
     // (Windows requires admin/Developer Mode for symlinks)
     cwd.symLink(io, abs_source, target, .{ .is_directory = true }) catch |err| {
         if (err == error.PathAlreadyExists) {
-            // Verify the existing entry points to the expected source
             var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const existing_len = std.Io.Dir.readLinkAbsolute(io, target, &link_buf) catch return; // not a symlink, assume OK
-            const existing = link_buf[0..existing_len];
-            if (!std.mem.eql(u8, existing, abs_source)) {
+            if (std.Io.Dir.readLinkAbsolute(io, target, &link_buf)) |existing_len| {
+                // A link already: keep it when it already points where we want.
+                const existing = link_buf[0..existing_len];
+                if (std.mem.eql(u8, existing, abs_source)) return;
                 std.log.warn("labelle: cache entry '{s}' points to '{s}', expected '{s}'", .{ target, existing, abs_source });
-                // Remove stale link and recreate
                 cwd.deleteFile(io, target) catch return;
-                cwd.symLink(io, abs_source, target, .{ .is_directory = true }) catch return;
+            } else |_| {
+                // NOT a link — an earlier run took the copy fallback below (or
+                // the platform has no directory symlinks at all). That copy is
+                // a SNAPSHOT: it does not track the source, and the reserved
+                // slot never changes name, so leaving it would serve stale
+                // sources indefinitely. Repopulating is the whole point of the
+                // call, so drop it (#688 review round 2).
+                cwd.deleteTree(io, target) catch |del_err| {
+                    std.log.warn("labelle: could not refresh cache entry '{s}': {any}", .{ target, del_err });
+                    return error.CachePopulationFailed;
+                };
             }
+            // Recreate: link if the platform allows it, copy if it does not.
+            cwd.symLink(io, abs_source, target, .{ .is_directory = true }) catch {
+                copyDirRecursive(allocator, abs_source, target) catch |copy_err| {
+                    std.log.err("labelle: could not link or copy '{s}' to '{s}': {any}", .{ abs_source, target, copy_err });
+                    return error.CachePopulationFailed;
+                };
+            };
             return;
         }
         // Fall back to copying the directory
@@ -635,4 +651,47 @@ test "purgeLegacyLocalSlots: sweeps the implicit null backend the tests target n
 
     try testing.expect(!dirExists(poisoned));
     try testing.expect(dirExists(checkout));
+}
+
+test "symlinkToCache: a stale COPIED slot is dropped and repopulated (#688 review)" {
+    // The copy fallback (Windows without symlink privileges) leaves a real
+    // directory in the slot. `symlinkToCache` used to hit PathAlreadyExists,
+    // fail to read it as a link, and return SUCCESS without touching it — so
+    // the probe reporting the copy stale bought nothing: `ensureCache` called
+    // populate, populate no-opped, and generation resolved the same snapshot.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home");
+    try tmp.dir.createDirPath(testing.io, "toolkit/labelle-gfx");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src = try tmp.dir.realPathFileAlloc(testing.io, "toolkit/labelle-gfx", alloc);
+    defer alloc.free(src);
+    try writeVersionStamp(src, "1.31.0");
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    // Stand in for the copy fallback's output: a real directory holding an
+    // out-of-date snapshot.
+    const slot = try local.frameworkSlot(alloc, "gfx");
+    defer alloc.free(slot);
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), slot);
+    try writeVersionStamp(slot, "1.29.0");
+    try testing.expect(!local.isSymlinkPath(slot));
+
+    try populateFrameworkPackage(alloc, "gfx", "1.31.0", src);
+
+    // Refreshed: it tracks the source again, and serves current sources.
+    try testing.expect(local.isSymlinkPath(slot));
+    const stamp = try readVersionStamp(alloc, slot);
+    defer alloc.free(stamp);
+    try testing.expectEqualStrings("1.31.0", stamp);
 }
