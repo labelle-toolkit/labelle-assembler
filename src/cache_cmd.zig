@@ -104,7 +104,7 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         if (isSafePathComponent(arg)) continue;
         std.log.err(
             "labelle-assembler install: '{s}' is not a valid package or version name " ++
-                "(no path separators, '.' or '..')",
+                "(no absolute paths, no '.' or '..' components)",
             .{arg},
         );
         std.process.exit(2);
@@ -757,12 +757,24 @@ fn fetchBackendWithFallback(allocator: std.mem.Allocator, bp: config.PluginDep) 
     };
 }
 
-/// Whether `name` is a single, ordinary path component — safe to join into
-/// a cache path that the migration sweep may delete.
+/// Whether `name` is safe to join into a cache path that the migration
+/// sweep may delete.
+///
+/// A `/` is NOT disqualifying (#688 review round 6): `versionToGitRef`
+/// passes non-semver versions through verbatim, so `feature/foo` and
+/// `2026/dev` are supported version pins and their cache paths are nested
+/// to match. Only traversal is rejected — a `..` component, or an absolute
+/// path that would ignore the cache root altogether.
 fn isSafePathComponent(name: []const u8) bool {
     if (name.len == 0) return false;
-    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
-    return std.mem.indexOfAny(u8, name, "/\\") == null;
+    if (std.fs.path.isAbsolute(name)) return false;
+    var it = std.mem.tokenizeAny(u8, name, "/\\");
+    var any = false;
+    while (it.next()) |component| {
+        any = true;
+        if (std.mem.eql(u8, component, "..") or std.mem.eql(u8, component, ".")) return false;
+    }
+    return any;
 }
 
 /// #685 migration for the single-package `install` forms, which have no
@@ -1005,4 +1017,21 @@ test "cleanLocalSlots: drops the local namespace, leaving version slots alone (#
 
     // Idempotent.
     try std.testing.expectEqual(@as(u32, 0), cleanLocalSlots(arena_alloc, io, packages_dir, false));
+}
+
+test "isSafePathComponent: slash-delimited git refs are versions, traversal is not (#688 review)" {
+    // `versionToGitRef` passes non-semver versions through verbatim, so a
+    // slash-delimited branch is a supported pin and `install feature/foo`
+    // must keep reaching the fetcher.
+    try std.testing.expect(isSafePathComponent("1.29.0"));
+    try std.testing.expect(isSafePathComponent("main"));
+    try std.testing.expect(isSafePathComponent("feature/foo"));
+    try std.testing.expect(isSafePathComponent("2026/dev"));
+
+    try std.testing.expect(!isSafePathComponent(""));
+    try std.testing.expect(!isSafePathComponent("."));
+    try std.testing.expect(!isSafePathComponent(".."));
+    try std.testing.expect(!isSafePathComponent("../../target"));
+    try std.testing.expect(!isSafePathComponent("feature/../../../etc"));
+    try std.testing.expect(!isSafePathComponent("/etc/passwd"));
 }

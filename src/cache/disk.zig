@@ -175,6 +175,16 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
 pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8) error{PurgeFailed}!bool {
     const io = config.globalIo();
 
+    // Containment, checked HERE rather than at each caller (#688 review
+    // round 6): every purge target is built from a user-supplied version
+    // string — a CLI argument, but also a `project.labelle` field, which no
+    // argument validation covers — and this function DELETES. A version like
+    // `../../../../tmp/1.2.3` would otherwise reach outside the cache.
+    if (!withinPackagesDir(allocator, slot_path)) {
+        std.log.warn("labelle: refusing to touch cache slot '{s}' — it is outside the package cache", .{slot_path});
+        return false;
+    }
+
     if (isSymlink(slot_path)) {
         std.Io.Dir.cwd().deleteFile(io, slot_path) catch |err| {
             std.log.warn("labelle: could not remove locally-sourced cache slot '{s}': {any}", .{ slot_path, err });
@@ -203,6 +213,25 @@ pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8)
         "labelle: removed cache slot '{s}' — it holds {s} sources, not the {s} release (#685)",
         .{ slot_path, declared, slot_version },
     );
+    return true;
+}
+
+/// Whether `path` lies strictly inside the packages directory, with no
+/// `..` component to walk back out of it. A prefix test alone is not
+/// enough: `<packages>/gfx/../../tmp/x` starts with the packages dir and
+/// still escapes it.
+fn withinPackagesDir(allocator: std.mem.Allocator, path: []const u8) bool {
+    const packages_dir = env.getPackagesDir(allocator) catch return false;
+    defer allocator.free(packages_dir);
+
+    if (path.len <= packages_dir.len) return false;
+    if (!std.mem.startsWith(u8, path, packages_dir)) return false;
+    if (path[packages_dir.len] != '/' and path[packages_dir.len] != '\\') return false;
+
+    var it = std.mem.tokenizeAny(u8, path[packages_dir.len + 1 ..], "/\\");
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return false;
+    }
     return true;
 }
 
@@ -655,6 +684,12 @@ test "purgeLegacyLocalSlot: drops a version slot symlinked at a local checkout (
     const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
     // The poisoned slot, exactly as the old populate wrote it.
     const poisoned = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
     defer alloc.free(poisoned);
@@ -828,6 +863,12 @@ test "purgeLegacyLocalSlot: drops a COPIED version slot whose contents are a dif
     const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
     defer alloc.free(home);
 
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
     // A copied working tree: the slot says 1.29.0, the sources say 1.31.0.
     const poisoned = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
     defer alloc.free(poisoned);
@@ -939,6 +980,12 @@ test "purgeLegacyLocalSlot: a non-semver ref slot is never judged by its zon ver
     const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
     defer alloc.free(home);
 
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
     const ref_slot = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "main" });
     defer alloc.free(ref_slot);
     try writeZon(ref_slot, ".{\n    .name = .labelle_gfx,\n    .version = \"1.31.0\",\n}\n");
@@ -1013,4 +1060,49 @@ test "purgeLegacyLocalSlots: sweeps a slot referenced only through the GUI packa
 
     try testing.expect(!dirExists(poisoned));
     try testing.expect(dirExists(checkout));
+}
+
+test "purgeLegacyLocalSlot: refuses a target outside the package cache (#688 review)" {
+    // Purge targets are built from user-supplied version strings — including
+    // `project.labelle` fields, which no CLI-argument validation covers — and
+    // this function deletes. A version like `../../../../tmp/1.2.3` must not
+    // reach outside the cache.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home/packages/gfx");
+    try tmp.dir.createDirPath(testing.io, "outside");
+    try tmp.dir.createDirPath(testing.io, "checkout");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const outside = try tmp.dir.realPathFileAlloc(testing.io, "outside", alloc);
+    defer alloc.free(outside);
+    const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
+    defer alloc.free(checkout);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    // A symlink outside the cache — exactly what an escaping version reaches.
+    const victim = try std.fs.path.join(alloc, &.{ outside, "1.2.3" });
+    defer alloc.free(victim);
+    try symlinkToCache(alloc, checkout, victim);
+    try testing.expect(dirExists(victim));
+
+    // Named directly …
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, victim));
+    try testing.expect(dirExists(victim));
+
+    // … and reached by traversal from a path that starts inside the cache,
+    // which a prefix test alone would wave through.
+    const traversed = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "..", "..", "..", "outside", "1.2.3" });
+    defer alloc.free(traversed);
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, traversed));
+    try testing.expect(dirExists(victim));
 }
