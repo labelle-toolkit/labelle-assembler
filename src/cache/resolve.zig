@@ -345,7 +345,15 @@ pub fn resolveGuiUrl(allocator: std.mem.Allocator, url: []const u8, ref: []const
 pub fn isFrameworkCached(allocator: std.mem.Allocator, package: []const u8, version: []const u8) !bool {
     if (config.isLocalVersion(version)) return true;
 
-    const path = try resolveFrameworkPackage(allocator, package, version, null);
+    // An active local slot satisfies the dep — unless it is a COPY rather
+    // than a link (the Windows symlink fallback), in which case it is a
+    // stale snapshot and must be repopulated (#688 review).
+    if (try local.activeFrameworkSlot(allocator, package)) |slot| {
+        defer allocator.free(slot);
+        return local.slotTracksSource(slot);
+    }
+
+    const path = try frameworkVersionPath(allocator, package, version);
     defer allocator.free(path);
     return @import("disk.zig").dirExists(path);
 }
@@ -355,10 +363,11 @@ pub fn isAssemblerCached(allocator: std.mem.Allocator, assembler_version: []cons
     if (config.isLocalVersion(assembler_version)) return true;
 
     // #685: a populated local slot satisfies the assembler dependency the
-    // same way the version slot does.
+    // same way the version slot does — as long as its bundled subdirs are
+    // still links and not stale copies (#688 review).
     if (try local.activeAssemblerSlot(allocator)) |slot| {
-        allocator.free(slot);
-        return true;
+        defer allocator.free(slot);
+        return local.assemblerSlotTracksSource(allocator, slot);
     }
 
     const packages_dir = try env.getPackagesDir(allocator);
@@ -372,7 +381,13 @@ pub fn isAssemblerCached(allocator: std.mem.Allocator, assembler_version: []cons
 pub fn isPluginCached(allocator: std.mem.Allocator, plugin: config.PluginDep) !bool {
     if (plugin.isLocal()) return true;
 
-    const path = try resolvePlugin(allocator, plugin, null);
+    // Same staleness rule as isFrameworkCached.
+    if (try local.activePluginSlot(allocator, plugin.repo)) |slot| {
+        defer allocator.free(slot);
+        return local.slotTracksSource(slot);
+    }
+
+    const path = try pluginVersionPath(allocator, plugin);
     defer allocator.free(path);
     return @import("disk.zig").dirExists(path);
 }

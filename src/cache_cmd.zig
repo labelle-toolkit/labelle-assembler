@@ -264,27 +264,19 @@ pub fn cmdClean(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
                     };
                 }
                 std.log.info("  removed {s}/{s}", .{ pkg_name, entry.name });
-                // #685: the reserved `local` slot carries a sibling
-                // provenance marker. Drop it with the slot so a later
-                // `install` can't read stale origin for a slot that's gone.
-                if (std.mem.eql(u8, entry.name, cache.localSlots.SLOT_NAME)) {
-                    if (std.fs.path.join(arena_alloc, &.{ pkg_dir_path, cache.localSlots.ORIGIN_NAME })) |origin_path| {
-                        std.Io.Dir.cwd().deleteFile(io, origin_path) catch {};
-                    } else |_| {}
-                }
             }
             removed_count += 1;
         }
     }
 
-    // Plugins and external backends live under `packages/plugins/<repo>/…`,
+    // Locally-sourced slots live in their own namespace (`packages/local/…`),
     // which the version-pruning loop above never walks — so the diagnostic
-    // that tells users `labelle-assembler clean` will drop a plugin's local
-    // slot used to be a lie, and the same implicit source stayed active
-    // (#688 review). Version pruning for plugins needs pins this command
-    // doesn't read; the reserved `local` slot needs none, so drop exactly
-    // that, wherever it sits in the repo path.
-    removed_count += cleanPluginLocalSlots(arena_alloc, io, packages_dir, dry_run);
+    // that tells users `labelle-assembler clean` will drop a local slot used
+    // to be a lie for plugins and external backends, and the same implicit
+    // source stayed active (#688 review). The whole namespace goes: every
+    // path under it is a slot or a marker by construction, so there is
+    // nothing to classify and no version pruning to do.
+    removed_count += cleanLocalSlots(arena_alloc, io, packages_dir, dry_run);
 
     if (removed_count == 0) {
         std.log.info("  nothing to clean", .{});
@@ -295,77 +287,34 @@ pub fn cmdClean(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
     }
 }
 
-/// Remove every reserved `local` slot (and its provenance marker) under
-/// `packages/plugins/`. Returns how many were removed (or, under
-/// `--dry-run`, would be).
+/// Remove the reserved local-slot namespace (`packages/local/`) whole.
+/// Returns 1 when it existed (or, under `--dry-run`, would have been
+/// removed), else 0.
 ///
-/// A plugin repo path is `<host>/<owner>/<name>`, so the slots sit at an
-/// unknown depth — walk down to a bounded depth looking for the reserved
-/// name rather than assuming one.
-fn cleanPluginLocalSlots(
+/// Deliberately NOT a search for directories named `local`: an earlier
+/// draft walked `packages/plugins/**` for that name and would have deleted
+/// an owner directory of a repo such as `github.com/local/example`, along
+/// with anything named `local` inside an extracted checkout (#688 review).
+/// The namespace makes the question structural instead.
+fn cleanLocalSlots(
     arena_alloc: std.mem.Allocator,
     io: std.Io,
     packages_dir: []const u8,
     dry_run: bool,
 ) u32 {
-    const plugins_dir = std.fs.path.join(arena_alloc, &.{ packages_dir, "plugins" }) catch return 0;
-    return cleanLocalSlotsIn(arena_alloc, io, plugins_dir, "plugins", dry_run, 0);
-}
+    const slots_root = std.fs.path.join(arena_alloc, &.{ packages_dir, cache.localSlots.SLOT_NS }) catch return 0;
+    if (!cache.localSlots.pathExists(slots_root)) return 0;
 
-fn cleanLocalSlotsIn(
-    arena_alloc: std.mem.Allocator,
-    io: std.Io,
-    dir_path: []const u8,
-    label: []const u8,
-    dry_run: bool,
-    depth: u8,
-) u32 {
-    // `<host>/<owner>/<name>/local` is depth 4 below `plugins/`; stop well
-    // short of walking a whole extracted checkout.
-    if (depth > 5) return 0;
-
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return 0;
-    defer dir.close(io);
-
-    var removed: u32 = 0;
-    var it = dir.iterate();
-    while (it.next(io) catch null) |entry| {
-        if (entry.kind != .directory and entry.kind != .sym_link) continue;
-        const full_path = std.fs.path.join(arena_alloc, &.{ dir_path, entry.name }) catch continue;
-        const entry_label = std.fs.path.join(arena_alloc, &.{ label, entry.name }) catch continue;
-
-        if (!std.mem.eql(u8, entry.name, cache.localSlots.SLOT_NAME)) {
-            // A version slot (or an intermediate repo-path component) — the
-            // former has nothing to recurse into, and the depth bound makes
-            // descending into it cheap either way.
-            removed += cleanLocalSlotsIn(arena_alloc, io, full_path, entry_label, dry_run, depth + 1);
-            continue;
-        }
-
-        if (dry_run) {
-            std.log.info("  would remove {s}", .{entry_label});
-            removed += 1;
-            continue;
-        }
-
-        if (entry.kind == .sym_link) {
-            std.Io.Dir.cwd().deleteFile(io, full_path) catch |err| {
-                std.log.warn("  could not remove {s}: {s}", .{ entry_label, @errorName(err) });
-                continue;
-            };
-        } else {
-            std.Io.Dir.cwd().deleteTree(io, full_path) catch |err| {
-                std.log.warn("  could not remove {s}: {s}", .{ entry_label, @errorName(err) });
-                continue;
-            };
-        }
-        if (std.fs.path.join(arena_alloc, &.{ dir_path, cache.localSlots.ORIGIN_NAME })) |origin_path| {
-            std.Io.Dir.cwd().deleteFile(io, origin_path) catch {};
-        } else |_| {}
-        std.log.info("  removed {s}", .{entry_label});
-        removed += 1;
+    if (dry_run) {
+        std.log.info("  would remove {s}/ (locally-sourced slots)", .{cache.localSlots.SLOT_NS});
+        return 1;
     }
-    return removed;
+    std.Io.Dir.cwd().deleteTree(io, slots_root) catch |err| {
+        std.log.warn("  could not remove {s}/: {s}", .{ cache.localSlots.SLOT_NS, @errorName(err) });
+        return 0;
+    };
+    std.log.info("  removed {s}/ (locally-sourced slots)", .{cache.localSlots.SLOT_NS});
+    return 1;
 }
 
 // ── upgrade ──────────────────────────────────────────────────────────
@@ -952,7 +901,7 @@ test "findFieldAssignment tolerates extra whitespace around =" {
     try std.testing.expectEqualStrings(".core_version   =   \"0.1.0\"", content[span.start..span.end]);
 }
 
-test "cleanPluginLocalSlots: drops a plugin's reserved local slot and its marker (#688 review)" {
+test "cleanLocalSlots: drops the local namespace, leaving version slots alone (#688 review)" {
     // `warnIfLocallySourced` tells users to run `labelle-assembler clean` to
     // drop a local slot, but `cmdClean`'s version-pruning loop only walks
     // core/engine/gfx/cli/assembler — a plugin or external backend's slot
@@ -969,8 +918,11 @@ test "cleanPluginLocalSlots: drops a plugin's reserved local slot and its marker
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const repo = "github.com/labelle-toolkit/labelle-physics";
-    try tmp.dir.createDirPath(std.testing.io, "packages/plugins/" ++ repo);
+    // A plugin local slot, a plugin RELEASE slot, and — the trap an earlier
+    // draft fell into — a plugin repo whose OWNER is literally named `local`.
+    try tmp.dir.createDirPath(std.testing.io, "packages/local/plugins/" ++ repo);
     try tmp.dir.createDirPath(std.testing.io, "packages/plugins/" ++ repo ++ "/0.4.0");
+    try tmp.dir.createDirPath(std.testing.io, "packages/plugins/github.com/local/example/1.0.0");
     try tmp.dir.createDirPath(std.testing.io, "checkout");
 
     const packages_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "packages", alloc);
@@ -978,8 +930,9 @@ test "cleanPluginLocalSlots: drops a plugin's reserved local slot and its marker
     const checkout = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
-    const slot = try std.fs.path.join(alloc, &.{ packages_dir, "plugins", repo, cache.localSlots.SLOT_NAME });
+    const slot = try std.fs.path.join(alloc, &.{ packages_dir, cache.localSlots.SLOT_NS, "plugins", repo });
     defer alloc.free(slot);
+    try std.Io.Dir.cwd().deleteTree(io, slot);
     try std.Io.Dir.cwd().symLink(io, checkout, slot, .{ .is_directory = true });
     cache.localSlots.writeOrigin(alloc, slot, checkout, "0.4.0");
 
@@ -988,18 +941,23 @@ test "cleanPluginLocalSlots: drops a plugin's reserved local slot and its marker
     try std.testing.expect(cache.localSlots.pathExists(marker));
 
     // A dry run reports it without touching anything.
-    try std.testing.expectEqual(@as(u32, 1), cleanPluginLocalSlots(arena_alloc, io, packages_dir, true));
+    try std.testing.expectEqual(@as(u32, 1), cleanLocalSlots(arena_alloc, io, packages_dir, true));
     try std.testing.expect(cache.localSlots.pathExists(slot));
 
-    try std.testing.expectEqual(@as(u32, 1), cleanPluginLocalSlots(arena_alloc, io, packages_dir, false));
+    try std.testing.expectEqual(@as(u32, 1), cleanLocalSlots(arena_alloc, io, packages_dir, false));
     try std.testing.expect(!cache.localSlots.pathExists(slot));
     try std.testing.expect(!cache.localSlots.pathExists(marker));
-    // The version slot beside it, and the source checkout, are untouched.
+
+    // The release slot, the `local`-OWNED repo, and the source checkout all
+    // survive untouched.
     const release = try std.fs.path.join(alloc, &.{ packages_dir, "plugins", repo, "0.4.0" });
     defer alloc.free(release);
     try std.testing.expect(cache.localSlots.pathExists(release));
+    const owner_local = try std.fs.path.join(alloc, &.{ packages_dir, "plugins", "github.com", "local", "example", "1.0.0" });
+    defer alloc.free(owner_local);
+    try std.testing.expect(cache.localSlots.pathExists(owner_local));
     try std.testing.expect(cache.localSlots.pathExists(checkout));
 
     // Idempotent.
-    try std.testing.expectEqual(@as(u32, 0), cleanPluginLocalSlots(arena_alloc, io, packages_dir, false));
+    try std.testing.expectEqual(@as(u32, 0), cleanLocalSlots(arena_alloc, io, packages_dir, false));
 }
