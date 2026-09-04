@@ -284,6 +284,26 @@ fn normalizePosix(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 /// (a background image layer) must NOT be embedded — the runtime never
 /// requests it, and embedding it could require an absent file or collide.
 ///
+/// **Per-tile images are DELIBERATE, not incidental (assembler#690).** A
+/// collection-of-images tileset has no top-level `<image>`; each tile
+/// carries its own file as `<tile id="N"><image source="prop.png"/></tile>`.
+/// The sweep below is bounded by the `<tileset>…</tileset>` span but is
+/// otherwise NESTING-BLIND, so those nested `<image>` elements are collected
+/// too — and that is the required behaviour, not a happy accident:
+/// labelle-gfx#343 renders collection tilesets, and gfx keys their per-tile
+/// lookup (`resolveTileFn`) by the VERBATIM `source` attribute, exactly the
+/// key this function returns and `collect` registers under. Dropping them
+/// would not fail the build; it would ship a map whose props silently draw
+/// as nothing.
+///
+/// So: anyone adding nesting awareness here (e.g. to attribute an `<image>`
+/// to the element that owns it) MUST keep emitting one source per
+/// `<tile><image>`, not just the tileset-level one. The span bound is the
+/// ONLY thing separating a tileset image from an `<imagelayer>` /
+/// object-template image that follows `</tileset>` — see the
+/// `extractImageSources … per-tile` / `… stops at </tileset>` tests in
+/// `tilemap_scan_test.zig`, which pin both halves.
+///
 /// **Raw values.** The returned source is the VERBATIM attribute-value
 /// bytes — no XML-entity decoding and no `\`→`/` normalization. gfx v1.21.0's
 /// TMX parser stores `image_source` as a raw dupe (`tilemap/src/root.zig`
@@ -312,6 +332,11 @@ pub fn extractImageSources(allocator: std.mem.Allocator, tmx: []const u8) ![][]c
         // to it.
         const ts_close = std.mem.indexOfPos(u8, tmx, ts_tag_end, "</tileset>") orelse tmx.len;
         var isearch = ts_tag_end;
+        // Nesting-blind BY CONTRACT: this sweep yields the tileset-level
+        // `<image>` of a sheet tileset AND the `<tile><image/></tile>` of a
+        // collection tileset alike, each under its verbatim `source` — the
+        // key gfx's `resolveTileFn` / `ImageProvider.get` uses. See the
+        // per-tile note in this function's doc comment before "fixing" it.
         while (indexOfTagSkippingComments(tmx, isearch, "<image")) |img_start| {
             if (img_start >= ts_close) break;
             // Bound the attr search to this element so a later element's

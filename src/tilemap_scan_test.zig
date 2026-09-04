@@ -165,6 +165,142 @@ test "extractImageSources ignores an <imagelayer> image, keeps the tileset image
     try testing.expectEqualStrings("tiles.png", imgs[0]);
 }
 
+// ── Collection-of-images tilesets: per-tile `<image>` (assembler#690) ──
+//
+// A collection tileset carries no top-level `<image>`; each tile brings its
+// own file as a `<tile><image source="..."/></tile>` child. labelle-gfx#343
+// makes those a rendering feature, so every one of them has to reach the
+// embedded registry — keyed by the VERBATIM `source`, which is what gfx's
+// `resolveTileFn` is handed. The scan collects them because its `<image>`
+// sweep is bounded by the `<tileset>…</tileset>` span and is otherwise
+// nesting-blind; these tests pin that as the contract rather than an
+// accident. See the `extractImageSources` doc comment.
+
+// A Tiled collection-of-images tileset: `columns="0"`, a `<grid>`, and one
+// `<image>` per `<tile>`.
+const collection_tmx =
+    \\<?xml version="1.0" encoding="UTF-8"?>
+    \\<map version="1.10" orientation="orthogonal" width="4" height="4" tilewidth="16" tileheight="16">
+    \\ <tileset firstgid="1" name="props" tilewidth="16" tileheight="32" tilecount="3" columns="0">
+    \\  <grid orientation="orthogonal" width="1" height="1"/>
+    \\  <tile id="0">
+    \\   <image source="props/barrel.png" width="16" height="16"/>
+    \\  </tile>
+    \\  <tile id="1">
+    \\   <image source="props/crate.png" width="16" height="16"/>
+    \\  </tile>
+    \\  <tile id="2">
+    \\   <image source="props/lamp.png" width="16" height="32"/>
+    \\  </tile>
+    \\ </tileset>
+    \\ <layer id="1" name="ground" width="4" height="4">
+    \\  <data encoding="csv">1,2,3,0,0,0,0,0,0,0,0,0,0,0,0,0</data>
+    \\ </layer>
+    \\</map>
+;
+
+test "extractImageSources collects EVERY per-tile <image> of a collection tileset" {
+    // No top-level `<image>` at all: if the nested ones were skipped this
+    // tileset would embed nothing and draw as a blank map at runtime.
+    const imgs = try tilemap_scan.extractImageSources(testing.allocator, collection_tmx);
+    defer {
+        for (imgs) |s| testing.allocator.free(s);
+        testing.allocator.free(imgs);
+    }
+    try testing.expectEqual(@as(usize, 3), imgs.len);
+    try testing.expectEqualStrings("props/barrel.png", imgs[0]);
+    try testing.expectEqualStrings("props/crate.png", imgs[1]);
+    try testing.expectEqualStrings("props/lamp.png", imgs[2]);
+}
+
+test "extractImageSources collects a collection AND a sheet tileset in one map" {
+    // The realistic mixed map: a terrain sheet plus a props collection.
+    // BOTH sets must come back, each attributed to its own tileset, in
+    // document order.
+    const tmx =
+        \\<map>
+        \\ <tileset firstgid="1" name="terrain" tilecount="16" columns="4">
+        \\  <image source="terrain.png" width="64" height="64"/>
+        \\ </tileset>
+        \\ <tileset firstgid="17" name="props" tilecount="2" columns="0">
+        \\  <grid orientation="orthogonal" width="1" height="1"/>
+        \\  <tile id="0"><image source="props/barrel.png" width="16" height="16"/></tile>
+        \\  <tile id="1"><image source="props/crate.png" width="16" height="16"/></tile>
+        \\ </tileset>
+        \\ <tileset firstgid="19" name="water" tilecount="4" columns="2">
+        \\  <image source="water.png" width="32" height="32"/>
+        \\ </tileset>
+        \\</map>
+    ;
+    const imgs = try tilemap_scan.extractImageSources(testing.allocator, tmx);
+    defer {
+        for (imgs) |s| testing.allocator.free(s);
+        testing.allocator.free(imgs);
+    }
+    try testing.expectEqual(@as(usize, 4), imgs.len);
+    try testing.expectEqualStrings("terrain.png", imgs[0]);
+    try testing.expectEqualStrings("props/barrel.png", imgs[1]);
+    try testing.expectEqualStrings("props/crate.png", imgs[2]);
+    try testing.expectEqualStrings("water.png", imgs[3]);
+}
+
+test "extractImageSources stops at </tileset>: an <image> AFTER it is not a tileset image" {
+    // The span bound is what makes the nesting-blind sweep safe. Put an
+    // imagelayer background AFTER a collection tileset — the only ordering
+    // that actually exercises `img_start >= ts_close` (an imagelayer BEFORE
+    // the tileset is simply behind the scan cursor) — and a second tileset
+    // after THAT, so the scan is proven to resume at the right place rather
+    // than swallowing everything to EOF.
+    const tmx =
+        \\<map>
+        \\ <tileset firstgid="1" name="props" tilecount="2" columns="0">
+        \\  <tile id="0"><image source="props/barrel.png" width="16" height="16"/></tile>
+        \\  <tile id="1"><image source="props/crate.png" width="16" height="16"/></tile>
+        \\ </tileset>
+        \\ <imagelayer id="2" name="bg"><image source="draft_bg.png" width="64" height="32"/></imagelayer>
+        \\ <tileset firstgid="3" name="terrain" tilecount="4" columns="2">
+        \\  <image source="terrain.png" width="32" height="32"/>
+        \\ </tileset>
+        \\ <objectgroup id="3" name="decor">
+        \\  <object id="1" gid="1" x="0" y="0"/>
+        \\ </objectgroup>
+        \\</map>
+    ;
+    const imgs = try tilemap_scan.extractImageSources(testing.allocator, tmx);
+    defer {
+        for (imgs) |s| testing.allocator.free(s);
+        testing.allocator.free(imgs);
+    }
+    try testing.expectEqual(@as(usize, 3), imgs.len);
+    try testing.expectEqualStrings("props/barrel.png", imgs[0]);
+    try testing.expectEqualStrings("props/crate.png", imgs[1]);
+    try testing.expectEqualStrings("terrain.png", imgs[2]);
+    // `draft_bg.png` belongs to the imagelayer: the engine's ImageProvider is
+    // never asked for it, so embedding it would demand a file the map does
+    // not need (or collide with a tileset key).
+    for (imgs) |s| try testing.expect(!std.mem.eql(u8, s, "draft_bg.png"));
+}
+
+test "extractImageSources ignores a trailing <imagelayer> when the LAST tileset is a collection" {
+    // Same bound, with nothing after the imagelayer to re-anchor the scan —
+    // a `</tileset>`-less fallback (`orelse tmx.len`) would take the bait.
+    const tmx =
+        \\<map>
+        \\ <tileset firstgid="1" name="props" tilecount="1" columns="0">
+        \\  <tile id="0"><image source="props/lamp.png" width="16" height="32"/></tile>
+        \\ </tileset>
+        \\ <imagelayer id="9" name="parallax"><image source="sky.png" width="64" height="64"/></imagelayer>
+        \\</map>
+    ;
+    const imgs = try tilemap_scan.extractImageSources(testing.allocator, tmx);
+    defer {
+        for (imgs) |s| testing.allocator.free(s);
+        testing.allocator.free(imgs);
+    }
+    try testing.expectEqual(@as(usize, 1), imgs.len);
+    try testing.expectEqualStrings("props/lamp.png", imgs[0]);
+}
+
 test "tmxEmbedPath appends .tmx for a bare asset name" {
     const p = try tilemap_scan.tmxEmbedPath(testing.allocator, "colony_map");
     defer testing.allocator.free(p);
@@ -228,6 +364,129 @@ test "collect embeds the .tmx and its tileset image, keyed for the engine" {
     try testing.expectEqualStrings("assets/tiles.png", regs[1].embed_path);
 }
 
+test "collect embeds every per-tile image of a collection tileset (assembler#690)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFileAbs(tmp.dir, "assets/level.tmx", collection_tmx);
+    try writeFileAbs(tmp.dir, "assets/props/barrel.png", fake_png);
+    try writeFileAbs(tmp.dir, "assets/props/crate.png", fake_png);
+    try writeFileAbs(tmp.dir, "assets/props/lamp.png", fake_png);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_scan.collect(testing.allocator, target_dir, &.{"level"});
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    // The `.tmx` plus ONE registration per tile image — nothing is dropped
+    // on the way from the scan to the generated `addEmbeddedTilemapAsset`.
+    try testing.expectEqual(@as(usize, 4), regs.len);
+    try testing.expectEqualStrings("level", regs[0].key);
+    try testing.expectEqualStrings("assets/level.tmx", regs[0].embed_path);
+    // KEY = the verbatim per-tile `source`; gfx hands `resolveTileFn` that
+    // exact string, so the registry entry must match it byte-for-byte.
+    // PATH = resolved against the `.tmx`'s directory, same as a sheet image.
+    try testing.expectEqualStrings("props/barrel.png", regs[1].key);
+    try testing.expectEqualStrings("assets/props/barrel.png", regs[1].embed_path);
+    try testing.expectEqualStrings("props/crate.png", regs[2].key);
+    try testing.expectEqualStrings("assets/props/crate.png", regs[2].embed_path);
+    try testing.expectEqualStrings("props/lamp.png", regs[3].key);
+    try testing.expectEqualStrings("assets/props/lamp.png", regs[3].embed_path);
+}
+
+test "collect embeds BOTH a collection and a sheet tileset from one map" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The map lives in a subdirectory so the per-tile paths are resolved,
+    // not merely echoed: `props/barrel.png` must land under `assets/maps/`.
+    const tmx =
+        \\<map version="1.10" orientation="orthogonal" width="2" height="2" tilewidth="16" tileheight="16">
+        \\ <tileset firstgid="1" name="terrain" tilecount="4" columns="2">
+        \\  <image source="../art/terrain.png" width="32" height="32"/>
+        \\ </tileset>
+        \\ <tileset firstgid="5" name="props" tilecount="2" columns="0">
+        \\  <grid orientation="orthogonal" width="1" height="1"/>
+        \\  <tile id="0"><image source="props/barrel.png" width="16" height="16"/></tile>
+        \\  <tile id="1"><image source="props/crate.png" width="16" height="16"/></tile>
+        \\ </tileset>
+        \\ <imagelayer id="9" name="bg"><image source="never_embedded.png" width="64" height="64"/></imagelayer>
+        \\</map>
+    ;
+    try writeFileAbs(tmp.dir, "assets/maps/level.tmx", tmx);
+    try writeFileAbs(tmp.dir, "assets/art/terrain.png", fake_png);
+    try writeFileAbs(tmp.dir, "assets/maps/props/barrel.png", fake_png);
+    try writeFileAbs(tmp.dir, "assets/maps/props/crate.png", fake_png);
+    // `never_embedded.png` is deliberately absent from disk: the imagelayer
+    // image must not be scanned at all, and `collect` reads nothing for it.
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try tilemap_scan.collect(testing.allocator, target_dir, &.{"maps/level"});
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    try testing.expectEqual(@as(usize, 4), regs.len);
+    try testing.expectEqualStrings("maps/level", regs[0].key);
+    try testing.expectEqualStrings("assets/maps/level.tmx", regs[0].embed_path);
+    // Sheet tileset: key raw, path normalised through the map's dir.
+    try testing.expectEqualStrings("../art/terrain.png", regs[1].key);
+    try testing.expectEqualStrings("assets/art/terrain.png", regs[1].embed_path);
+    // Collection tileset: same treatment, one registration per tile.
+    try testing.expectEqualStrings("props/barrel.png", regs[2].key);
+    try testing.expectEqualStrings("assets/maps/props/barrel.png", regs[2].embed_path);
+    try testing.expectEqualStrings("props/crate.png", regs[3].key);
+    try testing.expectEqualStrings("assets/maps/props/crate.png", regs[3].embed_path);
+    for (regs) |r| try testing.expect(!std.mem.eql(u8, r.key, "never_embedded.png"));
+}
+
+test "collect embeds the per-tile images of a collection tileset inside a .tsx" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A collection tileset shared as an external `.tsx`, stored in its own
+    // directory — so the `.tsx`-relative per-tile paths differ from the
+    // map-relative keys gfx rebases them to (`tsxImageKey`).
+    const tmx =
+        \\<map>
+        \\ <tileset firstgid="1" source="tilesets/Props.tsx"/>
+        \\</map>
+    ;
+    const tsx =
+        \\<tileset name="props" tilewidth="16" tileheight="16" tilecount="2" columns="0">
+        \\ <grid orientation="orthogonal" width="1" height="1"/>
+        \\ <tile id="0"><image source="../art/barrel.png" width="16" height="16"/></tile>
+        \\ <tile id="1"><image source="crate.png" width="16" height="16"/></tile>
+        \\</tileset>
+    ;
+    try writeFileAbs(tmp.dir, "assets/level.tmx", tmx);
+    try writeFileAbs(tmp.dir, "assets/tilesets/Props.tsx", tsx);
+    try writeFileAbs(tmp.dir, "assets/art/barrel.png", fake_png);
+    try writeFileAbs(tmp.dir, "assets/tilesets/crate.png", fake_png);
+
+    const target_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_dir);
+
+    const regs = try collectTsx(target_dir, &.{"level"});
+    defer tilemap_scan.freeRegistrations(testing.allocator, regs);
+
+    try testing.expectEqual(@as(usize, 4), regs.len);
+    try testing.expectEqualStrings("level", regs[0].key);
+    try testing.expectEqualStrings("tilesets/Props.tsx", regs[1].key);
+    try testing.expectEqualStrings("assets/tilesets/Props.tsx", regs[1].embed_path);
+    // PATH: relative to the `.TSX`'s own directory (`assets/tilesets/`).
+    // KEY: rebased onto the MAP's directory. gfx#343 (PR #347) rebases a
+    // `.tsx`'s PER-TILE sources with the very same
+    // `joinRelative(dirname(tsx_source), source)` it already applied to the
+    // tileset-level `image_source` — and, like gfx, only when the reference
+    // HAS a directory component. `tsxImageKey` mirrors both halves, so these
+    // keys are what `resolveTileFn` will be handed. (#690 investigation.)
+    try testing.expectEqualStrings("art/barrel.png", regs[2].key);
+    try testing.expectEqualStrings("assets/art/barrel.png", regs[2].embed_path);
+    try testing.expectEqualStrings("tilesets/crate.png", regs[3].key);
+    try testing.expectEqualStrings("assets/tilesets/crate.png", regs[3].embed_path);
+}
 test "collect: backslash source → RAW key, `/`-normalized embed path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
