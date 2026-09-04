@@ -129,6 +129,7 @@ pub const ResourceDef = config.ResourceDef;
 pub const ResourceKind = config.ResourceKind;
 pub const ResourceValidationError = config.ResourceValidationError;
 pub const FontBakeParams = config.FontBakeParams;
+pub const GridDef = config.GridDef;
 pub const CodepointRange = config.CodepointRange;
 pub const ProjectConfig = config.ProjectConfig;
 pub const CLI_VERSION = config.CLI_VERSION;
@@ -336,6 +337,46 @@ pub fn generate(
     // cleared the flag.)
     try generate_phases.checkEditorPreviewLinkPath(allocator, cfg, game_dir, backend_manifest_name);
 
+    const cwd = std.Io.Dir.cwd();
+
+    // Target subfolder: .labelle/raylib_desktop/, .labelle/sokol_ios/, etc.
+    // Override is used for the `.labelle/tests/` target where the name
+    // shouldn't reflect the backend (issue #83). Resolved HERE — ahead of the
+    // texture swaps rather than after them — because the grid-expansion phase
+    // below writes its synthesised manifests into this dir. Pure string
+    // computation, no filesystem effect, so hoisting it changes nothing else.
+    const target_name = if (target_name_override) |name|
+        try allocator.dupe(u8, name)
+    else
+        try std.fmt.allocPrint(allocator, "{s}_{s}", .{ cfg.backendName(), @tagName(cfg.platform) });
+    defer allocator.free(target_name);
+    const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
+    defer allocator.free(target_dir);
+
+    // Expand `.grid` resources into ordinary atlases (#675). A uniform tileset
+    // is a regular grid, so the TexturePacker manifest naming every frame is
+    // derivable from the image's own pixel dimensions — the phase reads the
+    // PNG IHDR, writes a synthesised manifest into the target dir, and rewrites
+    // the entry to `.json` + `.texture`. Everything downstream (emission, lazy
+    // inference, scene wiring, the pack machinery) then sees a normal atlas.
+    //
+    // Runs BEFORE the astc/rgba swaps on purpose, in both directions: the
+    // rewritten `.texture` is a `.png`, so a tileset picks up a pre-converted
+    // sibling exactly like a hand-authored atlas — and the dimensions must be
+    // read from the source PNG, which an `.astc` sibling would no longer be.
+    //
+    // Cost of that placement: the phase has to create `target_dir` (its
+    // manifests live there) ahead of the pack-graph / language / plugin-param
+    // gates below, which the `createDirPath` further down deliberately sits
+    // after. It does so ONLY when the project actually declares a `.grid`, so
+    // every existing project's generate is byte-identical — and the earliest
+    // artifact is an empty directory, not stale generated output.
+    var grid_manifest_allocs = try generate_phases.expandGridResources(allocator, io, mutable_resources, game_dir, target_dir);
+    defer {
+        for (grid_manifest_allocs.items) |s| allocator.free(s);
+        grid_manifest_allocs.deinit(allocator);
+    }
+
     // Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
     // target platform opts into ASTC (`asset_compression`) and `labelle astc`
     // produced one. The runtime detects the ASTC magic and uploads the
@@ -359,19 +400,6 @@ pub fn generate(
         for (rgba_path_allocs.items) |s| allocator.free(s);
         rgba_path_allocs.deinit(allocator);
     }
-
-    const cwd = std.Io.Dir.cwd();
-
-    // Target subfolder: .labelle/raylib_desktop/, .labelle/sokol_ios/, etc.
-    // Override is used for the `.labelle/tests/` target where the name
-    // shouldn't reflect the backend (issue #83).
-    const target_name = if (target_name_override) |name|
-        try allocator.dupe(u8, name)
-    else
-        try std.fmt.allocPrint(allocator, "{s}_{s}", .{ cfg.backendName(), @tagName(cfg.platform) });
-    defer allocator.free(target_name);
-    const target_dir = try std.fs.path.join(allocator, &.{ output_dir, target_name });
-    defer allocator.free(target_dir);
 
     // ── Pack manifest load + dependency-validation gate (Packs RFC §6, #441) ─
     //

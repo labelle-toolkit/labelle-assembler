@@ -92,6 +92,32 @@ pub fn validateResources(cfg: ProjectConfig) !void {
                 std.Io.File.stderr().writeStreamingAll(io, "' sets `.font_params` but is not a font resource. Remove `.font_params` or change to `.font = \"...\"`.\n") catch {};
                 return error.InvalidResource;
             },
+            .grid_misplaced => {
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' sets `.grid` but is not an image resource. `.grid` expands ONE `.image` into a synthesised tile atlas — pair it with `.image = \"assets/<sheet>.png\"`, or drop it.\n") catch {};
+                return error.InvalidResource;
+            },
+            .grid_zero_tile_size => {
+                std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: grid resource '") catch {};
+                std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+                std.Io.File.stderr().writeStreamingAll(io, "' declares a zero `tile_width` / `tile_height`. Both must be > 0 — the frame count is the image extent divided by the cell extent.\n") catch {};
+                return error.InvalidResource;
+            },
+        }
+        // A `.grid` reaching CODEGEN means the expansion pass never saw it
+        // (#675). `expandGridResources` rewrites every game-declared grid into
+        // an ordinary atlas and clears the field, so a survivor can only come
+        // from a path the pass does not walk — today that is a pack / plugin
+        // `.resources` entry, which is merged AFTER the pass runs and whose
+        // source image lives outside `game_dir`. Emitting it as a plain loose
+        // image would silently drop every frame the user declared the grid
+        // for, so refuse instead, and say exactly which surface is missing.
+        if (res.grid != null) {
+            std.Io.File.stderr().writeStreamingAll(io, "labelle-assembler: resource '") catch {};
+            std.Io.File.stderr().writeStreamingAll(io, res.name) catch {};
+            std.Io.File.stderr().writeStreamingAll(io, "' declares `.grid`, but grid expansion only runs over the GAME's own `.resources`. A pack- or plugin-shipped tileset must ship its TexturePacker manifest (`.json` + `.texture`) instead.\n") catch {};
+            return error.GridResourceNotExpanded;
         }
         // Extension sanity for a loose image (#675). Mirrors the
         // sound/font checks: the emitted `file_type` is derived from

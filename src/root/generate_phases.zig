@@ -103,6 +103,298 @@ pub fn checkEditorPreviewLinkPath(
     }
 }
 
+// ── Uniform tile grid → synthesised atlas (#675) ─────────────────────
+
+/// Pixel dimensions read out of a PNG's `IHDR` chunk.
+pub const PngDims = struct { width: u32, height: u32 };
+
+/// Per-axis cell counts derived from an image's own dimensions.
+pub const GridCounts = struct { cols: u32, rows: u32 };
+
+/// The 8-byte PNG signature every PNG file opens with.
+const png_signature = [_]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+
+/// Bytes of a PNG needed to reach the end of the `IHDR` width/height:
+/// 8 signature + 4 chunk length + 4 chunk type + 4 width + 4 height.
+const png_header_len = 24;
+
+/// Parse `width`/`height` out of a PNG header.
+///
+/// A PNG is: the 8-byte signature, then chunks. The FIRST chunk is
+/// required by the spec to be `IHDR`, whose data starts with a
+/// big-endian `u32` width then a big-endian `u32` height — bytes
+/// `[16,20)` and `[20,24)` of the file. The signature AND the `IHDR`
+/// chunk-type tag are both verified before those 8 bytes are trusted:
+/// without that check, any 24-byte file would yield two plausible-looking
+/// integers and the grid would expand against garbage dimensions.
+///
+/// Returns `error.GridImageNotPng` for anything that is not a PNG, and
+/// `error.GridImageZeroDimension` for a header claiming a 0-pixel axis
+/// (illegal per spec, and a divide-by-zero waiting to happen downstream).
+pub fn parsePngDims(bytes: []const u8) !PngDims {
+    if (bytes.len < png_header_len) return error.GridImageNotPng;
+    if (!std.mem.eql(u8, bytes[0..8], &png_signature)) return error.GridImageNotPng;
+    if (!std.mem.eql(u8, bytes[12..16], "IHDR")) return error.GridImageNotPng;
+    const dims: PngDims = .{
+        .width = std.mem.readInt(u32, bytes[16..20], .big),
+        .height = std.mem.readInt(u32, bytes[20..24], .big),
+    };
+    if (dims.width == 0 or dims.height == 0) return error.GridImageZeroDimension;
+    return dims;
+}
+
+/// Cell count along ONE axis, using Tiled's tileset layout.
+///
+/// `margin` borders BOTH edges of the axis and `spacing` sits BETWEEN
+/// adjacent cells (never after the last one), so cell `i` starts at
+/// `margin + i * (tile + spacing)` and `n` cells occupy
+/// `n * tile + (n - 1) * spacing` = `n * (tile + spacing) - spacing`
+/// pixels. Solving for `n` against the usable span `extent - 2*margin`:
+///
+///     n = (extent - 2*margin + spacing) / (tile + spacing)
+///
+/// The division must be EXACT. A grid that leaves a remainder is
+/// rejected (`error.GridDoesNotDivideEvenly`) rather than truncated:
+/// silently dropping the ragged last column is the failure mode that
+/// looks almost right, and the "almost" is what costs the afternoon.
+/// Arithmetic runs in `u64` so a hostile `margin` near `maxInt(u32)`
+/// cannot wrap `2 * margin` into a small number.
+fn axisCount(extent: u32, tile: u32, margin: u32, spacing: u32) !u32 {
+    if (tile == 0) return error.GridZeroTileSize;
+    const e: u64 = extent;
+    const m: u64 = margin;
+    const step: u64 = @as(u64, tile) + spacing;
+    if (e < 2 * m) return error.GridMarginExceedsImage;
+    const usable = e - 2 * m + spacing;
+    if (usable % step != 0) return error.GridDoesNotDivideEvenly;
+    const n = usable / step;
+    if (n == 0) return error.GridDoesNotDivideEvenly;
+    return @intCast(n);
+}
+
+/// Derive `cols` × `rows` from the image's own pixel dimensions —
+/// deliberately NOT from a user-supplied count, which would be a second
+/// source of truth that drifts the moment the artist adds a row.
+pub fn gridCounts(dims: PngDims, grid: config.GridDef) !GridCounts {
+    return .{
+        .cols = try axisCount(dims.width, grid.tile_width, grid.margin, grid.spacing),
+        .rows = try axisCount(dims.height, grid.tile_height, grid.margin, grid.spacing),
+    };
+}
+
+/// Render the synthesised TexturePacker manifest (JSON-hash flavour —
+/// the shape `labelle-engine/src/atlas.zig`'s `parseFramesObject` reads,
+/// and the same shape the in-tree example atlases are written in).
+///
+/// FRAME NAMING IS A PUBLIC CONTRACT: `<name>/<index>`, row-major from
+/// the top-left, zero-based, `index = row * cols + col`. See `GridDef`'s
+/// doc comment. Caller owns the returned bytes.
+///
+/// `meta.size` carries the image's real dimensions so the engine's
+/// `applyTextureScale` computes a 1.0 scale (the authored logical size
+/// and the uploaded texture agree); omitting it would leave the atlas
+/// with a null logical size that `resolveUiFrame` reads.
+pub fn buildGridManifest(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    image_rel: []const u8,
+    dims: PngDims,
+    grid: config.GridDef,
+    counts: GridCounts,
+) ![]u8 {
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer alloc_writer.deinit();
+    const w = &alloc_writer.writer;
+
+    try w.writeAll("{\n  \"frames\": {\n");
+    var row: u32 = 0;
+    while (row < counts.rows) : (row += 1) {
+        var col: u32 = 0;
+        while (col < counts.cols) : (col += 1) {
+            const index = row * counts.cols + col;
+            const x = grid.margin + col * (grid.tile_width + grid.spacing);
+            const y = grid.margin + row * (grid.tile_height + grid.spacing);
+            if (index != 0) try w.writeAll(",\n");
+            try w.print(
+                "    \"{s}/{d}\": {{ \"frame\": {{ \"x\": {d}, \"y\": {d}, \"w\": {d}, \"h\": {d} }}, " ++
+                    "\"rotated\": false, \"trimmed\": false, " ++
+                    "\"spriteSourceSize\": {{ \"x\": 0, \"y\": 0, \"w\": {d}, \"h\": {d} }}, " ++
+                    "\"sourceSize\": {{ \"w\": {d}, \"h\": {d} }} }}",
+                .{
+                    name,            index,            x,               y,
+                    grid.tile_width, grid.tile_height, grid.tile_width, grid.tile_height,
+                    grid.tile_width, grid.tile_height,
+                },
+            );
+        }
+    }
+    try w.writeAll("\n  },\n  \"meta\": {\n");
+    try w.writeAll("    \"app\": \"labelle-assembler\",\n");
+    try w.print("    \"image\": \"{s}\",\n", .{std.fs.path.basename(image_rel)});
+    try w.print("    \"size\": {{ \"w\": {d}, \"h\": {d} }},\n", .{ dims.width, dims.height });
+    try w.writeAll("    \"scale\": \"1\"\n  }\n}\n");
+
+    var arr_list = alloc_writer.toArrayList();
+    errdefer arr_list.deinit(allocator);
+    return arr_list.toOwnedSlice(allocator);
+}
+
+/// Filename (relative to the target dir) of the manifest synthesised for
+/// resource `name`. The `__` prefix is the target root's generated-file
+/// convention (`__pack_root.zig`, `__surface.zig`) and cannot collide with
+/// a user path: the target root holds only generated files plus the
+/// symlinked convention dirs. One file per resource, and resource names
+/// are proven unique by `validateResources`.
+pub fn gridManifestRel(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "__grid_{s}.json", .{name});
+}
+
+/// Read just enough of a PNG to parse its `IHDR`. Streams the first 24
+/// bytes rather than slurping the file: a tileset sheet is routinely tens
+/// of megabytes and nothing past the header is wanted.
+fn readPngHeader(io: std.Io, abs_path: []const u8, out: *[png_header_len]u8) !void {
+    var file = try std.Io.Dir.cwd().openFile(io, abs_path, .{});
+    defer file.close(io);
+    var filled: usize = 0;
+    while (filled < png_header_len) {
+        const n = file.readStreaming(io, &.{out[filled..]}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        filled += n;
+    }
+    if (filled < png_header_len) return error.GridImageNotPng;
+}
+
+/// Expand every `.grid` resource into an ordinary atlas (#675).
+///
+/// A uniform tileset is a regular grid, so the TexturePacker manifest that
+/// names each frame is derivable — `(col, row) * (tile + spacing) + margin`
+/// — from the image's own pixel dimensions. This pass does exactly that:
+/// it reads the PNG `IHDR` at `<game_dir>/<res.image>`, writes a synthesised
+/// manifest into the TARGET dir (a generated tree — the user's `assets/` is
+/// symlinked in and must never be written to), and REWRITES the entry to
+/// `.json` + `.texture`. Nothing downstream learns a new resource kind:
+/// emission, lazy inference, scene wiring, the reverse frame index and the
+/// pack machinery all see a normal atlas.
+///
+/// Runs BEFORE `swapAstcTexturePaths` / `swapRgbaTexturePaths`, which is the
+/// whole reason it sits here rather than after the target dir is otherwise
+/// populated: the rewritten `.texture` is a `.png` path, so a tileset gets
+/// the same `.astc` / `.rgba` sibling preference a hand-authored atlas does.
+/// Dimensions are read from the SOURCE `.png` — an `.astc` sibling has no
+/// PNG header — so the ordering is load-bearing in both directions.
+///
+/// Creates `target_dir` if needed (idempotent; `generate` calls
+/// `createDirPath` on it again later).
+///
+/// Returns the owned list of allocated manifest rel-paths — the rewritten
+/// `res.json` slices point INTO it, so the CALLER holds the cleanup `defer`,
+/// exactly like the two texture-swap phases below.
+pub fn expandGridResources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    mutable_resources: []ResourceDef,
+    game_dir: []const u8,
+    target_dir: []const u8,
+) !std.ArrayList([]const u8) {
+    var manifest_path_allocs: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (manifest_path_allocs.items) |s| allocator.free(s);
+        manifest_path_allocs.deinit(allocator);
+    }
+
+    var made_target_dir = false;
+    for (mutable_resources) |*res| {
+        const grid = res.grid orelse continue;
+
+        // Shape first: `.grid` is only meaningful next to `.image`, and a
+        // zero cell has no frame count. `validate()` owns both rules so the
+        // classification tests cover them without touching the filesystem.
+        switch (res.validate()) {
+            .ok => {},
+            .grid_misplaced => return gridFail(res.name, error.GridMisplaced, "`.grid` is only valid alongside `.image` (it expands ONE image into a synthesised atlas). Drop `.grid`, or declare the image with `.image = \"assets/<sheet>.png\"`."),
+            .grid_zero_tile_size => return gridFail(res.name, error.GridZeroTileSize, "`.grid` declares a zero `tile_width` / `tile_height`. Both must be > 0 — the frame count is the image extent divided by the cell extent."),
+            // Every other shape error is reported with its full diagnostic
+            // by `validateResources` at codegen time; bail here rather than
+            // reading a file for an entry that is already malformed.
+            else => return error.InvalidResource,
+        }
+
+        // PNG only: the dimensions come from the `IHDR`, and a `.jpg` /
+        // `.astc` / `.rgba` has no such header. Rejecting up front beats
+        // reporting "not a PNG" from inside the parser with no hint that
+        // the FORMAT, not the file, is the problem.
+        if (!std.ascii.endsWithIgnoreCase(res.image, ".png")) {
+            return gridFail(res.name, error.GridImageNotPng, "`.grid` requires a `.png` image — the tile counts are derived from the PNG header. Convert the sheet to PNG (a pre-converted `.astc`/`.rgba` sibling is still picked up automatically), or write the atlas manifest by hand.");
+        }
+
+        const abs = try std.fs.path.join(allocator, &.{ game_dir, res.image });
+        defer allocator.free(abs);
+        var header: [png_header_len]u8 = undefined;
+        readPngHeader(io, abs, &header) catch |err| {
+            return gridFail(res.name, if (err == error.GridImageNotPng) error.GridImageNotPng else error.GridImageUnreadable, "could not read the `.image` PNG header. Check that the path is correct and relative to the project root.");
+        };
+        const dims = parsePngDims(&header) catch |err| {
+            return gridFail(res.name, err, "the `.image` file is not a readable PNG (bad signature or IHDR).");
+        };
+        const counts = gridCounts(dims, grid) catch |err| {
+            return gridFailDims(res.name, err, dims, grid);
+        };
+
+        const manifest = try buildGridManifest(allocator, res.name, res.image, dims, grid, counts);
+        defer allocator.free(manifest);
+
+        if (!made_target_dir) {
+            try std.Io.Dir.cwd().createDirPath(io, target_dir);
+            made_target_dir = true;
+        }
+        const rel = try gridManifestRel(allocator, res.name);
+        {
+            errdefer allocator.free(rel);
+            try scanner.writeFile(target_dir, rel, manifest);
+            try manifest_path_allocs.append(allocator, rel);
+        }
+
+        // Rewrite to an ordinary atlas. `.grid` is cleared so a value
+        // surviving this pass (a pack-declared grid — see
+        // `validateResources`) is detectable rather than silently inert.
+        res.json = rel;
+        res.texture = res.image;
+        res.image = "";
+        res.grid = null;
+    }
+    return manifest_path_allocs;
+}
+
+/// One-line stderr diagnostic + the mapped error, in the style the rest of
+/// the generate gates use. Silenced under test: the Zig test runner fails
+/// any test that emits `std.log.err`, even when the error IS the assertion.
+fn gridFail(name: []const u8, err: anyerror, hint: []const u8) anyerror {
+    if (!builtin.is_test) {
+        std.log.err("labelle-assembler: grid resource '{s}': {s}", .{ name, hint });
+    }
+    return err;
+}
+
+/// The divides-evenly diagnostic, which is only useful with the numbers in
+/// it: the image's real dimensions and the cell pitch that failed to fit.
+fn gridFailDims(name: []const u8, err: anyerror, dims: PngDims, grid: config.GridDef) anyerror {
+    if (!builtin.is_test) {
+        std.log.err(
+            "labelle-assembler: grid resource '{s}': a {d}x{d} image does not divide evenly into " ++
+                "{d}x{d} tiles (margin {d}, spacing {d}). Tiled's layout puts cell (col,row) at " ++
+                "`margin + col*(tile_width+spacing), margin + row*(tile_height+spacing)`, so each axis must " ++
+                "satisfy `(extent - 2*margin + spacing) % (tile + spacing) == 0`. Fix the tile size, the " ++
+                "margin/spacing, or re-export the sheet — the frame count is derived from the image, never " ++
+                "truncated to fit.",
+            .{ name, dims.width, dims.height, grid.tile_width, grid.tile_height, grid.margin, grid.spacing },
+        );
+    }
+    return err;
+}
+
 /// Swap `.texture = "...png"` to the pre-converted `.astc` sibling when the
 /// target platform opts into ASTC (`asset_compression`) and `labelle astc`
 /// produced one (labelle-gfx#269 / #340). Done BEFORE the `.rgba` swap so ASTC
@@ -1278,5 +1570,377 @@ test "validateLanguagePolicy: plugin manifest requires_language mismatch errors 
     try testing.expectError(
         error.LanguageRequirementMismatch,
         validateLanguagePolicy(allocator, &.{}, &plugins, project_dir),
+    );
+}
+
+// ============================================================================
+// Tests — uniform tile grid → synthesised atlas (#675)
+// ============================================================================
+
+/// A PNG prefix that is real enough for `parsePngDims`: signature, the
+/// 13-byte IHDR chunk length, the `IHDR` tag, then big-endian width/height.
+/// The rest of a PNG is irrelevant to the pass — it never decodes pixels.
+fn fakePngHeader(width: u32, height: u32) [png_header_len]u8 {
+    var out: [png_header_len]u8 = undefined;
+    @memcpy(out[0..8], &png_signature);
+    std.mem.writeInt(u32, out[8..12], 13, .big);
+    @memcpy(out[12..16], "IHDR");
+    std.mem.writeInt(u32, out[16..20], width, .big);
+    std.mem.writeInt(u32, out[20..24], height, .big);
+    return out;
+}
+
+test "parsePngDims: reads big-endian width/height out of the IHDR (#675)" {
+    const header = fakePngHeader(640, 608);
+    const dims = try parsePngDims(&header);
+    try testing.expectEqual(@as(u32, 640), dims.width);
+    try testing.expectEqual(@as(u32, 608), dims.height);
+}
+
+test "parsePngDims: a bad signature is rejected before the ints are trusted (#675)" {
+    var header = fakePngHeader(64, 64);
+    header[1] = 'X';
+    try testing.expectError(error.GridImageNotPng, parsePngDims(&header));
+}
+
+test "parsePngDims: a non-IHDR first chunk is rejected (#675)" {
+    var header = fakePngHeader(64, 64);
+    @memcpy(header[12..16], "IDAT");
+    try testing.expectError(error.GridImageNotPng, parsePngDims(&header));
+}
+
+test "parsePngDims: a file shorter than the header is rejected (#675)" {
+    const header = fakePngHeader(64, 64);
+    try testing.expectError(error.GridImageNotPng, parsePngDims(header[0..23]));
+}
+
+test "gridCounts: the plain case divides the image by the tile size (#675)" {
+    const counts = try gridCounts(.{ .width = 640, .height = 608 }, .{ .tile_width = 16, .tile_height = 16 });
+    try testing.expectEqual(@as(u32, 40), counts.cols);
+    try testing.expectEqual(@as(u32, 38), counts.rows);
+}
+
+test "gridCounts: margin borders BOTH edges and spacing sits BETWEEN tiles (Tiled, #675)" {
+    // 4 tiles of 16 with 1px spacing between them and a 2px border:
+    //   2 + 4*16 + 3*1 + 2 = 71
+    // Getting this wrong (e.g. margin counted once, or spacing counted after
+    // the last tile) yields subtly-offset tiles that look almost right.
+    const counts = try gridCounts(
+        .{ .width = 71, .height = 71 },
+        .{ .tile_width = 16, .tile_height = 16, .margin = 2, .spacing = 1 },
+    );
+    try testing.expectEqual(@as(u32, 4), counts.cols);
+    try testing.expectEqual(@as(u32, 4), counts.rows);
+}
+
+test "gridCounts: a grid that does not divide evenly is an error, not a truncation (#675)" {
+    // 641 is one pixel past 40 columns of 16 — the silent-truncation bug
+    // would report 40 and drop the ragged remainder without a word.
+    try testing.expectError(
+        error.GridDoesNotDivideEvenly,
+        gridCounts(.{ .width = 641, .height = 608 }, .{ .tile_width = 16, .tile_height = 16 }),
+    );
+}
+
+test "gridCounts: a tile larger than the image is an error (#675)" {
+    try testing.expectError(
+        error.GridDoesNotDivideEvenly,
+        gridCounts(.{ .width = 8, .height = 8 }, .{ .tile_width = 16, .tile_height = 16 }),
+    );
+}
+
+test "gridCounts: a margin wider than the image is an error, not a wrap (#675)" {
+    try testing.expectError(
+        error.GridMarginExceedsImage,
+        gridCounts(.{ .width = 32, .height = 32 }, .{ .tile_width = 16, .tile_height = 16, .margin = 40 }),
+    );
+}
+
+test "gridCounts: a huge margin cannot wrap `2 * margin` into a small number (#675)" {
+    try testing.expectError(
+        error.GridMarginExceedsImage,
+        gridCounts(
+            .{ .width = 32, .height = 32 },
+            .{ .tile_width = 16, .tile_height = 16, .margin = std.math.maxInt(u32) },
+        ),
+    );
+}
+
+test "gridCounts: a zero tile size is an error, not a divide-by-zero (#675)" {
+    try testing.expectError(
+        error.GridZeroTileSize,
+        gridCounts(.{ .width = 32, .height = 32 }, .{ .tile_width = 0, .tile_height = 16 }),
+    );
+}
+
+test "buildGridManifest: FRAME NAMING CONTRACT — `<name>/<index>`, row-major, zero-based (#675)" {
+    // This is the string a game spells in a prefab's `sprite_name`, in
+    // `findSprite`, or derives from a Tiled GID. Changing it breaks every
+    // project that ships a `.grid` resource, so it is pinned here.
+    const allocator = testing.allocator;
+    const dims: PngDims = .{ .width = 48, .height = 32 };
+    const grid: config.GridDef = .{ .tile_width = 16, .tile_height = 16 };
+    const counts = try gridCounts(dims, grid);
+    try testing.expectEqual(@as(u32, 3), counts.cols);
+    try testing.expectEqual(@as(u32, 2), counts.rows);
+
+    const manifest = try buildGridManifest(allocator, "tiles", "assets/overworld.png", dims, grid, counts);
+    defer allocator.free(manifest);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, manifest, .{});
+    defer parsed.deinit();
+    const frames = parsed.value.object.get("frames").?.object;
+
+    // Exactly cols*rows frames, named 0..n-1 under the resource name.
+    try testing.expectEqual(@as(usize, 6), frames.count());
+    for (0..6) |i| {
+        var name_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&name_buf, "tiles/{d}", .{i});
+        try testing.expect(frames.get(key) != null);
+    }
+    // No zero-padding, no `t0` form, no 1-based index.
+    try testing.expect(frames.get("tiles/00") == null);
+    try testing.expect(frames.get("t0") == null);
+    try testing.expect(frames.get("tiles/6") == null);
+
+    // Row-major from the TOP-LEFT: index 1 is the cell to the RIGHT of 0,
+    // index 3 is the first cell of the second row.
+    const f0 = frames.get("tiles/0").?.object.get("frame").?.object;
+    try testing.expectEqual(@as(i64, 0), f0.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 0), f0.get("y").?.integer);
+    const f1 = frames.get("tiles/1").?.object.get("frame").?.object;
+    try testing.expectEqual(@as(i64, 16), f1.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 0), f1.get("y").?.integer);
+    const f3 = frames.get("tiles/3").?.object.get("frame").?.object;
+    try testing.expectEqual(@as(i64, 0), f3.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 16), f3.get("y").?.integer);
+    const f5 = frames.get("tiles/5").?.object.get("frame").?.object;
+    try testing.expectEqual(@as(i64, 32), f5.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 16), f5.get("y").?.integer);
+    try testing.expectEqual(@as(i64, 16), f5.get("w").?.integer);
+    try testing.expectEqual(@as(i64, 16), f5.get("h").?.integer);
+
+    // `meta.size` mirrors the real image so the engine's texture scale is 1.
+    const size = parsed.value.object.get("meta").?.object.get("size").?.object;
+    try testing.expectEqual(@as(i64, 48), size.get("w").?.integer);
+    try testing.expectEqual(@as(i64, 32), size.get("h").?.integer);
+}
+
+test "buildGridManifest: margin/spacing place cells at `margin + i*(tile+spacing)` (#675)" {
+    const allocator = testing.allocator;
+    const dims: PngDims = .{ .width = 71, .height = 71 };
+    const grid: config.GridDef = .{ .tile_width = 16, .tile_height = 16, .margin = 2, .spacing = 1 };
+    const counts = try gridCounts(dims, grid);
+    const manifest = try buildGridManifest(allocator, "extruded", "assets/extruded.png", dims, grid, counts);
+    defer allocator.free(manifest);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, manifest, .{});
+    defer parsed.deinit();
+    const frames = parsed.value.object.get("frames").?.object;
+    try testing.expectEqual(@as(usize, 16), frames.count());
+
+    const f0 = frames.get("extruded/0").?.object.get("frame").?.object;
+    try testing.expectEqual(@as(i64, 2), f0.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 2), f0.get("y").?.integer);
+    // col 1 → 2 + 1*(16+1) = 19; last col (3) → 2 + 3*17 = 53, ending at 69,
+    // which leaves exactly the 2px right margin of a 71px image.
+    const f1 = frames.get("extruded/1").?.object.get("frame").?.object;
+    try testing.expectEqual(@as(i64, 19), f1.get("x").?.integer);
+    const f15 = frames.get("extruded/15").?.object.get("frame").?.object;
+    try testing.expectEqual(@as(i64, 53), f15.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 53), f15.get("y").?.integer);
+}
+
+test "expandGridResources: rewrites the entry to an ordinary atlas + writes the manifest (#675)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const header = fakePngHeader(48, 32);
+    try writeTestFile(tmp.dir, "game/assets/overworld.png", &header);
+    try tmp.dir.createDirPath(testing.io, "game/.labelle/null_desktop");
+
+    const game_dir = try tmp.dir.realPathFileAlloc(testing.io, "game", allocator);
+    defer allocator.free(game_dir);
+    const target_dir = try std.fs.path.join(allocator, &.{ game_dir, ".labelle", "null_desktop" });
+    defer allocator.free(target_dir);
+
+    var resources = [_]ResourceDef{
+        .{ .name = "sfx", .sound = "audio/click.wav" },
+        .{
+            .name = "tiles",
+            .image = "assets/overworld.png",
+            .grid = .{ .tile_width = 16, .tile_height = 16 },
+        },
+    };
+
+    var allocs = try expandGridResources(allocator, testing.io, &resources, game_dir, target_dir);
+    defer {
+        for (allocs.items) |s| allocator.free(s);
+        allocs.deinit(allocator);
+    }
+
+    // The non-grid resource is untouched (purely additive).
+    try testing.expectEqual(config.ResourceKind.sound, resources[0].kind());
+    try testing.expectEqualStrings("audio/click.wav", resources[0].sound);
+
+    // The grid entry is now an ORDINARY atlas — nothing downstream needs to
+    // learn a new kind.
+    const tiles = resources[1];
+    try testing.expectEqual(config.ResourceKind.atlas, tiles.kind());
+    try testing.expectEqual(config.ResourceValidationError.ok, tiles.validate());
+    try testing.expectEqualStrings("__grid_tiles.json", tiles.json);
+    try testing.expectEqualStrings("assets/overworld.png", tiles.texture);
+    try testing.expectEqualStrings("", tiles.image);
+    try testing.expect(tiles.grid == null);
+
+    // The synthesised manifest landed in the TARGET dir (a generated tree),
+    // never in the user's `assets/` — which is symlinked into the target.
+    const written = try tmp.dir.readFileAlloc(
+        testing.io,
+        "game/.labelle/null_desktop/__grid_tiles.json",
+        allocator,
+        .limited(1 << 20),
+    );
+    defer allocator.free(written);
+    const frames = try pack_resources.collectAtlasFramesFromBytes(allocator, written);
+    defer {
+        for (frames) |f| allocator.free(f);
+        allocator.free(frames);
+    }
+    try testing.expectEqual(@as(usize, 6), frames.len);
+}
+
+test "expandGridResources: `.texture` stays a .png so the astc/rgba swaps still apply (#675)" {
+    // The phase deliberately runs BEFORE `swapAstcTexturePaths` /
+    // `swapRgbaTexturePaths`: those key on a `.png`-suffixed `res.texture`,
+    // so a tileset gets the same sibling preference a hand-authored atlas
+    // does. Reordering would silently drop compression for tilesets — the
+    // single biggest texture in most projects.
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const header = fakePngHeader(32, 32);
+    try writeTestFile(tmp.dir, "game/assets/tiles.png", &header);
+    try writeTestFile(tmp.dir, "game/assets/tiles.astc", "not-really-astc");
+    const game_dir = try tmp.dir.realPathFileAlloc(testing.io, "game", allocator);
+    defer allocator.free(game_dir);
+    const target_dir = try std.fs.path.join(allocator, &.{ game_dir, "target" });
+    defer allocator.free(target_dir);
+
+    var resources = [_]ResourceDef{.{
+        .name = "tiles",
+        .image = "assets/tiles.png",
+        .grid = .{ .tile_width = 16, .tile_height = 16 },
+    }};
+    var allocs = try expandGridResources(allocator, testing.io, &resources, game_dir, target_dir);
+    defer {
+        for (allocs.items) |s| allocator.free(s);
+        allocs.deinit(allocator);
+    }
+    try testing.expectEqualStrings("assets/tiles.png", resources[0].texture);
+
+    var astc_allocs = try swapAstcTexturePaths(
+        allocator,
+        testing.io,
+        .{ .name = "g", .asset_compression = .{ .desktop = .astc }, .platform = .desktop },
+        &resources,
+        game_dir,
+    );
+    defer {
+        for (astc_allocs.items) |s| allocator.free(s);
+        astc_allocs.deinit(allocator);
+    }
+    try testing.expectEqualStrings("assets/tiles.astc", resources[0].texture);
+}
+
+test "expandGridResources: a project with no `.grid` writes nothing and touches nothing (#675)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const game_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(game_dir);
+    const target_dir = try std.fs.path.join(allocator, &.{ game_dir, "target" });
+    defer allocator.free(target_dir);
+
+    var resources = [_]ResourceDef{
+        .{ .name = "hero", .json = "assets/hero.json", .texture = "assets/hero.png" },
+        .{ .name = "portrait", .image = "assets/portrait.png" },
+    };
+    const before = resources;
+    var allocs = try expandGridResources(allocator, testing.io, &resources, game_dir, target_dir);
+    defer allocs.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 0), allocs.items.len);
+    try testing.expectEqualStrings(before[0].json, resources[0].json);
+    try testing.expectEqualStrings(before[1].image, resources[1].image);
+    // The target dir is only created when there IS a grid to expand.
+    try testing.expectError(error.FileNotFound, tmp.dir.openDir(testing.io, "target", .{}));
+}
+
+test "expandGridResources: `.grid` on a non-image resource is refused (#675)" {
+    const allocator = testing.allocator;
+    var resources = [_]ResourceDef{.{
+        .name = "sfx",
+        .sound = "audio/click.wav",
+        .grid = .{ .tile_width = 16, .tile_height = 16 },
+    }};
+    try testing.expectError(
+        error.GridMisplaced,
+        expandGridResources(allocator, testing.io, &resources, "/nonexistent", "/nonexistent/target"),
+    );
+}
+
+test "expandGridResources: a non-PNG `.grid` image is refused up front (#675)" {
+    const allocator = testing.allocator;
+    var resources = [_]ResourceDef{.{
+        .name = "tiles",
+        .image = "assets/tiles.astc",
+        .grid = .{ .tile_width = 16, .tile_height = 16 },
+    }};
+    try testing.expectError(
+        error.GridImageNotPng,
+        expandGridResources(allocator, testing.io, &resources, "/nonexistent", "/nonexistent/target"),
+    );
+}
+
+test "expandGridResources: a missing `.image` file reports GridImageUnreadable (#675)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const game_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(game_dir);
+
+    var resources = [_]ResourceDef{.{
+        .name = "tiles",
+        .image = "assets/missing.png",
+        .grid = .{ .tile_width = 16, .tile_height = 16 },
+    }};
+    try testing.expectError(
+        error.GridImageUnreadable,
+        expandGridResources(allocator, testing.io, &resources, game_dir, "target"),
+    );
+}
+
+test "expandGridResources: an uneven grid is refused with the image in hand (#675)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header = fakePngHeader(50, 32);
+    try writeTestFile(tmp.dir, "assets/tiles.png", &header);
+    const game_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(game_dir);
+    const target_dir = try std.fs.path.join(allocator, &.{ game_dir, "target" });
+    defer allocator.free(target_dir);
+
+    var resources = [_]ResourceDef{.{
+        .name = "tiles",
+        .image = "assets/tiles.png",
+        .grid = .{ .tile_width = 16, .tile_height = 16 },
+    }};
+    try testing.expectError(
+        error.GridDoesNotDivideEvenly,
+        expandGridResources(allocator, testing.io, &resources, game_dir, target_dir),
     );
 }
