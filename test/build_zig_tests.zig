@@ -2169,3 +2169,69 @@ pub const LIBS_CONSTANTS_WIRING = struct {
         try std.testing.expect(std.mem.indexOf(u8, out, "lib.root_module.addImport(\"constants\", constants_mod);") != null);
     }
 };
+
+// ── Windows exe icon resource (labelle-cli#359) ────────────────────────────
+// Every DESKTOP exe gets `if (target.result.os.tag == .windows) exe.root_module
+// .addWin32ResourceFile(.{ .file = b.path("app_icon.rc") })`, right after the
+// exe declaration. The gate is on the RESOLVED build target, so a
+// `-Dtarget=x86_64-windows` cross-build from macOS/Linux picks it up and a
+// native macOS/Linux build ignores it. Non-desktop platforms and the tests
+// target (no exe) emit nothing.
+pub const WINDOWS_ICON_RESOURCE = struct {
+    const rc_line = "exe.root_module.addWin32ResourceFile(.{ .file = b.path(\"app_icon.rc\") });";
+
+    test "desktop exe: the resource block follows the exe declaration and precedes the backend link" {
+        const out = try h.genSokolBuildZigV2(std.testing.allocator, .{ .name = "g", .backend = .sokol, .ecs = .mock }, .{});
+        defer std.testing.allocator.free(out);
+        const block_idx = std.mem.indexOf(u8, out, generate.windows_icon_resource_block) orelse return error.NotFound;
+        const exe_idx = std.mem.indexOf(u8, out, "const exe = b.addExecutable(") orelse return error.NotFound;
+        try std.testing.expect(exe_idx < block_idx);
+        // Exactly once.
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, rc_line));
+        // Gated on the resolved target, never unconditional.
+        try std.testing.expect(std.mem.indexOf(u8, out, "if (target.result.os.tag == .windows) {\n        " ++ rc_line) != null);
+    }
+
+    test "tests target has no exe and therefore no resource block" {
+        const out = try h.genSokolBuildZigV2(std.testing.allocator, .{ .name = "g", .backend = .sokol, .ecs = .mock }, .{ .is_tests_target = true });
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "addWin32ResourceFile") == null);
+    }
+
+    test "non-desktop goldens (android / ios / wasm) carry no resource block" {
+        // These goldens are byte-checked against the generator elsewhere in this
+        // file, so asserting on them pins the platform gate without re-running
+        // the (manifest-needing) generators here.
+        inline for (.{
+            @embedFile("goldens/sokol_android_v2.build.zig"),
+            @embedFile("goldens/bgfx_v2_android.build.zig"),
+            @embedFile("goldens/sokol_ios_v2.build.zig"),
+            @embedFile("goldens/sokol_wasm_v2.build.zig"),
+            @embedFile("goldens/bgfx_v2_wasm.build.zig"),
+            @embedFile("goldens/raylib_v2_wasm.build.zig"),
+        }) |golden| {
+            try std.testing.expect(std.mem.indexOf(u8, golden, "addWin32ResourceFile") == null);
+        }
+    }
+
+    test "the emitted block is a well-formed build.zig fragment" {
+        // Wrap in a minimal `build` fn with the two names it references and
+        // run the Zig front-end over it — a typo in the hand-written block
+        // would otherwise only surface on a user's `zig build`.
+        const unit = "const std = @import(\"std\");\n" ++
+            "pub fn build(b: *std.Build) void {\n" ++
+            "    const target = b.standardTargetOptions(.{});\n" ++
+            "    const exe = b.addExecutable(.{ .name = \"g\", .root_module = b.createModule(.{ .root_source_file = b.path(\"main.zig\"), .target = target }) });\n" ++
+            generate.windows_icon_resource_block ++
+            "    b.installArtifact(exe);\n" ++
+            "}\n";
+        const src_z = try std.testing.allocator.dupeZ(u8, unit);
+        defer std.testing.allocator.free(src_z);
+        var ast = try std.zig.Ast.parse(std.testing.allocator, src_z, .zig);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        var zir = try std.zig.AstGen.generate(std.testing.allocator, ast);
+        defer zir.deinit(std.testing.allocator);
+        try std.testing.expect(!zir.hasCompileErrors());
+    }
+};

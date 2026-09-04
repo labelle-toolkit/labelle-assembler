@@ -27,6 +27,7 @@ const resource_loader = @import("../blocks/resource_loader.zig");
 const tilemap_assets = @import("../blocks/tilemap_assets.zig");
 const post_fx_block = @import("../blocks/post_fx.zig");
 const scripting_splice = @import("../../scripting_splice.zig");
+const app_icon = @import("../../app_icon.zig");
 
 const ProjectConfig = config.ProjectConfig;
 const ResourceDef = config.ResourceDef;
@@ -43,6 +44,15 @@ const pathToIdent = scan.pathToIdent;
 /// `view_names` from `self` so the orchestrator dispatches
 /// `ctx.buildSetupCode()` / `ctx.buildGuiDrawCode()` without re-threading
 /// those slices.
+/// Emit the gated window-icon call (see `buildSetupCode`). Standalone so
+/// the exact statement is unit-testable + AstGen-checkable in isolation.
+pub fn emitWindowIcon(w: anytype, cfg: ProjectConfig) !void {
+    try w.writeAll("    // Window icon (labelle-cli#359): the project's app_icon, embedded at build\n");
+    try w.writeAll("    // time and handed to the backend after initWindow. Folds away (embed included)\n");
+    try w.writeAll("    // on backends without the decl.\n");
+    try w.print("    if (comptime @hasDecl(window, \"setWindowIconPng\")) window.setWindowIconPng(@embedFile(\"{s}\"));\n\n", .{app_icon.iconEmbedPath(cfg)});
+}
+
 pub fn Mixin(comptime Self: type) type {
     return struct {
         pub fn buildSetupCode(self: *Self) ![]const u8 {
@@ -54,6 +64,15 @@ pub fn Mixin(comptime Self: type) type {
             var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
             errdefer alloc_writer.deinit();
             const w = &alloc_writer.writer;
+
+            // Window icon hand-off (labelle-cli#359). Desktop only: the
+            // loop templates call `window.initWindow` before `{{setup_code}}`,
+            // so the window exists here. Gated on the backend DECL, so raylib/
+            // sdl/null/wgpu (no `setWindowIconPng`) and bgfx releases predating
+            // it build unchanged — the `@embedFile` inside the dead branch is
+            // never analysed, so the icon bytes are not even embedded there.
+            // The path is the assembler-staged icon (`app_icon.iconEmbedPath`).
+            if (cfg.platform == .desktop) try emitWindowIcon(w, cfg);
 
             if (cfg.resolved_gui) |gui| {
                 if (gui.lifecycle.init) {

@@ -12,6 +12,7 @@
 /// ship their own icon assets.
 const std = @import("std");
 const config = @import("config.zig");
+const ico = @import("ico.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -100,6 +101,116 @@ pub fn injectDefaultIcon(allocator: std.mem.Allocator, cfg: ProjectConfig, targe
     // Plain (non-exclusive) write: regenerating an existing target must
     // refresh the default icon rather than fail on a stale copy.
     try cwd.writeFile(io, .{ .sub_path = icon_path, .data = default_icon_bytes });
+}
+
+// ── Desktop icon artifacts (labelle-cli#359) ─────────────────────────
+//
+// Two more consumers of the same icon on desktop:
+//
+//   * the RUNTIME window icon — the generated `main.zig` embeds the icon
+//     PNG (`@embedFile(iconEmbedPath(cfg))`) and hands it to the backend
+//     after `initWindow` (labelle-bgfx `setWindowIconPng`, gated on
+//     `@hasDecl` so other backends fold it away), and
+//   * the WINDOWS EXE ICON — an `ICON` resource compiled from
+//     `app_icon.rc` → `app_icon.ico`, added by the generated `build.zig`
+//     on Windows targets only.
+//
+// `@embedFile` can only reach files under the module root (the target
+// dir), and a project's `app_icon` is relative to the PROJECT root — it
+// may live outside the linked `assets/` (e.g. `icon.png` at the root),
+// where no symlink brings it into the target. So a custom icon is COPIED
+// to `<target>/app_icon.png`; the default already lands at
+// `default_icon.png`. The two never coexist (same stale-cleanup rule as
+// `injectDefaultIcon`), and the CLI's `default_icon.png` contract is
+// untouched.
+
+/// Target-relative path of the staged copy of a CUSTOM `app_icon`.
+pub const custom_icon_rel_path = "app_icon.png";
+/// Target-relative path of the Windows icon container.
+pub const windows_ico_rel_path = "app_icon.ico";
+/// Target-relative path of the resource script naming it.
+pub const windows_rc_rel_path = "app_icon.rc";
+/// The whole resource script: resource id 1, type ICON, the `.ico` beside
+/// it. Zig's built-in resource compiler handles this when cross-compiling.
+pub const windows_rc_source = "1 ICON \"" ++ windows_ico_rel_path ++ "\"\n";
+
+/// The target-relative path the generated `main.zig` should `@embedFile`
+/// for the window icon: the staged custom copy, or the injected default.
+pub fn iconEmbedPath(cfg: ProjectConfig) []const u8 {
+    return if (hasOwnIcon(cfg)) custom_icon_rel_path else default_icon_rel_path;
+}
+
+/// Read the effective icon's PNG bytes: the bundled default (no disk
+/// read), or `<game_dir>/<app_icon>`. A custom icon that is missing or
+/// unreadable is a HARD error naming the path — a project that names an
+/// icon and silently ships the stock one is the bug cli#340 fixed, and
+/// the generated `@embedFile` would fail the build anyway, only later and
+/// less clearly. Caller frees the result (the default is duplicated so
+/// ownership is uniform).
+pub fn readIconBytes(allocator: std.mem.Allocator, cfg: ProjectConfig, game_dir: []const u8) ![]u8 {
+    if (!hasOwnIcon(cfg)) return allocator.dupe(u8, default_icon_bytes);
+    const io = config.globalIo();
+    const path = try std.fs.path.join(allocator, &.{ game_dir, cfg.app_icon.? });
+    defer allocator.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 << 20)) catch |err| {
+        var buf: [1024]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &buf,
+            "labelle-assembler: app_icon not found or unreadable at {s} ({s})\n  `.app_icon` in project.labelle is resolved relative to the project root.\n  Fix the path or remove `.app_icon` to use the bundled default icon.\n",
+            .{ path, @errorName(err) },
+        ) catch "labelle-assembler: app_icon not found or unreadable\n";
+        std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+        return error.AppIconNotFound;
+    };
+}
+
+/// Write the desktop icon artifacts into `target_dir` (see the section
+/// comment): the staged custom copy (or remove a stale one), plus
+/// `app_icon.ico` and `app_icon.rc`. Desktop only — other platforms
+/// package their icon elsewhere (APK mipmaps, `.app` bundle, favicon) and
+/// never embed it, so they get nothing here. Runs after
+/// `injectDefaultIcon` (which owns `default_icon.png`).
+pub fn writeDesktopIconArtifacts(allocator: std.mem.Allocator, cfg: ProjectConfig, game_dir: []const u8, target_dir: []const u8) !void {
+    if (cfg.platform != .desktop) return;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    const png = try readIconBytes(allocator, cfg, game_dir);
+    defer allocator.free(png);
+
+    const custom_path = try std.fs.path.join(allocator, &.{ target_dir, custom_icon_rel_path });
+    defer allocator.free(custom_path);
+    if (hasOwnIcon(cfg)) {
+        try cwd.writeFile(io, .{ .sub_path = custom_path, .data = png });
+    } else {
+        cwd.deleteFile(io, custom_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
+    const ico_bytes = ico.buildIco(allocator, png) catch |err| switch (err) {
+        error.NotPng => {
+            var buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &buf,
+                "labelle-assembler: app_icon {s} is not a PNG — app icons must be PNG (a square source of at least 256x256 gives the best result)\n",
+                .{effectiveIconPath(cfg)},
+            ) catch "labelle-assembler: app_icon is not a PNG\n";
+            std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+            return error.AppIconNotPng;
+        },
+        else => return err,
+    };
+    defer allocator.free(ico_bytes);
+
+    const ico_path = try std.fs.path.join(allocator, &.{ target_dir, windows_ico_rel_path });
+    defer allocator.free(ico_path);
+    try cwd.writeFile(io, .{ .sub_path = ico_path, .data = ico_bytes });
+
+    const rc_path = try std.fs.path.join(allocator, &.{ target_dir, windows_rc_rel_path });
+    defer allocator.free(rc_path);
+    try cwd.writeFile(io, .{ .sub_path = rc_path, .data = windows_rc_source });
 }
 
 test "effectiveIconPath: falls back to the bundled default when unset" {
@@ -212,4 +323,113 @@ test "usesDefaultIcon: an empty app_icon string still gets the default" {
     // A stray `.app_icon = ""` is not a usable icon — treat it as unset.
     try std.testing.expect(usesDefaultIcon(.{ .name = "game", .app_icon = "" }));
     try std.testing.expectEqualStrings(default_icon_rel_path, effectiveIconPath(.{ .name = "game", .app_icon = "" }));
+}
+
+test "iconEmbedPath: default_icon.png when unset, the staged app_icon.png when custom" {
+    try std.testing.expectEqualStrings(default_icon_rel_path, iconEmbedPath(.{ .name = "game" }));
+    try std.testing.expectEqualStrings(default_icon_rel_path, iconEmbedPath(.{ .name = "game", .app_icon = "" }));
+    try std.testing.expectEqualStrings(custom_icon_rel_path, iconEmbedPath(.{ .name = "game", .app_icon = "icon.png" }));
+}
+
+test "writeDesktopIconArtifacts: default icon → .ico + .rc, no staged app_icon.png" {
+    const allocator = std.testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(target_dir);
+
+    try writeDesktopIconArtifacts(allocator, .{ .name = "game" }, target_dir, target_dir);
+
+    const rc_path = try std.fs.path.join(allocator, &.{ target_dir, windows_rc_rel_path });
+    defer allocator.free(rc_path);
+    const rc = try cwd.readFileAlloc(io, rc_path, allocator, .limited(1 << 10));
+    defer allocator.free(rc);
+    try std.testing.expectEqualStrings("1 ICON \"app_icon.ico\"\n", rc);
+
+    const ico_path = try std.fs.path.join(allocator, &.{ target_dir, windows_ico_rel_path });
+    defer allocator.free(ico_path);
+    const ico_bytes = try cwd.readFileAlloc(io, ico_path, allocator, .limited(4 << 20));
+    defer allocator.free(ico_bytes);
+    // ICONDIR: reserved 0, type 1, four entries (256/48/32/16 from the 512 default).
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 1, 0, 4, 0 }, ico_bytes[0..6]);
+
+    const custom_path = try std.fs.path.join(allocator, &.{ target_dir, custom_icon_rel_path });
+    defer allocator.free(custom_path);
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, custom_path, .{}));
+}
+
+test "writeDesktopIconArtifacts: a custom icon is staged as app_icon.png and its .ico built" {
+    const allocator = std.testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    // Project root with `icon.png` OUTSIDE assets/ — the case the staging exists for.
+    const game_dir = try std.fs.path.join(allocator, &.{ root, "game" });
+    defer allocator.free(game_dir);
+    const target_dir = try std.fs.path.join(allocator, &.{ root, "target" });
+    defer allocator.free(target_dir);
+    try cwd.createDirPath(io, game_dir);
+    try cwd.createDirPath(io, target_dir);
+
+    const px = [_]u8{ 1, 2, 3, 255 } ** (8 * 8);
+    const png = try ico.encodePng(allocator, &px, 8, 8);
+    defer allocator.free(png);
+    const src_icon = try std.fs.path.join(allocator, &.{ game_dir, "icon.png" });
+    defer allocator.free(src_icon);
+    try cwd.writeFile(io, .{ .sub_path = src_icon, .data = png });
+
+    const cfg = ProjectConfig{ .name = "game", .app_icon = "icon.png" };
+    try writeDesktopIconArtifacts(allocator, cfg, game_dir, target_dir);
+
+    const staged_path = try std.fs.path.join(allocator, &.{ target_dir, custom_icon_rel_path });
+    defer allocator.free(staged_path);
+    const staged = try cwd.readFileAlloc(io, staged_path, allocator, .limited(1 << 20));
+    defer allocator.free(staged);
+    try std.testing.expectEqualSlices(u8, png, staged);
+
+    const ico_path = try std.fs.path.join(allocator, &.{ target_dir, windows_ico_rel_path });
+    defer allocator.free(ico_path);
+    const ico_bytes = try cwd.readFileAlloc(io, ico_path, allocator, .limited(1 << 20));
+    defer allocator.free(ico_bytes);
+    // An 8-square source: one 8x8 entry, nothing upscaled.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 1, 0, 1, 0 }, ico_bytes[0..6]);
+    try std.testing.expectEqual(@as(u8, 8), ico_bytes[6]);
+
+    // Project drops its icon → the staged copy is removed, the default's .ico takes over.
+    try writeDesktopIconArtifacts(allocator, .{ .name = "game" }, game_dir, target_dir);
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, staged_path, .{}));
+}
+
+test "writeDesktopIconArtifacts: a missing custom icon fails loudly (never the default)" {
+    const allocator = std.testing.allocator;
+    const io = config.globalIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir);
+    const cfg = ProjectConfig{ .name = "game", .app_icon = "assets/nope.png" };
+    try std.testing.expectError(error.AppIconNotFound, writeDesktopIconArtifacts(allocator, cfg, dir, dir));
+}
+
+test "writeDesktopIconArtifacts: non-desktop platforms write nothing" {
+    const allocator = std.testing.allocator;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir);
+    inline for (.{ .android, .wasm, .ios }) |plat| {
+        try writeDesktopIconArtifacts(allocator, .{ .name = "game", .platform = plat }, dir, dir);
+    }
+    const rc_path = try std.fs.path.join(allocator, &.{ dir, windows_rc_rel_path });
+    defer allocator.free(rc_path);
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, rc_path, .{}));
 }
