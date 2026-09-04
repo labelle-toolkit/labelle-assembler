@@ -7,6 +7,48 @@ pub fn freeNames(allocator: std.mem.Allocator, names: []const []const u8) void {
     allocator.free(names);
 }
 
+/// Directory names that are never project source: generated output,
+/// compiler/package caches, vendored dependency trees, and the git
+/// metadata dir itself. Every recursive walk in this file prunes them.
+const skip_dir_names = [_][]const u8{
+    ".git",
+    ".labelle",
+    "zig-out",
+    "zig-cache",
+    ".zig-cache",
+    "zig-pkg",
+    "node_modules",
+};
+
+/// True when a directory entry named `name` inside `parent` must not be
+/// descended into (labelle-assembler#692).
+///
+/// Two rules, and the second is the one that matters:
+///
+///  1. `name` is a known generated/cache/vendored dir (`skip_dir_names`).
+///  2. `parent/name` is itself a REPOSITORY ROOT — it contains a `.git`
+///     entry. Naming `.worktrees` specifically would not do: `git worktree
+///     add` takes an arbitrary path, and a submodule or a plain nested
+///     clone has exactly the same problem. Note the `.git` of a worktree
+///     (and of a submodule) is a FILE holding a `gitdir:` pointer, not a
+///     directory, so this deliberately tests for the entry's EXISTENCE and
+///     not its kind.
+///
+/// Without rule 2 the scan walks every branch checked out beside the
+/// working tree and pulls that branch's scripts/components/tests into the
+/// build graph — duplicate compilation at best, code from an unrelated
+/// branch at worst.
+pub fn isSkippableDir(parent: std.Io.Dir, name: []const u8) bool {
+    for (skip_dir_names) |skip| {
+        if (std.mem.eql(u8, name, skip)) return true;
+    }
+    const io = config.globalIo();
+    var sub = parent.openDir(io, name, .{}) catch return false;
+    defer sub.close(io);
+    sub.access(io, ".git", .{}) catch return false;
+    return true;
+}
+
 /// Mirror files from src_base/folder to dst_base/folder (recursively) and
 /// return sorted file stems matching the given extension. Subfolder paths are
 /// preserved in the returned names (e.g., "enemies/goblin" for
@@ -115,6 +157,12 @@ fn copyAndScanRecursive(
                 }
             },
             .directory => {
+                // Nested repo roots / cache dirs are not project source
+                // (#692). `continue` (not just "don't recurse") keeps the
+                // name out of `written`, so the orphan sweep below also
+                // removes any copy a previous generate left behind.
+                if (isSkippableDir(src_dir, entry.name)) continue;
+
                 const sub_src = try std.fs.path.join(allocator, &.{ src_path, entry.name });
                 defer allocator.free(sub_src);
                 const sub_dst = try std.fs.path.join(allocator, &.{ dst_path, entry.name });
@@ -441,6 +489,11 @@ fn scanRecursive(
                 }
             },
             .directory => {
+                // A nested checkout under any name (`.worktrees/`, a
+                // submodule, a plain clone) is not this project's source
+                // — see `isSkippableDir` (#692).
+                if (isSkippableDir(src_dir, entry.name)) continue;
+
                 const sub_src = try std.fs.path.join(allocator, &.{ src_path, entry.name });
                 defer allocator.free(sub_src);
                 const sub_prefix = if (prefix.len > 0)
@@ -495,6 +548,12 @@ pub fn copyDirRecursiveAbs(allocator: std.mem.Allocator, src_path: []const u8, d
                 try src_dir.copyFile(entry.name, dst_dir, entry.name, io, .{});
             },
             .directory => {
+                // Same pruning as the scanning walks (#692): an asset tree
+                // (or a Windows symlink-fallback copy of a game dir) that
+                // happens to contain a nested checkout must not be
+                // duplicated wholesale into the generated target.
+                if (isSkippableDir(src_dir, entry.name)) continue;
+
                 const sub_src = try std.fs.path.join(allocator, &.{ src_path, entry.name });
                 defer allocator.free(sub_src);
                 const sub_dst = try std.fs.path.join(allocator, &.{ dst_path, entry.name });
