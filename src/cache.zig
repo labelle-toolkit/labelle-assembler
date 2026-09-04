@@ -66,6 +66,7 @@ pub const purgeLegacyLocalSlots = disk.purgeLegacyLocalSlots;
 pub const localSlots = local_slots;
 pub const findRepoRoot = local_slots.findRepoRoot;
 pub const isLocalSlotPath = local_slots.isLocalSlotPath;
+pub const localSlotRoot = local_slots.localSlotRoot;
 pub const warnIfLocallySourced = local_slots.warnIfLocallySourced;
 
 // ── remote fetching ──────────────────────────────────────────────────

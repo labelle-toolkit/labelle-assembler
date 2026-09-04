@@ -26,6 +26,7 @@
 //! which the `labelle` CLI shells out to) therefore always resolves the
 //! pinned release, which is what #679 expected and did not get.
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("../config.zig");
 const env = @import("env.zig");
 
@@ -69,15 +70,61 @@ pub fn originPath(allocator: std.mem.Allocator, slot: []const u8) ![]const u8 {
     return std.fs.path.join(allocator, &.{ parent, ORIGIN_NAME });
 }
 
-/// Whether `path` names a local slot — i.e. any path component is exactly
-/// `local`. Covers both a bare slot (`…/gfx/local`) and a subpath inside one
-/// (`…/assembler/local/backends/sokol`).
-pub fn isLocalSlotPath(path: []const u8) bool {
-    var iter = std.mem.tokenizeAny(u8, path, "/\\");
+fn isSep(c: u8) bool {
+    return c == '/' or c == '\\';
+}
+
+/// The reserved local slot `path` lies at or inside, or null when it does
+/// not. `…/gfx/local` → itself; `…/assembler/local/backends/sokol` →
+/// `…/assembler/local`. Caller owns the result.
+///
+/// The classification is *structural*, not textual (#688 review). A bare
+/// "does any component spell `local`" test misfires two ways:
+///
+///   * the cache root is configurable, so `LABELLE_HOME=/usr/local/labelle`
+///     or `~/.local/share/labelle` would make every released version slot
+///     look local; and
+///   * a plugin repo path carries its owner, so
+///     `plugins/github.com/local/foo/1.0.0` would too.
+///
+/// So the `local` component must lie strictly INSIDE the configured
+/// packages directory, and the candidate must actually be a slot: either it
+/// carries the sibling provenance marker, or it is the symlink a local
+/// install created. Both are things only `populate*` produces.
+pub fn localSlotRoot(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    const packages_dir = env.getPackagesDir(allocator) catch return null;
+    defer allocator.free(packages_dir);
+
+    if (path.len <= packages_dir.len) return null;
+    if (!std.mem.startsWith(u8, path, packages_dir)) return null;
+    if (!isSep(path[packages_dir.len])) return null;
+
+    const rel_start = packages_dir.len + 1;
+    var iter = std.mem.tokenizeAny(u8, path[rel_start..], "/\\");
     while (iter.next()) |component| {
-        if (std.mem.eql(u8, component, SLOT_NAME)) return true;
+        if (!std.mem.eql(u8, component, SLOT_NAME)) continue;
+        const candidate = path[0 .. rel_start + iter.index];
+        if (!looksLikeSlot(allocator, candidate)) continue;
+        return allocator.dupe(u8, candidate) catch null;
     }
-    return false;
+    return null;
+}
+
+/// Whether `candidate` bears the fingerprints of a populated local slot:
+/// the provenance marker beside it, or the symlink itself (the marker is
+/// best-effort, so a slot whose marker could not be written still counts).
+fn looksLikeSlot(allocator: std.mem.Allocator, candidate: []const u8) bool {
+    if (isSymlinkPath(candidate)) return true;
+    const marker = originPath(allocator, candidate) catch return false;
+    defer allocator.free(marker);
+    return pathExists(marker);
+}
+
+/// Whether `path` names a local slot or a subpath inside one.
+pub fn isLocalSlotPath(allocator: std.mem.Allocator, path: []const u8) bool {
+    const root = localSlotRoot(allocator, path) orelse return false;
+    allocator.free(root);
+    return true;
 }
 
 // ── monorepo probe ───────────────────────────────────────────────────
@@ -126,13 +173,6 @@ pub fn findRepoRoot(allocator: std.mem.Allocator) ?[]const u8 {
     return null;
 }
 
-/// Whether the running assembler lives inside the monorepo checkout.
-pub fn inMonorepo(allocator: std.mem.Allocator) bool {
-    const root = findRepoRoot(allocator) orelse return false;
-    allocator.free(root);
-    return true;
-}
-
 /// The sibling checkout directory name for a framework package
 /// (`core` → `labelle-core`).
 pub fn frameworkDirName(package: []const u8) []const u8 {
@@ -144,35 +184,120 @@ pub fn frameworkDirName(package: []const u8) []const u8 {
 
 // ── resolution ───────────────────────────────────────────────────────
 
-/// The local slot for a framework package, when it should be used: the
-/// running assembler is inside the monorepo AND the slot is populated.
-/// Caller owns the returned path.
+/// The local slot for a framework package, when it should be used: it is
+/// populated, and it was populated from the very checkout this assembler is
+/// running out of. Caller owns the returned path.
 pub fn activeFrameworkSlot(allocator: std.mem.Allocator, package: []const u8) !?[]const u8 {
-    if (!inMonorepo(allocator)) return null;
+    const root = findRepoRoot(allocator) orelse return null;
+    defer allocator.free(root);
     const slot = try frameworkSlot(allocator, package);
-    return activeOrFree(allocator, slot);
+    return activeOrFree(allocator, slot, root);
 }
 
 /// The local slot for a plugin / external backend package, when it should
 /// be used. Caller owns the returned path.
 pub fn activePluginSlot(allocator: std.mem.Allocator, repo: []const u8) !?[]const u8 {
-    if (!inMonorepo(allocator)) return null;
+    const root = findRepoRoot(allocator) orelse return null;
+    defer allocator.free(root);
     const slot = try pluginSlot(allocator, repo);
-    return activeOrFree(allocator, slot);
+    return activeOrFree(allocator, slot, root);
 }
 
 /// The local slot for the assembler-bundled packages, when it should be
 /// used. Caller owns the returned path.
+///
+/// Carries one extra condition the single-directory slots don't need: the
+/// slot is a *tree* of bundled subdirs, and it is never renamed, so a slot
+/// populated while the checkout still lacked `ecs`/`gui` would otherwise go
+/// on satisfying every later pin while `resolveAssemblerPackage` handed back
+/// paths that do not exist. Version-named slots used to get this for free —
+/// a version bump chose a fresh directory. Content-check instead.
 pub fn activeAssemblerSlot(allocator: std.mem.Allocator) !?[]const u8 {
-    if (!inMonorepo(allocator)) return null;
+    const root = findRepoRoot(allocator) orelse return null;
+    defer allocator.free(root);
+
     const slot = try assemblerSlot(allocator);
-    return activeOrFree(allocator, slot);
+    errdefer allocator.free(slot);
+    if (!pathExists(slot)) {
+        allocator.free(slot);
+        return null;
+    }
+    const origin = readOrigin(allocator, slot) orelse {
+        allocator.free(slot);
+        return null;
+    };
+    defer origin.deinit(allocator);
+    if (!sourcedFrom(allocator, origin.source, root) or
+        !assemblerSlotComplete(allocator, slot, origin.source))
+    {
+        allocator.free(slot);
+        return null;
+    }
+    return slot;
 }
 
-fn activeOrFree(allocator: std.mem.Allocator, slot: []const u8) ?[]const u8 {
-    if (pathExists(slot)) return slot;
+/// The bundled subdirectories `populateAssemblerCache` links into the slot.
+pub const ASSEMBLER_SUBDIRS = [_][]const u8{ "backends", "ecs", "gui" };
+
+/// Whether every bundled subdir the companion checkout has is present in
+/// the slot.
+pub fn assemblerSlotComplete(allocator: std.mem.Allocator, slot: []const u8, companion_dir: []const u8) bool {
+    for (ASSEMBLER_SUBDIRS) |subdir| {
+        const src = std.fs.path.join(allocator, &.{ companion_dir, subdir }) catch return false;
+        defer allocator.free(src);
+        if (!pathExists(src)) continue;
+
+        const dst = std.fs.path.join(allocator, &.{ slot, subdir }) catch return false;
+        defer allocator.free(dst);
+        if (!pathExists(dst)) return false;
+    }
+    return true;
+}
+
+/// A populated slot counts as active only when its provenance marker names
+/// a source inside the checkout this executable is running from (#688
+/// review). Two things go wrong without it:
+///
+///   * one `LABELLE_HOME` shared between monorepo clones or worktrees lets
+///     clone A's sources satisfy a build run out of clone B, silently, and
+///   * `versionToGitRef` passes non-semver versions through verbatim, so
+///     `local` is a fetchable branch name whose ordinary cache path is
+///     `<package>/local` — an existence test alone would mistake that
+///     release for a checkout and serve it for every other pin.
+///
+/// The marker is the discriminator: only `populate*` writes one.
+fn activeOrFree(allocator: std.mem.Allocator, slot: []const u8, repo_root: []const u8) ?[]const u8 {
+    if (pathExists(slot) and populatedFrom(allocator, slot, repo_root)) return slot;
     allocator.free(slot);
     return null;
+}
+
+fn populatedFrom(allocator: std.mem.Allocator, slot: []const u8, repo_root: []const u8) bool {
+    const origin = readOrigin(allocator, slot) orelse return false;
+    defer origin.deinit(allocator);
+    return sourcedFrom(allocator, origin.source, repo_root);
+}
+
+/// Every local source is a direct child of the monorepo root
+/// (`<root>/labelle-gfx`, `<root>/labelle-assembler`, …), so containment is
+/// a parent-directory comparison.
+fn sourcedFrom(allocator: std.mem.Allocator, source: []const u8, repo_root: []const u8) bool {
+    const parent = std.fs.path.dirname(source) orelse return false;
+    return samePath(allocator, parent, repo_root);
+}
+
+/// Path equality that survives symlinked/relative spellings of the same
+/// directory. Falls back to the textual answer when either side cannot be
+/// canonicalised (a source checkout that has since been deleted, say).
+fn samePath(allocator: std.mem.Allocator, a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    const canon_a = cwd.realPathFileAlloc(io, a, allocator) catch return false;
+    defer allocator.free(canon_a);
+    const canon_b = cwd.realPathFileAlloc(io, b, allocator) catch return false;
+    defer allocator.free(canon_b);
+    return std.mem.eql(u8, canon_a, canon_b);
 }
 
 /// Whether `path` exists (local copy of disk.dirExists — kept here so this
@@ -293,10 +418,22 @@ pub fn gitRevision(allocator: std.mem.Allocator, source_dir: []const u8) ?[]cons
 
     if (cwd.readFileAlloc(io, git_path, allocator, .limited(4096))) |linkfile| {
         defer allocator.free(linkfile);
-        const trimmed = std.mem.trim(u8, linkfile, " \t\r\n");
+        // Only the FIRST line is the `gitdir:` entry — a linkfile may carry
+        // further keys (mirrors resolveProjectRoot in resolve.zig).
+        const eol = std.mem.indexOfAny(u8, linkfile, "\r\n") orelse linkfile.len;
+        const trimmed = std.mem.trim(u8, linkfile[0..eol], " \t");
         if (std.mem.startsWith(u8, trimmed, "gitdir:")) {
-            const target = std.mem.trim(u8, trimmed["gitdir:".len..], " \t\r\n");
-            const owned = allocator.dupe(u8, target) catch return null;
+            const target = std.mem.trim(u8, trimmed["gitdir:".len..], " \t");
+            // git accepts a RELATIVE gitdir and resolves it against the
+            // directory holding the `.git` file. Submodules always write one;
+            // `worktree.useRelativePaths` / `git worktree add --relative-paths`
+            // makes worktrees write one too. Taken verbatim it would resolve
+            // against the process CWD and every read below would miss, so the
+            // revision would silently degrade to "unknown" (#688 review).
+            const owned = if (std.fs.path.isAbsolute(target))
+                allocator.dupe(u8, target) catch return null
+            else
+                std.fs.path.join(allocator, &.{ source_dir, target }) catch return null;
             allocator.free(git_dir);
             git_dir = owned;
         }
@@ -315,19 +452,45 @@ pub fn gitRevision(allocator: std.mem.Allocator, source_dir: []const u8) ?[]cons
     }
 
     const ref = std.mem.trim(u8, head_trimmed["ref:".len..], " \t\r\n");
-    // A worktree's refs live in the COMMON dir, not its per-worktree gitdir.
-    // Try the per-worktree dir first, then the main `.git` beside it.
-    const ref_path = std.fs.path.join(allocator, &.{ git_dir, ref }) catch return null;
-    defer allocator.free(ref_path);
 
-    if (cwd.readFileAlloc(io, ref_path, allocator, .limited(4096))) |sha| {
-        defer allocator.free(sha);
-        return allocator.dupe(u8, std.mem.trim(u8, sha, " \t\r\n")) catch null;
-    } else |_| {}
+    // A main checkout keeps its refs in `.git/<ref>`; try that first.
+    if (readRef(allocator, git_dir, ref)) |sha| return sha;
+
+    // A LINKED worktree does not: its per-worktree gitdir holds HEAD, but the
+    // branch ref lives in the common git dir named by `<gitdir>/commondir`.
+    // Without following it every worktree build recorded `refs/heads/<branch>`
+    // instead of a commit, and the recorded "revision" never moved as commits
+    // landed (#688 review).
+    if (readCommonDir(allocator, git_dir)) |common| {
+        defer allocator.free(common);
+        if (readRef(allocator, common, ref)) |sha| return sha;
+    }
 
     // Fall back to naming the branch — better than "unknown" for a
     // packed-refs checkout.
     return allocator.dupe(u8, ref) catch null;
+}
+
+/// `<git_dir>/<ref>` as a trimmed SHA, or null when it isn't a loose ref.
+fn readRef(allocator: std.mem.Allocator, git_dir: []const u8, ref: []const u8) ?[]const u8 {
+    const path = std.fs.path.join(allocator, &.{ git_dir, ref }) catch return null;
+    defer allocator.free(path);
+    const sha = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, allocator, .limited(4096)) catch return null;
+    defer allocator.free(sha);
+    return allocator.dupe(u8, std.mem.trim(u8, sha, " \t\r\n")) catch null;
+}
+
+/// The common git directory for a linked worktree, read from
+/// `<git_dir>/commondir`. Relative values resolve against `git_dir`.
+fn readCommonDir(allocator: std.mem.Allocator, git_dir: []const u8) ?[]const u8 {
+    const path = std.fs.path.join(allocator, &.{ git_dir, "commondir" }) catch return null;
+    defer allocator.free(path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, allocator, .limited(4096)) catch return null;
+    defer allocator.free(raw);
+    const target = std.mem.trim(u8, raw, " \t\r\n");
+    if (target.len == 0) return null;
+    if (std.fs.path.isAbsolute(target)) return allocator.dupe(u8, target) catch null;
+    return std.fs.path.join(allocator, &.{ git_dir, target }) catch null;
 }
 
 // ── build-time diagnostics ───────────────────────────────────────────
@@ -347,8 +510,13 @@ pub fn warnIfLocallySourced(
 ) void {
     if (config.isLocalVersion(version)) return;
 
-    if (isLocalSlotPath(path)) {
-        if (readOrigin(allocator, path)) |origin| {
+    // The marker sits beside the slot ROOT, so a resolved subpath
+    // (`…/assembler/local/backends/sokol`) has to be trimmed back to it
+    // before the lookup — otherwise every bundled package fell through to
+    // the path-only message and dropped source and revision (#688 review).
+    if (localSlotRoot(allocator, path)) |slot_root| {
+        defer allocator.free(slot_root);
+        if (readOrigin(allocator, slot_root)) |origin| {
             defer origin.deinit(allocator);
             std.log.warn(
                 "labelle: {s} is built from LOCAL sources, not the pinned {s} — " ++
@@ -375,12 +543,228 @@ pub fn warnIfLocallySourced(
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-test "isLocalSlotPath: recognises the reserved slot and subpaths inside it" {
-    try std.testing.expect(isLocalSlotPath("/home/u/.labelle/packages/gfx/local"));
-    try std.testing.expect(isLocalSlotPath("/home/u/.labelle/packages/assembler/local/backends/sokol"));
-    try std.testing.expect(isLocalSlotPath("C:\\Users\\u\\.labelle\\packages\\gfx\\local"));
-    try std.testing.expect(!isLocalSlotPath("/home/u/.labelle/packages/gfx/1.29.0"));
-    try std.testing.expect(!isLocalSlotPath("/home/u/.labelle/packages/plugins/github.com/x/localish/1.0.0"));
+/// Point LABELLE_HOME at `home` for the duration of a test; the caller
+/// restores the returned Environ. PosixBlock-only, so callers skip on
+/// Windows.
+fn setTestCacheHome(envp: *const [1:null]?[*:0]const u8) std.process.Environ {
+    const saved = std.testing.environ;
+    std.testing.environ = .{ .block = .{ .slice = envp } };
+    return saved;
+}
+
+test "localSlotRoot: the reserved slot, subpaths inside it, and nothing else" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A real local framework slot (a symlink, as populate makes it), a real
+    // assembler slot (a directory + marker), a genuine extracted release, and
+    // a plugin whose OWNER is literally called `local`.
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/gfx");
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/gfx/1.29.0");
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/assembler/local/backends");
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/plugins/github.com/local/foo/1.0.0");
+    try tmp.dir.createDirPath(std.testing.io, "checkout");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const checkout = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout", alloc);
+    defer alloc.free(checkout);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer std.testing.environ = saved_environ;
+
+    const gfx_slot = try frameworkSlot(alloc, "gfx");
+    defer alloc.free(gfx_slot);
+    try std.Io.Dir.cwd().symLink(std.testing.io, checkout, gfx_slot, .{ .is_directory = true });
+
+    const asm_slot = try assemblerSlot(alloc);
+    defer alloc.free(asm_slot);
+    writeOrigin(alloc, asm_slot, checkout, "1.2.3");
+
+    // Recognised: the slot itself, and a subpath inside one, trimmed back to
+    // the slot root.
+    try std.testing.expect(isLocalSlotPath(alloc, gfx_slot));
+
+    const sub = try std.fs.path.join(alloc, &.{ asm_slot, "backends", "sokol" });
+    defer alloc.free(sub);
+    const root = localSlotRoot(alloc, sub) orelse return error.TestUnexpectedResult;
+    defer alloc.free(root);
+    try std.testing.expectEqualStrings(asm_slot, root);
+
+    // Not recognised: a genuine release slot …
+    const release = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
+    defer alloc.free(release);
+    try std.testing.expect(!isLocalSlotPath(alloc, release));
+
+    // … a plugin whose repo OWNER happens to be named `local` (#688 review) …
+    const owner_local = try std.fs.path.join(alloc, &.{ home, "packages", "plugins", "github.com", "local", "foo", "1.0.0" });
+    defer alloc.free(owner_local);
+    try std.testing.expect(!isLocalSlotPath(alloc, owner_local));
+
+    // … and nothing outside the packages dir at all.
+    try std.testing.expect(!isLocalSlotPath(alloc, "/usr/local/share/whatever"));
+}
+
+test "localSlotRoot: a cache home containing a `local` component is not a local slot (#688 review)" {
+    // The regression the reviewers named: `LABELLE_HOME=/usr/local/labelle`
+    // made EVERY version slot classify as locally sourced, so genuine releases
+    // were reported as "built from LOCAL sources" and users were pointed at a
+    // destructive cleanup.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "usr/local/labelle/packages/gfx/1.29.0");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "usr/local/labelle", alloc);
+    defer alloc.free(home);
+    try std.testing.expect(std.mem.indexOf(u8, home, "/local/") != null);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer std.testing.environ = saved_environ;
+
+    const release = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
+    defer alloc.free(release);
+    try std.testing.expect(!isLocalSlotPath(alloc, release));
+}
+
+test "activeFrameworkSlot: a slot populated from ANOTHER checkout is not honoured (#688 review)" {
+    // One shared LABELLE_HOME, two monorepo clones. A slot populated from
+    // clone A must not satisfy a build run out of clone B — B's siblings can
+    // be at completely different revisions.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/gfx");
+    try tmp.dir.createDirPath(std.testing.io, "clone-a/labelle-core");
+    try tmp.dir.createDirPath(std.testing.io, "clone-a/labelle-gfx");
+    try tmp.dir.createDirPath(std.testing.io, "clone-b/labelle-core");
+    try tmp.dir.createDirPath(std.testing.io, "clone-b/labelle-assembler/zig-out/bin");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src_a = try tmp.dir.realPathFileAlloc(std.testing.io, "clone-a/labelle-gfx", alloc);
+    defer alloc.free(src_a);
+    const bin_b = try tmp.dir.realPathFileAlloc(std.testing.io, "clone-b/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin_b);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer std.testing.environ = saved_environ;
+
+    // Populated from clone A.
+    const slot = try frameworkSlot(alloc, "gfx");
+    defer alloc.free(slot);
+    try std.Io.Dir.cwd().symLink(std.testing.io, src_a, slot, .{ .is_directory = true });
+    writeOrigin(alloc, slot, src_a, "1.29.0");
+
+    // Running out of clone B: not honoured.
+    {
+        setProbeStartForTesting(bin_b);
+        defer setProbeStartForTesting(null);
+        try std.testing.expect(try activeFrameworkSlot(alloc, "gfx") == null);
+    }
+
+    // Running out of clone A: honoured.
+    try tmp.dir.createDirPath(std.testing.io, "clone-a/labelle-assembler/zig-out/bin");
+    const bin_a = try tmp.dir.realPathFileAlloc(std.testing.io, "clone-a/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin_a);
+    setProbeStartForTesting(bin_a);
+    defer setProbeStartForTesting(null);
+    const active = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
+    defer alloc.free(active);
+    try std.testing.expectEqualStrings(slot, active);
+}
+
+test "activeFrameworkSlot: an unmarked `local` directory is a fetched ref, not a checkout (#688 review)" {
+    // `versionToGitRef` passes non-semver versions through verbatim, so
+    // `local` is a fetchable branch whose ordinary cache path is
+    // `<package>/local`. Existence alone would mistake that release for a
+    // local checkout and serve it for every other pin. The provenance marker
+    // is what tells them apart.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/gfx/local");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-core");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-assembler/zig-out/bin");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer std.testing.environ = saved_environ;
+
+    setProbeStartForTesting(bin);
+    defer setProbeStartForTesting(null);
+
+    try std.testing.expect(try activeFrameworkSlot(alloc, "gfx") == null);
+}
+
+test "activeAssemblerSlot: an incomplete slot is refused so it gets repopulated (#688 review)" {
+    // A slot populated while the checkout still lacked `gui` must not go on
+    // reporting the assembler cached once the checkout grows one — the
+    // version-named slot used to get this for free by changing name.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/assembler/local/backends");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-core");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-assembler/backends");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-assembler/zig-out/bin");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const companion = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-assembler", alloc);
+    defer alloc.free(companion);
+    const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer std.testing.environ = saved_environ;
+
+    const slot = try assemblerSlot(alloc);
+    defer alloc.free(slot);
+    writeOrigin(alloc, slot, companion, "1.2.3");
+
+    setProbeStartForTesting(bin);
+    defer setProbeStartForTesting(null);
+
+    // Matched contents: active.
+    {
+        const active = try activeAssemblerSlot(alloc) orelse return error.TestUnexpectedResult;
+        defer alloc.free(active);
+        try std.testing.expectEqualStrings(slot, active);
+    }
+
+    // The checkout grows a `gui/` the slot doesn't have: refused.
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-assembler/gui");
+    try std.testing.expect(try activeAssemblerSlot(alloc) == null);
 }
 
 test "originPath: sits beside the slot, not inside it" {
@@ -432,6 +816,58 @@ test "findRepoRoot: returns null outside the monorepo" {
     defer setProbeStartForTesting(null);
 
     try std.testing.expect(findRepoRoot(alloc) == null);
+}
+
+/// Write `body` to `rel` inside `dir`, creating parent directories.
+fn writeFileAt(dir: std.Io.Dir, rel: []const u8, body: []const u8) !void {
+    if (std.fs.path.dirname(rel)) |parent| try dir.createDirPath(std.testing.io, parent);
+    const file = try dir.createFile(std.testing.io, rel, .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, body);
+}
+
+test "gitRevision: a main checkout reports its loose ref" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFileAt(tmp.dir, "repo/.git/HEAD", "ref: refs/heads/main\n");
+    try writeFileAt(tmp.dir, "repo/.git/refs/heads/main", "1111111111111111111111111111111111111111\n");
+
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, "repo", alloc);
+    defer alloc.free(repo);
+
+    const rev = gitRevision(alloc, repo) orelse return error.TestUnexpectedResult;
+    defer alloc.free(rev);
+    try std.testing.expectEqualStrings("1111111111111111111111111111111111111111", rev);
+}
+
+test "gitRevision: a worktree with a RELATIVE gitdir resolves through commondir (#688 review)" {
+    // Two defects in one layout: `gitdir:` is relative (git writes one for
+    // submodules, and for worktrees under `worktree.useRelativePaths`), so
+    // taken verbatim every read below resolves against the process CWD; and
+    // the branch ref lives in the COMMON git dir, not the per-worktree one,
+    // so the revision degraded to the branch NAME and stopped tracking
+    // commits.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFileAt(tmp.dir, "main/.git/HEAD", "ref: refs/heads/main\n");
+    try writeFileAt(tmp.dir, "main/.git/refs/heads/feature", "2222222222222222222222222222222222222222\n");
+    try writeFileAt(tmp.dir, "main/.git/worktrees/wt/HEAD", "ref: refs/heads/feature\n");
+    try writeFileAt(tmp.dir, "main/.git/worktrees/wt/commondir", "../..\n");
+    // Relative link back at the per-worktree gitdir.
+    try writeFileAt(tmp.dir, "wt/.git", "gitdir: ../main/.git/worktrees/wt\n");
+
+    const wt = try tmp.dir.realPathFileAlloc(std.testing.io, "wt", alloc);
+    defer alloc.free(wt);
+
+    const rev = gitRevision(alloc, wt) orelse return error.TestUnexpectedResult;
+    defer alloc.free(rev);
+    try std.testing.expectEqualStrings("2222222222222222222222222222222222222222", rev);
 }
 
 test "writeOrigin/readOrigin: round-trips provenance for a slot" {
