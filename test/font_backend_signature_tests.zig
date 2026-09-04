@@ -167,9 +167,11 @@ const engine_stub =
 ;
 
 /// Transcription of `backends/sokol/src/gfx/font.zig` — the font-capable
-/// backend shape. `decodeFont` ECHOES the marshalled params back through
+/// backend shape, MINUS `unloadFontAtlas` — the plain and registry-aware
+/// variants below append their own so the registry one can timestamp the
+/// atlas destruction. `decodeFont` ECHOES the marshalled params back through
 /// `DecodedFont` so the test can prove the bridge carried real values.
-const backend_with_fonts =
+const backend_font_core =
     \\const std = @import("std");
     \\
     \\pub const CodepointRange = extern struct {
@@ -251,11 +253,66 @@ const backend_with_fonts =
     \\pub fn uploadFontAtlas(decoded: DecodedFont) !FontAtlas {
     \\    return .{ .texture = decoded.width };
     \\}
+;
+
+/// A font-capable backend that has NOT opted into the registry seam — the
+/// sokol/bgfx shape today. Every `registerCatalogFont` reference the adapter
+/// emits must stay comptime-dead here.
+const backend_with_fonts = backend_font_core ++
     \\
     \\pub fn unloadFontAtlas(atlas: FontAtlas) void {
     \\    _ = atlas;
     \\}
 ;
+
+/// The shape a backend takes once it opts into the catalog font registry
+/// (labelle-bgfx#85): `backend_with_fonts` plus the
+/// `registerCatalogFont` / `unregisterCatalogFont` pair, recording what it
+/// was handed and WHEN, so the test can assert on the handle arithmetic and
+/// on the register-before-destroy ordering rather than on mere compilation.
+const registry_decls =
+    \\
+    \\pub var register_count: u32 = 0;
+    \\pub var last_registered_handle: u32 = 0;
+    \\pub var last_registered_atlas: ?FontAtlas = null;
+    \\pub var last_unregistered_handle: u32 = 0;
+    \\pub var seq: u32 = 0;
+    \\pub var registered_at: u32 = 0;
+    \\pub var unregistered_at: u32 = 0;
+    \\pub var destroyed_at: u32 = 0;
+    \\
+    \\pub fn registerCatalogFont(handle: u32, atlas: FontAtlas) void {
+    \\    register_count += 1;
+    \\    last_registered_handle = handle;
+    \\    last_registered_atlas = atlas;
+    \\    seq += 1;
+    \\    registered_at = seq;
+    \\}
+    \\
+    \\pub fn unregisterCatalogFont(handle: u32) void {
+    \\    last_unregistered_handle = handle;
+    \\    seq += 1;
+    \\    unregistered_at = seq;
+    \\}
+    \\
+    \\pub fn noteDestroy() void {
+    \\    seq += 1;
+    \\    destroyed_at = seq;
+    \\}
+;
+
+/// `unloadFontAtlas` that timestamps the atlas destruction, so the test can
+/// assert the registry entry is retired STRICTLY BEFORE the GPU atlas dies.
+const registry_unload =
+    \\
+    \\pub fn unloadFontAtlas(atlas: FontAtlas) void {
+    \\    _ = atlas;
+    \\    noteDestroy();
+    \\}
+;
+
+/// Font-capable backend that has opted into the registry seam.
+const backend_with_font_registry = backend_font_core ++ registry_decls ++ registry_unload;
 
 /// The bgfx shape: a graphics backend with NO font decls at all — not even
 /// `FontAtlas`. Every reference the adapter makes to a font type must stay
@@ -331,6 +388,60 @@ const capable_tests =
     \\}
 ;
 
+/// The whole point of the change: the id this adapter mints must reach the
+/// backend paired with the atlas, keyed by the SAME number the draw seam
+/// will hand back.
+///
+/// Only one test lives in this harness so the slot allocator is
+/// deterministic — the first upload always lands in slot 0, which makes the
+/// packed handle an exact literal (`0x0001_0000`: index 0 low, generation 1
+/// high) rather than something recomputed from the value under test.
+const registry_tests =
+    \\test "upload registers the packed handle + atlas; unload retires it first" {
+    \\    wire();
+    \\    const b = engine.FontLoader.currentBackend().?;
+    \\
+    \\    try std.testing.expectEqual(@as(u32, 0), BackendGfx.register_count);
+    \\    const id = try b.upload(.{
+    \\        .bitmap = &.{},
+    \\        .width = 7,
+    \\        .height = 1,
+    \\        .glyphs = &.{},
+    \\        .codepoint_index = &.{},
+    \\        .ascent = 0,
+    \\        .descent = 0,
+    \\        .line_gap = 0,
+    \\        .line_height = 0,
+    \\        .kerning = &.{},
+    \\    });
+    \\    try std.testing.expectEqual(@as(u16, 0), id.index);
+    \\    try std.testing.expectEqual(@as(u16, 1), id.generation);
+    \\
+    \\    // Registered exactly once, with the atlas `uploadFontAtlas`
+    \\    // returned (texture id echoes the decoded width, 7).
+    \\    try std.testing.expectEqual(@as(u32, 1), BackendGfx.register_count);
+    \\    try std.testing.expectEqual(@as(u32, 7), BackendGfx.last_registered_atlas.?.texture);
+    \\
+    \\    // The handle arithmetic must agree with labelle-engine#849's
+    \\    // `packFontId`: index in the LOW 16 bits, generation in the HIGH
+    \\    // 16. Slot 0 / generation 1 is 0x0001_0000 — a literal, so a
+    \\    // packing that swapped the halves (0x0000_0001) or dropped the
+    \\    // generation (0) fails here instead of coinciding.
+    \\    try std.testing.expectEqual(@as(u32, 0x0001_0000), BackendGfx.last_registered_handle);
+    \\    // ...and the slot index is recoverable by a plain @truncate, which
+    \\    // is how a slot-keyed backend resolver reads it.
+    \\    try std.testing.expectEqual(id.index, @as(u16, @truncate(BackendGfx.last_registered_handle)));
+    \\
+    \\    b.unload(id);
+    \\    try std.testing.expectEqual(@as(u32, 0x0001_0000), BackendGfx.last_unregistered_handle);
+    \\    // Retired BEFORE the GPU atlas was destroyed, so no draw can
+    \\    // resolve a handle to dead state in between.
+    \\    try std.testing.expect(BackendGfx.unregistered_at != 0);
+    \\    try std.testing.expect(BackendGfx.destroyed_at != 0);
+    \\    try std.testing.expect(BackendGfx.unregistered_at < BackendGfx.destroyed_at);
+    \\}
+;
+
 const fontless_tests =
     \\test "a font-less backend still compiles and reports the gap at runtime" {
     \\    wire();
@@ -388,5 +499,9 @@ pub const FONT_BACKEND_ADAPTER_COMPILES = struct {
 
     test "generated FontBackendAdapter compiles against a backend with no font decls" {
         try runHarness(std.testing.allocator, backend_without_fonts, fontless_tests);
+    }
+
+    test "generated FontBackendAdapter registers the minted handle with a registry-aware backend" {
+        try runHarness(std.testing.allocator, backend_with_font_registry, registry_tests);
     }
 };
