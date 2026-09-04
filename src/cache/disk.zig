@@ -6,8 +6,10 @@
 /// copies into it). The pure path-math is in `resolve.zig`; the network
 /// side (git clones) is in `fetch.zig`.
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("../config.zig");
 const env = @import("env.zig");
+const local = @import("local.zig");
 const resolve = @import("resolve.zig");
 
 /// Populate the assembler cache from the assembler source directory.
@@ -17,10 +19,10 @@ const resolve = @import("resolve.zig");
 /// skipped silently so the same function works through the staged migration
 /// as more subdirs (ecs, gui) move over.
 pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: []const u8, companion_dir: []const u8) !void {
-    const packages_dir = try env.getPackagesDir(allocator);
-    defer allocator.free(packages_dir);
-
-    const target = try std.fs.path.join(allocator, &.{ packages_dir, "assembler", assembler_version });
+    // #685: local sources go in the reserved `assembler/local` slot, never in
+    // `assembler/<version>` — a slot named for a version must contain that
+    // version.
+    const target = try local.assemblerSlot(allocator);
     defer allocator.free(target);
 
     const io = config.globalIo();
@@ -46,22 +48,30 @@ pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: [
             return error.CachePopulationFailed;
         };
     }
+
+    local.writeOrigin(allocator, target, companion_dir, assembler_version);
 }
 
 /// Populate a framework package (core, engine, gfx) into the cache from a source directory.
 /// Creates a symlink from the cache location to the source directory.
 pub fn populateFrameworkPackage(allocator: std.mem.Allocator, package: []const u8, version: []const u8, source_dir: []const u8) !void {
-    const target = try resolve.resolveFrameworkPackage(allocator, package, version, null);
+    // #685: `version` no longer names the slot — it is recorded in the
+    // provenance marker so diagnostics can say which pin this local source
+    // was installed *for* without pretending the slot holds that release.
+    const target = try local.frameworkSlot(allocator, package);
     defer allocator.free(target);
     try symlinkToCache(allocator, source_dir, target);
+    local.writeOrigin(allocator, target, source_dir, version);
 }
 
 /// Populate a plugin into the cache from a source directory.
 /// Creates a symlink from the cache location to the source directory.
 pub fn populatePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, source_dir: []const u8) !void {
-    const target = try resolve.resolvePlugin(allocator, plugin, null);
+    // #685: reserved `local` slot, same as the framework packages.
+    const target = try local.pluginSlot(allocator, plugin.repo);
     defer allocator.free(target);
     try symlinkToCache(allocator, source_dir, target);
+    local.writeOrigin(allocator, target, source_dir, plugin.version);
 }
 
 /// Create a symlink from cache target to source directory.
@@ -111,6 +121,89 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
             return error.CachePopulationFailed;
         };
     };
+}
+
+// ── #685 migration: legacy locally-poisoned version slots ────────────
+
+/// Remove a version-named cache slot that an older assembler symlinked at a
+/// sibling checkout. Such a slot is named `gfx/1.29.0` but contains whatever
+/// the monorepo working tree happened to hold, which is the whole of #685.
+///
+/// Only symlinked slots are removed: nothing is lost (the source checkout is
+/// untouched) and a real, extracted release directory is never a symlink, so
+/// a genuine cached release can't be caught by this. The Windows copy
+/// fallback in `symlinkToCache` produced a real directory that is
+/// indistinguishable from an extracted release — those are NOT purged; a
+/// `labelle-assembler clean` is the remedy there.
+///
+/// Returns true when something was removed.
+pub fn purgeLegacyLocalSlot(slot_path: []const u8) bool {
+    if (!isSymlink(slot_path)) return false;
+    const io = config.globalIo();
+    std.Io.Dir.cwd().deleteFile(io, slot_path) catch |err| {
+        std.log.warn("labelle: could not remove locally-sourced cache slot '{s}': {any}", .{ slot_path, err });
+        return false;
+    };
+    std.log.warn(
+        "labelle: removed cache slot '{s}' — it was a symlink to a local checkout, not the pinned release (#685)",
+        .{slot_path},
+    );
+    return true;
+}
+
+/// Sweep every version-named slot a project's pins point at, dropping the
+/// ones an older assembler poisoned with local sources. Called before the
+/// cache-presence probes so the affected packages get re-fetched.
+pub fn purgeLegacyLocalSlots(allocator: std.mem.Allocator, cfg: config.ProjectConfig) void {
+    const packages_dir = env.getPackagesDir(allocator) catch return;
+    defer allocator.free(packages_dir);
+
+    const framework = [_]struct { name: []const u8, version: []const u8 }{
+        .{ .name = "core", .version = cfg.core_version },
+        .{ .name = "engine", .version = cfg.engine_version },
+        .{ .name = "gfx", .version = cfg.gfx_version },
+    };
+    for (framework) |pkg| {
+        if (config.isLocalVersion(pkg.version)) continue;
+        const slot = std.fs.path.join(allocator, &.{ packages_dir, pkg.name, pkg.version }) catch continue;
+        defer allocator.free(slot);
+        _ = purgeLegacyLocalSlot(slot);
+    }
+
+    // The assembler slot is a real directory whose backends/ecs/gui SUBDIRS
+    // were symlinked out of the monorepo. Drop the whole slot when any of
+    // them is a link, so the release is re-fetched intact.
+    const asm_ver = cfg.assembler_version orelse cfg.labelle_version;
+    if (!config.isLocalVersion(asm_ver)) blk: {
+        const slot = std.fs.path.join(allocator, &.{ packages_dir, "assembler", asm_ver }) catch break :blk;
+        defer allocator.free(slot);
+        for ([_][]const u8{ "backends", "ecs", "gui" }) |subdir| {
+            const sub = std.fs.path.join(allocator, &.{ slot, subdir }) catch continue;
+            defer allocator.free(sub);
+            if (!isSymlink(sub)) continue;
+            std.Io.Dir.cwd().deleteTree(config.globalIo(), slot) catch |err| {
+                std.log.warn("labelle: could not remove locally-sourced assembler slot '{s}': {any}", .{ slot, err });
+                break;
+            };
+            std.log.warn(
+                "labelle: removed assembler cache slot '{s}' — its bundled packages were symlinks to a local checkout (#685)",
+                .{slot},
+            );
+            break;
+        }
+    }
+
+    for (cfg.plugins) |plugin| {
+        purgeLegacyPluginSlot(allocator, packages_dir, plugin);
+    }
+    if (cfg.effectiveBackendPackage()) |bp| purgeLegacyPluginSlot(allocator, packages_dir, bp);
+}
+
+fn purgeLegacyPluginSlot(allocator: std.mem.Allocator, packages_dir: []const u8, plugin: config.PluginDep) void {
+    if (plugin.isLocal() or plugin.repo.len == 0 or plugin.version.len == 0) return;
+    const slot = std.fs.path.join(allocator, &.{ packages_dir, "plugins", plugin.repo, plugin.version }) catch return;
+    defer allocator.free(slot);
+    _ = purgeLegacyLocalSlot(slot);
 }
 
 /// Whether `path` exists and is accessible. Public so the cache
@@ -251,4 +344,188 @@ fn replaceAll(allocator: std.mem.Allocator, haystack: []const u8, needle: []cons
         }
     }
     return list.toOwnedSlice(allocator);
+}
+
+// ── Tests: #685 — a local install must not occupy a version slot ─────
+
+const testing = std.testing;
+
+/// Point LABELLE_HOME at `home` for the duration of a test. Returns the
+/// previous `std.testing.environ` for the caller to restore.
+///
+/// PosixBlock-only construction (mirrors the hermetic probe in resolve.zig),
+/// so callers skip on Windows.
+fn setTestCacheHome(envp: *const [1:null]?[*:0]const u8) std.process.Environ {
+    const saved = testing.environ;
+    testing.environ = .{ .block = .{ .slice = envp } };
+    return saved;
+}
+
+/// Write `body` into `dir/VERSION` — a stand-in for "which release's source
+/// actually lives here", so a test can tell 1.29.0 sources from 1.30.0 ones.
+fn writeVersionStamp(dir: []const u8, body: []const u8) !void {
+    const io = config.globalIo();
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "VERSION" });
+    defer testing.allocator.free(path);
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, body);
+}
+
+fn readVersionStamp(allocator: std.mem.Allocator, dir: []const u8) ![]u8 {
+    const path = try std.fs.path.join(allocator, &.{ dir, "VERSION" });
+    defer allocator.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(config.globalIo(), path, allocator, .limited(4096));
+}
+
+test "populateFrameworkPackage: local sources never occupy the pinned version slot (#685)" {
+    // The #679 reproduction, in miniature: a sibling checkout holding gfx
+    // 1.30.0 sources is installed while the project pins 1.29.0. Before the
+    // fix, `~/.labelle/packages/gfx/1.29.0` became a symlink to that checkout
+    // and every later resolve of "gfx 1.29.0" handed back 1.30.0 code.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home");
+    try tmp.dir.createDirPath(testing.io, "toolkit/labelle-core");
+    try tmp.dir.createDirPath(testing.io, "toolkit/labelle-gfx");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src = try tmp.dir.realPathFileAlloc(testing.io, "toolkit/labelle-gfx", alloc);
+    defer alloc.free(src);
+
+    // The working tree is 1.30.0 — NOT the pinned version.
+    try writeVersionStamp(src, "1.30.0");
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    try populateFrameworkPackage(alloc, "gfx", "1.29.0", src);
+
+    // The invariant: the slot named for a version was not touched.
+    const version_slot = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
+    defer alloc.free(version_slot);
+    try testing.expect(!dirExists(version_slot));
+
+    // The local sources landed in the reserved slot instead, with provenance.
+    const slot = try local.frameworkSlot(alloc, "gfx");
+    defer alloc.free(slot);
+    try testing.expect(dirExists(slot));
+
+    const stamp = try readVersionStamp(alloc, slot);
+    defer alloc.free(stamp);
+    try testing.expectEqualStrings("1.30.0", stamp);
+
+    const origin = local.readOrigin(alloc, slot) orelse return error.TestUnexpectedResult;
+    defer origin.deinit(alloc);
+    try testing.expectEqualStrings(src, origin.source);
+    try testing.expectEqualStrings("1.29.0", origin.pinned);
+}
+
+test "resolveFrameworkPackage: a pinned version resolves to the release, not the sibling checkout (#685)" {
+    // Same setup, then the half that actually bit #679: resolving the pin.
+    // A released assembler (running outside the monorepo) must get the
+    // 1.29.0 release; the monorepo's own binary gets the local slot, and
+    // says so.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home/packages/gfx/1.29.0");
+    try tmp.dir.createDirPath(testing.io, "toolkit/labelle-core");
+    try tmp.dir.createDirPath(testing.io, "toolkit/labelle-gfx");
+    try tmp.dir.createDirPath(testing.io, "toolkit/labelle-assembler/zig-out/bin");
+    try tmp.dir.createDirPath(testing.io, "elsewhere/bin");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src = try tmp.dir.realPathFileAlloc(testing.io, "toolkit/labelle-gfx", alloc);
+    defer alloc.free(src);
+    const release = try tmp.dir.realPathFileAlloc(testing.io, "home/packages/gfx/1.29.0", alloc);
+    defer alloc.free(release);
+    const monorepo_bin = try tmp.dir.realPathFileAlloc(testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(monorepo_bin);
+    const outside_bin = try tmp.dir.realPathFileAlloc(testing.io, "elsewhere/bin", alloc);
+    defer alloc.free(outside_bin);
+
+    try writeVersionStamp(src, "1.30.0");
+    try writeVersionStamp(release, "1.29.0");
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    try populateFrameworkPackage(alloc, "gfx", "1.29.0", src);
+
+    {
+        // A released binary: the pin means the release.
+        local.setProbeStartForTesting(outside_bin);
+        defer local.setProbeStartForTesting(null);
+
+        const path = try resolve.resolveFrameworkPackage(alloc, "gfx", "1.29.0", null);
+        defer alloc.free(path);
+        const stamp = try readVersionStamp(alloc, path);
+        defer alloc.free(stamp);
+        try testing.expectEqualStrings("1.29.0", stamp);
+        try testing.expect(!local.isLocalSlotPath(path));
+    }
+
+    {
+        // The monorepo's own binary: local sources, honestly named.
+        local.setProbeStartForTesting(monorepo_bin);
+        defer local.setProbeStartForTesting(null);
+
+        const path = try resolve.resolveFrameworkPackage(alloc, "gfx", "1.29.0", null);
+        defer alloc.free(path);
+        const stamp = try readVersionStamp(alloc, path);
+        defer alloc.free(stamp);
+        try testing.expectEqualStrings("1.30.0", stamp);
+        try testing.expect(local.isLocalSlotPath(path));
+    }
+}
+
+test "purgeLegacyLocalSlot: drops a version slot symlinked at a local checkout (#685)" {
+    // Migration: caches populated by an older assembler already hold poisoned
+    // slots. A version slot that is a symlink can only have come from a local
+    // install, so it is removed and re-fetched. A real extracted release
+    // directory is never a symlink and must survive.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home/packages/gfx");
+    try tmp.dir.createDirPath(testing.io, "home/packages/core/1.27.0");
+    try tmp.dir.createDirPath(testing.io, "checkout");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
+    defer alloc.free(checkout);
+
+    // The poisoned slot, exactly as the old populate wrote it.
+    const poisoned = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
+    defer alloc.free(poisoned);
+    try symlinkToCache(alloc, checkout, poisoned);
+    try testing.expect(dirExists(poisoned));
+
+    try testing.expect(purgeLegacyLocalSlot(poisoned));
+    try testing.expect(!dirExists(poisoned));
+    // The source checkout is untouched — only the link went away.
+    try testing.expect(dirExists(checkout));
+
+    // A genuine extracted release is left alone.
+    const genuine = try std.fs.path.join(alloc, &.{ home, "packages", "core", "1.27.0" });
+    defer alloc.free(genuine);
+    try testing.expect(!purgeLegacyLocalSlot(genuine));
+    try testing.expect(dirExists(genuine));
 }

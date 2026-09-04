@@ -90,17 +90,26 @@ pub fn createDepsLinks(
         deps.deinit(allocator);
     }
 
+    // #685: this is the one place every framework/plugin dep is resolved
+    // exactly once per generate, so it is where a build says out loud that a
+    // package is NOT the version its pin names.
     const core_path = try cache.resolveFrameworkPackage(allocator, "core", cfg.core_version, project_dir);
+    cache.warnIfLocallySourced(allocator, "core", cfg.core_version, core_path);
     try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "labelle_core"), .link_name = try allocator.dupe(u8, "labelle-core"), .abs_path = core_path });
 
     const gfx_path = try cache.resolveFrameworkPackage(allocator, "gfx", cfg.gfx_version, project_dir);
+    cache.warnIfLocallySourced(allocator, "gfx", cfg.gfx_version, gfx_path);
     try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "labelle_gfx"), .link_name = try allocator.dupe(u8, "labelle-gfx"), .abs_path = gfx_path });
 
     const engine_path = try cache.resolveFrameworkPackage(allocator, "engine", cfg.engine_version, project_dir);
+    cache.warnIfLocallySourced(allocator, "engine", cfg.engine_version, engine_path);
     try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "engine"), .link_name = try allocator.dupe(u8, "labelle-engine"), .abs_path = engine_path });
 
     for (cfg.plugins) |plugin| {
         const plugin_path = try cache.resolvePlugin(allocator, plugin, project_dir);
+        // A `local:` plugin declares its locality in `.repo`, not `.version`,
+        // so it needs its own skip — it is already self-describing.
+        if (!plugin.isLocal()) cache.warnIfLocallySourced(allocator, plugin.name, plugin.version, plugin_path);
         const zon_name = try std.fmt.allocPrint(allocator, "labelle_{s}", .{plugin.name});
         const link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{plugin.name});
         try deps.append(allocator, .{ .zon_name = zon_name, .link_name = link_name, .abs_path = plugin_path });

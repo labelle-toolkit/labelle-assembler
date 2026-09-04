@@ -108,6 +108,7 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         std.log.info("labelle-assembler: caching core/engine/gfx at version {s}", .{version});
         const packages = [_][]const u8{ "core", "engine", "gfx" };
         for (packages) |pkg| {
+            purgeLegacyFrameworkSlot(allocator, pkg, version);
             if (!try cache.isFrameworkCached(allocator, pkg, version)) {
                 fetchFrameworkWithFallback(allocator, pkg, version) catch |err| {
                     std.log.err("labelle-assembler install: failed to fetch {s} {s}: {s}", .{ pkg, version, @errorName(err) });
@@ -135,6 +136,7 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         std.mem.eql(u8, pkg_name, "gfx"))
     {
         std.log.info("labelle-assembler: fetching {s} {s}", .{ pkg_name, version });
+        purgeLegacyFrameworkSlot(allocator, pkg_name, version);
         fetchFrameworkWithFallback(allocator, pkg_name, version) catch |err| {
             std.log.err("labelle-assembler install: failed to fetch {s}: {s}", .{ pkg_name, @errorName(err) });
             std.process.exit(1);
@@ -262,6 +264,14 @@ pub fn cmdClean(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
                     };
                 }
                 std.log.info("  removed {s}/{s}", .{ pkg_name, entry.name });
+                // #685: the reserved `local` slot carries a sibling
+                // provenance marker. Drop it with the slot so a later
+                // `install` can't read stale origin for a slot that's gone.
+                if (std.mem.eql(u8, entry.name, cache.localSlots.SLOT_NAME)) {
+                    if (std.fs.path.join(arena_alloc, &.{ pkg_dir_path, cache.localSlots.ORIGIN_NAME })) |origin_path| {
+                        std.Io.Dir.cwd().deleteFile(io, origin_path) catch {};
+                    } else |_| {}
+                }
             }
             removed_count += 1;
         }
@@ -506,6 +516,13 @@ fn findFieldAssignment(content: []const u8, field_token: []const u8) ?FieldSpan 
 /// Ensure every dependency declared in `cfg` is present in the local cache.
 /// No-op when the cache already validates.
 pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !void {
+    // #685 migration: drop any version-named slot an OLDER assembler
+    // symlinked at a sibling checkout, before the presence probes run — a
+    // poisoned slot looks cached but holds the wrong source, so it must be
+    // invalidated rather than trusted. Cheap (a readlink per pinned dep) and
+    // idempotent: once repaired, nothing here is a symlink any more.
+    cache.purgeLegacyLocalSlots(allocator, cfg);
+
     const missing = try cache.validateCache(allocator, cfg);
     defer {
         for (missing) |m| allocator.free(m);
@@ -578,18 +595,14 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !voi
 fn fetchFrameworkWithFallback(allocator: std.mem.Allocator, name: []const u8, version: []const u8) !void {
     if (findRepoRoot(allocator)) |repo_root| {
         defer allocator.free(repo_root);
-        const dir_name: []const u8 = if (std.mem.eql(u8, name, "core"))
-            "labelle-core"
-        else if (std.mem.eql(u8, name, "engine"))
-            "labelle-engine"
-        else if (std.mem.eql(u8, name, "gfx"))
-            "labelle-gfx"
-        else
-            name;
+        const dir_name = cache.localSlots.frameworkDirName(name);
         const src = try std.fs.path.join(allocator, &.{ repo_root, dir_name });
         defer allocator.free(src);
         if (cache.dirExists(src)) {
-            std.log.info("  caching {s} {s} (local)", .{ name, version });
+            std.log.warn(
+                "  {s}: using LOCAL sources from '{s}' — the pinned {s} will NOT be built (#685)",
+                .{ name, src, version },
+            );
             try cache.populateFrameworkPackage(allocator, name, version, src);
             return;
         }
@@ -606,7 +619,10 @@ fn fetchAssemblerWithFallback(allocator: std.mem.Allocator, version: []const u8)
         const companion = try std.fs.path.join(allocator, &.{ repo_root, "labelle-assembler" });
         defer allocator.free(companion);
         if (cache.dirExists(companion)) {
-            std.log.info("  caching assembler {s} (local)", .{version});
+            std.log.warn(
+                "  assembler: using LOCAL sources from '{s}' — the pinned {s} will NOT be built (#685)",
+                .{ companion, version },
+            );
             try cache.populateAssemblerCache(allocator, version, companion);
             return;
         }
@@ -624,7 +640,10 @@ fn fetchPluginWithFallback(allocator: std.mem.Allocator, plugin: config.PluginDe
         const src = try std.fs.path.join(allocator, &.{ repo_root, plugin_dir });
         defer allocator.free(src);
         if (cache.dirExists(src)) {
-            std.log.info("  caching plugin {s} {s} (local)", .{ plugin.name, plugin.version });
+            std.log.warn(
+                "  plugin {s}: using LOCAL sources from '{s}' — the pinned {s} will NOT be built (#685)",
+                .{ plugin.name, src, plugin.version },
+            );
             try cache.populatePlugin(allocator, plugin, src);
             return;
         }
@@ -663,7 +682,10 @@ fn fetchBackendWithFallback(allocator: std.mem.Allocator, bp: config.PluginDep) 
         const src = try std.fs.path.join(allocator, &.{ repo_root, dir_name });
         defer allocator.free(src);
         if (cache.dirExists(src)) {
-            std.log.info("  caching backend {s} {s} (local)", .{ bp.name, bp.version });
+            std.log.warn(
+                "  backend {s}: using LOCAL sources from '{s}' — the pinned {s} will NOT be built (#685)",
+                .{ bp.name, src, bp.version },
+            );
             try cache.populatePlugin(allocator, bp, src);
             return;
         }
@@ -679,27 +701,25 @@ fn fetchBackendWithFallback(allocator: std.mem.Allocator, bp: config.PluginDep) 
     };
 }
 
+/// #685 migration for the single-package `install` forms, which have no
+/// ProjectConfig to sweep: drop a version-named slot that an older
+/// assembler symlinked at a sibling checkout so the release is re-fetched.
+fn purgeLegacyFrameworkSlot(allocator: std.mem.Allocator, package: []const u8, version: []const u8) void {
+    if (config.isLocalVersion(version)) return;
+    const packages_dir = cache.getPackagesDir(allocator) catch return;
+    defer allocator.free(packages_dir);
+    const slot = std.fs.path.join(allocator, &.{ packages_dir, package, version }) catch return;
+    defer allocator.free(slot);
+    _ = cache.purgeLegacyLocalSlot(slot);
+}
+
 /// Walk up from the assembler executable's directory looking for the
 /// monorepo root (identified by a `labelle-core` sibling). Returns null
 /// when the binary isn't running inside the monorepo checkout.
-fn findRepoRoot(allocator: std.mem.Allocator) ?[]const u8 {
-    const io = config.globalIo();
-    const exe_path = std.process.executablePathAlloc(io, allocator) catch return null;
-    defer allocator.free(exe_path);
-
-    var dir = std.fs.path.dirname(exe_path) orelse return null;
-    var depth: u8 = 0;
-    while (depth < 6) : (depth += 1) {
-        const marker = std.fs.path.join(allocator, &.{ dir, "labelle-core" }) catch return null;
-        defer allocator.free(marker);
-        std.Io.Dir.cwd().access(io, marker, .{}) catch {
-            dir = std.fs.path.dirname(dir) orelse return null;
-            continue;
-        };
-        return allocator.dupe(u8, dir) catch return null;
-    }
-    return null;
-}
+///
+/// Lives in `cache/local.zig` now (#685) — the resolve side needs the same
+/// answer, so both sides share one probe.
+const findRepoRoot = cache.findRepoRoot;
 
 // ── project.labelle reading ──────────────────────────────────────────
 
