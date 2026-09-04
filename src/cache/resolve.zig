@@ -11,6 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("../config.zig");
 const env = @import("env.zig");
+const local = @import("local.zig");
 
 /// Resolve a framework package (core, engine, gfx) to its cached path.
 /// Returns an absolute path like: ~/.labelle/packages/core/0.3.0
@@ -20,9 +21,38 @@ pub fn resolveFrameworkPackage(allocator: std.mem.Allocator, package: []const u8
         return resolveLocalPath(allocator, config.localVersionPath(version), project_dir);
     }
 
+    // #685: a `(local)` install lives in the reserved `local` slot, never in
+    // the slot named for the pinned version. Prefer it only when this
+    // assembler is the monorepo's own binary — the same condition that
+    // populates it — so a released binary always gets the released version.
+    if (try local.activeFrameworkSlot(allocator, package)) |slot| return slot;
+
     const packages_dir = try env.getPackagesDir(allocator);
     defer allocator.free(packages_dir);
     return try std.fs.path.join(allocator, &.{ packages_dir, package, version });
+}
+
+/// The version-named slot for a framework package, ignoring any active
+/// local slot.
+///
+/// Remote writers MUST use this rather than `resolveFrameworkPackage`
+/// (#688 review): `archiveFetch` DELETES its target and extracts the
+/// release into it, so handing it the context-sensitive resolver would let
+/// a single-package `install` — run inside the monorepo while an older
+/// still-valid local slot exists — overwrite the reserved slot with one
+/// release, after which every other pin resolved to that release.
+pub fn frameworkVersionPath(allocator: std.mem.Allocator, package: []const u8, version: []const u8) ![]const u8 {
+    const packages_dir = try env.getPackagesDir(allocator);
+    defer allocator.free(packages_dir);
+    return try std.fs.path.join(allocator, &.{ packages_dir, package, version });
+}
+
+/// The version-named slot for a plugin, ignoring any active local slot.
+/// Same contract as `frameworkVersionPath`.
+pub fn pluginVersionPath(allocator: std.mem.Allocator, plugin: config.PluginDep) ![]const u8 {
+    const packages_dir = try env.getPackagesDir(allocator);
+    defer allocator.free(packages_dir);
+    return try std.fs.path.join(allocator, &.{ packages_dir, "plugins", plugin.repo, plugin.version });
 }
 
 /// Resolve an assembler-bundled package (backend, ecs adapter, gui) to its cached path.
@@ -34,6 +64,13 @@ pub fn resolveAssemblerPackage(allocator: std.mem.Allocator, assembler_version: 
         const joined = try std.fs.path.join(allocator, &.{ local_path, subpath });
         defer allocator.free(joined);
         return resolveLocalPath(allocator, joined, project_dir);
+    }
+
+    // #685: the bundled packages have the same defect — populateAssemblerCache
+    // symlinked backends/ecs/gui out of the monorepo into the version slot.
+    if (try local.activeAssemblerSlot(allocator)) |slot| {
+        defer allocator.free(slot);
+        return try std.fs.path.join(allocator, &.{ slot, subpath });
     }
 
     const packages_dir = try env.getPackagesDir(allocator);
@@ -59,6 +96,9 @@ pub fn resolvePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, pro
     if (plugin.isLocal()) {
         return resolveLocalPath(allocator, plugin.localPath(), project_dir);
     }
+
+    // #685: same reserved-slot rule as the framework packages.
+    if (try local.activePluginSlot(allocator, plugin)) |slot| return slot;
 
     const packages_dir = try env.getPackagesDir(allocator);
     defer allocator.free(packages_dir);
@@ -305,7 +345,15 @@ pub fn resolveGuiUrl(allocator: std.mem.Allocator, url: []const u8, ref: []const
 pub fn isFrameworkCached(allocator: std.mem.Allocator, package: []const u8, version: []const u8) !bool {
     if (config.isLocalVersion(version)) return true;
 
-    const path = try resolveFrameworkPackage(allocator, package, version, null);
+    // An active local slot satisfies the dep — unless it is a COPY rather
+    // than a link (the Windows symlink fallback), in which case it is a
+    // stale snapshot and must be repopulated (#688 review).
+    if (try local.activeFrameworkSlot(allocator, package)) |slot| {
+        defer allocator.free(slot);
+        return local.slotTracksSource(slot);
+    }
+
+    const path = try frameworkVersionPath(allocator, package, version);
     defer allocator.free(path);
     return @import("disk.zig").dirExists(path);
 }
@@ -313,6 +361,14 @@ pub fn isFrameworkCached(allocator: std.mem.Allocator, package: []const u8, vers
 /// Check if an assembler package version is cached.
 pub fn isAssemblerCached(allocator: std.mem.Allocator, assembler_version: []const u8) !bool {
     if (config.isLocalVersion(assembler_version)) return true;
+
+    // #685: a populated local slot satisfies the assembler dependency the
+    // same way the version slot does — as long as its bundled subdirs are
+    // still links and not stale copies (#688 review).
+    if (try local.activeAssemblerSlot(allocator)) |slot| {
+        defer allocator.free(slot);
+        return local.assemblerSlotTracksSource(allocator, slot);
+    }
 
     const packages_dir = try env.getPackagesDir(allocator);
     defer allocator.free(packages_dir);
@@ -325,7 +381,13 @@ pub fn isAssemblerCached(allocator: std.mem.Allocator, assembler_version: []cons
 pub fn isPluginCached(allocator: std.mem.Allocator, plugin: config.PluginDep) !bool {
     if (plugin.isLocal()) return true;
 
-    const path = try resolvePlugin(allocator, plugin, null);
+    // Same staleness rule as isFrameworkCached.
+    if (try local.activePluginSlot(allocator, plugin)) |slot| {
+        defer allocator.free(slot);
+        return local.slotTracksSource(slot);
+    }
+
+    const path = try pluginVersionPath(allocator, plugin);
     defer allocator.free(path);
     return @import("disk.zig").dirExists(path);
 }

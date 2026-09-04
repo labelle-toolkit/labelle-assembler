@@ -90,20 +90,42 @@ pub fn createDepsLinks(
         deps.deinit(allocator);
     }
 
+    // #685: this is the one place every framework/plugin dep is resolved
+    // exactly once per generate, so it is where a build says out loud that a
+    // package is NOT the version its pin names.
     const core_path = try cache.resolveFrameworkPackage(allocator, "core", cfg.core_version, project_dir);
+    cache.warnIfLocallySourced(allocator, "core", cfg.core_version, core_path);
     try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "labelle_core"), .link_name = try allocator.dupe(u8, "labelle-core"), .abs_path = core_path });
 
     const gfx_path = try cache.resolveFrameworkPackage(allocator, "gfx", cfg.gfx_version, project_dir);
+    cache.warnIfLocallySourced(allocator, "gfx", cfg.gfx_version, gfx_path);
     try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "labelle_gfx"), .link_name = try allocator.dupe(u8, "labelle-gfx"), .abs_path = gfx_path });
 
     const engine_path = try cache.resolveFrameworkPackage(allocator, "engine", cfg.engine_version, project_dir);
+    cache.warnIfLocallySourced(allocator, "engine", cfg.engine_version, engine_path);
     try deps.append(allocator, .{ .zon_name = try allocator.dupe(u8, "engine"), .link_name = try allocator.dupe(u8, "labelle-engine"), .abs_path = engine_path });
 
     for (cfg.plugins) |plugin| {
         const plugin_path = try cache.resolvePlugin(allocator, plugin, project_dir);
+        // A `local:` plugin declares its locality in `.repo`, not `.version`,
+        // so it needs its own skip — it is already self-describing.
+        if (!plugin.isLocal()) cache.warnIfLocallySourced(allocator, plugin.name, plugin.version, plugin_path);
         const zon_name = try std.fmt.allocPrint(allocator, "labelle_{s}", .{plugin.name});
         const link_name = try std.fmt.allocPrint(allocator, "labelle-{s}", .{plugin.name});
         try deps.append(allocator, .{ .zon_name = zon_name, .link_name = link_name, .abs_path = plugin_path });
+    }
+
+    // The assembler-bundled packages (built-in backends, ecs adapters, gui)
+    // all come out of ONE slot, so they get ONE warning rather than one per
+    // `resolveBundledPackage` call (#688 review). Probing the slot through
+    // the same resolver the deps use keeps the two in step.
+    {
+        const asm_ver = cfg.assembler_version orelse cfg.labelle_version;
+        if (!config.isLocalVersion(asm_ver)) {
+            const bundled = try cache.resolveBundledPackage(allocator, cfg.labelle_version, cfg.assembler_version, project_dir, "backends");
+            defer allocator.free(bundled);
+            cache.warnIfLocallySourced(allocator, "assembler", asm_ver, bundled);
+        }
     }
 
     {
@@ -125,6 +147,14 @@ pub fn createDepsLinks(
             // the same `labelle_{name}` / `labelle-{name}` convention either way.
             const backend_path = try backend_registry.resolveBackendPackage(allocator, cfg, project_dir);
             errdefer allocator.free(backend_path);
+            // #688 review: the backend is resolved here, not in the loop above,
+            // so it needs its own warning — a version-pinned backend served
+            // from a local slot is exactly as misleading as a plugin one. An
+            // explicitly `local:` backend declares its locality in `.repo` and
+            // is skipped, matching the plugin loop.
+            if (cfg.effectiveBackendPackage()) |bp| {
+                if (!bp.isLocal()) cache.warnIfLocallySourced(allocator, bp.name, bp.version, backend_path);
+            }
             try deps.append(allocator, .{ .zon_name = backend_info.zon_name, .link_name = backend_info.link_name, .abs_path = backend_path });
         }
 

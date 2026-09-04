@@ -160,6 +160,51 @@ pub fn build(b: *std.Build) void {
     bin_tests.root_module.link_libc = true; // see assembler_exe comment above
     test_step.dependOn(&b.addRunArtifact(bin_tests).step);
 
+    // ── `test-cache`: the local-slot cache machinery, alone ─────────────
+    //
+    // The Windows CI job runs THIS, not `test`. `zig build test` on Windows
+    // is red for ~33 pre-existing failures across the scripting-splice,
+    // panel-validate and pack-check suites (path-separator handling), which
+    // a Windows job added for #688 neither caused nor should be expected to
+    // fix — see the tracking issue linked from that PR. A job that is red
+    // for unrelated reasons guards nothing, so this step narrows to the
+    // modules the cache work touches: `cache.local`, `cache.disk` and
+    // `cache_cmd`.
+    //
+    // `cache.resolve` is deliberately NOT in the filter: two of its
+    // worktree-path tests are among the pre-existing Windows failures, and
+    // they predate and are untouched by the local-slot work. Add it back
+    // when those are fixed.
+    const cache_filters = [_][]const u8{ "cache.local", "cache.disk", "cache_cmd" };
+    const test_cache_step = b.step("test-cache", "Run only the cache/local-slot tests");
+
+    const cache_src_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &cache_filters,
+    });
+    cache_src_tests.root_module.addOptions("build_options", options);
+    cache_src_tests.root_module.addImport("flow_codegen", flow_codegen_module);
+    cache_src_tests.root_module.link_libc = true;
+    test_cache_step.dependOn(&b.addRunArtifact(cache_src_tests).step);
+
+    // `cache_cmd` is reachable only from the binary root.
+    const cache_bin_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &cache_filters,
+    });
+    cache_bin_tests.root_module.addOptions("build_options", options);
+    cache_bin_tests.root_module.addImport("flow_codegen", flow_codegen_module);
+    cache_bin_tests.root_module.link_libc = true;
+    test_cache_step.dependOn(&b.addRunArtifact(cache_bin_tests).step);
+
     // BDD-style tests from test/. Each test target gets `generator`,
     // `zspec`, and `flow_codegen` so any future test file can reach
     // them without further build.zig churn. flow_codegen is cheap to

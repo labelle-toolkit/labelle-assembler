@@ -96,6 +96,20 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         return;
     }
 
+    // Every remaining form takes a VERSION positional that is joined into a
+    // cache path — and, since the #685 migration, one that may be DELETED.
+    // A value like `../../x` would escape the package namespace entirely, so
+    // require a single, ordinary path component (#688 review round 5).
+    for (positionals.items) |arg| {
+        if (isSafePathComponent(arg)) continue;
+        std.log.err(
+            "labelle-assembler install: '{s}' is not a valid package or version name " ++
+                "(no absolute paths, no '.' or '..' components)",
+            .{arg},
+        );
+        std.process.exit(2);
+    }
+
     // Reject the `assembler` package — the CLI owns binary bootstrap.
     if (std.mem.eql(u8, positionals.items[0], "assembler")) {
         std.log.err("labelle-assembler install: the 'assembler' package is managed by the labelle CLI bootstrap, not the assembler binary", .{});
@@ -108,6 +122,10 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         std.log.info("labelle-assembler: caching core/engine/gfx at version {s}", .{version});
         const packages = [_][]const u8{ "core", "engine", "gfx" };
         for (packages) |pkg| {
+            purgeLegacyFrameworkSlot(allocator, pkg, version) catch |err| {
+                std.log.err("labelle-assembler install: could not repair the cache slot for {s} {s}: {s}", .{ pkg, version, @errorName(err) });
+                std.process.exit(1);
+            };
             if (!try cache.isFrameworkCached(allocator, pkg, version)) {
                 fetchFrameworkWithFallback(allocator, pkg, version) catch |err| {
                     std.log.err("labelle-assembler install: failed to fetch {s} {s}: {s}", .{ pkg, version, @errorName(err) });
@@ -135,6 +153,10 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         std.mem.eql(u8, pkg_name, "gfx"))
     {
         std.log.info("labelle-assembler: fetching {s} {s}", .{ pkg_name, version });
+        purgeLegacyFrameworkSlot(allocator, pkg_name, version) catch |err| {
+            std.log.err("labelle-assembler install: could not repair the cache slot for {s} {s}: {s}", .{ pkg_name, version, @errorName(err) });
+            std.process.exit(1);
+        };
         fetchFrameworkWithFallback(allocator, pkg_name, version) catch |err| {
             std.log.err("labelle-assembler install: failed to fetch {s}: {s}", .{ pkg_name, @errorName(err) });
             std.process.exit(1);
@@ -267,6 +289,15 @@ pub fn cmdClean(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
         }
     }
 
+    // Locally-sourced slots live in their own namespace (`packages/local/…`),
+    // which the version-pruning loop above never walks — so the diagnostic
+    // that tells users `labelle-assembler clean` will drop a local slot used
+    // to be a lie for plugins and external backends, and the same implicit
+    // source stayed active (#688 review). The whole namespace goes: every
+    // path under it is a slot or a marker by construction, so there is
+    // nothing to classify and no version pruning to do.
+    removed_count += cleanLocalSlots(arena_alloc, io, packages_dir, dry_run);
+
     if (removed_count == 0) {
         std.log.info("  nothing to clean", .{});
     } else if (dry_run) {
@@ -274,6 +305,41 @@ pub fn cmdClean(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
     } else {
         std.log.info("  cleaned {d} old version(s)", .{removed_count});
     }
+}
+
+/// Remove the reserved local-slot namespace (`packages/local/`) whole.
+/// Returns 1 when it existed (or, under `--dry-run`, would have been
+/// removed), else 0.
+///
+/// Deliberately NOT a search for directories named `local`: an earlier
+/// draft walked `packages/plugins/**` for that name and would have deleted
+/// an owner directory of a repo such as `github.com/local/example`, along
+/// with anything named `local` inside an extracted checkout (#688 review).
+/// The namespace makes the question structural instead.
+fn cleanLocalSlots(
+    arena_alloc: std.mem.Allocator,
+    io: std.Io,
+    packages_dir: []const u8,
+    dry_run: bool,
+) u32 {
+    var removed: u32 = 0;
+    for ([_][]const u8{ cache.localSlots.SLOT_NS, cache.localSlots.ORIGINS_NS }) |ns| {
+        const ns_root = std.fs.path.join(arena_alloc, &.{ packages_dir, ns }) catch continue;
+        if (!cache.localSlots.pathExists(ns_root)) continue;
+
+        if (dry_run) {
+            std.log.info("  would remove {s}/ (locally-sourced slots)", .{ns});
+            removed += 1;
+            continue;
+        }
+        std.Io.Dir.cwd().deleteTree(io, ns_root) catch |err| {
+            std.log.warn("  could not remove {s}/: {s}", .{ ns, @errorName(err) });
+            continue;
+        };
+        std.log.info("  removed {s}/ (locally-sourced slots)", .{ns});
+        removed += 1;
+    }
+    return removed;
 }
 
 // ── upgrade ──────────────────────────────────────────────────────────
@@ -506,6 +572,13 @@ fn findFieldAssignment(content: []const u8, field_token: []const u8) ?FieldSpan 
 /// Ensure every dependency declared in `cfg` is present in the local cache.
 /// No-op when the cache already validates.
 pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !void {
+    // #685 migration: drop any version-named slot an OLDER assembler
+    // symlinked at a sibling checkout, before the presence probes run — a
+    // poisoned slot looks cached but holds the wrong source, so it must be
+    // invalidated rather than trusted. Cheap (a readlink per pinned dep) and
+    // idempotent: once repaired, nothing here is a symlink any more.
+    try cache.purgeLegacyLocalSlots(allocator, cfg);
+
     const missing = try cache.validateCache(allocator, cfg);
     defer {
         for (missing) |m| allocator.free(m);
@@ -578,18 +651,14 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !voi
 fn fetchFrameworkWithFallback(allocator: std.mem.Allocator, name: []const u8, version: []const u8) !void {
     if (findRepoRoot(allocator)) |repo_root| {
         defer allocator.free(repo_root);
-        const dir_name: []const u8 = if (std.mem.eql(u8, name, "core"))
-            "labelle-core"
-        else if (std.mem.eql(u8, name, "engine"))
-            "labelle-engine"
-        else if (std.mem.eql(u8, name, "gfx"))
-            "labelle-gfx"
-        else
-            name;
+        const dir_name = cache.localSlots.frameworkDirName(name);
         const src = try std.fs.path.join(allocator, &.{ repo_root, dir_name });
         defer allocator.free(src);
         if (cache.dirExists(src)) {
-            std.log.info("  caching {s} {s} (local)", .{ name, version });
+            std.log.warn(
+                "  {s}: using LOCAL sources from '{s}' — the pinned {s} will NOT be built (#685)",
+                .{ name, src, version },
+            );
             try cache.populateFrameworkPackage(allocator, name, version, src);
             return;
         }
@@ -606,7 +675,10 @@ fn fetchAssemblerWithFallback(allocator: std.mem.Allocator, version: []const u8)
         const companion = try std.fs.path.join(allocator, &.{ repo_root, "labelle-assembler" });
         defer allocator.free(companion);
         if (cache.dirExists(companion)) {
-            std.log.info("  caching assembler {s} (local)", .{version});
+            std.log.warn(
+                "  assembler: using LOCAL sources from '{s}' — the pinned {s} will NOT be built (#685)",
+                .{ companion, version },
+            );
             try cache.populateAssemblerCache(allocator, version, companion);
             return;
         }
@@ -624,7 +696,10 @@ fn fetchPluginWithFallback(allocator: std.mem.Allocator, plugin: config.PluginDe
         const src = try std.fs.path.join(allocator, &.{ repo_root, plugin_dir });
         defer allocator.free(src);
         if (cache.dirExists(src)) {
-            std.log.info("  caching plugin {s} {s} (local)", .{ plugin.name, plugin.version });
+            std.log.warn(
+                "  plugin {s}: using LOCAL sources from '{s}' — the pinned {s} will NOT be built (#685)",
+                .{ plugin.name, src, plugin.version },
+            );
             try cache.populatePlugin(allocator, plugin, src);
             return;
         }
@@ -663,7 +738,10 @@ fn fetchBackendWithFallback(allocator: std.mem.Allocator, bp: config.PluginDep) 
         const src = try std.fs.path.join(allocator, &.{ repo_root, dir_name });
         defer allocator.free(src);
         if (cache.dirExists(src)) {
-            std.log.info("  caching backend {s} {s} (local)", .{ bp.name, bp.version });
+            std.log.warn(
+                "  backend {s}: using LOCAL sources from '{s}' — the pinned {s} will NOT be built (#685)",
+                .{ bp.name, src, bp.version },
+            );
             try cache.populatePlugin(allocator, bp, src);
             return;
         }
@@ -679,27 +757,48 @@ fn fetchBackendWithFallback(allocator: std.mem.Allocator, bp: config.PluginDep) 
     };
 }
 
+/// Whether `name` is safe to join into a cache path that the migration
+/// sweep may delete.
+///
+/// A `/` is NOT disqualifying (#688 review round 6): `versionToGitRef`
+/// passes non-semver versions through verbatim, so `feature/foo` and
+/// `2026/dev` are supported version pins and their cache paths are nested
+/// to match. Only traversal is rejected — a `..` component, or an absolute
+/// path that would ignore the cache root altogether.
+fn isSafePathComponent(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (std.fs.path.isAbsolute(name)) return false;
+    var it = std.mem.tokenizeAny(u8, name, "/\\");
+    var any = false;
+    while (it.next()) |component| {
+        any = true;
+        if (std.mem.eql(u8, component, "..") or std.mem.eql(u8, component, ".")) return false;
+    }
+    return any;
+}
+
+/// #685 migration for the single-package `install` forms, which have no
+/// ProjectConfig to sweep: drop a version-named slot that an older
+/// assembler symlinked at a sibling checkout so the release is re-fetched.
+fn purgeLegacyFrameworkSlot(allocator: std.mem.Allocator, package: []const u8, version: []const u8) !void {
+    if (config.isLocalVersion(version)) return;
+    const packages_dir = cache.getPackagesDir(allocator) catch return;
+    defer allocator.free(packages_dir);
+    const slot = std.fs.path.join(allocator, &.{ packages_dir, package, version }) catch return;
+    defer allocator.free(slot);
+    // NOT discarded: a purge that failed leaves the poisoned slot in place,
+    // and `isFrameworkCached` would then accept it as the pinned release
+    // (#688 review round 5). Abort the install instead.
+    _ = try cache.purgeLegacyLocalSlot(allocator, slot, version);
+}
+
 /// Walk up from the assembler executable's directory looking for the
 /// monorepo root (identified by a `labelle-core` sibling). Returns null
 /// when the binary isn't running inside the monorepo checkout.
-fn findRepoRoot(allocator: std.mem.Allocator) ?[]const u8 {
-    const io = config.globalIo();
-    const exe_path = std.process.executablePathAlloc(io, allocator) catch return null;
-    defer allocator.free(exe_path);
-
-    var dir = std.fs.path.dirname(exe_path) orelse return null;
-    var depth: u8 = 0;
-    while (depth < 6) : (depth += 1) {
-        const marker = std.fs.path.join(allocator, &.{ dir, "labelle-core" }) catch return null;
-        defer allocator.free(marker);
-        std.Io.Dir.cwd().access(io, marker, .{}) catch {
-            dir = std.fs.path.dirname(dir) orelse return null;
-            continue;
-        };
-        return allocator.dupe(u8, dir) catch return null;
-    }
-    return null;
-}
+///
+/// Lives in `cache/local.zig` now (#685) — the resolve side needs the same
+/// answer, so both sides share one probe.
+const findRepoRoot = cache.findRepoRoot;
 
 // ── project.labelle reading ──────────────────────────────────────────
 
@@ -848,4 +947,91 @@ test "findFieldAssignment tolerates extra whitespace around =" {
     ;
     const span = findFieldAssignment(content, ".core_version") orelse return error.NotFound;
     try std.testing.expectEqualStrings(".core_version   =   \"0.1.0\"", content[span.start..span.end]);
+}
+
+test "cleanLocalSlots: drops the local namespace, leaving version slots alone (#688 review)" {
+    // `warnIfLocallySourced` tells users to run `labelle-assembler clean` to
+    // drop a local slot, but `cmdClean`'s version-pruning loop only walks
+    // core/engine/gfx/cli/assembler — a plugin or external backend's slot
+    // survived it, so the same implicit source stayed active and the warning
+    // repeated forever.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = config.globalIo();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = "github.com/labelle-toolkit/labelle-physics";
+    // A plugin local slot, a plugin RELEASE slot, and — the trap an earlier
+    // draft fell into — a plugin repo whose OWNER is literally named `local`.
+    try tmp.dir.createDirPath(std.testing.io, "packages/local/plugins/" ++ repo);
+    try tmp.dir.createDirPath(std.testing.io, "packages/plugins/" ++ repo ++ "/0.4.0");
+    try tmp.dir.createDirPath(std.testing.io, "packages/plugins/github.com/local/example/1.0.0");
+    try tmp.dir.createDirPath(std.testing.io, "checkout");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(home);
+    const packages_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "packages", alloc);
+    defer alloc.free(packages_dir);
+    const checkout = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout", alloc);
+    defer alloc.free(checkout);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = std.testing.environ;
+    std.testing.environ = .{ .block = .{ .slice = &envp } };
+    defer std.testing.environ = saved_environ;
+
+    const slot = try std.fs.path.join(alloc, &.{ packages_dir, cache.localSlots.SLOT_NS, "plugins", repo });
+    defer alloc.free(slot);
+    try std.Io.Dir.cwd().deleteTree(io, slot);
+    try std.Io.Dir.cwd().symLink(io, checkout, slot, .{ .is_directory = true });
+    try cache.localSlots.writeOrigin(alloc, slot, checkout, "0.4.0");
+
+    const marker = try cache.localSlots.originPath(alloc, slot);
+    defer alloc.free(marker);
+    try std.testing.expect(cache.localSlots.pathExists(marker));
+
+    // A dry run reports both namespaces without touching anything.
+    try std.testing.expectEqual(@as(u32, 2), cleanLocalSlots(arena_alloc, io, packages_dir, true));
+    try std.testing.expect(cache.localSlots.pathExists(slot));
+
+    try std.testing.expectEqual(@as(u32, 2), cleanLocalSlots(arena_alloc, io, packages_dir, false));
+    try std.testing.expect(!cache.localSlots.pathExists(slot));
+    try std.testing.expect(!cache.localSlots.pathExists(marker));
+
+    // The release slot, the `local`-OWNED repo, and the source checkout all
+    // survive untouched.
+    const release = try std.fs.path.join(alloc, &.{ packages_dir, "plugins", repo, "0.4.0" });
+    defer alloc.free(release);
+    try std.testing.expect(cache.localSlots.pathExists(release));
+    const owner_local = try std.fs.path.join(alloc, &.{ packages_dir, "plugins", "github.com", "local", "example", "1.0.0" });
+    defer alloc.free(owner_local);
+    try std.testing.expect(cache.localSlots.pathExists(owner_local));
+    try std.testing.expect(cache.localSlots.pathExists(checkout));
+
+    // Idempotent.
+    try std.testing.expectEqual(@as(u32, 0), cleanLocalSlots(arena_alloc, io, packages_dir, false));
+}
+
+test "isSafePathComponent: slash-delimited git refs are versions, traversal is not (#688 review)" {
+    // `versionToGitRef` passes non-semver versions through verbatim, so a
+    // slash-delimited branch is a supported pin and `install feature/foo`
+    // must keep reaching the fetcher.
+    try std.testing.expect(isSafePathComponent("1.29.0"));
+    try std.testing.expect(isSafePathComponent("main"));
+    try std.testing.expect(isSafePathComponent("feature/foo"));
+    try std.testing.expect(isSafePathComponent("2026/dev"));
+
+    try std.testing.expect(!isSafePathComponent(""));
+    try std.testing.expect(!isSafePathComponent("."));
+    try std.testing.expect(!isSafePathComponent(".."));
+    try std.testing.expect(!isSafePathComponent("../../target"));
+    try std.testing.expect(!isSafePathComponent("feature/../../../etc"));
+    try std.testing.expect(!isSafePathComponent("/etc/passwd"));
 }

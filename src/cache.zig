@@ -29,6 +29,7 @@
 const env = @import("cache/env.zig");
 const resolve = @import("cache/resolve.zig");
 const disk = @import("cache/disk.zig");
+const local_slots = @import("cache/local.zig");
 const fetch = @import("cache/fetch.zig");
 
 // ── env / layout ─────────────────────────────────────────────────────
@@ -58,6 +59,15 @@ pub const patchCachedDeps = disk.patchCachedDeps;
 pub const dirExists = disk.dirExists;
 pub const isSymlink = disk.isSymlink;
 pub const copyDirRecursive = disk.copyDirRecursive;
+pub const purgeLegacyLocalSlot = disk.purgeLegacyLocalSlot;
+pub const purgeLegacyLocalSlots = disk.purgeLegacyLocalSlots;
+
+// ── locally-sourced slots (#685) ─────────────────────────────────────
+pub const localSlots = local_slots;
+pub const findRepoRoot = local_slots.findRepoRoot;
+pub const isLocalSlotPath = local_slots.isLocalSlotPath;
+pub const localSlotRoot = local_slots.localSlotRoot;
+pub const warnIfLocallySourced = local_slots.warnIfLocallySourced;
 
 // ── remote fetching ──────────────────────────────────────────────────
 pub const R2_BASE_URL = fetch.R2_BASE_URL;
@@ -75,6 +85,7 @@ test {
     // top-level test aggregator (root.zig's refAllDecls walk includes
     // `cache.zig` but does not descend into nested `@import`s).
     _ = env;
+    _ = local_slots;
     _ = resolve;
     _ = disk;
     _ = fetch;
