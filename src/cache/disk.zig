@@ -197,6 +197,20 @@ pub fn purgeLegacyLocalSlots(allocator: std.mem.Allocator, cfg: config.ProjectCo
         purgeLegacyPluginSlot(allocator, packages_dir, plugin);
     }
     if (cfg.effectiveBackendPackage()) |bp| purgeLegacyPluginSlot(allocator, packages_dir, bp);
+
+    // The tests target (#83) ALWAYS forces `.backend = .null`, so `validateCache`
+    // requires the null provider whatever the project's own backend is — and
+    // `isPluginCached` would accept a legacy symlinked `labelle-null` slot as
+    // cached, leaving the tests target compiling an old local checkout forever
+    // (#688 review). Sweep it too, deduplicated against the project backend.
+    const tests_target_cfg = config.ProjectConfig{ .name = cfg.name, .backend = .null };
+    if (tests_target_cfg.effectiveBackendPackage()) |null_bp| {
+        const already = if (cfg.effectiveBackendPackage()) |bp|
+            std.mem.eql(u8, bp.name, null_bp.name)
+        else
+            false;
+        if (!already) purgeLegacyPluginSlot(allocator, packages_dir, null_bp);
+    }
 }
 
 fn purgeLegacyPluginSlot(allocator: std.mem.Allocator, packages_dir: []const u8, plugin: config.PluginDep) void {
@@ -476,7 +490,7 @@ test "resolveFrameworkPackage: a pinned version resolves to the release, not the
         const stamp = try readVersionStamp(alloc, path);
         defer alloc.free(stamp);
         try testing.expectEqualStrings("1.29.0", stamp);
-        try testing.expect(!local.isLocalSlotPath(path));
+        try testing.expect(!local.isLocalSlotPath(alloc, path));
     }
 
     {
@@ -489,7 +503,7 @@ test "resolveFrameworkPackage: a pinned version resolves to the release, not the
         const stamp = try readVersionStamp(alloc, path);
         defer alloc.free(stamp);
         try testing.expectEqualStrings("1.30.0", stamp);
-        try testing.expect(local.isLocalSlotPath(path));
+        try testing.expect(local.isLocalSlotPath(alloc, path));
     }
 }
 
@@ -528,4 +542,97 @@ test "purgeLegacyLocalSlot: drops a version slot symlinked at a local checkout (
     defer alloc.free(genuine);
     try testing.expect(!purgeLegacyLocalSlot(genuine));
     try testing.expect(dirExists(genuine));
+}
+
+test "frameworkVersionPath / pluginVersionPath: remote fetch targets ignore an active local slot (#688 review)" {
+    // `archiveFetch` DELETES its target before extracting, so a remote fetch
+    // routed through the context-sensitive build resolver would overwrite the
+    // reserved local slot with one release — reachable through a single-package
+    // `install` run inside the monorepo. The write path must be version-named.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home");
+    try tmp.dir.createDirPath(testing.io, "toolkit/labelle-core");
+    try tmp.dir.createDirPath(testing.io, "toolkit/labelle-gfx");
+    try tmp.dir.createDirPath(testing.io, "toolkit/labelle-assembler/zig-out/bin");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src = try tmp.dir.realPathFileAlloc(testing.io, "toolkit/labelle-gfx", alloc);
+    defer alloc.free(src);
+    const bin = try tmp.dir.realPathFileAlloc(testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    try populateFrameworkPackage(alloc, "gfx", "1.29.0", src);
+
+    local.setProbeStartForTesting(bin);
+    defer local.setProbeStartForTesting(null);
+
+    // The build resolver honours the slot …
+    const resolved = try resolve.resolveFrameworkPackage(alloc, "gfx", "1.31.0", null);
+    defer alloc.free(resolved);
+    try testing.expect(local.isLocalSlotPath(alloc, resolved));
+
+    // … the fetch target never does.
+    const fetch_target = try resolve.frameworkVersionPath(alloc, "gfx", "1.31.0");
+    defer alloc.free(fetch_target);
+    const expected = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.31.0" });
+    defer alloc.free(expected);
+    try testing.expectEqualStrings(expected, fetch_target);
+
+    const plugin: config.PluginDep = .{ .name = "physics", .repo = "github.com/labelle-toolkit/labelle-physics", .version = "0.4.0" };
+    const plugin_target = try resolve.pluginVersionPath(alloc, plugin);
+    defer alloc.free(plugin_target);
+    const expected_plugin = try std.fs.path.join(alloc, &.{ home, "packages", "plugins", plugin.repo, plugin.version });
+    defer alloc.free(expected_plugin);
+    try testing.expectEqualStrings(expected_plugin, plugin_target);
+}
+
+test "purgeLegacyLocalSlots: sweeps the implicit null backend the tests target needs (#688 review)" {
+    // `validateCache` ALWAYS requires the null provider (the tests target forces
+    // `.backend = .null`), so a legacy symlinked `labelle-null` slot left behind
+    // would keep reporting cached and the tests target would keep compiling an
+    // old local checkout. The sweep must cover it even when the project's own
+    // backend is something else.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home");
+    try tmp.dir.createDirPath(testing.io, "checkout");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
+    defer alloc.free(checkout);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    const cfg = config.ProjectConfig{ .name = "demo", .backend = .bgfx };
+    const null_bp = (config.ProjectConfig{ .name = "demo", .backend = .null }).effectiveBackendPackage().?;
+
+    const poisoned = try std.fs.path.join(alloc, &.{ home, "packages", "plugins", null_bp.repo, null_bp.version });
+    defer alloc.free(poisoned);
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), std.fs.path.dirname(poisoned).?);
+    try symlinkToCache(alloc, checkout, poisoned);
+    try testing.expect(dirExists(poisoned));
+
+    purgeLegacyLocalSlots(alloc, cfg);
+
+    try testing.expect(!dirExists(poisoned));
+    try testing.expect(dirExists(checkout));
 }
