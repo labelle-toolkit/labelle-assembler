@@ -200,6 +200,21 @@ pub fn writeDesktopIconArtifacts(allocator: std.mem.Allocator, cfg: ProjectConfi
             std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
             return error.AppIconNotPng;
         },
+        // A real PNG this decoder cannot read (interlaced, or a broken
+        // stream) that ALSO cannot be described by an ICO directory entry —
+        // non-square, or larger than 256. The verbatim fallback would have to
+        // advertise dimensions that contradict the payload's own IHDR, so say
+        // what to change instead of shipping an icon Windows may discard.
+        error.IcoFallbackUnrepresentable => {
+            var buf: [640]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &buf,
+                "labelle-assembler: app_icon {s} could not be decoded (interlaced or damaged PNG) and its size cannot be described in a Windows .ico\n  Re-save it as a NON-INTERLACED, square PNG of at most 256x256 (512 masters are fine once they decode — only the undecodable fallback is limited).\n",
+                .{effectiveIconPath(cfg)},
+            ) catch "labelle-assembler: app_icon cannot be encoded as a Windows .ico\n";
+            std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+            return error.AppIconNotPng;
+        },
         else => return err,
     };
     defer allocator.free(ico_bytes);

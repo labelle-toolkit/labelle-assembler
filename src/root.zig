@@ -901,7 +901,16 @@ pub fn generate(
     // where `@embedFile` can reach it, and write the Windows `.ico` + `.rc`
     // the generated build.zig compiles in on Windows targets. No-op off
     // desktop. Fails loudly on a custom icon that is missing or not a PNG.
-    try app_icon.writeDesktopIconArtifacts(allocator, cfg, game_dir, target_dir);
+    //
+    // NOT for the tests target: `testsTargetConfig` forces `.platform =
+    // .desktop`, but that target emits neither `main.zig` nor an exe, so it
+    // consumes no icon at all. Generating one there costs an ICO encode per
+    // `labelle test` and — worse — would fail the whole test run with
+    // `AppIconNotFound`/`AppIconNotPng` over an icon the tests never touch
+    // (including for a mobile project, whose real target skips this).
+    if (!is_tests_target) {
+        try app_icon.writeDesktopIconArtifacts(allocator, cfg, game_dir, target_dir);
+    }
 
     // `tests/` mirrors the project source tree (e.g. `tests/components/foo.zig`
     // tests `components/foo.zig`). Linked + scanned so the generated

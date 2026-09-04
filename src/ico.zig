@@ -34,8 +34,12 @@
 //! NON-interlaced. That covers what any icon tool emits. A PNG it cannot
 //! decode (Adam7 interlace, a corrupt stream) still yields a VALID `.ico`:
 //! a single entry whose payload is the source PNG verbatim — Windows reads
-//! its dimensions from the PNG itself — so a generate never fails over an
-//! exotic icon. Only bytes that are not a PNG at all are an error.
+//! its dimensions from the PNG itself — so a generate does not fail over an
+//! exotic icon. That fallback needs the DIRECTORY to stay truthful, though,
+//! and an `ICONDIRENTRY` holds one byte per axis (0 = 256): an undecodable
+//! image that is non-square or larger than 256 cannot be described and is
+//! `error.IcoFallbackUnrepresentable` rather than a lying entry. Bytes that
+//! are not a PNG at all are `error.NotPng`.
 
 const std = @import("std");
 const flate = std.compress.flate;
@@ -356,36 +360,87 @@ pub fn encodePng(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32)
 
 // ── Resampling ─────────────────────────────────────────────────────────
 
-/// Box (area-average) downscale of RGBA8. Each destination pixel averages
-/// the whole source footprint it covers, so non-integer ratios blend rather
-/// than drop rows and integer ratios are the exact block mean. Downscale
-/// only. Mirrors labelle-bgfx `window_icon.downscaleBox`.
+/// Round a non-negative channel value to the nearest `u8`, clamped.
+fn quantizeChannel(v: f64) u8 {
+    return @intFromFloat(@round(std.math.clamp(v, 0.0, 255.0)));
+}
+
+/// Area-average ("box") downscale of RGBA8, in PREMULTIPLIED alpha.
+///
+/// Each destination pixel covers the real-valued source footprint
+/// `[dx·sw/dw, (dx+1)·sw/dw)` and weights every source pixel by its
+/// FRACTIONAL overlap with it, so a non-integer ratio (e.g. the 256→48 an
+/// icon build performs) blends instead of snapping edges to whole pixels;
+/// integer ratios still give the exact block mean. RGB is accumulated
+/// weighted by its own alpha and un-premultiplied at the end, so the
+/// invisible colour of transparent pixels cannot halo the art; a fully
+/// transparent destination pixel keeps the plain RGB average, having no
+/// colour to recover. Downscale only.
+///
+/// Mirrors labelle-bgfx `window_icon.downscaleBox` — the two produce the
+/// runtime window icon and the Windows exe icon from the same source, and
+/// must not disagree.
 pub fn downscaleBox(allocator: std.mem.Allocator, src: []const u8, sw: u32, sh: u32, dw: u32, dh: u32) ![]u8 {
     if (sw == 0 or sh == 0 or dw == 0 or dh == 0) return error.InvalidDimensions;
     if (dw > sw or dh > sh) return error.InvalidDimensions;
     if (src.len < @as(usize, sw) * sh * 4) return error.InvalidDimensions;
     const out = try allocator.alloc(u8, @as(usize, dw) * dh * 4);
     errdefer allocator.free(out);
+
+    const x_step = @as(f64, @floatFromInt(sw)) / @as(f64, @floatFromInt(dw));
+    const y_step = @as(f64, @floatFromInt(sh)) / @as(f64, @floatFromInt(dh));
+
     var dy: u32 = 0;
     while (dy < dh) : (dy += 1) {
-        const y0: u32 = @intCast((@as(u64, dy) * sh) / dh);
-        const y1: u32 = @max(y0 + 1, @as(u32, @intCast((@as(u64, dy + 1) * sh) / dh)));
+        const y_lo = @as(f64, @floatFromInt(dy)) * y_step;
+        const y_hi = y_lo + y_step;
+        const y0: u32 = @intFromFloat(@floor(y_lo));
+        const y1: u32 = @min(sh, @as(u32, @intFromFloat(@ceil(y_hi))));
         var dx: u32 = 0;
         while (dx < dw) : (dx += 1) {
-            const x0: u32 = @intCast((@as(u64, dx) * sw) / dw);
-            const x1: u32 = @max(x0 + 1, @as(u32, @intCast((@as(u64, dx + 1) * sw) / dw)));
-            var acc = [4]u64{ 0, 0, 0, 0 };
+            const x_lo = @as(f64, @floatFromInt(dx)) * x_step;
+            const x_hi = x_lo + x_step;
+            const x0: u32 = @intFromFloat(@floor(x_lo));
+            const x1: u32 = @min(sw, @as(u32, @intFromFloat(@ceil(x_hi))));
+
+            var acc_pre = [3]f64{ 0, 0, 0 };
+            var acc_flat = [3]f64{ 0, 0, 0 };
+            var acc_a: f64 = 0;
+            var acc_w: f64 = 0;
             var sy = y0;
             while (sy < y1) : (sy += 1) {
+                const wy = @min(y_hi, @as(f64, @floatFromInt(sy + 1))) -
+                    @max(y_lo, @as(f64, @floatFromInt(sy)));
+                if (wy <= 0) continue;
                 var sx = x0;
                 while (sx < x1) : (sx += 1) {
+                    const wx = @min(x_hi, @as(f64, @floatFromInt(sx + 1))) -
+                        @max(x_lo, @as(f64, @floatFromInt(sx)));
+                    if (wx <= 0) continue;
+                    const w = wx * wy;
                     const i = (@as(usize, sy) * sw + sx) * 4;
-                    inline for (0..4) |c| acc[c] += src[i + c];
+                    const a = @as(f64, @floatFromInt(src[i + 3]));
+                    acc_w += w;
+                    acc_a += a * w;
+                    inline for (0..3) |c| {
+                        const v = @as(f64, @floatFromInt(src[i + c]));
+                        acc_pre[c] += v * a * w;
+                        acc_flat[c] += v * w;
+                    }
                 }
             }
-            const count: u64 = @as(u64, y1 - y0) * (x1 - x0);
+
             const o = (@as(usize, dy) * dw + dx) * 4;
-            inline for (0..4) |c| out[o + c] = @intCast((acc[c] + count / 2) / count);
+            if (acc_w <= 0) {
+                @memset(out[o..][0..4], 0);
+                continue;
+            }
+            out[o + 3] = quantizeChannel(acc_a / acc_w);
+            if (acc_a > 0) {
+                inline for (0..3) |c| out[o + c] = quantizeChannel(acc_pre[c] / acc_a);
+            } else {
+                inline for (0..3) |c| out[o + c] = quantizeChannel(acc_flat[c] / acc_w);
+            }
         }
     }
     return out;
@@ -465,9 +520,18 @@ pub fn buildIco(allocator: std.mem.Allocator, source_png: []const u8) ![]u8 {
     const img = decodePng(allocator, source_png) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.NotPng => return error.NotPng,
-        // Undecodable here but a real PNG: ship it whole as the single entry.
+        // Undecodable here but a real PNG: ship it whole as the single entry —
+        // but ONLY when the directory can describe it truthfully. An
+        // `ICONDIRENTRY` carries one byte per axis (0 meaning 256), so a
+        // non-square or >256 image cannot be stated: a 100x200 would be
+        // advertised as 100x100 and a 512x512 as 256x256, leaving the
+        // directory inconsistent with the payload's own IHDR — which lets
+        // Windows (or the resource compiler) discard the icon we were trying
+        // to preserve. A silently-wrong entry is worse than a clear refusal,
+        // so those cases are an error the caller reports with the path.
         error.Unsupported, error.Malformed, error.TooLarge => {
-            const one = [_]Entry{.{ .size = @min(dims.width, dims.height), .png = source_png }};
+            if (dims.width != dims.height or dims.width > 256) return error.IcoFallbackUnrepresentable;
+            const one = [_]Entry{.{ .size = dims.width, .png = source_png }};
             return writeIcoContainer(allocator, &one);
         },
     };
@@ -730,8 +794,78 @@ test "buildIco falls back to one verbatim entry for a PNG it cannot decode" {
     var buf: [2]ParsedEntry = undefined;
     const entries = try parseIco(ico, &buf);
     try testing.expectEqual(@as(usize, 1), entries.len);
+    // The entry states the IHDR's OWN dimensions, so the directory and the
+    // payload agree.
     try testing.expectEqual(@as(u8, 2), entries[0].size_byte);
     try testing.expectEqualSlices(u8, png, entries[0].payload);
+}
+
+test "the verbatim fallback refuses to describe an undecodable 512 or non-square PNG" {
+    // An ICONDIRENTRY holds one byte per axis (0 = 256), so neither a 512
+    // square nor a 100x200 can be stated truthfully. Emitting one anyway
+    // would advertise 256x256 / 100x100 over a payload whose IHDR says
+    // otherwise, and a reader that trusts the directory drops the icon.
+    //
+    // Fixture: a real 4x4 PNG whose IHDR is rewritten to the target size —
+    // still a PNG (so `pngDimensions` reads it), no longer decodable (the
+    // IDAT is 4x4), which is exactly the state the fallback exists for.
+    inline for (.{ .{ 512, 512 }, .{ 100, 200 }, .{ 300, 300 } }) |dims| {
+        var png = try encodePng(testing.allocator, &[_]u8{0} ** (4 * 4 * 4), 4, 4);
+        defer testing.allocator.free(png);
+        std.mem.writeInt(u32, png[16..20], dims[0], .big);
+        std.mem.writeInt(u32, png[20..24], dims[1], .big);
+        try testing.expectEqual(@as(u32, dims[0]), pngDimensions(png).?.width);
+        try testing.expectError(error.IcoFallbackUnrepresentable, buildIco(testing.allocator, png));
+    }
+
+    // …while an undecodable image that IS representable still falls back: a
+    // 256 square is the largest the directory can state (as the byte 0).
+    var ok_png = try encodePng(testing.allocator, &[_]u8{0} ** (4 * 4 * 4), 4, 4);
+    defer testing.allocator.free(ok_png);
+    std.mem.writeInt(u32, ok_png[16..20], 256, .big);
+    std.mem.writeInt(u32, ok_png[20..24], 256, .big);
+    const ico = try buildIco(testing.allocator, ok_png);
+    defer testing.allocator.free(ico);
+    var buf: [2]ParsedEntry = undefined;
+    const entries = try parseIco(ico, &buf);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(@as(u8, 0), entries[0].size_byte); // 0 == 256
+}
+
+test "downscaleBox: fractional coverage is weighted, and alpha is premultiplied" {
+    // Mirrors the labelle-bgfx tests for the same filter (bgfx#81 review).
+    // 3x1 -> 2x1 at scale 1.5: footprints [0,1.5) and [1.5,3), so the middle
+    // pixel is split — 30 and 50, not the 0/60 an integer-footprint filter
+    // (which snapped the edge) produced.
+    {
+        const src = [_]u8{ 0, 0, 0, 255, 90, 90, 90, 255, 30, 30, 30, 255 };
+        const out = try downscaleBox(testing.allocator, &src, 3, 1, 2, 1);
+        defer testing.allocator.free(out);
+        try testing.expectEqualSlices(u8, &.{ 30, 30, 30, 255 }, out[0..4]);
+        try testing.expectEqualSlices(u8, &.{ 50, 50, 50, 255 }, out[4..8]);
+    }
+    // One opaque red among three fully transparent pixels stays PURE red at a
+    // quarter alpha; straight RGBA averaging returns (64,0,0,64) — the halo.
+    {
+        const src = [_]u8{
+            255, 0, 0, 255, 0, 0, 0, 0,
+            0,   0, 0, 0,   0, 0, 0, 0,
+        };
+        const out = try downscaleBox(testing.allocator, &src, 2, 2, 1, 1);
+        defer testing.allocator.free(out);
+        try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 64 }, out);
+    }
+    // An integer ratio is still the exact block mean (the ICO's 256->128-ish
+    // steps rely on this being unchanged).
+    {
+        const src = [_]u8{
+            0,   0,   0,   255, 255, 255, 255, 255,
+            255, 255, 255, 255, 0,   0,   0,   255,
+        };
+        const out = try downscaleBox(testing.allocator, &src, 2, 2, 1, 1);
+        defer testing.allocator.free(out);
+        try testing.expectEqualSlices(u8, &.{ 128, 128, 128, 255 }, out);
+    }
 }
 
 test "buildIco rejects bytes that are not a PNG" {
