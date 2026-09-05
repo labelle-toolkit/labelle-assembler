@@ -230,6 +230,20 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
 pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8, version: []const u8) error{PurgeFailed}!bool {
     const io = config.globalIo();
 
+    // Nothing there is nothing to purge, and that is the common case: a cold
+    // cache has no `packages/<pkg>/` at all. Checked BEFORE containment
+    // because `withinPackagesDir` canonicalises the slot's parent, and
+    // `realPath` on a directory that does not exist yet fails — which the
+    // blanket `catch return false` then reported as "outside the package
+    // cache", so every first install of a package warned about a path as
+    // central as a cache path gets (#706). A no-op needs no containment
+    // ruling, so the check below is not weakened by skipping it here.
+    //
+    // `pathExists` follows symlinks, so a DANGLING legacy link — exactly the
+    // #685 damage this repairs, its checkout since deleted — reads as absent;
+    // `isSymlinkPath` catches it.
+    if (!local.pathExists(slot_path) and !local.isSymlinkPath(slot_path)) return false;
+
     // Containment, checked HERE rather than at each caller (#688 review
     // round 6): every purge target is built from a user-supplied version
     // string — a CLI argument, but also a `project.labelle` field, which no
@@ -1375,4 +1389,82 @@ test "purgeLegacyLocalSlot: a symlinked ancestor cannot smuggle a deletion out o
     const victim = try std.fs.path.join(alloc, &.{ checkout, "1.2.3" });
     defer alloc.free(victim);
     try testing.expect(dirExists(victim));
+}
+
+test "purgeLegacyLocalSlot: a DANGLING legacy symlink is still purged (#706)" {
+    // The risk the #706 early return introduces. `pathExists` follows
+    // symlinks, so a link whose checkout has since been deleted reads as
+    // absent — and that is precisely the #685 damage this function exists to
+    // repair. Skipping it would leave a version-named slot pointing into
+    // nowhere, which every presence probe would then trip over.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home/packages/gfx");
+    try tmp.dir.createDirPath(testing.io, "checkout");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+    const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
+    defer alloc.free(checkout);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    const slot = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
+    defer alloc.free(slot);
+    try std.Io.Dir.cwd().symLink(testing.io, checkout, slot, .{ .is_directory = true });
+
+    // Delete the checkout out from under it: the link now dangles.
+    try std.Io.Dir.cwd().deleteTree(testing.io, checkout);
+    try testing.expect(!local.pathExists(slot));
+    try testing.expect(local.isSymlinkPath(slot));
+
+    try testing.expect(try purgeLegacyLocalSlot(alloc, slot, "1.29.0"));
+    try testing.expect(!local.isSymlinkPath(slot));
+}
+
+test "purgeLegacyLocalSlot: an absent slot is a silent no-op, not a containment refusal (#706)" {
+    // A cold cache has no `packages/<pkg>/` at all, and `withinPackagesDir`
+    // canonicalises the slot's PARENT — `realPath` on a directory that does
+    // not exist yet fails, and the blanket `catch return false` reported that
+    // as "outside the package cache". Every first install of a package
+    // warned about a path as central as a cache path gets.
+    //
+    // Both before and after the fix this returns false; what changed is the
+    // route and the warning. The assertion worth pinning is that an absent
+    // slot stays a no-op that touches nothing.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "home/packages");
+
+    const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
+    defer alloc.free(home);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer testing.environ = saved_environ;
+
+    // `packages/gfx` deliberately does not exist — the cold-cache shape.
+    const parent = try std.fs.path.join(alloc, &.{ home, "packages", "gfx" });
+    defer alloc.free(parent);
+    try testing.expect(!local.pathExists(parent));
+
+    const slot = try std.fs.path.join(alloc, &.{ parent, "1.29.0" });
+    defer alloc.free(slot);
+
+    try testing.expect(!try purgeLegacyLocalSlot(alloc, slot, "1.29.0"));
+    // A no-op creates nothing on its way through.
+    try testing.expect(!local.pathExists(parent));
+    try testing.expect(!local.pathExists(slot));
 }
