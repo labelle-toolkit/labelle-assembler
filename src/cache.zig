@@ -61,6 +61,7 @@ pub const isSymlink = disk.isSymlink;
 pub const copyDirRecursive = disk.copyDirRecursive;
 pub const purgeLegacyLocalSlot = disk.purgeLegacyLocalSlot;
 pub const purgeLegacyLocalSlots = disk.purgeLegacyLocalSlots;
+pub const declaredZonVersion = disk.declaredZonVersion;
 
 // ── locally-sourced slots (#685) ─────────────────────────────────────
 pub const localSlots = local_slots;
