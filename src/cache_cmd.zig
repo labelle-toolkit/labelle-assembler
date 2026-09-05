@@ -35,16 +35,25 @@ const install_usage =
     \\Usage:
     \\  labelle-assembler install --project-root <path>   Install deps for a project
     \\  labelle-assembler install <pkg> <version>         Cache a specific package
+    \\  labelle-assembler install <pkg> local:<path>      Build <pkg> from a local checkout
     \\  labelle-assembler install <version>               Cache core+engine+gfx at a version
     \\
     \\Packages: core, engine, gfx
     \\
+    \\`local:<path>` installs an EXPLICIT local-source override (#685, #704):
+    \\the checkout is linked into ~/.labelle/packages/local/<pkg>, and every
+    \\later build — by any assembler, released or not — resolves <pkg> there
+    \\instead of its pinned release, warning each time. A relative path
+    \\resolves against --project-root when given, else the working directory.
+    \\Run `labelle-assembler clean` to drop the override.
+    \\
 ;
 
-/// `install` subcommand. Three forms, matching the legacy CLI behavior:
-///   install --project-root <p>   → ensure every dep in project.labelle is cached
-///   install <pkg> <version>      → cache one framework package
-///   install <version>            → cache core/engine/gfx at one version
+/// `install` subcommand. Four forms:
+///   install --project-root <p>    → ensure every dep in project.labelle is cached
+///   install <pkg> <version>       → cache one framework package
+///   install <pkg> local:<path>    → build one framework package from a checkout
+///   install <version>             → cache core/engine/gfx at one version
 pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     var project_root: ?[]const u8 = null;
     var positionals: std.ArrayList([]const u8) = .empty;
@@ -100,7 +109,14 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
     // cache path — and, since the #685 migration, one that may be DELETED.
     // A value like `../../x` would escape the package namespace entirely, so
     // require a single, ordinary path component (#688 review round 5).
+    //
+    // A `local:<path>` spec is exempt: it is a SOURCE path, not a version,
+    // and it never names a cache path — the slot it populates is
+    // `packages/local/<pkg>`, named by the package. Running it through the
+    // component rule rejected every absolute path, which on Windows is
+    // every path a user would type (#704).
     for (positionals.items) |arg| {
+        if (config.isLocalVersion(arg)) continue;
         if (isSafePathComponent(arg)) continue;
         std.log.err(
             "labelle-assembler install: '{s}' is not a valid package or version name " ++
@@ -119,6 +135,18 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
     // Form 3: install <version> — cache core/engine/gfx at one version.
     if (positionals.items.len == 1) {
         const version = positionals.items[0];
+        // One checkout cannot be core AND engine AND gfx, so there is no
+        // sensible reading of `install local:<path>` — and the silent one
+        // (treat the spec as a git ref and go looking for a tarball named
+        // after it) is how #704 repro B ended up 404ing against GitHub.
+        if (config.isLocalVersion(version)) {
+            std.log.err(
+                "labelle-assembler install: a local source belongs to ONE package — " ++
+                    "write 'install <pkg> {s}' (pkg: core, engine, gfx)",
+                .{version},
+            );
+            std.process.exit(2);
+        }
         std.log.info("labelle-assembler: caching core/engine/gfx at version {s}", .{version});
         const packages = [_][]const u8{ "core", "engine", "gfx" };
         for (packages) |pkg| {
@@ -126,7 +154,11 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
                 std.log.err("labelle-assembler install: could not repair the cache slot for {s} {s}: {s}", .{ pkg, version, @errorName(err) });
                 std.process.exit(1);
             };
-            if (!try cache.isFrameworkCached(allocator, pkg, version)) {
+            // The VERSION-named slot, not the build resolver (#704 review):
+            // this form is asked to put a release on disk, and an active
+            // local override made the resolver answer yes for every
+            // version, so nothing was fetched.
+            if (!try cache.isFrameworkVersionCached(allocator, pkg, version)) {
                 fetchFrameworkWithFallback(allocator, pkg, version) catch |err| {
                     std.log.err("labelle-assembler install: failed to fetch {s} {s}: {s}", .{ pkg, version, @errorName(err) });
                     std.process.exit(1);
@@ -148,24 +180,131 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
     }
     const pkg_name = positionals.items[0];
     const version = positionals.items[1];
-    if (std.mem.eql(u8, pkg_name, "core") or
-        std.mem.eql(u8, pkg_name, "engine") or
-        std.mem.eql(u8, pkg_name, "gfx"))
+    if (!std.mem.eql(u8, pkg_name, "core") and
+        !std.mem.eql(u8, pkg_name, "engine") and
+        !std.mem.eql(u8, pkg_name, "gfx"))
     {
-        std.log.info("labelle-assembler: fetching {s} {s}", .{ pkg_name, version });
-        purgeLegacyFrameworkSlot(allocator, pkg_name, version) catch |err| {
-            std.log.err("labelle-assembler install: could not repair the cache slot for {s} {s}: {s}", .{ pkg_name, version, @errorName(err) });
-            std.process.exit(1);
-        };
-        fetchFrameworkWithFallback(allocator, pkg_name, version) catch |err| {
-            std.log.err("labelle-assembler install: failed to fetch {s}: {s}", .{ pkg_name, @errorName(err) });
-            std.process.exit(1);
-        };
-    } else {
         std.log.err("labelle-assembler install: unknown package '{s}' (known: core, engine, gfx)", .{pkg_name});
         std.process.exit(2);
     }
+
+    // Form 2b: install <pkg> local:<path> — an explicit local-source
+    // override (#704). Handled before the version path because none of it
+    // applies: nothing is fetched, no version-named slot is involved, and
+    // auto-discovery must NOT get a vote (that is the whole defect — the
+    // sibling checkout next to the running binary used to win over the path
+    // the user typed).
+    if (config.isLocalVersion(version)) {
+        installLocalFramework(allocator, pkg_name, version, project_root) catch |err| {
+            std.log.err(
+                "labelle-assembler install: could not install {s} from '{s}': {s}",
+                .{ pkg_name, config.localVersionPath(version), @errorName(err) },
+            );
+            std.process.exit(1);
+        };
+        std.log.info("labelle-assembler: done", .{});
+        return;
+    }
+
+    std.log.info("labelle-assembler: fetching {s} {s}", .{ pkg_name, version });
+    purgeLegacyFrameworkSlot(allocator, pkg_name, version) catch |err| {
+        std.log.err("labelle-assembler install: could not repair the cache slot for {s} {s}: {s}", .{ pkg_name, version, @errorName(err) });
+        std.process.exit(1);
+    };
+    fetchFrameworkWithFallback(allocator, pkg_name, version) catch |err| {
+        std.log.err("labelle-assembler install: failed to fetch {s}: {s}", .{ pkg_name, @errorName(err) });
+        std.process.exit(1);
+    };
     std.log.info("labelle-assembler: done", .{});
+}
+
+/// `install <pkg> local:<path>` — link a checkout into the reserved local
+/// slot and record it as an EXPLICIT override (#704).
+///
+/// Three things distinguish this from the auto-discovery in
+/// `fetchFrameworkWithFallback`, and each is one of the defects #704
+/// reported:
+///
+///   * the path the user typed is the source. Auto-discovery is not
+///     consulted, so a sibling checkout next to the running binary — quite
+///     possibly months stale — cannot take its place;
+///   * `pinned` records the version the checkout DECLARES rather than the
+///     `local:` spec, so the marker answers "which framework version is
+///     this, really" instead of restating the argument; and
+///   * the slot is marked `.explicit`, which is what lets the released
+///     `~/.labelle/bin/labelle-assembler` resolve through it. A discovered
+///     slot still activates only inside its own monorepo.
+fn installLocalFramework(
+    allocator: std.mem.Allocator,
+    package: []const u8,
+    spec: []const u8,
+    project_root: ?[]const u8,
+) !void {
+    // The canonical `local:` resolver, so a path typed here means exactly
+    // what the same path means in project.labelle: absolute as written,
+    // relative against --project-root (anchored at the main checkout when
+    // it escapes a worktree), else against the working directory.
+    const source = try cache.resolveFrameworkPackage(allocator, package, spec, project_root);
+    defer allocator.free(source);
+
+    // isDirectory, not dirExists: the latter only calls `access`, so a
+    // regular file passed and was then linked into the cache as though it
+    // were a checkout, failing far downstream (#704 review).
+    if (!cache.isDirectory(source)) {
+        std.log.err(
+            "labelle-assembler install: not a directory: '{s}' — " ++
+                "`local:` takes the path of a {s} checkout",
+            .{ source, cache.localSlots.frameworkDirName(package) },
+        );
+        return error.LocalSourceNotFound;
+    }
+
+    return populateExplicitLocal(allocator, package, source);
+}
+
+/// Honour an explicit `install <pkg> local:<path>` override for `package`,
+/// returning whether one is registered (in which case the caller must not
+/// fetch anything for this package).
+///
+/// Refreshing matters because of the Windows copy fallback. `symlinkToCache`
+/// links the checkout into the slot where it can — and a link needs nothing
+/// further, it tracks the source by construction — but `std.Io.Dir.symLink`
+/// needs SeCreateSymbolicLinkPrivilege on Windows, which an ordinary account
+/// does not hold, so the slot ends up a COPY. A copy is a snapshot: without
+/// this, the override would serve install-day sources forever while the user
+/// edited the checkout and wondered why nothing changed — the same class of
+/// baffling staleness #704 was filed about. Re-copying on every install is
+/// the price of the platform not linking.
+fn refreshExplicitLocalSlot(allocator: std.mem.Allocator, package: []const u8) !bool {
+    const source = try cache.localSlots.explicitFrameworkSource(allocator, package) orelse return false;
+    defer allocator.free(source);
+
+    const slot = try cache.localSlots.frameworkSlot(allocator, package);
+    defer allocator.free(slot);
+    if (cache.localSlots.slotTracksSource(slot)) return true;
+
+    try populateExplicitLocal(allocator, package, source);
+    return true;
+}
+
+/// Link (or, where the platform won't, copy) `source` into `package`'s
+/// reserved local slot and mark it an explicit override.
+///
+/// `pinned` records the version the checkout DECLARES, not the `local:` spec
+/// the user typed (#704 expectation C): the marker exists to answer "which
+/// framework version is this, really", and restating the argument answered
+/// nothing.
+fn populateExplicitLocal(allocator: std.mem.Allocator, package: []const u8, source: []const u8) !void {
+    const declared = cache.declaredZonVersion(allocator, source);
+    defer if (declared) |d| allocator.free(d);
+    const pinned = declared orelse "unknown";
+
+    std.log.warn(
+        "  {s}: LOCAL sources from '{s}' (declares {s}) will be built instead of any pinned release — " ++
+            "run 'labelle-assembler clean' to drop the override (#685)",
+        .{ package, source, pinned },
+    );
+    try cache.populateFrameworkPackage(allocator, package, pinned, source, .explicit);
 }
 
 // ── clean ────────────────────────────────────────────────────────────
@@ -594,6 +733,11 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !voi
         .{ .name = "gfx", .version = cfg.gfx_version },
     };
     for (framework) |pkg| {
+        // An explicit override owns the package outright: it must not be
+        // replaced by the pinned release the project asks for, and — where
+        // the platform copied instead of linking — it is the one thing here
+        // that goes stale, so it is refreshed rather than probed (#704).
+        if (try refreshExplicitLocalSlot(allocator, pkg.name)) continue;
         if (!try cache.isFrameworkCached(allocator, pkg.name, pkg.version)) {
             try fetchFrameworkWithFallback(allocator, pkg.name, pkg.version);
         }
@@ -649,7 +793,28 @@ pub fn ensureCache(allocator: std.mem.Allocator, cfg: config.ProjectConfig) !voi
 /// Fetch a framework package: symlink from the monorepo checkout when the
 /// assembler is running inside it, else shallow-clone from the repo.
 fn fetchFrameworkWithFallback(allocator: std.mem.Allocator, name: []const u8, version: []const u8) !void {
-    if (findRepoRoot(allocator)) |repo_root| {
+    // An explicit `local:` pin is a source path, never a git ref. Falling
+    // through to the fetcher with one built a release URL out of it and
+    // 404ed (#704 repro B); falling through to auto-discovery first would
+    // build the sibling checkout instead of the named one (repro C).
+    if (config.isLocalVersion(version)) return installLocalFramework(allocator, name, version, null);
+
+    // An explicit override OWNS the local slot, so auto-discovery must not
+    // populate over it (#704 review). Left unguarded, running `install core
+    // <version>` from inside the monorepo replaced the checkout the user
+    // registered with the sibling next door and rewrote the marker as
+    // `discovered` — defect C returning through another door, and a
+    // contradiction of the documented promise that only `clean` drops an
+    // override. The refresh keeps a copied slot (Windows) current while it
+    // is here.
+    const overridden = try refreshExplicitLocalSlot(allocator, name);
+    if (overridden) {
+        std.log.warn(
+            "  {s}: an explicit local override is active, so the pinned {s} will NOT be built — " ++
+                "caching it anyway; run 'labelle-assembler clean' to drop the override (#704)",
+            .{ name, version },
+        );
+    } else if (findRepoRoot(allocator)) |repo_root| {
         defer allocator.free(repo_root);
         const dir_name = cache.localSlots.frameworkDirName(name);
         const src = try std.fs.path.join(allocator, &.{ repo_root, dir_name });
@@ -659,7 +824,7 @@ fn fetchFrameworkWithFallback(allocator: std.mem.Allocator, name: []const u8, ve
                 "  {s}: using LOCAL sources from '{s}' — the pinned {s} will NOT be built (#685)",
                 .{ name, src, version },
             );
-            try cache.populateFrameworkPackage(allocator, name, version, src);
+            try cache.populateFrameworkPackage(allocator, name, version, src, .discovered);
             return;
         }
     }
@@ -991,7 +1156,7 @@ test "cleanLocalSlots: drops the local namespace, leaving version slots alone (#
     defer alloc.free(slot);
     try std.Io.Dir.cwd().deleteTree(io, slot);
     try std.Io.Dir.cwd().symLink(io, checkout, slot, .{ .is_directory = true });
-    try cache.localSlots.writeOrigin(alloc, slot, checkout, "0.4.0");
+    try cache.localSlots.writeOrigin(alloc, slot, checkout, "0.4.0", .discovered);
 
     const marker = try cache.localSlots.originPath(alloc, slot);
     defer alloc.free(marker);

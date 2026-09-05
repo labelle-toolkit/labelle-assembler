@@ -358,6 +358,23 @@ pub fn isFrameworkCached(allocator: std.mem.Allocator, package: []const u8, vers
     return @import("disk.zig").dirExists(path);
 }
 
+/// Whether the slot NAMED for `version` holds it, ignoring any active local
+/// slot.
+///
+/// The counterpart to `frameworkVersionPath`, and for the same reason
+/// (#704 review). `isFrameworkCached` asks "is this dependency satisfied",
+/// so an active local slot answers yes whatever version was requested —
+/// correct for a build, wrong for `install <version>`, whose contract is to
+/// put that release on disk. Under an override the latter reported every
+/// release already cached, fetched nothing, and left the user without the
+/// release once the override was dropped.
+pub fn isFrameworkVersionCached(allocator: std.mem.Allocator, package: []const u8, version: []const u8) !bool {
+    if (config.isLocalVersion(version)) return true;
+    const path = try frameworkVersionPath(allocator, package, version);
+    defer allocator.free(path);
+    return @import("disk.zig").dirExists(path);
+}
+
 /// Check if an assembler package version is cached.
 pub fn isAssemblerCached(allocator: std.mem.Allocator, assembler_version: []const u8) !bool {
     if (config.isLocalVersion(assembler_version)) return true;
@@ -552,7 +569,7 @@ test "resolveProjectRoot: main checkout (.git is a directory) returns project_di
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"project/.git");
+    try tmp.dir.createDirPath(std.testing.io, "project/.git");
     const project_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "project", alloc);
     defer alloc.free(project_abs);
 
@@ -571,8 +588,8 @@ test "resolveProjectRoot: worktree linkfile resolves to main checkout" {
     // Layout:
     //   tmp/main/.git/worktrees/wt
     //   tmp/wt/.git  (linkfile pointing back into main/.git/worktrees/wt)
-    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
-    try tmp.dir.createDirPath(std.testing.io,"wt");
+    try tmp.dir.createDirPath(std.testing.io, "main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io, "wt");
 
     const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
@@ -597,7 +614,7 @@ test "resolveProjectRoot: not a git repo returns project_dir unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"plain");
+    try tmp.dir.createDirPath(std.testing.io, "plain");
     const plain_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "plain", alloc);
     defer alloc.free(plain_abs);
 
@@ -622,9 +639,9 @@ test "resolveLocalPath: worktree-internal path (no `..` prefix) stays in the wor
     // Layout: main checkout has libs/foo/file with old content; worktree
     // has libs/foo/file with new content. resolveLocalPath called from
     // the worktree must return the worktree's libs/foo, not main's.
-    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
-    try tmp.dir.createDirPath(std.testing.io,"main/libs/foo");
-    try tmp.dir.createDirPath(std.testing.io,"wt/libs/foo");
+    try tmp.dir.createDirPath(std.testing.io, "main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io, "main/libs/foo");
+    try tmp.dir.createDirPath(std.testing.io, "wt/libs/foo");
 
     const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
@@ -655,9 +672,9 @@ test "resolveLocalPath: escaping path (starts with `..`) anchors at main checkou
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
-    try tmp.dir.createDirPath(std.testing.io,"sibling");
-    try tmp.dir.createDirPath(std.testing.io,"wt");
+    try tmp.dir.createDirPath(std.testing.io, "main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io, "sibling");
+    try tmp.dir.createDirPath(std.testing.io, "wt");
 
     const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
@@ -684,9 +701,9 @@ test "toMainCheckoutPath: worktree path inside project_dir maps to main checkout
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
-    try tmp.dir.createDirPath(std.testing.io,"main/libs/foo");
-    try tmp.dir.createDirPath(std.testing.io,"wt/libs/foo");
+    try tmp.dir.createDirPath(std.testing.io, "main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io, "main/libs/foo");
+    try tmp.dir.createDirPath(std.testing.io, "wt/libs/foo");
 
     const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
@@ -719,9 +736,9 @@ test "toMainCheckoutPath: path outside project_dir is returned unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
-    try tmp.dir.createDirPath(std.testing.io,"sibling");
-    try tmp.dir.createDirPath(std.testing.io,"wt");
+    try tmp.dir.createDirPath(std.testing.io, "main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io, "sibling");
+    try tmp.dir.createDirPath(std.testing.io, "wt");
 
     const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
@@ -748,8 +765,8 @@ test "toMainCheckoutPath: not in a worktree returns path unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"main/.git");
-    try tmp.dir.createDirPath(std.testing.io,"main/libs/foo");
+    try tmp.dir.createDirPath(std.testing.io, "main/.git");
+    try tmp.dir.createDirPath(std.testing.io, "main/libs/foo");
 
     const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
@@ -880,8 +897,8 @@ test "resolveProjectRoot: submodule .git linkfile returns project_dir unchanged"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"super/.git/modules/sub");
-    try tmp.dir.createDirPath(std.testing.io,"super/sub");
+    try tmp.dir.createDirPath(std.testing.io, "super/.git/modules/sub");
+    try tmp.dir.createDirPath(std.testing.io, "super/sub");
 
     const super_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "super", alloc);
     defer alloc.free(super_abs);
@@ -909,8 +926,8 @@ test "resolveProjectRoot: relative gitdir is resolved against project_dir" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
-    try tmp.dir.createDirPath(std.testing.io,"main/wt");
+    try tmp.dir.createDirPath(std.testing.io, "main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io, "main/wt");
 
     const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
@@ -935,8 +952,8 @@ test "resolveProjectRoot: linkfile with extra keys (commondir) parses first line
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"main/.git/worktrees/wt");
-    try tmp.dir.createDirPath(std.testing.io,"wt");
+    try tmp.dir.createDirPath(std.testing.io, "main/.git/worktrees/wt");
+    try tmp.dir.createDirPath(std.testing.io, "wt");
 
     const main_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "main", alloc);
     defer alloc.free(main_abs);
@@ -965,7 +982,7 @@ test "resolveProjectRoot: malformed linkfile returns project_dir unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io,"wt");
+    try tmp.dir.createDirPath(std.testing.io, "wt");
     const wt_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "wt", alloc);
     defer alloc.free(wt_abs);
 

@@ -12,6 +12,33 @@ const env = @import("env.zig");
 const local = @import("local.zig");
 const resolve = @import("resolve.zig");
 
+/// Write a slot's provenance, dropping the slot if that write fails.
+///
+/// A slot whose marker does not describe it is worse than no slot at all
+/// (#704 review). `symlinkToCache` may just have repointed an EXISTING slot
+/// at a new source, and the marker is what every reader trusts — an
+/// explicit one without even a source comparison. A failed write would
+/// leave the slot serving source B while the retained marker still named
+/// source A, and a link-backed slot (which already "tracks its source")
+/// never gets refreshed, so the two would never reconcile.
+///
+/// `deleteTree` removes a symlink rather than recursing through it, so the
+/// user's checkout is not touched.
+fn writeOriginOrDropSlot(
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    source_dir: []const u8,
+    version: []const u8,
+    mode: local.Origin.Mode,
+) !void {
+    local.writeOrigin(allocator, target, source_dir, version, mode) catch |err| {
+        std.Io.Dir.cwd().deleteTree(config.globalIo(), target) catch |del_err| {
+            std.log.warn("labelle: could not drop the unmarked cache slot '{s}': {any}", .{ target, del_err });
+        };
+        return err;
+    };
+}
+
 /// Populate the assembler cache from the assembler source directory.
 /// `companion_dir` points at the labelle-assembler repo root (for dev) or
 /// an install-time bundled directory. Symlinks `backends/` into
@@ -60,19 +87,30 @@ pub fn populateAssemblerCache(allocator: std.mem.Allocator, assembler_version: [
         };
     }
 
-    try local.writeOrigin(allocator, target, companion_dir, assembler_version);
+    try writeOriginOrDropSlot(allocator, target, companion_dir, assembler_version, .discovered);
 }
 
 /// Populate a framework package (core, engine, gfx) into the cache from a source directory.
 /// Creates a symlink from the cache location to the source directory.
-pub fn populateFrameworkPackage(allocator: std.mem.Allocator, package: []const u8, version: []const u8, source_dir: []const u8) !void {
+///
+/// `mode` says whether the caller found these sources by walking up from the
+/// running binary (`.discovered`) or was handed the path by the user
+/// (`.explicit`, i.e. `install <pkg> local:<path>`). It decides which
+/// assemblers may later resolve through the slot — see `local.Origin.Mode`.
+pub fn populateFrameworkPackage(
+    allocator: std.mem.Allocator,
+    package: []const u8,
+    version: []const u8,
+    source_dir: []const u8,
+    mode: local.Origin.Mode,
+) !void {
     // #685: `version` no longer names the slot — it is recorded in the
     // provenance marker so diagnostics can say which pin this local source
     // was installed *for* without pretending the slot holds that release.
     const target = try local.frameworkSlot(allocator, package);
     defer allocator.free(target);
     try symlinkToCache(allocator, source_dir, target);
-    try local.writeOrigin(allocator, target, source_dir, version);
+    try writeOriginOrDropSlot(allocator, target, source_dir, version, mode);
 }
 
 /// Populate a plugin into the cache from a source directory.
@@ -82,7 +120,7 @@ pub fn populatePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, so
     const target = try local.pluginSlot(allocator, plugin);
     defer allocator.free(target);
     try symlinkToCache(allocator, source_dir, target);
-    try local.writeOrigin(allocator, target, source_dir, plugin.version);
+    try writeOriginOrDropSlot(allocator, target, source_dir, plugin.version, .discovered);
 }
 
 /// Create a symlink from cache target to source directory.
@@ -102,12 +140,18 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
     const abs_source = try allocator.dupe(u8, abs_source_z);
     defer allocator.free(abs_source);
 
-    // Ensure parent directory exists
+    // Ensure the parent directory exists — but only create it when it does
+    // NOT, because on Windows `createDirPath` on a path that is already a
+    // filesystem root (`C:\`) fails with `error.BadPathName` instead of
+    // succeeding as a no-op. Any target whose parent is a drive root then
+    // aborted population outright (#704 repro A).
     if (std.fs.path.dirname(target)) |parent| {
-        cwd.createDirPath(io, parent) catch |err| {
-            std.log.err("labelle: could not create cache directory '{s}': {any}", .{ parent, err });
-            return error.CachePopulationFailed;
-        };
+        if (!local.pathExists(parent)) {
+            cwd.createDirPath(io, parent) catch |err| {
+                std.log.err("labelle: could not create cache directory '{s}': {any}", .{ parent, err });
+                return error.CachePopulationFailed;
+            };
+        }
     }
 
     // Create symlink (absolute target → source), fall back to copy on failure
@@ -299,7 +343,7 @@ fn withinPackagesDir(allocator: std.mem.Allocator, path: []const u8) bool {
 /// round 5): a manifest carrying a commented-out `.version` above the real
 /// field would otherwise report the commented value, and the caller DELETES
 /// a directory on a mismatch.
-fn declaredZonVersion(allocator: std.mem.Allocator, dir: []const u8) ?[]const u8 {
+pub fn declaredZonVersion(allocator: std.mem.Allocator, dir: []const u8) ?[]const u8 {
     const zon_path = std.fs.path.join(allocator, &.{ dir, "build.zig.zon" }) catch return null;
     defer allocator.free(zon_path);
 
@@ -449,6 +493,18 @@ fn purgeLegacyPluginSlot(allocator: std.mem.Allocator, packages_dir: []const u8,
 pub fn dirExists(path: []const u8) bool {
     std.Io.Dir.cwd().access(config.globalIo(), path, .{}) catch return false;
     return true;
+}
+
+/// Whether `path` is a directory, following symlinks.
+///
+/// Stricter than `dirExists`, which only calls `access` and so says yes to
+/// any reachable path — a regular file included (#704 review). A `local:`
+/// source that is a plain file would otherwise be symlinked into the cache
+/// as though it were a checkout, pass the cache probes, and fail much later
+/// when something tried to read `build.zig.zon` out of it.
+pub fn isDirectory(path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(config.globalIo(), path, .{}) catch return false;
+    return stat.kind == .directory;
 }
 
 /// Check if a path is a symlink.
@@ -643,7 +699,7 @@ test "populateFrameworkPackage: local sources never occupy the pinned version sl
     const saved_environ = setTestCacheHome(&envp);
     defer testing.environ = saved_environ;
 
-    try populateFrameworkPackage(alloc, "gfx", "1.29.0", src);
+    try populateFrameworkPackage(alloc, "gfx", "1.29.0", src, .discovered);
 
     // The invariant: the slot named for a version was not touched.
     const version_slot = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
@@ -701,7 +757,7 @@ test "resolveFrameworkPackage: a pinned version resolves to the release, not the
     const saved_environ = setTestCacheHome(&envp);
     defer testing.environ = saved_environ;
 
-    try populateFrameworkPackage(alloc, "gfx", "1.29.0", src);
+    try populateFrameworkPackage(alloc, "gfx", "1.29.0", src, .discovered);
 
     {
         // A released binary: the pin means the release.
@@ -801,7 +857,7 @@ test "frameworkVersionPath / pluginVersionPath: remote fetch targets ignore an a
     const saved_environ = setTestCacheHome(&envp);
     defer testing.environ = saved_environ;
 
-    try populateFrameworkPackage(alloc, "gfx", "1.29.0", src);
+    try populateFrameworkPackage(alloc, "gfx", "1.29.0", src, .discovered);
 
     local.setProbeStartForTesting(bin);
     defer local.setProbeStartForTesting(null);
@@ -900,7 +956,7 @@ test "symlinkToCache: a stale COPIED slot is dropped and repopulated (#688 revie
     try writeVersionStamp(slot, "1.29.0");
     try testing.expect(!local.isSymlinkPath(slot));
 
-    try populateFrameworkPackage(alloc, "gfx", "1.31.0", src);
+    try populateFrameworkPackage(alloc, "gfx", "1.31.0", src, .discovered);
 
     // Refreshed: it tracks the source again, and serves current sources.
     try testing.expect(local.isSymlinkPath(slot));
