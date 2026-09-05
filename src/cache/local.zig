@@ -275,9 +275,19 @@ pub fn pluginDirName(allocator: std.mem.Allocator, name: []const u8) ![]const u8
     return std.fmt.allocPrint(allocator, "labelle-{s}", .{name});
 }
 
-/// The local slot for a framework package, when it should be used: it is
-/// populated, and it was populated from the very checkout this assembler is
-/// running out of. Caller owns the returned path.
+/// The local slot for a framework package, when it should be used. Caller
+/// owns the returned path.
+///
+/// Two ways a slot qualifies, and they are not interchangeable — a caller
+/// must NOT assume the result is tied to the running assembler's own
+/// checkout (#704 review):
+///
+///   * a DISCOVERED slot, only when it was populated from the very checkout
+///     this assembler runs out of; and
+///   * an EXPLICIT slot — `install <pkg> local:<path>` — wherever this
+///     assembler runs, and whatever path it names.
+///
+/// Either way the source must still exist. See `Origin.Mode`.
 pub fn activeFrameworkSlot(allocator: std.mem.Allocator, package: []const u8) !?[]const u8 {
     const expected = try discoveredSource(allocator, frameworkDirName(package));
     defer if (expected) |e| allocator.free(e);
@@ -1640,4 +1650,137 @@ test "explicitFrameworkSource: names the checkout for an explicit slot only (#70
     defer alloc.free(marker);
     try std.Io.Dir.cwd().deleteTree(std.testing.io, marker);
     try std.testing.expect(try explicitFrameworkSource(alloc, "gfx") == null);
+}
+
+test "populateFrameworkPackage: a failed marker write drops the slot rather than leaving it unmarked (#704 review)" {
+    // `symlinkToCache` may have just REPOINTED an existing slot at a new
+    // source. If the marker write then fails, the slot serves source B
+    // while the retained marker still names source A — and an explicit
+    // marker is trusted without a source comparison, so nothing would ever
+    // catch it. A link-backed slot is never refreshed either, so the two
+    // would never reconcile. No slot at all is the honest outcome.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/local");
+    try tmp.dir.createDirPath(std.testing.io, "checkout-a");
+    try tmp.dir.createDirPath(std.testing.io, "checkout-b");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src_a = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout-a", alloc);
+    defer alloc.free(src_a);
+    const src_b = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout-b", alloc);
+    defer alloc.free(src_b);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer std.testing.environ = saved_environ;
+
+    const disk = @import("disk.zig");
+    const slot = try frameworkSlot(alloc, "gfx");
+    defer alloc.free(slot);
+
+    // A good explicit slot on checkout A.
+    try disk.populateFrameworkPackage(alloc, "gfx", "1.30.0", src_a, .explicit);
+    try std.testing.expect(pathExists(slot));
+
+    // Now block the marker path and repopulate from checkout B.
+    const marker = try originPath(alloc, slot);
+    defer alloc.free(marker);
+    try std.Io.Dir.cwd().deleteTree(config.globalIo(), marker);
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), marker);
+
+    try std.testing.expectError(
+        error.CachePopulationFailed,
+        disk.populateFrameworkPackage(alloc, "gfx", "1.30.0", src_b, .explicit),
+    );
+
+    // The slot is gone, so nothing resolves through unmatched provenance...
+    try std.testing.expect(!pathExists(slot));
+    try std.testing.expect(try activeFrameworkSlot(alloc, "gfx") == null);
+    // ...and both checkouts are untouched (deleteTree drops a symlink, it
+    // does not recurse through it).
+    try std.testing.expect(pathExists(src_a));
+    try std.testing.expect(pathExists(src_b));
+}
+
+test "isDirectory: a regular file is not a checkout, however accessible (#704 review)" {
+    // `dirExists` only calls `access`, so it says yes to a plain file. That
+    // file used to be linked into the cache as a framework package.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    _ = alloc;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "a-dir");
+    const file = try tmp.dir.createFile(std.testing.io, "a-file", .{});
+    file.close(std.testing.io);
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = dir_buf[0..try tmp.dir.realPathFile(std.testing.io, "a-dir", &dir_buf)];
+    const file_path = file_buf[0..try tmp.dir.realPathFile(std.testing.io, "a-file", &file_buf)];
+
+    const disk = @import("disk.zig");
+    try std.testing.expect(disk.dirExists(dir_path));
+    try std.testing.expect(disk.isDirectory(dir_path));
+
+    // The discriminating case.
+    try std.testing.expect(disk.dirExists(file_path));
+    try std.testing.expect(!disk.isDirectory(file_path));
+
+    try std.testing.expect(!disk.isDirectory("/no/such/path/at/all"));
+}
+
+test "isFrameworkVersionCached: an active override does not make every release cached (#704 review)" {
+    // `isFrameworkCached` answers "is this dependency satisfied", so an
+    // active local slot says yes whatever version is asked for. Right for a
+    // build; wrong for `install <version>`, which reported every release
+    // already cached and fetched nothing.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/local");
+    try tmp.dir.createDirPath(std.testing.io, "checkout");
+    try tmp.dir.createDirPath(std.testing.io, "elsewhere/bin");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout", alloc);
+    defer alloc.free(src);
+    const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "elsewhere/bin", alloc);
+    defer alloc.free(bin);
+
+    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
+    defer alloc.free(home_env);
+    const envp = [_:null]?[*:0]const u8{home_env.ptr};
+    const saved_environ = setTestCacheHome(&envp);
+    defer std.testing.environ = saved_environ;
+
+    setProbeStartForTesting(bin);
+    defer setProbeStartForTesting(null);
+
+    const slot = try frameworkSlot(alloc, "gfx");
+    defer alloc.free(slot);
+    try std.Io.Dir.cwd().symLink(std.testing.io, src, slot, .{ .is_directory = true });
+    try writeOrigin(alloc, slot, src, "1.34.0", .explicit);
+
+    const resolve = @import("resolve.zig");
+    // The build probe is satisfied by the override...
+    try std.testing.expect(try resolve.isFrameworkCached(alloc, "gfx", "1.29.0"));
+    // ...but the release itself is still not on disk.
+    try std.testing.expect(!try resolve.isFrameworkVersionCached(alloc, "gfx", "1.29.0"));
+
+    const version_slot = try resolve.frameworkVersionPath(alloc, "gfx", "1.29.0");
+    defer alloc.free(version_slot);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, version_slot);
+    try std.testing.expect(try resolve.isFrameworkVersionCached(alloc, "gfx", "1.29.0"));
 }

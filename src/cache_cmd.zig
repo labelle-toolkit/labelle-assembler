@@ -154,7 +154,11 @@ pub fn cmdInstall(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
                 std.log.err("labelle-assembler install: could not repair the cache slot for {s} {s}: {s}", .{ pkg, version, @errorName(err) });
                 std.process.exit(1);
             };
-            if (!try cache.isFrameworkCached(allocator, pkg, version)) {
+            // The VERSION-named slot, not the build resolver (#704 review):
+            // this form is asked to put a release on disk, and an active
+            // local override made the resolver answer yes for every
+            // version, so nothing was fetched.
+            if (!try cache.isFrameworkVersionCached(allocator, pkg, version)) {
                 fetchFrameworkWithFallback(allocator, pkg, version) catch |err| {
                     std.log.err("labelle-assembler install: failed to fetch {s} {s}: {s}", .{ pkg, version, @errorName(err) });
                     std.process.exit(1);
@@ -243,9 +247,12 @@ fn installLocalFramework(
     const source = try cache.resolveFrameworkPackage(allocator, package, spec, project_root);
     defer allocator.free(source);
 
-    if (!cache.dirExists(source)) {
+    // isDirectory, not dirExists: the latter only calls `access`, so a
+    // regular file passed and was then linked into the cache as though it
+    // were a checkout, failing far downstream (#704 review).
+    if (!cache.isDirectory(source)) {
         std.log.err(
-            "labelle-assembler install: no such directory '{s}' — " ++
+            "labelle-assembler install: not a directory: '{s}' — " ++
                 "`local:` takes the path of a {s} checkout",
             .{ source, cache.localSlots.frameworkDirName(package) },
         );
@@ -792,7 +799,22 @@ fn fetchFrameworkWithFallback(allocator: std.mem.Allocator, name: []const u8, ve
     // build the sibling checkout instead of the named one (repro C).
     if (config.isLocalVersion(version)) return installLocalFramework(allocator, name, version, null);
 
-    if (findRepoRoot(allocator)) |repo_root| {
+    // An explicit override OWNS the local slot, so auto-discovery must not
+    // populate over it (#704 review). Left unguarded, running `install core
+    // <version>` from inside the monorepo replaced the checkout the user
+    // registered with the sibling next door and rewrote the marker as
+    // `discovered` — defect C returning through another door, and a
+    // contradiction of the documented promise that only `clean` drops an
+    // override. The refresh keeps a copied slot (Windows) current while it
+    // is here.
+    const overridden = try refreshExplicitLocalSlot(allocator, name);
+    if (overridden) {
+        std.log.warn(
+            "  {s}: an explicit local override is active, so the pinned {s} will NOT be built — " ++
+                "caching it anyway; run 'labelle-assembler clean' to drop the override (#704)",
+            .{ name, version },
+        );
+    } else if (findRepoRoot(allocator)) |repo_root| {
         defer allocator.free(repo_root);
         const dir_name = cache.localSlots.frameworkDirName(name);
         const src = try std.fs.path.join(allocator, &.{ repo_root, dir_name });

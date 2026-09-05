@@ -47,6 +47,7 @@ pub const resolveGuiPackage = resolve.resolveGuiPackage;
 pub const resolveGuiUrl = resolve.resolveGuiUrl;
 pub const toMainCheckoutPath = resolve.toMainCheckoutPath;
 pub const isFrameworkCached = resolve.isFrameworkCached;
+pub const isFrameworkVersionCached = resolve.isFrameworkVersionCached;
 pub const isAssemblerCached = resolve.isAssemblerCached;
 pub const isPluginCached = resolve.isPluginCached;
 pub const validateCache = resolve.validateCache;
@@ -62,6 +63,7 @@ pub const copyDirRecursive = disk.copyDirRecursive;
 pub const purgeLegacyLocalSlot = disk.purgeLegacyLocalSlot;
 pub const purgeLegacyLocalSlots = disk.purgeLegacyLocalSlots;
 pub const declaredZonVersion = disk.declaredZonVersion;
+pub const isDirectory = disk.isDirectory;
 
 // ── locally-sourced slots (#685) ─────────────────────────────────────
 pub const localSlots = local_slots;
