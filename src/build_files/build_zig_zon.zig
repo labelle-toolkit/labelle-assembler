@@ -12,7 +12,7 @@ const backend_registry = @import("../backend_registry.zig");
 const manifest_splice = @import("../codegen/manifest_splice.zig");
 const manifest_v2 = @import("../codegen/manifest_v2.zig");
 const manifest_v2_splice = @import("../codegen/manifest_v2_splice.zig");
-const escapeZonString = @import("../zon_escape.zig").escapeZonString;
+const zonPath = @import("../zon_escape.zig").zonPath;
 pub const deps_linker = @import("../deps_linker.zig");
 
 const ProjectConfig = config.ProjectConfig;
@@ -320,19 +320,17 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
 /// If from_dir is null, uses `to_path` as-is (absolute).
 /// Both must be absolute paths when from_dir is provided. Returns an allocator-owned string.
 ///
-/// Two things happen on the way out, both of which only matter on Windows
-/// (#708), which is why CI on Linux and macOS could never have caught them:
+/// `zonPath` does two things on the way out, both of which only matter on
+/// Windows (#708) — which is why CI on Linux and macOS could never have
+/// caught them: it normalises the host separator to the `/` the deps-linked
+/// emitter above hardcodes, so the same project yields the same manifest on
+/// every host, and it escapes the result, because a backslash is both the
+/// Windows separator and the escape character in a Zig string literal
+/// (`..\deps\x` read back as `error: invalid escape character: 'd'`).
 ///
-///   * separators are normalised to `/`. `std.fs.path.relative` yields `\`
-///     there, while the primary (deps-linked) emitter above hardcodes `/` —
-///     so without this the same project produced different manifests on
-///     different hosts. Zig's build system takes `/` on every platform.
-///   * the result is ZON-escaped. A backslash is both the Windows separator
-///     and the escape character in a Zig string literal, so `..\deps\x` read
-///     back as `error: invalid escape character: 'd'`. Normalising already
-///     removes the separators, but escaping is what makes the emitter
-///     correct rather than merely lucky: a `"` or a literal `\` is legal in
-///     a POSIX filename and would break the literal just the same.
+/// Only the HOST separator is rewritten: a backslash is ordinary filename
+/// data on POSIX and must survive escaped rather than be translated into a
+/// different path (#708 review).
 fn relativePath(allocator: std.mem.Allocator, from_dir: ?[]const u8, to_path: []const u8) ![]const u8 {
     const raw = if (from_dir == null)
         try allocator.dupe(u8, to_path)
@@ -340,6 +338,5 @@ fn relativePath(allocator: std.mem.Allocator, from_dir: ?[]const u8, to_path: []
         try std.fs.path.relative(allocator, "", null, from_dir.?, to_path);
     defer allocator.free(raw);
 
-    std.mem.replaceScalar(u8, raw, '\\', '/');
-    return escapeZonString(allocator, raw);
+    return zonPath(allocator, raw);
 }
