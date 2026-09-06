@@ -219,10 +219,16 @@ const StagedTranspileProject = struct {
                 const rel_win = try allocator.dupe(u8, e.rel);
                 defer allocator.free(rel_win);
                 std.mem.replaceScalar(u8, rel_win, '/', '\\');
+                // A failed emit must FAIL the stub. Batch does not stop on
+                // error, so without the `||` an unwritable outDir reached the
+                // final `exit /b 0` and the assembler reported a successful
+                // transpile that produced nothing — the same misleading shape
+                // the PowerShell cut had (#699 review). Exit 5 is outside the
+                // real tsc's codes, so it reads as a fixture fault.
                 if (std.fs.path.dirnameWindows(rel_win)) |rel_dir| {
-                    try w.print("mkdir \"%OUT%\\{s}\" 2>nul\r\n", .{rel_dir});
+                    try w.print("if not exist \"%OUT%\\{s}\\\" mkdir \"%OUT%\\{s}\" || exit /b 5\r\n", .{ rel_dir, rel_dir });
                 }
-                try w.print("copy /y \"{s}\\fake-tsc.emit{d}\" \"%OUT%\\{s}\" >nul\r\n", .{ dir_abs, i, rel_win });
+                try w.print("copy /y \"{s}\\fake-tsc.emit{d}\" \"%OUT%\\{s}\" >nul || exit /b 5\r\n", .{ dir_abs, i, rel_win });
                 try w.print(":emit_skip_{d}\r\n", .{i});
             }
             try w.writeAll("exit /b 0\r\n");
@@ -287,10 +293,14 @@ const StagedTranspileProject = struct {
         const w = &body_aw.writer;
         if (windows) {
             try w.writeAll("@echo off\r\n");
+            try w.writeAll("setlocal enabledelayedexpansion\r\n");
             try w.print("break > \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
             try w.writeAll(":labelle_loop\r\n");
             try w.writeAll("if \"%~1\"==\"\" goto labelle_done\r\n");
-            try w.print("echo %~1>> \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
+            // Captured in quotes, echoed via delayed expansion: a `&`, `(`
+            // or `|` in the path must be recorded, not parsed (#699 review).
+            try w.writeAll("set \"ARG=%~1\"\r\n");
+            try w.print("echo(!ARG!>> \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
             try w.writeAll("shift\r\n");
             try w.writeAll("goto labelle_loop\r\n");
             try w.writeAll(":labelle_done\r\n");

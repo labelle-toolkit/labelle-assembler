@@ -292,12 +292,20 @@ const StagedProject = struct {
 
         if (windows) {
             try w.writeAll("@echo off\r\n");
+            try w.writeAll("setlocal enabledelayedexpansion\r\n");
             if (record_args) {
                 // Batch has no `printf "%s\n" "$@"`; walk argv with shift.
+                //
+                // Each argument is captured into a variable inside quotes
+                // and echoed through DELAYED expansion. Expanding `%~1`
+                // directly on the `echo` line would let a `&`, `(` or `|` in
+                // the path be parsed as batch syntax, truncating or
+                // corrupting what gets recorded (#699 review).
                 try w.print("break > \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
                 try w.writeAll(":labelle_loop\r\n");
                 try w.writeAll("if \"%~1\"==\"\" goto labelle_done\r\n");
-                try w.print("echo %~1>> \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
+                try w.writeAll("set \"ARG=%~1\"\r\n");
+                try w.print("echo(!ARG!>> \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
                 try w.writeAll("shift\r\n");
                 try w.writeAll("goto labelle_loop\r\n");
                 try w.writeAll(":labelle_done\r\n");
