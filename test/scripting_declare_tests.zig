@@ -286,9 +286,9 @@ const StagedProject = struct {
             try allocator.dupe(u8, name);
         defer allocator.free(script_name);
 
-        var body: std.ArrayList(u8) = .empty;
-        defer body.deinit(allocator);
-        const w = body.writer(allocator);
+        var body_aw = std.Io.Writer.Allocating.init(allocator);
+        defer body_aw.deinit();
+        const w = &body_aw.writer;
 
         if (windows) {
             try w.writeAll("@echo off\r\n");
@@ -317,7 +317,7 @@ const StagedProject = struct {
 
         var f = try self.tmp.dir.createFile(io, script_name, .{ .permissions = .executable_file });
         defer f.close(io);
-        try f.writeStreamingAll(io, body.items);
+        try f.writeStreamingAll(io, body_aw.written());
 
         return self.tmp.dir.realPathFileAlloc(io, script_name, allocator);
     }
