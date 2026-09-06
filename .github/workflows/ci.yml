@@ -1169,13 +1169,17 @@ jobs:
     name: Assembler test suite (Windows)
     runs-on: windows-latest
     # Was 25, sized for `zig build test-cache` (9 build steps). The full
-    # suite is 77 steps and compiles every test binary from cold on a CI
-    # runner, so the cap has to cover a cold build of the whole tree plus
-    # the run. Kept well clear of the observed time rather than trimmed to
-    # it: a cap that fires on ordinary runner variance is a flaky gate, not
-    # a safety net — the same lesson the `build-and-test` cap comment above
-    # records from PR #664.
-    timeout-minutes: 60
+    # suite is 77 steps and compiles every test binary from cold on the
+    # runner.
+    #
+    # MEASURED, not guessed: the first green run of this job on
+    # windows-latest took 6m17s end to end (the narrow job was ~2-3m). 30
+    # leaves ~5x headroom, matching the ratio `build-and-test` settled on
+    # (cap 20, ~6m30s green run) after PR #664 — where a cap trimmed close
+    # to the observed time fired on ordinary runner variance twice in a
+    # row, cancelling a job whose every real step had already passed. A cap
+    # exists to catch a hang, not to police normal spread.
+    timeout-minutes: 30
 
     defaults:
       run:
