@@ -61,6 +61,7 @@ const tilemap_phase = @import("root/tilemap_phase.zig");
 test {
     _ = @import("config.zig");
     _ = @import("zon_escape.zig");
+    _ = @import("junction.zig");
     _ = @import("plugin_manifest.zig");
     _ = @import("plugin_build_hook.zig");
     _ = @import("plugin_build_steps.zig");
