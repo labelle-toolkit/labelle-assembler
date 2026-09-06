@@ -125,10 +125,65 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # HTTPS + a tag pin authenticate the *host*, not the asset bytes, and
+      # GitHub release assets are mutable: an asset can be deleted and
+      # re-uploaded under the same name on an existing tag. Publishing a
+      # SHA256SUMS manifest alongside the binaries gives consumers something
+      # to verify a `curl`ed binary against before they `chmod +x` and run it.
+      # (Same-release manifest, so this hardens against asset replacement, not
+      # against a full repo compromise — that needs signing, e.g. minisign or
+      # cosign, which can layer on top later.)
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: |
+          # `merge-multiple: true` above flattens every matrix artifact into
+          # artifacts/, so the five binaries sit here as bare files.
+          #
+          # Checksum them by BARE FILENAME (cd into artifacts/, glob only the
+          # binaries) so the manifest reads:
+          #
+          #   <sha256>  labelle-assembler-linux-x86_64
+          #
+          # That is the plain coreutils/`shasum` format, which means a consumer
+          # that downloaded ONE binary into its cwd can verify with no path
+          # rewriting:
+          #
+          #   grep ' labelle-assembler-linux-x86_64$' SHA256SUMS | shasum -a 256 -c -
+          #
+          # A manifest keyed on paths (artifacts/..., or absolute) would force
+          # every consumer to sed the prefix off first. The glob is
+          # `labelle-assembler-*` rather than `*` so the manifest never tries
+          # to checksum itself.
+          shasum -a 256 labelle-assembler-* > SHA256SUMS
+          cat SHA256SUMS
+
+          # Guard the published contract, so a broken manifest fails the
+          # release run instead of shipping:
+          #
+          # 1. Exactly the five binaries, no more, no fewer — a matrix leg
+          #    that silently stopped producing an artifact must not yield a
+          #    quietly short manifest.
+          test "$(wc -l < SHA256SUMS)" -eq 5
+          # 2. Every line is `<64 hex>  <bare filename>` — TEXT mode, two
+          #    spaces. `shasum` picks its default mode from the platform and
+          #    emits ` *name` (binary mode) on Windows hosts; on the
+          #    ubuntu-latest runner it is text mode. Assert it rather than
+          #    trust it, because the two-space form is what the documented
+          #    consumer `grep` above matches.
+          if grep -qvE '^[0-9a-f]{64}  labelle-assembler-[a-z0-9_]+-[a-z0-9_]+$' SHA256SUMS; then
+            echo "::error::SHA256SUMS is not in plain two-space text format"
+            exit 1
+          fi
+          # 3. It is a file plain `shasum -c` / `sha256sum -c` accepts.
+          shasum -a 256 -c SHA256SUMS
+          sha256sum -c SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          # Six assets now: the five per-platform binaries plus the
+          # SHA256SUMS manifest the step above wrote into artifacts/.
           files: artifacts/*
           # On `push: tags:` this is implicit; on workflow_dispatch we must
           # pass the tag so assets land on the correct release.
