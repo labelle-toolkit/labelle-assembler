@@ -350,6 +350,12 @@ pub fn isFrameworkCached(allocator: std.mem.Allocator, package: []const u8, vers
     // stale snapshot and must be repopulated (#688 review).
     if (try local.activeFrameworkSlot(allocator, package)) |slot| {
         defer allocator.free(slot);
+        // A pre-#696 unkeyed slot serves the right sources but sits at the
+        // name the explicit override now owns. Reporting it stale is what
+        // gets `ensureCache` to repopulate, which migrates it to the keyed
+        // name (#696 review, codex) — the same lever the copied-slot case
+        // pulls below.
+        if (local.isLegacyUnkeyedFrameworkSlot(allocator, package, slot)) return false;
         return local.slotTracksSource(slot);
     }
 
