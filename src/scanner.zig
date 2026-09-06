@@ -1,6 +1,7 @@
 /// File scanning and directory copy utilities for the labelle-cli generator.
 const std = @import("std");
 const config = @import("config.zig");
+const junction = @import("junction.zig");
 
 pub fn freeNames(allocator: std.mem.Allocator, names: []const []const u8) void {
     for (names) |n| allocator.free(n);
@@ -390,13 +391,30 @@ pub fn linkDirAbs(
     }
 
     cwd.symLink(io, relative_target, dst_path, .{ .is_directory = true }) catch |err| {
-        // Windows needs admin / Developer Mode for symlinks — fall back
-        // to a copy-based layout, mirroring cache/disk.zig's fallback.
-        if (err == error.AccessDenied or err == error.PermissionDenied) {
+        if (err != error.AccessDenied and err != error.PermissionDenied) return err;
+
+        // Windows without SeCreateSymbolicLinkPrivilege, which an ordinary
+        // account does not hold (#710). A JUNCTION needs no privilege, and
+        // unlike the copy below it is a live view — which is the entire
+        // point of these links: `.labelle/<target>/scripts` exists so a
+        // source edit reaches the staged tree without re-generating.
+        //
+        // The trade is deliberate. A junction stores an NT path and has no
+        // relative form, so it does NOT survive moving the project the way
+        // the relative symlink above does. That is the lesser loss:
+        //
+        //   * a copy does not track edits at all, so it defeats the link's
+        //     primary purpose on every build, not just after a move; and
+        //   * a moved project breaks the junction LOUDLY — an unresolvable
+        //     path — and the next `generate` recreates it, whereas a stale
+        //     copy silently serves yesterday's source.
+        //
+        // POSIX, and Windows with Developer Mode, never reach this: they
+        // keep the relative symlink. The copy remains as the last resort
+        // for anything that can express neither.
+        junction.create(allocator, src_path, dst_path) catch {
             try copyDirRecursiveAbs(allocator, src_path, dst_path);
-            return;
-        }
-        return err;
+        };
     };
 }
 

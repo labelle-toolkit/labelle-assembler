@@ -157,13 +157,24 @@ pub fn create(allocator: std.mem.Allocator, target: []const u8, link: []const u8
 
     // SubstituteName is the NT form the filesystem resolves; PrintName is
     // the Win32 form tools display.
-    const subst = std.fmt.allocPrint(allocator, "\\??\\{s}", .{target}) catch return error.JunctionFailed;
+    //
+    // Separators are normalised to `\` first. An NT path accepts ONLY
+    // backslashes, and a caller can legitimately hand us a mixed path —
+    // `std.fs.path.join(base, "nested/deep")` yields
+    // `C:\...\base\nested/deep` on Windows. Left as-is that produced a
+    // reparse point the filesystem rejected with `error.BadPathName` on
+    // every read through it (#699: `scanner.linkDir` with a nested folder).
+    const win_target = allocator.dupe(u8, target) catch return error.JunctionFailed;
+    defer allocator.free(win_target);
+    std.mem.replaceScalar(u8, win_target, '/', std.fs.path.sep_windows);
+
+    const subst = std.fmt.allocPrint(allocator, "\\??\\{s}", .{win_target}) catch return error.JunctionFailed;
     defer allocator.free(subst);
 
     var subst_w: [std.os.windows.PATH_MAX_WIDE]u16 = undefined;
     const subst_len = std.unicode.wtf8ToWtf16Le(&subst_w, subst) catch return error.JunctionFailed;
     var print_w: [std.os.windows.PATH_MAX_WIDE]u16 = undefined;
-    const print_len = std.unicode.wtf8ToWtf16Le(&print_w, target) catch return error.JunctionFailed;
+    const print_len = std.unicode.wtf8ToWtf16Le(&print_w, win_target) catch return error.JunctionFailed;
 
     const subst_bytes = subst_len * 2;
     const print_bytes = print_len * 2;

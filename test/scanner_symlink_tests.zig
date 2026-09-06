@@ -30,7 +30,7 @@ fn writeSample(dir: std.Io.Dir, rel: []const u8, content: []const u8) !void {
 }
 
 pub const LinkDir = struct {
-    test "creates relative symlink at dst/folder → src/folder" {
+    test "creates a live link at dst/folder → src/folder, relative where the platform allows" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
@@ -49,15 +49,32 @@ pub const LinkDir = struct {
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
         const target_len = try tmp.dir.readLink(std.testing.io, "project/.labelle/target/scripts", &link_buf);
         const target = link_buf[0..target_len];
-        // Must be a relative path — not an absolute one — so the
-        // link survives project-directory moves.
-        try std.testing.expect(!std.fs.path.isAbsolute(target));
         try std.testing.expect(std.mem.endsWith(u8, target, "scripts"));
 
-        // The link must resolve to the source file.
+        // Relative is PREFERRED, not universal (#710). A relative symlink
+        // survives moving the project, so it is what gets written wherever
+        // one can be created. Windows without SeCreateSymbolicLinkPrivilege
+        // cannot, and falls back to a junction — which stores an NT path and
+        // has no relative form. Asserting relativity there would be
+        // asserting the platform, not the contract.
+        if (@import("builtin").os.tag != .windows) {
+            try std.testing.expect(!std.fs.path.isAbsolute(target));
+        }
+
+        // The contract on every platform: it is a LINK, and it resolves
+        // through to the source. This is what a copy could not do, and why
+        // the junction is worth an absolute target.
         const contents = try tmp.dir.readFileAlloc(std.testing.io, "project/.labelle/target/scripts/foo.zig", std.testing.allocator, .limited(64));
         defer std.testing.allocator.free(contents);
         try std.testing.expect(std.mem.eql(u8, contents, "// hi"));
+
+        // LIVE, not a snapshot: an edit made after linking is visible
+        // through the link with no re-link. The copy fallback fails this,
+        // which is the whole reason for the junction.
+        try writeSample(tmp.dir, "project/scripts/foo.zig", "// edited");
+        const after = try tmp.dir.readFileAlloc(std.testing.io, "project/.labelle/target/scripts/foo.zig", std.testing.allocator, .limited(64));
+        defer std.testing.allocator.free(after);
+        try std.testing.expectEqualStrings("// edited", after);
     }
 
     test "re-run is idempotent when link already points at correct target" {
@@ -125,11 +142,15 @@ pub const LinkDir = struct {
         defer std.testing.allocator.free(dst_base);
 
         try scanner.linkDir(std.testing.allocator, src_base, dst_base, "nested/deep");
-
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
         const target_len = try tmp.dir.readLink(std.testing.io, "project/.labelle/target/nested/deep", &link_buf);
         const target = link_buf[0..target_len];
-        try std.testing.expect(!std.fs.path.isAbsolute(target));
+        // Relative where the platform can express it; a Windows junction
+        // cannot (#710) — see the sibling test above.
+        if (@import("builtin").os.tag != .windows) {
+            try std.testing.expect(!std.fs.path.isAbsolute(target));
+        }
+        try std.testing.expect(std.mem.endsWith(u8, target, "deep"));
 
         // And the file through the link is reachable.
         const f = try tmp.dir.openFile(std.testing.io, "project/.labelle/target/nested/deep/thing.zig", .{});

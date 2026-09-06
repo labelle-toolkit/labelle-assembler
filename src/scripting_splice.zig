@@ -3029,12 +3029,17 @@ test "stageNativeSources: LINKS the game dir over the placeholder — live view,
 
     try stageNativeSources(allocator, fx.game_abs, fx.out_abs, rust_splice_fixture);
 
-    // The placement is the linkAndScan primitive: a symlink whose text is
-    // RELATIVE (survives a project move) — the same mechanism pin the
-    // scanner_symlink suite makes for embed script dirs.
+    // The placement is the linkAndScan primitive: a LINK, not a copy, so an
+    // edit reaches the staged crate without re-staging — asserted below.
+    // Its text is relative where the platform can express that (surviving a
+    // project move), which Windows without symlink privileges cannot: it
+    // gets a junction, and a junction stores an NT path with no relative
+    // form (#710). Same pin as the scanner_symlink suite for embed dirs.
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     const link_len = try fx.tmp.dir.readLink(testing.io, "out/deps/labelle-scripting/native/src/game", &link_buf);
-    try testing.expect(!std.fs.path.isAbsolute(link_buf[0..link_len]));
+    if (@import("builtin").os.tag != .windows) {
+        try testing.expect(!std.fs.path.isAbsolute(link_buf[0..link_len]));
+    }
 
     const game_mod = try fx.tmp.dir.readFileAlloc(testing.io, "out/deps/labelle-scripting/native/src/game/mod.rs", allocator, .limited(4096));
     defer allocator.free(game_mod);
@@ -3495,14 +3500,11 @@ test "emitHotReloadWatch: capable embed splice emits the Debug-gated source-tree
     const out = aw.written();
 
     // The double comptime gate: Debug-only + @hasDecl version probe.
-    try testing.expect(std.mem.indexOf(u8, out,
-        "if (comptime (@import(\"builtin\").mode == .Debug and @hasDecl(scripting, \"hot_reload\")))") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "if (comptime (@import(\"builtin\").mode == .Debug and @hasDecl(scripting, \"hot_reload\")))") != null);
     // Primary: the SOURCE tree relative to the target dir (the game's cwd
     // under `labelle run`), then the project-root-relative fallback.
-    const primary = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../scripts\") catch {").?;
-    const fallback = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {").?;
+    const primary = std.mem.indexOf(u8, out, "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../scripts\") catch {").?;
+    const fallback = std.mem.indexOf(u8, out, "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {").?;
     try testing.expect(primary < fallback);
     // Failure degrades (never takes the game down), success announces.
     try testing.expect(std.mem.indexOf(u8, out, "script hot reload disabled") != null);
@@ -3523,8 +3525,7 @@ test "emitHotReloadWatch: no relative path → single cwd-relative watch; incapa
     defer aw.deinit();
     try emitHotReloadWatch(&aw.writer, no_rel);
     const out = aw.written();
-    try testing.expect(std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {") != null);
     // Exactly one watchDir call — no fallback nesting without a primary.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "watchDir"));
 
@@ -3582,8 +3583,7 @@ test "emitHotReloadWatch: a TRANSPILED splice watches the target's own emitted d
     const out = aw.written();
 
     // Single watch of the cwd-relative target dir (cwd = the target).
-    try testing.expect(std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "watchDir"));
     try testing.expect(std.mem.indexOf(u8, out, "../../scripts") == null);
     // The v1-limitation messaging: live-edit the emitted output.
@@ -3614,23 +3614,17 @@ test "emitHotReloadWatch: local pack dirs emit namespaced dual candidates inside
     // on `watchDirNamed` (the multi-root + namespaced-reload surface) — an
     // OLD single-slot plugin lacks it, folding them out entirely so it never
     // sees a second watch call that would clobber the game-dir watch.
-    const gate = std.mem.indexOf(u8, out,
-        "if (comptime @hasDecl(scripting.hot_reload, \"watchDirNamed\"))").?;
+    const gate = std.mem.indexOf(u8, out, "if (comptime @hasDecl(scripting.hot_reload, \"watchDirNamed\"))").?;
     // Dual candidate per pack (coderabbit #642), each a `watchDirNamed`
     // under the pack's `<pack>__` reload prefix (codex round-2 #642) so the
     // reload keys onto the pack's namespaced registration.
-    const sky_primary = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDirNamed(hot_reload_io, std.heap.page_allocator, \"../../packs/sky/scripts\", \"sky__\") catch {").?;
-    const sky_fallback = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDirNamed(hot_reload_io, std.heap.page_allocator, \"packs/sky/scripts\", \"sky__\") catch |pack_watch_err| {").?;
-    const colony_primary = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDirNamed(hot_reload_io, std.heap.page_allocator, \"../../libs/colony/scripts\", \"colony__\") catch {").?;
-    const colony_fallback = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDirNamed(hot_reload_io, std.heap.page_allocator, \"libs/colony/scripts\", \"colony__\") catch |pack_watch_err| {").?;
+    const sky_primary = std.mem.indexOf(u8, out, "scripting.hot_reload.watchDirNamed(hot_reload_io, std.heap.page_allocator, \"../../packs/sky/scripts\", \"sky__\") catch {").?;
+    const sky_fallback = std.mem.indexOf(u8, out, "scripting.hot_reload.watchDirNamed(hot_reload_io, std.heap.page_allocator, \"packs/sky/scripts\", \"sky__\") catch |pack_watch_err| {").?;
+    const colony_primary = std.mem.indexOf(u8, out, "scripting.hot_reload.watchDirNamed(hot_reload_io, std.heap.page_allocator, \"../../libs/colony/scripts\", \"colony__\") catch {").?;
+    const colony_fallback = std.mem.indexOf(u8, out, "scripting.hot_reload.watchDirNamed(hot_reload_io, std.heap.page_allocator, \"libs/colony/scripts\", \"colony__\") catch |pack_watch_err| {").?;
     // Game dir watched FIRST (plain watchDir, primary + fallback), then
     // each pack's namespaced primary before its fallback, inside the gate.
-    const game_primary = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../scripts\") catch {").?;
+    const game_primary = std.mem.indexOf(u8, out, "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../scripts\") catch {").?;
     try testing.expect(game_primary < gate);
     try testing.expect(gate < sky_primary and sky_primary < sky_fallback);
     try testing.expect(sky_fallback < colony_primary and colony_primary < colony_fallback);
@@ -3789,10 +3783,8 @@ test "emitHotReloadWatch: a JS-ONLY typescript splice (transpile row, no emitted
     const out = aw.written();
 
     // Source-tree primary + cwd fallback — the ruby/lua shape.
-    const primary = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../scripts\") catch {").?;
-    const fallback = std.mem.indexOf(u8, out,
-        "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {").?;
+    const primary = std.mem.indexOf(u8, out, "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"../../scripts\") catch {").?;
+    const fallback = std.mem.indexOf(u8, out, "scripting.hot_reload.watchDir(hot_reload_io, std.heap.page_allocator, \"scripts\") catch |watch_err| {").?;
     try testing.expect(primary < fallback);
     // The plain source-edit message (with the runnable .js extension) —
     // not the emitted-output variant.
