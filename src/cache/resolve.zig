@@ -522,14 +522,15 @@ test "validateCache: a remote external backend with no cache entry is reported m
     // remote backend that was never fetched is the sole missing entry —
     // reported as `backend <name> <version>` so `ensureCache` knows to fetch it.
     //
-    // Hermetic: point LABELLE_HOME at a guaranteed-absent dir so the cache
-    // probe can't be swayed by whatever lives in the caller's real
-    // ~/.labelle/packages on a dev box or a reused CI home. The construction
-    // is PosixBlock-only, so skip on Windows (a different env-block layout).
-    const saved_environ = std.testing.environ;
-    defer std.testing.environ = saved_environ;
-    const envp = [_:null]?[*:0]const u8{"LABELLE_HOME=/nonexistent/labelle-validatecache-test-home"};
-    std.testing.environ = .{ .block = .{ .slice = &envp } };
+    // Hermetic: point the cache root at a guaranteed-absent dir so the probe
+    // cannot be swayed by whatever lives in the caller's real
+    // ~/.labelle/packages on a dev box or a reused CI home. Uses the seam
+    // rather than an env block: `std.testing.environ` cannot carry a
+    // synthetic environment on Windows at all (#699), and constructing a
+    // `PosixBlock` there is a COMPILE error, not a skippable one — it would
+    // have broken `zig build test` for the whole platform.
+    env.setCacheRootForTesting("/nonexistent/labelle-validatecache-test-home");
+    defer env.setCacheRootForTesting(null);
 
     const alloc = std.testing.allocator;
     const cfg = config.ProjectConfig{

@@ -67,6 +67,8 @@ pub const isDirectory = disk.isDirectory;
 
 // ── locally-sourced slots (#685) ─────────────────────────────────────
 pub const localSlots = local_slots;
+pub const cacheEnv = env;
+pub const junction = @import("junction.zig");
 pub const findRepoRoot = local_slots.findRepoRoot;
 pub const isLocalSlotPath = local_slots.isLocalSlotPath;
 pub const localSlotRoot = local_slots.localSlotRoot;

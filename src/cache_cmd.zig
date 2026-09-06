@@ -1120,7 +1120,6 @@ test "cleanLocalSlots: drops the local namespace, leaving version slots alone (#
     // core/engine/gfx/cli/assembler — a plugin or external backend's slot
     // survived it, so the same implicit source stayed active and the warning
     // repeated forever.
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const io = config.globalIo();
 
@@ -1145,17 +1144,13 @@ test "cleanLocalSlots: drops the local namespace, leaving version slots alone (#
     const checkout = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = std.testing.environ;
-    std.testing.environ = .{ .block = .{ .slice = &envp } };
-    defer std.testing.environ = saved_environ;
+    cache.cacheEnv.setCacheRootForTesting(home);
+    defer cache.cacheEnv.setCacheRootForTesting(null);
 
     const slot = try std.fs.path.join(alloc, &.{ packages_dir, cache.localSlots.SLOT_NS, "plugins", repo });
     defer alloc.free(slot);
     try std.Io.Dir.cwd().deleteTree(io, slot);
-    try std.Io.Dir.cwd().symLink(io, checkout, slot, .{ .is_directory = true });
+    try cache.junction.linkDir(alloc, checkout, slot);
     try cache.localSlots.writeOrigin(alloc, slot, checkout, "0.4.0", .discovered);
 
     const marker = try cache.localSlots.originPath(alloc, slot);
