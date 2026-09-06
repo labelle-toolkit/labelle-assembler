@@ -848,6 +848,10 @@ fn walkTsSources(
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         switch (entry.kind) {
             .directory => {
+                // #692: a nested checkout under the authoring dir would
+                // feed another branch's `.ts` sources into the transpile
+                // and emit their `.js` beside the real ones.
+                if (scanner.isRepoRootIo(io, dir, entry.name)) continue;
                 var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
                 defer sub.close(io);
                 const sub_prefix = if (rel_prefix.len == 0)

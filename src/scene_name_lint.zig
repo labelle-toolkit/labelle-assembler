@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const check = @import("check.zig");
+const scanner = @import("scanner.zig");
 
 // ── Inputs ────────────────────────────────────────────────────────────────
 
@@ -520,7 +521,15 @@ pub fn scanScenesDir(
     while (try it.next(io)) |entry| {
         const child = try std.fs.path.join(arena, &.{ dir_path, entry.name });
         switch (entry.kind) {
-            .directory => try scanScenesDir(arena, io, findings, child, pack_components, game_owned),
+            // #692: a nested repository root (worktree/submodule/clone)
+            // parked under `scenes/` or `prefabs/` holds another
+            // revision's scenes; linting them reports findings against
+            // paths the working tree does not contain. Keyed on the
+            // `.git` marker's existence, never its kind.
+            .directory => {
+                if (scanner.isRepoRootIo(io, dir, entry.name)) continue;
+                try scanScenesDir(arena, io, findings, child, pack_components, game_owned);
+            },
             .file => {
                 if (!std.mem.endsWith(u8, entry.name, ".jsonc")) continue;
                 const src = std.Io.Dir.cwd().readFileAlloc(io, child, arena, .limited(8 * 1024 * 1024)) catch continue;

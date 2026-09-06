@@ -76,6 +76,7 @@
 //! the `Context` from the discovered packs and drives the directory walk.
 
 const std = @import("std");
+const scanner = @import("scanner.zig");
 
 // ── Findings ────────────────────────────────────────────────────────────
 
@@ -577,7 +578,17 @@ fn walkDir(
     while (try it.next(io)) |entry| {
         const child = try std.fs.path.join(arena, &.{ dir_path, entry.name });
         switch (entry.kind) {
-            .directory => try walkDir(arena, io, findings, root, child, ctx),
+            // Never descend into a nested repository root — a `git
+            // worktree`, a submodule or a plain clone parked inside the
+            // pack (#692). Its files belong to a different revision, so
+            // every finding it produced would name a path the working
+            // tree does not contain. The probe keys on the `.git` marker's
+            // EXISTENCE, not its kind: a worktree's / submodule's `.git`
+            // is a FILE holding a `gitdir:` pointer.
+            .directory => {
+                if (scanner.isRepoRootIo(io, dir, entry.name)) continue;
+                try walkDir(arena, io, findings, root, child, ctx);
+            },
             .file => {
                 if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
                 const src = std.Io.Dir.cwd().readFileAlloc(io, child, arena, .limited(8 * 1024 * 1024)) catch continue;
@@ -996,5 +1007,105 @@ test "scanPackDir: walks a temp pack tree and reports a nested violation" {
     try scanPackDir(arena, io, &findings, pack_dir, ctx);
     try testing.expectEqual(@as(usize, 1), findings.items.len);
     try testing.expectEqual(Rule.cross_pack_registry_access, findings.items[0].rule);
+    try testing.expect(std.mem.endsWith(u8, findings.items[0].file, "00_work.zig"));
+}
+
+// ── Nested-checkout pruning (labelle-assembler#692) ─────────────────────
+
+/// One offending source, as a plain quoted literal so the fixture stays
+/// readable next to the assertions.
+const violating_source = "pub fn work(game: anytype) void {\n    _ = game.getType(\"citizens__Worker\");\n}\n";
+
+fn lintCtx() Context {
+    return .{
+        .current_prefix = "production",
+        .pack_prefixes = &.{ "production", "citizens" },
+    };
+}
+
+test "scanPackDir: a nested git checkout inside the pack is not walked (#692)" {
+    // A `git worktree` / submodule / nested clone parked in the pack holds
+    // a DIFFERENT revision. Linting it reports violations against files
+    // that are not in the working tree — the reader has no way to act on
+    // the diagnostic, and no way to see why it appeared.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "scripts/01_idle.zig",
+        .data = "pub fn idle() void {}",
+    });
+    // The nested checkout, under a name that carries no special meaning —
+    // the prune must not be keyed on `.worktrees`. `git worktree add`
+    // writes `.git` as a FILE holding a `gitdir:` pointer, so the probe
+    // tests the entry's existence, never its kind.
+    try tmp.dir.createDirPath(io, "verify-821/scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "verify-821/.git",
+        .data = "gitdir: /somewhere/.git/worktrees/verify-821\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "verify-821/scripts/00_work.zig",
+        .data = violating_source,
+    });
+
+    const pack_dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var findings: std.ArrayList(Finding) = .empty;
+    try scanPackDir(arena, io, &findings, pack_dir, lintCtx());
+    for (findings.items) |f| {
+        std.debug.print("check descended into a nested checkout: {s}\n", .{f.file});
+    }
+    try testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "scanPackDir: a nested clone whose .git is a DIRECTORY is not walked (#692)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "vendor/upstream/.git/objects");
+    try tmp.dir.createDirPath(io, "vendor/upstream/scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "vendor/upstream/scripts/00_work.zig",
+        .data = violating_source,
+    });
+
+    const pack_dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var findings: std.ArrayList(Finding) = .empty;
+    try scanPackDir(arena, io, &findings, pack_dir, lintCtx());
+    try testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "scanPackDir: an ordinary dir named worktrees is still walked (#692 negative control)" {
+    // The prune keys on the `.git` marker, never on the name: a plain
+    // folder that happens to be called `worktrees` holds real pack source.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "worktrees/scripts");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "worktrees/scripts/00_work.zig",
+        .data = violating_source,
+    });
+
+    const pack_dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    var findings: std.ArrayList(Finding) = .empty;
+    try scanPackDir(arena, io, &findings, pack_dir, lintCtx());
+    try testing.expectEqual(@as(usize, 1), findings.items.len);
     try testing.expect(std.mem.endsWith(u8, findings.items[0].file, "00_work.zig"));
 }

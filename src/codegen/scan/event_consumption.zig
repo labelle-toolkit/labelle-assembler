@@ -110,6 +110,7 @@ const std = @import("std");
 const config = @import("../../config.zig");
 const language_policy = @import("../../language_policy.zig");
 const plugin_events_mod = @import("plugin_events.zig");
+const scanner = @import("../../scanner.zig");
 const scripting_splice = @import("../../scripting_splice.zig");
 
 pub const PluginEvent = plugin_events_mod.PluginEvent;
@@ -730,6 +731,16 @@ fn scanDir(walk: *Walk, dir_path: []const u8, in_flows: bool) !void {
         switch (entry.kind) {
             .directory => {
                 if (isSkippedDir(entry.name)) continue;
+                // A nested repository root — a `git worktree`, a submodule
+                // or a plain clone parked in the project (#692). The game
+                // project dir is one of the scan roots, so without this
+                // the corpus swallows every branch checked out beside the
+                // working tree and another branch's stale text votes an
+                // event "consumed", keeping a variant alive that #630 is
+                // supposed to elide. `skipped_dirs` cannot catch it: the
+                // folder can be called anything, which is exactly why the
+                // probe keys on the `.git` marker instead.
+                if (scanner.isRepoRoot(dir, entry.name)) continue;
                 const child = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
                 defer allocator.free(child);
                 try enterDir(walk, child, in_flows or isFlowsDir(dir_path, entry.name));
@@ -754,7 +765,13 @@ fn scanDir(walk: *Walk, dir_path: []const u8, in_flows: bool) !void {
                     else => return scanFailure(child, err),
                 };
                 switch (st.kind) {
-                    .directory => try enterDir(walk, child, in_flows or isFlowsDir(dir_path, entry.name)),
+                    // Same #692 prune on the RESOLVED target: a symlink
+                    // pointing at a nested checkout is the same corpus
+                    // poisoning as descending into one directly.
+                    .directory => {
+                        if (scanner.isRepoRoot(std.Io.Dir.cwd(), child)) continue;
+                        try enterDir(walk, child, in_flows or isFlowsDir(dir_path, entry.name));
+                    },
                     .file => {
                         if (!walk.isScannedFile(entry.name)) continue;
                         if (in_flows and try isOrphanFlowSidecar(allocator, dir_path, entry.name)) continue;
@@ -1008,6 +1025,78 @@ test "filterConsumedEvents: qualified tag in a .zig hook keeps the event; unrefe
     try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
     try testing.expectEqual(@as(usize, 1), result.elided.len);
     try testing.expectEqualStrings("collision_end", result.elided[0].event_name);
+}
+
+// ── Nested-checkout pruning (labelle-assembler#692) ──────────────────
+//
+// The game project dir is one of `filterConsumedEvents`' scan roots, so
+// before the prune the corpus swallowed every `git worktree` /
+// submodule / nested clone parked inside the project. Another branch's
+// stale text then voted an event "consumed" and kept a variant #630 is
+// supposed to elide — a wrong build graph produced by source the working
+// tree does not contain. `skipped_dirs` never caught it: the folder can
+// be called anything, which is why the probe keys on the `.git` marker's
+// EXISTENCE (a worktree's / submodule's `.git` is a FILE holding a
+// `gitdir:` pointer, not a directory).
+
+test "filterConsumedEvents: a nested worktree (.git is a FILE) is not part of the corpus (#692)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A leftover verification worktree, exactly the #692 shape. Its copy
+    // of the project references the tag; nothing in the working tree does.
+    try tmp.dir.createDirPath(io, "verify-821/hooks");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "verify-821/.git",
+        .data = "gitdir: /somewhere/.git/worktrees/verify-821\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "verify-821/hooks/contact.zig",
+        .data = "// .box2d__collision_begin — from another branch\n",
+    });
+
+    var result = try filterTmp(&tmp, .consumed);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.kept.len);
+    try testing.expectEqual(@as(usize, 2), result.elided.len);
+}
+
+test "filterConsumedEvents: a nested clone (.git is a DIRECTORY) is not part of the corpus (#692)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "vendor/upstream/.git/objects");
+    try tmp.dir.createDirPath(io, "vendor/upstream/hooks");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "vendor/upstream/hooks/contact.zig",
+        .data = "// .box2d__collision_begin — from a vendored clone\n",
+    });
+
+    var result = try filterTmp(&tmp, .consumed);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.kept.len);
+    try testing.expectEqual(@as(usize, 2), result.elided.len);
+}
+
+test "filterConsumedEvents: an ordinary dir named worktrees is still scanned (#692 negative control)" {
+    // The prune keys on the marker, never on the name — a plain folder
+    // that happens to be called `worktrees` holds real project source.
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "worktrees/hooks");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "worktrees/hooks/contact.zig",
+        .data = "// .box2d__collision_begin — real game source\n",
+    });
+
+    var result = try filterTmp(&tmp, .consumed);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 1), result.kept.len);
+    try testing.expectEqualStrings("collision_begin", result.kept[0].event_name);
 }
 
 test "filterConsumedEvents: dotted OnEvent ref in a .flow.jsonc keeps the event" {
