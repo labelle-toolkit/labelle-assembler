@@ -48,6 +48,13 @@ const test_options = @import("test_options");
 
 const io = std.testing.io;
 
+/// The host executable extension: `.exe` on Windows, empty elsewhere. The
+/// spliced e2e projects install their binary as `zig-out/bin/e2e<ext>`, and
+/// a hardcoded POSIX `e2e` simply is not there on Windows (#699). Spelled as
+/// a comptime const rather than `builtin.target.exeFileExt()` inline, which
+/// does not const-fold inside a `++`.
+const exe_suffix = if (builtin.os.tag == .windows) ".exe" else "";
+
 test {
     zspec.runAll(@This());
 }
@@ -125,6 +132,31 @@ fn crystalManifest(allocator: std.mem.Allocator) ![]const u8 {
         \\    }},
         \\}}
     , .{ zig_exe, zig_exe, zig_exe });
+}
+
+/// The OSes the fixture's crystal `.language_builds` steps gate themselves
+/// to via `.os`, mirroring the SHIPPED crystal plugin: crystal games build
+/// on macos and linux only today. Kept immediately beside `crystalManifest`
+/// so the two cannot drift — when a step there gains an `.os` entry, adding
+/// it here is what lets the runnable acceptance start exercising that host.
+const crystal_build_step_oses = [_]std.Target.Os.Tag{ .macos, .linux };
+
+/// Whether the fixture declares any crystal build step for the host OS.
+///
+/// Deliberately a RUNTIME predicate, not a comptime one. `builtin.os.tag` is
+/// comptime-known, so `if (builtin.os.tag == ...) return error.SkipZigTest;`
+/// would make the rest of the test body statically unreachable and therefore
+/// UNANALYSED — the trap recorded in #699, where a guard like that was hiding
+/// code that did not compile rather than a test that failed. Laundering the
+/// tag through a runtime local keeps the branch a real one, so everything
+/// after the skip is still type-checked and compiled on every platform.
+fn hostHasCrystalBuildSteps() bool {
+    var host: std.Target.Os.Tag = builtin.os.tag;
+    _ = &host;
+    for (crystal_build_step_oses) |tag| {
+        if (host == tag) return true;
+    }
+    return false;
 }
 
 const placeholder_game_cr =
@@ -252,6 +284,24 @@ const other_localize_name = switch (builtin.os.tag) {
 pub const CRYSTAL_SPLICE_E2E = struct {
     test "acceptance: crystal generate — shared touchpoints, .language = .crystal, live-linked scripts/game.cr, one per-OS step, chained artifact-less build, resolved library paths, runnable" {
         const allocator = std.testing.allocator;
+
+        // This is the RUNNABLE acceptance: it splices the emitted wiring into
+        // a real build.zig, runs `zig build`, links the produced object and
+        // executes the binary. That needs the fixture to actually SELECT a
+        // per-OS step for this host — and its steps are `.os`-gated to
+        // macos/linux, mirroring the shipped crystal plugin. On any other
+        // host `generate` refuses with `PluginBuildNoStepsForOs`, which is
+        // the CORRECT product behaviour ("crystal games build on those OSes
+        // only today"), asserted directly by the "a windows generate fails
+        // pointedly" test below. There is no capability here to exercise, so
+        // the test is skipped rather than asserting one the platform does not
+        // have.
+        //
+        // The key is the FIXTURE'S OWN `.os` gate, not the platform: nothing
+        // here says "windows". Teach `crystalManifest` a step for another OS,
+        // list it in `crystal_build_step_oses`, and this runs there.
+        if (!hostHasCrystalBuildSteps()) return error.SkipZigTest;
+
         var staged = try StagedCrystalProject.init(allocator, .{});
         defer staged.deinit(allocator);
 
@@ -384,7 +434,9 @@ pub const CRYSTAL_SPLICE_E2E = struct {
         }
         try e2e_dir.access(io, "plugin-build/scripting/labelle_crystal_scripts_lib.o", .{});
         {
-            const exe_path = try std.fs.path.join(allocator, &.{ e2e_abs, "zig-out", "bin", "e2e" });
+            // Host executable extension, so this stays correct the day
+            // `crystal_build_step_oses` gains a host that needs one (#699).
+            const exe_path = try std.fs.path.join(allocator, &.{ e2e_abs, "zig-out", "bin", "e2e" ++ exe_suffix });
             defer allocator.free(exe_path);
             const result = try std.process.run(allocator, io, .{
                 .argv = &.{exe_path},
@@ -443,7 +495,15 @@ pub const CRYSTAL_SPLICE_E2E = struct {
 
         const backend_repo = try sokolFixtureRepoAbs(allocator);
         defer allocator.free(backend_repo);
-        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+        // This test is about LEGACY SOURCE STAGING — which files land where.
+        // That is OS-independent, but the fixture's crystal `.language_builds`
+        // steps are `.os`-gated to macos/linux (mirroring the shipped plugin),
+        // so on any other host `generate` correctly refuses with
+        // `PluginBuildNoStepsForOs` before it ever gets to the staging this
+        // asserts. Pin the build OS through the same seam the per-OS
+        // selection test uses, so the staging assertion is evaluated on every
+        // host instead of being hostage to the host's OS (#699).
+        try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = false, .plugin_build_os = .linux });
 
         const staged_game_cr = try staged.tmp.dir.readFileAlloc(io, "out/deps/labelle-scripting/native-crystal/src/game/game.cr", allocator, .limited(4096));
         defer allocator.free(staged_game_cr);

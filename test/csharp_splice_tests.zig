@@ -50,6 +50,13 @@ const test_options = @import("test_options");
 
 const io = std.testing.io;
 
+/// The host executable extension: `.exe` on Windows, empty elsewhere. The
+/// spliced e2e projects install their binary as `zig-out/bin/e2e<ext>`, and
+/// a hardcoded POSIX `e2e` simply is not there on Windows (#699). Spelled as
+/// a comptime const rather than `builtin.target.exeFileExt()` inline, which
+/// does not const-fold inside a `++`.
+const exe_suffix = if (builtin.os.tag == .windows) ".exe" else "";
+
 test {
     zspec.runAll(@This());
 }
@@ -337,7 +344,12 @@ pub const CSHARP_SPLICE_E2E = struct {
         try e2e_dir.access(io, "zig-out/bin/labelle_csharp_scripts.dll", .{});
         try e2e_dir.access(io, "zig-out/bin/labelle_csharp_scripts.runtimeconfig.json", .{});
         try e2e_dir.access(io, "zig-out/bin/labelle_csharp_scripts.deps.json", .{});
-        try e2e_dir.access(io, "zig-out/bin/e2e", .{});
+        // The installed exe carries the host's executable extension —
+        // `e2e.exe` on Windows, bare `e2e` everywhere else. The three
+        // runtime-payload assertions above already passed here, so the
+        // build and the InstallDir staging both worked; only this
+        // hardcoded POSIX name was wrong (#699).
+        try e2e_dir.access(io, "zig-out/bin/e2e" ++ exe_suffix, .{});
     }
 
     test "toolchain probe (#617): a csharp generate without the publish tool on PATH fails pointedly at generate" {

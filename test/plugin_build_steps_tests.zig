@@ -28,12 +28,20 @@
 //!      discovery entirely (no exe to hang an artifact on).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zspec = @import("zspec");
 const generate = @import("generator");
 const h = @import("helpers.zig");
 const test_options = @import("test_options");
 
 const io = std.testing.io;
+
+/// The host executable extension: `.exe` on Windows, empty elsewhere. The
+/// spliced e2e projects install their binary as `zig-out/bin/e2e<ext>`, and
+/// a hardcoded POSIX `e2e` simply is not there on Windows (#699). Spelled as
+/// a comptime const rather than `builtin.target.exeFileExt()` inline, which
+/// does not const-fold inside a `++`.
+const exe_suffix = if (builtin.os.tag == .windows) ".exe" else "";
 
 test {
     zspec.runAll(@This());
@@ -127,6 +135,14 @@ const StagedProject = struct {
 /// substitution), a mixed `-femit-bin={cache}/…` arg (build-time b.fmt),
 /// bare `{cache}` args, and a declared cwd.
 fn acceptanceManifest(allocator: std.mem.Allocator) ![]const u8 {
+    // The zig exe is an ABSOLUTE path, and on Windows that means
+    // backslashes: `C:\Users\...` carries `\U`, which is not a valid Zig
+    // escape, so the manifest written below would not parse (#708). The
+    // rust/crystal/csharp splice suites already do this; this one was the
+    // missed call site (#699). Invisible on Linux and macOS, where the
+    // path has no backslashes to trip over.
+    const zig_exe = try generate.escapeZonString(allocator, test_options.zig_exe);
+    defer allocator.free(zig_exe);
     return std.fmt.allocPrint(allocator,
         \\.{{
         \\    .name = "buildsteps",
@@ -141,7 +157,7 @@ fn acceptanceManifest(allocator: std.mem.Allocator) ![]const u8 {
         \\        }},
         \\    }},
         \\}}
-    , .{test_options.zig_exe});
+    , .{zig_exe});
 }
 
 const no_build_manifest =
@@ -168,17 +184,32 @@ pub const BUILD_STEPS_E2E = struct {
         // The {cache} const, resolved at build time against the build root.
         _ = try indexOfOrFail(build_zig, "const plugin_buildsteps_build_cache = b.pathFromRoot(\"plugin-build/buildsteps\");");
         // The system command carries the declared program (never a shell).
-        const cmd_pin = try std.fmt.allocPrint(allocator, "const plugin_buildsteps_build_step_0 = b.addSystemCommand(&.{{ \"{s}\", \"build-lib\", ", .{test_options.zig_exe});
+        //
+        // The pins below interpolate ABSOLUTE host paths, and the emitter
+        // writes them as ZIG STRING LITERALS via `std.zig.fmtString` — so on
+        // Windows the emitted bytes carry `C:\\Users\\…`, not the raw path.
+        // Formatting the pins the same way makes them match the emission on
+        // every host; on POSIX there is nothing to escape and `{f}` is a
+        // no-op against the previous `{s}` (#699).
+        const cmd_pin = try std.fmt.allocPrint(allocator, "const plugin_buildsteps_build_step_0 = b.addSystemCommand(&.{{ \"{f}\", \"build-lib\", ", .{std.zig.fmtString(test_options.zig_exe)});
         defer allocator.free(cmd_pin);
         _ = try indexOfOrFail(build_zig, cmd_pin);
         // {package} substituted at generate time to the STAGED deps copy…
-        const pkg_arg_pin = try std.fmt.allocPrint(allocator, "\"{s}/deps/labelle-buildsteps/native/adder.zig\"", .{staged.out_abs});
+        //
+        // `{package}` resolves to `realpath(out/deps/labelle-buildsteps)`, so
+        // resolve it here the same way rather than string-joining onto
+        // `out_abs`: on Windows realpath hands back host separators the whole
+        // way down (`…\out\deps\labelle-buildsteps`), which a hand-built
+        // `out_abs ++ "/deps/…"` would not reproduce (#699).
+        const package_abs = try staged.tmp.dir.realPathFileAlloc(io, "out/deps/labelle-buildsteps", allocator);
+        defer allocator.free(package_abs);
+        const pkg_arg_pin = try std.fmt.allocPrint(allocator, "\"{f}/native/adder.zig\"", .{std.zig.fmtString(package_abs)});
         defer allocator.free(pkg_arg_pin);
         _ = try indexOfOrFail(build_zig, pkg_arg_pin);
         // …a mixed {cache} arg becomes a build-time b.fmt…
         _ = try indexOfOrFail(build_zig, "b.fmt(\"-femit-bin={s}/libadder.a\", .{ plugin_buildsteps_build_cache })");
         // …cwd lands inside the staged package…
-        const cwd_pin = try std.fmt.allocPrint(allocator, "plugin_buildsteps_build_step_0.setCwd(.{{ .cwd_relative = \"{s}/deps/labelle-buildsteps/native\" }});", .{staged.out_abs});
+        const cwd_pin = try std.fmt.allocPrint(allocator, "plugin_buildsteps_build_step_0.setCwd(.{{ .cwd_relative = \"{f}/native\" }});", .{std.zig.fmtString(package_abs)});
         defer allocator.free(cwd_pin);
         _ = try indexOfOrFail(build_zig, cwd_pin);
         // …and the artifact links onto the exe, ordered after the command.
@@ -262,7 +293,9 @@ pub const BUILD_STEPS_E2E = struct {
 
         // And the linked binary reaches the symbol (exit 0 ⇔ 20+22==42).
         {
-            const exe_path = try std.fs.path.join(allocator, &.{ e2e_abs, "zig-out", "bin", "e2e" });
+            // The installed exe carries the host's executable extension —
+            // `e2e.exe` on Windows, bare `e2e` everywhere else (#699).
+            const exe_path = try std.fs.path.join(allocator, &.{ e2e_abs, "zig-out", "bin", "e2e" ++ exe_suffix });
             defer allocator.free(exe_path);
             const result = try std.process.run(allocator, io, .{
                 .argv = &.{exe_path},
