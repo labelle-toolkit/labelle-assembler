@@ -682,6 +682,11 @@ fn stripJsonc(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 
 const testing = std.testing;
 
+/// The host path separator, for diagnostics that embed a path: a message
+/// built with `path.join` uses the host separator, so a hardcoded "/"
+/// substring never matches on Windows (#699).
+const sep = std.fs.path.sep_str;
+
 /// Parse + validate a source string, returning the joined diagnostics (or an
 /// empty string when valid). Test-only convenience.
 fn diagnose(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
@@ -886,7 +891,7 @@ test "scanStudioDir: validates files directly in studio/, ignoring non-studio fi
     try testing.expect(errors.items.len >= 1);
     var saw_min = false;
     for (errors.items) |e| {
-        try testing.expect(std.mem.indexOf(u8, e, "studio/broken.panel.jsonc") != null);
+        try testing.expect(std.mem.indexOf(u8, e, "studio" ++ sep ++ "broken.panel.jsonc") != null);
         try testing.expect(std.mem.indexOf(u8, e, "decoy") == null);
         try testing.expect(std.mem.indexOf(u8, e, "generator") == null);
         if (std.mem.indexOf(u8, e, "a slider requires a numeric `min`") != null) saw_min = true;
@@ -959,7 +964,7 @@ test "discovery scope: a DECLARED pack's broken panel fails; an UNDECLARED pack'
         try testing.expect(std.mem.indexOf(u8, e, "experimental") == null);
         try testing.expect(std.mem.indexOf(u8, e, "wild") == null);
         try testing.expect(std.mem.indexOf(u8, e, "root.panel.jsonc") == null);
-        if (std.mem.indexOf(u8, e, "packs/shipped/studio/broken.panel.jsonc") != null and
+        if (std.mem.indexOf(u8, e, "packs" ++ sep ++ "shipped" ++ sep ++ "studio" ++ sep ++ "broken.panel.jsonc") != null and
             std.mem.indexOf(u8, e, "a slider requires a numeric `min`") != null) saw_shipped = true;
     }
     try testing.expect(saw_shipped);

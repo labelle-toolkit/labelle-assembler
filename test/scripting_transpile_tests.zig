@@ -130,17 +130,232 @@ const StagedTranspileProject = struct {
         self.tmp.cleanup();
     }
 
-    /// Stage an executable fake tsc and point `tsc_tool_override` at it
-    /// (caller clears the override). The happy fake honors the REAL
-    /// invocation contract — `<tool> -p <tsconfig>` — by pulling
-    /// `outDir` out of the generated tsconfig (its rendering is a unit
-    /// golden, so the extraction can't drift silently) and emitting a
-    /// known `.js` there, exactly where the real tsc 7.0.2 emits.
-    fn stageFakeTsc(self: *StagedTranspileProject, allocator: std.mem.Allocator, body: []const u8) ![:0]const u8 {
-        var f = try self.tmp.dir.createFile(io, "fake-tsc", .{ .permissions = .executable_file });
+    /// One file a fake tsc emits, relative to the tsconfig's `outDir`.
+    ///
+    /// `when_config_suffix` / `unless_config_suffix` gate it on which
+    /// tsconfig the tool was handed (the declare pass and the script pass
+    /// use different ones); both empty means always.
+    const Emit = struct {
+        when_config_suffix: []const u8 = "",
+        unless_config_suffix: []const u8 = "",
+        rel: []const u8,
+        body: []const u8,
+    };
+
+    /// Stage an executable fake tsc and return its absolute path.
+    ///
+    /// Honors the REAL invocation contract — `<tool> -p <tsconfig>` — by
+    /// pulling `outDir` out of the generated tsconfig (its rendering is a
+    /// unit golden, so the extraction cannot drift silently) and emitting
+    /// `emit` there, exactly where the real tsc 7.0.2 emits.
+    ///
+    /// Generated from `emit` rather than hand-written per test, because it
+    /// has to exist twice. A `#!/bin/sh` script is not executable on
+    /// Windows — no shebang, so `CreateProcess` fails with
+    /// `error.InvalidExe` — and the whole transpile suite failed for a
+    /// reason unrelated to what it tests (#699).
+    ///
+    /// The Windows side is a `.cmd`, which Zig's spawn does run, written in
+    /// PURE batch — no PowerShell. A first cut delegated to a `.ps1`, and
+    /// that failed in a way worth recording: under `zig build test` the
+    /// spawned child's environment is stripped enough that .NET cannot
+    /// initialise ("Loading managed Windows PowerShell failed with error
+    /// 8009001d"), and PowerShell then exits `-65536` = `0xFFFF0000`, whose
+    /// low 16 bits are ZERO — so the failure came back as exit 0 and the
+    /// assembler reported a successful transpile that emitted nothing.
+    /// Batch needs no runtime and cannot fail that way.
+    ///
+    /// Batch can parse the tsconfig because `writeJsonPath` emits `outDir`
+    /// with FORWARD slashes and no escaping, on one line of its own; the
+    /// stub splits that line at its first `:` and strips the quotes.
+    fn stageEmittingFakeTsc(dir: std.Io.Dir, allocator: std.mem.Allocator, emit: []const Emit) ![:0]const u8 {
+        const windows = @import("builtin").os.tag == .windows;
+        const dir_abs = try dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(dir_abs);
+
+        // Every emitted body travels as a FILE the stub copies, never as a
+        // literal inside the script. The bodies end in a newline, and a
+        // PowerShell single-quoted string cannot span lines — inlining them
+        // produced a stub that parsed as garbage and exited 49 instead of
+        // emitting anything. Files sidestep quoting in both shells.
+        for (emit, 0..) |e, i| {
+            const payload = try std.fmt.allocPrint(allocator, "fake-tsc.emit{d}", .{i});
+            defer allocator.free(payload);
+            var pf = try dir.createFile(io, payload, .{});
+            defer pf.close(io);
+            try pf.writeStreamingAll(io, e.body);
+        }
+
+        var body_aw = std.Io.Writer.Allocating.init(allocator);
+        defer body_aw.deinit();
+        const w = &body_aw.writer;
+
+        if (windows) {
+            try w.writeAll("@echo off\r\n");
+            try w.writeAll("if not \"%~1\"==\"-p\" exit /b 3\r\n");
+            try w.writeAll("set \"CFG=%~2\"\r\n");
+            // Builtins ONLY — no `findstr`. It is an external exe, and the
+            // stripped child PATH that hid PowerShell hides it too (the
+            // first cut used it and every test exited 4, "outDir missing").
+            //
+            // `for /f` reads the tsconfig line by line with `:` and space as
+            // delimiters, so the key line `    "outDir": "C:/x/y"` yields
+            // token 1 `"outDir"` and remainder `"C:/x/y"`; the `~` modifier
+            // strips the quotes from each. The drive colon survives because
+            // the remainder is taken verbatim after the first delimiter.
+            try w.writeAll("set \"OUT=\"\r\n");
+            try w.writeAll("for /f \"usebackq tokens=1,* delims=: \" %%A in (\"%~2\") do if \"%%~A\"==\"outDir\" set \"OUT=%%~B\"\r\n");
+            try w.writeAll("if not defined OUT exit /b 4\r\n");
+            try w.writeAll("set \"OUT=%OUT:/=\\%\"\r\n");
+            for (emit, 0..) |e, i| {
+                // Gate on the tsconfig NAME by comparing its last N chars, so
+                // `tsconfig.declare.json` matches only the declare pass.
+                if (e.when_config_suffix.len > 0) {
+                    try w.print("if not \"%CFG:~-{d}%\"==\"{s}\" goto emit_skip_{d}\r\n", .{ e.when_config_suffix.len, e.when_config_suffix, i });
+                }
+                if (e.unless_config_suffix.len > 0) {
+                    try w.print("if \"%CFG:~-{d}%\"==\"{s}\" goto emit_skip_{d}\r\n", .{ e.unless_config_suffix.len, e.unless_config_suffix, i });
+                }
+                const rel_win = try allocator.dupe(u8, e.rel);
+                defer allocator.free(rel_win);
+                std.mem.replaceScalar(u8, rel_win, '/', '\\');
+                // A failed emit must FAIL the stub. Batch does not stop on
+                // error, so without the `||` an unwritable outDir reached the
+                // final `exit /b 0` and the assembler reported a successful
+                // transpile that produced nothing — the same misleading shape
+                // the PowerShell cut had (#699 review). Exit 5 is outside the
+                // real tsc's codes, so it reads as a fixture fault.
+                if (std.fs.path.dirnameWindows(rel_win)) |rel_dir| {
+                    try w.print("if not exist \"%OUT%\\{s}\\\" mkdir \"%OUT%\\{s}\" || exit /b 5\r\n", .{ rel_dir, rel_dir });
+                }
+                try w.print("copy /y \"{s}\\fake-tsc.emit{d}\" \"%OUT%\\{s}\" >nul || exit /b 5\r\n", .{ dir_abs, i, rel_win });
+                try w.print(":emit_skip_{d}\r\n", .{i});
+            }
+            try w.writeAll("exit /b 0\r\n");
+        } else {
+            try w.writeAll("#!/bin/sh\n");
+            try w.writeAll("[ \"$1\" = \"-p\" ] || exit 3\n");
+            try w.writeAll("out=$(sed -n 's/^ *\"outDir\": \"\\(.*\\)\".*$/\\1/p' \"$2\")\n");
+            try w.writeAll("[ -n \"$out\" ] || exit 4\n");
+            for (emit, 0..) |e, i| {
+                const gated = e.when_config_suffix.len > 0 or e.unless_config_suffix.len > 0;
+                if (e.when_config_suffix.len > 0) {
+                    try w.print("case \"$2\" in *{s})\n", .{e.when_config_suffix});
+                }
+                if (e.unless_config_suffix.len > 0) {
+                    try w.print("case \"$2\" in *{s}) ;; *)\n", .{e.unless_config_suffix});
+                }
+                try w.print("mkdir -p \"$(dirname \"$out/{s}\")\"\n", .{e.rel});
+                try w.print("cat \"{s}/fake-tsc.emit{d}\" > \"$out/{s}\"\n", .{ dir_abs, i, e.rel });
+                if (gated) try w.writeAll(";; esac\n");
+            }
+            try w.writeAll("exit 0\n");
+        }
+
+        return stageToolScript(dir, allocator, "fake-tsc", body_aw.written());
+    }
+
+    /// Write `body` as an executable named `name` (`.cmd` on Windows) and
+    /// return its absolute path.
+    fn stageToolScript(dir: std.Io.Dir, allocator: std.mem.Allocator, name: []const u8, body: []const u8) ![:0]const u8 {
+        const windows = @import("builtin").os.tag == .windows;
+        const script_name = if (windows)
+            try std.fmt.allocPrint(allocator, "{s}.cmd", .{name})
+        else
+            try allocator.dupe(u8, name);
+        defer allocator.free(script_name);
+
+        var f = try dir.createFile(io, script_name, .{ .permissions = .executable_file });
         defer f.close(io);
         try f.writeStreamingAll(io, body);
-        return self.tmp.dir.realPathFileAlloc(io, "fake-tsc", allocator);
+        return dir.realPathFileAlloc(io, script_name, allocator);
+    }
+
+    /// A fake declare runner that RECORDS its argv (one per line, to
+    /// `recorded-args.txt` beside the fixture) and then prints
+    /// `schema_json`. Same portable shape as the transpile stubs: the schema
+    /// travels as a payload file, because it is JSON and `cmd` mangles `"`,
+    /// `<`, `>`, `&` and `|`; batch has no `printf "%s\n" "$@"`, so the
+    /// argv walk is a `shift` loop (#699).
+    fn stageRecordingFakeDeclare(dir: std.Io.Dir, allocator: std.mem.Allocator, schema_json: []const u8) ![:0]const u8 {
+        const windows = @import("builtin").os.tag == .windows;
+        const dir_abs = try dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(dir_abs);
+
+        {
+            var f = try dir.createFile(io, "fake-declare.out", .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, schema_json);
+        }
+
+        var body_aw = std.Io.Writer.Allocating.init(allocator);
+        defer body_aw.deinit();
+        const w = &body_aw.writer;
+        if (windows) {
+            try w.writeAll("@echo off\r\n");
+            // Literal paths bound in quotes with delayed expansion OFF
+            // (protects `&(|`, keeps `!` literal); expansion switched on only
+            // for the one `echo`, whose operands are variable values and so
+            // are not rescanned for `!` (#699 review, two rounds — see the
+            // declare suite's stub for the full note).
+            try w.print("set \"REC={s}\\recorded-args.txt\"\r\n", .{dir_abs});
+            try w.writeAll("break > \"%REC%\"\r\n");
+            try w.writeAll(":labelle_loop\r\n");
+            try w.writeAll("if \"%~1\"==\"\" goto labelle_done\r\n");
+            try w.writeAll("set \"ARG=%~1\"\r\n");
+            try w.writeAll("setlocal enabledelayedexpansion\r\n");
+            try w.writeAll("echo(!ARG!>> \"!REC!\"\r\n");
+            try w.writeAll("endlocal\r\n");
+            try w.writeAll("shift\r\n");
+            try w.writeAll("goto labelle_loop\r\n");
+            try w.writeAll(":labelle_done\r\n");
+            try w.print("type \"{s}\\fake-declare.out\"\r\n", .{dir_abs});
+            try w.writeAll("exit /b 0\r\n");
+        } else {
+            try w.writeAll("#!/bin/sh\n");
+            try w.print("printf '%s\\n' \"$@\" > \"{s}/recorded-args.txt\"\n", .{dir_abs});
+            try w.print("cat \"{s}/fake-declare.out\"\n", .{dir_abs});
+            try w.writeAll("exit 0\n");
+        }
+        return stageToolScript(dir, allocator, "fake-declare", body_aw.written());
+    }
+
+    /// A fake tsc that only reports — no emit. `stdout_text` goes to stdout
+    /// (where the real tsc prints diagnostics), `stderr_text` to stderr,
+    /// then it exits `code`.
+    fn stageReportingFakeTsc(dir: std.Io.Dir, allocator: std.mem.Allocator, stdout_text: []const u8, stderr_text: []const u8, code: u8) ![:0]const u8 {
+        const windows = @import("builtin").os.tag == .windows;
+        const dir_abs = try dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(dir_abs);
+
+        // Payloads travel through files: the diagnostics carry `'`, `"`,
+        // `(`, `)` and `{`, which neither `cmd` nor `sh` quotes the same way.
+        {
+            var f = try dir.createFile(io, "fake-tsc.out", .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, stdout_text);
+        }
+        {
+            var f = try dir.createFile(io, "fake-tsc.err", .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, stderr_text);
+        }
+
+        var body_aw = std.Io.Writer.Allocating.init(allocator);
+        defer body_aw.deinit();
+        const w = &body_aw.writer;
+        if (windows) {
+            try w.writeAll("@echo off\r\n");
+            if (stdout_text.len > 0) try w.print("type \"{s}\\fake-tsc.out\"\r\n", .{dir_abs});
+            if (stderr_text.len > 0) try w.print("type \"{s}\\fake-tsc.err\" 1>&2\r\n", .{dir_abs});
+            try w.print("exit /b {d}\r\n", .{code});
+        } else {
+            try w.writeAll("#!/bin/sh\n");
+            if (stdout_text.len > 0) try w.print("cat \"{s}/fake-tsc.out\"\n", .{dir_abs});
+            if (stderr_text.len > 0) try w.print("cat \"{s}/fake-tsc.err\" 1>&2\n", .{dir_abs});
+            try w.print("exit {d}\n", .{code});
+        }
+        return stageToolScript(dir, allocator, "fake-tsc", body_aw.written());
     }
 
     fn config(self: *StagedTranspileProject, backend_repo: []const u8) generate.ProjectConfig {
@@ -159,34 +374,19 @@ const StagedTranspileProject = struct {
     }
 };
 
-/// The happy fake: `$1` must be `-p` (the invocation contract), emit
-/// `enemy.js` into the tsconfig's `outDir`.
-const happy_fake_tsc =
-    \\#!/bin/sh
-    \\[ "$1" = "-p" ] || exit 3
-    \\out=$(sed -n 's/^ *"outDir": "\(.*\)".*$/\1/p' "$2")
-    \\[ -n "$out" ] || exit 4
-    \\printf 'export function update(dt) { /* emitted-by-fake-tsc */ }\n' > "$out/enemy.js"
-    \\exit 0
-    \\
-;
+/// The happy fake: emits the one `.js` the script pass expects, into the
+/// tsconfig's `outDir`.
+const happy_emit = [_]StagedTranspileProject.Emit{
+    .{ .rel = "enemy.js", .body = "export function update(dt) { /* emitted-by-fake-tsc */ }\n" },
+};
 
-/// The type-error fake: a tsc-shaped diagnostic on STDOUT (where the
-/// real tsc prints), nonzero exit, nothing emitted (noEmitOnError).
-const type_error_fake_tsc =
-    \\#!/bin/sh
-    \\echo "scripts/enemy.ts(1,34): error TS2551: Property 'levl' does not exist on type '{ level: number; }'. Did you mean 'level'?"
-    \\exit 2
-    \\
-;
+/// The type-error fake's diagnostic: tsc-shaped, on STDOUT (where the real
+/// tsc prints), nonzero exit, nothing emitted (noEmitOnError).
+const type_error_stdout =
+    "scripts/enemy.ts(1,34): error TS2551: Property 'levl' does not exist on type '{ level: number; }'. Did you mean 'level'?\n";
 
 /// The poison fake: reaching the tool AT ALL is the failure.
-const poison_fake_tsc =
-    \\#!/bin/sh
-    \\echo "poison fake tsc MUST NOT RUN" >&2
-    \\exit 1
-    \\
-;
+const poison_stderr = "poison fake tsc MUST NOT RUN\n";
 
 /// The in-tree sokol backend fixture as an ABSOLUTE `local:` repo (staged
 /// games live in tmp dirs, so the repo-relative spelling can't resolve).
@@ -226,7 +426,7 @@ pub const TRANSPILE_E2E = struct {
         // the transpile swap and stay registered FIRST.
         try writeFileIn(game_root, "components/glue.js", "export const GLUE = 1;\n");
 
-        const fake = try staged.stageFakeTsc(allocator, happy_fake_tsc);
+        const fake = try StagedTranspileProject.stageEmittingFakeTsc(staged.tmp.dir, allocator, &happy_emit);
         defer allocator.free(fake);
         generate.scripting_transpile.tsc_tool_override = fake;
         defer generate.scripting_transpile.tsc_tool_override = null;
@@ -306,7 +506,7 @@ pub const TRANSPILE_E2E = struct {
         defer staged.deinit(allocator);
         // No ts/labelle.d.ts here — the fixture plugin ships contract/.
 
-        const fake = try staged.stageFakeTsc(allocator, happy_fake_tsc);
+        const fake = try StagedTranspileProject.stageEmittingFakeTsc(staged.tmp.dir, allocator, &happy_emit);
         defer allocator.free(fake);
         generate.scripting_transpile.tsc_tool_override = fake;
         defer generate.scripting_transpile.tsc_tool_override = null;
@@ -333,7 +533,7 @@ pub const TRANSPILE_E2E = struct {
         var staged = try StagedTranspileProject.init(allocator);
         defer staged.deinit(allocator);
 
-        const fake = try staged.stageFakeTsc(allocator, type_error_fake_tsc);
+        const fake = try StagedTranspileProject.stageReportingFakeTsc(staged.tmp.dir, allocator, type_error_stdout, "", 2);
         defer allocator.free(fake);
         generate.scripting_transpile.tsc_tool_override = fake;
         defer generate.scripting_transpile.tsc_tool_override = null;
@@ -365,7 +565,7 @@ pub const TRANSPILE_E2E = struct {
         // and since tool resolution (and therefore the fetch) sits
         // BEHIND the need probe, a passing generate here is the pin that
         // .js-only projects never fetch the toolchain.
-        const fake = try staged.stageFakeTsc(allocator, poison_fake_tsc);
+        const fake = try StagedTranspileProject.stageReportingFakeTsc(staged.tmp.dir, allocator, "", poison_stderr, 1);
         defer allocator.free(fake);
         generate.scripting_transpile.tsc_tool_override = fake;
         defer generate.scripting_transpile.tsc_tool_override = null;
@@ -402,7 +602,7 @@ pub const TRANSPILE_E2E = struct {
         // enemy.ts already exists — author the stale twin.
         try writeFileIn(game_root, "scripts/enemy.js", "export function update(dt) {}\n");
 
-        const fake = try staged.stageFakeTsc(allocator, poison_fake_tsc);
+        const fake = try StagedTranspileProject.stageReportingFakeTsc(staged.tmp.dir, allocator, "", poison_stderr, 1);
         defer allocator.free(fake);
         generate.scripting_transpile.tsc_tool_override = fake;
         defer generate.scripting_transpile.tsc_tool_override = null;
@@ -423,7 +623,7 @@ pub const TRANSPILE_E2E = struct {
         defer game_root.close(io);
         try writeFileIn(game_root, "scripts/labelle.d.ts", "declare const labelle: any;\n");
 
-        const fake = try staged.stageFakeTsc(allocator, happy_fake_tsc);
+        const fake = try StagedTranspileProject.stageEmittingFakeTsc(staged.tmp.dir, allocator, &happy_emit);
         defer allocator.free(fake);
         generate.scripting_transpile.tsc_tool_override = fake;
         defer generate.scripting_transpile.tsc_tool_override = null;
@@ -474,17 +674,11 @@ pub const TRANSPILE_E2E = struct {
         try writeFileIn(game_root, "scripts/10_a.ts", "export function update(dt: number): void {}\n");
 
         // A fake tsc that emits BOTH prefix-named outputs into outDir.
-        const ordering_fake_tsc =
-            \\#!/bin/sh
-            \\[ "$1" = "-p" ] || exit 3
-            \\out=$(sed -n 's/^ *"outDir": "\(.*\)".*$/\1/p' "$2")
-            \\[ -n "$out" ] || exit 4
-            \\printf 'export function update(dt) {}\n' > "$out/10_a.js"
-            \\printf 'export function update(dt) {}\n' > "$out/20_b.js"
-            \\exit 0
-            \\
-        ;
-        const fake = try staged.stageFakeTsc(allocator, ordering_fake_tsc);
+        const ordering_emit = [_]StagedTranspileProject.Emit{
+            .{ .rel = "10_a.js", .body = "export function update(dt) {}\n" },
+            .{ .rel = "20_b.js", .body = "export function update(dt) {}\n" },
+        };
+        const fake = try StagedTranspileProject.stageEmittingFakeTsc(staged.tmp.dir, allocator, &ordering_emit);
         defer allocator.free(fake);
         generate.scripting_transpile.tsc_tool_override = fake;
         defer generate.scripting_transpile.tsc_tool_override = null;
@@ -518,7 +712,7 @@ pub const TRANSPILE_E2E = struct {
         try writeFileIn(game_root, "ts/behavior.js", "// @ts-check\nexport function update(dt) {}\n");
         try writeFileIn(game_root, "ts/enemy.ts", "export function update(dt: number): void {}\n");
 
-        const fake = try staged.stageFakeTsc(allocator, happy_fake_tsc);
+        const fake = try StagedTranspileProject.stageEmittingFakeTsc(staged.tmp.dir, allocator, &happy_emit);
         defer allocator.free(fake);
         generate.scripting_transpile.tsc_tool_override = fake;
         defer generate.scripting_transpile.tsc_tool_override = null;
@@ -578,24 +772,11 @@ const ts_decl_plugin_manifest =
 /// for whichever tsconfig it is handed (`tsconfig.declare.json` -> the
 /// declaration dirs' `.js`; the script tsconfig -> the script `.js`). Honors
 /// the `<tool> -p <tsconfig>` contract and reads `outDir` from the config.
-const decl_transpile_fake_tsc =
-    \\#!/bin/sh
-    \\[ "$1" = "-p" ] || exit 3
-    \\out=$(sed -n 's/^ *"outDir": "\(.*\)".*$/\1/p' "$2")
-    \\[ -n "$out" ] || exit 4
-    \\case "$2" in
-    \\  *tsconfig.declare.json)
-    \\    mkdir -p "$out/components" "$out/events"
-    \\    printf 'export const Hunger = labelle.component("Hunger", { level: 0.875 });\n' > "$out/components/hunger.js"
-    \\    printf 'export const Feed = labelle.event("hunger__feed", { amount: 0.5 });\n' > "$out/events/feed.js"
-    \\    ;;
-    \\  *)
-    \\    printf 'export function update(dt) {}\n' > "$out/logic.js"
-    \\    ;;
-    \\esac
-    \\exit 0
-    \\
-;
+const decl_emit = [_]StagedTranspileProject.Emit{
+    .{ .when_config_suffix = "tsconfig.declare.json", .rel = "components/hunger.js", .body = "export const Hunger = labelle.component(\"Hunger\", { level: 0.875 });\n" },
+    .{ .when_config_suffix = "tsconfig.declare.json", .rel = "events/feed.js", .body = "export const Feed = labelle.event(\"hunger__feed\", { amount: 0.5 });\n" },
+    .{ .unless_config_suffix = "tsconfig.declare.json", .rel = "logic.js", .body = "export function update(dt) {}\n" },
+};
 
 const decl_schema_json =
     \\{"components":[{"name":"Hunger","persist":"persistent","fields":[{"name":"level","type":"f32","default":0.875}]}],"events":[{"name":"hunger__feed","fields":[{"name":"amount","type":"f32","default":0.5}]}]}
@@ -636,28 +817,16 @@ pub const DECL_TRANSPILE_E2E = struct {
         const out_abs = try tmp.dir.realPathFileAlloc(io, "out", allocator);
         defer allocator.free(out_abs);
 
-        // Fake tsc.
-        var tf = try tmp.dir.createFile(io, "fake-tsc", .{ .permissions = .executable_file });
-        try tf.writeStreamingAll(io, decl_transpile_fake_tsc);
-        tf.close(io);
-        const fake_tsc = try tmp.dir.realPathFileAlloc(io, "fake-tsc", allocator);
+        // Fake tsc, through the portable helper (#699).
+        const fake_tsc = try StagedTranspileProject.stageEmittingFakeTsc(tmp.dir, allocator, &decl_emit);
         defer allocator.free(fake_tsc);
         generate.scripting_transpile.tsc_tool_override = fake_tsc;
         defer generate.scripting_transpile.tsc_tool_override = null;
 
-        // Fake declare runner that RECORDS its argv, then echoes the schema.
-        const args_abs = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-        defer allocator.free(args_abs);
-        const decl_body = try std.fmt.allocPrint(
-            allocator,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{s}/recorded-args.txt\"\necho '{s}'\n",
-            .{ args_abs, decl_schema_json },
-        );
-        defer allocator.free(decl_body);
-        var df = try tmp.dir.createFile(io, "fake-declare", .{ .permissions = .executable_file });
-        try df.writeStreamingAll(io, decl_body);
-        df.close(io);
-        const fake_declare = try tmp.dir.realPathFileAlloc(io, "fake-declare", allocator);
+        // Fake declare runner that RECORDS its argv, then echoes the schema —
+        // through the portable helper, since a `#!/bin/sh` body is not
+        // executable on Windows (#699).
+        const fake_declare = try StagedTranspileProject.stageRecordingFakeDeclare(tmp.dir, allocator, decl_schema_json);
         defer allocator.free(fake_declare);
         generate.scripting_declare.declare_tool_override = fake_declare;
         defer generate.scripting_declare.declare_tool_override = null;
