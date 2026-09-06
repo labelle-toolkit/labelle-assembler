@@ -70,9 +70,31 @@ pub const Error = error{
     JunctionFailed,
 };
 
+/// Whether `path` exists (local copy — this module sits below the cache).
+fn pathExists(path: []const u8) bool {
+    std.Io.Dir.cwd().access(@import("config.zig").globalIo(), path, .{}) catch return false;
+    return true;
+}
+
+/// Whether `path` is an empty directory. A directory that cannot be opened
+/// or read counts as NON-empty: this gates a deletion, so the cautious
+/// answer is the safe one.
+fn dirIsEmpty(path: []const u8) bool {
+    const io = @import("config.zig").globalIo();
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    const first = it.next(io) catch return false;
+    return first == null;
+}
+
 /// Create a directory junction at `link` pointing at `target`.
 ///
-/// `target` must be an absolute local path; `link` must not already exist.
+/// `target` must be an absolute local path. `link` may already exist only
+/// if it is an EMPTY directory — which is the ordinary case here, since
+/// Zig's `symLink` leaves one behind when its privilege check fails. A
+/// non-empty `link` is refused rather than converted or deleted.
+///
 /// Returns `error.Unsupported` off Windows so callers can keep one code
 /// path and fall through to their own fallback.
 pub fn create(allocator: std.mem.Allocator, target: []const u8, link: []const u8) Error!void {
@@ -86,9 +108,34 @@ pub fn create(allocator: std.mem.Allocator, target: []const u8, link: []const u8
     const io = @import("config.zig").globalIo();
     const cwd = std.Io.Dir.cwd();
 
-    // The reparse point is set on an existing, empty directory.
-    cwd.createDirPath(io, link) catch return error.JunctionFailed;
-    errdefer cwd.deleteTree(io, link) catch {};
+    // Parent first, leaf separately — `createDirPath` on the leaf would
+    // succeed for an EXISTING directory and lose the distinction the
+    // cleanup below depends on. Guarded on existence because
+    // `createDirPath` on a drive root fails with BadPathName (#704).
+    if (std.fs.path.dirname(link)) |parent| {
+        if (!pathExists(parent)) cwd.createDirPath(io, parent) catch return error.JunctionFailed;
+    }
+
+    // The reparse point is set on an existing, EMPTY directory.
+    //
+    // An existing one is not automatically ours to use, and never ours to
+    // delete (#710 review). An empty directory here is the ordinary case —
+    // Zig's own `symLink` creates the directory BEFORE its privilege check
+    // fails, so it leaves one behind on the very path that sends us here.
+    // But a NON-empty directory is somebody's data: converting it would
+    // hide the contents behind the junction, and an unconditional cleanup
+    // would delete them outright. Refuse instead.
+    var created = true;
+    cwd.createDir(io, link, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            if (!dirIsEmpty(link)) return error.JunctionFailed;
+            created = false;
+        },
+        else => return error.JunctionFailed,
+    };
+    // Armed only for a directory THIS call created, so a pre-existing one
+    // survives a failure untouched.
+    errdefer if (created) cwd.deleteTree(io, link) catch {};
 
     var link_w: [std.os.windows.PATH_MAX_WIDE:0]u16 = undefined;
     const link_len = std.unicode.wtf8ToWtf16Le(&link_w, link) catch return error.JunctionFailed;
@@ -216,4 +263,72 @@ test "create: a relative or UNC target is unsupported, not a broken reparse poin
     defer alloc.free(link);
     try std.testing.expectError(error.Unsupported, create(alloc, "..\\sibling", link));
     try std.testing.expectError(error.Unsupported, create(alloc, "\\\\server\\share", link));
+}
+
+test "create: a NON-EMPTY existing directory is refused, never converted or deleted (#710 review)" {
+    // The cleanup path is a `deleteTree`. If an existing directory could
+    // reach it, a failed junction would delete whatever was already there —
+    // so a non-empty one must be refused outright, and left intact.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "source");
+    try tmp.dir.createDirPath(io, "occupied");
+
+    const target = try tmp.dir.realPathFileAlloc(io, "source", alloc);
+    defer alloc.free(target);
+    const occupied = try tmp.dir.realPathFileAlloc(io, "occupied", alloc);
+    defer alloc.free(occupied);
+
+    const bystander = try std.fs.path.join(alloc, &.{ occupied, "do-not-delete.txt" });
+    defer alloc.free(bystander);
+    {
+        const f = try cwd.createFile(io, bystander, .{});
+        try f.writeStreamingAll(io, "mine");
+        f.close(io);
+    }
+
+    try std.testing.expectError(error.JunctionFailed, create(alloc, target, occupied));
+
+    // Still a plain directory, contents untouched.
+    try std.testing.expect(!isLink(occupied));
+    const content = try cwd.readFileAlloc(io, bystander, alloc, .limited(64));
+    defer alloc.free(content);
+    try std.testing.expectEqualStrings("mine", content);
+}
+
+test "create: an EMPTY existing directory is adopted — the path symLink leaves behind (#710 review)" {
+    // Zig's `symLink` creates the directory before its privilege check
+    // fails, so it leaves an empty one on exactly the path that falls
+    // through to a junction. Refusing that would make the fallback useless.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "source");
+    try tmp.dir.createDirPath(io, "empty");
+
+    const target = try tmp.dir.realPathFileAlloc(io, "source", alloc);
+    defer alloc.free(target);
+    const empty = try tmp.dir.realPathFileAlloc(io, "empty", alloc);
+    defer alloc.free(empty);
+
+    try create(alloc, target, empty);
+    try std.testing.expect(isLink(empty));
+
+    var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try std.Io.Dir.readLinkAbsolute(io, empty, &link_buf);
+    try std.testing.expectEqualStrings(target, link_buf[0..n]);
+}
+
+fn isLink(path: []const u8) bool {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    _ = std.Io.Dir.readLinkAbsolute(@import("config.zig").globalIo(), path, &buf) catch return false;
+    return true;
 }
