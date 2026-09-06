@@ -286,15 +286,26 @@ jobs:
               exit 1
             fi
             ( cd flat && shasum -a 256 -c SHA256SUMS )
+            ( cd flat && sha256sum -c SHA256SUMS )
 
             # aws is preinstalled on ubuntu-latest; no `pip install awscli`
             # (that breaks under Ubuntu 24.04's PEP 668 externally-managed env).
-            # The glob picks up SHA256SUMS alongside the binaries, so it lands
-            # at assembler/<tag>/SHA256SUMS next to what it describes.
-            for file in flat/*; do
+            #
+            # Upload the BINARIES first and the manifest LAST. Unlike the
+            # GitHub release, R2 objects appear one at a time under a
+            # well-known prefix a consumer can fetch directly, so the order is
+            # observable. A plain `flat/*` glob would publish the manifest
+            # FIRST — C-locale ordering puts uppercase `SHA256SUMS` ahead of
+            # the lowercase `labelle-assembler-*` names — leaving a window
+            # where the manifest describes binaries that are not there yet,
+            # which an interrupted run would leave in place indefinitely.
+            # Publishing it last makes its presence mean "all five landed".
+            for file in flat/labelle-assembler-*; do
               aws s3 cp "$file" "s3://$R2_BUCKET/assembler/$VERSION/$(basename "$file")" \
                 --endpoint-url "$R2_ENDPOINT"
             done
+            aws s3 cp flat/SHA256SUMS "s3://$R2_BUCKET/assembler/$VERSION/SHA256SUMS" \
+              --endpoint-url "$R2_ENDPOINT"
 
             # Only advance the latest.txt pointer on a real tag push. A
             # workflow_dispatch run can rebuild an OLDER tag; overwriting
