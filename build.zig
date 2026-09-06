@@ -175,7 +175,11 @@ pub fn build(b: *std.Build) void {
     // worktree-path tests are among the pre-existing Windows failures, and
     // they predate and are untouched by the local-slot work. Add it back
     // when those are fixed.
-    const cache_filters = [_][]const u8{ "cache.local", "cache.disk", "cache_cmd" };
+    // `junction` joins them for #710: the junction code is Windows-ONLY, and
+    // this job is the only place CI runs on Windows — the unfiltered `test`
+    // step runs on ubuntu/macos, where those tests skip. Without the filter
+    // the platform-specific code would have no automated execution anywhere.
+    const cache_filters = [_][]const u8{ "cache.local", "cache.disk", "cache_cmd", "junction" };
     const test_cache_step = b.step("test-cache", "Run only the cache/local-slot tests");
 
     const cache_src_tests = b.addTest(.{

@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const config = @import("../config.zig");
 const env = @import("env.zig");
 const local = @import("local.zig");
+const junction = @import("../junction.zig");
 const resolve = @import("resolve.zig");
 
 /// Write a slot's provenance, dropping the slot if that write fails.
@@ -123,6 +124,46 @@ pub fn populatePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, so
     try writeOriginOrDropSlot(allocator, target, source_dir, plugin.version, .discovered);
 }
 
+/// Create a link at `target` pointing at `abs_source`: a symlink where the
+/// platform allows one, else a Windows directory junction.
+///
+/// The junction is what makes this work at all on Windows (#710). Zig's
+/// `symLink` builds the reparse point itself and so needs
+/// SeCreateSymbolicLinkPrivilege, which an ordinary account does not hold —
+/// it fails even where `New-Item -ItemType SymbolicLink` succeeds. Without a
+/// junction every slot fell through to the COPY below: a snapshot that never
+/// sees a source edit, and that `slotTracksSource` correctly refuses to
+/// treat as live. A junction needs no privilege, and `readLink` and
+/// `deleteTree` both treat it exactly like the symlink it stands in for, so
+/// nothing on the resolve side changes.
+///
+/// `error.PathAlreadyExists` passes through unchanged — the caller has a
+/// reconcile path for it. Any other failure is returned as the ORIGINAL
+/// symlink error, so the caller still knows why linking was impossible.
+fn linkToTarget(allocator: std.mem.Allocator, abs_source: []const u8, target: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+
+    return cwd.symLink(io, abs_source, target, .{ .is_directory = true }) catch |err| {
+        if (err == error.PathAlreadyExists) return err;
+        junction.create(allocator, abs_source, target) catch return err;
+    };
+}
+
+/// Remove a cache entry that is a LINK, leaving whatever it points at alone.
+///
+/// `deleteFile` removes a symlink but cannot remove a junction, which is a
+/// directory reparse point (#710). `deleteTree` removes either, and — the
+/// property this relies on — it drops the link itself rather than recursing
+/// through it into the user's checkout.
+fn removeLinkEntry(target: []const u8) !void {
+    const io = config.globalIo();
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteFile(io, target) catch {
+        try cwd.deleteTree(io, target);
+    };
+}
+
 /// Create a symlink from cache target to source directory.
 /// The source_dir must be an absolute path (resolved via realpath).
 /// Creates parent directories as needed.
@@ -154,9 +195,9 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
         }
     }
 
-    // Create symlink (absolute target → source), fall back to copy on failure
-    // (Windows requires admin/Developer Mode for symlinks)
-    cwd.symLink(io, abs_source, target, .{ .is_directory = true }) catch |err| {
+    // Link the source in; copy only if the platform refuses BOTH a symlink
+    // and a junction (#710).
+    linkToTarget(allocator, abs_source, target) catch |err| {
         if (err == error.PathAlreadyExists) {
             var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             if (std.Io.Dir.readLinkAbsolute(io, target, &link_buf)) |existing_len| {
@@ -168,7 +209,7 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
                 // caller rewrite the provenance marker with the NEW source
                 // while the link still targets the old checkout, and
                 // `active*Slot` trusts that marker (#688 review round 4).
-                cwd.deleteFile(io, target) catch |del_err| {
+                removeLinkEntry(target) catch |del_err| {
                     std.log.warn("labelle: could not replace cache entry '{s}': {any}", .{ target, del_err });
                     return error.CachePopulationFailed;
                 };
@@ -185,7 +226,7 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
                 };
             }
             // Recreate: link if the platform allows it, copy if it does not.
-            cwd.symLink(io, abs_source, target, .{ .is_directory = true }) catch {
+            linkToTarget(allocator, abs_source, target) catch {
                 copyDirRecursive(allocator, abs_source, target) catch |copy_err| {
                     std.log.err("labelle: could not link or copy '{s}' to '{s}': {any}", .{ abs_source, target, copy_err });
                     return error.CachePopulationFailed;
