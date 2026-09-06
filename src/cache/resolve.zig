@@ -667,7 +667,7 @@ test "resolveLocalPath: worktree-internal path (no `..` prefix) stays in the wor
     const resolved = try resolveLocalPath(alloc, "libs/foo", wt_abs);
     defer alloc.free(resolved);
 
-    const expected = try std.fs.path.join(alloc, &.{ wt_abs, "libs/foo" });
+    const expected = try std.fs.path.join(alloc, &.{ wt_abs, "libs", "foo" });
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
 }
@@ -731,7 +731,7 @@ test "toMainCheckoutPath: worktree path inside project_dir maps to main checkout
     const mapped = try toMainCheckoutPath(alloc, wt_libs_foo, wt_abs);
     defer alloc.free(mapped);
 
-    const expected = try std.fs.path.join(alloc, &.{ main_abs, "libs/foo" });
+    const expected = try std.fs.path.join(alloc, &.{ main_abs, "libs", "foo" });
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, mapped);
 }

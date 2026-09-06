@@ -245,18 +245,92 @@ const StagedProject = struct {
         self.tmp.cleanup();
     }
 
-    /// Stage an executable fake declare runner printing `schema_json` and
-    /// point `declare_tool_override` at it (caller clears the override).
-    /// A `#!/bin/sh` stub, not a Zig exe: building the REAL tool here
-    /// would fetch lua from the network — the exact non-hermetic step the
-    /// override seam exists to bypass (see scripting_declare.zig).
-    fn stageFakeRunner(self: *StagedProject, allocator: std.mem.Allocator, schema_json: []const u8) ![:0]const u8 {
-        const body = try std.fmt.allocPrint(allocator, "#!/bin/sh\necho '{s}'\n", .{schema_json});
-        defer allocator.free(body);
-        var f = try self.tmp.dir.createFile(io, "fake-declare", .{ .permissions = .executable_file });
+    /// Write an executable stub at `name` that prints `stdout_text`, writes
+    /// `stderr_text` to stderr, and exits `code`. Returns its absolute path.
+    ///
+    /// A stub rather than the REAL tool because building that here would
+    /// drag a lua/ruby toolchain into the test. It has to be a stub the HOST
+    /// can execute, though, and a `#!/bin/sh` script is not that on Windows:
+    /// there is no shebang, so `CreateProcess` fails with `error.InvalidExe`
+    /// and the whole declare suite failed for a reason unrelated to what it
+    /// tests (#699).
+    ///
+    /// Windows gets a `.cmd`, which Zig's spawn does run. The payload is
+    /// `type`d out of a sidecar file rather than `echo`ed, because the
+    /// schema is JSON and `cmd` mangles `"`, `<`, `>`, `&` and `|` — piping
+    /// bytes through a file sidesteps batch quoting entirely.
+    fn stageStub(
+        self: *StagedProject,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        stdout_text: []const u8,
+        stderr_text: []const u8,
+        code: u8,
+        record_args: bool,
+    ) ![:0]const u8 {
+        const windows = @import("builtin").os.tag == .windows;
+        const dir_abs = try self.tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(dir_abs);
+
+        // Payload files, so neither shell has to quote the content.
+        const out_name = try std.fmt.allocPrint(allocator, "{s}.out", .{name});
+        defer allocator.free(out_name);
+        try writeFileBytes(self.tmp.dir, out_name, stdout_text);
+        const err_name = try std.fmt.allocPrint(allocator, "{s}.err", .{name});
+        defer allocator.free(err_name);
+        try writeFileBytes(self.tmp.dir, err_name, stderr_text);
+
+        const script_name = if (windows)
+            try std.fmt.allocPrint(allocator, "{s}.cmd", .{name})
+        else
+            try allocator.dupe(u8, name);
+        defer allocator.free(script_name);
+
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+        const w = body.writer(allocator);
+
+        if (windows) {
+            try w.writeAll("@echo off\r\n");
+            if (record_args) {
+                // Batch has no `printf "%s\n" "$@"`; walk argv with shift.
+                try w.print("break > \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
+                try w.writeAll(":labelle_loop\r\n");
+                try w.writeAll("if \"%~1\"==\"\" goto labelle_done\r\n");
+                try w.print("echo %~1>> \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
+                try w.writeAll("shift\r\n");
+                try w.writeAll("goto labelle_loop\r\n");
+                try w.writeAll(":labelle_done\r\n");
+            }
+            if (stdout_text.len > 0) try w.print("type \"{s}\\{s}\"\r\n", .{ dir_abs, out_name });
+            if (stderr_text.len > 0) try w.print("type \"{s}\\{s}\" 1>&2\r\n", .{ dir_abs, err_name });
+            try w.print("exit /b {d}\r\n", .{code});
+        } else {
+            try w.writeAll("#!/bin/sh\n");
+            if (record_args) {
+                try w.print("printf '%s\\n' \"$@\" > \"{s}/recorded-args.txt\"\n", .{dir_abs});
+            }
+            if (stdout_text.len > 0) try w.print("cat \"{s}/{s}\"\n", .{ dir_abs, out_name });
+            if (stderr_text.len > 0) try w.print("cat \"{s}/{s}\" 1>&2\n", .{ dir_abs, err_name });
+            try w.print("exit {d}\n", .{code});
+        }
+
+        var f = try self.tmp.dir.createFile(io, script_name, .{ .permissions = .executable_file });
         defer f.close(io);
-        try f.writeStreamingAll(io, body);
-        return self.tmp.dir.realPathFileAlloc(io, "fake-declare", allocator);
+        try f.writeStreamingAll(io, body.items);
+
+        return self.tmp.dir.realPathFileAlloc(io, script_name, allocator);
+    }
+
+    fn writeFileBytes(dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+        var f = try dir.createFile(io, name, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, bytes);
+    }
+
+    /// Prints `schema_json` and exits 0.
+    fn stageFakeRunner(self: *StagedProject, allocator: std.mem.Allocator, schema_json: []const u8) ![:0]const u8 {
+        return self.stageStub(allocator, "fake-declare", schema_json, "", 0, false);
     }
 
     /// The argv-RECORDING flavor: writes every script path it was invoked
@@ -264,18 +338,7 @@ const StagedProject = struct {
     /// prints the schema. Pins WHICH files reach the runner and in WHAT
     /// order — the components-first union contract.
     fn stageRecordingFakeRunner(self: *StagedProject, allocator: std.mem.Allocator, schema_json: []const u8) ![:0]const u8 {
-        const args_abs = try self.tmp.dir.realPathFileAlloc(io, ".", allocator);
-        defer allocator.free(args_abs);
-        const body = try std.fmt.allocPrint(
-            allocator,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{s}/recorded-args.txt\"\necho '{s}'\n",
-            .{ args_abs, schema_json },
-        );
-        defer allocator.free(body);
-        var f = try self.tmp.dir.createFile(io, "fake-declare", .{ .permissions = .executable_file });
-        defer f.close(io);
-        try f.writeStreamingAll(io, body);
-        return self.tmp.dir.realPathFileAlloc(io, "fake-declare", allocator);
+        return self.stageStub(allocator, "fake-declare", schema_json, "", 0, true);
     }
 
     /// `language` is COMPTIME so the anonymous `.plugins` array literal is
@@ -351,9 +414,12 @@ pub const DECLARE_PHASE_E2E = struct {
         // Pass 2: the declarations were removed (empty schema) → the phase
         // is a no-op AND the stale generated file is deleted, so the
         // target matches a never-declared project.
-        var f = try staged.tmp.dir.createFile(io, "fake-declare", .{ .permissions = .executable_file });
-        try f.writeStreamingAll(io, "#!/bin/sh\necho '{\"components\":[]}'\n");
-        f.close(io);
+        // Re-stage through the SAME helper so the override actually picks up
+        // the new payload: on Windows it points at `fake-declare.cmd`, so
+        // overwriting a bare `fake-declare` changed nothing (#699).
+        const fake_empty = try staged.stageStub(allocator, "fake-declare", "{\"components\":[]}", "", 0, false);
+        defer allocator.free(fake_empty);
+        generate.scripting_declare.declare_tool_override = fake_empty;
         try generate.generate(allocator, staged.config(backend_repo), staged.out_abs, staged.game_abs, .{ .is_tests_target = true });
         try std.testing.expectError(
             error.FileNotFound,
@@ -525,10 +591,7 @@ pub const DECLARE_PHASE_E2E = struct {
 
         // A fake runner that fails like the real one does on a malformed
         // spec: file-and-name-bearing message on stderr, exit 1.
-        var f = try staged.tmp.dir.createFile(io, "fake-declare", .{ .permissions = .executable_file });
-        try f.writeStreamingAll(io, "#!/bin/sh\necho 'labelle-declare: scripts/hunger.lua:1: bad spec' >&2\nexit 1\n");
-        f.close(io);
-        const fake = try staged.tmp.dir.realPathFileAlloc(io, "fake-declare", allocator);
+        const fake = try staged.stageStub(allocator, "fake-declare", "", "labelle-declare: scripts/hunger.lua:1: bad spec\n", 1, false);
         defer allocator.free(fake);
         generate.scripting_declare.declare_tool_override = fake;
         defer generate.scripting_declare.declare_tool_override = null;

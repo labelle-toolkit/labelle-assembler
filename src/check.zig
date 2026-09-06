@@ -816,21 +816,36 @@ test "rule 3: a higher pack referencing a lower pack's event is clean" {
     try testing.expectEqual(@as(usize, 0), f.len);
 }
 
+/// A fixture path in HOST-absolute form.
+///
+/// The rule-4 tests compare an `@import` that `checkCrossPackImport` has run
+/// through `std.fs.path.resolve` against the pack dirs in `Context`. On
+/// Windows that resolve turns a rooted `/proj/...` into `C:\proj\...`, so a
+/// POSIX literal on the other side of the comparison never matched and the
+/// rule silently found nothing (#699).
+///
+/// Resolving the fixture the same way mirrors production, where both sides
+/// come from one `resolvePlugin` realpath pass — which is exactly what the
+/// comment on `checkCrossPackImport` promises.
+fn fixturePath(arena: std.mem.Allocator, posix: []const u8) ![]const u8 {
+    return std.fs.path.resolve(arena, &.{posix});
+}
+
 test "rule 4: importing a non-dependency pack's file is flagged" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ctx = Context{
         .current_prefix = "production",
         .pack_prefixes = &.{ "production", "citizens" },
-        .current_pack_dir = "/proj/packs/production",
+        .current_pack_dir = try fixturePath(arena.allocator(), "/proj/packs/production"),
         .foreign_packs = &.{
-            .{ .name = "citizens", .dir = "/proj/packs/citizens", .allowed = false },
+            .{ .name = "citizens", .dir = try fixturePath(arena.allocator(), "/proj/packs/citizens"), .allowed = false },
         },
     };
     var findings: std.ArrayList(Finding) = .empty;
     try scanSource(arena.allocator(), &findings,
         \\const Worker = @import("../../citizens/components/worker.zig").Worker;
-    , "/proj/packs/production/scripts/00_work.zig", ctx);
+    , try fixturePath(arena.allocator(), "/proj/packs/production/scripts/00_work.zig"), ctx);
     try testing.expectEqual(@as(usize, 1), findings.items.len);
     try testing.expectEqual(Rule.cross_pack_import, findings.items[0].rule);
     try testing.expect(std.mem.indexOf(u8, findings.items[0].message, "citizens") != null);
@@ -843,15 +858,15 @@ test "rule 4: importing a DECLARED-dependency pack's file is allowed" {
     const ctx = Context{
         .current_prefix = "production",
         .pack_prefixes = &.{ "production", "citizens" },
-        .current_pack_dir = "/proj/packs/production",
+        .current_pack_dir = try fixturePath(arena.allocator(), "/proj/packs/production"),
         .foreign_packs = &.{
-            .{ .name = "citizens", .dir = "/proj/packs/citizens", .allowed = true },
+            .{ .name = "citizens", .dir = try fixturePath(arena.allocator(), "/proj/packs/citizens"), .allowed = true },
         },
     };
     var findings: std.ArrayList(Finding) = .empty;
     try scanSource(arena.allocator(), &findings,
         \\const Worker = @import("../../citizens/components/worker.zig").Worker;
-    , "/proj/packs/production/scripts/00_work.zig", ctx);
+    , try fixturePath(arena.allocator(), "/proj/packs/production/scripts/00_work.zig"), ctx);
     try testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
@@ -861,15 +876,15 @@ test "rule 4: a pack importing its OWN file is clean" {
     const ctx = Context{
         .current_prefix = "production",
         .pack_prefixes = &.{ "production", "citizens" },
-        .current_pack_dir = "/proj/packs/production",
+        .current_pack_dir = try fixturePath(arena.allocator(), "/proj/packs/production"),
         .foreign_packs = &.{
-            .{ .name = "citizens", .dir = "/proj/packs/citizens", .allowed = false },
+            .{ .name = "citizens", .dir = try fixturePath(arena.allocator(), "/proj/packs/citizens"), .allowed = false },
         },
     };
     var findings: std.ArrayList(Finding) = .empty;
     try scanSource(arena.allocator(), &findings,
         \\const Local = @import("../components/thing.zig").Thing;
-    , "/proj/packs/production/scripts/00_work.zig", ctx);
+    , try fixturePath(arena.allocator(), "/proj/packs/production/scripts/00_work.zig"), ctx);
     try testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
@@ -879,16 +894,16 @@ test "rule 4: a module import (no .zig) is never a cross-pack import" {
     const ctx = Context{
         .current_prefix = "production",
         .pack_prefixes = &.{ "production", "citizens" },
-        .current_pack_dir = "/proj/packs/production",
+        .current_pack_dir = try fixturePath(arena.allocator(), "/proj/packs/production"),
         .foreign_packs = &.{
-            .{ .name = "citizens", .dir = "/proj/packs/citizens", .allowed = false },
+            .{ .name = "citizens", .dir = try fixturePath(arena.allocator(), "/proj/packs/citizens"), .allowed = false },
         },
     };
     var findings: std.ArrayList(Finding) = .empty;
     try scanSource(arena.allocator(), &findings,
         \\const std = @import("std");
         \\const game = @import("game");
-    , "/proj/packs/production/scripts/00_work.zig", ctx);
+    , try fixturePath(arena.allocator(), "/proj/packs/production/scripts/00_work.zig"), ctx);
     try testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
@@ -915,16 +930,16 @@ test "rule 4: a sibling-prefix dir does not false-match (citizens vs citizens2)"
     const ctx = Context{
         .current_prefix = "production",
         .pack_prefixes = &.{ "production", "citizens", "citizens2" },
-        .current_pack_dir = "/proj/packs/production",
+        .current_pack_dir = try fixturePath(arena.allocator(), "/proj/packs/production"),
         .foreign_packs = &.{
-            .{ .name = "citizens", .dir = "/proj/packs/citizens", .allowed = false },
-            .{ .name = "citizens2", .dir = "/proj/packs/citizens2", .allowed = true },
+            .{ .name = "citizens", .dir = try fixturePath(arena.allocator(), "/proj/packs/citizens"), .allowed = false },
+            .{ .name = "citizens2", .dir = try fixturePath(arena.allocator(), "/proj/packs/citizens2"), .allowed = true },
         },
     };
     var findings: std.ArrayList(Finding) = .empty;
     try scanSource(arena.allocator(), &findings,
         \\const W = @import("../../citizens2/components/worker.zig").Worker;
-    , "/proj/packs/production/scripts/00_work.zig", ctx);
+    , try fixturePath(arena.allocator(), "/proj/packs/production/scripts/00_work.zig"), ctx);
     try testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
