@@ -1,6 +1,7 @@
 /// File scanning and directory copy utilities for the labelle-cli generator.
 const std = @import("std");
 const config = @import("config.zig");
+const junction = @import("junction.zig");
 
 pub fn freeNames(allocator: std.mem.Allocator, names: []const []const u8) void {
     for (names) |n| allocator.free(n);
@@ -378,10 +379,41 @@ pub fn linkDirAbs(
     // the plugin package's shipped placeholder dir). Safe because every
     // caller's destination is CLI-managed (`.labelle/<target>/`, the
     // staged deps tree).
+    // The source in ABSOLUTE, canonical form. Needed twice below, and for a
+    // reason worth stating: callers legitimately pass a RELATIVE source —
+    // `--project-root .` reaches `linkDir` as `.` and makes `src_path`
+    // `./scripts`. A junction target has no relative form, so without this
+    // `junction.create` refused it as `Unsupported` and Windows silently
+    // fell back to the copy this whole path exists to remove (#699 review).
+    //
+    // Null when the source cannot be canonicalised; the symlink below does
+    // not need it, and the copy is still a valid last resort.
+    // `null` means "could not canonicalise", which legitimately falls back to
+    // a copy. An ALLOCATION failure is not that: swallowing it here would
+    // report success having quietly staged a snapshot, so it propagates
+    // (#699 review).
+    const abs_src: ?[]u8 = if (cwd.realPathFileAlloc(io, src_path, allocator)) |canon| blk: {
+        defer allocator.free(canon);
+        break :blk try allocator.dupe(u8, canon);
+    } else |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (abs_src) |p| allocator.free(p);
+
     var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (cwd.readLink(io, dst_path, &link_buf)) |existing_len| {
         const existing = link_buf[0..existing_len];
         if (std.mem.eql(u8, existing, relative_target)) return;
+        // A junction reads back ABSOLUTE, so a correct one never equals
+        // `relative_target`. Left unrecognised it would be deleted and
+        // recreated on EVERY generate — defeating the documented no-op, and
+        // able to fail outright when another process holds the staged tree
+        // open (#699 review). Both sides here are canonical Windows paths
+        // (`readLink` and `realPath`), so they compare directly.
+        if (abs_src) |a| {
+            if (std.mem.eql(u8, existing, a)) return;
+        }
         try cwd.deleteTree(io, dst_path);
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -390,13 +422,36 @@ pub fn linkDirAbs(
     }
 
     cwd.symLink(io, relative_target, dst_path, .{ .is_directory = true }) catch |err| {
-        // Windows needs admin / Developer Mode for symlinks — fall back
-        // to a copy-based layout, mirroring cache/disk.zig's fallback.
-        if (err == error.AccessDenied or err == error.PermissionDenied) {
+        if (err != error.AccessDenied and err != error.PermissionDenied) return err;
+
+        // Windows without SeCreateSymbolicLinkPrivilege, which an ordinary
+        // account does not hold (#710). A JUNCTION needs no privilege, and
+        // unlike the copy below it is a live view — which is the entire
+        // point of these links: `.labelle/<target>/scripts` exists so a
+        // source edit reaches the staged tree without re-generating.
+        //
+        // The trade is deliberate. A junction stores an NT path and has no
+        // relative form, so it does NOT survive moving the project the way
+        // the relative symlink above does. That is the lesser loss:
+        //
+        //   * a copy does not track edits at all, so it defeats the link's
+        //     primary purpose on every build, not just after a move; and
+        //   * a moved project breaks the junction LOUDLY — an unresolvable
+        //     path — and the next `generate` recreates it, whereas a stale
+        //     copy silently serves yesterday's source.
+        //
+        // POSIX, and Windows with Developer Mode, never reach this: they
+        // keep the relative symlink. The copy remains as the last resort
+        // for anything that can express neither.
+        // `abs_src`, not `src_path`: see above — a relative source would be
+        // refused and silently become a copy.
+        if (abs_src) |a| {
+            junction.create(allocator, a, dst_path) catch {
+                try copyDirRecursiveAbs(allocator, src_path, dst_path);
+            };
+        } else {
             try copyDirRecursiveAbs(allocator, src_path, dst_path);
-            return;
         }
-        return err;
     };
 }
 
