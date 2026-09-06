@@ -55,13 +55,77 @@ pub fn isSkippableDir(parent: std.Io.Dir, name: []const u8) bool {
 /// none of `skip_dir_names`, so sharing the whole predicate would change
 /// which directories it treats as state dirs.
 pub fn isRepoRoot(parent: std.Io.Dir, name: []const u8) bool {
-    const io = config.globalIo();
+    return isRepoRootIo(config.globalIo(), parent, name);
+}
+
+/// `isRepoRoot` with the `Io` passed in, for the walks that thread their
+/// own `io` through rather than reaching for `config.globalIo()`
+/// (`check.zig`, `scene_name_lint.zig`).
+pub fn isRepoRootIo(io: std.Io, parent: std.Io.Dir, name: []const u8) bool {
     var sub = parent.openDir(io, name, .{}) catch return false;
     defer sub.close(io);
     // EXISTENCE, not kind: a worktree's / submodule's `.git` is a file
     // holding a `gitdir:` pointer, not a directory.
     sub.access(io, ".git", .{}) catch return false;
     return true;
+}
+
+/// Recursively collect every file under `dir` whose name ends in
+/// `suffix`, as paths relative to `dir` joined with the NATIVE separator,
+/// appended to `out` (each entry allocator-owned). Nested repository
+/// roots are pruned (`isRepoRoot`, labelle-assembler#692).
+///
+/// Exists because `std.Io.Dir.walk` has no prune hook: a `Walker` hands
+/// back a nested worktree's whole subtree with no way to cut the
+/// recursion off, so every walk that needs the #692 guard has to drive
+/// the descent itself.
+///
+/// Error policy matches the `Dir.walk` this replaced (codex on PR #716):
+/// only a subdirectory that VANISHED mid-walk is skipped, because
+/// nothing on disk means nothing to collect. Every other open failure —
+/// permissions, I/O — propagates. Swallowing those would hand the caller
+/// a silently short list: `flow_scanner.scanAndEmit` would codegen an
+/// incomplete flow registry and `pruneStaleSidecars` would skip cleanup,
+/// both with no diagnostic anywhere.
+pub fn collectFilesRecursive(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    suffix: []const u8,
+    out: *std.ArrayList([]u8),
+) !void {
+    const io = config.globalIo();
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                if (isRepoRoot(dir, entry.name)) continue;
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err| switch (err) {
+                    // Deleted or replaced between `iterate` and `openDir`
+                    // — no content, so provably nothing to collect.
+                    error.FileNotFound, error.NotDir => continue,
+                    else => return err,
+                };
+                defer sub.close(io);
+                const sub_prefix = if (rel_prefix.len == 0)
+                    try allocator.dupe(u8, entry.name)
+                else
+                    try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
+                defer allocator.free(sub_prefix);
+                try collectFilesRecursive(allocator, sub, sub_prefix, suffix, out);
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
+                const rel = if (rel_prefix.len == 0)
+                    try allocator.dupe(u8, entry.name)
+                else
+                    try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
+                errdefer allocator.free(rel);
+                try out.append(allocator, rel);
+            },
+            else => {},
+        }
+    }
 }
 
 /// Mirror files from src_base/folder to dst_base/folder (recursively) and

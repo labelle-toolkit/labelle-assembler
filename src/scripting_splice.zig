@@ -1140,6 +1140,13 @@ pub fn resolveScriptDir(
             if (entry.name.len == 0 or entry.name[0] == '.') continue;
             switch (entry.kind) {
                 .directory => {
+                    // #692: a nested checkout under `scripts/` is another
+                    // branch's tree — reporting its files as policy
+                    // offenders points the user at paths that are not in
+                    // the working tree. `script_scanner` already prunes
+                    // these, so without the same probe here the probe and
+                    // the registry disagree about what `scripts/` holds.
+                    if (scanner.isRepoRoot(scripts_dir, entry.name)) continue;
                     var sub = scripts_dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
                     defer sub.close(io);
                     const sub_prefix = try std.fs.path.join(allocator, &.{ language_policy.SCRIPTS_DIR, entry.name });
@@ -1247,6 +1254,8 @@ fn collectMatchingFiles(
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         switch (entry.kind) {
             .directory => {
+                // #692 — see `collectMatchingFiles`'s caller.
+                if (scanner.isRepoRootIo(io, dir, entry.name)) continue;
                 var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
                 defer sub.close(io);
                 const sub_prefix = try std.fs.path.join(allocator, &.{ rel_prefix, entry.name });
@@ -1448,6 +1457,10 @@ fn collectDeclEmbedsWalk(
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         switch (entry.kind) {
             .directory => {
+                // #692: without this, a worktree parked under the decl
+                // dir gets its scripts EMBEDDED into the shipped binary —
+                // another branch's code running in the built game.
+                if (scanner.isRepoRootIo(io, dir, entry.name)) continue;
                 var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
                 defer sub.close(io);
                 const sub_prefix = if (rel_prefix.len == 0)
@@ -1970,6 +1983,9 @@ fn collectNativeSources(
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         switch (entry.kind) {
             .directory => {
+                // #692: another branch's `.rs`/`.cs` sources must not
+                // join the native module's source set.
+                if (scanner.isRepoRootIo(io, dir, entry.name)) continue;
                 var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
                 defer sub.close(io);
                 const sub_prefix = if (rel_prefix.len == 0)

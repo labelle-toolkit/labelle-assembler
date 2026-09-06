@@ -30,6 +30,7 @@
 const std = @import("std");
 const flow_codegen = @import("flow_codegen");
 const script_scanner = @import("script_scanner.zig");
+const scanner = @import("scanner.zig");
 const config = @import("config.zig");
 const scan = @import("codegen/scan.zig");
 const discovery = @import("flow_catalog/discovery.zig");
@@ -147,15 +148,19 @@ pub fn scanAndEmit(
     // process. Matters because the codegen step is allowed to fail and
     // we want the error message to be reproducible across runs. Paths
     // are relative to `scripts/flows/`, using `/` separators.
-    var rel_paths: std.ArrayList([]const u8) = .empty;
+    var rel_paths: std.ArrayList([]u8) = .empty;
     defer {
         for (rel_paths.items) |p| allocator.free(p);
         rel_paths.deinit(allocator);
     }
 
-    // `std.Io.Dir.walk` yields every file in the subtree with a path
-    // relative to the opened directory — exactly the recursive `**`
-    // scan RFC FLOWS-JSONC §5 calls for.
+    // `scanner.collectFilesRecursive` yields every matching file in the
+    // subtree with a path relative to the opened directory — the
+    // recursive `**` scan RFC FLOWS-JSONC §5 calls for, minus nested
+    // repository roots (#692). It replaces `std.Io.Dir.walk`, which has
+    // no prune hook and so handed back every `.flow.jsonc` of any
+    // `git worktree` / submodule parked under `scripts/flows/`, codegen'ing
+    // another branch's flows into this build.
     //
     // NOTE: stale generated sidecars are NOT pruned here — pruning must
     // run BEFORE `script_scanner.scanDir` captures the flows tree (a
@@ -163,18 +168,11 @@ pub fn scanAndEmit(
     // an orphan `scripts/flows/<name>.zig` into its `flows`-state script
     // set before this later pass deletes it, dangling the reference).
     // `root.zig` calls `pruneStaleSidecars` up front; see #632.
-    var walker = try src_dir.walk(allocator);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.basename, flow_ext)) continue;
-        // `entry.path` may use the host separator on Windows; normalise
-        // to `/` so emitted import paths and identifiers stay portable.
-        const rel = try allocator.dupe(u8, entry.path);
-        std.mem.replaceScalar(u8, rel, std.fs.path.sep, '/');
-        try rel_paths.append(allocator, rel);
-    }
-    std.mem.sort([]const u8, rel_paths.items, {}, struct {
+    try scanner.collectFilesRecursive(allocator, src_dir, "", flow_ext, &rel_paths);
+    // The collected paths use the host separator on Windows; normalise to
+    // `/` so emitted import paths and identifiers stay portable.
+    for (rel_paths.items) |rel| std.mem.replaceScalar(u8, rel, std.fs.path.sep, '/');
+    std.mem.sort([]u8, rel_paths.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
         }
@@ -428,21 +426,22 @@ pub fn pruneStaleSidecars(allocator: std.mem.Allocator, game_dir: []const u8) !v
     // batching keeps the (source-existence) sibling probe reading a
     // stable tree. Paths are the walker's native-separator relatives,
     // reused verbatim for the sibling `access` and the `deleteFile`.
-    var sidecars: std.ArrayList([]const u8) = .empty;
+    var sidecars: std.ArrayList([]u8) = .empty;
     defer {
         for (sidecars.items) |p| allocator.free(p);
         sidecars.deinit(allocator);
     }
 
-    var walker = try flows_dir.walk(allocator);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        try sidecars.append(allocator, try allocator.dupe(u8, entry.path));
-    }
+    // `scanner.collectFilesRecursive`, not `std.Io.Dir.walk`: the walker
+    // has no prune hook, so it descended into any `git worktree` /
+    // submodule / nested clone parked under `scripts/flows/` (#692) — and
+    // this pass DELETES what it collects, so the gap here meant deleting
+    // another branch's files out of a checkout that has nothing to do
+    // with this build. Paths keep the host separator: they are reused
+    // verbatim for the sibling `access` and the `deleteFile` below.
+    try scanner.collectFilesRecursive(allocator, flows_dir, "", ".zig", &sidecars);
     // Deterministic prune/log order.
-    std.mem.sort([]const u8, sidecars.items, {}, struct {
+    std.mem.sort([]u8, sidecars.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
         }
