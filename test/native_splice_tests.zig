@@ -88,6 +88,12 @@ fn sokolFixtureRepoAbs(allocator: std.mem.Allocator) ![]const u8 {
 /// on any CI host; the full gcc_s set is pinned by the emission golden in
 /// `src/build_files/build_zig.zig`.
 fn rustManifest(allocator: std.mem.Allocator) ![]const u8 {
+    // The zig exe is an ABSOLUTE path, and on Windows that means backslashes:
+    // `C:\Users\...` carries `\U`, which is not a valid Zig escape, so the
+    // manifest written below would not parse (#708). Invisible on Linux and
+    // macOS, where the path has no backslashes to trip over.
+    const zig_exe = try generate.escapeZonString(allocator, test_options.zig_exe);
+    defer allocator.free(zig_exe);
     return std.fmt.allocPrint(allocator,
         \\.{{
         \\    .name = "scripting",
@@ -109,7 +115,7 @@ fn rustManifest(allocator: std.mem.Allocator) ![]const u8 {
         \\        }},
         \\    }},
         \\}}
-    , .{test_options.zig_exe});
+    , .{zig_exe});
 }
 
 const placeholder_mod_rs =

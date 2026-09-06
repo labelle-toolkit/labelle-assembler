@@ -19,25 +19,11 @@
 const std = @import("std");
 const gen = @import("root.zig");
 const config = @import("config.zig");
+const escapeZonString = @import("zon_escape.zig").escapeZonString;
 
 /// Write directly to stderr without a level prefix. Matches main.zig.
 fn writeStderr(io: std.Io, msg: []const u8) void {
     std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
-}
-
-/// Escape `value` for embedding inside a ZON double-quoted string literal.
-/// Backslashes and double quotes are the only characters that would break
-/// the literal — a project name or version containing either would
-/// otherwise produce a `project.labelle` that fails to parse. Returns an
-/// allocator-owned slice; the caller frees it.
-fn escapeZonString(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    for (value) |c| {
-        if (c == '\\' or c == '"') try out.append(allocator, '\\');
-        try out.append(allocator, c);
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 const init_usage =
@@ -587,22 +573,6 @@ test "scaffold emits flat-form scenes — RFC #594 / engine #592 regression" {
     try std.testing.expect(std.mem.indexOf(u8, scene, "\"root\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, scene, "\"components\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, scene, "\"assets\"") == null);
-}
-
-test "escapeZonString escapes quotes and backslashes" {
-    const alloc = std.testing.allocator;
-
-    const a = try escapeZonString(alloc, "say\"hi");
-    defer alloc.free(a);
-    try std.testing.expectEqualStrings("say\\\"hi", a);
-
-    const b = try escapeZonString(alloc, "path\\to");
-    defer alloc.free(b);
-    try std.testing.expectEqualStrings("path\\\\to", b);
-
-    const c = try escapeZonString(alloc, "plain");
-    defer alloc.free(c);
-    try std.testing.expectEqualStrings("plain", c);
 }
 
 test "scaffold writes a parseable project.labelle for a name with a quote" {

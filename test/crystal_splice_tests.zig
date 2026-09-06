@@ -83,6 +83,12 @@ fn sokolFixtureRepoAbs(allocator: std.mem.Allocator) ![]const u8 {
 /// is the per-OS selection and chaining; the step names carry the per-OS
 /// identity so the emission pins can tell the variants apart.
 fn crystalManifest(allocator: std.mem.Allocator) ![]const u8 {
+    // The zig exe is an ABSOLUTE path, and on Windows that means backslashes:
+    // `C:\Users\...` carries `\U`, which is not a valid Zig escape, so the
+    // manifest written below would not parse (#708). Invisible on Linux and
+    // macOS, where the path has no backslashes to trip over.
+    const zig_exe = try generate.escapeZonString(allocator, test_options.zig_exe);
+    defer allocator.free(zig_exe);
     return std.fmt.allocPrint(allocator,
         \\.{{
         \\    .name = "scripting",
@@ -118,7 +124,7 @@ fn crystalManifest(allocator: std.mem.Allocator) ![]const u8 {
         \\        }},
         \\    }},
         \\}}
-    , .{ test_options.zig_exe, test_options.zig_exe, test_options.zig_exe });
+    , .{ zig_exe, zig_exe, zig_exe });
 }
 
 const placeholder_game_cr =

@@ -12,6 +12,7 @@ const backend_registry = @import("../backend_registry.zig");
 const manifest_splice = @import("../codegen/manifest_splice.zig");
 const manifest_v2 = @import("../codegen/manifest_v2.zig");
 const manifest_v2_splice = @import("../codegen/manifest_v2_splice.zig");
+const zonPath = @import("../zon_escape.zig").zonPath;
 pub const deps_linker = @import("../deps_linker.zig");
 
 const ProjectConfig = config.ProjectConfig;
@@ -314,10 +315,28 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
     }
 }
 
-/// Compute a relative path from `from_dir` to `to_path`.
-/// If from_dir is null, returns a copy of to_path (absolute).
+/// Compute a relative path from `from_dir` to `to_path`, ready to embed in a
+/// ZON string literal.
+/// If from_dir is null, uses `to_path` as-is (absolute).
 /// Both must be absolute paths when from_dir is provided. Returns an allocator-owned string.
+///
+/// `zonPath` does two things on the way out, both of which only matter on
+/// Windows (#708) — which is why CI on Linux and macOS could never have
+/// caught them: it normalises the host separator to the `/` the deps-linked
+/// emitter above hardcodes, so the same project yields the same manifest on
+/// every host, and it escapes the result, because a backslash is both the
+/// Windows separator and the escape character in a Zig string literal
+/// (`..\deps\x` read back as `error: invalid escape character: 'd'`).
+///
+/// Only the HOST separator is rewritten: a backslash is ordinary filename
+/// data on POSIX and must survive escaped rather than be translated into a
+/// different path (#708 review).
 fn relativePath(allocator: std.mem.Allocator, from_dir: ?[]const u8, to_path: []const u8) ![]const u8 {
-    if (from_dir == null) return try allocator.dupe(u8, to_path);
-    return std.fs.path.relative(allocator, "", null, from_dir.?, to_path);
+    const raw = if (from_dir == null)
+        try allocator.dupe(u8, to_path)
+    else
+        try std.fs.path.relative(allocator, "", null, from_dir.?, to_path);
+    defer allocator.free(raw);
+
+    return zonPath(allocator, raw);
 }

@@ -84,6 +84,13 @@ fn sokolFixtureRepoAbs(allocator: std.mem.Allocator) ![]const u8 {
 /// `{cache}`. `tool` parameterizes argv[0] so the probe tests can declare
 /// a bare missing tool ("{s}" = the suite zig exe — absolute, probe-skipped).
 fn csharpManifest(allocator: std.mem.Allocator, tool: []const u8) ![]const u8 {
+    // `tool` is an ABSOLUTE path (the suite zig exe by default), and on
+    // Windows that means backslashes: the `\U` in `C:\Users\...` is not a
+    // valid Zig escape, so the manifest written below would not parse
+    // (#708). Invisible on Linux and macOS, where there are no backslashes
+    // to trip over.
+    const tool_z = try generate.escapeZonString(allocator, tool);
+    defer allocator.free(tool_z);
     return std.fmt.allocPrint(allocator,
         \\.{{
         \\    .name = "scripting",
@@ -107,7 +114,7 @@ fn csharpManifest(allocator: std.mem.Allocator, tool: []const u8) ![]const u8 {
         \\        }},
         \\    }},
         \\}}
-    , .{tool});
+    , .{tool_z});
 }
 
 /// The publish stand-in the fixture's step `zig run`s: writes the three
