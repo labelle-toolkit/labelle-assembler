@@ -251,18 +251,61 @@ jobs:
             VERSION="$RELEASE_TAG"
 
             # download-artifact (no merge-multiple) lays each matrix artifact
-            # out as artifacts/<name>/<name>; publish it verbatim so the R2 key
-            # is labelle-assembler-<os>-<arch> — byte-for-byte what studio's
-            # fetch-sidecars requests (assembler/<tag>/labelle-assembler-<os>-<arch>).
-            # aws is preinstalled on ubuntu-latest; no `pip install awscli`
-            # (that breaks under Ubuntu 24.04's PEP 668 externally-managed env).
+            # out as artifacts/<name>/<name>; the R2 key is the DIR name, so
+            # that the object is labelle-assembler-<os>-<arch> — byte-for-byte
+            # what studio's fetch-sidecars requests
+            # (assembler/<tag>/labelle-assembler-<os>-<arch>).
+            #
+            # Flatten to those names FIRST, then checksum and upload from the
+            # same flattened dir. That ordering is the point: the manifest
+            # then describes exactly the bytes that get published, under
+            # exactly the keys they are published as.
+            mkdir -p flat
             for dir in artifacts/*/; do
               name=$(basename "$dir")
               for file in "$dir"*; do
-                aws s3 cp "$file" "s3://$R2_BUCKET/assembler/$VERSION/$name" \
-                  --endpoint-url "$R2_ENDPOINT"
+                cp "$file" "flat/$name"
               done
             done
+
+            # R2 is a SEPARATE distribution channel from the GitHub release —
+            # studio's fetch-sidecars sources the assembler here and only
+            # falls back to the release — so it needs its own manifest, or
+            # everything fetched from R2 stays unverifiable (#616).
+            #
+            # Identical algorithm, format and filenames to the `release` job's
+            # step, over the same five artifacts, so the two manifests are
+            # byte-identical and a consumer can cross-check one channel
+            # against the other. Same three guards, same reasons: exactly five
+            # lines, plain two-space text form, and a `shasum -c` self-check.
+            ( cd flat && shasum -a 256 labelle-assembler-* > SHA256SUMS )
+            cat flat/SHA256SUMS
+            test "$(wc -l < flat/SHA256SUMS)" -eq 5
+            if grep -qvE '^[0-9a-f]{64}  labelle-assembler-[a-z0-9_]+-[a-z0-9_]+$' flat/SHA256SUMS; then
+              echo "::error::R2 SHA256SUMS is not in plain two-space text format"
+              exit 1
+            fi
+            ( cd flat && shasum -a 256 -c SHA256SUMS )
+            ( cd flat && sha256sum -c SHA256SUMS )
+
+            # aws is preinstalled on ubuntu-latest; no `pip install awscli`
+            # (that breaks under Ubuntu 24.04's PEP 668 externally-managed env).
+            #
+            # Upload the BINARIES first and the manifest LAST. Unlike the
+            # GitHub release, R2 objects appear one at a time under a
+            # well-known prefix a consumer can fetch directly, so the order is
+            # observable. A plain `flat/*` glob would publish the manifest
+            # FIRST — C-locale ordering puts uppercase `SHA256SUMS` ahead of
+            # the lowercase `labelle-assembler-*` names — leaving a window
+            # where the manifest describes binaries that are not there yet,
+            # which an interrupted run would leave in place indefinitely.
+            # Publishing it last makes its presence mean "all five landed".
+            for file in flat/labelle-assembler-*; do
+              aws s3 cp "$file" "s3://$R2_BUCKET/assembler/$VERSION/$(basename "$file")" \
+                --endpoint-url "$R2_ENDPOINT"
+            done
+            aws s3 cp flat/SHA256SUMS "s3://$R2_BUCKET/assembler/$VERSION/SHA256SUMS" \
+              --endpoint-url "$R2_ENDPOINT"
 
             # Only advance the latest.txt pointer on a real tag push. A
             # workflow_dispatch run can rebuild an OLDER tag; overwriting
