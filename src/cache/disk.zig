@@ -124,32 +124,6 @@ pub fn populatePlugin(allocator: std.mem.Allocator, plugin: config.PluginDep, so
     try writeOriginOrDropSlot(allocator, target, source_dir, plugin.version, .discovered);
 }
 
-/// Create a link at `target` pointing at `abs_source`: a symlink where the
-/// platform allows one, else a Windows directory junction.
-///
-/// The junction is what makes this work at all on Windows (#710). Zig's
-/// `symLink` builds the reparse point itself and so needs
-/// SeCreateSymbolicLinkPrivilege, which an ordinary account does not hold —
-/// it fails even where `New-Item -ItemType SymbolicLink` succeeds. Without a
-/// junction every slot fell through to the COPY below: a snapshot that never
-/// sees a source edit, and that `slotTracksSource` correctly refuses to
-/// treat as live. A junction needs no privilege, and `readLink` and
-/// `deleteTree` both treat it exactly like the symlink it stands in for, so
-/// nothing on the resolve side changes.
-///
-/// `error.PathAlreadyExists` passes through unchanged — the caller has a
-/// reconcile path for it. Any other failure is returned as the ORIGINAL
-/// symlink error, so the caller still knows why linking was impossible.
-fn linkToTarget(allocator: std.mem.Allocator, abs_source: []const u8, target: []const u8) !void {
-    const io = config.globalIo();
-    const cwd = std.Io.Dir.cwd();
-
-    return cwd.symLink(io, abs_source, target, .{ .is_directory = true }) catch |err| {
-        if (err == error.PathAlreadyExists) return err;
-        junction.create(allocator, abs_source, target) catch return err;
-    };
-}
-
 /// Remove a cache entry that is a LINK, leaving whatever it points at alone.
 ///
 /// `deleteFile` removes a symlink but cannot remove a junction, which is a
@@ -197,7 +171,7 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
 
     // Link the source in; copy only if the platform refuses BOTH a symlink
     // and a junction (#710).
-    linkToTarget(allocator, abs_source, target) catch |err| {
+    junction.linkDir(allocator, abs_source, target) catch |err| {
         if (err == error.PathAlreadyExists) {
             var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             if (std.Io.Dir.readLinkAbsolute(io, target, &link_buf)) |existing_len| {
@@ -226,7 +200,7 @@ pub fn symlinkToCache(allocator: std.mem.Allocator, source_dir: []const u8, targ
                 };
             }
             // Recreate: link if the platform allows it, copy if it does not.
-            linkToTarget(allocator, abs_source, target) catch {
+            junction.linkDir(allocator, abs_source, target) catch {
                 copyDirRecursive(allocator, abs_source, target) catch |copy_err| {
                     std.log.err("labelle: could not link or copy '{s}' to '{s}': {any}", .{ abs_source, target, copy_err });
                     return error.CachePopulationFailed;
@@ -296,7 +270,12 @@ pub fn purgeLegacyLocalSlot(allocator: std.mem.Allocator, slot_path: []const u8,
     }
 
     if (isSymlink(slot_path)) {
-        std.Io.Dir.cwd().deleteFile(io, slot_path) catch |err| {
+        // `removeLinkEntry`, not `deleteFile`: since #710 a local slot on
+        // Windows is a JUNCTION, and `deleteFile` cannot remove a directory
+        // reparse point — it fails with `error.IsDir`, so the #685 purge
+        // could not run at all. `deleteTree` removes either kind, and does
+        // not follow the link into the user's checkout (#699).
+        removeLinkEntry(slot_path) catch |err| {
             std.log.warn("labelle: could not remove locally-sourced cache slot '{s}': {any}", .{ slot_path, err });
             return error.PurgeFailed;
         };
@@ -695,19 +674,7 @@ fn replaceAll(allocator: std.mem.Allocator, haystack: []const u8, needle: []cons
 }
 
 // ── Tests: #685 — a local install must not occupy a version slot ─────
-
 const testing = std.testing;
-
-/// Point LABELLE_HOME at `home` for the duration of a test. Returns the
-/// previous `std.testing.environ` for the caller to restore.
-///
-/// PosixBlock-only construction (mirrors the hermetic probe in resolve.zig),
-/// so callers skip on Windows.
-fn setTestCacheHome(envp: *const [1:null]?[*:0]const u8) std.process.Environ {
-    const saved = testing.environ;
-    testing.environ = .{ .block = .{ .slice = envp } };
-    return saved;
-}
 
 /// Write `body` into `dir/VERSION` — a stand-in for "which release's source
 /// actually lives here", so a test can tell 1.29.0 sources from 1.30.0 ones.
@@ -731,7 +698,6 @@ test "populateFrameworkPackage: local sources never occupy the pinned version sl
     // 1.30.0 sources is installed while the project pins 1.29.0. Before the
     // fix, `~/.labelle/packages/gfx/1.29.0` became a symlink to that checkout
     // and every later resolve of "gfx 1.29.0" handed back 1.30.0 code.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -748,11 +714,8 @@ test "populateFrameworkPackage: local sources never occupy the pinned version sl
     // The working tree is 1.30.0 — NOT the pinned version.
     try writeVersionStamp(src, "1.30.0");
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     try populateFrameworkPackage(alloc, "gfx", "1.29.0", src, .discovered);
 
@@ -781,7 +744,6 @@ test "resolveFrameworkPackage: a pinned version resolves to the release, not the
     // A released assembler (running outside the monorepo) must get the
     // 1.29.0 release; the monorepo's own binary gets the local slot, and
     // says so.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -806,11 +768,8 @@ test "resolveFrameworkPackage: a pinned version resolves to the release, not the
     try writeVersionStamp(src, "1.30.0");
     try writeVersionStamp(release, "1.29.0");
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     try populateFrameworkPackage(alloc, "gfx", "1.29.0", src, .discovered);
 
@@ -846,7 +805,6 @@ test "purgeLegacyLocalSlot: drops a version slot symlinked at a local checkout (
     // slots. A version slot that is a symlink can only have come from a local
     // install, so it is removed and re-fetched. A real extracted release
     // directory is never a symlink and must survive.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -860,11 +818,8 @@ test "purgeLegacyLocalSlot: drops a version slot symlinked at a local checkout (
     const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     // The poisoned slot, exactly as the old populate wrote it.
     const poisoned = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
@@ -889,7 +844,6 @@ test "frameworkVersionPath / pluginVersionPath: remote fetch targets ignore an a
     // routed through the context-sensitive build resolver would overwrite the
     // reserved local slot with one release — reachable through a single-package
     // `install` run inside the monorepo. The write path must be version-named.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -906,11 +860,8 @@ test "frameworkVersionPath / pluginVersionPath: remote fetch targets ignore an a
     const bin = try tmp.dir.realPathFileAlloc(testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
     defer alloc.free(bin);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     try populateFrameworkPackage(alloc, "gfx", "1.29.0", src, .discovered);
 
@@ -943,7 +894,6 @@ test "purgeLegacyLocalSlots: sweeps the implicit null backend the tests target n
     // would keep reporting cached and the tests target would keep compiling an
     // old local checkout. The sweep must cover it even when the project's own
     // backend is something else.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -956,11 +906,8 @@ test "purgeLegacyLocalSlots: sweeps the implicit null backend the tests target n
     const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const cfg = config.ProjectConfig{ .name = "demo", .backend = .bgfx };
     const null_bp = (config.ProjectConfig{ .name = "demo", .backend = .null }).effectiveBackendPackage().?;
@@ -983,7 +930,6 @@ test "symlinkToCache: a stale COPIED slot is dropped and repopulated (#688 revie
     // fail to read it as a link, and return SUCCESS without touching it — so
     // the probe reporting the copy stale bought nothing: `ensureCache` called
     // populate, populate no-opped, and generation resolved the same snapshot.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -997,11 +943,8 @@ test "symlinkToCache: a stale COPIED slot is dropped and repopulated (#688 revie
     defer alloc.free(src);
     try writeVersionStamp(src, "1.31.0");
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     // Stand in for the copy fallback's output: a real directory holding an
     // out-of-date snapshot.
@@ -1027,7 +970,6 @@ test "purgeLegacyLocalSlot: drops a COPIED version slot whose contents are a dif
     // extracted release. `labelle-assembler clean` is not the remedy either
     // — it keeps whatever the project pins, which is exactly the affected
     // slot. Content decides: a release declares its own version.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1039,11 +981,8 @@ test "purgeLegacyLocalSlot: drops a COPIED version slot whose contents are a dif
     const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
     defer alloc.free(home);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     // A copied working tree: the slot says 1.29.0, the sources say 1.31.0.
     const poisoned = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
@@ -1082,7 +1021,6 @@ test "symlinkToCache: a link that cannot be replaced fails population (#688 revi
     // `populateFrameworkPackage` went on to rewrite the provenance marker
     // with the NEW source while the link still targeted the old checkout —
     // and `active*Slot` trusts that marker.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1098,11 +1036,8 @@ test "symlinkToCache: a link that cannot be replaced fails population (#688 revi
     const new_src = try tmp.dir.realPathFileAlloc(testing.io, "new", alloc);
     defer alloc.free(new_src);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     // A slot linked at the OLD checkout, inside a directory made read-only
     // so the link cannot be unlinked.
@@ -1110,7 +1045,7 @@ test "symlinkToCache: a link that cannot be replaced fails population (#688 revi
     defer alloc.free(slot);
     const parent = std.fs.path.dirname(slot).?;
     try std.Io.Dir.cwd().createDirPath(config.globalIo(), parent);
-    try std.Io.Dir.cwd().symLink(testing.io, old_src, slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, old_src, slot);
 
     const parent_z = try alloc.dupeZ(u8, parent);
     defer alloc.free(parent_z);
@@ -1146,7 +1081,6 @@ test "purgeLegacyLocalSlot: a non-semver ref slot is never judged by its zon ver
     // archive whose zon declares a RELEASE semver — nothing to do with the
     // directory name. Judging it by content would delete a perfectly good
     // cache on every install and break offline use.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1156,11 +1090,8 @@ test "purgeLegacyLocalSlot: a non-semver ref slot is never judged by its zon ver
     const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
     defer alloc.free(home);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const ref_slot = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "main" });
     defer alloc.free(ref_slot);
@@ -1173,7 +1104,6 @@ test "purgeLegacyLocalSlot: a non-semver ref slot is never judged by its zon ver
 test "declaredZonVersion: a commented-out version does not decide a deletion (#688 review)" {
     // The scan drives a `deleteTree`, so a manifest carrying a commented
     // `.version` above the real field must not report the commented value.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1202,7 +1132,6 @@ test "purgeLegacyLocalSlots: sweeps a slot referenced only through the GUI packa
     // `plugins/<repo>/<version>` path a declared plugin does, but is not in
     // `cfg.plugins` — so a slot an older project poisoned as a local plugin
     // survived the sweep and gui_resolve kept loading the checkout.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1215,11 +1144,8 @@ test "purgeLegacyLocalSlots: sweeps a slot referenced only through the GUI packa
     const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const gui_pkg = "github.com/labelle-toolkit/labelle-imgui";
     const poisoned = try std.fs.path.join(alloc, &.{ home, "packages", "plugins", gui_pkg, "0.3.0" });
@@ -1243,7 +1169,6 @@ test "purgeLegacyLocalSlot: refuses a target outside the package cache (#688 rev
     // `project.labelle` fields, which no CLI-argument validation covers — and
     // this function deletes. A version like `../../../../tmp/1.2.3` must not
     // reach outside the cache.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1259,11 +1184,8 @@ test "purgeLegacyLocalSlot: refuses a target outside the package cache (#688 rev
     const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     // A symlink outside the cache — exactly what an escaping version reaches.
     const victim = try std.fs.path.join(alloc, &.{ outside, "1.2.3" });
@@ -1287,7 +1209,6 @@ test "purgeLegacyLocalSlot: a ref ending in a semver component is judged by the 
     // `release/1.2.3` is a supported ref whose slot basename reads as semver.
     // Judging it by content would delete a valid remote cache on every
     // install; the pin decides, and `release/1.2.3` is not semver.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1297,11 +1218,8 @@ test "purgeLegacyLocalSlot: a ref ending in a semver component is judged by the 
     const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
     defer alloc.free(home);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const slot = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "release", "1.2.3" });
     defer alloc.free(slot);
@@ -1314,7 +1232,6 @@ test "purgeLegacyLocalSlot: a ref ending in a semver component is judged by the 
 test "purgeLegacyLocalSlots: an escaping assembler pin cannot aim the sweep outside the cache (#688 review)" {
     // The assembler branch builds its path directly and deletes the whole
     // slot, so it needs the same containment the generic purge has.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1330,11 +1247,8 @@ test "purgeLegacyLocalSlots: an escaping assembler pin cannot aim the sweep outs
     const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     // The escaping pin's slot, carrying the symlinked `backends/` that makes
     // the assembler branch delete the whole directory.
@@ -1367,7 +1281,6 @@ test "isCanonicalSemver: only a full X.Y.Z release authorises a content-based pu
 }
 
 test "purgeLegacyLocalSlot: an abbreviated pin never deletes a canonical release (#688 review)" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1377,11 +1290,8 @@ test "purgeLegacyLocalSlot: an abbreviated pin never deletes a canonical release
     const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
     defer alloc.free(home);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const slot = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.2" });
     defer alloc.free(slot);
@@ -1396,7 +1306,6 @@ test "purgeLegacyLocalSlot: a symlinked ancestor cannot smuggle a deletion out o
     // `gfx/release` — and a legacy `gfx/release` may itself be a symlink to a
     // checkout. The lexical containment test reads that path as inside the
     // cache while it resolves into the user's source tree.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1409,17 +1318,14 @@ test "purgeLegacyLocalSlot: a symlinked ancestor cannot smuggle a deletion out o
     const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     // `packages/gfx/release` → the checkout. The pin `release/1.2.3` then
     // names `packages/gfx/release/1.2.3`, i.e. `checkout/1.2.3`.
     const ancestor = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "release" });
     defer alloc.free(ancestor);
-    try std.Io.Dir.cwd().symLink(testing.io, checkout, ancestor, .{ .is_directory = true });
+    try junction.linkDir(alloc, checkout, ancestor);
 
     const inside = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "release", "1.2.3" });
     defer alloc.free(inside);
@@ -1438,7 +1344,6 @@ test "purgeLegacyLocalSlot: a DANGLING legacy symlink is still purged (#706)" {
     // absent — and that is precisely the #685 damage this function exists to
     // repair. Skipping it would leave a version-named slot pointing into
     // nowhere, which every presence probe would then trip over.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1451,25 +1356,25 @@ test "purgeLegacyLocalSlot: a DANGLING legacy symlink is still purged (#706)" {
     const checkout = try tmp.dir.realPathFileAlloc(testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const slot = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
     defer alloc.free(slot);
-    try std.Io.Dir.cwd().symLink(testing.io, checkout, slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, checkout, slot);
 
     // Delete the checkout out from under it: the link now dangles.
     try std.Io.Dir.cwd().deleteTree(testing.io, checkout);
-    try testing.expect(!local.pathExists(slot));
+    // How a dangling link READS is platform-specific — `access` follows a
+    // POSIX symlink to the missing target and reports absent, while a
+    // Windows junction is a real directory entry and reports present. The
+    // contract is the same either way and is what gets asserted: the slot
+    // is still recognised as a link, and the purge still removes it.
     try testing.expect(local.isSymlinkPath(slot));
 
     try testing.expect(try purgeLegacyLocalSlot(alloc, slot, "1.29.0"));
     try testing.expect(!local.isSymlinkPath(slot));
 }
-
 test "purgeLegacyLocalSlot: an absent slot is a silent no-op, not a containment refusal (#706)" {
     // A cold cache has no `packages/<pkg>/` at all, and `withinPackagesDir`
     // canonicalises the slot's PARENT — `realPath` on a directory that does
@@ -1480,7 +1385,6 @@ test "purgeLegacyLocalSlot: an absent slot is a silent no-op, not a containment 
     // Both before and after the fix this returns false; what changed is the
     // route and the warning. The assertion worth pinning is that an absent
     // slot stays a no-op that touches nothing.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -1490,11 +1394,8 @@ test "purgeLegacyLocalSlot: an absent slot is a silent no-op, not a containment 
     const home = try tmp.dir.realPathFileAlloc(testing.io, "home", alloc);
     defer alloc.free(home);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     // `packages/gfx` deliberately does not exist — the cold-cache shape.
     const parent = try std.fs.path.join(alloc, &.{ home, "packages", "gfx" });

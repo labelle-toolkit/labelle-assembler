@@ -526,7 +526,6 @@ test "validateCache: a remote external backend with no cache entry is reported m
     // probe can't be swayed by whatever lives in the caller's real
     // ~/.labelle/packages on a dev box or a reused CI home. The construction
     // is PosixBlock-only, so skip on Windows (a different env-block layout).
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const saved_environ = std.testing.environ;
     defer std.testing.environ = saved_environ;
     const envp = [_:null]?[*:0]const u8{"LABELLE_HOME=/nonexistent/labelle-validatecache-test-home"};

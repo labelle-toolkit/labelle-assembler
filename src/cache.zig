@@ -89,6 +89,7 @@ test {
     // `cache.zig` but does not descend into nested `@import`s).
     _ = env;
     _ = local_slots;
+
     _ = resolve;
     _ = disk;
     _ = fetch;

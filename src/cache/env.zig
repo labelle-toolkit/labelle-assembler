@@ -26,9 +26,37 @@ pub fn envLookup(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
     return null;
 }
 
+/// Test seam: the cache root, bypassing the environment entirely. `null`
+/// (the production value) means "read `$LABELLE_HOME`, else the home dir".
+///
+/// Needed because `std.testing.environ` cannot carry a synthetic environment
+/// on Windows. `Environ.Block` is `GlobalBlock` there — std's own comment
+/// explains why: "the memory pointed at by the PEB changes when the
+/// environment is modified, so a long-lived pointer cannot be used" — so it
+/// can only say *use the real process environment*, never *use this one*.
+/// (`WindowsBlock` exists, but for building a CHILD process's environment,
+/// not for overriding our own.)
+///
+/// Tests therefore set `$LABELLE_HOME` through a `PosixBlock` and opened
+/// with `if (os.tag == .windows) return error.SkipZigTest`, which is why the
+/// Windows CI job — the repo's only Windows job — executed 40 of the 123
+/// tests it nominally ran and skipped 83 (#699). A run of Windows-specific
+/// cache defects (#704, #706, #708, #710) all shipped green underneath it.
+///
+/// An explicit override needs no environment and works on every platform.
+/// Mirrors `local.setProbeStartForTesting`.
+var cache_root_override: ?[]const u8 = null;
+
+/// Point the cache root at `dir` instead of the environment. Tests only —
+/// pass `null` to restore.
+pub fn setCacheRootForTesting(dir: ?[]const u8) void {
+    cache_root_override = dir;
+}
+
 /// Resolve the cache root directory.
 /// Priority: LABELLE_HOME env var > ~/.labelle/
 pub fn getCacheRoot(allocator: std.mem.Allocator) ![]const u8 {
+    if (cache_root_override) |dir| return allocator.dupe(u8, dir);
     if (envLookup(allocator, "LABELLE_HOME")) |home| return home;
 
     // Fall back to platform-appropriate home directory
