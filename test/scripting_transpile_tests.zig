@@ -132,11 +132,12 @@ const StagedTranspileProject = struct {
 
     /// One file a fake tsc emits, relative to the tsconfig's `outDir`.
     ///
-    /// `when_config_suffix` gates it on which tsconfig the tool was handed
-    /// (the declare pass and the script pass use different ones); empty
-    /// means always.
+    /// `when_config_suffix` / `unless_config_suffix` gate it on which
+    /// tsconfig the tool was handed (the declare pass and the script pass
+    /// use different ones); both empty means always.
     const Emit = struct {
         when_config_suffix: []const u8 = "",
+        unless_config_suffix: []const u8 = "",
         rel: []const u8,
         body: []const u8,
     };
@@ -154,35 +155,19 @@ const StagedTranspileProject = struct {
     /// `error.InvalidExe` — and the whole transpile suite failed for a
     /// reason unrelated to what it tests (#699).
     ///
-    /// The Windows side is a `.cmd` (which Zig's spawn does run) delegating
-    /// to a `.ps1` sidecar. PowerShell rather than batch for one specific
-    /// reason: `outDir` sits in JSON, so on Windows its value is
-    /// backslash-ESCAPED (`C:\\out`). `sed` on POSIX yields a path that
-    /// needs no unescaping; batch would have to undo it by hand, while
-    /// `ConvertFrom-Json` does it correctly for free. The script goes in
-    /// its own file so nothing has to survive nested `cmd` quoting.
-    /// Absolute path to `powershell.exe`.
+    /// The Windows side is a `.cmd`, which Zig's spawn does run, written in
+    /// PURE batch — no PowerShell. A first cut delegated to a `.ps1`, and
+    /// that failed in a way worth recording: under `zig build test` the
+    /// spawned child's environment is stripped enough that .NET cannot
+    /// initialise ("Loading managed Windows PowerShell failed with error
+    /// 8009001d"), and PowerShell then exits `-65536` = `0xFFFF0000`, whose
+    /// low 16 bits are ZERO — so the failure came back as exit 0 and the
+    /// assembler reported a successful transpile that emitted nothing.
+    /// Batch needs no runtime and cannot fail that way.
     ///
-    /// Spelled out rather than invoked by name: the fake tool is spawned as
-    /// a child of the test process, and that child's PATH does not
-    /// necessarily carry the PowerShell directory — invoking it by name gave
-    /// `'powershell' is not recognized as an internal or external command`
-    /// and an exit 49 that looked like a tsc diagnostic (#699).
-    ///
-    /// `%SystemRoot%` is read from OUR environment, where it is reliable,
-    /// and baked into the stub. The literal fallback is the location on
-    /// every supported Windows.
-    fn powershellExe(allocator: std.mem.Allocator) ![]u8 {
-        const root = std.testing.environ.getAlloc(allocator, "SystemRoot") catch
-            try allocator.dupe(u8, "C:\\Windows");
-        defer allocator.free(root);
-        return std.fmt.allocPrint(
-            allocator,
-            "{s}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-            .{root},
-        );
-    }
-
+    /// Batch can parse the tsconfig because `writeJsonPath` emits `outDir`
+    /// with FORWARD slashes and no escaping, on one line of its own; the
+    /// stub splits that line at its first `:` and strips the quotes.
     fn stageEmittingFakeTsc(dir: std.Io.Dir, allocator: std.mem.Allocator, emit: []const Emit) ![:0]const u8 {
         const windows = @import("builtin").os.tag == .windows;
         const dir_abs = try dir.realPathFileAlloc(io, ".", allocator);
@@ -206,51 +191,57 @@ const StagedTranspileProject = struct {
         const w = &body_aw.writer;
 
         if (windows) {
-            var ps_aw = std.Io.Writer.Allocating.init(allocator);
-            defer ps_aw.deinit();
-            const p = &ps_aw.writer;
-            try p.writeAll("if ($args[0] -ne '-p') { exit 3 }\n");
-            // `ConvertFrom-Json` rather than a regex: `outDir` lives in JSON,
-            // so on Windows its value is backslash-ESCAPED (`C:\\out`), and
-            // this unescapes it correctly for free.
-            try p.writeAll("$cfg = Get-Content -Raw $args[1] | ConvertFrom-Json\n");
-            try p.writeAll("$out = $cfg.compilerOptions.outDir\n");
-            try p.writeAll("if (-not $out) { exit 4 }\n");
-            for (emit, 0..) |e, i| {
-                if (e.when_config_suffix.len > 0) {
-                    try p.print("if ($args[1] -like '*{s}') {{\n", .{e.when_config_suffix});
-                }
-                try p.print("$dst = Join-Path $out '{s}'\n", .{e.rel});
-                try p.writeAll("New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null\n");
-                try p.print("Copy-Item -LiteralPath '{s}\\fake-tsc.emit{d}' -Destination $dst -Force\n", .{ dir_abs, i });
-                if (e.when_config_suffix.len > 0) try p.writeAll("}\n");
-            }
-            try p.writeAll("exit 0\n");
-
-            var psf = try dir.createFile(io, "fake-tsc.ps1", .{});
-            try psf.writeStreamingAll(io, ps_aw.written());
-            psf.close(io);
-
             try w.writeAll("@echo off\r\n");
-            const ps_exe = try powershellExe(allocator);
-            defer allocator.free(ps_exe);
-            try w.print(
-                "\"{s}\" -NoProfile -ExecutionPolicy Bypass -File \"{s}\\fake-tsc.ps1\" %*\r\n",
-                .{ ps_exe, dir_abs },
-            );
-            try w.writeAll("exit /b %ERRORLEVEL%\r\n");
+            try w.writeAll("if not \"%~1\"==\"-p\" exit /b 3\r\n");
+            try w.writeAll("set \"CFG=%~2\"\r\n");
+            // Builtins ONLY — no `findstr`. It is an external exe, and the
+            // stripped child PATH that hid PowerShell hides it too (the
+            // first cut used it and every test exited 4, "outDir missing").
+            //
+            // `for /f` reads the tsconfig line by line with `:` and space as
+            // delimiters, so the key line `    "outDir": "C:/x/y"` yields
+            // token 1 `"outDir"` and remainder `"C:/x/y"`; the `~` modifier
+            // strips the quotes from each. The drive colon survives because
+            // the remainder is taken verbatim after the first delimiter.
+            try w.writeAll("set \"OUT=\"\r\n");
+            try w.writeAll("for /f \"usebackq tokens=1,* delims=: \" %%A in (\"%~2\") do if \"%%~A\"==\"outDir\" set \"OUT=%%~B\"\r\n");
+            try w.writeAll("if not defined OUT exit /b 4\r\n");
+            try w.writeAll("set \"OUT=%OUT:/=\\%\"\r\n");
+            for (emit, 0..) |e, i| {
+                // Gate on the tsconfig NAME by comparing its last N chars, so
+                // `tsconfig.declare.json` matches only the declare pass.
+                if (e.when_config_suffix.len > 0) {
+                    try w.print("if not \"%CFG:~-{d}%\"==\"{s}\" goto emit_skip_{d}\r\n", .{ e.when_config_suffix.len, e.when_config_suffix, i });
+                }
+                if (e.unless_config_suffix.len > 0) {
+                    try w.print("if \"%CFG:~-{d}%\"==\"{s}\" goto emit_skip_{d}\r\n", .{ e.unless_config_suffix.len, e.unless_config_suffix, i });
+                }
+                const rel_win = try allocator.dupe(u8, e.rel);
+                defer allocator.free(rel_win);
+                std.mem.replaceScalar(u8, rel_win, '/', '\\');
+                if (std.fs.path.dirnameWindows(rel_win)) |rel_dir| {
+                    try w.print("mkdir \"%OUT%\\{s}\" 2>nul\r\n", .{rel_dir});
+                }
+                try w.print("copy /y \"{s}\\fake-tsc.emit{d}\" \"%OUT%\\{s}\" >nul\r\n", .{ dir_abs, i, rel_win });
+                try w.print(":emit_skip_{d}\r\n", .{i});
+            }
+            try w.writeAll("exit /b 0\r\n");
         } else {
             try w.writeAll("#!/bin/sh\n");
             try w.writeAll("[ \"$1\" = \"-p\" ] || exit 3\n");
             try w.writeAll("out=$(sed -n 's/^ *\"outDir\": \"\\(.*\\)\".*$/\\1/p' \"$2\")\n");
             try w.writeAll("[ -n \"$out\" ] || exit 4\n");
             for (emit, 0..) |e, i| {
+                const gated = e.when_config_suffix.len > 0 or e.unless_config_suffix.len > 0;
                 if (e.when_config_suffix.len > 0) {
                     try w.print("case \"$2\" in *{s})\n", .{e.when_config_suffix});
                 }
+                if (e.unless_config_suffix.len > 0) {
+                    try w.print("case \"$2\" in *{s}) ;; *)\n", .{e.unless_config_suffix});
+                }
                 try w.print("mkdir -p \"$(dirname \"$out/{s}\")\"\n", .{e.rel});
                 try w.print("cat \"{s}/fake-tsc.emit{d}\" > \"$out/{s}\"\n", .{ dir_abs, i, e.rel });
-                if (e.when_config_suffix.len > 0) try w.writeAll(";; esac\n");
+                if (gated) try w.writeAll(";; esac\n");
             }
             try w.writeAll("exit 0\n");
         }
@@ -272,6 +263,46 @@ const StagedTranspileProject = struct {
         defer f.close(io);
         try f.writeStreamingAll(io, body);
         return dir.realPathFileAlloc(io, script_name, allocator);
+    }
+
+    /// A fake declare runner that RECORDS its argv (one per line, to
+    /// `recorded-args.txt` beside the fixture) and then prints
+    /// `schema_json`. Same portable shape as the transpile stubs: the schema
+    /// travels as a payload file, because it is JSON and `cmd` mangles `"`,
+    /// `<`, `>`, `&` and `|`; batch has no `printf "%s\n" "$@"`, so the
+    /// argv walk is a `shift` loop (#699).
+    fn stageRecordingFakeDeclare(dir: std.Io.Dir, allocator: std.mem.Allocator, schema_json: []const u8) ![:0]const u8 {
+        const windows = @import("builtin").os.tag == .windows;
+        const dir_abs = try dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(dir_abs);
+
+        {
+            var f = try dir.createFile(io, "fake-declare.out", .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, schema_json);
+        }
+
+        var body_aw = std.Io.Writer.Allocating.init(allocator);
+        defer body_aw.deinit();
+        const w = &body_aw.writer;
+        if (windows) {
+            try w.writeAll("@echo off\r\n");
+            try w.print("break > \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
+            try w.writeAll(":labelle_loop\r\n");
+            try w.writeAll("if \"%~1\"==\"\" goto labelle_done\r\n");
+            try w.print("echo %~1>> \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
+            try w.writeAll("shift\r\n");
+            try w.writeAll("goto labelle_loop\r\n");
+            try w.writeAll(":labelle_done\r\n");
+            try w.print("type \"{s}\\fake-declare.out\"\r\n", .{dir_abs});
+            try w.writeAll("exit /b 0\r\n");
+        } else {
+            try w.writeAll("#!/bin/sh\n");
+            try w.print("printf '%s\\n' \"$@\" > \"{s}/recorded-args.txt\"\n", .{dir_abs});
+            try w.print("cat \"{s}/fake-declare.out\"\n", .{dir_abs});
+            try w.writeAll("exit 0\n");
+        }
+        return stageToolScript(dir, allocator, "fake-declare", body_aw.written());
     }
 
     /// A fake tsc that only reports — no emit. `stdout_text` goes to stdout
@@ -726,24 +757,11 @@ const ts_decl_plugin_manifest =
 /// for whichever tsconfig it is handed (`tsconfig.declare.json` -> the
 /// declaration dirs' `.js`; the script tsconfig -> the script `.js`). Honors
 /// the `<tool> -p <tsconfig>` contract and reads `outDir` from the config.
-const decl_transpile_fake_tsc =
-    \\#!/bin/sh
-    \\[ "$1" = "-p" ] || exit 3
-    \\out=$(sed -n 's/^ *"outDir": "\(.*\)".*$/\1/p' "$2")
-    \\[ -n "$out" ] || exit 4
-    \\case "$2" in
-    \\  *tsconfig.declare.json)
-    \\    mkdir -p "$out/components" "$out/events"
-    \\    printf 'export const Hunger = labelle.component("Hunger", { level: 0.875 });\n' > "$out/components/hunger.js"
-    \\    printf 'export const Feed = labelle.event("hunger__feed", { amount: 0.5 });\n' > "$out/events/feed.js"
-    \\    ;;
-    \\  *)
-    \\    printf 'export function update(dt) {}\n' > "$out/logic.js"
-    \\    ;;
-    \\esac
-    \\exit 0
-    \\
-;
+const decl_emit = [_]StagedTranspileProject.Emit{
+    .{ .when_config_suffix = "tsconfig.declare.json", .rel = "components/hunger.js", .body = "export const Hunger = labelle.component(\"Hunger\", { level: 0.875 });\n" },
+    .{ .when_config_suffix = "tsconfig.declare.json", .rel = "events/feed.js", .body = "export const Feed = labelle.event(\"hunger__feed\", { amount: 0.5 });\n" },
+    .{ .unless_config_suffix = "tsconfig.declare.json", .rel = "logic.js", .body = "export function update(dt) {}\n" },
+};
 
 const decl_schema_json =
     \\{"components":[{"name":"Hunger","persist":"persistent","fields":[{"name":"level","type":"f32","default":0.875}]}],"events":[{"name":"hunger__feed","fields":[{"name":"amount","type":"f32","default":0.5}]}]}
@@ -784,28 +802,16 @@ pub const DECL_TRANSPILE_E2E = struct {
         const out_abs = try tmp.dir.realPathFileAlloc(io, "out", allocator);
         defer allocator.free(out_abs);
 
-        // Fake tsc.
-        var tf = try tmp.dir.createFile(io, "fake-tsc", .{ .permissions = .executable_file });
-        try tf.writeStreamingAll(io, decl_transpile_fake_tsc);
-        tf.close(io);
-        const fake_tsc = try tmp.dir.realPathFileAlloc(io, "fake-tsc", allocator);
+        // Fake tsc, through the portable helper (#699).
+        const fake_tsc = try StagedTranspileProject.stageEmittingFakeTsc(tmp.dir, allocator, &decl_emit);
         defer allocator.free(fake_tsc);
         generate.scripting_transpile.tsc_tool_override = fake_tsc;
         defer generate.scripting_transpile.tsc_tool_override = null;
 
-        // Fake declare runner that RECORDS its argv, then echoes the schema.
-        const args_abs = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-        defer allocator.free(args_abs);
-        const decl_body = try std.fmt.allocPrint(
-            allocator,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{s}/recorded-args.txt\"\necho '{s}'\n",
-            .{ args_abs, decl_schema_json },
-        );
-        defer allocator.free(decl_body);
-        var df = try tmp.dir.createFile(io, "fake-declare", .{ .permissions = .executable_file });
-        try df.writeStreamingAll(io, decl_body);
-        df.close(io);
-        const fake_declare = try tmp.dir.realPathFileAlloc(io, "fake-declare", allocator);
+        // Fake declare runner that RECORDS its argv, then echoes the schema —
+        // through the portable helper, since a `#!/bin/sh` body is not
+        // executable on Windows (#699).
+        const fake_declare = try StagedTranspileProject.stageRecordingFakeDeclare(tmp.dir, allocator, decl_schema_json);
         defer allocator.free(fake_declare);
         generate.scripting_declare.declare_tool_override = fake_declare;
         defer generate.scripting_declare.declare_tool_override = null;
