@@ -36,6 +36,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("../config.zig");
 const env = @import("env.zig");
+const junction = @import("../junction.zig");
 
 /// Reserved NAMESPACE for locally-sourced slots:
 /// `~/.labelle/packages/local/…`.
@@ -799,17 +800,7 @@ pub fn warnIfLocallySourced(
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-/// Point LABELLE_HOME at `home` for the duration of a test; the caller
-/// restores the returned Environ. PosixBlock-only, so callers skip on
-/// Windows.
-fn setTestCacheHome(envp: *const [1:null]?[*:0]const u8) std.process.Environ {
-    const saved = std.testing.environ;
-    std.testing.environ = .{ .block = .{ .slice = envp } };
-    return saved;
-}
-
 test "localSlotRoot: the reserved namespace, subpaths inside it, and nothing else" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -828,15 +819,12 @@ test "localSlotRoot: the reserved namespace, subpaths inside it, and nothing els
     const checkout = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout", alloc);
     defer alloc.free(checkout);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const gfx_slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(gfx_slot);
-    try std.Io.Dir.cwd().symLink(std.testing.io, checkout, gfx_slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, checkout, gfx_slot);
     try writeOrigin(alloc, gfx_slot, checkout, "1.29.0", .discovered);
 
     const asm_slot = try assemblerSlot(alloc);
@@ -878,7 +866,6 @@ test "localSlotRoot: a cache home containing a `local` component is not a local 
     // made EVERY version slot classify as locally sourced, so genuine releases
     // were reported as "built from LOCAL sources" and users were pointed at a
     // destructive cleanup.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -887,13 +874,14 @@ test "localSlotRoot: a cache home containing a `local` component is not a local 
 
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, "usr/local/labelle", alloc);
     defer alloc.free(home);
-    try std.testing.expect(std.mem.indexOf(u8, home, "/local/") != null);
+    // The `local` component, spelled with the HOST separator — a literal
+    // "/local/" is absent from a Windows realpath, so the test would fail
+    // on its own precondition rather than on the behaviour (#699).
+    const local_component = std.fs.path.sep_str ++ "local" ++ std.fs.path.sep_str;
+    try std.testing.expect(std.mem.indexOf(u8, home, local_component) != null);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const release = try std.fs.path.join(alloc, &.{ home, "packages", "gfx", "1.29.0" });
     defer alloc.free(release);
@@ -904,7 +892,6 @@ test "activeFrameworkSlot: a slot populated from ANOTHER checkout is not honoure
     // One shared LABELLE_HOME, two monorepo clones. A slot populated from
     // clone A must not satisfy a build run out of clone B — B's siblings can
     // be at completely different revisions.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -922,16 +909,13 @@ test "activeFrameworkSlot: a slot populated from ANOTHER checkout is not honoure
     const bin_b = try tmp.dir.realPathFileAlloc(std.testing.io, "clone-b/labelle-assembler/zig-out/bin", alloc);
     defer alloc.free(bin_b);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     // Populated from clone A.
     const slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
-    try std.Io.Dir.cwd().symLink(std.testing.io, src_a, slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, src_a, slot);
     try writeOrigin(alloc, slot, src_a, "1.29.0", .discovered);
 
     // Running out of clone B: not honoured.
@@ -960,7 +944,6 @@ test "resolveFrameworkPackage: the git ref `local` resolves to its own version s
     // resolved a `local` pin straight onto the monorepo-populated directory
     // and reported it cached. The reserved namespace makes the two paths
     // disjoint by construction.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -974,16 +957,13 @@ test "resolveFrameworkPackage: the git ref `local` resolves to its own version s
     defer alloc.free(home);
     const src = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-gfx", alloc);
     defer alloc.free(src);
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     // A populated local slot, exactly as a monorepo-run assembler leaves it.
     const slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
-    try std.Io.Dir.cwd().symLink(std.testing.io, src, slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, src, slot);
     try writeOrigin(alloc, slot, src, "1.29.0", .discovered);
 
     // A released binary, outside the monorepo, pinned to the ref `local`.
@@ -1007,7 +987,6 @@ test "activeAssemblerSlot: an incomplete slot is refused so it gets repopulated 
     // A slot populated while the checkout still lacked `gui` must not go on
     // reporting the assembler cached once the checkout grows one — the
     // version-named slot used to get this for free by changing name.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1024,11 +1003,8 @@ test "activeAssemblerSlot: an incomplete slot is refused so it gets repopulated 
     const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
     defer alloc.free(bin);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const slot = try assemblerSlot(alloc);
     defer alloc.free(slot);
@@ -1048,32 +1024,52 @@ test "activeAssemblerSlot: an incomplete slot is refused so it gets repopulated 
     try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-assembler/gui");
     try std.testing.expect(try activeAssemblerSlot(alloc) == null);
 }
-
 test "originPath: mirrors the slot tree into the marker namespace" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
-    const home_env = "LABELLE_HOME=/c";
-    const envp = [_:null]?[*:0]const u8{home_env};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
 
-    const framework = try originPath(alloc, "/c/packages/local/gfx");
+    env.setCacheRootForTesting(root);
+    defer env.setCacheRootForTesting(null);
+
+    // Every path here is JOINED rather than written with `/`. The cache root
+    // joins with `\` on Windows, so a hardcoded POSIX literal fails
+    // `originPath`'s namespace prefix check for a reason that has nothing to
+    // do with the behaviour under test (#699).
+    const slot = try std.fs.path.join(alloc, &.{ root, "packages", "local", "gfx" });
+    defer alloc.free(slot);
+    const want = try std.fs.path.join(alloc, &.{ root, "packages", "local.origins", "gfx" });
+    defer alloc.free(want);
+
+    const framework = try originPath(alloc, slot);
     defer alloc.free(framework);
-    try std.testing.expectEqualStrings("/c/packages/local.origins/gfx", framework);
+    try std.testing.expectEqualStrings(want, framework);
 
     // A repo whose NAME ends in `.origin` gets its own marker path — with a
     // `<slot>.origin` sibling the two would have collided (#688 review).
-    const a = try originPath(alloc, "/c/packages/local/plugins/github.com/acme/foo");
+    const repo = try std.fs.path.join(alloc, &.{ root, "packages", "local", "plugins", "github.com", "acme", "foo" });
+    defer alloc.free(repo);
+    const repo_origin = try std.fs.path.join(alloc, &.{ root, "packages", "local", "plugins", "github.com", "acme", "foo.origin" });
+    defer alloc.free(repo_origin);
+
+    const a = try originPath(alloc, repo);
     defer alloc.free(a);
-    const b = try originPath(alloc, "/c/packages/local/plugins/github.com/acme/foo.origin");
+    const b = try originPath(alloc, repo_origin);
     defer alloc.free(b);
-    try std.testing.expectEqualStrings("/c/packages/local.origins/plugins/github.com/acme/foo", a);
-    try std.testing.expect(!std.mem.eql(u8, a, "/c/packages/local/plugins/github.com/acme/foo.origin"));
+
+    const want_a = try std.fs.path.join(alloc, &.{ root, "packages", "local.origins", "plugins", "github.com", "acme", "foo" });
+    defer alloc.free(want_a);
+    try std.testing.expectEqualStrings(want_a, a);
+    try std.testing.expect(!std.mem.eql(u8, a, repo_origin));
     try std.testing.expect(!std.mem.eql(u8, a, b));
 
     // Anything outside the slot namespace has no marker path at all.
-    try std.testing.expectError(error.InvalidSlotPath, originPath(alloc, "/c/packages/gfx/1.29.0"));
+    const outside = try std.fs.path.join(alloc, &.{ root, "packages", "gfx", "1.29.0" });
+    defer alloc.free(outside);
+    try std.testing.expectError(error.InvalidSlotPath, originPath(alloc, outside));
 }
 
 test "fieldValue: parses the marker body" {
@@ -1129,7 +1125,6 @@ fn writeFileAt(dir: std.Io.Dir, rel: []const u8, body: []const u8) !void {
 }
 
 test "gitRevision: a main checkout reports its loose ref" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1152,7 +1147,6 @@ test "gitRevision: a worktree with a RELATIVE gitdir resolves through commondir 
     // the branch ref lives in the COMMON git dir, not the per-worktree one,
     // so the revision degraded to the branch NAME and stopped tracking
     // commits.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1173,7 +1167,6 @@ test "gitRevision: a worktree with a RELATIVE gitdir resolves through commondir 
 }
 
 test "writeOrigin/readOrigin: round-trips provenance for a slot" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1182,11 +1175,8 @@ test "writeOrigin/readOrigin: round-trips provenance for a slot" {
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
@@ -1205,7 +1195,6 @@ test "isFrameworkCached: a COPIED local slot is stale, so ensureCache repopulate
     // source edits never reach it. The version-named slot at least got a
     // fresh copy whenever the pin moved; the reserved slot never changes
     // name, so it would be reused indefinitely unless the probe calls it out.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1222,11 +1211,8 @@ test "isFrameworkCached: a COPIED local slot is stale, so ensureCache repopulate
     const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
     defer alloc.free(bin);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     setProbeStartForTesting(bin);
     defer setProbeStartForTesting(null);
@@ -1244,7 +1230,7 @@ test "isFrameworkCached: a COPIED local slot is stale, so ensureCache repopulate
 
     // The same slot as a symlink tracks its source, so it satisfies the pin.
     try std.Io.Dir.cwd().deleteTree(std.testing.io, slot);
-    try std.Io.Dir.cwd().symLink(std.testing.io, src, slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, src, slot);
     try std.testing.expect(try resolve.isFrameworkCached(alloc, "gfx", "1.29.0"));
 }
 
@@ -1254,7 +1240,6 @@ test "activePluginSlot: a slot populated for a DIFFERENT logical name is not hon
     // different logical names therefore expect different siblings — and both
     // checkouts can be present at different revisions — so "any direct child
     // of this monorepo" would let one compile the other's sources.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1272,18 +1257,15 @@ test "activePluginSlot: a slot populated for a DIFFERENT logical name is not hon
     const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
     defer alloc.free(bin);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const repo = "github.com/labelle-toolkit/labelle-physics";
     const same: config.PluginDep = .{ .name = "physics", .repo = repo, .version = "0.4.0" };
     const slot = try pluginSlot(alloc, same);
     defer alloc.free(slot);
     try std.Io.Dir.cwd().createDirPath(config.globalIo(), std.fs.path.dirname(slot).?);
-    try std.Io.Dir.cwd().symLink(std.testing.io, src, slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, src, slot);
     try writeOrigin(alloc, slot, src, "0.4.0", .discovered);
 
     setProbeStartForTesting(bin);
@@ -1304,7 +1286,7 @@ test "activePluginSlot: a slot populated for a DIFFERENT logical name is not hon
     // And even if that slot existed, holding the WRONG checkout, it would
     // not be honoured: the marker must name `labelle-physics2`.
     try std.Io.Dir.cwd().createDirPath(config.globalIo(), std.fs.path.dirname(other_slot).?);
-    try std.Io.Dir.cwd().symLink(std.testing.io, src, other_slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, src, other_slot);
     try writeOrigin(alloc, other_slot, src, "0.4.0", .discovered);
     try std.testing.expect(try activePluginSlot(alloc, other) == null);
 }
@@ -1314,7 +1296,6 @@ test "writeOrigin: an unwritable marker fails population rather than reporting s
     // silently-skipped marker would leave `install` reporting success while
     // the next generate ignored the slot and resolved a version-named
     // directory that does not exist.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1324,11 +1305,8 @@ test "writeOrigin: an unwritable marker fails population rather than reporting s
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
@@ -1347,13 +1325,10 @@ test "pluginSlot: no plugin identity can nest inside another's slot (#688 review
     // `{repo=github.com/acme/foo/bar/baz, name=qux}` put the second slot
     // INSIDE the first — which is a symlink to a checkout, so populating the
     // second would write through it into the user's source tree.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
-    const home_env = "LABELLE_HOME=/c";
-    const envp = [_:null]?[*:0]const u8{home_env};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting("/c");
+    defer env.setCacheRootForTesting(null);
 
     const outer: config.PluginDep = .{ .name = "bar", .repo = "github.com/acme/foo", .version = "1.0.0" };
     const inner: config.PluginDep = .{ .name = "qux", .repo = "github.com/acme/foo/bar/baz", .version = "1.0.0" };
@@ -1386,7 +1361,6 @@ test "pluginSlot: no plugin identity can nest inside another's slot (#688 review
 test "assemblerSlotComplete: a subdir the checkout dropped makes the slot stale (#688 review)" {
     // A leftover `gui/` — a stale copy, or a link whose target is gone —
     // would otherwise survive every repopulation and still be compiled.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1415,7 +1389,6 @@ test "activeFrameworkSlot: a slot whose source checkout is gone is not honoured 
     // canonicalises, so a deleted checkout still matches its own recorded
     // path. A COPIED slot (the Windows fallback) then outlives its source and
     // stays active while the probes fetch the release it stands in for.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1432,11 +1405,8 @@ test "activeFrameworkSlot: a slot whose source checkout is gone is not honoured 
     const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
     defer alloc.free(bin);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     setProbeStartForTesting(bin);
     defer setProbeStartForTesting(null);
@@ -1458,7 +1428,6 @@ test "readOrigin: a marker written before #704 has no mode and reads back discov
     // The mode field is additive. Every slot that exists today was
     // auto-discovered, and reading one as `.explicit` would hand a released
     // binary the monorepo sources #679 was filed about.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1468,11 +1437,8 @@ test "readOrigin: a marker written before #704 has no mode and reads back discov
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
@@ -1492,7 +1458,6 @@ test "readOrigin: a marker written before #704 has no mode and reads back discov
 }
 
 test "writeOrigin/readOrigin: round-trips an explicit mode" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1501,11 +1466,8 @@ test "writeOrigin/readOrigin: round-trips an explicit mode" {
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
@@ -1529,7 +1491,6 @@ test "activeFrameworkSlot: an explicit override activates outside the monorepo, 
     // The other half is the guard that must survive: a DISCOVERED slot
     // stays inert out here, so no released binary ever picks up a monorepo
     // checkout nobody asked it to build (#679/#685).
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1547,11 +1508,8 @@ test "activeFrameworkSlot: an explicit override activates outside the monorepo, 
     const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "elsewhere/bin", alloc);
     defer alloc.free(bin);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     setProbeStartForTesting(bin);
     defer setProbeStartForTesting(null);
@@ -1559,7 +1517,7 @@ test "activeFrameworkSlot: an explicit override activates outside the monorepo, 
 
     const slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
-    try std.Io.Dir.cwd().symLink(std.testing.io, src, slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, src, slot);
 
     try writeOrigin(alloc, slot, src, "1.30.0", .explicit);
     const active = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
@@ -1573,7 +1531,6 @@ test "activeFrameworkSlot: an explicit override activates outside the monorepo, 
 test "activeFrameworkSlot: an explicit override whose checkout is gone falls back to the pin (#704)" {
     // A deleted source must not leave a dangling slot standing in for a
     // release: the build would resolve a path that isn't there.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1589,18 +1546,15 @@ test "activeFrameworkSlot: an explicit override whose checkout is gone falls bac
     const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "elsewhere/bin", alloc);
     defer alloc.free(bin);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     setProbeStartForTesting(bin);
     defer setProbeStartForTesting(null);
 
     const slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
-    try std.Io.Dir.cwd().symLink(std.testing.io, src, slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, src, slot);
     try writeOrigin(alloc, slot, src, "1.30.0", .explicit);
 
     try std.Io.Dir.cwd().deleteTree(std.testing.io, src);
@@ -1612,7 +1566,6 @@ test "explicitFrameworkSource: names the checkout for an explicit slot only (#70
     // than linked, so — unlike `activeFrameworkSlot` — it must answer for a
     // slot that no longer tracks its source. It must stay silent for a
     // discovered slot, which auto-discovery already repopulates.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1626,11 +1579,8 @@ test "explicitFrameworkSource: names the checkout for an explicit slot only (#70
     const src = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout", alloc);
     defer alloc.free(src);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
@@ -1659,7 +1609,6 @@ test "populateFrameworkPackage: a failed marker write drops the slot rather than
     // marker is trusted without a source comparison, so nothing would ever
     // catch it. A link-backed slot is never refreshed either, so the two
     // would never reconcile. No slot at all is the honest outcome.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1675,11 +1624,8 @@ test "populateFrameworkPackage: a failed marker write drops the slot rather than
     const src_b = try tmp.dir.realPathFileAlloc(std.testing.io, "checkout-b", alloc);
     defer alloc.free(src_b);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     const disk = @import("disk.zig");
     const slot = try frameworkSlot(alloc, "gfx");
@@ -1712,7 +1658,6 @@ test "populateFrameworkPackage: a failed marker write drops the slot rather than
 test "isDirectory: a regular file is not a checkout, however accessible (#704 review)" {
     // `dirExists` only calls `access`, so it says yes to a plain file. That
     // file used to be linked into the cache as a framework package.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     _ = alloc;
 
@@ -1743,7 +1688,6 @@ test "isFrameworkVersionCached: an active override does not make every release c
     // active local slot says yes whatever version is asked for. Right for a
     // build; wrong for `install <version>`, which reported every release
     // already cached and fetched nothing.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1759,18 +1703,15 @@ test "isFrameworkVersionCached: an active override does not make every release c
     const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "elsewhere/bin", alloc);
     defer alloc.free(bin);
 
-    const home_env = try std.fmt.allocPrintSentinel(alloc, "LABELLE_HOME={s}", .{home}, 0);
-    defer alloc.free(home_env);
-    const envp = [_:null]?[*:0]const u8{home_env.ptr};
-    const saved_environ = setTestCacheHome(&envp);
-    defer std.testing.environ = saved_environ;
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
 
     setProbeStartForTesting(bin);
     defer setProbeStartForTesting(null);
 
     const slot = try frameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
-    try std.Io.Dir.cwd().symLink(std.testing.io, src, slot, .{ .is_directory = true });
+    try junction.linkDir(alloc, src, slot);
     try writeOrigin(alloc, slot, src, "1.34.0", .explicit);
 
     const resolve = @import("resolve.zig");

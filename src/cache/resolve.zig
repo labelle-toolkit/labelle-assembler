@@ -522,15 +522,25 @@ test "validateCache: a remote external backend with no cache entry is reported m
     // remote backend that was never fetched is the sole missing entry —
     // reported as `backend <name> <version>` so `ensureCache` knows to fetch it.
     //
-    // Hermetic: point LABELLE_HOME at a guaranteed-absent dir so the cache
-    // probe can't be swayed by whatever lives in the caller's real
-    // ~/.labelle/packages on a dev box or a reused CI home. The construction
-    // is PosixBlock-only, so skip on Windows (a different env-block layout).
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const saved_environ = std.testing.environ;
-    defer std.testing.environ = saved_environ;
-    const envp = [_:null]?[*:0]const u8{"LABELLE_HOME=/nonexistent/labelle-validatecache-test-home"};
-    std.testing.environ = .{ .block = .{ .slice = &envp } };
+    // Hermetic: point the cache root at a test-OWNED empty directory, so the
+    // probe cannot be swayed by whatever lives in the caller's real
+    // ~/.labelle/packages on a dev box or a reused CI home. A fixed
+    // "/nonexistent/..." literal was only guaranteed-absent by convention,
+    // and now that this test runs on Windows too it would resolve to
+    // `C:\nonexistent\...` on whatever drive happened to be current (#699
+    // review). A tmpDir is absent by construction and cleaned up after.
+    //
+    // The seam rather than an env block: `std.testing.environ` cannot carry
+    // a synthetic environment on Windows at all, and constructing a
+    // `PosixBlock` there is a COMPILE error rather than a skippable one — it
+    // broke `zig build test` for the whole platform (#699).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const empty_home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(empty_home);
+
+    env.setCacheRootForTesting(empty_home);
+    defer env.setCacheRootForTesting(null);
 
     const alloc = std.testing.allocator;
     const cfg = config.ProjectConfig{

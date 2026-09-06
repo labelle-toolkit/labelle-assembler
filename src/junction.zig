@@ -332,3 +332,23 @@ fn isLink(path: []const u8) bool {
     _ = std.Io.Dir.readLinkAbsolute(@import("config.zig").globalIo(), path, &buf) catch return false;
     return true;
 }
+
+/// Create a directory link at `link` pointing at `target`: a symlink where
+/// the platform allows one, a junction where it does not.
+///
+/// The one place that decision is made, so production and tests take the
+/// same path — a test that hand-rolled `symLink` would simply fail on
+/// Windows, which is how 83 of the Windows job's tests came to be skipped
+/// (#699).
+///
+/// `error.PathAlreadyExists` passes through unchanged: a caller with a
+/// reconcile path needs to tell "cannot link here" from "something is
+/// already here". Any other failure returns the ORIGINAL symlink error, so
+/// the caller still learns why linking was impossible.
+pub fn linkDir(allocator: std.mem.Allocator, target: []const u8, link: []const u8) !void {
+    const io = @import("config.zig").globalIo();
+    return std.Io.Dir.cwd().symLink(io, target, link, .{ .is_directory = true }) catch |err| {
+        if (err == error.PathAlreadyExists) return err;
+        create(allocator, target, link) catch return err;
+    };
+}
