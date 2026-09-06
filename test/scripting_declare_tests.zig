@@ -292,20 +292,27 @@ const StagedProject = struct {
 
         if (windows) {
             try w.writeAll("@echo off\r\n");
-            try w.writeAll("setlocal enabledelayedexpansion\r\n");
             if (record_args) {
                 // Batch has no `printf "%s\n" "$@"`; walk argv with shift.
                 //
-                // Each argument is captured into a variable inside quotes
-                // and echoed through DELAYED expansion. Expanding `%~1`
-                // directly on the `echo` line would let a `&`, `(` or `|` in
-                // the path be parsed as batch syntax, truncating or
-                // corrupting what gets recorded (#699 review).
-                try w.print("break > \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
+                // Two metacharacter classes, and cmd protects them in
+                // opposite modes (#699 review, two rounds):
+                //   * `&`, `(`, `|` are safe INSIDE QUOTES with delayed
+                //     expansion off — but not on an unquoted `echo %~1`;
+                //   * `!` is safe with delayed expansion OFF, and eaten
+                //     anywhere on a line while it is ON.
+                // So every literal path is bound to a variable inside
+                // quotes with expansion off, and expansion is switched on
+                // only for the one `echo`, whose operands are then variable
+                // VALUES — and expanded values are not rescanned for `!`.
+                try w.print("set \"REC={s}\\recorded-args.txt\"\r\n", .{dir_abs});
+                try w.writeAll("break > \"%REC%\"\r\n");
                 try w.writeAll(":labelle_loop\r\n");
                 try w.writeAll("if \"%~1\"==\"\" goto labelle_done\r\n");
                 try w.writeAll("set \"ARG=%~1\"\r\n");
-                try w.print("echo(!ARG!>> \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
+                try w.writeAll("setlocal enabledelayedexpansion\r\n");
+                try w.writeAll("echo(!ARG!>> \"!REC!\"\r\n");
+                try w.writeAll("endlocal\r\n");
                 try w.writeAll("shift\r\n");
                 try w.writeAll("goto labelle_loop\r\n");
                 try w.writeAll(":labelle_done\r\n");

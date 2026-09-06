@@ -293,14 +293,19 @@ const StagedTranspileProject = struct {
         const w = &body_aw.writer;
         if (windows) {
             try w.writeAll("@echo off\r\n");
-            try w.writeAll("setlocal enabledelayedexpansion\r\n");
-            try w.print("break > \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
+            // Literal paths bound in quotes with delayed expansion OFF
+            // (protects `&(|`, keeps `!` literal); expansion switched on only
+            // for the one `echo`, whose operands are variable values and so
+            // are not rescanned for `!` (#699 review, two rounds — see the
+            // declare suite's stub for the full note).
+            try w.print("set \"REC={s}\\recorded-args.txt\"\r\n", .{dir_abs});
+            try w.writeAll("break > \"%REC%\"\r\n");
             try w.writeAll(":labelle_loop\r\n");
             try w.writeAll("if \"%~1\"==\"\" goto labelle_done\r\n");
-            // Captured in quotes, echoed via delayed expansion: a `&`, `(`
-            // or `|` in the path must be recorded, not parsed (#699 review).
             try w.writeAll("set \"ARG=%~1\"\r\n");
-            try w.print("echo(!ARG!>> \"{s}\\recorded-args.txt\"\r\n", .{dir_abs});
+            try w.writeAll("setlocal enabledelayedexpansion\r\n");
+            try w.writeAll("echo(!ARG!>> \"!REC!\"\r\n");
+            try w.writeAll("endlocal\r\n");
             try w.writeAll("shift\r\n");
             try w.writeAll("goto labelle_loop\r\n");
             try w.writeAll(":labelle_done\r\n");
