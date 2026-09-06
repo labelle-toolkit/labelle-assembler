@@ -78,8 +78,15 @@ pub fn isRepoRootIo(io: std.Io, parent: std.Io.Dir, name: []const u8) bool {
 /// Exists because `std.Io.Dir.walk` has no prune hook: a `Walker` hands
 /// back a nested worktree's whole subtree with no way to cut the
 /// recursion off, so every walk that needs the #692 guard has to drive
-/// the descent itself. Unreadable subdirectories are skipped rather than
-/// fatal, matching the other walks here.
+/// the descent itself.
+///
+/// Error policy matches the `Dir.walk` this replaced (codex on PR #716):
+/// only a subdirectory that VANISHED mid-walk is skipped, because
+/// nothing on disk means nothing to collect. Every other open failure —
+/// permissions, I/O — propagates. Swallowing those would hand the caller
+/// a silently short list: `flow_scanner.scanAndEmit` would codegen an
+/// incomplete flow registry and `pruneStaleSidecars` would skip cleanup,
+/// both with no diagnostic anywhere.
 pub fn collectFilesRecursive(
     allocator: std.mem.Allocator,
     dir: std.Io.Dir,
@@ -93,7 +100,12 @@ pub fn collectFilesRecursive(
         switch (entry.kind) {
             .directory => {
                 if (isRepoRoot(dir, entry.name)) continue;
-                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err| switch (err) {
+                    // Deleted or replaced between `iterate` and `openDir`
+                    // — no content, so provably nothing to collect.
+                    error.FileNotFound, error.NotDir => continue,
+                    else => return err,
+                };
                 defer sub.close(io);
                 const sub_prefix = if (rel_prefix.len == 0)
                     try allocator.dupe(u8, entry.name)
