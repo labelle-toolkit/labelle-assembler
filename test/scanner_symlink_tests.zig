@@ -136,6 +136,52 @@ pub const LinkDir = struct {
         if (first_id) |a| try std.testing.expectEqual(a, second_id.?);
     }
 
+    test "re-run is idempotent even when the caller passes a RELATIVE source" {
+        // `--project-root .` reaches `linkDir` relative, which is what made
+        // the junction fall back to a copy before fdf47ca. The reconcile has
+        // to stay a no-op in that shape too: it compares the existing link
+        // against the CANONICAL source, so the caller's spelling should not
+        // matter (#699 review).
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(std.testing.io, "project/scenes");
+        try tmp.dir.createDirPath(std.testing.io, "project/.labelle/target");
+
+        const abs_src_base = try tmp.dir.realPathFileAlloc(std.testing.io, "project", std.testing.allocator);
+        defer std.testing.allocator.free(abs_src_base);
+        const dst_base = try tmp.dir.realPathFileAlloc(std.testing.io, "project/.labelle/target", std.testing.allocator);
+        defer std.testing.allocator.free(dst_base);
+
+        // The same directory, spelled RELATIVE to the process cwd.
+        const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(cwd_abs);
+        // BOTH sides relative, which is the shape production produces:
+        // `target_dir` is derived from `game_dir`, so `--project-root .`
+        // makes them relative together. A relative source against an
+        // ABSOLUTE destination is not a shape any caller creates.
+        const rel_src_base = try std.fs.path.relative(std.testing.allocator, "", null, cwd_abs, abs_src_base);
+        defer std.testing.allocator.free(rel_src_base);
+        const rel_dst_base = try std.fs.path.relative(std.testing.allocator, "", null, cwd_abs, dst_base);
+        defer std.testing.allocator.free(rel_dst_base);
+        try std.testing.expect(!std.fs.path.isAbsolute(rel_src_base));
+        try std.testing.expect(!std.fs.path.isAbsolute(rel_dst_base));
+
+        try scanner.linkDir(std.testing.allocator, rel_src_base, rel_dst_base, "scenes");
+        const first_id = try linkIdentity(tmp.dir, "project/.labelle/target/scenes");
+
+        try scanner.linkDir(std.testing.allocator, rel_src_base, rel_dst_base, "scenes");
+        const second_id = try linkIdentity(tmp.dir, "project/.labelle/target/scenes");
+        if (first_id) |a| try std.testing.expectEqual(a, second_id.?);
+
+        // And it is still a LIVE link, not a copy — the relative spelling
+        // must not have quietly demoted it.
+        try writeSample(tmp.dir, "project/scenes/live.jsonc", "fresh");
+        const through = try tmp.dir.readFileAlloc(std.testing.io, "project/.labelle/target/scenes/live.jsonc", std.testing.allocator, .limited(32));
+        defer std.testing.allocator.free(through);
+        try std.testing.expectEqualStrings("fresh", through);
+    }
+
     test "replaces a legacy copy-based directory with a symlink" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
