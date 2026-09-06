@@ -77,6 +77,31 @@ pub const LinkDir = struct {
         try std.testing.expectEqualStrings("// edited", after);
     }
 
+    /// The identity of the LINK ENTRY at `sub` — not of whatever it points
+    /// at — or null where the platform cannot express that.
+    ///
+    /// Needed because the obvious idempotence assertions cannot see a
+    /// replacement (#699 review): a marker written through the link lands in
+    /// the SOURCE directory and survives, and a recreated link has the same
+    /// target text. Both pass against an implementation that rebuilds the
+    /// link every call.
+    ///
+    /// Windows only, and that is where it matters. A junction is a real
+    /// directory entry, so `follow_symlinks = false` opens the reparse point
+    /// itself and its inode (the FileIndex) changes when the entry is
+    /// recreated. A POSIX symlink is not a directory, so the same open fails
+    /// with `error.NotDir` — and there is nothing to catch there anyway: a
+    /// symlink's target text equals `relative_target`, so the reconcile
+    /// returns early and the text assertion already pins it. The regression
+    /// this guards is junction-specific.
+    fn linkIdentity(dir: std.Io.Dir, sub: []const u8) !?std.Io.File.INode {
+        if (@import("builtin").os.tag != .windows) return null;
+        var entry = try dir.openDir(std.testing.io, sub, .{ .follow_symlinks = false });
+        defer entry.close(std.testing.io);
+        const st = try entry.stat(std.testing.io);
+        return st.inode;
+    }
+
     test "re-run is idempotent when link already points at correct target" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -93,24 +118,22 @@ pub const LinkDir = struct {
 
         var first_buf: [std.fs.max_path_bytes]u8 = undefined;
         const first_len = try tmp.dir.readLink(std.testing.io, "project/.labelle/target/scenes", &first_buf);
-        const first = first_buf[0..first_len];
-
-        // A marker INSIDE the destination path. If the second call tears the
-        // link down and rebuilds it, this is destroyed — which is what the
-        // old assertion ("must not fail") could not see, and what let a
-        // Windows junction be deleted and recreated on every generate
-        // unnoticed (#699 review).
-        try writeSample(tmp.dir, "project/scenes/marker.jsonc", "kept");
+        const first_text = first_buf[0..first_len];
+        const first_id = try linkIdentity(tmp.dir, "project/.labelle/target/scenes");
 
         try scanner.linkDir(std.testing.allocator, src_base, dst_base, "scenes");
 
+        // Same target text...
         var second_buf: [std.fs.max_path_bytes]u8 = undefined;
         const second_len = try tmp.dir.readLink(std.testing.io, "project/.labelle/target/scenes", &second_buf);
-        try std.testing.expectEqualStrings(first, second_buf[0..second_len]);
+        try std.testing.expectEqualStrings(first_text, second_buf[0..second_len]);
 
-        const kept = try tmp.dir.readFileAlloc(std.testing.io, "project/.labelle/target/scenes/marker.jsonc", std.testing.allocator, .limited(32));
-        defer std.testing.allocator.free(kept);
-        try std.testing.expectEqualStrings("kept", kept);
+        // ...and the SAME ENTRY, not an identical replacement. The assertion
+        // with teeth: it fails against an implementation that deletes and
+        // recreates the link, which is what a Windows junction got before
+        // the reconcile learned to recognise its absolute target.
+        const second_id = try linkIdentity(tmp.dir, "project/.labelle/target/scenes");
+        if (first_id) |a| try std.testing.expectEqual(a, second_id.?);
     }
 
     test "replaces a legacy copy-based directory with a symlink" {

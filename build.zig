@@ -209,6 +209,29 @@ pub fn build(b: *std.Build) void {
     cache_bin_tests.root_module.link_libc = true;
     test_cache_step.dependOn(&b.addRunArtifact(cache_bin_tests).step);
 
+    // The link-placement suite joins the Windows job too (#699 review). It
+    // lives in `test/`, so it rides `zig build test` — which runs on
+    // ubuntu/macos only. Yet it is precisely where the platform differs:
+    // Windows takes the junction fallback that POSIX never reaches, and the
+    // idempotence pin there is the one that catches a junction being rebuilt
+    // on every generate. Left out, the Windows-only path would again have
+    // Windows-only tests that no Windows job runs.
+    const scanner_link_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/scanner_symlink_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "generator", .module = generator_module },
+                .{ .name = "zspec", .module = zspec_dep.module("zspec") },
+                .{ .name = "flow_codegen", .module = flow_codegen_module },
+                .{ .name = "test_options", .module = test_options_module },
+            },
+        }),
+    });
+    scanner_link_tests.root_module.link_libc = true;
+    test_cache_step.dependOn(&b.addRunArtifact(scanner_link_tests).step);
+
     // BDD-style tests from test/. Each test target gets `generator`,
     // `zspec`, and `flow_codegen` so any future test file can reach
     // them without further build.zig churn. flow_codegen is cheap to

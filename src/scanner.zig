@@ -388,10 +388,16 @@ pub fn linkDirAbs(
     //
     // Null when the source cannot be canonicalised; the symlink below does
     // not need it, and the copy is still a valid last resort.
-    const abs_src: ?[]u8 = blk: {
-        const canon = cwd.realPathFileAlloc(io, src_path, allocator) catch break :blk null;
+    // `null` means "could not canonicalise", which legitimately falls back to
+    // a copy. An ALLOCATION failure is not that: swallowing it here would
+    // report success having quietly staged a snapshot, so it propagates
+    // (#699 review).
+    const abs_src: ?[]u8 = if (cwd.realPathFileAlloc(io, src_path, allocator)) |canon| blk: {
         defer allocator.free(canon);
-        break :blk allocator.dupe(u8, canon) catch null;
+        break :blk try allocator.dupe(u8, canon);
+    } else |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
     };
     defer if (abs_src) |p| allocator.free(p);
 
