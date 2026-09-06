@@ -91,9 +91,26 @@ pub const LinkDir = struct {
 
         try scanner.linkDir(std.testing.allocator, src_base, dst_base, "scenes");
 
-        // Second call must not fail (no FileExists error) and must
-        // preserve the original link.
+        var first_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const first_len = try tmp.dir.readLink(std.testing.io, "project/.labelle/target/scenes", &first_buf);
+        const first = first_buf[0..first_len];
+
+        // A marker INSIDE the destination path. If the second call tears the
+        // link down and rebuilds it, this is destroyed — which is what the
+        // old assertion ("must not fail") could not see, and what let a
+        // Windows junction be deleted and recreated on every generate
+        // unnoticed (#699 review).
+        try writeSample(tmp.dir, "project/scenes/marker.jsonc", "kept");
+
         try scanner.linkDir(std.testing.allocator, src_base, dst_base, "scenes");
+
+        var second_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const second_len = try tmp.dir.readLink(std.testing.io, "project/.labelle/target/scenes", &second_buf);
+        try std.testing.expectEqualStrings(first, second_buf[0..second_len]);
+
+        const kept = try tmp.dir.readFileAlloc(std.testing.io, "project/.labelle/target/scenes/marker.jsonc", std.testing.allocator, .limited(32));
+        defer std.testing.allocator.free(kept);
+        try std.testing.expectEqualStrings("kept", kept);
     }
 
     test "replaces a legacy copy-based directory with a symlink" {

@@ -379,10 +379,35 @@ pub fn linkDirAbs(
     // the plugin package's shipped placeholder dir). Safe because every
     // caller's destination is CLI-managed (`.labelle/<target>/`, the
     // staged deps tree).
+    // The source in ABSOLUTE, canonical form. Needed twice below, and for a
+    // reason worth stating: callers legitimately pass a RELATIVE source —
+    // `--project-root .` reaches `linkDir` as `.` and makes `src_path`
+    // `./scripts`. A junction target has no relative form, so without this
+    // `junction.create` refused it as `Unsupported` and Windows silently
+    // fell back to the copy this whole path exists to remove (#699 review).
+    //
+    // Null when the source cannot be canonicalised; the symlink below does
+    // not need it, and the copy is still a valid last resort.
+    const abs_src: ?[]u8 = blk: {
+        const canon = cwd.realPathFileAlloc(io, src_path, allocator) catch break :blk null;
+        defer allocator.free(canon);
+        break :blk allocator.dupe(u8, canon) catch null;
+    };
+    defer if (abs_src) |p| allocator.free(p);
+
     var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (cwd.readLink(io, dst_path, &link_buf)) |existing_len| {
         const existing = link_buf[0..existing_len];
         if (std.mem.eql(u8, existing, relative_target)) return;
+        // A junction reads back ABSOLUTE, so a correct one never equals
+        // `relative_target`. Left unrecognised it would be deleted and
+        // recreated on EVERY generate — defeating the documented no-op, and
+        // able to fail outright when another process holds the staged tree
+        // open (#699 review). Both sides here are canonical Windows paths
+        // (`readLink` and `realPath`), so they compare directly.
+        if (abs_src) |a| {
+            if (std.mem.eql(u8, existing, a)) return;
+        }
         try cwd.deleteTree(io, dst_path);
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -412,9 +437,15 @@ pub fn linkDirAbs(
         // POSIX, and Windows with Developer Mode, never reach this: they
         // keep the relative symlink. The copy remains as the last resort
         // for anything that can express neither.
-        junction.create(allocator, src_path, dst_path) catch {
+        // `abs_src`, not `src_path`: see above — a relative source would be
+        // refused and silently become a copy.
+        if (abs_src) |a| {
+            junction.create(allocator, a, dst_path) catch {
+                try copyDirRecursiveAbs(allocator, src_path, dst_path);
+            };
+        } else {
             try copyDirRecursiveAbs(allocator, src_path, dst_path);
-        };
+        }
     };
 }
 
