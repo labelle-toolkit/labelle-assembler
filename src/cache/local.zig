@@ -372,15 +372,52 @@ pub fn pluginDirName(allocator: std.mem.Allocator, name: []const u8) ![]const u8
 pub fn activeFrameworkSlot(allocator: std.mem.Allocator, package: []const u8) !?[]const u8 {
     // Null expected source: `activeOrFree` then admits an `.explicit`
     // marker only, so a pre-#696 unkeyed DISCOVERED slot sitting at this
-    // same path can never activate through here.
+    // same path cannot pass itself off as an override.
     const explicit = try explicitFrameworkSlot(allocator, package);
     if (activeOrFree(allocator, explicit, null)) |slot| return slot;
 
     const expected = try discoveredSource(allocator, frameworkDirName(package)) orelse return null;
     defer allocator.free(expected);
 
-    const slot = try discoveredFrameworkSlot(allocator, package, expected);
-    return activeOrFree(allocator, slot, expected);
+    const keyed = try discoveredFrameworkSlot(allocator, package, expected);
+    if (activeOrFree(allocator, keyed, expected)) |slot| return slot;
+
+    // A pre-#696 slot, populated for THIS checkout under the old unkeyed
+    // name, still serves the right sources — so honour it rather than
+    // silently falling back to the pinned release (#696 review, codex).
+    // Rejecting it outright was a real regression: a monorepo that already
+    // had the release cached would resolve the release, and because
+    // `isFrameworkCached` then said yes, `populateFrameworkPackage` — the
+    // only thing that migrates the slot — would never run to correct it.
+    //
+    // Honouring it does NOT reopen the thrash. The thrash needed two
+    // checkouts to POPULATE one name, and populate no longer writes this
+    // one: `isFrameworkCached` reports a legacy slot stale, so the next
+    // `ensureCache` migrates it to the keyed name and drops it.
+    const legacy = try explicitFrameworkSlot(allocator, package);
+    return activeOrFree(allocator, legacy, expected);
+}
+
+/// Whether `slot` is a pre-#696 unkeyed DISCOVERED slot for `package` —
+/// live, but at the name the EXPLICIT slot now owns.
+///
+/// `isFrameworkCached` treats one as stale, exactly as it treats a copied
+/// slot, so `ensureCache` repopulates and `purgeLegacyUnkeyedSlot` migrates
+/// it to the keyed name. Resolution keeps serving it in the meantime, so
+/// nothing builds the wrong sources while the migration is pending.
+pub fn isLegacyUnkeyedFrameworkSlot(
+    allocator: std.mem.Allocator,
+    package: []const u8,
+    slot: []const u8,
+) bool {
+    const unkeyed = explicitFrameworkSlot(allocator, package) catch return false;
+    defer allocator.free(unkeyed);
+    if (!std.mem.eql(u8, slot, unkeyed)) return false;
+
+    // The same path is the explicit override's, which is not legacy anything.
+    const origin = readOrigin(allocator, slot) orelse return false;
+    defer origin.deinit(allocator);
+    return origin.mode == .discovered;
 }
 
 /// The local slot for a plugin / external backend package, when it should
@@ -1945,13 +1982,19 @@ test "activeFrameworkSlot: an explicit override still wins over a keyed discover
     try std.testing.expectEqualStrings(picked, found);
 }
 
-test "purgeLegacyUnkeyedSlot: a pre-#696 unkeyed discovered slot is inert, then removed (#696)" {
+test "a pre-#696 unkeyed discovered slot keeps serving its checkout, then migrates (#696 review)" {
     // Slots written before this change sit at `packages/local/<pkg>` with a
-    // `discovered` marker. They must not activate from there — the unkeyed
-    // path is the EXPLICIT slot now — and the next populate should clear
-    // them out rather than leave a dangling link into someone's checkout.
+    // `discovered` marker. Rejecting one outright was a regression: with the
+    // pinned release already cached, `isFrameworkCached` said yes, so the
+    // build resolved the RELEASE instead of the sibling checkout and the
+    // populate that would have migrated the slot never ran.
+    //
+    // So it stays honoured for its own checkout, is reported STALE so
+    // `ensureCache` repopulates, and that populate moves it to the keyed
+    // name rather than leaving a dangling link into someone's checkout.
     const alloc = std.testing.allocator;
     const disk = @import("disk.zig");
+    const resolve = @import("resolve.zig");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1979,10 +2022,21 @@ test "purgeLegacyUnkeyedSlot: a pre-#696 unkeyed discovered slot is inert, then 
     try junction.linkDir(alloc, src, legacy);
     try writeOrigin(alloc, legacy, src, "1.29.0", .discovered);
 
-    // Inert: the marker matches the checkout, but the path is the explicit
-    // slot's and only an explicit marker qualifies there.
-    try std.testing.expect(try activeFrameworkSlot(alloc, "gfx") == null);
+    // Honoured for its own checkout — the sources it serves are the right
+    // ones — but never mistaken for an explicit override.
+    {
+        const active = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
+        defer alloc.free(active);
+        try std.testing.expectEqualStrings(legacy, active);
+    }
     try std.testing.expect(try explicitFrameworkSource(alloc, "gfx") == null);
+
+    // Reported stale even though the release IS on disk, so `ensureCache`
+    // repopulates rather than quietly switching the build to the release.
+    const release = try resolve.frameworkVersionPath(alloc, "gfx", "1.29.0");
+    defer alloc.free(release);
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), release);
+    try std.testing.expect(!try resolve.isFrameworkCached(alloc, "gfx", "1.29.0"));
 
     try disk.populateFrameworkPackage(alloc, "gfx", "1.29.0", src, .discovered);
 
@@ -1999,6 +2053,42 @@ test "purgeLegacyUnkeyedSlot: a pre-#696 unkeyed discovered slot is inert, then 
     const active = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
     defer alloc.free(active);
     try std.testing.expectEqualStrings(keyed, active);
+    // Migrated, so the dep is satisfied again without another populate.
+    try std.testing.expect(try resolve.isFrameworkCached(alloc, "gfx", "1.29.0"));
+}
+
+test "a pre-#696 unkeyed slot is NOT honoured for a different checkout (#696 review)" {
+    // The other half of honouring the legacy name: it must stay
+    // provenance-gated, or one clone's sources would satisfy another's
+    // build — the #679/#685 guarantee.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/local");
+    try tmp.dir.createDirPath(std.testing.io, "clone-a/labelle-gfx");
+    try tmp.dir.createDirPath(std.testing.io, "clone-b/labelle-core");
+    try tmp.dir.createDirPath(std.testing.io, "clone-b/labelle-gfx");
+    try tmp.dir.createDirPath(std.testing.io, "clone-b/labelle-assembler/zig-out/bin");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src_a = try tmp.dir.realPathFileAlloc(std.testing.io, "clone-a/labelle-gfx", alloc);
+    defer alloc.free(src_a);
+    const bin_b = try tmp.dir.realPathFileAlloc(std.testing.io, "clone-b/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin_b);
+
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
+    setProbeStartForTesting(bin_b);
+    defer setProbeStartForTesting(null);
+
+    const legacy = try explicitFrameworkSlot(alloc, "gfx");
+    defer alloc.free(legacy);
+    try junction.linkDir(alloc, src_a, legacy);
+    try writeOrigin(alloc, legacy, src_a, "1.29.0", .discovered);
+
+    try std.testing.expect(try activeFrameworkSlot(alloc, "gfx") == null);
 }
 
 test "keyed slots stay inside the namespaces `clean` sweeps (#696)" {
