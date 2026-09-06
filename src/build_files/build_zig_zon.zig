@@ -12,6 +12,7 @@ const backend_registry = @import("../backend_registry.zig");
 const manifest_splice = @import("../codegen/manifest_splice.zig");
 const manifest_v2 = @import("../codegen/manifest_v2.zig");
 const manifest_v2_splice = @import("../codegen/manifest_v2_splice.zig");
+const escapeZonString = @import("../zon_escape.zig").escapeZonString;
 pub const deps_linker = @import("../deps_linker.zig");
 
 const ProjectConfig = config.ProjectConfig;
@@ -314,10 +315,31 @@ fn generateZonPathsFallback(allocator: std.mem.Allocator, cfg: ProjectConfig, ta
     }
 }
 
-/// Compute a relative path from `from_dir` to `to_path`.
-/// If from_dir is null, returns a copy of to_path (absolute).
+/// Compute a relative path from `from_dir` to `to_path`, ready to embed in a
+/// ZON string literal.
+/// If from_dir is null, uses `to_path` as-is (absolute).
 /// Both must be absolute paths when from_dir is provided. Returns an allocator-owned string.
+///
+/// Two things happen on the way out, both of which only matter on Windows
+/// (#708), which is why CI on Linux and macOS could never have caught them:
+///
+///   * separators are normalised to `/`. `std.fs.path.relative` yields `\`
+///     there, while the primary (deps-linked) emitter above hardcodes `/` —
+///     so without this the same project produced different manifests on
+///     different hosts. Zig's build system takes `/` on every platform.
+///   * the result is ZON-escaped. A backslash is both the Windows separator
+///     and the escape character in a Zig string literal, so `..\deps\x` read
+///     back as `error: invalid escape character: 'd'`. Normalising already
+///     removes the separators, but escaping is what makes the emitter
+///     correct rather than merely lucky: a `"` or a literal `\` is legal in
+///     a POSIX filename and would break the literal just the same.
 fn relativePath(allocator: std.mem.Allocator, from_dir: ?[]const u8, to_path: []const u8) ![]const u8 {
-    if (from_dir == null) return try allocator.dupe(u8, to_path);
-    return std.fs.path.relative(allocator, "", null, from_dir.?, to_path);
+    const raw = if (from_dir == null)
+        try allocator.dupe(u8, to_path)
+    else
+        try std.fs.path.relative(allocator, "", null, from_dir.?, to_path);
+    defer allocator.free(raw);
+
+    std.mem.replaceScalar(u8, raw, '\\', '/');
+    return escapeZonString(allocator, raw);
 }

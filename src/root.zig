@@ -60,6 +60,7 @@ const tilemap_phase = @import("root/tilemap_phase.zig");
 // any compiled function path during `addTest` runs.
 test {
     _ = @import("config.zig");
+    _ = @import("zon_escape.zig");
     _ = @import("plugin_manifest.zig");
     _ = @import("plugin_build_hook.zig");
     _ = @import("plugin_build_steps.zig");
@@ -170,6 +171,7 @@ pub const pack_root = @import("codegen/pack_root.zig");
 pub const validateCache = cache.validateCache;
 pub const getCacheRoot = cache.getCacheRoot;
 pub const getPackagesDir = cache.getPackagesDir;
+pub const escapeZonString = @import("zon_escape.zig").escapeZonString;
 pub const populateAssemblerCache = cache.populateAssemblerCache;
 pub const populateFrameworkPackage = cache.populateFrameworkPackage;
 pub const populatePlugin = cache.populatePlugin;
