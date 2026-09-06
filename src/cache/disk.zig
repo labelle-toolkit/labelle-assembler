@@ -108,10 +108,57 @@ pub fn populateFrameworkPackage(
     // #685: `version` no longer names the slot — it is recorded in the
     // provenance marker so diagnostics can say which pin this local source
     // was installed *for* without pretending the slot holds that release.
-    const target = try local.frameworkSlot(allocator, package);
+    //
+    // #696: nor does the PACKAGE alone name a discovered slot. Activation
+    // was already gated on provenance, but population was not, so a second
+    // checkout simply repointed the one shared slot at itself and the first
+    // checkout's next build repointed it back. A discovered slot is keyed by
+    // the checkout that fills it; an explicit override, which has no
+    // checkout of its own to key by, keeps the unkeyed name.
+    const target = switch (mode) {
+        .explicit => try local.explicitFrameworkSlot(allocator, package),
+        .discovered => blk: {
+            purgeLegacyUnkeyedSlot(allocator, package);
+            break :blk try local.discoveredFrameworkSlot(allocator, package, source_dir);
+        },
+    };
     defer allocator.free(target);
     try symlinkToCache(allocator, source_dir, target);
     try writeOriginOrDropSlot(allocator, target, source_dir, version, mode);
+}
+
+/// Drop a pre-#696 unkeyed DISCOVERED slot, `packages/local/<package>`.
+///
+/// Such a slot can no longer activate — `activeFrameworkSlot` reads the
+/// unkeyed path with a null expected source, which admits `.explicit`
+/// markers only — but leaving it behind would leave a dangling link into
+/// somebody's checkout that no probe ever revisits. Removing it on the next
+/// populate migrates the old layout without a separate command; users who
+/// never build again still have `labelle-assembler clean`.
+///
+/// Best-effort by design: failing to tidy a slot that is already inert must
+/// not fail the populate. The mode check is what keeps it from eating a
+/// live EXPLICIT override, which shares this path deliberately.
+fn purgeLegacyUnkeyedSlot(allocator: std.mem.Allocator, package: []const u8) void {
+    const slot = local.explicitFrameworkSlot(allocator, package) catch return;
+    defer allocator.free(slot);
+    if (!local.pathExists(slot) and !local.isSymlinkPath(slot)) return;
+
+    const origin = local.readOrigin(allocator, slot) orelse return;
+    defer origin.deinit(allocator);
+    if (origin.mode != .discovered) return;
+
+    // `removeLinkEntry`, not `deleteFile`: on Windows the slot is a
+    // directory junction, which `deleteFile` cannot remove (#710). It also
+    // drops the link rather than recursing into the user's checkout.
+    removeLinkEntry(slot) catch |err| {
+        std.log.warn("labelle: could not remove legacy local slot '{s}': {any}", .{ slot, err });
+        return;
+    };
+    const marker = local.originPath(allocator, slot) catch return;
+    defer allocator.free(marker);
+    std.Io.Dir.cwd().deleteTree(config.globalIo(), marker) catch {};
+    std.log.info("labelle: removed the pre-#696 unkeyed local slot '{s}'", .{slot});
 }
 
 /// Populate a plugin into the cache from a source directory.
@@ -725,7 +772,7 @@ test "populateFrameworkPackage: local sources never occupy the pinned version sl
     try testing.expect(!dirExists(version_slot));
 
     // The local sources landed in the reserved slot instead, with provenance.
-    const slot = try local.frameworkSlot(alloc, "gfx");
+    const slot = try local.discoveredFrameworkSlot(alloc, "gfx", src);
     defer alloc.free(slot);
     try testing.expect(dirExists(slot));
 
@@ -948,7 +995,7 @@ test "symlinkToCache: a stale COPIED slot is dropped and repopulated (#688 revie
 
     // Stand in for the copy fallback's output: a real directory holding an
     // out-of-date snapshot.
-    const slot = try local.frameworkSlot(alloc, "gfx");
+    const slot = try local.discoveredFrameworkSlot(alloc, "gfx", src);
     defer alloc.free(slot);
     try std.Io.Dir.cwd().createDirPath(config.globalIo(), slot);
     try writeVersionStamp(slot, "1.29.0");
@@ -1041,7 +1088,7 @@ test "symlinkToCache: a link that cannot be replaced fails population (#688 revi
 
     // A slot linked at the OLD checkout, inside a directory made read-only
     // so the link cannot be unlinked.
-    const slot = try local.frameworkSlot(alloc, "gfx");
+    const slot = try local.explicitFrameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
     const parent = std.fs.path.dirname(slot).?;
     try std.Io.Dir.cwd().createDirPath(config.globalIo(), parent);

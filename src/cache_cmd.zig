@@ -279,7 +279,7 @@ fn refreshExplicitLocalSlot(allocator: std.mem.Allocator, package: []const u8) !
     const source = try cache.localSlots.explicitFrameworkSource(allocator, package) orelse return false;
     defer allocator.free(source);
 
-    const slot = try cache.localSlots.frameworkSlot(allocator, package);
+    const slot = try cache.localSlots.explicitFrameworkSlot(allocator, package);
     defer allocator.free(slot);
     if (cache.localSlots.slotTracksSource(slot)) return true;
 

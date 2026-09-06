@@ -77,12 +77,86 @@ pub fn slotsRoot(allocator: std.mem.Allocator) ![]const u8 {
     return std.fs.path.join(allocator, &.{ packages_dir, SLOT_NS });
 }
 
-/// `~/.labelle/packages/local/<package>` — the local slot for a framework
-/// package (core, engine, gfx).
-pub fn frameworkSlot(allocator: std.mem.Allocator, package: []const u8) ![]const u8 {
+/// `~/.labelle/packages/local/<package>` — the EXPLICIT local slot for a
+/// framework package (core, engine, gfx).
+///
+/// Deliberately NOT keyed by checkout (#696). An explicit override is
+/// registered by a human — `install <pkg> local:<path>` — and activates
+/// wherever this assembler runs, so there is no checkout to key it by: the
+/// running binary is usually a release living nowhere near the sources. It
+/// also has to be findable from the package name ALONE, because
+/// `explicitFrameworkSource` answers "is an override registered for gfx?"
+/// before anything knows which path it names. One override per package is
+/// the documented semantics anyway: a second `install gfx local:…` replaces
+/// the first, and `labelle-assembler clean` drops it.
+///
+/// The unkeyed name is also where PRE-#696 discovered slots sit. They do not
+/// activate through here — `activeFrameworkSlot` passes a null expected
+/// source, so only an `.explicit` marker qualifies — and
+/// `purgeLegacyUnkeyedSlot` clears them out on the next populate.
+pub fn explicitFrameworkSlot(allocator: std.mem.Allocator, package: []const u8) ![]const u8 {
     const root = try slotsRoot(allocator);
     defer allocator.free(root);
     return std.fs.path.join(allocator, &.{ root, package });
+}
+
+/// `~/.labelle/packages/local/<package>-<hash of the checkout>` — the
+/// DISCOVERED local slot for a framework package, keyed by the sibling
+/// checkout it is populated from.
+///
+/// Keyed because population is not provenance-gated the way activation is
+/// (#696). `activeFrameworkSlot` refuses a slot whose marker names a
+/// different checkout — but `ensureCache` then treats the dependency as
+/// uncached and `populateFrameworkPackage` repoints the one shared slot at
+/// whichever checkout asked. Two clones (or two `wt-*` worktrees) sharing a
+/// `LABELLE_HOME` therefore thrash it, each build undoing the last, and two
+/// concurrent builds can have one resolve the slot while the other repoints
+/// it mid-generate. `pluginSlot` hit exactly this and was keyed in #688
+/// review round 4; this is the same construction.
+///
+/// `source_dir` is the checkout — `<monorepo root>/labelle-<pkg>` — which is
+/// precisely what both sides already hold: `populateFrameworkPackage` is
+/// handed it, and `activeFrameworkSlot` computes it through
+/// `discoveredSource`. Both derive it from `findRepoRoot`, so the spellings
+/// agree. Where they somehow did not (a case-different drive letter, say)
+/// the cost is a redundant slot, never a wrong build: the marker comparison
+/// still gates activation.
+pub fn discoveredFrameworkSlot(
+    allocator: std.mem.Allocator,
+    package: []const u8,
+    source_dir: []const u8,
+) ![]const u8 {
+    const root = try slotsRoot(allocator);
+    defer allocator.free(root);
+
+    const key = try checkoutSlotKey(allocator, package, source_dir);
+    defer allocator.free(key);
+
+    return std.fs.path.join(allocator, &.{ root, key });
+}
+
+/// `<package>-<hash of package + checkout path>`: legible in a diagnostic,
+/// but still a single path component no other checkout can collide with.
+/// Same construction as `pluginSlotKey`.
+fn checkoutSlotKey(
+    allocator: std.mem.Allocator,
+    package: []const u8,
+    source_dir: []const u8,
+) ![]const u8 {
+    var hasher = std.hash.Wyhash.init(0x1abe11e);
+    hasher.update(package);
+    hasher.update(&[_]u8{0});
+    hasher.update(source_dir);
+
+    var label: std.ArrayList(u8) = .empty;
+    defer label.deinit(allocator);
+    for (package) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.') {
+            if (label.items.len < 32) try label.append(allocator, c);
+        }
+    }
+    const readable = if (label.items.len == 0) "package" else label.items;
+    return std.fmt.allocPrint(allocator, "{s}-{x:0>16}", .{ readable, hasher.final() });
 }
 
 /// `~/.labelle/packages/local/plugins/<key>` — the local slot for a plugin
@@ -289,11 +363,23 @@ pub fn pluginDirName(allocator: std.mem.Allocator, name: []const u8) ![]const u8
 ///     assembler runs, and whatever path it names.
 ///
 /// Either way the source must still exist. See `Origin.Mode`.
+///
+/// Since #696 the two live at DIFFERENT paths, so both are consulted, and
+/// the explicit one wins. Explicit-first mirrors the rule the populate side
+/// already enforces (`refreshExplicitLocalSlot` stops auto-discovery writing
+/// over an override, #704 review): a path the user typed outranks one the
+/// assembler went looking for, and only `clean` drops it.
 pub fn activeFrameworkSlot(allocator: std.mem.Allocator, package: []const u8) !?[]const u8 {
-    const expected = try discoveredSource(allocator, frameworkDirName(package));
-    defer if (expected) |e| allocator.free(e);
+    // Null expected source: `activeOrFree` then admits an `.explicit`
+    // marker only, so a pre-#696 unkeyed DISCOVERED slot sitting at this
+    // same path can never activate through here.
+    const explicit = try explicitFrameworkSlot(allocator, package);
+    if (activeOrFree(allocator, explicit, null)) |slot| return slot;
 
-    const slot = try frameworkSlot(allocator, package);
+    const expected = try discoveredSource(allocator, frameworkDirName(package)) orelse return null;
+    defer allocator.free(expected);
+
+    const slot = try discoveredFrameworkSlot(allocator, package, expected);
     return activeOrFree(allocator, slot, expected);
 }
 
@@ -326,7 +412,7 @@ pub fn activePluginSlot(allocator: std.mem.Allocator, plugin: config.PluginDep) 
 /// an ordinary account does not hold), and a copy that nothing refreshes
 /// serves the sources as they were on install day, forever (#704).
 pub fn explicitFrameworkSource(allocator: std.mem.Allocator, package: []const u8) !?[]const u8 {
-    const slot = try frameworkSlot(allocator, package);
+    const slot = try explicitFrameworkSlot(allocator, package);
     defer allocator.free(slot);
     if (!pathExists(slot)) return null;
 
@@ -822,7 +908,7 @@ test "localSlotRoot: the reserved namespace, subpaths inside it, and nothing els
     env.setCacheRootForTesting(home);
     defer env.setCacheRootForTesting(null);
 
-    const gfx_slot = try frameworkSlot(alloc, "gfx");
+    const gfx_slot = try discoveredFrameworkSlot(alloc, "gfx", checkout);
     defer alloc.free(gfx_slot);
     try junction.linkDir(alloc, checkout, gfx_slot);
     try writeOrigin(alloc, gfx_slot, checkout, "1.29.0", .discovered);
@@ -913,7 +999,7 @@ test "activeFrameworkSlot: a slot populated from ANOTHER checkout is not honoure
     defer env.setCacheRootForTesting(null);
 
     // Populated from clone A.
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try discoveredFrameworkSlot(alloc, "gfx", src_a);
     defer alloc.free(slot);
     try junction.linkDir(alloc, src_a, slot);
     try writeOrigin(alloc, slot, src_a, "1.29.0", .discovered);
@@ -961,7 +1047,7 @@ test "resolveFrameworkPackage: the git ref `local` resolves to its own version s
     defer env.setCacheRootForTesting(null);
 
     // A populated local slot, exactly as a monorepo-run assembler leaves it.
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try discoveredFrameworkSlot(alloc, "gfx", src);
     defer alloc.free(slot);
     try junction.linkDir(alloc, src, slot);
     try writeOrigin(alloc, slot, src, "1.29.0", .discovered);
@@ -1178,7 +1264,7 @@ test "writeOrigin/readOrigin: round-trips provenance for a slot" {
     env.setCacheRootForTesting(home);
     defer env.setCacheRootForTesting(null);
 
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try explicitFrameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
 
     try writeOrigin(alloc, slot, "/src/labelle-gfx", "1.29.0", .discovered);
@@ -1218,11 +1304,12 @@ test "isFrameworkCached: a COPIED local slot is stale, so ensureCache repopulate
     defer setProbeStartForTesting(null);
 
     const resolve = @import("resolve.zig");
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try discoveredFrameworkSlot(alloc, "gfx", src);
     defer alloc.free(slot);
 
     // The slot as a COPY (a plain directory), with a valid marker: active,
     // but stale — so the probe reports it not cached.
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), slot);
     try writeOrigin(alloc, slot, src, "1.29.0", .discovered);
     const active_copy = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
     alloc.free(active_copy);
@@ -1308,7 +1395,7 @@ test "writeOrigin: an unwritable marker fails population rather than reporting s
     env.setCacheRootForTesting(home);
     defer env.setCacheRootForTesting(null);
 
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try explicitFrameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
 
     // Block the marker path with a directory so createFile cannot win.
@@ -1412,8 +1499,9 @@ test "activeFrameworkSlot: a slot whose source checkout is gone is not honoured 
     defer setProbeStartForTesting(null);
 
     // A COPIED slot (a real directory, as the Windows fallback leaves it).
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try discoveredFrameworkSlot(alloc, "gfx", src);
     defer alloc.free(slot);
+    try std.Io.Dir.cwd().createDirPath(config.globalIo(), slot);
     try writeOrigin(alloc, slot, src, "1.29.0", .discovered);
 
     const active = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
@@ -1440,7 +1528,7 @@ test "readOrigin: a marker written before #704 has no mode and reads back discov
     env.setCacheRootForTesting(home);
     defer env.setCacheRootForTesting(null);
 
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try explicitFrameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
     const marker = try originPath(alloc, slot);
     defer alloc.free(marker);
@@ -1469,7 +1557,7 @@ test "writeOrigin/readOrigin: round-trips an explicit mode" {
     env.setCacheRootForTesting(home);
     defer env.setCacheRootForTesting(null);
 
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try explicitFrameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
 
     try writeOrigin(alloc, slot, "/src/labelle-gfx", "1.30.0", .explicit);
@@ -1515,7 +1603,7 @@ test "activeFrameworkSlot: an explicit override activates outside the monorepo, 
     defer setProbeStartForTesting(null);
     try std.testing.expect(findRepoRoot(alloc) == null);
 
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try explicitFrameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
     try junction.linkDir(alloc, src, slot);
 
@@ -1552,7 +1640,7 @@ test "activeFrameworkSlot: an explicit override whose checkout is gone falls bac
     setProbeStartForTesting(bin);
     defer setProbeStartForTesting(null);
 
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try explicitFrameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
     try junction.linkDir(alloc, src, slot);
     try writeOrigin(alloc, slot, src, "1.30.0", .explicit);
@@ -1582,7 +1670,7 @@ test "explicitFrameworkSource: names the checkout for an explicit slot only (#70
     env.setCacheRootForTesting(home);
     defer env.setCacheRootForTesting(null);
 
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try explicitFrameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
     try std.testing.expect(!slotTracksSource(slot));
 
@@ -1628,7 +1716,7 @@ test "populateFrameworkPackage: a failed marker write drops the slot rather than
     defer env.setCacheRootForTesting(null);
 
     const disk = @import("disk.zig");
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try explicitFrameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
 
     // A good explicit slot on checkout A.
@@ -1709,7 +1797,7 @@ test "isFrameworkVersionCached: an active override does not make every release c
     setProbeStartForTesting(bin);
     defer setProbeStartForTesting(null);
 
-    const slot = try frameworkSlot(alloc, "gfx");
+    const slot = try explicitFrameworkSlot(alloc, "gfx");
     defer alloc.free(slot);
     try junction.linkDir(alloc, src, slot);
     try writeOrigin(alloc, slot, src, "1.34.0", .explicit);
@@ -1724,4 +1812,224 @@ test "isFrameworkVersionCached: an active override does not make every release c
     defer alloc.free(version_slot);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, version_slot);
     try std.testing.expect(try resolve.isFrameworkVersionCached(alloc, "gfx", "1.29.0"));
+}
+
+test "populateFrameworkPackage: two checkouts get their own slots instead of thrashing one (#696)" {
+    // The defect: activation was provenance-gated, POPULATION was not. Clone
+    // B found the shared `packages/local/gfx` marked for clone A, refused it,
+    // and `ensureCache` then repointed that very slot at clone B — so clone
+    // A's next build refused it and pointed it back. Two builds racing in
+    // different checkouts could also have one resolve the slot while the
+    // other repointed it mid-generate.
+    const alloc = std.testing.allocator;
+    const disk = @import("disk.zig");
+    const resolve = @import("resolve.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    inline for (.{ "clone-a", "clone-b" }) |clone| {
+        try tmp.dir.createDirPath(std.testing.io, clone ++ "/labelle-core");
+        try tmp.dir.createDirPath(std.testing.io, clone ++ "/labelle-gfx");
+        try tmp.dir.createDirPath(std.testing.io, clone ++ "/labelle-assembler/zig-out/bin");
+    }
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src_a = try tmp.dir.realPathFileAlloc(std.testing.io, "clone-a/labelle-gfx", alloc);
+    defer alloc.free(src_a);
+    const src_b = try tmp.dir.realPathFileAlloc(std.testing.io, "clone-b/labelle-gfx", alloc);
+    defer alloc.free(src_b);
+    const bin_a = try tmp.dir.realPathFileAlloc(std.testing.io, "clone-a/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin_a);
+    const bin_b = try tmp.dir.realPathFileAlloc(std.testing.io, "clone-b/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin_b);
+
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
+
+    const slot_a = try discoveredFrameworkSlot(alloc, "gfx", src_a);
+    defer alloc.free(slot_a);
+    const slot_b = try discoveredFrameworkSlot(alloc, "gfx", src_b);
+    defer alloc.free(slot_b);
+    // The whole point: one shared name no longer serves both checkouts.
+    try std.testing.expect(!std.mem.eql(u8, slot_a, slot_b));
+
+    // Clone A builds.
+    {
+        setProbeStartForTesting(bin_a);
+        defer setProbeStartForTesting(null);
+        try disk.populateFrameworkPackage(alloc, "gfx", "1.29.0", src_a, .discovered);
+        const active = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
+        defer alloc.free(active);
+        try std.testing.expectEqualStrings(slot_a, active);
+    }
+
+    // Clone B builds. Before #696 this repointed the one slot at clone B.
+    {
+        setProbeStartForTesting(bin_b);
+        defer setProbeStartForTesting(null);
+        try std.testing.expect(try activeFrameworkSlot(alloc, "gfx") == null);
+        try disk.populateFrameworkPackage(alloc, "gfx", "1.29.0", src_b, .discovered);
+        const active = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
+        defer alloc.free(active);
+        try std.testing.expectEqualStrings(slot_b, active);
+    }
+
+    // Both slots are on disk, each naming its own checkout: neither populate
+    // rewrote the other's link or marker.
+    try std.testing.expect(pathExists(slot_a));
+    try std.testing.expect(pathExists(slot_b));
+
+    const origin_a = readOrigin(alloc, slot_a) orelse return error.TestUnexpectedResult;
+    defer origin_a.deinit(alloc);
+    try std.testing.expectEqualStrings(src_a, origin_a.source);
+
+    const origin_b = readOrigin(alloc, slot_b) orelse return error.TestUnexpectedResult;
+    defer origin_b.deinit(alloc);
+    try std.testing.expectEqualStrings(src_b, origin_b.source);
+
+    // And clone A's next build still resolves its own slot — cached, so
+    // `ensureCache` does not repopulate and the thrash cycle never starts.
+    setProbeStartForTesting(bin_a);
+    defer setProbeStartForTesting(null);
+    const again = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
+    defer alloc.free(again);
+    try std.testing.expectEqualStrings(slot_a, again);
+    try std.testing.expect(try resolve.isFrameworkCached(alloc, "gfx", "1.29.0"));
+}
+
+test "activeFrameworkSlot: an explicit override still wins over a keyed discovered slot (#696)" {
+    // Keying must not cost the explicit override its precedence: the
+    // populate side already refuses to let auto-discovery write over one
+    // (#704 review), and now that the two live at different paths the
+    // resolve side has to make the same choice.
+    const alloc = std.testing.allocator;
+    const disk = @import("disk.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-core");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-gfx");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-assembler/zig-out/bin");
+    try tmp.dir.createDirPath(std.testing.io, "hand-picked");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const sibling = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-gfx", alloc);
+    defer alloc.free(sibling);
+    const picked = try tmp.dir.realPathFileAlloc(std.testing.io, "hand-picked", alloc);
+    defer alloc.free(picked);
+    const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin);
+
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
+    setProbeStartForTesting(bin);
+    defer setProbeStartForTesting(null);
+
+    try disk.populateFrameworkPackage(alloc, "gfx", "1.29.0", sibling, .discovered);
+    try disk.populateFrameworkPackage(alloc, "gfx", "1.30.0", picked, .explicit);
+
+    const explicit = try explicitFrameworkSlot(alloc, "gfx");
+    defer alloc.free(explicit);
+    const active = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
+    defer alloc.free(active);
+    try std.testing.expectEqualStrings(explicit, active);
+
+    // ...and the override is still findable by name alone, which is what
+    // `refreshExplicitLocalSlot` needs and why it keeps the unkeyed path.
+    const found = try explicitFrameworkSource(alloc, "gfx") orelse return error.TestUnexpectedResult;
+    defer alloc.free(found);
+    try std.testing.expectEqualStrings(picked, found);
+}
+
+test "purgeLegacyUnkeyedSlot: a pre-#696 unkeyed discovered slot is inert, then removed (#696)" {
+    // Slots written before this change sit at `packages/local/<pkg>` with a
+    // `discovered` marker. They must not activate from there — the unkeyed
+    // path is the EXPLICIT slot now — and the next populate should clear
+    // them out rather than leave a dangling link into someone's checkout.
+    const alloc = std.testing.allocator;
+    const disk = @import("disk.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/packages/local");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-core");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-gfx");
+    try tmp.dir.createDirPath(std.testing.io, "toolkit/labelle-assembler/zig-out/bin");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    const src = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-gfx", alloc);
+    defer alloc.free(src);
+    const bin = try tmp.dir.realPathFileAlloc(std.testing.io, "toolkit/labelle-assembler/zig-out/bin", alloc);
+    defer alloc.free(bin);
+
+    env.setCacheRootForTesting(home);
+    defer env.setCacheRootForTesting(null);
+    setProbeStartForTesting(bin);
+    defer setProbeStartForTesting(null);
+
+    // Exactly what the old code left behind: the unkeyed slot, linked at the
+    // sibling checkout, with a `discovered` marker naming it.
+    const legacy = try explicitFrameworkSlot(alloc, "gfx");
+    defer alloc.free(legacy);
+    try junction.linkDir(alloc, src, legacy);
+    try writeOrigin(alloc, legacy, src, "1.29.0", .discovered);
+
+    // Inert: the marker matches the checkout, but the path is the explicit
+    // slot's and only an explicit marker qualifies there.
+    try std.testing.expect(try activeFrameworkSlot(alloc, "gfx") == null);
+    try std.testing.expect(try explicitFrameworkSource(alloc, "gfx") == null);
+
+    try disk.populateFrameworkPackage(alloc, "gfx", "1.29.0", src, .discovered);
+
+    // Gone — and the checkout it pointed at survived (the link was dropped,
+    // not followed).
+    try std.testing.expect(!pathExists(legacy) and !isSymlinkPath(legacy));
+    const legacy_marker = try originPath(alloc, legacy);
+    defer alloc.free(legacy_marker);
+    try std.testing.expect(!pathExists(legacy_marker));
+    try std.testing.expect(pathExists(src));
+
+    const keyed = try discoveredFrameworkSlot(alloc, "gfx", src);
+    defer alloc.free(keyed);
+    const active = try activeFrameworkSlot(alloc, "gfx") orelse return error.TestUnexpectedResult;
+    defer alloc.free(active);
+    try std.testing.expectEqualStrings(keyed, active);
+}
+
+test "keyed slots stay inside the namespaces `clean` sweeps (#696)" {
+    // `labelle-assembler clean` drops the whole `local/` and `local.origins/`
+    // trees, and remains the documented escape hatch. Keying changes the
+    // NAME inside those trees, never the tree — assert that structurally so
+    // a future key shape cannot quietly escape the sweep.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+
+    env.setCacheRootForTesting(root);
+    defer env.setCacheRootForTesting(null);
+
+    const slot = try discoveredFrameworkSlot(alloc, "gfx", "/somewhere/clone-a/labelle-gfx");
+    defer alloc.free(slot);
+
+    const ns = try std.fs.path.join(alloc, &.{ root, "packages", SLOT_NS });
+    defer alloc.free(ns);
+    try std.testing.expect(std.mem.startsWith(u8, slot, ns));
+    try std.testing.expect(isSep(slot[ns.len]));
+    // One component below the namespace, so nothing can nest inside a slot.
+    try std.testing.expect(std.mem.indexOfAny(u8, slot[ns.len + 1 ..], "/\\") == null);
+    try std.testing.expect(isLocalSlotPath(alloc, slot));
+
+    const marker = try originPath(alloc, slot);
+    defer alloc.free(marker);
+    const origins_ns = try std.fs.path.join(alloc, &.{ root, "packages", ORIGINS_NS });
+    defer alloc.free(origins_ns);
+    try std.testing.expect(std.mem.startsWith(u8, marker, origins_ns));
 }
