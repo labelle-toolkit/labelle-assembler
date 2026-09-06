@@ -1146,8 +1146,12 @@ jobs:
   #     was 83/123 SKIPPED behind a PosixBlock env seam), #710 + #713
   #     (symlink privilege → junctions), #714 (POSIX path/shell assumptions)
   #     and #719 (the last four) took Windows `zig build test` from 40
-  #     unique failures to zero: 77/77 steps, 2806/2839 tests passed,
-  #     33 skipped, 0 compile errors.
+  #     unique failures to zero: 77/77 steps, 0 failures, 0 compile errors.
+  #     Enumerated total 2839 on both a dev box and this runner; the pass/
+  #     skip SPLIT differs by environment — 2810 passed / 29 skipped here,
+  #     2806 / 33 on a local Windows box, because four tests that skip for
+  #     a missing local prerequisite actually run on the runner. Compare
+  #     the enumerated total across environments, never the pass count.
   #   * The old "what it does NOT cover" caveat — that `src/cache/local.zig`
   #     set `std.testing.environ` through a PosixBlock and skipped on
   #     Windows outright, so a green run proved nothing about the
@@ -1172,9 +1176,11 @@ jobs:
     # suite is 77 steps and compiles every test binary from cold on the
     # runner.
     #
-    # MEASURED, not guessed: the first green run of this job on
-    # windows-latest took 6m17s end to end (the narrow job was ~2-3m). 30
-    # leaves ~5x headroom, matching the ratio `build-and-test` settled on
+    # MEASURED, not guessed: green runs of this job on windows-latest took
+    # 6m17s and 8m34s (the narrow job was ~2-3m). That 36% spread between
+    # two runs of identical work is exactly why the cap is not trimmed to
+    # the fastest observation. 30 leaves ~3.5x headroom on the SLOWER of
+    # the two, matching the ratio `build-and-test` settled on
     # (cap 20, ~6m30s green run) after PR #664 — where a cap trimmed close
     # to the observed time fired on ordinary runner variance twice in a
     # row, cancelling a job whose every real step had already passed. A cap
