@@ -981,13 +981,6 @@ pub const HookOrderEntry = struct {
     rank: i32 = 0,
 };
 
-/// Opt-in hook-dispatch configuration (labelle-assembler#723).
-///
-/// `MergeHooks` takes ONE receiver tuple, walked in tuple order for
-/// EVERY event, so ordering here is per-RECEIVER and global across
-/// events — not per event. An empty `order` (the default, and the shape
-/// every project without a `.hooks` key parses to) leaves the generated
-/// receiver tuple byte-identical to the pre-#723 assembler.
 /// Opt-in hook tracing (labelle-engine#858). ABSENT means off, and off
 /// is the default: an unset `.trace` emits nothing at all, so generated
 /// output for every existing project is byte-identical to before this
@@ -1008,6 +1001,13 @@ pub const HookTraceConfig = struct {
     payload_capacity: usize = 0,
 };
 
+/// Opt-in hook-dispatch configuration (labelle-assembler#723).
+///
+/// `MergeHooks` takes ONE receiver tuple, walked in tuple order for
+/// EVERY event, so ordering here is per-RECEIVER and global across
+/// events — not per event. An empty `order` (the default, and the shape
+/// every project without a `.hooks` key parses to) leaves the generated
+/// receiver tuple byte-identical to the pre-#723 assembler.
 pub const HooksConfig = struct {
     order: []const HookOrderEntry = &.{},
     /// `null` (default) = tracing off, nothing emitted.
