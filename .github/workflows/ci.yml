@@ -356,15 +356,31 @@ jobs:
           $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
 
           cd .labelle/null_desktop
+          # The fingerprint fixup is OPTIONAL, so every grep in it must be
+          # allowed to match nothing. Under `set -e` a bare
+          # `X=$(... | grep ...)` aborts the whole step when the pattern is
+          # absent — which is the NORMAL case here, a build that simply
+          # succeeded, so the step would have failed every time. Hence
+          # `|| true` on each, plus an explicit check of the first build's
+          # exit code so a real (non-fingerprint) failure is reported with
+          # its output instead of being retried blindly.
           set +e
           ERR=$(zig build 2>&1)
+          BUILD_RC=$?
           set -e
-          BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
-          GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
-          if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
-            sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+          if [ "$BUILD_RC" -ne 0 ]; then
+            BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+            GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+            if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+              echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+              sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+              zig build
+            else
+              echo "FAIL: the generated project did not build, and it is not the fingerprint placeholder:"
+              printf '%s\n' "$ERR"
+              exit 1
+            fi
           fi
-          zig build
 
           LABELLE_NULL_FRAMES=6 ./zig-out/bin/hook_trace_ids > run.log 2>&1
           cat run.log
@@ -388,9 +404,11 @@ jobs:
 
           # RUNTIME ids vs the ROUTE REPORT, in dispatch order.
           grep -oE 'slot=[0-9]+ receiver=[^ ]+' run.log > /tmp/runtime_ids.txt
-          # `python3 -c`, not a heredoc: a plain heredoc terminator has to
-          # sit at column 0, which it cannot inside an indented YAML block
-          # scalar, so the heredoc would never close.
+          # `python3 -c` rather than a heredoc, purely to keep the quoting
+          # on one line. (A heredoc would work here too — YAML strips the
+          # block scalar's common indentation before bash sees it, so the
+          # terminator does land at column 0. An earlier revision of this
+          # comment claimed otherwise; that was wrong.)
           python3 -c 'import json; d=json.load(open("../hook_routes.json")); [print("slot=%d receiver=%s" % (i, r.get("id"))) for i, r in enumerate(d.get("receivers", []))]' > /tmp/report_ids.txt
 
           echo "--- runtime (tracer) ---"; cat /tmp/runtime_ids.txt
