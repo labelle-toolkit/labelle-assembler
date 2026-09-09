@@ -199,57 +199,51 @@ pub const GENERATION_FRESHNESS = struct {
     test "the production two-pass generate leaves a CURRENT route report (#724)" {
         // The regression for the P1 the review caught. `main.zig` runs the
         // executable generate and then `generateTestsTarget`; the sidecar is
-        // written only by the first, while the generation marker was being
-        // advanced by BOTH — so the ordinary CLI flow invalidated its own
-        // report and `routes` called a seconds-old file stale.
+        // written only by the first, while the marker was being advanced by
+        // BOTH — so the ordinary CLI flow invalidated its own report.
         //
-        // Driving the real `generate` twice, exactly as production does, is
-        // the only shape that catches it: a marker-only unit test passes
-        // either way, because the bug is in which passes advance it.
+        // Driving the real `generate` twice is the only shape that catches
+        // it: a marker-only unit test passes either way, because the bug is
+        // in WHICH passes advance it.
+        //
+        // Fully isolated in a staged temp project. An earlier revision used
+        // `game_dir = "."`, which wrote a real `.labelle/` into the
+        // repository checkout — an artifact that may belong to another
+        // operation and must not be created, gitignored or deleted by a test.
         const allocator = std.testing.allocator;
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const out_abs = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-        defer allocator.free(out_abs);
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
 
-        var cfg = generate.ProjectConfig{ .y_axis = .up, .name = "freshness-game", .backend = .sokol, .ecs = .mock };
-        cfg.backend_package = h.sokol_fixture_package;
+        const backend = try sokolFixtureAbs(allocator);
+        defer allocator.free(backend.repo);
+        var cfg = generate.ProjectConfig{
+            .y_axis = .up,
+            .name = "freshness-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        };
+        cfg.backend_package = backend;
 
-        // A real two-pass generate needs the engine package in the local
-        // cache (it reads the engine's `main.zig.template`). Check that
-        // PRECONDITION explicitly and skip, rather than catching errors from
-        // `generate` — a blanket catch would swallow the very regressions
-        // this test exists to catch.
-        {
-            const pkgs = generate.cache_env.getPackagesDir(allocator) catch return error.SkipZigTest;
-            defer allocator.free(pkgs);
-            // The RESOLVED version, not just the parent: the parent exists
-            // on any machine that has ever generated, while the specific
-            // version this config pins may not.
-            const engine_pkgs = try std.fs.path.join(allocator, &.{ pkgs, "engine", cfg.engine_version });
-            defer allocator.free(engine_pkgs);
-            std.Io.Dir.cwd().access(io, engine_pkgs, .{}) catch return error.SkipZigTest;
-        }
-
-        // Pass 1 — the executable target. The only pass that writes the
-        // sidecar, and the only one that may advance the marker.
-        try generate.generate(allocator, cfg, out_abs, ".", .{ .is_tests_target = false });
+        // Pass 1 — the executable target: writes the sidecar, and the only
+        // pass permitted to advance the marker.
+        try generate.generate(allocator, cfg, staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
         // Pass 2 — the tests target, exactly as `main.zig` follows up.
-        try generate.generateTestsTarget(allocator, cfg, out_abs, ".");
+        try generate.generateTestsTarget(allocator, cfg, staged.out_abs, staged.game_abs);
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const aa = arena.allocator();
 
-        // BOTH artifacts live under `<game_dir>/.labelle`, NOT under the
-        // output dir — an earlier revision of this test read `out_abs` and
-        // therefore found no sidecar and skipped, which is why it passed
-        // with the P1 restored. Read where they are actually written.
-        const labelle_dir = try std.fs.path.join(aa, &.{ ".", ".labelle" });
+        // Both artifacts live under `<game_dir>/.labelle`, NOT the output
+        // dir. Reading the output dir is what made an earlier revision skip
+        // silently and pass with the bug present.
+        const labelle_dir = try std.fs.path.join(aa, &.{ staged.game_abs, ".labelle" });
         const marker = try generate.generation.read(aa, labelle_dir);
         const report = try generate.hook_routes.readSidecar(aa, labelle_dir);
-        try std.testing.expect(report != null);
 
+        // ASSERT, never skip: a missing sidecar here is a failure, not a
+        // reason to go quiet.
+        try std.testing.expect(report != null);
         try std.testing.expectEqual(
             generate.generation.Freshness.current,
             generate.generation.compare(report.?.generation, marker),
