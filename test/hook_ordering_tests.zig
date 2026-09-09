@@ -392,6 +392,90 @@ pub const EXPLICIT_ORDER = struct {
     }
 };
 
+pub const HOOK_TRACE_OPT_IN = struct {
+    test "an unset .hooks.trace emits NOTHING (labelle-engine#858)" {
+        // The compatibility half, and the one that matters most: every
+        // project that does not ask for tracing must generate exactly what
+        // it generated before the option existed. Absence is the default
+        // and absence is silent.
+        const allocator = std.testing.allocator;
+        const main_zig = try gen(allocator, baseCfg(), &.{"animation_hooks"}, &.{}, &.{});
+        defer allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle_hook_trace") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "HookTraceOptions") == null);
+    }
+
+    test "a set .hooks.trace emits the root declaration (labelle-engine#858)" {
+        // Tracing is read off the compilation ROOT, and `main.zig` is the
+        // root of a generated project — so emitting it here is the only
+        // way a generated game can turn tracing on at all.
+        const allocator = std.testing.allocator;
+        var cfg = baseCfg();
+        cfg.hooks = .{ .trace = .{ .ring_capacity = 64, .payload_capacity = 32 } };
+        const main_zig = try gen(allocator, cfg, &.{"animation_hooks"}, &.{}, &.{});
+        defer allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            main_zig,
+            "pub const labelle_hook_trace: engine.HookTraceOptions = " ++
+                ".{ .ring_capacity = 64, .payload_capacity = 32 };",
+        ) != null);
+    }
+
+    test "project.labelle PARSES `.hooks.trace` (labelle-engine#858)" {
+        // The codegen tests above set `cfg.hooks` in Zig, which skips the
+        // parser entirely — so on their own they would not catch the
+        // option being unreachable from an actual `project.labelle`.
+        // `ProjectConfig` is parsed with `ignore_unknown_fields = false`,
+        // so an unmapped key is a hard error rather than a silent drop:
+        // this passing means the key really is wired through.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        const source =
+            \\.{
+            \\    .name = "traced-game",
+            \\    .hooks = .{ .trace = .{ .ring_capacity = 8, .payload_capacity = 4 } },
+            \\}
+        ;
+        const cfg = try generator.plugin_params.parseProjectConfig(arena.allocator(), source);
+        const t = cfg.hooks.trace orelse return error.TraceNotParsed;
+        try std.testing.expectEqual(@as(usize, 8), t.ring_capacity);
+        try std.testing.expectEqual(@as(usize, 4), t.payload_capacity);
+    }
+
+    test "a project.labelle WITHOUT `.hooks.trace` parses to tracing off (#858)" {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const source =
+            \\.{
+            \\    .name = "plain-game",
+            \\}
+        ;
+        const cfg = try generator.plugin_params.parseProjectConfig(arena.allocator(), source);
+        try std.testing.expect(cfg.hooks.trace == null);
+    }
+
+    test "tracing is emitted even for a project with NO hook receivers (#858)" {
+        // Tracing is about the event pipeline — enqueue, drain, dispatch —
+        // not only about receivers. A game with no hooks still has events
+        // worth tracing, and the declaration is written before the
+        // no-receivers early return so it is not silently dropped.
+        const allocator = std.testing.allocator;
+        var cfg = baseCfg();
+        cfg.hooks = .{ .trace = .{} };
+        const main_zig = try gen(allocator, cfg, &.{}, &.{}, &.{});
+        defer allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "labelle_hook_trace") != null);
+        // Defaults come through as the engine's own defaults.
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            main_zig,
+            ".{ .ring_capacity = 128, .payload_capacity = 0 }",
+        ) != null);
+    }
+};
+
 pub const RECEIVER_ID_TABLE = struct {
     test "hook_receiver_ids is index-aligned with the GameHooks tuple (#727)" {
         // THE deliverable of #727. `MergeHooks.emit` walks receivers by

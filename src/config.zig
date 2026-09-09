@@ -988,8 +988,30 @@ pub const HookOrderEntry = struct {
 /// events — not per event. An empty `order` (the default, and the shape
 /// every project without a `.hooks` key parses to) leaves the generated
 /// receiver tuple byte-identical to the pre-#723 assembler.
+/// Opt-in hook tracing (labelle-engine#858). ABSENT means off, and off
+/// is the default: an unset `.trace` emits nothing at all, so generated
+/// output for every existing project is byte-identical to before this
+/// existed.
+///
+/// Mirrors `engine.HookTraceOptions` field for field. The engine reads
+/// the declaration off the compilation ROOT, and the assembler owns
+/// `main.zig`, so this is the only place a generated project can turn
+/// tracing on.
+pub const HookTraceConfig = struct {
+    /// Records the in-process ring retains. `0` is legal and means
+    /// sink-only. Storage is `ring_capacity * @sizeOf(Record)` bytes
+    /// inline on `Game`, which is the whole memory cost.
+    ring_capacity: usize = 128,
+    /// Per-record byte budget for rendered payload scalars. `0` (the
+    /// default) removes the payload buffer AND the comptime field walk
+    /// from every trace call site.
+    payload_capacity: usize = 0,
+};
+
 pub const HooksConfig = struct {
     order: []const HookOrderEntry = &.{},
+    /// `null` (default) = tracing off, nothing emitted.
+    trace: ?HookTraceConfig = null,
 };
 
 pub const ProjectConfig = struct {
