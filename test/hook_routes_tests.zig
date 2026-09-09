@@ -493,6 +493,12 @@ pub const HONESTY = struct {
         // `consumable` with confidence while core's comptime check (which
         // accepts a literal `true` and nothing else) disagreed.
         const cases = [_]struct { src: []const u8, want: ?bool }{
+            // Absent decl on a struct that PARSED: definite false, because
+            // core's isConsumable returns false on `!@hasDecl`. This is the
+            // rev-2 correction — an earlier pass made absence null, and the
+            // renderer then claimed "a decl is present" about a struct with
+            // no decl at all.
+            .{ .src = "pub const E = struct { value: u32 };\n", .want = false },
             .{ .src = "pub const E = struct { pub const consumable = true; };\n", .want = true },
             .{ .src = "pub const E = struct { pub const consumable = false; };\n", .want = false },
             // Negation — the case Codex reproduced. Core sees false.
@@ -507,8 +513,8 @@ pub const HONESTY = struct {
             // Trailing comment containing the word — matched by the old
             // substring test, must not now.
             .{ .src = "pub const E = struct { pub const consumable = false; // not true\n };\n", .want = false },
-            // Absent decl entirely.
-            .{ .src = "pub const E = struct { a: u8 = 0 };\n", .want = null },
+            // Absent decl entirely — false, not null (see above).
+            .{ .src = "pub const E = struct { a: u8 = 0 };\n", .want = false },
         };
         for (cases) |c| {
             var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -544,9 +550,10 @@ pub const HONESTY = struct {
         const report = try buildIn(arena, dir, baseCfg(&.{}));
 
         try std.testing.expectEqual(@as(?bool, true), report.eventByTag("urgent").?.consumable);
-        // No `consumable` decl at all — absent, therefore unresolved rather
-        // than a confident `false` (#726 review).
-        try std.testing.expectEqual(@as(?bool, null), report.eventByTag("pulse").?.consumable);
+        // No `consumable` decl — DEFINITE false, matching core's
+        // `!@hasDecl -> false`. (An intermediate revision made this null;
+        // that was over-correction — absence is an answer, not a gap.)
+        try std.testing.expectEqual(@as(?bool, false), report.eventByTag("pulse").?.consumable);
 
         var aw: std.Io.Writer.Allocating = .init(arena);
         try hook_routes.writeText(&aw.writer, report, .{ .event = "urgent" });

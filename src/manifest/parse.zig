@@ -40,11 +40,18 @@ pub const StructDecl = struct {
     /// ORDER decides merely *when* a listener runs or *whether* it runs at
     /// all. Parsed here rather than in a second walker so there stays one
     /// AST pass over `events/*.zig`.
-    /// `true`/`false` from a literal `pub const consumable` decl; **null**
-    /// when the decl is absent OR its initialiser is an expression this
-    /// parser does not evaluate. Null means UNRESOLVED — never assume
-    /// `false` from it (#726 review).
-    consumable: ?bool = null,
+    /// Three states, matching what can actually be known from source:
+    ///   * `false` — the struct parsed and declares NO `consumable`. This is
+    ///     DEFINITE, not a guess: core's `isConsumable` returns false on
+    ///     `!@hasDecl` (`dispatcher.zig`), so absence IS the notification
+    ///     path.
+    ///   * `true` / `false` — a literal initialiser of that value.
+    ///   * `null` — UNKNOWN. A `consumable` decl is present but its
+    ///     initialiser is not a literal this parser evaluates, or the decl
+    ///     could not be read at all (name-only degradation).
+    /// Do not collapse null to false: null is "ask the source", absence is
+    /// an answer (#726 review, rev 2).
+    consumable: ?bool = false,
     fields: []const Field,
 };
 
@@ -140,7 +147,9 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
         var fields: std.ArrayList(Field) = .empty;
         var save: ?[]const u8 = null;
         var visibility: ?[]const u8 = null;
-        var consumable: ?bool = null;
+        // Absent decl == notification path, per core. Only a decl we cannot
+        // evaluate downgrades this to null.
+        var consumable: ?bool = false;
         for (container.ast.members) |m| {
             if (ast.fullContainerField(m)) |fd| {
                 const fname = ast.tokenSlice(fd.ast.main_token);
@@ -161,7 +170,7 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
                 const mname = ast.tokenSlice(member_vd.ast.mut_token + 1);
                 if (save == null and std.mem.eql(u8, mname, "save")) {
                     save = try extractSavePolicy(aa, ast.getNodeSource(m));
-                } else if (consumable == null and std.mem.eql(u8, mname, "consumable")) {
+                } else if (std.mem.eql(u8, mname, "consumable")) {
                     // `pub const consumable = true;` (RFC-PLUGIN-EVENTS O4).
                     //
                     // Match the INITIALISER EXACTLY, not a substring of the
@@ -173,13 +182,15 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
                     // report then stated `consumable` with confidence while
                     // core's comptime check disagreed (#726 review).
                     //
-                    // The dispatcher accepts a literal `true` and nothing
-                    // else, so that is what is recognised here. Anything the
-                    // parser cannot evaluate stays NULL — unresolved is
-                    // reported as unknown, which is honest; guessing `false`
-                    // would be a confident wrong answer on the exact path
-                    // where a consumable event silently behaves as a
-                    // notification.
+                    // NOTE, corrected (#726 review rev 2): core does NOT
+                    // accept "a literal `true` and nothing else". It
+                    // EVALUATES the decl — `@field(T, "consumable") == true`
+                    // — so `!false`, an alias, or any comptime expression
+                    // yielding true IS consumable at runtime. This parser
+                    // reads source, not comptime, so it cannot follow those.
+                    // Reporting them as UNKNOWN is honest; reporting them as
+                    // `false` would be a confident wrong answer about an
+                    // event that really does consume.
                     consumable = if (member_vd.ast.init_node.unwrap()) |init_idx| blk: {
                         const init_txt = std.mem.trim(u8, ast.getNodeSource(init_idx), " \t\r\n");
                         if (std.mem.eql(u8, init_txt, "true")) break :blk true;

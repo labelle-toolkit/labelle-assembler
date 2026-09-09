@@ -265,9 +265,12 @@ pub const Event = struct {
     /// true`. On a consumable event `MergeHooks.emit` STOPS at the first
     /// listener returning `true`, so order decides whether a later
     /// listener runs at all — not merely when.
-    /// null = the parser could not evaluate the `consumable` decl's
-    /// initialiser (or there was none). Consumers must treat null as
-    /// UNKNOWN, not as false (#726 review).
+    /// `false` = the event declares no `consumable` (core's notification
+    /// path — a definite answer, not a guess). `true`/`false` = a literal
+    /// decl. `null` = UNKNOWN: a decl exists but its initialiser is not a
+    /// literal this pass evaluates, or the payload could not be read.
+    /// Core EVALUATES the decl, so a null may still be consumable at
+    /// runtime (#726 review rev 2).
     consumable: ?bool = null,
     status: EventStatus = .active,
     /// Receivers declaring a handler for this tag, in dispatch order.

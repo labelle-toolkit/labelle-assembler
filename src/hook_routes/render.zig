@@ -249,7 +249,7 @@ fn writeOneEvent(w: *std.Io.Writer, ev: model.Event) !void {
             else
                 "notification — every listener runs, so order decides only WHEN")
         else
-            "UNKNOWN — a `consumable` decl is present but its initialiser is not a literal `true`/`false`, so this report cannot say. Check the event's source",
+            "UNKNOWN — could not be determined from source (a `consumable` decl whose initialiser is not a literal, or a payload this pass could not read). Core evaluates the decl, so this MAY be consumable. Check the event's source",
     });
 
     if (ev.payload.resolved) {
