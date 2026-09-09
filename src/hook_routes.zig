@@ -103,7 +103,15 @@ pub fn emitSidecar(
     // (#724 review). Rename is atomic on POSIX and on Windows via
     // `renameAt`, so the sidecar is either the previous complete file or
     // the new complete file, never a mixture.
-    const tmp_name = ROUTES_FILENAME ++ ".tmp";
+    // Unique per attempt, same reason as the generation marker: a shared
+    // `.tmp` lets two concurrent generates clobber each other's temp and
+    // rename a half-written file into place (#724 review). The generation
+    // token names it when there is one.
+    const tmp_name = if (generation_token) |t|
+        try std.fmt.allocPrint(allocator, ROUTES_FILENAME ++ ".{s}.tmp", .{t})
+    else
+        try allocator.dupe(u8, ROUTES_FILENAME ++ ".tmp");
+    defer allocator.free(tmp_name);
     {
         const file = try dir.createFile(io, tmp_name, .{});
         defer file.close(io);

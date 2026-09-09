@@ -53,21 +53,14 @@ pub const AdvanceError = error{
 /// than a counter so two generates racing on one directory cannot mint the
 /// same value and agree by accident.
 fn mint(aa: std.mem.Allocator) ![]const u8 {
-    // Zig 0.16 has no `std.time` clock and no `std.crypto.random`, so the
-    // seed is address entropy (ASLR) mixed with a process-local counter.
-    // That is ample for an EQUALITY TAG — nothing orders or parses these —
-    // and `advance` additionally guarantees the new token differs from the
-    // one it replaces, which is the property that actually matters.
-    var local: u8 = 0;
-    counter +%= 1;
-    const seed: u64 = @intFromPtr(&local) ^ (counter *% 0x9E3779B97F4A7C15);
-    var prng = std.Random.DefaultPrng.init(seed);
+    // `std.Io.random` (std/Io.zig) is threadsafe and properly seeded. An
+    // earlier revision used ASLR entropy plus a process-global counter,
+    // on my incorrect claim that Zig 0.16 exposed no random API — it does,
+    // and the counter was not concurrency-safe anyway (#724 review).
     var raw: [16]u8 = undefined;
-    prng.random().bytes(&raw);
+    std.Io.random(config.globalIo(), &raw);
     return std.fmt.allocPrint(aa, "{x}", .{&raw});
 }
-
-var counter: u64 = 0;
 
 /// Advance the marker and return the new token.
 ///
@@ -78,25 +71,13 @@ var counter: u64 = 0;
 ///
 /// Call this BEFORE mutating any generated output.
 pub fn advance(aa: std.mem.Allocator, labelle_dir: []const u8) AdvanceError![]const u8 {
-    // "Advance" has to mean CHANGED. Reading the previous marker and
-    // re-minting on a collision makes that true by construction rather than
-    // by trusting the seed — a token equal to its predecessor would leave a
-    // stale sidecar reading as current, the exact failure this exists to
-    // prevent.
-    // Scratch arena: `read` allocates the joined path and the file bytes,
-    // and neither outlives this check. Using the caller's allocator here
-    // leaked both on every generate.
-    var scratch = std.heap.ArenaAllocator.init(aa);
-    defer scratch.deinit();
-    const previous: ?[]const u8 = read(scratch.allocator(), labelle_dir) catch null;
-    var token = mint(aa) catch return error.OutOfMemory;
-    if (previous) |prev| {
-        var guard: u8 = 0;
-        while (std.mem.eql(u8, token, prev) and guard < 8) : (guard += 1) {
-            token = mint(aa) catch return error.OutOfMemory;
-        }
-        if (std.mem.eql(u8, token, prev)) return error.GenerationMarkerUnwritable;
-    }
+    // No previous-token comparison. It was there to make "advance" mean
+    // CHANGED despite a weak seed; with 128 bits from `std.Io.random` the
+    // collision probability is negligible, and — the review's sharper point
+    // — comparing only the PREVIOUS token never protected against matching
+    // an OLDER sidecar's token after several failed generates. Entropy is
+    // the property that covers both; a one-step comparison covered neither.
+    const token = mint(aa) catch return error.OutOfMemory;
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
@@ -104,7 +85,12 @@ pub fn advance(aa: std.mem.Allocator, labelle_dir: []const u8) AdvanceError![]co
     var dir = cwd.openDir(io, labelle_dir, .{}) catch return error.GenerationMarkerUnwritable;
     defer dir.close(io);
 
-    const tmp_name = FILENAME ++ ".tmp";
+    // Unique per attempt. A shared `generation.tmp` means two concurrent
+    // generates in one directory clobber each other's temp and can rename a
+    // half-written file into place (#724 review). The token is already
+    // unique, so it names the temp.
+    const tmp_name = std.fmt.allocPrint(aa, FILENAME ++ ".{s}.tmp", .{token}) catch return error.OutOfMemory;
+    defer aa.free(tmp_name);
     {
         const file = dir.createFile(io, tmp_name, .{}) catch return error.GenerationMarkerUnwritable;
         defer file.close(io);

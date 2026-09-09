@@ -315,6 +315,35 @@ test "freshness: a sidecar with no stamp is refused as unverifiable" {
     try std.testing.expectError(error.SidecarUntokenized, renderRoutes(arena, dir, true, .{}));
 }
 
+test "freshness: a marker that cannot be advanced fails BEFORE outputs change" {
+    // The ordering guarantee, as a test rather than an argument. Making the
+    // marker path a DIRECTORY makes the rename fail without chmod (which is
+    // unreliable as root and on some CI filesystems) — per the review's
+    // suggestion.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    // A sentinel standing in for generated output: it must be untouched.
+    try tmp.dir.writeFile(io, .{ .sub_path = "sentinel.txt", .data = "before" });
+
+    // `.labelle/generation` as a directory: createFile/rename cannot replace it.
+    try tmp.dir.createDirPath(io, ".labelle/generation");
+
+    const labelle_dir = try std.fs.path.join(arena, &.{ dir, ".labelle" });
+    try std.testing.expectError(error.GenerationMarkerUnwritable, generation.advance(arena, labelle_dir));
+
+    // The sentinel is unchanged: advance failed before anything downstream
+    // could run. In `generate` this is the early return before
+    // `createDirPath(target_dir)`.
+    const after = try tmp.dir.readFileAlloc(io, "sentinel.txt", arena, .limited(64));
+    try std.testing.expectEqualStrings("before", after);
+}
+
 test "freshness: advance() always changes the marker" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
