@@ -174,6 +174,21 @@ fn emitterEntry() ScriptEntry {
 
 const script_entries = [_]ScriptEntry{ flowEntry(), emitterEntry() };
 
+/// The decoy file must be a REAL scan candidate or the test that asserts it
+/// contributes no routes passes vacuously — the emit scan only reads
+/// receiver sources and declared script entries (#724 review caught this).
+fn decoyEntry() ScriptEntry {
+    return .{
+        .name = "playing/11_decoys.zig",
+        .filename = "playing/11_decoys.zig",
+        .states = &.{"playing"},
+        .sort_order = 11,
+        .subdir = "playing",
+        .rel_path = "playing/11_decoys.zig",
+    };
+}
+const script_entries_with_decoy = [_]ScriptEntry{ flowEntry(), emitterEntry(), decoyEntry() };
+
 /// Plugin events: one consumed, one elided. `box2d__collision_begin` is
 /// handled by `hooks/z_second`; `box2d__collision_end` is not, and is
 /// therefore the elided row whose status must not read like silence.
@@ -552,7 +567,23 @@ pub const HONESTY = struct {
         defer allocator.free(dir);
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
-        const report = try buildIn(arena_state.allocator(), dir, baseCfg(&.{}));
+        const arena = arena_state.allocator();
+
+        var in = inputs(dir, baseCfg(&.{}));
+        in.script_entries = &script_entries_with_decoy;
+        const report = try hook_routes.buildReport(arena, in);
+
+        // GUARD: the decoy must actually have been READ. Without this the
+        // assertion below passes whether the scanner is fixed or not — the
+        // emit scan only reads receiver sources and declared script
+        // entries, so a fixture file nobody declares is never opened.
+        // Proven by difference rather than an absolute count, which
+        // depends on how many receivers the fixture happens to have.
+        const without = try hook_routes.buildReport(arena, inputs(dir, baseCfg(&.{})));
+        try std.testing.expectEqual(
+            without.resolution.emit_sites_files_scanned + 1,
+            report.resolution.emit_sites_files_scanned,
+        );
 
         const pulse = report.eventByTag("pulse").?;
         // ONE site: the real emitter. The decoy file contributes nothing.

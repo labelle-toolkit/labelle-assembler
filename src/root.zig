@@ -641,7 +641,16 @@ pub fn generate(
     // current.
     const gen_dir = try std.fs.path.join(allocator, &.{ game_dir, ".labelle" });
     defer allocator.free(gen_dir);
-    const generation_token = generation.advance(allocator, gen_dir) catch |err| {
+    //
+    // SCOPED TO THE EXECUTABLE GENERATION. `generateTestsTarget` re-enters
+    // this function with `is_tests_target = true`, and the sidecar is only
+    // written when that is false. Advancing unconditionally therefore made
+    // the ordinary CLI flow invalidate its OWN report: the executable pass
+    // wrote a sidecar stamped T1, then the tests pass moved the marker to
+    // T2 without rewriting it, and `routes` correctly called the fresh
+    // report stale (#724 review P1). The marker tracks the generation the
+    // sidecar describes, so only that pass advances it.
+    const generation_token: ?[]const u8 = if (is_tests_target) null else generation.advance(allocator, gen_dir) catch |err| {
         std.log.err(
             "labelle-assembler: cannot advance the generation marker at {s}/{s} ({s}).\n" ++
                 "  Nothing has been generated — refusing to write outputs whose freshness\n" ++
@@ -650,7 +659,7 @@ pub fn generate(
         );
         return err;
     };
-    defer allocator.free(generation_token);
+    defer if (generation_token) |t| allocator.free(t);
 
     try cwd.createDirPath(io, target_dir);
 
