@@ -78,6 +78,39 @@ cd .labelle/null_desktop && zig build
 LABELLE_NULL_FRAMES=4 ./zig-out/bin/hook_order
 ```
 
+## Inspecting the route without reading generated code
+
+`generate` also writes `.labelle/hook_routes.json`, and
+
+```bash
+$ASM routes --project-root . --event pulse
+```
+
+prints the same sequence the transcript above proves at runtime:
+
+```
+  [0] rank   100 * hooks/z_second
+        root_hook  ·  hooks/z_second.zig  ·  baseline 1
+        handlers: pulse
+  [1] rank     0   hooks/a_first
+        root_hook  ·  hooks/a_first.zig  ·  baseline 0
+        handlers: pulse
+
+  pulse
+    owner: game  ·  events/pulse.zig
+    listeners (dispatch order):
+      [0] hooks/z_second
+      [1] hooks/a_first
+    emitted from:
+      scripts/playing/10_emitter.zig  [buffered]
+```
+
+That report is built from the SAME `buildReceiverPlan` call that emits the
+`MergeHooks` tuple, so the order it prints is the order that runs — see
+`docs/design/hook-route-inspection.md` (labelle-assembler#724). Delete the
+`.hooks` block, re-generate, and both the log and the report invert
+together.
+
 ## A note on consumable events
 
 `pulse` is a notification event, so both receivers always run and order
