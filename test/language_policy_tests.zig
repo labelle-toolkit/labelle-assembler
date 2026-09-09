@@ -214,6 +214,24 @@ pub const GENERATION_FRESHNESS = struct {
         var staged = try StagedProject.init(allocator);
         defer staged.deinit(allocator);
 
+        // HERMETIC, and it has to be. Unlike every other test in this file
+        // this one drives the EXECUTABLE target (`is_tests_target = false`),
+        // which emits `main.zig` from the engine's
+        // `codegen/main.zig.template`. Left unpinned, `engine_version`
+        // resolves to the default pin and the template is read out of
+        // `~/.labelle/packages/engine/<version>/` — present on my machine,
+        // absent on a clean runner, which is exactly how this passed
+        // locally and failed CI with `EngineTemplateNotFound` (#726 review).
+        //
+        // Staging the in-tree fixture template as a `local:` engine package
+        // removes the machine dependency without weakening anything: the
+        // two passes, the non-null sidecar assertion and the freshness
+        // comparison below are unchanged, and the test still fails (rather
+        // than skips) if generation cannot complete.
+        var game = try staged.game();
+        defer game.close(io);
+        try writeFileIn(game, "engine-fixture/codegen/main.zig.template", h.engine_template);
+
         const backend = try sokolFixtureAbs(allocator);
         defer allocator.free(backend.repo);
         var cfg = generate.ProjectConfig{
@@ -221,6 +239,7 @@ pub const GENERATION_FRESHNESS = struct {
             .name = "freshness-game",
             .backend = .sokol,
             .ecs = .mock,
+            .engine_version = "local:engine-fixture",
         };
         cfg.backend_package = backend;
 
