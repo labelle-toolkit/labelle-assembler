@@ -176,6 +176,32 @@ there is no hand-written writer that can fall behind a field.
   sidecar is not churn in every commit. A test asserts this, and asserts
   the absence of the build directory path in the output.
 
+### 2.3.1 `generation` is VOLATILE — do not byte-compare two reports
+
+`generation` carries the freshness token described in §2.5, and it is a fresh
+random value on **every** `generate`. Two runs over an unchanged project
+therefore produce reports that differ by exactly that field — by design, not as
+byte-instability to be fixed. The token is what lets `routes` refuse a sidecar
+left behind by a generate that failed partway (see `src/generation.zig`); a
+stable or content-derived value could not distinguish "regenerated identically"
+from "never regenerated", which is the case the whole mechanism exists for.
+
+Consequences for anyone diffing or asserting on reports:
+
+* **Do not byte-compare** two `hook_routes.json` files and expect equality.
+  A determinism test must exclude `generation` — everything else in the
+  document IS deterministic (no timestamps, no host paths, receivers in
+  dispatch order, events sorted by tag), and there is a test asserting exactly
+  that.
+* **Compare structurally.** Parse both and compare the fields you care about,
+  or strip `generation` before diffing.
+* **Treat the value as opaque.** Nothing may parse it, order two tokens, or
+  infer age from it. The only meaningful operation is equality against the
+  marker at `.labelle/generation`.
+
+The same applies to a consumer correlating this report against runtime traces:
+join on `Receiver.id` and `Event.tag`, never on `generation`.
+
 ### 2.4 Where each field comes from
 
 Most of the report is threaded from scans codegen already ran, so it
