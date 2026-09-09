@@ -138,13 +138,16 @@ pub const Codegen = struct {
     // script-less projects) emits byte-identical output.
     scripting: ?scripting_splice.ScriptingSplice = null,
 
-    // Priority-aware flow-handler ordering (indices into `script_entries`),
-    // built by `blocks/hooks.zig:buildFlowOrder`. Borrowed: the
-    // orchestrator owns the backing `ArrayList`. Shared between the
-    // game-hooks and hooks-init writers so the receiver-type order matches
-    // the receiver-pointer order. Defaults to empty for callers
-    // (`root.zig:generateGameShim`) that never wire flow handlers.
-    flow_order: []const usize = &.{},
+    // Resolved hook dispatch order (labelle-assembler#723), built by
+    // `blocks/hooks.zig:buildReceiverPlan`: the baseline sequence (root
+    // hooks → pack hooks → priority-shaped flow tail) after any
+    // `.hooks.order` ranks are applied. Borrowed — the orchestrator owns
+    // the backing `ReceiverPlan`. Shared between the game-hooks and
+    // hooks-init writers so the receiver-TYPE order and the
+    // receiver-POINTER order can never disagree (`MergeHooks.emit` looks
+    // each receiver up by tuple position). Defaults to empty for callers
+    // (`root.zig:generateGameShim`) that never wire hook receivers.
+    receiver_plan: []const hooks_block.Receiver = &.{},
 
     // Lifecycle-section render inputs (codegen/lifecycle/render.zig). Set by
     // the orchestrator just before `renderLifecycle` so the (non-capturing)

@@ -152,6 +152,20 @@ pub const main_template = main_zig.main_template;
 /// Pack dir-scan result (Packs RFC §4, #439). Re-exported so tests can build
 /// one directly and callers can name the `scanPack` return type.
 pub const PackScan = main_zig.PackScan;
+/// The hook ordering contract (labelle-assembler#723,
+/// `docs/design/hook-handler-ordering.md`). `buildReceiverPlan` is the
+/// SINGLE producer of hook dispatch order; `Receiver.id` is the stable
+/// source-oriented handler identity that `.hooks.order`, #724's route
+/// inspector and #858's tracing all key on.
+pub const hooks_block = main_zig.hooks_block;
+pub const Receiver = hooks_block.Receiver;
+pub const ReceiverKind = hooks_block.ReceiverKind;
+pub const ReceiverPlan = hooks_block.ReceiverPlan;
+pub const buildReceiverPlan = hooks_block.buildReceiverPlan;
+/// Opt-in hook dispatch-order declaration parsed from `project.labelle`
+/// `.hooks` (#723).
+pub const HooksConfig = config.HooksConfig;
+pub const HookOrderEntry = config.HookOrderEntry;
 pub const generateBuildZig = build_files.generateBuildZig;
 pub const windows_icon_resource_block = build_files.windows_icon_resource_block;
 /// The gated window-icon statement the desktop loop setup emits (labelle-cli#359).

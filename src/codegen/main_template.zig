@@ -380,24 +380,35 @@ pub fn generateMainZigFromTemplate(
         try data.scalars.put("all_hook_payloads_block", b);
     }
 
-    // Priority-aware ordering of the flow tail (RFC-PLUGIN-EVENTS phase
-    // 4/7, labelle-assembler#175). `buildFlowOrder` returns indices into
-    // `script_entries` for every `has_event_handler` flow — priority-set
-    // entries first (descending), then the rest in scanner order. Owned
-    // here so its lifetime is visible at the call site; both the
-    // game-hooks and hooks-init writers consume the same slice so the
-    // receiver-type order matches the receiver-pointer order
-    // (`MergeHooks.emit` looks receivers up by tuple position). See
-    // `codegen/blocks/hooks.zig` for the full rationale.
-    var flow_order = try hooks_block.buildFlowOrder(allocator, script_entries);
-    defer flow_order.deinit(allocator);
-    ctx.flow_order = flow_order.items;
+    // Resolved hook dispatch order (labelle-assembler#723 — THE ordering
+    // contract, `docs/design/hook-handler-ordering.md`). One producer for
+    // the whole receiver tuple: the baseline sequence (game-root hooks →
+    // pack hooks → the RFC-PLUGIN-EVENTS phase 4/7 priority-shaped flow
+    // tail) with `project.labelle`'s opt-in `.hooks.order` ranks applied
+    // over it. A project that declares nothing sorts to the identity, so
+    // the emitted tuple is byte-identical to the pre-#723 assembler.
+    //
+    // Owned here so its lifetime is visible at the call site; both the
+    // game-hooks and hooks-init writers consume the same slice, which is
+    // what makes the receiver-type order and the receiver-pointer order
+    // structurally identical (`MergeHooks.emit` looks receivers up by
+    // tuple position). Declaration errors (unknown / duplicate handler)
+    // surface HERE, before any emission, with a stderr diagnostic.
+    var receiver_plan = try hooks_block.buildReceiverPlan(
+        allocator,
+        cfg,
+        hook_names,
+        pack_scans,
+        script_entries,
+    );
+    defer receiver_plan.deinit(allocator);
+    ctx.receiver_plan = receiver_plan.receivers;
 
     // Game hooks block (codegen/blocks/hooks.zig).
     {
         const b = try block(allocator, &allocs, struct {
             fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
-                try c.writeGameHooksBlock(w, ib, c.flow_order);
+                try c.writeGameHooksBlock(w, ib, c.receiver_plan);
             }
         }.emit, &ctx, &ident_buf);
         try data.scalars.put("game_hooks_block", b);
@@ -407,7 +418,7 @@ pub fn generateMainZigFromTemplate(
     {
         const b = try block(allocator, &allocs, struct {
             fn emit(c: *Codegen, w: anytype, ib: *[256]u8) !void {
-                try c.writeHooksInitBlock(w, ib, c.flow_order);
+                try c.writeHooksInitBlock(w, ib, c.receiver_plan);
             }
         }.emit, &ctx, &ident_buf);
         try data.scalars.put("hooks_init_block", b);
