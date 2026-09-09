@@ -1,0 +1,8 @@
+{
+    // Minimal scene — no entities. The demo is purely hook dispatch
+    // ORDER; the scene exists so `g.setScene("main")` has a name to bind
+    // to. File-level entities would live under "children" (unified
+    // RFC #560).
+    "name": "main",
+    "children": []
+}
