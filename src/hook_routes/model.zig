@@ -291,6 +291,11 @@ pub const Event = struct {
 
 /// The whole report. Field order here is the JSON key order.
 pub const Report = struct {
+    /// The generation token this report was produced under (#724 review).
+    /// Compared against `.labelle/generation`; a mismatch or absence means
+    /// the report describes an OLDER generate than the one on disk. Null
+    /// only for a legacy sidecar written before the marker existed.
+    generation: ?[]const u8 = null,
     schema: []const u8 = SCHEMA,
     /// The assembler that produced it.
     assembler_version: []const u8,

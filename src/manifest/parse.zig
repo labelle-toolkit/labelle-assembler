@@ -177,6 +177,15 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
                 if (save == null and std.mem.eql(u8, mname, "save")) {
                     save = try extractSavePolicy(aa, ast.getNodeSource(m));
                 } else if (std.mem.eql(u8, mname, "consumable")) {
+                    // MUST be `pub`. A private `const consumable = true;`
+                    // is not visible to `@hasDecl` from another module, so
+                    // core's `isConsumable` returns FALSE for it — reporting
+                    // it consumable would contradict the dispatcher. Verified
+                    // with a two-module probe (#724 review).
+                    if (member_vd.visib_token == null) {
+                        consumable = false;
+                        continue;
+                    }
                     // `pub const consumable = true;` (RFC-PLUGIN-EVENTS O4).
                     //
                     // Match the INITIALISER EXACTLY, not a substring of the

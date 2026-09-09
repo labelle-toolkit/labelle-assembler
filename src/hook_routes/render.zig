@@ -313,6 +313,22 @@ fn writeNotesSection(w: *std.Io.Writer, report: model.Report, filter: Filter) !v
     try w.print("  · emission sites come from a literal-call-site scan of {d} source file(s):\n" ++
         "    every hook receiver plus every scanned script. A computed emit, or one from\n" ++
         "    a plugin's own sources, is not listed — \"no call site found\" is not \"never emitted\".\n", .{report.resolution.emit_sites_files_scanned});
+    // The completeness flags were JSON-only, so the human form — the one a
+    // person actually reads — still implied a full scan (#724 review).
+    if (report.resolution.emit_sites_truncated) {
+        try w.print(
+            "  · THE EMIT SCAN WAS TRUNCATED at its file cap. Emit sites are INCOMPLETE:\n" ++
+                "    \"no call site found\" below may mean \"not looked for\".\n",
+            .{},
+        );
+    }
+    if (report.resolution.emit_sites_unreadable > 0) {
+        try w.print(
+            "  · {d} file(s) could not be read during the emit scan — each is a hole in\n" ++
+                "    the results, not evidence that nothing emits there.\n",
+            .{report.resolution.emit_sites_unreadable},
+        );
+    }
     try w.writeAll("  · listeners are read from `pub fn <tag>(self, payload)` declarations. The\n" ++
         "    compiler is the authority; this is what the source says.\n");
     if (!report.ordering.declared) {

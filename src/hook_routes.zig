@@ -67,12 +67,21 @@ pub const Filter = render.Filter;
 /// and flow-catalog sidecars: `root.zig:generate` logs a failure and
 /// carries on, because a missing inspection artifact must never fail a
 /// build that would otherwise succeed.
-pub fn emitSidecar(allocator: std.mem.Allocator, labelle_dir: []const u8, in: Inputs) !void {
+pub fn emitSidecar(
+    allocator: std.mem.Allocator,
+    labelle_dir: []const u8,
+    in: Inputs,
+    /// The token `generate` advanced BEFORE it began mutating outputs. A
+    /// sidecar written without one is indistinguishable from a legacy file
+    /// and `routes` will refuse it as stale (#724 review).
+    generation_token: ?[]const u8,
+) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const report = try buildReport(aa, in);
+    var report = try buildReport(aa, in);
+    report.generation = generation_token;
 
     // Build in the arena, copy out for the write — the same lifetime
     // dance `manifest/emit.zig` uses.

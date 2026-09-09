@@ -177,6 +177,7 @@ pub const HookOrderEntry = config.HookOrderEntry;
 /// `generate` writes `<game>/.labelle/hook_routes.json`; the `routes`
 /// subcommand renders it.
 pub const hook_routes = @import("hook_routes.zig");
+pub const generation = @import("generation.zig");
 pub const HookRouteReport = hook_routes.Report;
 pub const generateBuildZig = build_files.generateBuildZig;
 pub const windows_icon_resource_block = build_files.windows_icon_resource_block;
@@ -623,6 +624,31 @@ pub fn generate(
         game_dir,
         cfg.asset_compression.formatFor(cfg.platform) == .astc,
     );
+
+    // ── Generation token, advanced BEFORE any output changes (#724) ──────
+    // `hook_routes.json` describes the last SUCCESSFUL generate. Writing it
+    // atomically prevents a torn file but not a stale one: a generate that
+    // dies after this point leaves the previous sidecar intact and
+    // valid-looking. Advancing the marker FIRST means any such failure
+    // leaves the marker ahead of the sidecar, which `routes` reads as stale
+    // — the safe direction. Advancing it last would let a failed generate
+    // look clean.
+    //
+    // If it cannot be advanced we stop HERE, before mutating anything,
+    // rather than generate outputs whose metadata would falsely read as
+    // current.
+    const gen_dir = try std.fs.path.join(allocator, &.{ game_dir, ".labelle" });
+    defer allocator.free(gen_dir);
+    const generation_token = generation.advance(allocator, gen_dir) catch |err| {
+        std.log.err(
+            "labelle-assembler: cannot advance the generation marker at {s}/{s} ({s}).\n" ++
+                "  Nothing has been generated — refusing to write outputs whose freshness\n" ++
+                "  could not be recorded. Check permissions on that directory and retry.",
+            .{ gen_dir, generation.FILENAME, @errorName(err) },
+        );
+        return err;
+    };
+    defer allocator.free(generation_token);
 
     try cwd.createDirPath(io, target_dir);
 
@@ -2601,7 +2627,10 @@ pub fn generate(
             .plugin_events_elided = event_consumption.elided,
             .plugin_events_force_kept = force_kept_ungated.items,
             .engine_dir = routes_engine_dir,
-        }) catch |err| {
+        }, generation_token) catch |err| {
+            // Best-effort BY DESIGN now that the marker leads: a failed
+            // emission leaves an OLD-token sidecar, which `routes` rejects
+            // as stale rather than serving as current (#724 review).
             std.log.warn("labelle-assembler: hook-routes sidecar emission failed: {s}", .{@errorName(err)});
         };
     }

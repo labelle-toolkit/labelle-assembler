@@ -39,6 +39,7 @@
 
 const std = @import("std");
 const gen = @import("root.zig");
+const generation = @import("generation.zig");
 
 const hook_routes = gen.hook_routes;
 
@@ -115,6 +116,29 @@ pub fn cmdRoutes(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Ar
             );
             std.process.exit(1);
         },
+        error.SidecarStale => {
+            // The distinction that matters: the file is fine, it is just
+            // OLD. Saying "missing" here would send the reader looking for
+            // a file that is sitting right there.
+            std.log.err(
+                "labelle-assembler routes: '{s}/{s}' is STALE — it was written by an earlier\n" ++
+                    "  generate than the one that last ran here. A generate that fails partway\n" ++
+                    "  leaves the previous report in place, so this is refused rather than served\n" ++
+                    "  as current.\n" ++
+                    "  Run `labelle-assembler generate --project-root {s}` and retry.",
+                .{ labelle_dir, hook_routes.ROUTES_FILENAME, root },
+            );
+            std.process.exit(1);
+        },
+        error.SidecarUntokenized => {
+            std.log.err(
+                "labelle-assembler routes: '{s}/{s}' carries no generation stamp, so its\n" ++
+                    "  freshness cannot be established. It predates the stamp; re-run\n" ++
+                    "  `labelle-assembler generate --project-root {s}` to replace it.",
+                .{ labelle_dir, hook_routes.ROUTES_FILENAME, root },
+            );
+            std.process.exit(1);
+        },
         error.UnknownSchema => {
             std.log.err(
                 "labelle-assembler routes: '{s}/{s}' does not carry schema '{s}'.\n" ++
@@ -139,6 +163,18 @@ pub fn renderRoutes(
 ) ![]const u8 {
     const report = (try hook_routes.readSidecar(arena, labelle_dir)) orelse return error.SidecarMissing;
     if (!std.mem.eql(u8, report.schema, hook_routes.SCHEMA)) return error.UnknownSchema;
+
+    // FRESHNESS. A sidecar that parses is not necessarily current: a
+    // generate that failed after advancing the marker leaves the previous
+    // one intact and valid-looking. Refuse anything whose stamp is not the
+    // marker on disk — serving a stale route list is worse than serving
+    // none, because it looks like an answer (#724 review).
+    switch (generation.compare(report.generation, try generation.read(arena, labelle_dir))) {
+        .current => {},
+        .stale => return error.SidecarStale,
+        .untokenized => return error.SidecarUntokenized,
+        .never_generated => return error.SidecarMissing,
+    }
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     if (as_json) {
@@ -224,6 +260,80 @@ fn applyFilter(
     return out;
 }
 
+test "freshness: a sidecar from an EARLIER generate is refused, not served" {
+    // The case atomic writes cannot cover: a generate that fails after
+    // advancing the marker leaves the previous sidecar intact and
+    // valid-looking. Serving it would look like an answer (#724 review).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    const cfg: gen.ProjectConfig = .{ .y_axis = .up, .name = "fresh", .backend = .raylib, .ecs = .mock };
+    const first = try generation.advance(arena, dir);
+    try hook_routes.emitSidecar(std.testing.allocator, dir, .{
+        .cfg = cfg,
+        .game_dir = dir,
+        .target_dir = dir,
+        .hook_names = &.{},
+        .event_names = &.{},
+    }, first);
+
+    // Readable while it matches.
+    _ = try renderRoutes(arena, dir, true, .{});
+
+    // A SECOND generate advances the marker; simulate one that then dies
+    // before rewriting the sidecar.
+    const second = try generation.advance(arena, dir);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expectError(error.SidecarStale, renderRoutes(arena, dir, true, .{}));
+}
+
+test "freshness: a sidecar with no stamp is refused as unverifiable" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    const cfg: gen.ProjectConfig = .{ .y_axis = .up, .name = "legacy", .backend = .raylib, .ecs = .mock };
+    _ = try generation.advance(arena, dir);
+    // A LEGACY sidecar: written before the stamp existed, so `null` token.
+    try hook_routes.emitSidecar(std.testing.allocator, dir, .{
+        .cfg = cfg,
+        .game_dir = dir,
+        .target_dir = dir,
+        .hook_names = &.{},
+        .event_names = &.{},
+    }, null);
+
+    try std.testing.expectError(error.SidecarUntokenized, renderRoutes(arena, dir, true, .{}));
+}
+
+test "freshness: advance() always changes the marker" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena);
+
+    var previous: []const u8 = "";
+    for (0..5) |_| {
+        const t = try generation.advance(arena, dir);
+        try std.testing.expect(!std.mem.eql(u8, t, previous));
+        // …and it is what a reader sees on disk.
+        const on_disk = (try generation.read(arena, dir)).?;
+        try std.testing.expectEqualStrings(t, on_disk);
+        previous = t;
+    }
+}
+
 fn missing(io: std.Io, flag: []const u8) noreturn {
     std.log.err("labelle-assembler routes: {s} requires a value", .{flag});
     writeStderr(io, "\n" ++ usage);
@@ -286,13 +396,16 @@ test "renderRoutes: renders both forms, and a filter narrows without renumbering
     const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
 
     const cfg: gen.ProjectConfig = .{ .y_axis = .up, .name = "routes-cmd", .backend = .raylib, .ecs = .mock };
+    // The sidecar is only readable when its stamp matches the marker, so
+    // the fixture has to advance one exactly as `generate` does.
+    const token = try generation.advance(arena, dir);
     try hook_routes.emitSidecar(allocator, dir, .{
         .cfg = cfg,
         .game_dir = dir,
         .target_dir = dir,
         .hook_names = &.{ "first", "second" },
         .event_names = &.{"ping"},
-    });
+    }, token);
 
     const text = try renderRoutes(arena, dir, false, .{});
     try std.testing.expect(std.mem.indexOf(u8, text, "DISPATCH ORDER") != null);

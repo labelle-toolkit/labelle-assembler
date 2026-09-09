@@ -536,6 +536,11 @@ pub const HONESTY = struct {
             // no decl at all.
             .{ .src = "pub const E = struct { value: u32 };\n", .want = false },
             .{ .src = "pub const E = struct { pub const consumable = true; };\n", .want = true },
+            // PRIVATE decl: `@hasDecl` cannot see it from another module, so
+            // core's isConsumable returns false. Reporting true here would
+            // contradict the dispatcher (#724 review, probe-verified).
+            .{ .src = "pub const E = struct { const consumable = true; };\n", .want = false },
+            .{ .src = "pub const E = struct { const consumable = false; };\n", .want = false },
             .{ .src = "pub const E = struct { pub const consumable = false; };\n", .want = false },
             // Negation — the case Codex reproduced. Core sees false.
             .{ .src = "pub const E = struct { pub const consumable = !true; };\n", .want = null },
@@ -734,7 +739,8 @@ pub const MACHINE_CONTRACT = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        try hook_routes.emitSidecar(allocator, dir, inputs(dir, baseCfg(&.{})));
+        const token = try generator.generation.advance(arena, dir);
+        try hook_routes.emitSidecar(allocator, dir, inputs(dir, baseCfg(&.{})), token);
         const back = (try hook_routes.readSidecar(arena, dir)).?;
         try std.testing.expectEqualStrings(hook_routes.SCHEMA, back.schema);
         try std.testing.expectEqual(@as(usize, 4), back.receivers.len);
