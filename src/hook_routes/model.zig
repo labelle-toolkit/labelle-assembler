@@ -94,9 +94,13 @@ pub const EventOwner = enum { game, pack, plugin, engine, engine_hook, script };
 ///   * `elided`     — discovered but dropped because nothing consumes it
 ///                    (labelle-assembler#630). NOT an error: an
 ///                    intentionally unobserved event is a normal state.
-///   * `force_kept` — unconsumed, but kept anyway because the PROVIDER
-///                    emits the tag with a raw union literal, so eliding
-///                    it would break the provider's own compile.
+///   * `force_kept` — UNGATED: the provider emits the tag with a raw union
+///                    literal, so the variant survives whether or not
+///                    anything consumes it. `generate` force-keeps every
+///                    ungated provider event and this status takes
+///                    precedence over `active`, so it does NOT imply the
+///                    event is unconsumed — read `listeners` for that
+///                    (#724 review).
 pub const EventStatus = enum { active, elided, force_kept };
 
 /// How an emission reaches handlers. A property of the CALL SITE, not of

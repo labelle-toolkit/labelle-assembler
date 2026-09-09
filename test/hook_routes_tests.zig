@@ -487,6 +487,43 @@ pub const HONESTY = struct {
         try std.testing.expectEqual(hook_routes.model.EventStatus.active, kept.status);
     }
 
+    test "force_kept means UNGATED, and never asserts an absence of consumers" {
+        // `generate` force-keeps every ungated provider event regardless of
+        // consumption, and force-kept takes precedence over active — so a
+        // force-kept event CAN have listeners. The note must not claim
+        // otherwise; the report would contradict itself (#724 review).
+        const notes_for = struct {
+            fn contains(haystack: []const []const u8, needle: []const u8) bool {
+                for (haystack) |h| if (std.mem.indexOf(u8, h, needle) != null) return true;
+                return false;
+            }
+        };
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const forced = [_]generator.codegen_scan.PluginEvent{.{
+            .plugin_sanitized = "prov",
+            .plugin_import_name = "prov",
+            .event_name = "ping",
+        }};
+        const report = try hook_routes.buildReport(aa, .{
+            .cfg = baseCfg(&.{}),
+            .game_dir = ".",
+            .target_dir = ".",
+            .hook_names = &.{},
+            .event_names = &.{},
+            .plugin_events = &forced,
+            .plugin_events_force_kept = &forced,
+        });
+        const ev = report.eventByTag("prov__ping") orelse return error.TestEventMissing;
+        try std.testing.expectEqual(hook_routes.model.EventStatus.force_kept, ev.status);
+        // The claim that used to be here.
+        try std.testing.expect(!notes_for.contains(ev.notes, "nothing consumes"));
+        // And the honest framing is present.
+        try std.testing.expect(notes_for.contains(ev.notes, "whether or not anything consumes"));
+    }
+
     test "an emit inside a comment or a string literal is NOT a route" {
         // The scan used to be a raw `indexOf("emit(")` over the file, so a
         // commented-out call and a doc example in a string both became

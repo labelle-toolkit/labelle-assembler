@@ -8,6 +8,8 @@ const config = @import("config.zig");
 const cache = @import("cache.zig");
 const backend_registry = @import("backend_registry.zig");
 pub const scanner = @import("scanner.zig");
+/// Exposed so tests can build  directly (#724).
+pub const codegen_scan = @import("codegen/scan.zig");
 pub const scene_manifest = @import("scene_manifest.zig");
 pub const tilemap_scan = @import("tilemap_scan.zig");
 pub const asset_validator = @import("asset_validator.zig");

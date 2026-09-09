@@ -345,7 +345,15 @@ fn collectPluginEvents(aa: std.mem.Allocator, in: Inputs, out: *std.ArrayList(mo
                     "Elided: no consumer was found, so the variant is not emitted into GameEvents (labelle-assembler#630). Not an error — an intentionally unobserved event is a normal state. Add a handler, or list it under `.plugin_events`, to keep it.",
                 },
                 .force_kept => &.{
-                    "Force-kept: nothing consumes this event, but the providing plugin emits the tag with a raw union literal, so eliding it would break the provider's own compile (labelle-assembler#630).",
+                    // Do NOT claim "nothing consumes this". `generate`
+                    // force-keeps every UNGATED provider event
+                    // (`root.zig`), consumed or not, and the force-kept
+                    // pass takes precedence over `.active` — so this status
+                    // means "kept regardless of consumption", not "kept
+                    // despite having none". The old wording asserted an
+                    // absence the report itself can contradict by listing
+                    // listeners below (#724 review).
+                    "Force-kept: the providing plugin emits this tag with a raw union literal, so the variant survives whether or not anything consumes it — eliding it would break the provider's own compile (labelle-assembler#630). This status says nothing about consumers: check the listeners above.",
                 },
             };
             try out.append(aa, .{

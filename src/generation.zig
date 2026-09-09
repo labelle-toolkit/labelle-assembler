@@ -78,6 +78,10 @@ pub fn advance(aa: std.mem.Allocator, labelle_dir: []const u8) AdvanceError![]co
     // an OLDER sidecar's token after several failed generates. Entropy is
     // the property that covers both; a one-step comparison covered neither.
     const token = mint(aa) catch return error.OutOfMemory;
+    // Every path below can fail. The caller's `defer free` only runs after
+    // a SUCCESSFUL return, so without this the token leaks on exactly the
+    // error paths the marker exists to handle (#724 review).
+    errdefer aa.free(token);
     const io = config.globalIo();
     const cwd = std.Io.Dir.cwd();
 
