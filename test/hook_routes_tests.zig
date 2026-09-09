@@ -539,6 +539,35 @@ pub const HONESTY = struct {
         try std.testing.expect(notes_for.contains(ev.notes, "whether or not anything consumes"));
     }
 
+    test "a brace inside a trailing comment does not skew union depth" {
+        // The variant scanner counts braces per line to track depth. A
+        // comment containing `{` or `}` skewed it, so lines after it were
+        // misclassified as nested (or as direct members) — either dropping
+        // real variants or inventing phantom ones (#724 review).
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const src =
+            \\pub fn HookPayload(comptime E: type) type {
+            \\    return union(enum) {
+            \\        alpha: struct { n: u8 = 0 },  // opens { and closes } in a comment
+            \\        beta: u32,
+            \\        // a lone { in a comment on its own line
+            \\        gamma: bool,
+            \\    };
+            \\}
+            \\
+        ;
+        const variants = try generator.hook_routes.buildTestOnlyParseVariants(aa, src);
+        var names: [8][]const u8 = undefined;
+        for (variants, 0..) |v, i| names[i] = v.name;
+        try std.testing.expectEqual(@as(usize, 3), variants.len);
+        try std.testing.expectEqualStrings("alpha", names[0]);
+        try std.testing.expectEqualStrings("beta", names[1]);
+        try std.testing.expectEqualStrings("gamma", names[2]);
+    }
+
     test "an emit inside a comment or a string literal is NOT a route" {
         // The scan used to be a raw `indexOf("emit(")` over the file, so a
         // commented-out call and a doc example in a string both became

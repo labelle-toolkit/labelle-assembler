@@ -173,3 +173,9 @@ pub fn readSidecar(aa: std.mem.Allocator, labelle_dir: []const u8) !?Report {
 test {
     std.testing.refAllDecls(@This());
 }
+
+/// Test-only door onto the union-variant parser, so its comment/brace
+/// handling can be pinned directly rather than through a whole report.
+pub fn buildTestOnlyParseVariants(aa: std.mem.Allocator, src: []const u8) ![]const build.HookVariant {
+    return build.parseHookPayloadVariantsForTest(aa, src);
+}

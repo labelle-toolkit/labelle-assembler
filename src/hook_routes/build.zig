@@ -416,7 +416,7 @@ fn collectEngineHookEvents(aa: std.mem.Allocator, in: Inputs, out: *std.ArrayLis
     return true;
 }
 
-const HookVariant = struct { name: []const u8, zig_type: []const u8 };
+pub const HookVariant = struct { name: []const u8, zig_type: []const u8 };
 
 /// Pull the field list out of `pub fn HookPayload(...) type { return
 /// union(enum) { ... }; }`.
@@ -427,6 +427,11 @@ const HookVariant = struct { name: []const u8, zig_type: []const u8 };
 /// no extra precision. The shape is one declaration in one engine file;
 /// a scan that stops finding fields degrades to `resolved = false`, which
 /// the report states outright.
+/// Test-only alias so the comment/brace handling can be pinned directly.
+pub fn parseHookPayloadVariantsForTest(aa: std.mem.Allocator, src: []const u8) ![]const HookVariant {
+    return parseHookPayloadVariants(aa, src);
+}
+
 fn parseHookPayloadVariants(aa: std.mem.Allocator, src: []const u8) ![]const HookVariant {
     const fn_at = std.mem.indexOf(u8, src, "pub fn HookPayload(") orelse return &.{};
     const union_marker = "union(enum) {";
@@ -444,7 +449,8 @@ fn parseHookPayloadVariants(aa: std.mem.Allocator, src: []const u8) ![]const Hoo
         // `foo: struct {`, which opens a nested scope on the same line and
         // would be missed by testing depth after counting.
         const depth_at_line_start = depth;
-        for (line) |c| {
+        const code = stripLineComment(line);
+        for (code) |c| {
             if (c == '{') depth += 1;
             if (c == '}') {
                 if (depth > 0) depth -= 1;
@@ -744,8 +750,47 @@ fn emittedTagAt(src: []const u8, start: usize) ?[]const u8 {
     return src[begin..i];
 }
 
+/// Skip whitespace AND `//` comments. A comment between `emit(` and the
+/// payload literal is legal Zig and used to stop the tag being read at all,
+/// so a real emit site went unreported (#724 review).
 fn skipWs(src: []const u8, start: usize) usize {
     var i = start;
-    while (i < src.len and (src[i] == ' ' or src[i] == '\t' or src[i] == '\n' or src[i] == '\r')) i += 1;
+    while (i < src.len) {
+        if (src[i] == ' ' or src[i] == '\t' or src[i] == '\n' or src[i] == '\r') {
+            i += 1;
+            continue;
+        }
+        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '/') {
+            i = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+            continue;
+        }
+        break;
+    }
     return i;
+}
+
+/// The line with any trailing `//` comment removed.
+///
+/// The variant scanner counts braces per line to track union depth, and a
+/// comment containing `{` or `}` skewed that count — corrupting which lines
+/// read as direct members. Quotes are respected so a `//` inside a string
+/// literal is not treated as a comment (#724 review).
+fn stripLineComment(line: []const u8) []const u8 {
+    var in_str = false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (c == '\\' and in_str) {
+            i += 1; // skip the escaped char
+            continue;
+        }
+        if (c == '"') {
+            in_str = !in_str;
+            continue;
+        }
+        if (!in_str and c == '/' and i + 1 < line.len and line[i + 1] == '/') {
+            return std.mem.trimEnd(u8, line[0..i], " \t");
+        }
+    }
+    return line;
 }
