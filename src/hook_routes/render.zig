@@ -167,6 +167,14 @@ fn writeEventSection(w: *std.Io.Writer, report: model.Report, filter: Filter) !v
         \\    `.plugin_events`, to keep one.
         \\
     );
+    try writeInertGroup(w, report, .force_kept,
+        "FORCE-KEPT — retained because the provider emits the tag",
+        \\    The providing plugin emits these with a raw union literal, so the variant
+        \\    survives whether or not anything consumes it — eliding one would break the
+        \\    provider's own compile (labelle-assembler#630). This says nothing about
+        \\    consumers; a force-kept event may well have listeners.
+        \\
+    );
     try writeInertGroup(w, report, null,
         "AVAILABLE — in the dispatcher, with no listener and no known emit site",
         \\    Subscribe by declaring `pub fn <tag>(self: *Hooks, ev: <Payload>) void`
@@ -210,7 +218,12 @@ fn writeInertGroup(
 
 fn inGroup(ev: model.Event, want_status: ?model.EventStatus) bool {
     if (want_status) |st| return ev.status == st;
-    return ev.status != .elided;
+    // The catch-all group must exclude BOTH classified statuses. Only
+    // excluding `.elided` swept force-kept rows into "AVAILABLE — no
+    // listener and no known emit site", which is true but drops the one
+    // thing worth knowing about them: they were retained deliberately
+    // because the provider emits the tag (#724 review).
+    return ev.status != .elided and ev.status != .force_kept;
 }
 
 fn eventPasses(ev: model.Event, filter: Filter) bool {
@@ -295,10 +308,37 @@ fn writeOneEvent(w: *std.Io.Writer, ev: model.Event) !void {
     try w.writeAll("\n");
 }
 
+/// The completeness caveats for the emit scan. Printed in BOTH the full and
+/// filtered views: they qualify the rows the reader is looking at, whichever
+/// view produced them.
+fn writeScanCaveats(w: *std.Io.Writer, report: model.Report) !void {
+    if (report.resolution.emit_sites_truncated) {
+        try w.writeAll(
+            "  · THE EMIT SCAN WAS TRUNCATED at its file cap. Emit sites are INCOMPLETE:\n" ++
+                "    \"no call site found\" may mean \"not looked for\".\n",
+        );
+    }
+    if (report.resolution.emit_sites_unreadable > 0) {
+        try w.print(
+            "  · {d} file(s) could not be read during the emit scan — each is a hole in\n" ++
+                "    the results, not evidence that nothing emits there.\n",
+            .{report.resolution.emit_sites_unreadable},
+        );
+    }
+}
+
 fn writeNotesSection(w: *std.Io.Writer, report: model.Report, filter: Filter) !void {
-    // A filtered view is a lens on one route, not a health report; the
-    // whole-project notes below would be misleading noise there.
-    if (filter.event != null or filter.receiver != null) return;
+    const filtered = filter.event != null or filter.receiver != null;
+
+    // SCAN CAVEATS ALWAYS PRINT, filtered or not. They are not
+    // whole-project noise — they describe how reliable the rows just shown
+    // are, and a filtered view reporting "emitted from: (none)" off a
+    // TRUNCATED scan is exactly the case where the caveat matters most
+    // (#724 review). Suppressing them was the reverse of the right call.
+    if (filtered) {
+        try writeScanCaveats(w, report);
+        return;
+    }
 
     if (report.unmatched_handlers.len > 0) {
         try w.writeAll("HANDLERS MATCHING NO EVENT\n");
@@ -328,20 +368,7 @@ fn writeNotesSection(w: *std.Io.Writer, report: model.Report, filter: Filter) !v
         "    a plugin's own sources, is not listed — \"no call site found\" is not \"never emitted\".\n", .{report.resolution.emit_sites_files_scanned});
     // The completeness flags were JSON-only, so the human form — the one a
     // person actually reads — still implied a full scan (#724 review).
-    if (report.resolution.emit_sites_truncated) {
-        try w.print(
-            "  · THE EMIT SCAN WAS TRUNCATED at its file cap. Emit sites are INCOMPLETE:\n" ++
-                "    \"no call site found\" below may mean \"not looked for\".\n",
-            .{},
-        );
-    }
-    if (report.resolution.emit_sites_unreadable > 0) {
-        try w.print(
-            "  · {d} file(s) could not be read during the emit scan — each is a hole in\n" ++
-                "    the results, not evidence that nothing emits there.\n",
-            .{report.resolution.emit_sites_unreadable},
-        );
-    }
+    try writeScanCaveats(w, report);
     try w.writeAll("  · listeners are read from `pub fn <tag>(self, payload)` declarations. The\n" ++
         "    compiler is the authority; this is what the source says.\n");
     if (!report.ordering.declared) {
