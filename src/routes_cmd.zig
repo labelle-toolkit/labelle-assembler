@@ -254,9 +254,22 @@ fn applyFilter(
     var out = report;
     out.events = try events.toOwnedSlice(arena);
     out.receivers = try receivers.toOwnedSlice(arena);
-    // A filtered document must not carry whole-project findings: an
-    // unmatched handler on some other receiver is not part of this route.
-    out.unmatched_handlers = &.{};
+    // A filtered document must not carry whole-project findings — but an
+    // unmatched handler ON A RETAINED RECEIVER is not a whole-project
+    // finding, it is the single most useful thing about that receiver.
+    // Dropping all of them meant `--receiver X` hid X's own "this handler
+    // matches no event" diagnostic, which is usually WHY someone filters
+    // to X (#724 review).
+    var unmatched: std.ArrayList(hook_routes.model.UnmatchedHandler) = .empty;
+    for (report.unmatched_handlers) |u| {
+        for (receivers.items) |r| {
+            if (std.mem.eql(u8, r.id, u.receiver)) {
+                try unmatched.append(arena, u);
+                break;
+            }
+        }
+    }
+    out.unmatched_handlers = try unmatched.toOwnedSlice(arena);
     return out;
 }
 

@@ -157,6 +157,16 @@ pub fn readSidecar(aa: std.mem.Allocator, labelle_dir: []const u8) !?Report {
         error.FileNotFound => return null,
         else => return err,
     };
+    // Check the discriminator BEFORE the full typed parse. A document from
+    // an incompatible writer otherwise fails as a parse error — the wrong
+    // diagnosis, since the file is well-formed JSON that this binary simply
+    // does not speak (#724 review).
+    const Peek = struct { schema: []const u8 = "" };
+    const peeked = std.json.parseFromSliceLeaky(Peek, aa, bytes, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.UnknownSchema;
+    if (!std.mem.eql(u8, peeked.schema, SCHEMA)) return error.UnknownSchema;
+
     return try parseReport(aa, bytes);
 }
 

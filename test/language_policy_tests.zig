@@ -195,6 +195,65 @@ pub const GENERATE_GATE = struct {
     }
 };
 
+pub const GENERATION_FRESHNESS = struct {
+    test "the production two-pass generate leaves a CURRENT route report (#724)" {
+        // The regression for the P1 the review caught. `main.zig` runs the
+        // executable generate and then `generateTestsTarget`; the sidecar is
+        // written only by the first, while the generation marker was being
+        // advanced by BOTH — so the ordinary CLI flow invalidated its own
+        // report and `routes` called a seconds-old file stale.
+        //
+        // Driving the real `generate` twice, exactly as production does, is
+        // the only shape that catches it: a marker-only unit test passes
+        // either way, because the bug is in which passes advance it.
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const out_abs = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(out_abs);
+
+        var cfg = generate.ProjectConfig{ .name = "freshness-game", .backend = .sokol, .ecs = .mock };
+        cfg.backend_package = h.sokol_fixture_package;
+
+        // A real two-pass generate needs the engine package in the local
+        // cache (it reads the engine's `main.zig.template`). Check that
+        // PRECONDITION explicitly and skip, rather than catching errors from
+        // `generate` — a blanket catch would swallow the very regressions
+        // this test exists to catch.
+        {
+            const pkgs = generate.cache_env.getPackagesDir(allocator) catch return error.SkipZigTest;
+            defer allocator.free(pkgs);
+            // The RESOLVED version, not just the parent: the parent exists
+            // on any machine that has ever generated, while the specific
+            // version this config pins may not.
+            const engine_pkgs = try std.fs.path.join(allocator, &.{ pkgs, "engine", cfg.engine_version });
+            defer allocator.free(engine_pkgs);
+            std.Io.Dir.cwd().access(io, engine_pkgs, .{}) catch return error.SkipZigTest;
+        }
+
+        // Pass 1 — the executable target. The only pass that writes the
+        // sidecar, and the only one that may advance the marker.
+        try generate.generate(allocator, cfg, out_abs, ".", .{ .is_tests_target = false });
+        // Pass 2 — the tests target, exactly as `main.zig` follows up.
+        try generate.generateTestsTarget(allocator, cfg, out_abs, ".");
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        // `generate`'s output_dir IS the `.labelle` dir from its caller's
+        // perspective; the sidecar and marker both live beside each other.
+        const marker = try generate.generation.read(aa, out_abs);
+        const report = try generate.hook_routes.readSidecar(aa, out_abs);
+        if (report == null) return error.SkipZigTest; // no sidecar in this fixture shape
+
+        try std.testing.expectEqual(
+            generate.generation.Freshness.current,
+            generate.generation.compare(report.?.generation, marker),
+        );
+    }
+};
+
 pub const CLEAN_PROJECT_BYTE_IDENTITY = struct {
     test "clean project (no .params.language, no language dirs): REAL generate output is byte-identical (#584)" {
         // The load-bearing no-behavior-change guard. `generateAndReadBuildZig`
