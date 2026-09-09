@@ -487,6 +487,49 @@ pub const HONESTY = struct {
         try std.testing.expectEqual(hook_routes.model.EventStatus.active, kept.status);
     }
 
+    test "consumable resolves ONLY a literal true/false; anything else is unresolved" {
+        // The regression this pins: `indexOf(src, "true")` matched `!true`,
+        // `untrue`, an alias, and the word "true" in a comment — reporting
+        // `consumable` with confidence while core's comptime check (which
+        // accepts a literal `true` and nothing else) disagreed.
+        const cases = [_]struct { src: []const u8, want: ?bool }{
+            .{ .src = "pub const E = struct { pub const consumable = true; };\n", .want = true },
+            .{ .src = "pub const E = struct { pub const consumable = false; };\n", .want = false },
+            // Negation — the case Codex reproduced. Core sees false.
+            .{ .src = "pub const E = struct { pub const consumable = !true; };\n", .want = null },
+            .{ .src = "pub const E = struct { pub const consumable = !false; };\n", .want = null },
+            // An alias the parser cannot follow.
+            .{ .src = "pub const E = struct { pub const consumable = other_flag; };\n", .want = null },
+            // A call expression.
+            .{ .src = "pub const E = struct { pub const consumable = isConsumable(); };\n", .want = null },
+            // A comptime conditional.
+            .{ .src = "pub const E = struct { pub const consumable = if (x) true else false; };\n", .want = null },
+            // Trailing comment containing the word — matched by the old
+            // substring test, must not now.
+            .{ .src = "pub const E = struct { pub const consumable = false; // not true\n };\n", .want = false },
+            // Absent decl entirely.
+            .{ .src = "pub const E = struct { a: u8 = 0 };\n", .want = null },
+        };
+        for (cases) |c| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const decls = try generator.pack_manifest.parse.parseStructFile(arena.allocator(), c.src);
+            try std.testing.expectEqual(@as(usize, 1), decls.len);
+            try std.testing.expectEqual(c.want, decls[0].consumable);
+        }
+    }
+
+    test "an unresolved consumable renders as UNKNOWN, not as a notification" {
+        // Saying "notification" for an expression we did not evaluate would
+        // be a confident wrong answer on exactly the path where a consumable
+        // event behaves unexpectedly.
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const decls = try generator.pack_manifest.parse.parseStructFile(arena.allocator(),
+            "pub const E = struct { pub const consumable = !true; };\n");
+        try std.testing.expectEqual(@as(?bool, null), decls[0].consumable);
+    }
+
     test "consumable is read from the payload, and drives the order-matters claim" {
         const allocator = std.testing.allocator;
         var tmp = std.testing.tmpDir(.{});
@@ -500,8 +543,10 @@ pub const HONESTY = struct {
         const arena = arena_state.allocator();
         const report = try buildIn(arena, dir, baseCfg(&.{}));
 
-        try std.testing.expect(report.eventByTag("urgent").?.consumable);
-        try std.testing.expect(!report.eventByTag("pulse").?.consumable);
+        try std.testing.expectEqual(@as(?bool, true), report.eventByTag("urgent").?.consumable);
+        // No `consumable` decl at all — absent, therefore unresolved rather
+        // than a confident `false` (#726 review).
+        try std.testing.expectEqual(@as(?bool, null), report.eventByTag("pulse").?.consumable);
 
         var aw: std.Io.Writer.Allocating = .init(arena);
         try hook_routes.writeText(&aw.writer, report, .{ .event = "urgent" });

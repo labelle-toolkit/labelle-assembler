@@ -265,7 +265,10 @@ pub const Event = struct {
     /// true`. On a consumable event `MergeHooks.emit` STOPS at the first
     /// listener returning `true`, so order decides whether a later
     /// listener runs at all — not merely when.
-    consumable: bool = false,
+    /// null = the parser could not evaluate the `consumable` decl's
+    /// initialiser (or there was none). Consumers must treat null as
+    /// UNKNOWN, not as false (#726 review).
+    consumable: ?bool = null,
     status: EventStatus = .active,
     /// Receivers declaring a handler for this tag, in dispatch order.
     listeners: []const Listener = &.{},

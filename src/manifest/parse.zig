@@ -40,7 +40,11 @@ pub const StructDecl = struct {
     /// ORDER decides merely *when* a listener runs or *whether* it runs at
     /// all. Parsed here rather than in a second walker so there stays one
     /// AST pass over `events/*.zig`.
-    consumable: bool = false,
+    /// `true`/`false` from a literal `pub const consumable` decl; **null**
+    /// when the decl is absent OR its initialiser is an expression this
+    /// parser does not evaluate. Null means UNRESOLVED — never assume
+    /// `false` from it (#726 review).
+    consumable: ?bool = null,
     fields: []const Field,
 };
 
@@ -111,7 +115,7 @@ pub fn parseStructDir(
 /// A `StructDecl` carrying only the registry name — the graceful-degradation
 /// stand-in for a component/event file the AST pass couldn't read or match.
 fn nameOnlyDecl(aa: std.mem.Allocator, name: []const u8) !StructDecl {
-    return .{ .name = try aa.dupe(u8, name), .save = null, .visibility = null, .consumable = false, .fields = &.{} };
+    return .{ .name = try aa.dupe(u8, name), .save = null, .visibility = null, .consumable = null, .fields = &.{} };
 }
 
 /// AST-walk one source buffer for top-level `pub const <Name> = struct
@@ -136,7 +140,7 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
         var fields: std.ArrayList(Field) = .empty;
         var save: ?[]const u8 = null;
         var visibility: ?[]const u8 = null;
-        var consumable = false;
+        var consumable: ?bool = null;
         for (container.ast.members) |m| {
             if (ast.fullContainerField(m)) |fd| {
                 const fname = ast.tokenSlice(fd.ast.main_token);
@@ -157,16 +161,31 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
                 const mname = ast.tokenSlice(member_vd.ast.mut_token + 1);
                 if (save == null and std.mem.eql(u8, mname, "save")) {
                     save = try extractSavePolicy(aa, ast.getNodeSource(m));
-                } else if (!consumable and std.mem.eql(u8, mname, "consumable")) {
+                } else if (consumable == null and std.mem.eql(u8, mname, "consumable")) {
                     // `pub const consumable = true;` (RFC-PLUGIN-EVENTS O4).
-                    // A literal `true` is the only shape the dispatcher's
-                    // comptime check accepts as opt-in, so a literal match
-                    // on the decl source is exactly as precise as the
-                    // runtime rule — and a `false` decl correctly stays on
-                    // the notification path.
-                    const src_txt = ast.getNodeSource(m);
-                    if (std.mem.indexOf(u8, src_txt, "=") != null and
-                        std.mem.indexOf(u8, src_txt, "true") != null) consumable = true;
+                    //
+                    // Match the INITIALISER EXACTLY, not a substring of the
+                    // decl. An earlier version tested
+                    // `indexOf(src, "true") != null` and claimed to be "as
+                    // precise as the runtime rule"; it is not. `!true`,
+                    // `untrue`, an aliased `const t = true;`, or the word
+                    // "true" in a trailing comment all matched, and the
+                    // report then stated `consumable` with confidence while
+                    // core's comptime check disagreed (#726 review).
+                    //
+                    // The dispatcher accepts a literal `true` and nothing
+                    // else, so that is what is recognised here. Anything the
+                    // parser cannot evaluate stays NULL — unresolved is
+                    // reported as unknown, which is honest; guessing `false`
+                    // would be a confident wrong answer on the exact path
+                    // where a consumable event silently behaves as a
+                    // notification.
+                    consumable = if (member_vd.ast.init_node.unwrap()) |init_idx| blk: {
+                        const init_txt = std.mem.trim(u8, ast.getNodeSource(init_idx), " \t\r\n");
+                        if (std.mem.eql(u8, init_txt, "true")) break :blk true;
+                        if (std.mem.eql(u8, init_txt, "false")) break :blk false;
+                        break :blk null; // unsupported expression — unresolved
+                    } else null;
                 } else if (visibility == null and std.mem.eql(u8, mname, "visibility")) {
                     // Handles both `pub const visibility = .pack;` and the
                     // typed `pub const visibility: Visibility = .pack;` — the

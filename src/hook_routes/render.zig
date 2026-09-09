@@ -238,11 +238,18 @@ fn writeOneEvent(w: *std.Io.Writer, ev: model.Event) !void {
     if (ev.status != .active) {
         try w.print("    status: {s}\n", .{@tagName(ev.status)});
     }
+    // Three states, not two. `null` means the `consumable` decl's
+    // initialiser was not something the parser evaluates — saying
+    // "notification" there would be a confident wrong answer on exactly
+    // the path where a consumable event behaves unexpectedly (#726 review).
     try w.print("    delivery semantics: {s}\n", .{
-        if (ev.consumable)
-            "CONSUMABLE — the first listener returning `true` stops the walk, so order decides WHETHER a later listener runs"
+        if (ev.consumable) |c|
+            (if (c)
+                "CONSUMABLE — the first listener returning `true` stops the walk, so order decides WHETHER a later listener runs"
+            else
+                "notification — every listener runs, so order decides only WHEN")
         else
-            "notification — every listener runs, so order decides only WHEN",
+            "UNKNOWN — a `consumable` decl is present but its initialiser is not a literal `true`/`false`, so this report cannot say. Check the event's source",
     });
 
     if (ev.payload.resolved) {

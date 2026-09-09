@@ -256,7 +256,7 @@ fn collectGameEvents(aa: std.mem.Allocator, in: Inputs, out: *std.ArrayList(mode
             .owner_name = "game",
             .source = try std.fmt.allocPrint(aa, "events/{s}.zig", .{name}),
             .payload = try payloadOf(aa, decl, try aa.dupe(u8, pascal)),
-            .consumable = if (decl) |d| d.consumable else false,
+            .consumable = if (decl) |d| d.consumable else null,
         });
     }
 }
@@ -285,7 +285,7 @@ fn collectPackEvents(aa: std.mem.Allocator, in: Inputs, out: *std.ArrayList(mode
                 .owner_name = try aa.dupe(u8, pack.name),
                 .source = try std.fmt.allocPrint(aa, "{s}/events/{s}.zig", .{ pack.import_prefix, name }),
                 .payload = try payloadOf(aa, decl, try aa.dupe(u8, pascal)),
-                .consumable = if (decl) |d| d.consumable else false,
+                .consumable = if (decl) |d| d.consumable else null,
             });
         }
     }
