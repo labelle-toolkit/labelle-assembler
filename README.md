@@ -35,6 +35,7 @@ The binary is written to `zig-out/bin/labelle-assembler`.
 ./zig-out/bin/labelle-assembler --help
 ./zig-out/bin/labelle-assembler --protocol-version
 ./zig-out/bin/labelle-assembler generate --project-root /path/to/game
+./zig-out/bin/labelle-assembler routes --project-root /path/to/game
 ```
 
 ### Generate options
@@ -55,6 +56,31 @@ integration / determinism tests that don't exercise rendering — see
 `examples/plugin-controllers/` for a worked example. The null backend is
 extracted out-of-tree (the labelle-null package); `.backend = .null`
 resolves to it automatically.
+
+### Inspect hook event routes
+
+```bash
+./zig-out/bin/labelle-assembler routes --project-root /path/to/game
+./zig-out/bin/labelle-assembler routes --project-root /path/to/game --event pulse
+./zig-out/bin/labelle-assembler routes --project-root /path/to/game --json | jq .
+```
+
+Answers "which listeners does event X reach, in what order, and can one of
+them consume it" without reading the generated `MergeHooks` tuple. Reports
+the receiver dispatch order (with each receiver's rank and why it sits
+where it does), every event with its final generated tag, payload schema,
+consumable semantics, listeners and emission call sites — plus, explicitly,
+what it could not resolve.
+
+`generate` writes the report to `<game>/.labelle/hook_routes.json` from the
+same data that emits the receiver tuple, so the reported order **is** the
+dispatch order rather than a second derivation of it. `routes` reads that
+file: no package cache, no backend, no renderer. Run `generate` first.
+
+`--json` emits the `labelle.hook-routes/v1` schema — deterministic,
+documented, and keyed on the same handler identity
+(`docs/design/hook-handler-ordering.md` §2.2) that runtime tracing uses.
+See `docs/design/hook-route-inspection.md`.
 
 ### Run tests
 

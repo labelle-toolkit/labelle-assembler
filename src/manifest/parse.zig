@@ -31,6 +31,33 @@ pub const StructDecl = struct {
     /// engine default (`pack`) in the writer, not here — the parser reports
     /// only what the source declared (labelle-engine `scene/src/component.zig`).
     visibility: ?[]const u8,
+    /// True when the struct declares `pub const consumable = true;` — the
+    /// marker labelle-core's `dispatcher.zig:isConsumable` reads to pick
+    /// the return-aware dispatch path, where `MergeHooks.emit` stops at
+    /// the first handler returning `true`. Only meaningful on events;
+    /// always false for components. Surfaced for the hook-route inspector
+    /// (labelle-assembler#724), which must tell an author whether receiver
+    /// ORDER decides merely *when* a listener runs or *whether* it runs at
+    /// all. Parsed here rather than in a second walker so there stays one
+    /// AST pass over `events/*.zig`.
+    /// Three states, matching what can actually be known from source:
+    ///   * `false` — the struct parsed and declares NO `consumable`. This is
+    ///     DEFINITE, not a guess: core's `isConsumable` returns false on
+    ///     `!@hasDecl` (`dispatcher.zig`), so absence IS the notification
+    ///     path.
+    ///   * `true` / `false` — a literal initialiser of that value.
+    ///   * `null` — UNKNOWN. A `consumable` decl is present but its
+    ///     initialiser is not a literal this parser evaluates, or the decl
+    ///     could not be read at all (name-only degradation).
+    /// Do not collapse null to false: null is "ask the source", absence is
+    /// an answer (#726 review, rev 2).
+    consumable: ?bool = false,
+    /// False when this decl is the NAME-ONLY degradation — the AST pass
+    /// could not read or match the file, so `fields` is empty because
+    /// nothing was parsed, NOT because the struct has no fields. Consumers
+    /// must not present an empty `fields` from such a decl as resolved
+    /// (#724 review).
+    parsed: bool = true,
     fields: []const Field,
 };
 
@@ -101,7 +128,7 @@ pub fn parseStructDir(
 /// A `StructDecl` carrying only the registry name — the graceful-degradation
 /// stand-in for a component/event file the AST pass couldn't read or match.
 fn nameOnlyDecl(aa: std.mem.Allocator, name: []const u8) !StructDecl {
-    return .{ .name = try aa.dupe(u8, name), .save = null, .visibility = null, .fields = &.{} };
+    return .{ .name = try aa.dupe(u8, name), .save = null, .visibility = null, .consumable = null, .fields = &.{}, .parsed = false };
 }
 
 /// AST-walk one source buffer for top-level `pub const <Name> = struct
@@ -126,6 +153,9 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
         var fields: std.ArrayList(Field) = .empty;
         var save: ?[]const u8 = null;
         var visibility: ?[]const u8 = null;
+        // Absent decl == notification path, per core. Only a decl we cannot
+        // evaluate downgrades this to null.
+        var consumable: ?bool = false;
         for (container.ast.members) |m| {
             if (ast.fullContainerField(m)) |fd| {
                 const fname = ast.tokenSlice(fd.ast.main_token);
@@ -146,6 +176,42 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
                 const mname = ast.tokenSlice(member_vd.ast.mut_token + 1);
                 if (save == null and std.mem.eql(u8, mname, "save")) {
                     save = try extractSavePolicy(aa, ast.getNodeSource(m));
+                } else if (std.mem.eql(u8, mname, "consumable")) {
+                    // MUST be `pub`. A private `const consumable = true;`
+                    // is not visible to `@hasDecl` from another module, so
+                    // core's `isConsumable` returns FALSE for it — reporting
+                    // it consumable would contradict the dispatcher. Verified
+                    // with a two-module probe (#724 review).
+                    if (member_vd.visib_token == null) {
+                        consumable = false;
+                        continue;
+                    }
+                    // `pub const consumable = true;` (RFC-PLUGIN-EVENTS O4).
+                    //
+                    // Match the INITIALISER EXACTLY, not a substring of the
+                    // decl. An earlier version tested
+                    // `indexOf(src, "true") != null` and claimed to be "as
+                    // precise as the runtime rule"; it is not. `!true`,
+                    // `untrue`, an aliased `const t = true;`, or the word
+                    // "true" in a trailing comment all matched, and the
+                    // report then stated `consumable` with confidence while
+                    // core's comptime check disagreed (#726 review).
+                    //
+                    // NOTE, corrected (#726 review rev 2): core does NOT
+                    // accept "a literal `true` and nothing else". It
+                    // EVALUATES the decl — `@field(T, "consumable") == true`
+                    // — so `!false`, an alias, or any comptime expression
+                    // yielding true IS consumable at runtime. This parser
+                    // reads source, not comptime, so it cannot follow those.
+                    // Reporting them as UNKNOWN is honest; reporting them as
+                    // `false` would be a confident wrong answer about an
+                    // event that really does consume.
+                    consumable = if (member_vd.ast.init_node.unwrap()) |init_idx| blk: {
+                        const init_txt = std.mem.trim(u8, ast.getNodeSource(init_idx), " \t\r\n");
+                        if (std.mem.eql(u8, init_txt, "true")) break :blk true;
+                        if (std.mem.eql(u8, init_txt, "false")) break :blk false;
+                        break :blk null; // unsupported expression — unresolved
+                    } else null;
                 } else if (visibility == null and std.mem.eql(u8, mname, "visibility")) {
                     // Handles both `pub const visibility = .pack;` and the
                     // typed `pub const visibility: Visibility = .pack;` — the
@@ -159,6 +225,7 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
             .name = try aa.dupe(u8, name),
             .save = save,
             .visibility = visibility,
+            .consumable = consumable,
             .fields = try fields.toOwnedSlice(aa),
         });
     }

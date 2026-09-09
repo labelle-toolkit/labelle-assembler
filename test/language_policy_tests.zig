@@ -195,6 +195,81 @@ pub const GENERATE_GATE = struct {
     }
 };
 
+pub const GENERATION_FRESHNESS = struct {
+    test "the production two-pass generate leaves a CURRENT route report (#724)" {
+        // The regression for the P1 the review caught. `main.zig` runs the
+        // executable generate and then `generateTestsTarget`; the sidecar is
+        // written only by the first, while the marker was being advanced by
+        // BOTH — so the ordinary CLI flow invalidated its own report.
+        //
+        // Driving the real `generate` twice is the only shape that catches
+        // it: a marker-only unit test passes either way, because the bug is
+        // in WHICH passes advance it.
+        //
+        // Fully isolated in a staged temp project. An earlier revision used
+        // `game_dir = "."`, which wrote a real `.labelle/` into the
+        // repository checkout — an artifact that may belong to another
+        // operation and must not be created, gitignored or deleted by a test.
+        const allocator = std.testing.allocator;
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
+
+        // HERMETIC, and it has to be. Unlike every other test in this file
+        // this one drives the EXECUTABLE target (`is_tests_target = false`),
+        // which emits `main.zig` from the engine's
+        // `codegen/main.zig.template`. Left unpinned, `engine_version`
+        // resolves to the default pin and the template is read out of
+        // `~/.labelle/packages/engine/<version>/` — present on my machine,
+        // absent on a clean runner, which is exactly how this passed
+        // locally and failed CI with `EngineTemplateNotFound` (#726 review).
+        //
+        // Staging the in-tree fixture template as a `local:` engine package
+        // removes the machine dependency without weakening anything: the
+        // two passes, the non-null sidecar assertion and the freshness
+        // comparison below are unchanged, and the test still fails (rather
+        // than skips) if generation cannot complete.
+        var game = try staged.game();
+        defer game.close(io);
+        try writeFileIn(game, "engine-fixture/codegen/main.zig.template", h.engine_template);
+
+        const backend = try sokolFixtureAbs(allocator);
+        defer allocator.free(backend.repo);
+        var cfg = generate.ProjectConfig{
+            .y_axis = .up,
+            .name = "freshness-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .engine_version = "local:engine-fixture",
+        };
+        cfg.backend_package = backend;
+
+        // Pass 1 — the executable target: writes the sidecar, and the only
+        // pass permitted to advance the marker.
+        try generate.generate(allocator, cfg, staged.out_abs, staged.game_abs, .{ .is_tests_target = false });
+        // Pass 2 — the tests target, exactly as `main.zig` follows up.
+        try generate.generateTestsTarget(allocator, cfg, staged.out_abs, staged.game_abs);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        // Both artifacts live under `<game_dir>/.labelle`, NOT the output
+        // dir. Reading the output dir is what made an earlier revision skip
+        // silently and pass with the bug present.
+        const labelle_dir = try std.fs.path.join(aa, &.{ staged.game_abs, ".labelle" });
+        const marker = try generate.generation.read(aa, labelle_dir);
+        const report = try generate.hook_routes.readSidecar(aa, labelle_dir);
+
+        // ASSERT, never skip: a missing sidecar here is a failure, not a
+        // reason to go quiet.
+        try std.testing.expect(report != null);
+        try std.testing.expectEqual(
+            generate.generation.Freshness.current,
+            generate.generation.compare(report.?.generation, marker),
+        );
+    }
+};
+
 pub const CLEAN_PROJECT_BYTE_IDENTITY = struct {
     test "clean project (no .params.language, no language dirs): REAL generate output is byte-identical (#584)" {
         // The load-bearing no-behavior-change guard. `generateAndReadBuildZig`

@@ -23,6 +23,7 @@ const cache_cmd = @import("cache_cmd.zig");
 const init_cmd = @import("init_cmd.zig");
 const check_cmd = @import("check_cmd.zig");
 const add_cmd = @import("add_cmd.zig");
+const routes_cmd = @import("routes_cmd.zig");
 
 /// Wire protocol version for CLI ↔ assembler subprocess communication.
 /// Bump when the command surface or output format changes in a way the
@@ -44,7 +45,14 @@ const add_cmd = @import("add_cmd.zig");
 /// v4 (Packs #271): added the `add` subcommand (`add pack <name>` /
 /// `add feature <kind> <name>`). The CLI delegates pack/feature-unit
 /// scaffolding to the binary.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// v6 (labelle-assembler#724): added the `routes` subcommand — the hook
+/// event-route inspector, human-readable and `labelle.hook-routes/v1`
+/// JSON. Additive: it reads the `.labelle/hook_routes.json` sidecar that
+/// the same bump makes `generate` write, so an older CLI driving a newer
+/// binary is unaffected and a newer CLI can probe for the subcommand by
+/// requiring protocol >= 6.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 const usage =
     \\labelle-assembler — code generator for the labelle game toolkit
@@ -60,6 +68,7 @@ const usage =
     \\  labelle-assembler check --project-root <path>
     \\  labelle-assembler add pack <name>
     \\  labelle-assembler add feature <kind> <name>
+    \\  labelle-assembler routes --project-root <path> [--json] [--event <tag>] [--receiver <id>]
     \\
     \\Subcommands:
     \\  generate    Materialize .labelle/<target>/ from project.labelle
@@ -69,6 +78,8 @@ const usage =
     \\  init        Scaffold a new project directory
     \\  check       Lint packs for §6 convention violations (Packs RFC)
     \\  add         Scaffold a pack or a feature-unit (need/role/status)
+    \\  routes      Inspect generated hook event routes (reads the sidecar
+    \\              `generate` writes; run `generate` first)
     \\
     \\Generate options:
     \\  --project-root <path>   Path to game project (containing project.labelle)
@@ -149,6 +160,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, first, "add")) {
         try add_cmd.cmdAdd(allocator, io, &args);
+        return;
+    }
+
+    if (std.mem.eql(u8, first, "routes")) {
+        try routes_cmd.cmdRoutes(allocator, io, &args);
         return;
     }
 
@@ -329,4 +345,5 @@ test {
     std.testing.refAllDecls(@import("cache_cmd.zig"));
     std.testing.refAllDecls(@import("check_cmd.zig"));
     std.testing.refAllDecls(@import("add_cmd.zig"));
+    std.testing.refAllDecls(@import("routes_cmd.zig"));
 }
