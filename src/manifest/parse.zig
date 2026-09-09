@@ -31,6 +31,16 @@ pub const StructDecl = struct {
     /// engine default (`pack`) in the writer, not here — the parser reports
     /// only what the source declared (labelle-engine `scene/src/component.zig`).
     visibility: ?[]const u8,
+    /// True when the struct declares `pub const consumable = true;` — the
+    /// marker labelle-core's `dispatcher.zig:isConsumable` reads to pick
+    /// the return-aware dispatch path, where `MergeHooks.emit` stops at
+    /// the first handler returning `true`. Only meaningful on events;
+    /// always false for components. Surfaced for the hook-route inspector
+    /// (labelle-assembler#724), which must tell an author whether receiver
+    /// ORDER decides merely *when* a listener runs or *whether* it runs at
+    /// all. Parsed here rather than in a second walker so there stays one
+    /// AST pass over `events/*.zig`.
+    consumable: bool = false,
     fields: []const Field,
 };
 
@@ -101,7 +111,7 @@ pub fn parseStructDir(
 /// A `StructDecl` carrying only the registry name — the graceful-degradation
 /// stand-in for a component/event file the AST pass couldn't read or match.
 fn nameOnlyDecl(aa: std.mem.Allocator, name: []const u8) !StructDecl {
-    return .{ .name = try aa.dupe(u8, name), .save = null, .visibility = null, .fields = &.{} };
+    return .{ .name = try aa.dupe(u8, name), .save = null, .visibility = null, .consumable = false, .fields = &.{} };
 }
 
 /// AST-walk one source buffer for top-level `pub const <Name> = struct
@@ -126,6 +136,7 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
         var fields: std.ArrayList(Field) = .empty;
         var save: ?[]const u8 = null;
         var visibility: ?[]const u8 = null;
+        var consumable = false;
         for (container.ast.members) |m| {
             if (ast.fullContainerField(m)) |fd| {
                 const fname = ast.tokenSlice(fd.ast.main_token);
@@ -146,6 +157,16 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
                 const mname = ast.tokenSlice(member_vd.ast.mut_token + 1);
                 if (save == null and std.mem.eql(u8, mname, "save")) {
                     save = try extractSavePolicy(aa, ast.getNodeSource(m));
+                } else if (!consumable and std.mem.eql(u8, mname, "consumable")) {
+                    // `pub const consumable = true;` (RFC-PLUGIN-EVENTS O4).
+                    // A literal `true` is the only shape the dispatcher's
+                    // comptime check accepts as opt-in, so a literal match
+                    // on the decl source is exactly as precise as the
+                    // runtime rule — and a `false` decl correctly stays on
+                    // the notification path.
+                    const src_txt = ast.getNodeSource(m);
+                    if (std.mem.indexOf(u8, src_txt, "=") != null and
+                        std.mem.indexOf(u8, src_txt, "true") != null) consumable = true;
                 } else if (visibility == null and std.mem.eql(u8, mname, "visibility")) {
                     // Handles both `pub const visibility = .pack;` and the
                     // typed `pub const visibility: Visibility = .pack;` — the
@@ -159,6 +180,7 @@ pub fn parseStructFile(aa: std.mem.Allocator, src: []const u8) ![]const StructDe
             .name = try aa.dupe(u8, name),
             .save = save,
             .visibility = visibility,
+            .consumable = consumable,
             .fields = try fields.toOwnedSlice(aa),
         });
     }

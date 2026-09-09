@@ -95,6 +95,10 @@ test {
     _ = @import("ico.zig");
     _ = @import("flow_catalog.zig");
     _ = @import("manifest.zig");
+    // Hook-route inspection (#724) — the barrel's `refAllDecls` pulls in
+    // model/build/render, none of which is reached by a compiled function
+    // path until `generate` runs.
+    _ = @import("hook_routes.zig");
     _ = @import("codegen/idents.zig");
     _ = @import("codegen/validate.zig");
     _ = @import("codegen/manifest_splice.zig");
@@ -166,6 +170,14 @@ pub const buildReceiverPlan = hooks_block.buildReceiverPlan;
 /// `.hooks` (#723).
 pub const HooksConfig = config.HooksConfig;
 pub const HookOrderEntry = config.HookOrderEntry;
+/// Static hook-route inspection (labelle-assembler#724,
+/// `docs/design/hook-route-inspection.md`). Consumes `buildReceiverPlan`
+/// above rather than re-deriving order, so the reported sequence and the
+/// emitted `MergeHooks` tuple are the same function of the same inputs.
+/// `generate` writes `<game>/.labelle/hook_routes.json`; the `routes`
+/// subcommand renders it.
+pub const hook_routes = @import("hook_routes.zig");
+pub const HookRouteReport = hook_routes.Report;
 pub const generateBuildZig = build_files.generateBuildZig;
 pub const windows_icon_resource_block = build_files.windows_icon_resource_block;
 /// The gated window-icon statement the desktop loop setup emits (labelle-cli#359).
@@ -2546,6 +2558,52 @@ pub fn generate(
         );
         defer allocator.free(main_zig_content);
         try scanner.writeFile(target_dir, "main.zig", main_zig_content);
+
+        // Hook-route sidecar (labelle-assembler#724, child of the hooks
+        // epic labelle-engine#854). `<game>/.labelle/hook_routes.json`:
+        // the resolved receiver order, the event universe with its
+        // listeners, and the emission call sites — the answer to "which
+        // listeners does event X reach, in what order, and can one of
+        // them consume it", which today costs a read of the generated
+        // `MergeHooks` tuple.
+        //
+        // Emitted HERE, after main.zig, on purpose. It is built from the
+        // SAME `buildReceiverPlan` inputs the emitter just used
+        // (`hook_names` / `pack_scans` / `merged_entries` / `cfg`), so
+        // the reported order is the emitted order by construction rather
+        // than by two derivations agreeing. Running after the emission
+        // also means a bad `.hooks.order` has already failed the
+        // generate with ONE diagnostic, instead of the sidecar printing
+        // a duplicate of it first.
+        //
+        // Additive and best-effort, exactly like the manifest and flow
+        // catalog above: a missing inspection artifact must never fail a
+        // build that would otherwise succeed.
+        const routes_engine_dir = cache.resolveFrameworkPackage(
+            allocator,
+            "engine",
+            cfg.engine_version,
+            game_dir,
+        ) catch null;
+        defer if (routes_engine_dir) |d| allocator.free(d);
+        hook_routes.emitSidecar(allocator, labelle_dir, .{
+            .cfg = cfg,
+            .game_dir = game_dir,
+            .target_dir = target_dir,
+            .hook_names = hook_names,
+            .pack_scans = pack_scans.items,
+            .script_entries = merged_entries,
+            .event_names = event_names,
+            .declared_events = if (maybe_scripting) |s| s.declared_events else &.{},
+            // The CONSUMED subset plus the two annotated remainders, so
+            // "elided" and "no listener" stay distinguishable (#630).
+            .plugin_events = event_consumption.kept,
+            .plugin_events_elided = event_consumption.elided,
+            .plugin_events_force_kept = force_kept_ungated.items,
+            .engine_dir = routes_engine_dir,
+        }) catch |err| {
+            std.log.warn("labelle-assembler: hook-routes sidecar emission failed: {s}", .{@errorName(err)});
+        };
     }
 
     // Emit `__tests_root.zig` — a `test { _ = @import("tests/<stem>.zig"); }`
