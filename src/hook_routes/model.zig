@@ -154,6 +154,19 @@ pub const Emitter = struct {
     /// Target-relative path of the file holding the call.
     site: []const u8,
     delivery: Delivery,
+    /// Source text of the receiver the call was made on — the `g` in
+    /// `g.emit(...)`. Empty when the call had no receiver (a bare
+    /// `emit(...)`).
+    receiver_expr: []const u8 = "",
+    /// Whether the receiver was PROVEN to be the game's event bus.
+    ///
+    /// Always false today, and the field exists to say so rather than let
+    /// silence imply otherwise. The scan reads source, not types, so
+    /// `self.bus.emit(.{ .tag = … })` on some unrelated object is
+    /// indistinguishable from `game.emit(...)`. Reporting such a site as a
+    /// proven route would be the same class of confident-wrong answer as
+    /// guessing `consumable = false` (#724 review).
+    receiver_resolved: bool = false,
 };
 
 /// One hook receiver, in dispatch order.

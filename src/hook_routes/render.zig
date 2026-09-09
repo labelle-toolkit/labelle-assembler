@@ -276,7 +276,20 @@ fn writeOneEvent(w: *std.Io.Writer, ev: model.Event) !void {
         try w.writeAll("    emitted from: no literal call site found (a computed or plugin-internal emit is invisible to this scan)\n");
     } else {
         try w.writeAll("    emitted from:\n");
-        for (ev.emitters) |e| try w.print("      {s}  [{s}]\n", .{ e.site, @tagName(e.delivery) });
+        for (ev.emitters) |e| {
+            // Name the receiver and say it was not resolved. The scan reads
+            // SOURCE, so `self.bus.emit(...)` on an unrelated object looks
+            // exactly like `game.emit(...)`; presenting either as a proven
+            // route would be a confident wrong answer (#724 review).
+            if (e.receiver_resolved or e.receiver_expr.len == 0) {
+                try w.print("      {s}  [{s}]\n", .{ e.site, @tagName(e.delivery) });
+            } else {
+                try w.print(
+                    "      {s}  [{s}]  candidate — receiver `{s}` not resolved to the game bus\n",
+                    .{ e.site, @tagName(e.delivery), e.receiver_expr },
+                );
+            }
+        }
     }
     for (ev.notes) |n| try w.print("    note: {s}\n", .{n});
     try w.writeAll("\n");

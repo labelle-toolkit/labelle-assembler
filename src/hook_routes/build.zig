@@ -316,6 +316,12 @@ fn collectDeclaredEvents(aa: std.mem.Allocator, in: Inputs, out: *std.ArrayList(
                 .fields = fields,
                 .resolved = true,
             },
+            // DEFINITELY false, not unknown. The assembler generates this
+            // payload struct itself and never emits a `consumable` decl into
+            // it, so core's `!@hasDecl` path applies — leaving it null would
+            // report "cannot tell" about a struct whose source we wrote
+            // (#724 review).
+            .consumable = false,
         });
     }
 }
@@ -694,11 +700,28 @@ fn scanOneFileForEmits(
     // unnecessary: `reemit` is its own token.
     var tok = std.zig.Tokenizer.init(src);
     var prev_ident: ?[]const u8 = null;
+    // The identifier before the `.` — the receiver the call is made on.
+    // Recorded so the report can name it instead of implying the call was
+    // proven to reach the game bus (#724 review).
+    var receiver_ident: []const u8 = "";
+    var saw_dot = false;
     while (true) {
         const t_tok = tok.next();
         if (t_tok.tag == .eof) break;
         if (t_tok.tag == .identifier) {
+            if (saw_dot) {
+                // `a.b` — `a` was the receiver, keep it.
+            } else {
+                receiver_ident = "";
+            }
             prev_ident = src[t_tok.loc.start..t_tok.loc.end];
+            saw_dot = false;
+            continue;
+        }
+        if (t_tok.tag == .period) {
+            if (prev_ident) |p| receiver_ident = p;
+            saw_dot = true;
+            prev_ident = null;
             continue;
         }
         const ident = prev_ident orelse continue;
@@ -722,7 +745,13 @@ fn scanOneFileForEmits(
                 for (lists[i].items) |e| {
                     if (e.delivery == delivery and std.mem.eql(u8, e.site, rel_path)) dup = true;
                 }
-                if (!dup) try lists[i].append(aa, .{ .site = rel_path, .delivery = delivery });
+                if (!dup) try lists[i].append(aa, .{
+                    .site = rel_path,
+                    .delivery = delivery,
+                    .receiver_expr = try aa.dupe(u8, receiver_ident),
+                    // Never proven — see `Emitter.receiver_resolved`.
+                    .receiver_resolved = false,
+                });
             }
         }
     }

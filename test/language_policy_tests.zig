@@ -212,7 +212,7 @@ pub const GENERATION_FRESHNESS = struct {
         const out_abs = try tmp.dir.realPathFileAlloc(io, ".", allocator);
         defer allocator.free(out_abs);
 
-        var cfg = generate.ProjectConfig{ .name = "freshness-game", .backend = .sokol, .ecs = .mock };
+        var cfg = generate.ProjectConfig{ .y_axis = .up, .name = "freshness-game", .backend = .sokol, .ecs = .mock };
         cfg.backend_package = h.sokol_fixture_package;
 
         // A real two-pass generate needs the engine package in the local
@@ -241,11 +241,14 @@ pub const GENERATION_FRESHNESS = struct {
         defer arena.deinit();
         const aa = arena.allocator();
 
-        // `generate`'s output_dir IS the `.labelle` dir from its caller's
-        // perspective; the sidecar and marker both live beside each other.
-        const marker = try generate.generation.read(aa, out_abs);
-        const report = try generate.hook_routes.readSidecar(aa, out_abs);
-        if (report == null) return error.SkipZigTest; // no sidecar in this fixture shape
+        // BOTH artifacts live under `<game_dir>/.labelle`, NOT under the
+        // output dir — an earlier revision of this test read `out_abs` and
+        // therefore found no sidecar and skipped, which is why it passed
+        // with the P1 restored. Read where they are actually written.
+        const labelle_dir = try std.fs.path.join(aa, &.{ ".", ".labelle" });
+        const marker = try generate.generation.read(aa, labelle_dir);
+        const report = try generate.hook_routes.readSidecar(aa, labelle_dir);
+        try std.testing.expect(report != null);
 
         try std.testing.expectEqual(
             generate.generation.Freshness.current,
