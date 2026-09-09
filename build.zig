@@ -341,6 +341,14 @@ pub fn build(b: *std.Build) void {
         // src/**/*.zig — the acceptance that a language plugin is addable
         // with zero assembler changes.
         "test/quokka_litmus_tests.zig",
+        // The HOOK ORDERING CONTRACT (labelle-assembler#723,
+        // docs/design/hook-handler-ordering.md): the default sequence is
+        // preserved (including a byte-identical proof that a rank-0
+        // declaration is a no-op), `.hooks.order` ranks cross the
+        // root/pack/flow group boundary, undeclared receivers keep their
+        // relative order, the type tuple and the instance tuple stay
+        // index-aligned, and a bad declaration is a hard error.
+        "test/hook_ordering_tests.zig",
         // i18n sentinel contract (flying-platform#786 friction #3): the
         // generated module is COMPILED AND RUN (`zig test` via the #586
         // zig_exe seam) against comptime @TypeOf asserts + runtime
