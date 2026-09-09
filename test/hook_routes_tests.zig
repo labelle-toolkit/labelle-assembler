@@ -487,6 +487,42 @@ pub const HONESTY = struct {
         try std.testing.expectEqual(hook_routes.model.EventStatus.active, kept.status);
     }
 
+    test "an emit inside a comment or a string literal is NOT a route" {
+        // The scan used to be a raw `indexOf("emit(")` over the file, so a
+        // commented-out call and a doc example in a string both became
+        // reported emit sites — the report then named a "site" that emits
+        // nothing. Tokenising fixes it by construction: the tokenizer drops
+        // comments and yields a string literal as ONE token (#724 review).
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try stageFixture(&tmp);
+
+        // Same event, same shape as the real emitter — but inert.
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/11_decoys.zig", .data =
+            \\const std = @import("std");
+            \\pub fn tick(g: anytype, dt: f32) void {
+            \\    _ = dt;
+            \\    // g.emit(.{ .pulse = .{ .n = 1 } });   <- commented out
+            \\    const doc = "call g.emit(.{ .pulse = .{ .n = 1 } }) to fire it";
+            \\    _ = g;
+            \\    _ = doc;
+            \\}
+            \\
+        });
+
+        const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        defer allocator.free(dir);
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const report = try buildIn(arena_state.allocator(), dir, baseCfg(&.{}));
+
+        const pulse = report.eventByTag("pulse").?;
+        // ONE site: the real emitter. The decoy file contributes nothing.
+        try std.testing.expectEqual(@as(usize, 1), pulse.emitters.len);
+        try std.testing.expectEqualStrings("scripts/playing/10_emitter.zig", pulse.emitters[0].site);
+    }
+
     test "consumable resolves ONLY a literal true/false; anything else is unresolved" {
         // The regression this pins: `indexOf(src, "true")` matched `!true`,
         // `untrue`, an alias, and the word "true" in a comment — reporting

@@ -52,6 +52,12 @@ pub const StructDecl = struct {
     /// Do not collapse null to false: null is "ask the source", absence is
     /// an answer (#726 review, rev 2).
     consumable: ?bool = false,
+    /// False when this decl is the NAME-ONLY degradation — the AST pass
+    /// could not read or match the file, so `fields` is empty because
+    /// nothing was parsed, NOT because the struct has no fields. Consumers
+    /// must not present an empty `fields` from such a decl as resolved
+    /// (#724 review).
+    parsed: bool = true,
     fields: []const Field,
 };
 
@@ -122,7 +128,7 @@ pub fn parseStructDir(
 /// A `StructDecl` carrying only the registry name — the graceful-degradation
 /// stand-in for a component/event file the AST pass couldn't read or match.
 fn nameOnlyDecl(aa: std.mem.Allocator, name: []const u8) !StructDecl {
-    return .{ .name = try aa.dupe(u8, name), .save = null, .visibility = null, .consumable = null, .fields = &.{} };
+    return .{ .name = try aa.dupe(u8, name), .save = null, .visibility = null, .consumable = null, .fields = &.{}, .parsed = false };
 }
 
 /// AST-walk one source buffer for top-level `pub const <Name> = struct

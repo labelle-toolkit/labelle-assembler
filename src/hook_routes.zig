@@ -85,9 +85,29 @@ pub fn emitSidecar(allocator: std.mem.Allocator, labelle_dir: []const u8, in: In
     try cwd.createDirPath(io, labelle_dir);
     var dir = try cwd.openDir(io, labelle_dir, .{});
     defer dir.close(io);
-    const file = try dir.createFile(io, ROUTES_FILENAME, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, aw.written());
+    // ATOMIC: write a temp beside the target, then rename over it.
+    // `createFile` truncates the real sidecar immediately, so a writer that
+    // failed part-way (disk full — which happened on this machine today —
+    // a crash, a kill) left a TRUNCATED or half-written `hook_routes.json`
+    // in place. `routes` would then either fail to parse it or, worse,
+    // parse a prefix and present a partial route list as the current one
+    // (#724 review). Rename is atomic on POSIX and on Windows via
+    // `renameAt`, so the sidecar is either the previous complete file or
+    // the new complete file, never a mixture.
+    const tmp_name = ROUTES_FILENAME ++ ".tmp";
+    {
+        const file = try dir.createFile(io, tmp_name, .{});
+        defer file.close(io);
+        file.writeStreamingAll(io, aw.written()) catch |err| {
+            // Do not leave the temp behind to be mistaken for a real file.
+            dir.deleteFile(io, tmp_name) catch {};
+            return err;
+        };
+    }
+    dir.rename(tmp_name, dir, ROUTES_FILENAME, io) catch |err| {
+        dir.deleteFile(io, tmp_name) catch {};
+        return err;
+    };
 }
 
 /// Read a sidecar back into the typed model.
@@ -113,8 +133,12 @@ pub fn readSidecar(aa: std.mem.Allocator, labelle_dir: []const u8) !?Report {
     const io = config.globalIo();
     const path = try std.fs.path.join(aa, &.{ labelle_dir, ROUTES_FILENAME });
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, aa, .limited(32 * 1024 * 1024)) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
+        // Only a genuinely ABSENT sidecar is "run generate first". Mapping
+        // every error to null turned a permissions problem, an I/O error or
+        // an over-cap file into that same message, sending the reader to
+        // re-run a generate that will not help (#724 review).
+        error.FileNotFound => return null,
+        else => return err,
     };
     return try parseReport(aa, bytes);
 }

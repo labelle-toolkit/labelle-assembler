@@ -227,6 +227,13 @@ pub const Resolution = struct {
     emit_sites_scanned: bool,
     /// Number of `.zig` files the emission scan read.
     emit_sites_files_scanned: usize,
+    /// True when the emit scan stopped at its file cap. A report with this
+    /// set is INCOMPLETE: "no emit site found" for a tag may mean "not
+    /// looked for" (#724 review).
+    emit_sites_truncated: bool = false,
+    /// Files the scan could not read. Same caveat as `emit_sites_truncated`
+    /// — these are holes, not evidence of absence.
+    emit_sites_unreadable: usize = 0,
 };
 
 /// The ordering contract this report describes, restated in the report so

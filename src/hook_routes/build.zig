@@ -231,6 +231,8 @@ pub fn buildReport(aa: std.mem.Allocator, in: Inputs) !Report {
             .engine_hook_payload = engine_resolved,
             .emit_sites_scanned = true,
             .emit_sites_files_scanned = emit_scan.files_scanned,
+            .emit_sites_truncated = emit_scan.truncated,
+            .emit_sites_unreadable = emit_scan.unreadable,
         },
         .receivers = receivers,
         .events = try events.toOwnedSlice(aa),
@@ -429,13 +431,21 @@ fn parseHookPayloadVariants(aa: std.mem.Allocator, src: []const u8) ![]const Hoo
         // uses, and comments/blank lines are skipped by the match below.
         const line_end = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
         const line = std.mem.trim(u8, src[i..line_end], " \t\r");
+        // Depth BEFORE this line's braces are counted. A union variant is a
+        // DIRECT member, so it starts at depth 1 — including
+        // `foo: struct {`, which opens a nested scope on the same line and
+        // would be missed by testing depth after counting.
+        const depth_at_line_start = depth;
         for (line) |c| {
             if (c == '{') depth += 1;
             if (c == '}') {
                 if (depth > 0) depth -= 1;
             }
         }
-        if (depth > 0 and line.len > 0 and !std.mem.startsWith(u8, line, "//")) {
+        // `depth > 0` accepted ANY nested line, so the fields of a multiline
+        // anonymous payload became phantom union variants — a route report
+        // listing events that do not exist (#724 review).
+        if (depth_at_line_start == 1 and line.len > 0 and !std.mem.startsWith(u8, line, "//")) {
             if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
                 const name = std.mem.trim(u8, line[0..colon], " \t");
                 if (isIdent(name)) {
@@ -479,7 +489,11 @@ fn payloadOf(aa: std.mem.Allocator, decl: ?parse.StructDecl, zig_type: []const u
         .name = src_f.name,
         .zig_type = src_f.zig_type,
     };
-    return .{ .zig_type = zig_type, .fields = fields, .resolved = true };
+    // `resolved` means "we read this payload", not "a decl by this name
+    // exists". A name-only degradation has zero fields because nothing was
+    // parsed; reporting it resolved presented "no fields" as a fact about
+    // the payload rather than a gap in the scan (#724 review).
+    return .{ .zig_type = zig_type, .fields = fields, .resolved = d.parsed };
 }
 
 // ── Handler discovery ───────────────────────────────────────────────────
@@ -561,6 +575,11 @@ fn scanHandlerDecls(
 const EmitScan = struct {
     per_tag: []const []const model.Emitter,
     files_scanned: usize,
+    /// The file cap was hit and the scan stopped early.
+    truncated: bool = false,
+    /// Files that could not be read (permissions, over the byte cap, a
+    /// race). Each is a hole in the scan, not an absence of emits.
+    unreadable: usize = 0,
 };
 
 /// Cap on files read by the emit scan. A bound keeps a pathological
@@ -607,54 +626,89 @@ fn scanEmitSites(
 
     const io = config.globalIo();
     var files: usize = 0;
+    var truncated = false;
+    var unreadable: usize = 0;
     for (candidates) |rel| {
-        if (files >= EMIT_SCAN_FILE_LIMIT) break;
+        if (files >= EMIT_SCAN_FILE_LIMIT) {
+            // The scan stopped early. Recorded rather than swallowed: a
+            // report that lists "emitted from" is read as exhaustive, and a
+            // silently truncated scan turns "no emit site found" into a
+            // false negative that looks like an answer (#724 review).
+            truncated = true;
+            break;
+        }
         const path = try std.fs.path.join(aa, &.{ target_dir, rel });
-        const src = std.Io.Dir.cwd().readFileAlloc(io, path, aa, .limited(EMIT_SCAN_MAX_BYTES)) catch |err| switch (err) {
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, path, aa, .limited(EMIT_SCAN_MAX_BYTES)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => continue,
+            // A file we could not read (permissions, a race, over the byte
+            // cap) is a HOLE in the scan, not an absence of emits. Counted.
+            else => {
+                unreadable += 1;
+                continue;
+            },
         };
         files += 1;
+        // The tokenizer needs a sentinel-terminated buffer (same shape
+        // `manifest/parse.zig` uses).
+        const src = try aa.dupeZ(u8, raw);
         try scanOneFileForEmits(aa, src, rel, tags, lists);
     }
 
     const out = try aa.alloc([]const model.Emitter, tags.len);
     for (lists, out) |*l, *o| o.* = try l.toOwnedSlice(aa);
-    return .{ .per_tag = out, .files_scanned = files };
+    return .{
+        .per_tag = out,
+        .files_scanned = files,
+        .truncated = truncated,
+        .unreadable = unreadable,
+    };
 }
 
 fn scanOneFileForEmits(
     aa: std.mem.Allocator,
-    src: []const u8,
+    src: [:0]const u8,
     rel_path: []const u8,
     tags: []const []const u8,
     lists: []std.ArrayList(model.Emitter),
 ) !void {
-    const calls = [_]struct { needle: []const u8, delivery: model.Delivery }{
-        // Longest first: `emitSync(` also ends in `(`, and matching
-        // `emit(` first on the same byte range would mislabel it.
-        .{ .needle = "emitSync(", .delivery = .sync },
-        .{ .needle = "emit(", .delivery = .buffered },
-    };
-    for (calls) |call| {
-        var from: usize = 0;
-        while (std.mem.indexOfPos(u8, src, from, call.needle)) |at| {
-            from = at + call.needle.len;
-            // Identifier boundary: `reemit(` / `emitHook(` must not match.
-            if (at > 0) {
-                const prev = src[at - 1];
-                if (std.ascii.isAlphanumeric(prev) or prev == '_') continue;
-            }
-            const tag = emittedTagAt(src, from) orelse continue;
+    // TOKENS, not raw bytes. The previous byte scan matched `emit(` inside
+    // a `//` comment and inside a string literal, so a commented-out call
+    // or a doc example became a reported route — the report then named a
+    // "site" that emits nothing (#724 review). The tokenizer drops comments
+    // entirely and yields a string literal as ONE token, so neither can be
+    // mistaken for a call. It also makes the identifier-boundary check
+    // unnecessary: `reemit` is its own token.
+    var tok = std.zig.Tokenizer.init(src);
+    var prev_ident: ?[]const u8 = null;
+    while (true) {
+        const t_tok = tok.next();
+        if (t_tok.tag == .eof) break;
+        if (t_tok.tag == .identifier) {
+            prev_ident = src[t_tok.loc.start..t_tok.loc.end];
+            continue;
+        }
+        const ident = prev_ident orelse continue;
+        prev_ident = null;
+        if (t_tok.tag != .l_paren) continue;
+
+        const delivery: model.Delivery = if (std.mem.eql(u8, ident, "emitSync"))
+            .sync
+        else if (std.mem.eql(u8, ident, "emit"))
+            .buffered
+        else
+            continue;
+
+        {
+            const tag = emittedTagAt(src, t_tok.loc.end) orelse continue;
             for (tags, 0..) |t, i| {
                 if (!std.mem.eql(u8, t, tag)) continue;
                 // One entry per (file, tag, delivery) — a loop emitting
                 // the same event twice is one route, not two.
                 var dup = false;
                 for (lists[i].items) |e| {
-                    if (e.delivery == call.delivery and std.mem.eql(u8, e.site, rel_path)) dup = true;
+                    if (e.delivery == delivery and std.mem.eql(u8, e.site, rel_path)) dup = true;
                 }
-                if (!dup) try lists[i].append(aa, .{ .site = rel_path, .delivery = call.delivery });
+                if (!dup) try lists[i].append(aa, .{ .site = rel_path, .delivery = delivery });
             }
         }
     }

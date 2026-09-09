@@ -182,19 +182,35 @@ fn applyFilter(
         try events.append(arena, ev);
     }
 
+    // RETAIN every receiver a retained event actually reaches, even one the
+    // `--receiver` filter would otherwise exclude.
+    //
+    // The filter selects which EVENTS are shown; it does not rewrite what a
+    // shown event's route IS. Previously `receivers[]` was filtered while
+    // `Event.listeners[]` kept every entry, so a filtered document carried
+    // listener rows naming receivers absent from `receivers[]` — a dangling
+    // join key for any JSON consumer, and #858's tracing correlates on
+    // exactly that key (#724 review).
+    //
+    // The alternative — filtering the listener rows to match — was
+    // rejected: it makes a route look like it has one listener when it has
+    // four, which is a worse lie for an inspector than showing an extra
+    // receiver definition.
     var receivers: std.ArrayList(hook_routes.Receiver) = .empty;
     for (report.receivers) |r| {
-        if (filter.receiver) |want| {
-            if (!std.mem.eql(u8, r.id, want)) continue;
-        }
-        if (filter.event != null) {
-            var hit = false;
-            for (events.items) |ev| {
-                for (ev.listeners) |l| {
-                    if (std.mem.eql(u8, l.receiver, r.id)) hit = true;
-                }
+        var referenced = false;
+        for (events.items) |ev| {
+            for (ev.listeners) |l| {
+                if (std.mem.eql(u8, l.receiver, r.id)) referenced = true;
             }
-            if (!hit) continue;
+        }
+        if (!referenced) {
+            // Not reached by any retained event. Keep it only when it IS
+            // the receiver asked for, so `--receiver X` on a receiver that
+            // listens to nothing still shows X rather than an empty report.
+            if (filter.receiver) |want| {
+                if (!std.mem.eql(u8, r.id, want)) continue;
+            } else continue;
         }
         try receivers.append(arena, r);
     }
@@ -290,10 +306,34 @@ test "renderRoutes: renders both forms, and a filter narrows without renumbering
     // `--event … --json` into the same parser it uses for the whole file.
     const one = try renderRoutes(arena, dir, true, .{ .receiver = "hooks/second" });
     const parsed = try hook_routes.parseReport(arena, one);
-    try std.testing.expectEqual(@as(usize, 1), parsed.receivers.len);
-    try std.testing.expectEqualStrings("hooks/second", parsed.receivers[0].id);
-    // …and it keeps the index it holds in the FULL tuple. Renumbering to
-    // 0 would produce a document that looks authoritative and disagrees
-    // with the build.
-    try std.testing.expectEqual(@as(usize, 1), parsed.receivers[0].order);
+
+    // THE JOIN MUST NOT DANGLE. A filtered document selects which EVENTS
+    // appear; it does not rewrite what a shown event's route is. So every
+    // `listeners[].receiver` has to resolve in `receivers[]` — including
+    // receivers the filter itself would exclude, because the retained event
+    // genuinely reaches them. Asserting only "receivers.len == 1" (as an
+    // earlier revision did) encoded the dangling behaviour as correct
+    // (#724 review).
+    for (parsed.events) |ev| {
+        for (ev.listeners) |l| {
+            var found = false;
+            for (parsed.receivers) |r| {
+                if (std.mem.eql(u8, r.id, l.receiver)) found = true;
+            }
+            try std.testing.expect(found);
+        }
+    }
+
+    // The receiver asked for is present…
+    var has_second = false;
+    for (parsed.receivers) |r| {
+        if (std.mem.eql(u8, r.id, "hooks/second")) {
+            has_second = true;
+            // …and keeps the index it holds in the FULL tuple. Renumbering
+            // to 0 would produce a document that looks authoritative and
+            // disagrees with the build.
+            try std.testing.expectEqual(@as(usize, 1), r.order);
+        }
+    }
+    try std.testing.expect(has_second);
 }

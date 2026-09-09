@@ -68,6 +68,7 @@ const usage =
     \\  labelle-assembler check --project-root <path>
     \\  labelle-assembler add pack <name>
     \\  labelle-assembler add feature <kind> <name>
+    \\  labelle-assembler routes --project-root <path> [--json] [--event <tag>] [--receiver <id>]
     \\
     \\Subcommands:
     \\  generate    Materialize .labelle/<target>/ from project.labelle
@@ -77,6 +78,8 @@ const usage =
     \\  init        Scaffold a new project directory
     \\  check       Lint packs for §6 convention violations (Packs RFC)
     \\  add         Scaffold a pack or a feature-unit (need/role/status)
+    \\  routes      Inspect generated hook event routes (reads the sidecar
+    \\              `generate` writes; run `generate` first)
     \\
     \\Generate options:
     \\  --project-root <path>   Path to game project (containing project.labelle)
