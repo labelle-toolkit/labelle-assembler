@@ -195,6 +195,106 @@ pub const GENERATE_GATE = struct {
     }
 };
 
+pub const HOOK_TRACE_ENGINE_GATE = struct {
+    test "`.hooks.trace` against an engine without HookTraceOptions FAILS generate (#858)" {
+        // The generated root declares
+        // `pub const labelle_hook_trace: engine.HookTraceOptions = …`, so
+        // an engine that does not export that type produces a `main.zig`
+        // which does not compile — and the error surfaces from GENERATED
+        // code, naming a type the user never wrote, in a file they did not
+        // author. Fail at generate instead, naming the pin.
+        const allocator = std.testing.allocator;
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
+
+        var game = try staged.game();
+        defer game.close(io);
+        try writeFileIn(game, "engine-fixture/codegen/main.zig.template", h.engine_template);
+        // An engine root WITHOUT the tracing API — what every released
+        // engine looks like until labelle-engine#858 ships.
+        try writeFileIn(game, "engine-fixture/src/root.zig",
+            \\pub const Something = struct {};
+        );
+
+        const backend = try sokolFixtureAbs(allocator);
+        defer allocator.free(backend.repo);
+        const cfg = generate.ProjectConfig{
+            .y_axis = .up,
+            .name = "traced-game",
+            .backend = .sokol,
+            .backend_package = backend,
+            .ecs = .mock,
+            .engine_version = "local:engine-fixture",
+            .hooks = .{ .trace = .{} },
+        };
+        try std.testing.expectError(
+            error.EngineTracingUnsupported,
+            generate.generate(allocator, cfg, staged.out_abs, staged.game_abs, .{ .is_tests_target = true }),
+        );
+    }
+
+    test "`.hooks.trace` against an engine WITH HookTraceOptions generates (#858)" {
+        // The positive control. Without it the test above would pass just
+        // as happily if the probe rejected every engine.
+        const allocator = std.testing.allocator;
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
+
+        var game = try staged.game();
+        defer game.close(io);
+        try writeFileIn(game, "engine-fixture/codegen/main.zig.template", h.engine_template);
+        try writeFileIn(game, "engine-fixture/src/root.zig",
+            \\pub const HookTraceOptions = struct {
+            \\    ring_capacity: usize = 128,
+            \\    payload_capacity: usize = 0,
+            \\};
+        );
+
+        const backend = try sokolFixtureAbs(allocator);
+        defer allocator.free(backend.repo);
+        const cfg = generate.ProjectConfig{
+            .y_axis = .up,
+            .name = "traced-game",
+            .backend = .sokol,
+            .backend_package = backend,
+            .ecs = .mock,
+            .engine_version = "local:engine-fixture",
+            .hooks = .{ .trace = .{} },
+        };
+        try generate.generate(allocator, cfg, staged.out_abs, staged.game_abs, .{ .is_tests_target = true });
+        try staged.tmp.dir.access(io, "out/sokol_desktop/build.zig", .{});
+    }
+
+    test "an engine without HookTraceOptions is fine when tracing is OFF (#858)" {
+        // The gate must only fire for projects that asked for tracing.
+        // Every existing project has no `.hooks.trace`, and none of them
+        // may start failing because of this check.
+        const allocator = std.testing.allocator;
+        var staged = try StagedProject.init(allocator);
+        defer staged.deinit(allocator);
+
+        var game = try staged.game();
+        defer game.close(io);
+        try writeFileIn(game, "engine-fixture/codegen/main.zig.template", h.engine_template);
+        try writeFileIn(game, "engine-fixture/src/root.zig",
+            \\pub const Something = struct {};
+        );
+
+        const backend = try sokolFixtureAbs(allocator);
+        defer allocator.free(backend.repo);
+        const cfg = generate.ProjectConfig{
+            .y_axis = .up,
+            .name = "plain-game",
+            .backend = .sokol,
+            .backend_package = backend,
+            .ecs = .mock,
+            .engine_version = "local:engine-fixture",
+        };
+        try generate.generate(allocator, cfg, staged.out_abs, staged.game_abs, .{ .is_tests_target = true });
+        try staged.tmp.dir.access(io, "out/sokol_desktop/build.zig", .{});
+    }
+};
+
 pub const GENERATION_FRESHNESS = struct {
     test "the production two-pass generate leaves a CURRENT route report (#724)" {
         // The regression for the P1 the review caught. `main.zig` runs the

@@ -834,6 +834,67 @@ pub fn validatePackGraph(
 /// Parse + validate ONLY: nothing here writes, and a project with no
 /// `.params.language` and no language dirs passes through untouched
 /// (byte-identical generation).
+/// The decl the engine must export for `.hooks.trace` to generate a
+/// project that COMPILES (labelle-engine#858).
+const hook_trace_options_decl = "pub const HookTraceOptions";
+
+/// Refuse `.hooks.trace` against an engine that has no `HookTraceOptions`.
+///
+/// The generated root declares
+/// `pub const labelle_hook_trace: engine.HookTraceOptions = …`, so an
+/// engine without that type produces a `main.zig` that does not compile —
+/// and the error surfaces from GENERATED code, naming a type the user
+/// never wrote, in a file they did not author. That is a miserable way to
+/// discover a version requirement.
+///
+/// Probing the resolved package rather than gating on a version number is
+/// deliberate: `local:` pins and pre-release branches are exactly how this
+/// feature is used before it ships, and a version comparison would reject
+/// those while accepting a release that happens to be numbered high enough
+/// but predates the API.
+///
+/// Silently dropping the declaration instead would be worse than either:
+/// tracing would compile and simply never happen, which is the silent
+/// failure the whole tracing epic exists to remove.
+pub fn requireEngineTracingSupport(
+    allocator: std.mem.Allocator,
+    cfg: anytype,
+    game_dir: []const u8,
+) !void {
+    if (cfg.hooks.trace == null) return;
+
+    const engine_path = try cache.resolveFrameworkPackage(allocator, "engine", cfg.engine_version, game_dir);
+    defer allocator.free(engine_path);
+
+    const root_path = try std.fs.path.join(allocator, &.{ engine_path, "src", "root.zig" });
+    defer allocator.free(root_path);
+
+    const src = std.Io.Dir.cwd().readFileAlloc(config.globalIo(), root_path, allocator, .limited(4 * 1024 * 1024)) catch |err| {
+        std.debug.print(
+            "labelle-assembler: `.hooks.trace` is set, but the engine's source could not be read " ++
+                "to confirm it supports tracing ('{s}': {any}).\n",
+            .{ root_path, err },
+        );
+        return error.EngineTracingUnsupported;
+    };
+    defer allocator.free(src);
+
+    if (std.mem.indexOf(u8, src, hook_trace_options_decl) != null) return;
+
+    std.debug.print(
+        "labelle-assembler: `.hooks.trace` needs an engine that exports " ++
+            "`HookTraceOptions`, and the resolved engine does not.\n" ++
+            "  engine: {s}\n" ++
+            "  pin:    {s}\n" ++
+            "Hook tracing is labelle-engine#858. Pin an engine that carries it, " ++
+            "or remove `.hooks.trace` from project.labelle.\n" ++
+            "Generating anyway would emit `engine.HookTraceOptions` into main.zig " ++
+            "and fail the build with an error in generated code.\n",
+        .{ engine_path, cfg.engine_version },
+    );
+    return error.EngineTracingUnsupported;
+}
+
 pub fn validateLanguagePolicy(
     allocator: std.mem.Allocator,
     pack_entries: []const PackEntry,

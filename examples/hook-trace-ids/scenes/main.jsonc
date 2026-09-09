@@ -1,0 +1,7 @@
+{
+    // No entities: the dispatch under test is driven by the tick script,
+    // not by world state. Exists so the generated setup has a scene to
+    // bind to.
+    "name": "main",
+    "children": []
+}

@@ -1,0 +1,45 @@
+// Integration proof for labelle-assembler#727 + labelle-engine#858.
+//
+// The unit tests prove the assembler EMITS an index-aligned
+// `hook_receiver_ids` table, and the engine's own harnesses prove the
+// tracer READS such a table. Neither proves the two halves agree in a
+// real generated game: the table could be emitted correctly and consumed
+// correctly while the ids in it disagreed with the ones the route
+// inspector reports, and nothing would notice.
+//
+// So this example is generated, BUILT and RUN by CI. It prints the
+// receiver id the tracer recorded at runtime for every delivery, and the
+// CI step compares those against the ids in the generated
+// `hook_routes.json`. Real emitted tuple, real emitted table, real route
+// report, real dispatch.
+//
+// Null backend: no window, no GPU, no input — it runs anywhere, including
+// a headless CI container.
+.{
+    .name = "hook_trace_ids",
+    .title = "LaBelle — hook receiver id trace",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    .backend = .null,
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // THE OPT-IN. Without it the generated root carries no
+    // `labelle_hook_trace`, the tracer is compiled out, and this example
+    // would prove nothing at runtime.
+    .hooks = .{ .trace = .{ .ring_capacity = 64, .payload_capacity = 0 } },
+    .core_version = "local:../../../labelle-core",
+    // A DEDICATED engine checkout, not the shared `labelle-engine`
+    // sibling: this example needs the #727 table consumer, which is not on
+    // engine `main` until engine#866 lands. CI clones the consumer branch
+    // here and falls back to `main`, the same branch-first pattern the
+    // workflow already uses for stacked cross-repo work — so this keeps
+    // working both before and after that merge, without changing the
+    // engine every other example builds against.
+    .engine_version = "local:../../../labelle-engine-727",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}

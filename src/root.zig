@@ -429,6 +429,14 @@ pub fn generate(
     // output.
     try generate_phases.validateLanguagePolicy(allocator, pack_entries.items, cfg.plugins, game_dir);
 
+    // Hook-tracing engine gate (labelle-engine#858) — beside the language
+    // gate, BEFORE the target dir is created, so a project asking for
+    // tracing against an engine that cannot provide it fails with no stale
+    // output. Placed HERE rather than in `loadEngineTemplate`: that only
+    // runs for the executable target, so a tests-target generate skipped
+    // the check entirely and emitted a `main.zig` that could not compile.
+    try generate_phases.requireEngineTracingSupport(allocator, cfg, game_dir);
+
     // ── Schema-declared plugin params gate + resolution (#591) ─────────
     // Validate every plugin entry's `.params` bag against its manifest's
     // `.params_schema` and resolve the final param sets (project values +

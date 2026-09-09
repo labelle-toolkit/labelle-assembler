@@ -169,6 +169,21 @@ jobs:
           || git clone --depth 1 --branch main \
             https://github.com/labelle-toolkit/labelle-engine.git labelle-engine
 
+      # Dedicated engine checkout for the hook-trace-ids example
+      # (labelle-assembler#727 / labelle-engine#858). That example needs the
+      # receiver-id TABLE CONSUMER, which is not on engine `main` until
+      # labelle-engine#866 lands. Kept separate from the shared
+      # `labelle-engine` sibling above so every other example keeps building
+      # against the engine it builds against today. Branch-first with a
+      # fallback to `main`, so this keeps working after #866 merges and the
+      # branch is deleted.
+      - name: Checkout labelle-engine for hook-trace-ids (#727 branch first)
+        run: |
+          git clone --depth 1 --branch feat/727-receiver-id-table \
+            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine-727 \
+          || git clone --depth 1 --branch main \
+            https://github.com/labelle-toolkit/labelle-engine.git labelle-engine-727
+
       # Sibling checkout for the scripting-smoke example: its explicit
       # `backend_package` pins `local:../../../labelle-null` so the generated
       # main carries the `script_contract.bind` touchpoint from labelle-null's
@@ -323,6 +338,85 @@ jobs:
       # can't surface — e.g. a future refactor accidentally routing null
       # through the sokol-callback branch, or the frame counter going
       # unbounded.
+      # THE #727 INTEGRATION PROOF. The unit tests show the assembler emits
+      # an index-aligned `hook_receiver_ids` table, and the engine harnesses
+      # show the tracer reads such a table. Neither shows the two halves
+      # AGREE in a real generated game — the table could be emitted and
+      # consumed correctly while its ids disagreed with the route
+      # inspector's, and nothing would notice.
+      #
+      # So: generate, BUILD and RUN a real game, then diff the receiver ids
+      # the tracer recorded at RUNTIME against the ids in the generated
+      # `hook_routes.json`. Real tuple, real table, real route report, real
+      # dispatch. The null backend needs no window, GPU or display server.
+      - name: Generate + build + run the hook-receiver-id trace integration (#727)
+        run: |
+          set -euo pipefail
+          cd labelle-assembler/examples/hook-trace-ids
+          $GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler generate --project-root .
+
+          cd .labelle/null_desktop
+          # The fingerprint fixup is OPTIONAL, so every grep in it must be
+          # allowed to match nothing. Under `set -e` a bare
+          # `X=$(... | grep ...)` aborts the whole step when the pattern is
+          # absent — which is the NORMAL case here, a build that simply
+          # succeeded, so the step would have failed every time. Hence
+          # `|| true` on each, plus an explicit check of the first build's
+          # exit code so a real (non-fingerprint) failure is reported with
+          # its output instead of being retried blindly.
+          set +e
+          ERR=$(zig build 2>&1)
+          BUILD_RC=$?
+          set -e
+          if [ "$BUILD_RC" -ne 0 ]; then
+            BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}' || true)
+            GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}' || true)
+            if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+              echo "labelle-cli-equivalent fixFingerprint: ${BAD} -> ${GOOD}"
+              sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+              zig build
+            else
+              echo "FAIL: the generated project did not build, and it is not the fingerprint placeholder:"
+              printf '%s\n' "$ERR"
+              exit 1
+            fi
+          fi
+
+          LABELLE_NULL_FRAMES=6 ./zig-out/bin/hook_trace_ids > run.log 2>&1
+          cat run.log
+
+          # NON-VACUITY FIRST. If nothing was delivered there is nothing to
+          # compare, and an empty list would diff clean against an empty
+          # list — the failure mode this whole check exists to avoid.
+          grep -q '\[trace\] deliver_count=2' run.log || {
+            echo "FAIL: expected 2 deliveries, trace says otherwise"; exit 1; }
+
+          # EVERY delivery must be labelled from the TABLE. This is the
+          # assertion that makes it a consumer proof: for a root hook the
+          # @typeName DERIVATION happens to produce the same string as the
+          # table, so matching ids alone would pass even with an engine that
+          # ignored the table entirely. `kind` is what distinguishes them.
+          if grep -E '\[trace\] slot=' run.log | grep -qv 'kind=table'; then
+            echo "FAIL: a delivery was not labelled from the generated table"
+            grep -E '\[trace\] slot=' run.log
+            exit 1
+          fi
+
+          # RUNTIME ids vs the ROUTE REPORT, in dispatch order.
+          grep -oE 'slot=[0-9]+ receiver=[^ ]+' run.log > /tmp/runtime_ids.txt
+          # `python3 -c` rather than a heredoc, purely to keep the quoting
+          # on one line. (A heredoc would work here too — YAML strips the
+          # block scalar's common indentation before bash sees it, so the
+          # terminator does land at column 0. An earlier revision of this
+          # comment claimed otherwise; that was wrong.)
+          python3 -c 'import json; d=json.load(open("../hook_routes.json")); [print("slot=%d receiver=%s" % (i, r.get("id"))) for i, r in enumerate(d.get("receivers", []))]' > /tmp/report_ids.txt
+
+          echo "--- runtime (tracer) ---"; cat /tmp/runtime_ids.txt
+          echo "--- generated route report ---"; cat /tmp/report_ids.txt
+          diff /tmp/runtime_ids.txt /tmp/report_ids.txt || {
+            echo "FAIL: runtime receiver ids disagree with hook_routes.json"; exit 1; }
+          echo "OK: runtime trace ids == route report ids, all from the generated table"
+
       - name: Generate + build + run the null headless example
         run: |
           cd labelle-assembler/examples/null

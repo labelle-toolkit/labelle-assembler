@@ -464,6 +464,29 @@ pub fn Mixin(comptime Self: type) type {
         /// receiver up by its tuple position, so a disagreement would
         /// mis-dispatch every event.
         pub fn writeGameHooksBlock(self: *Self, w: anytype, ident_buf: *[256]u8, receivers: []const Receiver) !void {
+            // Hook tracing opt-in (labelle-engine#858). The engine reads
+            // this declaration off the compilation ROOT, and `main.zig` is
+            // the root of a generated project — so this is the only place
+            // a generated game can turn tracing on.
+            //
+            // Emitted ONLY when the project asks for it. An unset
+            // `.hooks.trace` writes nothing, which is what keeps generated
+            // output byte-identical for every project that does not use
+            // this (pinned by the byte-identity guard in the suite).
+            //
+            // Written before the early return below so a game with no hook
+            // receivers can still trace its enqueues and drains — tracing
+            // is about the event pipeline, not only about receivers.
+            if (self.cfg.hooks.trace) |t| {
+                try w.writeAll(
+                    "/// Hook tracing, from `project.labelle`'s `.hooks.trace` (labelle-engine#858).\n",
+                );
+                try w.print(
+                    "pub const labelle_hook_trace: engine.HookTraceOptions = " ++
+                        ".{{ .ring_capacity = {d}, .payload_capacity = {d} }};\n\n",
+                    .{ t.ring_capacity, t.payload_capacity },
+                );
+            }
             if (receivers.len == 0) {
                 try w.writeAll("const GameHooks = struct {};\n\n");
                 return;
@@ -500,6 +523,28 @@ pub fn Mixin(comptime Self: type) type {
                 },
             };
             try w.writeAll(" });\n\n");
+
+            // ── Receiver identity table (#727) ───────────────────────────
+            // Index-aligned with the tuple above. `MergeHooks.emit` walks
+            // receivers BY TUPLE POSITION, so a tracer can label frame `i`
+            // with `hook_receiver_ids[i]` and get the exact same string the
+            // route inspector prints — shared identity by construction
+            // rather than two derivations agreeing.
+            //
+            // Why a table and not a `pub const labelle_receiver_id` on each
+            // receiver: the assembler does NOT generate hook receiver files.
+            // `<target>/hooks` is a symlink to the user's own directory and
+            // pack hooks are the pack author's files, so emitting a decl
+            // into them would be a codemod over source we do not own. The
+            // table lives in generated `main.zig`, which we do.
+            //
+            // Engine-side this is optional: a build that does not declare it
+            // (a hand-wired game with no generated main) falls back to
+            // deriving an id from `@typeName`.
+            try w.writeAll("/// Receiver ids, index-aligned with the `GameHooks` tuple (#727).\n");
+            try w.writeAll("pub const hook_receiver_ids = [_][]const u8{");
+            for (receivers) |r| try w.print(" \"{s}\",", .{r.id});
+            try w.writeAll(" };\n\n");
         }
 
         /// Hooks init block — instantiate every receiver and wire the
