@@ -439,6 +439,128 @@ pub const RECEIVER_ID_TABLE = struct {
         try std.testing.expect(ranked_comment < plain_comment);
     }
 
+    /// Everything between `.{` and `}` of the emitted `MergeHooks` call,
+    /// split into one entry per receiver — the ACTUAL tuple, read out of
+    /// the generated source.
+    fn tupleEntries(aa: std.mem.Allocator, main_zig: []const u8) ![]const []const u8 {
+        const marker = "const GameHooks = engine.MergeHooks(AllHookPayloads, .{";
+        const start = (std.mem.indexOf(u8, main_zig, marker) orelse
+            return error.TupleMissing) + marker.len;
+        const end = std.mem.indexOfPos(u8, main_zig, start, "});") orelse
+            return error.TupleUnterminated;
+        var out: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeScalar(u8, main_zig[start..end], ',');
+        while (it.next()) |raw| {
+            const e = std.mem.trim(u8, raw, " \t\r\n");
+            if (e.len > 0) try out.append(aa, e);
+        }
+        return out.toOwnedSlice(aa);
+    }
+
+    /// The quoted strings of the emitted `hook_receiver_ids`, in order.
+    fn tableEntries(aa: std.mem.Allocator, main_zig: []const u8) ![]const []const u8 {
+        const marker = "pub const hook_receiver_ids = [_][]const u8{";
+        const start = (std.mem.indexOf(u8, main_zig, marker) orelse
+            return error.TableMissing) + marker.len;
+        const end = std.mem.indexOfPos(u8, main_zig, start, "};") orelse
+            return error.TableUnterminated;
+        var out: std.ArrayList([]const u8) = .empty;
+        var rest = main_zig[start..end];
+        while (std.mem.indexOfScalar(u8, rest, '"')) |open| {
+            const after = rest[open + 1 ..];
+            const close = std.mem.indexOfScalar(u8, after, '"') orelse break;
+            try out.append(aa, after[0..close]);
+            rest = after[close + 1 ..];
+        }
+        return out.toOwnedSlice(aa);
+    }
+
+    /// `needs_hooks` -> `NeedsHooks`. The emitter's snake -> Pascal rule
+    /// for a receiver's type name, reimplemented here on purpose: calling
+    /// the production helper would make the test agree with the emitter by
+    /// construction even if the rule itself drifted under both.
+    fn pascalOf(aa: std.mem.Allocator, stem: []const u8) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var upper_next = true;
+        for (stem) |c| {
+            if (c == '_') {
+                upper_next = true;
+                continue;
+            }
+            try out.append(aa, if (upper_next) std.ascii.toUpper(c) else c);
+            upper_next = false;
+        }
+        return out.toOwnedSlice(aa);
+    }
+
+    test "the table is aligned with the EMITTED TUPLE, not merely with the order comment (#727)" {
+        // The integration proof. The sibling test above compares the table
+        // against the dispatch-order COMMENT, which is a second rendering
+        // of the same resolved plan — so if tuple emission and table
+        // emission ever diverged, the comment could still agree with the
+        // table while the tuple, the thing `MergeHooks.emit` actually
+        // walks, disagreed with both. That is the failure the engine would
+        // then inherit: `hook_receiver_ids[i]` naming a different receiver
+        // than tuple slot `i`.
+        //
+        // So this reads BOTH lists out of the generated source and matches
+        // them position by position. No ordering comment is consulted.
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        var cfg = baseCfg();
+        // A declared rank so resolved order differs from discovery order —
+        // otherwise both lists could be emitted in discovery order and
+        // still agree, proving nothing about alignment.
+        cfg.hooks = .{ .order = &.{.{ .handler = "packs/citizens/hooks/needs_hooks", .rank = 100 }} };
+        const main_zig = try gen(allocator, cfg, &.{"animation_hooks"}, &.{citizens_pack}, &.{});
+        defer allocator.free(main_zig);
+
+        const tuple = try tupleEntries(aa, main_zig);
+        const table = try tableEntries(aa, main_zig);
+
+        // A vacuous pass guard: with zero or one receiver, "aligned" is
+        // true no matter what the emitter does.
+        try std.testing.expect(tuple.len >= 2);
+        try std.testing.expectEqual(tuple.len, table.len);
+
+        for (tuple, table, 0..) |tuple_entry, id, i| {
+            // The tuple entry is a type expression and the table entry is
+            // the assembler's id — two spellings of one receiver:
+            //
+            //   table:  packs/citizens/hooks/needs_hooks
+            //   tuple: *citizens__needs_u_hooks.NeedsHooks
+            //
+            // The MODULE ident is escaped (`_` becomes `_u_`, keeping the
+            // path-to-ident mapping injective), so it is not a substring of
+            // the id. The TYPE name is the stable link: the emitter derives
+            // it from the same file stem by the snake -> Pascal rule, so
+            // `.NeedsHooks` must terminate the tuple entry whose table id
+            // ends in `needs_hooks`.
+            const stem = if (std.mem.lastIndexOfScalar(u8, id, '/')) |slash|
+                id[slash + 1 ..]
+            else
+                id;
+            const pascal = try pascalOf(aa, stem);
+            const want = try std.fmt.allocPrint(aa, ".{s}", .{pascal});
+            if (!std.mem.endsWith(u8, tuple_entry, want)) {
+                std.debug.print(
+                    "slot {d}: table says `{s}` (expects tuple type `{s}`) but the tuple has `{s}`\n",
+                    .{ i, id, want, tuple_entry },
+                );
+                return error.TableTupleMisaligned;
+            }
+        }
+
+        // And the ranked receiver really did move: slot 0 is the pack hook,
+        // which is NOT its discovery position. Without this the loop above
+        // would pass on a build where ranking silently stopped working.
+        try std.testing.expectEqualStrings("packs/citizens/hooks/needs_hooks", table[0]);
+        try std.testing.expectEqualStrings("hooks/animation_hooks", table[1]);
+    }
+
     test "a project with no hooks emits no table rather than an empty one" {
         const allocator = std.testing.allocator;
         const main_zig = try gen(allocator, baseCfg(), &.{}, &.{}, &.{});
