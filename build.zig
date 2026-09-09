@@ -349,6 +349,15 @@ pub fn build(b: *std.Build) void {
         // relative order, the type tuple and the instance tuple stay
         // index-aligned, and a bad declaration is a hard error.
         "test/hook_ordering_tests.zig",
+        // The HOOK ROUTE INSPECTOR (labelle-assembler#724,
+        // docs/design/hook-route-inspection.md). The load-bearing test
+        // generates a `main.zig` through the real emitter and compares the
+        // report's receiver sequence against the emitted `MergeHooks`
+        // tuple entry-by-entry, so the inspector cannot silently drift
+        // from dispatch. Also: qualified root/pack/plugin listener
+        // mappings, elided-vs-unlistened, consumable semantics, per-call-
+        // site delivery, and the JSON contract (round-trip + determinism).
+        "test/hook_routes_tests.zig",
         // i18n sentinel contract (flying-platform#786 friction #3): the
         // generated module is COMPILED AND RUN (`zig test` via the #586
         // zig_exe seam) against comptime @TypeOf asserts + runtime

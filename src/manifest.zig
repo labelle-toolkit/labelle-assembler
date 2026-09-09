@@ -126,7 +126,8 @@
 //!   - `manifest/emit.zig`  — orchestration (`MANIFEST_FILENAME`, `PackInput`,
 //!                            `emitManifestSidecar`)
 
-const parse = @import("manifest/parse.zig");
+/// Exposed for tests that pin the struct-decl parser directly (#726).
+pub const parse = @import("manifest/parse.zig");
 const json = @import("manifest/json.zig");
 const emit = @import("manifest/emit.zig");
 

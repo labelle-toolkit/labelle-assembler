@@ -320,8 +320,12 @@ the build, not quietly revert to discovery order.
 - **Group-level ranks** (`.{ .pack = "citizens", .rank = 10 }`) are a plausible
   extension for a project with many hooks from one pack. Left out to keep the
   first contract small; exact ids cover every case, just more verbosely.
-- **Manifest/JSON exposure** of the resolved plan belongs to #724, which should
-  consume `buildReceiverPlan` rather than duplicating the derivation.
+- **Manifest/JSON exposure** of the resolved plan belongs to #724 — now
+  **implemented**: `generate` writes `<game>/.labelle/hook_routes.json` and
+  `labelle-assembler routes` renders it. It consumes `buildReceiverPlan`
+  rather than duplicating the derivation, and a test compares its receiver
+  sequence against the emitted `MergeHooks` tuple entry-by-entry. See
+  [`hook-route-inspection.md`](hook-route-inspection.md).
 - **Runtime trace labels** belong to #858; the receiver id in §2.2 is the
   intended label.
 
