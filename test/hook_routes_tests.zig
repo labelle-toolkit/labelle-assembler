@@ -189,6 +189,21 @@ fn decoyEntry() ScriptEntry {
 }
 const script_entries_with_decoy = [_]ScriptEntry{ flowEntry(), emitterEntry(), decoyEntry() };
 
+/// A script whose emit goes through a DOTTED CHAIN (`self.bus.emit`), so
+/// the receiver the report names can be checked against the source text
+/// rather than against a trailing fragment of it (#726 review).
+fn chainEmitterEntry() ScriptEntry {
+    return .{
+        .name = "playing/12_chain.zig",
+        .filename = "playing/12_chain.zig",
+        .states = &.{"playing"},
+        .sort_order = 12,
+        .subdir = "playing",
+        .rel_path = "playing/12_chain.zig",
+    };
+}
+const script_entries_with_chain = [_]ScriptEntry{ flowEntry(), emitterEntry(), chainEmitterEntry() };
+
 /// Plugin events: one consumed, one elided. `box2d__collision_begin` is
 /// handled by `hooks/z_second`; `box2d__collision_end` is not, and is
 /// therefore the elided row whose status must not read like silence.
@@ -568,6 +583,43 @@ pub const HONESTY = struct {
         try std.testing.expectEqualStrings("gamma", names[2]);
     }
 
+    test "a trailing comment does not leak into a variant's TYPE" {
+        // The sibling test above pins NAMES, which is exactly why this got
+        // through: depth counting used the comment-stripped line while
+        // field extraction still used the raw one, so `foo: Foo, // note`
+        // reported the type as `Foo, // note` — the trailing-comma strip
+        // ran off the end of the comment instead of the field. Names were
+        // unaffected (they sit left of the colon), so a name-only
+        // assertion could not see it (#726 review).
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const src =
+            \\pub fn HookPayload(comptime E: type) type {
+            \\    return union(enum) {
+            \\        alpha: u32, // a trailing note
+            \\        beta: bool,// no space before the comment
+            \\        gamma: []const u8, // punctuation: a, b, c
+            \\        delta: f32,
+            \\    };
+            \\}
+            \\
+        ;
+        const variants = try generator.hook_routes.buildTestOnlyParseVariants(aa, src);
+        try std.testing.expectEqual(@as(usize, 4), variants.len);
+        try std.testing.expectEqualStrings("alpha", variants[0].name);
+        try std.testing.expectEqualStrings("u32", variants[0].zig_type);
+        try std.testing.expectEqualStrings("beta", variants[1].name);
+        try std.testing.expectEqualStrings("bool", variants[1].zig_type);
+        try std.testing.expectEqualStrings("gamma", variants[2].name);
+        try std.testing.expectEqualStrings("[]const u8", variants[2].zig_type);
+        // The uncommented control: proves the fix did not simply start
+        // truncating every type at the first `,`.
+        try std.testing.expectEqualStrings("delta", variants[3].name);
+        try std.testing.expectEqualStrings("f32", variants[3].zig_type);
+    }
+
     test "an emit inside a comment or a string literal is NOT a route" {
         // The scan used to be a raw `indexOf("emit(")` over the file, so a
         // commented-out call and a doc example in a string both became
@@ -618,6 +670,70 @@ pub const HONESTY = struct {
         // ONE site: the real emitter. The decoy file contributes nothing.
         try std.testing.expectEqual(@as(usize, 1), pulse.emitters.len);
         try std.testing.expectEqualStrings("scripts/playing/10_emitter.zig", pulse.emitters[0].site);
+    }
+
+    test "a dotted receiver chain is reported WHOLE, not just its last identifier" {
+        // `self.bus.emit(...)` was reported with receiver `bus`, which
+        // reads like a local variable named `bus` and hides that the call
+        // went through `self`. The scan walked the chain to find the call
+        // but kept only the identifier immediately before it (#726 review).
+        //
+        // This matters precisely because these sites are UNRESOLVED: the
+        // receiver text is the only thing the report gives a reader to
+        // judge whether the call reaches the game bus, so a fragment is
+        // the difference between a usable candidate and a misleading one.
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try stageFixture(&tmp);
+
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/playing/12_chain.zig", .data =
+            \\const std = @import("std");
+            \\pub fn tick(self: anytype, dt: f32) void {
+            \\    _ = dt;
+            \\    self.bus.emit(.{ .pulse = .{ .n = 1 } });
+            \\}
+            \\
+        });
+
+        const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        defer allocator.free(dir);
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var in = inputs(dir, baseCfg(&.{}));
+        in.script_entries = &script_entries_with_chain;
+        const report = try hook_routes.buildReport(arena, in);
+
+        // GUARD, same reason as the decoy test: an undeclared fixture file
+        // is never opened, so without this the assertion below could pass
+        // while the chain file was never scanned at all.
+        const without = try hook_routes.buildReport(arena, inputs(dir, baseCfg(&.{})));
+        try std.testing.expectEqual(
+            without.resolution.emit_sites_files_scanned + 1,
+            report.resolution.emit_sites_files_scanned,
+        );
+
+        const pulse = report.eventByTag("pulse").?;
+        var chain: ?hook_routes.model.Emitter = null;
+        for (pulse.emitters) |e| {
+            if (std.mem.eql(u8, e.site, "scripts/playing/12_chain.zig")) chain = e;
+        }
+        const c = chain orelse return error.TestChainSiteMissing;
+        try std.testing.expectEqualStrings("self.bus", c.receiver_expr);
+        // Still never PROVEN to be the game bus — naming it better does not
+        // make it resolved.
+        try std.testing.expect(!c.receiver_resolved);
+
+        // The single-identifier case must not regress into something like
+        // a chain with a leading dot.
+        var plain: ?hook_routes.model.Emitter = null;
+        for (pulse.emitters) |e| {
+            if (std.mem.eql(u8, e.site, "scripts/playing/10_emitter.zig")) plain = e;
+        }
+        const pl = plain orelse return error.TestPlainSiteMissing;
+        try std.testing.expectEqualStrings("game", pl.receiver_expr);
     }
 
     test "consumable resolves ONLY a literal true/false; anything else is unresolved" {

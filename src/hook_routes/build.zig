@@ -465,11 +465,18 @@ fn parseHookPayloadVariants(aa: std.mem.Allocator, src: []const u8) ![]const Hoo
         // `depth > 0` accepted ANY nested line, so the fields of a multiline
         // anonymous payload became phantom union variants — a route report
         // listing events that do not exist (#724 review).
-        if (depth_at_line_start == 1 and line.len > 0 and !std.mem.startsWith(u8, line, "//")) {
-            if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-                const name = std.mem.trim(u8, line[0..colon], " \t");
+        // Extract from `code`, NOT `line`. Depth counting already ignored
+        // comments; extraction did not, so `foo: Foo, // note` reported the
+        // type as `Foo, // note` — the trailing `,` strip fell off the end
+        // of the comment instead of the field (#726 review). One trailing
+        // comment on one variant was enough to put a nonsense type in the
+        // report. A comment-only line strips to empty and is skipped by the
+        // `code.len > 0` test, which subsumes the old `startsWith("//")`.
+        if (depth_at_line_start == 1 and code.len > 0) {
+            if (std.mem.indexOfScalar(u8, code, ':')) |colon| {
+                const name = std.mem.trim(u8, code[0..colon], " \t");
                 if (isIdent(name)) {
-                    var type_txt = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                    var type_txt = std.mem.trim(u8, code[colon + 1 ..], " \t");
                     if (std.mem.endsWith(u8, type_txt, ",")) type_txt = type_txt[0 .. type_txt.len - 1];
                     try out.append(aa, .{
                         .name = try aa.dupe(u8, name),
@@ -700,26 +707,48 @@ fn scanOneFileForEmits(
     // unnecessary: `reemit` is its own token.
     var tok = std.zig.Tokenizer.init(src);
     var prev_ident: ?[]const u8 = null;
-    // The identifier before the `.` — the receiver the call is made on.
-    // Recorded so the report can name it instead of implying the call was
-    // proven to reach the game bus (#724 review).
+    // The receiver expression the call is made on. Recorded so the report
+    // can NAME it instead of implying the call was proven to reach the
+    // game bus (#724 review).
+    //
+    // The WHOLE dotted chain, not just the last identifier before the
+    // call: `self.bus.emit(...)` was reported as receiver `bus`, which
+    // reads like a local named `bus` and loses the fact that the call went
+    // through `self` (#726 review). Tracked as offsets into `src` so the
+    // chain is a slice of the original text — no rewriting, no allocation,
+    // and no parser rewrite: `chain_start` is simply where the current
+    // chain began.
     var receiver_ident: []const u8 = "";
+    var chain_start: usize = 0;
+    var prev_end: usize = 0;
     var saw_dot = false;
     while (true) {
         const t_tok = tok.next();
         if (t_tok.tag == .eof) break;
         if (t_tok.tag == .identifier) {
-            if (saw_dot) {
-                // `a.b` — `a` was the receiver, keep it.
-            } else {
+            if (!saw_dot) {
+                // Not a continuation — this identifier starts a new chain.
                 receiver_ident = "";
+                chain_start = t_tok.loc.start;
             }
             prev_ident = src[t_tok.loc.start..t_tok.loc.end];
+            prev_end = t_tok.loc.end;
             saw_dot = false;
             continue;
         }
         if (t_tok.tag == .period) {
-            if (prev_ident) |p| receiver_ident = p;
+            if (prev_ident != null) {
+                // Everything from the start of the chain up to the
+                // identifier before this `.`.
+                receiver_ident = src[chain_start..prev_end];
+            } else {
+                // A `.` not preceded by an identifier — `foo().emit(...)`,
+                // an enum literal, a struct-init `.{`. We cannot name the
+                // receiver, and keeping the PREVIOUS chain's name here
+                // would attach an unrelated identifier to this call, which
+                // is worse than saying nothing (#726 review).
+                receiver_ident = "";
+            }
             saw_dot = true;
             prev_ident = null;
             continue;

@@ -155,8 +155,14 @@ pub const Emitter = struct {
     site: []const u8,
     delivery: Delivery,
     /// Source text of the receiver the call was made on — the `g` in
-    /// `g.emit(...)`. Empty when the call had no receiver (a bare
-    /// `emit(...)`).
+    /// `g.emit(...)`, the `self.bus` in `self.bus.emit(...)`. The WHOLE
+    /// dotted chain, so a reader sees the path the call took rather than
+    /// a bare trailing identifier that reads like a local (#726 review).
+    ///
+    /// Empty when the call had no receiver (a bare `emit(...)`) or when
+    /// the receiver is not a plain dotted chain (`foo().emit(...)`) — in
+    /// which case naming it would require evaluating an expression the
+    /// scan deliberately does not.
     receiver_expr: []const u8 = "",
     /// Whether the receiver was PROVEN to be the game's event bus.
     ///
