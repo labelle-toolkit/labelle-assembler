@@ -29,6 +29,13 @@ pub const lifecycle_loop = @import("codegen/lifecycle/loop.zig");
 pub const lifecycle_callback = @import("codegen/lifecycle/callback.zig");
 pub const main_template = @import("codegen/main_template.zig");
 pub const context = @import("codegen/context.zig");
+/// Hook-pipeline blocks AND the hook ordering contract
+/// (labelle-assembler#723). Exposed as a namespace so downstream tools —
+/// notably #724's static route inspector — can call
+/// `buildReceiverPlan` rather than re-deriving dispatch order, which is
+/// what makes "the inspector reports the order used for dispatch" true
+/// by construction. See `docs/design/hook-handler-ordering.md`.
+pub const hooks_block = @import("codegen/blocks/hooks.zig");
 
 /// Shared codegen context (labelle-assembler#183 mixin conversion).
 /// Models the engine's `Game` ↔ `*_mixin.zig` pairing — holds the

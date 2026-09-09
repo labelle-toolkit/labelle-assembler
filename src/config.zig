@@ -954,6 +954,44 @@ pub const PrebuildStep = struct {
     outputs: []const []const u8 = &.{},
 };
 
+/// One explicit dispatch-rank declaration for a hook receiver
+/// (labelle-assembler#723, `docs/design/hook-handler-ordering.md` §4).
+///
+/// `handler` is a receiver **id** — the receiver's source path relative
+/// to the generated target root, without the `.zig` extension:
+///   - game-root hook → `hooks/<stem>` (`hooks/animation_hooks`)
+///   - pack hook      → `<pack import prefix>/hooks/<stem>`
+///                      (`packs/citizens/hooks/needs_hooks`)
+///   - flow handler   → `<import base><rel path>` minus `.zig`
+///                      (`scripts/flows/hit_counter`)
+///
+/// It must match a discovered receiver exactly; a handler that matches
+/// nothing is `error.UnknownHookOrderHandler`, not a silent no-op (a
+/// silently-ignored ordering declaration is the exact failure this
+/// contract exists to remove).
+pub const HookOrderEntry = struct {
+    handler: []const u8,
+    /// Dispatch rank. HIGHER RUNS EARLIER; `0` (the default) is the
+    /// undeclared bucket. The full sort key is `(rank descending,
+    /// baseline index ascending)` over the default sequence, stable — so
+    /// a positive rank promotes a receiver ahead of every rank-0 one
+    /// (crossing the root/pack/flow group boundary), a negative rank
+    /// demotes it behind them, and everything nobody declared keeps its
+    /// relative order.
+    rank: i32 = 0,
+};
+
+/// Opt-in hook-dispatch configuration (labelle-assembler#723).
+///
+/// `MergeHooks` takes ONE receiver tuple, walked in tuple order for
+/// EVERY event, so ordering here is per-RECEIVER and global across
+/// events — not per event. An empty `order` (the default, and the shape
+/// every project without a `.hooks` key parses to) leaves the generated
+/// receiver tuple byte-identical to the pre-#723 assembler.
+pub const HooksConfig = struct {
+    order: []const HookOrderEntry = &.{},
+};
+
 pub const ProjectConfig = struct {
     name: []const u8,
     description: []const u8 = "",
@@ -1015,6 +1053,12 @@ pub const ProjectConfig = struct {
     /// no hitch. Set `true` only when you need Switch raw-HID decode and accept
     /// the connect stall. No effect when `gamepad = .none`.
     gamepad_hidapi: bool = false,
+    /// Explicit hook-receiver dispatch order (labelle-assembler#723).
+    /// Opt-in: the default empty `.order` reproduces the historical
+    /// discovery-driven sequence exactly. See `HooksConfig` and
+    /// `docs/design/hook-handler-ordering.md`.
+    hooks: HooksConfig = .{},
+
     /// Plugin-event folding policy (labelle-assembler#630). `.consumed`
     /// (default) folds only events something in the project references —
     /// see `PluginEventsMode`; `.all` restores unconditional folding.

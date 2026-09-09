@@ -1,0 +1,50 @@
+// Headless acceptance for the hook ORDERING contract
+// (labelle-assembler#723, docs/design/hook-handler-ordering.md).
+//
+// Two game-root hooks listen to the SAME event, so dispatch order is
+// directly observable in the log:
+//
+//   events/pulse.zig             the one event both hooks handle,
+//   scripts/playing/10_emitter.zig  emits it once per frame,
+//   hooks/a_first.zig            lexicographically first  → default [0],
+//   hooks/z_second.zig           lexicographically last   → default [1].
+//
+// `.hooks.order` below promotes `z_second`, inverting the default. Delete
+// the `.hooks` block and re-generate to see the discovery-driven order
+// return — that A/B is the example's whole point.
+//
+// Engine-level and backend-agnostic (no renderer, no ECS), so it builds
+// AND runs deterministically headless on `.null` for CI.
+//
+// VERSION PINS: `local:` siblings in-repo, matching examples/event-relay.
+.{
+    .name = "hook_order",
+    .title = "LaBelle — Hook Ordering Showcase",
+    .width = 320,
+    .height = 240,
+    .target_fps = 60,
+    .backend = .null,
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+
+    // THE opt-in (#723). A receiver is named by its `handler` id — its
+    // source path relative to the generated target root, without the
+    // `.zig`. `rank` is an i32 and HIGHER RUNS EARLIER; every undeclared
+    // receiver sits at rank 0 and keeps its default relative position.
+    //
+    // Ranks are global across the receiver list: this same mechanism can
+    // promote a pack hook or a flow handler ahead of a game-root hook.
+    .hooks = .{
+        .order = .{
+            .{ .handler = "hooks/z_second", .rank = 100 },
+        },
+    },
+
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../",
+}
