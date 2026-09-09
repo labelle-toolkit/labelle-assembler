@@ -500,6 +500,28 @@ pub fn Mixin(comptime Self: type) type {
                 },
             };
             try w.writeAll(" });\n\n");
+
+            // ── Receiver identity table (#727) ───────────────────────────
+            // Index-aligned with the tuple above. `MergeHooks.emit` walks
+            // receivers BY TUPLE POSITION, so a tracer can label frame `i`
+            // with `hook_receiver_ids[i]` and get the exact same string the
+            // route inspector prints — shared identity by construction
+            // rather than two derivations agreeing.
+            //
+            // Why a table and not a `pub const labelle_receiver_id` on each
+            // receiver: the assembler does NOT generate hook receiver files.
+            // `<target>/hooks` is a symlink to the user's own directory and
+            // pack hooks are the pack author's files, so emitting a decl
+            // into them would be a codemod over source we do not own. The
+            // table lives in generated `main.zig`, which we do.
+            //
+            // Engine-side this is optional: a build that does not declare it
+            // (a hand-wired game with no generated main) falls back to
+            // deriving an id from `@typeName`.
+            try w.writeAll("/// Receiver ids, index-aligned with the `GameHooks` tuple (#727).\n");
+            try w.writeAll("pub const hook_receiver_ids = [_][]const u8{");
+            for (receivers) |r| try w.print(" \"{s}\",", .{r.id});
+            try w.writeAll(" };\n\n");
         }
 
         /// Hooks init block — instantiate every receiver and wire the

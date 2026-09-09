@@ -392,6 +392,61 @@ pub const EXPLICIT_ORDER = struct {
     }
 };
 
+pub const RECEIVER_ID_TABLE = struct {
+    test "hook_receiver_ids is index-aligned with the GameHooks tuple (#727)" {
+        // THE deliverable of #727. `MergeHooks.emit` walks receivers by
+        // TUPLE POSITION, so a tracer labelling frame `i` with
+        // `hook_receiver_ids[i]` gets the same string the route inspector
+        // prints — identity shared by construction rather than by two
+        // derivations happening to agree.
+        //
+        // Asserting the ids exist is not enough: the alignment is the
+        // contract, so this walks both lists together and compares
+        // position by position.
+        const allocator = std.testing.allocator;
+        var cfg = baseCfg();
+        // A declared rank, so the table has to follow the RESOLVED order
+        // and not the discovery order — the case where a naive
+        // implementation emits ids in the wrong sequence.
+        cfg.hooks = .{ .order = &.{.{ .handler = "packs/citizens/hooks/needs_hooks", .rank = 100 }} };
+        const main_zig = try gen(allocator, cfg, &.{"animation_hooks"}, &.{citizens_pack}, &.{});
+        defer allocator.free(main_zig);
+
+        const ids_at = try at(main_zig, "pub const hook_receiver_ids = [_][]const u8{");
+        const tuple_at = try at(main_zig, "const GameHooks = engine.MergeHooks(");
+        try std.testing.expect(tuple_at < ids_at);
+
+        // The resolved order for this config: ranked pack hook first.
+        const expected = [_][]const u8{
+            "packs/citizens/hooks/needs_hooks",
+            "hooks/animation_hooks",
+        };
+        // Ids appear in the table in exactly that sequence…
+        var cursor = ids_at;
+        for (expected) |want| {
+            const quoted = try std.fmt.allocPrint(allocator, "\"{s}\"", .{want});
+            defer allocator.free(quoted);
+            const found = std.mem.indexOfPos(u8, main_zig, cursor, quoted) orelse
+                return error.IdMissingFromTable;
+            cursor = found + quoted.len;
+        }
+
+        // …and the SAME sequence in the dispatch-order comment, which is
+        // what the inspector reports. If these two ever disagree, a trace
+        // and a route report label the same receiver differently.
+        const ranked_comment = try at(main_zig, "//   [0] rank   100 * packs/citizens/hooks/needs_hooks\n");
+        const plain_comment = try at(main_zig, "//   [1] rank     0   hooks/animation_hooks\n");
+        try std.testing.expect(ranked_comment < plain_comment);
+    }
+
+    test "a project with no hooks emits no table rather than an empty one" {
+        const allocator = std.testing.allocator;
+        const main_zig = try gen(allocator, baseCfg(), &.{}, &.{}, &.{});
+        defer allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "hook_receiver_ids") == null);
+    }
+};
+
 pub const DIAGNOSTICS = struct {
     test "an unknown handler is a hard error, not a silent no-op" {
         // A silently ignored ordering declaration is the exact failure
