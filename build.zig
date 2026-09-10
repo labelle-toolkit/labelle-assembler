@@ -349,6 +349,7 @@ pub fn build(b: *std.Build) void {
         // relative order, the type tuple and the instance tuple stay
         // index-aligned, and a bad declaration is a hard error.
         "test/hook_ordering_tests.zig",
+        "test/animation_assets_tests.zig",
         // The HOOK ROUTE INSPECTOR (labelle-assembler#724,
         // docs/design/hook-route-inspection.md). The load-bearing test
         // generates a `main.zig` through the real emitter and compares the
@@ -379,7 +380,11 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        const run_test = b.addRunArtifact(t);
+        test_step.dependOn(&run_test.step);
+        if (std.mem.eql(u8, test_file, "test/animation_assets_tests.zig")) {
+            b.step("test-animation", "Test JSONC animation asset wiring").dependOn(&run_test.step);
+        }
     }
 
     // manifest-v2 sokol backend HOOK (epic #453 item 3, PR 5 android + PR 6 ios).
