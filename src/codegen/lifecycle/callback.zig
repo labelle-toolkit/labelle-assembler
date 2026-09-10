@@ -70,7 +70,7 @@ pub fn Mixin(comptime Self: type) type {
             errdefer alloc_writer.deinit();
             const w = &alloc_writer.writer;
 
-            try @import("../blocks/animation_assets.zig").emit(w, self.animation_jsonc_names);
+            try @import("../blocks/animation_assets.zig").emit(w, self.animation_jsonc_names, .catch_panic_style);
 
             if (cfg.resolved_gui) |gui| {
                 if (gui.lifecycle.init) {

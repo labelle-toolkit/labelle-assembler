@@ -65,7 +65,7 @@ pub fn Mixin(comptime Self: type) type {
             errdefer alloc_writer.deinit();
             const w = &alloc_writer.writer;
 
-            try @import("../blocks/animation_assets.zig").emit(w, self.animation_jsonc_names);
+            try @import("../blocks/animation_assets.zig").emit(w, self.animation_jsonc_names, .try_style);
 
             // Window icon hand-off (labelle-cli#359). Desktop only: the
             // loop templates call `window.initWindow` before `{{setup_code}}`,
