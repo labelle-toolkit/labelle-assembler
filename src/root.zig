@@ -1002,6 +1002,12 @@ pub fn generate(
 
     const animation_names = try scanner.linkAndScan(allocator, game_dir, target_dir, "animations", ".zon");
     defer scanner.freeNames(allocator, animation_names);
+    // The full directory was staged by the .zon scan; discover JSONC
+    // separately so existing comptime AnimationDef imports remain unchanged.
+    const animation_dir = try std.fs.path.join(allocator, &.{ game_dir, "animations" });
+    defer allocator.free(animation_dir);
+    const animation_jsonc_names = try scanner.scanDirAbs(allocator, animation_dir, ".jsonc");
+    defer scanner.freeNames(allocator, animation_jsonc_names);
 
     // Copy-only folders (no scanning needed)
     try scanner.linkDir(allocator, game_dir, target_dir, "assets");
@@ -2576,7 +2582,7 @@ pub fn generate(
         defer main_zig.main_template.plugin_events_force_kept = &.{};
         main_zig.main_template.plugin_events_force_kept = force_kept_ungated.items;
 
-        const main_zig_content = try main_zig.generateMainZigFromTemplate(
+        const main_zig_content = try main_zig.generateMainZigWithAnimations(
             allocator,
             engine_template,
             // `cfg_modules`: the plugin `@import` sites inside main.zig
@@ -2596,6 +2602,7 @@ pub fn generate(
             view_names,
             gizmo_names,
             animation_names,
+            animation_jsonc_names,
             // Consumed subset only (#630) — the full discovery list stays
             // with the collision gate + manifest sidecar above.
             event_consumption.kept,

@@ -70,6 +70,8 @@ pub fn Mixin(comptime Self: type) type {
             errdefer alloc_writer.deinit();
             const w = &alloc_writer.writer;
 
+            try @import("../blocks/animation_assets.zig").emit(w, self.animation_jsonc_names);
+
             if (cfg.resolved_gui) |gui| {
                 if (gui.lifecycle.init) {
                     try w.writeAll("    GuiBackend.init();\n");

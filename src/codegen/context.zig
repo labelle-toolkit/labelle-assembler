@@ -83,6 +83,7 @@ pub const Codegen = struct {
     view_names: []const []const u8,
     gizmo_names: []const []const u8,
     animation_names: []const []const u8,
+    animation_jsonc_names: []const []const u8 = &.{},
     plugin_events: []const PluginEvent,
     plugin_flow_nodes: []const PluginFlowNode,
     plugin_pin_styles: []const PluginPinStyle,

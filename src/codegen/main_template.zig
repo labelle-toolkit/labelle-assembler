@@ -198,6 +198,41 @@ pub fn generateMainZigFromTemplate(
     /// edge wrap, labelle-gui wire-fit check) stays uniform.
     plugin_coercions: []const PluginCoercion,
 ) ![]const u8 {
+    return generateMainZigWithAnimations(allocator, engine_template, cfg, lifecycle_tmpl, script_entries, prefab_names, jsonc_scene_names, scene_manifests, component_names, hook_names, event_names, enum_names, view_names, gizmo_names, animation_names, &.{}, plugin_events, plugin_flow_nodes, plugin_pin_styles, plugin_coercions);
+}
+
+pub fn generateMainZigWithAnimations(
+    allocator: std.mem.Allocator,
+    engine_template: []const u8,
+    cfg: ProjectConfig,
+    lifecycle_tmpl: []const u8,
+    script_entries: []const ScriptEntry,
+    prefab_names: []const []const u8,
+    jsonc_scene_names: []const []const u8,
+    scene_manifests: []const SceneManifest,
+    component_names: []const []const u8,
+    hook_names: []const []const u8,
+    event_names: []const []const u8,
+    enum_names: []const []const u8,
+    view_names: []const []const u8,
+    gizmo_names: []const []const u8,
+    animation_names: []const []const u8,
+    animation_jsonc_names: []const []const u8,
+    plugin_events: []const PluginEvent,
+    // RFC-FLOW-VOCABULARY phase 2 — discovered FlowNodes/PinStyles from
+    // plugin AND game-script modules. Both lists may be empty; the
+    // emitter writes a `PluginFlowNodes = struct {}` / `PluginPinStyles
+    // = struct {}` shell either way so downstream code paths
+    // (flow-codegen phase 3, labelle-gui phase 4) can reflect uniformly.
+    plugin_flow_nodes: []const PluginFlowNode,
+    plugin_pin_styles: []const PluginPinStyle,
+    /// RFC-FLOW-VOCABULARY §2 / O4 — plugin-declared coercions. Same
+    /// shape contract as `plugin_flow_nodes` / `plugin_pin_styles`:
+    /// emitter writes a `PluginCoercions = struct {}` shell when this
+    /// slice is empty so downstream comptime reflection (flow-codegen
+    /// edge wrap, labelle-gui wire-fit check) stays uniform.
+    plugin_coercions: []const PluginCoercion,
+) ![]const u8 {
     // Surface basename collisions at generate time, before any
     // code emission — otherwise two prefabs with the same filename
     // in different subfolders would both try to register the same
@@ -242,6 +277,7 @@ pub fn generateMainZigFromTemplate(
         .view_names = view_names,
         .gizmo_names = gizmo_names,
         .animation_names = animation_names,
+        .animation_jsonc_names = animation_jsonc_names,
         .plugin_events = plugin_events,
         .plugin_flow_nodes = plugin_flow_nodes,
         .plugin_pin_styles = plugin_pin_styles,

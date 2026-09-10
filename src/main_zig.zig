@@ -122,3 +122,5 @@ pub const PREVIEW_READBACK_CLEANUP_METAL_SOKOL = preview.PREVIEW_READBACK_CLEANU
 pub const generateMainZigFromTemplate = main_template.generateMainZigFromTemplate;
 pub const generateGameLayers = main_template.generateGameLayers;
 pub const generateResourceRegistry = main_template.generateResourceRegistry;
+
+pub const generateMainZigWithAnimations = main_template.generateMainZigWithAnimations;
