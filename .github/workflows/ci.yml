@@ -107,7 +107,23 @@ jobs:
   # dep doesn't fetch cleanly from the macos GitHub runner (see the
   # slot-allocator gate above for context).
   examples-integration:
-    name: Examples integration test
+    # NAMED for what it actually resolves (#732 half 2). This lane clones
+    # labelle-core / labelle-engine / labelle-gfx / labelle-null at `main` as
+    # SIBLINGS, and the assembler's monorepo auto-discovery (findRepoRoot walks
+    # up from the EXECUTABLE) builds those siblings INSTEAD of each example's
+    # declared pins. That is deliberate — it is the cross-repo integration
+    # signal — but it means a red here does NOT necessarily mean this PR is
+    # broken: during a multi-repo release train the four mains disagree for the
+    # minutes between merges, and an example fails on a contract that exists on
+    # one main and not another. PR #730 went red in a null-backend example on
+    # `backend_contract has no member named 'PixelWaterRgba'`, and a re-run of
+    # the IDENTICAL commit passed once the mains agreed.
+    #
+    # So: read a failure here as "this PR vs the toolkit mains, right now".
+    # The `bgfx-examples-pinned` job below is the lane that tests a PR against
+    # what it DECLARES; if that one is green and this one is red, check the SHA
+    # banner this job prints first — you are probably mid-train.
+    name: Examples integration (siblings @ main — cross-repo, may be mid-train)
     runs-on: ubuntu-latest
     # Builds several example projects end-to-end; normally a few minutes.
     # 15 gives headroom for the multi-repo checkout + apt install while
@@ -203,6 +219,36 @@ jobs:
           repository: labelle-toolkit/labelle-gfx
           ref: main
           path: labelle-gfx
+
+      # Print WHICH sibling revisions this run resolved, before anything is
+      # built (#732). The examples' own pins are overridden by these
+      # checkouts, so these SHAs — not the `project.labelle` version fields —
+      # are what a failure below was actually compiled against. Without this
+      # banner a mid-release-train red is indistinguishable from a real break
+      # and gets debugged from scratch; with it, one glance at the top of the
+      # log says "core is 40 commits ahead of engine, wait for the train".
+      - name: Sibling revisions under test (READ THIS FIRST on a failure)
+        run: |
+          set -uo pipefail
+          echo "::group::Sibling checkouts resolved for this run"
+          printf '%-22s %-46s %s\n' REPO REVISION DESCRIBE
+          for d in labelle-core labelle-engine labelle-gfx labelle-null \
+                   labelle-cli labelle-gui labelle-engine-727; do
+            dir="$GITHUB_WORKSPACE/$d"
+            if [ ! -d "$dir/.git" ]; then
+              printf '%-22s %-46s %s\n' "$d" "(not checked out)" "-"
+              continue
+            fi
+            sha=$(git -C "$dir" rev-parse HEAD)
+            ref=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+            desc=$(git -C "$dir" describe --tags --always 2>/dev/null || echo "?")
+            printf '%-22s %-46s %s\n' "$d" "$sha ($ref)" "$desc"
+          done
+          echo "::endgroup::"
+          echo "NOTE: these siblings OVERRIDE each example's project.labelle pins."
+          echo "      A failure here may be a mid-release-train disagreement between"
+          echo "      the mains above rather than a defect in this PR. The"
+          echo "      'bgfx examples (PINNED resolution)' job tests the declared pins."
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -888,9 +934,11 @@ jobs:
       # build is run for the raylib + sokol games (their system libs are
       # installed above, and sprite-runner is the regression guard for the #611
       # sokol-desktop material-seam fix). The two bgfx games (pack-city,
-      # material-demo) are generate-only here — the bgfx desktop C++ compile is
-      # heavy and their full build is covered locally; wiring it into CI is a
-      # follow-up. Screenshots are NOT part of CI: each game ships a committed
+      # material-demo) stay generate-only IN THIS LANE on purpose: here their
+      # pins are overridden by the sibling `main` checkouts, so a build would
+      # be a moving target. They are BUILT — not just generated — against their
+      # DECLARED pins in the `bgfx examples (PINNED resolution)` job below
+      # (#732). Screenshots are NOT part of CI: each game ships a committed
       # deterministic preview.png and documents manual `--screenshot` capture
       # (windowed backends need a GUI session / xvfb). See each game's README.
       - name: Generate + build the #611 showcase games (released runtime pins)
@@ -1318,3 +1366,319 @@ jobs:
         run: |
           .\zig-out\bin\labelle-assembler.exe --protocol-version
           .\zig-out\bin\labelle-assembler.exe --help
+
+  # ── bgfx examples, resolved from the PINS they declare (#732) ────────
+  #
+  # Two defects, one job.
+  #
+  # 1. CI GENERATED the bgfx examples and never BUILT them, so a break that
+  #    only appears at compile time — which is most of them, and all of the
+  #    ones that live in a DEPENDENCY — passed. labelle-core v1.32.0 shipped
+  #    `MaterialEffect.pixel_water`; `material-demo` and `pack-city` both
+  #    pinned a bgfx whose exhaustive switches had no arm for it. Both were
+  #    broken and CI said nothing, because `generate` succeeds — the error is
+  #    in backend source that only a real build compiles. The signal read as
+  #    "one backend (sokol) is broken" rather than "three examples are broken,
+  #    two of them untested" (#731).
+  #
+  # 2. The examples lane clones core/engine/gfx/null at `main` as SIBLINGS,
+  #    and the assembler's auto-discovery builds those INSTEAD of the pins.
+  #    Nothing tested a PR against what it DECLARES. During a release train
+  #    the mains disagree for the minutes between merges and CI fabricates
+  #    failures: #730 went red on `backend_contract has no member named
+  #    'PixelWaterRgba'` and a re-run of the identical commit passed.
+  #
+  # This job fixes both: it checks out NOTHING but the assembler (+ the
+  # labelle-gui path-dep that `build.zig.zon` needs), points LABELLE_HOME at a
+  # scratch dir so nothing is inherited from a warm cache, and BUILDS both
+  # bgfx examples against the exact `project.labelle` pins. It then ASSERTS the
+  # pins are what got used, rather than trusting a green build: the assembler
+  # warns `is built from LOCAL sources, not the pinned <v>` whenever
+  # auto-discovery wins, and this job fails on that string.
+  #
+  # WHY EVERY PR, AND WHY LINUX ONLY:
+  #   * Linux only — one platform is enough to catch a compile break in
+  #     backend source, and it is the cheapest runner. macOS would re-prove
+  #     the same sema against Metal instead of Vulkan for ~2x the minutes.
+  #   * Every PR, NOT gated on `examples/**` / `src/config.zig` / backend
+  #     pins. That gate was the tempting option and it does not cover the
+  #     defect that motivated the issue: the v1.32.0 break arrived from a
+  #     DEPENDENCY's release. No file in this repo changed, so a path filter
+  #     would have skipped the job on every PR while main stayed broken. A
+  #     check that skips exactly when the break lands is the same class of
+  #     defect as the one being fixed here.
+  #   * Cost is bounded by sharing one zig cache between the two examples —
+  #     the bgfx C++ objects compile once and pack-city links against them.
+  bgfx-examples-pinned:
+    name: bgfx examples (PINNED resolution)
+    runs-on: ubuntu-latest
+    # The first example pays a cold bgfx C++ compile; the second reuses it.
+    # 45 bounds a wedged runner far under GitHub's 6h default while leaving
+    # room for a cold package fetch on top.
+    timeout-minutes: 45
+
+    env:
+      # Scratch package home. NOT the default `~/.labelle` — a pinned lane
+      # must prove the pins resolve from the registry on a cold machine, and
+      # a warm shared cache would hide a pin that no longer exists.
+      LABELLE_HOME: ${{ github.workspace }}/pinned-labelle-home
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      # The ONLY sibling checkout in this job. `build.zig.zon` has a
+      # `../labelle-gui/flow-codegen` path-dep, so the assembler cannot build
+      # without it. It is not part of the runtime trio, so it cannot shadow a
+      # pin — deliberately, NO labelle-core / labelle-engine / labelle-gfx /
+      # labelle-null sibling lives here. That absence IS the test.
+      - name: Checkout labelle-gui (flow_codegen path-dep)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # bgfx desktop on Linux: X11/Wayland + Vulkan headers. Mirrors
+      # labelle-bgfx's own CI so the two lanes compile the same backend.
+      - name: Install bgfx desktop system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev \
+            libvulkan-dev
+
+      - name: Build labelle-assembler
+        run: cd labelle-assembler && zig build
+
+      - name: Assert no runtime sibling can shadow the pins
+        run: |
+          set -euo pipefail
+          for repo in labelle-core labelle-engine labelle-gfx labelle-null; do
+            if [ -d "$GITHUB_WORKSPACE/$repo" ]; then
+              echo "::error::$repo is checked out as a sibling — the assembler's"
+              echo "::error::auto-discovery would build it INSTEAD of the declared pin,"
+              echo "::error::which is exactly what this job exists to avoid."
+              exit 1
+            fi
+          done
+          echo "No runtime siblings present; pins will resolve from the registry."
+
+      - name: Generate + BUILD the bgfx examples against their declared pins
+        run: |
+          set -euo pipefail
+          ASM="$GITHUB_WORKSPACE/labelle-assembler/zig-out/bin/labelle-assembler"
+          mkdir -p "$LABELLE_HOME"
+
+          for g in material-demo pack-city; do
+            echo "::group::$g — declared pins"
+            grep -E '_version|backend_package' \
+              "$GITHUB_WORKSPACE/labelle-assembler/examples/$g/project.labelle" \
+              | grep -v '^\s*//' || true
+            echo "::endgroup::"
+
+            cd "$GITHUB_WORKSPACE/labelle-assembler/examples/$g"
+            "$ASM" install  --project-root . 2>&1 | tee install.log
+            "$ASM" generate --project-root . 2>&1 | tee generate.log
+
+            # MECHANISM assertion, not a value one. The assembler's monorepo
+            # auto-discovery symlinks a sibling checkout into the cache's local
+            # slot in preference to the pin, and SAYS SO when it does — two
+            # distinct strings, one per phase (both verified against a real
+            # sibling checkout while writing this job):
+            #   install:  core: using LOCAL sources from '<dir>' — the pinned
+            #             1.32.0 will NOT be built (#685)
+            #   generate: labelle: core is built from LOCAL sources, not the
+            #             pinned 1.32.0 — source '<dir>' (rev <sha>)
+            # A green build only proves the example compiles against SOMETHING.
+            # This is what proves it compiled against what the example declares.
+            if grep -Eq 'built from LOCAL sources|using LOCAL sources' install.log generate.log; then
+              echo "::error::$g resolved a LOCAL checkout instead of its pins:"
+              grep -E 'built from LOCAL sources|using LOCAL sources' install.log generate.log
+              exit 1
+            fi
+
+            # And the pinned versions really were fetched into the scratch home.
+            for pkg in core engine gfx; do
+              want=$(sed -n "s/.*\.${pkg}_version = \"\([^\"]*\)\".*/\1/p" project.labelle | head -1)
+              if [ ! -d "$LABELLE_HOME/packages/${pkg}/${want}" ]; then
+                echo "::error::$g pins ${pkg} ${want} but it was never fetched into the scratch LABELLE_HOME"
+                exit 1
+              fi
+              echo "$g: ${pkg} ${want} resolved from the registry"
+            done
+
+            # THE POINT OF THIS JOB. `generate` alone would already be green
+            # here; the backend source is only compiled by a real build.
+            echo "== $g: zig build (bgfx desktop) =="
+            cd .labelle/bgfx_desktop
+            # labelle-cli-equivalent fixFingerprint dance — the assembler emits
+            # a placeholder fingerprint (see the showcase step for context).
+            set +e
+            ERR=$(zig build 2>&1)
+            RC=$?
+            set -e
+            if [ $RC -ne 0 ]; then
+              BAD=$(printf '%s\n' "$ERR" | grep -oE 'invalid fingerprint: 0x[0-9a-f]+' | head -1 | awk '{print $3}')
+              GOOD=$(printf '%s\n' "$ERR" | grep -oE 'use this value: 0x[0-9a-f]+' | head -1 | awk '{print $4}')
+              if [ -n "$BAD" ] && [ -n "$GOOD" ]; then
+                sed -i "s/${BAD}/${GOOD}/" build.zig.zon
+              else
+                printf '%s\n' "$ERR"
+                echo "::error::$g failed to build against its declared pins"
+                exit 1
+              fi
+            fi
+            zig build
+            echo "PASS: $g BUILT against its declared pins"
+          done
+
+          echo "PASS: both bgfx examples built from the registry-resolved pins"
+
+  # ── The shader BUILD pipeline, end to end, with a real shaderc (#735) ─
+  #
+  # `test/material_pipeline_e2e.py` is the only test that covers the PRODUCER
+  # side of game-owned materials: descriptor -> shaderc -> packaged variants ->
+  # a material that compiles and validates against core's contract. Every other
+  # material check in CI covers CONSUMERS of already-compiled shaders (the
+  # goldens, the bgfx probe with checked-in `.bin` fixtures) — and pre-compiled
+  # fixtures are structurally incapable of noticing a pipeline regression.
+  #
+  # It was opt-in behind three `-D` flags because CI had no shaderc, so it
+  # never ran anywhere. This job provisions one and un-gates it. Nobody passes
+  # a flag by hand: the job DERIVES all three from the repo's own pins.
+  #
+  # The toolchain is REUSED, not duplicated: labelle-bgfx already builds
+  # shaderc from its pinned `zbgfx` for the golden harnesses, so this job reads
+  # the builtin bgfx provider version out of `src/config.zig`, reads that
+  # release's `zbgfx` archive URL out of its `build.zig.zon`, and builds
+  # `shaderc` from exactly that source. No second toolchain, and no separate
+  # pin to drift.
+  #
+  # Independent of `examples/condenser` by construction — the python driver
+  # synthesizes its own three-material fixture (shared includes, an escaping
+  # include, a deliberately broken shader) under `.zig-cache/`.
+  #
+  # FAILS CLOSED, not just open: the driver asserts five REJECTION paths as
+  # well as the happy one — an include that escapes the material dir
+  # (`EscapingShaderInclude`), an uncompilable `.sc`, a descriptor missing the
+  # variant the host renderer requires, and two component-collision cases in
+  # the emitted comptime guard. A pipeline that silently accepted any of those
+  # turns this job red.
+  material-pipeline-e2e:
+    name: Material shader pipeline e2e (real shaderc)
+    runs-on: ubuntu-latest
+    # Cold shaderc build (glslang + spirv-tools) dominates; ~2.5 min of it on
+    # a warm local machine, and it is cached below. 40 leaves room for a cold
+    # miss plus the fixture's 12 shader compiles.
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout labelle-assembler
+        uses: actions/checkout@v4
+        with:
+          path: labelle-assembler
+
+      - name: Checkout labelle-gui (flow_codegen path-dep)
+        uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-gui
+          ref: main
+          path: labelle-gui
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # zbgfx's default build step touches its glfw/bgfx targets alongside the
+      # shaderc host tool, so the X11/GL headers have to be present even
+      # though shaderc itself is a pure host compiler.
+      - name: Install zbgfx build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev libvulkan-dev
+
+      # Resolve the shaderc SOURCE from this repo's own pins, so the compiler
+      # under test is the one the builtin bgfx provider actually ships with.
+      # Chain: src/config.zig builtinProvider(.bgfx).version
+      #     -> labelle-bgfx@v<that>/build.zig.zon .zbgfx.url
+      #     -> that archive, built with -Dwith_shaderc=true.
+      - name: Resolve the pinned zbgfx (shaderc source)
+        id: zbgfx
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          BGFX_VER=$(sed -n 's/.*\.bgfx => .*\.repo = "github\.com\/labelle-toolkit\/labelle-bgfx".*\.version = "\([^"]*\)".*/\1/p' \
+            labelle-assembler/src/config.zig | head -1)
+          test -n "$BGFX_VER" || { echo "::error::could not read the builtin bgfx provider version from src/config.zig"; exit 1; }
+          echo "builtin bgfx provider: $BGFX_VER"
+
+          git clone --quiet --depth 1 --branch "v$BGFX_VER" \
+            https://github.com/labelle-toolkit/labelle-bgfx.git labelle-bgfx
+          ZBGFX_URL=$(sed -n 's#.*\.url = "\(https://[^"]*zbgfx/archive/[^"]*\)".*#\1#p' \
+            labelle-bgfx/build.zig.zon | head -1)
+          test -n "$ZBGFX_URL" || { echo "::error::labelle-bgfx v$BGFX_VER declares no zbgfx archive url"; exit 1; }
+          echo "pinned zbgfx: $ZBGFX_URL"
+
+          mkdir -p zbgfx
+          curl -sSfL "$ZBGFX_URL" -o zbgfx.tar.gz
+          tar xzf zbgfx.tar.gz -C zbgfx --strip-components=1
+          test -f zbgfx/build.zig
+
+          echo "url=$ZBGFX_URL" >> "$GITHUB_OUTPUT"
+          echo "key=$(printf '%s' "$ZBGFX_URL" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      # The build is deterministic in the pinned source, so cache it on the
+      # zbgfx URL. A cold miss costs a few minutes; a hit costs seconds.
+      - name: Cache the built shaderc
+        uses: actions/cache@v4
+        with:
+          path: |
+            zbgfx/zig-out
+            zbgfx/.zig-cache
+          key: shaderc-${{ runner.os }}-zig0.16.0-${{ steps.zbgfx.outputs.key }}
+
+      - name: Build shaderc from the pinned zbgfx
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/zbgfx"
+          zig build -Dwith_shaderc=true
+          test -x zig-out/bin/shaderc
+          ./zig-out/bin/shaderc --help >/dev/null 2>&1 || true
+          echo "shaderc ready: $PWD/zig-out/bin/shaderc"
+
+      # The fixture compiles `core.shader_material` descriptors, so it needs a
+      # core checkout. Take the CURATED default out of build.zig — the same
+      # version a fresh `labelle init` scaffolds — so this lane tracks the set
+      # the assembler ships rather than a second, drifting pin.
+      - name: Check out the curated labelle-core
+        id: core
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          CORE_VER=$(sed -n 's/.*"core_version", "Default core library version") orelse "\([^"]*\)".*/\1/p' \
+            labelle-assembler/build.zig | head -1)
+          test -n "$CORE_VER" || { echo "::error::could not read the curated core_version from build.zig"; exit 1; }
+          echo "curated core: $CORE_VER"
+          git clone --quiet --depth 1 --branch "v$CORE_VER" \
+            https://github.com/labelle-toolkit/labelle-core.git labelle-core-e2e
+
+      - name: Run the material pipeline e2e (descriptor -> shaderc -> material)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/labelle-assembler"
+          zig build test-material-integration \
+            -Dshaderc="$GITHUB_WORKSPACE/zbgfx/zig-out/bin/shaderc" \
+            -Dmaterial-test-core="$GITHUB_WORKSPACE/labelle-core-e2e" \
+            -Dmaterial-test-zbgfx="$GITHUB_WORKSPACE/zbgfx"
