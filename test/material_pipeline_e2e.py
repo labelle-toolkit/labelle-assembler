@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import zlib
 
@@ -84,8 +85,13 @@ build(False, "EscapingShaderInclude")
 (root / "materials/fog/fs.sc").write_text(shader + "\ninvalid shader syntax!\n", encoding="utf-8")
 build(False, "shader fog")
 (root / "materials/fog/fs.sc").write_text(shader, encoding="utf-8")
-descriptor["targets"] = ["glsl"]
+# Fails closed when the descriptor drops the variant the HOST needs.
+# `material_build.create` picks that per host (darwin -> mtl, else spv), so the
+# expectation follows the host rather than hard-coding a Linux-only answer —
+# this assertion used to make the whole test unrunnable on macOS.
+required_target = "mtl" if sys.platform == "darwin" else "spv"
+descriptor["targets"] = [t for t in ("glsl", "essl") if t != required_target]
 (root / "materials/fog/material.json").write_text(json.dumps(descriptor), encoding="utf-8")
-build(False, "target requires 'spv'")
+build(False, "target requires '%s'" % required_target)
 print("PASS: 12 real shader variants, generated core descriptors, cached rebuild, include invalidation, escaping include rejection, compiler failure, missing target diagnostic")
 print("Evidence fixture:", root)
