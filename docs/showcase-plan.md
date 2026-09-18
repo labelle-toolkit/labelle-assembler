@@ -89,10 +89,13 @@ generate+build CI assertion above.
 
 ### Games 6–9 (labelle-assembler#611) — released runtime, in-tree assembler
 
-Games 6–9 pin the **released RUNTIME** package set (core 1.26.0 / engine
-2.6.0 / gfx 1.28.1 / cli 1.58.0) + released backends, but — like every
-sibling example in this repo — pin the **assembler at `local:../../`** (the
-in-tree source). Two reasons the assembler is in-tree, not a release
+Games 6–9 pin a **released RUNTIME** package set + released backends —
+tile-explorer and sprite-runner on core 1.26.0 / engine 2.6.0 / gfx 1.28.1,
+the two bgfx games (pack-city, material-demo) on core 1.32.0 / engine 2.12.2
+/ gfx 1.30.1 because their bgfx 0.20.0 pin has a hard core floor of 1.28.0
+and was released against 1.32.0 (see their `project.labelle`), all on cli
+1.58.0 — but, like every sibling example in this repo, pin the **assembler
+at `local:../../`** (the in-tree source). Two reasons the assembler is in-tree, not a release
 number:
 
 1. `examples/` exist to validate the assembler *under test*. Numbered

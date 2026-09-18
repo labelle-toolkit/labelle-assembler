@@ -44,16 +44,16 @@ sources.
 
 ## Scope note — the two halves of gfx#305
 
-gfx#305 shipped TWO surfaces. This demo exercises the **post-fx** half,
-which is wired end-to-end for games in the released engine (2.6.0). The
-**per-entity material** half (`palette_swap` / `flash` / `dissolve` /
-`outline`) is plumbed through core + gfx (`SpriteVisual.material`) but the
-released engine `2.6.0` exposes **no game-facing authoring surface** for
-it — there is no `Sprite.material` field and no `setMaterial` on the game,
-so a game cannot drive per-entity materials yet. That engine bridge is the
-tracked follow-up ([labelle-engine#789](https://github.com/labelle-toolkit/labelle-engine/issues/789));
-when it lands, this demo grows a second scene that flashes / dissolves
-individual orbs.
+gfx#305 shipped TWO surfaces. This demo exercises the **post-fx** half
+only, wired end-to-end for games since engine 2.6.0 (the demo's original
+pin). The **per-entity material** half (`palette_swap` / `flash` /
+`dissolve` / `outline`) is plumbed through core + gfx
+(`SpriteVisual.material`), and the engine now pinned here (`2.12.2`) does
+expose `game.setMaterial(entity, material)` (`src/game/visuals.zig`) — it
+was `2.6.0` that had no game-facing authoring surface for it. This demo
+still does **not** drive per-entity materials; the second scene that
+flashes / dissolves individual orbs is the tracked follow-up
+([labelle-engine#789](https://github.com/labelle-toolkit/labelle-engine/issues/789)).
 
 Files:
 
@@ -70,19 +70,28 @@ The **runtime** packages + bgfx backend pin the **released** set; the
 see the pins note in `tile-explorer/README.md`):
 
 ```zig
-.core_version = "1.26.0", .engine_version = "2.6.0", .gfx_version = "1.28.1",
+.core_version = "1.32.0", .engine_version = "2.12.2", .gfx_version = "1.30.1",
 .labelle_version = "1.58.0", .assembler_version = "local:../../",
 .backend_package = .{ .name = "bgfx", … .version = "0.20.0" },
 ```
 
-> **Backend pin bumped to `0.20.0` (labelle-core v1.32.0).** That core
-> appended `MaterialEffect.pixel_water`; every bgfx release before
-> `0.20.0` switches exhaustively over that enum with no arm for the new
-> tag, so it stops compiling against it. `0.20.0` implements the effect
-> behind `@hasField(MaterialEffect, "pixel_water")` probes and builds
-> against old and new core alike. CI clones `labelle-core` at `main` as a
-> sibling checkout and the assembler builds that sibling in preference to
-> the `.core_version` pin above, so the old backend pin failed there.
+> **Backend pin `0.20.0`, and the runtime trio raised with it.**
+> labelle-core v1.32.0 appended `MaterialEffect.pixel_water`; every bgfx
+> release before `0.20.0` switches exhaustively over that enum with no arm
+> for the new tag, so it stops compiling against that core — and CI clones
+> `labelle-core` at `main` as a sibling checkout that the assembler builds
+> in preference to the `.core_version` pin. `0.20.0` implements the effect
+> behind `@hasField(MaterialEffect, "pixel_water")` probes.
+>
+> The core pin follows the backend. bgfx `0.20.0` has a **hard** core floor
+> of `1.28.0` (`core.BackendTextureId`, a struct field type), so the earlier
+> `core_version = "1.26.0"` pairing (#731) failed a **standalone** `labelle
+> build` inside the backend (`labelle-bgfx/src/gfx/types.zig:17:38: … no
+> member named 'BackendTextureId'`) — CI never saw it because the sibling
+> core is `main` and the bgfx games are generate-only there (#732). The pin
+> is `1.32.0`, the core bgfx `0.20.0` was released against and the one the
+> curated `labelle init` trio carries; the trio here is that curated set.
+> `project.labelle` spells out the reasoning.
 
 On the fully-released `labelle` path this game builds on assembler
 `0.94.0` (bgfx takes the generic desktop `unifyCoreDiamond` codegen,

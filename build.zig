@@ -18,12 +18,16 @@ pub fn build(b: *std.Build) void {
     // fetcher then mapped to a bogus `vdev` git ref (issue #159).
     // Keep this trio a MUTUALLY COMPATIBLE set: a fresh `labelle init` resolves
     // these defaults, so a mismatch fails `labelle build` before any user code.
-    // Set verified end-to-end (init → install → generate → full compile, on
-    // both the raylib_desktop and null_desktop targets, against the published
-    // release tarballs) for core 1.28.0 / engine 2.12.2 / gfx 1.30.1 with
-    // cli 1.61.2 — which is exactly `labelle-cli` v1.61.2's `versions.zon`,
-    // the set its own `labelle upgrade all` writes. Keep the two in step: when
-    // they drift, `init` scaffolds a project the very next `upgrade` rewrites.
+    // Set verified end-to-end STANDALONE (init → install → generate → full
+    // compile against the published release tarballs, scratch LABELLE_HOME,
+    // no sibling checkouts) for core 1.32.0 / engine 2.12.2 / gfx 1.30.1 with
+    // cli 1.61.2, on the bgfx_desktop, null_desktop, raylib_desktop and
+    // sokol_desktop targets. engine/gfx/cli are exactly `labelle-cli` v1.61.2's
+    // `versions.zon`, the set its own `labelle upgrade all` writes; core is
+    // AHEAD of it (that file still says 1.28.0 through cli v1.67.0) — see the
+    // bgfx paragraph below for why, and bump the cli side to match. Keep the
+    // two in step: when they drift, `init` scaffolds a project the very next
+    // `upgrade` rewrites.
     //
     // The hard floor inside the trio (#679): gfx >= 1.30.0 re-exports
     // `core.TextureId` instead of declaring its own (labelle-gfx#328,
@@ -51,11 +55,28 @@ pub fn build(b: *std.Build) void {
     //
     // (v0.96.0 bumped engine 2.7.0 → 2.11.0 while leaving core at 1.26.0, so
     // every fresh `labelle init` scaffold failed to compile.)
+    //
+    // core 1.32.0 (#731 follow-up): the builtin `.bgfx` provider default
+    // (`src/config.zig` builtinProvider) is labelle-bgfx 0.20.0, the lowest
+    // bgfx that survives core v1.32.0's `MaterialEffect.pixel_water`. Its
+    // HARD core floor is 1.28.0 (`core.BackendTextureId`, a struct field
+    // type, bgfx >= 0.15.0) — 0.20.0 does compile against core 1.28.0,
+    // verified standalone; the v1.32.0 `PixelWaterDraw` / `PIXEL_WATER_*`
+    // names it takes from `backend_contract` are reached only through
+    // `@hasField(MaterialEffect, "pixel_water")`-gated paths or lazy
+    // top-level aliases. 1.32.0 is a CURATED floor like the gfx 1.28 one: it
+    // is the core bgfx 0.20.0 was released against (its own build.zig.zon),
+    // the only core on which the pixel_water effect the default backend
+    // ships is reachable, and the pairing labelle-bgfx's own examples run
+    // on. A `labelle init --backend=bgfx` scaffold should not pair a backend
+    // with a core older than the backend's own pin. `src/init_cmd.zig`'s
+    // "scaffold core default pairs with the builtin bgfx provider" test
+    // asserts both floors.
     // Bump all three together when moving the engine default (their
     // build.zig.zon pins/floors must agree — read them from the tags), and
     // keep `src/init_cmd.zig`'s "scaffold pins a MUTUALLY COMPATIBLE trio"
     // test satisfied — it encodes the floors below as assertions.
-    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.28.0";
+    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.32.0";
     const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.12.2";
     const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.30.1";
     // Version this assembler binary stamps into a freshly scaffolded

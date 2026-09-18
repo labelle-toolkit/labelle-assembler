@@ -493,7 +493,8 @@ test "curated-trio floors reject each incoherent combination — #683 review" {
     // The floors themselves, against synthetic trios: the test above can
     // only ever see whatever `build.zig` defaults to today, so without
     // these a floor could be silently dropped and still go green.
-    try checkTrioFloors("1.28.0", "2.12.2", "1.30.1"); // the current curated set
+    try checkTrioFloors("1.32.0", "2.12.2", "1.30.1"); // the current curated set
+    try checkTrioFloors("1.28.0", "2.12.2", "1.30.1"); // the pre-#731 curated set — still coherent
 
     // gfx >= 1.30.0 needs core >= 1.28.0 and engine >= 2.12.1.
     try std.testing.expectError(error.TestUnexpectedResult, checkTrioFloors("1.27.0", "2.12.2", "1.30.1"));
@@ -506,6 +507,50 @@ test "curated-trio floors reject each incoherent combination — #683 review" {
 
     // Below every floor, nothing is asserted — old coherent sets stay legal.
     try checkTrioFloors("1.24.0", "2.7.0", "1.27.0");
+}
+
+/// The builtin backend providers are curated WITH the trio (#731 review):
+/// a `labelle init --backend=bgfx` scaffold pairs `src/config.zig`'s bgfx
+/// default with the core default above. Two floors on that pairing:
+///
+/// bgfx >= 0.15.0 floors core >= 1.28.0 — a COMPILE break: the backend's
+/// `src/gfx/types.zig` types a struct field as `core.BackendTextureId`
+/// (core#328 phase 3), which is analyzed eagerly, so an older core dies
+/// inside the backend with "root source file struct 'root' has no member
+/// named 'BackendTextureId'". That is exactly how #731's examples (core
+/// 1.26.0 + bgfx 0.20.0) failed a standalone `labelle build`.
+///
+/// bgfx >= 0.20.0 floors core >= 1.32.0 — a CURATED floor, like the gfx
+/// 1.28 one in `checkTrioFloors`: 0.20.0 does compile against core 1.28.0
+/// (its v1.32.0 `PixelWaterDraw` / `PIXEL_WATER_*` names are reached only
+/// through `@hasField(MaterialEffect, "pixel_water")`-gated paths or lazy
+/// top-level aliases — verified standalone), but 1.32.0 is the core it was
+/// released against (its build.zig.zon) and the only core on which the
+/// pixel_water effect the default backend ships is reachable. The scaffold
+/// pairs the default backend with the core it was released against, not
+/// merely one it happens to compile on.
+fn checkBgfxProviderFloors(core_version: []const u8, bgfx_version: []const u8) !void {
+    if (try pinAtLeast(bgfx_version, "0.20.0")) try std.testing.expect(try pinAtLeast(core_version, "1.32.0"));
+    if (try pinAtLeast(bgfx_version, "0.15.0")) try std.testing.expect(try pinAtLeast(core_version, "1.28.0"));
+}
+
+test "scaffold core default pairs with the builtin bgfx provider — #731 review" {
+    // Read the REAL default from `builtinProvider`, not a copy of its version
+    // string, so a provider bump that forgets the trio fails here.
+    const bgfx = config.ProjectConfig.builtinProvider(.bgfx) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(config.isSemverVersion(bgfx.version));
+    try checkBgfxProviderFloors(config.CORE_VERSION, bgfx.version);
+}
+
+test "bgfx-provider floors reject the #731 pairings" {
+    try checkBgfxProviderFloors("1.32.0", "0.20.0"); // the curated pairing
+    // What #731 shipped: the bgfx 0.20.0 default over the core 1.28.0 scaffold default.
+    try std.testing.expectError(error.TestUnexpectedResult, checkBgfxProviderFloors("1.28.0", "0.20.0"));
+    // What #731's examples pinned: bgfx 0.20.0 over core 1.26.0 — the compile break.
+    try std.testing.expectError(error.TestUnexpectedResult, checkBgfxProviderFloors("1.26.0", "0.20.0"));
+    try std.testing.expectError(error.TestUnexpectedResult, checkBgfxProviderFloors("1.26.0", "0.15.0"));
+    // Below every floor, nothing is asserted — old coherent pairings stay legal.
+    try checkBgfxProviderFloors("1.26.0", "0.13.1");
 }
 
 test "pinAtLeast normalizes the abbreviated `X.Y` pin form, and names a bad one — #683 review" {

@@ -1222,7 +1222,7 @@ pub const ProjectConfig = struct {
     /// just a *shorthand* for a provider. `.backend = .<tag>` transparently
     /// resolves to the fetched package (`isExternal()` ⇒ true) with no
     /// project-config change.
-    fn builtinProvider(backend: Backend) ?PluginDep {
+    pub fn builtinProvider(backend: Backend) ?PluginDep {
         return switch (backend) {
             // Extracted out-of-tree (#386 Phase 6c) — `.backend = .<tag>` resolves
             // to the provider package, not a bundled slot.
@@ -1254,13 +1254,23 @@ pub const ProjectConfig = struct {
             // FLOOR NOTE: this is a LATEST-as-lowest-fixed bump, not a bump for
             // its own sake — there is no older bgfx with the fix, because the
             // fix shipped the same day as the core release. It does raise the
-            // implicit runtime floor for a project that takes this default:
-            // bgfx >= 0.15.0 consumes core's typed `BackendTextureId`
-            // (core#328 phase 3, core >= v1.28.0), and — unlike labelle-sokol,
-            // which comptime-gates every v1.32.0 decl it names — bgfx names
-            // `PixelWaterDraw` / `PIXEL_WATER_*` from `backend_contract`
-            // ungated, so pair this default with core >= v1.32.0. A project
-            // pinned to an older core that must stay there should pin
+            // implicit runtime floor for a project that takes this default.
+            // The HARD floor is core >= v1.28.0: bgfx >= 0.15.0 types a struct
+            // field as core's `BackendTextureId` (core#328 phase 3), analyzed
+            // eagerly, so an older core fails inside the backend ("root source
+            // file struct 'root' has no member named 'BackendTextureId'" —
+            // how the #731 examples on core 1.26.0 failed standalone). The
+            // v1.32.0 `PixelWaterDraw` / `PIXEL_WATER_*` names bgfx takes from
+            // `backend_contract` are NOT a compile floor: unlike labelle-sokol,
+            // which comptime-gates each decl at its use, bgfx aliases them at
+            // top level — but every path that reaches them sits behind
+            // `@hasField(MaterialEffect, "pixel_water")` and an unreferenced
+            // alias is never analyzed, so 0.20.0 compiles against core 1.28.0
+            // (verified standalone). The CURATED pairing is still core >=
+            // v1.32.0: the core 0.20.0 was released against and the only one
+            // on which its pixel_water effect is reachable. `build.zig`'s
+            // scaffold trio carries it and `src/init_cmd.zig` asserts it. A
+            // project pinned to an older core that must stay there should pin
             // `.backend_package` explicitly rather than ride the default.
             .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.20.0" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
