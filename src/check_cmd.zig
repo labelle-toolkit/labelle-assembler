@@ -42,6 +42,7 @@ const scan = @import("codegen/scan.zig");
 const idents = @import("codegen/idents.zig");
 const check = @import("check.zig");
 const scene_name_lint = @import("scene_name_lint.zig");
+const version_floors = @import("version_floors.zig");
 
 const ProjectConfig = config.ProjectConfig;
 
@@ -88,6 +89,19 @@ pub fn cmdCheck(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Arg
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    // ── cross-package version floors (#739) ──────────────────────────────
+    // `check` is the OTHER door that resolves the same backend/core pairing
+    // `generate` does, and it is what CI runs first — so it must refuse the
+    // same pairings `generate` refuses, with the same diagnostic, rather
+    // than passing a project that cannot build. Parse failures are left to
+    // `runLint` below, which reports them with its own message.
+    if (readProjectConfig(arena, io, root)) |cfg| {
+        version_floors.enforce(cfg, "labelle-assembler check") catch |err| {
+            std.log.err("labelle-assembler check: {s} (in '{s}')", .{ @errorName(err), root });
+            std.process.exit(2);
+        };
+    } else |_| {}
 
     const result = runLint(arena, io, root) catch |err| {
         std.log.err("labelle-assembler check: {s} (in '{s}')", .{ @errorName(err), root });

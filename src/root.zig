@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 // ── Submodules ─────────────────────────────────────────────────────────
 const config = @import("config.zig");
 pub const material_pipeline = @import("material_pipeline.zig");
+pub const version_floors = @import("version_floors.zig");
 pub const component_collisions = @import("component_collisions.zig");
 const cache = @import("cache.zig");
 const backend_registry = @import("backend_registry.zig");
@@ -356,6 +357,19 @@ pub fn generate(
     // Passing the detected name to `requireManifestIfExternal` is load-bearing: a
     // v2-ONLY external backend (no legacy `backend.manifest.zon`) must not be
     // rejected as manifest-less (the requirement keys off THIS name).
+    // ── cross-package version floors (labelle-assembler#739) ─────────────
+    // `init` refuses a backend/core or core/engine/gfx pairing that cannot
+    // build — but a project.labelle is also hand-edited and `upgrade`d, and
+    // THIS is the only place the RESOLVED backend package (an explicit
+    // `.backend_package`, or the builtin provider the `.backend` tag is
+    // shorthand for — `init` has no `--backend-package` flag) and
+    // `.core_version` are both in hand. Without it a below-floor pairing
+    // generated clean and died at the first `zig build` with a missing-member
+    // error deep inside the backend's source, far from the pin that caused
+    // it. Same tables, same severity policy as `init`: a compile break
+    // refuses HERE, before any target file is written; a curated floor warns.
+    try version_floors.enforce(cfg, "labelle-assembler generate");
+
     const backend_manifest_name = manifest_detect.detectV2ManifestName(allocator, cfg, game_dir);
     try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, backend_manifest_name);
     try validateProviderContracts(allocator, cfg, game_dir, backend_manifest_name, is_tests_target);

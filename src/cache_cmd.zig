@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const gen = @import("root.zig");
+const version_floors = @import("version_floors.zig");
 const cache = @import("cache.zig");
 const config = @import("config.zig");
 
@@ -536,10 +537,12 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    // Parse project.labelle up front to fail fast on a malformed file —
-    // the parsed config itself is no longer needed (replaceVersionField
-    // edits the raw text and inserts omitted fields directly).
-    _ = readProjectConfig(arena_alloc, io, root) catch {
+    // Parse project.labelle up front to fail fast on a malformed file. The
+    // parsed config is not needed for the REWRITE (`replaceVersionField`
+    // edits the raw text and inserts omitted fields directly) — it is
+    // needed for the floor gate below, which judges the pins as they would
+    // be AFTER this upgrade.
+    const current = readProjectConfig(arena_alloc, io, root) catch {
         std.log.err("labelle-assembler upgrade: failed to read project.labelle in '{s}'", .{root});
         std.process.exit(1);
     };
@@ -550,14 +553,24 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         std.process.exit(1);
     };
 
+    // What this upgrade WOULD write, decided before anything is rewritten:
+    // the floor gate below judges the RESULTING trio + backend pairing, and
+    // a refusal must leave project.labelle untouched (#739). `null` = this
+    // field is not part of this upgrade and keeps its current pin.
+    var next_core: ?[]const u8 = null;
+    var next_engine: ?[]const u8 = null;
+    var next_gfx: ?[]const u8 = null;
+    var next_cli: ?[]const u8 = null;
+    // The log line the command prints once the pins are accepted.
+    var announce_set = false;
+    var announce_one: ?struct { pkg: []const u8, version: []const u8 } = null;
+
     if (positionals.items.len == 0) {
-        std.log.info("labelle-assembler: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})", .{
-            gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION,
-        });
-        content = try replaceVersionField(arena_alloc, content, "core_version", gen.CORE_VERSION);
-        content = try replaceVersionField(arena_alloc, content, "engine_version", gen.ENGINE_VERSION);
-        content = try replaceVersionField(arena_alloc, content, "gfx_version", gen.GFX_VERSION);
-        content = try replaceVersionField(arena_alloc, content, "labelle_version", gen.CLI_VERSION);
+        announce_set = true;
+        next_core = gen.CORE_VERSION;
+        next_engine = gen.ENGINE_VERSION;
+        next_gfx = gen.GFX_VERSION;
+        next_cli = gen.CLI_VERSION;
     } else {
         const pkg = positionals.items[0];
 
@@ -581,30 +594,72 @@ pub fn cmdUpgrade(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
         const version = if (positionals.items.len > 1) positionals.items[1] else default_version;
 
         if (std.mem.eql(u8, pkg, "core")) {
-            content = try replaceVersionField(arena_alloc, content, "core_version", version);
+            next_core = version;
         } else if (std.mem.eql(u8, pkg, "engine")) {
-            content = try replaceVersionField(arena_alloc, content, "engine_version", version);
+            next_engine = version;
         } else if (std.mem.eql(u8, pkg, "gfx")) {
-            content = try replaceVersionField(arena_alloc, content, "gfx_version", version);
+            next_gfx = version;
         } else if (std.mem.eql(u8, pkg, "labelle") or std.mem.eql(u8, pkg, "cli")) {
-            content = try replaceVersionField(arena_alloc, content, "labelle_version", version);
+            next_cli = version;
         } else if (std.mem.eql(u8, pkg, "all")) {
-            content = try replaceVersionField(arena_alloc, content, "core_version", gen.CORE_VERSION);
-            content = try replaceVersionField(arena_alloc, content, "engine_version", gen.ENGINE_VERSION);
-            content = try replaceVersionField(arena_alloc, content, "gfx_version", gen.GFX_VERSION);
-            content = try replaceVersionField(arena_alloc, content, "labelle_version", gen.CLI_VERSION);
+            next_core = gen.CORE_VERSION;
+            next_engine = gen.ENGINE_VERSION;
+            next_gfx = gen.GFX_VERSION;
+            next_cli = gen.CLI_VERSION;
+            announce_set = true;
         } else {
             std.log.err("labelle-assembler upgrade: unknown package '{s}' (packages: core, engine, gfx, cli, all)", .{pkg});
             std.process.exit(2);
         }
-        if (std.mem.eql(u8, pkg, "all")) {
-            std.log.info("labelle-assembler: upgrading all packages to the assembler's compatible set (core={s}, engine={s}, gfx={s}, cli={s})", .{
-                gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION,
-            });
+        if (!announce_set) announce_one = .{ .pkg = pkg, .version = version };
+    }
+
+    // ── cross-package version floors (#739) ──────────────────────────────
+    // `upgrade core <ver>` can move `.core_version` BELOW the floor of the
+    // backend the project already pins (or below the engine/gfx it is
+    // paired with) — the same pairing `init` refuses at the front door,
+    // arrived at from the side. Judged on the PROSPECTIVE pins, so the
+    // refusal happens before the rewrite lands: nothing is written.
+    //
+    // The gate REFUSES only when this upgrade actually moves a
+    // floor-bearing pin. An upgrade that touches none of them (`upgrade
+    // cli`) cannot make the pairing worse, and a project that is ALREADY
+    // below a floor — hand-edited, or upgraded by an older assembler — must
+    // still be able to bump its CLI pin, so that case warns instead of
+    // blocking an unrelated bump. (`upgrade all` / bare `upgrade` snap the
+    // whole trio to the curated set, which REPAIRS such a project.)
+    {
+        var prospective = current;
+        if (next_core) |v| prospective.core_version = v;
+        if (next_engine) |v| prospective.engine_version = v;
+        if (next_gfx) |v| prospective.gfx_version = v;
+        const touches_floor_pin = next_core != null or next_engine != null or next_gfx != null;
+        if (touches_floor_pin) {
+            version_floors.enforce(prospective, "labelle-assembler upgrade") catch |err| {
+                std.log.err("labelle-assembler upgrade: {s} — project.labelle left unchanged", .{@errorName(err)});
+                std.process.exit(2);
+            };
         } else {
-            std.log.info("labelle-assembler: upgrading {s} to {s}", .{ pkg, version });
+            const v = version_floors.verdict(prospective) catch |err| {
+                std.log.err("labelle-assembler upgrade: version pins: {s}", .{@errorName(err)});
+                std.process.exit(2);
+            };
+            if (v.refused()) std.log.warn("labelle-assembler upgrade: this project's core/engine/gfx pins are already below a hard floor and cannot build — run 'labelle-assembler upgrade all' to snap them to the compatible set (this upgrade changes none of them)", .{});
         }
     }
+
+    if (announce_set) {
+        std.log.info("labelle-assembler: upgrading to compatible set (core={s}, engine={s}, gfx={s}, cli={s})", .{
+            gen.CORE_VERSION, gen.ENGINE_VERSION, gen.GFX_VERSION, gen.CLI_VERSION,
+        });
+    } else if (announce_one) |a| {
+        std.log.info("labelle-assembler: upgrading {s} to {s}", .{ a.pkg, a.version });
+    }
+
+    if (next_core) |v| content = try replaceVersionField(arena_alloc, content, "core_version", v);
+    if (next_engine) |v| content = try replaceVersionField(arena_alloc, content, "engine_version", v);
+    if (next_gfx) |v| content = try replaceVersionField(arena_alloc, content, "gfx_version", v);
+    if (next_cli) |v| content = try replaceVersionField(arena_alloc, content, "labelle_version", v);
 
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = labelle_path, .data = content }) catch {
         std.log.err("labelle-assembler upgrade: could not write '{s}'", .{labelle_path});
