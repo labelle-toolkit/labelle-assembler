@@ -183,7 +183,32 @@ pub fn build(b: *std.Build) void {
     bin_tests.root_module.link_libc = true; // see assembler_exe comment above
     test_step.dependOn(&b.addRunArtifact(bin_tests).step);
 
-    const material_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize }), .filters = &.{ "material_schema", "material_pipeline", "component_collisions" } });
+    // ── `test-materials`: the materials pipeline, by EXPLICIT MODULE ────
+    //
+    // This used to be a `--test-filter` over `src/root.zig`:
+    //
+    //     .filters = &.{ "material_schema", "material_pipeline", "component_collisions" }
+    //
+    // and it selected ZERO material tests (#741). With `--test-filter`
+    // active, `src/root.zig`'s named tests are dropped and only the
+    // anonymous `test { _ = @import(...) }` discovery blocks survive
+    // (`*.test_0` — those are never filtered). None of those blocks names a
+    // material module, so `material_pipeline.zig` was never analyzed and its
+    // tests never existed to be matched. NO filter string fixed it: even
+    // `--test-filter "materials build emission"`, the literal name of a
+    // `material_pipeline` test, still ran the same nine assertion-free
+    // `test_0` blocks. Proof: force-failing that test left
+    // `zig build test-materials` at "127/127 tests passed" while
+    // `zig build test` went to "2915/2929 passed (2 failed)".
+    //
+    // An explicit test root cannot drift the way a name filter can, and
+    // `assertMaterialTestRootCoverage` below fails configure if a new
+    // `src/material_*.zig` is not imported by it.
+    //
+    // The SAME run artifact feeds `test-materials` and the full `test` step,
+    // so the two can never disagree on the material test count.
+    assertMaterialTestRootCoverage(b);
+    const material_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/material_test_root.zig"), .target = target, .optimize = optimize }) });
     material_tests.root_module.addOptions("build_options", options);
     material_tests.root_module.addImport("flow_codegen", flow_codegen_module);
     material_tests.root_module.link_libc = true;
@@ -487,4 +512,81 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(bgfx_hook_tests).step);
+}
+
+/// Configure-time guard for `zig build test-materials` (#741).
+///
+/// The step is only as good as `src/material_test_root.zig`'s import list, so
+/// this fails the BUILD (not just the step) when that list drifts:
+///
+///   * a `src/material_*.zig` exists that the root does not `@import`, or
+///   * the root's `covered_material_modules` list disagrees with either the
+///     imports or the filesystem, in EITHER direction.
+///
+/// It reads the root's SOURCE rather than importing it, so it runs at
+/// configure time on every `zig build`, before any test compiles — the one
+/// place where a silently-excluded module is cheap to catch.
+///
+/// The scan itself lives in `src/material_root_scan.zig` (so it has unit
+/// tests of its own, run by this very step) and is TOKENIZED rather than a
+/// `std.mem.indexOf` substring search: a substring search matches inside
+/// comments, so commenting out an import while leaving its coverage entry in
+/// place kept the guard green while the module dropped out of the step — the
+/// exact drift the guard exists to stop.
+fn assertMaterialTestRootCoverage(b: *std.Build) void {
+    const root_scan = @import("src/material_root_scan.zig");
+    const root_rel = "src/material_test_root.zig";
+    const io = b.graph.io;
+    const source = b.build_root.handle.readFileAlloc(
+        io,
+        root_rel,
+        b.allocator,
+        .limited(1 << 20),
+    ) catch |err| std.debug.panic("test-materials guard: cannot read {s}: {s}", .{ root_rel, @errorName(err) });
+
+    const scan = root_scan.scan(b.allocator, source) catch @panic("OOM");
+
+    var src_dir = b.build_root.handle.openDir(io, "src", .{ .iterate = true }) catch |err|
+        std.debug.panic("test-materials guard: cannot open src/: {s}", .{@errorName(err)});
+    defer src_dir.close(io);
+
+    var on_disk: std.ArrayList([]const u8) = .empty;
+    var it = src_dir.iterate();
+    while (it.next(io) catch |err| std.debug.panic("test-materials guard: cannot walk src/: {s}", .{@errorName(err)})) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "material_")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        if (std.mem.eql(u8, entry.name, "material_test_root.zig")) continue;
+        on_disk.append(b.allocator, b.dupe(entry.name)) catch @panic("OOM");
+    }
+
+    for (on_disk.items) |name| {
+        if (!root_scan.contains(scan.imports, name)) std.debug.panic(
+            "test-materials guard: src/{s} is not imported by {s}, so `zig build test-materials` would not run its tests. Add `_ = @import(\"{s}\");` to the `test` block there (and to `covered_material_modules`). A COMMENTED-OUT import does not count — the guard tokenizes.",
+            .{ name, root_rel, name },
+        );
+        if (!root_scan.contains(scan.listed, name)) std.debug.panic(
+            "test-materials guard: src/{s} is imported by {s} but missing from its `covered_material_modules` list.",
+            .{ name, root_rel },
+        );
+    }
+
+    // The other direction: an entry naming a module that is gone, or one that
+    // is listed but not actually imported, claims coverage the step does not
+    // have — just as much a lie as a missing entry.
+    for (scan.listed) |name| {
+        if (!root_scan.contains(on_disk.items, name)) std.debug.panic(
+            "test-materials guard: {s} lists `{s}` in `covered_material_modules`, but src/{s} does not exist (renamed or deleted?).",
+            .{ root_rel, name, name },
+        );
+        if (!root_scan.contains(scan.imports, name)) std.debug.panic(
+            "test-materials guard: {s} lists `{s}` in `covered_material_modules` but does not `@import` it from a `test` block — the entry claims coverage the step does not have.",
+            .{ root_rel, name },
+        );
+    }
+
+    if (on_disk.items.len == 0) std.debug.panic(
+        "test-materials guard: no src/material_*.zig found — the guard has gone blind (was the materials pipeline renamed?).",
+        .{},
+    );
 }
