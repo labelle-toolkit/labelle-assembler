@@ -107,8 +107,9 @@ All use the `CONDENSER_` prefix:
   `LAMP_SOFTNESS`, `LAMP_FALLOFF`, `LAMP_GLOW`, `LAMP_FLICKER`,
   `LAMP_FLICKER_SPEED`, `LAMP_OFF`.
 
-`CONDENSER_TEST_CONTROL=water|fog|lamp` triggers the corresponding Space/F/G
-control path at frame 60. `CONDENSER_TEST_LEFT=1` triggers all three. Both hooks
+`CONDENSER_TEST_CONTROL=water|fog|lamp|mist` triggers the corresponding
+Space/F/G/M control path at frame 60. `CONDENSER_TEST_LEFT=1` triggers all four.
+Both hooks
 change only the left unit and preserve normal keyboard input. Capture at two
 seconds with `LABELLE_FIXED_DT=0.016666667` for deterministic comparison.
 

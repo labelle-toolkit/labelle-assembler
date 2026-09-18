@@ -3,7 +3,30 @@ const std = @import("std");
 const config = @import("config.zig");
 const scanner = @import("scanner.zig");
 pub const schema = @import("material_schema.zig");
-pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8, backend: []const u8) ![][]const u8 {
+/// Whether the selected backend can consume game-owned `.sc` materials.
+///
+/// Keyed off the `.bgfx` ENUM TAG, never `backendName()` (PR #733 review,
+/// same reasoning as `ProjectConfig.effectiveGamepad`): the name is the
+/// resolved PACKAGE name, which a `.backend = .bgfx` project can override to
+/// anything (`.backend_package = .{ .name = "bgfx_v2", .. }` — the in-tree v2
+/// fixture — or a fork named `labelle-bgfx`). A literal `"bgfx"` string match
+/// rejected every such compatible provider with `UnsupportedMaterialBackend`.
+/// The tag survives the enum-as-shorthand resolution, so it is the reliable
+/// "is bgfx" signal. `.null` is accepted because the tests target
+/// (`testsTargetConfig`) force-substitutes it while the game still ships the
+/// materials module.
+///
+/// LIMITATION (documented, like `effectiveGamepad`): a third-party bgfx-shaped
+/// provider selected purely via `.backend_package` with `.backend` left at its
+/// `.raylib` default is rejected; declare `.backend = .bgfx` alongside the
+/// package. There is no material capability in the provider manifest yet.
+pub fn requireBackend(cfg: config.ProjectConfig) error{UnsupportedMaterialBackend}!void {
+    switch (cfg.backend) {
+        .bgfx, .null => {},
+        else => return error.UnsupportedMaterialBackend,
+    }
+}
+pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8, cfg: config.ProjectConfig) ![][]const u8 {
     const io = config.globalIo();
     const root = try std.fs.path.join(a, &.{ game_dir, "materials" });
     defer a.free(root);
@@ -54,10 +77,10 @@ pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8,
         try names.append(a, name);
     }
     if (names.items.len != 0) {
-        if (!std.mem.eql(u8, backend, "bgfx") and !std.mem.eql(u8, backend, "null")) {
-            std.log.err("game-owned .sc materials require bgfx (selected backend: {s})", .{backend});
-            return error.UnsupportedMaterialBackend;
-        }
+        requireBackend(cfg) catch |err| {
+            std.log.err("game-owned .sc materials require bgfx (selected backend: {s})", .{cfg.backendName()});
+            return err;
+        };
         std.mem.sort([]const u8, names.items, {}, struct {
             fn less(_: void, x: []const u8, y: []const u8) bool {
                 return std.mem.lessThan(u8, x, y);
@@ -88,4 +111,26 @@ test "materials build emission has explicit embedded descriptors and empty no-op
     try emit(&out.writer, &.{ "fog", "lamp" }, "desktop");
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "materials/fog/material.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "materials/lamp/material.json") != null);
+}
+
+test "requireBackend: keyed off the .bgfx enum tag, not the resolved package name (#733 P2)" {
+    // A `.backend = .bgfx` project whose provider package is NOT literally named
+    // "bgfx" — the in-tree v2 fixture spelling this repo itself uses — must be
+    // accepted: the tag is the identity, the name is configurable.
+    try requireBackend(.{
+        .name = "g",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "bgfx_v2", .repo = "local:backends/bgfx_v2" },
+    });
+    // Plain enum-as-shorthand default and the tests-target `.null` substitution.
+    try requireBackend(.{ .name = "g", .backend = .bgfx });
+    try requireBackend(.{ .name = "g", .backend = .null });
+    // A non-bgfx backend is still rejected — including one whose PACKAGE is
+    // named "bgfx" (the name must not be the signal in either direction).
+    try std.testing.expectError(error.UnsupportedMaterialBackend, requireBackend(.{ .name = "g", .backend = .sokol }));
+    try std.testing.expectError(error.UnsupportedMaterialBackend, requireBackend(.{
+        .name = "g",
+        .backend = .sokol,
+        .backend_package = .{ .name = "bgfx", .repo = "local:backends/bgfx_v2" },
+    }));
 }

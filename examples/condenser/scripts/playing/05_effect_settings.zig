@@ -110,7 +110,7 @@ pub fn tick(game: anytype, state: anytype, _: anytype, _: f32) void {
             }
             if (envEquals("CONDENSER_MIST_FREEZE", "1")) mist.drift_velocity = .{ 0, 0 };
         }
-        if (mist.unit == 0 and (game.isKeyPressed(.m) or (state.frame == 60 and envEquals("CONDENSER_TEST_CONTROL", "mist")))) mist.enabled = !mist.enabled;
+        if (mist.unit == 0 and (game.isKeyPressed(.m) or test_all or (state.frame == 60 and envEquals("CONDENSER_TEST_CONTROL", "mist")))) mist.enabled = !mist.enabled;
     }
     state.initialized = true;
 }

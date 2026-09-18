@@ -1,8 +1,11 @@
 # Migrating to game-owned effects
 
-The shader implementation is a coordinated, unreleased change across core,
-gfx, engine, bgfx, assembler and CLI. The condenser example uses explicit local
-dependencies. Do not substitute published versions and expect the new API.
+The shader implementation is a coordinated change across core, gfx, engine,
+bgfx, assembler and CLI. The toolkit side has shipped: core 2.0.0, gfx 2.0.0,
+engine 3.0.0 and bgfx 0.21.0 are released, and `examples/condenser` pins those
+releases (no local sibling checkouts). Older releases do not carry the generic
+material contract (v2); a game that adds `materials/` must resolve those
+versions or newer.
 
 ## Ownership
 
@@ -56,14 +59,22 @@ floor change (assembler#736). To develop against unreleased sibling checkouts,
 switch the example's four pins back to `local:../../../labelle-*`. Standalone
 BGFX tests require `-Dcore-source=<core>/src/root.zig`.
 
-## Validation limits
+## Validation
 
-The condenser compiles water, fog and lamp to SPIR-V, GLSL, ESSL and Metal.
-Windows/Vulkan execution covers ten deterministic scene scenarios, including
-per-instance isolation and independent effect disabling. Its generated unit
-suite passes 18 tests. See the example README for controls and reproduction.
+The condenser compiles water, fog, lamp and mist to SPIR-V, GLSL, ESSL and
+Metal. Windows/Vulkan execution covers the deterministic scene scenarios in the
+example README (16 native scenarios, including per-instance isolation and
+independent effect disabling). Its generated unit suite passes 20 tests. See the
+example README for controls and reproduction.
+
+Verified live against the released pins:
+
+- macOS/Metal: standalone `labelle run` of the condenser, four materials live
+  (2/2 instances each), no degrade lines.
+- Android/OpenGL ES: Galaxy Tab A7 (Adreno 610) through the CLI path, all eight
+  material instances live at 62 fps.
 
 Core, gfx, BGFX, assembler and CLI suites and engine's focused shader regression
 suite pass. The broad engine suite encounters Windows preview/network and time
-API failures; it is not reported as passing. Android, browser and Metal device
-execution have not been verified here. Direct3D runtime materials are unsupported.
+API failures; it is not reported as passing. Browser (wasm) execution has not
+been verified. Direct3D runtime materials are unsupported.

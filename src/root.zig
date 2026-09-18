@@ -1285,7 +1285,7 @@ pub fn generate(
     var flow_result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir, plugin_flow_decls.flow_nodes);
     defer flow_result.deinit();
 
-    const material_names = try material_pipeline.stage(allocator, game_dir, target_dir, cfg.backendName());
+    const material_names = try material_pipeline.stage(allocator, game_dir, target_dir, cfg);
     defer scanner.freeNames(allocator, material_names);
     if (material_names.len != 0) for (cfg.plugins) |plugin| {
         if (std.mem.eql(u8, plugin.name, "materials")) {
