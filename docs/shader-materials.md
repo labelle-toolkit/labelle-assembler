@@ -32,6 +32,22 @@ try game.createShaderMaterial(entity, .{
 });
 ```
 
+### Texture bindings are catalog `.image` entries only
+
+The engine resolves a `.catalog` binding through the AssetCatalog and rejects
+any entry whose `loader_kind` is not `.image` with `error.InvalidTexture`
+(`labelle-engine/src/game/shader_material_mixin.zig`). **An atlas frame is not
+an image entry**, so a mask/lookup texture a fragment shader samples must be
+declared as a STANDALONE `.{ .name = ..., .image = "..." }` resource in
+`project.labelle`, not packed into a sprite atlas. The generic material path
+carries the same constraint the retired built-in water effect had; budget the
+extra standalone PNGs when migrating.
+
+A binding that is registered but not yet resident returns `error.TextureNotReady`
+(streaming) or `error.AssetLoadFailed`; retry, do not treat either as fatal.
+Textures are sampled in the sprite's own UV space, so a mask normally spans
+exactly the logical rectangle it describes.
+
 The module imports the same `labelle-core` instance as the game. It is wired into ordinary and promoted scripts, pack modules, executables, and test roots. It has no backend imports. For lower-level use, `var bindings = materials.fog.textures; bindings[0].texture = backend_id; const d = materials.fog.descriptor(&bindings);` returns a **borrowed** core descriptor; retain the caller's array through creation. The engine uses a distinct texture union for catalog pinning, so compose its descriptor from the exported fields instead of passing the core helper result.
 
 | Variant | shaderc platform | profile |

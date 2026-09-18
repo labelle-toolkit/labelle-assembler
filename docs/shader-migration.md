@@ -37,7 +37,16 @@ Runtime handles must not be authored in prefabs or serialized as durable state.
 2. Update the BGFX core dependency pin and release the generic backend and gfx.
 3. Release engine's generic entity material API.
 4. Release assembler's shader pipeline and CLI integration.
-5. Replace the example's local dependency selections with those released versions.
+5. Bump the bgfx entry of `ProjectConfig.builtinProvider` (`src/config.zig`) to
+   the released contract-v2 backend, in the SAME change that adopts the new
+   core. `.backend = .bgfx` with no `.backend_package` resolves through that
+   default, so a default-backend project otherwise compiles a backend that
+   still names the removed water contract against the new core — the failure
+   mode assembler#731 repaired in the other direction.
+6. Replace the example's local dependency selections with those released
+   versions, and add it to the examples-integration lane (assembler#732: that
+   lane only GENERATES bgfx examples today, so a compile break in a pinned
+   backend passes unnoticed — build it, do not only generate it).
 
 Until then, build the sibling `feat/game-shader-materials` branches in this
 workspace. Standalone BGFX tests require `-Dcore-source=<core>/src/root.zig`.

@@ -31,7 +31,13 @@ pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8,
             std.log.err("materials/{s}: expected identifier directory name (max 63 bytes; generated-symbol names are reserved)", .{entry.name});
             return error.InvalidMaterialName;
         }
-        for (names.items) |n| if (std.ascii.eqlIgnoreCase(n, entry.name)) return error.DuplicateMaterialName;
+        for (names.items) |n| if (std.ascii.eqlIgnoreCase(n, entry.name)) {
+            // Case-insensitive: the generated module exports one Zig decl per
+            // folder, and a case-only difference collides on the many hosts
+            // whose filesystems fold case.
+            std.log.err("materials/{s}: collides with materials/{s} (material folder names must be unique ignoring case)", .{ entry.name, n });
+            return error.DuplicateMaterialName;
+        };
         const parsed = schema.parse(a, bytes) catch |err| {
             std.log.err("materials/{s}: {s}", .{ rel, @errorName(err) });
             return err;

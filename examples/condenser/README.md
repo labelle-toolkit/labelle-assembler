@@ -16,6 +16,12 @@ This example requires the **unreleased sibling branches** in this workspace.
 backend, and `local:../../` assembler. Released package versions do not provide
 this implementation. Regenerate after changing the coordinated branches.
 
+```sh
+# POSIX. `labelle build` from this directory does the same thing.
+../../zig-out/bin/labelle-assembler generate --project-root .
+( cd .labelle/bgfx_desktop && zig build && zig build test --summary all )
+```
+
 ```powershell
 ../../zig-out/bin/labelle-assembler.exe generate --project-root .
 Push-Location .labelle/bgfx_desktop
@@ -115,7 +121,8 @@ seconds with `LABELLE_FIXED_DT=0.016666667` for deterministic comparison.
   grid behavior, and descriptor shapes; writes a CPU reference contact sheet.
 - `tools/compile_shaders.ps1 -Shaderc <exe> -Include <bgfx-shader-directory>`:
   compiles all **16 variants** independently of the game build.
-- `python tools/verify_runtime.py`: **16 actual native runs**, eight live generic
+- `python tools/verify_runtime.py`: **16 actual native runs** (macOS/Metal and
+  Windows/Vulkan), eight live generic
   materials each, fixed-step captures, frame-60 left-only edits, zero width and
   zero fog opacity equivalence, and independent fog/lamp off cases.
 

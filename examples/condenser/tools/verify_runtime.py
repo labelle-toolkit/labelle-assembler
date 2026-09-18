@@ -12,7 +12,10 @@ from PIL import Image
 ROOT=Path(__file__).resolve().parents[1]
 OUT=ROOT/'.test-output/runtime'
 OUT.mkdir(parents=True,exist_ok=True)
-EXE=ROOT/'.labelle/bgfx_desktop/zig-out/bin/condenser.exe'
+import sys
+BIN=ROOT/'.labelle/bgfx_desktop/zig-out/bin'
+EXE=BIN/('condenser.exe' if sys.platform=='win32' else 'condenser')
+assert EXE.exists(), f'build the example first: no {EXE}'
 MODES={
     'default':{},
     'left_mist':{'CONDENSER_TEST_CONTROL':'mist'},
