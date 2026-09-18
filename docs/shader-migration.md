@@ -42,10 +42,15 @@ Runtime handles must not be authored in prefabs or serialized as durable state.
 4. Release assembler's shader pipeline and CLI integration.
 5. Bump the bgfx entry of `ProjectConfig.builtinProvider` (`src/config.zig`) to
    the released contract-v2 backend, in the SAME change that adopts the new
-   core. `.backend = .bgfx` with no `.backend_package` resolves through that
-   default, so a default-backend project otherwise compiles a backend that
-   still names the removed water contract against the new core — the failure
-   mode assembler#731 repaired in the other direction.
+   core (done: bgfx 0.21.0 with the core 2.0.0 / gfx 2.0.0 / engine 3.0.0
+   scaffold trio in `build.zig`). `.backend = .bgfx` with no
+   `.backend_package` resolves through that default, so bumping either side
+   alone ships a default that fails at the first `labelle build` — the
+   failure mode assembler#731 repaired in the other direction.
+   `src/init_cmd.zig`'s `bgfx_core_floors` carries the bgfx >= 0.21.0 →
+   core >= 2.0.0 hard floor, and `material_pipeline` rejects an explicit
+   pre-contract-v2 `.backend_package` / `.core_version` pin at generate time
+   for a project that owns `materials/`.
 6. Replace the example's local dependency selections with those released
    versions (done: `examples/condenser` pins core 2.0.0, gfx 2.0.0, engine
    3.0.0 and bgfx 0.21.0), and add it to the examples-integration lane
@@ -53,11 +58,12 @@ Runtime handles must not be authored in prefabs or serialized as durable state.
    break in a pinned backend passes unnoticed — build it, do not only
    generate it).
 
-Steps 1-4 and 6 have shipped (core v2.0.0, gfx v2.0.0, engine v3.0.0, bgfx
-v0.21.0). Step 5 is pending on the assembler side and follows the core >= 2.0.0
-floor change (assembler#736). To develop against unreleased sibling checkouts,
-switch the example's four pins back to `local:../../../labelle-*`. Standalone
-BGFX tests require `-Dcore-source=<core>/src/root.zig`.
+All six steps have shipped (core v2.0.0, gfx v2.0.0, engine v3.0.0, bgfx
+v0.21.0; assembler defaults in PR #733). A fresh `labelle init --backend=bgfx`
+resolves the contract-v2 stack and can own `materials/` with no explicit pins.
+To develop against unreleased sibling checkouts, switch the example's four pins
+back to `local:../../../labelle-*`. Standalone BGFX tests require
+`-Dcore-source=<core>/src/root.zig`.
 
 ## Validation
 

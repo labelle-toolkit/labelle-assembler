@@ -26,6 +26,43 @@ pub fn requireBackend(cfg: config.ProjectConfig) error{UnsupportedMaterialBacken
         else => return error.UnsupportedMaterialBackend,
     }
 }
+/// The first labelle-bgfx release that implements material contract v2
+/// (what `material_build.zig`'s generated module `@compileError`s without),
+/// and the first labelle-core that declares it. Both pins must be at least
+/// these for a project that owns `materials/`.
+pub const min_bgfx_for_materials = "0.21.0";
+pub const min_core_for_materials = "2.0.0";
+
+pub const ContractError = error{ MaterialContractUnsupported, UnparsableVersionPin };
+
+/// Reject, at GENERATE time, a project that owns materials but pins a
+/// backend or core release that predates material contract v2 (PR #733 P1,
+/// the "reject incompatible release pins" half). With the defaults
+/// (`builtinProvider` bgfx 0.21.0 + the core 2.0.0 scaffold trio) this is
+/// unreachable; an EXPLICIT `.backend_package` / `.core_version` that pins
+/// an older release used to generate successfully and always fail at the
+/// generated module's `@compileError` — a deep compile break instead of a
+/// diagnostic naming the pin. Only release-shaped (semver) pins are
+/// judged: a `local:…` checkout is resolved elsewhere and left alone. The
+/// general generate-time floor check is labelle-assembler#739; this is the
+/// materials-specific gate only.
+///
+/// Returns the offending side so the caller can name it; the tests target
+/// (`.backend = .null`) is skipped like `requireBackend` skips it.
+pub const ContractViolation = struct { what: []const u8, pinned: []const u8, floor: []const u8 };
+pub fn contractViolation(cfg: config.ProjectConfig) error{UnparsableVersionPin}!?ContractViolation {
+    if (cfg.backend != .bgfx) return null;
+    if (cfg.effectiveBackendPackage()) |bp| {
+        if (config.isSemverVersion(bp.version) and !try config.pinAtLeast(bp.version, min_bgfx_for_materials))
+            return .{ .what = "labelle-bgfx", .pinned = bp.version, .floor = min_bgfx_for_materials };
+    }
+    if (config.isSemverVersion(cfg.core_version) and !try config.pinAtLeast(cfg.core_version, min_core_for_materials))
+        return .{ .what = "labelle-core", .pinned = cfg.core_version, .floor = min_core_for_materials };
+    return null;
+}
+pub fn requireContract(cfg: config.ProjectConfig) ContractError!void {
+    if (try contractViolation(cfg)) |_| return error.MaterialContractUnsupported;
+}
 pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8, cfg: config.ProjectConfig) ![][]const u8 {
     const io = config.globalIo();
     const root = try std.fs.path.join(a, &.{ game_dir, "materials" });
@@ -81,6 +118,10 @@ pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8,
             std.log.err("game-owned .sc materials require bgfx (selected backend: {s})", .{cfg.backendName()});
             return err;
         };
+        if (try contractViolation(cfg)) |v| {
+            std.log.err("materials/: game-owned materials require material contract v2 (labelle-bgfx >= {s} on labelle-core >= {s}); project pins {s} {s}. Bump the pin, or drop it to take the default.", .{ min_bgfx_for_materials, min_core_for_materials, v.what, v.pinned });
+            return error.MaterialContractUnsupported;
+        }
         std.mem.sort([]const u8, names.items, {}, struct {
             fn less(_: void, x: []const u8, y: []const u8) bool {
                 return std.mem.lessThan(u8, x, y);
@@ -133,4 +174,51 @@ test "requireBackend: keyed off the .bgfx enum tag, not the resolved package nam
         .backend = .sokol,
         .backend_package = .{ .name = "bgfx", .repo = "local:backends/bgfx_v2" },
     }));
+}
+
+test "contractViolation: an explicit pre-contract-v2 bgfx or core pin is rejected at generate time; defaults and local pins pass (#733 P1)" {
+    // The defaults: builtinProvider bgfx + the scaffold core — unreachable.
+    try std.testing.expect((try contractViolation(.{ .name = "g", .backend = .bgfx })) == null);
+    try requireContract(.{ .name = "g", .backend = .bgfx });
+    // An explicit OLD backend pin (what material-demo / pack-city carry) with
+    // materials/ → named, not a deep @compileError.
+    const old_bgfx = try contractViolation(.{
+        .name = "g",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.20.0" },
+        .core_version = "2.0.0",
+    }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("labelle-bgfx", old_bgfx.what);
+    try std.testing.expectEqualStrings("0.20.0", old_bgfx.pinned);
+    try std.testing.expectEqualStrings("0.21.0", old_bgfx.floor);
+    // An explicit OLD core under a new backend.
+    const old_core = try contractViolation(.{
+        .name = "g",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.21.0" },
+        .core_version = "1.32.0",
+    }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("labelle-core", old_core.what);
+    try std.testing.expectEqualStrings("1.32.0", old_core.pinned);
+    try std.testing.expectError(error.MaterialContractUnsupported, requireContract(.{ .name = "g", .backend = .bgfx, .core_version = "1.32.0" }));
+    // The released pair, and anything newer, passes; an abbreviated pin too.
+    try requireContract(.{
+        .name = "g",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.21.0" },
+        .core_version = "2.0.0",
+    });
+    try requireContract(.{ .name = "g", .backend = .bgfx, .core_version = "2.1" });
+    // Non-release pins are resolved elsewhere — not judged here.
+    try requireContract(.{
+        .name = "g",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "bgfx", .repo = "local:../labelle-bgfx", .version = "local:../labelle-bgfx" },
+        .core_version = "local:../labelle-core",
+    });
+    // The tests target substitutes `.null`; other backends are `requireBackend`'s business.
+    try requireContract(.{ .name = "g", .backend = .null, .core_version = "1.26.0" });
+    try requireContract(.{ .name = "g", .backend = .sokol, .core_version = "1.26.0" });
+    // A dotted-but-unparsable pin surfaces as the named error, not a crash.
+    try std.testing.expectError(error.UnparsableVersionPin, requireContract(.{ .name = "g", .backend = .bgfx, .core_version = "1.2.3.4" }));
 }
