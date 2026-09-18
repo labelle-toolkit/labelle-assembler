@@ -345,18 +345,64 @@ pub const TrioViolation = struct {
 
 /// The floor the three pins violate, or null when the trio is coherent. A
 /// compile break beats a curated floor; among equals the first (strictest)
-/// wins. Pins that are not release versions (`local:…`) are resolved
-/// elsewhere and leave the trio unjudged.
+/// wins.
+///
+/// A pin that is not a release version (`local:…`, a branch name) is
+/// resolved elsewhere and cannot be compared, so the rules that READ it are
+/// skipped — but ONLY those (#746 review). A blanket early return on any
+/// unparseable pin suppressed every rule in the table, including rules whose
+/// subject and requirement are both known releases: `core_version =
+/// "local:../core"` with engine 3.0.0 / gfx 1.30.1 sailed through `generate`,
+/// `check` and `upgrade` even though the table independently states that
+/// engine 3.x requires gfx >= 2.0.0, a pairing that cannot compile whatever
+/// the local core turns out to be. Each rule reads exactly two pins — its
+/// subject and its requirement — so decidability is per rule, not per trio.
 pub fn trioFloorViolation(core_version: []const u8, engine_version: []const u8, gfx_version: []const u8) error{UnparsableVersionPin}!?TrioViolation {
-    if (!config.isSemverVersion(core_version) or !config.isSemverVersion(engine_version) or !config.isSemverVersion(gfx_version)) return null;
     var worst: ?TrioViolation = null;
     for (trio_floors) |f| {
         const v: TrioViolation = .{ .core_version = core_version, .engine_version = engine_version, .gfx_version = gfx_version, .floor = f };
+        // This rule's own two pins. A rule is decidable iff BOTH are
+        // release-shaped; the third pin is only ever quoted in the
+        // diagnostic and never compared.
+        if (!config.isSemverVersion(v.pinOf(f.subject))) continue;
+        if (!config.isSemverVersion(v.pinOf(f.requires))) continue;
         if (!try pinAtLeast(v.pinOf(f.subject), f.subject_at_least)) continue;
         if (try pinAtLeast(v.pinOf(f.requires), f.floor)) continue;
         if (worst == null or (f.severity == .compile_break and worst.?.floor.severity != .compile_break)) worst = v;
     }
     return worst;
+}
+
+test "a non-release pin suppresses only the rules that READ it — #746 review" {
+    // engine 3.x requires gfx >= 2.0.0. That rule's subject (engine) and
+    // requirement (gfx) are both known releases, so a `local:` CORE — a pin
+    // neither side of the rule reads — must not hide it.
+    const local_core = (try trioFloorViolation("local:../labelle-core", "3.0.0", "1.30.1")) orelse
+        return error.TestUnexpectedResult;
+    // Assert WHICH rule fired, not merely that something did: the value
+    // alone would also appear if some unrelated rule had matched.
+    try std.testing.expectEqual(TrioPackage.engine, local_core.floor.subject);
+    try std.testing.expectEqual(TrioPackage.gfx, local_core.floor.requires);
+    try std.testing.expectEqual(FloorSeverity.compile_break, local_core.severity());
+    // The unparseable pin is still quoted verbatim in the diagnostic.
+    var buf: [1024]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, local_core.describe(&buf), "local:../labelle-core") != null);
+
+    // Symmetrically, a `local:` GFX leaves the core-2.x/engine-3.x rule
+    // decidable.
+    const local_gfx = (try trioFloorViolation("2.0.0", "2.12.2", "local:../labelle-gfx")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(TrioPackage.core, local_gfx.floor.subject);
+    try std.testing.expectEqual(TrioPackage.engine, local_gfx.floor.requires);
+
+    // A rule is skipped when it is genuinely undecidable: with BOTH the
+    // subject and the requirement of every applicable rule unparseable there
+    // is nothing to judge.
+    try std.testing.expect((try trioFloorViolation("local:../c", "local:../e", "local:../g")) == null);
+    // ...and a `local:` pin must not INVENT a violation where the decidable
+    // rules are all satisfied.
+    try std.testing.expect((try trioFloorViolation("local:../labelle-core", "3.0.0", "2.0.0")) == null);
+    try std.testing.expect((try trioFloorViolation("2.0.0", "3.0.0", "local:../labelle-gfx")) == null);
 }
 
 test "the 2.x core line floors an OLD engine/gfx pinned under it — #742" {
@@ -395,8 +441,13 @@ test "the 2.x core line floors an OLD engine/gfx pinned under it — #742" {
     try std.testing.expect((try trioFloorViolation("2.0.0", "3.0.0", "2.0.0")) == null);
     try std.testing.expect((try trioFloorViolation("1.32.0", "2.12.2", "1.30.1")) == null);
     try std.testing.expect((try trioFloorViolation("1.24.0", "2.7.0", "1.27.0")) == null);
-    // A non-release core pin leaves the trio unjudged, as before.
+    // A non-release CORE pin leaves the rules whose subject is core
+    // unjudged — but no longer the whole table (#746 review): engine 2.12.2
+    // / gfx 1.30.1 is a coherent 1.x-era pair, so nothing else fires here
+    // and the result is still null, for the RIGHT reason.
     try std.testing.expect((try trioFloorViolation("local:../labelle-core", "2.12.2", "1.30.1")) == null);
+    // The same local core with an engine/gfx pair the table DOES reject is
+    // now caught; see the dedicated test below.
 }
 
 // ── the resolved-config gate (#739): generate / check / upgrade ──────
@@ -404,16 +455,39 @@ test "the 2.x core line floors an OLD engine/gfx pinned under it — #742" {
 // `init` validates the FLAGS. Everything below validates a CONFIG — the
 // same two tables, applied where the pins are already written down.
 
-/// Is `bp` the OFFICIAL provider package for `backend`? The floors above
-/// are facts about the official release train only: a third-party
-/// bgfx-shaped provider carries its own semver, so comparing e.g. acme/bgfx
-/// 0.1.0 against 0.21.0 would reject a perfectly good provider as an
-/// obsolete labelle-bgfx (same reasoning as `material_pipeline`'s
-/// `isOfficialBgfx`). Compared through `config.sameRemote`, so every
-/// spelling of the official remote the fetch path accepts is judged (#742).
-pub fn isOfficialProvider(backend: config.Backend, bp: config.PluginDep) bool {
-    const official = config.ProjectConfig.builtinProvider(backend) orelse return false;
-    return config.sameRemote(bp.repo, official.repo);
+/// Which OFFICIAL backend `bp` is, identified from the RESOLVED PACKAGE
+/// alone — or null for a third-party provider.
+///
+/// Deliberately does NOT consult `cfg.backend` (#746 review, P1). When a
+/// project selects a backend purely through `.backend_package`, the
+/// `.backend` enum is IGNORED and sits at its meaningless `.raylib` default
+/// (see `ProjectConfig.isEnumTagBacked`). Asking "is this package the
+/// official provider for `cfg.backend`?" therefore compared an explicit
+/// bgfx package against the raylib remote, answered "not official", and
+/// silently dropped the bgfx/core floor for exactly the configs that most
+/// need it: `.backend_package = .{ .repo = "github.com/labelle-toolkit/
+/// labelle-bgfx", .version = "0.21.0" }` with `core_version = "1.32.0"`
+/// sailed through `generate`, `check` and `upgrade` and then failed to
+/// compile inside the backend.
+///
+/// The floors are facts about the official release train only: a
+/// third-party bgfx-shaped provider carries its own semver, so comparing
+/// e.g. acme/bgfx 0.1.0 against 0.21.0 would reject a perfectly good
+/// provider as an obsolete labelle-bgfx (same reasoning as
+/// `material_pipeline`'s `isOfficialBgfx`). Compared through
+/// `config.sameRemote`, so every spelling of the official remote the fetch
+/// path accepts is judged (#742).
+pub fn officialBackendOf(bp: config.PluginDep) ?config.Backend {
+    for (std.enums.values(config.Backend)) |b| {
+        const official = config.ProjectConfig.builtinProvider(b) orelse continue;
+        if (config.sameRemote(bp.repo, official.repo)) return b;
+    }
+    return null;
+}
+
+/// Is `bp` an official provider package at all?
+pub fn isOfficialProvider(bp: config.PluginDep) bool {
+    return officialBackendOf(bp) != null;
 }
 
 /// The backend/core floor the project's RESOLVED backend package puts on
@@ -424,11 +498,57 @@ pub fn isOfficialProvider(backend: config.Backend, bp: config.PluginDep) bool {
 /// the `.backend` enum tag is shorthand for — and `init` has no
 /// `--backend-package` flag, so an explicit package is only ever seen here
 /// (#739). A non-official provider and a non-release pin are left alone.
+///
+/// The floor TABLE is chosen by the backend the PACKAGE identifies, never
+/// by `cfg.backend` — see `officialBackendOf`.
 pub fn configBackendCoreFloorViolation(cfg: config.ProjectConfig) error{UnparsableVersionPin}!?FloorViolation {
     const bp = cfg.effectiveBackendPackage() orelse return null;
-    if (!isOfficialProvider(cfg.backend, bp)) return null;
+    const backend = officialBackendOf(bp) orelse return null;
     if (!config.isSemverVersion(bp.version)) return null;
-    return providerCoreFloorViolation(cfg.backend, bp.version, cfg.core_version);
+    return providerCoreFloorViolation(backend, bp.version, cfg.core_version);
+}
+
+test "an explicit bgfx `.backend_package` is floored even though `.backend` is the ignored default — #746 review" {
+    // The config `ProjectConfig` documents as ignoring `.backend`: the
+    // provider is named ONLY by `.backend_package`, so `.backend` sits at
+    // its `.raylib` default and means nothing.
+    const cfg: config.ProjectConfig = .{
+        .name = "p",
+        .backend = .raylib, // ignored — the package selects the backend
+        .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.21.0" },
+        .core_version = "1.32.0",
+        .engine_version = config.ENGINE_VERSION,
+        .gfx_version = config.GFX_VERSION,
+    };
+
+    // Assert the MECHANISM, not just the value: the package must identify
+    // BGFX, not the `.raylib` tag beside it.
+    try std.testing.expectEqual(config.Backend.bgfx, officialBackendOf(cfg.backend_package.?).?);
+
+    // 0.21.0 hard-floors core >= 2.0.0, so this pairing must be refused.
+    const v = (try configBackendCoreFloorViolation(cfg)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(FloorSeverity.compile_break, v.severity);
+    try std.testing.expectEqualStrings("bgfx", v.backend);
+    try std.testing.expectEqualStrings("0.21.0", v.backend_version);
+
+    // The old code path: `isOfficialProvider(cfg.backend, bp)` compared the
+    // bgfx package against the RAYLIB remote and returned false, so the
+    // floor was skipped entirely. Pin that the two remotes really do differ,
+    // so this test cannot pass for the wrong reason.
+    const raylib_official = config.ProjectConfig.builtinProvider(.raylib).?;
+    try std.testing.expect(!config.sameRemote(cfg.backend_package.?.repo, raylib_official.repo));
+
+    // A genuine third-party provider is still left alone, whatever its pin.
+    const third_party: config.ProjectConfig = .{
+        .name = "p",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "acme_bgfx", .repo = "github.com/acme/bgfx", .version = "0.1.0" },
+        .core_version = "1.32.0",
+        .engine_version = config.ENGINE_VERSION,
+        .gfx_version = config.GFX_VERSION,
+    };
+    try std.testing.expect(officialBackendOf(third_party.backend_package.?) == null);
+    try std.testing.expect((try configBackendCoreFloorViolation(third_party)) == null);
 }
 
 pub const EnforceError = error{ VersionFloorViolation, UnparsableVersionPin };
@@ -626,11 +746,21 @@ test "init refuses --engine-version=2.12.2 under the 2.0.0 core/gfx defaults wit
     const both = (try trioFloorViolation("1.27.0", "2.12.0", "1.30.1")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, both.severity());
 
-    // Accepted: the defaults, every earlier curated set, and non-release pins.
+    // Accepted: the defaults and every earlier curated set.
     try std.testing.expect((try trioFloorViolation(config.CORE_VERSION, config.ENGINE_VERSION, config.GFX_VERSION)) == null);
     try std.testing.expect((try trioFloorViolation("2.0.0", "3.0.0", "2.0.0")) == null);
     try std.testing.expect((try trioFloorViolation("1.32.0", "2.12.2", "1.30.1")) == null);
-    try std.testing.expect((try trioFloorViolation("local:../labelle-core", "2.12.2", "2.0.0")) == null);
+    // A non-release CORE pin used to suppress the WHOLE table; now it
+    // suppresses only the rules that read core (#746 review). gfx 2.0.0 with
+    // engine 2.12.2 is a compile break the table states without reference to
+    // core, so it is caught even though the core pin is unresolvable here.
+    const local_core_bad_pair = (try trioFloorViolation("local:../labelle-core", "2.12.2", "2.0.0")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(TrioPackage.gfx, local_core_bad_pair.floor.subject);
+    try std.testing.expectEqual(TrioPackage.engine, local_core_bad_pair.floor.requires);
+    // ...and the same local core over a COHERENT engine/gfx pair is still
+    // accepted, so the rule above is the table firing, not the local pin.
+    try std.testing.expect((try trioFloorViolation("local:../labelle-core", "3.0.0", "2.0.0")) == null);
     try std.testing.expectError(error.UnparsableVersionPin, trioFloorViolation("1.2.3.4", "3.0.0", "2.0.0"));
 }
 

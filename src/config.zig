@@ -770,8 +770,9 @@ pub fn pinAtLeast(pin: []const u8, floor: []const u8) error{UnparsableVersionPin
     return p.order(f) != .lt;
 }
 
-/// The comparable identity of a package `repo` field: the remote with its
-/// scheme, any trailing `/`, and a trailing `.git` removed.
+/// The comparable identity of a package `repo` field: the remote with any
+/// `git+` prefix, its scheme, any `?query`/`#fragment`, any trailing `/` and
+/// a trailing `.git` removed.
 ///
 /// `parseProjectConfig` preserves `PluginDep.repo` VERBATIM, and the fetch
 /// path accepts every spelling of the same remote —
@@ -783,18 +784,33 @@ pub fn pinAtLeast(pin: []const u8, floor: []const u8) error{UnparsableVersionPin
 /// of the official repo as a third-party provider and skipped the floor
 /// checks that exist to name a bad pin.
 ///
+/// THE SINGLE NORMALIZER (#746 review). `cache/fetch.zig`'s `repoHostPath`
+/// — the function that decides which repository is actually CLONED — used
+/// to carry its own copy of this logic, and the copies had drifted: the
+/// fetcher stripped `git+` and `?query`/`#fragment`, this one did not. So
+/// `git+https://github.com/labelle-toolkit/labelle-bgfx?ref=main` FETCHED
+/// the official backend while every floor gate classified it as a custom
+/// provider and waved incompatible release pins through. `repoHostPath` now
+/// delegates here, so the identity a gate compares is by construction the
+/// identity the fetcher resolves.
+///
 /// A `local:` path is NOT a remote — it is a filesystem checkout resolved
 /// elsewhere — so it is returned untouched (scheme stripping would mangle
 /// it, and two different local paths must never compare equal to a remote).
 pub fn normalizeRemote(repo: []const u8) []const u8 {
     if (std.mem.startsWith(u8, repo, "local:")) return repo;
     var r = repo;
-    inline for (.{ "https://", "http://", "git://", "ssh://", "git+https://" }) |scheme| {
+    if (std.ascii.startsWithIgnoreCase(r, "git+")) r = r["git+".len..];
+    inline for (.{ "https://", "http://", "git://", "ssh://" }) |scheme| {
         if (std.ascii.startsWithIgnoreCase(r, scheme)) {
             r = r[scheme.len..];
             break;
         }
     }
+    // A `?ref=`/`#sha` suffix selects a REVISION of the same repository, so
+    // it is not part of the repository's identity — and the fetch path drops
+    // it before cloning.
+    if (std.mem.indexOfAny(u8, r, "?#")) |i| r = r[0..i];
     while (r.len > 0 and r[r.len - 1] == '/') r = r[0 .. r.len - 1];
     if (std.mem.endsWith(u8, r, ".git")) r = r[0 .. r.len - ".git".len];
     return r;
@@ -828,6 +844,15 @@ test "normalizeRemote/sameRemote fold every spelling of one remote, keep distinc
         "http://github.com/labelle-toolkit/labelle-bgfx/",
         "git://GitHub.com/labelle-toolkit/labelle-bgfx.git",
         "GITHUB.COM/labelle-toolkit/labelle-bgfx",
+        // A `?ref=`/`#sha` suffix selects a REVISION, not a repository, and
+        // `cache/fetch.zig` drops it before cloning — so the gates must fold
+        // it away too, or a `git+https://…?ref=main` spelling FETCHES the
+        // official backend while every floor check calls it third-party
+        // (#746 review).
+        "git+https://github.com/labelle-toolkit/labelle-bgfx?ref=main",
+        "git+https://github.com/labelle-toolkit/labelle-bgfx.git?ref=v0.21.0",
+        "https://github.com/labelle-toolkit/labelle-bgfx#deadbeef",
+        "git+https://github.com/labelle-toolkit/labelle-bgfx/?ref=main#frag",
     }) |spelling| {
         try std.testing.expect(sameRemote(spelling, canonical));
         try std.testing.expect(sameRemote(canonical, spelling));
