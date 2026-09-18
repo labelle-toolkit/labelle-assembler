@@ -1,0 +1,189 @@
+// COND-07 condenser — two units side by side.
+//
+// Each unit is the same six-layer stack, drawn in the order the assets
+// branch's README specifies:
+//
+//     machine_interior -> water -> mist -> drops -> cooler -> frame
+//
+// which here is simply layer order (project.labelle `.layers`). Emitter A
+// (native canvas x 25 = reservoir-local x 21) sits BEHIND the cooler, so
+// its drop is occluded on the way down and only its ripple shows.
+//
+// Every sprite is `pivot: top_left` at `scale 6`, so a coordinate below is
+// the measured native-art pixel times six.
+//
+// The reservoirs are PREFAB INSTANCES (`prefabs/reservoir.jsonc`). Each one
+// patches `water_level` and the `Reservoir.unit` marker at the instance
+// site with flat PascalCase override keys (RFC #596) — the same shape
+// `examples/fantasy-dungeon/scenes/main.jsonc` uses. Everything else about
+// the PixelWater block (mask, reflection, logical_size, grid, colours,
+// waves, ripple parameters) is INHERITED from the prefab: that deep merge
+// on a BUILT-IN component is one of the two things this example exists to
+// prove. The other is that the two instances are independent gfx water
+// instances — different levels, and a ripple in one never appears in the
+// other.
+{
+    "name": "main",
+    "children": [
+
+        // ── Condenser unit A (native canvas x 0..103) ─────────────────
+        {
+            "name": "interior_a",
+            "components": {
+                "Position": { "x": 0, "y": 0 },
+                "Sprite": { "sprite_name": "machine_interior.png", "pivot": "top_left", "layer": "machine", "scale_x": 6.0, "scale_y": 6.0 }
+            }
+        },
+        // Prefab instance — overrides ONLY the fill level and the unit
+        // marker; the measured 5/6 fill.
+        {
+            "prefab": "reservoir",
+            "name": "reservoir_a",
+            "Position": { "x": 24, "y": 288 },
+            "PixelWater": { "water_level": 0.8333 },
+            "Reservoir": { "unit": 0 }
+        },
+        {
+            "name": "mist_a",
+            "components": {
+                "Position": { "x": 0, "y": 0 },
+                "Sprite": { "sprite_name": "mist.png", "pivot": "top_left", "layer": "mist", "scale_x": 6.0, "scale_y": 6.0 },
+                "MistDrift": { "base_x": 0.0, "amplitude": 18.0, "period": 11.0, "phase": 0.0 }
+            }
+        },
+        {
+            "name": "drop_a0",
+            "components": {
+                "Position": { "x": 150, "y": -60 },
+                "Sprite": { "sprite_name": "drop.png", "pivot": "top_left", "layer": "drops", "scale_x": 6.0, "scale_y": 6.0 },
+                "Drop": { "unit": 0, "local_x": 21.0, "release_y": 2.0, "interval": 1.4, "phase": 0.0, "gravity": 230.0 }
+            }
+        },
+        {
+            "name": "drop_a1",
+            "components": {
+                "Position": { "x": 192, "y": -60 },
+                "Sprite": { "sprite_name": "drop.png", "pivot": "top_left", "layer": "drops", "scale_x": 6.0, "scale_y": 6.0 },
+                "Drop": { "unit": 0, "local_x": 28.0, "release_y": 2.0, "interval": 1.77, "phase": 0.31, "gravity": 230.0 }
+            }
+        },
+        {
+            "name": "drop_a2",
+            "components": {
+                "Position": { "x": 282, "y": -60 },
+                "Sprite": { "sprite_name": "drop.png", "pivot": "top_left", "layer": "drops", "scale_x": 6.0, "scale_y": 6.0 },
+                "Drop": { "unit": 0, "local_x": 43.0, "release_y": 2.0, "interval": 2.14, "phase": 0.62, "gravity": 230.0 }
+            }
+        },
+        {
+            "name": "drop_a3",
+            "components": {
+                "Position": { "x": 330, "y": -60 },
+                "Sprite": { "sprite_name": "drop.png", "pivot": "top_left", "layer": "drops", "scale_x": 6.0, "scale_y": 6.0 },
+                "Drop": { "unit": 0, "local_x": 51.0, "release_y": 2.0, "interval": 2.51, "phase": 0.93, "gravity": 230.0 }
+            }
+        },
+        {
+            "name": "drop_a4",
+            "components": {
+                "Position": { "x": 414, "y": -60 },
+                "Sprite": { "sprite_name": "drop.png", "pivot": "top_left", "layer": "drops", "scale_x": 6.0, "scale_y": 6.0 },
+                "Drop": { "unit": 0, "local_x": 65.0, "release_y": 2.0, "interval": 2.88, "phase": 1.24, "gravity": 230.0 }
+            }
+        },
+        {
+            "name": "cooler_a",
+            "components": {
+                "Position": { "x": 0, "y": 0 },
+                "Sprite": { "sprite_name": "cooler_foreground.png", "pivot": "top_left", "layer": "foreground", "z_index": 0, "scale_x": 6.0, "scale_y": 6.0 }
+            }
+        },
+        {
+            "name": "frame_a",
+            "components": {
+                "Position": { "x": 0, "y": 0 },
+                "Sprite": { "sprite_name": "frame_foreground.png", "pivot": "top_left", "layer": "foreground", "z_index": 1, "scale_x": 6.0, "scale_y": 6.0 }
+            }
+        },
+
+        // ── Condenser unit B (native canvas x 103..206) ─────────────────
+        {
+            "name": "interior_b",
+            "components": {
+                "Position": { "x": 618, "y": 0 },
+                "Sprite": { "sprite_name": "machine_interior.png", "pivot": "top_left", "layer": "machine", "scale_x": 6.0, "scale_y": 6.0 }
+            }
+        },
+        // Prefab instance — overrides ONLY the fill level and the unit
+        // marker; half full.
+        {
+            "prefab": "reservoir",
+            "name": "reservoir_b",
+            "Position": { "x": 642, "y": 288 },
+            "PixelWater": { "water_level": 0.5 },
+            "Reservoir": { "unit": 1 }
+        },
+        {
+            "name": "mist_b",
+            "components": {
+                "Position": { "x": 618, "y": 0 },
+                "Sprite": { "sprite_name": "mist.png", "pivot": "top_left", "layer": "mist", "scale_x": 6.0, "scale_y": 6.0 },
+                "MistDrift": { "base_x": 618.0, "amplitude": 18.0, "period": 11.0, "phase": 1.7 }
+            }
+        },
+        {
+            "name": "drop_b0",
+            "components": {
+                "Position": { "x": 768, "y": -60 },
+                "Sprite": { "sprite_name": "drop.png", "pivot": "top_left", "layer": "drops", "scale_x": 6.0, "scale_y": 6.0 },
+                "Drop": { "unit": 1, "local_x": 21.0, "release_y": 2.0, "interval": 2.0, "phase": 0.9, "gravity": 230.0 }
+            }
+        },
+        {
+            "name": "drop_b1",
+            "components": {
+                "Position": { "x": 810, "y": -60 },
+                "Sprite": { "sprite_name": "drop.png", "pivot": "top_left", "layer": "drops", "scale_x": 6.0, "scale_y": 6.0 },
+                "Drop": { "unit": 1, "local_x": 28.0, "release_y": 2.0, "interval": 2.37, "phase": 1.21, "gravity": 230.0 }
+            }
+        },
+        {
+            "name": "drop_b2",
+            "components": {
+                "Position": { "x": 900, "y": -60 },
+                "Sprite": { "sprite_name": "drop.png", "pivot": "top_left", "layer": "drops", "scale_x": 6.0, "scale_y": 6.0 },
+                "Drop": { "unit": 1, "local_x": 43.0, "release_y": 2.0, "interval": 2.74, "phase": 1.52, "gravity": 230.0 }
+            }
+        },
+        {
+            "name": "drop_b3",
+            "components": {
+                "Position": { "x": 948, "y": -60 },
+                "Sprite": { "sprite_name": "drop.png", "pivot": "top_left", "layer": "drops", "scale_x": 6.0, "scale_y": 6.0 },
+                "Drop": { "unit": 1, "local_x": 51.0, "release_y": 2.0, "interval": 3.11, "phase": 1.83, "gravity": 230.0 }
+            }
+        },
+        {
+            "name": "drop_b4",
+            "components": {
+                "Position": { "x": 1032, "y": -60 },
+                "Sprite": { "sprite_name": "drop.png", "pivot": "top_left", "layer": "drops", "scale_x": 6.0, "scale_y": 6.0 },
+                "Drop": { "unit": 1, "local_x": 65.0, "release_y": 2.0, "interval": 3.48, "phase": 2.14, "gravity": 230.0 }
+            }
+        },
+        {
+            "name": "cooler_b",
+            "components": {
+                "Position": { "x": 618, "y": 0 },
+                "Sprite": { "sprite_name": "cooler_foreground.png", "pivot": "top_left", "layer": "foreground", "z_index": 0, "scale_x": 6.0, "scale_y": 6.0 }
+            }
+        },
+        {
+            "name": "frame_b",
+            "components": {
+                "Position": { "x": 618, "y": 0 },
+                "Sprite": { "sprite_name": "frame_foreground.png", "pivot": "top_left", "layer": "foreground", "z_index": 1, "scale_x": 6.0, "scale_y": 6.0 }
+            }
+        }
+    ]
+}
