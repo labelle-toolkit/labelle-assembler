@@ -44,13 +44,17 @@ Runtime handles must not be authored in prefabs or serialized as durable state.
    still names the removed water contract against the new core — the failure
    mode assembler#731 repaired in the other direction.
 6. Replace the example's local dependency selections with those released
-   versions, and add it to the examples-integration lane (assembler#732: that
-   lane only GENERATES bgfx examples today, so a compile break in a pinned
-   backend passes unnoticed — build it, do not only generate it).
+   versions (done: `examples/condenser` pins core 2.0.0, gfx 2.0.0, engine
+   3.0.0 and bgfx 0.21.0), and add it to the examples-integration lane
+   (assembler#732: that lane only GENERATES bgfx examples today, so a compile
+   break in a pinned backend passes unnoticed — build it, do not only
+   generate it).
 
-Until then, build the sibling `feat/game-shader-materials` branches in this
-workspace. Standalone BGFX tests require `-Dcore-source=<core>/src/root.zig`.
-This local implementation does not publish packages or change existing PRs.
+Steps 1-4 and 6 have shipped (core v2.0.0, gfx v2.0.0, engine v3.0.0, bgfx
+v0.21.0). Step 5 is pending on the assembler side and follows the core >= 2.0.0
+floor change (assembler#736). To develop against unreleased sibling checkouts,
+switch the example's four pins back to `local:../../../labelle-*`. Standalone
+BGFX tests require `-Dcore-source=<core>/src/root.zig`.
 
 ## Validation limits
 

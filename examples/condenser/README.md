@@ -8,13 +8,14 @@ lay a second haze over the original plate.
 
 ![Windows/Vulkan capture](preview.png)
 
-## Coordinated development dependencies
+## Dependencies
 
-This example requires the **unreleased sibling branches** in this workspace.
-`project.labelle` explicitly selects `local:../../../labelle-core`,
-`local:../../../labelle-gfx`, `local:../../../labelle-engine`, the local bgfx
-backend, and `local:../../` assembler. Released package versions do not provide
-this implementation. Regenerate after changing the coordinated branches.
+`project.labelle` pins the released game-shader-material stack: core 2.0.0,
+gfx 2.0.0, engine 3.0.0 and the bgfx backend 0.21.0 (the first contract-v2
+backend; it requires core >= 2.0.0, so the four pins move together). Only the
+assembler is still selected as `local:../../`, like every example in this
+repository. To develop against unreleased sibling checkouts instead, switch the
+four pins to `local:../../../labelle-{core,gfx,engine,bgfx}` and regenerate.
 
 ```sh
 # POSIX. `labelle build` from this directory does the same thing.
