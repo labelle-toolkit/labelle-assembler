@@ -13,7 +13,15 @@
 // VERSION PINS: the RUNTIME packages (core/engine/gfx/cli) + the backend
 // pin the RELEASED set — this game proves the released runtime path (see
 // tile-explorer's note). bgfx is pinned explicitly (the registry default
-// 0.6.6 long predates the current backend train). The ASSEMBLER is
+// 0.6.6 long predates the current backend train). That pin is 0.20.0, not
+// 0.13.1: labelle-core 1.32.0 appended `MaterialEffect.pixel_water` and
+// every bgfx release before 0.20.0 switches EXHAUSTIVELY over that enum
+// with no arm for it. CI clones labelle-core at `main` as a sibling
+// checkout and the assembler's monorepo auto-discovery builds that sibling
+// INSTEAD of the `.core_version` pin below, so a pre-0.20.0 bgfx compiles
+// against the NEW core and fails sema. 0.20.0 IMPLEMENTS the effect behind
+// a `@hasField(MaterialEffect, "pixel_water")` gate, so it builds against
+// both the pinned 1.26.0 and core `main`. The ASSEMBLER is
 // `local:../../` (in-tree source, the examples convention). On the
 // fully-RELEASED `labelle` path this game builds on assembler 0.94.0 —
 // bgfx takes the generic desktop `unifyCoreDiamond` codegen, unaffected by
@@ -25,7 +33,7 @@
     .height = 270,
     .target_fps = 60,
     .backend = .bgfx,
-    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.13.1" },
+    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.20.0" },
     .y_axis = .down,
     .ecs = .zig_ecs,
     .initial_prefab = "main",
