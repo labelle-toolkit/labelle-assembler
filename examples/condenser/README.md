@@ -3,7 +3,9 @@
 Two independently controlled condenser units use production `WaterShader`,
 `FogShader`, `LampShader`, and `MistShader` components and the generic shader-material API.
 Contained water is still between drop impacts: no travelling wave or reflection
-flow. Fog and light replace their contributions in the static art; they do not
+flow. At `water_level = 1.0` the top edge is the brim: the impact displacement
+is clamped to the downward side, so crests rest on the brim, troughs dip below
+it, and the mask's top row never goes dry. Fog and light replace their contributions in the static art; they do not
 lay a second haze over the original plate.
 
 ![Windows/Vulkan capture](preview.png)
@@ -100,7 +102,13 @@ Keyboard controls affect **unit A only**:
 Startup environment overrides apply to both units. Numeric zero is a real value.
 All use the `CONDENSER_` prefix:
 
-- `WATER_LEVEL`, `WATER_OFF`.
+- `WATER_LEVEL`, `WATER_OFF`, `WATER_RIPPLE_STRENGTH` (zero renders exactly
+  like no impacts at all).
+- `WATER_SHADER_RIPPLE_DURATION` is a shader-uniform verification hook, not a
+  component control: it uploads every live impact at age zero with that raw
+  duration, the one state this example cannot otherwise produce (`validate()`
+  refuses a nonpositive duration, and impacts are emitted before `advance()`
+  here). It exists for `tools/verify_water_edges.py`.
 - `FOG_DENSITY`, `FOG_OPACITY`, `FOG_SPEED`, `FOG_VARIATION`, `FOG_WISP_SIZE`,
   `FOG_TURBULENCE`, `FOG_DRIFT_X`, `FOG_DRIFT_Y`, `FOG_LIGHT`, `FOG_OFF`.
 - `LAMP_WIDTH`, `LAMP_UP`, `LAMP_DOWN`, `LAMP_INTENSITY`, `LAMP_SPREAD`,
@@ -115,14 +123,18 @@ seconds with `LABELLE_FIXED_DT=0.016666667` for deterministic comparison.
 
 ## Verification
 
-- `zig build test --summary all` from the generated desktop directory: **20 tests**,
-  including water lifetime/bounds/rebase/invalid state, directional drift,
+- `zig build test --summary all` from the generated desktop directory: **21 tests**,
+  including water lifetime/bounds/rebase/invalid state, passive expiry erasing
+  the retained slot, directional drift,
   zero controls, flicker, actual prefab merge, and real keyboard paths.
 - `python tools/verify_effect_assets.py`: **10 checks**, including saved-mask
   reconstruction, alpha preservation, independent fog/lamp controls, shared
   grid behavior, and descriptor shapes; writes a CPU reference contact sheet.
 - `tools/compile_shaders.ps1 -Shaderc <exe> -Include <bgfx-shader-directory>`:
   compiles all **16 variants** independently of the game build.
+- `python tools/verify_water_edges.py`: **13 native runs** covering the water
+  edge cases of issue #734 — motion and brim coverage at `water_level = 1.0`,
+  and an empty ripple window contributing nothing at age zero.
 - `python tools/verify_runtime.py`: **16 actual native runs** (macOS/Metal and
   Windows/Vulkan), eight live generic
   materials each, fixed-step captures, frame-60 left-only edits, zero width and

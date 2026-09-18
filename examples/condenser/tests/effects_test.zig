@@ -28,6 +28,23 @@ test "expiry boundary is permanent after duration shortens then lengthens" {
     try equal([4]f32{ 0, 0, 0, 0 }, w.ripples[0]);
 }
 
+test "passive expiry erases the slot, so lengthening cannot resurrect it" {
+    var w = Water{};
+    try w.impact(20, 1);
+    // Time alone retires it: no patch, no shrink, no level change (#734).
+    try w.advance(1.0);
+    // Assert the RETAINED array, not a payload a filter could be hiding.
+    try equal(@as(usize, 0), w.ripple_count);
+    try equal([4]f32{ 0, 0, 0, 0 }, w.ripples[0]);
+    try w.patch(.{ .ripple_duration_seconds = @as(f32, 5) });
+    try equal(@as(usize, 0), w.ripple_count);
+    try equal([4]f32{ 0, 0, 0, 0 }, w.ripples[0]);
+    // A live impact under the longer window still works afterwards.
+    try w.impact(20, 1);
+    try w.advance(1.0);
+    try equal(@as(usize, 1), w.ripple_count);
+}
+
 test "shrinking width retires only out of bounds impacts" {
     var w = Water{};
     try w.impact(12, 1);
