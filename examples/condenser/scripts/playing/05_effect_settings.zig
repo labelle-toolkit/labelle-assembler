@@ -41,6 +41,10 @@ pub fn tick(game: anytype, state: anytype, _: anytype, _: f32) void {
             if (envFloat("CONDENSER_WATER_OFF")) |v| {
                 if (v != 0) water.setLevel(0) catch {};
             }
+            // Zero is a real value here: it renders exactly like "no impacts".
+            if (envFloat("CONDENSER_WATER_RIPPLE_STRENGTH")) |v| {
+                water.patch(.{ .ripple_strength_pixels = v }) catch {};
+            }
         }
         if (unit == 0 and change_level) water.setLevel(if (water.water_level > 0.6) 0.5 else 0.8333) catch {};
         if (unit == 0 and splash) water.impact(water.logical_size[0] * 0.5, 1) catch {};

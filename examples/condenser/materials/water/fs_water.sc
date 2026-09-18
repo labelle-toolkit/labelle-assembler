@@ -48,7 +48,12 @@ void main()
 	float period = max(u_water_params[0].w, 1e-4);
 
 	float reflect_opacity = clamp(u_water_params[1].y, 0.0, 1.0);
-	float ripple_duration = max(u_water_params[1].z, 1e-4);
+	// RAW lifetime: a nonpositive duration is an EMPTY window and must gate
+	// every impact out. Coercing it to 1e-4 first would turn [0, 0) into a
+	// non-empty interval and render one frame of a ripple that never lives.
+	float ripple_duration_raw = u_water_params[1].z;
+	// Safe denominator, used ONLY after the raw gate has passed.
+	float ripple_duration = max(ripple_duration_raw, 1e-4);
 	float ripple_radius = max(u_water_params[1].w, 1e-4);
 	float ripple_strength = u_water_params[2].x;
 
@@ -67,7 +72,7 @@ void main()
 		vec4 r = u_water_ripples[i];
 		float age = time - r.y;
 
-		if (age < 0.0 || age >= ripple_duration) continue;
+		if (ripple_duration_raw <= 0.0 || age < 0.0 || age >= ripple_duration_raw) continue;
 		float dist = abs(cell.x - r.x);
 		float falloff = max(0.0, 1.0 - dist / ripple_radius);
 		float fade = 1.0 - age / ripple_duration;
@@ -76,15 +81,25 @@ void main()
 	}
 
 	float offset = waterQuant(wave + ripple, grid);
-	float surface = surface_y + offset;
 
-	surface = mix(surface, min(surface, surface_y), step(1.0 - 1e-6, level));
+	// At full fill `surface_y` IS the brim: nothing may sit above it, or the
+	// mask's top row goes dry. Clamp the DISPLACEMENT to the downward side
+	// rather than the surface itself, so the crest rests on the brim and the
+	// troughs dip below it -- the water still moves at level == 1.0, which a
+	// surface clamp (min(surface, surface_y)) pinned into place.
+	float brimmed = step(1.0 - 1e-6, level);
+	float displacement = mix(offset, max(offset, 0.0), brimmed);
+	float surface = surface_y + displacement;
+
+	// Shading follows the displaced surface; coverage never recedes past the
+	// brim, so a trough darkens/lightens the top cells without exposing them.
+	float coverage_surface = mix(surface, min(surface, surface_y), brimmed);
 
 	vec2 cell_uv = clamp(cell / logical, vec2(0.0, 0.0), vec2(1.0, 1.0));
 	vec4 mask_texel = texture2D(s_water_mask, cell_uv);
 	float mask_a = mix(1.0, mask_texel.a * max(mask_texel.r, max(mask_texel.g, mask_texel.b)), has_mask);
 
-	float below = step(surface, cell.y);
+	float below = step(coverage_surface, cell.y);
 	float coverage = mask_a * below * step(1e-6, level);
 
 	float depth_span = max(logical.y - surface, 1e-4);
@@ -101,7 +116,7 @@ void main()
 	vec3 water_rgb = mix(body_rgb, reflect_texel.rgb, reflect_mix);
 
 	float crest_scale = max(amplitude + abs(ripple_strength), 1e-4);
-	float crest = clamp(0.5 + 0.5 * (offset / crest_scale), 0.0, 1.0);
+	float crest = clamp(0.5 + 0.5 * (displacement / crest_scale), 0.0, 1.0);
 	float highlight = u_water_color[2].a * (1.0 - step(grid, cell.y - surface)) * crest;
 	water_rgb = mix(water_rgb, u_water_color[2].rgb, highlight);
 
