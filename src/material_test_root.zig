@@ -37,6 +37,7 @@ test {
     _ = @import("material_pipeline.zig");
     _ = @import("material_schema.zig");
     _ = @import("material_build.zig");
+    _ = @import("material_root_scan.zig");
     // Not a `material_*` module, but the materials work owns it: the
     // generated materials module collides with a plugin literally named
     // "materials", and the emitted comptime guard lives here. It was in the
@@ -52,6 +53,7 @@ test {
 pub const covered_material_modules = [_][]const u8{
     "material_build.zig",
     "material_pipeline.zig",
+    "material_root_scan.zig",
     "material_schema.zig",
 };
 
