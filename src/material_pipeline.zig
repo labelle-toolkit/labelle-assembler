@@ -53,12 +53,27 @@ pub const ContractViolation = struct { what: []const u8, pinned: []const u8, flo
 pub fn contractViolation(cfg: config.ProjectConfig) error{UnparsableVersionPin}!?ContractViolation {
     if (cfg.backend != .bgfx) return null;
     if (cfg.effectiveBackendPackage()) |bp| {
-        if (config.isSemverVersion(bp.version) and !try config.pinAtLeast(bp.version, min_bgfx_for_materials))
+        // The 0.21.0 floor is a fact about the OFFICIAL labelle-bgfx release
+        // train only. A custom provider (`.backend_package` on another repo)
+        // carries its OWN semver — comparing e.g. acme/bgfx 0.1.0 against
+        // 0.21.0 would reject a contract-v2-capable provider as an obsolete
+        // labelle-bgfx (#733 review, round 3). Such a provider is validated
+        // by the generated module's `MATERIAL_CONTRACT_VERSION == 2` guard,
+        // which covers arbitrary providers.
+        if (isOfficialBgfx(bp) and config.isSemverVersion(bp.version) and !try config.pinAtLeast(bp.version, min_bgfx_for_materials))
             return .{ .what = "labelle-bgfx", .pinned = bp.version, .floor = min_bgfx_for_materials };
     }
     if (config.isSemverVersion(cfg.core_version) and !try config.pinAtLeast(cfg.core_version, min_core_for_materials))
         return .{ .what = "labelle-core", .pinned = cfg.core_version, .floor = min_core_for_materials };
     return null;
+}
+/// The resolved provider IS the official labelle-bgfx release train: the
+/// builtin provider's repo (the enum-as-shorthand default, or an explicit
+/// `.backend_package` that pins that same repo). Keyed off the REPO, never
+/// the package name — the name is configurable (`requireBackend`).
+pub fn isOfficialBgfx(bp: config.PluginDep) bool {
+    const official = config.ProjectConfig.builtinProvider(.bgfx) orelse return false;
+    return std.mem.eql(u8, bp.repo, official.repo);
 }
 pub fn requireContract(cfg: config.ProjectConfig) ContractError!void {
     if (try contractViolation(cfg)) |_| return error.MaterialContractUnsupported;
@@ -221,4 +236,36 @@ test "contractViolation: an explicit pre-contract-v2 bgfx or core pin is rejecte
     try requireContract(.{ .name = "g", .backend = .sokol, .core_version = "1.26.0" });
     // A dotted-but-unparsable pin surfaces as the named error, not a crash.
     try std.testing.expectError(error.UnparsableVersionPin, requireContract(.{ .name = "g", .backend = .bgfx, .core_version = "1.2.3.4" }));
+}
+
+test "contractViolation: the 0.21.0 floor applies to the OFFICIAL labelle-bgfx only — a custom provider's own semver is not judged (#733 round 3)" {
+    // A compatible custom provider with its own version line, selected by a
+    // `.backend = .bgfx` project: ACCEPTED at generate (the generated
+    // MATERIAL_CONTRACT_VERSION guard validates it instead).
+    try requireContract(.{
+        .name = "g",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "bgfx_v2", .repo = "github.com/acme/bgfx", .version = "0.1.0" },
+        .core_version = "2.0.0",
+    });
+    try std.testing.expect(!isOfficialBgfx(.{ .name = "bgfx_v2", .repo = "github.com/acme/bgfx", .version = "0.1.0" }));
+    // The official train, pinned explicitly or via the default, is judged:
+    // 0.20.0 still rejected, whatever the package is CALLED.
+    try std.testing.expect(isOfficialBgfx(config.ProjectConfig.builtinProvider(.bgfx).?));
+    const v = (try contractViolation(.{
+        .name = "g",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "bgfx_v2", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.20.0" },
+        .core_version = "2.0.0",
+    })) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("labelle-bgfx", v.what);
+    try std.testing.expectEqualStrings("0.20.0", v.pinned);
+    // The core floor is about labelle-core itself and still applies under a
+    // custom provider.
+    try std.testing.expectError(error.MaterialContractUnsupported, requireContract(.{
+        .name = "g",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "bgfx_v2", .repo = "github.com/acme/bgfx", .version = "0.1.0" },
+        .core_version = "1.32.0",
+    }));
 }

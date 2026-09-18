@@ -145,6 +145,25 @@ pub fn cmdInit(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
         }
     }
 
+    // #733 review (round 3): the core/engine/gfx trio must be coherent too —
+    // an explicit `--engine-version=`/`--gfx-version=`/`--core-version=`
+    // against the other two defaults used to pass the backend/core check
+    // above and scaffold a set the trio test declared incompatible. Same
+    // policy: a compile break refuses, a curated floor warns and scaffolds.
+    if (trioFloorViolation(opts.core_version, opts.engine_version, opts.gfx_version) catch |err| {
+        std.log.err("labelle-assembler init: core/engine/gfx version pins: {s}", .{@errorName(err)});
+        std.process.exit(2);
+    }) |v| {
+        var buf: [1024]u8 = undefined;
+        switch (v.severity()) {
+            .compile_break => {
+                std.log.err("labelle-assembler init: {s}", .{v.describe(&buf)});
+                std.process.exit(2);
+            },
+            .curated => std.log.warn("labelle-assembler init: {s}", .{v.describe(&buf)}),
+        }
+    }
+
     try scaffold(allocator, io, opts);
 }
 
@@ -337,6 +356,206 @@ fn providerCoreFloorViolation(backend: config.Backend, backend_version: []const 
         if (worst == null or (v.severity == .compile_break and worst.?.severity != .compile_break)) worst = v;
     }
     return worst;
+}
+
+// ── core ⇄ engine ⇄ gfx trio floor validation ─────────────────────────
+//
+// PRODUCTION check (#733 review, round 3 — the same shape #736's Major had):
+// the trio floors used to live only in a test helper, so
+// `labelle-assembler init game --engine-version=2.12.2` combined that explicit
+// pin with the core/gfx 2.0.0 defaults, passed the backend/core-only validator
+// above, and wrote the exact combination the test declared incompatible. The
+// table below is the ONE place the trio floors live; `checkTrioFloors` (the
+// test helper) wraps this same function. Scope: `init` only — generate/upgrade
+// is labelle-assembler#739's.
+
+const TrioPackage = enum {
+    core,
+    engine,
+    gfx,
+
+    fn label(self: TrioPackage) []const u8 {
+        return switch (self) {
+            .core => "labelle-core",
+            .engine => "labelle-engine",
+            .gfx => "labelle-gfx",
+        };
+    }
+    fn flag(self: TrioPackage) []const u8 {
+        return switch (self) {
+            .core => "--core-version",
+            .engine => "--engine-version",
+            .gfx => "--gfx-version",
+        };
+    }
+    fn curatedDefault(self: TrioPackage) []const u8 {
+        return switch (self) {
+            .core => config.CORE_VERSION,
+            .engine => config.ENGINE_VERSION,
+            .gfx => config.GFX_VERSION,
+        };
+    }
+};
+
+/// One floor: `subject >= subject_at_least` puts `requires >= floor` on the
+/// project.
+const TrioFloor = struct {
+    subject: TrioPackage,
+    subject_at_least: []const u8,
+    requires: TrioPackage,
+    floor: []const u8,
+    severity: FloorSeverity,
+    /// Why, in the words the diagnostic prints.
+    why: []const u8,
+};
+
+/// Strictest (newest line) first, so the reported violation is the
+/// actionable one. The 2.0.0 line (PR #733, game-owned shader materials):
+/// gfx 2.0.0 dispatches generic material draws through core 2.0.0's
+/// `shader_material` contract (its build.zig.zon pins core 2.0.0), and
+/// engine 3.0.0's entity material API is built on gfx 2.0.0 (its
+/// build.zig.zon pins gfx 2.0.0). The 1.x core carried the specialized
+/// PixelWater contract these replaced, and engine <= 2.12.x still compiles
+/// its PixelWater simulation against it — so nothing below the 2.0.0 line
+/// mixes with anything on it, in either direction.
+///
+/// #679: gfx >= 1.30.0 re-exports `core.TextureId` rather than declaring its
+/// own (labelle-gfx#328). That type landed in core 1.28.0, and the assembler
+/// unifies every package onto the project's `core_version` — so gfx 1.30.x
+/// against core < 1.28.0 dies inside the dependency with "root source file
+/// struct 'root' has no member named 'TextureId'". Engine >= 2.12.1 is the
+/// matching half (`game.nativeTextureId` compiles against the typed gfx
+/// surface, labelle-engine#813 phase 4) — CURATED, the engine takes no
+/// direct gfx dependency.
+///
+/// engine >= 2.11.0 floors core >= 1.27.0: core's `ChildrenComponent` went
+/// ArrayList-backed and `addChild` takes an allocator (labelle-core#65/#66),
+/// and the engine takes a REAL module dependency on core — an older core
+/// fails to compile.
+///
+/// engine >= 2.11.0 also floors gfx >= 1.28.0, but that one is a CURATED
+/// floor, not a compile break: the engine module takes no direct gfx
+/// dependency (the renderer arrives via `RenderImpl`), and its post-fx
+/// passthrough is `@hasDecl`-gated — labelle-engine `src/game/post_fx_mixin.zig`
+/// says in so many words that "an older gfx (< v1.28.0) … compiles to a
+/// no-op". So the pairing BUILDS; it just silently drops the post-fx stack
+/// the engine advertises. A curated set is what `labelle init` stamps and
+/// `upgrade all` writes, so it must be the coherent set, not merely one
+/// that compiles — hence the assertion, with the distinction recorded here
+/// so nobody later "fixes" a legitimate compile failure by relaxing it.
+const trio_floors = [_]TrioFloor{
+    .{ .subject = .gfx, .subject_at_least = "2.0.0", .requires = .core, .floor = "2.0.0", .severity = .compile_break, .why = "gfx 2.x dispatches material draws through core's `shader_material` contract, which only core >= 2.0.0 declares" },
+    .{ .subject = .gfx, .subject_at_least = "2.0.0", .requires = .engine, .floor = "3.0.0", .severity = .compile_break, .why = "an engine below 3.0.0 still compiles the PixelWater simulation the 2.0.0 line removed from core and gfx" },
+    .{ .subject = .engine, .subject_at_least = "3.0.0", .requires = .core, .floor = "2.0.0", .severity = .compile_break, .why = "engine 3.x's entity material API is built on core 2.0.0's `shader_material` contract" },
+    .{ .subject = .engine, .subject_at_least = "3.0.0", .requires = .gfx, .floor = "2.0.0", .severity = .compile_break, .why = "engine 3.x is built against gfx 2.0.0's generic material draw (its build.zig.zon pins it)" },
+    .{ .subject = .gfx, .subject_at_least = "1.30.0", .requires = .core, .floor = "1.28.0", .severity = .compile_break, .why = "gfx >= 1.30.0 re-exports `core.TextureId`, which landed in core 1.28.0 — an older core fails to compile" },
+    .{ .subject = .gfx, .subject_at_least = "1.30.0", .requires = .engine, .floor = "2.12.1", .severity = .curated, .why = "engine 2.12.1 is the half released against gfx's typed TextureId surface" },
+    .{ .subject = .engine, .subject_at_least = "2.11.0", .requires = .core, .floor = "1.27.0", .severity = .compile_break, .why = "engine >= 2.11.0 takes core's allocator-taking `ChildrenComponent` — an older core fails to compile" },
+    .{ .subject = .engine, .subject_at_least = "2.11.0", .requires = .gfx, .floor = "1.28.0", .severity = .curated, .why = "the engine's post-fx passthrough compiles to a no-op on an older gfx, silently dropping the post-fx stack" },
+};
+
+/// A trio pin set that violates a floor, with everything the diagnostic names.
+pub const TrioViolation = struct {
+    core_version: []const u8,
+    engine_version: []const u8,
+    gfx_version: []const u8,
+    floor: TrioFloor,
+
+    fn pinOf(self: TrioViolation, pkg: TrioPackage) []const u8 {
+        return switch (pkg) {
+            .core => self.core_version,
+            .engine => self.engine_version,
+            .gfx => self.gfx_version,
+        };
+    }
+
+    /// What to pass instead: the curated default of the required package
+    /// when it satisfies the floor (it always does for the shipped table),
+    /// else the floor itself.
+    pub fn recommended(self: TrioViolation) []const u8 {
+        const def = self.floor.requires.curatedDefault();
+        const ok = config.isSemverVersion(def) and (config.pinAtLeast(def, self.floor.floor) catch false);
+        return if (ok) def else self.floor.floor;
+    }
+
+    pub fn severity(self: TrioViolation) FloorSeverity {
+        return self.floor.severity;
+    }
+
+    /// The diagnostic, rendered into `buf`: names the subject pin, the
+    /// required package and floor, all three pins as given, why, and the
+    /// flag to pass.
+    pub fn describe(self: TrioViolation, buf: []u8) []const u8 {
+        const verb: []const u8 = switch (self.floor.severity) {
+            .compile_break => "requires",
+            .curated => "is released against",
+        };
+        return std.fmt.bufPrint(
+            buf,
+            "{s} {s} {s} {s} >= {s}; got core {s} / engine {s} / gfx {s} ({s}). Pass {s}={s} (the curated set is core {s} / engine {s} / gfx {s}).",
+            .{
+                self.floor.subject.label(),  self.pinOf(self.floor.subject), verb,
+                self.floor.requires.label(), self.floor.floor,               self.core_version,
+                self.engine_version,         self.gfx_version,               self.floor.why,
+                self.floor.requires.flag(),  self.recommended(),             config.CORE_VERSION,
+                config.ENGINE_VERSION,       config.GFX_VERSION,
+            },
+        ) catch "core/engine/gfx version floor violated (diagnostic too long to render)";
+    }
+};
+
+/// The floor the three pins violate, or null when the trio is coherent. A
+/// compile break beats a curated floor; among equals the first (strictest)
+/// wins. Pins that are not release versions (`local:…`) are resolved
+/// elsewhere and leave the trio unjudged.
+pub fn trioFloorViolation(core_version: []const u8, engine_version: []const u8, gfx_version: []const u8) error{UnparsableVersionPin}!?TrioViolation {
+    if (!config.isSemverVersion(core_version) or !config.isSemverVersion(engine_version) or !config.isSemverVersion(gfx_version)) return null;
+    var worst: ?TrioViolation = null;
+    for (trio_floors) |f| {
+        const v: TrioViolation = .{ .core_version = core_version, .engine_version = engine_version, .gfx_version = gfx_version, .floor = f };
+        if (!try pinAtLeast(v.pinOf(f.subject), f.subject_at_least)) continue;
+        if (try pinAtLeast(v.pinOf(f.requires), f.floor)) continue;
+        if (worst == null or (f.severity == .compile_break and worst.?.floor.severity != .compile_break)) worst = v;
+    }
+    return worst;
+}
+
+test "init refuses --engine-version=2.12.2 under the 2.0.0 core/gfx defaults with a named diagnostic; defaults pass — #733 review round 3" {
+    var buf: [1024]u8 = undefined;
+    // The front-door failure: the explicit engine pin against the curated
+    // core/gfx defaults trips a COMPILE-BREAK floor (refused, not warned),
+    // and the diagnostic names all three pins, the floor, and the flag.
+    const v = (try trioFloorViolation(config.CORE_VERSION, "2.12.2", config.GFX_VERSION)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(FloorSeverity.compile_break, v.severity());
+    try std.testing.expectEqual(TrioPackage.engine, v.floor.requires);
+    try std.testing.expectEqualStrings("3.0.0", v.floor.floor);
+    const msg = v.describe(&buf);
+    try std.testing.expect(std.mem.startsWith(u8, msg, "labelle-gfx 2.0.0 requires labelle-engine >= 3.0.0; got core 2.0.0 / engine 2.12.2 / gfx 2.0.0 ("));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "PixelWater") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Pass --engine-version=3.0.0") != null);
+
+    // The other direction and the other package: an old gfx or core under
+    // the new engine is refused too, naming the right flag.
+    const g = (try trioFloorViolation("2.0.0", "3.0.0", "1.30.1")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(FloorSeverity.compile_break, g.severity());
+    try std.testing.expect(std.mem.indexOf(u8, g.describe(&buf), "Pass --gfx-version=2.0.0") != null);
+    const c = (try trioFloorViolation("1.32.0", "3.0.0", "2.0.0")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, c.describe(&buf), "Pass --core-version=2.0.0") != null);
+
+    // A CURATED floor is reported as a warning-shaped violation, and a
+    // compile break wins over it when both are tripped.
+    const w = (try trioFloorViolation("1.28.0", "2.12.0", "1.30.1")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(FloorSeverity.curated, w.severity());
+    try std.testing.expect(std.mem.indexOf(u8, w.describe(&buf), "is released against labelle-engine >= 2.12.1") != null);
+    const both = (try trioFloorViolation("1.27.0", "2.12.0", "1.30.1")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(FloorSeverity.compile_break, both.severity());
+
+    // Accepted: the defaults, every earlier curated set, and non-release pins.
+    try std.testing.expect((try trioFloorViolation(config.CORE_VERSION, config.ENGINE_VERSION, config.GFX_VERSION)) == null);
+    try std.testing.expect((try trioFloorViolation("2.0.0", "3.0.0", "2.0.0")) == null);
+    try std.testing.expect((try trioFloorViolation("1.32.0", "2.12.2", "1.30.1")) == null);
+    try std.testing.expect((try trioFloorViolation("local:../labelle-core", "2.12.2", "2.0.0")) == null);
+    try std.testing.expectError(error.UnparsableVersionPin, trioFloorViolation("1.2.3.4", "3.0.0", "2.0.0"));
 }
 
 /// Materialize a new project directory from `opts`. Exits the process
@@ -618,57 +837,12 @@ test "scaffold pins real fetchable framework versions — #159 regression" {
 /// materials contract gate shares it; the guards below keep the short name.
 const pinAtLeast = config.pinAtLeast;
 
-/// The cross-package floors the curated trio must satisfy, as a pure
-/// function of the three pins so the rules can be exercised against
-/// synthetic trios (see the table test below) and not only against
-/// whatever `build.zig` currently defaults to.
-///
-/// #679: gfx >= 1.30.0 re-exports `core.TextureId` rather than declaring
-/// its own (labelle-gfx#328). That type landed in core 1.28.0, and the
-/// assembler unifies every package onto the project's `core_version` — so
-/// gfx 1.30.x against core < 1.28.0 dies inside the dependency with
-/// "root source file struct 'root' has no member named 'TextureId'".
-/// Engine >= 2.12.1 is the matching half (`game.nativeTextureId` compiles
-/// against the typed gfx surface, labelle-engine#813 phase 4).
-///
-/// engine >= 2.11.0 floors core >= 1.27.0: core's `ChildrenComponent` went
-/// ArrayList-backed and `addChild` takes an allocator (labelle-core#65/#66),
-/// and the engine takes a REAL module dependency on core — an older core
-/// fails to compile.
-///
-/// engine >= 2.11.0 also floors gfx >= 1.28.0, but that one is a CURATED
-/// floor, not a compile break: the engine module takes no direct gfx
-/// dependency (the renderer arrives via `RenderImpl`), and its post-fx
-/// passthrough is `@hasDecl`-gated — labelle-engine `src/game/post_fx_mixin.zig`
-/// says in so many words that "an older gfx (< v1.28.0) … compiles to a
-/// no-op". So the pairing BUILDS; it just silently drops the post-fx stack
-/// the engine advertises. A curated set is what `labelle init` stamps and
-/// `upgrade all` writes, so it must be the coherent set, not merely one
-/// that compiles — hence the assertion, with the distinction recorded here
-/// so nobody later "fixes" a legitimate compile failure by relaxing it.
+/// Test-shaped wrapper over the PRODUCTION trio validator `init` runs
+/// (`trioFloorViolation`): a curated set must be COHERENT, so any floor
+/// violation — compile break or curated — fails the assertion. The table
+/// the tests pin is the table the user hits (#733 review, round 3).
 fn checkTrioFloors(core_version: []const u8, engine_version: []const u8, gfx_version: []const u8) !void {
-    // PR #733 (game-owned shader materials): gfx 2.0.0 dispatches generic
-    // material draws through core 2.0.0's `shader_material` contract (its
-    // build.zig.zon pins core 2.0.0), and engine 3.0.0's entity material
-    // API is built on gfx 2.0.0 (its build.zig.zon pins gfx 2.0.0). The
-    // 1.x core carried the specialized PixelWater contract these replaced,
-    // so nothing below the 2.0.0 line mixes with anything on it.
-    if (try pinAtLeast(gfx_version, "2.0.0")) {
-        try std.testing.expect(try pinAtLeast(core_version, "2.0.0"));
-        try std.testing.expect(try pinAtLeast(engine_version, "3.0.0"));
-    }
-    if (try pinAtLeast(engine_version, "3.0.0")) {
-        try std.testing.expect(try pinAtLeast(core_version, "2.0.0"));
-        try std.testing.expect(try pinAtLeast(gfx_version, "2.0.0"));
-    }
-    if (try pinAtLeast(gfx_version, "1.30.0")) {
-        try std.testing.expect(try pinAtLeast(core_version, "1.28.0"));
-        try std.testing.expect(try pinAtLeast(engine_version, "2.12.1"));
-    }
-    if (try pinAtLeast(engine_version, "2.11.0")) {
-        try std.testing.expect(try pinAtLeast(core_version, "1.27.0"));
-        try std.testing.expect(try pinAtLeast(gfx_version, "1.28.0"));
-    }
+    if (try trioFloorViolation(core_version, engine_version, gfx_version)) |_| return error.TestUnexpectedResult;
 }
 
 test "scaffold pins a MUTUALLY COMPATIBLE trio — #679 regression" {

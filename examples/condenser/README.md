@@ -91,7 +91,7 @@ old ripple. Invalid optional-field water patches leave prior state intact.
 Keyboard controls affect **unit A only**:
 
 - **Space**: switch fill level; **R**: inject a demonstration impact.
-- **F**: toggle fog; **L**: toggle lamp.
+- **F**: toggle fog; **L**: toggle lamp; **M**: toggle mist.
 - **Q/E**: decrease/increase lamp width by 12 px.
 - **S/W**: decrease/increase upward reach by 6 px.
 - **A/D**: decrease/increase downward reach by 12 px.
