@@ -5,7 +5,7 @@
 // The `.post_fx` block below is the WHOLE feature surface: the assembler
 // emits it as a `g.setPostFx(...)` seed (src/codegen/blocks/post_fx.zig),
 // the engine forwards it to gfx's `PostFxDriver` (post_fx_mixin.zig, gated
-// on gfx >= 1.28), and bgfx 0.13.1 renders each pass from its
+// on gfx >= 1.28), and bgfx renders each pass from its
 // `.post_fx_passes = .{ .bloom, .vignette, .color_grade, .crt }` manifest.
 // A handful of bright radial orbs bob in the dark so the bloom threshold
 // catches their cores, the vignette frames the scene, color-grade lifts
@@ -13,18 +13,53 @@
 // in a single screenshot.
 //
 // SCOPE NOTE (precise): gfx#305 has TWO halves. This demo exercises the
-// POST-FX half, which is wired end-to-end for games in the released engine
-// (2.6.0). The PER-ENTITY MATERIAL half (palette_swap / flash / dissolve /
-// outline) is plumbed through core + gfx (`SpriteVisual.material`) but the
-// released engine 2.6.0 exposes NO game-facing authoring surface for it
-// (no `Sprite.material`, no `setMaterial`) — so a game cannot drive
-// per-entity materials yet. Tracked as the material-demo follow-up; see
-// README.md.
+// POST-FX half only. The PER-ENTITY MATERIAL half (palette_swap / flash /
+// dissolve / outline) is plumbed through core + gfx (`SpriteVisual.material`)
+// and the pinned engine 2.12.2 DOES expose `game.setMaterial(entity, m)`
+// (labelle-engine `src/game/visuals.zig`) — it was engine 2.6.0, this
+// demo's original pin, that had no authoring surface. The demo still does
+// not drive per-entity materials; that is the follow-up in README.md.
 //
 // VERSION PINS: the RUNTIME packages (core/engine/gfx/cli) + the backend
 // pin the RELEASED set — this game proves the released runtime path (see
-// tile-explorer's note). bgfx is pinned explicitly to 0.13.1, which
-// carries the post-fx shaders (the registry enum default predates them).
+// tile-explorer's note). bgfx is pinned explicitly (the registry enum
+// default predates the post-fx shaders this demo needs, which 0.13.1 first
+// carried), and that pin is 0.20.0: labelle-core 1.32.0 appended
+// `MaterialEffect.pixel_water` and every bgfx release before 0.20.0
+// switches EXHAUSTIVELY over that enum with no arm for it. CI clones
+// labelle-core at `main` as a sibling checkout and the assembler's
+// monorepo auto-discovery builds that sibling INSTEAD of the
+// `.core_version` pin below, so a pre-0.20.0 bgfx failed sema there.
+//
+// The core pin FOLLOWS the backend pin, not the other way round. The
+// assembler unifies every package onto `.core_version`, and released bgfx
+// 0.20.0 has a HARD core floor of 1.28.0: `src/gfx/types.zig` types a
+// struct field as `core.BackendTextureId` (core#328 phase 3, bgfx >=
+// 0.15.0), which is analyzed eagerly. So on a STANDALONE checkout — no
+// sibling labelle-core, i.e. the documented `labelle build` path — bgfx
+// 0.20.0 over the previous core 1.26.0 pin died inside the backend:
+//   labelle-bgfx/src/gfx/types.zig:17:38: error: root source file struct
+//   'root' has no member named 'BackendTextureId'
+// #731 shipped that pairing claiming it "builds against the pinned
+// 1.26.0"; CI never saw it because the sibling core at `main` is >= 1.32.0
+// AND the bgfx games are generate-only there (labelle-assembler#732). The
+// v1.32.0 names bgfx 0.20.0 takes from `backend_contract` (`PixelWaterDraw`,
+// `PIXEL_WATER_*`) are NOT a compile floor: they are reached only through
+// `@hasField(MaterialEffect, "pixel_water")`-gated paths or lazily-analyzed
+// top-level aliases, so 0.20.0 does compile against core 1.28.0 (proven
+// standalone with a `labelle init --backend=bgfx` scaffold).
+// The pin is 1.32.0 anyway: the core labelle-bgfx 0.20.0 was released
+// against (its own build.zig.zon), the one on which the pixel_water effect
+// the backend ships is reachable at all, and the core the curated `labelle
+// init` trio now carries — so this demo and a fresh scaffold prove ONE
+// pairing (core 1.32.0 / engine 2.12.2 / gfx 1.30.1), at or above
+// labelle-bgfx's own `examples/bgfx-android` pins (core 1.32.0 / engine
+// 2.11.0 / gfx 1.30.0). It satisfies every trio floor in build.zig /
+// `src/init_cmd.zig:checkTrioFloors` (engine >= 2.11.0 → core >= 1.27.0 +
+// gfx >= 1.28.0; gfx >= 1.30.0 → core >= 1.28.0 + engine >= 2.12.1).
+// Verified STANDALONE (scratch LABELLE_HOME, registry tarballs at these
+// exact tags, no sibling checkouts): install → generate → full `zig build`,
+// exit 0.
 // The ASSEMBLER is `local:../../` (in-tree source, the examples
 // convention). On the fully-RELEASED `labelle` path this game builds on
 // assembler 0.94.0 — bgfx takes the generic desktop `unifyCoreDiamond`
@@ -36,7 +71,7 @@
     .height = 270,
     .target_fps = 60,
     .backend = .bgfx,
-    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.13.1" },
+    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.20.0" },
     .y_axis = .down,
     .ecs = .zig_ecs,
     .initial_prefab = "main",
@@ -61,9 +96,9 @@
         // Subtle CRT: slight curve + scanlines + shadow mask.
         .{ .crt = .{ .curvature = 0.08, .scanline = 0.35, .mask = 0.25, .aberration = 0.12 } },
     },
-    .core_version = "1.26.0",
-    .engine_version = "2.6.0",
-    .gfx_version = "1.28.1",
+    .core_version = "1.32.0",
+    .engine_version = "2.12.2",
+    .gfx_version = "1.30.1",
     .labelle_version = "1.58.0",
     // In-tree assembler (examples convention). Fully-released path: 0.94.0.
     .assembler_version = "local:../../",

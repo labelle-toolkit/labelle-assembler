@@ -1222,7 +1222,7 @@ pub const ProjectConfig = struct {
     /// just a *shorthand* for a provider. `.backend = .<tag>` transparently
     /// resolves to the fetched package (`isExternal()` ⇒ true) with no
     /// project-config change.
-    fn builtinProvider(backend: Backend) ?PluginDep {
+    pub fn builtinProvider(backend: Backend) ?PluginDep {
         return switch (backend) {
             // Extracted out-of-tree (#386 Phase 6c) — `.backend = .<tag>` resolves
             // to the provider package, not a bundled slot.
@@ -1240,7 +1240,39 @@ pub const ProjectConfig = struct {
             // labelle-bgfx#30 fix: don't auto-select Direct3D on Windows (was
             // crashing at first sprite draw — engine#683) + #31 desktop-video
             // Windows fix.
-            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.6.6" },
+            //
+            // 0.20.0 is the LOWEST bgfx release that survives labelle-core
+            // v1.32.0. That core appended `MaterialEffect.pixel_water`, and
+            // every bgfx up to 0.19.0 switches EXHAUSTIVELY over that enum
+            // with no arm for the new tag — a project on core >= 1.32.0
+            // resolving the old default fails sema with "switch must handle
+            // all possibilities". 0.20.0 IMPLEMENTS the effect (fs_pixel_water)
+            // behind `@hasField(MaterialEffect, "pixel_water")` probes, so the
+            // exhaustive switches carry the arm and it also compiles against a
+            // core that lacks the tag.
+            //
+            // FLOOR NOTE: this is a LATEST-as-lowest-fixed bump, not a bump for
+            // its own sake — there is no older bgfx with the fix, because the
+            // fix shipped the same day as the core release. It does raise the
+            // implicit runtime floor for a project that takes this default.
+            // The HARD floor is core >= v1.28.0: bgfx >= 0.15.0 types a struct
+            // field as core's `BackendTextureId` (core#328 phase 3), analyzed
+            // eagerly, so an older core fails inside the backend ("root source
+            // file struct 'root' has no member named 'BackendTextureId'" —
+            // how the #731 examples on core 1.26.0 failed standalone). The
+            // v1.32.0 `PixelWaterDraw` / `PIXEL_WATER_*` names bgfx takes from
+            // `backend_contract` are NOT a compile floor: unlike labelle-sokol,
+            // which comptime-gates each decl at its use, bgfx aliases them at
+            // top level — but every path that reaches them sits behind
+            // `@hasField(MaterialEffect, "pixel_water")` and an unreferenced
+            // alias is never analyzed, so 0.20.0 compiles against core 1.28.0
+            // (verified standalone). The CURATED pairing is still core >=
+            // v1.32.0: the core 0.20.0 was released against and the only one
+            // on which its pixel_water effect is reachable. `build.zig`'s
+            // scaffold trio carries it and `src/init_cmd.zig` asserts it. A
+            // project pinned to an older core that must stay there should pin
+            // `.backend_package` explicitly rather than ride the default.
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.20.0" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.3.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.3.1" },
@@ -1248,7 +1280,22 @@ pub const ProjectConfig = struct {
             // 0.2.1 declares the sokol callback lifecycle SHAPE in its v2
             // manifest (#461) — the assembler selects it from data instead of
             // the `cfg.backend == .sokol` enum branch.
-            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.2.1" },
+            //
+            // 0.6.0 is the LOWEST sokol release that survives labelle-core
+            // v1.32.0, which appended `MaterialEffect.pixel_water`: every sokol
+            // up to and including 0.5.0 switches EXHAUSTIVELY over that enum
+            // with no arm for the new tag, so a project on core >= 1.32.0
+            // resolving the old default fails sema with "switch must handle all
+            // possibilities". 0.6.0 DECLINES the effect (no sokol water shader)
+            // behind `@hasField(MaterialEffect, "pixel_water")` /
+            // `@hasDecl(backend_contract, "pixel_water_fn_decl")` probes.
+            //
+            // No floor raise: sokol's material seam is gated on
+            // `@hasDecl(core.backend_contract, "MaterialEffect")` (core >=
+            // v1.25.0) and everything it needs from a LATER core carries its own
+            // comptime probe, so 0.6.0 compiles against old and new core alike —
+            // labelle-sokol's own examples still pin core 1.24.0.
+            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.6.0" },
         };
     }
 
