@@ -163,7 +163,25 @@ pub fn profile(target: Target) []const u8 {
         .dx11 => "s_5_0",
     };
 }
-pub fn platform(target: Target) []const u8 {
+/// shaderc's `--platform` for a shader language, given the project's target
+/// platform (`config.Platform`'s tag name, or `"tests"`).
+///
+/// `--platform` selects which `BX_PLATFORM_*` macro shaderc defines, so it has
+/// to follow the REAL target, not the language: Metal is macOS *and* iOS, and
+/// ESSL is Android *and* WebGL2-on-Emscripten. Compiling both halves of such a
+/// pair against one fixed platform silently takes the wrong branch of any
+/// `#if BX_PLATFORM_*` in the shader (labelle-assembler#740).
+///
+/// Names are shaderc's own spelling, read off `shaderc --help` for the pinned
+/// `tool_hash` build (android, asm.js, ios, linux, orbis, osx, windows) — note
+/// Emscripten is spelled `asm.js`, not `emscripten` or `wasm`.
+///
+/// Only the two ambiguous pairs are platform-keyed; every other
+/// language/platform combination keeps the pre-#740 mapping, so desktop and
+/// Android output stay byte-identical.
+pub fn platform(target: Target, project_platform: []const u8) []const u8 {
+    if (target == .mtl and std.mem.eql(u8, project_platform, "ios")) return "ios";
+    if (target == .essl and std.mem.eql(u8, project_platform, "wasm")) return "asm.js";
     return switch (target) {
         .spv, .glsl => "linux",
         .essl => "android",
@@ -231,4 +249,21 @@ test "material schema validates shapes and generates caller-owned textures and e
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "fog.essl.bin") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "fog.mtl.bin") == null);
     try std.testing.expectError(error.InvalidParameterDefaults, parse(a, "{\"version\":1,\"fragment\":\"f.sc\",\"targets\":[\"spv\"],\"parameters\":[{\"name\":\"u_x\",\"kind\":\"vec4\",\"defaults\":[1]}]}"));
+}
+test "shaderc platform follows the real target for the ambiguous metal/essl pairs (#740)" {
+    // The two pairs the fixed mapping got wrong.
+    try std.testing.expectEqualStrings("osx", platform(.mtl, "desktop"));
+    try std.testing.expectEqualStrings("ios", platform(.mtl, "ios"));
+    try std.testing.expectEqualStrings("android", platform(.essl, "android"));
+    try std.testing.expectEqualStrings("asm.js", platform(.essl, "wasm"));
+    // Everything else is unchanged on every platform, so desktop/Android
+    // binaries stay byte-identical to the pre-#740 pipeline.
+    inline for (.{ "desktop", "ios", "android", "wasm", "tests" }) |p| {
+        try std.testing.expectEqualStrings("linux", platform(.spv, p));
+        try std.testing.expectEqualStrings("linux", platform(.glsl, p));
+        try std.testing.expectEqualStrings("windows", platform(.dx11, p));
+    }
+    // A platform string the pipeline never emits falls back to the language map.
+    try std.testing.expectEqualStrings("osx", platform(.mtl, "tests"));
+    try std.testing.expectEqualStrings("android", platform(.essl, "tests"));
 }
