@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "label": "condenser_lamp",
+  "fragment": "fs_lamp.sc",
+  "targets": [
+    "spv",
+    "glsl",
+    "essl",
+    "mtl"
+  ],
+  "parameters": [
+    {
+      "name": "u_lamp",
+      "kind": "vec4",
+      "count": 5
+    }
+  ],
+  "textures": [
+    {
+      "name": "s_lamp_clean",
+      "sampler": "point"
+    },
+    {
+      "name": "s_lamp_mask",
+      "sampler": "point"
+    }
+  ],
+  "blend": "alpha"
+}

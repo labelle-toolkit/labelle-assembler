@@ -1,0 +1,354 @@
+// PR730 fullres 618x330 per unit; effect settings are inherited from game prefabs.
+{
+  "name": "main",
+  "children": [
+    {"name":"mist_a", "prefab":"mist", "MistShader":{"unit":0}},
+    {"name":"mist_b", "prefab":"mist", "Position":{"x":618,"y":0}, "MistShader":{"unit":1}},
+    {
+      "name": "interior_a",
+      "prefab": "fog",
+      "Position": {
+        "x": 0,
+        "y": 0
+      },
+      "FogShader": {
+        "unit": 0
+      }
+    },
+    {
+      "prefab": "reservoir",
+      "name": "reservoir_a",
+      "Position": {
+        "x": 24,
+        "y": 288
+      },
+      "Reservoir": {
+        "unit": 0
+      },
+      "WaterShader": {
+        "water_level": 0.8333
+      }
+    },
+    {
+      "name": "drop_a0",
+      "components": {
+        "Position": {
+          "x": 150,
+          "y": -60
+        },
+        "Sprite": {
+          "sprite_name": "drop.png",
+          "pivot": "top_left",
+          "layer": "drops",
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        },
+        "Drop": {
+          "unit": 0,
+          "local_x": 21.0,
+          "release_y": 2.0,
+          "interval": 1.4,
+          "phase": 0.0,
+          "gravity": 230.0
+        }
+      }
+    },
+    {
+      "name": "drop_a1",
+      "components": {
+        "Position": {
+          "x": 192,
+          "y": -60
+        },
+        "Sprite": {
+          "sprite_name": "drop.png",
+          "pivot": "top_left",
+          "layer": "drops",
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        },
+        "Drop": {
+          "unit": 0,
+          "local_x": 28.0,
+          "release_y": 2.0,
+          "interval": 1.77,
+          "phase": 0.31,
+          "gravity": 230.0
+        }
+      }
+    },
+    {
+      "name": "drop_a2",
+      "components": {
+        "Position": {
+          "x": 282,
+          "y": -60
+        },
+        "Sprite": {
+          "sprite_name": "drop.png",
+          "pivot": "top_left",
+          "layer": "drops",
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        },
+        "Drop": {
+          "unit": 0,
+          "local_x": 43.0,
+          "release_y": 2.0,
+          "interval": 2.14,
+          "phase": 0.62,
+          "gravity": 230.0
+        }
+      }
+    },
+    {
+      "name": "drop_a3",
+      "components": {
+        "Position": {
+          "x": 330,
+          "y": -60
+        },
+        "Sprite": {
+          "sprite_name": "drop.png",
+          "pivot": "top_left",
+          "layer": "drops",
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        },
+        "Drop": {
+          "unit": 0,
+          "local_x": 51.0,
+          "release_y": 2.0,
+          "interval": 2.51,
+          "phase": 0.93,
+          "gravity": 230.0
+        }
+      }
+    },
+    {
+      "name": "drop_a4",
+      "components": {
+        "Position": {
+          "x": 414,
+          "y": -60
+        },
+        "Sprite": {
+          "sprite_name": "drop.png",
+          "pivot": "top_left",
+          "layer": "drops",
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        },
+        "Drop": {
+          "unit": 0,
+          "local_x": 65.0,
+          "release_y": 2.0,
+          "interval": 2.88,
+          "phase": 1.24,
+          "gravity": 230.0
+        }
+      }
+    },
+    {
+      "name": "cooler_a",
+      "components": {
+        "Position": {
+          "x": 0,
+          "y": 0
+        },
+        "Sprite": {
+          "sprite_name": "cooler_foreground.png",
+          "pivot": "top_left",
+          "layer": "foreground",
+          "z_index": 0,
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        }
+      }
+    },
+    {
+      "name": "frame_a",
+      "prefab": "lamp",
+      "Position": {
+        "x": 0,
+        "y": 0
+      },
+      "LampShader": {
+        "unit": 0
+      }
+    },
+    {
+      "name": "interior_b",
+      "prefab": "fog",
+      "Position": {
+        "x": 618,
+        "y": 0
+      },
+      "FogShader": {
+        "unit": 1
+      }
+    },
+    {
+      "prefab": "reservoir",
+      "name": "reservoir_b",
+      "Position": {
+        "x": 642,
+        "y": 288
+      },
+      "Reservoir": {
+        "unit": 1
+      },
+      "WaterShader": {
+        "water_level": 0.5
+      }
+    },
+    {
+      "name": "drop_b0",
+      "components": {
+        "Position": {
+          "x": 768,
+          "y": -60
+        },
+        "Sprite": {
+          "sprite_name": "drop.png",
+          "pivot": "top_left",
+          "layer": "drops",
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        },
+        "Drop": {
+          "unit": 1,
+          "local_x": 21.0,
+          "release_y": 2.0,
+          "interval": 2.0,
+          "phase": 0.9,
+          "gravity": 230.0
+        }
+      }
+    },
+    {
+      "name": "drop_b1",
+      "components": {
+        "Position": {
+          "x": 810,
+          "y": -60
+        },
+        "Sprite": {
+          "sprite_name": "drop.png",
+          "pivot": "top_left",
+          "layer": "drops",
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        },
+        "Drop": {
+          "unit": 1,
+          "local_x": 28.0,
+          "release_y": 2.0,
+          "interval": 2.37,
+          "phase": 1.21,
+          "gravity": 230.0
+        }
+      }
+    },
+    {
+      "name": "drop_b2",
+      "components": {
+        "Position": {
+          "x": 900,
+          "y": -60
+        },
+        "Sprite": {
+          "sprite_name": "drop.png",
+          "pivot": "top_left",
+          "layer": "drops",
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        },
+        "Drop": {
+          "unit": 1,
+          "local_x": 43.0,
+          "release_y": 2.0,
+          "interval": 2.74,
+          "phase": 1.52,
+          "gravity": 230.0
+        }
+      }
+    },
+    {
+      "name": "drop_b3",
+      "components": {
+        "Position": {
+          "x": 948,
+          "y": -60
+        },
+        "Sprite": {
+          "sprite_name": "drop.png",
+          "pivot": "top_left",
+          "layer": "drops",
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        },
+        "Drop": {
+          "unit": 1,
+          "local_x": 51.0,
+          "release_y": 2.0,
+          "interval": 3.11,
+          "phase": 1.83,
+          "gravity": 230.0
+        }
+      }
+    },
+    {
+      "name": "drop_b4",
+      "components": {
+        "Position": {
+          "x": 1032,
+          "y": -60
+        },
+        "Sprite": {
+          "sprite_name": "drop.png",
+          "pivot": "top_left",
+          "layer": "drops",
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        },
+        "Drop": {
+          "unit": 1,
+          "local_x": 65.0,
+          "release_y": 2.0,
+          "interval": 3.48,
+          "phase": 2.14,
+          "gravity": 230.0
+        }
+      }
+    },
+    {
+      "name": "cooler_b",
+      "components": {
+        "Position": {
+          "x": 618,
+          "y": 0
+        },
+        "Sprite": {
+          "sprite_name": "cooler_foreground.png",
+          "pivot": "top_left",
+          "layer": "foreground",
+          "z_index": 0,
+          "scale_x": 1.0,
+          "scale_y": 1.0
+        }
+      }
+    },
+    {
+      "name": "frame_b",
+      "prefab": "lamp",
+      "Position": {
+        "x": 618,
+        "y": 0
+      },
+      "LampShader": {
+        "unit": 1
+      }
+    }
+  ]
+}

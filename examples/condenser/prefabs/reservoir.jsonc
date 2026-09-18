@@ -1,0 +1,32 @@
+// All omitted instance fields inherit; explicit zero disables its setting.
+{
+  "Position": {
+    "x": 24,
+    "y": 288
+  },
+  "Sprite": {
+    "sprite_name": "reservoir_art.png",
+    "pivot": "top_left",
+    "layer": "water",
+    "scale_x": 1,
+    "scale_y": 1
+  },
+  "WaterShader": {
+    "enabled": true,
+    "mask": "reservoir_mask",
+    "reflection": "reservoir_reflection",
+    "logical_size": [
+      93,
+      6
+    ],
+    "grid_pixels": 1,
+    "water_level": 0.8333,
+    "reflection_opacity": 0.35,
+    "ripple_duration_seconds": 0.9,
+    "ripple_radius_pixels": 14,
+    "ripple_strength_pixels": 1
+  },
+  "Reservoir": {
+    "unit": 0
+  }
+}

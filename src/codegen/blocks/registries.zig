@@ -120,6 +120,22 @@ pub fn Mixin(comptime Self: type) type {
                 try w.writeAll("});\n\n");
             }
 
+            if (has_plugins) {
+                try w.writeAll(@import("../../component_collisions.zig").plugin_guard);
+                try w.writeAll("comptime { rejectComponentCollisions(&.{\"VideoComponent\", ");
+                for (component_names) |name| try w.print("\"{s}\",", .{pathToPascal(name, &pascal_buf)});
+                for (self.pack_scans) |pack| {
+                    const prefix = scan.packNamespacePrefix(pack.name, &pack_prefix_buf);
+                    for (pack.component_names) |name| try w.print("\"{s}__{s}\",", .{ prefix, pathToPascal(name, &pascal_buf) });
+                }
+                if (self.scripting) |scripting| for (scripting.declared_components) |comp| {
+                    try w.print("\"{s}\",", .{comp.name});
+                };
+                try w.writeAll("}, .{ @import(\"labelle-gfx\"),");
+                for (cfg.plugins) |plugin| try w.print("@import(\"{s}\"),", .{plugin.name});
+                try w.writeAll("}); }\n\n");
+            }
+
             // Per-pack registry partition (labelle-engine#652, assembler#498).
             // Appended into the SAME `{{component_registry_block}}` scalar right
             // after `Components` — no new template placeholder — so the view

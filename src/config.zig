@@ -728,6 +728,48 @@ pub fn isSemverVersion(version: []const u8) bool {
     return has_dot;
 }
 
+/// Parse a release-shaped version pin into a `std.SemanticVersion`.
+///
+/// Pins reaching the floor checks are NOT all `build.zig` literals —
+/// `*_VERSION` carries any `-D*_version=` override, and `project.labelle`
+/// carries whatever the user wrote — so this cannot assume the strict
+/// `X.Y.Z` form `std.SemanticVersion.parse` demands. `isSemverVersion`
+/// (digits-and-dots, >= 1 dot) also admits the abbreviated `X.Y` release
+/// form, which the rest of the version-resolution code accepts:
+/// `scene_manifest.engineSupportsTargetOverrides` normalizes it by
+/// appending `.0`, and this does the same rather than inventing a second
+/// convention.
+///
+/// A dotted string that is still unparsable after padding (`1.2.3.4`, which
+/// `isSemverVersion` also admits) returns `error.UnparsableVersionPin` with
+/// the offending value named — a readable failure instead of the
+/// `catch unreachable` crash this used to take (#683 review).
+pub fn parsePin(version: []const u8) error{UnparsableVersionPin}!std.SemanticVersion {
+    if (std.SemanticVersion.parse(version)) |v| return v else |_| {}
+    var buf: [64]u8 = undefined;
+    const padded = std.fmt.bufPrint(&buf, "{s}.0", .{version}) catch {
+        std.debug.print("version pin '{s}' is too long to normalize\n", .{version});
+        return error.UnparsableVersionPin;
+    };
+    return std.SemanticVersion.parse(padded) catch {
+        std.debug.print(
+            "version pin '{s}' is not a usable release version (want `X.Y.Z` or `X.Y`)\n",
+            .{version},
+        );
+        return error.UnparsableVersionPin;
+    };
+}
+
+/// `pin >= floor` on two release-shaped version strings — the primitive
+/// under `init_cmd`'s curated-trio / backend-core floor guards and
+/// `material_pipeline`'s contract gate (moved here from `init_cmd.zig`,
+/// PR #733, so the generate-time check shares the exact comparison).
+pub fn pinAtLeast(pin: []const u8, floor: []const u8) error{UnparsableVersionPin}!bool {
+    const p = try parsePin(pin);
+    const f = try parsePin(floor);
+    return p.order(f) != .lt;
+}
+
 /// Map a package `version` string to the git ref to clone.
 ///
 /// A semver-shaped version (`1.2.3`) maps to the published release tag
@@ -1241,38 +1283,30 @@ pub const ProjectConfig = struct {
             // crashing at first sprite draw — engine#683) + #31 desktop-video
             // Windows fix.
             //
-            // 0.20.0 is the LOWEST bgfx release that survives labelle-core
-            // v1.32.0. That core appended `MaterialEffect.pixel_water`, and
-            // every bgfx up to 0.19.0 switches EXHAUSTIVELY over that enum
-            // with no arm for the new tag — a project on core >= 1.32.0
-            // resolving the old default fails sema with "switch must handle
-            // all possibilities". 0.20.0 IMPLEMENTS the effect (fs_pixel_water)
-            // behind `@hasField(MaterialEffect, "pixel_water")` probes, so the
-            // exhaustive switches carry the arm and it also compiles against a
-            // core that lacks the tag.
+            // 0.20.0 was the LOWEST bgfx release that survived labelle-core
+            // v1.32.0's `MaterialEffect.pixel_water` (exhaustive switches in
+            // every earlier bgfx lacked the arm; #731 follow-up). Its HARD
+            // floor was core >= v1.28.0 (`core.BackendTextureId` as a struct
+            // field type, bgfx >= 0.15.0) and its CURATED pairing core 1.32.0.
             //
-            // FLOOR NOTE: this is a LATEST-as-lowest-fixed bump, not a bump for
-            // its own sake — there is no older bgfx with the fix, because the
-            // fix shipped the same day as the core release. It does raise the
-            // implicit runtime floor for a project that takes this default.
-            // The HARD floor is core >= v1.28.0: bgfx >= 0.15.0 types a struct
-            // field as core's `BackendTextureId` (core#328 phase 3), analyzed
-            // eagerly, so an older core fails inside the backend ("root source
-            // file struct 'root' has no member named 'BackendTextureId'" —
-            // how the #731 examples on core 1.26.0 failed standalone). The
-            // v1.32.0 `PixelWaterDraw` / `PIXEL_WATER_*` names bgfx takes from
-            // `backend_contract` are NOT a compile floor: unlike labelle-sokol,
-            // which comptime-gates each decl at its use, bgfx aliases them at
-            // top level — but every path that reaches them sits behind
-            // `@hasField(MaterialEffect, "pixel_water")` and an unreferenced
-            // alias is never analyzed, so 0.20.0 compiles against core 1.28.0
-            // (verified standalone). The CURATED pairing is still core >=
-            // v1.32.0: the core 0.20.0 was released against and the only one
-            // on which its pixel_water effect is reachable. `build.zig`'s
-            // scaffold trio carries it and `src/init_cmd.zig` asserts it. A
+            // 0.21.0 is the first CONTRACT-v2 backend (game-owned shader
+            // materials, PR #733): the specialized PixelWater contract is gone
+            // and the backend names core's `shader_material` contract UNGATED
+            // (no `@hasDecl` probe) and asserts `MATERIAL_CONTRACT_VERSION ==
+            // 2`, so its HARD floor is core >= v2.0.0 — an older core fails to
+            // compile inside the backend. This default moves TOGETHER with
+            // `build.zig`'s scaffold trio (core 2.0.0 / gfx 2.0.0 / engine
+            // 3.0.0): a project that adds `materials/` takes this default and
+            // the generated materials module `@compileError`s on any core
+            // below 2.0.0, so bumping either side alone recreates the #731
+            // failure in one direction or the other. `src/init_cmd.zig`'s
+            // `bgfx_core_floors` carries the 0.21.0 → 2.0.0 floor (and the
+            // older ones) and its tests pin this default against the trio. A
             // project pinned to an older core that must stay there should pin
-            // `.backend_package` explicitly rather than ride the default.
-            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.20.0" },
+            // `.backend_package` explicitly (<= 0.20.0) rather than ride the
+            // default — and cannot own materials (`material_pipeline`
+            // rejects that pairing at generate time).
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.21.0" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.3.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.3.1" },

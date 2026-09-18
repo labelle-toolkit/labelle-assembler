@@ -1,0 +1,29 @@
+{
+  "Position": {
+    "x": 0,
+    "y": 0
+  },
+  "Sprite": {
+    "sprite_name": "machine_interior.png",
+    "pivot": "top_left",
+    "layer": "machine",
+    "scale_x": 1,
+    "scale_y": 1
+  },
+  "FogShader": {
+    "unit": 0,
+    "enabled": true,
+    "density": 1,
+    "speed": 0.12,
+    "variation": 0.18,
+    "light_coupling": 0.35,
+    "grid_pixels": 6,
+    "opacity": 1,
+    "wisp_size": 48,
+    "turbulence": 0.25,
+    "drift_velocity": [
+      6,
+      0
+    ]
+  }
+}

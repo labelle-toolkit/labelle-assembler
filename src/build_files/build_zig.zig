@@ -4,6 +4,7 @@
 /// split, mirrors #539/#541). Emits the generated project's `build.zig` from the
 /// embedded template + the resolved backend manifest-v2 data.
 const std = @import("std");
+const materials = @import("../material_pipeline.zig");
 const tpl = @import("../template.zig");
 const config = @import("../config.zig");
 const plugin_params = @import("../plugin_params.zig");
@@ -792,6 +793,7 @@ fn runtimeOutputsEntry(entries: []const PluginBuildStepsWiring) ?PluginBuildStep
 }
 
 pub const BuildZigOptions = struct {
+    materials: []const []const u8 = &.{},
     /// Emit a test-only build.zig: skip the exe step, the run step,
     /// and the backend artifact link. Used by `generateTestsTarget`
     /// in root.zig for `.labelle/tests/build.zig` (issue #83).
@@ -942,6 +944,16 @@ fn androidNeedsAppImport(m: manifest_v2.BackendManifestV2, cfg: ProjectConfig) b
     return false;
 }
 
+/// Whether an iOS/Android build.zig needs the `const target = <platform>_target;`
+/// alias. The cross-compile headers define only `ios_target`/`android_target`;
+/// every emitted consumer of the bare `target` name is enumerated HERE so the
+/// alias can never go missing for one of them (PR #466 Finding 1, PR #733
+/// review: a materials-only game passes `target` to `material_build.zig`).
+fn needsTargetAlias(cfg: ProjectConfig, opts: BuildZigOptions) bool {
+    return cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0 or
+        opts.constants or opts.i18n or opts.pack_modules.len > 0 or opts.materials.len != 0;
+}
+
 pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: BuildZigOptions) ![]const u8 {
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer alloc_writer.deinit();
@@ -1032,10 +1044,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // `target` (the alias for `ios_target`) is consumed by the deps/plugin
         // decls AND by `emitPromotedScriptModules` (`.target = target`). Emit the
         // alias whenever ANY consumer needs it — including promoted scripts on an
-        // otherwise plugin/ECS/GUI-free game (PR #466 Finding 1).
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0 or
-            opts.constants or opts.i18n or opts.pack_modules.len > 0)
-        {
+        // otherwise plugin/ECS/GUI-free game (PR #466 Finding 1) and the
+        // game-owned materials module (`materials.emit` passes `target` to
+        // `material_build.zig`; PR #733 review).
+        if (needsTargetAlias(cfg, opts)) {
             try tpl.writeSection(build_zig_tmpl, "ios_target_alias", w);
         }
         // manifest-v2 ios: emit the core/gfx/engine dep decls WITHOUT the unrolled
@@ -1048,10 +1060,9 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // decls AND by `emitPromotedScriptModules` (`.target = target`). Include the
         // promoted-scripts condition so `target` is defined whenever any consumer
         // needs it — a promoted-scripts + no-plugin/ECS/GUI android game previously
-        // emitted an undefined `target` (PR #466 Finding 1).
-        if (cfg.plugins.len > 0 or cfg.ecs != .mock or cfg.hasGui() or opts.promoted_scripts.len > 0 or
-            opts.constants or opts.i18n or opts.pack_modules.len > 0)
-        {
+        // emitted an undefined `target` (PR #466 Finding 1); a materials-only game
+        // likewise (PR #733 review).
+        if (needsTargetAlias(cfg, opts)) {
             try tpl.writeSection(build_zig_tmpl, "android_target_alias", w);
         }
         // manifest-v2 android: emit the core/gfx/engine dep decls WITHOUT the
@@ -1233,6 +1244,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // compiles under its own module, whose import table does not inherit
     // game_mod's -- without these entries, valid `@import("constants")` in
     // exactly the sources the usage scanner covers failed to resolve.
+    try materials.emit(w, opts.materials, if (opts.is_tests_target or std.mem.eql(u8, cfg.backendName(), "null")) "tests" else @tagName(cfg.platform));
     try emitConstantsModule(w, opts.constants);
     try emitI18nModule(w, opts.i18n);
     // In-project lib plugin modules pick the data modules up here — after
@@ -1243,6 +1255,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // Per-pack modules (assembler#498 PR 2) — declared beside the promoted
     // script modules, before any target artifact that imports them.
     try emitPackModules(w, cfg, opts.pack_modules, opts.constants, opts.i18n);
+    if (opts.materials.len != 0) {
+        for (opts.promoted_scripts) |script| try w.print("    {s}_mod.addImport(\"materials\", materials_mod);\n", .{script.module_name});
+        for (opts.pack_modules) |pack| try w.print("    pack__{s}_mod.addImport(\"materials\", materials_mod);\n", .{pack.prefix});
+    }
 
     if (cfg.platform == .wasm) {
         // manifest-v2 wasm: no emsdk-helper import in the generated build.zig — the
@@ -1269,6 +1285,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → wasm root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "wasm", opts.promoted_scripts);
         try emitConstantsImport(w, "wasm", opts.constants);
+        try materials.emitImport(w, opts.materials, "wasm");
         try emitI18nImport(w, "wasm", opts.i18n);
         try emitPackImports(w, "wasm", opts.pack_modules);
 
@@ -1339,6 +1356,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → iOS exe root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
         try emitConstantsImport(w, "exe", opts.constants);
+        try materials.emitImport(w, opts.materials, "exe");
         try emitI18nImport(w, "exe", opts.i18n);
         try emitPackImports(w, "exe", opts.pack_modules);
 
@@ -1405,6 +1423,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → Android lib root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "lib", opts.promoted_scripts);
         try emitConstantsImport(w, "lib", opts.constants);
+        try materials.emitImport(w, opts.materials, "lib");
         try emitI18nImport(w, "lib", opts.i18n);
         try emitPackImports(w, "lib", opts.pack_modules);
 
@@ -1478,6 +1497,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // `@import("<named>")` (labelle-assembler#240 Gap 2).
             try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
             try emitConstantsImport(w, "exe", opts.constants);
+            try materials.emitImport(w, opts.materials, "exe");
             try emitI18nImport(w, "exe", opts.i18n);
             try emitPackImports(w, "exe", opts.pack_modules);
 
@@ -1527,6 +1547,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // `__tests_root.zig` reaches the same named modules.
         try emitPromotedScriptImports(w, "test_root", opts.promoted_scripts);
         try emitConstantsImport(w, "test_root", opts.constants);
+        try materials.emitImport(w, opts.materials, "test_root");
         try emitI18nImport(w, "test_root", opts.i18n);
         try emitPackImports(w, "test_root", opts.pack_modules);
 
@@ -2083,4 +2104,49 @@ test "generateBuildZig footer (codex #644 round 2): the C# run env + InstallDir 
     try testing.expect(std.mem.indexOf(u8, out, "plugin_helper_runtime_outputs") == null);
     // The helper's own build step still emits — it just doesn't stage/capture.
     try testing.expect(std.mem.indexOf(u8, out, "plugin_helper_build_step_0") != null);
+}
+
+test "generateBuildZig: a materials-only iOS/Android game defines `target` before material_build.zig consumes it (#733 review)" {
+    // The cross-compile headers define only `ios_target`/`android_target`; the
+    // bare `target` name exists solely via the guarded alias section. A game
+    // with NO plugins/ECS/GUI/promoted scripts but a `materials/` directory
+    // emits `material_build.zig".create(b, target, ...)` — so the alias must be
+    // emitted for it. Assert the MECHANISM: the alias line is present exactly
+    // when materials are, and every `target` use is preceded by its definition.
+    const allocator = testing.allocator;
+    const cases = [_]struct { platform: config.Platform, pkg: config.PluginDep, alias: []const u8 }{
+        .{ .platform = .android, .pkg = .{ .name = "bgfx_v2", .repo = "local:backends/bgfx_v2" }, .alias = "    const target = android_target;\n" },
+        .{ .platform = .ios, .pkg = .{ .name = "sokol", .repo = "local:backends/sokol" }, .alias = "    const target = ios_target;\n" },
+    };
+    for (cases) |c| {
+        // `.backend = .bgfx` + a package NOT literally named "bgfx" doubles as the
+        // enum-as-shorthand shape; generateBuildZig is the pure emitter and does
+        // not run the materials backend gate (that is `material_pipeline.stage`).
+        const cfg = ProjectConfig{
+            .name = "materials-only",
+            .backend = if (c.platform == .android) .bgfx else .sokol,
+            .backend_package = c.pkg,
+            .platform = c.platform,
+            .ecs = .mock,
+        };
+        const with = try generateBuildZig(allocator, cfg, .{
+            .project_dir = ".",
+            .backend_manifest_name = "backend.manifest.v2.zon",
+            .materials = &.{"fog"},
+        });
+        defer allocator.free(with);
+        const alias_at = std.mem.indexOf(u8, with, c.alias) orelse return error.TestExpectedAlias;
+        const consumer_at = std.mem.indexOf(u8, with, "@import(\"material_build.zig\").create(b, target,") orelse return error.TestExpectedMaterialsConsumer;
+        try testing.expect(alias_at < consumer_at);
+
+        // Control: the same game WITHOUT materials has no consumer of `target`
+        // and must keep its byte-identical alias-free build.zig.
+        const without = try generateBuildZig(allocator, cfg, .{
+            .project_dir = ".",
+            .backend_manifest_name = "backend.manifest.v2.zon",
+        });
+        defer allocator.free(without);
+        try testing.expect(std.mem.indexOf(u8, without, c.alias) == null);
+        try testing.expect(std.mem.indexOf(u8, without, "material_build.zig") == null);
+    }
 }

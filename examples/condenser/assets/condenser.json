@@ -1,0 +1,104 @@
+{
+ "frames": {
+  "machine_interior.png": {
+   "frame": {
+    "x": 0,
+    "y": 0,
+    "w": 618,
+    "h": 330
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 618,
+    "h": 330
+   },
+   "sourceSize": {
+    "w": 618,
+    "h": 330
+   }
+  },
+  "cooler_foreground.png": {
+   "frame": {
+    "x": 0,
+    "y": 334,
+    "w": 618,
+    "h": 330
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 618,
+    "h": 330
+   },
+   "sourceSize": {
+    "w": 618,
+    "h": 330
+   }
+  },
+  "frame_foreground.png": {
+   "frame": {
+    "x": 0,
+    "y": 668,
+    "w": 618,
+    "h": 330
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 618,
+    "h": 330
+   },
+   "sourceSize": {
+    "w": 618,
+    "h": 330
+   }
+  },
+  "drop.png": {
+   "frame": {
+    "x": 0,
+    "y": 1002,
+    "w": 6,
+    "h": 30
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 6,
+    "h": 30
+   },
+   "sourceSize": {
+    "w": 6,
+    "h": 30
+   }
+  },
+  "reservoir_art.png": {
+   "frame": {
+    "x": 0,
+    "y": 1036,
+    "w": 558,
+    "h": 36
+   },
+   "rotated": false,
+   "trimmed": false,
+   "spriteSourceSize": {
+    "x": 0,
+    "y": 0,
+    "w": 558,
+    "h": 36
+   },
+   "sourceSize": {
+    "w": 558,
+    "h": 36
+   }
+  }
+ }
+}

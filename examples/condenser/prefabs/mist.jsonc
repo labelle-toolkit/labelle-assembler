@@ -1,0 +1,14 @@
+{
+  "Position": {"x": 0, "y": 0},
+  "Sprite": {
+    "sprite_name": "machine_interior.png",
+    "pivot": "top_left", "layer": "mist", "scale_x": 1, "scale_y": 1
+  },
+  "MistShader": {
+    "unit": 0, "enabled": true, "height": 54,
+    "density": 1.4, "opacity": 0.42, "wisp_size": 96,
+    "turbulence": 0.45, "drift_velocity": [12, -3],
+    "grid_pixels": 6, "light_coupling": 0.35,
+    "color": [0.48, 0.67, 0.74]
+  }
+}

@@ -1,0 +1,51 @@
+// Full-resolution PR730 art. Game-owned shaders discovered under materials/.
+.{
+    .name = "condenser",
+    .title = "LaBelle — COND-07 Condenser (game-owned water, fog and lamps)",
+    .width = 1236,
+    .height = 330,
+    .target_fps = 60,
+    .backend = .bgfx,
+    // Released game-shader-material stack (docs/shader-migration.md "Release
+    // sequence" step 6): bgfx 0.21.0 is the first contract-v2 backend and
+    // requires core >= 2.0.0, so these four pins move together.
+    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.21.0" },
+    .y_axis = .down,
+    .ecs = .zig_ecs,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    // Every texture a fragment shader samples is a STANDALONE `.image`
+    // resource, never an atlas frame: the engine resolves a `.catalog`
+    // shader-texture binding through the AssetCatalog and rejects any entry
+    // whose `loader_kind` is not `.image` (`error.InvalidTexture`). That was
+    // true of the retired built-in water effect and is still true of the
+    // generic material path. The reservoir mask/reflection additionally span
+    // exactly the 93x6 logical rectangle, because the shader samples them in
+    // reservoir-local UV.
+    .resources = .{
+        .{ .name = "fog_clean", .image = "assets/effects/interior_clean.png" },
+        .{ .name = "fog_mask", .image = "assets/effects/fog_mask.png" },
+        .{ .name = "lamp_clean", .image = "assets/effects/frame_clean.png" },
+        .{ .name = "lamp_mask", .image = "assets/effects/lamp_mask.png" },
+        .{ .name = "condenser", .json = "assets/condenser.json", .texture = "assets/condenser.png" },
+        .{ .name = "reservoir_mask", .image = "assets/reservoir_mask_rect.png" },
+        .{ .name = "reservoir_reflection", .image = "assets/layers/reflection.png" },
+    },
+    // SCREEN-space layers, not world: this is a fixed, pixel-exact
+    // composition, so a scene coordinate must be a window coordinate. On a
+    // WORLD layer the default camera centres the world origin in the window,
+    // which puts the measured native-px coordinates half a screen off —
+    // correct behaviour for a camera, wrong for a machine panel.
+    .layers = .{
+        .{ .name = "machine", .order = 0, .space = .screen },
+        .{ .name = "water", .order = 1, .space = .screen },
+        .{ .name = "mist", .order = 2, .space = .screen },
+        .{ .name = "drops", .order = 3, .space = .screen },
+        .{ .name = "foreground", .order = 4, .space = .screen },
+    },
+    .core_version = "2.0.0",
+    .engine_version = "3.0.0",
+    .gfx_version = "2.0.0",
+    .labelle_version = "1.67.0",
+    .assembler_version = "local:../../",
+}

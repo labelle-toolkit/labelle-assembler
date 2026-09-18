@@ -20,14 +20,14 @@ pub fn build(b: *std.Build) void {
     // these defaults, so a mismatch fails `labelle build` before any user code.
     // Set verified end-to-end STANDALONE (init → install → generate → full
     // compile against the published release tarballs, scratch LABELLE_HOME,
-    // no sibling checkouts) for core 1.32.0 / engine 2.12.2 / gfx 1.30.1 with
-    // cli 1.61.2, on the bgfx_desktop, null_desktop, raylib_desktop and
-    // sokol_desktop targets. engine/gfx/cli are exactly `labelle-cli` v1.61.2's
-    // `versions.zon`, the set its own `labelle upgrade all` writes; core is
-    // AHEAD of it (that file still says 1.28.0 through cli v1.67.0) — see the
-    // bgfx paragraph below for why, and bump the cli side to match. Keep the
-    // two in step: when they drift, `init` scaffolds a project the very next
-    // `upgrade` rewrites.
+    // no sibling checkouts) for core 2.0.0 / engine 3.0.0 / gfx 2.0.0 with
+    // labelle-bgfx 0.21.0 on the bgfx_desktop target (PR #733), after the
+    // 1.32.0 / 2.12.2 / 1.30.1 predecessor was verified the same way on
+    // bgfx/null/raylib/sokol (#736). labelle-cli's `versions.zon` (the set
+    // its `labelle upgrade all` writes) still says 1.28.0 / 2.12.2 / 1.30.1
+    // through cli v1.67.0 — BEHIND this trio; bump the cli side to match.
+    // Keep the two in step: when they drift, `init` scaffolds a project the
+    // very next `upgrade` rewrites.
     //
     // The hard floor inside the trio (#679): gfx >= 1.30.0 re-exports
     // `core.TextureId` instead of declaring its own (labelle-gfx#328,
@@ -56,29 +56,31 @@ pub fn build(b: *std.Build) void {
     // (v0.96.0 bumped engine 2.7.0 → 2.11.0 while leaving core at 1.26.0, so
     // every fresh `labelle init` scaffold failed to compile.)
     //
-    // core 1.32.0 (#731 follow-up): the builtin `.bgfx` provider default
-    // (`src/config.zig` builtinProvider) is labelle-bgfx 0.20.0, the lowest
-    // bgfx that survives core v1.32.0's `MaterialEffect.pixel_water`. Its
-    // HARD core floor is 1.28.0 (`core.BackendTextureId`, a struct field
-    // type, bgfx >= 0.15.0) — 0.20.0 does compile against core 1.28.0,
-    // verified standalone; the v1.32.0 `PixelWaterDraw` / `PIXEL_WATER_*`
-    // names it takes from `backend_contract` are reached only through
-    // `@hasField(MaterialEffect, "pixel_water")`-gated paths or lazy
-    // top-level aliases. 1.32.0 is a CURATED floor like the gfx 1.28 one: it
-    // is the core bgfx 0.20.0 was released against (its own build.zig.zon),
-    // the only core on which the pixel_water effect the default backend
-    // ships is reachable, and the pairing labelle-bgfx's own examples run
-    // on. A `labelle init --backend=bgfx` scaffold should not pair a backend
-    // with a core older than the backend's own pin. `src/init_cmd.zig`'s
-    // "scaffold core default pairs with the builtin bgfx provider" test
-    // asserts both floors.
+    // core 2.0.0 / gfx 2.0.0 / engine 3.0.0 (PR #733, game-owned shader
+    // materials): the builtin `.bgfx` provider default (`src/config.zig`
+    // builtinProvider) is labelle-bgfx 0.21.0, the first contract-v2 backend.
+    // It names core's `shader_material` contract UNGATED and its
+    // `MATERIAL_CONTRACT_VERSION == 2`, both of which only core >= 2.0.0
+    // declares — so its HARD core floor is 2.0.0 (a compile break inside the
+    // backend on any older core), and the assembler's generated materials
+    // module `@compileError`s on any core below it. gfx 2.0.0 and engine
+    // 3.0.0 are the releases built against that core (their build.zig.zon
+    // pins: gfx → core 2.0.0, engine → gfx 2.0.0); the specialized
+    // PixelWater contract the 1.32.0 core carried is GONE in 2.0.0, so the
+    // 1.x/2.12.x/1.30.x trio and bgfx 0.20.0 do not mix with any of these.
+    // The four move TOGETHER (the #731 lesson: bumping the provider without
+    // the core, or vice versa, ships a default that fails at the first
+    // `labelle build`). `src/init_cmd.zig`'s `bgfx_core_floors` carries the
+    // 0.21.0 → 2.0.0 floor and its "scaffold core default pairs with the
+    // builtin bgfx provider" test asserts the pairing; `checkTrioFloors`
+    // asserts the trio.
     // Bump all three together when moving the engine default (their
     // build.zig.zon pins/floors must agree — read them from the tags), and
     // keep `src/init_cmd.zig`'s "scaffold pins a MUTUALLY COMPATIBLE trio"
     // test satisfied — it encodes the floors below as assertions.
-    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "1.32.0";
-    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "2.12.2";
-    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "1.30.1";
+    const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "2.0.0";
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "3.0.0";
+    const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "2.0.0";
     // Version this assembler binary stamps into a freshly scaffolded
     // project.labelle's `assembler_version` field.
     //
@@ -180,6 +182,29 @@ pub fn build(b: *std.Build) void {
     bin_tests.root_module.addImport("flow_codegen", flow_codegen_module);
     bin_tests.root_module.link_libc = true; // see assembler_exe comment above
     test_step.dependOn(&b.addRunArtifact(bin_tests).step);
+
+    const material_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize }), .filters = &.{ "material_schema", "material_pipeline", "component_collisions" } });
+    material_tests.root_module.addOptions("build_options", options);
+    material_tests.root_module.addImport("flow_codegen", flow_codegen_module);
+    material_tests.root_module.link_libc = true;
+    const material_test_run = b.addRunArtifact(material_tests);
+    const material_test_step = b.step("test-materials", "Validate material JSON, descriptor generation and build wiring");
+    material_test_step.dependOn(&material_test_run.step);
+    test_step.dependOn(&material_test_run.step);
+    const shaderc_test_exe = b.option([]const u8, "shaderc", "Host shaderc for material integration tests") orelse b.graph.environ_map.get("LABELLE_SHADERC");
+    const material_test_core = b.option([]const u8, "material-test-core", "Local core checkout for material integration test");
+    const material_test_zbgfx = b.option([]const u8, "material-test-zbgfx", "Pinned zbgfx directory for material integration test");
+    const material_integration = b.step("test-material-integration", "Compile shaders/descriptors and verify include cache invalidation with a real shaderc");
+    if (shaderc_test_exe != null and material_test_core != null and material_test_zbgfx != null) {
+        const python = b.option([]const u8, "python", "Python executable for integration tests") orelse (if (@import("builtin").os.tag == .windows) "py" else "python3");
+        const integration = b.addSystemCommand(&.{python});
+        if (@import("builtin").os.tag == .windows and std.mem.eql(u8, python, "py")) integration.addArg("-3");
+        integration.addFileArg(b.path("test/material_pipeline_e2e.py"));
+        integration.addArgs(&.{ "--zig", b.graph.zig_exe, "--shaderc", shaderc_test_exe.?, "--core", material_test_core.?, "--zbgfx", material_test_zbgfx.? });
+        material_integration.dependOn(&integration.step);
+    } else {
+        material_integration.dependOn(&b.addFail("Supply -Dshaderc=PATH (or LABELLE_SHADERC), -Dmaterial-test-core=DIR and -Dmaterial-test-zbgfx=DIR").step);
+    }
 
     // ── `test-cache`: the local-slot cache machinery, alone ─────────────
     //
@@ -403,6 +428,7 @@ pub fn build(b: *std.Build) void {
         });
         const run_test = b.addRunArtifact(t);
         test_step.dependOn(&run_test.step);
+        if (std.mem.eql(u8, test_file, "test/build_zig_tests.zig") or std.mem.eql(u8, test_file, "test/build_zig_zon_tests.zig")) material_test_step.dependOn(&run_test.step);
         if (std.mem.eql(u8, test_file, "test/animation_assets_tests.zig")) {
             b.step("test-animation", "Test JSONC animation asset wiring").dependOn(&run_test.step);
         }

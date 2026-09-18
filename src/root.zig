@@ -5,6 +5,8 @@ const builtin = @import("builtin");
 
 // ── Submodules ─────────────────────────────────────────────────────────
 const config = @import("config.zig");
+pub const material_pipeline = @import("material_pipeline.zig");
+pub const component_collisions = @import("component_collisions.zig");
 const cache = @import("cache.zig");
 const backend_registry = @import("backend_registry.zig");
 pub const scanner = @import("scanner.zig");
@@ -1283,6 +1285,15 @@ pub fn generate(
     var flow_result = try flow_scanner.scanAndEmit(allocator, game_dir, target_dir, plugin_flow_decls.flow_nodes);
     defer flow_result.deinit();
 
+    const material_names = try material_pipeline.stage(allocator, game_dir, target_dir, cfg);
+    defer scanner.freeNames(allocator, material_names);
+    if (material_names.len != 0) for (cfg.plugins) |plugin| {
+        if (std.mem.eql(u8, plugin.name, "materials")) {
+            std.log.err("plugin 'materials' collides with the generated game-owned materials module", .{});
+            return error.MaterialModuleCollision;
+        }
+    };
+
     // Generate build.zig.zon
     // `cfg_modules` (not `cfg`): a light pack has no `build.zig`/module, so it
     // must not become a `.labelle_<name> = .{ .path }` dep (#481).
@@ -1290,6 +1301,7 @@ pub fn generate(
         // The tests target runs second — additive merge so the exe
         // target's deps (chosen-backend, plugins) survive. Issue #83.
         .recreate_deps = !is_tests_target,
+        .materials = material_names.len != 0,
         // manifest-v2 cutover: when the backend ships a v2 manifest, key the
         // backend dep entry off its `dep_name` + drive its `root_build_deps`
         // (design §3). Null → v1/enum, byte-unchanged.
@@ -1542,6 +1554,7 @@ pub fn generate(
         break :blk names;
     };
     defer allocator.free(declared_component_names);
+    try component_collisions.check(allocator, component_names, pack_scans.items, if (maybe_scripting) |s| s.declared_components else &.{});
     const tilemap_registrations = try tilemap_phase.collectRegistrations(allocator, target_dir, scene_manifests, component_names, declared_component_names, prefab_names, pack_scans.items, cfg.engine_version);
     defer tilemap_scan.freeRegistrations(allocator, tilemap_registrations);
 
@@ -1982,6 +1995,7 @@ pub fn generate(
     // instead — a third wiring category driven by `pack_scans`, never by
     // `cfg.plugins`.
     const build_zig = try build_files.generateBuildZig(allocator, cfg_modules, .{
+        .materials = material_names,
         .is_tests_target = is_tests_target,
         .constants = has_constants,
         .i18n = has_i18n,
