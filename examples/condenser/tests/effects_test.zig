@@ -184,3 +184,29 @@ test "lamp glow zero disables halo and flicker is bounded and paused" {
     l.phase = std.math.inf(f32);
     try std.testing.expectError(error.InvalidPhase, l.advance(0));
 }
+
+const Mist = @import("../components/mist_shader.zig").MistShader;
+test "mist anchors to live surface and has bounded independent signed motion" {
+    try equal(@as(f32, 294), Mist.surfaceY(288, 36, 5.0 / 6.0));
+    try equal(@as(f32, 306), Mist.surfaceY(288, 36, 0.5));
+    var a = Mist{ .wisp_size = 96, .drift_velocity = .{ 12, -3 } };
+    const b = a;
+    try a.advance(8);
+    try equal([2]f32{ 0, 0.75 }, a.phase);
+    try equal([2]f32{ 0, 0 }, b.phase);
+    a.drift_velocity = .{ 0, 0 };
+    const before = a;
+    try a.advance(100);
+    try expect(std.meta.eql(before, a));
+    try std.testing.expectError(error.InvalidDelta, a.advance(std.math.nan(f32)));
+    try expect(std.meta.eql(before, a));
+}
+test "mist accepts explicit zero controls and rejects malformed state" {
+    var m = Mist{ .height = 0, .density = 0, .opacity = 0, .light_coupling = 0 };
+    try m.validate();
+    m.wisp_size = 0;
+    try std.testing.expectError(error.InvalidMistSetting, m.advance(1));
+    m.wisp_size = 96;
+    m.drift_velocity[0] = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidMistSetting, m.advance(1));
+}

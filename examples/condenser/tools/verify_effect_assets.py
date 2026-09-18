@@ -132,7 +132,7 @@ class Effects(unittest.TestCase):
 
     def test_descriptors_use_reserved_automatic_atlas_binding(self):
         channels=dict(scalar=1,vec2=2,vec3=3,vec4=4,mat4=16)
-        for name in ['water','fog','lamp']:
+        for name in ['water','fog','lamp','mist']:
             d=json.loads((ROOT/f'materials/{name}/material.json').read_text())
             source=(ROOT/f'materials/{name}/{d["fragment"]}').read_text()
             self.assertIn('uniform vec4 u_material_rect;',source)
@@ -141,7 +141,7 @@ class Effects(unittest.TestCase):
             for p in d['parameters']:
                 self.assertNotIn(p['name'],['u_material_rect','s_tex'])
                 if 'defaults' in p: self.assertEqual(len(p['defaults']),p['count']*channels[p['kind']])
-            for t in d['textures']: self.assertEqual(t['sampler'],'point')
+            for t in d.get('textures', []): self.assertEqual(t['sampler'],'point')
 
 def sheet():
     cases=[('Default reconstruction',{}),('Fog OFF; lamp ON',dict(fog_on=False)),

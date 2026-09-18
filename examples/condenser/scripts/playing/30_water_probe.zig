@@ -2,6 +2,7 @@
 const WaterShader = @import("../../components/water_shader.zig").WaterShader;
 const FogShader = @import("../../components/fog_shader.zig").FogShader;
 const LampShader = @import("../../components/lamp_shader.zig").LampShader;
+const MistShader = @import("../../components/mist_shader.zig").MistShader;
 pub const game_states = .{"playing"};
 pub fn State(comptime EcsBackend: type) type {
     _ = EcsBackend;
@@ -11,7 +12,7 @@ pub fn tick(game: anytype, state: anytype, _: anytype, _: f32) void {
     state.frame +%= 1;
     if (state.frame != 30 and state.frame % 600 != 0) return;
     const ecs = &game.active_world.ecs_backend;
-    inline for (.{ WaterShader, FogShader, LampShader }) |T| {
+    inline for (.{ WaterShader, FogShader, LampShader, MistShader }) |T| {
         var view = ecs.view(.{T}, .{});
         defer view.deinit();
         var live: u32 = 0;

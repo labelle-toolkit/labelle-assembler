@@ -1,7 +1,7 @@
 # COND-07: game-owned water, fog and lamps
 
 Two independently controlled condenser units use production `WaterShader`,
-`FogShader`, and `LampShader` components and the generic shader-material API.
+`FogShader`, `LampShader`, and `MistShader` components and the generic shader-material API.
 Contained water is still between drop impacts: no travelling wave or reflection
 flow. Fog and light replace their contributions in the static art; they do not
 lay a second haze over the original plate.
@@ -107,15 +107,15 @@ seconds with `LABELLE_FIXED_DT=0.016666667` for deterministic comparison.
 
 ## Verification
 
-- `zig build test --summary all` from the generated desktop directory: **18 tests**,
+- `zig build test --summary all` from the generated desktop directory: **20 tests**,
   including water lifetime/bounds/rebase/invalid state, directional drift,
   zero controls, flicker, actual prefab merge, and real keyboard paths.
 - `python tools/verify_effect_assets.py`: **10 checks**, including saved-mask
   reconstruction, alpha preservation, independent fog/lamp controls, shared
   grid behavior, and descriptor shapes; writes a CPU reference contact sheet.
 - `tools/compile_shaders.ps1 -Shaderc <exe> -Include <bgfx-shader-directory>`:
-  compiles all **12 variants** independently of the game build.
-- `python tools/verify_runtime.py`: **10 actual native runs**, six live generic
+  compiles all **16 variants** independently of the game build.
+- `python tools/verify_runtime.py`: **16 actual native runs**, eight live generic
   materials each, fixed-step captures, frame-60 left-only edits, zero width and
   zero fog opacity equivalence, and independent fog/lamp off cases.
 
@@ -124,18 +124,30 @@ across every left-control run. Results, logs and captures are under
 `.test-output/runtime/`; the directory is ignored. Other shader targets compile
 but have not been executed here. `preview.png` is the current native capture.
 
-Final fixed-step capture results (also confirmed by the integrator):
+Mist verification also checks clipping above each live water surface, empty
+reservoir suppression, zero opacity, moving versus frozen wisps, and a left-only
+M toggle. All 16 native scenarios pass; changing the left mist changes 17,886
+left pixels and zero right pixels. The captures and measurements are in
+`.test-output/runtime/results.txt`.
 
-| Frame-60 left control | Changed left pixels | Changed right pixels |
-|---|---:|---:|
-| Water | 16,704 | 0 |
-| Fog | 109,220 | 0 |
-| Lamp | 44,960 | 0 |
-| All three | 131,767 | 0 |
+## Floating water mist
 
-Zero lamp width is byte-identical to lamp off; zero fog opacity is
-byte-identical to fog off. Default and combined-control captures were visually
-checked for alignment. Final generated unit suite: 18/18; asset checks: 10/10.
+`prefabs/mist.jsonc` configures a separate transparent `MistShader` above each
+reservoir. It uses procedural wisps, without new artwork or moving background
+samples. The layer sits behind drops and foreground machinery. **M** toggles
+only the left mist; **Space** changes the water level and its mist anchor.
+
+- `height`: vertical band above the water, in screen pixels; zero disables it.
+- `density`, `opacity` and `color`: thickness and tint; zero density/opacity removes it.
+- `drift_velocity`: signed screen pixels/second; default `[12,-3]` drifts right and rises.
+  `[0,0]` freezes the pattern.
+- `wisp_size`, `turbulence`, `grid_pixels`: shape, detail and pixel scale.
+- `light_coupling`: response to the matching lamp; zero removes that response.
+
+Bounds and surface height come from the matching reservoir in this example;
+empty or disabled water emits no mist. Startup overrides: `CONDENSER_MIST_OFF`,
+`CONDENSER_MIST_OPACITY`, `CONDENSER_MIST_FREEZE`. The deterministic runtime
+hook `CONDENSER_TEST_CONTROL=mist` exercises the same M-key path at frame 60.
 
 The probe queries actual `game.shaderMaterial(entity)` bindings. Cold catalog
 loads retry silently during the first 300 frames; hard failures and prolonged

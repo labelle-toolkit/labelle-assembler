@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "label": "condenser_mist",
+  "fragment": "fs_mist.sc",
+  "targets": ["spv", "glsl", "essl", "mtl"],
+  "parameters": [
+    {"name": "u_mist_bounds", "kind": "vec4"},
+    {"name": "u_mist_style", "kind": "vec4"},
+    {"name": "u_mist_motion", "kind": "vec4"},
+    {"name": "u_mist_color", "kind": "vec4"},
+    {"name": "u_lamp", "kind": "vec4", "count": 5}
+  ],
+  "blend": "alpha"
+}

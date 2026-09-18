@@ -3,6 +3,8 @@ const materials = @import("materials");
 const WaterShader = @import("../../components/water_shader.zig").WaterShader;
 const FogShader = @import("../../components/fog_shader.zig").FogShader;
 const LampShader = @import("../../components/lamp_shader.zig").LampShader;
+const MistShader = @import("../../components/mist_shader.zig").MistShader;
+const Reservoir = @import("../../components/reservoir.zig").Reservoir;
 pub const game_states = .{"playing"};
 pub fn State(comptime EcsBackend: type) type {
     _ = EcsBackend;
@@ -51,6 +53,41 @@ pub fn tick(game: anytype, state: anytype, _: anytype, dt: f32) void {
             }
         }
         bindFog(game, entity, fog, light) catch |err| report(game, state.frame, "fog material", err);
+    }
+    var mv = ecs.view(.{MistShader}, .{});
+    defer mv.deinit();
+    while (mv.next()) |entity| {
+        const mist = ecs.getComponent(entity, MistShader) orelse continue;
+        mist.advance(dt) catch |err| {
+            report(game, state.frame, "mist state", err);
+            continue;
+        };
+        var bounds: [4]f32 = .{ 0, 0, 0, mist.height };
+        var wet = false;
+        var reservoirs = ecs.view(.{ WaterShader, Reservoir }, .{});
+        defer reservoirs.deinit();
+        while (reservoirs.next()) |re| {
+            const res = ecs.getComponent(re, Reservoir) orelse continue;
+            if (res.unit != mist.unit) continue;
+            const water = ecs.getComponent(re, WaterShader) orelse continue;
+            const pos = game.getPosition(re);
+            const origin = game.getPosition(entity);
+            // Reservoir art is 558x36 screen pixels, or 93x6 water cells.
+            bounds = .{ pos.x - origin.x, 558, MistShader.surfaceY(pos.y - origin.y, 36, water.water_level), mist.height };
+            wet = water.enabled and water.water_level > 0;
+            break;
+        }
+        var light = LampShader{ .enabled = false };
+        var lights = ecs.view(.{LampShader}, .{});
+        defer lights.deinit();
+        while (lights.next()) |le| {
+            const candidate = ecs.getComponent(le, LampShader) orelse continue;
+            if (candidate.unit == mist.unit) {
+                light = candidate.*;
+                break;
+            }
+        }
+        bindMist(game, entity, mist, bounds, wet, light) catch |err| report(game, state.frame, "mist material", err);
     }
 }
 
@@ -129,4 +166,20 @@ pub fn bindLamp(game: anytype, entity: anytype, light: *LampShader) !void {
         });
     }
     try game.setShaderParameter(entity, "u_lamp", &lampParameters(light.*));
+}
+
+pub fn bindMist(game: anytype, entity: anytype, m: *MistShader, bounds: [4]f32, wet: bool, light: LampShader) !void {
+    try m.validate();
+    if (game.shaderMaterial(entity) == null) {
+        try game.createShaderMaterial(entity, .{
+            .label = "condenser_mist",
+            .shaders = materials.mist.shaders,
+            .parameters = &materials.mist.parameters,
+        });
+    }
+    try game.setShaderParameter(entity, "u_mist_bounds", &bounds);
+    try game.setShaderParameter(entity, "u_mist_style", &.{ m.density, m.opacity, m.grid_pixels, if (m.enabled and wet and m.height > 0) 1 else 0 });
+    try game.setShaderParameter(entity, "u_mist_motion", &.{ m.wisp_size, m.turbulence, m.phase[0], m.phase[1] });
+    try game.setShaderParameter(entity, "u_mist_color", &.{ m.color[0], m.color[1], m.color[2], m.light_coupling });
+    try game.setShaderParameter(entity, "u_lamp", &lampParameters(light));
 }

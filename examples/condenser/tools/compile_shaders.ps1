@@ -13,7 +13,7 @@ $profiles = @{
     essl = @('android', '300_es'); mtl = @('osx', 'metal')
     dx11 = @('windows', 's_5_0')
 }
-foreach ($effect in @('water', 'fog', 'lamp')) {
+foreach ($effect in @('water', 'fog', 'lamp', 'mist')) {
     $dir = Join-Path $root "materials/$effect"
     $descriptor = Get-Content -Raw -LiteralPath (Join-Path $dir 'material.json') | ConvertFrom-Json
     foreach ($target in $descriptor.targets) {

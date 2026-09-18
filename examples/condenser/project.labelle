@@ -24,6 +24,7 @@
     .layers = .{
         .{ .name = "machine", .order = 0, .space = .screen },
         .{ .name = "water", .order = 1, .space = .screen },
+        .{ .name = "mist", .order = 2, .space = .screen },
         .{ .name = "drops", .order = 3, .space = .screen },
         .{ .name = "foreground", .order = 4, .space = .screen },
     },

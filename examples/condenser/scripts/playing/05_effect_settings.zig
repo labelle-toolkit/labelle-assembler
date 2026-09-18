@@ -4,6 +4,7 @@ const WaterShader = @import("../../components/water_shader.zig").WaterShader;
 const FogShader = @import("../../components/fog_shader.zig").FogShader;
 const LampShader = @import("../../components/lamp_shader.zig").LampShader;
 const Reservoir = @import("../../components/reservoir.zig").Reservoir;
+const MistShader = @import("../../components/mist_shader.zig").MistShader;
 pub const game_states = .{"playing"};
 pub fn State(comptime EcsBackend: type) type {
     _ = EcsBackend;
@@ -97,6 +98,19 @@ pub fn tick(game: anytype, state: anytype, _: anytype, _: f32) void {
             if (up_step != 0) lamp.reach_up = std.math.clamp(lamp.reach_up + up_step, 0, 330);
             if (down_step != 0) lamp.reach_down = std.math.clamp(lamp.reach_down + down_step, 0, 330);
         }
+    }
+    var mv = ecs.view(.{MistShader}, .{});
+    defer mv.deinit();
+    while (mv.next()) |entity| {
+        const mist = ecs.getComponent(entity, MistShader) orelse continue;
+        if (!state.initialized) {
+            if (envFloat("CONDENSER_MIST_OFF")) |v| mist.enabled = v == 0;
+            if (envFloat("CONDENSER_MIST_OPACITY")) |v| {
+                if (v >= 0 and v <= 1) mist.opacity = v;
+            }
+            if (envEquals("CONDENSER_MIST_FREEZE", "1")) mist.drift_velocity = .{ 0, 0 };
+        }
+        if (mist.unit == 0 and (game.isKeyPressed(.m) or (state.frame == 60 and envEquals("CONDENSER_TEST_CONTROL", "mist")))) mist.enabled = !mist.enabled;
     }
     state.initialized = true;
 }
