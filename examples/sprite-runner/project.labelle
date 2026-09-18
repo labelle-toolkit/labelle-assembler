@@ -48,7 +48,7 @@
     // possibilities"). 0.6.0 declines the effect behind a
     // `@hasField(MaterialEffect, "pixel_water")` gate, so it builds against
     // both the pinned 1.26.0 and core `main`.
-    .backend_package = .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.6.0" },
+    .backend_package = .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.6.1" },
     .y_axis = .down,
     .ecs = .zig_ecs,
     .initial_prefab = "main",

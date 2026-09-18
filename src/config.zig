@@ -1435,7 +1435,7 @@ pub const ProjectConfig = struct {
             // `.backend_package` explicitly (<= 0.20.0) rather than ride the
             // default — and cannot own materials (`material_pipeline`
             // rejects that pairing at generate time).
-            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.21.0" },
+            .bgfx => .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.22.0" },
             .wgpu => .{ .name = "wgpu", .repo = "github.com/labelle-toolkit/labelle-wgpu", .version = "0.3.0" },
             .null => .{ .name = "null", .repo = "github.com/labelle-toolkit/labelle-null", .version = "0.3.0" },
             .sdl => .{ .name = "sdl", .repo = "github.com/labelle-toolkit/labelle-sdl", .version = "0.3.1" },
@@ -1458,7 +1458,7 @@ pub const ProjectConfig = struct {
             // v1.25.0) and everything it needs from a LATER core carries its own
             // comptime probe, so 0.6.0 compiles against old and new core alike —
             // labelle-sokol's own examples still pin core 1.24.0.
-            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.6.0" },
+            .sokol => .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.6.1" },
         };
     }
 
