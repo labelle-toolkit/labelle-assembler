@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
     // keep `src/init_cmd.zig`'s "scaffold pins a MUTUALLY COMPATIBLE trio"
     // test satisfied — it encodes the floors below as assertions.
     const core_version: []const u8 = b.option([]const u8, "core_version", "Default core library version") orelse "2.0.0";
-    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "3.0.0";
+    const engine_version: []const u8 = b.option([]const u8, "engine_version", "Default engine library version") orelse "3.0.1";
     const gfx_version: []const u8 = b.option([]const u8, "gfx_version", "Default gfx library version") orelse "2.0.0";
     // Version this assembler binary stamps into a freshly scaffolded
     // project.labelle's `assembler_version` field.

@@ -9,7 +9,7 @@
     // Released game-shader-material stack (docs/shader-migration.md "Release
     // sequence" step 6): bgfx 0.21.0 is the first contract-v2 backend and
     // requires core >= 2.0.0, so these four pins move together.
-    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.21.0" },
+    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.22.0" },
     .y_axis = .down,
     .ecs = .zig_ecs,
     .initial_prefab = "main",

@@ -415,16 +415,19 @@ test "the 2.x core line floors an OLD engine/gfx pinned under it — #742" {
     try std.testing.expectEqual(TrioPackage.core, v.floor.subject);
     try std.testing.expectEqual(TrioPackage.engine, v.floor.requires);
     const msg = v.describe(&buf);
-    // Names all three pins, the floor, and the flag to pass.
+    // Names all three pins, the floor, and the flag to pass. The flag VALUE
+    // is `recommended()` — the curated default, which moves with releases —
+    // so it is asserted from `config.*_VERSION`, not a literal; the FLOOR
+    // is the literal `>= 3.0.0` above.
     try std.testing.expect(std.mem.startsWith(u8, msg, "labelle-core 2.0.0 requires labelle-engine >= 3.0.0; got core 2.0.0 / engine 2.12.2 / gfx 1.30.1 ("));
     try std.testing.expect(std.mem.indexOf(u8, msg, "PixelWater") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "Pass --engine-version=3.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Pass --engine-version=" ++ config.ENGINE_VERSION) != null);
 
     // The gfx half of the same reverse direction, reported when the engine
     // is already on the 3.x line.
     const g = (try trioFloorViolation("2.0.0", "3.0.0", "1.30.1")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, g.severity());
-    try std.testing.expect(std.mem.indexOf(u8, g.describe(&buf), "Pass --gfx-version=2.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g.describe(&buf), "Pass --gfx-version=" ++ config.GFX_VERSION) != null);
     // ...and with BOTH old, core is still the subject and the engine floor
     // is named first (the table order the older rules rely on).
     const both = (try trioFloorViolation("2.0.0", "2.6.0", "1.28.1")) orelse return error.TestUnexpectedResult;
@@ -728,15 +731,15 @@ test "init refuses --engine-version=2.12.2 under the 2.0.0 core/gfx defaults wit
     const msg = v.describe(&buf);
     try std.testing.expect(std.mem.startsWith(u8, msg, "labelle-gfx 2.0.0 requires labelle-engine >= 3.0.0; got core 2.0.0 / engine 2.12.2 / gfx 2.0.0 ("));
     try std.testing.expect(std.mem.indexOf(u8, msg, "PixelWater") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "Pass --engine-version=3.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Pass --engine-version=" ++ config.ENGINE_VERSION) != null);
 
     // The other direction and the other package: an old gfx or core under
     // the new engine is refused too, naming the right flag.
     const g = (try trioFloorViolation("2.0.0", "3.0.0", "1.30.1")) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FloorSeverity.compile_break, g.severity());
-    try std.testing.expect(std.mem.indexOf(u8, g.describe(&buf), "Pass --gfx-version=2.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g.describe(&buf), "Pass --gfx-version=" ++ config.GFX_VERSION) != null);
     const c = (try trioFloorViolation("1.32.0", "3.0.0", "2.0.0")) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, c.describe(&buf), "Pass --core-version=2.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.describe(&buf), "Pass --core-version=" ++ config.CORE_VERSION) != null);
 
     // A CURATED floor is reported as a warning-shaped violation, and a
     // compile break wins over it when both are tripped.
