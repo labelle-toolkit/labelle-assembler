@@ -1,0 +1,33 @@
+{
+  "Position": {
+    "x": 0,
+    "y": 0
+  },
+  "Sprite": {
+    "sprite_name": "frame_foreground.png",
+    "pivot": "top_left",
+    "layer": "foreground",
+    "scale_x": 1,
+    "scale_y": 1,
+    "z_index": 1
+  },
+  "LampShader": {
+    "unit": 0,
+    "enabled": true,
+    "center": [
+      309,
+      12
+    ],
+    "width": 348,
+    "reach_up": 12,
+    "reach_down": 132,
+    "intensity": 1,
+    "grid_pixels": 6,
+    "spread": 0,
+    "softness": 6,
+    "falloff": 2,
+    "glow": 1,
+    "flicker": 0,
+    "flicker_speed": 8
+  }
+}

@@ -1,21 +1,8 @@
-//! Condensation drops: fall, contact the reservoir's CURRENT water surface,
-//! and emit exactly ONE ripple each through the engine's built-in
-//! `game.addWaterRipple`.
-//!
-//! Nothing here animates water. The script's entire contact with the effect
-//! is the single `addWaterRipple(reservoir, local_x, strength)` call below —
-//! the surface, the wave, the ripple's shape and its decay are all
-//! `fs_pixel_water` on the GPU, driven by the engine's water tick.
-//!
-//! "CURRENT surface" is meant literally: the surface Y is recomputed every
-//! frame from the live `PixelWater.water_level` (`surface_y = 6 * (1 -
-//! level)` on the measured 6-row basin), so the two reservoirs' different
-//! fill levels are honoured by the same code, and a runtime
-//! `game.setWaterLevel` would move the impact point with no change here.
-
+//! Condensation drops emit one impact into the game-owned reservoir state.
 const std = @import("std");
 
 const Drop = @import("../../components/drop.zig").Drop;
+const WaterShader = @import("../../components/water_shader.zig").WaterShader;
 const Reservoir = @import("../../components/reservoir.zig").Reservoir;
 
 pub const game_states = .{"playing"};
@@ -67,7 +54,13 @@ pub fn tick(game: anytype, state: anytype, _: anytype, dt: f32) void {
         }
         drop.t += dt;
 
-        const basin = basins[@min(drop.unit, basins.len - 1)] orelse continue;
+        const basin = if (drop.unit < basins.len) basins[drop.unit] else null;
+        if (basin == null) {
+            var p = game.getPosition(e);
+            p.y = PARKED_Y;
+            game.setPosition(e, p);
+            continue;
+        }
 
         // Waiting between drips: keep it off screen.
         if (drop.t < 0) {
@@ -77,8 +70,8 @@ pub fn tick(game: anytype, state: anytype, _: anytype, dt: f32) void {
             continue;
         }
 
-        // The LIVE fill level, read off the built-in component every frame.
-        const water = game.pixelWater(basin) orelse continue;
+        // The LIVE fill level, read off the game-owned component every frame.
+        const water = ecs.getComponent(basin.?, WaterShader) orelse continue;
         const level = std.math.clamp(water.water_level, 0.0, 1.0);
         const surface_native = RESERVOIR_TOP_Y + RESERVOIR_H * (1.0 - level);
 
@@ -86,15 +79,15 @@ pub fn tick(game: anytype, state: anytype, _: anytype, dt: f32) void {
         const y_native = drop.release_y + 0.5 * drop.gravity * drop.t * drop.t;
         const head_native = y_native + DROP_HEAD_OFFSET;
 
-        if (!drop.rippled and head_native >= surface_native) {
+        if (!drop.rippled and water.enabled and level > 0 and head_native >= surface_native) {
             drop.rippled = true;
             // ONE ripple per fall. `strength` is a DIMENSIONLESS [0,1]
             // scale on the authored `ripple_strength_pixels`; a faster
             // drop hits harder, capped at 1.
             const speed = drop.gravity * drop.t;
             const strength = std.math.clamp(speed / 140.0, 0.35, 1.0);
-            game.addWaterRipple(basin, drop.local_x, strength) catch |err| {
-                game.log.err("[condenser] addWaterRipple(unit={d}, x={d}) failed: {s}", .{
+            water.impact(drop.local_x, strength) catch |err| {
+                game.log.err("[condenser] impact(unit={d}, x={d}) failed: {s}", .{
                     drop.unit, drop.local_x, @errorName(err),
                 });
                 continue;

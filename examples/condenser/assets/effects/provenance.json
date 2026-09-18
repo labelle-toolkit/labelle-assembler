@@ -1,0 +1,21 @@
+{
+  "size": [
+    618,
+    330
+  ],
+  "effect_grid": 6,
+  "source": "PR730 full-resolution layers from condenser-detail.gif (620x330, crop left 2px)",
+  "fog_color": [
+    0.48,
+    0.65,
+    0.73
+  ],
+  "lamp_color": [
+    0.64,
+    0.85,
+    0.94
+  ],
+  "fog_mask": "R=estimated baked veil, G=lamp response, A=interior coverage",
+  "lamp_mask": "R=lamp response, G=physical emissive tube coverage, A=frame coverage",
+  "method": "bounded inverse-over decomposition; estimated clean background, full-resolution structure retained"
+}

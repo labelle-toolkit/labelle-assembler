@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "label": "condenser_water",
+  "fragment": "fs_water.sc",
+  "targets": [
+    "spv",
+    "glsl",
+    "essl",
+    "mtl"
+  ],
+  "parameters": [
+    {
+      "name": "u_water_head",
+      "kind": "vec4",
+      "count": 2,
+      "defaults": [
+        93,
+        6,
+        1,
+        0,
+        0,
+        1,
+        1,
+        0
+      ]
+    },
+    {
+      "name": "u_water_color",
+      "kind": "vec4",
+      "count": 3
+    },
+    {
+      "name": "u_water_params",
+      "kind": "vec4",
+      "count": 3
+    },
+    {
+      "name": "u_water_ripples",
+      "kind": "vec4",
+      "count": 8
+    }
+  ],
+  "textures": [
+    {
+      "name": "s_water_mask",
+      "sampler": "point"
+    },
+    {
+      "name": "s_water_reflect",
+      "sampler": "point"
+    }
+  ],
+  "blend": "alpha"
+}

@@ -9,7 +9,7 @@ pub const Drop = struct {
     pub const save = @import("labelle-core").Saveable(.transient, @This(), .{});
     /// The reservoir (`Reservoir.unit`) this drop falls into.
     unit: u32 = 0,
-    /// Impact X in RESERVOIR-LOCAL native px — what `addWaterRipple` takes.
+    /// Impact X in RESERVOIR-LOCAL native px — what WaterShader.impact takes.
     /// The five measured emitters are local x 21, 28, 43, 51, 65.
     local_x: f32 = 0,
     /// Native canvas Y the drop is released from (the reference releases at

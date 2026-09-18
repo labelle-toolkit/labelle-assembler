@@ -1,79 +1,32 @@
-// The COND-07 reservoir — a game-root prefab whose whole point is the
-// built-in `PixelWater` block below.
-//
-// A prefab file is a flat components block (same shape as
-// `examples/fantasy-dungeon/plugin/packs/props/prefabs/torch.jsonc`). The
-// scene instantiates it with `{ "prefab": "reservoir", ... }` and patches
-// individual fields at the instance site; unmentioned fields are inherited
-// (engine RFC-OVERRIDES-MERGE-RULES, deep merge).
+// All omitted instance fields inherit; explicit zero disables its setting.
 {
-    // Placed by the scene — (4, 48) native px within each condenser unit,
-    // times the x6 enlargement.
-    "Position": { "x": 24, "y": 288 },
-
-    // The water sprite's OWN texture: the authored static reservoir art,
-    // cropped to the logical rectangle. `fs_pixel_water` samples it as
-    // `s_tex` and composites the water OVER it, so it is also exactly what
-    // you see if the water program ever degrades — which is why this
-    // example verifies the effect by DIFFING FRAMES, not by eyeballing a
-    // screenshot.
-    "Sprite": {
-        "sprite_name": "reservoir_art.png",
-        "pivot": "top_left",
-        "layer": "water",
-        "scale_x": 1.0,
-        "scale_y": 1.0
-    },
-
-    // ── The built-in engine component (engine v2.22.0) ────────────────
-    // Authored here, in the prefab's JSON config. The JSONC apply path
-    // routes it through `game.addPixelWater`, which validates every field
-    // (a bad value reports `field '<name>' <reason>` instead of a GPU-side
-    // mystery), acquires the mask/reflection in the AssetCatalog and
-    // creates the gfx water instance.
-    "PixelWater": {
-        // AssetCatalog `.image` keys (declared in project.labelle), each
-        // spanning exactly the logical rectangle.
-        "mask": "reservoir_mask",
-        "reflection": "reservoir_reflection",
-
-        // MEASURED reservoir rect: x 4, y 48, w 93, h 6 on the 103x55
-        // native canvas. `grid_pixels` is 1 because a native art pixel IS
-        // an effect cell here — the reference's "6x6" is the x6 screen
-        // enlargement, not the cell size.
-        "logical_size": [93, 6],
-        "grid_pixels": 1,
-
-        // Default fill. The basin is only 6 native rows tall, so the level
-        // has 6 quantisation steps; 5/6 keeps one dry row of headroom so a
-        // +-1 px wave/ripple crest is actually visible (at level 1.0 the
-        // shader clamps the displaced surface to the top edge and ripples
-        // would be invisible). Overridden per instance in the scene.
-        "water_level": 0.8333,
-
-        // Measured sRGB palette (assets branch README, "Water-specific").
-        // The engine keeps these as authored hex and converts to linear
-        // exactly once, at the gfx seam.
-        "deep_color": "#0F1719",
-        "surface_color": "#7AA5BB",
-        "highlight_color": "#425F6C",
-
-        // Contained water rests between impacts: no travelling base wave.
-        "wave_amplitude_pixels": 0.0,
-        "wave_period_seconds": 3.0,
-        "waves_enabled": false,
-
-        // Keep the supplied reflection fixed; only drop ripples move water.
-        "reflection_opacity": 0.35,
-        "distortion_pixels": 0.0,
-
-        // Drop impacts: one ripple per drop, from `game.addWaterRipple`.
-        "ripple_duration_seconds": 0.9,
-        "ripple_radius_pixels": 14.0,
-        "ripple_strength_pixels": 1.0
-    },
-
-    // Marker so the drop script can find its reservoir (unit 0 = left
-    // condenser). Overridden to 1 on the second instance.
-    "Reservoir": { "unit": 0 }
+  "Position": {
+    "x": 24,
+    "y": 288
+  },
+  "Sprite": {
+    "sprite_name": "reservoir_art.png",
+    "pivot": "top_left",
+    "layer": "water",
+    "scale_x": 1,
+    "scale_y": 1
+  },
+  "WaterShader": {
+    "enabled": true,
+    "mask": "reservoir_mask",
+    "reflection": "reservoir_reflection",
+    "logical_size": [
+      93,
+      6
+    ],
+    "grid_pixels": 1,
+    "water_level": 0.8333,
+    "reflection_opacity": 0.35,
+    "ripple_duration_seconds": 0.9,
+    "ripple_radius_pixels": 14,
+    "ripple_strength_pixels": 1
+  },
+  "Reservoir": {
+    "unit": 0
+  }
 }

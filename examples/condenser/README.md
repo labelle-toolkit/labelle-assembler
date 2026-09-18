@@ -1,92 +1,143 @@
-# COND-07 condenser — contained water on reference-resolution artwork
+# COND-07: game-owned water, fog and lamps
 
-Two condenser units show the engine's built-in `PixelWater` component, using one
-reservoir prefab with independent fill levels. Drops create localized fading
-ripples. Continuous waves and reflection drift are disabled. Mist is stationary
-and baked into the machine artwork.
+Two independently controlled condenser units use production `WaterShader`,
+`FogShader`, and `LampShader` components and the generic shader-material API.
+Contained water is still between drop impacts: no travelling wave or reflection
+flow. Fog and light replace their contributions in the static art; they do not
+lay a second haze over the original plate.
 
 ![Windows/Vulkan capture](preview.png)
 
-## Run
+## Coordinated development dependencies
 
-Use CLI 1.67.0 or newer:
+This example requires the **unreleased sibling branches** in this workspace.
+`project.labelle` explicitly selects `local:../../../labelle-core`,
+`local:../../../labelle-gfx`, `local:../../../labelle-engine`, the local bgfx
+backend, and `local:../../` assembler. Released package versions do not provide
+this implementation. Regenerate after changing the coordinated branches.
 
-```sh
-labelle run
+```powershell
+../../zig-out/bin/labelle-assembler.exe generate --project-root .
+Push-Location .labelle/bgfx_desktop
+zig build
+zig build test --summary all
+Pop-Location
 ```
 
-The example uses the in-tree assembler from this branch, core 1.32.0, engine
-2.22.0, gfx 1.36.0 and BGFX 0.20.0. A monorepo assembler can discover sibling
-package checkouts instead of these pins; read its package-resolution output.
+The assembler owns descriptor discovery, compilation, and the generated
+`@import("materials")`. Set `LABELLE_SHADERC` to a host shaderc executable when
+using an existing compiler. The requested targets are SPIR-V, GLSL, ESSL and
+Metal. Game code uses generated `.shaders` / `.parameters` and engine catalog
+texture bindings; it never imports a graphics backend. The backend provides
+`s_tex` and `u_material_rect`, including atlas remapping.
 
-## Pixel density
+## Art and masks
 
-The original 620x330 cropped reference is kept in
-`assets/reference/condenser-detail.gif`. The wider room image is not included.
-Source: https://raw.githubusercontent.com/labelle-toolkit/labelle-bgfx/6a1ce3a24f42adf75b41dec81ec33921b6a27918/docs/issue-references/condenser-100/condenser-detail.gif
+PR730 artwork stays **618x330 per unit at scale 1**, in a 1236x330 window. Only
+the left two columns of the authorized 620x330 `condenser-detail.gif` crop were
+removed. No full-room reference is used. The original atlas/layers are retained.
+Water uses a separate 93x6 logical grid (six screen pixels per cell), a 558x36
+mask and a fixed supplied reflection. Fog and light use full-canvas standalone
+images and an independently adjustable effect grid (default six screen pixels).
 
-The old asset pipeline reduced the art to 103x55 and enlarged it sixfold. This
-lost grain and irregular small edges because the painting has no uniform native
-pixel grid. The new pipeline preserves source-resolution pixels and renders
-sprites at scale 1. Two left border columns are cropped to keep the existing
-618x330 unit layout and drop alignment; the two-unit window is 1236x330.
-
-A temporal median across the reference's 72 frames removes moving drops without
-spatial downsampling. Static mist remains in this plate. The derivation asserts
-that the layered composition reconstructs the median plate pixel-for-pixel.
-This is preservation of the static plate, not an assertion that the reference's
-animation or inferred occluder silhouettes were recovered exactly.
-
-## Artwork versus water grid
-
-Artwork resolution and effect resolution are independent:
-
-| Quantity | Texture/screen pixels | Water/effect coordinates |
-|---|---|---|
-| Unit canvas | 618x330 | 103x55 |
-| Basin origin | 24, 288 | 4, 48 |
-| Basin size | 558x36 | 93x6 |
-| Drop sprite | 6x30 at scale 1 | 1x5 |
-| Impact X positions within basin | 126/168/258/306/390 | 21/28/43/51/65 |
-
-The shader still uses `logical_size: [93, 6]`, `grid_pixels: 1`. Its impacts remain
-six screen pixels per effect cell while the underlying artwork keeps its finer
-detail. Both the drawn reservoir texture and its standalone mask cover the same
-558x36 rectangle. Mask and reflection are standalone `.image` resources; drawn
-sprites use an atlas.
-
-Unit A is 5/6 full; unit B is half full. The six-row effect grid has limited fill
-resolution. Drops use the live fill level to find the contact plane and call
-`game.addWaterRipple` once per impact. The foreground cooler and frame cover
-water and drops in front-to-back layer order.
-
-## Rebuild assets
-
-Install Pillow and numpy, then from this example directory:
+`tools/derive_effect_masks.py` decomposes the existing full-resolution layers
+with a bounded inverse-over model. It produces estimated clean interior/frame
+plates, a veil/lighting-response mask, and the physical lamp source mask.
+This is an estimated reconstruction, not recovered original layered artwork.
+The static interior recomposes within two byte values after PNG quantization.
+Full-resolution structural texture and alpha boundaries remain intact; only
+effect modulation snaps to cells. The emissive tube is reconstructed out of
+the clean frame and restored only inside its source mask and live lamp width.
 
 ```sh
-python3 tools/derive_layers.py
-python3 tools/pack_atlas.py
+python tools/derive_layers.py
+python tools/pack_atlas.py
+python tools/derive_effect_masks.py
 ```
 
-`derive_layers.py` creates the full-resolution layers and verifies their static
-composition. `pack_atlas.py` crops the basin textures and rebuilds the atlas.
-The reflection is authored from the coil band; hidden water under the cooler is
-reconstructed. Rectangular occlusion boundaries are inherited from the asset
-investigation in labelle-bgfx#106. They are assumptions, not original layered art.
+The cooler and frame continue to occlude the water and falling drops. Fog's
+background sample never moves. Both shaders include the same
+`materials/shared/lamp_footprint.sc` for exact lamp/fog coupling.
 
-## Validation
+## Prefab and runtime controls
 
-The updated example builds and runs on Windows/Vulkan. Logs confirm both live
-water instances at 0.8333 and 0.5, the water program initializes, and drops emit
-ripples. `preview.png` is an engine screenshot of this full-resolution revision.
-The earlier branch's Metal verification used the older downsampled assets.
+Edit `prefabs/reservoir.jsonc`, `prefabs/fog.jsonc`, and `prefabs/lamp.jsonc`.
+Scene instances use partial `WaterShader`/`FogShader`/`LampShader` overrides.
+Missing fields inherit; explicit `0` and `false` are retained. Tests exercise
+the real engine prefab merge and deserializer, including these zero cases.
 
-`CONDENSER_WATER_OFF=1` disables water shading for a static-art control. Example:
+| Component | Controls and zero semantics |
+|---|---|
+| WaterShader | `water_level` 0..1; `reflection_opacity` 0..1; positive `ripple_duration_seconds` and `ripple_radius_pixels`; nonnegative `ripple_strength_pixels`; logical size/grid, colors, mask/reflection catalog keys. Zero fill clears impacts. |
+| FogShader | `density` changes optical depth; `opacity` separately fades its result (0..1). Either zero removes the veil. `variation` controls contrast, `wisp_size` the spatial wavelength (screen px; zero removes variation), `turbulence` blends a second evolving octave (0..1). |
+| FogShader motion | `speed` scales all motion; zero freezes it. Signed `drift_velocity: [x,y]` gives direction and rate in screen px/s before speed scaling; `[0,0]` disables translation. `light_coupling` controls scattering, zero removes coupling. Color/grid are independent controls. |
+| LampShader | `center`, `width`, `reach_up`, `reach_down` in screen px. Zero width/intensity disables source and halo; a zero reach disables only that side of the halo. |
+| LampShader shape | `spread` expands the halo away from the source; `softness` feathers horizontal edges (zero is hard); `falloff` is a vertical exponent (zero is flat inside the bounded reach); `glow` scales halo only (zero keeps the physical tube). |
+| LampShader animation | `flicker` amplitude 0..1 (default zero, constant lamp); `flicker_speed` cycles/s (zero freezes phase). Flicker is deterministic, bounded and shared with fog scattering. Color/grid and `enabled` remain editable. |
 
-```sh
-labelle run --timeout=5s --screenshot=condenser.png --after=2s
-```
+Simulation clocks wrap/rebase without wall-clock dependence. Water owns eight
+bounded impacts, expires them permanently, drops impacts when bounds shrink,
+rejects nonfinite/malformed state, and replaces the oldest impact deterministically.
+Drops read the live level and emit once on contact. Refill cannot resurrect an
+old ripple. Invalid optional-field water patches leave prior state intact.
 
-The main authoring files are `prefabs/reservoir.jsonc`, `scenes/main.jsonc`,
-`scripts/playing/10_drops.zig` and `scripts/playing/30_water_probe.zig`.
+Keyboard controls affect **unit A only**:
+
+- **Space**: switch fill level; **R**: inject a demonstration impact.
+- **F**: toggle fog; **L**: toggle lamp.
+- **Q/E**: decrease/increase lamp width by 12 px.
+- **S/W**: decrease/increase upward reach by 6 px.
+- **A/D**: decrease/increase downward reach by 12 px.
+- **G**: alternate the default lamp and width=120/up=0/down=66 preset.
+
+Startup environment overrides apply to both units. Numeric zero is a real value.
+All use the `CONDENSER_` prefix:
+
+- `WATER_LEVEL`, `WATER_OFF`.
+- `FOG_DENSITY`, `FOG_OPACITY`, `FOG_SPEED`, `FOG_VARIATION`, `FOG_WISP_SIZE`,
+  `FOG_TURBULENCE`, `FOG_DRIFT_X`, `FOG_DRIFT_Y`, `FOG_LIGHT`, `FOG_OFF`.
+- `LAMP_WIDTH`, `LAMP_UP`, `LAMP_DOWN`, `LAMP_INTENSITY`, `LAMP_SPREAD`,
+  `LAMP_SOFTNESS`, `LAMP_FALLOFF`, `LAMP_GLOW`, `LAMP_FLICKER`,
+  `LAMP_FLICKER_SPEED`, `LAMP_OFF`.
+
+`CONDENSER_TEST_CONTROL=water|fog|lamp` triggers the corresponding Space/F/G
+control path at frame 60. `CONDENSER_TEST_LEFT=1` triggers all three. Both hooks
+change only the left unit and preserve normal keyboard input. Capture at two
+seconds with `LABELLE_FIXED_DT=0.016666667` for deterministic comparison.
+
+## Verification
+
+- `zig build test --summary all` from the generated desktop directory: **18 tests**,
+  including water lifetime/bounds/rebase/invalid state, directional drift,
+  zero controls, flicker, actual prefab merge, and real keyboard paths.
+- `python tools/verify_effect_assets.py`: **10 checks**, including saved-mask
+  reconstruction, alpha preservation, independent fog/lamp controls, shared
+  grid behavior, and descriptor shapes; writes a CPU reference contact sheet.
+- `tools/compile_shaders.ps1 -Shaderc <exe> -Include <bgfx-shader-directory>`:
+  compiles all **12 variants** independently of the game build.
+- `python tools/verify_runtime.py`: **10 actual native runs**, six live generic
+  materials each, fixed-step captures, frame-60 left-only edits, zero width and
+  zero fog opacity equivalence, and independent fog/lamp off cases.
+
+Windows/Vulkan runtime checks pass. The right 618x330 half is byte-identical
+across every left-control run. Results, logs and captures are under
+`.test-output/runtime/`; the directory is ignored. Other shader targets compile
+but have not been executed here. `preview.png` is the current native capture.
+
+Final fixed-step capture results (also confirmed by the integrator):
+
+| Frame-60 left control | Changed left pixels | Changed right pixels |
+|---|---:|---:|
+| Water | 16,704 | 0 |
+| Fog | 109,220 | 0 |
+| Lamp | 44,960 | 0 |
+| All three | 131,767 | 0 |
+
+Zero lamp width is byte-identical to lamp off; zero fog opacity is
+byte-identical to fog off. Default and combined-control captures were visually
+checked for alignment. Final generated unit suite: 18/18; asset checks: 10/10.
+
+The probe queries actual `game.shaderMaterial(entity)` bindings. Cold catalog
+loads retry silently during the first 300 frames; hard failures and prolonged
+loading failures are reported. Context loss can recreate materials from the
+same game components. GPU and texture lifetime cleanup remains engine-owned.

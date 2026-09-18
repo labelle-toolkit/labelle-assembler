@@ -1,75 +1,35 @@
-// COND-07 condenser — the built-in `PixelWater` reservoir effect on real
-// artwork (labelle-bgfx#100's acceptance criterion: "a runnable Labelle
-// example using this condenser's artwork").
-//
-// WHAT IS BEING EXERCISED
-//
-// `PixelWater` is a BUILT-IN engine component as of engine v2.22.0: the
-// JSONC apply path routes it through `game.addPixelWater`, which validates
-// the candidate, pins the mask/reflection in the AssetCatalog and creates
-// the gfx-owned water instance; `MaterialEffect.pixel_water` then selects
-// bgfx's `fs_pixel_water` program at draw time. Nothing in this project
-// registers a component, a material or a shader by hand.
-//
-// The reservoir itself is authored as a PREFAB (`prefabs/reservoir.jsonc`)
-// and instantiated TWICE from the scene with a per-instance `water_level`
-// override, so the prefab-defaults -> scene-overrides deep merge (engine
-// RFC-OVERRIDES-MERGE-RULES) runs on a built-in component, and the two
-// reservoirs prove the engine creates INDEPENDENT gfx water instances
-// (ripples must not leak between them).
-//
-// GEOMETRY. Full-resolution art is 618x330 per unit, drawn at scale 1.
-// Only the two left border columns of the 620x330 reference are cropped.
-// The shader's separate 93x6 logical basin retains six screen pixels/cell.
-// Two units side by side fill the 1236x330 window.
-//
-// DRAW ORDER (the foreground occlusion the issue asks for) is layer order:
-// machine interior (static mist baked in) -> water -> drops -> foreground.
-// Emitter A (reservoir-local x 21) sits behind the cooler, so its drop is
-// occluded on the way down — that is the order holding, not a special case.
+// Full-resolution PR730 art. Game-owned shaders discovered under materials/.
 .{
     .name = "condenser",
-    .title = "LaBelle — COND-07 Condenser (pixel water)",
+    .title = "LaBelle — COND-07 Condenser (game-owned water, fog and lamps)",
     .width = 1236,
     .height = 330,
     .target_fps = 60,
-    // bgfx is the backend that ships `fs_pixel_water` (0.20.0).
     .backend = .bgfx,
-    .backend_package = .{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.20.0" },
-    // The art is authored +Y down (native y 0 is the top of the canvas,
-    // y 48 is the reservoir lip) — declare it rather than flipping every
-    // measured coordinate.
+    // Coordinated unreleased shader API: use this workspace's sibling branches.
+    .backend_package = .{ .name = "bgfx", .repo = "local:../../../labelle-bgfx" },
     .y_axis = .down,
     .ecs = .zig_ecs,
     .initial_prefab = "main",
     .states = .{"playing"},
     .resources = .{
-        // Drawn layers, packed into one atlas by `tools/pack_atlas.py`.
+        .{ .name = "fog_clean", .image = "assets/effects/interior_clean.png" },
+        .{ .name = "fog_mask", .image = "assets/effects/fog_mask.png" },
+        .{ .name = "lamp_clean", .image = "assets/effects/frame_clean.png" },
+        .{ .name = "lamp_mask", .image = "assets/effects/lamp_mask.png" },
         .{ .name = "condenser", .json = "assets/condenser.json", .texture = "assets/condenser.png" },
-        // The pixel-water MASK and REFLECTION are STANDALONE images, not
-        // atlas frames: `PixelWater.mask` / `.reflection` are AssetCatalog
-        // `.image` keys, and the engine's `catalogTexture` refuses anything
-        // whose `loader_kind` is not `.image`. Both span exactly the
-        // logical reservoir rectangle (93x6) because the shader samples
-        // them in reservoir-local UV.
         .{ .name = "reservoir_mask", .image = "assets/reservoir_mask_rect.png" },
         .{ .name = "reservoir_reflection", .image = "assets/layers/reflection.png" },
     },
-    // SCREEN-space layers, not world: this is a fixed, pixel-exact
-    // composition, so a scene coordinate must be a window coordinate. On a
-    // WORLD layer the default camera centres the world origin in the
-    // window, which puts the measured native-px coordinates half a screen
-    // off — correct behaviour for a camera, wrong for a machine panel.
     .layers = .{
         .{ .name = "machine", .order = 0, .space = .screen },
         .{ .name = "water", .order = 1, .space = .screen },
         .{ .name = "drops", .order = 3, .space = .screen },
         .{ .name = "foreground", .order = 4, .space = .screen },
     },
-    .core_version = "1.32.0",
-    .engine_version = "2.22.0",
-    .gfx_version = "1.36.0",
+    .core_version = "local:../../../labelle-core",
+    .engine_version = "local:../../../labelle-engine",
+    .gfx_version = "local:../../../labelle-gfx",
     .labelle_version = "1.67.0",
-    // In-tree assembler (the examples convention).
     .assembler_version = "local:../../",
 }
