@@ -46,8 +46,19 @@ the pins note in `tile-explorer/README.md`):
 ```zig
 .core_version = "1.26.0", .engine_version = "2.6.0", .gfx_version = "1.28.1",
 .labelle_version = "1.58.0", .assembler_version = "local:../../",
-.backend_package = .{ .name = "sokol", … .version = "0.5.0" },
+.backend_package = .{ .name = "sokol", … .version = "0.6.0" },
 ```
+
+> **Backend pin bumped to `0.6.0` (labelle-core v1.32.0).** That core
+> appended `MaterialEffect.pixel_water`; every sokol release up to and
+> including `0.5.0` switches exhaustively over that enum with no arm for
+> the new tag, so it stops compiling against it. `0.6.0` declines the
+> effect behind `@hasField(MaterialEffect, "pixel_water")` probes and
+> builds against old and new core alike. CI clones `labelle-core` at
+> `main` as a sibling checkout and the assembler builds that sibling in
+> preference to the `.core_version` pin above, so the old backend pin
+> failed there — this was the observed "Examples integration test"
+> breakage.
 
 **Caveat (assembler#611) — why the assembler is in-tree, and the released
 requirement:** the current released assembler `0.94.0` does NOT build this
