@@ -18,14 +18,13 @@
 // reservoirs prove the engine creates INDEPENDENT gfx water instances
 // (ripples must not leak between them).
 //
-// GEOMETRY. The art's native canvas is 103x55 with a ~6 screen-px block
-// (measured; see README.md and the assets branch). Two condenser units sit
-// side by side, so the logical canvas is 206x55 and the window is 206*6 x
-// 55*6 = 1236x330. Every sprite is `pivot: top_left, scale 6`, so a scene
-// coordinate is simply `native_px * 6`.
+// GEOMETRY. Full-resolution art is 618x330 per unit, drawn at scale 1.
+// Only the two left border columns of the 620x330 reference are cropped.
+// The shader's separate 93x6 logical basin retains six screen pixels/cell.
+// Two units side by side fill the 1236x330 window.
 //
 // DRAW ORDER (the foreground occlusion the issue asks for) is layer order:
-// machine interior -> water -> mist -> drops -> cooler/frame foreground.
+// machine interior (static mist baked in) -> water -> drops -> foreground.
 // Emitter A (reservoir-local x 21) sits behind the cooler, so its drop is
 // occluded on the way down — that is the order holding, not a special case.
 .{
@@ -64,7 +63,6 @@
     .layers = .{
         .{ .name = "machine", .order = 0, .space = .screen },
         .{ .name = "water", .order = 1, .space = .screen },
-        .{ .name = "mist", .order = 2, .space = .screen },
         .{ .name = "drops", .order = 3, .space = .screen },
         .{ .name = "foreground", .order = 4, .space = .screen },
     },

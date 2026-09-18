@@ -2,9 +2,9 @@
 //! contacts the reservoir's CURRENT water surface, emits exactly ONE ripple,
 //! and waits before the next release.
 //!
-//! All the geometry here is in NATIVE ART PIXELS on the 103x55 canvas (the
-//! script multiplies by the x6 enlargement when it writes the position), so
-//! the numbers match the measurements on the assets branch directly.
+//! Geometry uses the original 103x55 EFFECT coordinate system; the script
+//! multiplies by six for screen positions. Static artwork is independently
+//! stored at reference resolution and drawn at scale 1.
 pub const Drop = struct {
     pub const save = @import("labelle-core").Saveable(.transient, @This(), .{});
     /// The reservoir (`Reservoir.unit`) this drop falls into.

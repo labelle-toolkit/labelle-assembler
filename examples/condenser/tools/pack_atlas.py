@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Pack the COND-07 condenser layers into the single `condenser` atlas.
 
-The layer PNGs in `assets/layers/` are vendored verbatim from labelle-bgfx
-PR #106 (`docs/issue-references/condenser-100/layers/`). Two of them are
-also cropped here to the measured reservoir rect (x 4, y 48, w 93, h 6):
+The layer PNGs in `assets/layers/` are rebuilt by `derive_layers.py` from
+the cropped reference at full resolution. Two are cropped to the basin
+rectangle (x 24, y 288, w 558, h 36):
 
   * `reservoir_mask_rect.png` — the pixel-water silhouette MASK. The shader
     samples it in reservoir-LOCAL uv, so it must span exactly the logical
-    rectangle, not the 103x55 canvas.
+    rectangle, not the full 618x330 canvas.
   * `reservoir_art.png`       — the authored static reservoir, which is the
     water sprite's own texture (`s_tex`) and the degrade fallback.
 
@@ -20,8 +20,8 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(HERE, "assets", "layers")
 DST = os.path.join(HERE, "assets")
 
-# Measured reservoir rect on the 103x55 native canvas (README on the assets branch).
-RESERVOIR = (4, 48, 4 + 93, 48 + 6)
+# Reference-resolution reservoir; shader logical coordinates remain 93x6.
+RESERVOIR = (24, 288, 582, 324)
 PAD = 4
 
 def crop(name, out):
@@ -30,7 +30,7 @@ def crop(name, out):
 crop("reservoir_mask.png", "reservoir_mask_rect.png")
 crop("reservoir_static.png", "reservoir_art.png")
 
-frames = ["machine_interior.png", "mist.png", "cooler_foreground.png",
+frames = ["machine_interior.png", "cooler_foreground.png",
           "frame_foreground.png", "drop.png"]
 images = [(n, Image.open(os.path.join(SRC, n)).convert("RGBA")) for n in frames]
 images.append(("reservoir_art.png", Image.open(os.path.join(DST, "reservoir_art.png"))))
@@ -52,6 +52,6 @@ for name, im in images:
     y += im.height + PAD
 
 sheet.save(os.path.join(DST, "condenser.png"))
-with open(os.path.join(DST, "condenser.json"), "w") as f:
+with open(os.path.join(DST, "condenser.json"), "w", encoding="utf-8", newline="\n") as f:
     json.dump(manifest, f, indent=1)
 print("packed", width, "x", height, "->", list(manifest["frames"]))

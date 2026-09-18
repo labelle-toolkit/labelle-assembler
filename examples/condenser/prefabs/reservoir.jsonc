@@ -21,8 +21,8 @@
         "sprite_name": "reservoir_art.png",
         "pivot": "top_left",
         "layer": "water",
-        "scale_x": 6.0,
-        "scale_y": 6.0
+        "scale_x": 1.0,
+        "scale_y": 1.0
     },
 
     // ── The built-in engine component (engine v2.22.0) ────────────────

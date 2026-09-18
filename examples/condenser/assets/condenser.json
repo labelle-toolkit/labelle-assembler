@@ -4,120 +4,100 @@
    "frame": {
     "x": 0,
     "y": 0,
-    "w": 103,
-    "h": 55
+    "w": 618,
+    "h": 330
    },
    "rotated": false,
    "trimmed": false,
    "spriteSourceSize": {
     "x": 0,
     "y": 0,
-    "w": 103,
-    "h": 55
+    "w": 618,
+    "h": 330
    },
    "sourceSize": {
-    "w": 103,
-    "h": 55
-   }
-  },
-  "mist.png": {
-   "frame": {
-    "x": 0,
-    "y": 59,
-    "w": 103,
-    "h": 55
-   },
-   "rotated": false,
-   "trimmed": false,
-   "spriteSourceSize": {
-    "x": 0,
-    "y": 0,
-    "w": 103,
-    "h": 55
-   },
-   "sourceSize": {
-    "w": 103,
-    "h": 55
+    "w": 618,
+    "h": 330
    }
   },
   "cooler_foreground.png": {
    "frame": {
     "x": 0,
-    "y": 118,
-    "w": 103,
-    "h": 55
+    "y": 334,
+    "w": 618,
+    "h": 330
    },
    "rotated": false,
    "trimmed": false,
    "spriteSourceSize": {
     "x": 0,
     "y": 0,
-    "w": 103,
-    "h": 55
+    "w": 618,
+    "h": 330
    },
    "sourceSize": {
-    "w": 103,
-    "h": 55
+    "w": 618,
+    "h": 330
    }
   },
   "frame_foreground.png": {
    "frame": {
     "x": 0,
-    "y": 177,
-    "w": 103,
-    "h": 55
+    "y": 668,
+    "w": 618,
+    "h": 330
    },
    "rotated": false,
    "trimmed": false,
    "spriteSourceSize": {
     "x": 0,
     "y": 0,
-    "w": 103,
-    "h": 55
+    "w": 618,
+    "h": 330
    },
    "sourceSize": {
-    "w": 103,
-    "h": 55
+    "w": 618,
+    "h": 330
    }
   },
   "drop.png": {
    "frame": {
     "x": 0,
-    "y": 236,
-    "w": 1,
-    "h": 5
+    "y": 1002,
+    "w": 6,
+    "h": 30
    },
    "rotated": false,
    "trimmed": false,
    "spriteSourceSize": {
     "x": 0,
     "y": 0,
-    "w": 1,
-    "h": 5
+    "w": 6,
+    "h": 30
    },
    "sourceSize": {
-    "w": 1,
-    "h": 5
+    "w": 6,
+    "h": 30
    }
   },
   "reservoir_art.png": {
    "frame": {
     "x": 0,
-    "y": 245,
-    "w": 93,
-    "h": 6
+    "y": 1036,
+    "w": 558,
+    "h": 36
    },
    "rotated": false,
    "trimmed": false,
    "spriteSourceSize": {
     "x": 0,
     "y": 0,
-    "w": 93,
-    "h": 6
+    "w": 558,
+    "h": 36
    },
    "sourceSize": {
-    "w": 93,
-    "h": 6
+    "w": 558,
+    "h": 36
    }
   }
  }
