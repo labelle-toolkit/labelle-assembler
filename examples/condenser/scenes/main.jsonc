@@ -47,8 +47,7 @@
             "name": "mist_a",
             "components": {
                 "Position": { "x": 0, "y": 0 },
-                "Sprite": { "sprite_name": "mist.png", "pivot": "top_left", "layer": "mist", "scale_x": 6.0, "scale_y": 6.0 },
-                "MistDrift": { "base_x": 0.0, "amplitude": 18.0, "period": 11.0, "phase": 0.0 }
+                "Sprite": { "sprite_name": "mist.png", "pivot": "top_left", "layer": "mist", "scale_x": 6.0, "scale_y": 6.0 }
             }
         },
         {
@@ -127,8 +126,7 @@
             "name": "mist_b",
             "components": {
                 "Position": { "x": 618, "y": 0 },
-                "Sprite": { "sprite_name": "mist.png", "pivot": "top_left", "layer": "mist", "scale_x": 6.0, "scale_y": 6.0 },
-                "MistDrift": { "base_x": 618.0, "amplitude": 18.0, "period": 11.0, "phase": 1.7 }
+                "Sprite": { "sprite_name": "mist.png", "pivot": "top_left", "layer": "mist", "scale_x": 6.0, "scale_y": 6.0 }
             }
         },
         {

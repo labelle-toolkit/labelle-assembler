@@ -6,7 +6,7 @@ artwork"* — exercising the engine's built-in `PixelWater` component and
 bgfx's `fs_pixel_water` program through the ordinary `labelle` CLI path.
 
 Two COND-07 condenser units stand side by side. Each has a reactive water
-reservoir in its basin, drifting mist, and condensation drops that fall from
+reservoir in its basin, stationary mist artwork, and condensation drops that fall from
 the coils, contact the *current* water surface and put one ripple into it.
 
 ## What it demonstrates
@@ -40,8 +40,8 @@ the coils, contact the *current* water surface and put one ripple into it.
    `.space = .screen`. On a `.world` layer the default camera centres the
    world origin in the window, which puts these measured native-px
    coordinates half a screen off.
-7. **Mist drifting independently of the water** — its own sine, an
-   unrelated period, on its own layer.
+7. **Stationary mist artwork.** The reconstructed mist stays aligned with the
+   machine interior. Animation is limited to the water shader and falling drops.
 
 ## The measurements (do not re-derive them)
 
@@ -200,8 +200,6 @@ same phase and only live ripples show, which understates the effect badly.
 - `scenes/main.jsonc` — two units; two prefab instances with overrides.
 - `components/reservoir.zig` — unit marker.
 - `components/drop.zig` — one drop's fall + impact bookkeeping.
-- `components/mist_drift.zig` — mist drift parameters.
 - `scripts/playing/10_drops.zig` — fall, contact, one `addWaterRipple`.
-- `scripts/playing/20_mist.zig` — independent mist drift.
 - `scripts/playing/30_water_probe.zig` — verification + control switch.
 - `tools/pack_atlas.py` — crops + packs `assets/`.
