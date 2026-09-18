@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 // ── Submodules ─────────────────────────────────────────────────────────
 const config = @import("config.zig");
 pub const material_pipeline = @import("material_pipeline.zig");
+pub const version_floors = @import("version_floors.zig");
 pub const component_collisions = @import("component_collisions.zig");
 const cache = @import("cache.zig");
 const backend_registry = @import("backend_registry.zig");
@@ -358,6 +359,30 @@ pub fn generate(
     // rejected as manifest-less (the requirement keys off THIS name).
     const backend_manifest_name = manifest_detect.detectV2ManifestName(allocator, cfg, game_dir);
     try manifest_splice.requireManifestIfExternal(allocator, cfg, game_dir, backend_manifest_name);
+
+    // ── cross-package version floors (labelle-assembler#739) ─────────────
+    // `init` refuses a backend/core or core/engine/gfx pairing that cannot
+    // build — but a project.labelle is also hand-edited and `upgrade`d, and
+    // THIS is the only place the RESOLVED backend package (an explicit
+    // `.backend_package`, or the builtin provider the `.backend` tag is
+    // shorthand for — `init` has no `--backend-package` flag) and
+    // `.core_version` are both in hand. Without it a below-floor pairing
+    // generated clean and died at the first `zig build` with a missing-member
+    // error deep inside the backend's source, far from the pin that caused
+    // it. Same tables, same severity policy as `init`: a compile break
+    // refuses HERE, before any target file is written; a curated floor warns.
+    //
+    // ORDERING (#746 review): AFTER `requireManifestIfExternal`, before any
+    // target file is written. An external provider that BOTH lacks its
+    // required manifest AND carries incompatible pins must report the
+    // MISSING MANIFEST first — that provider is unusable no matter which
+    // versions are pinned, so telling the user to change framework versions
+    // sends them to fix the wrong thing and leaves the real blocker to be
+    // discovered on the next run. The surrounding invariant is that
+    // configuration errors that invalidate the provider outright precede
+    // errors about how the provider is pinned.
+    try version_floors.enforce(cfg, "labelle-assembler generate");
+
     try validateProviderContracts(allocator, cfg, game_dir, backend_manifest_name, is_tests_target);
 
     // ── Editor-preview link-path gate (#526 review, codex P2) ────────────

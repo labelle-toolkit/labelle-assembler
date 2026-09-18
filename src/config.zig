@@ -770,6 +770,115 @@ pub fn pinAtLeast(pin: []const u8, floor: []const u8) error{UnparsableVersionPin
     return p.order(f) != .lt;
 }
 
+/// The comparable identity of a package `repo` field: the remote with any
+/// `git+` prefix, its scheme, any `?query`/`#fragment`, any trailing `/` and
+/// a trailing `.git` removed.
+///
+/// `parseProjectConfig` preserves `PluginDep.repo` VERBATIM, and the fetch
+/// path accepts every spelling of the same remote —
+/// `github.com/labelle-toolkit/labelle-bgfx`,
+/// `https://github.com/labelle-toolkit/labelle-bgfx` and either with a
+/// `.git` suffix all clone the same repository. Any gate that asks "is this
+/// the official provider?" must therefore compare the NORMALIZED form
+/// (#742): comparing the raw string treated the `https://…/….git` spelling
+/// of the official repo as a third-party provider and skipped the floor
+/// checks that exist to name a bad pin.
+///
+/// THE SINGLE NORMALIZER (#746 review). `cache/fetch.zig`'s `repoHostPath`
+/// — the function that decides which repository is actually CLONED — used
+/// to carry its own copy of this logic, and the copies had drifted: the
+/// fetcher stripped `git+` and `?query`/`#fragment`, this one did not. So
+/// `git+https://github.com/labelle-toolkit/labelle-bgfx?ref=main` FETCHED
+/// the official backend while every floor gate classified it as a custom
+/// provider and waved incompatible release pins through. `repoHostPath` now
+/// delegates here, so the identity a gate compares is by construction the
+/// identity the fetcher resolves.
+///
+/// A `local:` path is NOT a remote — it is a filesystem checkout resolved
+/// elsewhere — so it is returned untouched (scheme stripping would mangle
+/// it, and two different local paths must never compare equal to a remote).
+pub fn normalizeRemote(repo: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, repo, "local:")) return repo;
+    var r = repo;
+    if (std.ascii.startsWithIgnoreCase(r, "git+")) r = r["git+".len..];
+    inline for (.{ "https://", "http://", "git://", "ssh://" }) |scheme| {
+        if (std.ascii.startsWithIgnoreCase(r, scheme)) {
+            r = r[scheme.len..];
+            break;
+        }
+    }
+    // A `?ref=`/`#sha` suffix selects a REVISION of the same repository, so
+    // it is not part of the repository's identity — and the fetch path drops
+    // it before cloning.
+    if (std.mem.indexOfAny(u8, r, "?#")) |i| r = r[0..i];
+    while (r.len > 0 and r[r.len - 1] == '/') r = r[0 .. r.len - 1];
+    if (std.mem.endsWith(u8, r, ".git")) r = r[0 .. r.len - ".git".len];
+    return r;
+}
+
+/// Two `repo` fields naming the same repository. Host is compared
+/// case-INSENSITIVELY (DNS is case-folding); the path after it is compared
+/// exactly, because forge paths are case-sensitive on every forge the
+/// registry talks to — folding it would make `labelle-toolkit/Foo` and
+/// `labelle-toolkit/foo` the same repo when they are not. `local:` paths
+/// compare verbatim.
+pub fn sameRemote(a: []const u8, b: []const u8) bool {
+    const x = normalizeRemote(a);
+    const y = normalizeRemote(b);
+    if (std.mem.startsWith(u8, x, "local:") or std.mem.startsWith(u8, y, "local:")) return std.mem.eql(u8, x, y);
+    const xs = std.mem.indexOfScalar(u8, x, '/') orelse x.len;
+    const ys = std.mem.indexOfScalar(u8, y, '/') orelse y.len;
+    if (!std.ascii.eqlIgnoreCase(x[0..xs], y[0..ys])) return false;
+    return std.mem.eql(u8, x[xs..], y[ys..]);
+}
+
+test "normalizeRemote/sameRemote fold every spelling of one remote, keep distinct repos distinct — #742" {
+    // The mechanism: the SPELLING is normalized away, so the official-repo
+    // gate sees one identity for all four forms the fetch path accepts.
+    const canonical = "github.com/labelle-toolkit/labelle-bgfx";
+    inline for (.{
+        "github.com/labelle-toolkit/labelle-bgfx",
+        "https://github.com/labelle-toolkit/labelle-bgfx",
+        "https://github.com/labelle-toolkit/labelle-bgfx.git",
+        "github.com/labelle-toolkit/labelle-bgfx.git",
+        "http://github.com/labelle-toolkit/labelle-bgfx/",
+        "git://GitHub.com/labelle-toolkit/labelle-bgfx.git",
+        "GITHUB.COM/labelle-toolkit/labelle-bgfx",
+        // A `?ref=`/`#sha` suffix selects a REVISION, not a repository, and
+        // `cache/fetch.zig` drops it before cloning — so the gates must fold
+        // it away too, or a `git+https://…?ref=main` spelling FETCHES the
+        // official backend while every floor check calls it third-party
+        // (#746 review).
+        "git+https://github.com/labelle-toolkit/labelle-bgfx?ref=main",
+        "git+https://github.com/labelle-toolkit/labelle-bgfx.git?ref=v0.21.0",
+        "https://github.com/labelle-toolkit/labelle-bgfx#deadbeef",
+        "git+https://github.com/labelle-toolkit/labelle-bgfx/?ref=main#frag",
+    }) |spelling| {
+        try std.testing.expect(sameRemote(spelling, canonical));
+        try std.testing.expect(sameRemote(canonical, spelling));
+    }
+    try std.testing.expectEqualStrings(canonical, normalizeRemote("https://github.com/labelle-toolkit/labelle-bgfx.git"));
+
+    // A genuinely different repo stays different — including a fork with the
+    // same trailing name, a case-differing PATH, and another host.
+    inline for (.{
+        "github.com/acme/labelle-bgfx",
+        "https://github.com/acme/labelle-bgfx.git",
+        "github.com/labelle-toolkit/labelle-bgfx-fork",
+        "github.com/labelle-toolkit/Labelle-Bgfx",
+        "gitlab.com/labelle-toolkit/labelle-bgfx",
+    }) |other| {
+        try std.testing.expect(!sameRemote(other, canonical));
+    }
+
+    // `local:` is a checkout path, not a remote: untouched, and never equal
+    // to a remote that happens to normalize similarly.
+    try std.testing.expectEqualStrings("local:../labelle-bgfx.git", normalizeRemote("local:../labelle-bgfx.git"));
+    try std.testing.expect(sameRemote("local:../labelle-bgfx", "local:../labelle-bgfx"));
+    try std.testing.expect(!sameRemote("local:../labelle-bgfx", "local:../other"));
+    try std.testing.expect(!sameRemote("local:github.com/labelle-toolkit/labelle-bgfx", canonical));
+}
+
 /// Map a package `version` string to the git ref to clone.
 ///
 /// A semver-shaped version (`1.2.3`) maps to the published release tag

@@ -326,19 +326,16 @@ fn archiveFetch(allocator: std.mem.Allocator, repo: []const u8, ref: []const u8,
 
 /// Normalize a clone URL / host-path to a bare `host/owner/repo`: strip a
 /// `git+` prefix, the scheme, any `?query`/`#fragment`, a trailing `.git`, and
-/// a trailing slash. Idempotent for values already in host-path form.
+/// trailing slashes. Idempotent for values already in host-path form.
+///
+/// Delegates to `config.normalizeRemote` so the identity used to CLONE and
+/// the identity the version-floor / official-provider gates COMPARE are the
+/// same function (#746 review). They used to be two copies that had drifted:
+/// this one stripped `git+` and `?query`/`#fragment`, the gate's did not, so
+/// `git+https://github.com/labelle-toolkit/labelle-bgfx?ref=main` fetched the
+/// official backend and was then judged a custom provider.
 fn repoHostPath(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-    var s = url;
-    if (std.mem.startsWith(u8, s, "git+")) s = s["git+".len..];
-    if (std.mem.startsWith(u8, s, "https://")) {
-        s = s["https://".len..];
-    } else if (std.mem.startsWith(u8, s, "http://")) {
-        s = s["http://".len..];
-    }
-    if (std.mem.indexOfAny(u8, s, "?#")) |i| s = s[0..i];
-    if (std.mem.endsWith(u8, s, ".git")) s = s[0 .. s.len - ".git".len];
-    if (std.mem.endsWith(u8, s, "/")) s = s[0 .. s.len - 1];
-    return allocator.dupe(u8, s);
+    return allocator.dupe(u8, config.normalizeRemote(url));
 }
 
 /// Filesystem-safe slug for a temp filename: non-alphanumerics → `-`.
@@ -427,6 +424,10 @@ test "repoHostPath: normalizes clone URLs and host-paths" {
         .{ "https://github.com/labelle-toolkit/labelle-core.git", "github.com/labelle-toolkit/labelle-core" },
         .{ "git+https://github.com/x/y?ref=v1.0#abc", "github.com/x/y" },
         .{ "https://codeberg.org/a/b/", "codeberg.org/a/b" },
+        // Now shared with `config.normalizeRemote` (#746 review): the extra
+        // spellings that helper already folded must survive the delegation.
+        .{ "git://GitHub.com/x/y.git", "GitHub.com/x/y" },
+        .{ "github.com/x/y/?ref=main#frag", "github.com/x/y" },
     }) |case| {
         const got = try repoHostPath(alloc, case[0]);
         defer alloc.free(got);

@@ -71,9 +71,74 @@ pub fn contractViolation(cfg: config.ProjectConfig) error{UnparsableVersionPin}!
 /// builtin provider's repo (the enum-as-shorthand default, or an explicit
 /// `.backend_package` that pins that same repo). Keyed off the REPO, never
 /// the package name — the name is configurable (`requireBackend`).
+///
+/// Compared through `config.sameRemote`, never `std.mem.eql` (#742):
+/// `parseProjectConfig` keeps `PluginDep.repo` verbatim and the fetch path
+/// clones `github.com/labelle-toolkit/labelle-bgfx`,
+/// `https://github.com/…/labelle-bgfx` and `….git` alike — so a raw string
+/// compare classified those spellings of the OFFICIAL repo as a custom
+/// provider, skipped `contractViolation`, and let an old pin fail at the
+/// generated `MATERIAL_CONTRACT_VERSION` guard instead of at generate with
+/// the pin named.
 pub fn isOfficialBgfx(bp: config.PluginDep) bool {
     const official = config.ProjectConfig.builtinProvider(.bgfx) orelse return false;
-    return std.mem.eql(u8, bp.repo, official.repo);
+    return config.sameRemote(bp.repo, official.repo);
+}
+
+test "isOfficialBgfx accepts every spelling of the official repo, rejects a custom provider — #742" {
+    const official = config.ProjectConfig.builtinProvider(.bgfx) orelse return error.TestUnexpectedResult;
+    // The `https://` and `.git` spellings the fetch path accepts are the
+    // OFFICIAL train, so the materials floor gate judges them.
+    inline for (.{
+        "github.com/labelle-toolkit/labelle-bgfx",
+        "https://github.com/labelle-toolkit/labelle-bgfx",
+        "https://github.com/labelle-toolkit/labelle-bgfx.git",
+        "github.com/labelle-toolkit/labelle-bgfx.git",
+    }) |spelling| {
+        try std.testing.expect(isOfficialBgfx(.{ .name = "bgfx", .repo = spelling, .version = "0.20.0" }));
+    }
+    try std.testing.expect(isOfficialBgfx(official));
+
+    // A genuinely custom provider carries its own semver and stays custom —
+    // the generated module's contract guard covers it instead.
+    inline for (.{
+        "github.com/acme/labelle-bgfx",
+        "https://github.com/acme/labelle-bgfx.git",
+        "local:../labelle-bgfx",
+    }) |custom| {
+        try std.testing.expect(!isOfficialBgfx(.{ .name = "bgfx", .repo = custom, .version = "0.1.0" }));
+    }
+}
+
+test "contractViolation names an OLD official bgfx pinned with the `https://…/.git` spelling — #742" {
+    // BEFORE: the raw-string compare made this a custom provider, the gate
+    // returned null, and the project failed at the generated
+    // `MATERIAL_CONTRACT_VERSION == 2` guard deep inside the build.
+    const cfg: config.ProjectConfig = .{
+        .name = "g",
+        .backend = .bgfx,
+        .backend_package = .{ .name = "bgfx", .repo = "https://github.com/labelle-toolkit/labelle-bgfx.git", .version = "0.20.0" },
+        .core_version = "2.0.0",
+        .engine_version = "3.0.0",
+        .gfx_version = "2.0.0",
+    };
+    const v = (try contractViolation(cfg)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("labelle-bgfx", v.what);
+    try std.testing.expectEqualStrings("0.20.0", v.pinned);
+    try std.testing.expectEqualStrings(min_bgfx_for_materials, v.floor);
+    try std.testing.expectError(error.MaterialContractUnsupported, requireContract(cfg));
+
+    // A contract-v2 pin in the same spelling is still accepted (the fix
+    // normalizes the spelling; it does not reject the repo).
+    var ok = cfg;
+    ok.backend_package = .{ .name = "bgfx", .repo = "https://github.com/labelle-toolkit/labelle-bgfx.git", .version = min_bgfx_for_materials };
+    try std.testing.expect((try contractViolation(ok)) == null);
+
+    // A CUSTOM provider on its own semver is still left to the generated
+    // guard — the normalization must not widen the gate.
+    var custom = cfg;
+    custom.backend_package = .{ .name = "bgfx", .repo = "github.com/acme/bgfx-provider", .version = "0.1.0" };
+    try std.testing.expect((try contractViolation(custom)) == null);
 }
 pub fn requireContract(cfg: config.ProjectConfig) ContractError!void {
     if (try contractViolation(cfg)) |_| return error.MaterialContractUnsupported;
