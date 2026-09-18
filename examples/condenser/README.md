@@ -9,6 +9,9 @@ Two COND-07 condenser units stand side by side. Each has a reactive water
 reservoir in its basin, stationary mist artwork, and condensation drops that fall from
 the coils, contact the *current* water surface and put one ripple into it.
 
+The water is contained and rests between impacts. Continuous surface waves and
+reflection distortion are disabled; only drop-triggered, fading ripples disturb it.
+
 ## What it demonstrates
 
 1. **`PixelWater` authored in a PREFAB's JSON config.** The whole block —

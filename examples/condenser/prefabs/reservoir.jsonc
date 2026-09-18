@@ -58,16 +58,14 @@
         "surface_color": "#7AA5BB",
         "highlight_color": "#425F6C",
 
-        // A restrained periodic surface wave. Displacement is quantised to
-        // whole grid increments, so an amplitude below 1 would round to no
-        // motion at all on this 1-px grid.
-        "wave_amplitude_pixels": 1.0,
+        // Contained water rests between impacts: no travelling base wave.
+        "wave_amplitude_pixels": 0.0,
         "wave_period_seconds": 3.0,
-        "waves_enabled": true,
+        "waves_enabled": false,
 
-        // The authored (not captured) reflection, gently displaced.
+        // Keep the supplied reflection fixed; only drop ripples move water.
         "reflection_opacity": 0.35,
-        "distortion_pixels": 1.0,
+        "distortion_pixels": 0.0,
 
         // Drop impacts: one ripple per drop, from `game.addWaterRipple`.
         "ripple_duration_seconds": 0.9,
