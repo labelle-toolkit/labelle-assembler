@@ -28,7 +28,7 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             const run = if (override) |exe| b.addSystemCommand(&.{exe}) else b.addRunArtifact(tool.artifact("shaderc"));
             run.step.name = b.fmt("shader {s} ({s})", .{ input.name, @tagName(variant) });
             if (override) |exe| run.addFileInput(.{ .cwd_relative = exe });
-            run.addArgs(&.{ "--type", "fragment", "--platform", schema.platform(variant), "-p", schema.profile(variant), "-O", "3", "-f" });
+            run.addArgs(&.{ "--type", "fragment", "--platform", schema.platform(variant, platform), "-p", schema.profile(variant), "-O", "3", "-f" });
             run.addFileArg(b.path(b.fmt("materials/{s}/{s}", .{ input.name, d.fragment })));
             run.addArg("--varyingdef");
             run.addFileArg(varying);
