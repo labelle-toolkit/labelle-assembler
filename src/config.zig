@@ -388,6 +388,26 @@ pub const AndroidConfig = struct {
     /// requires runtime native code (JNI `WindowInsetsController` calls)
     /// and is a planned follow-up.
     immersive_mode: bool = false,
+    /// Build the APK `android:debuggable` (labelle-assembler#737).
+    ///
+    /// OPT-IN, off by default — a shipping build must never carry it. Its only
+    /// purpose is on-device VERIFICATION: an activity launched normally inherits
+    /// zygote's environment, so the `LABELLE_*` knobs the desktop path already
+    /// honours (`LABELLE_FIXED_DT`, `LABELLE_SCREENSHOT_PATH`) cannot reach the
+    /// process at all. The platform's `wrap.<package>` property CAN give the
+    /// process a real environment, but it is honoured only for a debuggable app.
+    ///
+    /// With this set, `adb shell setprop wrap.<package> 'LABELLE_FIXED_DT=… '`
+    /// pins the simulation timestep and `LABELLE_SCREENSHOT_PATH` makes the
+    /// engine-owned capture path write a frame the harness can `adb pull` —
+    /// which is what makes two captures at the same simulated time byte-identical.
+    /// Without it, on-device checking falls back to `adb screencap` at wall-clock
+    /// times: a display colour transform on some devices, and ~1s of latency.
+    ///
+    /// The flag only reaches the generated `AndroidManifest.xml` (labelle-cli);
+    /// the generated `main.zig` reads the env vars unconditionally, because on a
+    /// non-debuggable APK they are simply never set.
+    debuggable: bool = false,
 };
 
 pub const LayerSpace = enum { world, screen, screen_fill };
@@ -1737,6 +1757,19 @@ test "effectiveGamepad: bgfx defaults to .none, other backends to .auto, explici
         try std.testing.expectEqual(GamepadSource.auto, (ProjectConfig{ .name = "g", .backend = tag, .gamepad = .auto }).effectiveGamepad());
         try std.testing.expectEqual(GamepadSource.none, (ProjectConfig{ .name = "g", .backend = tag, .gamepad = .none }).effectiveGamepad());
     }
+}
+
+test "AndroidConfig.debuggable is off by default and parses from the android block (#737)" {
+    // Off by default: a shipping APK must never carry `android:debuggable`.
+    try std.testing.expect(!(AndroidConfig{}).debuggable);
+    const alloc = std.testing.allocator;
+    const on = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .package_name = \"com.labelle.t\", .debuggable = true }", null, .{});
+    defer std.zon.parse.free(alloc, on);
+    try std.testing.expect(on.debuggable);
+    // Projects that never mention it keep the release shape.
+    const off = try std.zon.parse.fromSliceAlloc(AndroidConfig, alloc, ".{ .package_name = \"com.labelle.t\" }", null, .{});
+    defer std.zon.parse.free(alloc, off);
+    try std.testing.expect(!off.debuggable);
 }
 
 test "Orientation: every value parses from ZON on BOTH the android and ios blocks (labelle-cli#341)" {
