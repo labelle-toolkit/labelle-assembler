@@ -34,7 +34,7 @@ the declarative `.post_fx` block in `project.labelle`:
   runtime drop).
 - The engine forwards the stack to gfx's `PostFxDriver`
   (`post_fx_mixin.zig`, gated on gfx ≥ 1.28).
-- bgfx `0.13.1` renders each pass from its
+- bgfx `0.20.0` renders each pass from its
   `.post_fx_passes = .{ .bloom, .vignette, .color_grade, .crt }` manifest.
 
 A tiny script (`scripts/playing/10_bob.zig`) bobs the orbs on sine paths
@@ -72,8 +72,17 @@ see the pins note in `tile-explorer/README.md`):
 ```zig
 .core_version = "1.26.0", .engine_version = "2.6.0", .gfx_version = "1.28.1",
 .labelle_version = "1.58.0", .assembler_version = "local:../../",
-.backend_package = .{ .name = "bgfx", … .version = "0.13.1" },
+.backend_package = .{ .name = "bgfx", … .version = "0.20.0" },
 ```
+
+> **Backend pin bumped to `0.20.0` (labelle-core v1.32.0).** That core
+> appended `MaterialEffect.pixel_water`; every bgfx release before
+> `0.20.0` switches exhaustively over that enum with no arm for the new
+> tag, so it stops compiling against it. `0.20.0` implements the effect
+> behind `@hasField(MaterialEffect, "pixel_water")` probes and builds
+> against old and new core alike. CI clones `labelle-core` at `main` as a
+> sibling checkout and the assembler builds that sibling in preference to
+> the `.core_version` pin above, so the old backend pin failed there.
 
 On the fully-released `labelle` path this game builds on assembler
 `0.94.0` (bgfx takes the generic desktop `unifyCoreDiamond` codegen,
