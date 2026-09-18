@@ -25,6 +25,7 @@ const build_zig_zon_tmpl = @embedFile("../templates/build_zig_zon.txt");
 // ============================================================
 
 pub const BuildZigZonOptions = struct {
+    materials: bool = false,
     /// True (default) wipes the shared `.labelle/deps/` directory before
     /// recreating it. The tests target (issue #83) sets this to false so
     /// the second-pass generation merges its null-backend dep into the
@@ -147,6 +148,11 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     const hash_str = std.fmt.bufPrint(&hash_buf, "{x}", .{hash}) catch unreachable;
 
     try tpl.renderSection(build_zig_zon_tmpl, "header", .{ .hash = hash_str, .version = cfg.version }, w);
+
+    if (opts.materials) {
+        const material_schema = @import("../material_schema.zig");
+        try w.print("        .material_shaderc = .{{ .url = \"{s}\", .hash = \"{s}\" }},\n", .{ material_schema.tool_url, material_schema.tool_hash });
+    }
 
     // Manifest-v2 backend dep key: the generated build.zig calls
     // `b.dependency(m.dep_name, ..)`, so the zon backend entry must be keyed by

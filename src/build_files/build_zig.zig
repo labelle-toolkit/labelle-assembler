@@ -4,6 +4,7 @@
 /// split, mirrors #539/#541). Emits the generated project's `build.zig` from the
 /// embedded template + the resolved backend manifest-v2 data.
 const std = @import("std");
+const materials = @import("../material_pipeline.zig");
 const tpl = @import("../template.zig");
 const config = @import("../config.zig");
 const plugin_params = @import("../plugin_params.zig");
@@ -792,6 +793,7 @@ fn runtimeOutputsEntry(entries: []const PluginBuildStepsWiring) ?PluginBuildStep
 }
 
 pub const BuildZigOptions = struct {
+    materials: []const []const u8 = &.{},
     /// Emit a test-only build.zig: skip the exe step, the run step,
     /// and the backend artifact link. Used by `generateTestsTarget`
     /// in root.zig for `.labelle/tests/build.zig` (issue #83).
@@ -1233,6 +1235,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // compiles under its own module, whose import table does not inherit
     // game_mod's -- without these entries, valid `@import("constants")` in
     // exactly the sources the usage scanner covers failed to resolve.
+    try materials.emit(w, opts.materials, if (opts.is_tests_target or std.mem.eql(u8, cfg.backendName(), "null")) "tests" else @tagName(cfg.platform));
     try emitConstantsModule(w, opts.constants);
     try emitI18nModule(w, opts.i18n);
     // In-project lib plugin modules pick the data modules up here — after
@@ -1243,6 +1246,10 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // Per-pack modules (assembler#498 PR 2) — declared beside the promoted
     // script modules, before any target artifact that imports them.
     try emitPackModules(w, cfg, opts.pack_modules, opts.constants, opts.i18n);
+    if (opts.materials.len != 0) {
+        for (opts.promoted_scripts) |script| try w.print("    {s}_mod.addImport(\"materials\", materials_mod);\n", .{script.module_name});
+        for (opts.pack_modules) |pack| try w.print("    pack__{s}_mod.addImport(\"materials\", materials_mod);\n", .{pack.prefix});
+    }
 
     if (cfg.platform == .wasm) {
         // manifest-v2 wasm: no emsdk-helper import in the generated build.zig — the
@@ -1269,6 +1276,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → wasm root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "wasm", opts.promoted_scripts);
         try emitConstantsImport(w, "wasm", opts.constants);
+        try materials.emitImport(w, opts.materials, "wasm");
         try emitI18nImport(w, "wasm", opts.i18n);
         try emitPackImports(w, "wasm", opts.pack_modules);
 
@@ -1339,6 +1347,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → iOS exe root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
         try emitConstantsImport(w, "exe", opts.constants);
+        try materials.emitImport(w, opts.materials, "exe");
         try emitI18nImport(w, "exe", opts.i18n);
         try emitPackImports(w, "exe", opts.pack_modules);
 
@@ -1405,6 +1414,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // Promoted game-script modules → Android lib root module (#240 Gap 2).
         try emitPromotedScriptImports(w, "lib", opts.promoted_scripts);
         try emitConstantsImport(w, "lib", opts.constants);
+        try materials.emitImport(w, opts.materials, "lib");
         try emitI18nImport(w, "lib", opts.i18n);
         try emitPackImports(w, "lib", opts.pack_modules);
 
@@ -1478,6 +1488,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
             // `@import("<named>")` (labelle-assembler#240 Gap 2).
             try emitPromotedScriptImports(w, "exe", opts.promoted_scripts);
             try emitConstantsImport(w, "exe", opts.constants);
+            try materials.emitImport(w, opts.materials, "exe");
             try emitI18nImport(w, "exe", opts.i18n);
             try emitPackImports(w, "exe", opts.pack_modules);
 
@@ -1527,6 +1538,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
         // `__tests_root.zig` reaches the same named modules.
         try emitPromotedScriptImports(w, "test_root", opts.promoted_scripts);
         try emitConstantsImport(w, "test_root", opts.constants);
+        try materials.emitImport(w, opts.materials, "test_root");
         try emitI18nImport(w, "test_root", opts.i18n);
         try emitPackImports(w, "test_root", opts.pack_modules);
 

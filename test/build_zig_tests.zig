@@ -31,6 +31,18 @@ test {
     zspec.runAll(@This());
 }
 
+test "materials are one shared core module in desktop game and test imports" {
+    const out = try h.genBgfxV2BuildZig(std.testing.allocator, .{ .name = "materials-game", .ecs = .mock }, .{ .materials = &.{ "water", "fog", "lamp" } });
+    defer std.testing.allocator.free(out);
+    for ([_][]const u8{
+        "material_build.zig",
+        "materials/fog/material.json",
+        "overrideImport(game_mod, \"materials\", materials_mod)",
+        "exe.root_module.addImport(\"materials\", materials_mod)",
+        "test_root.root_module.addImport(\"materials\", materials_mod)",
+    }) |expected| try std.testing.expect(std.mem.indexOf(u8, out, expected) != null);
+}
+
 // ── manifest-v2 desktop byte anchor (epic #453 item 3, PR 3, design §7) ──
 // The critical proof-of-concept: the v2 desktop codegen path
 // (`backend.manifest.v2.zon` → `manifest_v2_splice`) must generate a build.zig

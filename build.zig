@@ -160,6 +160,29 @@ pub fn build(b: *std.Build) void {
     bin_tests.root_module.link_libc = true; // see assembler_exe comment above
     test_step.dependOn(&b.addRunArtifact(bin_tests).step);
 
+    const material_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize }), .filters = &.{ "material_schema", "material_pipeline", "component_collisions" } });
+    material_tests.root_module.addOptions("build_options", options);
+    material_tests.root_module.addImport("flow_codegen", flow_codegen_module);
+    material_tests.root_module.link_libc = true;
+    const material_test_run = b.addRunArtifact(material_tests);
+    const material_test_step = b.step("test-materials", "Validate material JSON, descriptor generation and build wiring");
+    material_test_step.dependOn(&material_test_run.step);
+    test_step.dependOn(&material_test_run.step);
+    const shaderc_test_exe = b.option([]const u8, "shaderc", "Host shaderc for material integration tests") orelse b.graph.environ_map.get("LABELLE_SHADERC");
+    const material_test_core = b.option([]const u8, "material-test-core", "Local core checkout for material integration test");
+    const material_test_zbgfx = b.option([]const u8, "material-test-zbgfx", "Pinned zbgfx directory for material integration test");
+    const material_integration = b.step("test-material-integration", "Compile shaders/descriptors and verify include cache invalidation with a real shaderc");
+    if (shaderc_test_exe != null and material_test_core != null and material_test_zbgfx != null) {
+        const python = b.option([]const u8, "python", "Python executable for integration tests") orelse (if (@import("builtin").os.tag == .windows) "py" else "python3");
+        const integration = b.addSystemCommand(&.{python});
+        if (@import("builtin").os.tag == .windows and std.mem.eql(u8, python, "py")) integration.addArg("-3");
+        integration.addFileArg(b.path("test/material_pipeline_e2e.py"));
+        integration.addArgs(&.{ "--zig", b.graph.zig_exe, "--shaderc", shaderc_test_exe.?, "--core", material_test_core.?, "--zbgfx", material_test_zbgfx.? });
+        material_integration.dependOn(&integration.step);
+    } else {
+        material_integration.dependOn(&b.addFail("Supply -Dshaderc=PATH (or LABELLE_SHADERC), -Dmaterial-test-core=DIR and -Dmaterial-test-zbgfx=DIR").step);
+    }
+
     // ── `test-cache`: the local-slot cache machinery, alone ─────────────
     //
     // The Windows CI job runs THIS, not `test`. `zig build test` on Windows
@@ -382,6 +405,7 @@ pub fn build(b: *std.Build) void {
         });
         const run_test = b.addRunArtifact(t);
         test_step.dependOn(&run_test.step);
+        if (std.mem.eql(u8, test_file, "test/build_zig_tests.zig") or std.mem.eql(u8, test_file, "test/build_zig_zon_tests.zig")) material_test_step.dependOn(&run_test.step);
         if (std.mem.eql(u8, test_file, "test/animation_assets_tests.zig")) {
             b.step("test-animation", "Test JSONC animation asset wiring").dependOn(&run_test.step);
         }
