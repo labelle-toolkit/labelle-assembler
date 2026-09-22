@@ -435,6 +435,10 @@ pub fn build(b: *std.Build) void {
         // zig_exe seam) against comptime @TypeOf asserts + runtime
         // .ptr[len]==0 probes, so a `[:0]` regression in t/tf cannot land.
         "test/i18n_sentinel_tests.zig",
+        // i18n device-language boot (flying-platform#917): the generated
+        // module is compiled and run against `applySystemLocale` resolution
+        // (region -> language fallback, POSIX spellings, setLocale wins).
+        "test/i18n_system_locale_tests.zig",
     };
 
     for (test_files) |test_file| {

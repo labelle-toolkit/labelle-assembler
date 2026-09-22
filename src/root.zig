@@ -190,6 +190,8 @@ pub const generateBuildZig = build_files.generateBuildZig;
 pub const windows_icon_resource_block = build_files.windows_icon_resource_block;
 /// The gated window-icon statement the desktop loop setup emits (labelle-cli#359).
 pub const emitWindowIcon = @import("codegen/lifecycle/loop.zig").emitWindowIcon;
+/// The gated device-language statement the loop + callback setup emit for i18n projects.
+pub const emitSystemLocale = @import("codegen/lifecycle/loop.zig").emitSystemLocale;
 pub const BuildZigOptions = build_files.BuildZigOptions;
 pub const generateBuildZigZon = build_files.generateBuildZigZon;
 pub const deps_linker = build_files.deps_linker;
@@ -2602,6 +2604,11 @@ pub fn generate(
         // Empty for tilemap-free projects, so their main.zig is byte-identical.
         defer main_zig.main_template.tilemap_registrations = &.{};
         main_zig.main_template.tilemap_registrations = tilemap_registrations;
+
+        // i18n device-language hand-off (RFC-I18N section 8) — same scoped
+        // pattern. False for locale-less projects: byte-identical main.zig.
+        defer main_zig.main_template.i18n_enabled = false;
+        main_zig.main_template.i18n_enabled = has_i18n;
 
         // Scripting splice (labelle-assembler#593) — same scoped pattern.
         // Carries the plugin import name + language + the sorted script
