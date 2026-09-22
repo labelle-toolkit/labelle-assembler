@@ -72,6 +72,10 @@ pub fn Mixin(comptime Self: type) type {
 
             try @import("../blocks/animation_assets.zig").emit(w, self.animation_jsonc_names, .catch_panic_style);
 
+            // Device language (RFC-I18N section 8) — same hand-off and
+            // placement as the loop-path setup (`loop.emitSystemLocale`).
+            if (self.i18n) try @import("loop.zig").emitSystemLocale(w);
+
             if (cfg.resolved_gui) |gui| {
                 if (gui.lifecycle.init) {
                     try w.writeAll("    GuiBackend.init();\n");

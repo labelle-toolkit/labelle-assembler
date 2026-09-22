@@ -1460,6 +1460,67 @@ pub const TILEMAP_EMBED = struct {
     }
 };
 
+// ── Device-language hand-off (RFC-I18N section 8, flying-platform#917) ──────
+// A project with locales boots in the device language: the setup hands the
+// backend's `window.systemLocale` to the generated i18n module behind
+// `@hasDecl`, on both the loop (desktop) and callback (Android) paths.
+// Locale-less projects emit nothing.
+pub const SYSTEM_LOCALE = struct {
+    const apply_call = "if (window.systemLocale(&locale_buf)) |tag| _ = @import(\"i18n\").applySystemLocale(tag);";
+
+    fn generateMain(platform: anytype, lifecycle: []const u8) ![]const u8 {
+        return generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{
+            .y_axis = .up,
+            .name = "test-game",
+            .backend = .bgfx,
+            .platform = platform,
+            .ecs = .mock,
+        }, lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+    }
+
+    test "a locale-less project emits no device-language call" {
+        const main_zig = try generateMain(.desktop, raylib_lifecycle);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "applySystemLocale") == null);
+    }
+
+    test "desktop loop main applies the device language before runner.setup" {
+        generate.main_template.i18n_enabled = true;
+        defer generate.main_template.i18n_enabled = false;
+        const main_zig = try generateMain(.desktop, raylib_lifecycle);
+        defer std.testing.allocator.free(main_zig);
+        const call_idx = std.mem.indexOf(u8, main_zig, apply_call) orelse return error.NotFound;
+        const setup_idx = std.mem.indexOf(u8, main_zig, "runner.setup(&g);") orelse return error.NotFound;
+        try std.testing.expect(call_idx < setup_idx);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "if (comptime @hasDecl(window, \"systemLocale\")) {") != null);
+    }
+
+    test "bgfx android callback main applies the device language too" {
+        h.setBgfxAndroidLifecycle();
+        defer h.clearLifecycleOverrides();
+        generate.main_template.i18n_enabled = true;
+        defer generate.main_template.i18n_enabled = false;
+        const main_zig = try generateMain(.android, bgfx_android_lifecycle);
+        defer std.testing.allocator.free(main_zig);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, apply_call) != null);
+    }
+
+    test "the emitted statement passes AstGen against a stub window (both with and without the decl)" {
+        var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        try generate.emitSystemLocale(&aw.writer);
+        const stmt = aw.written();
+        inline for (.{
+            "const window = struct { pub fn systemLocale(_: []u8) ?[]const u8 { return null; } };\n",
+            "const window = struct {};\n",
+        }) |stub| {
+            const unit = try std.mem.concat(std.testing.allocator, u8, &.{ stub, "pub fn setup() void {\n", stmt, "}\n" });
+            defer std.testing.allocator.free(unit);
+            try WINDOW_ICON.expectAstGenOk(unit);
+        }
+    }
+};
+
 // ── Window icon hand-off (labelle-cli#359) ─────────────────────────────────
 // The generated desktop main embeds the assembler-staged icon and hands it to
 // the backend behind `@hasDecl(window, "setWindowIconPng")` — bgfx implements
