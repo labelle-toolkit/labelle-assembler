@@ -4,13 +4,21 @@ const schema = @import("material_schema.zig");
 pub const Input = struct { name: []const u8, json: []const u8 };
 /// `glsl_profile` is the toolchain's (`material_schema.Toolchain`), chosen at
 /// generate time from the project's bgfx pin together with `material_shaderc`.
-pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module, inputs: []const Input, platform: []const u8, glsl_profile: []const u8) *std.Build.Module {
+/// `bgfx_api` is that toolchain's API: an explicit shaderc override must
+/// report it, or it would emit a container the linked bgfx rejects.
+pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module, inputs: []const Input, platform: []const u8, glsl_profile: []const u8, bgfx_api: []const u8) *std.Build.Module {
     // Always a HOST executable, even for Android, Emscripten and iOS.
     const tool = b.dependency("material_shaderc", .{ .target = b.graph.host, .with_shaderc = true });
     const override = b.option([]const u8, "shaderc", "Override the pinned host shaderc executable") orelse b.graph.environ_map.get("LABELLE_SHADERC");
-    if (override) |exe| if (!std.fs.path.isAbsolute(exe)) {
-        std.debug.panic("shaderc override must be an absolute host executable path: {s}", .{exe});
-    };
+    if (override) |exe| {
+        if (!std.fs.path.isAbsolute(exe)) std.debug.panic("shaderc override must be an absolute host executable path: {s}", .{exe});
+        // Only when materials exist: `create` is emitted only then.
+        const version = b.run(&.{ exe, "--version" });
+        if (!schema.shadercReportsApi(version, bgfx_api)) std.debug.panic(
+            "shaderc override {s} is not for bgfx API {s} (it reports: {s}). This project links bgfx API {s}; a shaderc from another API emits a shader container the runtime rejects.",
+            .{ exe, bgfx_api, std.mem.trim(u8, version, " \r\n"), bgfx_api },
+        );
+    }
     const files = b.addWriteFiles();
     const varying = b.addWriteFiles().add("sprite-varying.def.sc", schema.varying);
     var source = std.Io.Writer.Allocating.init(b.allocator);

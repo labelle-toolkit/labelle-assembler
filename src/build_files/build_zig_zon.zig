@@ -26,6 +26,8 @@ const build_zig_zon_tmpl = @embedFile("../templates/build_zig_zon.txt");
 
 pub const BuildZigZonOptions = struct {
     materials: bool = false,
+    /// Null = derive from cfg (`material_pipeline.toolchain`).
+    material_toolchain: ?@import("../material_schema.zig").Toolchain = null,
     /// True (default) wipes the shared `.labelle/deps/` directory before
     /// recreating it. The tests target (issue #83) sets this to false so
     /// the second-pass generation merges its null-backend dep into the
@@ -152,7 +154,7 @@ pub fn generateBuildZigZon(allocator: std.mem.Allocator, cfg: ProjectConfig, tar
     if (opts.materials) {
         // Chosen from the project's bgfx pin: the shader container must match
         // the bgfx API the game links (labelle-bgfx >= 0.24.0 is API 161).
-        const tc = @import("../material_pipeline.zig").toolchain(cfg);
+        const tc = opts.material_toolchain orelse @import("../material_pipeline.zig").toolchain(cfg);
         try w.print("        .material_shaderc = .{{ .url = \"{s}\", .hash = \"{s}\" }},\n", .{ tc.url, tc.hash });
     }
 

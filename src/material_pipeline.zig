@@ -229,11 +229,11 @@ pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8,
     }
     return names.toOwnedSlice(a);
 }
-pub fn emit(w: *std.Io.Writer, names: []const []const u8, platform: []const u8, glsl_profile: []const u8) !void {
+pub fn emit(w: *std.Io.Writer, names: []const []const u8, platform: []const u8, tc: schema.Toolchain) !void {
     if (names.len == 0) return;
     try w.writeAll("    const materials_mod = @import(\"material_build.zig\").create(b, target, optimize, core_mod, &.{\n");
     for (names) |name| try w.print("        .{{ .name = \"{s}\", .json = @embedFile(\"materials/{s}/material.json\") }},\n", .{ name, name });
-    try w.print("    }}, \"{s}\", \"{s}\");\n    overrideImport(game_mod, \"materials\", materials_mod);\n", .{ platform, glsl_profile });
+    try w.print("    }}, \"{s}\", \"{s}\", \"{s}\");\n    overrideImport(game_mod, \"materials\", materials_mod);\n", .{ platform, tc.glsl_profile, tc.api });
 }
 pub fn emitImport(w: *std.Io.Writer, names: []const []const u8, artifact: []const u8) !void {
     if (names.len != 0) try w.print("    {s}.root_module.addImport(\"materials\", materials_mod);\n", .{artifact});
@@ -243,13 +243,13 @@ test "materials build emission has explicit embedded descriptors and empty no-op
     _ = schema;
     var out = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer out.deinit();
-    try emit(&out.writer, &.{}, "desktop", "330");
+    try emit(&out.writer, &.{}, "desktop", schema.toolchain_api161);
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
-    try emit(&out.writer, &.{ "fog", "lamp" }, "desktop", "330");
+    try emit(&out.writer, &.{ "fog", "lamp" }, "desktop", schema.toolchain_api161);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "materials/fog/material.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "materials/lamp/material.json") != null);
-    // The toolchain's GLSL profile reaches material_build.create.
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "}, \"desktop\", \"330\");") != null);
+    // The toolchain's GLSL profile and API reach material_build.create.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "}, \"desktop\", \"330\", \"161\");") != null);
 }
 
 test "toolchain: the material shaderc follows the project's bgfx API (labelle-bgfx v0.24.0 = API 161)" {

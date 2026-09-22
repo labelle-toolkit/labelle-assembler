@@ -26,12 +26,38 @@ pub const Toolchain = struct {
     /// `-p` for `.glsl`. API 161's shaderc starts its GLSL profiles at 330
     /// (and the GL renderer loads `#version 430`); API 142 took 120.
     glsl_profile: []const u8,
+    /// The bgfx API this shaderc belongs to, as `shaderc --version` reports it
+    /// (`version 1.19.<api>.`). Used to reject a `-Dshaderc`/`LABELLE_SHADERC`
+    /// override from the other API, which would otherwise get this profile
+    /// and emit a container the linked runtime rejects.
+    api: []const u8,
 };
+/// Does `shaderc --version` output belong to bgfx `api`? Matches the
+/// `version <major>.<minor>.<api>` triple exactly, so 142 never matches 1142.
+pub fn shadercReportsApi(version_output: []const u8, api: []const u8) bool {
+    const key = "version ";
+    const at = std.mem.indexOf(u8, version_output, key) orelse return false;
+    var parts = std.mem.splitScalar(u8, version_output[at + key.len ..], '.');
+    _ = parts.next() orelse return false; // major
+    _ = parts.next() orelse return false; // minor
+    const patch = parts.next() orelse return false;
+    var end: usize = 0;
+    while (end < patch.len and std.ascii.isDigit(patch[end])) end += 1;
+    return end > 0 and std.mem.eql(u8, patch[0..end], api);
+}
+test "shadercReportsApi reads the API off shaderc --version" {
+    try std.testing.expect(shadercReportsApi("shaderc, bgfx shader compiler tool, version 1.19.161.\n", "161"));
+    try std.testing.expect(!shadercReportsApi("shaderc, bgfx shader compiler tool, version 1.19.161.\n", "142"));
+    try std.testing.expect(shadercReportsApi("shaderc, bgfx shader compiler tool, version 1.18.142.", "142"));
+    try std.testing.expect(!shadercReportsApi("version 1.19.1142.", "142"));
+    try std.testing.expect(!shadercReportsApi("not a shaderc", "161"));
+}
 /// bgfx API 142: labelle-bgfx < 0.24.0. Container v11.
 pub const toolchain_api142: Toolchain = .{
     .url = "https://github.com/labelle-toolkit/zbgfx/archive/934372f13b92e651c9e43613af6dff96d231e782.tar.gz",
     .hash = "zbgfx-0.12.0-Sm4IxBGjywYbjOha8_dczGXQq53qynqGka3vWDhKI3pD",
     .glsl_profile = "120",
+    .api = "142",
 };
 /// bgfx API 161: labelle-bgfx >= 0.24.0. Container v12. Same zbgfx pin as
 /// labelle-bgfx v0.24.0 (labelle-toolkit/zbgfx#1 merge).
@@ -39,6 +65,7 @@ pub const toolchain_api161: Toolchain = .{
     .url = "https://github.com/labelle-toolkit/zbgfx/archive/ba2786f11b8042afc2f90e10b2a6432bd24befae.tar.gz",
     .hash = "zbgfx-0.12.0-Sm4IxMnIDAdzAesVbziV41cUrt0j8cBIG8xGe7UL1fpY",
     .glsl_profile = "330",
+    .api = "161",
 };
 pub const varying =
     \\vec4 v_color0 : COLOR0 = vec4(1.0, 1.0, 1.0, 1.0);
