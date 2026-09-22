@@ -251,6 +251,11 @@ pub const GenerateOptions = struct {
     /// the real generate with it (the declare phase's override-runner
     /// pattern).
     plugin_build_os: ?std.Target.Os.Tag = null,
+    /// The material shaderc toolchain, when the caller knows better than this
+    /// cfg. The tests target sets it from the GAME's config: its own cfg has
+    /// `backend = .null`, which would otherwise pick a different bgfx API and
+    /// compile the game's materials in another dialect/container.
+    material_toolchain: ?material_pipeline.schema.Toolchain = null,
 };
 
 /// The `.os`-filtered view of `steps` for `os_tag`
@@ -311,6 +316,7 @@ pub fn generate(
 ) !void {
     const target_name_override = opts.target_name_override;
     const is_tests_target = opts.is_tests_target;
+    const material_toolchain = opts.material_toolchain orelse material_pipeline.toolchain(cfg_in);
     // Shadow the caller's cfg with a mutable copy. Ticket #48's lazy
     // default-inference pass needs to rewrite `cfg.resources[i].lazy`
     // in place, and we don't want to surprise callers by touching
@@ -1327,6 +1333,7 @@ pub fn generate(
         // target's deps (chosen-backend, plugins) survive. Issue #83.
         .recreate_deps = !is_tests_target,
         .materials = material_names.len != 0,
+        .material_toolchain = material_toolchain,
         // manifest-v2 cutover: when the backend ships a v2 manifest, key the
         // backend dep entry off its `dep_name` + drive its `root_build_deps`
         // (design §3). Null → v1/enum, byte-unchanged.
@@ -2021,6 +2028,7 @@ pub fn generate(
     // `cfg.plugins`.
     const build_zig = try build_files.generateBuildZig(allocator, cfg_modules, .{
         .materials = material_names,
+        .material_toolchain = material_toolchain,
         .is_tests_target = is_tests_target,
         .constants = has_constants,
         .i18n = has_i18n,
@@ -2732,6 +2740,9 @@ pub fn generateTestsTarget(
     try generate(allocator, testsTargetConfig(cfg_in), output_dir, game_dir, .{
         .target_name_override = "tests",
         .is_tests_target = true,
+        // From cfg_in, before the `.null` backend swap: the tests target must
+        // compile materials exactly like the game does.
+        .material_toolchain = material_pipeline.toolchain(cfg_in),
     });
 }
 
@@ -2758,6 +2769,19 @@ fn testsTargetConfig(cfg_in: ProjectConfig) ProjectConfig {
     // Applies to every backend: raylib/sokol tests shouldn't link SDL either.
     cfg.gamepad = .none;
     return cfg;
+}
+
+test "tests target must take the GAME's material toolchain, not its own (.null backend) one" {
+    // An unpinned bgfx project follows the builtin provider; the tests-target
+    // cfg swaps the backend to `.null`, which cannot be judged and falls to
+    // the newest toolchain. Whenever the two differ, `generateTestsTarget`
+    // passing `toolchain(cfg_in)` is what keeps game and tests on one dialect.
+    const game: ProjectConfig = .{ .name = "g", .backend = .bgfx };
+    const tests_tc = material_pipeline.toolchain(testsTargetConfig(game));
+    try std.testing.expectEqualStrings(material_pipeline.schema.toolchain_api161.url, tests_tc.url);
+    const game_tc = material_pipeline.toolchain(game);
+    const default_is_161 = try config.pinAtLeast(ProjectConfig.builtinProvider(.bgfx).?.version, material_pipeline.min_bgfx_for_api161);
+    try std.testing.expectEqual(default_is_161, std.mem.eql(u8, game_tc.url, tests_tc.url));
 }
 
 test "testsTargetConfig: never resolves gamepad .auto — tests must not link SDL (any backend)" {
