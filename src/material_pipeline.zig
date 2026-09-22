@@ -50,6 +50,22 @@ pub const ContractError = error{ MaterialContractUnsupported, UnparsableVersionP
 /// Returns the offending side so the caller can name it; the tests target
 /// (`.backend = .null`) is skipped like `requireBackend` skips it.
 pub const ContractViolation = struct { what: []const u8, pinned: []const u8, floor: []const u8 };
+/// First official labelle-bgfx on bgfx API 161 (shader container v12).
+pub const min_bgfx_for_api161 = "0.24.0";
+/// The material shaderc + GLSL profile for this project's bgfx.
+///
+/// Official labelle-bgfx with a semver pin: API 161 from 0.24.0, API 142
+/// below. Anything else follows the builtin provider's default pin, so a
+/// project that doesn't pin bgfx gets the toolchain matching what it links.
+/// A custom provider or a non-semver (commit / `local:`) pin can't be judged
+/// here; it gets the newest toolchain, and the runtime's container check is
+/// the backstop.
+pub fn toolchain(cfg: config.ProjectConfig) schema.Toolchain {
+    const bp = cfg.effectiveBackendPackage() orelse return schema.toolchain_api161;
+    if (!isOfficialBgfx(bp) or !config.isSemverVersion(bp.version)) return schema.toolchain_api161;
+    const new = config.pinAtLeast(bp.version, min_bgfx_for_api161) catch return schema.toolchain_api161;
+    return if (new) schema.toolchain_api161 else schema.toolchain_api142;
+}
 pub fn contractViolation(cfg: config.ProjectConfig) error{UnparsableVersionPin}!?ContractViolation {
     if (cfg.backend != .bgfx) return null;
     if (cfg.effectiveBackendPackage()) |bp| {
@@ -213,11 +229,11 @@ pub fn stage(a: std.mem.Allocator, game_dir: []const u8, target_dir: []const u8,
     }
     return names.toOwnedSlice(a);
 }
-pub fn emit(w: *std.Io.Writer, names: []const []const u8, platform: []const u8) !void {
+pub fn emit(w: *std.Io.Writer, names: []const []const u8, platform: []const u8, glsl_profile: []const u8) !void {
     if (names.len == 0) return;
     try w.writeAll("    const materials_mod = @import(\"material_build.zig\").create(b, target, optimize, core_mod, &.{\n");
     for (names) |name| try w.print("        .{{ .name = \"{s}\", .json = @embedFile(\"materials/{s}/material.json\") }},\n", .{ name, name });
-    try w.print("    }}, \"{s}\");\n    overrideImport(game_mod, \"materials\", materials_mod);\n", .{platform});
+    try w.print("    }}, \"{s}\", \"{s}\");\n    overrideImport(game_mod, \"materials\", materials_mod);\n", .{ platform, glsl_profile });
 }
 pub fn emitImport(w: *std.Io.Writer, names: []const []const u8, artifact: []const u8) !void {
     if (names.len != 0) try w.print("    {s}.root_module.addImport(\"materials\", materials_mod);\n", .{artifact});
@@ -227,11 +243,38 @@ test "materials build emission has explicit embedded descriptors and empty no-op
     _ = schema;
     var out = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer out.deinit();
-    try emit(&out.writer, &.{}, "desktop");
+    try emit(&out.writer, &.{}, "desktop", "330");
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
-    try emit(&out.writer, &.{ "fog", "lamp" }, "desktop");
+    try emit(&out.writer, &.{ "fog", "lamp" }, "desktop", "330");
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "materials/fog/material.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "materials/lamp/material.json") != null);
+    // The toolchain's GLSL profile reaches material_build.create.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "}, \"desktop\", \"330\");") != null);
+}
+
+test "toolchain: the material shaderc follows the project's bgfx API (labelle-bgfx v0.24.0 = API 161)" {
+    const bgfx_repo = (config.ProjectConfig.builtinProvider(.bgfx) orelse return error.TestUnexpectedResult).repo;
+    const T = struct {
+        fn pinned(repo: []const u8, version: []const u8) config.ProjectConfig {
+            return .{ .name = "g", .backend = .bgfx, .backend_package = .{ .name = "bgfx", .repo = repo, .version = version } };
+        }
+    };
+    // Below 0.24.0 the game links API 142: container v11, GLSL 120.
+    try std.testing.expectEqualStrings(schema.toolchain_api142.url, toolchain(T.pinned(bgfx_repo, "0.23.0")).url);
+    try std.testing.expectEqualStrings("120", toolchain(T.pinned(bgfx_repo, "0.23.2")).glsl_profile);
+    // From 0.24.0: API 161, container v12, GLSL 330. Every spelling of the
+    // official repo is judged the same (#742).
+    try std.testing.expectEqualStrings(schema.toolchain_api161.url, toolchain(T.pinned(bgfx_repo, "0.24.0")).url);
+    try std.testing.expectEqualStrings("330", toolchain(T.pinned("https://github.com/labelle-toolkit/labelle-bgfx.git", "0.25.1")).glsl_profile);
+    // No pin: follows the builtin provider's default, whatever it is.
+    const default_bp = config.ProjectConfig.builtinProvider(.bgfx).?;
+    const expect_default = if (try config.pinAtLeast(default_bp.version, min_bgfx_for_api161)) schema.toolchain_api161 else schema.toolchain_api142;
+    try std.testing.expectEqualStrings(expect_default.url, toolchain(.{ .name = "g", .backend = .bgfx }).url);
+    // A custom provider or a non-semver pin cannot be judged: newest toolchain.
+    try std.testing.expectEqualStrings(schema.toolchain_api161.url, toolchain(T.pinned("github.com/acme/bgfx", "0.1.0")).url);
+    try std.testing.expectEqualStrings(schema.toolchain_api161.url, toolchain(T.pinned("local:../labelle-bgfx", "main")).url);
+    // The two toolchains are distinct pins with distinct GLSL profiles.
+    try std.testing.expect(!std.mem.eql(u8, schema.toolchain_api142.hash, schema.toolchain_api161.hash));
 }
 
 test "requireBackend: keyed off the .bgfx enum tag, not the resolved package name (#733 P2)" {

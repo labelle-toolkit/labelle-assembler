@@ -13,8 +13,33 @@ pub const Descriptor = struct {
     textures: []const Texture = &.{},
     blend: enum { alpha, additive } = .alpha,
 };
-pub const tool_url = "https://github.com/labelle-toolkit/zbgfx/archive/934372f13b92e651c9e43613af6dff96d231e782.tar.gz";
-pub const tool_hash = "zbgfx-0.12.0-Sm4IxBGjywYbjOha8_dczGXQq53qynqGka3vWDhKI3pD";
+/// The shaderc that compiles game materials, and the GLSL profile it takes.
+///
+/// It MUST come from the same bgfx API the game links: the shader container
+/// version and the GLSL dialect both changed at bgfx API 161 (labelle-bgfx
+/// v0.24.0), and each runtime rejects the other's container. So the generator
+/// picks one per project from its resolved bgfx pin
+/// (`material_pipeline.toolchain`), never a single global pin.
+pub const Toolchain = struct {
+    url: []const u8,
+    hash: []const u8,
+    /// `-p` for `.glsl`. API 161's shaderc starts its GLSL profiles at 330
+    /// (and the GL renderer loads `#version 430`); API 142 took 120.
+    glsl_profile: []const u8,
+};
+/// bgfx API 142: labelle-bgfx < 0.24.0. Container v11.
+pub const toolchain_api142: Toolchain = .{
+    .url = "https://github.com/labelle-toolkit/zbgfx/archive/934372f13b92e651c9e43613af6dff96d231e782.tar.gz",
+    .hash = "zbgfx-0.12.0-Sm4IxBGjywYbjOha8_dczGXQq53qynqGka3vWDhKI3pD",
+    .glsl_profile = "120",
+};
+/// bgfx API 161: labelle-bgfx >= 0.24.0. Container v12. Same zbgfx pin as
+/// labelle-bgfx v0.24.0 (labelle-toolkit/zbgfx#1 merge).
+pub const toolchain_api161: Toolchain = .{
+    .url = "https://github.com/labelle-toolkit/zbgfx/archive/ba2786f11b8042afc2f90e10b2a6432bd24befae.tar.gz",
+    .hash = "zbgfx-0.12.0-Sm4IxMnIDAdzAesVbziV41cUrt0j8cBIG8xGe7UL1fpY",
+    .glsl_profile = "330",
+};
 pub const varying =
     \\vec4 v_color0 : COLOR0 = vec4(1.0, 1.0, 1.0, 1.0);
     \\vec2 v_texcoord0 : TEXCOORD0 = vec2(0.0, 0.0);
@@ -154,10 +179,10 @@ pub fn validateIncludes(source: []const u8) !void {
         if (!relativePath(rest[1 .. end + 1])) return error.EscapingShaderInclude;
     }
 }
-pub fn profile(target: Target) []const u8 {
+pub fn profile(target: Target, glsl_profile: []const u8) []const u8 {
     return switch (target) {
         .spv => "spirv",
-        .glsl => "120",
+        .glsl => glsl_profile,
         .essl => "300_es",
         .mtl => "metal",
         .dx11 => "s_5_0",
@@ -173,7 +198,7 @@ pub fn profile(target: Target) []const u8 {
 /// `#if BX_PLATFORM_*` in the shader (labelle-assembler#740).
 ///
 /// Names are shaderc's own spelling, read off `shaderc --help` for the pinned
-/// `tool_hash` build (android, asm.js, ios, linux, orbis, osx, windows) — note
+/// toolchain builds (API 142 and 161 list the same names) (android, asm.js, ios, linux, orbis, osx, windows) — note
 /// Emscripten is spelled `asm.js`, not `emscripten` or `wasm`.
 ///
 /// Only the two ambiguous pairs are platform-keyed; every other

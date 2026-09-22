@@ -2,7 +2,9 @@
 const std = @import("std");
 const schema = @import("material_schema.zig");
 pub const Input = struct { name: []const u8, json: []const u8 };
-pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module, inputs: []const Input, platform: []const u8) *std.Build.Module {
+/// `glsl_profile` is the toolchain's (`material_schema.Toolchain`), chosen at
+/// generate time from the project's bgfx pin together with `material_shaderc`.
+pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module, inputs: []const Input, platform: []const u8, glsl_profile: []const u8) *std.Build.Module {
     // Always a HOST executable, even for Android, Emscripten and iOS.
     const tool = b.dependency("material_shaderc", .{ .target = b.graph.host, .with_shaderc = true });
     const override = b.option([]const u8, "shaderc", "Override the pinned host shaderc executable") orelse b.graph.environ_map.get("LABELLE_SHADERC");
@@ -28,7 +30,7 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             const run = if (override) |exe| b.addSystemCommand(&.{exe}) else b.addRunArtifact(tool.artifact("shaderc"));
             run.step.name = b.fmt("shader {s} ({s})", .{ input.name, @tagName(variant) });
             if (override) |exe| run.addFileInput(.{ .cwd_relative = exe });
-            run.addArgs(&.{ "--type", "fragment", "--platform", schema.platform(variant, platform), "-p", schema.profile(variant), "-O", "3", "-f" });
+            run.addArgs(&.{ "--type", "fragment", "--platform", schema.platform(variant, platform), "-p", schema.profile(variant, glsl_profile), "-O", "3", "-f" });
             run.addFileArg(b.path(b.fmt("materials/{s}/{s}", .{ input.name, d.fragment })));
             run.addArg("--varyingdef");
             run.addFileArg(varying);

@@ -1244,7 +1244,7 @@ pub fn generateBuildZig(allocator: std.mem.Allocator, cfg: ProjectConfig, opts: 
     // compiles under its own module, whose import table does not inherit
     // game_mod's -- without these entries, valid `@import("constants")` in
     // exactly the sources the usage scanner covers failed to resolve.
-    try materials.emit(w, opts.materials, if (opts.is_tests_target or std.mem.eql(u8, cfg.backendName(), "null")) "tests" else @tagName(cfg.platform));
+    try materials.emit(w, opts.materials, if (opts.is_tests_target or std.mem.eql(u8, cfg.backendName(), "null")) "tests" else @tagName(cfg.platform), materials.toolchain(cfg).glsl_profile);
     try emitConstantsModule(w, opts.constants);
     try emitI18nModule(w, opts.i18n);
     // In-project lib plugin modules pick the data modules up here — after
