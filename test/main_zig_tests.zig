@@ -1017,6 +1017,66 @@ pub const SOKOL = struct {
         try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"intro\")") == null);
     }
 
+    // ── `labelle run --scene=<name>` (assembler#751) ──────────────────
+    // The CLI passes the scene at runtime (LABELLE_SCENE); the generated
+    // loop must switch to it after boot unless the project opted out.
+
+    test "--scene: generated main switches to the requested scene by default" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        const jsonc_scenes = &[_][]const u8{ "intro", "main_menu", "gameplay" };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .initial_prefab = "intro",
+        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        // Boot is unchanged: still the initial prefab (cli#229's race).
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"intro\")") != null);
+        // The helper reads the runtime request and retries setScene.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "fn honourRequestedScene(game: *AssembledGame) void") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "engine.requestedScene()") != null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "game.setScene(requested)") != null);
+        // An unknown name warns with the valid scenes, in scan order.
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "const requested_scene_known = \"intro, main_menu, gameplay\";") != null);
+        // Called every frame, BEFORE the pause-gated script tick.
+        const call = std.mem.indexOf(u8, main_zig, "honourRequestedScene(&g);") orelse return error.TestExpectedCall;
+        const scripts = std.mem.indexOf(u8, main_zig, "runner.tick(&g, scaled_dt)") orelse return error.TestExpectedTick;
+        try std.testing.expect(call < scripts);
+    }
+
+    test "--scene: .scene_override = .project leaves it to the project" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        const jsonc_scenes = &[_][]const u8{ "intro", "main_menu" };
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+            .initial_prefab = "intro",
+            .scene_override = .project,
+        }, sokol_lifecycle, empty_entries, empty_names, jsonc_scenes, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "honourRequestedScene") == null);
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "g.setScene(\"intro\")") != null);
+    }
+
+    test "--scene: no JSONC scenes, nothing to switch to, no hook" {
+        h.setSokolLifecycle();
+        defer h.clearLifecycleOverrides();
+        const main_zig = try generate.generateMainZigFromTemplate(std.testing.allocator, engine_template, .{ .y_axis = .up,
+            .name = "test-game",
+            .backend = .sokol,
+            .ecs = .mock,
+        }, sokol_lifecycle, empty_entries, empty_names, empty_names, empty_scene_manifests, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_names, empty_plugin_events, empty_plugin_flow_nodes, empty_plugin_pin_styles, empty_plugin_coercions);
+        defer std.testing.allocator.free(main_zig);
+
+        try std.testing.expect(std.mem.indexOf(u8, main_zig, "honourRequestedScene") == null);
+    }
+
     test "initial_prefab wins over deprecated initial_scene when both set" {
         var cfg = generate.ProjectConfig{
             .name = "test-game",

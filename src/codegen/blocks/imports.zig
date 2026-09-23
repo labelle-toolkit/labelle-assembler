@@ -265,7 +265,69 @@ pub fn Mixin(comptime Self: type) type {
                 // (labelle-engine#500) — emit only the scenes that opted in,
                 // so the generated inline-for is a no-op for back-compat.
                 try self.writeSceneInitialStateManifests(w);
+
+                if (self.emitsRequestedSceneHook()) try writeRequestedSceneHook(w, jsonc_scene_names);
             }
         }
     };
+}
+
+/// `labelle run --scene=<name>` (assembler#751). The CLI passes the name at
+/// runtime as `LABELLE_SCENE` → `engine.requestedScene()` and the startup still
+/// boots the initial prefab, so this helper — called once per frame from the
+/// tick code, before the pause gate — switches afterwards.
+///
+/// It retries `setScene(requested)` every frame until the current scene IS the
+/// requested one: `setScene` defers while the scene's assets are still
+/// streaming and never retries on its own (cli#243), which is exactly the
+/// frame-0 race booting the scene directly would hit (cli#229). Settles for
+/// good once the switch lands, when nothing was requested, when the request is
+/// the scene already running, or with ONE warning naming the valid scenes when
+/// the name is not a registered scene. Gated on `@hasDecl` so an engine without
+/// `requestedScene` keeps building.
+fn writeRequestedSceneHook(w: anytype, jsonc_scene_names: []const []const u8) !void {
+    try w.writeAll(
+        \\
+        \\// --- `labelle run --scene=<name>` (labelle-assembler#751) ---
+        \\// The CLI passes the scene at runtime (`LABELLE_SCENE`); the startup boots
+        \\// the initial prefab, and this switches once the scene's assets allow it.
+        \\// Opt out with `.scene_override = .project` when the project's own loading
+        \\// controller reads `engine.requestedScene()`.
+        \\var requested_scene_settled: bool = false;
+        \\const requested_scene_known = "
+    );
+    for (jsonc_scene_names, 0..) |name, i| {
+        if (i > 0) try w.writeAll(", ");
+        try w.writeAll(name);
+    }
+    try w.writeAll(
+        \\";
+        \\fn honourRequestedScene(game: *AssembledGame) void {
+        \\    if (requested_scene_settled) return;
+        \\    if (comptime @hasDecl(engine, "requestedScene")) {
+        \\        const requested = engine.requestedScene() orelse {
+        \\            requested_scene_settled = true;
+        \\            return;
+        \\        };
+        \\        if (game.scenes.get(requested) == null) {
+        \\            requested_scene_settled = true;
+        \\            game.log.warn("--scene={s}: no such scene; valid scenes: {s}", .{ requested, requested_scene_known });
+        \\            return;
+        \\        }
+        \\        if (game.getCurrentSceneName()) |current| {
+        \\            if (std.mem.eql(u8, current, requested)) {
+        \\                requested_scene_settled = true;
+        \\                return;
+        \\            }
+        \\        }
+        \\        game.setScene(requested) catch |err| {
+        \\            requested_scene_settled = true;
+        \\            game.log.err("--scene={s}: setScene failed: {s}", .{ requested, @errorName(err) });
+        \\        };
+        \\    } else {
+        \\        requested_scene_settled = true;
+        \\    }
+        \\}
+        \\
+    );
 }

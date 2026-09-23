@@ -84,6 +84,7 @@ test {
     _ = @import("scene_name_lint.zig");
     _ = @import("scene_manifest.zig");
     _ = @import("scene_manifest_test.zig");
+    _ = @import("scene_override_check.zig");
     _ = @import("tilemap_scan_test.zig"); // covers tilemap_scan + tilemap_scene_scan
     _ = @import("asset_validator.zig");
     _ = @import("pack_resources.zig");
@@ -772,6 +773,34 @@ pub fn generate(
     defer allocator.free(scenes_target);
     const scene_manifests = try scene_manifest.parseSceneDir(allocator, scenes_target, jsonc_scene_names);
     defer scene_manifest.freeManifests(allocator, scene_manifests);
+
+    // ── `labelle run --scene=<name>` guards (assembler#751) ─────────────
+    // Warnings, not errors: both setups build and run, they just make the
+    // boot scene surprising. Skipped for the tests target, which never boots.
+    if (!is_tests_target) {
+        const scene_check = @import("scene_override_check.zig");
+        if (scene_check.initialPrefabAmbiguous(cfg.resolvedInitialPrefab(), jsonc_scene_names.len)) {
+            std.log.warn(
+                "labelle-assembler: {d} scenes and no `.initial_prefab` in project.labelle — the game boots '{s}' " ++
+                    "only because it sorts first, so adding a scene can change what `labelle run` boots. " ++
+                    "Set `.initial_prefab` (assembler#751).",
+                .{ jsonc_scene_names.len, jsonc_scene_names[0] },
+            );
+        }
+        if (cfg.scene_override == .generated and jsonc_scene_names.len > 0) {
+            const scripts_dir = try std.fs.path.join(allocator, &.{ game_dir, "scripts" });
+            defer allocator.free(scripts_dir);
+            if (try scene_check.findRequestedSceneReader(allocator, scripts_dir)) |reader| {
+                defer allocator.free(reader);
+                std.log.warn(
+                    "labelle-assembler: '{s}' reads `engine.requestedScene()`, and the generated frame loop now " ++
+                        "switches to `--scene` itself — both would switch the boot scene. If that script is the " ++
+                        "project's loading controller, set `.scene_override = .project` in project.labelle (assembler#751).",
+                    .{reader},
+                );
+            }
+        }
+    }
 
     // ── `@` target-override version gate (labelle-engine#801) ──────────
     // Compat checking is MAJOR-only (labelle-cli#269), so "new assembler +

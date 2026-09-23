@@ -126,6 +126,9 @@ pub const Capability = enum {
 /// so no existing game silently flips when the framework default becomes
 /// `.down`. See `requireYAxis` and RFC §4 / the Migration section.
 pub const YAxis = enum { up, down };
+/// Who switches to the scene `labelle run --scene=<name>` asked for — see
+/// `ProjectConfig.scene_override` (assembler#751).
+pub const SceneOverride = enum { generated, project };
 
 /// Texture container a platform ships atlases in. `.png` (source, CPU-decoded
 /// at load) or `.astc` (GPU-native compressed, zero decode — see #340).
@@ -1282,6 +1285,19 @@ pub const ProjectConfig = struct {
     /// `initial_prefab` wins. Prefer reading `resolvedInitialPrefab()` instead of this
     /// field directly so the legacy alias is honored consistently.
     initial_scene: ?[]const u8 = null,
+    /// Who honours `labelle run --scene=<name>` (assembler#751). The CLI
+    /// passes the name at RUNTIME, as `LABELLE_SCENE` → `engine.requestedScene()`
+    /// (cli#229/#243/#244), never to this generator — so the startup still
+    /// boots the initial prefab, and something has to switch afterwards.
+    ///
+    /// - `.generated` (default): the generated frame loop does it, retrying
+    ///   `setScene(requested)` each tick until the scene's assets are resident
+    ///   and the switch lands (the same retry a loading controller does), and
+    ///   warns once when the name is not a registered scene.
+    /// - `.project`: the project's own loading controller reads
+    ///   `engine.requestedScene()` itself, so the generated loop stays out of it
+    ///   (two switchers would fight over the boot scene).
+    scene_override: SceneOverride = .generated,
     /// Sprite atlas resources — each entry declares a named atlas with frame data and texture.
     resources: []const ResourceDef = &.{},
     /// Commands the CLI runs — in declared order, project root as cwd —

@@ -275,6 +275,16 @@ pub const Codegen = struct {
     /// True iff any pack contributed at least one `prefabs/*.jsonc`. Gates
     /// the `JsoncBridge` decl + the embedded-prefab registration so a pack
     /// can ship prefabs even when the game root declares none.
+    /// Whether the generated `main.zig` honours `labelle run --scene=<name>`
+    /// itself (assembler#751): the `honourRequestedScene` helper in the JSONC
+    /// scene block AND its per-frame call in `tick_code`. ONE predicate for
+    /// both halves, so the call is never emitted without the helper it
+    /// names. Needs JSONC scenes (nothing to switch to otherwise) and a
+    /// project that has not claimed the job (`.scene_override = .project`).
+    pub fn emitsRequestedSceneHook(self: *const Self) bool {
+        return self.cfg.scene_override == .generated and self.jsonc_scene_names.len > 0;
+    }
+
     pub fn hasPackPrefabs(self: *const Self) bool {
         for (self.pack_scans) |p| {
             if (p.prefab_names.len > 0) return true;
