@@ -319,6 +319,22 @@ pub fn Mixin(comptime Self: type) type {
                 "            g.script_profile_count = @TypeOf(runner).script_count;\n" ++
                 "        }\n";
 
+            // `labelle run --scene=<name>` (assembler#751): switch to the
+            // requested scene once its assets allow it. FIRST in the frame and
+            // OUTSIDE the scaled_dt gate, so a game that boots paused (or whose
+            // initial state has time_scale 0) still gets there. The helper it
+            // calls is emitted by the JSONC scene block under the same
+            // predicate, so the call never names a missing function.
+            const requested_scene_tick =
+                "        // `labelle run --scene=<name>` (labelle-assembler#751).\n" ++
+                "        honourRequestedScene(&g);\n";
+            const emit_scene_hook = self.emitsRequestedSceneHook();
+            const tick_code_final: []const u8 = if (emit_scene_hook)
+                try std.mem.concat(allocator, u8, &.{ requested_scene_tick, tick_code })
+            else
+                tick_code;
+            defer if (emit_scene_hook) allocator.free(tick_code_final);
+
             const gui_draw_code = try self.buildGuiDrawCode();
             defer allocator.free(gui_draw_code);
 
@@ -654,7 +670,7 @@ pub fn Mixin(comptime Self: type) type {
                     .fps = fps_str,
                     .init_code = init_code,
                     .setup_code = init_code,
-                    .tick_code = tick_code,
+                    .tick_code = tick_code_final,
                     .gui_draw_code = gui_draw_code,
                     .gui_event_extern = gui_event_extern,
                     .gui_event_forward = gui_event_forward,
@@ -744,7 +760,7 @@ pub fn Mixin(comptime Self: type) type {
                     .title = cfg.title,
                     .fps = fps_str,
                     .setup_code = setup_code,
-                    .tick_code = tick_code,
+                    .tick_code = tick_code_final,
                     .gui_draw_code = gui_draw_code,
                     .hidden_setup = hidden_setup,
                     .hooks_init_block = hooks_init,
